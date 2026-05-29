@@ -30,6 +30,7 @@ from trading.strategy.pipeline import GatePipelineResult
 from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.review import TradeReviewService
 from trading.strategy.runtime import StrategyRuntime, StrategyRuntimeConfig
+from trading.strategy.themes import ThemeMapping
 from trading.strategy.virtual_orders import VirtualOrderService
 
 
@@ -349,19 +350,21 @@ def test_no_gate_result_repeated_cycle_does_not_resave_candidate(tmp_path, monke
         db,
         "111111",
         CandidateState.WATCHING,
-        metadata={"sub_status": "DATA_INSUFFICIENT", "insufficient_reason": ["NO_GATE_RESULT"]},
+        metadata={},
     )
     original_last_seen = candidate.last_seen_at
     runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=15))
     calls = []
 
     monkeypatch.setattr(db, "save_candidate", lambda changed: calls.append(changed) or changed)
 
-    snapshot = runtime.cycle(NOW + timedelta(seconds=15))
+    snapshot = runtime.cycle(NOW + timedelta(seconds=30))
 
     assert calls == []
     assert snapshot.candidate_save_count == 0
     assert db.load_candidate_by_id(candidate.id).last_seen_at == original_last_seen
+    assert "NO_GATE_RESULT" in db.load_candidate_by_id(candidate.id).metadata["insufficient_reason"]
     db.close()
 
 
@@ -440,6 +443,82 @@ def test_expire_stale_keeps_recent_tick_and_open_virtual_activity(tmp_path):
     assert db.load_candidate_by_id(tick_candidate.id).state == CandidateState.WATCHING
     assert db.load_candidate_by_id(order_candidate.id).state == CandidateState.WATCHING
     assert db.load_candidate_by_id(position_candidate.id).state == CandidateState.WATCHING
+    db.close()
+
+
+def test_runtime_readiness_warns_when_theme_mappings_empty(tmp_path):
+    runtime, db, _, _, _ = build_runtime(tmp_path, gate_pipeline=FakeGatePipeline(results_factory=lambda candidate: []))
+    save_candidate(db, "111111", CandidateState.WATCHING)
+
+    snapshot = runtime.start(NOW)
+    cycle_snapshot = runtime.cycle(NOW)
+    reloaded = db.load_candidate("2026-05-29", "111111")
+
+    assert snapshot.theme_mappings_count == 0
+    assert "THEME_MAPPING_EMPTY" in snapshot.warnings
+    assert "NO_THEME_MAPPING_FOR_ACTIVE_CANDIDATES" in snapshot.warnings
+    assert "THEME_MAPPING_EMPTY" in cycle_snapshot.warnings
+    assert "THEME_MAPPING_EMPTY" in reloaded.metadata["insufficient_reason"]
+    db.close()
+
+
+def test_runtime_readiness_warns_when_active_candidates_mostly_unmapped(tmp_path):
+    runtime, db, _, _, _ = build_runtime(tmp_path)
+    db.upsert_theme_mapping(
+        ThemeMapping(
+            code="111111",
+            name="Mapped",
+            market="KOSDAQ",
+            theme_id="robot",
+            theme_name="Robot",
+            strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
+            enabled=True,
+        )
+    )
+    save_candidate(db, "111111", CandidateState.WATCHING)
+    save_candidate(db, "222222", CandidateState.WATCHING)
+    save_candidate(db, "333333", CandidateState.WATCHING)
+
+    snapshot = runtime.start(NOW)
+
+    assert snapshot.theme_mappings_count == 1
+    assert snapshot.enabled_theme_mappings_count == 1
+    assert snapshot.active_candidates_with_theme_mapping == 1
+    assert snapshot.active_candidates_without_theme_mapping == 2
+    assert snapshot.theme_mapping_coverage_pct < 50
+    assert "NO_THEME_MAPPING_FOR_ACTIVE_CANDIDATES" in snapshot.warnings
+    db.close()
+
+
+def test_mapped_candidate_enters_gate_without_no_gate_reason(tmp_path):
+    def mapped_results(candidate):
+        if db.theme_mappings_for_code(candidate.code, enabled=True):
+            return [runtime_gate_result(candidate)]
+        return []
+
+    gate = FakeGatePipeline(results_factory=mapped_results)
+    runtime, db, _, _, _ = build_runtime(tmp_path, gate_pipeline=gate)
+    db.upsert_theme_mapping(
+        ThemeMapping(
+            code="111111",
+            name="Mapped",
+            market="KOSDAQ",
+            theme_id="robot",
+            theme_name="Robot",
+            strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
+            enabled=True,
+        )
+    )
+    candidate = save_candidate(db, "111111", CandidateState.WATCHING)
+    runtime.start(NOW)
+
+    snapshot = runtime.cycle(NOW)
+    reloaded = db.load_candidate_by_id(candidate.id)
+
+    assert snapshot.gate_result_count == 1
+    assert reloaded.metadata["sub_status"] == "PASS"
+    assert "insufficient_reason" not in reloaded.metadata
+    assert "NO_GATE_RESULT" not in str(reloaded.metadata)
     db.close()
 
 

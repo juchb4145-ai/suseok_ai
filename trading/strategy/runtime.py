@@ -28,6 +28,7 @@ from trading.strategy.models import (
     VirtualPosition,
 )
 from trading.strategy.pipeline import GatePipeline, GatePipelineResult
+from trading.strategy.readiness import ReadinessReport, build_readiness_report, dedupe_warnings
 from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.review import TradeReviewService
 from trading.strategy.virtual_orders import VirtualOrderService
@@ -115,6 +116,14 @@ class StrategyRuntimeSnapshot:
     ui_refresh_skipped_count: int = 0
     subscription_active_count: int = 0
     virtual_order_status_change_count: int = 0
+    condition_profiles_count: int = 0
+    unresolved_condition_profiles_count: int = 0
+    theme_mappings_count: int = 0
+    enabled_theme_mappings_count: int = 0
+    active_candidates_with_theme_mapping: int = 0
+    active_candidates_without_theme_mapping: int = 0
+    theme_mapping_coverage_pct: float = 0.0
+    protected_subscription_usage: str = ""
     warnings: list[str] = field(default_factory=list)
 
 
@@ -161,10 +170,11 @@ class StrategyRuntime:
         self.started = False
         self._warnings: list[str] = []
         self.startup_warnings: list[str] = []
+        self.readiness_report: Optional[ReadinessReport] = None
 
     def start(self, now: Optional[datetime] = None) -> StrategyRuntimeSnapshot:
         current = _clean_time(now or self.clock())
-        self._warnings = list(self.startup_warnings) + self.config.validate()
+        self._warnings = dedupe_warnings(list(self.startup_warnings) + self.config.validate())
         self.subscription_manager.max_codes = self.config.realtime_subscription_limit
         self.started = True
         snapshot = self._snapshot(current)
@@ -192,6 +202,8 @@ class StrategyRuntime:
             ]
         )
         self._reconcile_subscriptions(active_candidates, snapshot)
+        self._refresh_readiness_snapshot(snapshot, current)
+        snapshot.warnings = dedupe_warnings(snapshot.warnings)
         return snapshot
 
     def stop(self) -> StrategyRuntimeSnapshot:
@@ -221,6 +233,7 @@ class StrategyRuntime:
             subscription_candidates = self._subscription_candidates(trade_date)
             snapshot.candidate_count = len(self.db.list_candidates(trade_date))
             self._reconcile_subscriptions(subscription_candidates, snapshot)
+            self._refresh_readiness_snapshot(snapshot, current, trade_date)
             candidates = self._active_candidates(trade_date, current)
             snapshot.active_candidate_count = len(candidates)
             snapshot.evaluated_candidate_count = len(candidates)
@@ -245,6 +258,8 @@ class StrategyRuntime:
             self._open_filled_orders(context_by_candidate, snapshot, current)
             self._evaluate_positions(context_by_candidate, snapshot, current)
             self._save_reviews(context_by_candidate, expired, snapshot, current)
+            self._refresh_readiness_snapshot(snapshot, current, trade_date)
+            snapshot.warnings = dedupe_warnings(snapshot.warnings)
             return snapshot
         finally:
             snapshot.cycle_duration_ms = int(round((perf_counter() - started) * 1000))
@@ -362,9 +377,11 @@ class StrategyRuntime:
         metadata = dict(candidate.metadata)
 
         if not results:
+            no_gate_reasons = self._no_gate_result_reasons(candidate, snapshot)
             metadata["sub_status"] = "DATA_INSUFFICIENT"
-            metadata["insufficient_reason"] = ["NO_GATE_RESULT"]
+            metadata["insufficient_reason"] = no_gate_reasons
             candidate.metadata = metadata
+            snapshot.warnings.extend(reason for reason in no_gate_reasons if reason != "NO_GATE_RESULT")
             if candidate.state in {CandidateState.READY, CandidateState.BLOCKED}:
                 CandidateLifecycle.transition(candidate, CandidateState.WATCHING)
                 candidate.block_type = BlockType.NONE
@@ -404,7 +421,11 @@ class StrategyRuntime:
             metadata.pop("best_theme_id", None)
             metadata.pop("best_gate_result_key", None)
             metadata["sub_status"] = "DATA_INSUFFICIENT"
-            metadata["insufficient_reason"] = _group_reason_codes(results)
+            insufficient_reasons = _group_reason_codes(results)
+            metadata["insufficient_reason"] = insufficient_reasons
+            snapshot.warnings.extend(
+                reason for reason in insufficient_reasons if reason in {"INDEX_DATA_INSUFFICIENT", "INDICATOR_DATA_INSUFFICIENT"}
+            )
             if candidate.state in {CandidateState.READY, CandidateState.BLOCKED, CandidateState.DETECTED}:
                 CandidateLifecycle.transition(candidate, CandidateState.WATCHING)
             candidate.block_type = BlockType.NONE
@@ -537,6 +558,18 @@ class StrategyRuntime:
         snapshot.candidate_save_count += 1
         snapshot.db_write_count_per_cycle += 1
         return True
+
+    def _no_gate_result_reasons(self, candidate: Candidate, snapshot: StrategyRuntimeSnapshot) -> list[str]:
+        reasons = ["NO_GATE_RESULT"]
+        if snapshot.theme_mappings_count == 0:
+            reasons.append("THEME_MAPPING_EMPTY")
+        elif not self.db.theme_mappings_for_code(candidate.code, enabled=True):
+            reasons.append("NO_THEME_MAPPING_FOR_CANDIDATE")
+        if "NO_THEME_MAPPING_FOR_ACTIVE_CANDIDATES" in snapshot.warnings:
+            reasons.append("NO_THEME_MAPPING_FOR_ACTIVE_CANDIDATES")
+        if any(str(warning).startswith("CONDITION_PROFILE_UNRESOLVED") for warning in snapshot.warnings):
+            reasons.append("CONDITION_PROFILE_UNRESOLVED")
+        return _dedupe(reasons)
 
     def _evaluate_virtual_orders(
         self,
@@ -870,8 +903,34 @@ class StrategyRuntime:
         return StrategyRuntimeSnapshot(
             started=self.started,
             cycle_at=current.isoformat(),
-            warnings=list(self._warnings),
+            warnings=dedupe_warnings(self._warnings),
         )
+
+    def _refresh_readiness_snapshot(
+        self,
+        snapshot: StrategyRuntimeSnapshot,
+        current: datetime,
+        trade_date: Optional[str] = None,
+    ) -> None:
+        try:
+            report = build_readiness_report(
+                self.db,
+                trade_date=trade_date or current.date().isoformat(),
+                subscription_manager=self.subscription_manager,
+            )
+        except Exception as exc:
+            snapshot.warnings.append(f"READINESS_REPORT_FAILED:{exc}")
+            return
+        self.readiness_report = report
+        snapshot.condition_profiles_count = report.condition_profiles_count
+        snapshot.unresolved_condition_profiles_count = report.unresolved_condition_profiles_count
+        snapshot.theme_mappings_count = report.theme_mappings_count
+        snapshot.enabled_theme_mappings_count = report.enabled_theme_mappings_count
+        snapshot.active_candidates_with_theme_mapping = report.active_candidates_with_theme_mapping
+        snapshot.active_candidates_without_theme_mapping = report.active_candidates_without_theme_mapping
+        snapshot.theme_mapping_coverage_pct = report.theme_mapping_coverage_pct
+        snapshot.protected_subscription_usage = report.protected_subscription_usage
+        snapshot.warnings = dedupe_warnings(list(snapshot.warnings) + report.warnings)
 
 
 @dataclass
@@ -950,7 +1009,13 @@ def _block_record(result: GatePipelineResult) -> dict:
 def _result_reason_codes(result: GatePipelineResult) -> list[str]:
     values: list[str] = []
     for decision in result.decisions:
-        values.extend(str(code) for code in decision.reason_codes)
+        decision_codes = [str(code) for code in decision.reason_codes]
+        values.extend(decision_codes)
+        if "DATA_INSUFFICIENT" in decision_codes or decision.details.get("sub_status") == "DATA_INSUFFICIENT":
+            if decision.gate_name == "MarketIndexGate":
+                values.append("INDEX_DATA_INSUFFICIENT")
+            elif decision.gate_name in {"ThemeStrengthGate", "ThemePullbackGate", "StockPullbackEntryGate"}:
+                values.append("INDICATOR_DATA_INSUFFICIENT")
     values.extend(str(code) for code in result.details.get("cap_rules_applied", []))
     sub_status = result.details.get("sub_status")
     if sub_status:

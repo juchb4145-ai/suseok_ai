@@ -46,6 +46,7 @@ class FakeRuntime:
     start_fail: bool = False
     stop_fail: bool = False
     cycle_fail: bool = False
+    startup_warnings: list[str] = field(default_factory=list)
 
     def start(self):
         self.start_calls += 1
@@ -55,7 +56,15 @@ class FakeRuntime:
             started=True,
             cycle_at=NOW.isoformat(),
             active_candidate_count=2,
-            warnings=["STARTED"],
+            condition_profiles_count=3,
+            unresolved_condition_profiles_count=1,
+            theme_mappings_count=0,
+            enabled_theme_mappings_count=0,
+            active_candidates_with_theme_mapping=0,
+            active_candidates_without_theme_mapping=2,
+            theme_mapping_coverage_pct=0.0,
+            protected_subscription_usage="4/85",
+            warnings=["STARTED", "THEME_MAPPING_EMPTY", "THEME_MAPPING_EMPTY"],
         )
 
     def stop(self):
@@ -87,6 +96,7 @@ class QuietRuntime:
     start_calls: int = 0
     stop_calls: int = 0
     cycle_calls: int = 0
+    startup_warnings: list[str] = field(default_factory=list)
 
     def start(self):
         self.start_calls += 1
@@ -117,6 +127,43 @@ def make_window(tmp_path, qapp, runtime=None):
     engine = TradingEngine(client=client, db=db)
     window = MainWindow(engine=engine, db=db, mock_mode=True, strategy_runtime=runtime)
     return window, db, client, engine
+
+
+def test_login_refreshes_accounts_after_connection_event(tmp_path, qapp):
+    class DelayedAccountClient(MockKiwoomClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.accounts: list[str] = []
+            self.login_calls = 0
+            self.get_accounts_calls = 0
+
+        def login(self) -> int:
+            self.login_calls += 1
+            return 0
+
+        def get_accounts(self) -> list[str]:
+            self.get_accounts_calls += 1
+            return list(self.accounts)
+
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    client = DelayedAccountClient()
+    engine = TradingEngine(client=client, db=db)
+    window = MainWindow(engine=engine, db=db, mock_mode=False, strategy_runtime=FakeRuntime())
+
+    window._login()
+
+    assert client.login_calls == 1
+    assert client.get_accounts_calls == 0
+    assert window.account_combo.count() == 0
+
+    client.accounts = ["1234567890"]
+    client.connected.emit(True, 0, "connected")
+
+    assert client.get_accounts_calls == 1
+    assert window.account_combo.itemText(0) == "1234567890"
+    assert engine.account == "1234567890"
+    db.close()
+    window.close()
 
 
 def save_candidate(db, code, state, last_seen, metadata=None):
@@ -155,6 +202,50 @@ def test_observe_start_stop_and_duplicate_noops_do_not_call_order_paths(tmp_path
     assert client.orders == []
     assert not window.strategy_timer.isActive()
     assert window.strategy_start_button.isEnabled()
+    db.close()
+    window.close()
+
+
+def test_observe_readiness_summary_displays_snapshot_and_dedupes_warnings(tmp_path, qapp):
+    runtime = FakeRuntime(startup_warnings=["THEME_MAPPING_EMPTY", "THEME_MAPPING_EMPTY"])
+    window, db, _, _ = make_window(tmp_path, qapp, runtime)
+
+    window.start_observe_strategy()
+
+    readiness_text = window.strategy_readiness_view.toPlainText()
+    warning_text = window.strategy_warning_view.toPlainText()
+    assert window.strategy_readiness_view.isReadOnly()
+    assert "conditions=3 unresolved=1" in readiness_text
+    assert "themes=0 enabled=0" in readiness_text
+    assert "active candidates=2 mapped=0 unmapped=2" in readiness_text
+    assert "protected subs=4/85" in readiness_text
+    assert warning_text.splitlines().count("THEME_MAPPING_EMPTY") == 1
+    db.close()
+    window.close()
+
+
+def test_readiness_summary_render_is_read_only(tmp_path, qapp, monkeypatch):
+    runtime = FakeRuntime()
+    window, db, _, _ = make_window(tmp_path, qapp, runtime)
+    monkeypatch.setattr(runtime, "cycle", lambda: (_ for _ in ()).throw(AssertionError("readiness display must not cycle")))
+    monkeypatch.setattr(db, "save_candidate", lambda candidate: (_ for _ in ()).throw(AssertionError("readiness display must not save candidate")))
+    monkeypatch.setattr(db, "save_trade_review", lambda review: (_ for _ in ()).throw(AssertionError("readiness display must not save review")))
+    monkeypatch.setattr(db, "save_virtual_order", lambda order: (_ for _ in ()).throw(AssertionError("readiness display must not save order")))
+
+    window._display_strategy_snapshot(
+        StrategyRuntimeSnapshot(
+            started=True,
+            active_candidate_count=1,
+            condition_profiles_count=3,
+            theme_mappings_count=1,
+            enabled_theme_mappings_count=1,
+            active_candidates_with_theme_mapping=1,
+            protected_subscription_usage="4/85",
+        ),
+        0.0,
+    )
+
+    assert "readiness:" in window.strategy_readiness_view.toPlainText()
     db.close()
     window.close()
 

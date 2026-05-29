@@ -45,7 +45,7 @@ def build_observe_runtime(client, db: TradingDatabase):
     from trading.strategy.bridge import StrategyMarketDataBridge
     from trading.strategy.candidates import CandidateCollector
     from trading.strategy.candles import CandleBuilder
-    from trading.strategy.conditions import ConditionProfileRepository, KiwoomConditionAdapter
+    from trading.strategy.conditions import ConditionProfileRepository, KiwoomConditionAdapter, ensure_default_condition_profiles
     from trading.strategy.entry import EntryPlanBuilder
     from trading.strategy.exit import ExitDecisionEngine, VirtualPositionService
     from trading.strategy.holding import StaticHoldingProvider
@@ -54,6 +54,7 @@ def build_observe_runtime(client, db: TradingDatabase):
     from trading.strategy.market_data import MarketDataStore
     from trading.strategy.market_index import IndexCodeMapper, MarketIndexStore
     from trading.strategy.pipeline import GatePipeline
+    from trading.strategy.readiness import build_readiness_report, dedupe_warnings
     from trading.strategy.realtime import RealTimeSubscriptionManager
     from trading.strategy.review import TradeReviewService
     from trading.strategy.config import StrategyRuntimeConfigRepository
@@ -62,6 +63,7 @@ def build_observe_runtime(client, db: TradingDatabase):
     from trading.strategy.virtual_orders import VirtualOrderService
 
     config_result = StrategyRuntimeConfigRepository(db).load()
+    condition_seed_result = ensure_default_condition_profiles(db)
     config = config_result.config
     market_data = MarketDataStore()
     candle_builder = CandleBuilder()
@@ -102,7 +104,11 @@ def build_observe_runtime(client, db: TradingDatabase):
         condition_adapter=condition_adapter,
         holding_provider=StaticHoldingProvider(set(config.holding_watch_codes)),
     )
-    runtime.startup_warnings = list(config_result.warnings)
+    readiness_report = build_readiness_report(db, subscription_manager=runtime.subscription_manager)
+    runtime.readiness_report = readiness_report
+    runtime.startup_warnings = dedupe_warnings(
+        list(config_result.warnings) + condition_seed_result.warnings + readiness_report.warnings
+    )
     return runtime
 
 

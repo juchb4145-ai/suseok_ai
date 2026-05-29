@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import csv
+import re
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from trading.strategy.candidates import add_unique, normalize_code
@@ -26,6 +29,17 @@ class ThemeMapping:
     is_signal_stock: bool = False
     enabled: bool = True
     memo: str = ""
+
+
+@dataclass
+class ThemeImportResult:
+    total_rows: int = 0
+    inserted: int = 0
+    updated: int = 0
+    skipped: int = 0
+    disabled: int = 0
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -151,3 +165,157 @@ class ThemeRepository:
             enriched.strategy_profile = first.strategy_profile
         enriched.metadata["theme_mappings"] = mapping_details
         return enriched
+
+
+REQUIRED_THEME_COLUMNS = {
+    "code",
+    "name",
+    "market",
+    "theme_id",
+    "theme_name",
+    "strategy_profile",
+    "enabled",
+}
+OPTIONAL_THEME_COLUMNS = {
+    "sub_theme",
+    "is_large_cap",
+    "is_leader_candidate",
+    "base_priority",
+    "is_signal_stock",
+    "memo",
+}
+ALLOWED_THEME_MARKETS = {"KOSPI", "KOSDAQ"}
+
+
+def import_theme_mappings_csv(db: "TradingDatabase", csv_path) -> ThemeImportResult:
+    path = Path(csv_path)
+    result = ThemeImportResult()
+    repository = ThemeRepository(db)
+
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = set(reader.fieldnames or [])
+            missing = sorted(REQUIRED_THEME_COLUMNS - fieldnames)
+            if missing:
+                result.errors.append(f"missing required columns: {', '.join(missing)}")
+                return result
+            unknown = sorted(fieldnames - REQUIRED_THEME_COLUMNS - OPTIONAL_THEME_COLUMNS)
+            if unknown:
+                result.warnings.append(f"unknown columns ignored: {', '.join(unknown)}")
+            for row_number, row in enumerate(reader, start=2):
+                result.total_rows += 1
+                mapping = _parse_theme_mapping_row(row, row_number, result)
+                if mapping is None:
+                    result.skipped += 1
+                    continue
+                existing = _find_theme_mapping(db, mapping.code, mapping.theme_id)
+                saved = repository.upsert_mapping(mapping)
+                if existing is None:
+                    result.inserted += 1
+                else:
+                    result.updated += 1
+                if not saved.enabled:
+                    result.disabled += 1
+    except FileNotFoundError:
+        result.errors.append(f"file not found: {path}")
+    return result
+
+
+def _parse_theme_mapping_row(row: dict, row_number: int, result: ThemeImportResult) -> Optional[ThemeMapping]:
+    code = _parse_import_code(row.get("code"), row_number, result)
+    if code is None:
+        result.errors.append(f"row {row_number}: invalid code {row.get('code')!r}")
+        return None
+
+    market = str(row.get("market") or "").strip().upper()
+    if market not in ALLOWED_THEME_MARKETS:
+        result.errors.append(f"row {row_number}: invalid market {row.get('market')!r}")
+        return None
+
+    try:
+        strategy_profile = StrategyProfile(str(row.get("strategy_profile") or "").strip())
+    except ValueError:
+        result.errors.append(f"row {row_number}: invalid strategy_profile {row.get('strategy_profile')!r}")
+        return None
+
+    enabled = _parse_bool(row.get("enabled"), row_number, "enabled", result)
+    if enabled is None:
+        return None
+    is_large_cap = _parse_bool(row.get("is_large_cap", "0"), row_number, "is_large_cap", result)
+    is_leader_candidate = _parse_bool(row.get("is_leader_candidate", "0"), row_number, "is_leader_candidate", result)
+    is_signal_stock = _parse_bool(row.get("is_signal_stock", "0"), row_number, "is_signal_stock", result)
+    if is_large_cap is None or is_leader_candidate is None or is_signal_stock is None:
+        return None
+
+    base_priority = _parse_base_priority(row.get("base_priority", "0"), row_number, result)
+    if base_priority is None:
+        return None
+
+    theme_id = str(row.get("theme_id") or "").strip()
+    theme_name = str(row.get("theme_name") or "").strip()
+    if not theme_id:
+        result.errors.append(f"row {row_number}: theme_id is required")
+        return None
+    if not theme_name:
+        result.errors.append(f"row {row_number}: theme_name is required")
+        return None
+
+    return ThemeMapping(
+        code=code,
+        name=str(row.get("name") or "").strip(),
+        market=market,
+        theme_id=theme_id,
+        theme_name=theme_name,
+        sub_theme=str(row.get("sub_theme") or "").strip(),
+        strategy_profile=strategy_profile,
+        is_large_cap=is_large_cap,
+        is_leader_candidate=is_leader_candidate,
+        base_priority=base_priority,
+        is_signal_stock=is_signal_stock,
+        enabled=enabled,
+        memo=str(row.get("memo") or "").strip(),
+    )
+
+
+def _parse_import_code(value, row_number: int, result: ThemeImportResult) -> Optional[str]:
+    raw = str(value or "").strip().upper()
+    code = normalize_code(raw)
+    if re.fullmatch(r"\d+\.0+", code):
+        code = code.split(".", 1)[0]
+    if code.isdigit() and 1 <= len(code) <= 6:
+        normalized = code.zfill(6)
+        if normalized != code and "short numeric codes were left-padded to 6 digits" not in result.warnings:
+            result.warnings.append("short numeric codes were left-padded to 6 digits")
+        return normalized
+    return None
+
+
+def _parse_bool(value, row_number: int, field_name: str, result: ThemeImportResult) -> Optional[bool]:
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "t", "y", "yes"}:
+        return True
+    if text in {"0", "false", "f", "n", "no"}:
+        return False
+    result.errors.append(f"row {row_number}: invalid bool {field_name}={value!r}")
+    return None
+
+
+def _parse_base_priority(value, row_number: int, result: ThemeImportResult) -> Optional[int]:
+    text = str(value or "0").strip()
+    try:
+        priority = int(text)
+    except ValueError:
+        result.errors.append(f"row {row_number}: invalid base_priority {value!r}")
+        return None
+    if not 0 <= priority <= 100:
+        result.errors.append(f"row {row_number}: base_priority out of range {priority}")
+        return None
+    return priority
+
+
+def _find_theme_mapping(db: "TradingDatabase", code: str, theme_id: str) -> Optional[ThemeMapping]:
+    for mapping in db.theme_mappings_for_code(code, enabled=None):
+        if mapping.theme_id == theme_id:
+            return mapping
+    return None

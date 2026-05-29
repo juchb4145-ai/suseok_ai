@@ -134,6 +134,7 @@ class KiwoomClient:
         self.condition_real_received = Signal()
         self.condition_candidate_included = Signal()
         self.condition_candidate_removed = Signal()
+        self.tr_data_received = Signal()
         self.condition_load_state = ConditionLoadState.IDLE
         self._conditions: list[ConditionInfo] = []
 
@@ -150,6 +151,7 @@ class KiwoomClient:
         self.ocx.OnReceiveConditionVer.connect(self._on_receive_condition_ver)
         self.ocx.OnReceiveTrCondition.connect(self._on_receive_tr_condition)
         self.ocx.OnReceiveRealCondition.connect(self._on_receive_real_condition)
+        self.ocx.OnReceiveTrData.connect(self._on_receive_tr_data)
 
     def login(self) -> int:
         return int(self.ocx.dynamicCall("CommConnect()"))
@@ -233,6 +235,38 @@ class KiwoomClient:
             condition_name,
             int(condition_index),
         )
+
+    def set_input_value(self, input_name: str, value: str) -> None:
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", str(input_name), str(value))
+
+    def comm_rq_data(self, rq_name: str, tr_code: str, prev_next: int, screen_no: str) -> int:
+        return int(
+            self.ocx.dynamicCall(
+                "CommRqData(QString, QString, int, QString)",
+                str(rq_name),
+                str(tr_code),
+                int(prev_next),
+                str(screen_no),
+            )
+            or 0
+        )
+
+    def get_repeat_count(self, tr_code: str, rq_name: str) -> int:
+        return int(self.ocx.dynamicCall("GetRepeatCnt(QString, QString)", str(tr_code), str(rq_name)) or 0)
+
+    def get_comm_data(self, tr_code: str, rq_name: str, index: int, item_name: str) -> str:
+        value = self.ocx.dynamicCall(
+            "GetCommData(QString, QString, int, QString)",
+            str(tr_code),
+            str(rq_name),
+            int(index),
+            str(item_name),
+        )
+        return str(value or "").strip()
+
+    def get_code_list_by_market(self, market_code: str) -> list[str]:
+        raw = str(self.ocx.dynamicCall("GetCodeListByMarket(QString)", str(market_code)) or "")
+        return [code.strip().replace("A", "") for code in raw.split(";") if code.strip()]
 
     def send_order(self, request: OrderRequest) -> OrderResult:
         result_code = int(
@@ -341,6 +375,30 @@ class KiwoomClient:
             index = -1
         self.condition_real_received.emit(str(code or ""), str(event_type or ""), str(condition_name or ""), index)
 
+    def _on_receive_tr_data(
+        self,
+        screen_no: str,
+        rq_name: str,
+        tr_code: str,
+        record_name: str,
+        prev_next: str,
+        data_length: int,
+        error_code: str,
+        message: str,
+        splm_msg: str,
+    ) -> None:
+        self.tr_data_received.emit(
+            str(screen_no or ""),
+            str(rq_name or ""),
+            str(tr_code or ""),
+            str(record_name or ""),
+            str(prev_next or ""),
+            int(data_length or 0),
+            str(error_code or ""),
+            str(message or ""),
+            str(splm_msg or ""),
+        )
+
     def _on_receive_real_data(self, code: str, real_type: str, real_data: str) -> None:
         current = self._real_int(code, FID_CURRENT_PRICE)
         change_rate = self._real_float(code, FID_CHANGE_RATE)
@@ -409,6 +467,7 @@ class MockKiwoomClient:
         self.condition_real_received = Signal()
         self.condition_candidate_included = Signal()
         self.condition_candidate_removed = Signal()
+        self.tr_data_received = Signal()
         self.condition_load_state = ConditionLoadState.IDLE
         self.orders: list[OrderRequest] = []
         self.registered_codes: set[str] = set()
@@ -420,6 +479,11 @@ class MockKiwoomClient:
         self.stop_condition_calls: list[dict] = []
         self.condition_load_calls = 0
         self.condition_send_failures: set[tuple[str, int, int]] = set()
+        self._market_codes: dict[str, list[str]] = {"0": [], "10": []}
+        self.tr_calls: list[dict] = []
+        self._tr_inputs: dict[str, str] = {}
+        self._tr_pages: dict[tuple[str, str], list[dict]] = {}
+        self._current_tr_page: dict = {}
         self._names: dict[str, str] = {
             "005930": "삼성전자",
             "000660": "SK하이닉스",
@@ -496,6 +560,57 @@ class MockKiwoomClient:
                 "condition_index": int(condition_index),
             }
         )
+
+    def set_input_value(self, input_name: str, value: str) -> None:
+        self._tr_inputs[str(input_name)] = str(value)
+
+    def comm_rq_data(self, rq_name: str, tr_code: str, prev_next: int, screen_no: str) -> int:
+        tr_code_text = str(tr_code)
+        key = (tr_code_text.lower(), _mock_tr_key(tr_code_text, self._tr_inputs))
+        pages = self._tr_pages.get(key, [])
+        page = pages.pop(0) if pages else {"rows": [], "prev_next": "", "error_code": "", "message": ""}
+        self._current_tr_page = page
+        self.tr_calls.append(
+            {
+                "rq_name": str(rq_name),
+                "tr_code": str(tr_code),
+                "prev_next": int(prev_next),
+                "screen_no": str(screen_no),
+                "inputs": dict(self._tr_inputs),
+            }
+        )
+        if int(page.get("request_code", 0) or 0) < 0:
+            return int(page.get("request_code"))
+        self.tr_data_received.emit(
+            str(screen_no),
+            str(rq_name),
+            str(tr_code),
+            str(page.get("record_name", "")),
+            str(page.get("prev_next", "")),
+            0,
+            str(page.get("error_code", "")),
+            str(page.get("message", "")),
+            "",
+        )
+        return 0
+
+    def get_repeat_count(self, tr_code: str, rq_name: str) -> int:
+        return len(self._current_tr_page.get("rows", []))
+
+    def get_comm_data(self, tr_code: str, rq_name: str, index: int, item_name: str) -> str:
+        rows = self._current_tr_page.get("rows", [])
+        if index < 0 or index >= len(rows):
+            return ""
+        return str(rows[index].get(str(item_name), "") or "").strip()
+
+    def set_tr_pages(self, tr_code: str, key: str, pages: list[dict]) -> None:
+        self._tr_pages[(str(tr_code).lower(), str(key))] = [dict(page) for page in pages]
+
+    def set_market_codes(self, market_code: str, codes: list[str]) -> None:
+        self._market_codes[str(market_code)] = [str(code).replace("A", "") for code in codes]
+
+    def get_code_list_by_market(self, market_code: str) -> list[str]:
+        return list(self._market_codes.get(str(market_code), []))
 
     def set_conditions(self, conditions: list[tuple[int, str]]) -> None:
         self._conditions = [ConditionInfo(index=int(index), name=str(name)) for index, name in conditions]
@@ -684,3 +799,9 @@ def parse_condition_name_list(raw: str) -> list[ConditionInfo]:
             continue
         conditions.append(ConditionInfo(index=index, name=name))
     return conditions
+
+
+def _mock_tr_key(tr_code: str, inputs: dict[str, str]) -> str:
+    if str(tr_code).lower() == "opt90002":
+        return inputs.get("종목코드", "")
+    return ""

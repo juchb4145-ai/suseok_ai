@@ -311,6 +311,9 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.strategy_refresh_button)
 
         self.strategy_snapshot_label = QLabel("cycle: - / candidates: - / warnings: 0")
+        self.strategy_readiness_view = QTextEdit()
+        self.strategy_readiness_view.setReadOnly(True)
+        self.strategy_readiness_view.setMaximumHeight(100)
         self.strategy_warning_view = QTextEdit()
         self.strategy_warning_view.setReadOnly(True)
         self.strategy_warning_view.setMaximumHeight(90)
@@ -324,6 +327,7 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(controls)
         layout.addWidget(self.strategy_snapshot_label)
+        layout.addWidget(self.strategy_readiness_view)
         layout.addWidget(self.strategy_warning_view)
         layout.addWidget(self.strategy_candidate_table, 1)
         return box
@@ -411,6 +415,8 @@ class MainWindow(QMainWindow):
 
     def _wire_events(self) -> None:
         self.login_button.clicked.connect(self._login)
+        self.engine.client.connected.connect(self._on_connection_changed)
+        self.account_combo.currentTextChanged.connect(self.engine.set_account)
         self.realtime_button.clicked.connect(self.engine.register_realtime)
         self.ordering_check.toggled.connect(self.engine.set_ordering_enabled)
         self.lookup_button.clicked.connect(self._lookup_name)
@@ -512,7 +518,7 @@ class MainWindow(QMainWindow):
             self._strategy_cycle_running = False
 
     def _display_strategy_snapshot(self, snapshot: StrategyRuntimeSnapshot, duration_sec: float) -> None:
-        warnings = list(snapshot.warnings or [])
+        warnings = self._dedupe_text(snapshot.warnings or [])
         if warnings:
             self._strategy_last_warning_at = datetime.now().replace(microsecond=0).isoformat()
         self.strategy_status_label.setText("OBSERVE running" if snapshot.started else "OBSERVE stopped")
@@ -538,8 +544,32 @@ class MainWindow(QMainWindow):
                 warning_at=self._strategy_last_warning_at or "-",
             )
         )
+        self._display_strategy_readiness(snapshot)
         if warnings:
             self.strategy_warning_view.setPlainText("\n".join(warnings[-20:]))
+        else:
+            self.strategy_warning_view.clear()
+
+    def _display_strategy_readiness(self, snapshot: StrategyRuntimeSnapshot) -> None:
+        lines = [
+            "readiness: conditions={conditions} unresolved={unresolved} / themes={themes} enabled={enabled}".format(
+                conditions=getattr(snapshot, "condition_profiles_count", 0),
+                unresolved=getattr(snapshot, "unresolved_condition_profiles_count", 0),
+                themes=getattr(snapshot, "theme_mappings_count", 0),
+                enabled=getattr(snapshot, "enabled_theme_mappings_count", 0),
+            ),
+            "active candidates={active} mapped={mapped} unmapped={unmapped} coverage={coverage:.2f}% / protected subs={protected}".format(
+                active=snapshot.active_candidate_count,
+                mapped=getattr(snapshot, "active_candidates_with_theme_mapping", 0),
+                unmapped=getattr(snapshot, "active_candidates_without_theme_mapping", 0),
+                coverage=float(getattr(snapshot, "theme_mapping_coverage_pct", 0.0) or 0.0),
+                protected=getattr(snapshot, "protected_subscription_usage", "") or "-",
+            ),
+        ]
+        startup_warnings = self._dedupe_text(getattr(self.strategy_runtime, "startup_warnings", []) if self.strategy_runtime is not None else [])
+        if startup_warnings:
+            lines.append("startup warnings: " + ", ".join(startup_warnings[-8:]))
+        self.strategy_readiness_view.setPlainText("\n".join(lines))
 
     def refresh_strategy_candidates(self) -> None:
         self._strategy_ui_refresh_count += 1
@@ -643,7 +673,7 @@ class MainWindow(QMainWindow):
         self._strategy_last_warning_at = datetime.now().replace(microsecond=0).isoformat()
         if hasattr(self, "strategy_warning_view"):
             current = self.strategy_warning_view.toPlainText().splitlines()
-            current.append(str(message))
+            current = self._dedupe_text(current + [str(message)])
             self.strategy_warning_view.setPlainText("\n".join(current[-20:]))
         self._append_log(f"OBSERVE warning: {message}")
 
@@ -731,7 +761,7 @@ class MainWindow(QMainWindow):
 
     def _strategy_settings_warning(self, message: str) -> None:
         current = self.strategy_settings_warning_view.toPlainText().splitlines()
-        current.append(str(message))
+        current = self._dedupe_text(current + [str(message)])
         self.strategy_settings_warning_view.setPlainText("\n".join(current[-20:]))
         self._append_log(f"OBSERVE config warning: {message}")
 
@@ -749,21 +779,51 @@ class MainWindow(QMainWindow):
     def _split_codes(text: str) -> list[str]:
         return [part.strip() for part in str(text or "").replace("\n", ",").split(",") if part.strip()]
 
+    @staticmethod
+    def _dedupe_text(values) -> list[str]:
+        result: list[str] = []
+        for value in values:
+            text = str(value or "")
+            if text and text not in result:
+                result.append(text)
+        return result
+
+    def _on_connection_changed(self, ok: bool, error_code: int, message: str) -> None:
+        if not ok:
+            self.connection_label.setText(f"로그인 실패({error_code})")
+            self._append_log(f"로그인 실패: {message}")
+            return
+        self.connection_label.setText("로그인 완료")
+        self._refresh_accounts()
+
+    def _refresh_accounts(self) -> None:
+        try:
+            accounts = self.engine.client.get_accounts()
+        except Exception as exc:
+            self.account_combo.clear()
+            self.engine.set_account("")
+            self.connection_label.setText("로그인 완료 / 계좌 조회 실패")
+            self._append_log(f"계좌 조회 실패: {exc}")
+            return
+
+        selected_account = self.account_combo.currentText()
+        self.account_combo.clear()
+        self.account_combo.addItems(accounts)
+        if selected_account not in accounts:
+            selected_account = accounts[0] if accounts else ""
+        if selected_account:
+            self.account_combo.setCurrentText(selected_account)
+        self.engine.set_account(selected_account)
+        if not accounts:
+            self.connection_label.setText("로그인 완료 / 계좌 없음")
+
     def _login(self) -> None:
+        self.connection_label.setText("로그인 요청 중")
         result = self.engine.client.login()
         if result < 0:
             self._append_log(f"로그인 요청 실패: {result}")
+            self.connection_label.setText("로그인 요청 실패")
             return
-        try:
-            accounts = self.engine.client.get_accounts()
-            self.account_combo.clear()
-            self.account_combo.addItems(accounts)
-            if accounts:
-                self.engine.set_account(accounts[0])
-            self.connection_label.setText("로그인 요청/완료")
-        except Exception as exc:
-            self._append_log(f"계좌 조회 실패: {exc}")
-        self.account_combo.currentTextChanged.connect(self.engine.set_account)
 
     def _lookup_name(self) -> None:
         code = self._clean_code(self.code_edit.text())

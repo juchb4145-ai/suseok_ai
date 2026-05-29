@@ -116,3 +116,23 @@ def test_review_tab_refresh_is_read_only_static_contract():
     assert "save_trade_review" not in refresh_source
     assert "TradeReviewService" not in refresh_source
     assert "CandidateState" not in refresh_source
+
+
+def test_theme_template_generator_is_separate_from_observe_runtime_paths():
+    for path in [
+        "kiwoom/tr.py",
+        "trading/strategy/theme_template.py",
+        "scripts/generate_theme_mappings.py",
+        "scripts/generate_naver_theme_mappings.py",
+    ]:
+        source = open(path, encoding="utf-8").read()
+        assert "OrderRequest" not in source
+        assert "send_order" not in source
+    for path in [
+        "main.py",
+        "ui/main_window.py",
+        "trading/strategy/runtime.py",
+    ]:
+        source = open(path, encoding="utf-8").read()
+        assert "generate_theme_mappings" not in source
+        assert "theme_mappings_auto" not in source

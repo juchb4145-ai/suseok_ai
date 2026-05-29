@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 
@@ -33,6 +33,43 @@ class RegisteredCondition:
     registered_at: str = ""
 
 
+@dataclass
+class ConditionProfileSeedResult:
+    inserted: int = 0
+    existing: int = 0
+    warnings: list[str] = field(default_factory=list)
+
+
+DEFAULT_CONDITION_PROFILES = [
+    ConditionProfile(
+        condition_name="코스닥_테마주_눌림",
+        strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
+        enabled=True,
+        priority=90,
+        purpose="kosdaq_pullback_candidate",
+    ),
+    ConditionProfile(
+        condition_name="코스피_대형주_주도",
+        strategy_profile=StrategyProfile.KOSPI_LEADER_PROFILE,
+        enabled=True,
+        priority=85,
+        purpose="kospi_leader_candidate",
+    ),
+    ConditionProfile(
+        condition_name="주도테마_넓은후보",
+        strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+        enabled=True,
+        priority=70,
+        purpose="theme_broad_candidate",
+    ),
+]
+KNOWN_CONDITION_PURPOSES = {
+    "kosdaq_pullback_candidate",
+    "kospi_leader_candidate",
+    "theme_broad_candidate",
+}
+
+
 class ConditionProfileRepository:
     def __init__(self, db: "TradingDatabase") -> None:
         self.db = db
@@ -45,6 +82,29 @@ class ConditionProfileRepository:
 
     def update_last_resolved_index(self, condition_name: str, condition_index: int) -> None:
         self.db.update_condition_last_resolved_index(condition_name, condition_index)
+
+
+def ensure_default_condition_profiles(db: "TradingDatabase") -> ConditionProfileSeedResult:
+    repository = ConditionProfileRepository(db)
+    result = ConditionProfileSeedResult()
+    existing_profiles = {profile.condition_name: profile for profile in db.list_condition_profiles(enabled=None)}
+
+    for profile in db.list_condition_profiles(enabled=None):
+        if not str(profile.purpose or "").strip():
+            result.warnings.append(f"CONDITION_PROFILE_PURPOSE_MISSING:{profile.condition_name}")
+        elif profile.purpose not in KNOWN_CONDITION_PURPOSES:
+            result.warnings.append(f"CONDITION_PROFILE_PURPOSE_UNKNOWN:{profile.condition_name}:{profile.purpose}")
+        if _looks_mojibake(profile.condition_name):
+            result.warnings.append(f"CONDITION_PROFILE_NAME_MOJIBAKE_SUSPECTED:{profile.condition_name}")
+
+    for default in DEFAULT_CONDITION_PROFILES:
+        if default.condition_name in existing_profiles:
+            result.existing += 1
+            continue
+        repository.upsert_profile(default)
+        result.inserted += 1
+    result.warnings = _dedupe(result.warnings)
+    return result
 
 
 class KiwoomConditionAdapter:
@@ -253,3 +313,16 @@ def _parse_code_list(code_list: str) -> list[str]:
 
 def _clean_time(value: datetime) -> datetime:
     return value.replace(microsecond=0)
+
+
+def _looks_mojibake(value: str) -> bool:
+    text = str(value or "")
+    return any(marker in text for marker in ["�", "Ã", "Â", "ì", "ë", "í", "ê"])
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if value and value not in result:
+            result.append(value)
+    return result

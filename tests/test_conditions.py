@@ -5,7 +5,13 @@ import pytest
 from kiwoom.client import ConditionInfo, MockKiwoomClient, parse_condition_name_list
 from storage.db import TradingDatabase
 from trading.strategy.candidates import CandidateCollector
-from trading.strategy.conditions import ConditionProfile, ConditionProfileRepository, KiwoomConditionAdapter
+from trading.strategy.conditions import (
+    DEFAULT_CONDITION_PROFILES,
+    ConditionProfile,
+    ConditionProfileRepository,
+    KiwoomConditionAdapter,
+    ensure_default_condition_profiles,
+)
 from trading.strategy.models import StrategyProfile
 
 
@@ -64,6 +70,74 @@ def test_parse_condition_name_list():
         ConditionInfo(1, "leader"),
         ConditionInfo(2, "kosdaq"),
     ]
+
+
+def test_ensure_default_condition_profiles_seeds_missing_only(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    repo = ConditionProfileRepository(db)
+    existing_name = "코스닥_테마주_눌림"
+    repo.upsert_profile(
+        ConditionProfile(
+            condition_name=existing_name,
+            strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
+            enabled=False,
+            priority=11,
+            purpose="kosdaq_pullback_candidate",
+        )
+    )
+
+    result = ensure_default_condition_profiles(db)
+
+    profiles = {profile.condition_name: profile for profile in db.list_condition_profiles(enabled=None)}
+    assert result.inserted == 2
+    assert result.existing == 1
+    assert set(profiles) == {profile.condition_name for profile in DEFAULT_CONDITION_PROFILES}
+    assert profiles[existing_name].enabled is False
+    assert profiles[existing_name].priority == 11
+    db.close()
+
+
+def test_ensure_default_condition_profiles_warns_suspicious_rows(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    repo = ConditionProfileRepository(db)
+    repo.upsert_profile(
+        ConditionProfile(
+            condition_name="ì½ìŠ¤ë‹¥",
+            strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
+            enabled=True,
+            priority=1,
+            purpose="",
+        )
+    )
+    repo.upsert_profile(
+        ConditionProfile(
+            condition_name="unknown-purpose",
+            strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
+            enabled=True,
+            priority=1,
+            purpose="unexpected",
+        )
+    )
+
+    result = ensure_default_condition_profiles(db)
+
+    assert any(warning.startswith("CONDITION_PROFILE_PURPOSE_MISSING") for warning in result.warnings)
+    assert any(warning.startswith("CONDITION_PROFILE_NAME_MOJIBAKE_SUSPECTED") for warning in result.warnings)
+    assert any(warning.startswith("CONDITION_PROFILE_PURPOSE_UNKNOWN") for warning in result.warnings)
+    db.close()
+
+
+def test_default_condition_names_round_trip_with_unicode_escape(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+
+    ensure_default_condition_profiles(db)
+
+    names = {profile.condition_name for profile in db.list_condition_profiles(enabled=None)}
+    for expected in [profile.condition_name for profile in DEFAULT_CONDITION_PROFILES]:
+        assert expected in names
+        escaped = expected.encode("unicode_escape").decode("ascii")
+        assert escaped.encode("ascii").decode("unicode_escape") == expected
+    db.close()
 
 
 def test_condition_load_success_required_before_send_condition(tmp_path):
