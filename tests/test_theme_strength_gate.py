@@ -7,8 +7,8 @@ from trading.strategy.models import Candidate, CandidateState, StrategyProfile
 from trading.strategy.themes import ThemeMapping, ThemeRepository
 
 
-def candidate(code, state=CandidateState.WATCHING):
-    return Candidate(code=code, state=state)
+def candidate(code, state=CandidateState.WATCHING, *, strategy_profile=None, metadata=None):
+    return Candidate(code=code, state=state, strategy_profile=strategy_profile, metadata=metadata or {})
 
 
 def tick(store, code, price=10_000, change_rate=5.0, cum_volume=1_000):
@@ -88,6 +88,35 @@ def test_tick_shortage_caps_theme_and_records_insufficient_details(tmp_path):
     assert result.details["missing_turnover_count"] == 2
     assert "tick_missing" in result.details["insufficient_reason"]
     assert "turnover_missing" in result.details["insufficient_reason"]
+    db.close()
+
+
+def test_discovery_only_without_tick_counts_for_breadth_but_not_missing_tick_penalty(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    repo = ThemeRepository(db)
+    store = MarketDataStore()
+    for code in ["111111", "222222", "333333"]:
+        map_stock(repo, code, "robot")
+    tick(store, "111111", change_rate=5.0, cum_volume=10_000)
+    tick(store, "222222", change_rate=4.0, cum_volume=8_000)
+    discovery = candidate(
+        "333333",
+        strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+        metadata={
+            "condition_purposes": {"주도테마_넓은후보": "theme_broad_candidate"},
+            "entry_condition_names": [],
+            "entry_excluded": True,
+        },
+    )
+
+    result = ThemeStrengthGate(repo, store).evaluate([candidate("111111"), candidate("222222"), discovery])[0]
+
+    assert result.active_candidate_count == 3
+    assert result.details["scored_candidate_count"] == 2
+    assert result.details["discovery_only_unscored_count"] == 1
+    assert result.details["valid_tick_ratio"] == 1.0
+    assert result.details["missing_turnover_count"] == 0
+    assert "tick_missing" not in result.details["insufficient_reason"]
     db.close()
 
 

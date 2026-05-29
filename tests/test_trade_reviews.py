@@ -198,6 +198,8 @@ def test_blocked_review_horizon_and_gate_snapshot_false_negative():
     assert review.false_negative_flag is True
     assert review.details["false_negative_type"] == "BLOCKED_LATER_RALLIED"
     assert review.details["gate_decisions_snapshot"][0]["gate_name"] == "MarketIndexGate"
+    assert "MARKET_WAIT" in review.details["blocking_reason_codes"]
+    assert "MARKET_INDEX_TEMPORARY_CAP" in review.details["blocking_reason_codes"]
 
 
 def test_unfilled_later_rallied_is_separate_false_negative_type():
@@ -370,6 +372,53 @@ def test_review_export_has_fixed_columns_and_does_not_create_db_rows(tmp_path):
     assert before_count == after_count == 1
     assert csv_text.splitlines()[0] == ",".join(REVIEW_EXPORT_COLUMNS)
     assert md_path.read_text(encoding="utf-8").startswith("# Strategy Review")
+    db.close()
+
+
+def test_review_export_groups_false_positive_and_negative_by_reason_code(tmp_path):
+    from trading.strategy.export import ReviewExporter
+
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    db.save_trade_review(
+        TradeReview(
+            candidate_id=1,
+            trade_date="2026-05-29",
+            code="111111",
+            theme_id="robot",
+            review_key="fn",
+            final_status=ReviewFinalStatus.BLOCKED_TEMP.value,
+            max_return_20m=4.5,
+            max_drawdown_20m=-1.0,
+            false_negative_flag=True,
+            details={"blocking_reason_codes": ["MARKET_WAIT"]},
+            created_at="2026-05-29T09:00:00",
+        )
+    )
+    db.save_trade_review(
+        TradeReview(
+            candidate_id=2,
+            trade_date="2026-05-29",
+            code="222222",
+            theme_id="robot",
+            review_key="fp",
+            final_status=ReviewFinalStatus.VIRTUAL_CLOSED_SUPPORT_LOSS.value,
+            max_return_20m=1.0,
+            max_drawdown_20m=-4.0,
+            false_positive_flag=True,
+            details={"entry_condition_codes": ["SUPPORT_RECLAIMED"], "exit_reason_codes": ["SUPPORT_LOSS"]},
+            created_at="2026-05-29T09:05:00",
+        )
+    )
+
+    assert len(db.list_trade_reviews(trade_date="2026-05-29")) == 2
+    md_path = ReviewExporter().export_markdown(db.list_trade_reviews(), tmp_path / "reason.md")
+    text = md_path.read_text(encoding="utf-8")
+
+    assert "Missed Reason Code Performance" in text
+    assert "Loss Reason Code Performance" in text
+    assert "MARKET_WAIT" in text
+    assert "SUPPORT_RECLAIMED" in text
+    assert "SUPPORT_LOSS" in text
     db.close()
 
 

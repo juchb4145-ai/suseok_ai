@@ -9,7 +9,8 @@ from trading.strategy.candles import CandleBuilder
 from trading.strategy.entry import EntryPlanBuilder
 from trading.strategy.exit import ExitDecisionEngine, VirtualPositionService
 from trading.strategy.holding import StaticHoldingProvider
-from trading.strategy.market_data import StrategyTick
+from trading.strategy.market_data import MarketDataStore, StrategyTick
+from trading.strategy.market_index import IndexTick, MarketIndexStore
 from trading.strategy.models import (
     BlockType,
     Candidate,
@@ -57,6 +58,13 @@ class FakeGatePipeline:
             else:
                 results.extend(self.results_factory(candidate))
         return results
+
+
+class WarmupGatePipeline(FakeGatePipeline):
+    def __init__(self, *, market_data=None, market_index_store=None):
+        super().__init__()
+        self.market_data = market_data or MarketDataStore()
+        self.market_index_store = market_index_store or MarketIndexStore()
 
 
 def runtime_gate_result(candidate, eligible=True, block_type=BlockType.NONE):
@@ -310,6 +318,51 @@ def test_start_recovers_active_candidates_orders_and_positions(tmp_path):
     db.close()
 
 
+def test_start_rolls_over_previous_trade_date_candidates_without_unfinished_virtual_activity(tmp_path):
+    runtime, db, _client, _, _ = build_runtime(tmp_path)
+    stale_watch = save_candidate(db, "111111", CandidateState.WATCHING, trade_date="2026-05-29")
+    stale_ready = save_candidate(db, "222222", CandidateState.READY, trade_date="2026-05-29")
+    submitted_candidate = save_candidate(db, "333333", CandidateState.WATCHING, trade_date="2026-05-29")
+    filled_candidate = save_candidate(db, "444444", CandidateState.WATCHING, trade_date="2026-05-29")
+    today_candidate = save_candidate(db, "555555", CandidateState.WATCHING, trade_date="2026-05-30")
+    submitted_plan = db.save_entry_plan(plan_for(submitted_candidate.id, submitted_candidate.code))
+    db.save_virtual_order(
+        VirtualOrder(
+            candidate_id=submitted_candidate.id,
+            entry_plan_id=submitted_plan.id,
+            status=VirtualOrderStatus.SUBMITTED,
+            limit_price=10_000,
+        )
+    )
+    filled_plan = db.save_entry_plan(plan_for(filled_candidate.id, filled_candidate.code))
+    db.save_virtual_order(
+        VirtualOrder(
+            candidate_id=filled_candidate.id,
+            entry_plan_id=filled_plan.id,
+            status=VirtualOrderStatus.FILLED,
+            limit_price=10_000,
+        )
+    )
+
+    snapshot = runtime.start(datetime(2026, 5, 30, 9, 0))
+
+    reloaded_watch = db.load_candidate_by_id(stale_watch.id)
+    reloaded_ready = db.load_candidate_by_id(stale_ready.id)
+    assert reloaded_watch.state == CandidateState.EXPIRED
+    assert reloaded_ready.state == CandidateState.EXPIRED
+    assert reloaded_watch.metadata["sub_status"] == "SESSION_ROLLOVER_EXPIRED"
+    assert event_types(db, stale_watch.id) == ["candidate_session_rolled_over"]
+    assert event_types(db, stale_ready.id) == ["candidate_session_rolled_over"]
+    assert db.load_candidate_by_id(submitted_candidate.id).state == CandidateState.WATCHING
+    assert db.load_candidate_by_id(filled_candidate.id).state == CandidateState.WATCHING
+    assert db.load_candidate_by_id(today_candidate.id).state == CandidateState.WATCHING
+    assert snapshot.candidate_count == 1
+    assert snapshot.active_candidate_count == 1
+    assert snapshot.expired_count == 2
+    assert "SESSION_ROLLOVER_EXPIRED_CANDIDATES=2" in snapshot.warnings
+    db.close()
+
+
 def test_cycle_orchestrates_virtual_flow_and_is_idempotent(tmp_path):
     runtime, db, _, _, builder = build_runtime(tmp_path)
     candidate = save_candidate(db)
@@ -340,6 +393,69 @@ def test_cycle_orchestrates_virtual_flow_and_is_idempotent(tmp_path):
     assert len(db.list_trade_reviews(candidate.id)) == 1
     assert db.list_trade_reviews(candidate.id)[0].final_status == ReviewFinalStatus.VIRTUAL_PARTIAL_TAKE_PROFIT.value
     assert db.load_candidate_by_id(candidate.id).state == CandidateState.READY
+    db.close()
+
+
+def test_runtime_submits_next_split_leg_even_with_open_position(tmp_path):
+    runtime, db, _, _, _ = build_runtime(tmp_path)
+    db.upsert_theme_mapping(
+        ThemeMapping(
+            code="111111",
+            name="Mapped",
+            market="KOSDAQ",
+            theme_id="robot",
+            theme_name="Robot",
+            strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
+            enabled=True,
+        )
+    )
+    candidate = save_candidate(db)
+    existing_plan = plan_for(candidate.id, candidate.code)
+    existing_plan.split_plan = [
+        {"leg": 1, "weight_pct": 40, "limit_price": 10_000, "submittable": True},
+        {"leg": 2, "weight_pct": 30, "limit_price": 9_800, "submittable": True, "requires_previous_leg": True},
+        {"leg": 3, "weight_pct": 30, "limit_price": 9_600, "submittable": True, "requires_previous_leg": True},
+    ]
+    saved_plan = db.save_entry_plan(existing_plan)
+    filled_order = db.save_virtual_order(
+        VirtualOrder(
+            candidate_id=candidate.id,
+            entry_plan_id=saved_plan.id,
+            leg_index=1,
+            weight_pct=40,
+            status=VirtualOrderStatus.FILLED,
+            limit_price=10_000,
+            virtual_fill_price=10_000,
+            submitted_at=NOW.isoformat(),
+            filled_at=NOW.isoformat(),
+        )
+    )
+    db.save_virtual_position(
+        VirtualPosition(
+            candidate_id=candidate.id,
+            virtual_order_id=filled_order.id,
+            entry_price=10_000,
+            quantity=1,
+            opened_at=NOW.isoformat(),
+            details={
+                "entry_plan_id": saved_plan.id,
+                "filled_legs": [1],
+                "filled_order_ids": [filled_order.id],
+                "filled_weight_pct": 40,
+                "remaining_weight_pct": 60,
+            },
+        )
+    )
+    runtime.start(NOW)
+
+    snapshot = runtime.cycle(NOW)
+    orders = db.list_virtual_orders(candidate.id)
+
+    assert snapshot.virtual_order_count == 1
+    assert len(orders) == 2
+    assert orders[-1].leg_index == 2
+    assert orders[-1].weight_pct == 30
+    assert orders[-1].status == VirtualOrderStatus.SUBMITTED
     db.close()
 
 
@@ -606,8 +722,8 @@ def test_invalid_active_candidate_is_removed_by_quality_control(tmp_path):
     db.close()
 
 
-def test_theme_discovery_candidate_feeds_gate_but_never_creates_entry_plan(tmp_path):
-    runtime, db, _, _, builder = build_runtime(tmp_path)
+def test_theme_discovery_candidate_is_not_subscribed_or_entry_evaluated(tmp_path):
+    runtime, db, client, _, builder = build_runtime(tmp_path)
     candidate = save_candidate(
         db,
         "412350",
@@ -626,12 +742,127 @@ def test_theme_discovery_candidate_feeds_gate_but_never_creates_entry_plan(tmp_p
     runtime.start(NOW)
 
     snapshot = runtime.cycle(NOW)
+    reloaded = db.load_candidate_by_id(candidate.id)
 
-    assert runtime.gate_pipeline.calls[-1] == ["412350"]
-    assert snapshot.gate_result_count == 1
-    assert db.load_candidate_by_id(candidate.id).state == CandidateState.READY
+    assert runtime.gate_pipeline.calls == []
+    assert snapshot.gate_result_count == 0
+    assert snapshot.candidate_subscription_skipped_discovery_count == 1
+    assert "412350" not in client.registered_codes
+    assert reloaded.state == CandidateState.WATCHING
+    assert reloaded.metadata["quality_status"] == "discovery_only"
+    assert reloaded.metadata["sub_status"] == "DISCOVERY_ONLY"
     assert db.list_entry_plans(candidate.id) == []
     assert db.list_virtual_orders(candidate.id) == []
+    db.close()
+
+
+def test_market_closed_cycle_skips_mutating_runtime_flow_and_removes_candidate_watch(tmp_path):
+    runtime, db, client, _, _ = build_runtime(
+        tmp_path,
+        config=StrategyRuntimeConfig(max_candidates_to_watch=1, realtime_subscription_limit=10),
+    )
+    candidate = save_candidate(db, "111111", CandidateState.WATCHING, expires_at=(NOW + timedelta(minutes=1)).isoformat())
+    runtime.start(NOW)
+    assert "111111" in client.registered_codes
+
+    snapshot = runtime.cycle(datetime(2026, 5, 29, 16, 0))
+    reloaded = db.load_candidate_by_id(candidate.id)
+
+    assert snapshot.market_session_status == "closed"
+    assert snapshot.data_warmup_status == "closed"
+    assert snapshot.gate_skip_reason == "MARKET_SESSION_CLOSED"
+    assert snapshot.expired_count == 0
+    assert snapshot.gate_result_count == 0
+    assert snapshot.review_count == 0
+    assert reloaded.state == CandidateState.WATCHING
+    assert "111111" not in runtime.subscription_manager.records
+    db.close()
+
+
+def test_market_closed_runtime_does_not_start_conditions_or_register_new_candidate(tmp_path):
+    closed = datetime(2026, 5, 29, 20, 0)
+
+    class Adapter:
+        def __init__(self):
+            self.start_calls = []
+            self.stop_calls = 0
+
+        def start(self, now):
+            self.start_calls.append(now)
+            return []
+
+        def stop(self):
+            self.stop_calls += 1
+            return []
+
+    adapter = Adapter()
+    runtime, db, client, collector, _ = build_runtime(tmp_path, clock=closed, condition_adapter=adapter)
+
+    snapshot = runtime.start()
+    client.emit_condition_include("after_close", "412350")
+
+    rows = db.conn.execute("SELECT * FROM candidate_events").fetchall()
+    assert snapshot.market_session_status == "closed"
+    assert "CONDITION_ADAPTER_SKIPPED_MARKET_CLOSED" in snapshot.warnings
+    assert adapter.start_calls == []
+    assert db.list_candidates("2026-05-29") == []
+    assert rows[0]["event_type"] == "candidate_rejected"
+    assert rows[0]["reason"] == "market session closed"
+    assert "MARKET_SESSION_CLOSED_CONDITION_EVENT:after_close:412350" in collector.warnings
+    db.close()
+
+
+def test_data_warmup_waits_for_index_before_gate_and_review(tmp_path):
+    warmup_gate = WarmupGatePipeline()
+    runtime, db, _, _, _ = build_runtime(tmp_path, gate_pipeline=warmup_gate)
+    candidate = save_candidate(db, "111111", CandidateState.WATCHING)
+    runtime.start(NOW)
+
+    snapshot = runtime.cycle(NOW)
+
+    assert snapshot.market_session_status == "open"
+    assert snapshot.data_warmup_status == "waiting_index"
+    assert snapshot.gate_skip_reason == "DATA_WARMUP"
+    assert snapshot.gate_result_count == 0
+    assert warmup_gate.calls == []
+    assert db.list_trade_reviews(candidate.id) == []
+    db.close()
+
+
+def test_candidate_subscription_prefers_entry_candidates_and_removes_cap_overflow(tmp_path):
+    runtime, db, client, _, _ = build_runtime(
+        tmp_path,
+        config=StrategyRuntimeConfig(max_candidates_to_watch=1, realtime_subscription_limit=10),
+    )
+    discovery = save_candidate(
+        db,
+        "222222",
+        CandidateState.WATCHING,
+        strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+        metadata={
+            "condition_profiles": {"주도테마_넓은후보": StrategyProfile.THEME_DISCOVERY_PROFILE.value},
+            "condition_purposes": {"주도테마_넓은후보": "theme_broad_candidate"},
+            "entry_condition_names": [],
+            "entry_excluded": True,
+        },
+    )
+    entry = save_candidate(db, "111111", CandidateState.WATCHING, last_seen_at=(NOW - timedelta(minutes=1)).isoformat())
+    runtime.subscription_manager.ensure_subscription(discovery.code, "candidate_watch")
+
+    snapshot = runtime.start(NOW)
+
+    candidate_watch_codes = {
+        code
+        for code, record in runtime.subscription_manager.records.items()
+        if "candidate_watch" in record.sources
+    }
+    assert candidate_watch_codes == {"111111"}
+    assert snapshot.candidate_subscription_selected_count == 1
+    assert snapshot.candidate_subscription_skipped_discovery_count == 1
+    assert "111111" in client.registered_codes
+    assert "222222" not in runtime.subscription_manager.records
+    assert runtime.subscription_manager.records["111111"].sources == {"candidate_watch"}
+    assert db.load_candidate_by_id(entry.id).state == CandidateState.WATCHING
     db.close()
 
 

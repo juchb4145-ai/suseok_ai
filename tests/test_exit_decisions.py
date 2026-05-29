@@ -7,6 +7,7 @@ from trading.strategy.exit import (
     SUPPORT_LOSS,
     TAKE_PROFIT,
     TIME_EXIT,
+    TRAILING_STOP,
     ExitDecisionEngine,
     VirtualPositionService,
 )
@@ -70,11 +71,11 @@ def position(opened_at="2026-05-29T09:00:30", profile=StrategyProfile.KOSDAQ_THE
     )
 
 
-def snapshot(profile=StrategyProfile.KOSDAQ_THEME_PROFILE, vwap=10_050, day_mid=10_020, ema20=10_000, ema_ready=True):
+def snapshot(profile=StrategyProfile.KOSDAQ_THEME_PROFILE, vwap=10_050, day_mid=10_020, ema20=10_000, ema_ready=True, price=9_900):
     return IndicatorSnapshot(
         candidate_id=1,
         code="111111",
-        price=9_900,
+        price=price,
         vwap=vwap,
         day_mid=day_mid,
         ema20_5m=ema20,
@@ -110,6 +111,47 @@ def test_only_filled_virtual_order_opens_position_and_duplicates_are_rejected():
     assert opened.position.entry_price == 10_000
     assert duplicate.duplicate is True
     assert duplicate.position is opened.position
+
+
+def test_filled_legs_aggregate_into_one_virtual_position(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    service = VirtualPositionService(db=db)
+    plan_to_save = entry_plan()
+    plan_to_save.id = None
+    plan = db.save_entry_plan(plan_to_save)
+    plan.split_plan = [
+        {"leg": 1, "weight_pct": 40, "limit_price": 10_000},
+        {"leg": 2, "weight_pct": 30, "limit_price": 9_700},
+    ]
+    first_order = virtual_order()
+    first_order.id = None
+    first_order.entry_plan_id = plan.id
+    first_order.leg_index = 1
+    first_order.weight_pct = 40
+    first_order.limit_price = 10_000
+    first_order.virtual_fill_price = 10_000
+    first_order = db.save_virtual_order(first_order)
+    second_order = virtual_order(candidate_id=1)
+    second_order.id = None
+    second_order.entry_plan_id = plan.id
+    second_order.leg_index = 2
+    second_order.weight_pct = 30
+    second_order.limit_price = 9_700
+    second_order.virtual_fill_price = 9_700
+    second_order = db.save_virtual_order(second_order)
+
+    opened = service.open_from_filled_order(first_order, plan)
+    aggregated = service.open_from_filled_order(second_order, plan)
+
+    assert opened.opened is True
+    assert aggregated.aggregated is True
+    assert len(db.list_virtual_positions(1)) == 1
+    position = db.list_virtual_positions(1)[0]
+    assert position.entry_price == 9_871
+    assert position.details["filled_legs"] == [1, 2]
+    assert position.details["filled_weight_pct"] == 70
+    assert position.details["remaining_weight_pct"] == 30
+    db.close()
 
 
 def test_opened_at_previous_and_same_candle_are_excluded_from_mfe_mae():
@@ -169,6 +211,36 @@ def test_support_loss_full_closes_position():
     assert pos.close_price == 9_850
     assert pos.close_reason == SUPPORT_LOSS
     assert pos.realized_return_pct == -1.5
+
+
+def test_partial_take_profit_switches_remaining_position_to_trailing_stop():
+    builder = candle_builder(
+        (datetime(2026, 5, 29, 9, 1), 10_000, 10_400, 10_100, 10_200),
+        (datetime(2026, 5, 29, 9, 2), 10_200, 10_300, 10_000, 10_000),
+        (datetime(2026, 5, 29, 9, 3), 10_000, 10_050, 9_900, 9_950),
+    )
+    pos = position()
+    existing = ExitDecision(
+        virtual_position_id=1,
+        decision_type=TAKE_PROFIT,
+        trigger_price=10_500,
+        filled=True,
+        details={"partial_exit": True, "exit_percent": 70},
+        created_at="2026-05-29T09:02:00",
+    )
+
+    decisions = ExitDecisionEngine().evaluate(
+        pos,
+        snapshot(vwap=10_050, day_mid=None, ema20=None, price=10_100),
+        builder,
+        [existing],
+        datetime(2026, 5, 29, 9, 4),
+    )
+
+    assert [decision.decision_type for decision in decisions] == [TRAILING_STOP]
+    assert decisions[0].reason_codes == ["TRAILING_STOP_CONFIRMED"]
+    assert pos.close_reason == TRAILING_STOP
+    assert pos.details["trailing_floor"] == 10_050
 
 
 def test_time_exit_requires_max_hold_and_momentum_failure_then_full_closes():

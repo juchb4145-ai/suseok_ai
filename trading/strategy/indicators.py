@@ -61,6 +61,9 @@ class IndicatorCalculator:
 
         vwap = self._calculate_vwap(clean_code, metadata)
         ema20_5m = self._calculate_ema20_5m(clean_code, metadata)
+        base_line_120 = self._calculate_sma_5m(clean_code, 120, "base_line_120", metadata)
+        envelope_mid = self._calculate_sma_5m(clean_code, 20, "envelope_mid", metadata)
+        self._calculate_volatility_5m(clean_code, metadata)
         day_mid = ((day_high + day_low) / 2.0) if day_high > 0 and day_low > 0 else None
         pullback_pct = None
         if day_high > 0:
@@ -73,8 +76,8 @@ class IndicatorCalculator:
             price=latest_tick.price,
             vwap=vwap,
             ema20_5m=ema20_5m,
-            base_line_120=None,
-            envelope_mid=None,
+            base_line_120=base_line_120,
+            envelope_mid=envelope_mid,
             day_high=day_high,
             day_low=day_low,
             day_mid=day_mid,
@@ -116,6 +119,45 @@ class IndicatorCalculator:
             return None
         closes = [float(candle.close) for candle in candles]
         return _ema(closes, 20)
+
+    def _calculate_sma_5m(
+        self,
+        code: str,
+        period: int,
+        metadata_key: str,
+        metadata: dict[str, object],
+    ) -> Optional[float]:
+        candles = self.candle_builder.completed_candles(code, 5)
+        count_key = f"{metadata_key}_candle_count"
+        ready_key = f"{metadata_key}_ready"
+        metadata[count_key] = len(candles)
+        metadata[ready_key] = len(candles) >= period
+        if not candles:
+            _append_insufficient(metadata, f"{metadata_key}_missing")
+            return None
+        closes = [float(candle.close) for candle in candles[-period:]]
+        return sum(closes) / len(closes)
+
+    def _calculate_volatility_5m(self, code: str, metadata: dict[str, object]) -> Optional[float]:
+        candles = self.candle_builder.completed_candles(code, 5)[-6:]
+        metadata["volatility_5m_candle_count"] = len(candles)
+        metadata["volatility_5m_ready"] = len(candles) >= 6
+        if not candles:
+            _append_insufficient(metadata, "volatility_5m_missing")
+            metadata["volatility_5m_pct"] = None
+            return None
+        values = [
+            ((candle.high - candle.low) / candle.close) * 100.0
+            for candle in candles
+            if candle.close > 0
+        ]
+        if not values:
+            _append_insufficient(metadata, "volatility_5m_missing")
+            metadata["volatility_5m_pct"] = None
+            return None
+        volatility = sum(values) / len(values)
+        metadata["volatility_5m_pct"] = round(volatility, 6)
+        return volatility
 
 
 def _ema(values: list[float], period: int) -> float:

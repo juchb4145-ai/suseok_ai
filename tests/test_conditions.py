@@ -97,6 +97,32 @@ def test_ensure_default_condition_profiles_seeds_missing_only(tmp_path):
     db.close()
 
 
+def test_ensure_default_condition_profiles_repairs_known_profile_drift(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    repo = ConditionProfileRepository(db)
+    repo.upsert_profile(
+        ConditionProfile(
+            condition_name="주도테마_넓은후보",
+            strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
+            enabled=False,
+            priority=12,
+            purpose="theme_broad_candidate",
+            last_resolved_index=80,
+        )
+    )
+
+    result = ensure_default_condition_profiles(db)
+    saved = {profile.condition_name: profile for profile in db.list_condition_profiles(enabled=None)}["주도테마_넓은후보"]
+
+    assert saved.strategy_profile == StrategyProfile.THEME_DISCOVERY_PROFILE
+    assert saved.purpose == "theme_broad_candidate"
+    assert saved.enabled is False
+    assert saved.priority == 12
+    assert saved.last_resolved_index == 80
+    assert "CONDITION_PROFILE_DEFAULT_UPDATED:주도테마_넓은후보" in result.warnings
+    db.close()
+
+
 def test_ensure_default_condition_profiles_warns_suspicious_rows(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     repo = ConditionProfileRepository(db)

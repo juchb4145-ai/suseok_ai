@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from trading.strategy.candidates import normalize_code
+from trading.strategy.candidates import candidate_is_discovery_only, normalize_code
 from trading.strategy.candles import Candle, CandleBuilder
 from trading.strategy.indicators import IndicatorCalculator
 from trading.strategy.intraday import IntradayStateTracker
@@ -27,6 +27,7 @@ KOSDAQ_SHALLOW_PULLBACK_RANGE = (-2.0, -1.5)
 KOSPI_PULLBACK_RANGE = (-3.0, -0.8)
 KOSDAQ_SUPPORT_NEAR_PCT = 2.5
 KOSPI_SUPPORT_NEAR_PCT = 1.5
+SUPPORT_DEDUPE_PCT = 0.25
 
 
 @dataclass
@@ -35,6 +36,7 @@ class _ThemeEntry:
     mapping: ThemeMapping
     tick: Optional[StrategyTick]
     turnover: int
+    discovery_only: bool = False
 
 
 class ThemeStrengthGate:
@@ -79,6 +81,7 @@ class ThemeStrengthGate:
                         mapping=mapping,
                         tick=tick,
                         turnover=turnover,
+                        discovery_only=candidate_is_discovery_only(candidate),
                     )
                 )
         return groups
@@ -92,11 +95,17 @@ class ThemeStrengthGate:
     ) -> ThemeStrengthResult:
         active_count = len(entries)
         valid_ticks = [entry for entry in entries if _valid_tick(entry.tick)]
+        scored_entries = [
+            entry
+            for entry in entries
+            if not (entry.discovery_only and not _valid_tick(entry.tick))
+        ]
         valid_turnovers = [entry for entry in entries if entry.turnover > 0]
-        missing_turnover_count = active_count - len(valid_turnovers)
-        valid_tick_ratio = len(valid_ticks) / active_count if active_count else 0.0
+        scored_valid_turnovers = [entry for entry in scored_entries if entry.turnover > 0]
+        missing_turnover_count = len(scored_entries) - len(scored_valid_turnovers)
+        valid_tick_ratio = len(valid_ticks) / len(scored_entries) if scored_entries else 1.0
         insufficient_reason = []
-        if len(valid_ticks) < active_count:
+        if len(valid_ticks) < len(scored_entries):
             insufficient_reason.append("tick_missing")
         if missing_turnover_count:
             insufficient_reason.append("turnover_missing")
@@ -124,7 +133,7 @@ class ThemeStrengthGate:
             score=score,
             active_count=active_count,
             valid_tick_ratio=valid_tick_ratio,
-            valid_turnover_count=len(valid_turnovers),
+            valid_turnover_count=len(scored_valid_turnovers),
             signal_pair=signal_pair,
         )
         leader_codes = [entry.candidate.code for entry in top_entries[:2]]
@@ -142,9 +151,11 @@ class ThemeStrengthGate:
                 "theme_name": theme_name,
                 "score_components": score_components,
                 "active_candidate_count": active_count,
+                "scored_candidate_count": len(scored_entries),
+                "discovery_only_unscored_count": active_count - len(scored_entries),
                 "valid_tick_count": len(valid_ticks),
                 "valid_tick_ratio": valid_tick_ratio,
-                "valid_turnover_count": len(valid_turnovers),
+                "valid_turnover_count": len(scored_valid_turnovers),
                 "missing_turnover_count": missing_turnover_count,
                 "theme_turnover": theme_turnover,
                 "top2_turnover": top2_turnover,
@@ -418,6 +429,7 @@ class StockPullbackEntryGate:
         candidate: Candidate,
         theme_result: ThemeStrengthResult,
         leadership_result: StockLeadershipResult,
+        market_decision: Optional[GateDecision] = None,
     ) -> tuple[GateDecision, Optional[IndicatorSnapshot]]:
         snapshot = _snapshot_for(
             self.indicator_calculator,
@@ -430,11 +442,18 @@ class StockPullbackEntryGate:
         profile = candidate.strategy_profile
         if profile == StrategyProfile.SEMICONDUCTOR_SIGNAL_PROFILE:
             profile = StrategyProfile.KOSPI_LEADER_PROFILE
+        market_position = ""
+        if market_decision is not None:
+            market_position = str(market_decision.details.get("position_vs_mid") or "")
         details = {
             "theme_id": theme_result.theme_id,
+            "theme_grade": theme_result.grade,
+            "leadership_role": leadership_result.leadership_role,
+            "market_position": market_position,
             "profile": profile.value if profile else "",
             "pullback_pct": snapshot.pullback_pct if snapshot else None,
             "valid_range": _valid_pullback_range(profile),
+            "dynamic_pullback_policy": {},
             "nearest_support": None,
             "support_distance_pct": None,
             "support_touched": False,
@@ -467,6 +486,9 @@ class StockPullbackEntryGate:
                 snapshot,
             )
 
+        policy = _dynamic_pullback_policy(profile, theme_result, leadership_result, snapshot, market_position)
+        details["valid_range"] = policy["valid_range"]
+        details["dynamic_pullback_policy"] = policy
         support_threshold = KOSPI_SUPPORT_NEAR_PCT if profile == StrategyProfile.KOSPI_LEADER_PROFILE else KOSDAQ_SUPPORT_NEAR_PCT
         support_status = support_status_for_snapshot(snapshot, self.candle_builder, support_threshold)
         details.update(support_status)
@@ -502,9 +524,11 @@ class StockPullbackEntryGate:
         pullback = snapshot.pullback_pct
         if pullback is None:
             return self._temporary_stock_wait(details, snapshot, "DATA_INSUFFICIENT")
+        valid_range = tuple(details.get("valid_range") or KOSDAQ_PULLBACK_RANGE)
+        confirmation_mode = str(details.get("dynamic_pullback_policy", {}).get("confirmation_mode") or "standard")
         support_ok = details["support_touched"] and details["support_reclaimed"]
-        confirmation_ok = snapshot.volume_reaccel or snapshot.failed_low_break_rebound
-        basic_range = KOSDAQ_PULLBACK_RANGE[0] <= pullback <= KOSDAQ_PULLBACK_RANGE[1]
+        confirmation_ok = _confirmation_ok(snapshot, details, confirmation_mode)
+        basic_range = valid_range[0] <= pullback <= valid_range[1]
         shallow_exception = (
             KOSDAQ_SHALLOW_PULLBACK_RANGE[0] < pullback <= KOSDAQ_SHALLOW_PULLBACK_RANGE[1]
             and theme_result.grade == "A"
@@ -512,7 +536,7 @@ class StockPullbackEntryGate:
             and support_ok
             and confirmation_ok
         )
-        if pullback < KOSDAQ_PULLBACK_RANGE[0]:
+        if pullback < valid_range[0]:
             details["sub_status"] = "PULLBACK_TOO_DEEP"
             return _decision("StockPullbackEntryGate", False, 0.0, BlockType.FINAL, ["PULLBACK_TOO_DEEP"], details), snapshot
         if (basic_range and support_ok and confirmation_ok) or shallow_exception:
@@ -530,13 +554,16 @@ class StockPullbackEntryGate:
         pullback = snapshot.pullback_pct
         if pullback is None:
             return self._temporary_stock_wait(details, snapshot, "DATA_INSUFFICIENT")
-        if pullback < KOSPI_PULLBACK_RANGE[0]:
+        valid_range = tuple(details.get("valid_range") or KOSPI_PULLBACK_RANGE)
+        confirmation_mode = str(details.get("dynamic_pullback_policy", {}).get("confirmation_mode") or "standard")
+        if pullback < valid_range[0]:
             details["sub_status"] = "PULLBACK_TOO_DEEP"
             return _decision("StockPullbackEntryGate", False, 0.0, BlockType.FINAL, ["PULLBACK_TOO_DEEP"], details), snapshot
         recovery = self._kospi_recovery(snapshot)
         details["recovery_confirmed"] = recovery
         support_ok = details["support_touched"] and details["support_reclaimed"]
-        if KOSPI_PULLBACK_RANGE[0] <= pullback <= KOSPI_PULLBACK_RANGE[1] and support_ok and recovery:
+        confirmation_ok = recovery and _confirmation_ok(snapshot, details, confirmation_mode)
+        if valid_range[0] <= pullback <= valid_range[1] and support_ok and confirmation_ok:
             details["sub_status"] = "PASS"
             return _decision("StockPullbackEntryGate", True, 100.0, BlockType.NONE, [], details), snapshot
         return self._temporary_stock_wait(details, snapshot, "WAIT_PULLBACK_CONFIRMATION")
@@ -638,11 +665,108 @@ def _snapshot_for(
 def _support_candidates(snapshot: IndicatorSnapshot) -> dict:
     candidates = {
         "vwap": snapshot.vwap,
+        "base_line_120": snapshot.base_line_120,
+        "envelope_mid": snapshot.envelope_mid,
         "day_mid": snapshot.day_mid,
         "prev_high": float(snapshot.prev_high) if snapshot.prev_high > 0 else None,
         "ema20_5m": snapshot.ema20_5m,
     }
-    return {name: float(value) for name, value in candidates.items() if value is not None and value > 0}
+    supports = {name: float(value) for name, value in candidates.items() if value is not None and value > 0}
+    return _dedupe_price_levels(supports, SUPPORT_DEDUPE_PCT, snapshot.price)
+
+
+def _dedupe_price_levels(candidates: dict[str, float], threshold_pct: float, current_price: int) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for name, price in candidates.items():
+        duplicate_name = ""
+        for kept_name, kept_price in result.items():
+            if kept_price > 0 and abs((price - kept_price) / kept_price) * 100.0 <= threshold_pct:
+                duplicate_name = kept_name
+                break
+        if not duplicate_name:
+            result[name] = price
+            continue
+        kept_price = result[duplicate_name]
+        kept_is_support = kept_price <= current_price
+        candidate_is_support = price <= current_price
+        if candidate_is_support and not kept_is_support:
+            result.pop(duplicate_name)
+            result[name] = price
+    return result
+
+
+def _dynamic_pullback_policy(
+    profile: Optional[StrategyProfile],
+    theme_result: ThemeStrengthResult,
+    leadership_result: StockLeadershipResult,
+    snapshot: IndicatorSnapshot,
+    market_position: str,
+) -> dict:
+    is_kospi = profile in {StrategyProfile.KOSPI_LEADER_PROFILE, StrategyProfile.SEMICONDUCTOR_SIGNAL_PROFILE}
+    base_range = KOSPI_PULLBACK_RANGE if is_kospi else KOSDAQ_PULLBACK_RANGE
+    role = leadership_result.leadership_role
+    leader_role = role in {"leader", "second_leader", "signal_leader", "signal_second_leader"}
+    strong_theme = theme_result.grade in {"A", "A_SIGNAL"} and leader_role
+    weak_context = theme_result.grade == "B" or not leader_role or market_position == "BELOW_MID"
+    mode = "base"
+    confirmation_mode = "standard"
+    if strong_theme:
+        valid_range = (-2.5, -0.5) if is_kospi else (-4.0, -1.2)
+        mode = "strong_leader_shallow"
+    elif weak_context:
+        valid_range = (-4.0, -1.5) if is_kospi else (-6.5, -3.0)
+        mode = "weak_or_late_deep"
+        confirmation_mode = "strong"
+    else:
+        valid_range = base_range
+
+    volatility = _float_or_none(snapshot.metadata.get("volatility_5m_pct"))
+    volatility_adjustment = "none"
+    low, high = valid_range
+    if volatility is not None and volatility > 2.5:
+        low -= 1.0
+        high -= 0.5
+        volatility_adjustment = "deeper_for_high_volatility"
+    elif volatility is not None and volatility < 1.0:
+        low += 0.5
+        high += 0.3
+        volatility_adjustment = "shallower_for_low_volatility"
+
+    valid_range = (round(low, 4), round(high, 4))
+    return {
+        "mode": mode,
+        "profile": profile.value if profile else "",
+        "theme_grade": theme_result.grade,
+        "leadership_role": role,
+        "market_position": market_position,
+        "base_range": base_range,
+        "valid_range": valid_range,
+        "confirmation_mode": confirmation_mode,
+        "volatility_5m_pct": volatility,
+        "volatility_adjustment": volatility_adjustment,
+    }
+
+
+def _confirmation_ok(snapshot: IndicatorSnapshot, details: dict, mode: str) -> bool:
+    if mode == "strong":
+        return bool(
+            snapshot.failed_low_break_rebound
+            or (
+                snapshot.volume_reaccel
+                and details.get("support_reclaimed")
+                and details.get("support_touched")
+            )
+        )
+    return bool(snapshot.volume_reaccel or snapshot.failed_low_break_rebound)
+
+
+def _float_or_none(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _distance_pct(price: int, support: float) -> float:

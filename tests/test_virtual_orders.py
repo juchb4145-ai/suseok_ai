@@ -74,6 +74,28 @@ def test_duplicate_submitted_virtual_order_is_not_created():
     assert second.rejected_reason == "duplicate_submitted"
 
 
+def test_multi_leg_plan_submits_next_leg_only_after_previous_fill():
+    service = VirtualOrderService()
+    entry_plan = plan()
+    entry_plan.split_plan = [
+        {"leg": 1, "weight_pct": 40, "limit_price": 10_000, "submittable": True},
+        {"leg": 2, "weight_pct": 30, "limit_price": 9_800, "submittable": True, "requires_previous_leg": True},
+        {"leg": 3, "weight_pct": 30, "limit_price": 9_600, "submittable": True, "requires_previous_leg": True},
+    ]
+
+    first = service.submit_virtual_order(entry_plan, datetime(2026, 5, 29, 9, 0))
+    duplicate = service.submit_virtual_order(entry_plan, datetime(2026, 5, 29, 9, 1))
+    first.order.status = VirtualOrderStatus.FILLED
+    second = service.submit_virtual_order(entry_plan, datetime(2026, 5, 29, 9, 2))
+
+    assert first.order.leg_index == 1
+    assert first.order.weight_pct == 40
+    assert duplicate.duplicate is True
+    assert second.submitted is True
+    assert second.order.leg_index == 2
+    assert second.order.limit_price == 9_800
+
+
 def test_fill_policies_use_tick_provider_thresholds():
     builder = builder_with_completed_candle(low=9_995)
     service = VirtualOrderService(tick_provider=FixedTickProvider())

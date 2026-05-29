@@ -691,6 +691,8 @@ def test_observe_readiness_summary_displays_snapshot_and_dedupes_warnings(tmp_pa
     assert "themes=0 enabled=0" in readiness_text
     assert "active candidates=2 mapped=0 unmapped=2" in readiness_text
     assert "protected subs=4/85" in readiness_text
+    assert "flow: market=" in readiness_text
+    assert "candidate subscriptions:" in readiness_text
     assert warning_text.splitlines().count("THEME_MAPPING_EMPTY") == 1
     db.close()
     window.close()
@@ -907,6 +909,18 @@ def test_candidate_filters_are_proxy_only_and_cover_state_search_recover_theme(t
     )
     save_candidate(db, "333333", CandidateState.WATCHING, NOW + timedelta(minutes=2), name="Watch Search")
     save_candidate(db, "444444", CandidateState.DETECTED, NOW + timedelta(minutes=1), name="Detected Name")
+    save_candidate(
+        db,
+        "555555",
+        CandidateState.WATCHING,
+        NOW + timedelta(minutes=5),
+        {
+            "condition_purposes": {"주도테마_넓은후보": "theme_broad_candidate"},
+            "entry_condition_names": [],
+            "entry_excluded": True,
+        },
+        name="Discovery Only",
+    )
     window.refresh_strategy_candidates()
 
     monkeypatch.setattr(window.strategy_runtime, "cycle", lambda: (_ for _ in ()).throw(AssertionError("filter must not cycle")))
@@ -916,6 +930,16 @@ def test_candidate_filters_are_proxy_only_and_cover_state_search_recover_theme(t
     monkeypatch.setattr(db, "save_virtual_position", lambda position: (_ for _ in ()).throw(AssertionError("filter must not save virtual position")))
     monkeypatch.setattr(client, "send_order", lambda request: (_ for _ in ()).throw(AssertionError("filter must not call order path")))
     monkeypatch.setattr(engine, "register_realtime", lambda: (_ for _ in ()).throw(AssertionError("filter must not register realtime")))
+
+    assert "555555" not in candidate_table_codes(window)
+
+    window.strategy_candidate_filter_bar.quality_combo.setCurrentIndex(
+        window.strategy_candidate_filter_bar.quality_combo.findData("ALL")
+    )
+    assert "555555" in candidate_table_codes(window)
+
+    window.strategy_candidate_filter_bar.clear_filters()
+    assert "555555" not in candidate_table_codes(window)
 
     window.strategy_candidate_filter_bar.state_combo.setCurrentText("READY")
     assert candidate_table_codes(window) == ["111111"]
@@ -951,11 +975,20 @@ def test_candidate_filters_are_proxy_only_and_cover_state_search_recover_theme(t
     assert candidate_table_codes(window) == ["222222", "333333", "444444"]
 
     window.strategy_candidate_filter_bar.clear_filters()
-    window.strategy_candidate_filter_bar.quality_combo.setCurrentIndex(1)
+    window.strategy_candidate_filter_bar.quality_combo.setCurrentIndex(
+        window.strategy_candidate_filter_bar.quality_combo.findData("actionable")
+    )
     assert candidate_table_codes(window) == ["111111"]
 
-    window.strategy_candidate_filter_bar.quality_combo.setCurrentIndex(3)
+    window.strategy_candidate_filter_bar.quality_combo.setCurrentIndex(
+        window.strategy_candidate_filter_bar.quality_combo.findData("unmapped")
+    )
     assert candidate_table_codes(window) == ["222222", "333333", "444444"]
+
+    window.strategy_candidate_filter_bar.quality_combo.setCurrentIndex(
+        window.strategy_candidate_filter_bar.quality_combo.findData("discovery_only")
+    )
+    assert candidate_table_codes(window) == ["555555"]
     db.close()
     window.close()
 
@@ -1091,6 +1124,8 @@ def test_candidate_detail_panel_displays_read_only_related_records(tmp_path, qap
     assert "state: READY" in detail_text
     assert "quality_status: actionable" in detail_text
     assert "enabled_theme_mapping: Y" in detail_text
+    assert "entry_evaluation_target: Y" in detail_text
+    assert "subscription_excluded_reason: -" in detail_text
     assert "theme_id=robot" in detail_text
     assert "price: 12,345" in detail_text
     assert "entry_type=pullback" in detail_text

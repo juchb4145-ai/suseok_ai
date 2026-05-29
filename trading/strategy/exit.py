@@ -21,8 +21,9 @@ from trading.strategy.models import (
 TAKE_PROFIT = "TAKE_PROFIT"
 SUPPORT_LOSS = "SUPPORT_LOSS"
 TIME_EXIT = "TIME_EXIT"
+TRAILING_STOP = "TRAILING_STOP"
 DATA_INSUFFICIENT_EXIT_BASIS = "DATA_INSUFFICIENT_EXIT_BASIS"
-FINAL_EXIT_TYPES = {SUPPORT_LOSS, TIME_EXIT}
+FINAL_EXIT_TYPES = {SUPPORT_LOSS, TIME_EXIT, TRAILING_STOP}
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class ExitPolicy:
 class PositionOpenResult:
     position: Optional[VirtualPosition]
     opened: bool = False
+    aggregated: bool = False
     duplicate: bool = False
     rejected_reason: str = ""
     details: dict = field(default_factory=dict)
@@ -79,6 +81,18 @@ class VirtualPositionService:
 
         opened_at = order.filled_at or (now or datetime.now()).replace(microsecond=0).isoformat()
         entry_price = order.virtual_fill_price or order.limit_price or plan.limit_price
+        open_position = self._find_open_position(order)
+        if open_position is not None:
+            position = _aggregate_position_fill(open_position, order, plan, int(entry_price))
+            if self.db is not None:
+                position = self.db.save_virtual_position(position)
+            if order.id is not None:
+                self._positions_by_order[order.id] = position
+            details["aggregated"] = True
+            details["leg_index"] = order.leg_index
+            details["weight_pct"] = order.weight_pct
+            return PositionOpenResult(position, aggregated=True, details=details)
+
         position = VirtualPosition(
             candidate_id=order.candidate_id,
             virtual_order_id=order.id,
@@ -88,6 +102,7 @@ class VirtualPositionService:
             max_return_pct=0.0,
             max_drawdown_pct=0.0,
             realized_return_pct=0.0,
+            details=_initial_position_details(order, plan),
         )
         if self.db is not None:
             position = self.db.save_virtual_position(position)
@@ -149,8 +164,20 @@ class VirtualPositionService:
         if existing is not None:
             return existing
         if self.db is not None:
-            return self.db.load_virtual_position_by_order(order.id)
+            position = self.db.load_virtual_position_by_order(order.id)
+            if position is not None:
+                return position
+            if order.candidate_id is not None:
+                for candidate_position in self.db.list_virtual_positions(order.candidate_id):
+                    filled_order_ids = candidate_position.details.get("filled_order_ids") or []
+                    if order.id in filled_order_ids:
+                        return candidate_position
         return None
+
+    def _find_open_position(self, order: VirtualOrder) -> Optional[VirtualPosition]:
+        if order.candidate_id is None or self.db is None:
+            return None
+        return self.db.load_open_virtual_position(order.candidate_id)
 
 
 class ExitDecisionEngine:
@@ -201,6 +228,15 @@ class ExitDecisionEngine:
 
         decisions: list[ExitDecision] = []
         take_profit = self._take_profit_decision(position, snapshot, policy, candles, existing_decisions, evaluated_at)
+        if _has_partial_take_profit(existing_decisions):
+            trailing_stop = self._trailing_stop_decision(position, snapshot, policy, candles, existing_decisions, evaluated_at)
+            if take_profit is not None:
+                decisions.append(take_profit)
+            if trailing_stop is not None:
+                _apply_full_close(position, trailing_stop)
+                decisions.append(trailing_stop)
+            return decisions
+
         support_loss = self._support_loss_decision(position, snapshot, policy, candles, existing_decisions, evaluated_at)
 
         if take_profit is not None and support_loss is not None:
@@ -314,6 +350,63 @@ class ExitDecisionEngine:
                     )
         return None
 
+    def _trailing_stop_decision(
+        self,
+        position: VirtualPosition,
+        snapshot: IndicatorSnapshot,
+        policy: ExitPolicy,
+        candles: list[Candle],
+        existing_decisions: list[ExitDecision],
+        created_at: datetime,
+    ) -> Optional[ExitDecision]:
+        if _has_final_exit(existing_decisions):
+            self.last_details["reason_codes"].append("duplicate_final_exit")
+            return None
+        floor_basis = _trailing_floor_basis(snapshot, candles)
+        self.last_details["trailing_floor_basis"] = floor_basis
+        if not floor_basis:
+            self.last_details["reason_codes"].append(DATA_INSUFFICIENT_EXIT_BASIS)
+            return None
+        basis_name, calculated_floor = max(floor_basis, key=lambda item: item[1])
+        details = dict(position.details or {})
+        previous_floor = _float(details.get("trailing_floor"), default=0.0)
+        trailing_floor = max(previous_floor, calculated_floor)
+        if trailing_floor != previous_floor or details.get("trailing_floor_basis") != basis_name:
+            details["trailing_floor"] = trailing_floor
+            details["trailing_floor_basis"] = basis_name
+            details["trailing_floor_updated_at"] = created_at.isoformat()
+            position.details = details
+            self.last_details["position_details_changed"] = True
+        self.last_details["trailing_floor"] = trailing_floor
+        self.last_details["trailing_floor_source"] = basis_name
+        if len(candles) < 2:
+            self.last_details["reason_codes"].append("trailing_stop_candles_insufficient")
+            return None
+        previous, current = candles[-2], candles[-1]
+        if previous.close >= trailing_floor or current.close >= trailing_floor:
+            return None
+        return ExitDecision(
+            virtual_position_id=position.id,
+            decision_type=TRAILING_STOP,
+            trigger_price=current.close,
+            filled=True,
+            fill_policy=FillPolicy.NORMAL,
+            reason_codes=["TRAILING_STOP_CONFIRMED"],
+            details={
+                "virtual_only": True,
+                "strategy_profile": policy.strategy_profile.value,
+                "code": snapshot.code,
+                "trailing_floor": trailing_floor,
+                "trailing_floor_basis": basis_name,
+                "consecutive_closes_below": 2,
+                "full_exit": True,
+                "position_closed": True,
+                "virtual_exit_price": current.close,
+                "trigger_candle_start_at": current.start_at.isoformat(),
+            },
+            created_at=created_at.isoformat(),
+        )
+
     def _time_exit_decision(
         self,
         position: VirtualPosition,
@@ -401,11 +494,44 @@ def _support_basis(snapshot: IndicatorSnapshot) -> list[tuple[str, float]]:
     basis: list[tuple[str, float]] = []
     if snapshot.vwap is not None:
         basis.append(("vwap", float(snapshot.vwap)))
+    if snapshot.base_line_120 is not None:
+        basis.append(("base_line_120", float(snapshot.base_line_120)))
+    if snapshot.envelope_mid is not None:
+        basis.append(("envelope_mid", float(snapshot.envelope_mid)))
     if snapshot.day_mid is not None:
         basis.append(("day_mid", float(snapshot.day_mid)))
     if snapshot.ema20_5m is not None and snapshot.metadata.get("ema20_5m_ready") is True:
         basis.append(("ema20_5m", float(snapshot.ema20_5m)))
-    return basis
+    return _dedupe_basis(basis)
+
+
+def _trailing_floor_basis(snapshot: IndicatorSnapshot, candles: list[Candle]) -> list[tuple[str, float]]:
+    basis = [
+        (name, price)
+        for name, price in _support_basis(snapshot)
+        if price <= snapshot.price
+    ]
+    recent = candles[-3:]
+    if recent:
+        recent_low = min(candle.low for candle in recent)
+        if recent_low > 0 and recent_low <= snapshot.price:
+            basis.append(("recent_3m_low", float(recent_low)))
+    return _dedupe_basis(basis)
+
+
+def _dedupe_basis(values: list[tuple[str, float]]) -> list[tuple[str, float]]:
+    result: list[tuple[str, float]] = []
+    for name, price in values:
+        if price <= 0:
+            continue
+        duplicate = False
+        for _, kept_price in result:
+            if abs((price - kept_price) / kept_price) * 100.0 <= 0.25:
+                duplicate = True
+                break
+        if not duplicate:
+            result.append((name, price))
+    return result
 
 
 def _post_open_completed_candles(
@@ -435,12 +561,25 @@ def _has_final_exit(existing_decisions: list[ExitDecision]) -> bool:
     )
 
 
+def _has_partial_take_profit(existing_decisions: list[ExitDecision]) -> bool:
+    return any(
+        decision.decision_type == TAKE_PROFIT
+        and decision.filled
+        and bool(decision.details.get("partial_exit"))
+        for decision in existing_decisions
+    )
+
+
 def _apply_full_close(position: VirtualPosition, decision: ExitDecision) -> None:
     close_price = int(decision.details.get("virtual_exit_price") or decision.trigger_price)
     position.closed_at = decision.created_at
     position.close_price = close_price
     position.close_reason = decision.decision_type
     position.realized_return_pct = _return_pct(close_price, position.entry_price)
+    details = dict(position.details or {})
+    if details:
+        details["remaining_weight_pct"] = 0.0
+        position.details = details
 
 
 def _recent_high_update_failed(candles: list[Candle]) -> bool:
@@ -458,6 +597,65 @@ def _plan_quantity(plan: EntryPlan) -> int:
         return max(1, int(value))
     except (TypeError, ValueError):
         return 1
+
+
+def _initial_position_details(order: VirtualOrder, plan: EntryPlan) -> dict:
+    weight = _order_weight(order)
+    return {
+        "entry_plan_id": plan.id,
+        "filled_legs": [int(order.leg_index or 1)],
+        "filled_order_ids": [order.id] if order.id is not None else [],
+        "filled_weight_pct": weight,
+        "remaining_weight_pct": max(0.0, round(100.0 - weight, 6)),
+        "trailing_floor": None,
+        "trailing_floor_basis": "",
+    }
+
+
+def _aggregate_position_fill(
+    position: VirtualPosition,
+    order: VirtualOrder,
+    plan: EntryPlan,
+    entry_price: int,
+) -> VirtualPosition:
+    details = dict(position.details or {})
+    filled_legs = [int(value) for value in details.get("filled_legs") or []]
+    filled_order_ids = [int(value) for value in details.get("filled_order_ids") or []]
+    leg_index = int(order.leg_index or 1)
+    if leg_index not in filled_legs:
+        filled_legs.append(leg_index)
+    if order.id is not None and order.id not in filled_order_ids:
+        filled_order_ids.append(order.id)
+    old_weight = _float(details.get("filled_weight_pct"), default=100.0 if not details else 0.0)
+    new_weight = _order_weight(order)
+    total_weight = old_weight + new_weight
+    if total_weight > 0 and position.entry_price > 0 and entry_price > 0:
+        position.entry_price = int(round(((position.entry_price * old_weight) + (entry_price * new_weight)) / total_weight))
+    position.quantity = max(1, int(position.quantity or 0) + _plan_quantity(plan))
+    details.update(
+        {
+            "entry_plan_id": details.get("entry_plan_id") or plan.id,
+            "filled_legs": sorted(filled_legs),
+            "filled_order_ids": filled_order_ids,
+            "filled_weight_pct": round(min(100.0, total_weight), 6),
+            "remaining_weight_pct": max(0.0, round(100.0 - total_weight, 6)),
+        }
+    )
+    details.setdefault("trailing_floor", None)
+    details.setdefault("trailing_floor_basis", "")
+    position.details = details
+    return position
+
+
+def _order_weight(order: VirtualOrder) -> float:
+    return max(0.0, _float(order.weight_pct, default=100.0))
+
+
+def _float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _return_pct(price: int, entry_price: int) -> float:

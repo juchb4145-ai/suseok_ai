@@ -8,6 +8,8 @@ from trading.strategy.market_index import IndexTick, MarketIndexStore
 from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.strategy.models import Candidate, CandidateState, StrategyProfile
 from trading.strategy.pipeline import GatePipeline
+from trading.strategy.gates import support_status_for_snapshot
+from trading.strategy.models import IndicatorSnapshot
 from trading.strategy.themes import ThemeMapping, ThemeRepository
 
 
@@ -28,8 +30,8 @@ def map_stock(repo, code, theme_id="robot", profile=StrategyProfile.KOSDAQ_THEME
     )
 
 
-def candidate(code, profile=StrategyProfile.KOSDAQ_THEME_PROFILE, market="KOSDAQ", state=CandidateState.WATCHING):
-    return Candidate(code=code, state=state, strategy_profile=profile, market=market)
+def candidate(code, profile=StrategyProfile.KOSDAQ_THEME_PROFILE, market="KOSDAQ", state=CandidateState.WATCHING, metadata=None):
+    return Candidate(code=code, state=state, strategy_profile=profile, market=market, metadata=metadata or {})
 
 
 def feed_stock(store, builder, code, high=10_000, low=9_500, current=9_750, cum_base=1_000, change_rate=5.0):
@@ -121,6 +123,38 @@ def test_active_only_and_multi_theme_results(tmp_path):
     )
 
     assert {(result.code, result.theme_id) for result in results} == {("111111", "robot"), ("111111", "ai")}
+    db.close()
+
+
+def test_discovery_only_candidate_feeds_theme_universe_but_not_entry_result(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    repo = ThemeRepository(db)
+    store = MarketDataStore()
+    builder = CandleBuilder()
+    index_store = MarketIndexStore()
+    map_stock(repo, "111111", "robot", priority=90)
+    map_stock(repo, "222222", "robot", priority=80)
+    map_stock(repo, "333333", "robot", priority=70)
+    feed_stock(store, builder, "111111", cum_base=3_000)
+    feed_stock(store, builder, "222222", cum_base=2_000)
+    feed_index(index_store, "KOSDAQ")
+    entry = candidate("111111")
+    peer = candidate("222222")
+    discovery = candidate(
+        "333333",
+        profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+        metadata={
+            "condition_purposes": {"주도테마_넓은후보": "theme_broad_candidate"},
+            "entry_condition_names": [],
+            "entry_excluded": True,
+        },
+    )
+
+    results = build_pipeline(repo, store, builder, index_store).evaluate([entry, peer, discovery], entry_candidates=[entry])
+
+    assert {result.code for result in results} == {"111111"}
+    assert results[0].decisions[1].details["active_candidate_count"] == 3
+    assert results[0].decisions[1].details["discovery_only_unscored_count"] == 1
     db.close()
 
 
@@ -224,7 +258,10 @@ def test_kosdaq_shallow_pullback_requires_strong_exception(tmp_path):
     )
 
     assert strong.final_grade == "A"
-    assert next(dec for dec in strong.decisions if dec.gate_name == "StockPullbackEntryGate").details["shallow_exception"] is True
+    strong_details = next(dec for dec in strong.decisions if dec.gate_name == "StockPullbackEntryGate").details
+    assert strong_details["shallow_exception"] is True
+    assert strong_details["dynamic_pullback_policy"]["mode"] == "strong_leader_shallow"
+    assert strong_details["valid_range"] == (-4.0, -1.2)
 
     weak_results = build_pipeline(repo, store, builder, index_store).evaluate(
         [candidate("111111"), candidate("222222")]
@@ -262,6 +299,27 @@ def test_support_details_separate_distance_touch_and_reclaim(tmp_path):
     assert isinstance(stock_details["support_touched"], bool)
     assert isinstance(stock_details["support_reclaimed"], bool)
     db.close()
+
+
+def test_support_candidates_include_base_line_and_envelope_with_deduping():
+    snapshot = IndicatorSnapshot(
+        candidate_id=1,
+        code="111111",
+        price=10_050,
+        vwap=10_000,
+        base_line_120=10_040,
+        envelope_mid=10_041,
+        day_mid=9_900,
+        prev_high=9_800,
+        ema20_5m=9_700,
+        metadata={"base_line_120_ready": True, "envelope_mid_ready": True, "ema20_5m_ready": True},
+    )
+
+    details = support_status_for_snapshot(snapshot, CandleBuilder(), 2.5)
+
+    assert details["nearest_support"] == "base_line_120"
+    assert "base_line_120" in details["support_candidates"]
+    assert "envelope_mid" not in details["support_candidates"]
 
 
 def test_kospi_leader_without_recovery_is_wait(tmp_path):

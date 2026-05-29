@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from inspect import Parameter, signature
 from time import perf_counter
 from typing import Callable, Optional
 
@@ -50,6 +51,14 @@ ACTIVE_RUNTIME_STATES = {
     CandidateState.READY,
 }
 TERMINAL_CANDIDATE_STATES = {CandidateState.EXPIRED, CandidateState.REMOVED}
+MARKET_SESSION_OPEN = "open"
+MARKET_SESSION_CLOSED = "closed"
+DATA_WARMUP_READY = "ready"
+DATA_WARMUP_WAITING_INDEX = "waiting_index"
+DATA_WARMUP_WAITING_CANDIDATE_TICKS = "waiting_candidate_ticks"
+DATA_WARMUP_CLOSED = "closed"
+GATE_SKIP_MARKET_SESSION_CLOSED = "MARKET_SESSION_CLOSED"
+GATE_SKIP_DATA_WARMUP = "DATA_WARMUP"
 
 
 @dataclass
@@ -138,6 +147,12 @@ class StrategyRuntimeSnapshot:
     quality_unmapped_count: int = 0
     quality_invalid_code_count: int = 0
     quality_data_wait_count: int = 0
+    market_session_status: str = MARKET_SESSION_OPEN
+    data_warmup_status: str = DATA_WARMUP_READY
+    gate_skip_reason: str = ""
+    candidate_subscription_selected_count: int = 0
+    candidate_subscription_skipped_discovery_count: int = 0
+    candidate_subscription_skipped_unmapped_count: int = 0
     protected_subscription_usage: str = ""
     warnings: list[str] = field(default_factory=list)
 
@@ -186,6 +201,9 @@ class StrategyRuntime:
         self._warnings: list[str] = []
         self.startup_warnings: list[str] = []
         self.readiness_report: Optional[ReadinessReport] = None
+        self._last_runtime_time = _clean_time(self.clock())
+        if hasattr(self.candidate_collector, "set_condition_event_allowed"):
+            self.candidate_collector.set_condition_event_allowed(self._condition_events_allowed)
 
     def start(
         self,
@@ -204,6 +222,7 @@ class StrategyRuntime:
                     timing_callback(label, perf_counter() - started)
 
         current = timed("prepare", lambda: _clean_time(now or self.clock()))
+        self._last_runtime_time = current
 
         def prepare_snapshot() -> StrategyRuntimeSnapshot:
             self._warnings = dedupe_warnings(list(self.startup_warnings) + self.config.validate())
@@ -215,7 +234,12 @@ class StrategyRuntime:
         timed("condition_adapter_start", lambda: self._start_condition_adapter(snapshot, current))
 
         def recover_state():
-            active = self._active_candidates(current.date().isoformat())
+            trade_date = current.date().isoformat()
+            self._apply_flow_diagnostics(snapshot, current, trade_date, [])
+            if snapshot.gate_skip_reason != GATE_SKIP_MARKET_SESSION_CLOSED:
+                self._rollover_previous_trade_date_candidates(trade_date, current, snapshot)
+            active = self._active_candidates(trade_date)
+            subscription_candidates = [] if snapshot.gate_skip_reason == GATE_SKIP_MARKET_SESSION_CLOSED else self._subscription_candidates(trade_date, snapshot)
             submitted_orders = self.db.list_virtual_orders_by_status(VirtualOrderStatus.SUBMITTED)
             filled_orders = [
                 order
@@ -223,7 +247,7 @@ class StrategyRuntime:
                 if order.id is not None and self.db.load_virtual_position_by_order(order.id) is None
             ]
             open_items = self.db.list_open_virtual_positions()
-            snapshot.candidate_count = len(self.db.list_candidates(current.date().isoformat()))
+            snapshot.candidate_count = len(self.db.list_candidates(trade_date))
             snapshot.active_candidate_count = len(active)
             snapshot.recovered_candidate_count = len(active)
             snapshot.virtual_order_count = len(submitted_orders)
@@ -237,10 +261,10 @@ class StrategyRuntime:
                     f"RECOVERED_OPEN_POSITIONS={len(open_items)}",
                 ]
             )
-            return active
+            return subscription_candidates
 
-        active_candidates = timed("recover_db_state", recover_state)
-        timed("reconcile_realtime_subscriptions", lambda: self._reconcile_subscriptions(active_candidates, snapshot))
+        subscription_candidates = timed("recover_db_state", recover_state)
+        timed("reconcile_realtime_subscriptions", lambda: self._reconcile_subscriptions(subscription_candidates, snapshot))
         timed("readiness_snapshot", lambda: self._refresh_readiness_snapshot(snapshot, current))
         snapshot.warnings = dedupe_warnings(snapshot.warnings)
         if timing_callback is not None:
@@ -260,6 +284,7 @@ class StrategyRuntime:
     def cycle(self, now: Optional[datetime] = None) -> StrategyRuntimeSnapshot:
         started = perf_counter()
         current = _clean_time(now or self.clock())
+        self._last_runtime_time = current
         snapshot = self._snapshot(current)
         self._drain_candidate_collector_warnings(snapshot)
         try:
@@ -267,19 +292,36 @@ class StrategyRuntime:
                 snapshot.warnings.append("RUNTIME_NOT_STARTED")
                 return snapshot
 
+            trade_date = self.candidate_collector._trade_date()
+            self._apply_flow_diagnostics(snapshot, current, trade_date, [])
+            if snapshot.gate_skip_reason == GATE_SKIP_MARKET_SESSION_CLOSED:
+                snapshot.candidate_count = len(self.db.list_candidates(trade_date))
+                snapshot.active_candidate_count = len(self._active_candidates(trade_date, current))
+                self._stop_condition_adapter_for_market_closed(snapshot)
+                self._reconcile_subscriptions([], snapshot)
+                self._refresh_readiness_snapshot(snapshot, current, trade_date)
+                snapshot.warnings = dedupe_warnings(snapshot.warnings)
+                return snapshot
+
+            self._rollover_previous_trade_date_candidates(trade_date, current, snapshot)
             expired = self.candidate_collector.expire_stale(current, keep_alive=self._candidate_expire_keep_alive)
-            snapshot.expired_count = len(expired)
+            snapshot.expired_count += len(expired)
             snapshot.candidate_save_count += len(expired)
             snapshot.db_write_count_per_cycle += len(expired)
-            trade_date = self.candidate_collector._trade_date()
             self._apply_quality_controls(trade_date, current, snapshot)
-            subscription_candidates = self._subscription_candidates(trade_date)
+            subscription_candidates = self._subscription_candidates(trade_date, snapshot)
             snapshot.candidate_count = len(self.db.list_candidates(trade_date))
             self._reconcile_subscriptions(subscription_candidates, snapshot)
             self._refresh_readiness_snapshot(snapshot, current, trade_date)
             candidates = self._active_candidates(trade_date, current)
             snapshot.active_candidate_count = len(candidates)
-            snapshot.evaluated_candidate_count = len(candidates)
+            self._apply_flow_diagnostics(snapshot, current, trade_date, candidates)
+            if snapshot.gate_skip_reason == GATE_SKIP_DATA_WARMUP:
+                snapshot.evaluated_candidate_count = 0
+                self._refresh_readiness_snapshot(snapshot, current, trade_date)
+                snapshot.warnings = dedupe_warnings(snapshot.warnings)
+                return snapshot
+            snapshot.evaluated_candidate_count = len([candidate for candidate in candidates if self._candidate_entry_evaluable(candidate)])
 
             gate_results = self._evaluate_gates(candidates, snapshot)
             snapshot.gate_result_count = len(gate_results)
@@ -324,8 +366,6 @@ class StrategyRuntime:
             return
         if not self._entry_allowed_for_candidate(candidate, result):
             return
-        if self.db.load_open_virtual_position(result.candidate_id) is not None:
-            return
         plan = self.entry_plan_builder.build(result, now)
         if plan is None:
             context.review_needed = True
@@ -357,12 +397,8 @@ class StrategyRuntime:
         if existing_order is not None:
             context.virtual_order = existing_order
             return
-        existing_terminal_order = self._latest_virtual_order_for_plan(plan)
-        if existing_terminal_order is not None:
-            context.virtual_order = existing_terminal_order
-            return
         submitted = self.virtual_order_service.submit_virtual_order(plan, now)
-        if submitted.order is not None:
+        if submitted.submitted and submitted.order is not None:
             if submitted.order.id is not None:
                 context.virtual_order = submitted.order
             else:
@@ -374,6 +410,10 @@ class StrategyRuntime:
 
     def _start_condition_adapter(self, snapshot: StrategyRuntimeSnapshot, now: datetime) -> None:
         if not self.config.condition_profiles_enabled or self.condition_adapter is None:
+            return
+        if self._market_session_status(now) == MARKET_SESSION_CLOSED:
+            snapshot.warnings.append("CONDITION_ADAPTER_SKIPPED_MARKET_CLOSED")
+            self._stop_condition_adapter_for_market_closed(snapshot)
             return
         try:
             snapshot.warnings.extend(self.condition_adapter.start(now))
@@ -431,6 +471,19 @@ class StrategyRuntime:
         metadata["quality_status"] = self._candidate_quality_status(candidate)
 
         if not results:
+            if _candidate_entry_excluded(candidate):
+                metadata["sub_status"] = "DISCOVERY_ONLY"
+                metadata["quality_status"] = QUALITY_DISCOVERY_ONLY
+                metadata["insufficient_reason"] = ["ENTRY_EXCLUDED_DISCOVERY_ONLY"]
+                metadata["subscription_excluded_reason"] = "discovery_only"
+                candidate.metadata = metadata
+                if candidate.state == CandidateState.DETECTED:
+                    CandidateLifecycle.transition(candidate, CandidateState.WATCHING)
+                candidate.block_type = BlockType.NONE
+                candidate.can_recover = False
+                candidate.recheck_after_sec = 0
+                self._save_candidate_if_changed(candidate, previous_persist_signature, snapshot)
+                return None
             no_gate_reasons = self._no_gate_result_reasons(candidate, snapshot)
             metadata["sub_status"] = "DATA_INSUFFICIENT"
             metadata["quality_status"] = QUALITY_DATA_WAIT
@@ -477,7 +530,7 @@ class StrategyRuntime:
             metadata.pop("best_theme_id", None)
             metadata.pop("best_gate_result_key", None)
             metadata["sub_status"] = "DATA_INSUFFICIENT"
-            metadata["quality_status"] = QUALITY_DATA_WAIT
+            metadata["quality_status"] = QUALITY_DISCOVERY_ONLY if _candidate_entry_excluded(candidate) else QUALITY_DATA_WAIT
             insufficient_reasons = _group_reason_codes(results)
             metadata["insufficient_reason"] = insufficient_reasons
             snapshot.warnings.extend(
@@ -726,6 +779,62 @@ class StrategyRuntime:
         snapshot.db_write_count_per_cycle += 1
         snapshot.warnings.append("NO_THEME_MAPPING_FOR_CANDIDATE")
 
+    def _rollover_previous_trade_date_candidates(
+        self,
+        current_trade_date: str,
+        now: datetime,
+        snapshot: StrategyRuntimeSnapshot,
+    ) -> None:
+        rolled = 0
+        for candidate in self.db.list_candidates():
+            if not candidate.trade_date or candidate.trade_date >= current_trade_date:
+                continue
+            if candidate.state not in ACTIVE_RUNTIME_STATES and not (
+                candidate.state == CandidateState.BLOCKED
+                and candidate.block_type == BlockType.TEMPORARY
+                and candidate.can_recover
+            ):
+                continue
+            if self._has_unfinished_virtual_activity(candidate):
+                continue
+            previous_state = candidate.state
+            metadata = dict(candidate.metadata or {})
+            metadata["session_rollover_at"] = _clean_time(now).isoformat()
+            metadata["session_rollover_trade_date"] = current_trade_date
+            metadata["sub_status"] = "SESSION_ROLLOVER_EXPIRED"
+            metadata["insufficient_reason"] = ["SESSION_ROLLOVER_EXPIRED"]
+            candidate.metadata = metadata
+            CandidateLifecycle.transition(candidate, CandidateState.EXPIRED)
+            candidate.expires_at = _clean_time(now).isoformat()
+            candidate.block_type = BlockType.NONE
+            candidate.can_recover = False
+            candidate.recheck_after_sec = 0
+            self.db.save_candidate_with_events(
+                candidate,
+                [
+                    self._candidate_event(
+                        "candidate_session_rolled_over",
+                        candidate,
+                        previous_state,
+                        CandidateState.EXPIRED,
+                        "previous trade date candidate expired at session rollover",
+                        {
+                            "code": candidate.code,
+                            "candidate_trade_date": candidate.trade_date,
+                            "current_trade_date": current_trade_date,
+                            "previous_state": previous_state.value,
+                        },
+                        now,
+                    )
+                ],
+            )
+            rolled += 1
+        if rolled:
+            snapshot.expired_count += rolled
+            snapshot.candidate_save_count += rolled
+            snapshot.db_write_count_per_cycle += rolled
+            snapshot.warnings.append(f"SESSION_ROLLOVER_EXPIRED_CANDIDATES={rolled}")
+
     def _evaluate_virtual_orders(
         self,
         contexts: dict[int, "_ReviewContext"],
@@ -780,6 +889,9 @@ class StrategyRuntime:
                         snapshot.open_position_count += 1
                         snapshot.db_write_count_per_cycle += 1
                         context.review_needed = True
+                    elif opened.aggregated:
+                        snapshot.db_write_count_per_cycle += 1
+                        context.review_needed = True
             except Exception as exc:
                 snapshot.warnings.append(f"VIRTUAL_POSITION_OPEN_FAILED:{order.id}:{exc}")
 
@@ -808,6 +920,7 @@ class StrategyRuntime:
                 snapshot_for_exit = _snapshot_for_exit(context)
                 existing_decisions = self.db.list_exit_decisions(position.id) if position.id is not None else []
                 new_decisions = self.exit_decision_engine.evaluate(position, snapshot_for_exit, self.candle_builder, existing_decisions, now)
+                position_details_changed = bool(self.exit_decision_engine.last_details.get("position_details_changed"))
                 saved_decisions: list[ExitDecision] = []
                 for decision in new_decisions:
                     if decision.details.get("position_closed") is True:
@@ -817,6 +930,10 @@ class StrategyRuntime:
                         saved_decision = self.db.save_exit_decision(decision)
                         snapshot.db_write_count_per_cycle += 1
                     saved_decisions.append(saved_decision)
+                if position_details_changed and not position.closed_at:
+                    position = self.db.save_virtual_position(position)
+                    snapshot.db_write_count_per_cycle += 1
+                    context.review_needed = True
                 if saved_decisions:
                     context.exit_decisions.extend(existing_decisions + saved_decisions)
                     context.virtual_position = position
@@ -877,19 +994,29 @@ class StrategyRuntime:
         return True
 
     def _evaluate_gates(self, candidates: list[Candidate], snapshot: StrategyRuntimeSnapshot) -> list[GatePipelineResult]:
-        if not candidates:
+        entry_candidates = [candidate for candidate in candidates if self._candidate_entry_evaluable(candidate)]
+        if not entry_candidates:
             return []
         try:
-            return list(self.gate_pipeline.evaluate(candidates))
+            return list(self._evaluate_gate_pipeline(candidates, entry_candidates))
         except Exception as exc:
             snapshot.warnings.append(f"GATE_PIPELINE_BATCH_FAILED:{exc}")
         results: list[GatePipelineResult] = []
-        for candidate in candidates:
+        for candidate in entry_candidates:
             try:
-                results.extend(self.gate_pipeline.evaluate([candidate]))
+                results.extend(self._evaluate_gate_pipeline(candidates, [candidate]))
             except Exception as exc:
                 snapshot.warnings.append(f"GATE_PIPELINE_CANDIDATE_FAILED:{candidate.code}:{exc}")
         return results
+
+    def _evaluate_gate_pipeline(
+        self,
+        candidates: list[Candidate],
+        entry_candidates: list[Candidate],
+    ) -> list[GatePipelineResult]:
+        if _accepts_entry_candidates(self.gate_pipeline):
+            return list(self.gate_pipeline.evaluate(candidates, entry_candidates=entry_candidates))
+        return list(self.gate_pipeline.evaluate(entry_candidates))
 
     def _entry_results(self, gate_results: list[GatePipelineResult]) -> list[GatePipelineResult]:
         selected: list[GatePipelineResult] = []
@@ -926,13 +1053,15 @@ class StrategyRuntime:
                 self.subscription_manager.ensure_subscription(code, "holding", protected=True)
             for code in self._holding_codes(snapshot):
                 self.subscription_manager.ensure_subscription(code, "holding", protected=True)
-            watched = self.subscription_manager.watch_candidates(candidates[: self.config.max_candidates_to_watch])
-            for candidate in candidates:
+            desired_candidates = candidates[: self.config.max_candidates_to_watch]
+            snapshot.candidate_subscription_selected_count = len(desired_candidates)
+            watched = self.subscription_manager.watch_candidates(desired_candidates)
+            for candidate in desired_candidates:
                 if candidate.state == CandidateState.DETECTED and normalize_code(candidate.code) in watched:
                     self.candidate_collector.mark_watching(candidate.code, trade_date=candidate.trade_date, reason="realtime subscription registered")
                     snapshot.candidate_save_count += 1
                     snapshot.db_write_count_per_cycle += 1
-            self._remove_inactive_candidate_subscriptions(candidates)
+            self._remove_inactive_candidate_subscriptions(desired_candidates)
             snapshot.subscription_active_count = len(self.subscription_manager.code_to_screen)
             protected_count = sum(1 for record in self.subscription_manager.records.values() if record.protected)
             if protected_count > self.subscription_manager.max_codes:
@@ -998,11 +1127,20 @@ class StrategyRuntime:
         except Exception:
             return False
 
-    def _subscription_candidates(self, trade_date: str) -> list[Candidate]:
+    def _subscription_candidates(self, trade_date: str, snapshot: Optional[StrategyRuntimeSnapshot] = None) -> list[Candidate]:
         result: list[Candidate] = []
         for candidate in self.db.list_candidates(trade_date=trade_date):
             has_open_activity = self._has_open_virtual_activity(candidate)
-            if not has_open_activity and self._candidate_quality_status(candidate) in {QUALITY_INVALID_CODE, QUALITY_UNMAPPED}:
+            quality_status = self._candidate_quality_status(candidate)
+            if quality_status == QUALITY_DISCOVERY_ONLY:
+                if snapshot is not None:
+                    snapshot.candidate_subscription_skipped_discovery_count += 1
+                continue
+            if quality_status in {QUALITY_INVALID_CODE, QUALITY_UNMAPPED}:
+                if snapshot is not None and quality_status == QUALITY_UNMAPPED:
+                    snapshot.candidate_subscription_skipped_unmapped_count += 1
+                continue
+            if not has_open_activity and quality_status not in {QUALITY_ACTIONABLE, QUALITY_DATA_WAIT}:
                 continue
             if candidate.state in ACTIVE_RUNTIME_STATES:
                 result.append(candidate)
@@ -1014,7 +1152,7 @@ class StrategyRuntime:
                 result.append(candidate)
             elif has_open_activity:
                 result.append(candidate)
-        return result
+        return sorted(result, key=self._candidate_subscription_sort_key)
 
     def _active_candidates(self, trade_date: str, now: Optional[datetime] = None) -> list[Candidate]:
         result: list[Candidate] = []
@@ -1058,6 +1196,27 @@ class StrategyRuntime:
                 has_theme_mapping = False
         return candidate_quality_status(candidate, has_theme_mapping)
 
+    def _candidate_entry_evaluable(self, candidate: Candidate) -> bool:
+        if _candidate_entry_excluded(candidate):
+            return False
+        return self._candidate_quality_status(candidate) not in {QUALITY_INVALID_CODE, QUALITY_UNMAPPED}
+
+    def _candidate_subscription_sort_key(self, candidate: Candidate) -> tuple[int, int, str, str]:
+        quality = self._candidate_quality_status(candidate)
+        blocked = candidate.state == CandidateState.BLOCKED
+        quality_priority = {
+            QUALITY_ACTIONABLE: 0,
+            QUALITY_DATA_WAIT: 1,
+        }.get(quality, 9)
+        if blocked:
+            quality_priority = max(quality_priority, 2)
+        return (
+            quality_priority,
+            _candidate_state_priority(candidate.state),
+            _last_seen_desc_value(candidate),
+            normalize_code(candidate.code),
+        )
+
     def _has_enabled_theme_mappings(self) -> bool:
         try:
             return bool(self.db.list_theme_mappings(enabled=True))
@@ -1073,6 +1232,31 @@ class StrategyRuntime:
             order.status == VirtualOrderStatus.SUBMITTED
             for order in self.db.list_virtual_orders(candidate.id)
         )
+
+    def _has_unfinished_virtual_activity(self, candidate: Candidate) -> bool:
+        if candidate.id is None:
+            return False
+        if self.db.load_open_virtual_position(candidate.id) is not None:
+            return True
+        for order in self.db.list_virtual_orders(candidate.id):
+            if order.status == VirtualOrderStatus.SUBMITTED:
+                return True
+            if order.status == VirtualOrderStatus.FILLED and not self._virtual_order_has_position(candidate, order):
+                return True
+        return False
+
+    def _virtual_order_has_position(self, candidate: Candidate, order: VirtualOrder) -> bool:
+        if order.id is None:
+            return False
+        if self.db.load_virtual_position_by_order(order.id) is not None:
+            return True
+        if candidate.id is None:
+            return False
+        for position in self.db.list_virtual_positions(candidate.id):
+            filled_order_ids = position.details.get("filled_order_ids") or []
+            if order.id in filled_order_ids:
+                return True
+        return False
 
     def _load_virtual_order(self, order_id: int) -> Optional[VirtualOrder]:
         for status in [VirtualOrderStatus.SUBMITTED, VirtualOrderStatus.FILLED, VirtualOrderStatus.UNFILLED, VirtualOrderStatus.CANCELLED]:
@@ -1090,6 +1274,79 @@ class StrategyRuntime:
             if order.entry_plan_id == plan.id
         ]
         return sorted(orders, key=lambda order: order.id or 0, reverse=True)[0] if orders else None
+
+    def _apply_flow_diagnostics(
+        self,
+        snapshot: StrategyRuntimeSnapshot,
+        current: datetime,
+        trade_date: str,
+        candidates: list[Candidate],
+    ) -> None:
+        snapshot.market_session_status = self._market_session_status(current)
+        if snapshot.market_session_status == MARKET_SESSION_CLOSED:
+            snapshot.data_warmup_status = DATA_WARMUP_CLOSED
+            snapshot.gate_skip_reason = GATE_SKIP_MARKET_SESSION_CLOSED
+            snapshot.warnings.append(GATE_SKIP_MARKET_SESSION_CLOSED)
+            return
+        snapshot.data_warmup_status = self._data_warmup_status(current, trade_date, candidates)
+        if snapshot.data_warmup_status != DATA_WARMUP_READY:
+            snapshot.gate_skip_reason = GATE_SKIP_DATA_WARMUP
+            snapshot.warnings.append(GATE_SKIP_DATA_WARMUP)
+            snapshot.warnings.append(f"DATA_WARMUP_STATUS:{snapshot.data_warmup_status}")
+            return
+        snapshot.gate_skip_reason = ""
+
+    @staticmethod
+    def _market_session_status(current: datetime) -> str:
+        minutes = current.hour * 60 + current.minute
+        open_minutes = 9 * 60
+        close_minutes = 15 * 60 + 30
+        return MARKET_SESSION_OPEN if open_minutes <= minutes <= close_minutes else MARKET_SESSION_CLOSED
+
+    def _condition_events_allowed(self, current: datetime) -> bool:
+        basis = getattr(self, "_last_runtime_time", None) or _clean_time(current)
+        return self._market_session_status(basis) == MARKET_SESSION_OPEN
+
+    def _stop_condition_adapter_for_market_closed(self, snapshot: StrategyRuntimeSnapshot) -> None:
+        if self.condition_adapter is None or not hasattr(self.condition_adapter, "stop"):
+            return
+        registered = getattr(self.condition_adapter, "registered_conditions", None)
+        if isinstance(registered, dict) and not registered:
+            return
+        try:
+            warnings = self.condition_adapter.stop()
+            snapshot.warnings.extend(warnings or [])
+            snapshot.warnings.append("CONDITION_ADAPTER_STOPPED_MARKET_CLOSED")
+        except Exception as exc:
+            snapshot.warnings.append(f"CONDITION_ADAPTER_STOP_MARKET_CLOSED_FAILED:{exc}")
+
+    def _data_warmup_status(self, current: datetime, trade_date: str, candidates: list[Candidate]) -> str:
+        market_index_store = getattr(self.gate_pipeline, "market_index_store", None)
+        market_data = getattr(self.gate_pipeline, "market_data", None)
+        if market_index_store is None or market_data is None:
+            return DATA_WARMUP_READY
+        for logical_code in self.config.index_watch_codes:
+            try:
+                if market_index_store.state(logical_code).price <= 0:
+                    return DATA_WARMUP_WAITING_INDEX
+            except Exception:
+                return DATA_WARMUP_WAITING_INDEX
+        entry_candidates = [candidate for candidate in (candidates or self._active_candidates(trade_date, current)) if self._candidate_entry_evaluable(candidate)]
+        if not entry_candidates:
+            return DATA_WARMUP_READY
+        max_age_sec = max(60, int(self.config.evaluation_interval_sec) * 4)
+        if not any(self._candidate_has_recent_tick(candidate, current, max_age_sec) for candidate in entry_candidates):
+            return DATA_WARMUP_WAITING_CANDIDATE_TICKS
+        return DATA_WARMUP_READY
+
+    def _candidate_has_recent_tick(self, candidate: Candidate, current: datetime, max_age_sec: int) -> bool:
+        market_data = getattr(self.gate_pipeline, "market_data", None)
+        if market_data is None or not hasattr(market_data, "has_recent_tick"):
+            return True
+        try:
+            return bool(market_data.has_recent_tick(candidate.code, current, max_age_sec))
+        except Exception:
+            return False
 
     def _snapshot(self, current: datetime) -> StrategyRuntimeSnapshot:
         return StrategyRuntimeSnapshot(
@@ -1109,6 +1366,12 @@ class StrategyRuntime:
                 self.db,
                 trade_date=trade_date or current.date().isoformat(),
                 subscription_manager=self.subscription_manager,
+                market_session_status=snapshot.market_session_status,
+                data_warmup_status=snapshot.data_warmup_status,
+                gate_skip_reason=snapshot.gate_skip_reason,
+                candidate_subscription_selected_count=snapshot.candidate_subscription_selected_count,
+                candidate_subscription_skipped_discovery_count=snapshot.candidate_subscription_skipped_discovery_count,
+                candidate_subscription_skipped_unmapped_count=snapshot.candidate_subscription_skipped_unmapped_count,
             )
         except Exception as exc:
             snapshot.warnings.append(f"READINESS_REPORT_FAILED:{exc}")
@@ -1126,6 +1389,12 @@ class StrategyRuntime:
         snapshot.quality_unmapped_count = report.quality_unmapped_count
         snapshot.quality_invalid_code_count = report.quality_invalid_code_count
         snapshot.quality_data_wait_count = report.quality_data_wait_count
+        snapshot.market_session_status = report.market_session_status
+        snapshot.data_warmup_status = report.data_warmup_status
+        snapshot.gate_skip_reason = report.gate_skip_reason
+        snapshot.candidate_subscription_selected_count = report.candidate_subscription_selected_count
+        snapshot.candidate_subscription_skipped_discovery_count = report.candidate_subscription_skipped_discovery_count
+        snapshot.candidate_subscription_skipped_unmapped_count = report.candidate_subscription_skipped_unmapped_count
         snapshot.protected_subscription_usage = report.protected_subscription_usage
         snapshot.warnings = dedupe_warnings(list(snapshot.warnings) + report.warnings)
 
@@ -1171,6 +1440,31 @@ def _candidate_entry_excluded(candidate: Candidate) -> bool:
     if "theme_broad_candidate" in purposes:
         return True
     return candidate.strategy_profile == StrategyProfile.THEME_DISCOVERY_PROFILE
+
+
+def _candidate_state_priority(state: CandidateState) -> int:
+    return {
+        CandidateState.READY: 0,
+        CandidateState.WATCHING: 1,
+        CandidateState.DETECTED: 2,
+        CandidateState.BLOCKED: 3,
+    }.get(state, 9)
+
+
+def _last_seen_desc_value(candidate: Candidate) -> float:
+    try:
+        return -_parse_time(candidate.last_seen_at).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _accepts_entry_candidates(pipeline) -> bool:
+    callback = getattr(type(pipeline), "evaluate", None) or getattr(pipeline, "evaluate", None)
+    try:
+        params = signature(callback).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(param.name == "entry_candidates" or param.kind == Parameter.VAR_KEYWORD for param in params)
 
 
 def _best_result(results: list[GatePipelineResult]) -> GatePipelineResult:

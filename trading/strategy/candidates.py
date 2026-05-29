@@ -99,12 +99,14 @@ class CandidateCollector:
         clock: Optional[Callable[[], datetime]] = None,
         trade_date_provider: Optional[Callable[[], str]] = None,
         default_ttl_minutes: int = 30,
+        condition_event_allowed: Optional[Callable[[datetime], bool]] = None,
     ) -> None:
         self.db = db
         self.client = None
         self.clock = clock or datetime.now
         self.trade_date_provider = trade_date_provider
         self.default_ttl_minutes = default_ttl_minutes
+        self.condition_event_allowed = condition_event_allowed
         self.warnings: list[str] = []
         if client is not None:
             self.attach(client)
@@ -114,12 +116,17 @@ class CandidateCollector:
         client.condition_candidate_included.connect(self.handle_condition_include)
         client.condition_candidate_removed.connect(self.handle_condition_remove)
 
+    def set_condition_event_allowed(self, callback: Optional[Callable[[datetime], bool]]) -> None:
+        self.condition_event_allowed = callback
+
     def handle_condition_include(self, event: ConditionCandidateEvent) -> Optional[Candidate]:
         now = self._now_text()
         trade_date = self._trade_date()
         code = normalize_code(event.code)
         if not is_valid_stock_code(code):
             self._reject_condition_event(event, "include")
+            return None
+        if not self._condition_event_is_allowed(event, "include"):
             return None
         existing = self.db.load_candidate(trade_date, code)
         if existing is None:
@@ -206,6 +213,8 @@ class CandidateCollector:
         code = normalize_code(event.code)
         if not is_valid_stock_code(code):
             self._reject_condition_event(event, "remove")
+            return None
+        if not self._condition_event_is_allowed(event, "remove"):
             return None
         candidate = self.db.load_candidate(trade_date, code)
         if candidate is None:
@@ -440,8 +449,29 @@ class CandidateCollector:
             payload=payload,
         )
 
-    def _reject_condition_event(self, event: ConditionCandidateEvent, event_action: str) -> None:
-        warning = f"INVALID_CONDITION_CODE:{event.condition_name}:{event.code}"
+    def _condition_event_is_allowed(self, event: ConditionCandidateEvent, event_action: str) -> bool:
+        if self.condition_event_allowed is None:
+            return True
+        try:
+            allowed = bool(self.condition_event_allowed(self.clock()))
+        except Exception as exc:
+            self.warnings.append(f"CONDITION_EVENT_SESSION_CHECK_FAILED:{exc}")
+            return True
+        if allowed:
+            return True
+        warning = f"MARKET_SESSION_CLOSED_CONDITION_EVENT:{event.condition_name}:{normalize_code(event.code)}"
+        self._reject_condition_event(event, event_action, warning=warning, reason="market session closed")
+        return False
+
+    def _reject_condition_event(
+        self,
+        event: ConditionCandidateEvent,
+        event_action: str,
+        *,
+        warning: Optional[str] = None,
+        reason: str = "invalid condition code",
+    ) -> None:
+        warning = warning or f"INVALID_CONDITION_CODE:{event.condition_name}:{event.code}"
         self.warnings.append(warning)
         payload = {
             "raw_code": str(event.code or ""),
@@ -453,6 +483,7 @@ class CandidateCollector:
             "purpose": str(getattr(event, "purpose", "") or ""),
             "source": CandidateSourceType.CONDITION.value,
             "warning": warning,
+            "reject_reason": reason,
         }
         self.db.save_candidate_event(
             CandidateEvent(
@@ -461,7 +492,7 @@ class CandidateCollector:
                 from_state=None,
                 to_state=None,
                 source=CandidateSourceType.CONDITION,
-                reason="invalid condition code",
+                reason=reason,
                 created_at=self._now_text(),
                 payload=payload,
             )

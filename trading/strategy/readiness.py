@@ -41,6 +41,12 @@ class ReadinessReport:
     quality_unmapped_count: int = 0
     quality_invalid_code_count: int = 0
     quality_data_wait_count: int = 0
+    market_session_status: str = "open"
+    data_warmup_status: str = "ready"
+    gate_skip_reason: str = ""
+    candidate_subscription_selected_count: int = 0
+    candidate_subscription_skipped_discovery_count: int = 0
+    candidate_subscription_skipped_unmapped_count: int = 0
     protected_subscription_usage: str = ""
     warnings: list[str] = field(default_factory=list)
 
@@ -51,6 +57,12 @@ def build_readiness_report(
     trade_date: Optional[str] = None,
     subscription_manager=None,
     extra_warnings: Optional[list[str]] = None,
+    market_session_status: str = "open",
+    data_warmup_status: str = "ready",
+    gate_skip_reason: str = "",
+    candidate_subscription_selected_count: int = 0,
+    candidate_subscription_skipped_discovery_count: int = 0,
+    candidate_subscription_skipped_unmapped_count: int = 0,
 ) -> ReadinessReport:
     profiles = db.list_condition_profiles(enabled=None)
     enabled_profiles = [profile for profile in profiles if profile.enabled]
@@ -87,6 +99,8 @@ def build_readiness_report(
         warnings.append(f"CONDITION_PROFILE_UNRESOLVED:{profile.condition_name}")
     if _broad_candidates_only(candidates):
         warnings.append("BROAD_CANDIDATES_ONLY")
+    if gate_skip_reason:
+        warnings.append(gate_skip_reason)
 
     return ReadinessReport(
         condition_profiles_count=len(profiles),
@@ -102,6 +116,12 @@ def build_readiness_report(
         quality_unmapped_count=quality_counts[QUALITY_UNMAPPED],
         quality_invalid_code_count=quality_counts[QUALITY_INVALID_CODE],
         quality_data_wait_count=quality_counts[QUALITY_DATA_WAIT],
+        market_session_status=market_session_status,
+        data_warmup_status=data_warmup_status,
+        gate_skip_reason=gate_skip_reason,
+        candidate_subscription_selected_count=int(candidate_subscription_selected_count),
+        candidate_subscription_skipped_discovery_count=int(candidate_subscription_skipped_discovery_count),
+        candidate_subscription_skipped_unmapped_count=int(candidate_subscription_skipped_unmapped_count),
         protected_subscription_usage=_protected_subscription_usage(subscription_manager),
         warnings=dedupe_warnings(warnings),
     )

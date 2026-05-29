@@ -41,10 +41,10 @@ from storage.db import TradingDatabase
 from trading.engine import TradingEngine
 from trading.models import BuyLeg, LegStatus, WatchItem
 from trading.rules import tick_size
-from trading.strategy.candidates import candidate_quality_status
+from trading.strategy.candidates import candidate_is_discovery_only, candidate_quality_status
 from trading.strategy.config import StrategyRuntimeConfigRepository, config_from_dict, config_to_dict
 from trading.strategy.export import ReviewExporter
-from trading.strategy.models import CandidateState, FillPolicy
+from trading.strategy.models import CandidateState, FillPolicy, TradeReview
 from trading.strategy.runtime import StrategyRuntime, StrategyRuntimeConfig, StrategyRuntimeSnapshot
 from ui.formatters import dedupe_text, format_metric, format_money, format_percent
 from ui.table_models import (
@@ -993,6 +993,16 @@ class MainWindow(QMainWindow):
                 unmapped=getattr(snapshot, "quality_unmapped_count", 0),
                 invalid=getattr(snapshot, "quality_invalid_code_count", 0),
             ),
+            "flow: market={market} warmup={warmup} gate_skip={skip}".format(
+                market=getattr(snapshot, "market_session_status", "open") or "open",
+                warmup=getattr(snapshot, "data_warmup_status", "ready") or "ready",
+                skip=getattr(snapshot, "gate_skip_reason", "") or "-",
+            ),
+            "candidate subscriptions: selected={selected} skipped_discovery={discovery} skipped_unmapped={unmapped}".format(
+                selected=getattr(snapshot, "candidate_subscription_selected_count", 0),
+                discovery=getattr(snapshot, "candidate_subscription_skipped_discovery_count", 0),
+                unmapped=getattr(snapshot, "candidate_subscription_skipped_unmapped_count", 0),
+            ),
         ]
         startup_warnings = self._dedupe_text(getattr(self.strategy_runtime, "startup_warnings", []) if self.strategy_runtime is not None else [])
         if startup_warnings:
@@ -1102,6 +1112,10 @@ class MainWindow(QMainWindow):
     def _candidate_has_theme_mapping(self, candidate) -> bool:
         return bool(self._candidate_theme_mappings(candidate))
 
+    @staticmethod
+    def _candidate_entry_excluded(candidate) -> bool:
+        return candidate_is_discovery_only(candidate)
+
     def _candidate_theme_mappings(self, candidate):
         try:
             return self.db.theme_mappings_for_code(candidate.code, enabled=True)
@@ -1155,7 +1169,10 @@ class MainWindow(QMainWindow):
             f"quality_status: {candidate_quality_status(candidate, self._candidate_has_theme_mapping(candidate))}",
             f"quality_reason: {self._metadata_text(metadata, 'quality_reason') or '-'}",
             f"enabled_theme_mapping: {'Y' if self._candidate_has_theme_mapping(candidate) else 'N'}",
+            f"entry_evaluation_target: {'N' if self._candidate_entry_excluded(candidate) else 'Y'}",
             f"entry_excluded_reason: {self._metadata_text(metadata, 'entry_excluded_reason') or '-'}",
+            f"subscription_excluded_reason: {self._metadata_text(metadata, 'subscription_excluded_reason') or '-'}",
+            f"warmup_wait_reason: {self._metadata_text(metadata, 'warmup_wait_reason') or '-'}",
             f"best_theme_id: {self._metadata_text(metadata, 'best_theme_id') or '-'}",
             f"best_gate_result_key: {self._metadata_text(metadata, 'best_gate_result_key') or '-'}",
             f"sub_status: {self._metadata_text(metadata, 'sub_status') or '-'}",
@@ -1502,7 +1519,18 @@ class MainWindow(QMainWindow):
                 return collector._trade_date()
             except Exception:
                 pass
+        if self.mock_mode:
+            latest = self._latest_candidate_trade_date()
+            if latest:
+                return latest
         return date.today().isoformat()
+
+    def _latest_candidate_trade_date(self) -> str:
+        try:
+            dates = [candidate.trade_date for candidate in self.db.list_candidates() if candidate.trade_date]
+        except Exception:
+            return ""
+        return max(dates, default="")
 
     def _strategy_warning(self, message: str) -> None:
         self._strategy_last_warning_at = datetime.now().replace(microsecond=0).isoformat()
@@ -2210,6 +2238,7 @@ class MainWindow(QMainWindow):
             self.review_refresh_status_label.setText(message)
             self._append_log(message)
             return
+        self.review_proxy_model.set_reference_date(self._review_reference_date(reviews) if self.mock_mode else None)
         self.review_filter_bar.set_status_values(sorted({review.final_status for review in reviews if review.final_status}))
         self.review_model.set_reviews(reviews)
         self._update_review_analysis()
@@ -2222,6 +2251,19 @@ class MainWindow(QMainWindow):
         else:
             self.review_table.clearSelection()
             self.review_detail_panel.show_empty()
+
+    @staticmethod
+    def _review_reference_date(reviews: list[TradeReview]) -> Optional[date]:
+        dates = []
+        for review in reviews:
+            raw = str(review.trade_date or "")
+            if not raw and review.created_at:
+                raw = str(review.created_at)[:10]
+            try:
+                dates.append(date.fromisoformat(raw))
+            except ValueError:
+                continue
+        return max(dates) if dates else None
 
     def _apply_review_filters(self) -> None:
         selected_review_id = self._selected_review_id()

@@ -6,7 +6,7 @@ from PyQt5.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel
 from PyQt5.QtGui import QBrush, QColor, QFont
 
 from trading.models import LegStatus, WatchItem
-from trading.strategy.candidates import candidate_quality_status
+from trading.strategy.candidates import candidate_is_discovery_only, candidate_quality_status
 from trading.strategy.models import Candidate, CandidateState, TradeReview
 
 
@@ -178,7 +178,7 @@ class CandidateFilterProxyModel(QSortFilterProxyModel):
         self._state_filter = ""
         self._recover_only = False
         self._theme_filter = ""
-        self._quality_filter = ""
+        self._quality_filter = "ENTRY"
 
     def set_search_text(self, text: str) -> None:
         self._search_text = str(text or "").strip().lower()
@@ -205,7 +205,7 @@ class CandidateFilterProxyModel(QSortFilterProxyModel):
         self._state_filter = ""
         self._recover_only = False
         self._theme_filter = ""
-        self._quality_filter = ""
+        self._quality_filter = "ENTRY"
         self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
@@ -227,7 +227,15 @@ class CandidateFilterProxyModel(QSortFilterProxyModel):
                 return False
         if self._quality_filter:
             quality = model.data(source_index, CandidateTableModel.QualityRole)
-            if quality != self._quality_filter:
+            candidate = model.data(source_index, CandidateTableModel.CandidateRole)
+            discovery_only = isinstance(candidate, Candidate) and candidate_is_discovery_only(candidate)
+            if self._quality_filter == "ENTRY":
+                if quality == "discovery_only" or discovery_only:
+                    return False
+            elif self._quality_filter == "discovery_only":
+                if quality != self._quality_filter and not discovery_only:
+                    return False
+            elif discovery_only or quality != self._quality_filter:
                 return False
         if self._search_text:
             text = model.data(source_index, CandidateTableModel.SearchTextRole) or ""
@@ -431,6 +439,11 @@ class ReviewFilterProxyModel(QSortFilterProxyModel):
         self._false_negative_only = False
         self._false_positive_only = False
         self._metric_thresholds: dict[str, float | None] = {"5m": None, "10m": None, "20m": None, "20m_dd": None}
+        self._reference_date: date | None = None
+
+    def set_reference_date(self, value: date | None) -> None:
+        self._reference_date = value
+        self.invalidateFilter()
 
     def set_filters(
         self,
@@ -494,7 +507,7 @@ class ReviewFilterProxyModel(QSortFilterProxyModel):
         review_date = _parse_date(ReviewTableModel.review_date(review))
         if review_date is None:
             return False
-        today = date.today()
+        today = self._reference_date or date.today()
         if self._date_range == "오늘":
             return review_date == today
         if self._date_range == "최근 3일":

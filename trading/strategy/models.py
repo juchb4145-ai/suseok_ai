@@ -72,6 +72,7 @@ class ReviewFinalStatus(str, Enum):
     VIRTUAL_CLOSED_TAKE_PROFIT = "VIRTUAL_CLOSED_TAKE_PROFIT"
     VIRTUAL_CLOSED_SUPPORT_LOSS = "VIRTUAL_CLOSED_SUPPORT_LOSS"
     VIRTUAL_CLOSED_TIME_EXIT = "VIRTUAL_CLOSED_TIME_EXIT"
+    VIRTUAL_CLOSED_TRAILING_STOP = "VIRTUAL_CLOSED_TRAILING_STOP"
     DATA_INSUFFICIENT = "DATA_INSUFFICIENT"
 
 
@@ -190,6 +191,8 @@ class VirtualOrder(SerializableDataclass):
     id: Optional[int] = None
     candidate_id: Optional[int] = None
     entry_plan_id: Optional[int] = None
+    leg_index: int = 1
+    weight_pct: float = 100.0
     status: VirtualOrderStatus = VirtualOrderStatus.PLANNED
     limit_price: int = 0
     virtual_fill_price: int = 0
@@ -214,6 +217,7 @@ class VirtualPosition(SerializableDataclass):
     max_return_pct: float = 0.0
     max_drawdown_pct: float = 0.0
     realized_return_pct: float = 0.0
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

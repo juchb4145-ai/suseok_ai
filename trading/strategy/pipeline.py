@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from trading.strategy.candidates import candidate_is_discovery_only
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.gates import (
     ACTIVE_STATES,
@@ -53,9 +54,23 @@ class GatePipeline:
         self.intraday_tracker = intraday_tracker
         self.market_index_store = market_index_store
 
-    def evaluate(self, candidates: list[Candidate]) -> list[GatePipelineResult]:
+    def evaluate(
+        self,
+        candidates: list[Candidate],
+        *,
+        entry_candidates: Optional[list[Candidate]] = None,
+    ) -> list[GatePipelineResult]:
         active_candidates = [candidate for candidate in candidates if candidate.state in ACTIVE_STATES]
         enriched_candidates = [self.theme_repository.enrich_candidate(candidate) for candidate in active_candidates]
+        entry_source = entry_candidates if entry_candidates is not None else active_candidates
+        active_entry_candidates = [
+            candidate
+            for candidate in entry_source
+            if candidate.state in ACTIVE_STATES and not candidate_is_discovery_only(candidate)
+        ]
+        enriched_entry_candidates = [
+            self.theme_repository.enrich_candidate(candidate) for candidate in active_entry_candidates
+        ]
         theme_results = {
             result.theme_id: result
             for result in ThemeStrengthGate(self.theme_repository, self.market_data).evaluate(enriched_candidates)
@@ -79,7 +94,7 @@ class GatePipeline:
         )
 
         results: list[GatePipelineResult] = []
-        for candidate in enriched_candidates:
+        for candidate in enriched_entry_candidates:
             for mapping in self.theme_repository.themes_for_code(candidate.code):
                 theme_result = theme_results.get(mapping.theme_id)
                 if theme_result is None:
@@ -114,7 +129,12 @@ class GatePipeline:
         theme_strength_decision = _theme_strength_decision(theme_result)
         theme_pullback_decision = theme_pullback_gate.evaluate(theme_result)
         leadership_decision = _leadership_decision(leadership_result)
-        stock_pullback_decision, snapshot = stock_pullback_gate.evaluate(candidate, theme_result, leadership_result)
+        stock_pullback_decision, snapshot = stock_pullback_gate.evaluate(
+            candidate,
+            theme_result,
+            leadership_result,
+            market_decision,
+        )
         decisions = [
             market_decision,
             theme_strength_decision,

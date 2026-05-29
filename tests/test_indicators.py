@@ -95,6 +95,22 @@ def test_ema20_5m_twenty_candles_is_ready():
     assert snapshot.metadata["ema20_5m_ready"] is True
 
 
+def test_base_line_120_and_envelope_mid_use_completed_5m_sma():
+    store, builder = build_5m_history(120)
+    calculator = IndicatorCalculator(store, builder)
+
+    snapshot = calculator.build_snapshot(1, "005930")
+
+    completed = builder.completed_candles("005930", 5)
+    assert snapshot.base_line_120 == sum(candle.close for candle in completed[-120:]) / 120
+    assert snapshot.envelope_mid == sum(candle.close for candle in completed[-20:]) / 20
+    assert snapshot.metadata["base_line_120_candle_count"] == 120
+    assert snapshot.metadata["base_line_120_ready"] is True
+    assert snapshot.metadata["envelope_mid_candle_count"] == 120
+    assert snapshot.metadata["envelope_mid_ready"] is True
+    assert snapshot.metadata["volatility_5m_ready"] is True
+
+
 def test_build_snapshot_returns_none_without_latest_tick():
     calculator = IndicatorCalculator(MarketDataStore(), CandleBuilder())
 

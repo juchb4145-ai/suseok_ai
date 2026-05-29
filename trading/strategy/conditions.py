@@ -98,7 +98,24 @@ def ensure_default_condition_profiles(db: "TradingDatabase") -> ConditionProfile
             result.warnings.append(f"CONDITION_PROFILE_NAME_MOJIBAKE_SUSPECTED:{profile.condition_name}")
 
     for default in DEFAULT_CONDITION_PROFILES:
-        if default.condition_name in existing_profiles:
+        existing = existing_profiles.get(default.condition_name)
+        if existing is not None:
+            if (
+                existing.strategy_profile != default.strategy_profile
+                or str(existing.purpose or "") != str(default.purpose or "")
+            ):
+                repository.upsert_profile(
+                    ConditionProfile(
+                        id=existing.id,
+                        condition_name=existing.condition_name,
+                        strategy_profile=default.strategy_profile,
+                        enabled=existing.enabled,
+                        priority=existing.priority,
+                        purpose=default.purpose,
+                        last_resolved_index=existing.last_resolved_index,
+                    )
+                )
+                result.warnings.append(f"CONDITION_PROFILE_DEFAULT_UPDATED:{existing.condition_name}")
             result.existing += 1
             continue
         repository.upsert_profile(default)

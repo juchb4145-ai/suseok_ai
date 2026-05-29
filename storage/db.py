@@ -198,6 +198,8 @@ class TradingDatabase:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 candidate_id INTEGER,
                 entry_plan_id INTEGER,
+                leg_index INTEGER NOT NULL DEFAULT 1,
+                weight_pct REAL NOT NULL DEFAULT 100,
                 status TEXT NOT NULL,
                 limit_price INTEGER NOT NULL DEFAULT 0,
                 virtual_fill_price INTEGER NOT NULL DEFAULT 0,
@@ -219,7 +221,8 @@ class TradingDatabase:
                 close_reason TEXT NOT NULL DEFAULT '',
                 max_return_pct REAL NOT NULL DEFAULT 0,
                 max_drawdown_pct REAL NOT NULL DEFAULT 0,
-                realized_return_pct REAL NOT NULL DEFAULT 0
+                realized_return_pct REAL NOT NULL DEFAULT 0,
+                details_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS exit_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -268,6 +271,9 @@ class TradingDatabase:
             """
         )
         self._ensure_column("indicator_snapshots", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("virtual_orders", "leg_index", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column("virtual_orders", "weight_pct", "REAL NOT NULL DEFAULT 100")
+        self._ensure_column("virtual_positions", "details_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_trade_review_columns()
         self.conn.execute(
             """
@@ -657,9 +663,10 @@ class TradingDatabase:
                 cursor = self.conn.execute(
                     """
                     INSERT INTO virtual_orders(
-                        candidate_id, entry_plan_id, status, limit_price, virtual_fill_price,
-                        fill_policy, submitted_at, filled_at, cancelled_at, unfilled_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        candidate_id, entry_plan_id, leg_index, weight_pct, status,
+                        limit_price, virtual_fill_price, fill_policy, submitted_at,
+                        filled_at, cancelled_at, unfilled_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     self._virtual_order_params(order),
                 )
@@ -670,6 +677,8 @@ class TradingDatabase:
                     UPDATE virtual_orders SET
                         candidate_id = ?,
                         entry_plan_id = ?,
+                        leg_index = ?,
+                        weight_pct = ?,
                         status = ?,
                         limit_price = ?,
                         virtual_fill_price = ?,
@@ -788,15 +797,36 @@ class TradingDatabase:
             saved = self._save_trade_review_no_commit(review)
         return saved
 
-    def list_trade_reviews(self, candidate_id: Optional[int] = None) -> list[TradeReview]:
-        if candidate_id is None:
-            rows = self.conn.execute("SELECT * FROM trade_reviews ORDER BY id").fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT * FROM trade_reviews WHERE candidate_id = ? ORDER BY id",
-                (candidate_id,),
-            ).fetchall()
+    def list_trade_reviews(
+        self,
+        candidate_id: Optional[int] = None,
+        trade_date: Optional[str] = None,
+    ) -> list[TradeReview]:
+        rows = self._trade_review_rows(candidate_id=candidate_id, trade_date=trade_date)
         return [self._row_to_trade_review(row) for row in rows]
+
+    def list_trade_reviews_for_date(self, trade_date: str) -> list[TradeReview]:
+        rows = self._trade_review_rows(trade_date=trade_date)
+        return [self._row_to_trade_review(row) for row in rows]
+
+    def _trade_review_rows(
+        self,
+        candidate_id: Optional[int] = None,
+        trade_date: Optional[str] = None,
+    ) -> list[sqlite3.Row]:
+        query = "SELECT * FROM trade_reviews"
+        clauses = []
+        params = []
+        if candidate_id is not None:
+            clauses.append("candidate_id = ?")
+            params.append(candidate_id)
+        if trade_date is not None:
+            clauses.append("trade_date = ?")
+            params.append(trade_date)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id"
+        return self.conn.execute(query, params).fetchall()
 
     def latest_trade_reviews(self, limit: int = 200) -> list[TradeReview]:
         rows = self.conn.execute(
@@ -959,8 +989,8 @@ class TradingDatabase:
                 INSERT INTO virtual_positions(
                     candidate_id, virtual_order_id, entry_price, quantity, opened_at,
                     closed_at, close_price, close_reason, max_return_pct,
-                    max_drawdown_pct, realized_return_pct
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    max_drawdown_pct, realized_return_pct, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._virtual_position_params(position),
             )
@@ -979,7 +1009,8 @@ class TradingDatabase:
                     close_reason = ?,
                     max_return_pct = ?,
                     max_drawdown_pct = ?,
-                    realized_return_pct = ?
+                    realized_return_pct = ?,
+                    details_json = ?
                 WHERE id = ?
                 """,
                 self._virtual_position_params(position) + (position.id,),
@@ -1091,6 +1122,8 @@ class TradingDatabase:
         return (
             order.candidate_id,
             order.entry_plan_id,
+            int(order.leg_index or 1),
+            float(order.weight_pct if order.weight_pct is not None else 100.0),
             order.status.value,
             order.limit_price,
             order.virtual_fill_price,
@@ -1115,6 +1148,7 @@ class TradingDatabase:
             position.max_return_pct,
             position.max_drawdown_pct,
             position.realized_return_pct,
+            json.dumps(position.details, ensure_ascii=False),
         )
 
     @staticmethod
@@ -1316,10 +1350,13 @@ class TradingDatabase:
 
     @staticmethod
     def _row_to_virtual_order(row: sqlite3.Row) -> VirtualOrder:
+        keys = set(row.keys())
         return VirtualOrder(
             id=int(row["id"]),
             candidate_id=int(row["candidate_id"]) if row["candidate_id"] is not None else None,
             entry_plan_id=int(row["entry_plan_id"]) if row["entry_plan_id"] is not None else None,
+            leg_index=int(row["leg_index"]) if "leg_index" in keys else 1,
+            weight_pct=float(row["weight_pct"]) if "weight_pct" in keys else 100.0,
             status=VirtualOrderStatus(row["status"]),
             limit_price=int(row["limit_price"]),
             virtual_fill_price=int(row["virtual_fill_price"]),
@@ -1332,6 +1369,7 @@ class TradingDatabase:
 
     @staticmethod
     def _row_to_virtual_position(row: sqlite3.Row) -> VirtualPosition:
+        keys = set(row.keys())
         return VirtualPosition(
             id=int(row["id"]),
             candidate_id=int(row["candidate_id"]) if row["candidate_id"] is not None else None,
@@ -1345,6 +1383,7 @@ class TradingDatabase:
             max_return_pct=float(row["max_return_pct"]),
             max_drawdown_pct=float(row["max_drawdown_pct"]),
             realized_return_pct=float(row["realized_return_pct"]),
+            details=dict(json.loads(row["details_json"] if "details_json" in keys else "{}")),
         )
 
     @staticmethod

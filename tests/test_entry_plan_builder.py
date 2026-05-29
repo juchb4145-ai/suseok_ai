@@ -11,12 +11,19 @@ class FixedTickProvider(TickSizeProvider):
         return 7
 
 
-def gate_result(strategy_eligible=True, profile=StrategyProfile.KOSDAQ_THEME_PROFILE, support_price=9_700, price=9_750):
+def gate_result(
+    strategy_eligible=True,
+    profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
+    support_price=9_700,
+    price=9_750,
+    final_grade="A",
+    support_candidates=None,
+):
     return GatePipelineResult(
         candidate_id=1,
         code="111111",
         theme_id="robot",
-        final_grade="A",
+        final_grade=final_grade,
         final_score=88.0,
         strategy_eligible=strategy_eligible,
         decisions=[
@@ -28,6 +35,7 @@ def gate_result(strategy_eligible=True, profile=StrategyProfile.KOSDAQ_THEME_PRO
                     "nearest_support": "vwap",
                     "nearest_support_price": support_price,
                     "support_distance_pct": 0.2,
+                    "support_candidates": support_candidates or {},
                 },
             )
         ],
@@ -80,6 +88,34 @@ def test_tick_provider_is_used_for_limit_price():
 
     assert plan.limit_price == 9_707
     assert plan.tick_offset == 1
+
+
+def test_split_plan_uses_grade_weights_and_lower_supports():
+    plan = EntryPlanBuilder().build(
+        gate_result(
+            final_grade="B+",
+            support_price=9_700,
+            support_candidates={
+                "vwap": 9_700,
+                "base_line_120": 9_600,
+                "envelope_mid": 9_500,
+            },
+        )
+    )
+
+    assert [leg["weight_pct"] for leg in plan.split_plan] == [50, 30, 20]
+    assert [leg["support_name"] for leg in plan.split_plan] == ["vwap", "base_line_120", "envelope_mid"]
+    assert all(leg["submittable"] for leg in plan.split_plan)
+    assert plan.split_plan[1]["requires_previous_leg"] is True
+
+
+def test_split_plan_marks_later_legs_unsubmittable_when_supports_are_missing():
+    plan = EntryPlanBuilder().build(gate_result(final_grade="B", support_candidates={"vwap": 9_700}))
+
+    assert [leg["weight_pct"] for leg in plan.split_plan] == [60, 25, 15]
+    assert plan.split_plan[0]["submittable"] is True
+    assert plan.split_plan[1]["submittable"] is False
+    assert plan.split_plan[2]["reason"] == "support_missing"
 
 
 def test_entry_plan_contains_review_context_and_does_not_mutate_result():

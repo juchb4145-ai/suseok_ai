@@ -65,6 +65,10 @@ class ReviewExporter:
         lines.extend(_summary_rows(false_negative))
         lines.extend(["", "## False Positive", ""])
         lines.extend(_summary_rows(false_positive))
+        lines.extend(["", "## Missed Reason Code Performance", ""])
+        lines.extend(_reason_code_rows(false_negative, "false_negative"))
+        lines.extend(["", "## Loss Reason Code Performance", ""])
+        lines.extend(_reason_code_rows(false_positive, "false_positive"))
         lines.extend(["", "## Details", ""])
         if reviews:
             lines.append("| Time | Code | Theme | Grade | Status | 20m High | 20m DD | Reason |")
@@ -113,6 +117,78 @@ def _summary_rows(reviews: list[TradeReview]) -> list[str]:
             + " |"
         )
     return rows
+
+
+def _reason_code_rows(reviews: list[TradeReview], mode: str) -> list[str]:
+    groups: dict[str, list[TradeReview]] = {}
+    for review in reviews:
+        for code in _reason_codes(review, mode):
+            groups.setdefault(code, []).append(review)
+    if not groups:
+        return ["_None._"]
+    rows = [
+        "| Reason Code | Count | Avg 20m High | Max 20m High | Avg 20m DD | Samples |",
+        "|---|---:|---:|---:|---:|---|",
+    ]
+    for code, items in sorted(groups.items(), key=lambda item: (-len(item[1]), item[0])):
+        returns = [float(review.max_return_20m) for review in items if review.max_return_20m is not None]
+        drawdowns = [float(review.max_drawdown_20m) for review in items if review.max_drawdown_20m is not None]
+        samples = ", ".join(_sample_codes(items))
+        rows.append(
+            "| "
+            + " | ".join(
+                [
+                    _cell(code),
+                    _cell(len(items)),
+                    _cell(_avg(returns)),
+                    _cell(max(returns) if returns else None),
+                    _cell(_avg(drawdowns)),
+                    _cell(samples),
+                ]
+            )
+            + " |"
+        )
+    return rows
+
+
+def _reason_codes(review: TradeReview, mode: str) -> list[str]:
+    details = dict(review.details or {})
+    if mode == "false_negative":
+        values = list(details.get("blocking_reason_codes") or [])
+        if not values and review.missed_reason:
+            values.append(review.missed_reason)
+        return _dedupe(values)
+    values = list(details.get("entry_condition_codes") or [])
+    values.extend(details.get("exit_reason_codes") or [])
+    if not values and review.exit_reason:
+        values.append(review.exit_reason)
+    return _dedupe(values)
+
+
+def _sample_codes(reviews: list[TradeReview]) -> list[str]:
+    result: list[str] = []
+    for review in reviews:
+        code = str(review.code or "")
+        if code and code not in result:
+            result.append(code)
+        if len(result) >= 5:
+            break
+    return result
+
+
+def _avg(values: list[float]):
+    if not values:
+        return None
+    return round(sum(values) / len(values), 4)
+
+
+def _dedupe(values) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = str(value or "")
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 class _temp_path:

@@ -163,6 +163,31 @@ def test_invalid_condition_code_is_rejected_without_candidate_row(tmp_path):
     db.close()
 
 
+def test_condition_include_is_rejected_when_session_guard_is_closed(tmp_path):
+    collector, _client, db, _clock = make_collector(tmp_path, clock=MutableClock(datetime(2026, 5, 29, 20, 0, 0)))
+    collector.set_condition_event_allowed(lambda _now: False)
+
+    result = collector.handle_condition_include(
+        ConditionCandidateEvent(
+            condition_name="肄붿뒪?ν뀒留덉＜",
+            code="412350",
+            condition_index=1,
+            strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE.value,
+            purpose="kosdaq_pullback_candidate",
+        )
+    )
+
+    rows = db.conn.execute("SELECT * FROM candidate_events").fetchall()
+    payload = json.loads(rows[0]["payload_json"])
+    assert result is None
+    assert db.list_candidates("2026-05-29") == []
+    assert rows[0]["event_type"] == "candidate_rejected"
+    assert rows[0]["reason"] == "market session closed"
+    assert payload["reject_reason"] == "market session closed"
+    assert "MARKET_SESSION_CLOSED_CONDITION_EVENT:肄붿뒪?ν뀒留덉＜:412350" in collector.warnings
+    db.close()
+
+
 def test_partial_condition_remove_keeps_candidate(tmp_path):
     collector, client, db, _clock = make_collector(tmp_path)
     client.set_conditions([(1, "주도테마"), (2, "코스닥테마주")])

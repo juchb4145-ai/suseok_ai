@@ -24,12 +24,13 @@ class CandidateFilterBar(QWidget):
         self.theme_combo.addItem("매핑 있음", "mapped")
         self.theme_combo.addItem("매핑 없음", "unmapped")
         self.quality_combo = QComboBox()
+        self.quality_combo.addItem("Entry Candidates", "ENTRY")
         self.quality_combo.addItem("All Quality", "ALL")
         self.quality_combo.addItem("Actionable", "actionable")
-        self.quality_combo.addItem("Discovery", "discovery_only")
+        self.quality_combo.addItem("Data Wait", "data_wait")
         self.quality_combo.addItem("Unmapped", "unmapped")
         self.quality_combo.addItem("Invalid Code", "invalid_code")
-        self.quality_combo.addItem("Data Wait", "data_wait")
+        self.quality_combo.addItem("Discovery", "discovery_only")
         self.clear_button = QPushButton("초기화")
 
         layout = QGridLayout(self)
@@ -70,7 +71,7 @@ class CandidateFilterBar(QWidget):
         return str(self.theme_combo.currentData() or "ALL")
 
     def quality_filter(self) -> str:
-        return str(self.quality_combo.currentData() or "ALL")
+        return str(self.quality_combo.currentData() or "ENTRY")
 
     def clear_filters(self) -> None:
         self.search_edit.clear()

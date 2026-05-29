@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from trading.strategy.candles import Candle, CandleBuilder, minute_start
-from trading.strategy.exit import SUPPORT_LOSS, TAKE_PROFIT, TIME_EXIT
+from trading.strategy.exit import SUPPORT_LOSS, TAKE_PROFIT, TIME_EXIT, TRAILING_STOP
 from trading.strategy.models import (
     BlockType,
     Candidate,
@@ -54,6 +54,7 @@ class TradeReviewService:
             "horizon_start_reason": "",
         }
         details.update(_partial_exit_details(virtual_position, decisions))
+        details.update(_reason_code_details(gate_result, decisions))
 
         horizon_start, horizon_reason = _horizon_start(candidate, gate_result, entry_plan, virtual_order, virtual_position, final_status)
         details["horizon_start_at"] = horizon_start.isoformat() if horizon_start else ""
@@ -70,6 +71,7 @@ class TradeReviewService:
         false_negative_type = _false_negative_type(final_status, metrics)
         details["false_negative_type"] = false_negative_type
         false_positive = _false_positive(final_status, virtual_position, details, metrics)
+        details["false_positive_type"] = _false_positive_type(false_positive, final_status, virtual_position, details, decisions, metrics)
         final_grade = gate_result.final_grade if gate_result else ""
         exit_reason = _exit_reason(final_status, virtual_position, decisions)
         review = TradeReview(
@@ -123,6 +125,8 @@ def _final_status(
             return ReviewFinalStatus.VIRTUAL_CLOSED_SUPPORT_LOSS.value
         if full_exit.decision_type == TIME_EXIT:
             return ReviewFinalStatus.VIRTUAL_CLOSED_TIME_EXIT.value
+        if full_exit.decision_type == TRAILING_STOP:
+            return ReviewFinalStatus.VIRTUAL_CLOSED_TRAILING_STOP.value
         return ReviewFinalStatus.VIRTUAL_CLOSED_TAKE_PROFIT.value
     if any(decision.decision_type == TAKE_PROFIT and decision.details.get("partial_exit") for decision in exit_decisions):
         return ReviewFinalStatus.VIRTUAL_PARTIAL_TAKE_PROFIT.value
@@ -236,6 +240,48 @@ def _gate_snapshot(decisions: list[GateDecision]) -> list[dict]:
     ]
 
 
+def _reason_code_details(
+    gate_result: Optional[GatePipelineResult],
+    exit_decisions: list[ExitDecision],
+) -> dict:
+    blocking_reason_codes: list[str] = []
+    entry_condition_codes: list[str] = []
+    dynamic_pullback_policy = {}
+    if gate_result is not None:
+        for decision in gate_result.decisions:
+            sub_status = decision.details.get("sub_status")
+            if not decision.passed or decision.block_type != BlockType.NONE:
+                blocking_reason_codes.extend(str(code) for code in decision.reason_codes)
+                if sub_status:
+                    blocking_reason_codes.append(str(sub_status))
+            if decision.gate_name == "FinalGrade":
+                blocking_reason_codes.extend(str(code) for code in decision.reason_codes)
+            if decision.gate_name == "StockPullbackEntryGate":
+                dynamic_pullback_policy = dict(decision.details.get("dynamic_pullback_policy") or {})
+                if decision.passed:
+                    if decision.details.get("support_touched"):
+                        entry_condition_codes.append("SUPPORT_TOUCHED")
+                    if decision.details.get("support_reclaimed"):
+                        entry_condition_codes.append("SUPPORT_RECLAIMED")
+                    if decision.details.get("volume_reaccel"):
+                        entry_condition_codes.append("VOLUME_REACCEL")
+                    if decision.details.get("failed_low_break_rebound"):
+                        entry_condition_codes.append("FAILED_LOW_BREAK_REBOUND")
+                    mode = dynamic_pullback_policy.get("mode")
+                    if mode:
+                        entry_condition_codes.append(f"DYNAMIC_PULLBACK_{str(mode).upper()}")
+    exit_reason_codes: list[str] = []
+    for decision in exit_decisions:
+        exit_reason_codes.append(decision.decision_type)
+        exit_reason_codes.extend(str(code) for code in decision.reason_codes)
+    return {
+        "blocking_reason_codes": _dedupe(blocking_reason_codes),
+        "entry_condition_codes": _dedupe(entry_condition_codes),
+        "exit_reason_codes": _dedupe(exit_reason_codes),
+        "dynamic_pullback_policy": dynamic_pullback_policy,
+    }
+
+
 def _partial_exit_details(virtual_position: Optional[VirtualPosition], decisions: list[ExitDecision]) -> dict:
     partial = next((decision for decision in decisions if decision.decision_type == TAKE_PROFIT and decision.details.get("partial_exit")), None)
     full = _latest_full_exit(decisions)
@@ -293,6 +339,29 @@ def _false_positive(
         return True
     drawdown = metrics.get("max_drawdown_20m")
     return drawdown is not None and drawdown <= FALSE_POSITIVE_DRAWDOWN_THRESHOLD_PCT
+
+
+def _false_positive_type(
+    false_positive: bool,
+    final_status: str,
+    virtual_position: Optional[VirtualPosition],
+    details: dict,
+    decisions: list[ExitDecision],
+    metrics: dict[str, Optional[float]],
+) -> str:
+    if not false_positive:
+        return ""
+    if details.get("partial_take_profit_hit"):
+        return "PARTIAL_TAKE_PROFIT_WEIGHTED_LOSS"
+    full = _latest_full_exit(decisions)
+    if full is not None:
+        return f"{full.decision_type}_LOSS"
+    if virtual_position is not None and virtual_position.closed_at and virtual_position.realized_return_pct < 0:
+        return f"{virtual_position.close_reason or final_status}_LOSS"
+    drawdown = metrics.get("max_drawdown_20m")
+    if drawdown is not None and drawdown <= FALSE_POSITIVE_DRAWDOWN_THRESHOLD_PCT:
+        return "DRAWDOWN_AFTER_ENTRY"
+    return "FALSE_POSITIVE"
 
 
 def _missed_reason(final_status: str, false_negative_type: str) -> str:
@@ -410,6 +479,15 @@ def _return_pct(price: int, base_price: int) -> float:
     if base_price <= 0:
         return 0.0
     return round(((price - base_price) / base_price) * 100.0, 6)
+
+
+def _dedupe(values) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = str(value or "")
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def _parse_time(value: str) -> datetime:
