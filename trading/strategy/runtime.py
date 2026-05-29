@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from time import perf_counter
-from typing import Optional
+from typing import Callable, Optional
 
 from trading.strategy.candidates import CandidateCollector, CandidateLifecycle, normalize_code
 from trading.strategy.candles import CandleBuilder
@@ -172,38 +172,64 @@ class StrategyRuntime:
         self.startup_warnings: list[str] = []
         self.readiness_report: Optional[ReadinessReport] = None
 
-    def start(self, now: Optional[datetime] = None) -> StrategyRuntimeSnapshot:
-        current = _clean_time(now or self.clock())
-        self._warnings = dedupe_warnings(list(self.startup_warnings) + self.config.validate())
-        self.subscription_manager.max_codes = self.config.realtime_subscription_limit
-        self.started = True
-        snapshot = self._snapshot(current)
-        self._start_condition_adapter(snapshot, current)
-        active_candidates = self._active_candidates(current.date().isoformat())
-        submitted = self.db.list_virtual_orders_by_status(VirtualOrderStatus.SUBMITTED)
-        filled_without_position = [
-            order
-            for order in self.db.list_virtual_orders_by_status(VirtualOrderStatus.FILLED)
-            if order.id is not None and self.db.load_virtual_position_by_order(order.id) is None
-        ]
-        open_positions = self.db.list_open_virtual_positions()
-        snapshot.candidate_count = len(self.db.list_candidates(current.date().isoformat()))
-        snapshot.active_candidate_count = len(active_candidates)
-        snapshot.recovered_candidate_count = len(active_candidates)
-        snapshot.virtual_order_count = len(submitted)
-        snapshot.filled_order_count = len(filled_without_position)
-        snapshot.open_position_count = len(open_positions)
-        snapshot.warnings.extend(
-            [
-                f"RECOVERED_ACTIVE_CANDIDATES={len(active_candidates)}",
-                f"RECOVERED_SUBMITTED_VIRTUAL_ORDERS={len(submitted)}",
-                f"RECOVERED_FILLED_WITHOUT_POSITION={len(filled_without_position)}",
-                f"RECOVERED_OPEN_POSITIONS={len(open_positions)}",
+    def start(
+        self,
+        now: Optional[datetime] = None,
+        *,
+        timing_callback: Optional[Callable[[str, float], None]] = None,
+    ) -> StrategyRuntimeSnapshot:
+        total_started = perf_counter()
+
+        def timed(label: str, callback):
+            started = perf_counter()
+            try:
+                return callback()
+            finally:
+                if timing_callback is not None:
+                    timing_callback(label, perf_counter() - started)
+
+        current = timed("prepare", lambda: _clean_time(now or self.clock()))
+
+        def prepare_snapshot() -> StrategyRuntimeSnapshot:
+            self._warnings = dedupe_warnings(list(self.startup_warnings) + self.config.validate())
+            self.subscription_manager.max_codes = self.config.realtime_subscription_limit
+            self.started = True
+            return self._snapshot(current)
+
+        snapshot = timed("validate_config", prepare_snapshot)
+        timed("condition_adapter_start", lambda: self._start_condition_adapter(snapshot, current))
+
+        def recover_state():
+            active = self._active_candidates(current.date().isoformat())
+            submitted_orders = self.db.list_virtual_orders_by_status(VirtualOrderStatus.SUBMITTED)
+            filled_orders = [
+                order
+                for order in self.db.list_virtual_orders_by_status(VirtualOrderStatus.FILLED)
+                if order.id is not None and self.db.load_virtual_position_by_order(order.id) is None
             ]
-        )
-        self._reconcile_subscriptions(active_candidates, snapshot)
-        self._refresh_readiness_snapshot(snapshot, current)
+            open_items = self.db.list_open_virtual_positions()
+            snapshot.candidate_count = len(self.db.list_candidates(current.date().isoformat()))
+            snapshot.active_candidate_count = len(active)
+            snapshot.recovered_candidate_count = len(active)
+            snapshot.virtual_order_count = len(submitted_orders)
+            snapshot.filled_order_count = len(filled_orders)
+            snapshot.open_position_count = len(open_items)
+            snapshot.warnings.extend(
+                [
+                    f"RECOVERED_ACTIVE_CANDIDATES={len(active)}",
+                    f"RECOVERED_SUBMITTED_VIRTUAL_ORDERS={len(submitted_orders)}",
+                    f"RECOVERED_FILLED_WITHOUT_POSITION={len(filled_orders)}",
+                    f"RECOVERED_OPEN_POSITIONS={len(open_items)}",
+                ]
+            )
+            return active
+
+        active_candidates = timed("recover_db_state", recover_state)
+        timed("reconcile_realtime_subscriptions", lambda: self._reconcile_subscriptions(active_candidates, snapshot))
+        timed("readiness_snapshot", lambda: self._refresh_readiness_snapshot(snapshot, current))
         snapshot.warnings = dedupe_warnings(snapshot.warnings)
+        if timing_callback is not None:
+            timing_callback("total", perf_counter() - total_started)
         return snapshot
 
     def stop(self) -> StrategyRuntimeSnapshot:

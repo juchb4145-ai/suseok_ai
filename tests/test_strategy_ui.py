@@ -1,4 +1,6 @@
+import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -12,13 +14,16 @@ from main import configure_qt_paths
 
 configure_qt_paths()
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import Qt
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import QApplication, QGroupBox, QMessageBox
 
 from kiwoom.client import MockKiwoomClient
 from main import build_observe_runtime
 from storage.db import TradingDatabase
 from trading.engine import TradingEngine
-from trading.strategy.config import StrategyRuntimeConfigRepository
+from trading.models import BuyLeg, LegStatus, WatchItem
+from trading.strategy.config import StrategyRuntimeConfigRepository, config_to_dict
 from trading.strategy.models import (
     BlockType,
     Candidate,
@@ -26,6 +31,7 @@ from trading.strategy.models import (
     CandidateSourceType,
     CandidateState,
     EntryPlan,
+    ExitDecision,
     FillPolicy,
     IndicatorSnapshot,
     ReviewFinalStatus,
@@ -38,6 +44,8 @@ from trading.strategy.models import (
 from trading.strategy.runtime import StrategyRuntimeConfig, StrategyRuntimeSnapshot
 from trading.strategy.themes import ThemeMapping, ThemeRepository
 from ui.main_window import MainWindow
+from ui.table_models import WatchItemTableModel
+from ui.ui_state import settings as ui_settings
 from ui.widgets import StatusBadge, SummaryCard
 
 
@@ -139,12 +147,54 @@ class QuietRuntime:
         )
 
 
-def make_window(tmp_path, qapp, runtime=None):
+@dataclass
+class TimingRuntime(FakeRuntime):
+    def start(self, *, timing_callback=None):
+        if timing_callback is not None:
+            timing_callback("custom_probe", 0.123)
+        return super().start()
+
+
+def make_window(tmp_path, qapp, runtime=None, clear_ui_state=True):
+    if clear_ui_state:
+        ui_settings().clear()
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     client = MockKiwoomClient()
     engine = TradingEngine(client=client, db=db)
     window = MainWindow(engine=engine, db=db, mock_mode=True, strategy_runtime=runtime)
     return window, db, client, engine
+
+
+def watch_table_row_count(window):
+    return window.watch_proxy_model.rowCount()
+
+
+def watch_table_text(window, row, column):
+    index = window.watch_proxy_model.index(row, column)
+    return window.watch_proxy_model.data(index)
+
+
+def watch_table_numeric(window, row, column):
+    index = window.watch_proxy_model.index(row, column)
+    source = window.watch_proxy_model.mapToSource(index)
+    return window.watch_model.data(source, window.watch_model.SortRole)
+
+
+def watch_table_codes(window):
+    return [watch_table_text(window, row, 0) for row in range(watch_table_row_count(window))]
+
+
+def watch_table_row_for_code(window, code):
+    for row, value in enumerate(watch_table_codes(window)):
+        if value == code:
+            return row
+    raise AssertionError(f"watch code not visible: {code}")
+
+
+def select_watch_row(window, row):
+    index = window.watch_proxy_model.index(row, 0)
+    window.table.setCurrentIndex(index)
+    window.table.selectRow(row)
 
 
 def candidate_table_row_count(window):
@@ -154,6 +204,38 @@ def candidate_table_row_count(window):
 def candidate_table_text(window, row, column):
     index = window.strategy_candidate_proxy_model.index(row, column)
     return window.strategy_candidate_proxy_model.data(index)
+
+
+def review_table_row_count(window):
+    return window.review_proxy_model.rowCount()
+
+
+def review_table_text(window, row, column):
+    index = window.review_proxy_model.index(row, column)
+    return window.review_proxy_model.data(index)
+
+
+def review_table_numeric(window, row, column):
+    index = window.review_proxy_model.index(row, column)
+    source = window.review_proxy_model.mapToSource(index)
+    return window.review_model.data(source, window.review_model.SortRole)
+
+
+def review_table_codes(window):
+    return [review_table_text(window, row, 1) for row in range(review_table_row_count(window))]
+
+
+def review_table_row_for_code(window, code):
+    for row, value in enumerate(review_table_codes(window)):
+        if value == code:
+            return row
+    raise AssertionError(f"review code not visible: {code}")
+
+
+def select_review_row(window, row):
+    index = window.review_proxy_model.index(row, 0)
+    window.review_table.setCurrentIndex(index)
+    window.review_table.selectRow(row)
 
 
 def candidate_table_codes(window):
@@ -171,6 +253,22 @@ def select_candidate_row(window, row):
     index = window.strategy_candidate_proxy_model.index(row, 0)
     window.strategy_candidate_table.setCurrentIndex(index)
     window.strategy_candidate_table.selectRow(row)
+
+
+def wait_for_filter_debounce(qapp):
+    QTest.qWait(230)
+    qapp.processEvents()
+
+
+def wait_until(qapp, predicate, timeout_ms=1500):
+    deadline = perf_counter() + timeout_ms / 1000.0
+    while perf_counter() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return
+        QTest.qWait(20)
+    qapp.processEvents()
+    assert predicate()
 
 
 def test_status_badge_and_summary_card_state_changes(qapp):
@@ -226,6 +324,235 @@ def test_login_refreshes_accounts_after_connection_event(tmp_path, qapp):
     window.close()
 
 
+def test_watch_item_model_displays_and_sorts_numeric_columns(tmp_path, qapp):
+    window, db, _, engine = make_window(tmp_path, qapp, FakeRuntime())
+    engine.items = {
+        "111111": watch_item("111111", "Alpha", current_price=2_000, budget=500_000),
+        "222222": watch_item("222222", "Beta", current_price=10_000, budget=1_500_000),
+        "333333": watch_item("333333", "Gamma", current_price=900, budget=200_000),
+    }
+
+    window.refresh_table()
+
+    assert watch_table_row_count(window) == 3
+    row = watch_table_row_for_code(window, "222222")
+    assert watch_table_text(window, row, 0) == "222222"
+    assert watch_table_text(window, row, 1) == "Beta"
+    assert watch_table_text(window, row, 2) == "10,000"
+    assert watch_table_text(window, row, 3) == "1,500,000"
+    assert watch_table_numeric(window, row, 2) == 10_000.0
+
+    window.table.sortByColumn(2, Qt.AscendingOrder)
+    assert watch_table_codes(window) == ["333333", "111111", "222222"]
+    window.table.sortByColumn(2, Qt.DescendingOrder)
+    assert watch_table_codes(window) == ["222222", "111111", "333333"]
+    db.close()
+    window.close()
+
+
+def test_watch_item_filters_are_proxy_only(tmp_path, qapp, monkeypatch):
+    runtime = FakeRuntime()
+    window, db, client, engine = make_window(tmp_path, qapp, runtime)
+    engine.items = {
+        "111111": watch_item("111111", "Holding", holding_quantity=5, average_price=9_900),
+        "222222": watch_item("222222", "Auto", auto_buy_enabled=True),
+        "333333": watch_item("333333", "OpenOrder", leg1_status=LegStatus.UNFILLED, order_no="A1", ordered_quantity=10, filled_quantity=3),
+        "444444": watch_item("444444", "StopRisk", current_price=8_900, stop_loss_price=9_000),
+        "555555": watch_item("555555", "ProfitDone", take_profit_done=True),
+        "666666": watch_item("666666", "Watching", leg1_status=LegStatus.WATCHING),
+    }
+    window.refresh_table()
+
+    monkeypatch.setattr(runtime, "cycle", lambda: (_ for _ in ()).throw(AssertionError("watch filter must not cycle")))
+    monkeypatch.setattr(db, "save_candidate", lambda item: (_ for _ in ()).throw(AssertionError("watch filter must not save candidate")))
+    monkeypatch.setattr(db, "save_trade_review", lambda item: (_ for _ in ()).throw(AssertionError("watch filter must not save review")))
+    monkeypatch.setattr(db, "save_virtual_order", lambda item: (_ for _ in ()).throw(AssertionError("watch filter must not save virtual order")))
+    monkeypatch.setattr(engine, "register_realtime", lambda: (_ for _ in ()).throw(AssertionError("watch filter must not register realtime")))
+    monkeypatch.setattr(client, "send_order", lambda request: (_ for _ in ()).throw(AssertionError("watch filter must not call order path")))
+
+    window.watch_filter_bar.search_edit.setText("Holding")
+    wait_for_filter_debounce(qapp)
+    assert watch_table_codes(window) == ["111111"]
+
+    window.watch_filter_bar.clear_filters()
+    window.watch_filter_bar.holding_combo.setCurrentIndex(1)
+    assert watch_table_codes(window) == ["111111"]
+
+    window.watch_filter_bar.clear_filters()
+    window.watch_filter_bar.auto_buy_combo.setCurrentIndex(1)
+    assert watch_table_codes(window) == ["222222"]
+
+    window.watch_filter_bar.clear_filters()
+    window.watch_filter_bar.open_order_combo.setCurrentIndex(1)
+    assert watch_table_codes(window) == ["333333"]
+
+    window.watch_filter_bar.clear_filters()
+    window.watch_filter_bar.stop_risk_combo.setCurrentIndex(1)
+    assert watch_table_codes(window) == ["444444"]
+
+    window.watch_filter_bar.clear_filters()
+    window.watch_filter_bar.take_profit_combo.setCurrentIndex(1)
+    assert watch_table_codes(window) == ["555555"]
+
+    window.watch_filter_bar.clear_filters()
+    window.watch_filter_bar.watching_combo.setCurrentIndex(1)
+    assert watch_table_codes(window) == ["666666"]
+
+    window.watch_filter_bar.clear_filters()
+    window.watch_filter_bar.pending_combo.setCurrentIndex(1)
+    assert watch_table_codes(window) == ["333333"]
+
+    window.watch_filter_bar.clear_filters()
+    assert watch_table_row_count(window) == 6
+    db.close()
+    window.close()
+
+
+def test_watch_selection_loads_form_through_proxy_sort_and_filter(tmp_path, qapp):
+    window, db, _, engine = make_window(tmp_path, qapp, FakeRuntime())
+    engine.items = {
+        "111111": watch_item("111111", "Alpha", current_price=2_000, budget=500_000),
+        "222222": watch_item("222222", "Beta", current_price=10_000, budget=1_500_000),
+        "333333": watch_item("333333", "Gamma", current_price=900, budget=200_000),
+    }
+    window.refresh_table()
+
+    select_watch_row(window, watch_table_row_for_code(window, "111111"))
+    assert window.code_edit.text() == "111111"
+    assert window.name_edit.text() == "Alpha"
+
+    window.table.sortByColumn(2, Qt.DescendingOrder)
+    select_watch_row(window, watch_table_row_for_code(window, "222222"))
+    assert window.code_edit.text() == "222222"
+    assert window.name_edit.text() == "Beta"
+
+    window.watch_filter_bar.search_edit.setText("Gamma")
+    wait_for_filter_debounce(qapp)
+    select_watch_row(window, 0)
+    assert window.code_edit.text() == "333333"
+    assert window.name_edit.text() == "Gamma"
+    db.close()
+    window.close()
+
+
+def test_watch_detail_panel_and_live_auto_buy_warning(tmp_path, qapp):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    client = MockKiwoomClient()
+    engine = TradingEngine(client=client, db=db)
+    item = watch_item(
+        "111111",
+        "Risky",
+        current_price=8_900,
+        stop_loss_price=9_000,
+        holding_quantity=4,
+        average_price=9_100,
+        auto_buy_enabled=True,
+        leg1_status=LegStatus.UNFILLED,
+        order_no="O-1",
+        ordered_quantity=10,
+        filled_quantity=4,
+    )
+    engine.items = {item.code: item}
+    window = MainWindow(engine=engine, db=db, mock_mode=False, strategy_runtime=FakeRuntime())
+
+    window.ordering_check.setChecked(True)
+    window.refresh_table()
+    select_watch_row(window, 0)
+    detail = window.watch_detail_panel.text()
+
+    assert "코드: 111111" in detail
+    assert "종목명: Risky" in detail
+    assert "현재가: 8,900" in detail
+    assert "손절가: 9,000" in detail
+    assert "자동매수: ON" in detail
+    assert "보유수량: 4" in detail
+    assert "1차 목표가=10,100" in detail
+    assert "주문번호=O-1" in detail
+    assert "경고: 실거래 가능 + 주문 가능 ON + 자동매수 ON" in detail
+    db.close()
+    window.close()
+
+
+def test_watch_risk_tones_and_leg_status_tones(tmp_path, qapp):
+    window, db, _, engine = make_window(tmp_path, qapp, FakeRuntime())
+    engine.items = {
+        "111111": watch_item("111111", "Danger", current_price=8_900, stop_loss_price=9_000),
+        "222222": watch_item("222222", "Warning", current_price=9_200, stop_loss_price=9_000),
+        "333333": watch_item("333333", "Profit", take_profit_done=True),
+        "444444": watch_item("444444", "Open", leg1_status=LegStatus.UNFILLED, order_no="O-1", ordered_quantity=5),
+        "555555": watch_item("555555", "Watching", leg1_status=LegStatus.WATCHING),
+        "666666": watch_item("666666", "Filled", leg1_status=LegStatus.FILLED),
+    }
+    window.refresh_table()
+
+    def tone(code):
+        row = watch_table_row_for_code(window, code)
+        source = window.watch_proxy_model.mapToSource(window.watch_proxy_model.index(row, 0))
+        return window.watch_model.data(source, WatchItemTableModel.RiskToneRole)
+
+    def leg_tone(code):
+        row = watch_table_row_for_code(window, code)
+        source = window.watch_proxy_model.mapToSource(window.watch_proxy_model.index(row, 7))
+        return window.watch_model.data(source, WatchItemTableModel.LegToneRole)
+
+    assert tone("111111") == "danger"
+    assert tone("222222") == "warning"
+    assert tone("333333") == "success"
+    assert tone("444444") == "warning"
+    assert leg_tone("555555") == "info"
+    assert leg_tone("666666") == "success"
+    db.close()
+    window.close()
+
+
+def test_watch_save_delete_selection_and_filter_state(tmp_path, qapp):
+    window, db, _, engine = make_window(tmp_path, qapp, FakeRuntime())
+    item = watch_item("111111", "Alpha", auto_buy_enabled=True, budget=500_000)
+    engine.items = {item.code: item}
+    window.refresh_table()
+    window.watch_filter_bar.auto_buy_combo.setCurrentIndex(1)
+    select_watch_row(window, 0)
+
+    window.budget_spin.setValue(700_000)
+    window._save_current()
+
+    assert window.code_edit.text() == "111111"
+    assert engine.items["111111"].budget == 700_000
+    assert window.watch_filter_bar.auto_buy_only()
+    assert watch_table_codes(window) == ["111111"]
+
+    window._delete_current()
+
+    assert "선택된 종목 없음" in window.watch_detail_panel.text()
+    assert watch_table_row_count(window) == 0
+    assert window.watch_filter_bar.auto_buy_only()
+    db.close()
+    window.close()
+
+
+def test_watch_refresh_filter_detail_are_read_only(tmp_path, qapp, monkeypatch):
+    runtime = FakeRuntime()
+    window, db, client, engine = make_window(tmp_path, qapp, runtime)
+    engine.items = {"111111": watch_item("111111", "Alpha", current_price=10_000)}
+
+    monkeypatch.setattr(runtime, "cycle", lambda: (_ for _ in ()).throw(AssertionError("watch ui must not cycle")))
+    monkeypatch.setattr(db, "save_candidate", lambda item: (_ for _ in ()).throw(AssertionError("watch ui must not save candidate")))
+    monkeypatch.setattr(db, "save_trade_review", lambda item: (_ for _ in ()).throw(AssertionError("watch ui must not save review")))
+    monkeypatch.setattr(db, "save_virtual_order", lambda item: (_ for _ in ()).throw(AssertionError("watch ui must not save virtual order")))
+    monkeypatch.setattr(engine, "register_realtime", lambda: (_ for _ in ()).throw(AssertionError("watch ui must not register realtime")))
+    monkeypatch.setattr(client, "send_order", lambda request: (_ for _ in ()).throw(AssertionError("watch ui must not call order path")))
+
+    window.refresh_table()
+    window.watch_filter_bar.search_edit.setText("Alpha")
+    wait_for_filter_debounce(qapp)
+    select_watch_row(window, 0)
+    window._display_watch_detail(engine.items["111111"])
+
+    assert "코드: 111111" in window.watch_detail_panel.text()
+    db.close()
+    window.close()
+
+
 def save_candidate(db, code, state, last_seen, metadata=None, name=None, can_recover=None, theme_ids=None):
     return db.save_candidate(
         Candidate(
@@ -244,6 +571,73 @@ def save_candidate(db, code, state, last_seen, metadata=None, name=None, can_rec
     )
 
 
+def save_review(db, code, status, grade="", created_at=None, candidate_id=1, **kwargs):
+    return db.save_trade_review(
+        TradeReview(
+            candidate_id=candidate_id,
+            trade_date=kwargs.pop("trade_date", "2026-05-29"),
+            code=code,
+            name=kwargs.pop("name", code),
+            market=kwargs.pop("market", "KOSDAQ"),
+            theme_id=kwargs.pop("theme_id", "robot"),
+            theme_name=kwargs.pop("theme_name", "Robot Theme"),
+            final_grade=grade,
+            final_status=status,
+            virtual_order_status=kwargs.pop("virtual_order_status", ""),
+            exit_reason=kwargs.pop("exit_reason", ""),
+            max_return_5m=kwargs.pop("max_return_5m", None),
+            max_return_10m=kwargs.pop("max_return_10m", None),
+            max_return_20m=kwargs.pop("max_return_20m", None),
+            max_drawdown_20m=kwargs.pop("max_drawdown_20m", None),
+            missed_reason=kwargs.pop("missed_reason", ""),
+            false_negative_flag=kwargs.pop("false_negative_flag", False),
+            false_positive_flag=kwargs.pop("false_positive_flag", False),
+            blocked_but_later_rallied=kwargs.pop("blocked_but_later_rallied", False),
+            expired_but_later_rallied=kwargs.pop("expired_but_later_rallied", False),
+            details=kwargs.pop("details", {}),
+            virtual_position_id=kwargs.pop("virtual_position_id", None),
+            created_at=created_at or NOW.isoformat(),
+            **kwargs,
+        )
+    )
+
+
+def watch_item(
+    code,
+    name=None,
+    *,
+    current_price=10_000,
+    stop_loss_price=9_000,
+    budget=1_000_000,
+    holding_quantity=0,
+    average_price=0.0,
+    auto_buy_enabled=False,
+    take_profit_done=False,
+    leg1_status=LegStatus.WAITING,
+    leg2_status=LegStatus.WAITING,
+    leg3_status=LegStatus.WAITING,
+    order_no="",
+    ordered_quantity=0,
+    filled_quantity=0,
+):
+    return WatchItem(
+        code=code,
+        name=name or code,
+        current_price=current_price,
+        stop_loss_price=stop_loss_price,
+        budget=budget,
+        holding_quantity=holding_quantity,
+        average_price=average_price,
+        auto_buy_enabled=auto_buy_enabled,
+        take_profit_done=take_profit_done,
+        legs=[
+            BuyLeg(1, 10_100, 40.0, leg1_status, order_no, ordered_quantity, filled_quantity),
+            BuyLeg(2, 9_900, 30.0, leg2_status),
+            BuyLeg(3, 9_700, 30.0, leg3_status),
+        ],
+    )
+
+
 def test_observe_start_stop_and_duplicate_noops_do_not_call_order_paths(tmp_path, qapp, monkeypatch):
     runtime = FakeRuntime()
     window, db, client, engine = make_window(tmp_path, qapp, runtime)
@@ -253,6 +647,7 @@ def test_observe_start_stop_and_duplicate_noops_do_not_call_order_paths(tmp_path
     monkeypatch.setattr(engine, "register_realtime", lambda: (_ for _ in ()).throw(AssertionError("manual realtime must not be called")))
 
     window.start_observe_strategy()
+    wait_until(qapp, lambda: runtime.start_calls == 1 and window._strategy_running)
     window.start_observe_strategy()
     window.stop_observe_strategy()
     window.stop_observe_strategy()
@@ -267,11 +662,27 @@ def test_observe_start_stop_and_duplicate_noops_do_not_call_order_paths(tmp_path
     window.close()
 
 
+def test_observe_start_logs_timing_steps_on_ui_thread(tmp_path, qapp):
+    runtime = TimingRuntime()
+    window, db, _, _ = make_window(tmp_path, qapp, runtime)
+
+    window.start_observe_strategy()
+
+    assert runtime.start_calls == 1
+    assert window._strategy_starting is False
+    assert window._strategy_running is True
+    assert "OBSERVE start step: custom_probe 0.123s" in window.log_view.toPlainText()
+    assert "OBSERVE running" in window.strategy_status_label.text()
+    db.close()
+    window.close()
+
+
 def test_observe_readiness_summary_displays_snapshot_and_dedupes_warnings(tmp_path, qapp):
     runtime = FakeRuntime(startup_warnings=["THEME_MAPPING_EMPTY", "THEME_MAPPING_EMPTY"])
     window, db, _, _ = make_window(tmp_path, qapp, runtime)
 
     window.start_observe_strategy()
+    wait_until(qapp, lambda: window._strategy_running)
 
     readiness_text = window.strategy_readiness_view.toPlainText()
     warning_text = window.strategy_warning_view.toPlainText()
@@ -316,6 +727,7 @@ def test_start_failure_does_not_start_timer(tmp_path, qapp):
     window, db, _, _ = make_window(tmp_path, qapp, runtime)
 
     window.start_observe_strategy()
+    wait_until(qapp, lambda: runtime.start_calls == 1 and not window._strategy_starting)
 
     assert runtime.start_calls == 1
     assert not window.strategy_timer.isActive()
@@ -329,6 +741,7 @@ def test_stop_failure_still_stops_timer_and_marks_stopped(tmp_path, qapp):
     window, db, _, _ = make_window(tmp_path, qapp, runtime)
 
     window.start_observe_strategy()
+    wait_until(qapp, lambda: window._strategy_running)
     assert window.strategy_timer.isActive()
     window.stop_observe_strategy()
 
@@ -344,6 +757,7 @@ def test_timer_cycle_reentry_guard_and_exception_warning(tmp_path, qapp):
     runtime = FakeRuntime()
     window, db, _, _ = make_window(tmp_path, qapp, runtime)
     window.start_observe_strategy()
+    wait_until(qapp, lambda: window._strategy_running)
 
     window._strategy_cycle_running = True
     window._run_strategy_cycle()
@@ -353,6 +767,7 @@ def test_timer_cycle_reentry_guard_and_exception_warning(tmp_path, qapp):
     window._strategy_cycle_running = False
     runtime.cycle_fail = True
     window._run_strategy_cycle()
+    wait_until(qapp, lambda: not window._strategy_cycle_running)
     assert runtime.cycle_calls == 1
     assert "STRATEGY_CYCLE_FAILED" in window.strategy_warning_view.toPlainText()
     db.close()
@@ -363,13 +778,16 @@ def test_strategy_cycle_throttles_candidate_table_auto_refresh(tmp_path, qapp):
     runtime = QuietRuntime()
     window, db, _, _ = make_window(tmp_path, qapp, runtime)
     window.start_observe_strategy()
+    wait_until(qapp, lambda: window._strategy_running)
     refresh_calls = []
     window.refresh_strategy_candidates = lambda: refresh_calls.append("refresh")
     window._strategy_last_auto_refresh_at = perf_counter()
     window._strategy_last_snapshot = StrategyRuntimeSnapshot(started=True, active_candidate_count=2)
 
     window._run_strategy_cycle()
+    wait_until(qapp, lambda: not window._strategy_cycle_running)
     window._run_strategy_cycle()
+    wait_until(qapp, lambda: not window._strategy_cycle_running)
 
     assert runtime.cycle_calls == 2
     assert refresh_calls == []
@@ -504,17 +922,21 @@ def test_candidate_filters_are_proxy_only_and_cover_state_search_recover_theme(t
 
     window.strategy_candidate_filter_bar.clear_filters()
     window.strategy_candidate_filter_bar.search_edit.setText("Watch Search")
+    wait_for_filter_debounce(qapp)
     assert candidate_table_codes(window) == ["333333"]
 
     window.strategy_candidate_filter_bar.clear_filters()
     window.strategy_candidate_filter_bar.search_edit.setText("robot")
+    wait_for_filter_debounce(qapp)
     assert candidate_table_codes(window) == ["111111"]
 
     window.strategy_candidate_filter_bar.search_edit.setText("Robot Theme")
+    wait_for_filter_debounce(qapp)
     assert candidate_table_codes(window) == ["111111"]
 
     window.strategy_candidate_filter_bar.clear_filters()
     window.strategy_candidate_filter_bar.search_edit.setText("BLOCK_REASON")
+    wait_for_filter_debounce(qapp)
     assert candidate_table_codes(window) == ["222222"]
 
     window.strategy_candidate_filter_bar.clear_filters()
@@ -745,6 +1167,7 @@ def test_strategy_settings_load_save_is_db_only_and_next_start(tmp_path, qapp, m
     assert window.config_interval_spin.value() == 4
 
     window.start_observe_strategy()
+    wait_until(qapp, lambda: window._strategy_running)
     original_interval = window.strategy_timer.interval()
     window.config_interval_spin.setValue(9)
     monkeypatch.setattr(runtime, "cycle", lambda: (_ for _ in ()).throw(AssertionError("settings save must not cycle")))
@@ -784,6 +1207,167 @@ def test_strategy_settings_show_runtime_unavailable_reason(tmp_path, qapp):
 
     assert "runtime unavailable" in window.strategy_settings_pending_label.text()
     assert "runtime disabled for test" in window.strategy_warning_view.toPlainText()
+    db.close()
+    window.close()
+
+
+def test_strategy_settings_groups_render_core_fields(tmp_path, qapp):
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime())
+
+    titles = {group.title() for group in window.findChildren(QGroupBox)}
+
+    assert {"실행 주기", "조건식/후보", "지수 감시", "테마/대장주 감시", "가상 체결/리뷰", "실시간 구독", "안전 설정"} <= titles
+    assert window.config_interval_spin.value() > 0
+    assert window.config_leader_codes_edit is not None
+    assert window.config_fill_policy_combo.count() == 3
+    assert "no real orders" in window.strategy_settings_safety_label.text()
+    db.close()
+    window.close()
+
+
+def test_strategy_settings_validation_blocks_invalid_numeric_values(tmp_path, qapp):
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime())
+    repo = StrategyRuntimeConfigRepository(db)
+    repo.save(StrategyRuntimeConfig(evaluation_interval_sec=6, max_candidates_to_watch=50))
+    window.load_strategy_settings()
+
+    window.config_interval_spin.setValue(0)
+    window.config_max_candidates_spin.setValue(0)
+    window.config_realtime_limit_spin.setValue(0)
+    window.save_strategy_settings()
+
+    loaded = repo.load().config
+    assert loaded.evaluation_interval_sec == 6
+    assert loaded.max_candidates_to_watch == 50
+    assert "CONFIG_SAVE_FAILED" in window.strategy_settings_warning_view.toPlainText()
+    assert window.strategy_settings_validation_badge.tone == "danger"
+    db.close()
+    window.close()
+
+
+def test_strategy_settings_code_list_normalizes_duplicates(tmp_path, qapp):
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime())
+    repo = StrategyRuntimeConfigRepository(db)
+    repo.save(StrategyRuntimeConfig())
+    window.load_strategy_settings()
+
+    window.config_leader_codes_edit.setText("005930, 000660\n005930 000660")
+    window.save_strategy_settings()
+
+    loaded = repo.load().config
+    assert loaded.leader_watch_codes == ["005930", "000660"]
+    assert "duplicate codes normalized" in window.strategy_settings_warning_view.toPlainText()
+    db.close()
+    window.close()
+
+
+def test_strategy_settings_saved_active_diff_and_dirty_state(tmp_path, qapp):
+    runtime = FakeRuntime(config=StrategyRuntimeConfig(evaluation_interval_sec=3))
+    window, db, _, _ = make_window(tmp_path, qapp, runtime)
+    StrategyRuntimeConfigRepository(db).save(StrategyRuntimeConfig(evaluation_interval_sec=5))
+
+    window.load_strategy_settings()
+
+    assert "saved config differs from active runtime" in window.strategy_settings_pending_label.text()
+    assert "evaluation_interval_sec" in window.strategy_settings_diff_view.toPlainText()
+
+    window.config_interval_spin.setValue(7)
+
+    assert "변경사항 있음" in window.strategy_settings_status_label.text()
+    assert window.strategy_settings_status_cards["saved"].tone == "warning"
+
+    window.save_strategy_settings()
+
+    assert "변경사항 없음" in window.strategy_settings_status_label.text()
+    assert StrategyRuntimeConfigRepository(db).load().config.evaluation_interval_sec == 7
+    db.close()
+    window.close()
+
+
+def test_strategy_settings_json_export_import_and_default_restore(tmp_path, qapp, monkeypatch):
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime())
+    repo = StrategyRuntimeConfigRepository(db)
+    repo.save(StrategyRuntimeConfig(evaluation_interval_sec=8, leader_watch_codes=["005930"]))
+    window.load_strategy_settings()
+
+    export_path = tmp_path / "strategy_config.json"
+    import_path = tmp_path / "strategy_config_import.json"
+    import_path.write_text(
+        json.dumps(config_to_dict(StrategyRuntimeConfig(evaluation_interval_sec=12, leader_watch_codes=["000660"]))),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("ui.main_window.QFileDialog.getSaveFileName", lambda *args, **kwargs: (str(export_path), ""))
+    monkeypatch.setattr("ui.main_window.QFileDialog.getOpenFileName", lambda *args, **kwargs: (str(import_path), ""))
+
+    window.export_strategy_settings_json()
+    exported = json.loads(export_path.read_text(encoding="utf-8"))
+    assert exported["evaluation_interval_sec"] == 8
+
+    window.import_strategy_settings_json()
+
+    assert window.config_interval_spin.value() == 12
+    assert repo.load().config.evaluation_interval_sec == 8
+    assert "CONFIG_IMPORT_PREVIEW_NOT_SAVED" in window.strategy_settings_warning_view.toPlainText()
+
+    window.save_strategy_settings()
+    assert repo.load().config.evaluation_interval_sec == 12
+
+    monkeypatch.setattr("ui.main_window.QMessageBox.question", lambda *args, **kwargs: QMessageBox.Yes)
+    window.restore_default_strategy_settings()
+
+    assert window.config_interval_spin.value() == StrategyRuntimeConfig().evaluation_interval_sec
+    assert repo.load().config.evaluation_interval_sec == 12
+    assert "CONFIG_DEFAULT_PREVIEW_NOT_SAVED" in window.strategy_settings_warning_view.toPlainText()
+    db.close()
+    window.close()
+
+
+def test_strategy_settings_invalid_import_keeps_ui_and_config(tmp_path, qapp, monkeypatch):
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime())
+    repo = StrategyRuntimeConfigRepository(db)
+    repo.save(StrategyRuntimeConfig(evaluation_interval_sec=9))
+    window.load_strategy_settings()
+    invalid_path = tmp_path / "invalid_strategy_config.json"
+    invalid_path.write_text("{bad json", encoding="utf-8")
+    monkeypatch.setattr("ui.main_window.QFileDialog.getOpenFileName", lambda *args, **kwargs: (str(invalid_path), ""))
+
+    window.import_strategy_settings_json()
+
+    assert window.config_interval_spin.value() == 9
+    assert repo.load().config.evaluation_interval_sec == 9
+    assert "CONFIG_IMPORT_FAILED" in window.strategy_settings_warning_view.toPlainText()
+    db.close()
+    window.close()
+
+
+def test_strategy_settings_render_diff_import_export_are_read_only(tmp_path, qapp, monkeypatch):
+    runtime = FakeRuntime(config=StrategyRuntimeConfig())
+    window, db, client, engine = make_window(tmp_path, qapp, runtime)
+    export_path = tmp_path / "settings_read_only.json"
+    import_path = tmp_path / "settings_read_only_import.json"
+    import_path.write_text(json.dumps(config_to_dict(StrategyRuntimeConfig(evaluation_interval_sec=11))), encoding="utf-8")
+    monkeypatch.setattr("ui.main_window.QFileDialog.getSaveFileName", lambda *args, **kwargs: (str(export_path), ""))
+    monkeypatch.setattr("ui.main_window.QFileDialog.getOpenFileName", lambda *args, **kwargs: (str(import_path), ""))
+    monkeypatch.setattr("ui.main_window.QMessageBox.question", lambda *args, **kwargs: QMessageBox.Yes)
+    monkeypatch.setattr(runtime, "cycle", lambda: (_ for _ in ()).throw(AssertionError("settings UI must not cycle")))
+    monkeypatch.setattr(runtime, "start", lambda: (_ for _ in ()).throw(AssertionError("settings UI must not start runtime")))
+    monkeypatch.setattr(runtime, "stop", lambda: (_ for _ in ()).throw(AssertionError("settings UI must not stop runtime")))
+    monkeypatch.setattr(db, "save_candidate", lambda candidate: (_ for _ in ()).throw(AssertionError("settings UI must not save candidate")))
+    monkeypatch.setattr(db, "save_trade_review", lambda review: (_ for _ in ()).throw(AssertionError("settings UI must not save review")))
+    monkeypatch.setattr(db, "save_virtual_order", lambda order: (_ for _ in ()).throw(AssertionError("settings UI must not save virtual order")))
+    monkeypatch.setattr(db, "save_virtual_position", lambda position: (_ for _ in ()).throw(AssertionError("settings UI must not save virtual position")))
+    monkeypatch.setattr(engine, "register_realtime", lambda: (_ for _ in ()).throw(AssertionError("settings UI must not register realtime")))
+    monkeypatch.setattr(client, "send_order", lambda request: (_ for _ in ()).throw(AssertionError("settings UI must not call order path")))
+
+    window.load_strategy_settings()
+    window.config_interval_spin.setValue(10)
+    window.show_strategy_settings_diff()
+    window.export_strategy_settings_json()
+    window.import_strategy_settings_json()
+    window.restore_default_strategy_settings()
+
+    assert export_path.exists()
+    assert window.config_interval_spin.value() == StrategyRuntimeConfig().evaluation_interval_sec
     db.close()
     window.close()
 
@@ -842,6 +1426,254 @@ def test_dashboard_update_is_read_only(tmp_path, qapp, monkeypatch):
     window.close()
 
 
+def test_review_model_displays_headers_and_numeric_sort(tmp_path, qapp):
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime())
+    save_review(db, "111111", ReviewFinalStatus.VIRTUAL_SUBMITTED.value, "A", max_return_5m=10.0, max_return_10m=1.0, max_return_20m=2.0, max_drawdown_20m=-1.0)
+    save_review(db, "222222", ReviewFinalStatus.BLOCKED_TEMP.value, "B", max_return_5m=2.0, max_return_10m=3.0, max_return_20m=4.0, max_drawdown_20m=-8.0)
+    save_review(db, "333333", ReviewFinalStatus.EXPIRED.value, "C", max_return_5m=-1.0, max_return_10m=-2.0, max_return_20m=-3.0, max_drawdown_20m=-2.0)
+
+    window.refresh_review_table()
+
+    assert review_table_row_count(window) == 3
+    row = review_table_row_for_code(window, "111111")
+    assert review_table_text(window, row, 0) == NOW.isoformat()
+    assert review_table_text(window, row, 1) == "111111"
+    assert review_table_text(window, row, 4) == "Robot Theme"
+    assert review_table_text(window, row, 5) == "A"
+    assert review_table_numeric(window, row, 9) == 10.0
+
+    window.review_table.sortByColumn(9, Qt.AscendingOrder)
+    assert review_table_codes(window) == ["333333", "222222", "111111"]
+    window.review_table.sortByColumn(9, Qt.DescendingOrder)
+    assert review_table_codes(window) == ["111111", "222222", "333333"]
+    db.close()
+    window.close()
+
+
+def test_review_filters_are_proxy_only(tmp_path, qapp, monkeypatch):
+    runtime = FakeRuntime()
+    window, db, client, engine = make_window(tmp_path, qapp, runtime)
+    save_review(db, "111111", ReviewFinalStatus.VIRTUAL_SUBMITTED.value, "A", max_return_20m=2.0, missed_reason="", virtual_order_status="submitted")
+    save_review(db, "222222", ReviewFinalStatus.BLOCKED_TEMP.value, "B", missed_reason="THEME_UNMAPPED", false_negative_flag=True, details={"false_negative_type": "LATE_CHASE"})
+    save_review(db, "333333", ReviewFinalStatus.EXPIRED.value, "C", false_positive_flag=True, exit_reason="TIME_EXIT", details={"false_positive_type": "FAKE_BREAK"})
+    window.refresh_review_table()
+
+    monkeypatch.setattr(runtime, "cycle", lambda: (_ for _ in ()).throw(AssertionError("review filter must not cycle")))
+    monkeypatch.setattr(db, "save_candidate", lambda item: (_ for _ in ()).throw(AssertionError("review filter must not save candidate")))
+    monkeypatch.setattr(db, "save_trade_review", lambda item: (_ for _ in ()).throw(AssertionError("review filter must not save review")))
+    monkeypatch.setattr(db, "save_virtual_order", lambda item: (_ for _ in ()).throw(AssertionError("review filter must not save virtual order")))
+    monkeypatch.setattr(db, "save_virtual_position", lambda item: (_ for _ in ()).throw(AssertionError("review filter must not save virtual position")))
+    monkeypatch.setattr(client, "send_order", lambda request: (_ for _ in ()).throw(AssertionError("review filter must not call order path")))
+    monkeypatch.setattr(engine, "register_realtime", lambda: (_ for _ in ()).throw(AssertionError("review filter must not register realtime")))
+
+    window.review_filter_bar.status_combo.setCurrentText("blocked")
+    assert review_table_codes(window) == ["222222"]
+
+    window.review_filter_bar.clear_filters()
+    window.review_filter_bar.grade_combo.setCurrentText("A")
+    assert review_table_codes(window) == ["111111"]
+
+    window.review_filter_bar.clear_filters()
+    window.review_filter_bar.fn_combo.setCurrentIndex(1)
+    assert review_table_codes(window) == ["222222"]
+
+    window.review_filter_bar.clear_filters()
+    window.review_filter_bar.fp_combo.setCurrentIndex(1)
+    assert review_table_codes(window) == ["333333"]
+
+    window.review_filter_bar.clear_filters()
+    window.review_filter_bar.search_edit.setText("THEME_UNMAPPED")
+    wait_for_filter_debounce(qapp)
+    assert review_table_codes(window) == ["222222"]
+
+    window.review_filter_bar.search_edit.setText("FAKE_BREAK")
+    wait_for_filter_debounce(qapp)
+    assert review_table_codes(window) == ["333333"]
+    db.close()
+    window.close()
+
+
+def test_review_date_filter(tmp_path, qapp):
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime())
+    save_review(db, "111111", ReviewFinalStatus.VIRTUAL_SUBMITTED.value, trade_date="2026-05-29", created_at="2026-05-29T09:00:00")
+    save_review(db, "222222", ReviewFinalStatus.BLOCKED_TEMP.value, trade_date="2026-05-25", created_at="2026-05-25T09:00:00")
+    save_review(db, "333333", ReviewFinalStatus.EXPIRED.value, trade_date="2026-05-20", created_at="2026-05-20T09:00:00")
+    window.refresh_review_table()
+
+    window.review_filter_bar.date_range_combo.setCurrentText("오늘")
+    assert review_table_codes(window) == ["111111"]
+
+    window.review_filter_bar.date_range_combo.setCurrentText("최근 7일")
+    assert review_table_codes(window) == ["111111", "222222"]
+
+    window.review_filter_bar.date_range_combo.setCurrentText("전체")
+    assert review_table_codes(window) == ["111111", "222222", "333333"]
+    db.close()
+    window.close()
+
+
+def test_review_summary_cards_and_missed_reason_top_follow_filters(tmp_path, qapp):
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime())
+    save_review(db, "111111", ReviewFinalStatus.VIRTUAL_SUBMITTED.value, "A", max_return_5m=2.0, max_return_10m=4.0, max_return_20m=6.0, max_drawdown_20m=-1.0)
+    save_review(db, "222222", ReviewFinalStatus.BLOCKED_TEMP.value, "B", max_return_5m=4.0, max_return_10m=6.0, max_return_20m=8.0, max_drawdown_20m=-3.0, missed_reason="LATE_CHASE", false_negative_flag=True, blocked_but_later_rallied=True)
+    save_review(db, "333333", ReviewFinalStatus.EXPIRED.value, "C", max_return_5m=6.0, max_return_10m=8.0, max_return_20m=10.0, max_drawdown_20m=-5.0, missed_reason="THEME_UNMAPPED", false_positive_flag=True, expired_but_later_rallied=True)
+    window.refresh_review_table()
+
+    assert window.review_summary_cards["total"].value_label.text() == "3"
+    assert window.review_summary_cards["false_negative"].value_label.text() == "1"
+    assert window.review_summary_cards["false_positive"].value_label.text() == "1"
+    assert window.review_summary_cards["avg_5m"].value_label.text() == "4.00"
+    assert "LATE_CHASE: 1" in window.review_missed_reason_view.toPlainText()
+
+    window.review_filter_bar.fn_combo.setCurrentIndex(1)
+
+    assert window.review_summary_cards["total"].value_label.text() == "1"
+    assert window.review_summary_cards["false_negative"].value_label.text() == "1"
+    assert window.review_summary_cards["false_positive"].value_label.text() == "0"
+    assert window.review_summary_cards["avg_5m"].value_label.text() == "4.00"
+    assert window.review_missed_reason_view.toPlainText().strip() == "LATE_CHASE: 1"
+    db.close()
+    window.close()
+
+
+def test_review_detail_panel_is_read_only_and_shows_linked_records(tmp_path, qapp, monkeypatch):
+    runtime = FakeRuntime()
+    window, db, client, engine = make_window(tmp_path, qapp, runtime)
+    candidate = save_candidate(db, "111111", CandidateState.READY, NOW, name="Review Candidate")
+    plan = db.save_entry_plan(EntryPlan(candidate_id=candidate.id, entry_type="pullback", limit_price=12300, created_at=NOW.isoformat()))
+    virtual_order = db.save_virtual_order(
+        VirtualOrder(
+            candidate_id=candidate.id,
+            entry_plan_id=plan.id,
+            status=VirtualOrderStatus.FILLED,
+            limit_price=12300,
+            virtual_fill_price=12300,
+            submitted_at=NOW.isoformat(),
+            filled_at=(NOW + timedelta(minutes=1)).isoformat(),
+        )
+    )
+    position = db.save_virtual_position(
+        VirtualPosition(
+            candidate_id=candidate.id,
+            virtual_order_id=virtual_order.id,
+            entry_price=12300,
+            quantity=5,
+            opened_at=NOW.isoformat(),
+            closed_at=(NOW + timedelta(minutes=20)).isoformat(),
+            close_price=12600,
+            close_reason="TAKE_PROFIT",
+            realized_return_pct=2.44,
+        )
+    )
+    db.save_exit_decision(
+        ExitDecision(
+            virtual_position_id=position.id,
+            decision_type="take_profit",
+            trigger_price=12600,
+            filled=True,
+            reason_codes=["TAKE_PROFIT"],
+            created_at=(NOW + timedelta(minutes=20)).isoformat(),
+        )
+    )
+    save_review(
+        db,
+        "111111",
+        ReviewFinalStatus.VIRTUAL_CLOSED_TAKE_PROFIT.value,
+        "A",
+        candidate_id=candidate.id,
+        virtual_position_id=position.id,
+        max_return_20m=3.0,
+        missed_reason="none",
+        details={"reason_codes": ["TAKE_PROFIT"]},
+    )
+    window.refresh_review_table()
+
+    monkeypatch.setattr(runtime, "cycle", lambda: (_ for _ in ()).throw(AssertionError("review detail must not cycle")))
+    monkeypatch.setattr(db, "save_candidate", lambda item: (_ for _ in ()).throw(AssertionError("review detail must not save candidate")))
+    monkeypatch.setattr(db, "save_trade_review", lambda item: (_ for _ in ()).throw(AssertionError("review detail must not save review")))
+    monkeypatch.setattr(db, "save_virtual_order", lambda item: (_ for _ in ()).throw(AssertionError("review detail must not save virtual order")))
+    monkeypatch.setattr(db, "save_virtual_position", lambda item: (_ for _ in ()).throw(AssertionError("review detail must not save virtual position")))
+    monkeypatch.setattr(db, "close_virtual_position_with_decision", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("review detail must not close position")))
+    monkeypatch.setattr(client, "send_order", lambda request: (_ for _ in ()).throw(AssertionError("review detail must not call order path")))
+    monkeypatch.setattr(engine, "register_realtime", lambda: (_ for _ in ()).throw(AssertionError("review detail must not register realtime")))
+
+    select_review_row(window, review_table_row_for_code(window, "111111"))
+    window._display_selected_review_detail()
+
+    detail = window.review_detail_panel.text()
+    assert "code: 111111" in detail
+    assert "final_status: VIRTUAL_CLOSED_TAKE_PROFIT" in detail
+    assert "max_return_20m: 3.00" in detail
+    assert "missed_reason: none" in detail
+    assert "virtual positions:" in detail
+    assert "realized_return_pct=2.44" in detail
+    assert "decision_type=take_profit" in detail
+    db.close()
+    window.close()
+
+
+def test_review_filtered_export_uses_proxy_rows(tmp_path, qapp, monkeypatch):
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime())
+    save_review(db, "111111", ReviewFinalStatus.VIRTUAL_SUBMITTED.value, "A")
+    save_review(db, "222222", ReviewFinalStatus.BLOCKED_TEMP.value, "B")
+    save_review(db, "333333", ReviewFinalStatus.EXPIRED.value, "C")
+    window.refresh_review_table()
+    window.review_filter_bar.grade_combo.setCurrentText("A")
+
+    captured = []
+
+    class FakeExporter:
+        def export_csv(self, reviews, path):
+            captured.append(("csv", [review.code for review in reviews], path))
+
+        def export_markdown(self, reviews, path):
+            captured.append(("md", [review.code for review in reviews], path))
+
+    paths = iter([("filtered.csv", ""), ("filtered.md", ""), ("all.csv", ""), ("all.md", "")])
+    monkeypatch.setattr("ui.main_window.ReviewExporter", lambda: FakeExporter())
+    monkeypatch.setattr("ui.main_window.QFileDialog.getSaveFileName", lambda *args, **kwargs: next(paths))
+
+    window.review_filtered_export_check.setChecked(True)
+    window._export_reviews_csv()
+    window._export_reviews_markdown()
+    window.review_filtered_export_check.setChecked(False)
+    window._export_reviews_csv()
+    window._export_reviews_markdown()
+
+    assert captured[0] == ("csv", ["111111"], "filtered.csv")
+    assert captured[1] == ("md", ["111111"], "filtered.md")
+    assert captured[2][0] == "csv"
+    assert captured[2][1] == ["111111", "222222", "333333"]
+    assert captured[3][0] == "md"
+    assert captured[3][1] == ["111111", "222222", "333333"]
+    db.close()
+    window.close()
+
+
+def test_review_selection_survives_refresh_until_review_disappears(tmp_path, qapp, monkeypatch):
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime())
+    review_a = save_review(db, "111111", ReviewFinalStatus.VIRTUAL_SUBMITTED.value, "A")
+    review_b = save_review(db, "222222", ReviewFinalStatus.BLOCKED_TEMP.value, "B")
+    window.refresh_review_table()
+
+    select_review_row(window, review_table_row_for_code(window, "111111"))
+    window._display_selected_review_detail()
+    assert "code: 111111" in window.review_detail_panel.text()
+
+    window.refresh_review_table()
+
+    assert window._selected_review_id() == review_a.id
+    assert "code: 111111" in window.review_detail_panel.text()
+
+    monkeypatch.setattr(db, "latest_trade_reviews", lambda limit=200: [review_b])
+    window.refresh_review_table()
+
+    assert "선택된 리뷰 없음" in window.review_detail_panel.text()
+    assert review_table_codes(window) == ["222222"]
+    db.close()
+    window.close()
+
+
 def test_review_export_ui_is_read_only_and_does_not_touch_runtime(tmp_path, qapp, monkeypatch):
     runtime = FakeRuntime()
     window, db, _, _ = make_window(tmp_path, qapp, runtime)
@@ -873,6 +1705,171 @@ def test_review_export_ui_is_read_only_and_does_not_touch_runtime(tmp_path, qapp
     assert md_path.exists()
     db.close()
     window.close()
+
+
+def test_ui_state_persists_core_layout_table_sort_and_log_option(tmp_path, qapp):
+    ui_settings().clear()
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime(), clear_ui_state=False)
+    window.resize(1040, 720)
+    window.tabs.setCurrentIndex(3)
+    window.main_splitter.setSizes([320, 980])
+    window.watch_splitter.setSizes([700, 300])
+    window.strategy_candidate_splitter.setSizes([650, 350])
+    window.review_splitter.setSizes([640, 360])
+    window.table.setColumnWidth(0, 133)
+    window.strategy_candidate_table.setColumnWidth(0, 144)
+    window.review_table.setColumnWidth(1, 155)
+    window.table.sortByColumn(2, Qt.DescendingOrder)
+    window.review_table.sortByColumn(9, Qt.DescendingOrder)
+    window.log_autoscroll_check.setChecked(False)
+    window._save_ui_state()
+    window.close()
+    db.close()
+
+    restored, db2, _, _ = make_window(tmp_path, qapp, FakeRuntime(), clear_ui_state=False)
+
+    assert restored.tabs.currentIndex() == 3
+    assert restored.table.columnWidth(0) == 133
+    assert restored.strategy_candidate_table.columnWidth(0) == 144
+    assert restored.review_table.columnWidth(1) == 155
+    assert restored.table.horizontalHeader().sortIndicatorSection() == 2
+    assert restored.review_table.horizontalHeader().sortIndicatorSection() == 9
+    assert restored.log_autoscroll_check.isChecked() is False
+    db2.close()
+    restored.close()
+
+
+def test_ui_state_restore_falls_back_on_bad_values(tmp_path, qapp):
+    store = ui_settings()
+    store.clear()
+    store.setValue("tabs/current_index", "bad")
+    store.setValue("watch_table/column_widths", ["bad"])
+    store.setValue("splitters/main/sizes", ["bad"])
+
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime(), clear_ui_state=False)
+
+    assert window.tabs.currentIndex() == 0
+    assert window.table.columnWidth(0) > 0
+    db.close()
+    window.close()
+
+
+def test_table_refresh_preserves_column_widths(tmp_path, qapp):
+    window, db, _, engine = make_window(tmp_path, qapp, FakeRuntime())
+    engine.items = {"111111": watch_item("111111", "Alpha")}
+    save_candidate(db, "111111", CandidateState.READY, NOW, name="Alpha")
+    save_review(db, "111111", ReviewFinalStatus.VIRTUAL_SUBMITTED.value, "A")
+    window.table.setColumnWidth(0, 141)
+    window.strategy_candidate_table.setColumnWidth(0, 142)
+    window.review_table.setColumnWidth(1, 143)
+
+    for _ in range(3):
+        window.refresh_table()
+        window.refresh_strategy_candidates()
+        window.refresh_review_table()
+
+    assert window.table.columnWidth(0) == 141
+    assert window.strategy_candidate_table.columnWidth(0) == 142
+    assert window.review_table.columnWidth(1) == 143
+    db.close()
+    window.close()
+
+
+def test_search_filter_debounce_uses_final_text_without_refresh_paths(tmp_path, qapp, monkeypatch):
+    window, db, client, engine = make_window(tmp_path, qapp, FakeRuntime())
+    save_candidate(db, "111111", CandidateState.READY, NOW, name="Alpha")
+    save_candidate(db, "222222", CandidateState.WATCHING, NOW, name="Beta")
+    window.refresh_strategy_candidates()
+    monkeypatch.setattr(db, "list_candidates", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("filter debounce must not reload candidates")))
+    monkeypatch.setattr(window.strategy_runtime, "cycle", lambda: (_ for _ in ()).throw(AssertionError("filter debounce must not cycle")))
+    monkeypatch.setattr(engine, "register_realtime", lambda: (_ for _ in ()).throw(AssertionError("filter debounce must not register realtime")))
+    monkeypatch.setattr(client, "send_order", lambda request: (_ for _ in ()).throw(AssertionError("filter debounce must not call order path")))
+
+    window.strategy_candidate_filter_bar.search_edit.setText("Al")
+    window.strategy_candidate_filter_bar.search_edit.setText("Bet")
+
+    assert candidate_table_row_count(window) == 2
+    wait_for_filter_debounce(qapp)
+    assert candidate_table_codes(window) == ["222222"]
+    db.close()
+    window.close()
+
+
+def test_last_refresh_labels_update_for_major_tabs(tmp_path, qapp):
+    window, db, _, engine = make_window(tmp_path, qapp, FakeRuntime())
+    engine.items = {"111111": watch_item("111111", "Alpha")}
+    save_candidate(db, "111111", CandidateState.READY, NOW, name="Alpha")
+    save_review(db, "111111", ReviewFinalStatus.VIRTUAL_SUBMITTED.value, "A")
+
+    window.refresh_table()
+    window.refresh_strategy_candidates()
+    window.refresh_review_table()
+    window.config_interval_spin.setValue(6)
+    window.save_strategy_settings()
+
+    pattern = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"
+    assert re.search(pattern, window.watch_last_refresh_label.text())
+    assert re.search(pattern, window.strategy_candidate_last_refresh_label.text())
+    assert re.search(pattern, window.review_last_refresh_label.text())
+    assert re.search(pattern, window.strategy_settings_last_refresh_label.text())
+    assert "완료" in window.watch_refresh_status_label.text()
+    assert "완료" in window.strategy_candidate_refresh_status_label.text()
+    assert "완료" in window.review_refresh_status_label.text()
+    db.close()
+    window.close()
+
+
+def test_log_tab_filter_clear_autoscroll_and_max_lines(tmp_path, qapp):
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime())
+    window._log_max_lines = 5
+    for index in range(7):
+        window._append_log(f"INFO line {index}")
+
+    assert "line 0" not in window.log_view.toPlainText()
+    assert "line 6" in window.log_view.toPlainText()
+    assert window.log_view.verticalScrollBar().value() == window.log_view.verticalScrollBar().maximum()
+
+    window.log_autoscroll_check.setChecked(False)
+    window.log_view.verticalScrollBar().setValue(0)
+    window._append_log("WARNING pinned")
+    assert window.log_view.verticalScrollBar().value() == 0
+
+    window.log_filter_input.setText("pinned")
+    assert window.log_view.toPlainText() == "WARNING pinned"
+
+    window.log_clear_button.click()
+    assert window.log_view.toPlainText() == ""
+    assert window._log_lines == []
+    db.close()
+    window.close()
+
+
+def test_dashboard_and_close_ui_state_are_read_only(tmp_path, qapp, monkeypatch):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    client = MockKiwoomClient()
+    engine = TradingEngine(client=client, db=db)
+    runtime = FakeRuntime()
+    window = MainWindow(engine=engine, db=db, mock_mode=False, strategy_runtime=runtime)
+    monkeypatch.setattr(window, "refresh_strategy_candidates", lambda: (_ for _ in ()).throw(AssertionError("dashboard must not refresh candidates")))
+    monkeypatch.setattr(runtime, "cycle", lambda: (_ for _ in ()).throw(AssertionError("dashboard must not cycle")))
+    monkeypatch.setattr(runtime, "start", lambda: (_ for _ in ()).throw(AssertionError("dashboard must not start runtime")))
+    monkeypatch.setattr(db, "save_candidate", lambda item: (_ for _ in ()).throw(AssertionError("dashboard must not save candidate")))
+    monkeypatch.setattr(db, "save_trade_review", lambda item: (_ for _ in ()).throw(AssertionError("dashboard must not save review")))
+    monkeypatch.setattr(db, "save_virtual_order", lambda item: (_ for _ in ()).throw(AssertionError("dashboard must not save virtual order")))
+    monkeypatch.setattr(engine, "register_realtime", lambda: (_ for _ in ()).throw(AssertionError("dashboard must not register realtime")))
+    monkeypatch.setattr(client, "send_order", lambda request: (_ for _ in ()).throw(AssertionError("dashboard must not call order path")))
+
+    window.ordering_check.setChecked(True)
+    snapshot = StrategyRuntimeSnapshot(started=True, cycle_at=NOW.isoformat(), active_candidate_count=2)
+    window._update_dashboard(snapshot)
+    window._update_dashboard(snapshot)
+
+    assert window.dashboard_cards["ordering"].tone == "danger"
+    assert window.dashboard_cards["mode"].tone == "danger"
+
+    monkeypatch.setattr(window, "_save_ui_state", lambda: (_ for _ in ()).throw(RuntimeError("save failed")))
+    window.close()
+    db.close()
 
 
 def test_strategy_ui_has_no_auto_or_real_order_controls(tmp_path, qapp):

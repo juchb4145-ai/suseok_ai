@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-VALID_TONES = {"neutral", "success", "warning", "danger", "unavailable"}
+VALID_TONES = {"neutral", "success", "warning", "danger", "unavailable", "info", "muted"}
 
 TONE_COLORS = {
     "neutral": ("#f5f7fb", "#1f2937", "#d7dde8"),
@@ -9,6 +9,8 @@ TONE_COLORS = {
     "warning": ("#ffefe0", "#8a3d00", "#f3c28a"),
     "danger": ("#ffe8e8", "#9f1d1d", "#f1a8a8"),
     "unavailable": ("#eceff3", "#5b6472", "#c9d0d9"),
+    "info": ("#eef4ff", "#1d4f8f", "#b8cdf6"),
+    "muted": ("#f5f7fb", "#5b6472", "#d7dde8"),
 }
 
 
