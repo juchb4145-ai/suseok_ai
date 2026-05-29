@@ -5,7 +5,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Optional
 
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QItemSelectionModel, QTimer
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QAction,
@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QSpinBox,
     QSplitter,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -42,7 +43,8 @@ from trading.strategy.export import ReviewExporter
 from trading.strategy.models import CandidateState, FillPolicy
 from trading.strategy.runtime import StrategyRuntime, StrategyRuntimeConfig, StrategyRuntimeSnapshot
 from ui.formatters import dedupe_text, format_metric, format_money, format_percent
-from ui.widgets import StatusBadge, SummaryCard
+from ui.table_models import CandidateFilterProxyModel, CandidateTableModel
+from ui.widgets import CandidateDetailPanel, CandidateFilterBar, StatusBadge, SummaryCard
 
 
 class TickPriceSpinBox(QSpinBox):
@@ -337,19 +339,30 @@ class MainWindow(QMainWindow):
         self.strategy_warning_view = QTextEdit()
         self.strategy_warning_view.setReadOnly(True)
         self.strategy_warning_view.setMaximumHeight(90)
-        self.strategy_candidate_table = QTableWidget(0, len(self.strategy_candidate_headers))
-        self.strategy_candidate_table.setHorizontalHeaderLabels(self.strategy_candidate_headers)
+        self.strategy_candidate_filter_bar = CandidateFilterBar()
+        self.strategy_candidate_model = CandidateTableModel()
+        self.strategy_candidate_proxy_model = CandidateFilterProxyModel()
+        self.strategy_candidate_proxy_model.setSourceModel(self.strategy_candidate_model)
+        self.strategy_candidate_table = QTableView()
+        self.strategy_candidate_table.setModel(self.strategy_candidate_proxy_model)
         self.strategy_candidate_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.strategy_candidate_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.strategy_candidate_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.strategy_candidate_table.setSortingEnabled(False)
         self.strategy_candidate_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.strategy_candidate_table.horizontalHeader().setStretchLastSection(True)
+        self.strategy_candidate_detail_panel = CandidateDetailPanel()
+        candidate_splitter = QSplitter()
+        candidate_splitter.addWidget(self.strategy_candidate_table)
+        candidate_splitter.addWidget(self.strategy_candidate_detail_panel)
+        candidate_splitter.setSizes([820, 420])
 
         layout.addLayout(controls)
+        layout.addWidget(self.strategy_candidate_filter_bar)
         layout.addWidget(self.strategy_snapshot_label)
         layout.addWidget(self.strategy_readiness_view)
         layout.addWidget(self.strategy_warning_view)
-        layout.addWidget(self.strategy_candidate_table, 1)
+        layout.addWidget(candidate_splitter, 1)
         return box
 
     def _build_strategy_settings_tab(self) -> QWidget:
@@ -454,6 +467,10 @@ class MainWindow(QMainWindow):
         self.strategy_start_button.clicked.connect(self.start_observe_strategy)
         self.strategy_stop_button.clicked.connect(self.stop_observe_strategy)
         self.strategy_refresh_button.clicked.connect(self.refresh_strategy_candidates)
+        self.strategy_candidate_filter_bar.filters_changed.connect(self._apply_strategy_candidate_filters)
+        self.strategy_candidate_table.selectionModel().selectionChanged.connect(
+            lambda _selected, _deselected: self._display_selected_candidate_detail()
+        )
         self.strategy_settings_load_button.clicked.connect(self.load_strategy_settings)
         self.strategy_settings_save_button.clicked.connect(self.save_strategy_settings)
         self.engine.log_handlers.append(self._append_log)
@@ -596,33 +613,316 @@ class MainWindow(QMainWindow):
 
     def refresh_strategy_candidates(self) -> None:
         self._strategy_ui_refresh_count += 1
+        selected_candidate_id = self._selected_strategy_candidate_id()
         trade_date = self._strategy_trade_date()
         candidates = self.db.list_candidates(trade_date=trade_date)
         candidates.sort(key=lambda candidate: candidate.last_seen_at or "", reverse=True)
         candidates.sort(key=lambda candidate: self._candidate_state_priority(candidate.state))
         candidates = candidates[:200]
         self._set_strategy_candidate_dashboard_counts(candidates)
-        self.strategy_candidate_table.setRowCount(len(candidates))
-        for row, candidate in enumerate(candidates):
+        mapped_codes = set()
+        theme_text_by_code = {}
+        for candidate in candidates:
             metadata, metadata_warning = self._safe_candidate_metadata(candidate)
             if metadata_warning:
                 self._strategy_warning(metadata_warning)
-            values = [
-                candidate.code,
-                candidate.name,
-                candidate.state.value,
-                candidate.block_type.value,
-                "Y" if candidate.can_recover else "",
-                self._metadata_text(metadata, "best_theme_id"),
-                self._metadata_text(metadata, "best_gate_result_key"),
-                self._metadata_text(metadata, "sub_status"),
-                candidate.last_seen_at,
-                candidate.expires_at,
-                self._block_reason_summary(metadata),
-            ]
-            for column, value in enumerate(values):
-                self.strategy_candidate_table.setItem(row, column, QTableWidgetItem(str(value or "")))
+            mappings = self._candidate_theme_mappings(candidate)
+            if mappings:
+                mapped_codes.add(candidate.code)
+                theme_text_by_code[candidate.code] = self._theme_mapping_search_text(mappings)
+        self.strategy_candidate_model.set_candidates(candidates, mapped_codes, theme_text_by_code)
         self._update_dashboard()
+        if selected_candidate_id is not None and self._select_strategy_candidate(selected_candidate_id):
+            self._display_selected_candidate_detail()
+        else:
+            self.strategy_candidate_table.clearSelection()
+            self.strategy_candidate_detail_panel.show_empty()
+
+    def _apply_strategy_candidate_filters(self) -> None:
+        self.strategy_candidate_proxy_model.set_search_text(self.strategy_candidate_filter_bar.search_text())
+        self.strategy_candidate_proxy_model.set_state_filter(self.strategy_candidate_filter_bar.state_filter())
+        self.strategy_candidate_proxy_model.set_recover_only(self.strategy_candidate_filter_bar.recover_only())
+        self.strategy_candidate_proxy_model.set_theme_filter(self.strategy_candidate_filter_bar.theme_filter())
+        selected_candidate_id = self._selected_strategy_candidate_id()
+        if selected_candidate_id is not None and self._select_strategy_candidate(selected_candidate_id):
+            self._display_selected_candidate_detail()
+        else:
+            self.strategy_candidate_table.clearSelection()
+            self.strategy_candidate_detail_panel.show_empty()
+
+    def _selected_strategy_candidate_id(self) -> Optional[int]:
+        if not hasattr(self, "strategy_candidate_table"):
+            return None
+        current = self.strategy_candidate_table.currentIndex()
+        if not current.isValid():
+            return None
+        source_index = self.strategy_candidate_proxy_model.mapToSource(current)
+        candidate_id = self.strategy_candidate_model.data(source_index, CandidateTableModel.CandidateIdRole)
+        return int(candidate_id) if candidate_id is not None else None
+
+    def _select_strategy_candidate(self, candidate_id: int) -> bool:
+        source_candidate = self.strategy_candidate_model.candidate_by_id(candidate_id)
+        if source_candidate is None:
+            return False
+        for source_row in range(self.strategy_candidate_model.rowCount()):
+            candidate = self.strategy_candidate_model.candidate_at(source_row)
+            if candidate is None or candidate.id != candidate_id:
+                continue
+            source_index = self.strategy_candidate_model.index(source_row, 0)
+            proxy_index = self.strategy_candidate_proxy_model.mapFromSource(source_index)
+            if not proxy_index.isValid():
+                return False
+            self.strategy_candidate_table.setCurrentIndex(proxy_index)
+            selection_model = self.strategy_candidate_table.selectionModel()
+            selection_model.select(proxy_index, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+            return True
+        return False
+
+    def _selected_strategy_candidate(self):
+        current = self.strategy_candidate_table.currentIndex()
+        if not current.isValid():
+            return None
+        source_index = self.strategy_candidate_proxy_model.mapToSource(current)
+        return self.strategy_candidate_model.data(source_index, CandidateTableModel.CandidateRole)
+
+    def _display_selected_candidate_detail(self) -> None:
+        candidate = self._selected_strategy_candidate()
+        if candidate is None or candidate.id is None:
+            self.strategy_candidate_detail_panel.show_empty()
+            return
+        detail_text = self._candidate_detail_text(candidate)
+        self.strategy_candidate_detail_panel.show_detail(f"{candidate.code} {candidate.name}".strip(), detail_text)
+
+    def _candidate_has_theme_mapping(self, candidate) -> bool:
+        return bool(self._candidate_theme_mappings(candidate))
+
+    def _candidate_theme_mappings(self, candidate):
+        try:
+            return self.db.theme_mappings_for_code(candidate.code, enabled=True)
+        except Exception:
+            return []
+
+    def _theme_mapping_search_text(self, mappings) -> str:
+        parts = []
+        for mapping in mappings:
+            parts.extend(
+                [
+                    mapping.theme_id,
+                    mapping.theme_name,
+                    mapping.sub_theme,
+                    self._value_text(mapping.strategy_profile),
+                ]
+            )
+        return " ".join(str(part or "") for part in parts)
+
+    def _candidate_detail_text(self, candidate) -> str:
+        loaded = self.db.load_candidate_by_id(candidate.id) if candidate.id is not None else None
+        candidate = loaded or candidate
+        metadata, metadata_warning = self._safe_candidate_metadata(candidate)
+        sections = [
+            self._candidate_basic_detail(candidate, metadata, metadata_warning),
+            self._candidate_theme_mapping_detail(candidate),
+            self._candidate_indicator_detail(candidate),
+            self._candidate_entry_plan_detail(candidate),
+            self._candidate_virtual_activity_detail(candidate),
+            self._candidate_event_detail(candidate),
+        ]
+        return "\n\n".join(section for section in sections if section)
+
+    def _candidate_basic_detail(self, candidate, metadata: dict, metadata_warning: str) -> str:
+        lines = [
+            "[기본 정보]",
+            f"candidate id: {candidate.id or '-'}",
+            f"code: {candidate.code}",
+            f"name: {candidate.name}",
+            f"market: {candidate.market or '-'}",
+            f"trade_date: {candidate.trade_date or '-'}",
+            f"state: {self._value_text(candidate.state)}",
+            f"block_type: {self._value_text(candidate.block_type)}",
+            f"can_recover: {'Y' if candidate.can_recover else 'N'}",
+            f"detected_at: {candidate.detected_at or '-'}",
+            f"last_seen_at: {candidate.last_seen_at or '-'}",
+            f"expires_at: {candidate.expires_at or '-'}",
+            f"strategy_profile: {self._value_text(candidate.strategy_profile) or '-'}",
+            "condition_names: " + (", ".join(candidate.condition_names) if candidate.condition_names else "-"),
+            "theme_ids: " + (", ".join(candidate.theme_ids) if candidate.theme_ids else "-"),
+            f"best_theme_id: {self._metadata_text(metadata, 'best_theme_id') or '-'}",
+            f"best_gate_result_key: {self._metadata_text(metadata, 'best_gate_result_key') or '-'}",
+            f"sub_status: {self._metadata_text(metadata, 'sub_status') or '-'}",
+            f"block reasons: {self._block_reason_summary(metadata) or '-'}",
+        ]
+        if metadata_warning:
+            lines.append(f"metadata warning: {metadata_warning}")
+        return "\n".join(lines)
+
+    def _candidate_theme_mapping_detail(self, candidate) -> str:
+        mappings = self.db.theme_mappings_for_code(candidate.code, enabled=True)
+        lines = ["[테마 매핑]"]
+        if not mappings:
+            lines.append("-")
+            return "\n".join(lines)
+        for mapping in mappings:
+            lines.append(
+                "theme_id={theme_id} / theme_name={theme_name} / sub_theme={sub_theme} / "
+                "strategy_profile={profile} / leader={leader} / signal={signal} / base_priority={priority}".format(
+                    theme_id=mapping.theme_id or "-",
+                    theme_name=mapping.theme_name or "-",
+                    sub_theme=mapping.sub_theme or "-",
+                    profile=self._value_text(mapping.strategy_profile) or "-",
+                    leader="Y" if mapping.is_leader_candidate else "N",
+                    signal="Y" if mapping.is_signal_stock else "N",
+                    priority=mapping.base_priority,
+                )
+            )
+        return "\n".join(lines)
+
+    def _candidate_indicator_detail(self, candidate) -> str:
+        snapshots = self.db.list_indicator_snapshots(candidate.id)
+        lines = ["[최신 지표 스냅샷]"]
+        if not snapshots:
+            lines.append("-")
+            return "\n".join(lines)
+        snapshot = snapshots[-1]
+        lines.extend(
+            [
+                f"created_at: {snapshot.created_at or '-'}",
+                f"price: {self._money(snapshot.price)}",
+                f"vwap: {self._metric(snapshot.vwap)}",
+                f"ema20_5m: {self._metric(snapshot.ema20_5m)}",
+                f"base_line_120: {self._metric(snapshot.base_line_120)}",
+                f"envelope_mid: {self._metric(snapshot.envelope_mid)}",
+                f"day_high: {self._money(snapshot.day_high)}",
+                f"day_low: {self._money(snapshot.day_low)}",
+                f"day_mid: {self._metric(snapshot.day_mid)}",
+                f"pullback_pct: {self._metric(snapshot.pullback_pct)}",
+                f"volume_reaccel: {snapshot.volume_reaccel}",
+                f"failed_low_break_rebound: {snapshot.failed_low_break_rebound}",
+                f"chase_risk: {snapshot.chase_risk}",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _candidate_entry_plan_detail(self, candidate) -> str:
+        plans = self.db.list_entry_plans(candidate.id)
+        lines = ["[진입 계획]"]
+        if not plans:
+            lines.append("-")
+            return "\n".join(lines)
+        for plan in plans[-3:]:
+            lines.append(
+                "entry_type={entry_type} / base_price_source={source} / limit_price={price} / "
+                "tick_offset={tick_offset} / max_chase_pct={chase} / split_plan={split_plan} / "
+                "fill_policy={fill_policy} / created_at={created_at}".format(
+                    entry_type=plan.entry_type or "-",
+                    source=plan.base_price_source or "-",
+                    price=self._money(plan.limit_price),
+                    tick_offset=plan.tick_offset,
+                    chase=self._metric(plan.max_chase_pct),
+                    split_plan=plan.split_plan,
+                    fill_policy=self._value_text(plan.fill_policy),
+                    created_at=plan.created_at or "-",
+                )
+            )
+        return "\n".join(lines)
+
+    def _candidate_virtual_activity_detail(self, candidate) -> str:
+        lines = ["[가상 주문/포지션/리뷰]"]
+        virtual_orders = self.db.list_virtual_orders(candidate.id)
+        virtual_positions = self.db.list_virtual_positions(candidate.id)
+        reviews = self.db.list_trade_reviews(candidate.id)
+        lines.append("virtual orders:")
+        if virtual_orders:
+            for item in virtual_orders[-3:]:
+                lines.append(
+                    "  status={status} / limit_price={limit_price} / virtual_fill_price={fill_price} / "
+                    "fill_policy={fill_policy} / submitted_at={submitted_at} / filled_at={filled_at} / "
+                    "cancelled_at={cancelled_at} / unfilled_reason={reason}".format(
+                        status=self._value_text(item.status),
+                        limit_price=self._money(item.limit_price),
+                        fill_price=self._money(item.virtual_fill_price),
+                        fill_policy=self._value_text(item.fill_policy),
+                        submitted_at=item.submitted_at or "-",
+                        filled_at=item.filled_at or "-",
+                        cancelled_at=item.cancelled_at or "-",
+                        reason=item.unfilled_reason or "-",
+                    )
+                )
+        else:
+            lines.append("  -")
+        lines.append("virtual positions:")
+        if virtual_positions:
+            for item in virtual_positions[-3:]:
+                lines.append(
+                    "  entry_price={entry_price} / quantity={quantity} / opened_at={opened_at} / "
+                    "closed_at={closed_at} / close_price={close_price} / close_reason={reason} / "
+                    "max_return_pct={max_return} / max_drawdown_pct={drawdown} / realized_return_pct={realized}".format(
+                        entry_price=self._money(item.entry_price),
+                        quantity=item.quantity,
+                        opened_at=item.opened_at or "-",
+                        closed_at=item.closed_at or "-",
+                        close_price=self._money(item.close_price),
+                        reason=item.close_reason or "-",
+                        max_return=self._metric(item.max_return_pct),
+                        drawdown=self._metric(item.max_drawdown_pct),
+                        realized=self._metric(item.realized_return_pct),
+                    )
+                )
+        else:
+            lines.append("  -")
+        lines.append("trade reviews:")
+        if reviews:
+            for item in reviews[-3:]:
+                lines.append(
+                    "  final_status={status} / max_return_5m={r5} / max_return_10m={r10} / "
+                    "max_return_20m={r20} / max_drawdown_20m={dd20} / missed_reason={missed} / "
+                    "false_negative={fn} / false_positive={fp}".format(
+                        status=item.final_status or "-",
+                        r5=self._metric(item.max_return_5m),
+                        r10=self._metric(item.max_return_10m),
+                        r20=self._metric(item.max_return_20m),
+                        dd20=self._metric(item.max_drawdown_20m),
+                        missed=item.missed_reason or "-",
+                        fn=item.false_negative_flag,
+                        fp=item.false_positive_flag,
+                    )
+                )
+        else:
+            lines.append("  -")
+        return "\n".join(lines)
+
+    def _candidate_event_detail(self, candidate) -> str:
+        events = self.db.list_candidate_events(candidate.id)
+        lines = ["[이벤트 타임라인 - 시간순]"]
+        if not events:
+            lines.append("-")
+            return "\n".join(lines)
+        for event in events:
+            lines.append(
+                "event_type={event_type} / from_state={from_state} / to_state={to_state} / "
+                "source={source} / reason={reason} / created_at={created_at} / payload={payload}".format(
+                    event_type=event.event_type or "-",
+                    from_state=self._value_text(event.from_state) or "-",
+                    to_state=self._value_text(event.to_state) or "-",
+                    source=self._value_text(event.source) or "-",
+                    reason=event.reason or "-",
+                    created_at=event.created_at or "-",
+                    payload=self._payload_summary(event.payload),
+                )
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _value_text(value) -> str:
+        if value is None:
+            return ""
+        return str(value.value if hasattr(value, "value") else value)
+
+    @staticmethod
+    def _payload_summary(payload) -> str:
+        if not payload:
+            return "-"
+        text = str(payload)
+        return text if len(text) <= 160 else text[:157] + "..."
 
     def _set_strategy_candidate_dashboard_counts(self, candidates) -> None:
         self._strategy_dashboard_candidate_count = len(candidates)

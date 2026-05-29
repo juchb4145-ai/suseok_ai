@@ -19,8 +19,24 @@ from main import build_observe_runtime
 from storage.db import TradingDatabase
 from trading.engine import TradingEngine
 from trading.strategy.config import StrategyRuntimeConfigRepository
-from trading.strategy.models import BlockType, Candidate, CandidateState, ReviewFinalStatus, TradeReview
+from trading.strategy.models import (
+    BlockType,
+    Candidate,
+    CandidateEvent,
+    CandidateSourceType,
+    CandidateState,
+    EntryPlan,
+    FillPolicy,
+    IndicatorSnapshot,
+    ReviewFinalStatus,
+    StrategyProfile,
+    TradeReview,
+    VirtualOrder,
+    VirtualOrderStatus,
+    VirtualPosition,
+)
 from trading.strategy.runtime import StrategyRuntimeConfig, StrategyRuntimeSnapshot
+from trading.strategy.themes import ThemeMapping, ThemeRepository
 from ui.main_window import MainWindow
 from ui.widgets import StatusBadge, SummaryCard
 
@@ -131,6 +147,32 @@ def make_window(tmp_path, qapp, runtime=None):
     return window, db, client, engine
 
 
+def candidate_table_row_count(window):
+    return window.strategy_candidate_proxy_model.rowCount()
+
+
+def candidate_table_text(window, row, column):
+    index = window.strategy_candidate_proxy_model.index(row, column)
+    return window.strategy_candidate_proxy_model.data(index)
+
+
+def candidate_table_codes(window):
+    return [candidate_table_text(window, row, 0) for row in range(candidate_table_row_count(window))]
+
+
+def candidate_table_row_for_code(window, code):
+    for row, value in enumerate(candidate_table_codes(window)):
+        if value == code:
+            return row
+    raise AssertionError(f"candidate code not visible: {code}")
+
+
+def select_candidate_row(window, row):
+    index = window.strategy_candidate_proxy_model.index(row, 0)
+    window.strategy_candidate_table.setCurrentIndex(index)
+    window.strategy_candidate_table.selectRow(row)
+
+
 def test_status_badge_and_summary_card_state_changes(qapp):
     badge = StatusBadge("대기", "neutral")
     card = SummaryCard("OBSERVE", "stopped", "-", "neutral")
@@ -184,18 +226,19 @@ def test_login_refreshes_accounts_after_connection_event(tmp_path, qapp):
     window.close()
 
 
-def save_candidate(db, code, state, last_seen, metadata=None):
+def save_candidate(db, code, state, last_seen, metadata=None, name=None, can_recover=None, theme_ids=None):
     return db.save_candidate(
         Candidate(
             trade_date="2026-05-29",
             code=code,
-            name=code,
+            name=name or code,
             state=state,
             detected_at=NOW.isoformat(),
             last_seen_at=last_seen.isoformat(),
             expires_at=(NOW + timedelta(minutes=30)).isoformat(),
             block_type=BlockType.TEMPORARY if state == CandidateState.BLOCKED else BlockType.NONE,
-            can_recover=state == CandidateState.BLOCKED,
+            can_recover=(state == CandidateState.BLOCKED) if can_recover is None else can_recover,
+            theme_ids=theme_ids or [],
             metadata=metadata or {},
         )
     )
@@ -368,12 +411,12 @@ def test_candidate_refresh_is_today_limited_sorted_and_read_only(tmp_path, qapp,
 
     window.refresh_strategy_candidates()
 
-    assert window.strategy_candidate_table.rowCount() == 3
-    assert window.strategy_candidate_table.item(0, 0).text() == "333333"
-    assert window.strategy_candidate_table.item(1, 0).text() == "222222"
-    assert window.strategy_candidate_table.item(1, 5).text() == "robot"
-    assert window.strategy_candidate_table.item(1, 7).text() == "PASS"
-    assert "999999" not in [window.strategy_candidate_table.item(row, 0).text() for row in range(3)]
+    assert candidate_table_row_count(window) == 3
+    assert candidate_table_text(window, 0, 0) == "333333"
+    assert candidate_table_text(window, 1, 0) == "222222"
+    assert candidate_table_text(window, 1, 5) == "robot"
+    assert candidate_table_text(window, 1, 7) == "PASS"
+    assert "999999" not in [candidate_table_text(window, row, 0) for row in range(3)]
     db.close()
     window.close()
 
@@ -393,7 +436,7 @@ def test_manual_candidate_refresh_runs_immediately(tmp_path, qapp, monkeypatch):
     window.refresh_strategy_candidates()
 
     assert calls
-    assert window.strategy_candidate_table.rowCount() == 1
+    assert candidate_table_row_count(window) == 1
     db.close()
     window.close()
 
@@ -409,8 +452,270 @@ def test_metadata_parse_error_does_not_break_candidate_refresh(tmp_path, qapp):
 
     window.refresh_strategy_candidates()
 
-    assert window.strategy_candidate_table.rowCount() == 1
+    assert candidate_table_row_count(window) == 1
     assert "CANDIDATE_METADATA_INVALID:111111" in window.strategy_warning_view.toPlainText()
+    db.close()
+    window.close()
+
+
+def test_candidate_filters_are_proxy_only_and_cover_state_search_recover_theme(tmp_path, qapp, monkeypatch):
+    window, db, client, engine = make_window(tmp_path, qapp, FakeRuntime())
+    ThemeRepository(db).upsert_mapping(
+        ThemeMapping(
+            code="111111",
+            name="Ready Robot",
+            theme_id="robot",
+            theme_name="Robot Theme",
+            enabled=True,
+        )
+    )
+    save_candidate(
+        db,
+        "111111",
+        CandidateState.READY,
+        NOW + timedelta(minutes=4),
+        {"best_theme_id": "robot", "best_gate_result_key": "gate-a", "sub_status": "PASS"},
+        name="Ready Robot",
+        theme_ids=["robot"],
+    )
+    save_candidate(
+        db,
+        "222222",
+        CandidateState.BLOCKED,
+        NOW + timedelta(minutes=3),
+        {"block_reasons_by_theme": {"robot": {"reason_codes": ["BLOCK_REASON"]}}},
+        name="Blocked Recover",
+        can_recover=True,
+    )
+    save_candidate(db, "333333", CandidateState.WATCHING, NOW + timedelta(minutes=2), name="Watch Search")
+    save_candidate(db, "444444", CandidateState.DETECTED, NOW + timedelta(minutes=1), name="Detected Name")
+    window.refresh_strategy_candidates()
+
+    monkeypatch.setattr(window.strategy_runtime, "cycle", lambda: (_ for _ in ()).throw(AssertionError("filter must not cycle")))
+    monkeypatch.setattr(db, "save_candidate", lambda candidate: (_ for _ in ()).throw(AssertionError("filter must not save candidate")))
+    monkeypatch.setattr(db, "save_trade_review", lambda review: (_ for _ in ()).throw(AssertionError("filter must not save review")))
+    monkeypatch.setattr(db, "save_virtual_order", lambda order: (_ for _ in ()).throw(AssertionError("filter must not save virtual order")))
+    monkeypatch.setattr(db, "save_virtual_position", lambda position: (_ for _ in ()).throw(AssertionError("filter must not save virtual position")))
+    monkeypatch.setattr(client, "send_order", lambda request: (_ for _ in ()).throw(AssertionError("filter must not call order path")))
+    monkeypatch.setattr(engine, "register_realtime", lambda: (_ for _ in ()).throw(AssertionError("filter must not register realtime")))
+
+    window.strategy_candidate_filter_bar.state_combo.setCurrentText("READY")
+    assert candidate_table_codes(window) == ["111111"]
+
+    window.strategy_candidate_filter_bar.clear_filters()
+    window.strategy_candidate_filter_bar.search_edit.setText("Watch Search")
+    assert candidate_table_codes(window) == ["333333"]
+
+    window.strategy_candidate_filter_bar.clear_filters()
+    window.strategy_candidate_filter_bar.search_edit.setText("robot")
+    assert candidate_table_codes(window) == ["111111"]
+
+    window.strategy_candidate_filter_bar.search_edit.setText("Robot Theme")
+    assert candidate_table_codes(window) == ["111111"]
+
+    window.strategy_candidate_filter_bar.clear_filters()
+    window.strategy_candidate_filter_bar.search_edit.setText("BLOCK_REASON")
+    assert candidate_table_codes(window) == ["222222"]
+
+    window.strategy_candidate_filter_bar.clear_filters()
+    window.strategy_candidate_filter_bar.recover_combo.setCurrentIndex(1)
+    assert candidate_table_codes(window) == ["222222"]
+
+    window.strategy_candidate_filter_bar.clear_filters()
+    window.strategy_candidate_filter_bar.theme_combo.setCurrentIndex(1)
+    assert candidate_table_codes(window) == ["111111"]
+
+    window.strategy_candidate_filter_bar.theme_combo.setCurrentIndex(2)
+    assert candidate_table_codes(window) == ["222222", "333333", "444444"]
+    db.close()
+    window.close()
+
+
+def test_candidate_detail_panel_displays_read_only_related_records(tmp_path, qapp, monkeypatch):
+    runtime = FakeRuntime()
+    window, db, client, engine = make_window(tmp_path, qapp, runtime)
+    ThemeRepository(db).upsert_mapping(
+        ThemeMapping(
+            code="111111",
+            name="Ready Robot",
+            market="KOSDAQ",
+            theme_id="robot",
+            theme_name="Robot Theme",
+            sub_theme="Automation",
+            strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
+            is_leader_candidate=True,
+            is_signal_stock=True,
+            base_priority=100,
+            enabled=True,
+        )
+    )
+    candidate = save_candidate(
+        db,
+        "111111",
+        CandidateState.READY,
+        NOW,
+        {
+            "best_theme_id": "robot",
+            "best_gate_result_key": "gate-a",
+            "sub_status": "PASS",
+            "block_reasons_by_theme": {"robot": {"reason_codes": ["OK"]}},
+        },
+        name="Ready Robot",
+        theme_ids=["robot"],
+    )
+    db.save_candidate_event(
+        CandidateEvent(
+            candidate_id=candidate.id,
+            event_type="state",
+            from_state=CandidateState.DETECTED,
+            to_state=CandidateState.READY,
+            source=CandidateSourceType.CONDITION,
+            reason="passed gate",
+            created_at=NOW.isoformat(),
+            payload={"note": "sample"},
+        )
+    )
+    db.save_indicator_snapshot(
+        IndicatorSnapshot(
+            candidate_id=candidate.id,
+            code="111111",
+            created_at=NOW.isoformat(),
+            price=12345,
+            vwap=12300.0,
+            ema20_5m=12250.0,
+            base_line_120=12000.0,
+            envelope_mid=12100.0,
+            day_high=13000,
+            day_low=12000,
+            day_mid=12500.0,
+            pullback_pct=-1.25,
+            volume_reaccel=True,
+            failed_low_break_rebound=True,
+            chase_risk=False,
+        )
+    )
+    plan = db.save_entry_plan(
+        EntryPlan(
+            candidate_id=candidate.id,
+            entry_type="pullback",
+            base_price_source="vwap",
+            limit_price=12300,
+            tick_offset=-1,
+            max_chase_pct=1.5,
+            split_plan=[{"weight": 50}],
+            fill_policy=FillPolicy.NORMAL,
+            created_at=NOW.isoformat(),
+        )
+    )
+    virtual_order = db.save_virtual_order(
+        VirtualOrder(
+            candidate_id=candidate.id,
+            entry_plan_id=plan.id,
+            status=VirtualOrderStatus.SUBMITTED,
+            limit_price=12300,
+            virtual_fill_price=0,
+            fill_policy=FillPolicy.NORMAL,
+            submitted_at=NOW.isoformat(),
+        )
+    )
+    db.save_virtual_position(
+        VirtualPosition(
+            candidate_id=candidate.id,
+            virtual_order_id=virtual_order.id,
+            entry_price=12300,
+            quantity=3,
+            opened_at=NOW.isoformat(),
+            max_return_pct=2.2,
+            max_drawdown_pct=-0.5,
+            realized_return_pct=0.0,
+        )
+    )
+    db.save_trade_review(
+        TradeReview(
+            candidate_id=candidate.id,
+            trade_date="2026-05-29",
+            code="111111",
+            final_status=ReviewFinalStatus.VIRTUAL_SUBMITTED.value,
+            max_return_5m=1.2,
+            max_return_10m=1.8,
+            max_return_20m=2.5,
+            max_drawdown_20m=-0.4,
+            missed_reason="none",
+            created_at=NOW.isoformat(),
+        )
+    )
+    window.refresh_strategy_candidates()
+
+    monkeypatch.setattr(runtime, "cycle", lambda: (_ for _ in ()).throw(AssertionError("detail must not cycle")))
+    monkeypatch.setattr(db, "save_candidate", lambda item: (_ for _ in ()).throw(AssertionError("detail must not save candidate")))
+    monkeypatch.setattr(db, "save_trade_review", lambda item: (_ for _ in ()).throw(AssertionError("detail must not save review")))
+    monkeypatch.setattr(db, "save_virtual_order", lambda item: (_ for _ in ()).throw(AssertionError("detail must not save virtual order")))
+    monkeypatch.setattr(db, "save_virtual_position", lambda item: (_ for _ in ()).throw(AssertionError("detail must not save virtual position")))
+    monkeypatch.setattr(client, "send_order", lambda request: (_ for _ in ()).throw(AssertionError("detail must not call order path")))
+    monkeypatch.setattr(engine, "register_realtime", lambda: (_ for _ in ()).throw(AssertionError("detail must not register realtime")))
+
+    select_candidate_row(window, 0)
+    window._display_selected_candidate_detail()
+
+    detail_text = window.strategy_candidate_detail_panel.text()
+    assert "code: 111111" in detail_text
+    assert "state: READY" in detail_text
+    assert "theme_id=robot" in detail_text
+    assert "price: 12,345" in detail_text
+    assert "entry_type=pullback" in detail_text
+    assert "status=submitted" in detail_text
+    assert "final_status=VIRTUAL_SUBMITTED" in detail_text
+    assert "passed gate" in detail_text
+    db.close()
+    window.close()
+
+
+def test_candidate_selection_survives_refresh_until_candidate_disappears(tmp_path, qapp):
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime())
+    candidate_a = save_candidate(db, "111111", CandidateState.READY, NOW + timedelta(minutes=2), name="Candidate A")
+    save_candidate(db, "222222", CandidateState.BLOCKED, NOW + timedelta(minutes=1), name="Candidate B")
+    window.refresh_strategy_candidates()
+
+    select_candidate_row(window, candidate_table_row_for_code(window, "111111"))
+    window._display_selected_candidate_detail()
+    assert "code: 111111" in window.strategy_candidate_detail_panel.text()
+
+    window.refresh_strategy_candidates()
+
+    assert window._selected_strategy_candidate_id() == candidate_a.id
+    assert "code: 111111" in window.strategy_candidate_detail_panel.text()
+
+    with db.conn:
+        db.conn.execute("UPDATE candidates SET trade_date = ? WHERE id = ?", ("2026-05-28", candidate_a.id))
+    window.refresh_strategy_candidates()
+
+    assert "선택된 후보 없음" in window.strategy_candidate_detail_panel.text()
+    assert candidate_table_codes(window) == ["222222"]
+    db.close()
+    window.close()
+
+
+def test_candidate_model_keeps_proxy_display_sorting_and_limit_contract(tmp_path, qapp):
+    window, db, _, _ = make_window(tmp_path, qapp, FakeRuntime())
+    for index in range(205):
+        save_candidate(
+            db,
+            f"{index:06d}",
+            CandidateState.DETECTED,
+            NOW + timedelta(seconds=index),
+        )
+    save_candidate(db, "900001", CandidateState.WATCHING, NOW + timedelta(minutes=1))
+    save_candidate(db, "900002", CandidateState.BLOCKED, NOW + timedelta(minutes=2))
+    save_candidate(db, "900003", CandidateState.READY, NOW + timedelta(minutes=3))
+    save_candidate(db, "900004", CandidateState.READY, NOW + timedelta(minutes=4))
+
+    window.refresh_strategy_candidates()
+
+    assert candidate_table_row_count(window) == 200
+    assert candidate_table_text(window, 0, 0) == "900004"
+    assert candidate_table_text(window, 1, 0) == "900003"
+    assert candidate_table_text(window, 2, 0) == "900002"
+    assert candidate_table_text(window, 3, 0) == "900001"
     db.close()
     window.close()
 
