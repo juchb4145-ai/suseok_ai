@@ -949,6 +949,13 @@ def test_candidate_filters_are_proxy_only_and_cover_state_search_recover_theme(t
 
     window.strategy_candidate_filter_bar.theme_combo.setCurrentIndex(2)
     assert candidate_table_codes(window) == ["222222", "333333", "444444"]
+
+    window.strategy_candidate_filter_bar.clear_filters()
+    window.strategy_candidate_filter_bar.quality_combo.setCurrentIndex(1)
+    assert candidate_table_codes(window) == ["111111"]
+
+    window.strategy_candidate_filter_bar.quality_combo.setCurrentIndex(3)
+    assert candidate_table_codes(window) == ["222222", "333333", "444444"]
     db.close()
     window.close()
 
@@ -1082,6 +1089,8 @@ def test_candidate_detail_panel_displays_read_only_related_records(tmp_path, qap
     detail_text = window.strategy_candidate_detail_panel.text()
     assert "code: 111111" in detail_text
     assert "state: READY" in detail_text
+    assert "quality_status: actionable" in detail_text
+    assert "enabled_theme_mapping: Y" in detail_text
     assert "theme_id=robot" in detail_text
     assert "price: 12,345" in detail_text
     assert "entry_type=pullback" in detail_text

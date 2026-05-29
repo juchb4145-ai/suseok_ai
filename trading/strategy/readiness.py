@@ -3,7 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
-from trading.strategy.candidates import normalize_code
+from trading.strategy.candidates import (
+    QUALITY_ACTIONABLE,
+    QUALITY_DATA_WAIT,
+    QUALITY_DISCOVERY_ONLY,
+    QUALITY_INVALID_CODE,
+    QUALITY_UNMAPPED,
+    candidate_is_discovery_only,
+    candidate_quality_status,
+)
 from trading.strategy.models import BlockType, Candidate, CandidateState, StrategyProfile
 
 if TYPE_CHECKING:
@@ -28,6 +36,11 @@ class ReadinessReport:
     active_candidates_with_theme_mapping: int = 0
     active_candidates_without_theme_mapping: int = 0
     theme_mapping_coverage_pct: float = 0.0
+    quality_actionable_count: int = 0
+    quality_discovery_only_count: int = 0
+    quality_unmapped_count: int = 0
+    quality_invalid_code_count: int = 0
+    quality_data_wait_count: int = 0
     protected_subscription_usage: str = ""
     warnings: list[str] = field(default_factory=list)
 
@@ -45,7 +58,20 @@ def build_readiness_report(
     theme_mappings = db.list_theme_mappings(enabled=None)
     enabled_theme_mappings = [mapping for mapping in theme_mappings if mapping.enabled]
     candidates = _active_candidates(db, trade_date)
-    mapped_count = sum(1 for candidate in candidates if db.theme_mappings_for_code(candidate.code, enabled=True))
+    mapping_by_code = {
+        candidate.code: bool(db.theme_mappings_for_code(candidate.code, enabled=True))
+        for candidate in candidates
+    }
+    quality_counts = {
+        QUALITY_ACTIONABLE: 0,
+        QUALITY_DISCOVERY_ONLY: 0,
+        QUALITY_UNMAPPED: 0,
+        QUALITY_INVALID_CODE: 0,
+        QUALITY_DATA_WAIT: 0,
+    }
+    for candidate in candidates:
+        quality_counts[candidate_quality_status(candidate, mapping_by_code.get(candidate.code, False))] += 1
+    mapped_count = sum(1 for candidate in candidates if mapping_by_code.get(candidate.code, False))
     active_count = len(candidates)
     unmapped_count = active_count - mapped_count
     coverage_pct = round((mapped_count / active_count) * 100.0, 2) if active_count else 0.0
@@ -55,6 +81,8 @@ def build_readiness_report(
         warnings.append("THEME_MAPPING_EMPTY")
     if active_count and coverage_pct < LOW_THEME_MAPPING_COVERAGE_PCT:
         warnings.append("NO_THEME_MAPPING_FOR_ACTIVE_CANDIDATES")
+    if quality_counts[QUALITY_INVALID_CODE]:
+        warnings.append("INVALID_CODE_ACTIVE_CANDIDATES")
     for profile in unresolved:
         warnings.append(f"CONDITION_PROFILE_UNRESOLVED:{profile.condition_name}")
     if _broad_candidates_only(candidates):
@@ -69,6 +97,11 @@ def build_readiness_report(
         active_candidates_with_theme_mapping=mapped_count,
         active_candidates_without_theme_mapping=unmapped_count,
         theme_mapping_coverage_pct=coverage_pct,
+        quality_actionable_count=quality_counts[QUALITY_ACTIONABLE],
+        quality_discovery_only_count=quality_counts[QUALITY_DISCOVERY_ONLY],
+        quality_unmapped_count=quality_counts[QUALITY_UNMAPPED],
+        quality_invalid_code_count=quality_counts[QUALITY_INVALID_CODE],
+        quality_data_wait_count=quality_counts[QUALITY_DATA_WAIT],
         protected_subscription_usage=_protected_subscription_usage(subscription_manager),
         warnings=dedupe_warnings(warnings),
     )
@@ -116,16 +149,7 @@ def _broad_candidates_only(candidates: list[Candidate]) -> bool:
 
 
 def _is_broad_candidate(candidate: Candidate) -> bool:
-    metadata = dict(candidate.metadata or {})
-    purposes = {str(value) for value in dict(metadata.get("condition_purposes", {})).values()}
-    profiles = {str(value) for value in dict(metadata.get("condition_profiles", {})).values()}
-    if bool(metadata.get("entry_excluded")):
-        return True
-    if "theme_broad_candidate" in purposes:
-        return True
-    if StrategyProfile.THEME_DISCOVERY_PROFILE.value in profiles:
-        return True
-    return candidate.strategy_profile == StrategyProfile.THEME_DISCOVERY_PROFILE
+    return candidate_is_discovery_only(candidate)
 
 
 def _protected_subscription_usage(subscription_manager) -> str:

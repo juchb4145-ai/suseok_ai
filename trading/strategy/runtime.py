@@ -6,7 +6,17 @@ from datetime import datetime, timedelta
 from time import perf_counter
 from typing import Callable, Optional
 
-from trading.strategy.candidates import CandidateCollector, CandidateLifecycle, normalize_code
+from trading.strategy.candidates import (
+    QUALITY_ACTIONABLE,
+    QUALITY_DATA_WAIT,
+    QUALITY_DISCOVERY_ONLY,
+    QUALITY_INVALID_CODE,
+    QUALITY_UNMAPPED,
+    CandidateCollector,
+    CandidateLifecycle,
+    candidate_quality_status,
+    normalize_code,
+)
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.entry import EntryPlanBuilder
 from trading.strategy.exit import ExitDecisionEngine, VirtualPositionService
@@ -123,6 +133,11 @@ class StrategyRuntimeSnapshot:
     active_candidates_with_theme_mapping: int = 0
     active_candidates_without_theme_mapping: int = 0
     theme_mapping_coverage_pct: float = 0.0
+    quality_actionable_count: int = 0
+    quality_discovery_only_count: int = 0
+    quality_unmapped_count: int = 0
+    quality_invalid_code_count: int = 0
+    quality_data_wait_count: int = 0
     protected_subscription_usage: str = ""
     warnings: list[str] = field(default_factory=list)
 
@@ -246,6 +261,7 @@ class StrategyRuntime:
         started = perf_counter()
         current = _clean_time(now or self.clock())
         snapshot = self._snapshot(current)
+        self._drain_candidate_collector_warnings(snapshot)
         try:
             if not self.started:
                 snapshot.warnings.append("RUNTIME_NOT_STARTED")
@@ -256,6 +272,7 @@ class StrategyRuntime:
             snapshot.candidate_save_count += len(expired)
             snapshot.db_write_count_per_cycle += len(expired)
             trade_date = self.candidate_collector._trade_date()
+            self._apply_quality_controls(trade_date, current, snapshot)
             subscription_candidates = self._subscription_candidates(trade_date)
             snapshot.candidate_count = len(self.db.list_candidates(trade_date))
             self._reconcile_subscriptions(subscription_candidates, snapshot)
@@ -363,6 +380,16 @@ class StrategyRuntime:
         except Exception as exc:
             snapshot.warnings.append(f"CONDITION_ADAPTER_START_FAILED:{exc}")
 
+    def _drain_candidate_collector_warnings(self, snapshot: StrategyRuntimeSnapshot) -> None:
+        warnings = list(getattr(self.candidate_collector, "warnings", []) or [])
+        if not warnings:
+            return
+        snapshot.warnings.extend(warnings)
+        try:
+            self.candidate_collector.warnings.clear()
+        except AttributeError:
+            pass
+
     def _apply_lifecycle(
         self,
         candidates: list[Candidate],
@@ -401,10 +428,12 @@ class StrategyRuntime:
         recheck_due = _blocked_recheck_due(candidate, now, self._has_open_virtual_activity(candidate))
         previous_reasons = _candidate_reason_codes(candidate)
         metadata = dict(candidate.metadata)
+        metadata["quality_status"] = self._candidate_quality_status(candidate)
 
         if not results:
             no_gate_reasons = self._no_gate_result_reasons(candidate, snapshot)
             metadata["sub_status"] = "DATA_INSUFFICIENT"
+            metadata["quality_status"] = QUALITY_DATA_WAIT
             metadata["insufficient_reason"] = no_gate_reasons
             candidate.metadata = metadata
             snapshot.warnings.extend(reason for reason in no_gate_reasons if reason != "NO_GATE_RESULT")
@@ -433,6 +462,7 @@ class StrategyRuntime:
             metadata["best_theme_id"] = best_result.theme_id
             metadata["best_gate_result_key"] = _gate_result_key(best_result)
             metadata["sub_status"] = "PASS"
+            metadata["quality_status"] = QUALITY_DISCOVERY_ONLY if _candidate_entry_excluded(candidate) else QUALITY_ACTIONABLE
             if candidate.state == CandidateState.DETECTED:
                 CandidateLifecycle.transition(candidate, CandidateState.WATCHING)
             elif candidate.state in {CandidateState.WATCHING, CandidateState.BLOCKED, CandidateState.READY}:
@@ -447,6 +477,7 @@ class StrategyRuntime:
             metadata.pop("best_theme_id", None)
             metadata.pop("best_gate_result_key", None)
             metadata["sub_status"] = "DATA_INSUFFICIENT"
+            metadata["quality_status"] = QUALITY_DATA_WAIT
             insufficient_reasons = _group_reason_codes(results)
             metadata["insufficient_reason"] = insufficient_reasons
             snapshot.warnings.extend(
@@ -461,6 +492,7 @@ class StrategyRuntime:
             metadata.pop("best_theme_id", None)
             metadata.pop("best_gate_result_key", None)
             metadata["sub_status"] = best_result.details.get("sub_status", "FINAL_BLOCK")
+            metadata["quality_status"] = QUALITY_DISCOVERY_ONLY if _candidate_entry_excluded(candidate) else QUALITY_ACTIONABLE
             if candidate.state == CandidateState.DETECTED:
                 CandidateLifecycle.transition(candidate, CandidateState.WATCHING)
                 candidate.block_type = BlockType.NONE
@@ -476,6 +508,7 @@ class StrategyRuntime:
             metadata.pop("best_theme_id", None)
             metadata.pop("best_gate_result_key", None)
             metadata["sub_status"] = best_result.details.get("sub_status", "WAIT")
+            metadata["quality_status"] = QUALITY_DISCOVERY_ONLY if _candidate_entry_excluded(candidate) else QUALITY_ACTIONABLE
             if candidate.state == CandidateState.DETECTED:
                 CandidateLifecycle.transition(candidate, CandidateState.WATCHING)
                 candidate.block_type = BlockType.NONE
@@ -491,6 +524,7 @@ class StrategyRuntime:
             metadata.pop("best_theme_id", None)
             metadata.pop("best_gate_result_key", None)
             metadata["sub_status"] = best_result.details.get("sub_status", "LOW_SCORE")
+            metadata["quality_status"] = QUALITY_DISCOVERY_ONLY if _candidate_entry_excluded(candidate) else QUALITY_ACTIONABLE
             if candidate.state in {CandidateState.READY, CandidateState.BLOCKED, CandidateState.DETECTED}:
                 CandidateLifecycle.transition(candidate, CandidateState.WATCHING)
             candidate.block_type = BlockType.NONE
@@ -596,6 +630,101 @@ class StrategyRuntime:
         if any(str(warning).startswith("CONDITION_PROFILE_UNRESOLVED") for warning in snapshot.warnings):
             reasons.append("CONDITION_PROFILE_UNRESOLVED")
         return _dedupe(reasons)
+
+    def _apply_quality_controls(self, trade_date: str, now: datetime, snapshot: StrategyRuntimeSnapshot) -> None:
+        for candidate in self._runtime_candidates(trade_date):
+            if candidate.id is None or self._has_open_virtual_activity(candidate):
+                continue
+            quality_status = self._candidate_quality_status(candidate)
+            if quality_status == QUALITY_INVALID_CODE:
+                self._remove_invalid_candidate(candidate, now, snapshot)
+            elif quality_status == QUALITY_UNMAPPED:
+                self._block_unmapped_candidate(candidate, now, snapshot)
+
+    def _remove_invalid_candidate(self, candidate: Candidate, now: datetime, snapshot: StrategyRuntimeSnapshot) -> None:
+        previous_signature = _candidate_persist_signature(candidate)
+        previous_state = candidate.state
+        metadata = dict(candidate.metadata or {})
+        metadata["quality_status"] = QUALITY_INVALID_CODE
+        metadata["quality_reason"] = "invalid_stock_code"
+        metadata["sub_status"] = "INVALID_CODE"
+        metadata["insufficient_reason"] = ["INVALID_CODE"]
+        candidate.metadata = metadata
+        if candidate.state != CandidateState.REMOVED:
+            CandidateLifecycle.transition(candidate, CandidateState.REMOVED)
+        candidate.block_type = BlockType.NONE
+        candidate.can_recover = False
+        candidate.recheck_after_sec = 0
+        if _candidate_persist_signature(candidate) == previous_signature:
+            return
+        self.db.save_candidate_with_events(
+            candidate,
+            [
+                self._candidate_event(
+                    "candidate_quality_removed",
+                    candidate,
+                    previous_state,
+                    CandidateState.REMOVED,
+                    "invalid candidate code removed from active quality set",
+                    {"code": candidate.code, "quality_status": QUALITY_INVALID_CODE},
+                    now,
+                )
+            ],
+        )
+        snapshot.candidate_save_count += 1
+        snapshot.db_write_count_per_cycle += 1
+        snapshot.warnings.append(f"INVALID_CANDIDATE_CODE:{candidate.code}")
+
+    def _block_unmapped_candidate(self, candidate: Candidate, now: datetime, snapshot: StrategyRuntimeSnapshot) -> None:
+        previous_signature = _candidate_persist_signature(candidate)
+        previous_state = candidate.state
+        metadata = dict(candidate.metadata or {})
+        metadata["quality_status"] = QUALITY_UNMAPPED
+        metadata["quality_reason"] = "no_enabled_theme_mapping"
+        metadata["sub_status"] = "NO_THEME_MAPPING_FOR_CANDIDATE"
+        metadata["insufficient_reason"] = ["NO_THEME_MAPPING_FOR_CANDIDATE"]
+        metadata["block_reasons_by_theme"] = {
+            "__quality__": {
+                "theme_id": "",
+                "gate_result_key": "",
+                "final_grade": "C",
+                "block_type": BlockType.TEMPORARY.value,
+                "reason_codes": ["NO_THEME_MAPPING_FOR_CANDIDATE"],
+                "sub_status": "NO_THEME_MAPPING_FOR_CANDIDATE",
+            }
+        }
+        metadata.setdefault("blocked_at", _clean_time(now).isoformat())
+        metadata.setdefault("next_recheck_at", (_clean_time(now) + timedelta(seconds=60)).isoformat())
+        candidate.metadata = metadata
+        if candidate.state != CandidateState.BLOCKED:
+            CandidateLifecycle.transition(candidate, CandidateState.BLOCKED)
+        candidate.block_type = BlockType.TEMPORARY
+        candidate.can_recover = True
+        candidate.recheck_after_sec = 60
+        if _candidate_persist_signature(candidate) == previous_signature:
+            return
+        event_type = "candidate_quality_blocked"
+        self.db.save_candidate_with_events(
+            candidate,
+            [
+                self._candidate_event(
+                    event_type,
+                    candidate,
+                    previous_state,
+                    CandidateState.BLOCKED,
+                    "candidate blocked until an enabled theme mapping exists",
+                    {
+                        "code": candidate.code,
+                        "quality_status": QUALITY_UNMAPPED,
+                        "reason_codes": ["NO_THEME_MAPPING_FOR_CANDIDATE"],
+                    },
+                    now,
+                )
+            ],
+        )
+        snapshot.candidate_save_count += 1
+        snapshot.db_write_count_per_cycle += 1
+        snapshot.warnings.append("NO_THEME_MAPPING_FOR_CANDIDATE")
 
     def _evaluate_virtual_orders(
         self,
@@ -872,6 +1001,40 @@ class StrategyRuntime:
     def _subscription_candidates(self, trade_date: str) -> list[Candidate]:
         result: list[Candidate] = []
         for candidate in self.db.list_candidates(trade_date=trade_date):
+            has_open_activity = self._has_open_virtual_activity(candidate)
+            if not has_open_activity and self._candidate_quality_status(candidate) in {QUALITY_INVALID_CODE, QUALITY_UNMAPPED}:
+                continue
+            if candidate.state in ACTIVE_RUNTIME_STATES:
+                result.append(candidate)
+            elif (
+                candidate.state == CandidateState.BLOCKED
+                and candidate.block_type == BlockType.TEMPORARY
+                and candidate.can_recover
+            ):
+                result.append(candidate)
+            elif has_open_activity:
+                result.append(candidate)
+        return result
+
+    def _active_candidates(self, trade_date: str, now: Optional[datetime] = None) -> list[Candidate]:
+        result: list[Candidate] = []
+        for candidate in self.db.list_candidates(trade_date=trade_date):
+            if not self._has_open_virtual_activity(candidate) and self._candidate_quality_status(candidate) in {QUALITY_INVALID_CODE, QUALITY_UNMAPPED}:
+                continue
+            if candidate.state in ACTIVE_RUNTIME_STATES:
+                result.append(candidate)
+            elif (
+                candidate.state == CandidateState.BLOCKED
+                and candidate.block_type == BlockType.TEMPORARY
+                and candidate.can_recover
+                and (now is None or _blocked_recheck_due(candidate, now, self._has_open_virtual_activity(candidate)))
+            ):
+                result.append(candidate)
+        return result
+
+    def _runtime_candidates(self, trade_date: str) -> list[Candidate]:
+        result: list[Candidate] = []
+        for candidate in self.db.list_candidates(trade_date=trade_date):
             if candidate.state in ACTIVE_RUNTIME_STATES:
                 result.append(candidate)
             elif (
@@ -884,19 +1047,22 @@ class StrategyRuntime:
                 result.append(candidate)
         return result
 
-    def _active_candidates(self, trade_date: str, now: Optional[datetime] = None) -> list[Candidate]:
-        result: list[Candidate] = []
-        for candidate in self.db.list_candidates(trade_date=trade_date):
-            if candidate.state in ACTIVE_RUNTIME_STATES:
-                result.append(candidate)
-            elif (
-                candidate.state == CandidateState.BLOCKED
-                and candidate.block_type == BlockType.TEMPORARY
-                and candidate.can_recover
-                and (now is None or _blocked_recheck_due(candidate, now, self._has_open_virtual_activity(candidate)))
-            ):
-                result.append(candidate)
-        return result
+    def _candidate_quality_status(self, candidate: Candidate, has_theme_mapping: Optional[bool] = None) -> str:
+        if has_theme_mapping is None:
+            try:
+                has_theme_mapping = (
+                    not self._has_enabled_theme_mappings()
+                    or bool(self.db.theme_mappings_for_code(candidate.code, enabled=True))
+                )
+            except Exception:
+                has_theme_mapping = False
+        return candidate_quality_status(candidate, has_theme_mapping)
+
+    def _has_enabled_theme_mappings(self) -> bool:
+        try:
+            return bool(self.db.list_theme_mappings(enabled=True))
+        except Exception:
+            return True
 
     def _has_open_virtual_activity(self, candidate: Candidate) -> bool:
         if candidate.id is None:
@@ -955,6 +1121,11 @@ class StrategyRuntime:
         snapshot.active_candidates_with_theme_mapping = report.active_candidates_with_theme_mapping
         snapshot.active_candidates_without_theme_mapping = report.active_candidates_without_theme_mapping
         snapshot.theme_mapping_coverage_pct = report.theme_mapping_coverage_pct
+        snapshot.quality_actionable_count = report.quality_actionable_count
+        snapshot.quality_discovery_only_count = report.quality_discovery_only_count
+        snapshot.quality_unmapped_count = report.quality_unmapped_count
+        snapshot.quality_invalid_code_count = report.quality_invalid_code_count
+        snapshot.quality_data_wait_count = report.quality_data_wait_count
         snapshot.protected_subscription_usage = report.protected_subscription_usage
         snapshot.warnings = dedupe_warnings(list(snapshot.warnings) + report.warnings)
 
@@ -1088,7 +1259,7 @@ def _blocked_recheck_due(candidate: Candidate, now: datetime, has_open_virtual_a
         return False
     if candidate.expires_at and _parse_time(candidate.expires_at) <= now:
         return False
-    if not candidate.sources and not has_open_virtual_activity:
+    if not candidate.sources and not has_open_virtual_activity and candidate.metadata.get("quality_status") != QUALITY_UNMAPPED:
         return False
     next_recheck_at = candidate.metadata.get("next_recheck_at")
     if next_recheck_at:
@@ -1145,6 +1316,8 @@ def _candidate_persist_signature(candidate: Candidate) -> tuple:
         str(metadata.get("best_theme_id") or ""),
         str(metadata.get("best_gate_result_key") or ""),
         str(metadata.get("sub_status") or ""),
+        str(metadata.get("quality_status") or ""),
+        str(metadata.get("quality_reason") or ""),
         tuple(str(reason) for reason in (metadata.get("insufficient_reason") or [])),
         _stable_value(_without_evaluated_at(metadata.get("gate_results_by_theme", {}))),
         _stable_value(metadata.get("block_reasons_by_theme", {})),

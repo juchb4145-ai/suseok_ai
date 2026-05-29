@@ -522,6 +522,90 @@ def test_mapped_candidate_enters_gate_without_no_gate_reason(tmp_path):
     db.close()
 
 
+def test_unmapped_candidate_is_blocked_and_excluded_from_candidate_subscription(tmp_path):
+    runtime, db, client, _, _ = build_runtime(tmp_path)
+    db.upsert_theme_mapping(
+        ThemeMapping(
+            code="111111",
+            name="Mapped",
+            market="KOSDAQ",
+            theme_id="robot",
+            theme_name="Robot",
+            strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
+            enabled=True,
+        )
+    )
+    mapped = save_candidate(db, "111111", CandidateState.WATCHING)
+    unmapped = save_candidate(db, "222222", CandidateState.WATCHING)
+
+    runtime.start(NOW)
+    snapshot = runtime.cycle(NOW)
+    reloaded = db.load_candidate_by_id(unmapped.id)
+
+    assert runtime.gate_pipeline.calls[-1] == [mapped.code]
+    assert reloaded.state == CandidateState.BLOCKED
+    assert reloaded.block_type == BlockType.TEMPORARY
+    assert reloaded.can_recover is True
+    assert reloaded.metadata["quality_status"] == "unmapped"
+    assert reloaded.metadata["insufficient_reason"] == ["NO_THEME_MAPPING_FOR_CANDIDATE"]
+    assert "222222" not in client.registered_codes
+    assert "candidate_quality_blocked" in event_types(db, unmapped.id)
+    assert "NO_THEME_MAPPING_FOR_CANDIDATE" in snapshot.warnings
+    db.close()
+
+
+def test_unmapped_candidate_recovers_when_theme_mapping_is_added(tmp_path):
+    runtime, db, _, _, _ = build_runtime(tmp_path)
+    db.upsert_theme_mapping(
+        ThemeMapping(
+            code="111111",
+            name="Mapped",
+            market="KOSDAQ",
+            theme_id="robot",
+            theme_name="Robot",
+            strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
+            enabled=True,
+        )
+    )
+    candidate = save_candidate(db, "222222", CandidateState.WATCHING)
+    runtime.start(NOW)
+    runtime.cycle(NOW)
+    assert db.load_candidate_by_id(candidate.id).state == CandidateState.BLOCKED
+
+    db.upsert_theme_mapping(
+        ThemeMapping(
+            code="222222",
+            name="Recovered",
+            market="KOSDAQ",
+            theme_id="robot",
+            theme_name="Robot",
+            strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
+            enabled=True,
+        )
+    )
+    runtime.cycle(NOW + timedelta(seconds=61))
+
+    reloaded = db.load_candidate_by_id(candidate.id)
+    assert reloaded.state == CandidateState.READY
+    assert reloaded.metadata["quality_status"] == "actionable"
+    db.close()
+
+
+def test_invalid_active_candidate_is_removed_by_quality_control(tmp_path):
+    runtime, db, _, _, _ = build_runtime(tmp_path)
+    candidate = save_candidate(db, "0007C0", CandidateState.WATCHING)
+    runtime.start(NOW)
+
+    snapshot = runtime.cycle(NOW)
+    reloaded = db.load_candidate_by_id(candidate.id)
+
+    assert reloaded.state == CandidateState.REMOVED
+    assert reloaded.metadata["quality_status"] == "invalid_code"
+    assert "candidate_quality_removed" in event_types(db, candidate.id)
+    assert "INVALID_CANDIDATE_CODE:0007C0" in snapshot.warnings
+    db.close()
+
+
 def test_theme_discovery_candidate_feeds_gate_but_never_creates_entry_plan(tmp_path):
     runtime, db, _, _, builder = build_runtime(tmp_path)
     candidate = save_candidate(

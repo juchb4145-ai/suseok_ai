@@ -308,6 +308,30 @@ def test_initial_tr_and_real_i_duplicate_is_deduped_before_collector(tmp_path):
     db.close()
 
 
+def test_invalid_condition_code_warns_and_reaches_collector_rejection(tmp_path):
+    adapter, repo, client, db, clock = make_adapter(tmp_path)
+    upsert_profile(repo, "leader")
+    client.set_conditions([(1, "leader")])
+    collector = CandidateCollector(
+        db,
+        client=adapter,
+        clock=clock,
+        trade_date_provider=lambda: "2026-05-29",
+    )
+    adapter.start(NOW)
+    client.emit_condition_load_result(True, "ok")
+
+    client.emit_tr_condition("7600", "0007C0;A005930;", "leader", 1, "")
+
+    rejected = db.conn.execute("SELECT * FROM candidate_events WHERE event_type = 'candidate_rejected'").fetchall()
+    assert db.load_candidate("2026-05-29", "0007C0") is None
+    assert db.load_candidate("2026-05-29", "005930") is not None
+    assert rejected[0]["candidate_id"] is None
+    assert "INVALID_CONDITION_CODE:leader:0007C0" in adapter.warnings
+    assert "INVALID_CONDITION_CODE:leader:0007C0" in collector.warnings
+    db.close()
+
+
 def test_send_condition_failure_is_not_registered_or_stopped(tmp_path):
     adapter, repo, client, db, _clock = make_adapter(tmp_path)
     upsert_profile(repo, "leader")

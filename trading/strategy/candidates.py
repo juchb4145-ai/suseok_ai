@@ -23,6 +23,18 @@ FORBIDDEN_ORDER_STATES = {
     CandidateState.FILLED,
     CandidateState.CANCELLED,
 }
+QUALITY_ACTIONABLE = "actionable"
+QUALITY_DISCOVERY_ONLY = "discovery_only"
+QUALITY_UNMAPPED = "unmapped"
+QUALITY_INVALID_CODE = "invalid_code"
+QUALITY_DATA_WAIT = "data_wait"
+QUALITY_STATUSES = {
+    QUALITY_ACTIONABLE,
+    QUALITY_DISCOVERY_ONLY,
+    QUALITY_UNMAPPED,
+    QUALITY_INVALID_CODE,
+    QUALITY_DATA_WAIT,
+}
 
 
 class CandidateLifecycle:
@@ -43,6 +55,7 @@ class CandidateLifecycle:
         allowed = {
             CandidateState.DETECTED: {
                 CandidateState.WATCHING,
+                CandidateState.BLOCKED,
                 CandidateState.REMOVED,
                 CandidateState.EXPIRED,
             },
@@ -92,6 +105,7 @@ class CandidateCollector:
         self.clock = clock or datetime.now
         self.trade_date_provider = trade_date_provider
         self.default_ttl_minutes = default_ttl_minutes
+        self.warnings: list[str] = []
         if client is not None:
             self.attach(client)
 
@@ -100,10 +114,13 @@ class CandidateCollector:
         client.condition_candidate_included.connect(self.handle_condition_include)
         client.condition_candidate_removed.connect(self.handle_condition_remove)
 
-    def handle_condition_include(self, event: ConditionCandidateEvent) -> Candidate:
+    def handle_condition_include(self, event: ConditionCandidateEvent) -> Optional[Candidate]:
         now = self._now_text()
         trade_date = self._trade_date()
         code = normalize_code(event.code)
+        if not is_valid_stock_code(code):
+            self._reject_condition_event(event, "include")
+            return None
         existing = self.db.load_candidate(trade_date, code)
         if existing is None:
             metadata = {"condition_indices": {event.condition_name: event.condition_index}}
@@ -139,6 +156,11 @@ class CandidateCollector:
             )
 
         previous_state = existing.state
+        previous_index = dict(existing.metadata.get("condition_indices", {})).get(event.condition_name)
+        previous_profile = dict(existing.metadata.get("condition_profiles", {})).get(event.condition_name)
+        previous_purpose = dict(existing.metadata.get("condition_purposes", {})).get(event.condition_name)
+        source_added = CandidateSourceType.CONDITION not in existing.sources
+        condition_added = event.condition_name not in existing.condition_names
         if existing.state in {CandidateState.REMOVED, CandidateState.EXPIRED}:
             CandidateLifecycle.transition(existing, CandidateState.DETECTED)
             existing.block_type = BlockType.NONE
@@ -156,7 +178,14 @@ class CandidateCollector:
         existing.last_seen_at = now
         existing.expires_at = self._expires_at()
 
-        event_type = "candidate_reactivated" if previous_state in {CandidateState.REMOVED, CandidateState.EXPIRED} else "candidate_merged"
+        profile_changed = previous_profile != dict(existing.metadata.get("condition_profiles", {})).get(event.condition_name)
+        purpose_changed = previous_purpose != dict(existing.metadata.get("condition_purposes", {})).get(event.condition_name)
+        index_changed = previous_index != event.condition_index
+        reactivated = previous_state in {CandidateState.REMOVED, CandidateState.EXPIRED}
+        if not (reactivated or source_added or condition_added or index_changed or profile_changed or purpose_changed):
+            return self.db.save_candidate(existing)
+
+        event_type = "candidate_reactivated" if reactivated else "candidate_merged"
         return self.db.save_candidate_with_events(
             existing,
             [
@@ -175,6 +204,9 @@ class CandidateCollector:
     def handle_condition_remove(self, event: ConditionCandidateEvent) -> Optional[Candidate]:
         trade_date = self._trade_date()
         code = normalize_code(event.code)
+        if not is_valid_stock_code(code):
+            self._reject_condition_event(event, "remove")
+            return None
         candidate = self.db.load_candidate(trade_date, code)
         if candidate is None:
             return None
@@ -408,6 +440,33 @@ class CandidateCollector:
             payload=payload,
         )
 
+    def _reject_condition_event(self, event: ConditionCandidateEvent, event_action: str) -> None:
+        warning = f"INVALID_CONDITION_CODE:{event.condition_name}:{event.code}"
+        self.warnings.append(warning)
+        payload = {
+            "raw_code": str(event.code or ""),
+            "normalized_code": normalize_code(event.code),
+            "condition_name": event.condition_name,
+            "condition_index": event.condition_index,
+            "event_action": event_action,
+            "strategy_profile": str(getattr(event, "strategy_profile", "") or ""),
+            "purpose": str(getattr(event, "purpose", "") or ""),
+            "source": CandidateSourceType.CONDITION.value,
+            "warning": warning,
+        }
+        self.db.save_candidate_event(
+            CandidateEvent(
+                candidate_id=None,
+                event_type="candidate_rejected",
+                from_state=None,
+                to_state=None,
+                source=CandidateSourceType.CONDITION,
+                reason="invalid condition code",
+                created_at=self._now_text(),
+                payload=payload,
+            )
+        )
+
     @staticmethod
     def _condition_payload(event: ConditionCandidateEvent, candidate: Candidate) -> dict:
         return {
@@ -489,9 +548,49 @@ def normalize_code(code: str) -> str:
     return value
 
 
+def is_valid_stock_code(code: str) -> bool:
+    value = normalize_code(code)
+    return len(value) == 6 and value.isdigit()
+
+
+def candidate_is_discovery_only(candidate: Candidate) -> bool:
+    metadata = _candidate_metadata(candidate)
+    profiles = {str(value) for value in dict(metadata.get("condition_profiles", {})).values()}
+    purposes = {str(value) for value in dict(metadata.get("condition_purposes", {})).values()}
+    entry_conditions = list(metadata.get("entry_condition_names") or [])
+    if entry_conditions:
+        return False
+    if bool(metadata.get("entry_excluded")):
+        return True
+    if StrategyProfile.THEME_DISCOVERY_PROFILE.value in profiles:
+        return True
+    if "theme_broad_candidate" in purposes:
+        return True
+    return candidate.strategy_profile == StrategyProfile.THEME_DISCOVERY_PROFILE
+
+
+def candidate_quality_status(candidate: Candidate, has_theme_mapping: Optional[bool] = None) -> str:
+    metadata = _candidate_metadata(candidate)
+    if not is_valid_stock_code(candidate.code):
+        return QUALITY_INVALID_CODE
+    if has_theme_mapping is False:
+        return QUALITY_UNMAPPED
+    if candidate_is_discovery_only(candidate):
+        return QUALITY_DISCOVERY_ONLY
+    sub_status = str(metadata.get("sub_status") or "")
+    insufficient = {str(reason) for reason in list(metadata.get("insufficient_reason") or [])}
+    if sub_status == "DATA_INSUFFICIENT" or "DATA_INSUFFICIENT" in insufficient:
+        return QUALITY_DATA_WAIT
+    return QUALITY_ACTIONABLE
+
+
 def add_unique(items: list, value) -> None:
     if value not in items:
         items.append(value)
+
+
+def _candidate_metadata(candidate: Candidate) -> dict:
+    return candidate.metadata if isinstance(candidate.metadata, dict) else {}
 
 
 def _is_theme_discovery_condition(strategy_profile: str, purpose: str) -> bool:

@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -133,8 +134,32 @@ def test_duplicate_condition_includes_merge_into_single_candidate(tmp_path):
     assert event_types(db, candidates[0].id) == [
         "candidate_detected",
         "candidate_merged",
-        "candidate_merged",
     ]
+    db.close()
+
+
+def test_invalid_condition_code_is_rejected_without_candidate_row(tmp_path):
+    collector, _client, db, _clock = make_collector(tmp_path)
+
+    result = collector.handle_condition_include(
+        ConditionCandidateEvent(
+            condition_name="코스닥테마주",
+            code="0007C0",
+            condition_index=1,
+            strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE.value,
+            purpose="kosdaq_pullback_candidate",
+        )
+    )
+
+    rows = db.conn.execute("SELECT * FROM candidate_events").fetchall()
+    assert result is None
+    assert db.list_candidates("2026-05-29") == []
+    assert rows[0]["candidate_id"] is None
+    assert rows[0]["event_type"] == "candidate_rejected"
+    payload = json.loads(rows[0]["payload_json"])
+    assert payload["raw_code"] == "0007C0"
+    assert payload["normalized_code"] == "0007C0"
+    assert "INVALID_CONDITION_CODE:코스닥테마주:0007C0" in collector.warnings
     db.close()
 
 

@@ -6,6 +6,7 @@ from PyQt5.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel
 from PyQt5.QtGui import QBrush, QColor, QFont
 
 from trading.models import LegStatus, WatchItem
+from trading.strategy.candidates import candidate_quality_status
 from trading.strategy.models import Candidate, CandidateState, TradeReview
 
 
@@ -16,6 +17,7 @@ class CandidateTableModel(QAbstractTableModel):
     StateRole = Qt.UserRole + 4
     RecoverRole = Qt.UserRole + 5
     ThemeMappedRole = Qt.UserRole + 6
+    QualityRole = Qt.UserRole + 7
 
     headers = [
         "Code",
@@ -29,6 +31,7 @@ class CandidateTableModel(QAbstractTableModel):
         "Last Seen",
         "Expires",
         "Reasons",
+        "Quality",
     ]
 
     _state_backgrounds = {
@@ -83,6 +86,8 @@ class CandidateTableModel(QAbstractTableModel):
             return bool(candidate.can_recover)
         if role == self.ThemeMappedRole:
             return candidate.code in self._mapped_codes
+        if role == self.QualityRole:
+            return self._quality_status(candidate)
         return None
 
     def set_candidates(
@@ -108,21 +113,21 @@ class CandidateTableModel(QAbstractTableModel):
                 return candidate
         return None
 
-    @classmethod
-    def _display_value(cls, candidate: Candidate, column: int) -> str:
-        metadata = cls._metadata(candidate)
+    def _display_value(self, candidate: Candidate, column: int) -> str:
+        metadata = self._metadata(candidate)
         values = [
             candidate.code,
             candidate.name,
             candidate.state.value,
             candidate.block_type.value,
             "Y" if candidate.can_recover else "",
-            cls._metadata_text(metadata, "best_theme_id"),
-            cls._metadata_text(metadata, "best_gate_result_key"),
-            cls._metadata_text(metadata, "sub_status"),
+            self._metadata_text(metadata, "best_theme_id"),
+            self._metadata_text(metadata, "best_gate_result_key"),
+            self._metadata_text(metadata, "sub_status"),
             candidate.last_seen_at,
             candidate.expires_at,
-            cls.block_reason_summary(metadata),
+            self.block_reason_summary(metadata),
+            self._quality_status(candidate),
         ]
         return str(values[column] or "") if 0 <= column < len(values) else ""
 
@@ -141,8 +146,12 @@ class CandidateTableModel(QAbstractTableModel):
             self._metadata_text(metadata, "best_gate_result_key"),
             self._metadata_text(metadata, "sub_status"),
             self.block_reason_summary(metadata),
+            self._quality_status(candidate),
         ]
         return " ".join(str(part or "") for part in parts).lower()
+
+    def _quality_status(self, candidate: Candidate) -> str:
+        return candidate_quality_status(candidate, candidate.code in self._mapped_codes)
 
     @staticmethod
     def _metadata(candidate: Candidate) -> dict:
@@ -169,6 +178,7 @@ class CandidateFilterProxyModel(QSortFilterProxyModel):
         self._state_filter = ""
         self._recover_only = False
         self._theme_filter = ""
+        self._quality_filter = ""
 
     def set_search_text(self, text: str) -> None:
         self._search_text = str(text or "").strip().lower()
@@ -186,11 +196,16 @@ class CandidateFilterProxyModel(QSortFilterProxyModel):
         self._theme_filter = "" if value in {"", "ALL", "전체"} else str(value)
         self.invalidateFilter()
 
+    def set_quality_filter(self, value: str) -> None:
+        self._quality_filter = "" if value in {"", "ALL", "전체"} else str(value)
+        self.invalidateFilter()
+
     def clear_filters(self) -> None:
         self._search_text = ""
         self._state_filter = ""
         self._recover_only = False
         self._theme_filter = ""
+        self._quality_filter = ""
         self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
@@ -209,6 +224,10 @@ class CandidateFilterProxyModel(QSortFilterProxyModel):
             if self._theme_filter == "mapped" and not mapped:
                 return False
             if self._theme_filter == "unmapped" and mapped:
+                return False
+        if self._quality_filter:
+            quality = model.data(source_index, CandidateTableModel.QualityRole)
+            if quality != self._quality_filter:
                 return False
         if self._search_text:
             text = model.data(source_index, CandidateTableModel.SearchTextRole) or ""

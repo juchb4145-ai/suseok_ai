@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 
 from kiwoom.client import ConditionCandidateEvent, ConditionInfo, Signal
-from trading.strategy.candidates import normalize_code
+from trading.strategy.candidates import is_valid_stock_code, normalize_code
 from trading.strategy.models import StrategyProfile
 
 if TYPE_CHECKING:
@@ -281,7 +281,10 @@ class KiwoomConditionAdapter:
         return None
 
     def _emit_candidate_event(self, event_type: str, condition: RegisteredCondition, code: str) -> bool:
+        raw_code = str(code or "").strip().upper()
         clean_code = normalize_code(code)
+        if not is_valid_stock_code(clean_code):
+            self._warn(f"INVALID_CONDITION_CODE:{condition.condition_name}:{raw_code}")
         now = _clean_time(self.clock())
         key = (now.date().isoformat(), condition.condition_name, condition.condition_index, clean_code, event_type)
         previous = self._recent_events.get(key)
@@ -308,7 +311,7 @@ class KiwoomConditionAdapter:
 
 
 def _parse_code_list(code_list: str) -> list[str]:
-    return [normalize_code(code) for code in str(code_list or "").split(";") if normalize_code(code)]
+    return [str(code or "").strip() for code in str(code_list or "").split(";") if normalize_code(code)]
 
 
 def _clean_time(value: datetime) -> datetime:

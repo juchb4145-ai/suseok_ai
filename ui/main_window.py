@@ -41,6 +41,7 @@ from storage.db import TradingDatabase
 from trading.engine import TradingEngine
 from trading.models import BuyLeg, LegStatus, WatchItem
 from trading.rules import tick_size
+from trading.strategy.candidates import candidate_quality_status
 from trading.strategy.config import StrategyRuntimeConfigRepository, config_from_dict, config_to_dict
 from trading.strategy.export import ReviewExporter
 from trading.strategy.models import CandidateState, FillPolicy
@@ -126,6 +127,7 @@ class MainWindow(QMainWindow):
         "Last Seen",
         "Expires",
         "Reasons",
+        "Quality",
     ]
 
     def __init__(
@@ -461,7 +463,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _candidate_table_default_widths() -> list[int]:
-        return [84, 130, 96, 96, 82, 160, 170, 180, 165, 165, 360]
+        return [84, 130, 96, 96, 82, 160, 170, 180, 165, 165, 360, 120]
 
     @staticmethod
     def _review_table_default_widths() -> list[int]:
@@ -984,6 +986,13 @@ class MainWindow(QMainWindow):
                 coverage=float(getattr(snapshot, "theme_mapping_coverage_pct", 0.0) or 0.0),
                 protected=getattr(snapshot, "protected_subscription_usage", "") or "-",
             ),
+            "quality: actionable={actionable} data_wait={data_wait} discovery={discovery} unmapped={unmapped} invalid={invalid}".format(
+                actionable=getattr(snapshot, "quality_actionable_count", 0),
+                data_wait=getattr(snapshot, "quality_data_wait_count", 0),
+                discovery=getattr(snapshot, "quality_discovery_only_count", 0),
+                unmapped=getattr(snapshot, "quality_unmapped_count", 0),
+                invalid=getattr(snapshot, "quality_invalid_code_count", 0),
+            ),
         ]
         startup_warnings = self._dedupe_text(getattr(self.strategy_runtime, "startup_warnings", []) if self.strategy_runtime is not None else [])
         if startup_warnings:
@@ -1001,10 +1010,6 @@ class MainWindow(QMainWindow):
             self.strategy_candidate_refresh_status_label.setText(message)
             self._strategy_warning(f"CANDIDATE_REFRESH_FAILED:{exc}")
             return
-        candidates.sort(key=lambda candidate: candidate.last_seen_at or "", reverse=True)
-        candidates.sort(key=lambda candidate: self._candidate_state_priority(candidate.state))
-        candidates = candidates[:200]
-        self._set_strategy_candidate_dashboard_counts(candidates)
         mapped_codes = set()
         theme_text_by_code = {}
         for candidate in candidates:
@@ -1015,6 +1020,13 @@ class MainWindow(QMainWindow):
             if mappings:
                 mapped_codes.add(candidate.code)
                 theme_text_by_code[candidate.code] = self._theme_mapping_search_text(mappings)
+        candidates.sort(key=lambda candidate: candidate.last_seen_at or "", reverse=True)
+        candidates.sort(key=lambda candidate: self._candidate_quality_priority(candidate, candidate.code in mapped_codes))
+        candidates.sort(key=lambda candidate: self._candidate_state_priority(candidate.state))
+        candidates = candidates[:200]
+        mapped_codes = {code for code in mapped_codes if any(candidate.code == code for candidate in candidates)}
+        theme_text_by_code = {code: text for code, text in theme_text_by_code.items() if code in mapped_codes}
+        self._set_strategy_candidate_dashboard_counts(candidates)
         self.strategy_candidate_model.set_candidates(candidates, mapped_codes, theme_text_by_code)
         self._set_last_refresh(self.strategy_candidate_last_refresh_label)
         message = f"후보 새로고침 완료: {len(candidates)}개"
@@ -1032,6 +1044,7 @@ class MainWindow(QMainWindow):
         self.strategy_candidate_proxy_model.set_state_filter(self.strategy_candidate_filter_bar.state_filter())
         self.strategy_candidate_proxy_model.set_recover_only(self.strategy_candidate_filter_bar.recover_only())
         self.strategy_candidate_proxy_model.set_theme_filter(self.strategy_candidate_filter_bar.theme_filter())
+        self.strategy_candidate_proxy_model.set_quality_filter(self.strategy_candidate_filter_bar.quality_filter())
         selected_candidate_id = self._selected_strategy_candidate_id()
         if selected_candidate_id is not None and self._select_strategy_candidate(selected_candidate_id):
             self._display_selected_candidate_detail()
@@ -1139,6 +1152,10 @@ class MainWindow(QMainWindow):
             f"strategy_profile: {self._value_text(candidate.strategy_profile) or '-'}",
             "condition_names: " + (", ".join(candidate.condition_names) if candidate.condition_names else "-"),
             "theme_ids: " + (", ".join(candidate.theme_ids) if candidate.theme_ids else "-"),
+            f"quality_status: {candidate_quality_status(candidate, self._candidate_has_theme_mapping(candidate))}",
+            f"quality_reason: {self._metadata_text(metadata, 'quality_reason') or '-'}",
+            f"enabled_theme_mapping: {'Y' if self._candidate_has_theme_mapping(candidate) else 'N'}",
+            f"entry_excluded_reason: {self._metadata_text(metadata, 'entry_excluded_reason') or '-'}",
             f"best_theme_id: {self._metadata_text(metadata, 'best_theme_id') or '-'}",
             f"best_gate_result_key: {self._metadata_text(metadata, 'best_gate_result_key') or '-'}",
             f"sub_status: {self._metadata_text(metadata, 'sub_status') or '-'}",
@@ -1447,6 +1464,16 @@ class MainWindow(QMainWindow):
             CandidateState.WATCHING: 2,
             CandidateState.DETECTED: 3,
         }.get(state, 9)
+
+    @staticmethod
+    def _candidate_quality_priority(candidate, has_theme_mapping: bool) -> int:
+        return {
+            "actionable": 0,
+            "data_wait": 1,
+            "discovery_only": 2,
+            "unmapped": 3,
+            "invalid_code": 4,
+        }.get(candidate_quality_status(candidate, has_theme_mapping), 9)
 
     @staticmethod
     def _safe_candidate_metadata(candidate) -> tuple[dict, str]:

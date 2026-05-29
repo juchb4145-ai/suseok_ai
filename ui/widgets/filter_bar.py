@@ -23,6 +23,13 @@ class CandidateFilterBar(QWidget):
         self.theme_combo.addItem("전체", "ALL")
         self.theme_combo.addItem("매핑 있음", "mapped")
         self.theme_combo.addItem("매핑 없음", "unmapped")
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItem("All Quality", "ALL")
+        self.quality_combo.addItem("Actionable", "actionable")
+        self.quality_combo.addItem("Discovery", "discovery_only")
+        self.quality_combo.addItem("Unmapped", "unmapped")
+        self.quality_combo.addItem("Invalid Code", "invalid_code")
+        self.quality_combo.addItem("Data Wait", "data_wait")
         self.clear_button = QPushButton("초기화")
 
         layout = QGridLayout(self)
@@ -38,13 +45,16 @@ class CandidateFilterBar(QWidget):
         layout.addWidget(self.recover_combo, 1, 3)
         layout.addWidget(QLabel("테마"), 1, 4)
         layout.addWidget(self.theme_combo, 1, 5)
+        layout.addWidget(QLabel("Quality"), 1, 6)
+        layout.addWidget(self.quality_combo, 1, 7)
         layout.setColumnStretch(1, 1)
-        layout.setColumnStretch(6, 1)
+        layout.setColumnStretch(8, 1)
 
         self.search_edit.textChanged.connect(self.search_changed.emit)
         self.state_combo.currentIndexChanged.connect(self.filters_changed.emit)
         self.recover_combo.currentIndexChanged.connect(self.filters_changed.emit)
         self.theme_combo.currentIndexChanged.connect(self.filters_changed.emit)
+        self.quality_combo.currentIndexChanged.connect(self.filters_changed.emit)
         self.clear_button.clicked.connect(self.clear_filters)
 
     def search_text(self) -> str:
@@ -59,11 +69,15 @@ class CandidateFilterBar(QWidget):
     def theme_filter(self) -> str:
         return str(self.theme_combo.currentData() or "ALL")
 
+    def quality_filter(self) -> str:
+        return str(self.quality_combo.currentData() or "ALL")
+
     def clear_filters(self) -> None:
         self.search_edit.clear()
         self.state_combo.setCurrentIndex(0)
         self.recover_combo.setCurrentIndex(0)
         self.theme_combo.setCurrentIndex(0)
+        self.quality_combo.setCurrentIndex(0)
         self.filters_changed.emit()
 
 
