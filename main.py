@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+from storage.db import TradingDatabase
+from trading.engine import TradingEngine
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Kiwoom pullback semi-auto trader")
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        help="Run without Kiwoom OpenAPI ActiveX for UI and logic testing.",
+    )
+    parser.add_argument(
+        "--db",
+        default=str(Path("data") / "trader.sqlite3"),
+        help="SQLite database path.",
+    )
+    return parser.parse_args()
+
+
+def configure_qt_paths() -> None:
+    try:
+        import PyQt5
+    except ImportError:
+        return
+
+    pyqt_dir = Path(PyQt5.__file__).resolve().parent
+    qt_root = pyqt_dir / "Qt5"
+    platforms_dir = qt_root / "plugins" / "platforms"
+    qt_bin = qt_root / "bin"
+
+    if platforms_dir.exists():
+        os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(platforms_dir))
+    if qt_bin.exists():
+        os.environ["PATH"] = f"{qt_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+
+
+def build_observe_runtime(client, db: TradingDatabase):
+    from trading.strategy.bridge import StrategyMarketDataBridge
+    from trading.strategy.candidates import CandidateCollector
+    from trading.strategy.candles import CandleBuilder
+    from trading.strategy.conditions import ConditionProfileRepository, KiwoomConditionAdapter
+    from trading.strategy.entry import EntryPlanBuilder
+    from trading.strategy.exit import ExitDecisionEngine, VirtualPositionService
+    from trading.strategy.holding import StaticHoldingProvider
+    from trading.strategy.indicators import IndicatorCalculator
+    from trading.strategy.intraday import IntradayStateTracker
+    from trading.strategy.market_data import MarketDataStore
+    from trading.strategy.market_index import IndexCodeMapper, MarketIndexStore
+    from trading.strategy.pipeline import GatePipeline
+    from trading.strategy.realtime import RealTimeSubscriptionManager
+    from trading.strategy.review import TradeReviewService
+    from trading.strategy.config import StrategyRuntimeConfigRepository
+    from trading.strategy.runtime import StrategyRuntime
+    from trading.strategy.themes import ThemeRepository
+    from trading.strategy.virtual_orders import VirtualOrderService
+
+    config_result = StrategyRuntimeConfigRepository(db).load()
+    config = config_result.config
+    market_data = MarketDataStore()
+    candle_builder = CandleBuilder()
+    market_index_store = MarketIndexStore()
+    bridge = StrategyMarketDataBridge(
+        market_data,
+        candle_builder,
+        market_index_store=market_index_store,
+        index_code_mapper=IndexCodeMapper(),
+    )
+    bridge.attach(client)
+
+    candidate_collector = CandidateCollector(db, client=client)
+    theme_repository = ThemeRepository(db)
+    indicator_calculator = IndicatorCalculator(market_data, candle_builder)
+    gate_pipeline = GatePipeline(
+        theme_repository,
+        market_data,
+        candle_builder,
+        indicator_calculator,
+        IntradayStateTracker(),
+        market_index_store,
+    )
+    condition_adapter = KiwoomConditionAdapter(client, ConditionProfileRepository(db))
+    candidate_collector.attach(condition_adapter)
+    runtime = StrategyRuntime(
+        db=db,
+        candidate_collector=candidate_collector,
+        subscription_manager=RealTimeSubscriptionManager(client, max_codes=config.realtime_subscription_limit),
+        candle_builder=candle_builder,
+        gate_pipeline=gate_pipeline,
+        entry_plan_builder=EntryPlanBuilder(),
+        virtual_order_service=VirtualOrderService(db=db),
+        virtual_position_service=VirtualPositionService(db=db),
+        exit_decision_engine=ExitDecisionEngine(),
+        trade_review_service=TradeReviewService(),
+        config=config,
+        condition_adapter=condition_adapter,
+        holding_provider=StaticHoldingProvider(set(config.holding_watch_codes)),
+    )
+    runtime.startup_warnings = list(config_result.warnings)
+    return runtime
+
+
+def main() -> int:
+    args = parse_args()
+    configure_qt_paths()
+
+    try:
+        from PyQt5.QtWidgets import QApplication
+    except ImportError as exc:
+        print("PyQt5 is required. Install dependencies in 32bit Python 3.9.13.", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    from kiwoom.client import KiwoomClient, MockKiwoomClient
+    from ui.main_window import MainWindow
+
+    app = QApplication(sys.argv)
+    db = TradingDatabase(args.db)
+    client = MockKiwoomClient() if args.mock else KiwoomClient()
+    engine = TradingEngine(client=client, db=db)
+    strategy_runtime_unavailable_reason = ""
+    try:
+        strategy_runtime = build_observe_runtime(client, db)
+    except Exception as exc:
+        strategy_runtime_unavailable_reason = f"OBSERVE runtime disabled: {exc}"
+        print(strategy_runtime_unavailable_reason, file=sys.stderr)
+        strategy_runtime = None
+    window = MainWindow(
+        engine=engine,
+        db=db,
+        mock_mode=args.mock,
+        strategy_runtime=strategy_runtime,
+        strategy_runtime_unavailable_reason=strategy_runtime_unavailable_reason,
+    )
+    app.aboutToQuit.connect(db.close)
+    window.resize(1320, 820)
+    window.show()
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

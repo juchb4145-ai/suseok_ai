@@ -1,0 +1,64 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+venv_*/
+venv_32/
+
+# Build and package outputs
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Local app data and databases
+data/*
+!data/.gitkeep
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+
+# Logs and runtime outputs
+logs/
+*.log
+*.tmp
+*.bak
+*.pid
+exports/
+reports/
+
+# Secrets and account-specific configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+
+# Local reference documents
+doc/*.docx
+doc/*.pdf
+
+# IDE/editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
