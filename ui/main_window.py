@@ -41,6 +41,8 @@ from trading.strategy.config import StrategyRuntimeConfigRepository, config_to_d
 from trading.strategy.export import ReviewExporter
 from trading.strategy.models import CandidateState, FillPolicy
 from trading.strategy.runtime import StrategyRuntime, StrategyRuntimeConfig, StrategyRuntimeSnapshot
+from ui.formatters import dedupe_text, format_metric, format_money, format_percent
+from ui.widgets import StatusBadge, SummaryCard
 
 
 class TickPriceSpinBox(QSpinBox):
@@ -130,6 +132,9 @@ class MainWindow(QMainWindow):
         self._strategy_ui_refresh_count = 0
         self._strategy_ui_refresh_skipped_count = 0
         self._strategy_auto_refresh_interval_sec = 15.0
+        self._strategy_dashboard_candidate_count = 0
+        self._strategy_dashboard_ready_count = 0
+        self._strategy_dashboard_blocked_count = 0
         self.strategy_timer = QTimer(self)
         self.strategy_timer.timeout.connect(self._run_strategy_cycle)
         self.setWindowTitle("키움 눌림목 반자동 매매")
@@ -141,27 +146,25 @@ class MainWindow(QMainWindow):
         central = QWidget()
         outer = QVBoxLayout(central)
 
-        status_bar = QHBoxLayout()
-        self.connection_label = QLabel("연결 안됨")
-        self.mode_label = QLabel("MOCK" if self.mock_mode else "실거래 가능")
-        self.mode_label.setStyleSheet(
-            "font-weight: 700; padding: 6px 10px; background: #ffefe0; color: #8a3d00;"
-            if not self.mock_mode
-            else "font-weight: 700; padding: 6px 10px; background: #e9f7ef; color: #17633a;"
-        )
+        dashboard = self._build_dashboard()
+        self.connection_label = StatusBadge("연결 안됨", "neutral")
+        self.mode_label = StatusBadge("MOCK" if self.mock_mode else "실거래 가능", "success" if self.mock_mode else "warning")
         self.account_combo = QComboBox()
         self.login_button = QPushButton("로그인")
         self.ordering_check = QCheckBox("주문 가능")
         self.realtime_button = QPushButton("실시간 등록")
-        status_bar.addWidget(QLabel("상태"))
-        status_bar.addWidget(self.connection_label)
-        status_bar.addWidget(self.mode_label)
-        status_bar.addWidget(QLabel("계좌"))
-        status_bar.addWidget(self.account_combo, 1)
-        status_bar.addWidget(self.login_button)
-        status_bar.addWidget(self.realtime_button)
-        status_bar.addWidget(self.ordering_check)
-        outer.addLayout(status_bar)
+
+        status_controls = QHBoxLayout()
+        status_controls.addWidget(QLabel("상태"))
+        status_controls.addWidget(self.connection_label)
+        status_controls.addWidget(self.mode_label)
+        status_controls.addWidget(QLabel("계좌"))
+        status_controls.addWidget(self.account_combo, 1)
+        status_controls.addWidget(self.login_button)
+        status_controls.addWidget(self.realtime_button)
+        status_controls.addWidget(self.ordering_check)
+        outer.addLayout(dashboard)
+        outer.addLayout(status_controls)
 
         splitter = QSplitter()
         splitter.addWidget(self._build_form())
@@ -177,6 +180,23 @@ class MainWindow(QMainWindow):
         mock_fill.triggered.connect(self._mock_fill)
         toolbar.addAction(mock_tick)
         toolbar.addAction(mock_fill)
+
+    def _build_dashboard(self) -> QGridLayout:
+        layout = QGridLayout()
+        self.dashboard_cards = {
+            "connection": SummaryCard("연결", "연결 안됨", "-", "neutral"),
+            "mode": SummaryCard("거래 모드", "MOCK" if self.mock_mode else "실거래 가능", "-", "success" if self.mock_mode else "warning"),
+            "ordering": SummaryCard("주문 가능", "OFF", "-", "neutral"),
+            "observe": SummaryCard("OBSERVE", "stopped", "-", "neutral"),
+            "candidates": SummaryCard("후보 수", "0", "-", "neutral"),
+            "ready_blocked": SummaryCard("READY/BLOCKED", "0 / 0", "-", "neutral"),
+            "theme": SummaryCard("테마 매핑률", "0.00%", "-", "neutral"),
+            "subscription": SummaryCard("구독 사용량", "-", "-", "neutral"),
+            "warnings": SummaryCard("경고", "0", "last: -", "neutral"),
+        }
+        for index, card in enumerate(self.dashboard_cards.values()):
+            layout.addWidget(card, index // 5, index % 5)
+        return layout
 
     def _build_form(self) -> QWidget:
         box = QWidget()
@@ -417,8 +437,10 @@ class MainWindow(QMainWindow):
         self.login_button.clicked.connect(self._login)
         self.engine.client.connected.connect(self._on_connection_changed)
         self.account_combo.currentTextChanged.connect(self.engine.set_account)
+        self.account_combo.currentTextChanged.connect(lambda _account: self._update_dashboard())
         self.realtime_button.clicked.connect(self.engine.register_realtime)
         self.ordering_check.toggled.connect(self.engine.set_ordering_enabled)
+        self.ordering_check.toggled.connect(lambda _enabled: self._update_dashboard())
         self.lookup_button.clicked.connect(self._lookup_name)
         self.save_button.clicked.connect(self._save_current)
         self.delete_button.clicked.connect(self._delete_current)
@@ -549,6 +571,7 @@ class MainWindow(QMainWindow):
             self.strategy_warning_view.setPlainText("\n".join(warnings[-20:]))
         else:
             self.strategy_warning_view.clear()
+        self._update_dashboard(snapshot)
 
     def _display_strategy_readiness(self, snapshot: StrategyRuntimeSnapshot) -> None:
         lines = [
@@ -578,6 +601,7 @@ class MainWindow(QMainWindow):
         candidates.sort(key=lambda candidate: candidate.last_seen_at or "", reverse=True)
         candidates.sort(key=lambda candidate: self._candidate_state_priority(candidate.state))
         candidates = candidates[:200]
+        self._set_strategy_candidate_dashboard_counts(candidates)
         self.strategy_candidate_table.setRowCount(len(candidates))
         for row, candidate in enumerate(candidates):
             metadata, metadata_warning = self._safe_candidate_metadata(candidate)
@@ -598,6 +622,90 @@ class MainWindow(QMainWindow):
             ]
             for column, value in enumerate(values):
                 self.strategy_candidate_table.setItem(row, column, QTableWidgetItem(str(value or "")))
+        self._update_dashboard()
+
+    def _set_strategy_candidate_dashboard_counts(self, candidates) -> None:
+        self._strategy_dashboard_candidate_count = len(candidates)
+        self._strategy_dashboard_ready_count = sum(1 for candidate in candidates if candidate.state == CandidateState.READY)
+        self._strategy_dashboard_blocked_count = sum(1 for candidate in candidates if candidate.state == CandidateState.BLOCKED)
+
+    def _update_dashboard(self, snapshot: Optional[StrategyRuntimeSnapshot] = None) -> None:
+        if not hasattr(self, "dashboard_cards"):
+            return
+        cards = self.dashboard_cards
+        current_snapshot = snapshot or self._strategy_last_snapshot
+        order_enabled = self.ordering_check.isChecked() if hasattr(self, "ordering_check") else False
+        live_order_enabled = not self.mock_mode and order_enabled
+
+        account = self.account_combo.currentText() if hasattr(self, "account_combo") else ""
+        connection_text = self.connection_label.text() if hasattr(self, "connection_label") else "연결 안됨"
+        connection_tone = "success" if "완료" in connection_text else "warning" if "요청" in connection_text else "neutral"
+        self.connection_label.set_status(connection_text, connection_tone)
+        cards["connection"].set_summary(connection_text, account or "계좌 -", connection_tone)
+
+        mode_text = "MOCK" if self.mock_mode else "실거래 가능"
+        mode_tone = "danger" if live_order_enabled else "success" if self.mock_mode else "warning"
+        self.mode_label.set_status(mode_text, mode_tone)
+        cards["mode"].set_summary(mode_text, "주문 ON" if order_enabled else "주문 OFF", mode_tone)
+
+        ordering_tone = "danger" if live_order_enabled else "warning" if order_enabled else "neutral"
+        cards["ordering"].set_summary("ON" if order_enabled else "OFF", "engine enabled" if order_enabled else "engine disabled", ordering_tone)
+
+        if self.strategy_runtime is None:
+            observe_text = "unavailable"
+            observe_detail = self.strategy_runtime_unavailable_reason or "-"
+            observe_tone = "unavailable"
+        else:
+            observe_running = self._strategy_running or bool(current_snapshot and current_snapshot.started)
+            observe_text = "running" if observe_running else "stopped"
+            observe_detail = getattr(current_snapshot, "cycle_at", "") if current_snapshot is not None else "-"
+            observe_tone = "success" if observe_running else "neutral"
+        cards["observe"].set_summary(observe_text, observe_detail or "-", observe_tone)
+
+        if current_snapshot is not None:
+            candidate_count = getattr(current_snapshot, "active_candidate_count", 0)
+        else:
+            candidate_count = self._strategy_dashboard_candidate_count
+        cards["candidates"].set_summary(str(candidate_count), "active candidates", "neutral")
+        cards["ready_blocked"].set_summary(
+            f"{self._strategy_dashboard_ready_count} / {self._strategy_dashboard_blocked_count}",
+            "READY / BLOCKED",
+            "warning" if self._strategy_dashboard_blocked_count else "neutral",
+        )
+
+        coverage = float(getattr(current_snapshot, "theme_mapping_coverage_pct", 0.0) or 0.0) if current_snapshot is not None else 0.0
+        theme_tone = "success" if coverage >= 80.0 else "warning" if coverage > 0.0 else "neutral"
+        cards["theme"].set_summary(format_percent(coverage), "mapped active", theme_tone)
+
+        subscription = ""
+        if current_snapshot is not None:
+            subscription = getattr(current_snapshot, "protected_subscription_usage", "") or str(getattr(current_snapshot, "subscription_active_count", 0) or "")
+        cards["subscription"].set_summary(subscription or "-", "protected subs", self._subscription_tone(subscription))
+
+        warnings = []
+        if hasattr(self, "strategy_warning_view"):
+            warnings = self._dedupe_text(self.strategy_warning_view.toPlainText().splitlines())
+        warning_tone = "danger" if warnings else "neutral"
+        cards["warnings"].set_summary(str(len(warnings)), f"last: {self._strategy_last_warning_at or '-'}", warning_tone)
+
+    @staticmethod
+    def _subscription_tone(value: str) -> str:
+        if "/" not in str(value or ""):
+            return "neutral"
+        used_text, limit_text = str(value).split("/", 1)
+        try:
+            used = int(used_text)
+            limit = int(limit_text)
+        except ValueError:
+            return "neutral"
+        if limit <= 0:
+            return "neutral"
+        ratio = used / limit
+        if ratio >= 0.95:
+            return "danger"
+        if ratio >= 0.8:
+            return "warning"
+        return "success"
 
     def _refresh_strategy_candidates_after_cycle(self, snapshot: StrategyRuntimeSnapshot) -> None:
         if self._should_auto_refresh_strategy_candidates(snapshot):
@@ -676,6 +784,7 @@ class MainWindow(QMainWindow):
             current = self._dedupe_text(current + [str(message)])
             self.strategy_warning_view.setPlainText("\n".join(current[-20:]))
         self._append_log(f"OBSERVE warning: {message}")
+        self._update_dashboard()
 
     def _update_strategy_buttons(self) -> None:
         has_runtime = self.strategy_runtime is not None
@@ -684,6 +793,7 @@ class MainWindow(QMainWindow):
         self.strategy_refresh_button.setEnabled(True)
         if not has_runtime and self.strategy_runtime_unavailable_reason:
             self.strategy_status_label.setText("OBSERVE unavailable")
+        self._update_dashboard()
 
     def load_strategy_settings(self) -> None:
         try:
@@ -781,20 +891,17 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _dedupe_text(values) -> list[str]:
-        result: list[str] = []
-        for value in values:
-            text = str(value or "")
-            if text and text not in result:
-                result.append(text)
-        return result
+        return dedupe_text(values)
 
     def _on_connection_changed(self, ok: bool, error_code: int, message: str) -> None:
         if not ok:
             self.connection_label.setText(f"로그인 실패({error_code})")
             self._append_log(f"로그인 실패: {message}")
+            self._update_dashboard()
             return
         self.connection_label.setText("로그인 완료")
         self._refresh_accounts()
+        self._update_dashboard()
 
     def _refresh_accounts(self) -> None:
         try:
@@ -804,6 +911,7 @@ class MainWindow(QMainWindow):
             self.engine.set_account("")
             self.connection_label.setText("로그인 완료 / 계좌 조회 실패")
             self._append_log(f"계좌 조회 실패: {exc}")
+            self._update_dashboard()
             return
 
         selected_account = self.account_combo.currentText()
@@ -816,6 +924,7 @@ class MainWindow(QMainWindow):
         self.engine.set_account(selected_account)
         if not accounts:
             self.connection_label.setText("로그인 완료 / 계좌 없음")
+        self._update_dashboard()
 
     def _login(self) -> None:
         self.connection_label.setText("로그인 요청 중")
@@ -1049,8 +1158,8 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _money(value: int) -> str:
-        return f"{int(value):,}" if value else ""
+        return format_money(value)
 
     @staticmethod
     def _metric(value) -> str:
-        return "" if value is None else f"{float(value):.2f}"
+        return format_metric(value)

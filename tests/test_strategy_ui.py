@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from time import perf_counter
 
 import pytest
@@ -21,6 +22,7 @@ from trading.strategy.config import StrategyRuntimeConfigRepository
 from trading.strategy.models import BlockType, Candidate, CandidateState, ReviewFinalStatus, TradeReview
 from trading.strategy.runtime import StrategyRuntimeConfig, StrategyRuntimeSnapshot
 from ui.main_window import MainWindow
+from ui.widgets import StatusBadge, SummaryCard
 
 
 NOW = datetime(2026, 5, 29, 9, 0)
@@ -127,6 +129,22 @@ def make_window(tmp_path, qapp, runtime=None):
     engine = TradingEngine(client=client, db=db)
     window = MainWindow(engine=engine, db=db, mock_mode=True, strategy_runtime=runtime)
     return window, db, client, engine
+
+
+def test_status_badge_and_summary_card_state_changes(qapp):
+    badge = StatusBadge("대기", "neutral")
+    card = SummaryCard("OBSERVE", "stopped", "-", "neutral")
+
+    badge.set_status("위험", "danger")
+    card.set_summary("running", "cycle now", "success")
+
+    assert badge.text() == "위험"
+    assert badge.tone == "danger"
+    assert card.value_label.text() == "running"
+    assert card.detail_label.text() == "cycle now"
+    assert card.tone == "success"
+    badge.close()
+    card.close()
 
 
 def test_login_refreshes_accounts_after_connection_event(tmp_path, qapp):
@@ -465,6 +483,60 @@ def test_strategy_settings_show_runtime_unavailable_reason(tmp_path, qapp):
     window.close()
 
 
+def test_observe_dashboard_card_marks_runtime_unavailable(tmp_path, qapp):
+    window, db, _, _ = make_window(tmp_path, qapp, None)
+    window.strategy_runtime_unavailable_reason = "runtime disabled for test"
+
+    window._update_strategy_buttons()
+
+    card = window.dashboard_cards["observe"]
+    assert card.tone == "unavailable"
+    assert card.value_label.text() == "unavailable"
+    assert "runtime disabled for test" in card.detail_label.text()
+    db.close()
+    window.close()
+
+
+def test_live_mode_ordering_enabled_marks_order_cards_danger(tmp_path, qapp):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    client = MockKiwoomClient()
+    engine = TradingEngine(client=client, db=db)
+    window = MainWindow(engine=engine, db=db, mock_mode=False, strategy_runtime=FakeRuntime())
+
+    window.ordering_check.setChecked(True)
+
+    assert window.dashboard_cards["mode"].tone == "danger"
+    assert window.dashboard_cards["ordering"].tone == "danger"
+    db.close()
+    window.close()
+
+
+def test_dashboard_update_is_read_only(tmp_path, qapp, monkeypatch):
+    runtime = FakeRuntime()
+    window, db, client, _ = make_window(tmp_path, qapp, runtime)
+
+    monkeypatch.setattr(runtime, "cycle", lambda: (_ for _ in ()).throw(AssertionError("dashboard update must not cycle")))
+    monkeypatch.setattr(db, "save_candidate", lambda candidate: (_ for _ in ()).throw(AssertionError("dashboard update must not save candidate")))
+    monkeypatch.setattr(db, "save_trade_review", lambda review: (_ for _ in ()).throw(AssertionError("dashboard update must not save review")))
+    monkeypatch.setattr(db, "save_virtual_order", lambda order: (_ for _ in ()).throw(AssertionError("dashboard update must not save virtual order")))
+    monkeypatch.setattr(client, "send_order", lambda request: (_ for _ in ()).throw(AssertionError("dashboard update must not call order path")))
+    monkeypatch.setattr(window, "refresh_strategy_candidates", lambda: (_ for _ in ()).throw(AssertionError("dashboard update must not refresh candidates")))
+
+    window._update_dashboard(
+        StrategyRuntimeSnapshot(
+            started=True,
+            active_candidate_count=2,
+            theme_mapping_coverage_pct=50.0,
+            protected_subscription_usage="4/85",
+        )
+    )
+
+    assert window.dashboard_cards["observe"].value_label.text() == "running"
+    assert window.dashboard_cards["candidates"].value_label.text() == "2"
+    db.close()
+    window.close()
+
+
 def test_review_export_ui_is_read_only_and_does_not_touch_runtime(tmp_path, qapp, monkeypatch):
     runtime = FakeRuntime()
     window, db, _, _ = make_window(tmp_path, qapp, runtime)
@@ -508,3 +580,11 @@ def test_strategy_ui_has_no_auto_or_real_order_controls(tmp_path, qapp):
     assert "no real orders" in window.strategy_safety_label.text()
     db.close()
     window.close()
+
+
+def test_ui_modules_do_not_reference_real_order_path():
+    forbidden = ["OrderRequest", "send_order", "KiwoomClient"]
+    for path in Path("ui").glob("**/*.py"):
+        source = path.read_text(encoding="utf-8")
+        for text in forbidden:
+            assert text not in source, f"{text} found in {path}"
