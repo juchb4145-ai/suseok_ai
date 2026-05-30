@@ -438,21 +438,7 @@ def run_real_gateway(args: argparse.Namespace) -> int:
     runtime.start_network_worker(interval_sec=args.poll_wait_sec or args.network_interval_sec or args.interval_sec)
 
     heartbeat_timer = QTimer()
-    heartbeat_timer.timeout.connect(
-        lambda: runtime.emit(
-            "heartbeat",
-            {
-                "kiwoom_logged_in": False,
-                "orderable": False,
-                "mode": "OBSERVE",
-                "account": "",
-                "last_error": runtime.last_error,
-                "reconnect_count": runtime.reconnect_count,
-                "rate_limit": runtime.rate_limiter.snapshot(),
-                **runtime.transport_snapshot(),
-            },
-        )
-    )
+    heartbeat_timer.timeout.connect(lambda: runtime.emit("heartbeat", _kiwoom_heartbeat_payload(client, runtime)))
     heartbeat_timer.start(int(max(1.0, args.interval_sec) * 1000))
 
     command_timer = QTimer()
@@ -464,6 +450,45 @@ def run_real_gateway(args: argparse.Namespace) -> int:
         return int(app.exec_())
     finally:
         runtime.stop()
+
+
+def _kiwoom_connect_state(client) -> bool:
+    ocx = getattr(client, "ocx", None)
+    dynamic_call = getattr(ocx, "dynamicCall", None)
+    if callable(dynamic_call):
+        try:
+            return int(dynamic_call("GetConnectState()") or 0) == 1
+        except Exception:
+            return False
+    try:
+        return bool(client.get_accounts())
+    except Exception:
+        return False
+
+
+def _kiwoom_accounts(client) -> list[str]:
+    try:
+        return list(client.get_accounts() or [])
+    except Exception:
+        return []
+
+
+def _kiwoom_heartbeat_payload(client, runtime: GatewayRuntime) -> dict[str, Any]:
+    logged_in = _kiwoom_connect_state(client)
+    accounts = _kiwoom_accounts(client) if logged_in else []
+    configured_account = os.environ.get("TRADING_ACCOUNT", "").strip()
+    account = configured_account or (accounts[0] if accounts else "")
+    return {
+        "kiwoom_logged_in": logged_in,
+        "orderable": bool(logged_in and account),
+        "mode": os.environ.get("TRADING_MODE", "OBSERVE"),
+        "account": account,
+        "accounts": accounts,
+        "last_error": runtime.last_error,
+        "reconnect_count": runtime.reconnect_count,
+        "rate_limit": runtime.rate_limiter.snapshot(),
+        **runtime.transport_snapshot(),
+    }
 
 
 def _wire_kiwoom_signals(client, runtime: GatewayRuntime) -> None:
