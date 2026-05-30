@@ -447,6 +447,55 @@ class TradingDatabase:
                 warning_count INTEGER NOT NULL DEFAULT 0,
                 error TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS runtime_order_intents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                intent_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT '',
+                dry_run INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                account TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                price INTEGER NOT NULL DEFAULT 0,
+                order_amount INTEGER NOT NULL DEFAULT 0,
+                order_type INTEGER NOT NULL DEFAULT 0,
+                hoga TEXT NOT NULL DEFAULT '',
+                tag TEXT NOT NULL DEFAULT '',
+                strategy_name TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                entry_plan_id INTEGER,
+                virtual_order_id INTEGER,
+                virtual_position_id INTEGER,
+                trade_review_id INTEGER,
+                leg_index INTEGER,
+                entry_type TEXT NOT NULL DEFAULT '',
+                gate_reason TEXT NOT NULL DEFAULT '',
+                gate_status TEXT NOT NULL DEFAULT '',
+                idempotency_key TEXT NOT NULL DEFAULT '',
+                dedupe_key TEXT NOT NULL DEFAULT '',
+                duplicate_of TEXT NOT NULL DEFAULT '',
+                safety_json TEXT NOT NULL DEFAULT '{}',
+                live_safety_json TEXT NOT NULL DEFAULT '{}',
+                request_json TEXT NOT NULL DEFAULT '{}',
+                response_json TEXT NOT NULL DEFAULT '{}',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS runtime_order_intent_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                intent_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                status_from TEXT NOT NULL DEFAULT '',
+                status_to TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS strategy_runtime_settings (
                 config_key TEXT PRIMARY KEY,
                 config_version INTEGER NOT NULL,
@@ -533,6 +582,24 @@ class TradingDatabase:
                 ON runtime_cycles(started_at);
             CREATE INDEX IF NOT EXISTS idx_runtime_cycles_status
                 ON runtime_cycles(status);
+            CREATE INDEX IF NOT EXISTS idx_runtime_order_intents_trade_date_created_at
+                ON runtime_order_intents(trade_date, created_at);
+            CREATE INDEX IF NOT EXISTS idx_runtime_order_intents_code_created_at
+                ON runtime_order_intents(code, created_at);
+            CREATE INDEX IF NOT EXISTS idx_runtime_order_intents_candidate_id
+                ON runtime_order_intents(candidate_id);
+            CREATE INDEX IF NOT EXISTS idx_runtime_order_intents_virtual_order_id
+                ON runtime_order_intents(virtual_order_id);
+            CREATE INDEX IF NOT EXISTS idx_runtime_order_intents_status
+                ON runtime_order_intents(status);
+            CREATE INDEX IF NOT EXISTS idx_runtime_order_intents_dedupe_key
+                ON runtime_order_intents(dedupe_key);
+            CREATE INDEX IF NOT EXISTS idx_runtime_order_intents_idempotency_key
+                ON runtime_order_intents(idempotency_key);
+            CREATE INDEX IF NOT EXISTS idx_runtime_order_intent_events_intent_id
+                ON runtime_order_intent_events(intent_id, id);
+            CREATE INDEX IF NOT EXISTS idx_runtime_order_intent_events_type_created_at
+                ON runtime_order_intent_events(event_type, created_at);
             """
         )
         self._ensure_column("indicator_snapshots", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
@@ -708,6 +775,276 @@ class TradingDatabase:
             {
                 **{key: row[key] for key in row.keys() if key != "snapshot_json"},
                 "snapshot": json.loads(row["snapshot_json"] or "{}"),
+            }
+            for row in rows
+        ]
+
+    def save_runtime_order_intent(self, record: dict) -> dict:
+        payload = dict(record or {})
+        now = payload.get("created_at") or payload.get("updated_at") or ""
+        payload.setdefault("created_at", now)
+        payload.setdefault("updated_at", payload["created_at"])
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO runtime_order_intents(
+                    intent_id, trade_date, source, mode, dry_run, status, reason,
+                    account, code, side, quantity, price, order_amount, order_type,
+                    hoga, tag, strategy_name, candidate_id, entry_plan_id,
+                    virtual_order_id, virtual_position_id, trade_review_id,
+                    leg_index, entry_type, gate_reason, gate_status,
+                    idempotency_key, dedupe_key, duplicate_of, safety_json,
+                    live_safety_json, request_json, response_json, metadata_json,
+                    created_at, updated_at
+                ) VALUES (
+                    :intent_id, :trade_date, :source, :mode, :dry_run, :status, :reason,
+                    :account, :code, :side, :quantity, :price, :order_amount, :order_type,
+                    :hoga, :tag, :strategy_name, :candidate_id, :entry_plan_id,
+                    :virtual_order_id, :virtual_position_id, :trade_review_id,
+                    :leg_index, :entry_type, :gate_reason, :gate_status,
+                    :idempotency_key, :dedupe_key, :duplicate_of, :safety_json,
+                    :live_safety_json, :request_json, :response_json, :metadata_json,
+                    :created_at, :updated_at
+                )
+                """,
+                _runtime_order_intent_params(payload),
+            )
+        return self.get_runtime_order_intent(str(payload.get("intent_id") or "")) or payload
+
+    def update_runtime_order_intent_response(self, intent_id: str, response: dict, *, status: str = "", reason: str = "") -> bool:
+        updated_at = str(response.get("updated_at") or response.get("created_at") or "")
+        if not updated_at:
+            from trading.broker.models import utc_timestamp
+
+            updated_at = utc_timestamp()
+        fields = ["response_json = ?", "updated_at = ?"]
+        params: list[object] = [json.dumps(response or {}, ensure_ascii=False, sort_keys=True, default=str), updated_at]
+        if status:
+            fields.append("status = ?")
+            params.append(status)
+        if reason:
+            fields.append("reason = ?")
+            params.append(reason)
+        params.append(intent_id)
+        with self.conn:
+            cursor = self.conn.execute(
+                f"UPDATE runtime_order_intents SET {', '.join(fields)} WHERE intent_id = ?",
+                tuple(params),
+            )
+        return cursor.rowcount > 0
+
+    def link_runtime_order_intent_review(self, intent_id: str, trade_review_id: int) -> bool:
+        from trading.broker.models import utc_timestamp
+
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                UPDATE runtime_order_intents
+                SET trade_review_id = ?, updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (int(trade_review_id), utc_timestamp(), intent_id),
+            )
+        return cursor.rowcount > 0
+
+    def get_runtime_order_intent(self, intent_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM runtime_order_intents WHERE intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+        return _row_to_runtime_order_intent(row) if row else None
+
+    def find_runtime_order_intent_by_dedupe(self, dedupe_key: str) -> Optional[dict]:
+        if not dedupe_key:
+            return None
+        row = self.conn.execute(
+            """
+            SELECT * FROM runtime_order_intents
+            WHERE dedupe_key = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (dedupe_key,),
+        ).fetchone()
+        return _row_to_runtime_order_intent(row) if row else None
+
+    def find_runtime_order_intent_by_idempotency(self, idempotency_key: str) -> Optional[dict]:
+        if not idempotency_key:
+            return None
+        row = self.conn.execute(
+            """
+            SELECT * FROM runtime_order_intents
+            WHERE idempotency_key = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (idempotency_key,),
+        ).fetchone()
+        return _row_to_runtime_order_intent(row) if row else None
+
+    def append_runtime_order_intent_event(
+        self,
+        intent_id: str,
+        event_type: str,
+        *,
+        status_from: str = "",
+        status_to: str = "",
+        message: str = "",
+        payload: Optional[dict] = None,
+        created_at: str = "",
+    ) -> None:
+        if not created_at:
+            from trading.broker.models import utc_timestamp
+
+            created_at = utc_timestamp()
+        self.conn.execute(
+            """
+            INSERT INTO runtime_order_intent_events(
+                intent_id, event_type, status_from, status_to, message, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                intent_id,
+                event_type,
+                status_from,
+                status_to,
+                message,
+                json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str),
+                created_at,
+            ),
+        )
+        self.conn.commit()
+
+    def list_runtime_order_intents(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        status: Optional[str] = None,
+        code: Optional[str] = None,
+        candidate_id: Optional[int] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(trade_date)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if code:
+            clauses.append("code = ?")
+            params.append(code)
+        if candidate_id is not None:
+            clauses.append("candidate_id = ?")
+            params.append(int(candidate_id))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM runtime_order_intents
+            {where}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_runtime_order_intent(row) for row in rows]
+
+    def runtime_order_intent_summary(self, *, trade_date: Optional[str] = None) -> dict:
+        params: list[object] = []
+        where = ""
+        if trade_date:
+            where = "WHERE trade_date = ?"
+            params.append(trade_date)
+        rows = self.conn.execute(
+            f"""
+            SELECT status, COUNT(*) AS count
+            FROM runtime_order_intents
+            {where}
+            GROUP BY status
+            """,
+            tuple(params),
+        ).fetchall()
+        status_counts = {str(row["status"]): int(row["count"] or 0) for row in rows}
+        duplicate_event_query = """
+            SELECT COUNT(*) AS count
+            FROM runtime_order_intent_events
+            WHERE event_type = 'duplicate_rejected'
+        """
+        duplicate_event_params: tuple = ()
+        if trade_date:
+            duplicate_event_query += " AND substr(created_at, 1, 10) = ?"
+            duplicate_event_params = (trade_date,)
+        duplicate_events = self.conn.execute(duplicate_event_query, duplicate_event_params).fetchone()
+        duplicate_count = int(duplicate_events["count"] or 0) if duplicate_events else 0
+        total = sum(status_counts.values())
+        live_rows = self.conn.execute(
+            f"""
+            SELECT live_safety_json, reason, code, strategy_name
+            FROM runtime_order_intents
+            {where}
+            """,
+            tuple(params),
+        ).fetchall()
+        live_would_pass = 0
+        reject_reasons: dict[str, int] = {}
+        by_code: dict[str, int] = {}
+        by_strategy_name: dict[str, int] = {}
+        for row in live_rows:
+            live_safety = _safe_json_loads(row["live_safety_json"], {})
+            if bool(live_safety.get("ok")):
+                live_would_pass += 1
+            else:
+                reason = str(live_safety.get("reason") or row["reason"] or "UNKNOWN")
+                reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
+            code = str(row["code"] or "")
+            if code:
+                by_code[code] = by_code.get(code, 0) + 1
+            strategy_name = str(row["strategy_name"] or "")
+            if strategy_name:
+                by_strategy_name[strategy_name] = by_strategy_name.get(strategy_name, 0) + 1
+        return {
+            "total": total,
+            "accepted": status_counts.get("DRY_RUN_ACCEPTED", 0) + status_counts.get("ACCEPTED", 0),
+            "rejected": status_counts.get("DRY_RUN_REJECTED", 0) + status_counts.get("REJECTED", 0),
+            "duplicate": status_counts.get("DUPLICATE", 0) + duplicate_count,
+            "observe_skipped": status_counts.get("OBSERVE_SKIPPED", 0),
+            "live_blocked": status_counts.get("LIVE_BLOCKED", 0),
+            "error": status_counts.get("ERROR", 0),
+            "live_would_pass": live_would_pass,
+            "live_would_reject": max(0, total - live_would_pass),
+            "top_reject_reasons": [
+                {"reason": reason, "count": count}
+                for reason, count in sorted(reject_reasons.items(), key=lambda item: item[1], reverse=True)[:10]
+            ],
+            "by_code": [
+                {"code": code, "count": count}
+                for code, count in sorted(by_code.items(), key=lambda item: item[1], reverse=True)[:20]
+            ],
+            "by_strategy_name": [
+                {"strategy_name": strategy_name, "count": count}
+                for strategy_name, count in sorted(by_strategy_name.items(), key=lambda item: item[1], reverse=True)[:20]
+            ],
+            "status_counts": status_counts,
+        }
+
+    def list_runtime_order_intent_events(self, intent_id: str, limit: int = 100) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT id, intent_id, event_type, status_from, status_to, message,
+                   payload_json, created_at
+            FROM runtime_order_intent_events
+            WHERE intent_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (intent_id, max(1, int(limit or 100))),
+        ).fetchall()
+        return [
+            {
+                **{key: row[key] for key in row.keys() if key != "payload_json"},
+                "payload": _safe_json_loads(row["payload_json"], {}),
             }
             for row in rows
         ]
@@ -1834,3 +2171,73 @@ class TradingDatabase:
 def _default_review_key(review: TradeReview) -> str:
     status = review.final_status.value if isinstance(review.final_status, ReviewFinalStatus) else str(review.final_status)
     return f"{review.gate_result_key}:{status}:{review.virtual_order_id or ''}:{review.virtual_position_id or ''}"
+
+
+def _runtime_order_intent_params(payload: dict) -> dict:
+    json_fields = {
+        "safety_json": payload.get("safety_json", payload.get("safety", {})),
+        "live_safety_json": payload.get("live_safety_json", payload.get("live_safety", {})),
+        "request_json": payload.get("request_json", payload.get("request", {})),
+        "response_json": payload.get("response_json", payload.get("response", {})),
+        "metadata_json": payload.get("metadata_json", payload.get("metadata", {})),
+    }
+    normalized = {
+        "intent_id": str(payload.get("intent_id") or ""),
+        "trade_date": str(payload.get("trade_date") or ""),
+        "source": str(payload.get("source") or ""),
+        "mode": str(payload.get("mode") or ""),
+        "dry_run": int(bool(payload.get("dry_run", True))),
+        "status": str(payload.get("status") or ""),
+        "reason": str(payload.get("reason") or ""),
+        "account": str(payload.get("account") or ""),
+        "code": str(payload.get("code") or ""),
+        "side": str(payload.get("side") or ""),
+        "quantity": int(payload.get("quantity") or 0),
+        "price": int(payload.get("price") or 0),
+        "order_amount": int(payload.get("order_amount") or 0),
+        "order_type": int(payload.get("order_type") or 0),
+        "hoga": str(payload.get("hoga") or ""),
+        "tag": str(payload.get("tag") or ""),
+        "strategy_name": str(payload.get("strategy_name") or ""),
+        "candidate_id": payload.get("candidate_id"),
+        "entry_plan_id": payload.get("entry_plan_id"),
+        "virtual_order_id": payload.get("virtual_order_id"),
+        "virtual_position_id": payload.get("virtual_position_id"),
+        "trade_review_id": payload.get("trade_review_id"),
+        "leg_index": payload.get("leg_index"),
+        "entry_type": str(payload.get("entry_type") or ""),
+        "gate_reason": str(payload.get("gate_reason") or ""),
+        "gate_status": str(payload.get("gate_status") or ""),
+        "idempotency_key": str(payload.get("idempotency_key") or ""),
+        "dedupe_key": str(payload.get("dedupe_key") or ""),
+        "duplicate_of": str(payload.get("duplicate_of") or ""),
+        "created_at": str(payload.get("created_at") or ""),
+        "updated_at": str(payload.get("updated_at") or payload.get("created_at") or ""),
+    }
+    for key, value in json_fields.items():
+        if isinstance(value, str):
+            normalized[key] = value or "{}"
+        else:
+            normalized[key] = json.dumps(value or {}, ensure_ascii=False, sort_keys=True, default=str)
+    return normalized
+
+
+def _row_to_runtime_order_intent(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    for key in ("dry_run",):
+        data[key] = bool(data.get(key))
+    for key in ("safety_json", "live_safety_json", "request_json", "response_json", "metadata_json"):
+        public_key = key[:-5]
+        data[public_key] = _safe_json_loads(data.get(key), {})
+    data["live_would_pass"] = bool(data.get("live_safety", {}).get("ok"))
+    data["live_reject_reason"] = "" if data["live_would_pass"] else str(data.get("live_safety", {}).get("reason") or "")
+    return data
+
+
+def _safe_json_loads(value: object, default):
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value or ""))
+    except Exception:
+        return default

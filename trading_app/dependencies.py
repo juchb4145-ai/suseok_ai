@@ -38,6 +38,14 @@ class CoreSettings:
     runtime_require_gateway_heartbeat: bool = True
     runtime_require_kiwoom_login: bool = True
     runtime_require_orderable_for_order: bool = True
+    runtime_dry_run_account: str = ""
+    runtime_dry_run_position_amount: int = 1_000_000
+    runtime_dry_run_min_quantity: int = 1
+    runtime_dry_run_hoga: str = "00"
+    runtime_dry_run_order_type_buy: int = 1
+    runtime_dry_run_order_type_sell: int = 2
+    runtime_dry_run_require_account: bool = False
+    runtime_dry_run_respect_weight_pct: bool = True
 
     @property
     def live_order_enabled(self) -> bool:
@@ -76,6 +84,14 @@ def get_settings() -> CoreSettings:
         runtime_require_gateway_heartbeat=_bool_env("TRADING_RUNTIME_REQUIRE_GATEWAY_HEARTBEAT", True),
         runtime_require_kiwoom_login=_bool_env("TRADING_RUNTIME_REQUIRE_KIWOOM_LOGIN", True),
         runtime_require_orderable_for_order=_bool_env("TRADING_RUNTIME_REQUIRE_ORDERABLE_FOR_ORDER", True),
+        runtime_dry_run_account=os.environ.get("TRADING_RUNTIME_DRY_RUN_ACCOUNT", ""),
+        runtime_dry_run_position_amount=_int_env("TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT", 1_000_000),
+        runtime_dry_run_min_quantity=_int_env("TRADING_RUNTIME_DRY_RUN_MIN_QUANTITY", 1),
+        runtime_dry_run_hoga=os.environ.get("TRADING_RUNTIME_DRY_RUN_HOGA", "00"),
+        runtime_dry_run_order_type_buy=_int_env("TRADING_RUNTIME_DRY_RUN_ORDER_TYPE_BUY", 1),
+        runtime_dry_run_order_type_sell=_int_env("TRADING_RUNTIME_DRY_RUN_ORDER_TYPE_SELL", 2),
+        runtime_dry_run_require_account=_bool_env("TRADING_RUNTIME_DRY_RUN_REQUIRE_ACCOUNT", False),
+        runtime_dry_run_respect_weight_pct=_bool_env("TRADING_RUNTIME_DRY_RUN_RESPECT_WEIGHT_PCT", True),
     )
 
 

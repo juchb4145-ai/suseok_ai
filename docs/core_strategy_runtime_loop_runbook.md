@@ -51,10 +51,21 @@ If auto-start fails, the API server stays alive and exposes the failure through 
 ## Order Policy
 
 - `OBSERVE`: virtual order/review only. No `/api/orders/enqueue` call and no `send_order` GatewayCommand.
-- `DRY_RUN`: accepted as runtime policy only when `TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS=1`, but PR-4 does not wire automatic dry-run order enqueue yet.
+- `DRY_RUN`: when `TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS=1`, entry virtual order submissions create durable dry-run order intents through `OrderEnqueueService`. They do not create Gateway `send_order` commands.
 - `LIVE`: runtime auto live order is blocked. `TRADING_RUNTIME_ALLOW_LIVE_ORDERS=1` records a warning; live enablement is a separate safety PR.
 
 `StrategyRuntimeConfig.order_mode` remains forced to `OBSERVE` to avoid mixing legacy order modes with Core `TRADING_MODE`.
+
+## Runtime Order Sink
+
+PR-5 adds a runtime order sink:
+
+- `NoopRuntimeOrderSink` for OBSERVE and disabled DRY_RUN order enqueue.
+- `DryRunRuntimeOrderSink` for `TRADING_RUNTIME_MODE=DRY_RUN` and `TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS=1`.
+
+The sink is called after a valid entry plan has a submitted or recovered virtual order. It records `runtime_order_intents` with decision safety and live safety. The sink uses the same `OrderEnqueueService` as `POST /api/orders/enqueue`, but it calls the service directly in-process rather than calling the HTTP endpoint.
+
+LIVE runtime orders remain disabled in PR-5.
 
 ## Gateway Event Flow
 
@@ -110,9 +121,11 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/runtime/cycle -Headers 
 Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/runtime/stop -Headers $headers
 Invoke-RestMethod http://127.0.0.1:8000/api/runtime/snapshot
 Invoke-RestMethod http://127.0.0.1:8000/api/runtime/readiness
+Invoke-RestMethod http://127.0.0.1:8000/api/runtime/orders/dry-run/summary
+Invoke-RestMethod http://127.0.0.1:8000/api/runtime/orders/dry-run?limit=20
 ```
 
-Dashboard `/` shows runtime enabled/running state, last cycle, counts, warnings, and errors.
+Dashboard `/` shows runtime enabled/running state, last cycle, counts, warnings, errors, and DRY_RUN order intent summary.
 
 ## Persistence
 
@@ -120,6 +133,8 @@ Runtime events and cycle summaries are stored in:
 
 - `runtime_events`
 - `runtime_cycles`
+- `runtime_order_intents`
+- `runtime_order_intent_events`
 - existing `logs`
 
 These are intentionally lightweight summaries, not raw tick storage.

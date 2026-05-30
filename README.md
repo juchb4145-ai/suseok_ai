@@ -33,11 +33,19 @@ Common Core environment variables:
 - `TRADING_COMMAND_RECOVERY_EXPIRE_STALE_DISPATCHED`: mark stale dispatched commands expired on recovery when `1`.
 - `TRADING_RUNTIME_ENABLED`: enable Core StrategyRuntime supervisor, default `0`.
 - `TRADING_RUNTIME_AUTO_START`: start runtime on API startup, default `0`.
-- `TRADING_RUNTIME_MODE`: runtime policy, `OBSERVE` or `DRY_RUN`; runtime internals stay OBSERVE in PR-4.
+- `TRADING_RUNTIME_MODE`: runtime policy, `OBSERVE` or `DRY_RUN`; runtime internals stay OBSERVE.
 - `TRADING_RUNTIME_EVALUATION_INTERVAL_SEC`: runtime loop interval.
 - `TRADING_RUNTIME_CYCLE_TIMEOUT_SEC`: cycle timeout.
-- `TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS`: reserved for dry-run order adapter, default `0`.
-- `TRADING_RUNTIME_ALLOW_LIVE_ORDERS`: live auto order flag, default `0`; PR-4 still blocks runtime live orders.
+- `TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS`: enables runtime DRY_RUN order intent records when runtime mode is `DRY_RUN`, default `0`.
+- `TRADING_RUNTIME_ALLOW_LIVE_ORDERS`: live auto order flag, default `0`; PR-5 still blocks runtime live orders.
+- `TRADING_RUNTIME_DRY_RUN_ACCOUNT`: optional account label for runtime dry-run intents.
+- `TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT`: base notional amount for runtime dry-run quantity, default `1000000`.
+- `TRADING_RUNTIME_DRY_RUN_MIN_QUANTITY`: minimum runtime dry-run quantity, default `1`.
+- `TRADING_RUNTIME_DRY_RUN_HOGA`: runtime dry-run hoga code, default `00`.
+- `TRADING_RUNTIME_DRY_RUN_ORDER_TYPE_BUY`: runtime dry-run buy order type, default `1`.
+- `TRADING_RUNTIME_DRY_RUN_ORDER_TYPE_SELL`: runtime dry-run sell order type, default `2`.
+- `TRADING_RUNTIME_DRY_RUN_REQUIRE_ACCOUNT`: require explicit account for runtime dry-run intents, default `0`.
+- `TRADING_RUNTIME_DRY_RUN_RESPECT_WEIGHT_PCT`: apply split-leg weight to dry-run quantity, default `1`.
 
 Dashboard:
 
@@ -72,6 +80,9 @@ Core APIs:
 - `POST /api/runtime/cycle`
 - `GET /api/runtime/snapshot`
 - `GET /api/runtime/readiness`
+- `GET /api/runtime/orders/dry-run`
+- `GET /api/runtime/orders/dry-run/summary`
+- `GET /api/runtime/orders/dry-run/{intent_id}`
 
 Order enqueue example:
 
@@ -109,7 +120,15 @@ $env:TRADING_RUNTIME_ENABLED = "1"
 $env:TRADING_RUNTIME_AUTO_START = "1"
 $env:TRADING_RUNTIME_MODE = "OBSERVE"
 python -m uvicorn trading_app.api:app --host 127.0.0.1 --port 8000
+
+$env:TRADING_RUNTIME_ENABLED = "1"
+$env:TRADING_RUNTIME_MODE = "DRY_RUN"
+$env:TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS = "1"
+$env:TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT = "1000000"
+python -m uvicorn trading_app.api:app --host 127.0.0.1 --port 8000
 ```
+
+The DRY_RUN runtime setting records order intents only. It does not create Gateway `send_order` commands and does not send Kiwoom orders.
 
 ## 32bit Kiwoom Gateway
 
@@ -159,7 +178,7 @@ py -3.9-32 apps/legacy_pyqt_app.py --mock
 - Gateway polling does not mean success. Only `command_ack status=ACKED` marks a command successful.
 - Duplicate `idempotency_key` or deterministic order dedupe keys are rejected while active or retained in SQLite.
 - Core restart restores valid `QUEUED` commands only. `DISPATCHED` order commands are not automatically resent.
-- StrategyRuntime auto LIVE orders are not enabled in PR-4. Runtime uses GatewayCommand for realtime/condition requests and virtual order/review for strategy flow.
+- StrategyRuntime auto LIVE orders are not enabled in PR-5. Runtime uses GatewayCommand for realtime/condition requests, virtual order/review for strategy flow, and optional DRY_RUN order intent records for analysis.
 
 More detail:
 
@@ -168,3 +187,4 @@ More detail:
 - [Gateway Command Queue Runbook](docs/gateway_command_queue_runbook.md)
 - [Gateway Command Persistence Runbook](docs/gateway_command_persistence_runbook.md)
 - [Core StrategyRuntime Loop Runbook](docs/core_strategy_runtime_loop_runbook.md)
+- [Runtime DRY_RUN Order Enqueue Runbook](docs/runtime_dry_run_order_enqueue_runbook.md)

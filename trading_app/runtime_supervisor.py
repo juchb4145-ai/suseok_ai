@@ -57,7 +57,7 @@ class RuntimeSupervisor:
         if self.mode != "OBSERVE":
             self._warn(f"RUNTIME_ORDER_MODE_FORCED_OBSERVE:{self.mode}")
         if self.settings.runtime_allow_live_orders:
-            self._warn("RUNTIME_LIVE_ORDERS_DISABLED_IN_PR4")
+            self._warn("RUNTIME_LIVE_ORDERS_DISABLED_IN_PR5")
 
     def build_runtime(self) -> StrategyRuntime:
         db = TradingDatabase(str(self.settings.db_path))
@@ -209,6 +209,7 @@ class RuntimeSupervisor:
     def status(self) -> dict[str, Any]:
         gateway = self.gateway_state.snapshot().to_dict()
         command_summary = self.gateway_state.command_snapshot()
+        dry_run_order_summary = _dry_run_order_summary(self.settings.db_path)
         with self._state_lock:
             snapshot = dict(self.last_snapshot or {})
             warnings = list(self.warnings[-50:])
@@ -238,6 +239,7 @@ class RuntimeSupervisor:
                     "orderable": gateway.get("orderable"),
                 },
                 "commands": command_summary,
+                "dry_run_orders": dry_run_order_summary,
                 "db_path": str(self.settings.db_path),
             }
 
@@ -375,6 +377,17 @@ def _jsonable(value: Any) -> Any:
     if hasattr(value, "value"):
         return value.value
     return value
+
+
+def _dry_run_order_summary(db_path) -> dict[str, Any]:
+    try:
+        db = TradingDatabase(str(db_path))
+        try:
+            return db.runtime_order_intent_summary()
+        finally:
+            db.close()
+    except Exception:
+        return {}
 
 
 def _utc_now() -> str:

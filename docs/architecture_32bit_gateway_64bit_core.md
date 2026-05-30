@@ -61,7 +61,7 @@ The Core depends on `trading.broker.*` protocol models, not on `kiwoom.client`.
 - Gateway `price_tick` events update Core market data and candles.
 - Realtime register/remove requests are enqueued as `GatewayCommand`.
 - Condition load/send/stop requests are enqueued as `GatewayCommand`.
-- Runtime order behavior stays OBSERVE/virtual only in PR-4.
+- Runtime order behavior is OBSERVE-first. PR-5 can record DRY_RUN order intents through `OrderEnqueueService`, but it still never emits Gateway `send_order` commands from the runtime.
 
 The 32bit Gateway remains Kiwoom communication only.
 
@@ -184,7 +184,8 @@ WebSocket command transport is still deferred because PR-2/PR-3 priority is corr
 - Gateway status exposes heartbeat age, stale state, Kiwoom login state, and orderable flag.
 - `/api/orders/enqueue` is the only Core API path that can create a real `send_order` command.
 - `OBSERVE` never queues real order commands. `DRY_RUN` accepts only dry-run records. `LIVE` requires `TRADING_MODE=LIVE` and `TRADING_ALLOW_LIVE=1`.
-- Runtime auto orders are disabled in PR-4. StrategyRuntime remains OBSERVE even if Core trading mode is LIVE.
+- Runtime LIVE auto orders are disabled in PR-5. StrategyRuntime remains OBSERVE internally even if Core trading mode is LIVE.
+- Runtime DRY_RUN intent recording is enabled only with `TRADING_RUNTIME_MODE=DRY_RUN` and `TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS=1`; these records go to `runtime_order_intents`, not the Gateway command queue.
 
 ## Persistence and Performance
 
@@ -238,9 +239,17 @@ PR-4:
 - Realtime/condition requests through GatewayCommand queue.
 - Runtime dashboard status.
 
+PR-5:
+
+- `OrderEnqueueService` shared by API and runtime.
+- Runtime DRY_RUN order intent sink.
+- Persistent `runtime_order_intents` and event timeline.
+- DRY_RUN decision safety vs LIVE safety recording.
+- No runtime Gateway `send_order` creation.
+
 Next:
 
-- Runtime DRY_RUN order enqueue adapter.
+- Runtime DRY_RUN exit/sell intent adapter.
 - Real TR response row extraction and request correlation.
 - Gateway WebSocket channel when long-poll latency is measured as a bottleneck.
 - Dashboard screen hardening and richer order/position views.

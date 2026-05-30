@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from storage.db import TradingDatabase
 from trading.broker.gateway_state import GatewayStateStore
@@ -33,6 +33,8 @@ from trading_app.runtime_adapters import (
     GatewayCommandRealtimeClient,
     GatewayEventMarketDataBridge,
 )
+from trading_app.order_enqueue_service import OrderEnqueueService
+from trading_app.runtime_order_sink import DryRunRuntimeOrderSink, NoopRuntimeOrderSink
 
 
 @dataclass
@@ -40,6 +42,7 @@ class CoreRuntimeBundle:
     runtime: StrategyRuntime
     market_data_bridge: GatewayEventMarketDataBridge
     db: TradingDatabase
+    order_sink: Any = None
 
 
 def build_core_strategy_runtime(
@@ -88,6 +91,7 @@ def build_core_strategy_runtime(
         hybrid_validation_repository=HybridValidationRepository(db),
     )
     realtime_client = GatewayCommandRealtimeClient(gateway_state, warning_sink=warning_sink)
+    order_sink = _build_order_sink(settings, gateway_state, warning_sink)
     runtime = StrategyRuntime(
         db=db,
         candidate_collector=candidate_collector,
@@ -102,6 +106,7 @@ def build_core_strategy_runtime(
         config=config,
         condition_adapter=condition_adapter,
         holding_provider=StaticHoldingProvider(set(config.holding_watch_codes)),
+        order_sink=order_sink,
     )
     readiness_report = build_readiness_report(db, subscription_manager=runtime.subscription_manager)
     runtime.readiness_report = readiness_report
@@ -111,4 +116,27 @@ def build_core_strategy_runtime(
         + condition_seed_result.warnings
         + readiness_report.warnings
     )
-    return CoreRuntimeBundle(runtime=runtime, market_data_bridge=market_data_bridge, db=db)
+    return CoreRuntimeBundle(runtime=runtime, market_data_bridge=market_data_bridge, db=db, order_sink=order_sink)
+
+
+def _build_order_sink(
+    settings: CoreSettings,
+    gateway_state: GatewayStateStore,
+    warning_sink: Callable[[str], None] | None,
+):
+    if settings.runtime_allow_live_orders and warning_sink is not None:
+        warning_sink("RUNTIME_LIVE_ORDERS_DISABLED_IN_PR5")
+    if settings.runtime_mode == "DRY_RUN" and settings.runtime_allow_dry_run_orders:
+        service = OrderEnqueueService(
+            settings=settings,
+            gateway_state=gateway_state,
+            db_path=settings.db_path,
+        )
+        return DryRunRuntimeOrderSink(settings=settings, service=service, warning_sink=warning_sink)
+    if settings.runtime_mode == "DRY_RUN" and warning_sink is not None:
+        warning_sink("DRY_RUN_ORDER_ENQUEUE_DISABLED")
+    return NoopRuntimeOrderSink(
+        reason="DRY_RUN_ORDER_ENQUEUE_DISABLED"
+        if settings.runtime_mode == "DRY_RUN"
+        else "OBSERVE_VIRTUAL_ONLY"
+    )

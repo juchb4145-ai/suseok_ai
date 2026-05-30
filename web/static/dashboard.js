@@ -47,6 +47,7 @@ function render(snapshot) {
   const gateway = snapshot.gateway || {};
   const commands = snapshot.commands || {};
   const runtime = snapshot.runtime || {};
+  const dryRunOrders = snapshot.dry_run_orders || runtime.dry_run_orders || { summary: {}, items: [] };
   const candidates = snapshot.candidates || { summary: {}, items: [] };
   const themes = snapshot.themes || { summary: {}, items: [] };
   const orders = snapshot.orders || { summary: {}, order_results: [], executions: [] };
@@ -87,6 +88,38 @@ function render(snapshot) {
   if (runtimeNode) {
     runtimeNode.innerHTML = runtimeWarnings.length ? runtimeWarnings.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">No runtime warnings</span>';
   }
+
+  const drySummary = dryRunOrders.summary || {};
+  text("dryrun-order-policy", runtime.dry_run_order_sink_enabled ? runtime.dry_run_order_policy || "enabled" : runtime.dry_run_order_policy || "disabled");
+  text("dryrun-order-total", drySummary.total ?? runtime.dry_run_order_intent_count ?? 0);
+  text("dryrun-order-accepted", drySummary.accepted ?? runtime.dry_run_order_accepted_count ?? 0);
+  text("dryrun-order-rejected", drySummary.rejected ?? runtime.dry_run_order_rejected_count ?? 0);
+  text("dryrun-order-duplicate", drySummary.duplicate ?? runtime.dry_run_order_duplicate_count ?? 0);
+  text("dryrun-order-live-pass", drySummary.live_would_pass ?? runtime.dry_run_order_live_would_pass_count ?? 0);
+  text("dryrun-order-live-reject", drySummary.live_would_reject ?? runtime.dry_run_order_live_would_reject_count ?? 0);
+  const rejectNode = document.getElementById("dryrun-reject-reasons");
+  if (rejectNode) {
+    const reasons = (drySummary.top_reject_reasons || []).map((item) => `${item.reason}: ${item.count}`);
+    rejectNode.innerHTML = reasons.length ? reasons.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">No reject reasons</span>';
+  }
+  renderRows(
+    "dryrun-order-rows",
+    (dryRunOrders.items || []).slice(0, 20).map((item) =>
+      rowHtml([
+        item.created_at || "-",
+        item.code || "-",
+        item.side || "-",
+        item.quantity || 0,
+        item.price || 0,
+        item.status || "-",
+        item.reason || "-",
+        item.live_would_pass ? "PASS" : item.live_reject_reason || "REJECT",
+        item.candidate_id || "-",
+        item.virtual_order_id || "-",
+      ]),
+    ),
+    10,
+  );
 
   text("command-queued", commands.queued_count || 0);
   text("command-dispatched", commands.dispatched_count || 0);

@@ -133,6 +133,16 @@ class StrategyRuntimeSnapshot:
     review_upsert_count: int = 0
     ui_refresh_count: int = 0
     ui_refresh_skipped_count: int = 0
+    dry_run_order_intent_count: int = 0
+    dry_run_order_accepted_count: int = 0
+    dry_run_order_rejected_count: int = 0
+    dry_run_order_duplicate_count: int = 0
+    dry_run_order_live_would_pass_count: int = 0
+    dry_run_order_live_would_reject_count: int = 0
+    last_dry_run_order_intent_at: str = ""
+    last_dry_run_order_reject_reason: str = ""
+    dry_run_order_policy: str = ""
+    dry_run_order_sink_enabled: bool = False
     subscription_active_count: int = 0
     virtual_order_status_change_count: int = 0
     condition_profiles_count: int = 0
@@ -191,6 +201,7 @@ class StrategyRuntime:
         clock=None,
         condition_adapter=None,
         holding_provider: Optional[HoldingProvider] = None,
+        order_sink=None,
     ) -> None:
         self.db = db
         self.candidate_collector = candidate_collector
@@ -206,6 +217,7 @@ class StrategyRuntime:
         self.clock = clock or datetime.now
         self.condition_adapter = condition_adapter
         self.holding_provider = holding_provider or StaticHoldingProvider()
+        self.order_sink = order_sink
         self.started = False
         self._warnings: list[str] = []
         self.startup_warnings: list[str] = []
@@ -405,6 +417,7 @@ class StrategyRuntime:
         )
         if existing_order is not None:
             context.virtual_order = existing_order
+            self._emit_entry_order_intent(candidate, result, plan, existing_order, context, snapshot, now)
             return
         submitted = self.virtual_order_service.submit_virtual_order(plan, now)
         if submitted.submitted and submitted.order is not None:
@@ -416,6 +429,7 @@ class StrategyRuntime:
         if submitted.submitted and context.virtual_order is not None:
             snapshot.virtual_order_count += 1
             context.review_needed = True
+            self._emit_entry_order_intent(candidate, result, plan, context.virtual_order, context, snapshot, now)
 
     def _start_condition_adapter(self, snapshot: StrategyRuntimeSnapshot, now: datetime) -> None:
         if not self.config.condition_profiles_enabled or self.condition_adapter is None:
@@ -986,9 +1000,19 @@ class StrategyRuntime:
                     self.candle_builder,
                     now,
                 )
+                if context.dry_run_order_result:
+                    _attach_dry_run_order_review_details(review, context.dry_run_order_result)
                 if not self._review_changed(review):
                     continue
-                self.db.save_trade_review(review)
+                saved_review = self.db.save_trade_review(review)
+                if context.dry_run_order_result.get("intent_id") and getattr(saved_review, "id", None) is not None:
+                    try:
+                        self.db.link_runtime_order_intent_review(
+                            str(context.dry_run_order_result.get("intent_id") or ""),
+                            int(saved_review.id),
+                        )
+                    except Exception:
+                        pass
                 snapshot.review_upsert_count += 1
                 snapshot.db_write_count_per_cycle += 1
                 snapshot.review_count += 1
@@ -1356,11 +1380,59 @@ class StrategyRuntime:
             return False
 
     def _snapshot(self, current: datetime) -> StrategyRuntimeSnapshot:
-        return StrategyRuntimeSnapshot(
+        snapshot = StrategyRuntimeSnapshot(
             started=self.started,
             cycle_at=current.isoformat(),
             warnings=dedupe_warnings(self._warnings),
         )
+        self._apply_order_sink_snapshot(snapshot)
+        return snapshot
+
+    def _emit_entry_order_intent(
+        self,
+        candidate: Candidate,
+        result: GatePipelineResult,
+        plan: EntryPlan,
+        virtual_order: VirtualOrder,
+        context: "_ReviewContext",
+        snapshot: StrategyRuntimeSnapshot,
+        now: datetime,
+    ) -> None:
+        if self.order_sink is None:
+            return
+        try:
+            payload = self.order_sink.on_entry_order_decision(
+                candidate=candidate,
+                gate_result=result,
+                entry_plan=plan,
+                virtual_order=virtual_order,
+                runtime_cycle_at=now.isoformat(),
+            )
+            context.dry_run_order_result = dict(payload or {})
+            if payload and payload.get("status") not in {"SKIPPED", ""}:
+                context.review_needed = True
+            self._apply_order_sink_snapshot(snapshot)
+        except Exception as exc:
+            snapshot.warnings.append(f"RUNTIME_DRY_RUN_ORDER_SINK_FAILED:{candidate.code}:{exc}")
+
+    def _apply_order_sink_snapshot(self, snapshot: StrategyRuntimeSnapshot) -> None:
+        if self.order_sink is None or not hasattr(self.order_sink, "snapshot"):
+            return
+        try:
+            payload = dict(self.order_sink.snapshot() or {})
+        except Exception as exc:
+            snapshot.warnings.append(f"RUNTIME_ORDER_SINK_SNAPSHOT_FAILED:{exc}")
+            return
+        snapshot.dry_run_order_intent_count = int(payload.get("dry_run_order_intent_count") or 0)
+        snapshot.dry_run_order_accepted_count = int(payload.get("dry_run_order_accepted_count") or 0)
+        snapshot.dry_run_order_rejected_count = int(payload.get("dry_run_order_rejected_count") or 0)
+        snapshot.dry_run_order_duplicate_count = int(payload.get("dry_run_order_duplicate_count") or 0)
+        snapshot.dry_run_order_live_would_pass_count = int(payload.get("dry_run_order_live_would_pass_count") or 0)
+        snapshot.dry_run_order_live_would_reject_count = int(payload.get("dry_run_order_live_would_reject_count") or 0)
+        snapshot.last_dry_run_order_intent_at = str(payload.get("last_dry_run_order_intent_at") or "")
+        snapshot.last_dry_run_order_reject_reason = str(payload.get("last_dry_run_order_reject_reason") or "")
+        snapshot.dry_run_order_policy = str(payload.get("dry_run_order_policy") or "")
+        snapshot.dry_run_order_sink_enabled = bool(payload.get("dry_run_order_sink_enabled"))
 
     def _refresh_readiness_snapshot(
         self,
@@ -1422,6 +1494,7 @@ class _ReviewContext:
     virtual_order: Optional[VirtualOrder] = None
     virtual_position: Optional[VirtualPosition] = None
     exit_decisions: list[ExitDecision] = field(default_factory=list)
+    dry_run_order_result: dict = field(default_factory=dict)
     review_needed: bool = False
 
 
@@ -1429,6 +1502,30 @@ def _snapshot_for_exit(context: _ReviewContext):
     if context.gate_result is not None:
         return context.gate_result.snapshot
     return None
+
+
+def _attach_dry_run_order_review_details(review: TradeReview, result: dict) -> None:
+    details = dict(review.details or {})
+    safety = dict(result.get("safety") or result.get("safety_checks") or {})
+    request = dict(result.get("request") or {})
+    details.update(
+        {
+            "dry_run_order_intent_id": result.get("intent_id", ""),
+            "dry_run_order_status": result.get("status", ""),
+            "dry_run_order_reason": result.get("reason", ""),
+            "dry_run_dedupe_key": result.get("dedupe_key", ""),
+            "dry_run_live_would_pass": bool(result.get("live_would_pass")),
+            "dry_run_live_reject_reason": result.get("live_reject_reason", ""),
+            "dry_run_quantity": request.get("quantity", 0),
+            "dry_run_price": request.get("price", 0),
+            "dry_run_order_amount": int(request.get("quantity") or 0) * max(0, int(request.get("price") or 0)),
+            "dry_run_safety_summary": {
+                "ok": safety.get("ok"),
+                "reason": safety.get("reason", ""),
+            },
+        }
+    )
+    review.details = details
 
 
 def _clean_time(value: datetime) -> datetime:
