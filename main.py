@@ -60,8 +60,9 @@ def build_observe_runtime(client, db: TradingDatabase):
     from trading.strategy.config import StrategyRuntimeConfigRepository
     from trading.strategy.runtime_settings import StrategyRuntimeSettingsRepository
     from trading.strategy.runtime import StrategyRuntime
-    from trading.strategy.themes import ThemeRepository
     from trading.strategy.virtual_orders import VirtualOrderService
+    from trading.theme_engine.context_provider import DynamicThemeContextProvider
+    from trading.theme_engine.repository import ThemeEngineRepository
 
     config_result = StrategyRuntimeConfigRepository(db).load()
     settings = StrategyRuntimeSettingsRepository(db).load()
@@ -79,10 +80,10 @@ def build_observe_runtime(client, db: TradingDatabase):
     bridge.attach(client)
 
     candidate_collector = CandidateCollector(db, client=client)
-    theme_repository = ThemeRepository(db)
+    theme_context_provider = DynamicThemeContextProvider(ThemeEngineRepository(db))
     indicator_calculator = IndicatorCalculator(market_data, candle_builder)
     gate_pipeline = GatePipeline(
-        theme_repository,
+        theme_context_provider,
         market_data,
         candle_builder,
         indicator_calculator,

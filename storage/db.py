@@ -25,7 +25,6 @@ from trading.strategy.models import (
     VirtualPosition,
 )
 from trading.strategy.conditions import ConditionProfile
-from trading.strategy.themes import ThemeMapping
 
 
 class TradingDatabase:
@@ -38,6 +37,7 @@ class TradingDatabase:
         self._migrate()
 
     def _migrate(self) -> None:
+        self._archive_legacy_theme_mappings()
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS watch_items (
@@ -92,24 +92,102 @@ class TradingDatabase:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE TABLE IF NOT EXISTS theme_mappings (
+            CREATE TABLE IF NOT EXISTS canonical_themes (
+                theme_id TEXT PRIMARY KEY,
+                canonical_name TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                theme_group TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'CANDIDATE',
+                confidence REAL NOT NULL DEFAULT 0,
+                trade_eligible INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS theme_aliases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT NOT NULL,
-                name TEXT NOT NULL DEFAULT '',
-                market TEXT NOT NULL DEFAULT '',
+                theme_id TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                normalized_alias TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(theme_id, normalized_alias, source)
+            );
+            CREATE TABLE IF NOT EXISTS source_theme_catalog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                source_theme_id TEXT NOT NULL DEFAULT '',
+                source_theme_name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                matched_theme_id TEXT NOT NULL DEFAULT '',
+                match_confidence REAL NOT NULL DEFAULT 0,
+                raw_payload_hash TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(source, source_theme_id, normalized_name)
+            );
+            CREATE TABLE IF NOT EXISTS theme_member_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                theme_id TEXT NOT NULL,
+                stock_code TEXT NOT NULL,
+                stock_name TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL,
+                evidence_type TEXT NOT NULL,
+                relation_type TEXT NOT NULL DEFAULT 'unknown',
+                reason TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0,
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS theme_membership_current (
+                theme_id TEXT NOT NULL,
+                stock_code TEXT NOT NULL,
+                stock_name TEXT NOT NULL DEFAULT '',
+                membership_score REAL NOT NULL DEFAULT 0,
+                relation_type TEXT NOT NULL DEFAULT 'unknown',
+                source_count INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                trade_eligible INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(theme_id, stock_code)
+            );
+            CREATE TABLE IF NOT EXISTS theme_activity_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 theme_id TEXT NOT NULL,
                 theme_name TEXT NOT NULL DEFAULT '',
-                sub_theme TEXT NOT NULL DEFAULT '',
-                strategy_profile TEXT,
-                is_large_cap INTEGER NOT NULL DEFAULT 0,
-                is_leader_candidate INTEGER NOT NULL DEFAULT 0,
-                base_priority INTEGER NOT NULL DEFAULT 0,
-                is_signal_stock INTEGER NOT NULL DEFAULT 0,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                memo TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(code, theme_id)
+                theme_score REAL NOT NULL DEFAULT 0,
+                rank INTEGER NOT NULL DEFAULT 0,
+                rank_delta_1m INTEGER NOT NULL DEFAULT 0,
+                rank_delta_5m INTEGER NOT NULL DEFAULT 0,
+                weighted_return_pct REAL NOT NULL DEFAULT 0,
+                turnover REAL NOT NULL DEFAULT 0,
+                turnover_strength REAL NOT NULL DEFAULT 0,
+                breadth REAL NOT NULL DEFAULT 0,
+                rising_count INTEGER NOT NULL DEFAULT 0,
+                falling_count INTEGER NOT NULL DEFAULT 0,
+                total_count INTEGER NOT NULL DEFAULT 0,
+                leader_code TEXT NOT NULL DEFAULT '',
+                leader_name TEXT NOT NULL DEFAULT '',
+                leader_return_pct REAL NOT NULL DEFAULT 0,
+                leader_turnover REAL NOT NULL DEFAULT 0,
+                leader_gap REAL NOT NULL DEFAULT 0,
+                top3_concentration REAL NOT NULL DEFAULT 0,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS dynamic_theme_clusters (
+                cluster_id TEXT PRIMARY KEY,
+                matched_theme_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'CANDIDATE',
+                stock_codes_json TEXT NOT NULL DEFAULT '[]',
+                keywords_json TEXT NOT NULL DEFAULT '[]',
+                score REAL NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS candidates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -274,10 +352,26 @@ class TradingDatabase:
                 ON candidates(trade_date, code);
             CREATE INDEX IF NOT EXISTS idx_candidate_events_candidate_id_created_at
                 ON candidate_events(candidate_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_theme_mappings_code_enabled
-                ON theme_mappings(code, enabled);
-            CREATE INDEX IF NOT EXISTS idx_theme_mappings_theme_enabled
-                ON theme_mappings(theme_id, enabled);
+            CREATE INDEX IF NOT EXISTS idx_canonical_themes_status
+                ON canonical_themes(status);
+            CREATE INDEX IF NOT EXISTS idx_canonical_themes_trade_eligible
+                ON canonical_themes(trade_eligible);
+            CREATE INDEX IF NOT EXISTS idx_theme_aliases_normalized
+                ON theme_aliases(normalized_alias);
+            CREATE INDEX IF NOT EXISTS idx_source_theme_catalog_matched
+                ON source_theme_catalog(matched_theme_id);
+            CREATE INDEX IF NOT EXISTS idx_theme_member_evidence_theme_stock
+                ON theme_member_evidence(theme_id, stock_code);
+            CREATE INDEX IF NOT EXISTS idx_theme_member_evidence_stock
+                ON theme_member_evidence(stock_code);
+            CREATE INDEX IF NOT EXISTS idx_theme_membership_current_stock
+                ON theme_membership_current(stock_code);
+            CREATE INDEX IF NOT EXISTS idx_theme_membership_current_theme
+                ON theme_membership_current(theme_id);
+            CREATE INDEX IF NOT EXISTS idx_theme_activity_snapshots_created_rank
+                ON theme_activity_snapshots(created_at, rank);
+            CREATE INDEX IF NOT EXISTS idx_dynamic_theme_clusters_status
+                ON dynamic_theme_clusters(status);
             """
         )
         self._ensure_column("indicator_snapshots", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
@@ -519,86 +613,6 @@ class TradingDatabase:
                 """,
                 (int(condition_index), condition_name),
             )
-
-    def upsert_theme_mapping(self, mapping: ThemeMapping) -> ThemeMapping:
-        from trading.strategy.candidates import normalize_code
-
-        mapping.code = normalize_code(mapping.code)
-        with self.conn:
-            self.conn.execute(
-                """
-                INSERT INTO theme_mappings(
-                    code, name, market, theme_id, theme_name, sub_theme, strategy_profile,
-                    is_large_cap, is_leader_candidate, base_priority, is_signal_stock,
-                    enabled, memo, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(code, theme_id) DO UPDATE SET
-                    name=excluded.name,
-                    market=excluded.market,
-                    theme_name=excluded.theme_name,
-                    sub_theme=excluded.sub_theme,
-                    strategy_profile=excluded.strategy_profile,
-                    is_large_cap=excluded.is_large_cap,
-                    is_leader_candidate=excluded.is_leader_candidate,
-                    base_priority=excluded.base_priority,
-                    is_signal_stock=excluded.is_signal_stock,
-                    enabled=excluded.enabled,
-                    memo=excluded.memo,
-                    updated_at=CURRENT_TIMESTAMP
-                """,
-                (
-                    mapping.code,
-                    mapping.name,
-                    mapping.market,
-                    mapping.theme_id,
-                    mapping.theme_name,
-                    mapping.sub_theme,
-                    mapping.strategy_profile.value if mapping.strategy_profile else None,
-                    int(mapping.is_large_cap),
-                    int(mapping.is_leader_candidate),
-                    int(mapping.base_priority),
-                    int(mapping.is_signal_stock),
-                    int(mapping.enabled),
-                    mapping.memo,
-                ),
-            )
-            row = self.conn.execute(
-                "SELECT * FROM theme_mappings WHERE code = ? AND theme_id = ?",
-                (mapping.code, mapping.theme_id),
-            ).fetchone()
-            return self._row_to_theme_mapping(row)
-
-    def list_theme_mappings(self, enabled: Optional[bool] = None) -> list[ThemeMapping]:
-        query = "SELECT * FROM theme_mappings"
-        params: list[int] = []
-        if enabled is not None:
-            query += " WHERE enabled = ?"
-            params.append(int(enabled))
-        query += " ORDER BY theme_id, code"
-        rows = self.conn.execute(query, params).fetchall()
-        return [self._row_to_theme_mapping(row) for row in rows]
-
-    def theme_mappings_for_code(self, code: str, enabled: Optional[bool] = True) -> list[ThemeMapping]:
-        from trading.strategy.candidates import normalize_code
-
-        query = "SELECT * FROM theme_mappings WHERE code = ?"
-        params: list[object] = [normalize_code(code)]
-        if enabled is not None:
-            query += " AND enabled = ?"
-            params.append(int(enabled))
-        query += " ORDER BY base_priority DESC, theme_id"
-        rows = self.conn.execute(query, params).fetchall()
-        return [self._row_to_theme_mapping(row) for row in rows]
-
-    def theme_members(self, theme_id: str, enabled: Optional[bool] = True) -> list[ThemeMapping]:
-        query = "SELECT * FROM theme_mappings WHERE theme_id = ?"
-        params: list[object] = [theme_id]
-        if enabled is not None:
-            query += " AND enabled = ?"
-            params.append(int(enabled))
-        query += " ORDER BY base_priority DESC, code"
-        rows = self.conn.execute(query, params).fetchall()
-        return [self._row_to_theme_mapping(row) for row in rows]
 
     def save_entry_plan(self, plan: EntryPlan) -> EntryPlan:
         with self.conn:
@@ -953,6 +967,21 @@ class TradingDatabase:
 
     def close(self) -> None:
         self.conn.close()
+
+    def _archive_legacy_theme_mappings(self) -> None:
+        row = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'theme_mappings'"
+        ).fetchone()
+        if row is None:
+            return
+        with self.conn:
+            archive_exists = self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'legacy_theme_mappings_archive'"
+            ).fetchone()
+            if archive_exists is None:
+                self.conn.execute("ALTER TABLE theme_mappings RENAME TO legacy_theme_mappings_archive")
+            else:
+                self.conn.execute("DROP TABLE theme_mappings")
 
     def _save_candidate_no_commit(self, candidate: Candidate) -> Candidate:
         self.conn.execute(
@@ -1392,26 +1421,6 @@ class TradingDatabase:
             failed_low_break_rebound=bool(row["failed_low_break_rebound"]),
             chase_risk=bool(row["chase_risk"]),
             metadata=dict(json.loads(metadata_json or "{}")),
-        )
-
-    @staticmethod
-    def _row_to_theme_mapping(row: sqlite3.Row) -> ThemeMapping:
-        strategy_profile = row["strategy_profile"]
-        return ThemeMapping(
-            id=int(row["id"]) if row["id"] is not None else None,
-            code=row["code"],
-            name=row["name"],
-            market=row["market"],
-            theme_id=row["theme_id"],
-            theme_name=row["theme_name"],
-            sub_theme=row["sub_theme"],
-            strategy_profile=StrategyProfile(strategy_profile) if strategy_profile else None,
-            is_large_cap=bool(row["is_large_cap"]),
-            is_leader_candidate=bool(row["is_leader_candidate"]),
-            base_priority=int(row["base_priority"]),
-            is_signal_stock=bool(row["is_signal_stock"]),
-            enabled=bool(row["enabled"]),
-            memo=row["memo"],
         )
 
     @staticmethod

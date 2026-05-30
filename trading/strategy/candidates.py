@@ -600,11 +600,11 @@ def candidate_is_discovery_only(candidate: Candidate) -> bool:
     return candidate.strategy_profile == StrategyProfile.THEME_DISCOVERY_PROFILE
 
 
-def candidate_quality_status(candidate: Candidate, has_theme_mapping: Optional[bool] = None) -> str:
+def candidate_quality_status(candidate: Candidate, has_active_theme: Optional[bool] = None) -> str:
     metadata = _candidate_metadata(candidate)
     if not is_valid_stock_code(candidate.code):
         return QUALITY_INVALID_CODE
-    if has_theme_mapping is False:
+    if has_active_theme is False:
         return QUALITY_UNMAPPED
     if candidate_is_discovery_only(candidate):
         return QUALITY_DISCOVERY_ONLY

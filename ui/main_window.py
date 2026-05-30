@@ -46,6 +46,8 @@ from trading.strategy.config import StrategyRuntimeConfigRepository, config_from
 from trading.strategy.export import ReviewExporter
 from trading.strategy.models import CandidateState, FillPolicy, TradeReview
 from trading.strategy.runtime import StrategyRuntime, StrategyRuntimeConfig, StrategyRuntimeSnapshot
+from trading.theme_engine.context_provider import DynamicThemeContextProvider
+from trading.theme_engine.repository import ThemeEngineRepository
 from ui.formatters import dedupe_text, format_metric, format_money, format_percent
 from ui.table_models import (
     CandidateFilterProxyModel,
@@ -233,8 +235,11 @@ class MainWindow(QMainWindow):
             "observe": SummaryCard("OBSERVE", "stopped", "-", "neutral"),
             "candidates": SummaryCard("후보 수", "0", "-", "neutral"),
             "ready_blocked": SummaryCard("READY/BLOCKED", "0 / 0", "-", "neutral"),
-            "theme": SummaryCard("테마 매핑률", "0.00%", "-", "neutral"),
-            "subscription": SummaryCard("구독 사용량", "-", "-", "neutral"),
+            "theme_engine": SummaryCard("테마 엔진", "warming", "-", "neutral"),
+            "active_theme": SummaryCard("ACTIVE 테마", "0", "-", "neutral"),
+            "watch_theme": SummaryCard("WATCH 테마", "0", "-", "neutral"),
+            "theme_candidates": SummaryCard("테마 후보", "0", "-", "neutral"),
+            "subscription": SummaryCard("WS 구독", "-", "-", "neutral"),
             "warnings": SummaryCard("경고", "0", "last: -", "neutral"),
         }
         for index, card in enumerate(self.dashboard_cards.values()):
@@ -973,17 +978,20 @@ class MainWindow(QMainWindow):
 
     def _display_strategy_readiness(self, snapshot: StrategyRuntimeSnapshot) -> None:
         lines = [
-            "readiness: conditions={conditions} unresolved={unresolved} / themes={themes} enabled={enabled}".format(
+            "readiness: conditions={conditions} unresolved={unresolved} / theme_engine={engine} data={data} active={active_themes} watch={watch_themes} candidates={candidate_themes}".format(
                 conditions=getattr(snapshot, "condition_profiles_count", 0),
                 unresolved=getattr(snapshot, "unresolved_condition_profiles_count", 0),
-                themes=getattr(snapshot, "theme_mappings_count", 0),
-                enabled=getattr(snapshot, "enabled_theme_mappings_count", 0),
+                engine=getattr(snapshot, "theme_engine_status", "stopped"),
+                data=getattr(snapshot, "theme_data_status", "warming"),
+                active_themes=getattr(snapshot, "active_theme_count", 0),
+                watch_themes=getattr(snapshot, "watch_theme_count", 0),
+                candidate_themes=getattr(snapshot, "candidate_theme_count", 0),
             ),
-            "active candidates={active} mapped={mapped} unmapped={unmapped} coverage={coverage:.2f}% / protected subs={protected}".format(
+            "active candidates={active} themed={mapped} no_active_theme={unmapped} coverage={coverage:.2f}% / protected subs={protected}".format(
                 active=snapshot.active_candidate_count,
-                mapped=getattr(snapshot, "active_candidates_with_theme_mapping", 0),
-                unmapped=getattr(snapshot, "active_candidates_without_theme_mapping", 0),
-                coverage=float(getattr(snapshot, "theme_mapping_coverage_pct", 0.0) or 0.0),
+                mapped=getattr(snapshot, "active_candidates_with_active_theme", 0),
+                unmapped=getattr(snapshot, "active_candidates_without_active_theme", 0),
+                coverage=float(getattr(snapshot, "theme_context_coverage_pct", 0.0) or 0.0),
                 protected=getattr(snapshot, "protected_subscription_usage", "") or "-",
             ),
             "quality: actionable={actionable} data_wait={data_wait} discovery={discovery} unmapped={unmapped} invalid={invalid}".format(
@@ -1020,24 +1028,24 @@ class MainWindow(QMainWindow):
             self.strategy_candidate_refresh_status_label.setText(message)
             self._strategy_warning(f"CANDIDATE_REFRESH_FAILED:{exc}")
             return
-        mapped_codes = set()
+        themed_codes = set()
         theme_text_by_code = {}
         for candidate in candidates:
             metadata, metadata_warning = self._safe_candidate_metadata(candidate)
             if metadata_warning:
                 self._strategy_warning(metadata_warning)
-            mappings = self._candidate_theme_mappings(candidate)
-            if mappings:
-                mapped_codes.add(candidate.code)
-                theme_text_by_code[candidate.code] = self._theme_mapping_search_text(mappings)
+            contexts = self._candidate_theme_contexts(candidate)
+            if contexts:
+                themed_codes.add(candidate.code)
+                theme_text_by_code[candidate.code] = self._theme_context_search_text(contexts)
         candidates.sort(key=lambda candidate: candidate.last_seen_at or "", reverse=True)
-        candidates.sort(key=lambda candidate: self._candidate_quality_priority(candidate, candidate.code in mapped_codes))
+        candidates.sort(key=lambda candidate: self._candidate_quality_priority(candidate, candidate.code in themed_codes))
         candidates.sort(key=lambda candidate: self._candidate_state_priority(candidate.state))
         candidates = candidates[:200]
-        mapped_codes = {code for code in mapped_codes if any(candidate.code == code for candidate in candidates)}
-        theme_text_by_code = {code: text for code, text in theme_text_by_code.items() if code in mapped_codes}
+        themed_codes = {code for code in themed_codes if any(candidate.code == code for candidate in candidates)}
+        theme_text_by_code = {code: text for code, text in theme_text_by_code.items() if code in themed_codes}
         self._set_strategy_candidate_dashboard_counts(candidates)
-        self.strategy_candidate_model.set_candidates(candidates, mapped_codes, theme_text_by_code)
+        self.strategy_candidate_model.set_candidates(candidates, themed_codes, theme_text_by_code)
         self._set_last_refresh(self.strategy_candidate_last_refresh_label)
         message = f"후보 새로고침 완료: {len(candidates)}개"
         self.strategy_candidate_refresh_status_label.setText(message)
@@ -1109,31 +1117,38 @@ class MainWindow(QMainWindow):
             self._strategy_warning(f"CANDIDATE_DETAIL_FAILED:{exc}")
         self.strategy_candidate_detail_panel.show_detail(f"{candidate.code} {candidate.name}".strip(), detail_text)
 
-    def _candidate_has_theme_mapping(self, candidate) -> bool:
-        return bool(self._candidate_theme_mappings(candidate))
+    def _candidate_has_active_theme(self, candidate) -> bool:
+        return bool(self._candidate_theme_contexts(candidate))
 
     @staticmethod
     def _candidate_entry_excluded(candidate) -> bool:
         return candidate_is_discovery_only(candidate)
 
-    def _candidate_theme_mappings(self, candidate):
+    def _candidate_theme_contexts(self, candidate):
         try:
-            return self.db.theme_mappings_for_code(candidate.code, enabled=True)
+            return self._theme_context_provider().themes_for_code(candidate.code)
         except Exception:
             return []
 
-    def _theme_mapping_search_text(self, mappings) -> str:
+    def _theme_context_search_text(self, contexts) -> str:
         parts = []
-        for mapping in mappings:
+        for context in contexts:
             parts.extend(
                 [
-                    mapping.theme_id,
-                    mapping.theme_name,
-                    mapping.sub_theme,
-                    self._value_text(mapping.strategy_profile),
+                    context.theme_id,
+                    context.theme_name,
+                    self._value_text(context.status),
+                    self._value_text(context.relation_type),
                 ]
             )
         return " ".join(str(part or "") for part in parts)
+
+    def _theme_context_provider(self) -> DynamicThemeContextProvider:
+        pipeline = getattr(getattr(self, "strategy_runtime", None), "gate_pipeline", None)
+        provider = getattr(pipeline, "theme_context_provider", None)
+        if provider is not None:
+            return provider
+        return DynamicThemeContextProvider(ThemeEngineRepository(self.db))
 
     def _candidate_detail_text(self, candidate) -> str:
         loaded = self.db.load_candidate_by_id(candidate.id) if candidate.id is not None else None
@@ -1141,7 +1156,7 @@ class MainWindow(QMainWindow):
         metadata, metadata_warning = self._safe_candidate_metadata(candidate)
         sections = [
             self._candidate_basic_detail(candidate, metadata, metadata_warning),
-            self._candidate_theme_mapping_detail(candidate),
+            self._candidate_dynamic_theme_detail(candidate),
             self._candidate_indicator_detail(candidate),
             self._candidate_entry_plan_detail(candidate),
             self._candidate_virtual_activity_detail(candidate),
@@ -1166,9 +1181,9 @@ class MainWindow(QMainWindow):
             f"strategy_profile: {self._value_text(candidate.strategy_profile) or '-'}",
             "condition_names: " + (", ".join(candidate.condition_names) if candidate.condition_names else "-"),
             "theme_ids: " + (", ".join(candidate.theme_ids) if candidate.theme_ids else "-"),
-            f"quality_status: {candidate_quality_status(candidate, self._candidate_has_theme_mapping(candidate))}",
+            f"quality_status: {candidate_quality_status(candidate, self._candidate_has_active_theme(candidate))}",
             f"quality_reason: {self._metadata_text(metadata, 'quality_reason') or '-'}",
-            f"enabled_theme_mapping: {'Y' if self._candidate_has_theme_mapping(candidate) else 'N'}",
+            f"active_dynamic_theme: {'Y' if self._candidate_has_active_theme(candidate) else 'N'}",
             f"entry_evaluation_target: {'N' if self._candidate_entry_excluded(candidate) else 'Y'}",
             f"entry_excluded_reason: {self._metadata_text(metadata, 'entry_excluded_reason') or '-'}",
             f"subscription_excluded_reason: {self._metadata_text(metadata, 'subscription_excluded_reason') or '-'}",
@@ -1182,23 +1197,23 @@ class MainWindow(QMainWindow):
             lines.append(f"metadata warning: {metadata_warning}")
         return "\n".join(lines)
 
-    def _candidate_theme_mapping_detail(self, candidate) -> str:
-        mappings = self.db.theme_mappings_for_code(candidate.code, enabled=True)
+    def _candidate_dynamic_theme_detail(self, candidate) -> str:
+        contexts = self._candidate_theme_contexts(candidate)
         lines = ["[테마 매핑]"]
-        if not mappings:
+        if not contexts:
             lines.append("-")
             return "\n".join(lines)
-        for mapping in mappings:
+        for context in contexts:
             lines.append(
-                "theme_id={theme_id} / theme_name={theme_name} / sub_theme={sub_theme} / "
-                "strategy_profile={profile} / leader={leader} / signal={signal} / base_priority={priority}".format(
-                    theme_id=mapping.theme_id or "-",
-                    theme_name=mapping.theme_name or "-",
-                    sub_theme=mapping.sub_theme or "-",
-                    profile=self._value_text(mapping.strategy_profile) or "-",
-                    leader="Y" if mapping.is_leader_candidate else "N",
-                    signal="Y" if mapping.is_signal_stock else "N",
-                    priority=mapping.base_priority,
+                "theme_id={theme_id} / theme_name={theme_name} / status={sub_theme} / "
+                "relation={profile} / trade_eligible={leader} / membership={signal} / rank={priority}".format(
+                    theme_id=context.theme_id or "-",
+                    theme_name=context.theme_name or "-",
+                    sub_theme=self._value_text(context.status) or "-",
+                    profile=self._value_text(context.relation_type) or "-",
+                    leader="Y" if context.trade_eligible else "N",
+                    signal=f"{float(context.membership_score or 0.0):.2f}",
+                    priority=context.rank or 0,
                 )
             )
         return "\n".join(lines)
@@ -1400,14 +1415,21 @@ class MainWindow(QMainWindow):
             "warning" if self._strategy_dashboard_blocked_count else "neutral",
         )
 
-        coverage = float(getattr(current_snapshot, "theme_mapping_coverage_pct", 0.0) or 0.0) if current_snapshot is not None else 0.0
-        theme_tone = "success" if coverage >= 80.0 else "warning" if coverage > 0.0 else "neutral"
-        self._set_dashboard_card("theme", format_percent(coverage), "mapped active", theme_tone)
+        theme_status = getattr(current_snapshot, "theme_engine_status", "stopped") if current_snapshot is not None else "warming"
+        theme_data = getattr(current_snapshot, "theme_data_status", "warming") if current_snapshot is not None else "warming"
+        active_themes = int(getattr(current_snapshot, "active_theme_count", 0) or 0) if current_snapshot is not None else 0
+        watch_themes = int(getattr(current_snapshot, "watch_theme_count", 0) or 0) if current_snapshot is not None else 0
+        candidate_themes = int(getattr(current_snapshot, "candidate_theme_count", 0) or 0) if current_snapshot is not None else 0
+        theme_tone = "success" if theme_status == "running" and active_themes else "warning" if theme_status == "running" else "neutral"
+        self._set_dashboard_card("theme_engine", str(theme_status), f"data {theme_data}", theme_tone)
+        self._set_dashboard_card("active_theme", str(active_themes), "trade radar", "success" if active_themes else "neutral")
+        self._set_dashboard_card("watch_theme", str(watch_themes), "warming watch", "warning" if watch_themes else "neutral")
+        self._set_dashboard_card("theme_candidates", str(candidate_themes), "canonical candidates", "neutral")
 
         subscription = ""
         if current_snapshot is not None:
             subscription = getattr(current_snapshot, "protected_subscription_usage", "") or str(getattr(current_snapshot, "subscription_active_count", 0) or "")
-        self._set_dashboard_card("subscription", subscription or "-", "protected subs", self._subscription_tone(subscription))
+        self._set_dashboard_card("subscription", subscription or "-", "WS clients / protected", self._subscription_tone(subscription))
 
         warnings = []
         if hasattr(self, "strategy_warning_view"):
@@ -1483,14 +1505,14 @@ class MainWindow(QMainWindow):
         }.get(state, 9)
 
     @staticmethod
-    def _candidate_quality_priority(candidate, has_theme_mapping: bool) -> int:
+    def _candidate_quality_priority(candidate, has_active_theme: bool) -> int:
         return {
             "actionable": 0,
             "data_wait": 1,
             "discovery_only": 2,
             "unmapped": 3,
             "invalid_code": 4,
-        }.get(candidate_quality_status(candidate, has_theme_mapping), 9)
+        }.get(candidate_quality_status(candidate, has_active_theme), 9)
 
     @staticmethod
     def _safe_candidate_metadata(candidate) -> tuple[dict, str]:

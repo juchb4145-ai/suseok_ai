@@ -17,7 +17,8 @@ from trading.strategy.runtime_settings import (
     attach_settings_details,
     legacy_strategy_runtime_settings,
 )
-from trading.strategy.themes import StockLeadershipResult, ThemeMapping, ThemeRepository, ThemeStrengthResult
+from trading.theme_engine.context_provider import DynamicThemeContextProvider
+from trading.theme_engine.models import StockLeadershipResult, ThemeContext, ThemeStrengthResult
 
 
 ACTIVE_STATES = {
@@ -47,7 +48,7 @@ LATE_CHASE_SOFT_BLOCK_SCORE = 80.0
 @dataclass
 class _ThemeEntry:
     candidate: Candidate
-    mapping: ThemeMapping
+    mapping: ThemeContext
     tick: Optional[StrategyTick]
     turnover: int
     discovery_only: bool = False
@@ -56,12 +57,12 @@ class _ThemeEntry:
 class ThemeStrengthGate:
     def __init__(
         self,
-        repository: ThemeRepository,
+        context_provider: DynamicThemeContextProvider,
         market_data: MarketDataStore,
         candle_builder: Optional[CandleBuilder] = None,
         settings: Optional[StrategyRuntimeSettings] = None,
     ) -> None:
-        self.repository = repository
+        self.context_provider = context_provider
         self.market_data = market_data
         self.candle_builder = candle_builder
         self.settings = settings or legacy_strategy_runtime_settings()
@@ -96,10 +97,10 @@ class ThemeStrengthGate:
             clean_code = normalize_code(candidate.code)
             tick = self.market_data.latest_tick(clean_code)
             turnover = _turnover(tick)
-            for mapping in self.repository.themes_for_code(clean_code):
+            for mapping in self.context_provider.themes_for_code(clean_code):
                 groups.setdefault(mapping.theme_id, []).append(
                     _ThemeEntry(
-                        candidate=self.repository.enrich_candidate(candidate),
+                        candidate=self.context_provider.enrich_candidate(candidate),
                         mapping=mapping,
                         tick=tick,
                         turnover=turnover,
@@ -164,7 +165,7 @@ class ThemeStrengthGate:
             "leader_turnover": (top2_turnover / max_top2_turnover) * leader_turnover_max if max_top2_turnover > 0 else 0.0,
         }
         score = sum(score_components.values())
-        signal_pair = sum(1 for entry in valid_turnovers if entry.mapping.is_signal_stock) >= 2
+        signal_pair = False
         grade = _theme_grade(
             score=score,
             active_count=active_count,
@@ -209,13 +210,13 @@ class ThemeStrengthGate:
 class StockLeadershipGate:
     def __init__(
         self,
-        repository: ThemeRepository,
+        context_provider: DynamicThemeContextProvider,
         market_data: MarketDataStore,
         candle_builder: Optional[CandleBuilder] = None,
         market_index_store: Optional[MarketIndexStore] = None,
         settings: Optional[StrategyRuntimeSettings] = None,
     ) -> None:
-        self.repository = repository
+        self.context_provider = context_provider
         self.market_data = market_data
         self.candle_builder = candle_builder
         self.market_index_store = market_index_store
@@ -223,7 +224,7 @@ class StockLeadershipGate:
 
     def evaluate(self, candidate: Candidate, candidates: list[Candidate]) -> list[StockLeadershipResult]:
         clean_code = normalize_code(candidate.code)
-        mappings = self.repository.themes_for_code(clean_code)
+        mappings = self.context_provider.themes_for_code(clean_code)
         return [self._evaluate_mapping(candidate, mapping, candidates) for mapping in mappings]
 
     def evaluate_all(self, candidates: list[Candidate]) -> list[StockLeadershipResult]:
@@ -233,25 +234,23 @@ class StockLeadershipGate:
                 results.extend(self.evaluate(candidate, candidates))
         return results
 
-    def _evaluate_mapping(self, candidate: Candidate, mapping: ThemeMapping, candidates: list[Candidate]) -> StockLeadershipResult:
-        scope = _leadership_scope(candidate, mapping)
+    def _evaluate_mapping(self, candidate: Candidate, mapping: ThemeContext, candidates: list[Candidate]) -> StockLeadershipResult:
+        scope = "same_dynamic_theme"
         scope_entries = self._scope_entries(mapping, candidates, scope)
         ranked = sorted(
             scope_entries,
             key=lambda entry: (
                 entry.turnover,
                 entry.tick.change_rate if entry.tick else 0.0,
-                _clamp(entry.mapping.base_priority, 0, 100),
+                entry.mapping.membership_score,
             ),
             reverse=True,
         )
         code = normalize_code(candidate.code)
         rank = next((index + 1 for index, entry in enumerate(ranked) if entry.candidate.code == code), 0)
-        role = _leadership_role(rank, mapping.is_signal_stock, self.settings)
+        role = _dynamic_leadership_role(rank)
         tick = self.market_data.latest_tick(code)
         turnover = _turnover(tick)
-        base_priority_original = mapping.base_priority
-        base_priority_normalized = _clamp(base_priority_original, 0, 100)
         rank_count = max(1, len(ranked))
         turnover_rank_score = _rank_score(
             self.settings.number("leadership_thresholds.turnover_rank_score_max", 35.0),
@@ -264,40 +263,41 @@ class StockLeadershipGate:
             change_rank,
             rank_count,
         )
-        leader_candidate_score = self.settings.number("leadership_thresholds.leader_candidate_points", 15.0) if mapping.is_leader_candidate else 0.0
-        base_priority_max = self.settings.number("leadership_thresholds.base_priority_max", 100.0)
-        base_priority_score = (base_priority_normalized / base_priority_max) * self.settings.number(
-            "leadership_thresholds.base_priority_score_max",
-            15.0,
-        )
-        signal_large_cap_score = self.settings.number("leadership_thresholds.signal_or_large_cap_points", 10.0) if mapping.is_signal_stock or mapping.is_large_cap else 0.0
+        membership_score = _clamp(mapping.membership_score, 0.0, 1.0) * 25.0
+        relation_penalty = 0.0 if str(mapping.relation_type.value if hasattr(mapping.relation_type, "value") else mapping.relation_type) not in {"rumor", "unknown"} else -20.0
+        trade_eligible_penalty = 0.0 if mapping.trade_eligible else -15.0
         score_components = {
             "turnover_rank": turnover_rank_score,
             "change_rate_rank": change_rate_rank_score,
-            "leader_candidate": leader_candidate_score,
-            "base_priority": base_priority_score,
-            "signal_or_large_cap": signal_large_cap_score,
+            "membership_score": membership_score,
+            "relation_penalty": relation_penalty,
+            "trade_eligible_penalty": trade_eligible_penalty,
         }
         insufficient_reason = []
         if not _valid_tick(tick):
             insufficient_reason.append("tick_missing")
         if turnover <= 0:
             insufficient_reason.append("turnover_missing")
-        diagnostics_v2, comparison_reason_codes = _leadership_diagnostics_v2(
-            code,
-            mapping,
-            ranked,
-            self.candle_builder,
-            self.market_index_store,
-            self.settings,
-        )
+        diagnostics_v2 = {
+            "feature_version": "dynamic_leadership_v1",
+            "leader_trade_value_rank": rank,
+            "scope_candidate_codes": [entry.candidate.code for entry in ranked],
+            "membership_score": mapping.membership_score,
+            "relation_type": str(mapping.relation_type.value if hasattr(mapping.relation_type, "value") else mapping.relation_type),
+            "trade_eligible": mapping.trade_eligible,
+        }
+        comparison_reason_codes = []
+        if not mapping.trade_eligible:
+            comparison_reason_codes.append("THEME_MEMBER_NOT_TRADE_ELIGIBLE")
+        if diagnostics_v2["relation_type"] in {"rumor", "unknown"}:
+            comparison_reason_codes.append("WEAK_THEME_RELATION")
 
         return StockLeadershipResult(
             candidate_id=candidate.id,
             code=code,
             theme_id=mapping.theme_id,
             theme_name=mapping.theme_name,
-            score=round(sum(score_components.values()), 4),
+            score=round(_clamp(sum(score_components.values()), 0.0, 100.0), 4),
             leadership_rank=rank,
             leadership_role=role,
             leadership_scope=scope,
@@ -311,8 +311,6 @@ class StockLeadershipGate:
                 "scope_candidate_codes": [entry.candidate.code for entry in ranked],
                 "turnover": turnover,
                 "change_rate": tick.change_rate if tick else 0.0,
-                "base_priority_original": base_priority_original,
-                "base_priority_normalized": base_priority_normalized,
                 "insufficient_reason": insufficient_reason,
                 "leadership_diagnostics_v2": diagnostics_v2,
                 "comparison_reason_codes": comparison_reason_codes,
@@ -320,16 +318,14 @@ class StockLeadershipGate:
             }, self.settings),
         )
 
-    def _scope_entries(self, mapping: ThemeMapping, candidates: list[Candidate], scope: str) -> list[_ThemeEntry]:
+    def _scope_entries(self, mapping: ThemeContext, candidates: list[Candidate], scope: str) -> list[_ThemeEntry]:
         entries: list[_ThemeEntry] = []
         for candidate in candidates:
             if candidate.state not in ACTIVE_STATES:
                 continue
-            enriched = self.repository.enrich_candidate(candidate)
-            for member_mapping in self.repository.themes_for_code(enriched.code):
+            enriched = self.context_provider.enrich_candidate(candidate)
+            for member_mapping in self.context_provider.themes_for_code(enriched.code):
                 if member_mapping.theme_id != mapping.theme_id:
-                    continue
-                if not _in_leadership_scope(mapping, member_mapping, enriched, scope):
                     continue
                 tick = self.market_data.latest_tick(enriched.code)
                 entries.append(_ThemeEntry(enriched, member_mapping, tick, _turnover(tick)))
@@ -341,8 +337,8 @@ class MarketIndexGate:
         self.market_index_store = market_index_store
         self.settings = settings or legacy_strategy_runtime_settings()
 
-    def evaluate(self, candidate: Candidate, theme_mapping: Optional[ThemeMapping] = None) -> GateDecision:
-        index_code = _index_code_for(candidate, theme_mapping)
+    def evaluate(self, candidate: Candidate, theme_context: Optional[ThemeContext] = None) -> GateDecision:
+        index_code = _index_code_for(candidate, theme_context)
         state = self.market_index_store.state(index_code)
         details = {
             "index_code": index_code,
@@ -1066,7 +1062,7 @@ def _theme_diagnostics_v2(
 
 def _leadership_diagnostics_v2(
     code: str,
-    mapping: ThemeMapping,
+    mapping: ThemeContext,
     ranked: list[_ThemeEntry],
     candle_builder: Optional[CandleBuilder],
     market_index_store: Optional[MarketIndexStore],
@@ -1318,14 +1314,12 @@ def _persistence_score(
 
 
 def _expected_leader(entries: list[_ThemeEntry]) -> Optional[_ThemeEntry]:
-    leader_candidates = [entry for entry in entries if entry.mapping.is_leader_candidate]
-    pool = leader_candidates or entries
-    if not pool:
+    if not entries:
         return None
     return sorted(
-        pool,
+        entries,
         key=lambda entry: (
-            _clamp(entry.mapping.base_priority, 0, 100),
+            entry.mapping.membership_score,
             entry.turnover,
             entry.tick.change_rate if entry.tick else 0.0,
         ),
@@ -1429,7 +1423,7 @@ def _leader_follower_gap(
 
 def _relative_strength_vs_index(
     code: str,
-    mapping: ThemeMapping,
+    mapping: ThemeContext,
     candle_builder: Optional[CandleBuilder],
     market_index_store: Optional[MarketIndexStore],
     minutes: int,
@@ -1555,9 +1549,9 @@ def _distance_pct(price: int, support: float) -> float:
     return ((price - support) / support) * 100.0
 
 
-def _index_code_for(candidate: Candidate, theme_mapping: Optional[ThemeMapping]) -> str:
-    profile = candidate.strategy_profile or (theme_mapping.strategy_profile if theme_mapping else None)
-    market = candidate.market or (theme_mapping.market if theme_mapping else "")
+def _index_code_for(candidate: Candidate, theme_context: Optional[ThemeContext]) -> str:
+    profile = candidate.strategy_profile or (theme_context.strategy_profile if theme_context else None)
+    market = candidate.market or (theme_context.market if theme_context else "")
     if profile == StrategyProfile.KOSDAQ_THEME_PROFILE or str(market).upper() == "KOSDAQ":
         return "KOSDAQ"
     return "KOSPI"
@@ -1627,36 +1621,6 @@ def _theme_grade(
     return "C"
 
 
-def _leadership_scope(candidate: Candidate, mapping: ThemeMapping) -> str:
-    if mapping.is_signal_stock:
-        return "signal_only"
-    profile = mapping.strategy_profile or candidate.strategy_profile
-    if profile is not None:
-        return "same_strategy_profile"
-    if mapping.market or candidate.market:
-        return "same_market"
-    return "same_theme_all"
-
-
-def _in_leadership_scope(
-    target_mapping: ThemeMapping,
-    candidate_mapping: ThemeMapping,
-    candidate: Candidate,
-    scope: str,
-) -> bool:
-    if scope == "signal_only":
-        return candidate_mapping.is_signal_stock
-    if candidate_mapping.is_signal_stock:
-        return False
-    if scope == "same_strategy_profile":
-        target_profile = target_mapping.strategy_profile
-        candidate_profile = candidate_mapping.strategy_profile or candidate.strategy_profile
-        return target_profile is None or candidate_profile == target_profile
-    if scope == "same_market":
-        return bool(target_mapping.market) and candidate_mapping.market == target_mapping.market
-    return True
-
-
 def _leadership_role(
     rank: int,
     is_signal_stock: bool,
@@ -1669,6 +1633,18 @@ def _leadership_role(
         return "signal_second_leader" if is_signal_stock else "second_leader"
     if rank >= active_settings.integer("leadership_thresholds.follower_min_rank", 3):
         return "follower"
+    return "unranked"
+
+
+def _dynamic_leadership_role(rank: int) -> str:
+    if rank == 1:
+        return "leader"
+    if 2 <= rank <= 3:
+        return "co_leader"
+    if 4 <= rank <= 5:
+        return "follower"
+    if rank >= 6:
+        return "late_laggard"
     return "unranked"
 
 

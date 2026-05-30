@@ -66,12 +66,7 @@ from trading.strategy.runtime_settings import (
 )
 from trading.strategy.safety import ActualOrderGuard, OrderGuardDecision
 from trading.strategy.session import session_bucket_at
-from trading.strategy.themes import (
-    StockLeadershipResult,
-    ThemeMapping,
-    ThemeRepository,
-    ThemeStrengthResult,
-)
+from trading.theme_engine.models import StockLeadershipResult, ThemeStrengthResult
 from trading.strategy.virtual_orders import (
     VirtualOrderEvaluationResult,
     VirtualOrderService,
@@ -146,8 +141,6 @@ __all__ = [
     "StrategyTick",
     "STRATEGY_FEATURE_VERSION",
     "SubscriptionRecord",
-    "ThemeMapping",
-    "ThemeRepository",
     "ThemeStrengthGate",
     "ThemeStrengthResult",
     "TickSizeProvider",

@@ -137,11 +137,14 @@ class StrategyRuntimeSnapshot:
     virtual_order_status_change_count: int = 0
     condition_profiles_count: int = 0
     unresolved_condition_profiles_count: int = 0
-    theme_mappings_count: int = 0
-    enabled_theme_mappings_count: int = 0
-    active_candidates_with_theme_mapping: int = 0
-    active_candidates_without_theme_mapping: int = 0
-    theme_mapping_coverage_pct: float = 0.0
+    active_theme_count: int = 0
+    watch_theme_count: int = 0
+    candidate_theme_count: int = 0
+    theme_engine_status: str = "stopped"
+    theme_data_status: str = "warming"
+    active_candidates_with_active_theme: int = 0
+    active_candidates_without_active_theme: int = 0
+    theme_context_coverage_pct: float = 0.0
     quality_actionable_count: int = 0
     quality_discovery_only_count: int = 0
     quality_unmapped_count: int = 0
@@ -674,12 +677,13 @@ class StrategyRuntime:
 
     def _no_gate_result_reasons(self, candidate: Candidate, snapshot: StrategyRuntimeSnapshot) -> list[str]:
         reasons = ["NO_GATE_RESULT"]
-        if snapshot.theme_mappings_count == 0:
-            reasons.append("THEME_MAPPING_EMPTY")
-        elif not self.db.theme_mappings_for_code(candidate.code, enabled=True):
-            reasons.append("NO_THEME_MAPPING_FOR_CANDIDATE")
-        if "NO_THEME_MAPPING_FOR_ACTIVE_CANDIDATES" in snapshot.warnings:
-            reasons.append("NO_THEME_MAPPING_FOR_ACTIVE_CANDIDATES")
+        provider = getattr(self.gate_pipeline, "theme_context_provider", None)
+        if provider is not None and not provider.is_ready():
+            reasons.append("THEME_CONTEXT_NOT_READY")
+        elif provider is not None and not provider.themes_for_code(candidate.code):
+            reasons.append("NO_ACTIVE_THEME")
+        if "NO_ACTIVE_THEME_FOR_ACTIVE_CANDIDATES" in snapshot.warnings:
+            reasons.append("NO_ACTIVE_THEME_FOR_ACTIVE_CANDIDATES")
         if any(str(warning).startswith("CONDITION_PROFILE_UNRESOLVED") for warning in snapshot.warnings):
             reasons.append("CONDITION_PROFILE_UNRESOLVED")
         return _dedupe(reasons)
@@ -733,17 +737,17 @@ class StrategyRuntime:
         previous_state = candidate.state
         metadata = dict(candidate.metadata or {})
         metadata["quality_status"] = QUALITY_UNMAPPED
-        metadata["quality_reason"] = "no_enabled_theme_mapping"
-        metadata["sub_status"] = "NO_THEME_MAPPING_FOR_CANDIDATE"
-        metadata["insufficient_reason"] = ["NO_THEME_MAPPING_FOR_CANDIDATE"]
+        metadata["quality_reason"] = "no_active_dynamic_theme"
+        metadata["sub_status"] = "NO_ACTIVE_THEME"
+        metadata["insufficient_reason"] = ["NO_ACTIVE_THEME"]
         metadata["block_reasons_by_theme"] = {
             "__quality__": {
                 "theme_id": "",
                 "gate_result_key": "",
                 "final_grade": "C",
                 "block_type": BlockType.TEMPORARY.value,
-                "reason_codes": ["NO_THEME_MAPPING_FOR_CANDIDATE"],
-                "sub_status": "NO_THEME_MAPPING_FOR_CANDIDATE",
+                "reason_codes": ["NO_ACTIVE_THEME"],
+                "sub_status": "NO_ACTIVE_THEME",
             }
         }
         metadata.setdefault("blocked_at", _clean_time(now).isoformat())
@@ -765,11 +769,11 @@ class StrategyRuntime:
                     candidate,
                     previous_state,
                     CandidateState.BLOCKED,
-                    "candidate blocked until an enabled theme mapping exists",
+                    "candidate blocked until an active dynamic theme exists",
                     {
                         "code": candidate.code,
                         "quality_status": QUALITY_UNMAPPED,
-                        "reason_codes": ["NO_THEME_MAPPING_FOR_CANDIDATE"],
+                        "reason_codes": ["NO_ACTIVE_THEME"],
                     },
                     now,
                 )
@@ -777,7 +781,7 @@ class StrategyRuntime:
         )
         snapshot.candidate_save_count += 1
         snapshot.db_write_count_per_cycle += 1
-        snapshot.warnings.append("NO_THEME_MAPPING_FOR_CANDIDATE")
+        snapshot.warnings.append("NO_ACTIVE_THEME")
 
     def _rollover_previous_trade_date_candidates(
         self,
@@ -1187,16 +1191,17 @@ class StrategyRuntime:
                 result.append(candidate)
         return result
 
-    def _candidate_quality_status(self, candidate: Candidate, has_theme_mapping: Optional[bool] = None) -> str:
-        if has_theme_mapping is None:
+    def _candidate_quality_status(self, candidate: Candidate, has_active_theme: Optional[bool] = None) -> str:
+        if has_active_theme is None:
             try:
-                has_theme_mapping = (
-                    not self._has_enabled_theme_mappings()
-                    or bool(self.db.theme_mappings_for_code(candidate.code, enabled=True))
-                )
+                provider = getattr(self.gate_pipeline, "theme_context_provider", None)
+                if provider is None:
+                    has_active_theme = True
+                else:
+                    has_active_theme = bool(provider.themes_for_code(candidate.code))
             except Exception:
-                has_theme_mapping = False
-        return candidate_quality_status(candidate, has_theme_mapping)
+                has_active_theme = False
+        return candidate_quality_status(candidate, has_active_theme)
 
     def _candidate_entry_evaluable(self, candidate: Candidate) -> bool:
         if _candidate_entry_excluded(candidate):
@@ -1218,12 +1223,6 @@ class StrategyRuntime:
             _last_seen_desc_value(candidate),
             normalize_code(candidate.code),
         )
-
-    def _has_enabled_theme_mappings(self) -> bool:
-        try:
-            return bool(self.db.list_theme_mappings(enabled=True))
-        except Exception:
-            return True
 
     def _has_open_virtual_activity(self, candidate: Candidate) -> bool:
         if candidate.id is None:
@@ -1381,11 +1380,14 @@ class StrategyRuntime:
         self.readiness_report = report
         snapshot.condition_profiles_count = report.condition_profiles_count
         snapshot.unresolved_condition_profiles_count = report.unresolved_condition_profiles_count
-        snapshot.theme_mappings_count = report.theme_mappings_count
-        snapshot.enabled_theme_mappings_count = report.enabled_theme_mappings_count
-        snapshot.active_candidates_with_theme_mapping = report.active_candidates_with_theme_mapping
-        snapshot.active_candidates_without_theme_mapping = report.active_candidates_without_theme_mapping
-        snapshot.theme_mapping_coverage_pct = report.theme_mapping_coverage_pct
+        snapshot.active_theme_count = report.active_theme_count
+        snapshot.watch_theme_count = report.watch_theme_count
+        snapshot.candidate_theme_count = report.candidate_theme_count
+        snapshot.theme_engine_status = report.theme_engine_status
+        snapshot.theme_data_status = report.theme_data_status
+        snapshot.active_candidates_with_active_theme = report.active_candidates_with_active_theme
+        snapshot.active_candidates_without_active_theme = report.active_candidates_without_active_theme
+        snapshot.theme_context_coverage_pct = report.theme_context_coverage_pct
         snapshot.quality_actionable_count = report.quality_actionable_count
         snapshot.quality_discovery_only_count = report.quality_discovery_only_count
         snapshot.quality_unmapped_count = report.quality_unmapped_count

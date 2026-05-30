@@ -24,7 +24,8 @@ from trading.strategy.runtime_settings import (
     attach_settings_details,
     legacy_strategy_runtime_settings,
 )
-from trading.strategy.themes import StockLeadershipResult, ThemeMapping, ThemeRepository, ThemeStrengthResult
+from trading.theme_engine.context_provider import DynamicThemeContextProvider
+from trading.theme_engine.models import StockLeadershipResult, ThemeContext, ThemeStrengthResult
 
 
 @dataclass
@@ -46,7 +47,7 @@ class GatePipelineResult:
 class GatePipeline:
     def __init__(
         self,
-        theme_repository: ThemeRepository,
+        theme_context_provider: DynamicThemeContextProvider,
         market_data: MarketDataStore,
         candle_builder: CandleBuilder,
         indicator_calculator: IndicatorCalculator,
@@ -54,7 +55,7 @@ class GatePipeline:
         market_index_store: MarketIndexStore,
         settings: Optional[StrategyRuntimeSettings] = None,
     ) -> None:
-        self.theme_repository = theme_repository
+        self.theme_context_provider = theme_context_provider
         self.market_data = market_data
         self.candle_builder = candle_builder
         self.indicator_calculator = indicator_calculator
@@ -69,7 +70,7 @@ class GatePipeline:
         entry_candidates: Optional[list[Candidate]] = None,
     ) -> list[GatePipelineResult]:
         active_candidates = [candidate for candidate in candidates if candidate.state in ACTIVE_STATES]
-        enriched_candidates = [self.theme_repository.enrich_candidate(candidate) for candidate in active_candidates]
+        enriched_candidates = [self.theme_context_provider.enrich_candidate(candidate) for candidate in active_candidates]
         entry_source = entry_candidates if entry_candidates is not None else active_candidates
         active_entry_candidates = [
             candidate
@@ -77,12 +78,12 @@ class GatePipeline:
             if candidate.state in ACTIVE_STATES and not candidate_is_discovery_only(candidate)
         ]
         enriched_entry_candidates = [
-            self.theme_repository.enrich_candidate(candidate) for candidate in active_entry_candidates
+            self.theme_context_provider.enrich_candidate(candidate) for candidate in active_entry_candidates
         ]
         theme_results = {
             result.theme_id: result
             for result in ThemeStrengthGate(
-                self.theme_repository,
+                self.theme_context_provider,
                 self.market_data,
                 self.candle_builder,
                 self.settings,
@@ -91,7 +92,7 @@ class GatePipeline:
         leadership_results = {
             (result.code, result.theme_id): result
             for result in StockLeadershipGate(
-                self.theme_repository,
+                self.theme_context_provider,
                 self.market_data,
                 self.candle_builder,
                 self.market_index_store,
@@ -116,7 +117,7 @@ class GatePipeline:
 
         results: list[GatePipelineResult] = []
         for candidate in enriched_entry_candidates:
-            for mapping in self.theme_repository.themes_for_code(candidate.code):
+            for mapping in self.theme_context_provider.themes_for_code(candidate.code):
                 theme_result = theme_results.get(mapping.theme_id)
                 if theme_result is None:
                     continue
@@ -139,7 +140,7 @@ class GatePipeline:
     def _evaluate_candidate_theme(
         self,
         candidate: Candidate,
-        mapping: ThemeMapping,
+        mapping: ThemeContext,
         theme_result: ThemeStrengthResult,
         leadership_result: StockLeadershipResult,
         market_gate: MarketIndexGate,
@@ -265,9 +266,7 @@ def _theme_strength_decision(theme_result: ThemeStrengthResult) -> GateDecision:
 def _leadership_decision(result: StockLeadershipResult) -> GateDecision:
     passed = result.leadership_role in {
         "leader",
-        "second_leader",
-        "signal_leader",
-        "signal_second_leader",
+        "co_leader",
     }
     return GateDecision(
         candidate_id=result.candidate_id,
@@ -309,7 +308,7 @@ def _final_score(decisions: list[GateDecision], settings: Optional[StrategyRunti
 
 def _final_grade(
     candidate: Candidate,
-    mapping: ThemeMapping,
+    mapping: ThemeContext,
     theme_result: ThemeStrengthResult,
     leadership_result: StockLeadershipResult,
     decisions: list[GateDecision],
@@ -373,18 +372,18 @@ def _final_grade(
 
 def _theme_allows_a(
     candidate: Candidate,
-    mapping: ThemeMapping,
+    mapping: ThemeContext,
     theme_result: ThemeStrengthResult,
     leadership_result: StockLeadershipResult,
     stock_pullback: GateDecision,
 ) -> bool:
     if theme_result.grade == "A":
-        return leadership_result.leadership_role in {"leader", "second_leader"}
+        return leadership_result.leadership_role in {"leader", "co_leader"}
     if theme_result.grade == "A_SIGNAL" and mapping.strategy_profile in {
         StrategyProfile.KOSPI_LEADER_PROFILE,
         StrategyProfile.SEMICONDUCTOR_SIGNAL_PROFILE,
     }:
-        return leadership_result.leadership_role in {"signal_leader", "signal_second_leader", "leader", "second_leader"}
+        return leadership_result.leadership_role in {"leader", "co_leader"}
     if theme_result.grade == "A_SIGNAL" and mapping.strategy_profile == StrategyProfile.KOSDAQ_THEME_PROFILE:
         return _kosdaq_signal_can_promote(theme_result, leadership_result, stock_pullback)
     return False
@@ -398,8 +397,7 @@ def _kosdaq_signal_can_promote(
     non_signal_scope_count = len(leadership_result.details.get("scope_candidate_codes", []))
     return (
         non_signal_scope_count >= 3
-        and leadership_result.leadership_role in {"leader", "second_leader"}
-        and not leadership_result.leadership_role.startswith("signal_")
+        and leadership_result.leadership_role in {"leader", "co_leader"}
         and stock_pullback.passed
     )
 

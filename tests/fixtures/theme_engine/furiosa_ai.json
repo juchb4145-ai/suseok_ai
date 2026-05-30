@@ -1,0 +1,164 @@
+{
+  "aliases": [
+    "퓨리오사AI",
+    "퓨리오사 AI",
+    "FuriosaAI",
+    "퓨리오사/창투사"
+  ],
+  "source_themes": [
+    {
+      "source": "themelab_fixture",
+      "source_theme_id": "furiosa_ai",
+      "source_theme_name": "퓨리오사AI"
+    },
+    {
+      "source": "infostock_fixture",
+      "source_theme_id": "furiosa_ai_vc",
+      "source_theme_name": "퓨리오사AI/창투사"
+    },
+    {
+      "source": "news_fixture",
+      "source_theme_id": "furiosa_ai_news",
+      "source_theme_name": "퓨리오사 AI"
+    }
+  ],
+  "members": [
+    {
+      "stock_code": "000001",
+      "stock_name": "MOCK-TSINV",
+      "relation_type": "investor",
+      "reason": "early investor",
+      "confidence": 0.92
+    },
+    {
+      "stock_code": "000002",
+      "stock_name": "MOCK-DSC",
+      "relation_type": "partner",
+      "reason": "strategic partner",
+      "confidence": 0.86
+    },
+    {
+      "stock_code": "000003",
+      "stock_name": "MOCK-LB",
+      "relation_type": "news_mentioned",
+      "reason": "news mention",
+      "confidence": 0.74
+    },
+    {
+      "stock_code": "000004",
+      "stock_name": "MOCK-4BY4",
+      "relation_type": "unknown",
+      "reason": "market rumor basket",
+      "confidence": 0.35
+    },
+    {
+      "stock_code": "000005",
+      "stock_name": "MOCK-XPERIX",
+      "relation_type": "rumor",
+      "reason": "unverified mention",
+      "confidence": 0.28
+    }
+  ],
+  "mock_ticks": [
+    {
+      "stock_code": "000001",
+      "stock_name": "MOCK-TSINV",
+      "current_price": 8700,
+      "change_rate": 8.7,
+      "volume": 2200000,
+      "turnover": 120000000000,
+      "execution_strength": 170,
+      "momentum_1m": 1.6,
+      "momentum_3m": 3.1,
+      "momentum_5m": 5.4,
+      "turnover_strength": 4.1
+    },
+    {
+      "stock_code": "000002",
+      "stock_name": "MOCK-DSC",
+      "current_price": 7300,
+      "change_rate": 5.9,
+      "volume": 1800000,
+      "turnover": 65000000000,
+      "execution_strength": 145,
+      "momentum_1m": 1.1,
+      "momentum_3m": 2.7,
+      "momentum_5m": 4.2,
+      "turnover_strength": 3.4
+    },
+    {
+      "stock_code": "000003",
+      "stock_name": "MOCK-LB",
+      "current_price": 5400,
+      "change_rate": 4.2,
+      "volume": 900000,
+      "turnover": 28000000000,
+      "execution_strength": 120,
+      "momentum_1m": 0.8,
+      "momentum_3m": 1.9,
+      "momentum_5m": 3.2,
+      "turnover_strength": 2.6
+    },
+    {
+      "stock_code": "000004",
+      "stock_name": "MOCK-4BY4",
+      "current_price": 4100,
+      "change_rate": -0.8,
+      "volume": 210000,
+      "turnover": 3500000000,
+      "execution_strength": 82,
+      "momentum_1m": -0.1,
+      "momentum_3m": 0.1,
+      "momentum_5m": 0.4,
+      "turnover_strength": 0.8
+    },
+    {
+      "stock_code": "000005",
+      "stock_name": "MOCK-XPERIX",
+      "current_price": 3200,
+      "change_rate": -1.2,
+      "volume": 130000,
+      "turnover": 1900000000,
+      "execution_strength": 70,
+      "momentum_1m": -0.2,
+      "momentum_3m": -0.3,
+      "momentum_5m": -0.1,
+      "turnover_strength": 0.5
+    }
+  ],
+  "leader_only_ticks": [
+    {
+      "stock_code": "000001",
+      "stock_name": "MOCK-TSINV",
+      "change_rate": 9.2,
+      "turnover": 180000000000,
+      "execution_strength": 180,
+      "momentum_1m": 2.0,
+      "momentum_3m": 3.5,
+      "momentum_5m": 6.0,
+      "turnover_strength": 4.6
+    },
+    {
+      "stock_code": "000002",
+      "stock_name": "MOCK-DSC",
+      "change_rate": -0.4,
+      "turnover": 12000000000,
+      "execution_strength": 80,
+      "momentum_1m": -0.1,
+      "momentum_3m": 0.0,
+      "momentum_5m": 0.2,
+      "turnover_strength": 0.9
+    },
+    {
+      "stock_code": "000003",
+      "stock_name": "MOCK-LB",
+      "change_rate": -0.7,
+      "turnover": 9000000000,
+      "execution_strength": 74,
+      "momentum_1m": -0.2,
+      "momentum_3m": -0.2,
+      "momentum_5m": 0.1,
+      "turnover_strength": 0.7
+    }
+  ]
+}
