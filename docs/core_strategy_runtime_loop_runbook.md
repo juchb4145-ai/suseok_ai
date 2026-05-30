@@ -63,9 +63,10 @@ PR-5 adds a runtime order sink:
 - `NoopRuntimeOrderSink` for OBSERVE and disabled DRY_RUN order enqueue.
 - `DryRunRuntimeOrderSink` for `TRADING_RUNTIME_MODE=DRY_RUN` and `TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS=1`.
 
-The sink is called after a valid entry plan has a submitted or recovered virtual order. It records `runtime_order_intents` with decision safety and live safety. The sink uses the same `OrderEnqueueService` as `POST /api/orders/enqueue`, but it calls the service directly in-process rather than calling the HTTP endpoint.
+The entry sink is called after a valid entry plan has a submitted or recovered virtual order. The exit sink is called after a filled exit decision is saved for an open virtual position. Both record `runtime_order_intents` with decision safety and live safety. The sink uses the same `OrderEnqueueService` as `POST /api/orders/enqueue`, but it calls the service directly in-process rather than calling the HTTP endpoint.
 
 LIVE runtime orders remain disabled in PR-5.
+PR-6 still keeps LIVE runtime orders disabled; exit decisions are recorded as DRY_RUN sell intents only.
 
 ## Gateway Event Flow
 

@@ -74,13 +74,19 @@
         </div>
         <div class="mini-grid command-grid">
           <div><span>INTENTS</span><strong id="dryrun-order-total">0</strong></div>
+          <div><span>ENTRY / BUY</span><strong id="dryrun-order-entry-buy">0 / 0</strong></div>
+          <div><span>EXIT / SELL</span><strong id="dryrun-order-exit-sell">0 / 0</strong></div>
           <div><span>ACCEPTED</span><strong id="dryrun-order-accepted">0</strong></div>
           <div><span>REJECTED</span><strong id="dryrun-order-rejected">0</strong></div>
           <div><span>DUPLICATE</span><strong id="dryrun-order-duplicate">0</strong></div>
+          <div><span>SELL ACCEPT</span><strong id="dryrun-sell-accepted">0</strong></div>
+          <div><span>SELL REJECT</span><strong id="dryrun-sell-rejected">0</strong></div>
+          <div><span>SELL DUP</span><strong id="dryrun-sell-duplicate">0</strong></div>
           <div><span>LIVE WOULD PASS</span><strong id="dryrun-order-live-pass">0</strong></div>
           <div><span>LIVE WOULD REJECT</span><strong id="dryrun-order-live-reject">0</strong></div>
         </div>
         <div id="dryrun-reject-reasons" class="inline-log"></div>
+        <div id="dryrun-exit-type-lines" class="inline-log"></div>
         <table>
           <thead>
             <tr>
@@ -97,6 +103,23 @@
             </tr>
           </thead>
           <tbody id="dryrun-order-rows"></tbody>
+        </table>
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Code</th>
+              <th>Decision</th>
+              <th>Qty</th>
+              <th>Price</th>
+              <th>Status</th>
+              <th>Reason</th>
+              <th>Live</th>
+              <th>Position</th>
+              <th>Exit Decision</th>
+            </tr>
+          </thead>
+          <tbody id="dryrun-sell-order-rows"></tbody>
         </table>
       </section>
 

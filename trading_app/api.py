@@ -183,6 +183,10 @@ def runtime_dry_run_orders(
     status: Optional[str] = None,
     code: Optional[str] = None,
     candidate_id: Optional[int] = None,
+    side: Optional[str] = None,
+    order_phase: Optional[str] = None,
+    virtual_position_id: Optional[int] = None,
+    exit_decision_id: Optional[int] = None,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
@@ -191,6 +195,10 @@ def runtime_dry_run_orders(
         status=status,
         code=code,
         candidate_id=candidate_id,
+        side=side,
+        order_phase=order_phase,
+        virtual_position_id=virtual_position_id,
+        exit_decision_id=exit_decision_id,
         limit=limit,
         offset=offset,
     )
@@ -420,6 +428,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     dry_run_orders_payload = {
         "summary": db.runtime_order_intent_summary(),
         "items": db.list_runtime_order_intents(limit=20),
+        "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=20),
     }
     runtime_payload["dry_run_orders"] = dry_run_orders_payload
     return {
@@ -687,13 +696,23 @@ def _runtime_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
         "dry_run_order_sink_enabled": snapshot_payload.get("dry_run_order_sink_enabled", False),
         "dry_run_order_policy": snapshot_payload.get("dry_run_order_policy", status.get("order_policy", "")),
         "dry_run_order_intent_count": snapshot_payload.get("dry_run_order_intent_count", 0),
+        "dry_run_entry_order_intent_count": snapshot_payload.get("dry_run_entry_order_intent_count", 0),
+        "dry_run_exit_order_intent_count": snapshot_payload.get("dry_run_exit_order_intent_count", 0),
+        "dry_run_sell_order_intent_count": snapshot_payload.get("dry_run_sell_order_intent_count", 0),
         "dry_run_order_accepted_count": snapshot_payload.get("dry_run_order_accepted_count", 0),
         "dry_run_order_rejected_count": snapshot_payload.get("dry_run_order_rejected_count", 0),
         "dry_run_order_duplicate_count": snapshot_payload.get("dry_run_order_duplicate_count", 0),
+        "dry_run_exit_accepted_count": snapshot_payload.get("dry_run_exit_accepted_count", 0),
+        "dry_run_exit_rejected_count": snapshot_payload.get("dry_run_exit_rejected_count", 0),
+        "dry_run_exit_duplicate_count": snapshot_payload.get("dry_run_exit_duplicate_count", 0),
         "dry_run_order_live_would_pass_count": snapshot_payload.get("dry_run_order_live_would_pass_count", 0),
         "dry_run_order_live_would_reject_count": snapshot_payload.get("dry_run_order_live_would_reject_count", 0),
+        "dry_run_exit_live_would_pass_count": snapshot_payload.get("dry_run_exit_live_would_pass_count", 0),
+        "dry_run_exit_live_would_reject_count": snapshot_payload.get("dry_run_exit_live_would_reject_count", 0),
         "last_dry_run_order_intent_at": snapshot_payload.get("last_dry_run_order_intent_at", ""),
         "last_dry_run_order_reject_reason": snapshot_payload.get("last_dry_run_order_reject_reason", ""),
+        "last_dry_run_exit_order_intent_at": snapshot_payload.get("last_dry_run_exit_order_intent_at", ""),
+        "last_dry_run_exit_order_reject_reason": snapshot_payload.get("last_dry_run_exit_order_reject_reason", ""),
         "market_session_status": readiness.get("market_session_status", ""),
         "data_warmup_status": readiness.get("data_warmup_status", ""),
         "gate_skip_reason": readiness.get("gate_skip_reason", ""),

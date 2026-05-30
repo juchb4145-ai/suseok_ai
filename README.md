@@ -130,6 +130,15 @@ python -m uvicorn trading_app.api:app --host 127.0.0.1 --port 8000
 
 The DRY_RUN runtime setting records order intents only. It does not create Gateway `send_order` commands and does not send Kiwoom orders.
 
+Dry-run sell intent checks:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/runtime/orders/dry-run/summary
+Invoke-RestMethod "http://127.0.0.1:8000/api/runtime/orders/dry-run?side=sell&order_phase=exit"
+```
+
+Dashboard `/` shows entry/buy counts, exit/sell counts, recent sell intents, and exit decision type summaries.
+
 ## 32bit Kiwoom Gateway
 
 Use 32bit Python 3.9.13 with Kiwoom OpenAPI+ installed and OCX registered.
@@ -178,7 +187,7 @@ py -3.9-32 apps/legacy_pyqt_app.py --mock
 - Gateway polling does not mean success. Only `command_ack status=ACKED` marks a command successful.
 - Duplicate `idempotency_key` or deterministic order dedupe keys are rejected while active or retained in SQLite.
 - Core restart restores valid `QUEUED` commands only. `DISPATCHED` order commands are not automatically resent.
-- StrategyRuntime auto LIVE orders are not enabled in PR-5. Runtime uses GatewayCommand for realtime/condition requests, virtual order/review for strategy flow, and optional DRY_RUN order intent records for analysis.
+- StrategyRuntime auto LIVE orders are not enabled in PR-6. Runtime uses GatewayCommand for realtime/condition requests, virtual order/review for strategy flow, and optional DRY_RUN buy/sell order intent records for analysis.
 
 More detail:
 
@@ -188,3 +197,4 @@ More detail:
 - [Gateway Command Persistence Runbook](docs/gateway_command_persistence_runbook.md)
 - [Core StrategyRuntime Loop Runbook](docs/core_strategy_runtime_loop_runbook.md)
 - [Runtime DRY_RUN Order Enqueue Runbook](docs/runtime_dry_run_order_enqueue_runbook.md)
+- [Runtime DRY_RUN Exit/Sell Intent Runbook](docs/runtime_dry_run_exit_sell_intent_runbook.md)

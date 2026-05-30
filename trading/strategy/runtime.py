@@ -20,7 +20,7 @@ from trading.strategy.candidates import (
 )
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.entry import EntryPlanBuilder
-from trading.strategy.exit import ExitDecisionEngine, VirtualPositionService
+from trading.strategy.exit import SUPPORT_LOSS, TAKE_PROFIT, TIME_EXIT, TRAILING_STOP, ExitDecisionEngine, VirtualPositionService
 from trading.strategy.holding import HoldingProvider, StaticHoldingProvider
 from trading.strategy.models import (
     BlockType,
@@ -139,8 +139,18 @@ class StrategyRuntimeSnapshot:
     dry_run_order_duplicate_count: int = 0
     dry_run_order_live_would_pass_count: int = 0
     dry_run_order_live_would_reject_count: int = 0
+    dry_run_entry_order_intent_count: int = 0
+    dry_run_exit_order_intent_count: int = 0
+    dry_run_sell_order_intent_count: int = 0
+    dry_run_exit_accepted_count: int = 0
+    dry_run_exit_rejected_count: int = 0
+    dry_run_exit_duplicate_count: int = 0
+    dry_run_exit_live_would_pass_count: int = 0
+    dry_run_exit_live_would_reject_count: int = 0
     last_dry_run_order_intent_at: str = ""
     last_dry_run_order_reject_reason: str = ""
+    last_dry_run_exit_order_intent_at: str = ""
+    last_dry_run_exit_order_reject_reason: str = ""
     dry_run_order_policy: str = ""
     dry_run_order_sink_enabled: bool = False
     subscription_active_count: int = 0
@@ -956,6 +966,8 @@ class StrategyRuntime:
                         saved_decision = self.db.save_exit_decision(decision)
                         snapshot.db_write_count_per_cycle += 1
                     saved_decisions.append(saved_decision)
+                    if candidate is not None:
+                        self._emit_exit_order_intent(candidate, position, saved_decision, context, snapshot, now)
                 if position_details_changed and not position.closed_at:
                     position = self.db.save_virtual_position(position)
                     snapshot.db_write_count_per_cycle += 1
@@ -1000,19 +1012,21 @@ class StrategyRuntime:
                     self.candle_builder,
                     now,
                 )
-                if context.dry_run_order_result:
-                    _attach_dry_run_order_review_details(review, context.dry_run_order_result)
+                if context.dry_run_entry_order_result or context.dry_run_exit_order_results or context.dry_run_order_result:
+                    _attach_dry_run_order_review_details(review, context)
                 if not self._review_changed(review):
                     continue
                 saved_review = self.db.save_trade_review(review)
-                if context.dry_run_order_result.get("intent_id") and getattr(saved_review, "id", None) is not None:
-                    try:
-                        self.db.link_runtime_order_intent_review(
-                            str(context.dry_run_order_result.get("intent_id") or ""),
-                            int(saved_review.id),
-                        )
-                    except Exception:
-                        pass
+                if getattr(saved_review, "id", None) is not None:
+                    for order_result in _context_dry_run_order_results(context):
+                        if order_result.get("intent_id"):
+                            try:
+                                self.db.link_runtime_order_intent_review(
+                                    str(order_result.get("intent_id") or ""),
+                                    int(saved_review.id),
+                                )
+                            except Exception:
+                                pass
                 snapshot.review_upsert_count += 1
                 snapshot.db_write_count_per_cycle += 1
                 snapshot.review_count += 1
@@ -1408,12 +1422,46 @@ class StrategyRuntime:
                 virtual_order=virtual_order,
                 runtime_cycle_at=now.isoformat(),
             )
+            context.dry_run_entry_order_result = dict(payload or {})
             context.dry_run_order_result = dict(payload or {})
             if payload and payload.get("status") not in {"SKIPPED", ""}:
                 context.review_needed = True
             self._apply_order_sink_snapshot(snapshot)
         except Exception as exc:
             snapshot.warnings.append(f"RUNTIME_DRY_RUN_ORDER_SINK_FAILED:{candidate.code}:{exc}")
+
+    def _emit_exit_order_intent(
+        self,
+        candidate: Candidate,
+        position: VirtualPosition,
+        decision: ExitDecision,
+        context: "_ReviewContext",
+        snapshot: StrategyRuntimeSnapshot,
+        now: datetime,
+    ) -> None:
+        if self.order_sink is None:
+            return
+        if not bool(decision.filled):
+            return
+        if decision.decision_type not in {TAKE_PROFIT, SUPPORT_LOSS, TIME_EXIT, TRAILING_STOP}:
+            return
+        if not decision.details.get("virtual_exit_price") and not decision.trigger_price:
+            return
+        try:
+            payload = self.order_sink.on_exit_order_decision(
+                candidate=candidate,
+                virtual_position=position,
+                exit_decision=decision,
+                runtime_cycle_at=now.isoformat(),
+                context={"runtime": "strategy_runtime"},
+            )
+            result = dict(payload or {})
+            context.dry_run_exit_order_results.append(result)
+            if result and result.get("status") not in {"SKIPPED", ""}:
+                context.review_needed = True
+            self._apply_order_sink_snapshot(snapshot)
+        except Exception as exc:
+            snapshot.warnings.append(f"RUNTIME_DRY_RUN_EXIT_ORDER_SINK_FAILED:{candidate.code}:{decision.id}:{exc}")
 
     def _apply_order_sink_snapshot(self, snapshot: StrategyRuntimeSnapshot) -> None:
         if self.order_sink is None or not hasattr(self.order_sink, "snapshot"):
@@ -1429,8 +1477,18 @@ class StrategyRuntime:
         snapshot.dry_run_order_duplicate_count = int(payload.get("dry_run_order_duplicate_count") or 0)
         snapshot.dry_run_order_live_would_pass_count = int(payload.get("dry_run_order_live_would_pass_count") or 0)
         snapshot.dry_run_order_live_would_reject_count = int(payload.get("dry_run_order_live_would_reject_count") or 0)
+        snapshot.dry_run_entry_order_intent_count = int(payload.get("dry_run_entry_order_intent_count") or 0)
+        snapshot.dry_run_exit_order_intent_count = int(payload.get("dry_run_exit_order_intent_count") or 0)
+        snapshot.dry_run_sell_order_intent_count = int(payload.get("dry_run_sell_order_intent_count") or 0)
+        snapshot.dry_run_exit_accepted_count = int(payload.get("dry_run_exit_accepted_count") or 0)
+        snapshot.dry_run_exit_rejected_count = int(payload.get("dry_run_exit_rejected_count") or 0)
+        snapshot.dry_run_exit_duplicate_count = int(payload.get("dry_run_exit_duplicate_count") or 0)
+        snapshot.dry_run_exit_live_would_pass_count = int(payload.get("dry_run_exit_live_would_pass_count") or 0)
+        snapshot.dry_run_exit_live_would_reject_count = int(payload.get("dry_run_exit_live_would_reject_count") or 0)
         snapshot.last_dry_run_order_intent_at = str(payload.get("last_dry_run_order_intent_at") or "")
         snapshot.last_dry_run_order_reject_reason = str(payload.get("last_dry_run_order_reject_reason") or "")
+        snapshot.last_dry_run_exit_order_intent_at = str(payload.get("last_dry_run_exit_order_intent_at") or "")
+        snapshot.last_dry_run_exit_order_reject_reason = str(payload.get("last_dry_run_exit_order_reject_reason") or "")
         snapshot.dry_run_order_policy = str(payload.get("dry_run_order_policy") or "")
         snapshot.dry_run_order_sink_enabled = bool(payload.get("dry_run_order_sink_enabled"))
 
@@ -1495,6 +1553,8 @@ class _ReviewContext:
     virtual_position: Optional[VirtualPosition] = None
     exit_decisions: list[ExitDecision] = field(default_factory=list)
     dry_run_order_result: dict = field(default_factory=dict)
+    dry_run_entry_order_result: dict = field(default_factory=dict)
+    dry_run_exit_order_results: list[dict] = field(default_factory=list)
     review_needed: bool = False
 
 
@@ -1504,27 +1564,86 @@ def _snapshot_for_exit(context: _ReviewContext):
     return None
 
 
-def _attach_dry_run_order_review_details(review: TradeReview, result: dict) -> None:
+def _context_dry_run_order_results(context: _ReviewContext) -> list[dict]:
+    results: list[dict] = []
+    if context.dry_run_entry_order_result:
+        results.append(context.dry_run_entry_order_result)
+    elif context.dry_run_order_result:
+        results.append(context.dry_run_order_result)
+    results.extend([dict(item or {}) for item in context.dry_run_exit_order_results if item])
+    return results
+
+
+def _attach_dry_run_order_review_details(review: TradeReview, context: _ReviewContext) -> None:
     details = dict(review.details or {})
-    safety = dict(result.get("safety") or result.get("safety_checks") or {})
-    request = dict(result.get("request") or {})
-    details.update(
-        {
-            "dry_run_order_intent_id": result.get("intent_id", ""),
-            "dry_run_order_status": result.get("status", ""),
-            "dry_run_order_reason": result.get("reason", ""),
-            "dry_run_dedupe_key": result.get("dedupe_key", ""),
-            "dry_run_live_would_pass": bool(result.get("live_would_pass")),
-            "dry_run_live_reject_reason": result.get("live_reject_reason", ""),
-            "dry_run_quantity": request.get("quantity", 0),
-            "dry_run_price": request.get("price", 0),
-            "dry_run_order_amount": int(request.get("quantity") or 0) * max(0, int(request.get("price") or 0)),
-            "dry_run_safety_summary": {
-                "ok": safety.get("ok"),
-                "reason": safety.get("reason", ""),
-            },
-        }
-    )
+    entry = context.dry_run_entry_order_result or context.dry_run_order_result
+    if entry:
+        safety = dict(entry.get("safety") or entry.get("safety_checks") or {})
+        request = dict(entry.get("request") or {})
+        amount = int(request.get("quantity") or 0) * max(0, int(request.get("price") or 0))
+        details.update(
+            {
+                "dry_run_entry_order_intent_id": entry.get("intent_id", ""),
+                "dry_run_entry_order_status": entry.get("status", ""),
+                "dry_run_entry_order_reason": entry.get("reason", ""),
+                "dry_run_entry_dedupe_key": entry.get("dedupe_key", ""),
+                "dry_run_entry_live_would_pass": bool(entry.get("live_would_pass")),
+                "dry_run_entry_live_reject_reason": entry.get("live_reject_reason", ""),
+                "dry_run_entry_quantity": request.get("quantity", 0),
+                "dry_run_entry_price": request.get("price", 0),
+                "dry_run_entry_order_amount": amount,
+                "dry_run_entry_safety_summary": {
+                    "ok": safety.get("ok"),
+                    "reason": safety.get("reason", ""),
+                },
+                "dry_run_order_intent_id": entry.get("intent_id", ""),
+                "dry_run_order_status": entry.get("status", ""),
+                "dry_run_order_reason": entry.get("reason", ""),
+                "dry_run_dedupe_key": entry.get("dedupe_key", ""),
+                "dry_run_live_would_pass": bool(entry.get("live_would_pass")),
+                "dry_run_live_reject_reason": entry.get("live_reject_reason", ""),
+                "dry_run_quantity": request.get("quantity", 0),
+                "dry_run_price": request.get("price", 0),
+                "dry_run_order_amount": amount,
+                "dry_run_safety_summary": {
+                    "ok": safety.get("ok"),
+                    "reason": safety.get("reason", ""),
+                },
+            }
+        )
+    exit_results = [dict(item or {}) for item in context.dry_run_exit_order_results if item]
+    if exit_results:
+        exit_requests = [dict(item.get("request") or {}) for item in exit_results]
+        details.update(
+            {
+                "dry_run_exit_order_intent_ids": [item.get("intent_id", "") for item in exit_results],
+                "dry_run_exit_order_statuses": [item.get("status", "") for item in exit_results],
+                "dry_run_exit_reasons": [item.get("reason", "") for item in exit_results],
+                "dry_run_exit_decision_ids": [request.get("exit_decision_id") for request in exit_requests],
+                "dry_run_exit_live_would_pass_count": sum(1 for item in exit_results if item.get("live_would_pass")),
+                "dry_run_exit_live_would_reject_count": sum(1 for item in exit_results if not item.get("live_would_pass")),
+                "dry_run_exit_sell_quantity_total": sum(int(request.get("quantity") or 0) for request in exit_requests),
+                "dry_run_exit_sell_amount_total": sum(
+                    int(request.get("quantity") or 0) * max(0, int(request.get("price") or 0))
+                    for request in exit_requests
+                ),
+                "dry_run_exit_summary": [
+                    {
+                        "intent_id": item.get("intent_id", ""),
+                        "status": item.get("status", ""),
+                        "reason": item.get("reason", ""),
+                        "dedupe_key": item.get("dedupe_key", ""),
+                        "live_would_pass": bool(item.get("live_would_pass")),
+                        "live_reject_reason": item.get("live_reject_reason", ""),
+                        "exit_decision_id": request.get("exit_decision_id"),
+                        "exit_decision_type": request.get("exit_decision_type", ""),
+                        "quantity": request.get("quantity", 0),
+                        "price": request.get("price", 0),
+                    }
+                    for item, request in zip(exit_results, exit_requests)
+                ],
+            }
+        )
     review.details = details
 
 

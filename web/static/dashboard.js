@@ -92,15 +92,25 @@ function render(snapshot) {
   const drySummary = dryRunOrders.summary || {};
   text("dryrun-order-policy", runtime.dry_run_order_sink_enabled ? runtime.dry_run_order_policy || "enabled" : runtime.dry_run_order_policy || "disabled");
   text("dryrun-order-total", drySummary.total ?? runtime.dry_run_order_intent_count ?? 0);
+  text("dryrun-order-entry-buy", `${drySummary.entry_total ?? runtime.dry_run_entry_order_intent_count ?? 0} / ${drySummary.buy_total ?? 0}`);
+  text("dryrun-order-exit-sell", `${drySummary.exit_total ?? runtime.dry_run_exit_order_intent_count ?? 0} / ${drySummary.sell_total ?? runtime.dry_run_sell_order_intent_count ?? 0}`);
   text("dryrun-order-accepted", drySummary.accepted ?? runtime.dry_run_order_accepted_count ?? 0);
   text("dryrun-order-rejected", drySummary.rejected ?? runtime.dry_run_order_rejected_count ?? 0);
   text("dryrun-order-duplicate", drySummary.duplicate ?? runtime.dry_run_order_duplicate_count ?? 0);
+  text("dryrun-sell-accepted", drySummary.exit_accepted ?? runtime.dry_run_exit_accepted_count ?? 0);
+  text("dryrun-sell-rejected", drySummary.exit_rejected ?? runtime.dry_run_exit_rejected_count ?? 0);
+  text("dryrun-sell-duplicate", drySummary.exit_duplicate ?? runtime.dry_run_exit_duplicate_count ?? 0);
   text("dryrun-order-live-pass", drySummary.live_would_pass ?? runtime.dry_run_order_live_would_pass_count ?? 0);
   text("dryrun-order-live-reject", drySummary.live_would_reject ?? runtime.dry_run_order_live_would_reject_count ?? 0);
   const rejectNode = document.getElementById("dryrun-reject-reasons");
   if (rejectNode) {
     const reasons = (drySummary.top_reject_reasons || []).map((item) => `${item.reason}: ${item.count}`);
     rejectNode.innerHTML = reasons.length ? reasons.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">No reject reasons</span>';
+  }
+  const exitTypeNode = document.getElementById("dryrun-exit-type-lines");
+  if (exitTypeNode) {
+    const decisionTypes = (drySummary.exit_by_decision_type || []).map((item) => `${item.decision_type}: ${item.count}`);
+    exitTypeNode.innerHTML = decisionTypes.length ? decisionTypes.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">No exit decision types</span>';
   }
   renderRows(
     "dryrun-order-rows",
@@ -116,6 +126,24 @@ function render(snapshot) {
         item.live_would_pass ? "PASS" : item.live_reject_reason || "REJECT",
         item.candidate_id || "-",
         item.virtual_order_id || "-",
+      ]),
+    ),
+    10,
+  );
+  renderRows(
+    "dryrun-sell-order-rows",
+    (dryRunOrders.recent_sell || []).slice(0, 20).map((item) =>
+      rowHtml([
+        item.created_at || "-",
+        item.code || "-",
+        item.exit_decision_type || "-",
+        item.quantity || 0,
+        item.price || 0,
+        item.status || "-",
+        item.reason || "-",
+        item.live_would_pass ? "PASS" : item.live_reject_reason || "REJECT",
+        item.virtual_position_id || "-",
+        item.exit_decision_id || "-",
       ]),
     ),
     10,

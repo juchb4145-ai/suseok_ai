@@ -473,6 +473,21 @@ class TradingDatabase:
                 trade_review_id INTEGER,
                 leg_index INTEGER,
                 entry_type TEXT NOT NULL DEFAULT '',
+                order_phase TEXT NOT NULL DEFAULT 'entry',
+                exit_decision_id INTEGER,
+                exit_decision_type TEXT NOT NULL DEFAULT '',
+                exit_reason TEXT NOT NULL DEFAULT '',
+                exit_percent REAL,
+                exit_quantity INTEGER,
+                remaining_quantity INTEGER,
+                position_entry_price INTEGER,
+                position_quantity INTEGER,
+                position_opened_at TEXT NOT NULL DEFAULT '',
+                position_closed_at TEXT NOT NULL DEFAULT '',
+                position_max_return_pct REAL,
+                position_max_drawdown_pct REAL,
+                realized_return_pct REAL,
+                virtual_exit_price INTEGER,
                 gate_reason TEXT NOT NULL DEFAULT '',
                 gate_status TEXT NOT NULL DEFAULT '',
                 idempotency_key TEXT NOT NULL DEFAULT '',
@@ -608,6 +623,8 @@ class TradingDatabase:
         self._ensure_column("virtual_orders", "details_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("virtual_positions", "details_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_strategy_runtime_settings_columns()
+        self._ensure_runtime_order_intent_columns()
+        self._ensure_runtime_order_intent_indexes()
         self._seed_legacy_strategy_runtime_settings()
         self._ensure_trade_review_columns()
         self.conn.execute(
@@ -792,7 +809,12 @@ class TradingDatabase:
                     account, code, side, quantity, price, order_amount, order_type,
                     hoga, tag, strategy_name, candidate_id, entry_plan_id,
                     virtual_order_id, virtual_position_id, trade_review_id,
-                    leg_index, entry_type, gate_reason, gate_status,
+                    leg_index, entry_type, order_phase, exit_decision_id,
+                    exit_decision_type, exit_reason, exit_percent, exit_quantity,
+                    remaining_quantity, position_entry_price, position_quantity,
+                    position_opened_at, position_closed_at, position_max_return_pct,
+                    position_max_drawdown_pct, realized_return_pct, virtual_exit_price,
+                    gate_reason, gate_status,
                     idempotency_key, dedupe_key, duplicate_of, safety_json,
                     live_safety_json, request_json, response_json, metadata_json,
                     created_at, updated_at
@@ -801,7 +823,12 @@ class TradingDatabase:
                     :account, :code, :side, :quantity, :price, :order_amount, :order_type,
                     :hoga, :tag, :strategy_name, :candidate_id, :entry_plan_id,
                     :virtual_order_id, :virtual_position_id, :trade_review_id,
-                    :leg_index, :entry_type, :gate_reason, :gate_status,
+                    :leg_index, :entry_type, :order_phase, :exit_decision_id,
+                    :exit_decision_type, :exit_reason, :exit_percent, :exit_quantity,
+                    :remaining_quantity, :position_entry_price, :position_quantity,
+                    :position_opened_at, :position_closed_at, :position_max_return_pct,
+                    :position_max_drawdown_pct, :realized_return_pct, :virtual_exit_price,
+                    :gate_reason, :gate_status,
                     :idempotency_key, :dedupe_key, :duplicate_of, :safety_json,
                     :live_safety_json, :request_json, :response_json, :metadata_json,
                     :created_at, :updated_at
@@ -922,6 +949,10 @@ class TradingDatabase:
         status: Optional[str] = None,
         code: Optional[str] = None,
         candidate_id: Optional[int] = None,
+        side: Optional[str] = None,
+        order_phase: Optional[str] = None,
+        virtual_position_id: Optional[int] = None,
+        exit_decision_id: Optional[int] = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict]:
@@ -939,6 +970,18 @@ class TradingDatabase:
         if candidate_id is not None:
             clauses.append("candidate_id = ?")
             params.append(int(candidate_id))
+        if side:
+            clauses.append("side = ?")
+            params.append(side)
+        if order_phase:
+            clauses.append("order_phase = ?")
+            params.append(order_phase)
+        if virtual_position_id is not None:
+            clauses.append("virtual_position_id = ?")
+            params.append(int(virtual_position_id))
+        if exit_decision_id is not None:
+            clauses.append("exit_decision_id = ?")
+            params.append(int(exit_decision_id))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.conn.execute(
             f"""
@@ -981,16 +1024,24 @@ class TradingDatabase:
         total = sum(status_counts.values())
         live_rows = self.conn.execute(
             f"""
-            SELECT live_safety_json, reason, code, strategy_name
+            SELECT status, live_safety_json, reason, code, strategy_name, side, order_phase,
+                   exit_decision_type, exit_reason
             FROM runtime_order_intents
             {where}
             """,
             tuple(params),
         ).fetchall()
         live_would_pass = 0
+        exit_live_would_pass = 0
+        exit_live_would_reject = 0
         reject_reasons: dict[str, int] = {}
         by_code: dict[str, int] = {}
         by_strategy_name: dict[str, int] = {}
+        by_side: dict[str, int] = {}
+        by_order_phase: dict[str, int] = {}
+        exit_by_decision_type: dict[str, int] = {}
+        exit_by_reason: dict[str, int] = {}
+        exit_status_counts: dict[str, int] = {}
         for row in live_rows:
             live_safety = _safe_json_loads(row["live_safety_json"], {})
             if bool(live_safety.get("ok")):
@@ -998,6 +1049,25 @@ class TradingDatabase:
             else:
                 reason = str(live_safety.get("reason") or row["reason"] or "UNKNOWN")
                 reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
+            side = str(row["side"] or "")
+            order_phase = str(row["order_phase"] or "")
+            if side:
+                by_side[side] = by_side.get(side, 0) + 1
+            if order_phase:
+                by_order_phase[order_phase] = by_order_phase.get(order_phase, 0) + 1
+            if order_phase == "exit" or side == "sell":
+                status = str(row["status"] or "")
+                exit_status_counts[status] = exit_status_counts.get(status, 0) + 1
+                if bool(live_safety.get("ok")):
+                    exit_live_would_pass += 1
+                else:
+                    exit_live_would_reject += 1
+                decision_type = str(row["exit_decision_type"] or "")
+                if decision_type:
+                    exit_by_decision_type[decision_type] = exit_by_decision_type.get(decision_type, 0) + 1
+                exit_reason = str(row["exit_reason"] or row["reason"] or "")
+                if exit_reason:
+                    exit_by_reason[exit_reason] = exit_by_reason.get(exit_reason, 0) + 1
             code = str(row["code"] or "")
             if code:
                 by_code[code] = by_code.get(code, 0) + 1
@@ -1009,11 +1079,20 @@ class TradingDatabase:
             "accepted": status_counts.get("DRY_RUN_ACCEPTED", 0) + status_counts.get("ACCEPTED", 0),
             "rejected": status_counts.get("DRY_RUN_REJECTED", 0) + status_counts.get("REJECTED", 0),
             "duplicate": status_counts.get("DUPLICATE", 0) + duplicate_count,
+            "entry_total": by_order_phase.get("entry", 0),
+            "exit_total": by_order_phase.get("exit", 0),
+            "buy_total": by_side.get("buy", 0),
+            "sell_total": by_side.get("sell", 0),
+            "exit_accepted": exit_status_counts.get("DRY_RUN_ACCEPTED", 0) + exit_status_counts.get("ACCEPTED", 0),
+            "exit_rejected": exit_status_counts.get("DRY_RUN_REJECTED", 0) + exit_status_counts.get("REJECTED", 0),
+            "exit_duplicate": exit_status_counts.get("DUPLICATE", 0),
             "observe_skipped": status_counts.get("OBSERVE_SKIPPED", 0),
             "live_blocked": status_counts.get("LIVE_BLOCKED", 0),
             "error": status_counts.get("ERROR", 0),
             "live_would_pass": live_would_pass,
             "live_would_reject": max(0, total - live_would_pass),
+            "exit_live_would_pass": exit_live_would_pass,
+            "exit_live_would_reject": exit_live_would_reject,
             "top_reject_reasons": [
                 {"reason": reason, "count": count}
                 for reason, count in sorted(reject_reasons.items(), key=lambda item: item[1], reverse=True)[:10]
@@ -1025,6 +1104,22 @@ class TradingDatabase:
             "by_strategy_name": [
                 {"strategy_name": strategy_name, "count": count}
                 for strategy_name, count in sorted(by_strategy_name.items(), key=lambda item: item[1], reverse=True)[:20]
+            ],
+            "by_side": [
+                {"side": side, "count": count}
+                for side, count in sorted(by_side.items(), key=lambda item: item[1], reverse=True)
+            ],
+            "by_order_phase": [
+                {"order_phase": phase, "count": count}
+                for phase, count in sorted(by_order_phase.items(), key=lambda item: item[1], reverse=True)
+            ],
+            "exit_by_decision_type": [
+                {"decision_type": decision_type, "count": count}
+                for decision_type, count in sorted(exit_by_decision_type.items(), key=lambda item: item[1], reverse=True)
+            ],
+            "exit_by_reason": [
+                {"reason": reason, "count": count}
+                for reason, count in sorted(exit_by_reason.items(), key=lambda item: item[1], reverse=True)[:10]
             ],
             "status_counts": status_counts,
         }
@@ -1335,6 +1430,10 @@ class TradingDatabase:
         ).fetchone()
         return self._row_to_virtual_position(row) if row else None
 
+    def load_virtual_position(self, virtual_position_id: int) -> Optional[VirtualPosition]:
+        row = self.conn.execute("SELECT * FROM virtual_positions WHERE id = ?", (virtual_position_id,)).fetchone()
+        return self._row_to_virtual_position(row) if row else None
+
     def list_virtual_positions(self, candidate_id: Optional[int] = None) -> list[VirtualPosition]:
         if candidate_id is None:
             rows = self.conn.execute("SELECT * FROM virtual_positions ORDER BY id").fetchall()
@@ -1362,6 +1461,14 @@ class TradingDatabase:
             (virtual_position_id,),
         ).fetchall()
         return [self._row_to_exit_decision(row) for row in rows]
+
+    def load_exit_decision(self, exit_decision_id: int) -> Optional[ExitDecision]:
+        row = self.conn.execute("SELECT * FROM exit_decisions WHERE id = ?", (exit_decision_id,)).fetchone()
+        return self._row_to_exit_decision(row) if row else None
+
+    def load_virtual_order(self, virtual_order_id: int) -> Optional[VirtualOrder]:
+        row = self.conn.execute("SELECT * FROM virtual_orders WHERE id = ?", (virtual_order_id,)).fetchone()
+        return self._row_to_virtual_order(row) if row else None
 
     def close_virtual_position_with_decision(
         self,
@@ -1418,6 +1525,10 @@ class TradingDatabase:
             (limit,),
         ).fetchall()
         return [self._row_to_trade_review(row) for row in reversed(rows)]
+
+    def load_trade_review(self, trade_review_id: int) -> Optional[TradeReview]:
+        row = self.conn.execute("SELECT * FROM trade_reviews WHERE id = ?", (trade_review_id,)).fetchone()
+        return self._row_to_trade_review(row) if row else None
 
     def load_strategy_runtime_setting(self, config_key: str) -> Optional[dict]:
         row = self.conn.execute(
@@ -2126,6 +2237,48 @@ class TradingDatabase:
         for name, definition in columns.items():
             self._ensure_column("strategy_runtime_settings", name, definition)
 
+    def _ensure_runtime_order_intent_columns(self) -> None:
+        columns = {
+            "order_phase": "TEXT NOT NULL DEFAULT 'entry'",
+            "exit_decision_id": "INTEGER",
+            "exit_decision_type": "TEXT NOT NULL DEFAULT ''",
+            "exit_reason": "TEXT NOT NULL DEFAULT ''",
+            "exit_percent": "REAL",
+            "exit_quantity": "INTEGER",
+            "remaining_quantity": "INTEGER",
+            "position_entry_price": "INTEGER",
+            "position_quantity": "INTEGER",
+            "position_opened_at": "TEXT NOT NULL DEFAULT ''",
+            "position_closed_at": "TEXT NOT NULL DEFAULT ''",
+            "position_max_return_pct": "REAL",
+            "position_max_drawdown_pct": "REAL",
+            "realized_return_pct": "REAL",
+            "virtual_exit_price": "INTEGER",
+        }
+        for name, definition in columns.items():
+            self._ensure_column("runtime_order_intents", name, definition)
+        self.conn.execute(
+            """
+            UPDATE runtime_order_intents
+            SET order_phase = CASE WHEN side = 'sell' THEN 'exit' ELSE 'entry' END
+            WHERE order_phase = ''
+            """
+        )
+
+    def _ensure_runtime_order_intent_indexes(self) -> None:
+        self.conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_runtime_order_intents_order_phase
+                ON runtime_order_intents(order_phase);
+            CREATE INDEX IF NOT EXISTS idx_runtime_order_intents_side_created_at
+                ON runtime_order_intents(side, created_at);
+            CREATE INDEX IF NOT EXISTS idx_runtime_order_intents_virtual_position_id
+                ON runtime_order_intents(virtual_position_id);
+            CREATE INDEX IF NOT EXISTS idx_runtime_order_intents_exit_decision_id
+                ON runtime_order_intents(exit_decision_id);
+            """
+        )
+
     def _seed_legacy_strategy_runtime_settings(self) -> None:
         from trading.strategy.runtime_settings import legacy_profile_payload
 
@@ -2206,6 +2359,21 @@ def _runtime_order_intent_params(payload: dict) -> dict:
         "trade_review_id": payload.get("trade_review_id"),
         "leg_index": payload.get("leg_index"),
         "entry_type": str(payload.get("entry_type") or ""),
+        "order_phase": str(payload.get("order_phase") or ("exit" if str(payload.get("side") or "") == "sell" else "entry")),
+        "exit_decision_id": payload.get("exit_decision_id"),
+        "exit_decision_type": str(payload.get("exit_decision_type") or ""),
+        "exit_reason": str(payload.get("exit_reason") or ""),
+        "exit_percent": payload.get("exit_percent"),
+        "exit_quantity": payload.get("exit_quantity"),
+        "remaining_quantity": payload.get("remaining_quantity"),
+        "position_entry_price": payload.get("position_entry_price"),
+        "position_quantity": payload.get("position_quantity"),
+        "position_opened_at": str(payload.get("position_opened_at") or ""),
+        "position_closed_at": str(payload.get("position_closed_at") or ""),
+        "position_max_return_pct": payload.get("position_max_return_pct"),
+        "position_max_drawdown_pct": payload.get("position_max_drawdown_pct"),
+        "realized_return_pct": payload.get("realized_return_pct"),
+        "virtual_exit_price": payload.get("virtual_exit_price"),
         "gate_reason": str(payload.get("gate_reason") or ""),
         "gate_status": str(payload.get("gate_status") or ""),
         "idempotency_key": str(payload.get("idempotency_key") or ""),

@@ -50,6 +50,21 @@ class RuntimeOrderIntentRequest:
     runtime_cycle_at: str = ""
     idempotency_key: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    order_phase: str = "entry"
+    exit_decision_id: Optional[int] = None
+    exit_decision_type: str = ""
+    exit_reason: str = ""
+    exit_percent: Optional[float] = None
+    exit_quantity: Optional[int] = None
+    remaining_quantity: Optional[int] = None
+    position_entry_price: Optional[int] = None
+    position_quantity: Optional[int] = None
+    position_opened_at: str = ""
+    position_closed_at: str = ""
+    position_max_return_pct: Optional[float] = None
+    position_max_drawdown_pct: Optional[float] = None
+    realized_return_pct: Optional[float] = None
+    virtual_exit_price: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -136,6 +151,7 @@ class OrderEnqueueService:
                 candidate_id=request.candidate_id,
                 reason=request.reason,
                 idempotency_key=broker_request.idempotency_key,
+                order_phase="exit" if broker_request.side == "sell" else "entry",
                 metadata={"api": "/api/orders/enqueue"},
             )
             return self.enqueue_dry_run_order(intent)
@@ -218,6 +234,7 @@ class OrderEnqueueService:
         db = TradingDatabase(str(self.db_path))
         try:
             duplicate = db.find_runtime_order_intent_by_idempotency(idempotency_key) or db.find_runtime_order_intent_by_dedupe(dedupe_key)
+            response_request = {**broker_request.to_dict(), **request.to_dict()}
             if duplicate is not None:
                 db.append_runtime_order_intent_event(
                     str(duplicate.get("intent_id") or ""),
@@ -238,7 +255,7 @@ class OrderEnqueueService:
                     duplicate_of=str(duplicate.get("intent_id") or ""),
                     status=DUPLICATE,
                     reason="DUPLICATE_DRY_RUN_ORDER_INTENT",
-                    request=broker_request.to_dict(),
+                    request=response_request,
                     response={"duplicate_of": duplicate.get("intent_id"), "created_at": now},
                 )
 
@@ -255,7 +272,7 @@ class OrderEnqueueService:
                 duplicate=self.gateway_state.has_duplicate(dedupe_key),
             )
             status = DRY_RUN_ACCEPTED if decision_safety.ok else DRY_RUN_REJECTED
-            reason = "DRY_RUN_ORDER_INTENT_RECORDED" if decision_safety.ok else decision_safety.reason
+            reason = "DRY_RUN_ORDER_INTENT_RECORDED" if decision_safety.ok else _dry_run_reject_reason(request, decision_safety.reason)
             intent_id = new_message_id("intent")
             metadata = {
                 **dict(request.metadata or {}),
@@ -290,6 +307,21 @@ class OrderEnqueueService:
                 "trade_review_id": request.trade_review_id,
                 "leg_index": request.leg_index,
                 "entry_type": request.entry_type,
+                "order_phase": request.order_phase or ("exit" if request.side == "sell" else "entry"),
+                "exit_decision_id": request.exit_decision_id,
+                "exit_decision_type": request.exit_decision_type,
+                "exit_reason": request.exit_reason,
+                "exit_percent": request.exit_percent,
+                "exit_quantity": request.exit_quantity,
+                "remaining_quantity": request.remaining_quantity,
+                "position_entry_price": request.position_entry_price,
+                "position_quantity": request.position_quantity,
+                "position_opened_at": request.position_opened_at,
+                "position_closed_at": request.position_closed_at,
+                "position_max_return_pct": request.position_max_return_pct,
+                "position_max_drawdown_pct": request.position_max_drawdown_pct,
+                "realized_return_pct": request.realized_return_pct,
+                "virtual_exit_price": request.virtual_exit_price,
                 "gate_reason": request.gate_reason,
                 "gate_status": request.gate_status,
                 "idempotency_key": idempotency_key,
@@ -334,7 +366,7 @@ class OrderEnqueueService:
                 live_safety=live_safety.to_dict(),
                 live_would_pass=bool(live_safety.ok),
                 live_reject_reason="" if live_safety.ok else live_safety.reason,
-                request=broker_request.to_dict(),
+                request=response_request,
                 response=response,
                 record=saved,
             )
@@ -355,6 +387,10 @@ class OrderEnqueueService:
         status: str | None = None,
         code: str | None = None,
         candidate_id: int | None = None,
+        side: str | None = None,
+        order_phase: str | None = None,
+        virtual_position_id: int | None = None,
+        exit_decision_id: int | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> dict:
@@ -367,6 +403,10 @@ class OrderEnqueueService:
                     status=status,
                     code=code,
                     candidate_id=candidate_id,
+                    side=side,
+                    order_phase=order_phase,
+                    virtual_position_id=virtual_position_id,
+                    exit_decision_id=exit_decision_id,
                     limit=limit,
                     offset=offset,
                 ),
@@ -386,6 +426,23 @@ class OrderEnqueueService:
             if candidate_id is not None:
                 candidate = db.load_candidate_by_id(int(candidate_id))
                 linked["candidate"] = candidate.to_dict() if candidate is not None else None
+            virtual_order_id = record.get("virtual_order_id")
+            if virtual_order_id is not None:
+                virtual_order = db.load_virtual_order(int(virtual_order_id))
+                linked["virtual_order"] = virtual_order.to_dict() if virtual_order is not None else None
+            virtual_position_id = record.get("virtual_position_id")
+            if virtual_position_id is not None:
+                virtual_position = db.load_virtual_position(int(virtual_position_id))
+                linked["virtual_position"] = virtual_position.to_dict() if virtual_position is not None else None
+            exit_decision_id = record.get("exit_decision_id")
+            if exit_decision_id is not None:
+                exit_decision = db.load_exit_decision(int(exit_decision_id))
+                linked["exit_decision"] = exit_decision.to_dict() if exit_decision is not None else None
+            trade_review_id = record.get("trade_review_id")
+            if trade_review_id is not None:
+                trade_review = db.load_trade_review(int(trade_review_id))
+                linked["trade_review"] = trade_review.to_dict() if trade_review is not None else None
+                linked["trade_review_id"] = trade_review_id
             return {"record": record, "events": events, "linked": linked}
         finally:
             db.close()
@@ -433,24 +490,49 @@ class OrderEnqueueService:
                 "entry_plan_id": request.entry_plan_id,
                 "virtual_order_id": request.virtual_order_id,
                 "virtual_position_id": request.virtual_position_id,
+                "exit_decision_id": request.exit_decision_id,
+                "exit_decision_type": request.exit_decision_type,
+                "exit_percent": request.exit_percent,
+                "exit_quantity": request.exit_quantity,
+                "position_quantity": request.position_quantity,
+                "virtual_exit_price": request.virtual_exit_price,
+                "order_phase": request.order_phase or ("exit" if request.side == "sell" else "entry"),
                 "leg_index": request.leg_index,
                 "reason": request.reason,
-                "strategy_order_id": f"{request.virtual_order_id or ''}:{request.leg_index or ''}",
+                "strategy_order_id": self._strategy_order_id(request),
             },
         )
 
     def _runtime_idempotency_key(self, request: RuntimeOrderIntentRequest, broker_request: BrokerOrderRequest) -> str:
         trade_date = self._trade_date(request, str(self.clock()))
         if request.side == "sell":
+            if request.exit_decision_id is not None:
+                return (
+                    f"runtime:dryrun:exit:{trade_date}:{request.virtual_position_id or ''}:"
+                    f"{request.exit_decision_id}:{request.exit_decision_type}:"
+                    f"{broker_request.code}:sell:{broker_request.price}:"
+                    f"{_key_number(request.exit_percent)}:{request.exit_quantity or ''}"
+                )
             return (
                 f"runtime:dryrun:exit:{trade_date}:{request.virtual_position_id or ''}:"
-                f"{request.reason}:{broker_request.code}:{broker_request.side}:{broker_request.price}"
+                f"{request.exit_decision_type}:{request.reason}:{broker_request.code}:sell:{broker_request.price}:"
+                f"{_key_number(request.exit_percent)}:{request.exit_quantity or ''}"
             )
         return (
             f"runtime:dryrun:entry:{trade_date}:{request.candidate_id or ''}:"
             f"{request.entry_plan_id or ''}:{request.virtual_order_id or ''}:"
             f"{request.leg_index or ''}:{broker_request.code}:{broker_request.side}:{broker_request.price}"
         )
+
+    @staticmethod
+    def _strategy_order_id(request: RuntimeOrderIntentRequest) -> str:
+        if request.side == "sell":
+            return (
+                f"exit:{request.virtual_position_id or ''}:"
+                f"{request.exit_decision_id or ''}:{request.exit_decision_type}:"
+                f"{_key_number(request.exit_percent)}:{request.exit_quantity or ''}"
+            )
+        return f"entry:{request.virtual_order_id or ''}:{request.leg_index or ''}"
 
     def _decision_guard(self) -> OrderCommandSafetyGuard:
         return OrderCommandSafetyGuard(
@@ -507,3 +589,23 @@ class OrderEnqueueService:
         if now:
             return now[:10]
         return datetime.now(timezone.utc).date().isoformat()
+
+
+def _key_number(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.6f}".rstrip("0").rstrip(".")
+
+
+def _dry_run_reject_reason(request: RuntimeOrderIntentRequest, fallback: str) -> str:
+    metadata = dict(request.metadata or {})
+    quantity_reason = str(metadata.get("quantity_calculation_reason") or "")
+    if fallback == "QUANTITY_INVALID" and quantity_reason in {"QUANTITY_ZERO", "QUANTITY_BELOW_MIN"}:
+        return quantity_reason
+    return fallback

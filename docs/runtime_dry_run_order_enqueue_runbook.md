@@ -2,7 +2,7 @@
 
 ## Purpose
 
-PR-5 connects StrategyRuntime entry decisions to DRY_RUN order intents. These intents are not real orders. They are durable records of what the runtime would have wanted to order, with idempotency, dedupe, quantity calculation, and safety results attached.
+PR-5 connected StrategyRuntime entry decisions to DRY_RUN buy intents. PR-6 adds exit decisions as DRY_RUN sell intents. These intents are not real orders. They are durable records of what the runtime would have wanted to order, with idempotency, dedupe, quantity calculation, and safety results attached.
 
 The runtime still never calls Kiwoom, `QAxWidget`, or Gateway `send_order` directly.
 
@@ -10,7 +10,7 @@ The runtime still never calls Kiwoom, `QAxWidget`, or Gateway `send_order` direc
 
 - `TRADING_RUNTIME_MODE=OBSERVE`: runtime creates virtual orders/reviews only. No dry-run order intent is created.
 - `TRADING_RUNTIME_MODE=DRY_RUN` and `TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS=0`: runtime still creates virtual orders/reviews only and records `DRY_RUN_ORDER_ENQUEUE_DISABLED`.
-- `TRADING_RUNTIME_MODE=DRY_RUN` and `TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS=1`: entry virtual order submissions create `runtime_order_intents` rows.
+- `TRADING_RUNTIME_MODE=DRY_RUN` and `TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS=1`: entry virtual order submissions create buy intents and saved exit decisions create sell intents in `runtime_order_intents`.
 - `TRADING_RUNTIME_ALLOW_LIVE_ORDERS=1`: still blocked in PR-5. Runtime LIVE automation remains a separate safety PR.
 
 `StrategyRuntimeConfig.order_mode` remains forced to `OBSERVE`. DRY_RUN order intent creation is handled by the runtime order sink, not by changing the legacy runtime order mode.
@@ -24,7 +24,18 @@ StrategyRuntime cycle
   -> VirtualOrder submitted or recovered
   -> RuntimeOrderSink.on_entry_order_decision
   -> OrderEnqueueService.enqueue_dry_run_order
-  -> runtime_order_intents + runtime_order_intent_events
+  -> runtime_order_intents(order_phase=entry, side=buy) + runtime_order_intent_events
+```
+
+Exit flow:
+
+```text
+StrategyRuntime cycle
+  -> virtual position evaluated
+  -> ExitDecision saved
+  -> RuntimeOrderSink.on_exit_order_decision
+  -> OrderEnqueueService.enqueue_dry_run_order
+  -> runtime_order_intents(order_phase=exit, side=sell) + runtime_order_intent_events
 ```
 
 API callers also use the same service:
@@ -46,6 +57,8 @@ runtime:dryrun:entry:{trade_date}:{candidate_id}:{entry_plan_id}:{virtual_order_
 ```
 
 The deterministic broker dedupe key still includes order payload fields and runtime metadata such as `candidate_id`, `virtual_order_id`, and `leg_index`. This allows split entries to coexist while blocking the same virtual order leg from creating repeated intents after cycles or Core restarts.
+
+Runtime exit idempotency key includes `virtual_position_id`, `exit_decision_id` when available, `exit_decision_type`, price, exit percent, and exit quantity. This keeps partial take-profit and later full-close sell intents distinct.
 
 Duplicates do not create another `runtime_order_intents` row. They append a `duplicate_rejected` event to the original intent and return `duplicate_of`.
 
@@ -97,6 +110,11 @@ Important fields:
 - `candidate_id`
 - `entry_plan_id`
 - `virtual_order_id`
+- `virtual_position_id`
+- `exit_decision_id`
+- `exit_decision_type`
+- `order_phase`
+- `side`
 - `trade_review_id`
 - `idempotency_key`
 - `dedupe_key`
@@ -111,6 +129,7 @@ Important fields:
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/api/runtime/orders/dry-run/summary
 Invoke-RestMethod http://127.0.0.1:8000/api/runtime/orders/dry-run?limit=20
+Invoke-RestMethod "http://127.0.0.1:8000/api/runtime/orders/dry-run?side=sell&order_phase=exit"
 Invoke-RestMethod http://127.0.0.1:8000/api/runtime/orders/dry-run/<intent_id>
 ```
 
@@ -141,6 +160,9 @@ The dashboard shows:
 
 - dry-run sink enabled/policy
 - total/accepted/rejected/duplicate intents
+- entry/buy and exit/sell counts
+- recent sell intents
+- exit decision type summary
 - live would pass/reject counts
 - recent dry-run intents
 - top live reject reasons

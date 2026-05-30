@@ -61,7 +61,7 @@ The Core depends on `trading.broker.*` protocol models, not on `kiwoom.client`.
 - Gateway `price_tick` events update Core market data and candles.
 - Realtime register/remove requests are enqueued as `GatewayCommand`.
 - Condition load/send/stop requests are enqueued as `GatewayCommand`.
-- Runtime order behavior is OBSERVE-first. PR-5 can record DRY_RUN order intents through `OrderEnqueueService`, but it still never emits Gateway `send_order` commands from the runtime.
+- Runtime order behavior is OBSERVE-first. PR-5 records DRY_RUN entry/buy intents and PR-6 records DRY_RUN exit/sell intents through `OrderEnqueueService`, but the runtime still never emits Gateway `send_order` commands.
 
 The 32bit Gateway remains Kiwoom communication only.
 
@@ -185,7 +185,7 @@ WebSocket command transport is still deferred because PR-2/PR-3 priority is corr
 - `/api/orders/enqueue` is the only Core API path that can create a real `send_order` command.
 - `OBSERVE` never queues real order commands. `DRY_RUN` accepts only dry-run records. `LIVE` requires `TRADING_MODE=LIVE` and `TRADING_ALLOW_LIVE=1`.
 - Runtime LIVE auto orders are disabled in PR-5. StrategyRuntime remains OBSERVE internally even if Core trading mode is LIVE.
-- Runtime DRY_RUN intent recording is enabled only with `TRADING_RUNTIME_MODE=DRY_RUN` and `TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS=1`; these records go to `runtime_order_intents`, not the Gateway command queue.
+- Runtime DRY_RUN intent recording is enabled only with `TRADING_RUNTIME_MODE=DRY_RUN` and `TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS=1`; entry/buy and exit/sell records go to `runtime_order_intents`, not the Gateway command queue.
 
 ## Persistence and Performance
 
@@ -247,9 +247,15 @@ PR-5:
 - DRY_RUN decision safety vs LIVE safety recording.
 - No runtime Gateway `send_order` creation.
 
+PR-6:
+
+- Runtime exit decisions generate DRY_RUN sell intents.
+- `order_phase` and `side` distinguish entry/buy from exit/sell.
+- Partial take-profit and full-close decisions use distinct idempotency keys.
+- Dashboard/API summarize sell intents and exit decision types.
+
 Next:
 
-- Runtime DRY_RUN exit/sell intent adapter.
 - Real TR response row extraction and request correlation.
 - Gateway WebSocket channel when long-poll latency is measured as a bottleneck.
 - Dashboard screen hardening and richer order/position views.
