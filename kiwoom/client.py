@@ -1,8 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
 from typing import Callable, Iterable, Optional
+
+from trading.broker.models import (
+    BrokerConditionEvent as ConditionCandidateEvent,
+    BrokerExecutionEvent as ExecutionEvent,
+    BrokerOrderRequest as OrderRequest,
+    BrokerOrderResult as OrderResult,
+    ConditionInfo,
+    ConditionLoadState,
+    Signal,
+)
 
 
 FID_CURRENT_PRICE = 10
@@ -44,75 +52,6 @@ ERROR_MESSAGES = {
     -340: "계좌정보없음",
     -500: "종목코드없음",
 }
-
-
-@dataclass(frozen=True)
-class OrderRequest:
-    account: str
-    code: str
-    quantity: int
-    price: int
-    side: str
-    tag: str
-    order_type: int
-    hoga: str = "00"
-    original_order_no: str = ""
-
-
-@dataclass(frozen=True)
-class OrderResult:
-    ok: bool
-    code: int
-    message: str
-    request: OrderRequest
-
-
-@dataclass(frozen=True)
-class ExecutionEvent:
-    code: str
-    order_no: str
-    side: str
-    quantity: int
-    price: int
-    filled_quantity: int
-    remaining_quantity: int
-    tag: str = ""
-
-
-@dataclass(frozen=True)
-class ConditionInfo:
-    index: int
-    name: str
-
-
-@dataclass(frozen=True)
-class ConditionCandidateEvent:
-    condition_name: str
-    code: str
-    condition_index: int = -1
-    event_type: str = "include"
-    source: str = "condition"
-    strategy_profile: str = ""
-    purpose: str = ""
-
-
-class ConditionLoadState(str, Enum):
-    IDLE = "IDLE"
-    LOADING = "LOADING"
-    LOADED = "LOADED"
-    FAILED = "FAILED"
-
-
-class Signal:
-    def __init__(self) -> None:
-        self._handlers: list[Callable] = []
-
-    def connect(self, handler: Callable) -> None:
-        self._handlers.append(handler)
-
-    def emit(self, *args, **kwargs) -> None:
-        for handler in list(self._handlers):
-            handler(*args, **kwargs)
 
 
 class KiwoomClient:

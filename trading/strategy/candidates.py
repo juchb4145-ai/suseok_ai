@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Callable, Optional
 
-from kiwoom.client import ConditionCandidateEvent
+from trading.broker.models import ConditionCandidateEvent
 from trading.strategy.models import (
     BlockType,
     Candidate,

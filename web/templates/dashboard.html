@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trading Core Dashboard</title>
+    <link rel="stylesheet" href="/static/dashboard.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Trading Core</h1>
+        <p id="snapshot-time">snapshot pending</p>
+      </div>
+      <div class="mode-strip">
+        <span id="core-mode" class="pill">OBSERVE</span>
+        <span id="gateway-state" class="pill muted">DISCONNECTED</span>
+        <span id="orderable-state" class="pill muted">ORDER BLOCKED</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="band status-grid">
+        <div class="metric">
+          <span>Core</span>
+          <strong id="core-state">OK</strong>
+        </div>
+        <div class="metric">
+          <span>Gateway</span>
+          <strong id="gateway-connection">DISCONNECTED</strong>
+        </div>
+        <div class="metric">
+          <span>Kiwoom Login</span>
+          <strong id="kiwoom-login">NO</strong>
+        </div>
+        <div class="metric">
+          <span>Heartbeat</span>
+          <strong id="heartbeat-age">-</strong>
+        </div>
+      </section>
+
+      <section class="band two-col">
+        <div>
+          <div class="section-head">
+            <h2>후보 / 게이트</h2>
+            <span id="candidate-total" class="counter">0</span>
+          </div>
+          <div class="mini-grid">
+            <div><span>READY</span><strong id="candidate-ready">0</strong></div>
+            <div><span>BLOCKED</span><strong id="candidate-blocked">0</strong></div>
+            <div><span>WAIT</span><strong id="candidate-wait">0</strong></div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Code</th>
+                <th>State</th>
+                <th>Theme</th>
+                <th>Hybrid</th>
+                <th>Reasons</th>
+              </tr>
+            </thead>
+            <tbody id="candidate-rows"></tbody>
+          </table>
+        </div>
+        <div>
+          <div class="section-head">
+            <h2>테마</h2>
+            <span id="top-theme" class="counter">-</span>
+          </div>
+          <div class="mini-grid">
+            <div><span>ACTIVE</span><strong id="theme-active">0</strong></div>
+            <div><span>WATCH</span><strong id="theme-watch">0</strong></div>
+            <div><span>Top Score</span><strong id="theme-top-score">0</strong></div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Rank</th>
+                <th>Theme</th>
+                <th>Score</th>
+                <th>Breadth</th>
+                <th>Leader Gap</th>
+                <th>Top3</th>
+              </tr>
+            </thead>
+            <tbody id="theme-rows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="band two-col">
+        <div>
+          <div class="section-head">
+            <h2>주문 / 포지션</h2>
+            <span id="order-count" class="counter">0</span>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Code</th>
+                <th>Side</th>
+                <th>Qty</th>
+                <th>Price</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="order-rows"></tbody>
+          </table>
+        </div>
+        <div>
+          <div class="section-head">
+            <h2>리뷰 / 성과</h2>
+            <span id="review-count" class="counter">0</span>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Code</th>
+                <th>Status</th>
+                <th>5m</th>
+                <th>10m</th>
+                <th>20m</th>
+                <th>Flags</th>
+              </tr>
+            </thead>
+            <tbody id="review-rows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="band">
+        <div class="section-head">
+          <h2>로그</h2>
+          <span id="log-count" class="counter">0</span>
+        </div>
+        <div id="log-lines" class="log"></div>
+      </section>
+    </main>
+
+    <script src="/static/dashboard.js"></script>
+  </body>
+</html>

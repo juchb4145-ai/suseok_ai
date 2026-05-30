@@ -1,41 +1,77 @@
-# 키움 눌림목 반자동 매매
+# Kiwoom Trading System
 
-키움 OpenAPI+ ActiveX를 사용하는 PyQt5 기반 데스크톱 반자동 매매 프로그램입니다.
+This repository is moving from a 32bit single-process PyQt/Kiwoom app to a split architecture:
 
-## 실행 환경
+- **32bit Kiwoom Gateway**: Kiwoom OpenAPI+ ActiveX/QAxWidget only.
+- **64bit Core/API/Web Dashboard**: strategy runtime, candidates, themes, reviews, risk checks, DB, API, and web UI.
 
-- Windows
-- Kiwoom OpenAPI+ 설치 및 OCX 등록
-- 32bit Python `3.9.13`
-- 권장 패키지 설치:
+The old PyQt desktop app is still available as a deprecated legacy entrypoint.
 
-```powershell
-python -m pip install -r requirements.txt
-```
+## 64bit Core/API
 
-## 실행
-
-키움 OpenAPI 연결:
+Use a 64bit Python environment. The Core requirements intentionally do not include PyQt5.
 
 ```powershell
-python main.py
+python -m pip install -r requirements-64.txt
+$env:TRADING_CORE_TOKEN = "change-me-local-token"
+$env:TRADING_MODE = "OBSERVE"
+python -m uvicorn trading_app.api:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-키움 없이 UI와 로직 테스트:
+Dashboard:
+
+```text
+http://127.0.0.1:8000/
+```
+
+Core APIs:
+
+- `GET /health`
+- `GET /api/status`
+- `GET /api/gateway/status`
+- `GET /api/candidates`
+- `GET /api/themes`
+- `GET /api/orders`
+- `GET /api/reviews`
+- `GET /api/snapshot`
+- `WS /ws/dashboard`
+- `POST /api/gateway/events`
+- `GET /api/gateway/commands`
+
+## 32bit Kiwoom Gateway
+
+Use 32bit Python 3.9.13 with Kiwoom OpenAPI+ installed and OCX registered.
 
 ```powershell
-python main.py --mock
+py -3.9-32 -m pip install -r requirements-32.txt
+py -3.9-32 apps/kiwoom_gateway.py --core-url http://127.0.0.1:8000 --token change-me-local-token
 ```
 
-## 주요 동작
+Mock Gateway smoke test:
 
-- 앱 내부 `매수종목` 목록 관리
-- 종목별 1차/2차/3차 목표매수가와 비중 설정
-- 현재가가 목표가 N틱 이내 접근 시 지정가 매수
-- 평균매수가 대비 기본 5% 수익 도달 시 보유수량의 기본 70% 지정가 매도
-- 손절가는 자동매도가 아니라 알림으로 처리
-- 실시간 시세 기반 감시로 TR 반복조회 최소화
+```powershell
+py -3.9-32 apps/kiwoom_gateway.py --mock --once --core-url http://127.0.0.1:8000 --token change-me-local-token
+```
 
-## 주의
+## Legacy PyQt App
 
-실거래 주문 잠금은 두지 않았습니다. 앱 상단의 접속 모드와 `주문 가능` 체크 상태를 반드시 확인한 뒤 사용하세요.
+Deprecated compatibility path:
+
+```powershell
+py -3.9-32 apps/legacy_pyqt_app.py --mock
+```
+
+`main.py` remains for compatibility, but new strategy/API/dashboard development should target `trading_app` and `apps/kiwoom_gateway.py`.
+
+## Safety Defaults
+
+- Default mode is `OBSERVE`.
+- `LIVE` order enablement requires both `TRADING_MODE=LIVE` and `TRADING_ALLOW_LIVE=1`.
+- Gateway/Core traffic requires a local token.
+- Bind Core to `127.0.0.1` unless there is a reviewed deployment plan.
+- Core must pass order/risk guards before queueing any real order command.
+
+More detail:
+
+- [Architecture](docs/architecture_32bit_gateway_64bit_core.md)
+- [Runbook](docs/runbook_32bit_gateway_64bit_core.md)

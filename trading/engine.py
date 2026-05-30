@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from kiwoom.client import ExecutionEvent, OrderRequest, OrderResult
+from trading.broker.models import BrokerExecutionEvent, BrokerOrderRequest, BrokerOrderResult
 from storage.db import TradingDatabase
 from trading.models import LegStatus, PriceTick, WatchItem
 from trading.rules import (
@@ -21,7 +21,7 @@ class ClientProtocol(Protocol):
     execution_received: object
     message_received: object
 
-    def send_order(self, request: OrderRequest) -> OrderResult: ...
+    def send_order(self, request: BrokerOrderRequest) -> BrokerOrderResult: ...
 
     def register_realtime(self, codes) -> None: ...
 
@@ -169,7 +169,7 @@ class TradingEngine:
             leg.status = LegStatus.WATCHING
             if is_within_ticks(item.current_price, leg.target_price, item.tick_threshold):
                 quantity = calculate_order_quantity(item.budget, leg.weight_percent, leg.target_price)
-                request = OrderRequest(
+                request = BrokerOrderRequest(
                     account=self.account,
                     code=item.code,
                     quantity=quantity,
@@ -195,7 +195,7 @@ class TradingEngine:
         quantity = calculate_take_profit_quantity(item.holding_quantity, item.take_profit_sell_percent)
         if quantity <= 0:
             return
-        request = OrderRequest(
+        request = BrokerOrderRequest(
             account=self.account,
             code=item.code,
             quantity=quantity,
@@ -221,7 +221,7 @@ class TradingEngine:
         else:
             self._stop_loss_alerted_codes.discard(item.code)
 
-    def on_order_result(self, result: OrderResult) -> None:
+    def on_order_result(self, result: BrokerOrderResult) -> None:
         request = result.request
         item = self.items.get(request.code)
         self.order_handlers_call(result)
@@ -242,7 +242,7 @@ class TradingEngine:
         self.db.save_watch_item(item)
         self.emit_item_changed(item)
 
-    def on_execution(self, event: ExecutionEvent) -> None:
+    def on_execution(self, event: BrokerExecutionEvent) -> None:
         item = self.items.get(event.code)
         self.db.save_execution(event)
         if not item:
@@ -284,7 +284,7 @@ class TradingEngine:
         except (ValueError, KeyError, IndexError):
             return None
 
-    def _leg_from_event(self, item: WatchItem, event: ExecutionEvent):
+    def _leg_from_event(self, item: WatchItem, event: BrokerExecutionEvent):
         leg = self._leg_from_tag(item, event.tag)
         if leg:
             return leg
@@ -310,6 +310,6 @@ class TradingEngine:
         for handler in self.item_handlers:
             handler(item)
 
-    def order_handlers_call(self, result: OrderResult) -> None:
+    def order_handlers_call(self, result: BrokerOrderResult) -> None:
         for handler in self.order_handlers:
             handler(result)

@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 from typing import Iterable, Optional, Union
 
-from kiwoom.client import ExecutionEvent, OrderResult
+from trading.broker.models import BrokerExecutionEvent, BrokerOrderResult
 from trading.models import BuyLeg, LegStatus, WatchItem
 from trading.strategy.models import (
     BlockType,
@@ -34,7 +34,13 @@ class TradingDatabase:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
+        self._configure_connection()
         self._migrate()
+
+    def _configure_connection(self) -> None:
+        self.conn.execute("PRAGMA busy_timeout = 5000")
+        self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA synchronous = NORMAL")
 
     def _migrate(self) -> None:
         self._archive_legacy_theme_mappings()
@@ -513,19 +519,19 @@ class TradingDatabase:
         self.conn.execute("DELETE FROM watch_items WHERE code = ?", (code,))
         self.conn.commit()
 
-    def save_order_result(self, result: OrderResult) -> None:
+    def save_order_result(self, result: BrokerOrderResult) -> None:
         self.conn.execute(
             "INSERT INTO order_results(ok, result_code, message, request_json) VALUES (?, ?, ?, ?)",
             (
                 int(result.ok),
                 result.code,
                 result.message,
-                json.dumps(result.request.__dict__, ensure_ascii=False),
+                json.dumps(result.request.to_dict(), ensure_ascii=False),
             ),
         )
         self.conn.commit()
 
-    def save_execution(self, event: ExecutionEvent) -> None:
+    def save_execution(self, event: BrokerExecutionEvent) -> None:
         self.conn.execute(
             """
             INSERT INTO executions(

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 
-from kiwoom.client import ConditionCandidateEvent, ConditionInfo, Signal
+from trading.broker.models import ConditionCandidateEvent, ConditionInfo, Signal
 from trading.strategy.candidates import is_valid_stock_code, normalize_code
 from trading.strategy.models import StrategyProfile
 
