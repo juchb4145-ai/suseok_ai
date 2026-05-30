@@ -503,6 +503,49 @@ function renderInlineCounts(id, rows, key, emptyText) {
   node.innerHTML = lines.length ? lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : `<span class="empty">${escapeHtml(emptyText)}</span>`;
 }
 
+function renderOpsAlerts(payload) {
+  const ops = payload || { summary: {}, alerts: [] };
+  const summary = ops.summary || {};
+  const severity = summary.highest_severity || "ok";
+  const severityLabel = {
+    critical: "긴급 확인",
+    warning: "주의 필요",
+    info: "참고",
+    ok: "정상",
+  }[severity] || "점검 대기";
+  const severityTone = severity === "critical" ? "bad" : severity === "warning" ? "warn" : severity === "info" ? "muted" : "ok";
+
+  text("ops-alert-severity", severityLabel);
+  cls("ops-alert-severity", `counter ${severityTone}`);
+  text("ops-alert-critical", summary.critical || 0);
+  text("ops-alert-warning", summary.warning || 0);
+  text("ops-alert-info", summary.info || 0);
+  text("ops-safe-collect", summary.safe_to_collect_data ? "가능" : "확인 필요");
+  text("ops-safe-ws-pilot", summary.safe_to_run_ws_pilot ? "가능" : "확인 필요");
+  text("ops-safe-live", summary.safe_to_live_order ? "가능" : "차단");
+
+  const node = document.getElementById("ops-alert-lines");
+  if (!node) return;
+  const alerts = ops.alerts || [];
+  if (!alerts.length) {
+    node.innerHTML = '<div class="alert-item ok"><strong>정상</strong><span>현재 긴급 운영 알림이 없습니다. OBSERVE/DRY_RUN 수집을 계속해도 됩니다.</span></div>';
+    return;
+  }
+  node.innerHTML = alerts
+    .slice(0, 8)
+    .map((alert) => {
+      const tone = alert.severity === "critical" ? "bad" : alert.severity === "warning" ? "warn" : "info";
+      return `
+        <div class="alert-item ${tone}">
+          <strong>${escapeHtml(alert.title || alert.id || "-")}</strong>
+          <span>${escapeHtml(alert.message || "")}</span>
+          ${alert.action ? `<em>${escapeHtml(alert.action)}</em>` : ""}
+        </div>
+      `;
+    })
+    .join("");
+}
+
 function render(snapshot) {
   state.latestSnapshot = snapshot;
   const core = snapshot.core || {};
@@ -518,6 +561,7 @@ function render(snapshot) {
   const orders = snapshot.orders || { summary: {}, order_results: [], executions: [] };
   const reviews = snapshot.reviews || { summary: {}, items: [] };
   const logs = snapshot.logs || { core: [], gateway: [], warnings: [] };
+  const opsAlerts = snapshot.ops_alerts || { summary: {}, alerts: [] };
 
   text("snapshot-time", snapshot.timestamp || "");
   text("core-mode", core.mode || "OBSERVE");
@@ -530,6 +574,7 @@ function render(snapshot) {
   text("orderable-state", gateway.orderable ? "주문 가능" : "주문 차단");
   cls("gateway-state", `pill ${gateway.heartbeat_ok ? "ok" : gateway.connected ? "warn" : "bad"}`);
   cls("orderable-state", `pill ${gateway.orderable ? "ok" : "muted"}`);
+  renderOpsAlerts(opsAlerts);
 
   text("transport-mode", transport.mode || "rest_long_poll");
   text("transport-event-p95", formatMs(transport.event_latency_p95_ms));

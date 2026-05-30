@@ -184,6 +184,10 @@ button:disabled {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.ops-grid {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
 .metric,
 .mini-grid div {
   min-width: 0;
@@ -460,6 +464,58 @@ td {
   line-height: 1.45;
 }
 
+.alert-list {
+  display: grid;
+  gap: 8px;
+}
+
+.alert-item {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.35fr) minmax(0, 1fr);
+  gap: 6px 12px;
+  align-items: start;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfcfe;
+  padding: 10px 12px;
+}
+
+.alert-item strong {
+  font-size: 13px;
+}
+
+.alert-item span,
+.alert-item em {
+  color: var(--muted);
+  font-style: normal;
+  line-height: 1.45;
+}
+
+.alert-item em {
+  grid-column: 2;
+  font-size: 12px;
+}
+
+.alert-item.ok {
+  border-color: #a6d8c1;
+  background: #f3fbf7;
+}
+
+.alert-item.warn {
+  border-color: #f2c98f;
+  background: #fff9ed;
+}
+
+.alert-item.bad {
+  border-color: #f1b4ae;
+  background: #fff5f3;
+}
+
+.alert-item.info {
+  border-color: #b9c6d8;
+  background: #f7f9fc;
+}
+
 .empty {
   color: var(--muted);
 }
@@ -477,6 +533,7 @@ td {
 
   .status-grid,
   .mini-grid,
+  .ops-grid,
   .filter-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -497,8 +554,17 @@ td {
 
   .status-grid,
   .mini-grid,
+  .ops-grid,
   .filter-grid,
   .detail-summary {
     grid-template-columns: 1fr;
+  }
+
+  .alert-item {
+    grid-template-columns: 1fr;
+  }
+
+  .alert-item em {
+    grid-column: auto;
   }
 }

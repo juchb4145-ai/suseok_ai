@@ -29,6 +29,22 @@
 
       <section class="band">
         <div class="section-head">
+          <h2>운영 점검 알림</h2>
+          <span id="ops-alert-severity" class="counter">점검 대기</span>
+        </div>
+        <div class="mini-grid ops-grid">
+          <div><span>긴급</span><strong id="ops-alert-critical">0</strong></div>
+          <div><span>주의</span><strong id="ops-alert-warning">0</strong></div>
+          <div><span>정보</span><strong id="ops-alert-info">0</strong></div>
+          <div><span>데이터 수집</span><strong id="ops-safe-collect">확인 중</strong></div>
+          <div><span>WS Pilot</span><strong id="ops-safe-ws-pilot">확인 중</strong></div>
+          <div><span>LIVE 자동주문</span><strong id="ops-safe-live">차단</strong></div>
+        </div>
+        <div id="ops-alert-lines" class="alert-list"></div>
+      </section>
+
+      <section class="band">
+        <div class="section-head">
           <h2>게이트웨이 전송 상태</h2>
           <span id="transport-ws-decision" class="counter">KEEP_REST_LONG_POLL</span>
         </div>

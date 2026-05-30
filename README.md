@@ -63,10 +63,20 @@ python -m uvicorn trading_app.api:app --host 127.0.0.1 --port 8000 --reload
 http://127.0.0.1:8000/
 ```
 
+빠른 운영 점검:
+
+```powershell
+python tools/ops_check.py --core-url http://127.0.0.1:8000 --token change-me-local-token
+Invoke-RestMethod "http://127.0.0.1:8000/api/ops/alerts"
+```
+
+대시보드 상단의 `운영 점검 알림`은 Gateway heartbeat, Kiwoom 로그인, command 실패/거부, WebSocket pilot fallback, Runtime 오류, DRY_RUN 오탐/미탐 신호를 한곳에 모아 보여준다. `LIVE` 자동주문은 별도 안전 PR 전까지 항상 차단으로 표시된다.
+
 Core API:
 
 - `GET /health`
 - `GET /api/status`
+- `GET /api/ops/alerts`
 - `GET /api/gateway/status`
 - `GET /api/candidates`
 - `GET /api/themes`

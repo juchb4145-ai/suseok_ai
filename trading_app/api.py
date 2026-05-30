@@ -45,6 +45,7 @@ from trading.strategy.models import CandidateState
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
 from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, config_from_settings
+from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
@@ -260,6 +261,35 @@ def api_status() -> dict[str, Any]:
             "token_required_for_gateway": True,
         },
     }
+
+
+@app.get("/api/ops/alerts")
+def ops_alerts() -> dict[str, Any]:
+    db = open_database()
+    try:
+        status_payload = api_status()
+        runtime_payload = _runtime_dashboard_payload(runtime_supervisor.status())
+        performance_report = _performance_analyzer(db).build_report(limit=20)
+        dry_run_performance_payload = {
+            **dict(performance_report.get("summary") or {}),
+            "top_false_positive_types": performance_report.get("false_signal_summary", {}).get("top_false_positive_types", []),
+            "top_false_negative_types": performance_report.get("false_signal_summary", {}).get("top_false_negative_types", []),
+            "top_reject_reasons_with_rally": performance_report.get("false_signal_summary", {}).get(
+                "top_live_reject_reasons_with_rally",
+                [],
+            ),
+        }
+        return build_ops_alerts(
+            core=status_payload["core"],
+            gateway=status_payload["gateway"],
+            commands=status_payload["commands"],
+            transport=status_payload["transport"],
+            runtime=runtime_payload,
+            dry_run_performance=dry_run_performance_payload,
+            logs=build_logs_snapshot(db),
+        )
+    finally:
+        close_database(db)
 
 
 @app.get("/api/gateway/status")
@@ -1349,6 +1379,15 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     }
     runtime_payload["dry_run_orders"] = dry_run_orders_payload
     runtime_payload["dry_run_performance"] = dry_run_performance_payload
+    ops_alerts_payload = build_ops_alerts(
+        core=status_payload["core"],
+        gateway=status_payload["gateway"],
+        commands=status_payload["commands"],
+        transport=transport_payload,
+        runtime=runtime_payload,
+        dry_run_performance=dry_run_performance_payload,
+        logs=logs_payload,
+    )
     return {
         "timestamp": utc_timestamp(),
         "core": status_payload["core"],
@@ -1359,6 +1398,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "runtime": runtime_payload,
         "dry_run_orders": dry_run_orders_payload,
         "dry_run_performance": dry_run_performance_payload,
+        "ops_alerts": ops_alerts_payload,
         "safety": status_payload["safety"],
         "candidates": candidates_payload,
         "themes": themes_payload,
