@@ -443,6 +443,10 @@ class TradingDatabase:
                 success INTEGER NOT NULL DEFAULT 1,
                 error TEXT NOT NULL DEFAULT '',
                 transport_mode TEXT NOT NULL DEFAULT 'rest_long_poll',
+                experiment_id TEXT NOT NULL DEFAULT '',
+                scenario TEXT NOT NULL DEFAULT '',
+                connection_id TEXT NOT NULL DEFAULT '',
+                websocket_session_id TEXT NOT NULL DEFAULT '',
                 payload_size_bytes INTEGER NOT NULL DEFAULT 0,
                 total_wall_ms REAL,
                 gateway_queue_wait_ms REAL,
@@ -456,6 +460,10 @@ class TradingDatabase:
                 rate_limit_wait_ms REAL,
                 gateway_execute_ms REAL,
                 ack_round_trip_ms REAL,
+                ws_send_ms REAL,
+                ws_receive_ms REAL,
+                ws_reconnect_count INTEGER NOT NULL DEFAULT 0,
+                ws_message_sequence INTEGER,
                 clock_skew_warning INTEGER NOT NULL DEFAULT 0,
                 stage_ms_json TEXT NOT NULL DEFAULT '{}',
                 metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -466,6 +474,8 @@ class TradingDatabase:
                 report_id TEXT UNIQUE NOT NULL,
                 trade_date TEXT NOT NULL DEFAULT '',
                 transport_mode TEXT NOT NULL DEFAULT 'rest_long_poll',
+                experiment_id TEXT NOT NULL DEFAULT '',
+                scenario TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT '',
                 summary_json TEXT NOT NULL DEFAULT '{}',
                 recommendation_json TEXT NOT NULL DEFAULT '{}',
@@ -729,6 +739,8 @@ class TradingDatabase:
         self._ensure_strategy_runtime_settings_columns()
         self._ensure_runtime_order_intent_columns()
         self._ensure_runtime_order_intent_indexes()
+        self._ensure_gateway_transport_latency_columns()
+        self._ensure_gateway_transport_latency_indexes()
         self._seed_legacy_strategy_runtime_settings()
         self._ensure_trade_review_columns()
         self.conn.execute(
@@ -1454,16 +1466,22 @@ class TradingDatabase:
                 INSERT INTO gateway_transport_latency_samples(
                     sample_id, trace_id, trade_date, direction, message_type,
                     event_id, command_id, request_id, source, success, error,
-                    transport_mode, payload_size_bytes, total_wall_ms,
+                    transport_mode, experiment_id, scenario, connection_id, websocket_session_id,
+                    payload_size_bytes, total_wall_ms,
                     gateway_queue_wait_ms, gateway_post_ms, core_receive_ms,
                     core_persist_ms, core_dispatch_wait_ms, long_poll_wait_ms,
                     gateway_receive_wait_ms, gateway_local_queue_wait_ms,
                     rate_limit_wait_ms, gateway_execute_ms, ack_round_trip_ms,
+                    ws_send_ms, ws_receive_ms, ws_reconnect_count, ws_message_sequence,
                     clock_skew_warning, stage_ms_json, metadata_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sample_id) DO UPDATE SET
                     success=excluded.success,
                     error=excluded.error,
+                    experiment_id=excluded.experiment_id,
+                    scenario=excluded.scenario,
+                    connection_id=excluded.connection_id,
+                    websocket_session_id=excluded.websocket_session_id,
                     payload_size_bytes=excluded.payload_size_bytes,
                     total_wall_ms=excluded.total_wall_ms,
                     gateway_queue_wait_ms=excluded.gateway_queue_wait_ms,
@@ -1477,6 +1495,10 @@ class TradingDatabase:
                     rate_limit_wait_ms=excluded.rate_limit_wait_ms,
                     gateway_execute_ms=excluded.gateway_execute_ms,
                     ack_round_trip_ms=excluded.ack_round_trip_ms,
+                    ws_send_ms=excluded.ws_send_ms,
+                    ws_receive_ms=excluded.ws_receive_ms,
+                    ws_reconnect_count=excluded.ws_reconnect_count,
+                    ws_message_sequence=excluded.ws_message_sequence,
                     clock_skew_warning=excluded.clock_skew_warning,
                     stage_ms_json=excluded.stage_ms_json,
                     metadata_json=excluded.metadata_json
@@ -1494,6 +1516,10 @@ class TradingDatabase:
                     int(bool(sample.get("success", True))),
                     str(sample.get("error") or ""),
                     str(sample.get("transport_mode") or "rest_long_poll"),
+                    str(sample.get("experiment_id") or (sample.get("metadata") or {}).get("experiment_id") or ""),
+                    str(sample.get("scenario") or (sample.get("metadata") or {}).get("scenario") or ""),
+                    str(sample.get("connection_id") or (sample.get("metadata") or {}).get("connection_id") or ""),
+                    str(sample.get("websocket_session_id") or (sample.get("metadata") or {}).get("websocket_session_id") or ""),
                     int(sample.get("payload_size_bytes") or 0),
                     sample.get("total_wall_ms"),
                     sample.get("gateway_queue_wait_ms"),
@@ -1507,6 +1533,10 @@ class TradingDatabase:
                     sample.get("rate_limit_wait_ms"),
                     sample.get("gateway_execute_ms"),
                     sample.get("ack_round_trip_ms"),
+                    sample.get("ws_send_ms"),
+                    sample.get("ws_receive_ms"),
+                    int(sample.get("ws_reconnect_count") or 0),
+                    sample.get("ws_message_sequence"),
                     int(bool(sample.get("clock_skew_warning"))),
                     json.dumps(sample.get("stage_ms") or {}, ensure_ascii=False, sort_keys=True, default=str),
                     json.dumps(sample.get("metadata") or {}, ensure_ascii=False, sort_keys=True, default=str),
@@ -1531,6 +1561,8 @@ class TradingDatabase:
         command_id: Optional[str] = None,
         event_id: Optional[str] = None,
         transport_mode: Optional[str] = None,
+        experiment_id: Optional[str] = None,
+        scenario: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict]:
@@ -1554,6 +1586,12 @@ class TradingDatabase:
         if transport_mode:
             clauses.append("transport_mode = ?")
             params.append(transport_mode)
+        if experiment_id:
+            clauses.append("experiment_id = ?")
+            params.append(experiment_id)
+        if scenario:
+            clauses.append("scenario = ?")
+            params.append(scenario)
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
         rows = self.conn.execute(
             f"""
@@ -1578,6 +1616,36 @@ class TradingDatabase:
         ).fetchall()
         return [_row_to_gateway_transport_latency_sample(row) for row in rows]
 
+    def list_gateway_transport_experiments(self, *, limit: int = 50, offset: int = 0) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT
+                experiment_id,
+                scenario,
+                GROUP_CONCAT(DISTINCT transport_mode) AS transport_modes,
+                COUNT(*) AS sample_count,
+                MIN(created_at) AS started_at,
+                MAX(created_at) AS ended_at
+            FROM gateway_transport_latency_samples
+            WHERE experiment_id != ''
+            GROUP BY experiment_id, scenario
+            ORDER BY ended_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (max(1, int(limit or 50)), max(0, int(offset or 0))),
+        ).fetchall()
+        return [
+            {
+                "experiment_id": row["experiment_id"],
+                "scenario": row["scenario"],
+                "transport_modes": [item for item in str(row["transport_modes"] or "").split(",") if item],
+                "sample_count": int(row["sample_count"] or 0),
+                "started_at": row["started_at"],
+                "ended_at": row["ended_at"],
+            }
+            for row in rows
+        ]
+
     def save_gateway_transport_latency_report(self, report: dict) -> dict:
         report_id = str(report.get("report_id") or "")
         if not report_id:
@@ -1586,12 +1654,14 @@ class TradingDatabase:
             self.conn.execute(
                 """
                 INSERT INTO gateway_transport_latency_reports(
-                    report_id, trade_date, transport_mode, status, summary_json,
+                    report_id, trade_date, transport_mode, experiment_id, scenario, status, summary_json,
                     recommendation_json, generated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(report_id) DO UPDATE SET
                     trade_date=excluded.trade_date,
                     transport_mode=excluded.transport_mode,
+                    experiment_id=excluded.experiment_id,
+                    scenario=excluded.scenario,
                     status=excluded.status,
                     summary_json=excluded.summary_json,
                     recommendation_json=excluded.recommendation_json,
@@ -1601,6 +1671,8 @@ class TradingDatabase:
                     report_id,
                     str(report.get("trade_date") or ""),
                     str(report.get("transport_mode") or "rest_long_poll"),
+                    str(report.get("experiment_id") or report.get("filters", {}).get("experiment_id") or ""),
+                    str(report.get("scenario") or report.get("filters", {}).get("scenario") or ""),
                     str(report.get("status") or "READY"),
                     json.dumps(report.get("summary") or {}, ensure_ascii=False, sort_keys=True, default=str),
                     json.dumps(report.get("websocket_recommendation") or {}, ensure_ascii=False, sort_keys=True, default=str),
@@ -2775,6 +2847,36 @@ class TradingDatabase:
             """
         )
 
+    def _ensure_gateway_transport_latency_columns(self) -> None:
+        sample_columns = {
+            "experiment_id": "TEXT NOT NULL DEFAULT ''",
+            "scenario": "TEXT NOT NULL DEFAULT ''",
+            "connection_id": "TEXT NOT NULL DEFAULT ''",
+            "websocket_session_id": "TEXT NOT NULL DEFAULT ''",
+            "ws_send_ms": "REAL",
+            "ws_receive_ms": "REAL",
+            "ws_reconnect_count": "INTEGER NOT NULL DEFAULT 0",
+            "ws_message_sequence": "INTEGER",
+        }
+        for name, definition in sample_columns.items():
+            self._ensure_column("gateway_transport_latency_samples", name, definition)
+        report_columns = {
+            "experiment_id": "TEXT NOT NULL DEFAULT ''",
+            "scenario": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in report_columns.items():
+            self._ensure_column("gateway_transport_latency_reports", name, definition)
+
+    def _ensure_gateway_transport_latency_indexes(self) -> None:
+        self.conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_gateway_transport_latency_experiment_id
+                ON gateway_transport_latency_samples(experiment_id);
+            CREATE INDEX IF NOT EXISTS idx_gateway_transport_latency_scenario_transport
+                ON gateway_transport_latency_samples(scenario, transport_mode);
+            """
+        )
+
     def _seed_legacy_strategy_runtime_settings(self) -> None:
         from trading.strategy.runtime_settings import legacy_profile_payload
 
@@ -2964,6 +3066,8 @@ def _row_to_gateway_transport_latency_report(row: sqlite3.Row) -> dict:
         "report_id": row["report_id"],
         "trade_date": row["trade_date"],
         "transport_mode": row["transport_mode"],
+        "experiment_id": row["experiment_id"] if "experiment_id" in row.keys() else "",
+        "scenario": row["scenario"] if "scenario" in row.keys() else "",
         "status": row["status"],
         "summary": _safe_json_loads(row["summary_json"], {}),
         "websocket_recommendation": _safe_json_loads(row["recommendation_json"], {}),

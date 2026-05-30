@@ -85,7 +85,7 @@ py -3.9-32 apps/kiwoom_gateway.py `
   --network-interval-sec 0.5
 ```
 
-`--transport websocket-experimental` is reserved for a later mock experiment and is not the production default.
+`--transport websocket-experimental` is mock-only in PR-9 and is not the production default.
 
 ## APIs
 
@@ -118,6 +118,19 @@ WebSocket decision:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/websocket-decision
+```
+
+REST vs WebSocket mock experiment comparison:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/experiments
+
+$headers = @{ "X-Local-Token" = $env:TRADING_CORE_TOKEN }
+Invoke-RestMethod -Method Post `
+  "http://127.0.0.1:8000/api/gateway/transport/experiments/rebuild?experiment_id=exp-001&scenario=command-heavy&persist=true&export=true" `
+  -Headers $headers
+
+Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/experiments/exp-001
 ```
 
 Exports are written to:
@@ -172,6 +185,37 @@ Decision labels:
 - `SWITCH_TO_WEBSOCKET_AFTER_TESTS`
 
 PR-8 can produce `TRY_WEBSOCKET_EXPERIMENT`; it does not switch production transport.
+
+PR-9 adds a mock-only WebSocket comparison path. It can produce labels such as:
+
+- `TUNE_REST_LONG_POLL`
+- `RUN_LONGER_WEBSOCKET_EXPERIMENT`
+- `WEBSOCKET_PROMISING_BUT_NEEDS_REAL_GATEWAY_TEST`
+- `WEBSOCKET_NOT_HELPFUL_RATE_LIMIT_BOUND`
+- `WEBSOCKET_NOT_HELPFUL_KIWOOM_EXECUTION_BOUND`
+
+`real_gateway_switch_ready` stays `false` in PR-9. Mock WebSocket results are evidence for the next PR, not a production transport switch.
+
+## REST vs WebSocket Mock Comparison
+
+The mock experiment uses `/ws/gateway/transport`, which is separate from Dashboard `/ws/dashboard`.
+
+The WebSocket path still uses:
+
+- `gateway_state.dispatch_commands()` for command dispatch,
+- the same command persistence and dedupe tables,
+- the same `command_started`, `command_ack`, and `command_failed` event handlers,
+- the same latency sample table with `transport_mode='websocket_mock'`.
+
+Compare these values first:
+
+- REST `command_latency_p95_ms` vs WebSocket `command_latency_p95_ms`
+- REST `ack_latency_p95_ms` vs WebSocket `ack_latency_p95_ms`
+- REST `event_latency_p95_ms` vs WebSocket `event_latency_p95_ms`
+- REST `long_poll_wait_p95_ms`
+- both transports' error/reconnect counts
+
+If WebSocket improves command p95 but REST was not long-poll bound, the result is not enough to justify a real Gateway switch. If `rate_limit_wait_ms` or `gateway_execute_ms` dominates, WebSocket is the wrong fix.
 
 ## Operational Tuning Order
 

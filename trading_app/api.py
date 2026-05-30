@@ -28,6 +28,7 @@ from trading.broker.models import (
     utc_timestamp,
 )
 from trading.broker.transport_metrics import (
+    TRANSPORT_MODE_WEBSOCKET_MOCK,
     TransportLatencySample,
     ensure_transport_trace,
     monotonic_ms,
@@ -37,6 +38,7 @@ from trading.broker.transport_metrics import (
     utc_now_ms,
     wall_ms,
 )
+from trading.broker.ws_messages import GatewayWsMessage
 from trading.strategy.candidates import CandidateCollector
 from trading.strategy.models import CandidateState
 from trading.theme_engine.repository import ThemeEngineRepository
@@ -223,6 +225,8 @@ def gateway_transport_latency(
     command_id: Optional[str] = None,
     event_id: Optional[str] = None,
     transport_mode: Optional[str] = None,
+    experiment_id: Optional[str] = None,
+    scenario: Optional[str] = None,
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0, le=100000),
 ) -> dict[str, Any]:
@@ -235,6 +239,8 @@ def gateway_transport_latency(
             command_id=command_id,
             event_id=event_id,
             transport_mode=transport_mode,
+            experiment_id=experiment_id,
+            scenario=scenario,
             limit=limit,
             offset=offset,
         )
@@ -243,6 +249,8 @@ def gateway_transport_latency(
             direction=direction,
             message_type=message_type,
             transport_mode=transport_mode,
+            experiment_id=experiment_id,
+            scenario=scenario,
             limit=10000,
         )
         return {"summary": report.get("summary", {}), "samples": samples, "filters": report.get("filters", {})}
@@ -336,12 +344,90 @@ def gateway_transport_latency_export(
         close_database(db)
 
 
+@app.get("/api/gateway/transport/experiments")
+def gateway_transport_experiments(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0, le=100000),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        analyzer = _transport_analyzer(db)
+        items = []
+        for item in db.list_gateway_transport_experiments(limit=limit, offset=offset):
+            comparison = analyzer.build_transport_comparison_report(
+                experiment_id=item.get("experiment_id"),
+                scenario=item.get("scenario"),
+            )
+            items.append(
+                {
+                    **item,
+                    "latest_recommendation": comparison.get("websocket_recommendation", {}).get("recommendation", ""),
+                    "sample_counts": comparison.get("sample_counts", {}),
+                }
+            )
+        return {"items": items}
+    finally:
+        close_database(db)
+
+
+@app.post("/api/gateway/transport/experiments/rebuild")
+def gateway_transport_experiment_rebuild(
+    experiment_id: Optional[str] = None,
+    scenario: Optional[str] = None,
+    trade_date: Optional[str] = None,
+    persist: bool = True,
+    export: bool = False,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        analyzer = _transport_analyzer(db)
+        report = analyzer.build_transport_comparison_report(
+            trade_date=trade_date,
+            experiment_id=experiment_id,
+            scenario=scenario,
+        )
+        saved = db.save_gateway_transport_latency_report(report) if persist else None
+        export_paths = analyzer.export_report(report, formats=["json", "md"]) if export else {}
+        return {"report": report, "saved": saved, "export_paths": export_paths}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/gateway/transport/experiments/{experiment_id}")
+def gateway_transport_experiment_detail(experiment_id: str, scenario: Optional[str] = None) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _transport_analyzer(db).build_transport_comparison_report(
+            experiment_id=experiment_id,
+            scenario=scenario,
+        )
+        return {"found": bool(report.get("sample_counts", {}).get("rest_long_poll") or report.get("sample_counts", {}).get("websocket_mock")), "report": report}
+    finally:
+        close_database(db)
+
+
 @app.get("/api/gateway/transport/websocket-decision")
 def gateway_transport_websocket_decision(trade_date: Optional[str] = None) -> dict[str, Any]:
     db = open_database()
     try:
-        report = _transport_analyzer(db).build_report(trade_date=trade_date, limit=10000)
-        return report.get("websocket_recommendation", {})
+        analyzer = _transport_analyzer(db)
+        report = analyzer.build_report(trade_date=trade_date, limit=10000)
+        payload = dict(report.get("websocket_recommendation", {}))
+        latest = db.list_gateway_transport_experiments(limit=1)
+        latest_comparison = None
+        if latest:
+            latest_comparison = analyzer.build_transport_comparison_report(
+                trade_date=trade_date,
+                experiment_id=latest[0].get("experiment_id"),
+                scenario=latest[0].get("scenario"),
+            )
+            payload["latest_comparison_report"] = latest_comparison
+            payload["websocket_mock_recommendation"] = latest_comparison.get("websocket_recommendation", {})
+        payload["real_gateway_switch_ready"] = False
+        payload.setdefault("blockers", [])
+        payload["blockers"] = list(payload["blockers"]) + ["REAL_GATEWAY_WEBSOCKET_NOT_ENABLED_IN_PR9"]
+        return payload
     finally:
         close_database(db)
 
@@ -605,10 +691,18 @@ async def gateway_events(
     event_in: GatewayEventIn,
     _: None = Depends(verify_gateway_token),
 ) -> dict[str, Any]:
+    event = _event_with_trace(
+        event_in.to_gateway_event(),
+        {"transport_mode": "rest_long_poll"},
+    )
+    return await _process_gateway_event(event)
+
+
+async def _process_gateway_event(event: GatewayEvent) -> dict[str, Any]:
     core_received_at = utc_now_ms()
     core_received_monotonic = monotonic_ms()
     event = _event_with_trace(
-        event_in.to_gateway_event(),
+        event,
         {
             "core_event_received_at_utc": core_received_at,
             "core_event_received_monotonic_ms": core_received_monotonic,
@@ -841,6 +935,129 @@ async def dashboard_ws(websocket: WebSocket) -> None:
         dashboard_connections.disconnect(websocket)
 
 
+@app.websocket("/ws/gateway/transport")
+async def gateway_transport_ws(websocket: WebSocket) -> None:
+    if not _valid_gateway_ws_token(websocket):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    session_id = f"ws_session_{int(time.time() * 1000)}"
+    connection_id = f"ws_conn_{id(websocket)}"
+    sequence = 0
+    await websocket.send_json(
+        GatewayWsMessage(
+            type="hello_ack",
+            source="core",
+            payload={
+                "transport_mode": TRANSPORT_MODE_WEBSOCKET_MOCK,
+                "websocket_session_id": session_id,
+                "real_gateway_switch_ready": False,
+            },
+            metadata={"connection_id": connection_id, "websocket_session_id": session_id},
+        ).to_dict()
+    )
+    try:
+        while True:
+            receive_started = time.perf_counter()
+            raw = await websocket.receive_json()
+            receive_ms = (time.perf_counter() - receive_started) * 1000.0
+            message = GatewayWsMessage.from_dict(raw)
+            sequence = message.sequence or sequence + 1
+            metadata = {
+                **dict(message.metadata or {}),
+                "connection_id": connection_id,
+                "websocket_session_id": session_id,
+                "transport_mode": TRANSPORT_MODE_WEBSOCKET_MOCK,
+                "ws_receive_ms": receive_ms,
+                "ws_message_sequence": sequence,
+            }
+            if message.type == "hello":
+                await websocket.send_json(
+                    GatewayWsMessage(
+                        type="hello_ack",
+                        trace_id=message.trace_id,
+                        source="core",
+                        payload={"transport_mode": TRANSPORT_MODE_WEBSOCKET_MOCK, "websocket_session_id": session_id},
+                        metadata=metadata,
+                        sequence=sequence,
+                    ).to_dict()
+                )
+            elif message.type == "ping":
+                await websocket.send_json(
+                    GatewayWsMessage(
+                        type="pong",
+                        trace_id=message.trace_id,
+                        source="core",
+                        payload={"received_at": utc_now_ms()},
+                        metadata=metadata,
+                        sequence=sequence,
+                    ).to_dict()
+                )
+            elif message.type == "ready_for_commands":
+                limit = int(message.payload.get("limit") or 20)
+                commands = gateway_state.dispatch_commands(limit=max(1, min(limit, 100)))
+                sent_at = utc_now_ms()
+                payloads = [
+                    _ws_command_dict_with_trace(
+                        command,
+                        {
+                            **metadata,
+                            "core_command_ws_send_at_utc": sent_at,
+                            "core_command_ws_send_monotonic_ms": monotonic_ms(),
+                            "experiment_id": metadata.get("experiment_id", ""),
+                            "scenario": metadata.get("scenario", ""),
+                        },
+                    )
+                    for command in commands
+                ]
+                db = open_database()
+                try:
+                    for payload in payloads:
+                        _save_ws_command_transport_sample(
+                            db,
+                            payload,
+                            sent_at=sent_at,
+                            metadata=metadata,
+                        )
+                finally:
+                    close_database(db)
+                await websocket.send_json(
+                    GatewayWsMessage(
+                        type="core_command_batch",
+                        trace_id=message.trace_id,
+                        source="core",
+                        payload={"commands": payloads, "count": len(payloads), "timestamp": sent_at},
+                        metadata=metadata,
+                        sequence=sequence,
+                    ).to_dict()
+                )
+            elif message.type in {"gateway_event", "heartbeat", "command_started", "command_ack", "command_failed", "rate_limited"}:
+                event = _gateway_event_from_ws_message(message, metadata=metadata)
+                result = await _process_gateway_event(event)
+                await websocket.send_json(
+                    GatewayWsMessage(
+                        type="event_ack",
+                        trace_id=message.trace_id,
+                        source="core",
+                        event_id=result.get("event_id", ""),
+                        command_id=event.command_id,
+                        payload=result,
+                        metadata=metadata,
+                        sequence=sequence,
+                    ).to_dict()
+                )
+            else:
+                event = GatewayEvent(
+                    type="transport_error",
+                    source=message.source,
+                    payload={"message": f"unsupported websocket message type: {message.type}", "metadata": metadata},
+                )
+                await _process_gateway_event(event)
+    except WebSocketDisconnect:
+        return
+
+
+
 def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     status_payload = api_status()
     commands_payload = dict(status_payload["commands"])
@@ -851,6 +1068,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     reviews_payload = build_reviews_snapshot(db)
     logs_payload = build_logs_snapshot(db)
     transport_payload = dict(status_payload.get("transport") or _transport_dashboard_payload(_transport_status_payload(db)))
+    transport_experiment_payload = _transport_experiment_dashboard_payload(db)
     runtime_payload = _runtime_dashboard_payload(runtime_supervisor.status())
     dry_run_orders_payload = {
         "summary": db.runtime_order_intent_summary(),
@@ -895,6 +1113,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "gateway": status_payload["gateway"],
         "commands": commands_payload,
         "transport": transport_payload,
+        "transport_experiment": transport_experiment_payload,
         "runtime": runtime_payload,
         "dry_run_orders": dry_run_orders_payload,
         "dry_run_performance": dry_run_performance_payload,
@@ -1355,6 +1574,156 @@ def _transport_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
         "warning_flags": summary.get("warning_flags", []),
         "recent_errors": status.get("recent_errors", [])[:10],
     }
+
+
+def _transport_experiment_dashboard_payload(db: TradingDatabase) -> dict[str, Any]:
+    experiments = db.list_gateway_transport_experiments(limit=1)
+    if not experiments:
+        return {
+            "latest_experiment_id": "",
+            "latest_scenario": "",
+            "recommendation": "NO_EXPERIMENT",
+            "real_gateway_switch_ready": False,
+            "blockers": ["NO_MOCK_EXPERIMENT_DATA"],
+            "sample_counts": {},
+        }
+    latest = experiments[0]
+    report = _transport_analyzer(db).build_transport_comparison_report(
+        experiment_id=latest.get("experiment_id"),
+        scenario=latest.get("scenario"),
+    )
+    rest = report.get("rest_summary", {})
+    ws = report.get("websocket_summary", {})
+    delta = report.get("delta", {})
+    recommendation = report.get("websocket_recommendation", {})
+    return {
+        "latest_experiment_id": latest.get("experiment_id", ""),
+        "latest_scenario": latest.get("scenario", ""),
+        "rest_command_p95_ms": rest.get("command_latency_p95_ms", 0),
+        "websocket_command_p95_ms": ws.get("command_latency_p95_ms", 0),
+        "command_p95_delta_ms": delta.get("command_p95_delta_ms", 0),
+        "rest_ack_p95_ms": rest.get("ack_latency_p95_ms", 0),
+        "websocket_ack_p95_ms": ws.get("ack_latency_p95_ms", 0),
+        "ack_p95_delta_ms": delta.get("ack_p95_delta_ms", 0),
+        "rest_event_p95_ms": rest.get("event_latency_p95_ms", 0),
+        "websocket_event_p95_ms": ws.get("event_latency_p95_ms", 0),
+        "event_p95_delta_ms": delta.get("event_p95_delta_ms", 0),
+        "recommendation": recommendation.get("recommendation", "KEEP_REST_LONG_POLL"),
+        "real_gateway_switch_ready": False,
+        "blockers": recommendation.get("blockers", []),
+        "sample_counts": report.get("sample_counts", {}),
+    }
+
+
+def _valid_gateway_ws_token(websocket: WebSocket) -> bool:
+    expected = get_settings().local_token
+    provided = str(websocket.query_params.get("token") or websocket.headers.get("x-local-token") or "")
+    authorization = str(websocket.headers.get("authorization") or "")
+    if authorization.lower().startswith("bearer "):
+        provided = authorization.split(" ", 1)[1].strip()
+    return bool(expected and provided == expected)
+
+
+def _gateway_event_from_ws_message(message: GatewayWsMessage, *, metadata: dict[str, Any]) -> GatewayEvent:
+    payload = dict(message.payload or {})
+    if message.type == "gateway_event" and isinstance(payload.get("event"), dict):
+        event = GatewayEvent.from_dict(payload["event"])
+    elif message.type == "gateway_event":
+        event_type = str(payload.get("type") or "gateway_event")
+        event = GatewayEvent(
+            type=event_type,
+            payload=dict(payload.get("payload") or payload),
+            event_id=str(payload.get("event_id") or message.event_id or ""),
+            request_id=str(payload.get("request_id") or ""),
+            source=message.source,
+            command_id=str(payload.get("command_id") or message.command_id or ""),
+            idempotency_key=str(payload.get("idempotency_key") or ""),
+        )
+    else:
+        event = GatewayEvent(
+            type=message.type,
+            payload=payload,
+            event_id=message.event_id or "",
+            request_id=str(payload.get("request_id") or ""),
+            source=message.source,
+            command_id=message.command_id or str(payload.get("command_id") or ""),
+            idempotency_key=str(payload.get("idempotency_key") or ""),
+        )
+    trace_payload = ensure_transport_trace(
+        event.payload,
+        trace_id=message.trace_id or trace_from_payload(event.payload).get("trace_id"),
+        process="gateway",
+        extra={
+            **metadata,
+            "transport_mode": TRANSPORT_MODE_WEBSOCKET_MOCK,
+            "gateway_ws_message_id": message.message_id,
+            "gateway_ws_message_type": message.type,
+            "gateway_ws_message_timestamp": message.timestamp,
+            "gateway_ws_message_sequence": message.sequence,
+            "core_ws_received_at_utc": utc_now_ms(),
+        },
+    )
+    data = event.to_dict()
+    data["payload"] = trace_payload
+    data["event_id"] = event.event_id or message.event_id or f"evt_ws_{message.message_id}"
+    data["source"] = event.source or message.source
+    data["command_id"] = event.command_id or message.command_id
+    return GatewayEvent.from_dict(data)
+
+
+def _ws_command_dict_with_trace(command: GatewayCommand, trace_updates: dict[str, Any]) -> dict[str, Any]:
+    data = command.to_dict()
+    trace = trace_from_payload(data.get("payload") or {})
+    payload = ensure_transport_trace(
+        data.get("payload") or {},
+        trace_id=trace.get("trace_id") or f"trace:{command.command_id}",
+        process="core",
+        extra={
+            "core_command_created_at_utc": command.timestamp,
+            "core_command_dispatched_at_utc": trace_updates.get("core_command_ws_send_at_utc"),
+            "transport_mode": TRANSPORT_MODE_WEBSOCKET_MOCK,
+            **trace_updates,
+        },
+    )
+    data["payload"] = payload
+    return data
+
+
+def _save_ws_command_transport_sample(
+    db: TradingDatabase,
+    command_payload: dict[str, Any],
+    *,
+    sent_at: str,
+    metadata: dict[str, Any],
+) -> None:
+    settings = get_settings()
+    if not settings.transport_metrics_enabled:
+        return
+    payload = dict(command_payload.get("payload") or {})
+    trace = trace_from_payload(payload)
+    total_wall = wall_ms(command_payload.get("timestamp"), sent_at) or 0.0
+    sample = TransportLatencySample(
+        sample_id=f"lat_ws_cmd_{command_payload.get('command_id')}_{int(time.time() * 1000)}",
+        trace_id=str(trace.get("trace_id") or f"trace:{command_payload.get('command_id')}"),
+        trade_date=str(sent_at)[:10],
+        direction="core_to_gateway",
+        message_type=str(command_payload.get("type") or ""),
+        command_id=str(command_payload.get("command_id") or ""),
+        request_id=str(command_payload.get("request_id") or ""),
+        source="core",
+        created_at=str(command_payload.get("timestamp") or sent_at),
+        completed_at=sent_at,
+        payload_size_bytes=payload_size_bytes(command_payload),
+        stage_ms={"ws_send_ms": 0.0, "core_dispatch_wait_ms": total_wall},
+        total_wall_ms=total_wall,
+        core_dispatch_wait_ms=total_wall,
+        ws_send_ms=0.0,
+        ws_receive_ms=metadata.get("ws_receive_ms"),
+        ws_message_sequence=metadata.get("ws_message_sequence"),
+        transport_mode=TRANSPORT_MODE_WEBSOCKET_MOCK,
+        metadata={**trace, **metadata},
+    )
+    db.save_gateway_transport_latency_sample(sample.to_dict())
 
 
 def _command_history_item(item: dict[str, Any], *, include_payload: bool) -> dict[str, Any]:

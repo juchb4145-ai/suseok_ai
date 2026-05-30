@@ -178,6 +178,17 @@ WebSocket command transport is still deferred because PR-2/PR-3 priority is corr
 
 PR-8 records `gateway_transport_latency_samples` and `gateway_transport_latency_reports` so this decision is numeric. WebSocket is considered only when command p95 is high and `long_poll_wait_ms` is the dominant source. If `rate_limit_wait_ms`, `gateway_execute_ms`, or Core DB persistence dominates, WebSocket is not expected to fix the issue.
 
+PR-9 adds a mock-only Gateway WebSocket experiment endpoint at `/ws/gateway/transport`. This endpoint is not the Dashboard WebSocket and is not the real Kiwoom Gateway default. The real 32bit Gateway still uses REST event ingest plus command long-poll by default.
+
+The mock WebSocket path deliberately reuses the same Core safety path:
+
+- Core sends commands only through `GatewayStateStore.dispatch_commands()`.
+- WebSocket command delivery does not mark commands successful.
+- `command_started`, `command_ack`, and `command_failed` are converted back into `GatewayEvent` records and handled by the same persistence/ack code as REST.
+- Existing idempotency, dedupe, command history, recovery, and transport latency tables remain authoritative.
+
+The WebSocket mock experiment is used to compare `transport_mode='rest_long_poll'` and `transport_mode='websocket_mock'` samples under the same scenario. A real Gateway WebSocket pilot requires a separate PR after reconnect, duplicate ack, session loss, and LIVE-disabled command behavior are proven.
+
 ## Safety Defaults
 
 - Default mode is `OBSERVE`.
@@ -252,6 +263,14 @@ PR-8:
 - Dashboard transport latency card.
 - WebSocket remains off by default.
 
+PR-9:
+
+- Mock-only Gateway WebSocket transport endpoint.
+- Mock WebSocket Gateway CLI and REST-vs-WebSocket comparison report.
+- WebSocket path reuses command queue, dedupe, persistence, and ack handlers.
+- Dashboard mock experiment summary.
+- Real Kiwoom Gateway remains REST long-poll by default.
+
 PR-5:
 
 - `OrderEnqueueService` shared by API and runtime.
@@ -276,7 +295,8 @@ PR-7:
 
 Next:
 
-- Gateway WebSocket channel when long-poll latency is measured as a bottleneck.
+- Dashboard transport/performance pagination hardening.
+- Real Gateway WebSocket limited pilot only if mock comparison supports it.
 - Dashboard screen hardening and richer order/position views.
 - DRY_RUN report-driven gate/risk threshold A/B suggestions.
 - LIVE order enablement as a separate safety PR.

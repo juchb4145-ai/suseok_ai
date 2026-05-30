@@ -68,6 +68,7 @@ function render(snapshot) {
   const gateway = snapshot.gateway || {};
   const commands = snapshot.commands || {};
   const transport = snapshot.transport || {};
+  const transportExperiment = snapshot.transport_experiment || {};
   const runtime = snapshot.runtime || {};
   const dryRunOrders = snapshot.dry_run_orders || runtime.dry_run_orders || { summary: {}, items: [] };
   const dryRunPerformance = snapshot.dry_run_performance || runtime.dry_run_performance || {};
@@ -123,6 +124,22 @@ function render(snapshot) {
     ),
     5,
   );
+
+  text("transport-exp-id", transportExperiment.latest_experiment_id || "-");
+  text("transport-exp-scenario", transportExperiment.latest_scenario || "-");
+  text("transport-exp-decision", transportExperiment.recommendation || "NO_EXPERIMENT");
+  text("transport-exp-rest-cmd", `${fmtNumber(transportExperiment.rest_command_p95_ms, 1)}ms`);
+  text("transport-exp-ws-cmd", `${fmtNumber(transportExperiment.websocket_command_p95_ms, 1)}ms`);
+  text("transport-exp-cmd-delta", `${fmtNumber(transportExperiment.command_p95_delta_ms, 1)}ms`);
+  text("transport-exp-rest-ack", `${fmtNumber(transportExperiment.rest_ack_p95_ms, 1)}ms`);
+  text("transport-exp-ws-ack", `${fmtNumber(transportExperiment.websocket_ack_p95_ms, 1)}ms`);
+  text("transport-exp-ack-delta", `${fmtNumber(transportExperiment.ack_p95_delta_ms, 1)}ms`);
+  text("transport-exp-ready", transportExperiment.real_gateway_switch_ready ? "YES" : "NO");
+  const expBlockerNode = document.getElementById("transport-exp-blockers");
+  if (expBlockerNode) {
+    const blockers = transportExperiment.blockers || [];
+    expBlockerNode.innerHTML = blockers.length ? blockers.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">No blockers from latest mock comparison</span>';
+  }
 
   text("runtime-enabled", runtime.enabled ? "YES" : "NO");
   text("runtime-running", runtime.running ? "YES" : "NO");

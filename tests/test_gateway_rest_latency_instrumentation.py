@@ -1,4 +1,6 @@
-from apps.kiwoom_gateway import RestCoreClient
+from argparse import Namespace
+
+from apps.kiwoom_gateway import RestCoreClient, _build_core_client
 from trading.broker.models import GatewayEvent
 
 
@@ -68,3 +70,16 @@ def test_rest_core_client_poll_commands_adds_gateway_receive_trace():
     assert trace["gateway_command_polled_at_utc"]
     assert trace["gateway_command_poll_duration_ms"] >= 0
     assert client.last_poll_command_count == 1
+
+
+def test_real_gateway_websocket_experimental_falls_back_to_rest():
+    client = _build_core_client(
+        Namespace(
+            transport="websocket-experimental",
+            core_url="http://127.0.0.1:8000",
+            token="token",
+            metrics_enabled=True,
+        )
+    )
+
+    assert client.transport_mode == "rest_long_poll"

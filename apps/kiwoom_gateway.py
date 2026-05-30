@@ -260,7 +260,7 @@ def parse_args() -> argparse.Namespace:
 
 def _build_core_client(args: argparse.Namespace) -> RestCoreClient:
     if args.transport == "websocket-experimental":
-        print("websocket-experimental is reserved for a future mock experiment; falling back to REST long-poll.")
+        print("websocket-experimental is mock-only in apps/mock_websocket_gateway.py; falling back to REST long-poll.")
     transport_mode = "rest_long_poll"
     return RestCoreClient(
         core_url=args.core_url,

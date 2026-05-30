@@ -10,6 +10,7 @@ from uuid import uuid4
 
 
 TRANSPORT_MODE_REST_LONG_POLL = "rest_long_poll"
+TRANSPORT_MODE_WEBSOCKET_MOCK = "websocket_mock"
 
 
 def utc_now_ms() -> str:
@@ -184,6 +185,10 @@ class TransportLatencySample:
     rate_limit_wait_ms: Optional[float] = None
     gateway_execute_ms: Optional[float] = None
     ack_round_trip_ms: Optional[float] = None
+    ws_send_ms: Optional[float] = None
+    ws_receive_ms: Optional[float] = None
+    ws_reconnect_count: int = 0
+    ws_message_sequence: Optional[int] = None
     clock_skew_warning: bool = False
     transport_mode: str = TRANSPORT_MODE_REST_LONG_POLL
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -224,6 +229,10 @@ class TransportLatencySample:
             "rate_limit_wait_ms": self.rate_limit_wait_ms,
             "gateway_execute_ms": self.gateway_execute_ms,
             "ack_round_trip_ms": self.ack_round_trip_ms,
+            "ws_send_ms": self.ws_send_ms,
+            "ws_receive_ms": self.ws_receive_ms,
+            "ws_reconnect_count": self.ws_reconnect_count,
+            "ws_message_sequence": self.ws_message_sequence,
             "clock_skew_warning": self.clock_skew_warning,
             "transport_mode": self.transport_mode,
             "metadata": dict(self.metadata or {}),
@@ -259,6 +268,14 @@ class TransportLatencySample:
             rate_limit_wait_ms=_optional_float(data.get("rate_limit_wait_ms")),
             gateway_execute_ms=_optional_float(data.get("gateway_execute_ms")),
             ack_round_trip_ms=_optional_float(data.get("ack_round_trip_ms")),
+            ws_send_ms=_optional_float(data.get("ws_send_ms")),
+            ws_receive_ms=_optional_float(data.get("ws_receive_ms")),
+            ws_reconnect_count=int(data.get("ws_reconnect_count") or 0),
+            ws_message_sequence=(
+                int(data.get("ws_message_sequence"))
+                if data.get("ws_message_sequence") not in (None, "")
+                else None
+            ),
             clock_skew_warning=bool(data.get("clock_skew_warning", False)),
             transport_mode=str(data.get("transport_mode") or TRANSPORT_MODE_REST_LONG_POLL),
             metadata=_dict_value(data.get("metadata") or data.get("metadata_json") or {}),
@@ -308,7 +325,10 @@ class TransportLatencySample:
         }
         command_ack_types = {"command_ack", "command_failed", "command_started", "rate_limited"}
         direction = "gateway_ack_to_core" if event_type in command_ack_types or command_id else "gateway_to_core"
-        ack_round_trip = wall_ms(trace_data.get("core_command_long_poll_response_at_utc"), completed_at)
+        ack_round_trip = wall_ms(
+            trace_data.get("core_command_long_poll_response_at_utc") or trace_data.get("core_command_ws_send_at_utc"),
+            completed_at,
+        )
         return cls(
             sample_id=new_trace_id("lat"),
             trace_id=trace_id,
@@ -335,6 +355,15 @@ class TransportLatencySample:
             rate_limit_wait_ms=_optional_float(trace_data.get("rate_limit_wait_ms")),
             gateway_execute_ms=_optional_float(trace_data.get("gateway_execute_ms")),
             ack_round_trip_ms=ack_round_trip,
+            ws_receive_ms=_optional_float(trace_data.get("ws_receive_ms")),
+            ws_send_ms=_optional_float(trace_data.get("ws_send_ms")),
+            ws_reconnect_count=int(trace_data.get("ws_reconnect_count") or 0),
+            ws_message_sequence=(
+                int(trace_data.get("ws_message_sequence"))
+                if trace_data.get("ws_message_sequence") not in (None, "")
+                else None
+            ),
+            transport_mode=str(trace_data.get("transport_mode") or (metadata or {}).get("transport_mode") or TRANSPORT_MODE_REST_LONG_POLL),
             metadata={**trace_data, **dict(metadata or {})},
         )
 

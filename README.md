@@ -192,6 +192,27 @@ Invoke-RestMethod -Method Post "http://127.0.0.1:8000/api/gateway/transport/late
 
 Transport reports are written to `reports/gateway_transport_latency/<trade_date>/` as JSON, CSV, and Markdown. PR-8 keeps Gateway transport on REST + long-poll by default; WebSocket is only a later experiment if latency reports show long-poll wait is the bottleneck.
 
+Gateway WebSocket mock experiment checks:
+
+```powershell
+python apps/mock_websocket_gateway.py `
+  --ws-url ws://127.0.0.1:8000/ws/gateway/transport `
+  --token $env:TRADING_CORE_TOKEN `
+  --scenario command-heavy `
+  --duration-sec 60 `
+  --command-delay-ms 20 `
+  --experiment-id exp-001
+
+$headers = @{ "X-Local-Token" = $env:TRADING_CORE_TOKEN }
+Invoke-RestMethod -Method Post `
+  "http://127.0.0.1:8000/api/gateway/transport/experiments/rebuild?experiment_id=exp-001&scenario=command-heavy&persist=true&export=true" `
+  -Headers $headers
+
+Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/experiments/exp-001
+```
+
+`/ws/gateway/transport` is mock-only in PR-9. It is separate from Dashboard `/ws/dashboard`, and it still uses the same Gateway command queue, dedupe ledger, persistence, and ack/fail handlers. The real 32bit Kiwoom Gateway remains on REST + long-poll by default.
+
 ## 32bit Kiwoom Gateway
 
 Use 32bit Python 3.9.13 with Kiwoom OpenAPI+ installed and OCX registered.
@@ -221,12 +242,34 @@ py -3.9-32 apps/kiwoom_gateway.py --mock --once --core-url http://127.0.0.1:8000
 Gateway transport options:
 
 - `--transport rest`: default production path.
-- `--transport websocket-experimental`: reserved for future mock experiments; not a production default.
+- `--transport websocket-experimental`: mock-only experiment path; real Kiwoom Gateway falls back to or stays on REST unless `--mock` is used.
 - `--poll-wait-sec`: command long-poll wait duration.
 - `--network-interval-sec`: network worker interval hint.
 - `--metrics-enabled`: emit transport trace metadata.
 - `--metrics-sample-price-tick-rate`: noisy tick metric sampling rate.
 - `--metrics-sample-heartbeat-rate`: heartbeat metric sampling rate.
+
+Mock WebSocket Gateway:
+
+```powershell
+python apps/mock_websocket_gateway.py `
+  --core-url http://127.0.0.1:8000 `
+  --ws-url ws://127.0.0.1:8000/ws/gateway/transport `
+  --token change-me-local-token `
+  --scenario basic `
+  --duration-sec 30
+```
+
+Transport experiment report helper:
+
+```powershell
+python apps/transport_experiment.py `
+  --core-url http://127.0.0.1:8000 `
+  --token change-me-local-token `
+  --experiment-id exp-001 `
+  --scenario command-heavy `
+  --export
+```
 
 ## Legacy PyQt App
 
@@ -263,3 +306,4 @@ More detail:
 - [Runtime DRY_RUN Exit/Sell Intent Runbook](docs/runtime_dry_run_exit_sell_intent_runbook.md)
 - [DRY_RUN Performance Report Runbook](docs/dry_run_performance_report_runbook.md)
 - [Gateway Transport Latency Runbook](docs/gateway_transport_latency_runbook.md)
+- [Gateway WebSocket Mock Experiment Runbook](docs/gateway_websocket_mock_experiment_runbook.md)

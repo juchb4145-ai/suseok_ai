@@ -166,6 +166,13 @@ When a command stays `DISPATCHED` for too long:
 
 The transport report is exported to `reports/gateway_transport_latency/<trade_date>/`.
 
+PR-9 adds `/ws/gateway/transport` only for mock experiments. It does not bypass this command queue:
+
+- WebSocket command delivery still calls `dispatch_commands()`.
+- WebSocket delivery alone does not move a command to `ACKED`.
+- `command_ack` and `command_failed` over WebSocket reuse the same ack/fail persistence path as REST.
+- Reconnect experiments must verify that already `DISPATCHED` commands are not replayed as new commands.
+
 ## Reconnect Notes
 
 Gateway reconnects can re-poll only commands that Core still considers dispatchable. Core restart recovery reloads valid `QUEUED` commands only. `DISPATCHED` order commands are not automatically requeued or resent. Order commands have `max_attempts=1` by default, and idempotency/dedupe keys prevent the same order from being queued twice after restart. If Gateway loses the ack after a real Kiwoom send, operators should inspect Kiwoom order/execution events and command history before manual retry.

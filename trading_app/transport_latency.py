@@ -30,6 +30,9 @@ class WebSocketDecisionAdvisor:
         self.config = config or TransportLatencyConfig()
 
     def evaluate(self, summary: dict[str, Any]) -> dict[str, Any]:
+        comparison = summary.get("comparison")
+        if isinstance(comparison, dict):
+            return self.evaluate_comparison(comparison)
         metrics = {
             "event_latency_p95_ms": _float(summary.get("event_latency_p95_ms")),
             "command_latency_p95_ms": _float(summary.get("command_latency_p95_ms")),
@@ -98,6 +101,71 @@ class WebSocketDecisionAdvisor:
             ],
         }
 
+    def evaluate_comparison(self, comparison: dict[str, Any]) -> dict[str, Any]:
+        rest = dict(comparison.get("rest_summary") or {})
+        websocket = dict(comparison.get("websocket_summary") or {})
+        delta = dict(comparison.get("delta") or {})
+        rest_command = _float(rest.get("command_latency_p95_ms"))
+        ws_command = _float(websocket.get("command_latency_p95_ms"))
+        rest_ack = _float(rest.get("ack_latency_p95_ms"))
+        ws_ack = _float(websocket.get("ack_latency_p95_ms"))
+        rest_long_poll = _float(rest.get("long_poll_wait_p95_ms"))
+        rest_rate_limit = _float(rest.get("rate_limit_wait_p95_ms"))
+        rest_execute = _float(rest.get("gateway_execute_p95_ms"))
+        ws_errors = _float(websocket.get("transport_error_count"))
+        rest_errors = _float(rest.get("transport_error_count"))
+        command_improvement = rest_command - ws_command
+        significant_command = rest_command > 0 and command_improvement >= max(100.0, rest_command * 0.2)
+        recommendation = "KEEP_REST_LONG_POLL"
+        reasons: list[str] = []
+        blockers: list[str] = []
+
+        if rest_rate_limit >= self.config.websocket_recommend_p95_ms:
+            recommendation = "WEBSOCKET_NOT_HELPFUL_RATE_LIMIT_BOUND"
+            blockers.append("RATE_LIMIT_WAIT_DOMINATES")
+            reasons.append("REST baseline is rate-limit bound; WebSocket is unlikely to help.")
+        elif rest_execute >= self.config.websocket_recommend_p95_ms:
+            recommendation = "WEBSOCKET_NOT_HELPFUL_KIWOOM_EXECUTION_BOUND"
+            blockers.append("GATEWAY_EXECUTION_DOMINATES")
+            reasons.append("REST baseline is Gateway/Kiwoom execution bound; WebSocket is unlikely to help.")
+        elif significant_command and rest_long_poll >= self.config.websocket_recommend_p95_ms * 0.5 and ws_errors <= rest_errors:
+            recommendation = "WEBSOCKET_PROMISING_BUT_NEEDS_REAL_GATEWAY_TEST"
+            reasons.append("Mock WebSocket reduced command p95 and REST was long-poll-wait bound.")
+        elif significant_command:
+            recommendation = "RUN_LONGER_WEBSOCKET_EXPERIMENT"
+            reasons.append("Mock WebSocket improved command p95, but more samples are needed before a real pilot.")
+        elif rest_long_poll >= self.config.websocket_recommend_p95_ms * 0.5:
+            recommendation = "TUNE_REST_LONG_POLL"
+            reasons.append("REST long-poll wait is visible, but mock WebSocket did not improve enough.")
+        else:
+            reasons.append("Mock comparison does not show a strong WebSocket advantage.")
+
+        if ws_errors > rest_errors:
+            blockers.append("WEBSOCKET_ERROR_RATE_HIGHER")
+            reasons.append("Mock WebSocket has more transport errors than REST.")
+
+        return {
+            "recommendation": recommendation,
+            "should_switch": False,
+            "real_gateway_switch_ready": False,
+            "reasons": reasons,
+            "blockers": blockers,
+            "current_metrics": {
+                "rest_command_p95_ms": rest_command,
+                "websocket_command_p95_ms": ws_command,
+                "command_p95_delta_ms": delta.get("command_p95_delta_ms", command_improvement),
+                "rest_ack_p95_ms": rest_ack,
+                "websocket_ack_p95_ms": ws_ack,
+                "ack_p95_delta_ms": delta.get("ack_p95_delta_ms", rest_ack - ws_ack),
+                "rest_long_poll_wait_p95_ms": rest_long_poll,
+            },
+            "next_steps": [
+                "Run a longer mock scenario if sample counts are low.",
+                "Keep real Kiwoom Gateway on REST until reconnect/idempotency pilot passes.",
+                "If WebSocket remains promising, prepare a limited real-gateway pilot with LIVE orders disabled.",
+            ],
+        }
+
 
 class TransportLatencyAnalyzer:
     def __init__(
@@ -119,6 +187,8 @@ class TransportLatencyAnalyzer:
         direction: Optional[str] = None,
         message_type: Optional[str] = None,
         transport_mode: Optional[str] = None,
+        experiment_id: Optional[str] = None,
+        scenario: Optional[str] = None,
         limit: int = 10000,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -127,6 +197,8 @@ class TransportLatencyAnalyzer:
             direction=direction,
             message_type=message_type,
             transport_mode=transport_mode,
+            experiment_id=experiment_id,
+            scenario=scenario,
             limit=limit,
             offset=offset,
         )
@@ -143,6 +215,8 @@ class TransportLatencyAnalyzer:
                 "direction": direction or "",
                 "message_type": message_type or "",
                 "transport_mode": transport_mode or "",
+                "experiment_id": experiment_id or "",
+                "scenario": scenario or "",
                 "limit": int(limit or 10000),
                 "offset": int(offset or 0),
             },
@@ -151,6 +225,70 @@ class TransportLatencyAnalyzer:
             "samples": samples[: min(len(samples), 500)],
         }
         return report
+
+    def build_transport_comparison_report(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        experiment_id: Optional[str] = None,
+        scenario: Optional[str] = None,
+        baseline_transport: str = "rest_long_poll",
+        candidate_transport: str = "websocket_mock",
+        limit: int = 10000,
+    ) -> dict[str, Any]:
+        rest_samples = self.db.list_gateway_transport_latency_samples(
+            trade_date=trade_date,
+            experiment_id=experiment_id,
+            scenario=scenario,
+            transport_mode=baseline_transport,
+            limit=limit,
+        )
+        ws_samples = self.db.list_gateway_transport_latency_samples(
+            trade_date=trade_date,
+            experiment_id=experiment_id,
+            scenario=scenario,
+            transport_mode=candidate_transport,
+            limit=limit,
+        )
+        rest_summary = self.aggregate_summary(rest_samples)
+        ws_summary = self.aggregate_summary(ws_samples)
+        delta = {
+            "event_p95_delta_ms": _float(rest_summary.get("event_latency_p95_ms")) - _float(ws_summary.get("event_latency_p95_ms")),
+            "command_p95_delta_ms": _float(rest_summary.get("command_latency_p95_ms")) - _float(ws_summary.get("command_latency_p95_ms")),
+            "ack_p95_delta_ms": _float(rest_summary.get("ack_latency_p95_ms")) - _float(ws_summary.get("ack_latency_p95_ms")),
+            "empty_poll_rate_delta": _float(rest_summary.get("empty_poll_rate")) - _float(ws_summary.get("empty_poll_rate")),
+            "error_count_delta": _float(rest_summary.get("transport_error_count")) - _float(ws_summary.get("transport_error_count")),
+        }
+        comparison = {"rest_summary": rest_summary, "websocket_summary": ws_summary, "delta": delta}
+        recommendation = self.advisor.evaluate({"comparison": comparison})
+        sample_counts = {baseline_transport: len(rest_samples), candidate_transport: len(ws_samples)}
+        return {
+            "report_id": new_message_id("transport_cmp"),
+            "status": "READY",
+            "generated_at": utc_now_ms(),
+            "trade_date": trade_date or "",
+            "transport_mode": f"{baseline_transport}_vs_{candidate_transport}",
+            "experiment_id": experiment_id or "",
+            "scenario": scenario or "",
+            "filters": {
+                "trade_date": trade_date or "",
+                "experiment_id": experiment_id or "",
+                "scenario": scenario or "",
+                "baseline_transport": baseline_transport,
+                "candidate_transport": candidate_transport,
+            },
+            "rest_summary": rest_summary,
+            "websocket_summary": ws_summary,
+            "delta": delta,
+            "sample_counts": sample_counts,
+            "websocket_recommendation": recommendation,
+            "summary": {
+                "comparison": comparison,
+                "sample_counts": sample_counts,
+                "recommendation": recommendation.get("recommendation"),
+                **delta,
+            },
+        }
 
     def aggregate_summary(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
         base = TransportLatencySummary.from_samples(samples).to_dict()

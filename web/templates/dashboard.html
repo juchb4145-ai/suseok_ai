@@ -73,6 +73,25 @@
 
       <section class="band">
         <div class="section-head">
+          <h2>Gateway WebSocket Mock Experiment</h2>
+          <span id="transport-exp-decision" class="counter">NO_EXPERIMENT</span>
+        </div>
+        <div class="mini-grid command-grid">
+          <div><span>EXPERIMENT</span><strong id="transport-exp-id">-</strong></div>
+          <div><span>SCENARIO</span><strong id="transport-exp-scenario">-</strong></div>
+          <div><span>REST CMD P95</span><strong id="transport-exp-rest-cmd">0ms</strong></div>
+          <div><span>WS CMD P95</span><strong id="transport-exp-ws-cmd">0ms</strong></div>
+          <div><span>CMD DELTA</span><strong id="transport-exp-cmd-delta">0ms</strong></div>
+          <div><span>REST ACK P95</span><strong id="transport-exp-rest-ack">0ms</strong></div>
+          <div><span>WS ACK P95</span><strong id="transport-exp-ws-ack">0ms</strong></div>
+          <div><span>ACK DELTA</span><strong id="transport-exp-ack-delta">0ms</strong></div>
+          <div><span>READY</span><strong id="transport-exp-ready">NO</strong></div>
+        </div>
+        <div id="transport-exp-blockers" class="inline-log"></div>
+      </section>
+
+      <section class="band">
+        <div class="section-head">
           <h2>Strategy Runtime</h2>
           <div class="action-strip">
             <button id="runtime-start" type="button">Start</button>
