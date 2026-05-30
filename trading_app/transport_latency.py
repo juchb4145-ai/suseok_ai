@@ -305,9 +305,10 @@ class TransportLatencyAnalyzer:
             for sample in samples
             if sample.get("message_type") == "rate_limited" or (_float(sample.get("rate_limit_wait_ms")) > 0)
         ]
+        transport_modes = sorted({str(sample.get("transport_mode") or "") for sample in samples if sample.get("transport_mode")})
         summary = {
             **base,
-            "transport_mode": "rest_long_poll",
+            "transport_mode": transport_modes[0] if len(transport_modes) == 1 else ("mixed" if transport_modes else "rest_long_poll"),
             "event_latency_p95_ms": _summary_value(event_samples, "total_wall_ms", 95),
             "command_latency_p95_ms": _summary_value(command_samples, "total_wall_ms", 95),
             "ack_latency_p95_ms": _summary_value(ack_samples, "ack_round_trip_ms", 95)

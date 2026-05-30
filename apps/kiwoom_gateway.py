@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from trading.broker.gateway_client import GatewayEventQueue
+from trading.broker.gateway_transport import WebSocketRealCoreClient, WebSocketPilotPolicy
 from trading.broker.models import (
     BrokerExecutionEvent,
     BrokerOrderRequest,
@@ -25,6 +26,8 @@ from trading.broker.models import (
 )
 from trading.broker.rate_limit import RateLimiter
 from trading.broker.transport_metrics import (
+    TRANSPORT_MODE_REST_LONG_POLL,
+    TRANSPORT_MODE_WEBSOCKET_REAL_PILOT,
     ensure_transport_trace,
     monotonic_ms,
     monotonic_delta_ms,
@@ -132,6 +135,29 @@ class RestCoreClient:
             self.last_poll_error = str(exc)
             raise
 
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        if self._session is not None:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "transport_mode": self.transport_mode,
+            "gateway_last_poll_ms": round(self.last_poll_ms, 3),
+            "gateway_last_event_post_ms": round(self.last_event_post_ms, 3),
+            "gateway_poll_count": self.poll_count,
+            "gateway_empty_poll_count": self.empty_poll_count,
+            "gateway_event_post_count": self.post_count,
+            "gateway_event_post_error_count": self.post_error_count,
+            "gateway_last_poll_command_count": self.last_poll_command_count,
+            "gateway_network_last_error": self.last_poll_error,
+        }
+
 
 class GatewayRuntime:
     def __init__(self, core_client: RestCoreClient, *, source: str = "kiwoom_gateway") -> None:
@@ -175,6 +201,9 @@ class GatewayRuntime:
     def start_network_worker(self, *, interval_sec: float = 0.5) -> None:
         if self._worker and self._worker.is_alive():
             return
+        start = getattr(self.core_client, "start", None)
+        if callable(start):
+            start()
         self.network_interval_sec = interval_sec
         self._stop.clear()
         self._worker = threading.Thread(
@@ -189,6 +218,9 @@ class GatewayRuntime:
         self._stop.set()
         if self._worker and self._worker.is_alive():
             self._worker.join(timeout=3)
+        stop = getattr(self.core_client, "stop", None)
+        if callable(stop):
+            stop()
 
     def _network_loop(self, *, interval_sec: float) -> None:
         while not self._stop.is_set():
@@ -215,8 +247,13 @@ class GatewayRuntime:
                 time.sleep(min(5.0, max(1.0, interval_sec)))
 
     def transport_snapshot(self) -> dict[str, Any]:
+        client_snapshot = {}
+        snapshot = getattr(self.core_client, "snapshot", None)
+        if callable(snapshot):
+            client_snapshot = dict(snapshot() or {})
+        transport_mode = client_snapshot.get("transport_mode") or self.core_client.transport_mode
         return {
-            "transport_mode": self.core_client.transport_mode,
+            "transport_mode": transport_mode,
             "gateway_network_last_error": self.last_error or self.core_client.last_poll_error,
             "gateway_reconnect_count": self.reconnect_count,
             "gateway_poll_interval_sec": self.network_interval_sec,
@@ -229,6 +266,7 @@ class GatewayRuntime:
             "gateway_event_post_count": self.core_client.post_count,
             "gateway_event_post_error_count": self.core_client.post_error_count,
             "gateway_last_poll_command_count": self.core_client.last_poll_command_count,
+            **client_snapshot,
             "gateway_transport_metrics": {
                 "last_poll_ms": round(self.core_client.last_poll_ms, 3),
                 "last_event_post_ms": round(self.core_client.last_event_post_ms, 3),
@@ -248,7 +286,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mock", action="store_true", help="Send mock events instead of loading Kiwoom ActiveX.")
     parser.add_argument("--once", action="store_true", help="Send one mock batch and exit.")
     parser.add_argument("--interval-sec", type=float, default=1.0, help="Heartbeat/mock interval.")
-    parser.add_argument("--transport", choices=["rest", "websocket-experimental"], default=os.environ.get("TRADING_GATEWAY_TRANSPORT", "rest"))
+    parser.add_argument(
+        "--transport",
+        choices=["rest", "websocket-pilot", "websocket-experimental"],
+        default=os.environ.get("TRADING_GATEWAY_TRANSPORT", "rest"),
+    )
     parser.add_argument("--poll-wait-sec", type=float, default=float(os.environ.get("TRADING_GATEWAY_POLL_WAIT_SEC", "1.0")))
     parser.add_argument("--network-interval-sec", type=float, default=float(os.environ.get("TRADING_GATEWAY_NETWORK_INTERVAL_SEC", "0.5")))
     parser.add_argument("--ws-url", default=os.environ.get("TRADING_GATEWAY_WS_URL", ""))
@@ -259,9 +301,40 @@ def parse_args() -> argparse.Namespace:
 
 
 def _build_core_client(args: argparse.Namespace) -> RestCoreClient:
-    if args.transport == "websocket-experimental":
+    transport = str(getattr(args, "transport", "rest") or "rest")
+    if transport == "websocket-experimental":
         print("websocket-experimental is mock-only in apps/mock_websocket_gateway.py; falling back to REST long-poll.")
-    transport_mode = "rest_long_poll"
+        transport = "rest"
+    policy = WebSocketPilotPolicy.from_env()
+    if transport == "websocket-pilot":
+        if bool(getattr(args, "mock", False)):
+            print("websocket-pilot is for the real Kiwoom Gateway; use apps/mock_websocket_gateway.py for mock experiments. Falling back to REST.")
+            transport = "rest"
+        elif not (policy.enabled and policy.allow_real):
+            if policy.fallback_to_rest:
+                print("websocket-pilot feature flags are not enabled; falling back to REST long-poll.")
+                transport = "rest"
+            else:
+                raise RuntimeError(
+                    "websocket-pilot requires TRADING_GATEWAY_WEBSOCKET_REAL_PILOT=1 "
+                    "and TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL=1"
+                )
+    if transport == "websocket-pilot":
+        fallback = RestCoreClient(
+            core_url=args.core_url,
+            token=args.token,
+            transport_mode=TRANSPORT_MODE_REST_LONG_POLL,
+            metrics_enabled=bool(getattr(args, "metrics_enabled", True)),
+        )
+        return WebSocketRealCoreClient(
+            core_url=args.core_url,
+            ws_url=getattr(args, "ws_url", "") or os.environ.get("TRADING_GATEWAY_WS_URL", ""),
+            token=args.token,
+            fallback_client=fallback if policy.fallback_to_rest else None,
+            policy=policy,
+            source="kiwoom_gateway",
+        )
+    transport_mode = TRANSPORT_MODE_REST_LONG_POLL
     return RestCoreClient(
         core_url=args.core_url,
         token=args.token,
@@ -471,6 +544,32 @@ def _drain_real_commands(client, runtime: GatewayRuntime) -> None:
             )
             runtime.commands.put(command)
             return
+        rejection = _websocket_pilot_command_rejection(runtime, command)
+        if rejection:
+            recorder = getattr(runtime.core_client, "record_blocked_order_command", None)
+            if callable(recorder) and command.type in {"send_order", "cancel_order", "modify_order"}:
+                recorder()
+            runtime.emit(
+                "command_ack",
+                {
+                    **_command_event_payload(
+                        command,
+                        {
+                            "gateway_command_ack_created_at_utc": utc_now_ms(),
+                            "gateway_command_ack_created_monotonic_ms": monotonic_ms(),
+                            "gateway_execute_ms": 0.0,
+                            "pilot_blocked_order_command": command.type in {"send_order", "cancel_order", "modify_order"},
+                        },
+                    ),
+                    "status": "REJECTED",
+                    "result_code": -1,
+                    "message": rejection,
+                    "reason": rejection,
+                    "raw": {"transport_mode": TRANSPORT_MODE_WEBSOCKET_REAL_PILOT},
+                },
+                command_id=command.command_id,
+            )
+            continue
         try:
             start_monotonic = monotonic_ms()
             runtime.emit(
@@ -607,6 +706,25 @@ def _execute_command(client, command: GatewayCommand) -> dict[str, Any]:
         "result_code": -1,
         "raw": {},
     }
+
+
+def _websocket_pilot_command_rejection(runtime: GatewayRuntime, command: GatewayCommand) -> str:
+    snapshot = {}
+    snapshot_func = getattr(runtime.core_client, "snapshot", None)
+    if callable(snapshot_func):
+        snapshot = dict(snapshot_func() or {})
+    original_transport = str(snapshot.get("original_transport") or snapshot.get("transport_mode") or runtime.core_client.transport_mode)
+    if original_transport != TRANSPORT_MODE_WEBSOCKET_REAL_PILOT:
+        return ""
+    policy = getattr(runtime.core_client, "policy", None)
+    if command.type in {"send_order", "cancel_order", "modify_order"}:
+        block_order = bool(getattr(policy, "block_order_commands", True))
+        allow_order = bool(getattr(policy, "allow_order_commands", False))
+        if block_order or not allow_order:
+            return "WEBSOCKET_PILOT_ORDER_COMMAND_BLOCKED"
+    if policy is not None and hasattr(policy, "command_allowed") and not policy.command_allowed(command.type):
+        return "WEBSOCKET_PILOT_COMMAND_NOT_ALLOWED"
+    return ""
 
 
 def _drain_mock_commands(runtime: GatewayRuntime) -> None:

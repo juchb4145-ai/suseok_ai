@@ -278,6 +278,14 @@ PR-10:
 - 행 상세보기는 `/api/snapshot`에 큰 데이터를 넣지 않고 각 상세 API를 호출한다.
 - 대시보드에는 주문 실행 버튼이나 WebSocket 전송 전환 버튼을 추가하지 않는다.
 
+PR-11:
+
+- 실제 32bit Kiwoom Gateway에서 `websocket-pilot` transport를 명시적 feature flag로만 사용할 수 있다.
+- 기본 transport는 계속 REST event ingest + command long-poll이다.
+- WebSocket real pilot도 기존 command queue, dedupe, persistence, ack/fail handler를 우회하지 않는다.
+- Pilot 단계에서는 `send_order`, `cancel_order`, `modify_order`가 기본 차단된다.
+- Soak test와 `websocket_real_pilot` latency report가 통과해야 실제 전환 PR을 검토한다.
+
 PR-5:
 
 - `OrderEnqueueService` shared by API and runtime.

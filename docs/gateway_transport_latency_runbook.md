@@ -208,6 +208,21 @@ PR-9 adds a mock-only WebSocket comparison path. It can produce labels such as:
 
 The mock experiment uses `/ws/gateway/transport`, which is separate from Dashboard `/ws/dashboard`.
 
+## WebSocket Real Pilot 지표
+
+PR-11부터 실제 32bit Gateway도 명시적 feature flag가 켜진 경우 `transport_mode=websocket_real_pilot` 샘플을 남길 수 있다. 기본 운영 경로는 여전히 REST long-poll이다.
+
+확인 API:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/websocket-pilot/status
+Invoke-RestMethod "http://127.0.0.1:8000/api/gateway/transport/latency?transport_mode=websocket_real_pilot"
+Invoke-RestMethod "http://127.0.0.1:8000/api/gateway/transport/latency/summary?transport_mode=websocket_real_pilot"
+Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/websocket-decision
+```
+
+Real pilot 분석에서는 `session_loss_count`, `duplicate_ack_count`, `unknown_ack_count`, `ws_fallback_reason`, `pilot_blocked_order_command_count`를 command/ack p95만큼 중요하게 본다. WebSocket 지연이 낮아도 session loss나 duplicate ack가 있으면 실제 전환 준비 완료로 보지 않는다.
+
 The WebSocket path still uses:
 
 - `gateway_state.dispatch_commands()` for command dispatch,

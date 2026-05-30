@@ -19,12 +19,15 @@ class GatewayWsMessage:
     command_id: str = ""
     event_id: str = ""
     sequence: int = 0
+    ws_session_id: str = ""
+    ws_connection_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "GatewayWsMessage":
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
         return cls(
             type=str(data.get("type") or ""),
             message_id=str(data.get("message_id") or new_message_id("ws")),
@@ -32,8 +35,10 @@ class GatewayWsMessage:
             timestamp=str(data.get("timestamp") or utc_now_ms()),
             source=str(data.get("source") or "mock_websocket_gateway"),
             payload=dict(data.get("payload") or {}),
-            metadata=dict(data.get("metadata") or {}),
+            metadata=dict(metadata),
             command_id=str(data.get("command_id") or ""),
             event_id=str(data.get("event_id") or ""),
             sequence=int(data.get("sequence") or 0),
+            ws_session_id=str(data.get("ws_session_id") or metadata.get("ws_session_id") or ""),
+            ws_connection_id=str(data.get("ws_connection_id") or metadata.get("ws_connection_id") or ""),
         )

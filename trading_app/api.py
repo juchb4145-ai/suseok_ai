@@ -29,6 +29,7 @@ from trading.broker.models import (
 )
 from trading.broker.transport_metrics import (
     TRANSPORT_MODE_WEBSOCKET_MOCK,
+    TRANSPORT_MODE_WEBSOCKET_REAL_PILOT,
     TransportLatencySample,
     ensure_transport_trace,
     monotonic_ms,
@@ -84,6 +85,23 @@ def _build_gateway_state() -> GatewayStateStore:
 
 gateway_state = _build_gateway_state()
 dashboard_connections = DashboardConnectionManager()
+gateway_ws_transport_state: dict[str, Any] = {
+    "enabled": False,
+    "connected": False,
+    "state": "DISCONNECTED",
+    "transport_mode": "",
+    "ws_session_id": "",
+    "ws_connection_id": "",
+    "reconnect_count": 0,
+    "fallback_state": "",
+    "fallback_reason": "",
+    "blocked_order_command_count": 0,
+    "session_loss_count": 0,
+    "duplicate_ack_count": 0,
+    "unknown_ack_count": 0,
+    "last_ws_event_at": "",
+    "last_ws_ack_at": "",
+}
 
 
 def _build_runtime_supervisor() -> RuntimeSupervisor:
@@ -169,6 +187,7 @@ def _transport_status_payload(db: TradingDatabase) -> dict[str, Any]:
     recent_errors = db.latest_gateway_transport_errors(limit=10)
     gateway_snapshot = gateway_state.snapshot().to_dict()
     heartbeat_payload = gateway_snapshot.get("last_heartbeat_payload") or {}
+    real_pilot = _real_gateway_websocket_pilot_status(heartbeat_payload)
     return {
         "transport_mode": heartbeat_payload.get("transport_mode") or "rest_long_poll",
         "metrics_enabled": settings.transport_metrics_enabled,
@@ -177,6 +196,7 @@ def _transport_status_payload(db: TradingDatabase) -> dict[str, Any]:
         "websocket_recommendation": recommendation,
         "recent_errors": recent_errors,
         "latest_report_id": latest_reports[0].get("report_id") if latest_reports else "",
+        "real_gateway_websocket_pilot": real_pilot,
         "gateway": {
             "reconnect_count": gateway_snapshot.get("reconnect_count", 0),
             "network_last_error": heartbeat_payload.get("gateway_network_last_error") or heartbeat_payload.get("last_error") or "",
@@ -315,12 +335,13 @@ def gateway_transport_latency(
 @app.get("/api/gateway/transport/latency/summary")
 def gateway_transport_latency_summary(
     trade_date: Optional[str] = None,
+    transport_mode: Optional[str] = None,
     window_sec: Optional[int] = Query(None, ge=1, le=604800),
     group_by: Optional[str] = None,
 ) -> dict[str, Any]:
     db = open_database()
     try:
-        report = _transport_analyzer(db).build_report(trade_date=trade_date, limit=10000)
+        report = _transport_analyzer(db).build_report(trade_date=trade_date, transport_mode=transport_mode, limit=10000)
         summary = dict(report.get("summary") or {})
         if group_by:
             key = {
@@ -512,12 +533,39 @@ def gateway_transport_websocket_decision(trade_date: Optional[str] = None) -> di
             )
             payload["latest_comparison_report"] = latest_comparison
             payload["websocket_mock_recommendation"] = latest_comparison.get("websocket_recommendation", {})
+        real_pilot_report = analyzer.build_transport_comparison_report(
+            trade_date=trade_date,
+            baseline_transport="rest_long_poll",
+            candidate_transport=TRANSPORT_MODE_WEBSOCKET_REAL_PILOT,
+        )
+        real_status = _real_gateway_websocket_pilot_status(gateway_state.snapshot().last_heartbeat_payload)
+        payload["real_pilot_summary"] = {
+            "status": real_status,
+            "sample_counts": real_pilot_report.get("sample_counts", {}),
+            "rest_summary": real_pilot_report.get("rest_summary", {}),
+            "websocket_real_pilot_summary": real_pilot_report.get("websocket_summary", {}),
+            "delta": real_pilot_report.get("delta", {}),
+            "recommendation": real_pilot_report.get("websocket_recommendation", {}),
+        }
+        payload["real_pilot_ready"] = bool(real_status.get("enabled") and real_status.get("connected"))
+        payload["switch_to_websocket_ready"] = False
         payload["real_gateway_switch_ready"] = False
+        payload["next_required_soak_test"] = {
+            "duration_sec": 3600,
+            "max_reconnect_count": 3,
+            "fail_on_duplicate_ack": True,
+            "fail_on_session_loss": True,
+        }
         payload.setdefault("blockers", [])
-        payload["blockers"] = list(payload["blockers"]) + ["REAL_GATEWAY_WEBSOCKET_NOT_ENABLED_IN_PR9"]
+        payload["blockers"] = list(payload["blockers"]) + ["REAL_GATEWAY_WEBSOCKET_REQUIRES_LIMITED_SOAK_TEST"]
         return payload
     finally:
         close_database(db)
+
+
+@app.get("/api/gateway/transport/websocket-pilot/status")
+def gateway_transport_websocket_pilot_status() -> dict[str, Any]:
+    return _real_gateway_websocket_pilot_status(gateway_state.snapshot().last_heartbeat_payload)
 
 
 @app.get("/api/runtime/status")
@@ -1097,6 +1145,16 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
     session_id = f"ws_session_{int(time.time() * 1000)}"
     connection_id = f"ws_conn_{id(websocket)}"
     sequence = 0
+    connection_transport_mode = TRANSPORT_MODE_WEBSOCKET_MOCK
+    _update_gateway_ws_transport_state(
+        {
+            "connected": True,
+            "state": "CONNECTED",
+            "transport_mode": connection_transport_mode,
+            "ws_session_id": session_id,
+            "ws_connection_id": connection_id,
+        }
+    )
     await websocket.send_json(
         GatewayWsMessage(
             type="hello_ack",
@@ -1116,21 +1174,41 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
             receive_ms = (time.perf_counter() - receive_started) * 1000.0
             message = GatewayWsMessage.from_dict(raw)
             sequence = message.sequence or sequence + 1
+            if message.type == "hello":
+                connection_transport_mode = _ws_message_transport_mode(message, default=connection_transport_mode)
+            message_transport_mode = _ws_message_transport_mode(message, default=connection_transport_mode)
             metadata = {
                 **dict(message.metadata or {}),
                 "connection_id": connection_id,
                 "websocket_session_id": session_id,
-                "transport_mode": TRANSPORT_MODE_WEBSOCKET_MOCK,
+                "ws_connection_id": connection_id,
+                "ws_session_id": session_id,
+                "transport_mode": message_transport_mode,
                 "ws_receive_ms": receive_ms,
                 "ws_message_sequence": sequence,
             }
             if message.type == "hello":
+                _update_gateway_ws_transport_state(
+                    {
+                        "enabled": message_transport_mode == TRANSPORT_MODE_WEBSOCKET_REAL_PILOT,
+                        "connected": True,
+                        "state": "AUTHENTICATED",
+                        "transport_mode": message_transport_mode,
+                        "ws_session_id": session_id,
+                        "ws_connection_id": connection_id,
+                        "reconnect_count": int(message.payload.get("reconnect_count") or message.metadata.get("ws_reconnect_count") or 0),
+                    }
+                )
                 await websocket.send_json(
                     GatewayWsMessage(
                         type="hello_ack",
                         trace_id=message.trace_id,
                         source="core",
-                        payload={"transport_mode": TRANSPORT_MODE_WEBSOCKET_MOCK, "websocket_session_id": session_id},
+                        payload={
+                            "transport_mode": message_transport_mode,
+                            "websocket_session_id": session_id,
+                            "real_gateway_switch_ready": False,
+                        },
                         metadata=metadata,
                         sequence=sequence,
                     ).to_dict()
@@ -1160,6 +1238,7 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                             "experiment_id": metadata.get("experiment_id", ""),
                             "scenario": metadata.get("scenario", ""),
                         },
+                        transport_mode=message_transport_mode,
                     )
                     for command in commands
                 ]
@@ -1186,6 +1265,7 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                 )
             elif message.type in {"gateway_event", "heartbeat", "command_started", "command_ack", "command_failed", "rate_limited"}:
                 event = _gateway_event_from_ws_message(message, metadata=metadata)
+                _record_ws_message_side_effects(event, metadata)
                 result = await _process_gateway_event(event)
                 await websocket.send_json(
                     GatewayWsMessage(
@@ -1207,6 +1287,15 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                 )
                 await _process_gateway_event(event)
     except WebSocketDisconnect:
+        _update_gateway_ws_transport_state(
+            {
+                "connected": False,
+                "state": "DISCONNECTED",
+                "transport_mode": connection_transport_mode,
+                "ws_session_id": session_id,
+                "ws_connection_id": connection_id,
+            }
+        )
         return
 
 
@@ -1643,10 +1732,32 @@ def _handle_command_ack(db: TradingDatabase, event: GatewayEvent) -> None:
     command_type = str(payload.get("command_type") or "")
     error = str(payload.get("message") or payload.get("error") or "")
     if command_id:
+        existing_record = gateway_state.get_command(command_id)
         if status == CommandStatus.FAILED.value:
-            gateway_state.fail_command(command_id, error, retryable=False)
+            handled = gateway_state.fail_command(command_id, error, retryable=False)
         else:
-            gateway_state.ack_command(command_id, status=status, result_payload=payload, error=error)
+            handled = gateway_state.ack_command(command_id, status=status, result_payload=payload, error=error)
+        trace = trace_from_payload(payload)
+        if trace.get("transport_mode") == TRANSPORT_MODE_WEBSOCKET_REAL_PILOT:
+            if existing_record is None and not handled:
+                gateway_ws_transport_state["unknown_ack_count"] = int(gateway_ws_transport_state.get("unknown_ack_count") or 0) + 1
+                db.save_log(f"[gateway][ws_real_pilot][WARN] unknown command ack {command_id}")
+            elif existing_record is not None and (
+                getattr(getattr(existing_record, "status", ""), "value", str(getattr(existing_record, "status", "")))
+            ) in {
+                CommandStatus.ACKED.value,
+                CommandStatus.FAILED.value,
+                CommandStatus.REJECTED.value,
+                CommandStatus.EXPIRED.value,
+                CommandStatus.CANCELLED.value,
+            }:
+                gateway_ws_transport_state["duplicate_ack_count"] = int(gateway_ws_transport_state.get("duplicate_ack_count") or 0) + 1
+                gateway_state.append_command_event(
+                    command_id,
+                    "duplicate_ack",
+                    message="duplicate websocket real pilot ack",
+                    payload=payload,
+                )
     order_result = payload.get("order_result")
     if command_type == "send_order" and isinstance(order_result, dict):
         db.save_order_result(BrokerOrderResult.from_dict(order_result))
@@ -1704,6 +1815,7 @@ def _transport_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
     summary = dict(status.get("latest_summary") or {})
     recommendation = dict(status.get("websocket_recommendation") or {})
     gateway = dict(status.get("gateway") or {})
+    real_pilot = dict(status.get("real_gateway_websocket_pilot") or {})
     reason = ""
     reasons = recommendation.get("reasons") or []
     if reasons:
@@ -1726,6 +1838,17 @@ def _transport_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
         "latest_report_id": status.get("latest_report_id", ""),
         "warning_flags": summary.get("warning_flags", []),
         "recent_errors": status.get("recent_errors", [])[:10],
+        "real_gateway_websocket_pilot": real_pilot,
+        "real_pilot_enabled": real_pilot.get("enabled", False),
+        "real_pilot_connected": real_pilot.get("connected", False),
+        "real_pilot_state": real_pilot.get("state", "DISCONNECTED"),
+        "real_pilot_ws_session_id": real_pilot.get("ws_session_id", ""),
+        "real_pilot_reconnect_count": real_pilot.get("reconnect_count", 0),
+        "real_pilot_fallback_reason": real_pilot.get("fallback_reason", ""),
+        "real_pilot_blocked_order_command_count": real_pilot.get("blocked_order_command_count", 0),
+        "real_pilot_session_loss_count": real_pilot.get("session_loss_count", 0),
+        "real_pilot_duplicate_ack_count": real_pilot.get("duplicate_ack_count", 0),
+        "real_pilot_unknown_ack_count": real_pilot.get("unknown_ack_count", 0),
     }
 
 
@@ -1777,6 +1900,86 @@ def _valid_gateway_ws_token(websocket: WebSocket) -> bool:
     return bool(expected and provided == expected)
 
 
+def _ws_message_transport_mode(message: GatewayWsMessage, *, default: str = TRANSPORT_MODE_WEBSOCKET_MOCK) -> str:
+    raw = (
+        message.metadata.get("transport_mode")
+        or message.payload.get("transport_mode")
+        or trace_from_payload(message.payload).get("transport_mode")
+        or default
+    )
+    normalized = str(raw or default)
+    if normalized in {TRANSPORT_MODE_WEBSOCKET_MOCK, TRANSPORT_MODE_WEBSOCKET_REAL_PILOT}:
+        return normalized
+    return default
+
+
+def _update_gateway_ws_transport_state(patch: dict[str, Any]) -> None:
+    gateway_ws_transport_state.update({key: value for key, value in patch.items() if value is not None})
+
+
+def _record_ws_message_side_effects(event: GatewayEvent, metadata: dict[str, Any]) -> None:
+    if metadata.get("transport_mode") != TRANSPORT_MODE_WEBSOCKET_REAL_PILOT:
+        return
+    patch: dict[str, Any] = {
+        "enabled": True,
+        "connected": True,
+        "state": "AUTHENTICATED",
+        "transport_mode": TRANSPORT_MODE_WEBSOCKET_REAL_PILOT,
+        "ws_session_id": metadata.get("ws_session_id") or metadata.get("websocket_session_id") or "",
+        "ws_connection_id": metadata.get("ws_connection_id") or metadata.get("connection_id") or "",
+    }
+    if event.type in {"command_ack", "command_failed"}:
+        patch["last_ws_ack_at"] = utc_now_ms()
+    else:
+        patch["last_ws_event_at"] = utc_now_ms()
+    payload = dict(event.payload or {})
+    for source_key, target_key in (
+        ("ws_reconnect_count", "reconnect_count"),
+        ("ws_fallback_state", "fallback_state"),
+        ("ws_fallback_reason", "fallback_reason"),
+        ("pilot_blocked_order_command_count", "blocked_order_command_count"),
+        ("ws_session_loss_count", "session_loss_count"),
+        ("ws_duplicate_ack_count", "duplicate_ack_count"),
+        ("ws_unknown_ack_count", "unknown_ack_count"),
+    ):
+        if source_key in payload:
+            patch[target_key] = payload.get(source_key)
+    _update_gateway_ws_transport_state(patch)
+
+
+def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    heartbeat = dict(heartbeat_payload or {})
+    state = dict(gateway_ws_transport_state)
+    enabled = bool(
+        state.get("enabled")
+        or heartbeat.get("ws_pilot_enabled")
+        or heartbeat.get("transport_mode") == TRANSPORT_MODE_WEBSOCKET_REAL_PILOT
+        or heartbeat.get("original_transport") == TRANSPORT_MODE_WEBSOCKET_REAL_PILOT
+    )
+    connected = bool(
+        state.get("connected")
+        or str(heartbeat.get("ws_connection_state") or "").upper() in {"CONNECTED", "AUTHENTICATED"}
+    )
+    return {
+        "enabled": enabled,
+        "connected": connected,
+        "state": heartbeat.get("ws_connection_state") or state.get("state") or "DISCONNECTED",
+        "ws_session_id": heartbeat.get("ws_session_id") or state.get("ws_session_id") or "",
+        "ws_connection_id": heartbeat.get("ws_connection_id") or state.get("ws_connection_id") or "",
+        "reconnect_count": int(heartbeat.get("ws_reconnect_count") or state.get("reconnect_count") or 0),
+        "fallback_state": heartbeat.get("ws_fallback_state") or state.get("fallback_state") or "",
+        "fallback_reason": heartbeat.get("ws_fallback_reason") or state.get("fallback_reason") or "",
+        "blocked_order_command_count": int(
+            heartbeat.get("pilot_blocked_order_command_count") or state.get("blocked_order_command_count") or 0
+        ),
+        "session_loss_count": int(heartbeat.get("ws_session_loss_count") or state.get("session_loss_count") or 0),
+        "duplicate_ack_count": int(heartbeat.get("ws_duplicate_ack_count") or state.get("duplicate_ack_count") or 0),
+        "unknown_ack_count": int(heartbeat.get("ws_unknown_ack_count") or state.get("unknown_ack_count") or 0),
+        "last_ws_event_at": heartbeat.get("last_ws_event_at") or state.get("last_ws_event_at") or "",
+        "last_ws_ack_at": heartbeat.get("last_ws_ack_at") or state.get("last_ws_ack_at") or "",
+    }
+
+
 def _gateway_event_from_ws_message(message: GatewayWsMessage, *, metadata: dict[str, Any]) -> GatewayEvent:
     payload = dict(message.payload or {})
     if message.type == "gateway_event" and isinstance(payload.get("event"), dict):
@@ -1808,7 +2011,7 @@ def _gateway_event_from_ws_message(message: GatewayWsMessage, *, metadata: dict[
         process="gateway",
         extra={
             **metadata,
-            "transport_mode": TRANSPORT_MODE_WEBSOCKET_MOCK,
+            "transport_mode": metadata.get("transport_mode") or TRANSPORT_MODE_WEBSOCKET_MOCK,
             "gateway_ws_message_id": message.message_id,
             "gateway_ws_message_type": message.type,
             "gateway_ws_message_timestamp": message.timestamp,
@@ -1824,7 +2027,7 @@ def _gateway_event_from_ws_message(message: GatewayWsMessage, *, metadata: dict[
     return GatewayEvent.from_dict(data)
 
 
-def _ws_command_dict_with_trace(command: GatewayCommand, trace_updates: dict[str, Any]) -> dict[str, Any]:
+def _ws_command_dict_with_trace(command: GatewayCommand, trace_updates: dict[str, Any], *, transport_mode: str = TRANSPORT_MODE_WEBSOCKET_MOCK) -> dict[str, Any]:
     data = command.to_dict()
     trace = trace_from_payload(data.get("payload") or {})
     payload = ensure_transport_trace(
@@ -1834,7 +2037,7 @@ def _ws_command_dict_with_trace(command: GatewayCommand, trace_updates: dict[str
         extra={
             "core_command_created_at_utc": command.timestamp,
             "core_command_dispatched_at_utc": trace_updates.get("core_command_ws_send_at_utc"),
-            "transport_mode": TRANSPORT_MODE_WEBSOCKET_MOCK,
+            "transport_mode": transport_mode,
             **trace_updates,
         },
     )
@@ -1873,7 +2076,7 @@ def _save_ws_command_transport_sample(
         ws_send_ms=0.0,
         ws_receive_ms=metadata.get("ws_receive_ms"),
         ws_message_sequence=metadata.get("ws_message_sequence"),
-        transport_mode=TRANSPORT_MODE_WEBSOCKET_MOCK,
+        transport_mode=str(metadata.get("transport_mode") or TRANSPORT_MODE_WEBSOCKET_MOCK),
         metadata={**trace, **metadata},
     )
     db.save_gateway_transport_latency_sample(sample.to_dict())

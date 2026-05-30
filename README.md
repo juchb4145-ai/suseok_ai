@@ -257,12 +257,51 @@ py -3.9-32 apps/kiwoom_gateway.py --mock --once --core-url http://127.0.0.1:8000
 Gateway transport options:
 
 - `--transport rest`: default production path.
-- `--transport websocket-experimental`: mock-only experiment path; real Kiwoom Gateway falls back to or stays on REST unless `--mock` is used.
+- `--transport websocket-pilot`: real 32bit Gateway limited pilot path; requires explicit feature flags and still blocks order commands by default.
+- `--transport websocket-experimental`: deprecated mock-only alias; real Gateway falls back to REST.
 - `--poll-wait-sec`: command long-poll wait duration.
 - `--network-interval-sec`: network worker interval hint.
 - `--metrics-enabled`: emit transport trace metadata.
 - `--metrics-sample-price-tick-rate`: noisy tick metric sampling rate.
 - `--metrics-sample-heartbeat-rate`: heartbeat metric sampling rate.
+
+WebSocket real Gateway pilot:
+
+```powershell
+$env:TRADING_GATEWAY_WEBSOCKET_REAL_PILOT = "1"
+$env:TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL = "1"
+$env:TRADING_GATEWAY_TRANSPORT = "websocket-pilot"
+$env:TRADING_GATEWAY_WS_URL = "ws://127.0.0.1:8000/ws/gateway/transport"
+$env:TRADING_GATEWAY_WEBSOCKET_FALLBACK_TO_REST = "1"
+
+py -3.9-32 apps/kiwoom_gateway.py `
+  --core-url http://127.0.0.1:8000 `
+  --token change-me-local-token `
+  --transport websocket-pilot `
+  --ws-url ws://127.0.0.1:8000/ws/gateway/transport
+```
+
+Pilot safety flags:
+
+- `TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOWED_COMMANDS`: default allows login/condition/realtime/TR commands.
+- `TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS=1`: default blocks `send_order`, `cancel_order`, `modify_order`.
+- `TRADING_GATEWAY_WEBSOCKET_FALLBACK_AFTER_ERRORS=3`
+- `TRADING_GATEWAY_WEBSOCKET_FALLBACK_AFTER_RECONNECTS=5`
+
+Soak check:
+
+```powershell
+python tools/websocket_real_pilot_soak.py `
+  --core-url http://127.0.0.1:8000 `
+  --token change-me-local-token `
+  --duration-sec 3600 `
+  --interval-sec 30 `
+  --fail-on-duplicate-ack `
+  --fail-on-session-loss `
+  --max-reconnect-count 3
+```
+
+Even in `websocket-pilot`, LIVE auto orders are not enabled. Order commands are rejected by default with `WEBSOCKET_PILOT_ORDER_COMMAND_BLOCKED`.
 
 Mock WebSocket Gateway:
 
@@ -322,4 +361,5 @@ More detail:
 - [DRY_RUN 성과 리포트 Runbook](docs/dry_run_performance_report_runbook.md)
 - [Gateway 전송 지연 Runbook](docs/gateway_transport_latency_runbook.md)
 - [Gateway WebSocket Mock 실험 Runbook](docs/gateway_websocket_mock_experiment_runbook.md)
+- [Gateway WebSocket Real Pilot Runbook](docs/gateway_websocket_real_pilot_runbook.md)
 - [대시보드 페이지네이션 Runbook](docs/dashboard_pagination_runbook.md)

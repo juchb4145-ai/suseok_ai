@@ -542,6 +542,15 @@ function render(snapshot) {
   text("transport-errors", transport.transport_error_count || 0);
   text("transport-reconnect", transport.reconnect_count || 0);
   text("transport-ws-decision", transport.websocket_recommendation || "KEEP_REST_LONG_POLL");
+  const realPilot = transport.real_gateway_websocket_pilot || {};
+  text("transport-real-pilot-state", realPilot.enabled ? `${realPilot.connected ? "연결됨" : "미연결"} / ${realPilot.state || "-"}` : "비활성");
+  text("transport-real-pilot-session", compactId(realPilot.ws_session_id || "-").replace(/<[^>]+>/g, ""));
+  text("transport-real-pilot-reconnect", realPilot.reconnect_count || 0);
+  text("transport-real-pilot-blocked-orders", realPilot.blocked_order_command_count || 0);
+  text("transport-real-pilot-session-loss", realPilot.session_loss_count || 0);
+  text("transport-real-pilot-duplicate-ack", realPilot.duplicate_ack_count || 0);
+  text("transport-real-pilot-unknown-ack", realPilot.unknown_ack_count || 0);
+  text("transport-real-pilot-fallback", realPilot.fallback_reason || realPilot.fallback_state || "-");
   const transportWarnings = [transport.websocket_recommendation_reason || "", ...((transport.warning_flags || []).map((flag) => `경고: ${flag}`))].filter(Boolean);
   const transportNode = document.getElementById("transport-warning-lines");
   if (transportNode) transportNode.innerHTML = transportWarnings.length ? transportWarnings.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">전송 상태가 안정적입니다</span>';

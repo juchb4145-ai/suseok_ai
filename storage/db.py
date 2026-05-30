@@ -447,6 +447,13 @@ class TradingDatabase:
                 scenario TEXT NOT NULL DEFAULT '',
                 connection_id TEXT NOT NULL DEFAULT '',
                 websocket_session_id TEXT NOT NULL DEFAULT '',
+                ws_session_id TEXT NOT NULL DEFAULT '',
+                ws_connection_id TEXT NOT NULL DEFAULT '',
+                ws_connection_state TEXT NOT NULL DEFAULT '',
+                ws_fallback_reason TEXT NOT NULL DEFAULT '',
+                session_loss_count INTEGER NOT NULL DEFAULT 0,
+                duplicate_ack_count INTEGER NOT NULL DEFAULT 0,
+                unknown_ack_count INTEGER NOT NULL DEFAULT 0,
                 payload_size_bytes INTEGER NOT NULL DEFAULT 0,
                 total_wall_ms REAL,
                 gateway_queue_wait_ms REAL,
@@ -1467,6 +1474,8 @@ class TradingDatabase:
                     sample_id, trace_id, trade_date, direction, message_type,
                     event_id, command_id, request_id, source, success, error,
                     transport_mode, experiment_id, scenario, connection_id, websocket_session_id,
+                    ws_session_id, ws_connection_id, ws_connection_state, ws_fallback_reason,
+                    session_loss_count, duplicate_ack_count, unknown_ack_count,
                     payload_size_bytes, total_wall_ms,
                     gateway_queue_wait_ms, gateway_post_ms, core_receive_ms,
                     core_persist_ms, core_dispatch_wait_ms, long_poll_wait_ms,
@@ -1474,7 +1483,7 @@ class TradingDatabase:
                     rate_limit_wait_ms, gateway_execute_ms, ack_round_trip_ms,
                     ws_send_ms, ws_receive_ms, ws_reconnect_count, ws_message_sequence,
                     clock_skew_warning, stage_ms_json, metadata_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sample_id) DO UPDATE SET
                     success=excluded.success,
                     error=excluded.error,
@@ -1482,6 +1491,13 @@ class TradingDatabase:
                     scenario=excluded.scenario,
                     connection_id=excluded.connection_id,
                     websocket_session_id=excluded.websocket_session_id,
+                    ws_session_id=excluded.ws_session_id,
+                    ws_connection_id=excluded.ws_connection_id,
+                    ws_connection_state=excluded.ws_connection_state,
+                    ws_fallback_reason=excluded.ws_fallback_reason,
+                    session_loss_count=excluded.session_loss_count,
+                    duplicate_ack_count=excluded.duplicate_ack_count,
+                    unknown_ack_count=excluded.unknown_ack_count,
                     payload_size_bytes=excluded.payload_size_bytes,
                     total_wall_ms=excluded.total_wall_ms,
                     gateway_queue_wait_ms=excluded.gateway_queue_wait_ms,
@@ -1520,6 +1536,13 @@ class TradingDatabase:
                     str(sample.get("scenario") or (sample.get("metadata") or {}).get("scenario") or ""),
                     str(sample.get("connection_id") or (sample.get("metadata") or {}).get("connection_id") or ""),
                     str(sample.get("websocket_session_id") or (sample.get("metadata") or {}).get("websocket_session_id") or ""),
+                    str(sample.get("ws_session_id") or (sample.get("metadata") or {}).get("ws_session_id") or (sample.get("metadata") or {}).get("websocket_session_id") or ""),
+                    str(sample.get("ws_connection_id") or (sample.get("metadata") or {}).get("ws_connection_id") or (sample.get("metadata") or {}).get("connection_id") or ""),
+                    str(sample.get("ws_connection_state") or (sample.get("metadata") or {}).get("ws_connection_state") or ""),
+                    str(sample.get("ws_fallback_reason") or (sample.get("metadata") or {}).get("ws_fallback_reason") or ""),
+                    int(sample.get("session_loss_count") or (sample.get("metadata") or {}).get("session_loss_count") or 0),
+                    int(sample.get("duplicate_ack_count") or (sample.get("metadata") or {}).get("duplicate_ack_count") or 0),
+                    int(sample.get("unknown_ack_count") or (sample.get("metadata") or {}).get("unknown_ack_count") or 0),
                     int(sample.get("payload_size_bytes") or 0),
                     sample.get("total_wall_ms"),
                     sample.get("gateway_queue_wait_ms"),
@@ -2869,6 +2892,13 @@ class TradingDatabase:
             "scenario": "TEXT NOT NULL DEFAULT ''",
             "connection_id": "TEXT NOT NULL DEFAULT ''",
             "websocket_session_id": "TEXT NOT NULL DEFAULT ''",
+            "ws_session_id": "TEXT NOT NULL DEFAULT ''",
+            "ws_connection_id": "TEXT NOT NULL DEFAULT ''",
+            "ws_connection_state": "TEXT NOT NULL DEFAULT ''",
+            "ws_fallback_reason": "TEXT NOT NULL DEFAULT ''",
+            "session_loss_count": "INTEGER NOT NULL DEFAULT 0",
+            "duplicate_ack_count": "INTEGER NOT NULL DEFAULT 0",
+            "unknown_ack_count": "INTEGER NOT NULL DEFAULT 0",
             "ws_send_ms": "REAL",
             "ws_receive_ms": "REAL",
             "ws_reconnect_count": "INTEGER NOT NULL DEFAULT 0",
@@ -2890,6 +2920,8 @@ class TradingDatabase:
                 ON gateway_transport_latency_samples(experiment_id);
             CREATE INDEX IF NOT EXISTS idx_gateway_transport_latency_scenario_transport
                 ON gateway_transport_latency_samples(scenario, transport_mode);
+            CREATE INDEX IF NOT EXISTS idx_gateway_transport_latency_ws_session_id
+                ON gateway_transport_latency_samples(ws_session_id);
             """
         )
 

@@ -11,6 +11,7 @@ from uuid import uuid4
 
 TRANSPORT_MODE_REST_LONG_POLL = "rest_long_poll"
 TRANSPORT_MODE_WEBSOCKET_MOCK = "websocket_mock"
+TRANSPORT_MODE_WEBSOCKET_REAL_PILOT = "websocket_real_pilot"
 
 
 def utc_now_ms() -> str:
@@ -189,6 +190,13 @@ class TransportLatencySample:
     ws_receive_ms: Optional[float] = None
     ws_reconnect_count: int = 0
     ws_message_sequence: Optional[int] = None
+    ws_session_id: str = ""
+    ws_connection_id: str = ""
+    ws_connection_state: str = ""
+    ws_fallback_reason: str = ""
+    session_loss_count: int = 0
+    duplicate_ack_count: int = 0
+    unknown_ack_count: int = 0
     clock_skew_warning: bool = False
     transport_mode: str = TRANSPORT_MODE_REST_LONG_POLL
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -233,6 +241,13 @@ class TransportLatencySample:
             "ws_receive_ms": self.ws_receive_ms,
             "ws_reconnect_count": self.ws_reconnect_count,
             "ws_message_sequence": self.ws_message_sequence,
+            "ws_session_id": self.ws_session_id,
+            "ws_connection_id": self.ws_connection_id,
+            "ws_connection_state": self.ws_connection_state,
+            "ws_fallback_reason": self.ws_fallback_reason,
+            "session_loss_count": self.session_loss_count,
+            "duplicate_ack_count": self.duplicate_ack_count,
+            "unknown_ack_count": self.unknown_ack_count,
             "clock_skew_warning": self.clock_skew_warning,
             "transport_mode": self.transport_mode,
             "metadata": dict(self.metadata or {}),
@@ -240,6 +255,7 @@ class TransportLatencySample:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TransportLatencySample":
+        metadata_value = _dict_value(data.get("metadata") or data.get("metadata_json") or {})
         return cls(
             sample_id=str(data.get("sample_id") or new_trace_id("lat")),
             trace_id=str(data.get("trace_id") or ""),
@@ -276,9 +292,16 @@ class TransportLatencySample:
                 if data.get("ws_message_sequence") not in (None, "")
                 else None
             ),
+            ws_session_id=str(data.get("ws_session_id") or metadata_value.get("ws_session_id") or ""),
+            ws_connection_id=str(data.get("ws_connection_id") or metadata_value.get("ws_connection_id") or ""),
+            ws_connection_state=str(data.get("ws_connection_state") or metadata_value.get("ws_connection_state") or ""),
+            ws_fallback_reason=str(data.get("ws_fallback_reason") or metadata_value.get("ws_fallback_reason") or ""),
+            session_loss_count=int(data.get("session_loss_count") or metadata_value.get("session_loss_count") or 0),
+            duplicate_ack_count=int(data.get("duplicate_ack_count") or metadata_value.get("duplicate_ack_count") or 0),
+            unknown_ack_count=int(data.get("unknown_ack_count") or metadata_value.get("unknown_ack_count") or 0),
             clock_skew_warning=bool(data.get("clock_skew_warning", False)),
             transport_mode=str(data.get("transport_mode") or TRANSPORT_MODE_REST_LONG_POLL),
-            metadata=_dict_value(data.get("metadata") or data.get("metadata_json") or {}),
+            metadata=metadata_value,
         )
 
     @classmethod
@@ -363,6 +386,13 @@ class TransportLatencySample:
                 if trace_data.get("ws_message_sequence") not in (None, "")
                 else None
             ),
+            ws_session_id=str(trace_data.get("ws_session_id") or (metadata or {}).get("ws_session_id") or ""),
+            ws_connection_id=str(trace_data.get("ws_connection_id") or (metadata or {}).get("ws_connection_id") or ""),
+            ws_connection_state=str(trace_data.get("ws_connection_state") or (metadata or {}).get("ws_connection_state") or ""),
+            ws_fallback_reason=str(trace_data.get("ws_fallback_reason") or (metadata or {}).get("ws_fallback_reason") or ""),
+            session_loss_count=int(trace_data.get("session_loss_count") or (metadata or {}).get("session_loss_count") or 0),
+            duplicate_ack_count=int(trace_data.get("duplicate_ack_count") or (metadata or {}).get("duplicate_ack_count") or 0),
+            unknown_ack_count=int(trace_data.get("unknown_ack_count") or (metadata or {}).get("unknown_ack_count") or 0),
             transport_mode=str(trace_data.get("transport_mode") or (metadata or {}).get("transport_mode") or TRANSPORT_MODE_REST_LONG_POLL),
             metadata={**trace_data, **dict(metadata or {})},
         )
