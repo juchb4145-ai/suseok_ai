@@ -125,6 +125,41 @@
 
       <section class="band">
         <div class="section-head">
+          <h2>DRY_RUN Performance</h2>
+          <span id="dryrun-performance-generated" class="counter">-</span>
+        </div>
+        <div class="mini-grid command-grid">
+          <div><span>LIFECYCLES</span><strong id="dryrun-perf-total">0</strong></div>
+          <div><span>COMPLETED</span><strong id="dryrun-perf-completed">0</strong></div>
+          <div><span>WIN RATE</span><strong id="dryrun-perf-win-rate">-</strong></div>
+          <div><span>AVG RETURN</span><strong id="dryrun-perf-avg-return">-</strong></div>
+          <div><span>FALSE POSITIVE</span><strong id="dryrun-perf-fp">0</strong></div>
+          <div><span>FALSE NEGATIVE</span><strong id="dryrun-perf-fn">0</strong></div>
+          <div><span>OPPORTUNITY LOSS</span><strong id="dryrun-perf-opp">0</strong></div>
+          <div><span>LIVE PASS WIN</span><strong id="dryrun-perf-live-pass-win">-</strong></div>
+        </div>
+        <div id="dryrun-perf-fp-lines" class="inline-log"></div>
+        <div id="dryrun-perf-fn-lines" class="inline-log"></div>
+        <div id="dryrun-perf-reject-rally-lines" class="inline-log"></div>
+        <table>
+          <thead>
+            <tr>
+              <th>Code</th>
+              <th>Class</th>
+              <th>FP</th>
+              <th>FN/Opp</th>
+              <th>Return</th>
+              <th>Max 20m</th>
+              <th>Drawdown</th>
+              <th>Gate</th>
+            </tr>
+          </thead>
+          <tbody id="dryrun-perf-case-rows"></tbody>
+        </table>
+      </section>
+
+      <section class="band">
+        <div class="section-head">
           <h2>Gateway Command Queue</h2>
           <span id="command-last-order" class="counter">-</span>
         </div>

@@ -254,8 +254,16 @@ PR-6:
 - Partial take-profit and full-close decisions use distinct idempotency keys.
 - Dashboard/API summarize sell intents and exit decision types.
 
+PR-7:
+
+- DRY_RUN entry/buy and exit/sell intents are linked into performance lifecycles.
+- The analyzer joins `runtime_order_intents`, `virtual_positions`, `exit_decisions`, and `trade_reviews`.
+- False positive, false negative, opportunity-loss, and data-quality summaries are exposed through API, Dashboard, and JSON/CSV/Markdown exports.
+- This layer is analysis-only and still does not create Gateway `send_order`.
+
 Next:
 
-- Real TR response row extraction and request correlation.
 - Gateway WebSocket channel when long-poll latency is measured as a bottleneck.
 - Dashboard screen hardening and richer order/position views.
+- DRY_RUN report-driven gate/risk threshold A/B suggestions.
+- LIVE order enablement as a separate safety PR.

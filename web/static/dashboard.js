@@ -19,6 +19,20 @@ function fmtNumber(value, digits = 1) {
   return number.toFixed(digits);
 }
 
+function formatRate(value) {
+  if (value == null || value === "") return "-";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return `${(number * 100).toFixed(1)}%`;
+}
+
+function formatPercentValue(value) {
+  if (value == null || value === "") return "-";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return `${number.toFixed(2)}%`;
+}
+
 function rowHtml(cells) {
   return `<tr>${cells.map((cell) => `<td>${escapeHtml(cell)}</td>`).join("")}</tr>`;
 }
@@ -42,12 +56,20 @@ function renderRows(id, rows, emptyColumns) {
   body.innerHTML = rows.join("");
 }
 
+function renderInlineCounts(id, rows, key, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const lines = (rows || []).map((item) => `${item[key] || "-"}: ${item.count || 0}`);
+  node.innerHTML = lines.length ? lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
 function render(snapshot) {
   const core = snapshot.core || {};
   const gateway = snapshot.gateway || {};
   const commands = snapshot.commands || {};
   const runtime = snapshot.runtime || {};
   const dryRunOrders = snapshot.dry_run_orders || runtime.dry_run_orders || { summary: {}, items: [] };
+  const dryRunPerformance = snapshot.dry_run_performance || runtime.dry_run_performance || {};
   const candidates = snapshot.candidates || { summary: {}, items: [] };
   const themes = snapshot.themes || { summary: {}, items: [] };
   const orders = snapshot.orders || { summary: {}, order_results: [], executions: [] };
@@ -147,6 +169,35 @@ function render(snapshot) {
       ]),
     ),
     10,
+  );
+
+  text("dryrun-performance-generated", dryRunPerformance.generated_at || "-");
+  text("dryrun-perf-total", dryRunPerformance.total_lifecycle_count || 0);
+  text("dryrun-perf-completed", dryRunPerformance.completed_lifecycle_count || 0);
+  text("dryrun-perf-win-rate", formatRate(dryRunPerformance.win_rate));
+  text("dryrun-perf-avg-return", formatPercentValue(dryRunPerformance.avg_realized_return_pct));
+  text("dryrun-perf-fp", dryRunPerformance.false_positive_count || 0);
+  text("dryrun-perf-fn", dryRunPerformance.false_negative_count || 0);
+  text("dryrun-perf-opp", dryRunPerformance.opportunity_loss_count || 0);
+  text("dryrun-perf-live-pass-win", formatRate(dryRunPerformance.live_would_pass_win_rate));
+  renderInlineCounts("dryrun-perf-fp-lines", dryRunPerformance.top_false_positive_types || [], "type", "No false positive types");
+  renderInlineCounts("dryrun-perf-fn-lines", dryRunPerformance.top_false_negative_types || [], "type", "No false negative types");
+  renderInlineCounts("dryrun-perf-reject-rally-lines", dryRunPerformance.top_reject_reasons_with_rally || [], "reason", "No reject reasons with rally");
+  renderRows(
+    "dryrun-perf-case-rows",
+    (dryRunPerformance.bad_cases || []).slice(0, 10).map((item) =>
+      rowHtml([
+        item.code || "-",
+        item.quality_bucket || item.signal_classification || "-",
+        item.dry_run_false_positive_type || "-",
+        item.dry_run_false_negative_type || item.opportunity_loss_type || "-",
+        formatPercentValue(item.realized_return_pct),
+        formatPercentValue(item.max_return_20m),
+        formatPercentValue(item.max_drawdown_20m),
+        item.gate_reason || "-",
+      ]),
+    ),
+    8,
   );
 
   text("command-queued", commands.queued_count || 0);

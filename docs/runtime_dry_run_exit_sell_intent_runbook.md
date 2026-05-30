@@ -101,6 +101,24 @@ Dashboard `/` shows:
 - recent sell intents
 - exit decision type summary
 
+## Performance Lifecycle Link
+
+PR-7 links exit/sell intents into the DRY_RUN performance lifecycle. A sell intent is connected by `virtual_position_id` first, then `virtual_order_id`, `trade_review_id`, and finally `candidate_id + code + trade_date`.
+
+This lets the report distinguish:
+
+- entry/buy accepted but later SUPPORT_LOSS
+- partial TAKE_PROFIT followed by a later full exit
+- exit intent without an entry intent (`orphan_exit`)
+- review exists but no entry intent (`NO_ENTRY_INTENT_BUT_RALLIED`)
+
+Check:
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8000/api/runtime/performance/dry-run?order_phase=exit"
+Invoke-RestMethod "http://127.0.0.1:8000/api/runtime/performance/dry-run/false-signals?type=all"
+```
+
 ## Incident Checklist
 
 1. Confirm `/api/runtime/status` shows DRY_RUN policy and no LIVE runtime order enablement.

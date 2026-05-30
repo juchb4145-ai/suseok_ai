@@ -30,6 +30,7 @@ from trading.strategy.candidates import CandidateCollector
 from trading.strategy.models import CandidateState
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
+from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, config_from_settings
 from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
@@ -81,6 +82,10 @@ runtime_supervisor = _build_runtime_supervisor()
 def _order_service() -> OrderEnqueueService:
     settings = get_settings()
     return OrderEnqueueService(settings=settings, gateway_state=gateway_state, db_path=settings.db_path)
+
+
+def _performance_analyzer(db: TradingDatabase) -> DryRunPerformanceAnalyzer:
+    return DryRunPerformanceAnalyzer(db, config=config_from_settings(get_settings()))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -211,6 +216,136 @@ def runtime_dry_run_order_detail(intent_id: str) -> dict[str, Any]:
         return {"intent_id": intent_id, "record": None, "events": [], "linked": {}, "found": False}
     payload["found"] = True
     return payload
+
+
+@app.get("/api/runtime/performance/dry-run")
+def runtime_dry_run_performance(
+    trade_date: Optional[str] = None,
+    strategy_name: Optional[str] = None,
+    code: Optional[str] = None,
+    theme_name: Optional[str] = None,
+    side: Optional[str] = None,
+    order_phase: Optional[str] = None,
+    include_rejected: bool = True,
+    include_duplicates: bool = False,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return _performance_analyzer(db).build_report(
+            trade_date=trade_date,
+            strategy_name=strategy_name,
+            code=code,
+            theme_name=theme_name,
+            side=side,
+            order_phase=order_phase,
+            include_rejected=include_rejected,
+            include_duplicates=include_duplicates,
+            limit=limit,
+            offset=offset,
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/performance/dry-run/rebuild")
+def rebuild_runtime_dry_run_performance(
+    trade_date: Optional[str] = None,
+    persist: bool = True,
+    export: bool = False,
+    format: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        analyzer = _performance_analyzer(db)
+        report = analyzer.build_report(trade_date=trade_date, limit=10000)
+        persisted = analyzer.persist_report(report) if persist else None
+        exports = analyzer.export_report(report, fmt=format) if export else {}
+        return {
+            "report_id": report["report_id"],
+            "persisted": persisted is not None,
+            "exported": exports,
+            "report": report,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/performance/dry-run/reports")
+def runtime_dry_run_performance_reports(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return {"items": db.list_dry_run_performance_reports(limit=limit, offset=offset)}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/performance/dry-run/reports/{report_id}")
+def runtime_dry_run_performance_report_detail(report_id: str) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = db.get_dry_run_performance_report(report_id)
+        if report is None:
+            return {"report_id": report_id, "found": False}
+        report["found"] = True
+        return report
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/performance/dry-run/export")
+def export_runtime_dry_run_performance(
+    trade_date: Optional[str] = None,
+    format: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+    persist: bool = False,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        analyzer = _performance_analyzer(db)
+        report = analyzer.build_report(trade_date=trade_date, limit=10000)
+        persisted = analyzer.persist_report(report) if persist else None
+        return {
+            "report_id": report["report_id"],
+            "persisted": persisted is not None,
+            "exports": analyzer.export_report(report, fmt=format),
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/performance/dry-run/false-signals")
+def runtime_dry_run_false_signals(
+    trade_date: Optional[str] = None,
+    type: str = Query("all", pattern="^(false_positive|false_negative|opportunity_loss|all)$"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _performance_analyzer(db).build_report(trade_date=trade_date, limit=10000)
+        items = list(report.get("items") or [])
+        if type == "false_positive":
+            items = [item for item in items if item.get("dry_run_false_positive_type")]
+        elif type == "false_negative":
+            items = [item for item in items if item.get("dry_run_false_negative_type")]
+        elif type == "opportunity_loss":
+            items = [item for item in items if item.get("opportunity_loss_type")]
+        start = max(0, int(offset or 0))
+        end = start + max(1, int(limit or 100))
+        return {
+            "summary": report.get("false_signal_summary", {}),
+            "type": type,
+            "total": len(items),
+            "items": items[start:end],
+        }
+    finally:
+        close_database(db)
 
 
 @app.get("/api/candidates")
@@ -430,7 +565,38 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "items": db.list_runtime_order_intents(limit=20),
         "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=20),
     }
+    dry_run_performance_report = _performance_analyzer(db).build_report(limit=10)
+    dry_run_performance_payload = {
+        "generated_at": dry_run_performance_report.get("generated_at", ""),
+        "trade_date": dry_run_performance_report.get("trade_date", ""),
+        **{
+            key: dry_run_performance_report.get("summary", {}).get(key)
+            for key in [
+                "total_lifecycle_count",
+                "completed_lifecycle_count",
+                "win_rate",
+                "avg_realized_return_pct",
+                "false_positive_count",
+                "false_negative_count",
+                "opportunity_loss_count",
+                "live_would_pass_win_rate",
+                "live_would_reject_but_rallied_count",
+            ]
+        },
+        "top_false_positive_types": dry_run_performance_report.get("false_signal_summary", {}).get("top_false_positive_types", []),
+        "top_false_negative_types": dry_run_performance_report.get("false_signal_summary", {}).get("top_false_negative_types", []),
+        "top_reject_reasons_with_rally": dry_run_performance_report.get("false_signal_summary", {}).get(
+            "top_live_reject_reasons_with_rally",
+            [],
+        ),
+        "bad_cases": [
+            item
+            for item in dry_run_performance_report.get("items", [])
+            if item.get("dry_run_false_positive_type") or item.get("opportunity_loss_type")
+        ][:10],
+    }
     runtime_payload["dry_run_orders"] = dry_run_orders_payload
+    runtime_payload["dry_run_performance"] = dry_run_performance_payload
     return {
         "timestamp": utc_timestamp(),
         "core": status_payload["core"],
@@ -438,6 +604,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "commands": commands_payload,
         "runtime": runtime_payload,
         "dry_run_orders": dry_run_orders_payload,
+        "dry_run_performance": dry_run_performance_payload,
         "safety": status_payload["safety"],
         "candidates": candidates_payload,
         "themes": themes_payload,

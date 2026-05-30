@@ -169,6 +169,23 @@ The dashboard shows:
 
 Raw ticks are not rendered.
 
+## Performance Report Link
+
+PR-7 consumes the DRY_RUN intent rows produced here and links them to virtual positions, exit decisions, and trade reviews. The performance analyzer treats this table as the order-intent source of truth:
+
+```text
+entry/buy intent -> virtual order/position -> exit/sell intent -> trade review
+```
+
+Use:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/runtime/performance/dry-run
+Invoke-RestMethod "http://127.0.0.1:8000/api/runtime/performance/dry-run/false-signals?type=all"
+```
+
+The report separates DRY_RUN decision safety from LIVE safety, so an intent can be useful for analysis even when a real LIVE order would have been blocked.
+
 ## Incident Checklist
 
 1. Confirm `/api/runtime/status` has `mode=DRY_RUN` and no LIVE order warning.

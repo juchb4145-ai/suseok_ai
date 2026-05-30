@@ -128,6 +128,18 @@ Invoke-RestMethod http://127.0.0.1:8000/api/runtime/orders/dry-run?limit=20
 
 Dashboard `/` shows runtime enabled/running state, last cycle, counts, warnings, errors, and DRY_RUN order intent summary.
 
+## DRY_RUN Performance Report Procedure
+
+After runtime cycles have produced entry/buy and exit/sell intents, generate an analysis report:
+
+```powershell
+$headers = @{ "X-Local-Token" = $env:TRADING_CORE_TOKEN }
+Invoke-RestMethod http://127.0.0.1:8000/api/runtime/performance/dry-run
+Invoke-RestMethod -Method Post "http://127.0.0.1:8000/api/runtime/performance/dry-run/rebuild?persist=true&export=true&format=all" -Headers $headers
+```
+
+The report is analysis-only. It reads `runtime_order_intents`, `virtual_positions`, `exit_decisions`, and `trade_reviews`; it does not run a StrategyRuntime cycle and does not enqueue Gateway `send_order`.
+
 ## Persistence
 
 Runtime events and cycle summaries are stored in:

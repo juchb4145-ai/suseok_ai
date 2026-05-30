@@ -511,6 +511,41 @@ class TradingDatabase:
                 payload_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS dry_run_performance_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                grouped_json TEXT NOT NULL DEFAULT '{}',
+                false_signal_json TEXT NOT NULL DEFAULT '{}',
+                recommendation_json TEXT NOT NULL DEFAULT '[]',
+                filters_json TEXT NOT NULL DEFAULT '{}',
+                generated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS dry_run_performance_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id TEXT NOT NULL,
+                lifecycle_id TEXT NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                virtual_order_id INTEGER,
+                virtual_position_id INTEGER,
+                trade_review_id INTEGER,
+                entry_intent_id TEXT NOT NULL DEFAULT '',
+                exit_intent_ids_json TEXT NOT NULL DEFAULT '[]',
+                final_status TEXT NOT NULL DEFAULT '',
+                realized_return_pct REAL,
+                max_return_20m REAL,
+                max_drawdown_20m REAL,
+                dry_run_false_positive_type TEXT NOT NULL DEFAULT '',
+                dry_run_false_negative_type TEXT NOT NULL DEFAULT '',
+                quality_bucket TEXT NOT NULL DEFAULT '',
+                item_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS strategy_runtime_settings (
                 config_key TEXT PRIMARY KEY,
                 config_version INTEGER NOT NULL,
@@ -615,6 +650,18 @@ class TradingDatabase:
                 ON runtime_order_intent_events(intent_id, id);
             CREATE INDEX IF NOT EXISTS idx_runtime_order_intent_events_type_created_at
                 ON runtime_order_intent_events(event_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_dry_run_performance_reports_trade_date
+                ON dry_run_performance_reports(trade_date, generated_at);
+            CREATE INDEX IF NOT EXISTS idx_dry_run_performance_items_report_id
+                ON dry_run_performance_items(report_id);
+            CREATE INDEX IF NOT EXISTS idx_dry_run_performance_items_code
+                ON dry_run_performance_items(code);
+            CREATE INDEX IF NOT EXISTS idx_dry_run_performance_items_candidate_id
+                ON dry_run_performance_items(candidate_id);
+            CREATE INDEX IF NOT EXISTS idx_dry_run_performance_items_false_positive_type
+                ON dry_run_performance_items(dry_run_false_positive_type);
+            CREATE INDEX IF NOT EXISTS idx_dry_run_performance_items_false_negative_type
+                ON dry_run_performance_items(dry_run_false_negative_type);
             """
         )
         self._ensure_column("indicator_snapshots", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
@@ -1143,6 +1190,202 @@ class TradingDatabase:
             }
             for row in rows
         ]
+
+    def list_runtime_order_intents_for_analysis(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        strategy_name: Optional[str] = None,
+        code: Optional[str] = None,
+        side: Optional[str] = None,
+        order_phase: Optional[str] = None,
+        include_rejected: bool = True,
+        include_duplicates: bool = False,
+        limit: int = 10000,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(trade_date)
+        if strategy_name:
+            clauses.append("strategy_name = ?")
+            params.append(strategy_name)
+        if code:
+            clauses.append("code = ?")
+            params.append(code)
+        if side:
+            clauses.append("side = ?")
+            params.append(side)
+        if order_phase:
+            clauses.append("order_phase = ?")
+            params.append(order_phase)
+        if not include_rejected:
+            clauses.append("status NOT IN ('DRY_RUN_REJECTED', 'REJECTED', 'LIVE_BLOCKED')")
+        if not include_duplicates:
+            clauses.append("status != 'DUPLICATE'")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM runtime_order_intents
+            {where}
+            ORDER BY id ASC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 10000)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_runtime_order_intent(row) for row in rows]
+
+    def list_trade_reviews_for_analysis(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        strategy_name: Optional[str] = None,
+        limit: int = 10000,
+        offset: int = 0,
+    ) -> list[TradeReview]:
+        query = "SELECT * FROM trade_reviews"
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(trade_date)
+        if code:
+            clauses.append("code = ?")
+            params.append(code)
+        if strategy_name:
+            clauses.append("strategy_profile = ?")
+            params.append(strategy_name)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id ASC LIMIT ? OFFSET ?"
+        rows = self.conn.execute(
+            query,
+            tuple(params + [max(1, int(limit or 10000)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [self._row_to_trade_review(row) for row in rows]
+
+    def list_virtual_positions_for_analysis(self) -> list[VirtualPosition]:
+        rows = self.conn.execute("SELECT * FROM virtual_positions ORDER BY id ASC").fetchall()
+        return [self._row_to_virtual_position(row) for row in rows]
+
+    def list_exit_decisions_for_analysis(self) -> list[ExitDecision]:
+        rows = self.conn.execute("SELECT * FROM exit_decisions ORDER BY id ASC").fetchall()
+        return [self._row_to_exit_decision(row) for row in rows]
+
+    def save_dry_run_performance_report(self, report: dict) -> dict:
+        report_id = str(report.get("report_id") or "")
+        if not report_id:
+            raise ValueError("report_id is required")
+        summary = dict(report.get("summary") or {})
+        grouped = dict(report.get("grouped") or {})
+        false_signal = dict(report.get("false_signal_summary") or {})
+        recommendations = list(report.get("recommendations") or [])
+        filters = dict(report.get("filters") or {})
+        items = list(report.get("items") or [])
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO dry_run_performance_reports(
+                    report_id, trade_date, status, summary_json, grouped_json,
+                    false_signal_json, recommendation_json, filters_json, generated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_id) DO UPDATE SET
+                    trade_date=excluded.trade_date,
+                    status=excluded.status,
+                    summary_json=excluded.summary_json,
+                    grouped_json=excluded.grouped_json,
+                    false_signal_json=excluded.false_signal_json,
+                    recommendation_json=excluded.recommendation_json,
+                    filters_json=excluded.filters_json,
+                    generated_at=excluded.generated_at
+                """,
+                (
+                    report_id,
+                    str(report.get("trade_date") or filters.get("trade_date") or ""),
+                    str(report.get("status") or "READY"),
+                    json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(grouped, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(false_signal, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(recommendations, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(filters, ensure_ascii=False, sort_keys=True, default=str),
+                    str(report.get("generated_at") or ""),
+                ),
+            )
+            self.conn.execute("DELETE FROM dry_run_performance_items WHERE report_id = ?", (report_id,))
+            for item in items:
+                self.conn.execute(
+                    """
+                    INSERT INTO dry_run_performance_items(
+                        report_id, lifecycle_id, trade_date, code, candidate_id,
+                        virtual_order_id, virtual_position_id, trade_review_id,
+                        entry_intent_id, exit_intent_ids_json, final_status,
+                        realized_return_pct, max_return_20m, max_drawdown_20m,
+                        dry_run_false_positive_type, dry_run_false_negative_type,
+                        quality_bucket, item_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        report_id,
+                        str(item.get("lifecycle_id") or ""),
+                        str(item.get("trade_date") or ""),
+                        str(item.get("code") or ""),
+                        item.get("candidate_id"),
+                        item.get("virtual_order_id"),
+                        item.get("virtual_position_id"),
+                        item.get("trade_review_id"),
+                        str(item.get("entry_intent_id") or ""),
+                        json.dumps(list(item.get("exit_intent_ids") or []), ensure_ascii=False),
+                        str(item.get("final_status") or ""),
+                        item.get("realized_return_pct"),
+                        item.get("max_return_20m"),
+                        item.get("max_drawdown_20m"),
+                        str(item.get("dry_run_false_positive_type") or ""),
+                        str(item.get("dry_run_false_negative_type") or ""),
+                        str(item.get("quality_bucket") or ""),
+                        json.dumps(item, ensure_ascii=False, sort_keys=True, default=str),
+                    ),
+                )
+        return self.get_dry_run_performance_report(report_id) or {"report_id": report_id}
+
+    def list_dry_run_performance_reports(self, *, limit: int = 50, offset: int = 0) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT id, report_id, trade_date, status, summary_json, false_signal_json,
+                   recommendation_json, filters_json, generated_at, created_at
+            FROM dry_run_performance_reports
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (max(1, int(limit or 50)), max(0, int(offset or 0))),
+        ).fetchall()
+        return [_row_to_dry_run_performance_report(row, include_grouped=False, include_items=False) for row in rows]
+
+    def get_dry_run_performance_report(self, report_id: str, *, include_items: bool = True) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM dry_run_performance_reports WHERE report_id = ?",
+            (report_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = _row_to_dry_run_performance_report(row, include_grouped=True, include_items=False)
+        if include_items:
+            payload["items"] = self.list_dry_run_performance_items(report_id, limit=10000)
+        return payload
+
+    def list_dry_run_performance_items(self, report_id: str, *, limit: int = 1000, offset: int = 0) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM dry_run_performance_items
+            WHERE report_id = ?
+            ORDER BY id ASC
+            LIMIT ? OFFSET ?
+            """,
+            (report_id, max(1, int(limit or 1000)), max(0, int(offset or 0))),
+        ).fetchall()
+        return [_row_to_dry_run_performance_item(row) for row in rows]
 
     def save_candidate(self, candidate: Candidate) -> Candidate:
         with self.conn:
@@ -2400,6 +2643,57 @@ def _row_to_runtime_order_intent(row: sqlite3.Row) -> dict:
     data["live_would_pass"] = bool(data.get("live_safety", {}).get("ok"))
     data["live_reject_reason"] = "" if data["live_would_pass"] else str(data.get("live_safety", {}).get("reason") or "")
     return data
+
+
+def _row_to_dry_run_performance_report(
+    row: sqlite3.Row,
+    *,
+    include_grouped: bool,
+    include_items: bool,
+) -> dict:
+    payload = {
+        "id": int(row["id"]),
+        "report_id": row["report_id"],
+        "trade_date": row["trade_date"],
+        "status": row["status"],
+        "summary": _safe_json_loads(row["summary_json"], {}),
+        "false_signal_summary": _safe_json_loads(row["false_signal_json"], {}),
+        "recommendations": _safe_json_loads(row["recommendation_json"], []),
+        "filters": _safe_json_loads(row["filters_json"], {}),
+        "generated_at": row["generated_at"],
+        "created_at": row["created_at"],
+    }
+    if include_grouped and "grouped_json" in row.keys():
+        payload["grouped"] = _safe_json_loads(row["grouped_json"], {})
+    if include_items:
+        payload["items"] = []
+    return payload
+
+
+def _row_to_dry_run_performance_item(row: sqlite3.Row) -> dict:
+    item = _safe_json_loads(row["item_json"], {})
+    if not isinstance(item, dict):
+        item = {}
+    item.setdefault("id", int(row["id"]))
+    item.setdefault("report_id", row["report_id"])
+    item.setdefault("lifecycle_id", row["lifecycle_id"])
+    item.setdefault("trade_date", row["trade_date"])
+    item.setdefault("code", row["code"])
+    item.setdefault("candidate_id", row["candidate_id"])
+    item.setdefault("virtual_order_id", row["virtual_order_id"])
+    item.setdefault("virtual_position_id", row["virtual_position_id"])
+    item.setdefault("trade_review_id", row["trade_review_id"])
+    item.setdefault("entry_intent_id", row["entry_intent_id"])
+    item.setdefault("exit_intent_ids", _safe_json_loads(row["exit_intent_ids_json"], []))
+    item.setdefault("final_status", row["final_status"])
+    item.setdefault("realized_return_pct", row["realized_return_pct"])
+    item.setdefault("max_return_20m", row["max_return_20m"])
+    item.setdefault("max_drawdown_20m", row["max_drawdown_20m"])
+    item.setdefault("dry_run_false_positive_type", row["dry_run_false_positive_type"])
+    item.setdefault("dry_run_false_negative_type", row["dry_run_false_negative_type"])
+    item.setdefault("quality_bucket", row["quality_bucket"])
+    item.setdefault("created_at", row["created_at"])
+    return item
 
 
 def _safe_json_loads(value: object, default):

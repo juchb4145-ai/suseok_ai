@@ -137,7 +137,29 @@ Invoke-RestMethod http://127.0.0.1:8000/api/runtime/orders/dry-run/summary
 Invoke-RestMethod "http://127.0.0.1:8000/api/runtime/orders/dry-run?side=sell&order_phase=exit"
 ```
 
-Dashboard `/` shows entry/buy counts, exit/sell counts, recent sell intents, and exit decision type summaries.
+DRY_RUN performance report checks:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/runtime/performance/dry-run
+Invoke-RestMethod "http://127.0.0.1:8000/api/runtime/performance/dry-run/false-signals?type=all"
+
+$headers = @{ "X-Local-Token" = $env:TRADING_CORE_TOKEN }
+Invoke-RestMethod -Method Post "http://127.0.0.1:8000/api/runtime/performance/dry-run/rebuild?persist=true&export=true&format=all" -Headers $headers
+Invoke-RestMethod http://127.0.0.1:8000/api/runtime/performance/dry-run/reports
+```
+
+Exports are written to `reports/dry_run_performance/<trade_date>/` as JSON, CSV, and Markdown.
+
+False signal thresholds:
+
+- `TRADING_DRY_RUN_FP_LOSS_THRESHOLD_PCT` default `-1.0`
+- `TRADING_DRY_RUN_FP_DRAWDOWN_THRESHOLD_PCT` default `-3.0`
+- `TRADING_DRY_RUN_FN_RALLY_THRESHOLD_PCT` default `3.0`
+- `TRADING_DRY_RUN_GOOD_TRADE_THRESHOLD_PCT` default `2.0`
+- `TRADING_DRY_RUN_MIN_HOLD_MINUTES_FOR_FINAL` default `20`
+- `TRADING_DRY_RUN_PENDING_GRACE_MINUTES` default `30`
+
+Dashboard `/` shows entry/buy counts, exit/sell counts, recent sell intents, exit decision type summaries, and DRY_RUN performance false-positive/false-negative summaries.
 
 ## 32bit Kiwoom Gateway
 
@@ -198,3 +220,4 @@ More detail:
 - [Core StrategyRuntime Loop Runbook](docs/core_strategy_runtime_loop_runbook.md)
 - [Runtime DRY_RUN Order Enqueue Runbook](docs/runtime_dry_run_order_enqueue_runbook.md)
 - [Runtime DRY_RUN Exit/Sell Intent Runbook](docs/runtime_dry_run_exit_sell_intent_runbook.md)
+- [DRY_RUN Performance Report Runbook](docs/dry_run_performance_report_runbook.md)

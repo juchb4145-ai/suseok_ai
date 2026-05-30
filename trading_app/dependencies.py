@@ -46,6 +46,12 @@ class CoreSettings:
     runtime_dry_run_order_type_sell: int = 2
     runtime_dry_run_require_account: bool = False
     runtime_dry_run_respect_weight_pct: bool = True
+    dry_run_fp_loss_threshold_pct: float = -1.0
+    dry_run_fp_drawdown_threshold_pct: float = -3.0
+    dry_run_fn_rally_threshold_pct: float = 3.0
+    dry_run_good_trade_threshold_pct: float = 2.0
+    dry_run_min_hold_minutes_for_final: int = 20
+    dry_run_pending_grace_minutes: int = 30
 
     @property
     def live_order_enabled(self) -> bool:
@@ -92,6 +98,12 @@ def get_settings() -> CoreSettings:
         runtime_dry_run_order_type_sell=_int_env("TRADING_RUNTIME_DRY_RUN_ORDER_TYPE_SELL", 2),
         runtime_dry_run_require_account=_bool_env("TRADING_RUNTIME_DRY_RUN_REQUIRE_ACCOUNT", False),
         runtime_dry_run_respect_weight_pct=_bool_env("TRADING_RUNTIME_DRY_RUN_RESPECT_WEIGHT_PCT", True),
+        dry_run_fp_loss_threshold_pct=_float_env("TRADING_DRY_RUN_FP_LOSS_THRESHOLD_PCT", -1.0),
+        dry_run_fp_drawdown_threshold_pct=_float_env("TRADING_DRY_RUN_FP_DRAWDOWN_THRESHOLD_PCT", -3.0),
+        dry_run_fn_rally_threshold_pct=_float_env("TRADING_DRY_RUN_FN_RALLY_THRESHOLD_PCT", 3.0),
+        dry_run_good_trade_threshold_pct=_float_env("TRADING_DRY_RUN_GOOD_TRADE_THRESHOLD_PCT", 2.0),
+        dry_run_min_hold_minutes_for_final=_int_env("TRADING_DRY_RUN_MIN_HOLD_MINUTES_FOR_FINAL", 20),
+        dry_run_pending_grace_minutes=_int_env("TRADING_DRY_RUN_PENDING_GRACE_MINUTES", 30),
     )
 
 
@@ -136,6 +148,13 @@ def verify_gateway_token(
 def _int_env(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
     except ValueError:
         return default
 
