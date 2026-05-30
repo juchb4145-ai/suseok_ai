@@ -76,12 +76,12 @@ Broker-neutral models live in `trading/broker/models.py`:
 
 Two options were considered:
 
-| Option | Pros | Cons | PR-1 decision |
+| Option | Pros | Cons | Current decision |
 | --- | --- | --- | --- |
-| FastAPI WebSocket Gateway channel | Lower latency, bidirectional, natural command stream | More reconnection and Qt-thread coordination to finish safely | Defer to PR-2 |
-| REST event ingest + command long-poll | Simple, debuggable, easier with QAx event loop, resilient to short disconnects | Slightly higher latency, more HTTP requests | Use in PR-1 |
+| FastAPI WebSocket Gateway channel | Lower latency, bidirectional, natural command stream | More reconnection, heartbeat, and Qt-thread coordination to harden before live orders | Revisit after command queue metrics are stable |
+| REST event ingest + command long-poll | Simple, debuggable, easier with QAx event loop, resilient to short disconnects | Slightly higher latency, more HTTP requests | Keep through PR-2 |
 
-PR-1 uses:
+Current communication:
 
 - Gateway -> Core: `POST /api/gateway/events`
 - Core -> Gateway: `GET /api/gateway/commands?wait_sec=...`
@@ -116,6 +116,40 @@ Every Core command includes:
 
 Order-related commands must carry `command_id` or `idempotency_key` to prevent duplicate execution after reconnect.
 
+## Command Queue
+
+PR-2 replaces the simple in-memory list with a stateful command queue:
+
+- `QUEUED`
+- `DISPATCHED`
+- `ACKED`
+- `REJECTED`
+- `FAILED`
+- `EXPIRED`
+- `CANCELLED`
+
+Gateway polling moves commands from `QUEUED` to `DISPATCHED`. Gateway execution then reports `command_started`, `command_ack`, or `command_failed`. A command is successful only after `command_ack status=ACKED`.
+
+Order commands use deterministic dedupe keys when `idempotency_key` is absent. Duplicate keys already in `QUEUED`, `DISPATCHED`, or `ACKED` are rejected.
+
+Status APIs:
+
+- `GET /api/gateway/commands/status`
+- `GET /api/gateway/commands/history?status=&limit=`
+- `POST /api/gateway/commands/{command_id}/cancel`
+- `POST /api/gateway/commands/prune`
+
+## Rate Limit
+
+Gateway applies conservative local rate limits immediately before Kiwoom calls. Defaults can be overridden with `GATEWAY_RATE_LIMIT_*_SEC` environment variables. This keeps the Core queue simple while ensuring the 32bit process never bursts Kiwoom commands during reconnect or backlog drain.
+
+WebSocket command transport is still deferred because PR-2's priority is correctness: idempotency, ack, retry, expiration, and rate-limit observability. A WebSocket channel should be reconsidered when:
+
+- command latency from long-poll becomes a measured bottleneck,
+- command ack/event correlation is stable in production logs,
+- reconnection semantics are tested against Kiwoom login/session loss,
+- dashboard users need sub-second command status updates beyond current polling.
+
 ## Safety Defaults
 
 - Default mode is `OBSERVE`.
@@ -124,6 +158,8 @@ Order-related commands must carry `command_id` or `idempotency_key` to prevent d
 - Core binding should stay at `127.0.0.1`.
 - Real order command creation must pass `OrderGuard`/risk guard before it is enqueued.
 - Gateway status exposes heartbeat age, stale state, Kiwoom login state, and orderable flag.
+- `/api/orders/enqueue` is the only Core API path that can create a real `send_order` command.
+- `OBSERVE` never queues real order commands. `DRY_RUN` accepts only dry-run records. `LIVE` requires `TRADING_MODE=LIVE` and `TRADING_ALLOW_LIVE=1`.
 
 ## Persistence and Performance
 
@@ -143,6 +179,8 @@ python apps/legacy_pyqt_app.py --mock
 
 It is deprecated for new development. `main.py` remains as a compatibility entrypoint while strategy/UI work moves to Core/API/Web.
 
+`trading/engine.py` still has a direct `client.send_order` path for the legacy PyQt app. New 64bit Core order flow must use `/api/orders/enqueue`, which creates a `GatewayCommand` and lets the 32bit Gateway execute Kiwoom calls.
+
 ## PR Roadmap
 
 PR-1:
@@ -157,8 +195,13 @@ PR-1:
 PR-2:
 
 - Full Kiwoom Gateway command queue and rate limits.
+- Command ack/fail/expire history.
+- Hardened `/api/orders/enqueue` safety gate.
+
+Next:
+
 - Persistent Gateway WebSocket if latency needs it.
 - Real TR response row extraction and request correlation.
 - StrategyRuntime process loop inside Core.
-- RiskGuard-backed real order command API.
+- Command queue DB persistence.
 - Dashboard screen hardening and richer order/position views.

@@ -21,6 +21,10 @@ class CoreSettings:
     local_token: str
     mode: str = "OBSERVE"
     allow_live: bool = False
+    max_order_amount: int = 3_000_000
+    max_daily_orders_per_code: int = 5
+    command_ttl_sec: int = 30
+    command_max_attempts: int = 1
 
     @property
     def live_order_enabled(self) -> bool:
@@ -36,6 +40,10 @@ def get_settings() -> CoreSettings:
         local_token=os.environ.get("TRADING_CORE_TOKEN", DEFAULT_LOCAL_TOKEN),
         mode=mode,
         allow_live=os.environ.get("TRADING_ALLOW_LIVE", "0") == "1",
+        max_order_amount=_int_env("TRADING_MAX_ORDER_AMOUNT", 3_000_000),
+        max_daily_orders_per_code=_int_env("TRADING_MAX_DAILY_ORDERS_PER_CODE", 5),
+        command_ttl_sec=_int_env("TRADING_ORDER_COMMAND_TTL_SEC", 30),
+        command_max_attempts=_int_env("TRADING_ORDER_COMMAND_MAX_ATTEMPTS", 1),
     )
 
 
@@ -75,3 +83,10 @@ def verify_gateway_token(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid local gateway token",
         )
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default

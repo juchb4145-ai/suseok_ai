@@ -49,8 +49,8 @@ def test_gateway_state_dedupes_events_and_commands():
 
     assert state.record_event(event) is True
     assert state.record_event(event) is False
-    assert state.enqueue_command(command) is True
-    assert state.enqueue_command(command) is False
+    assert state.enqueue_command(command).accepted is True
+    assert state.enqueue_command(command).accepted is False
 
     snapshot = state.snapshot()
     assert snapshot.kiwoom_logged_in is True

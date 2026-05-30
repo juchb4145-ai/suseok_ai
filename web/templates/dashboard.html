@@ -39,6 +39,35 @@
         </div>
       </section>
 
+      <section class="band">
+        <div class="section-head">
+          <h2>Gateway Command Queue</h2>
+          <span id="command-last-order" class="counter">-</span>
+        </div>
+        <div class="mini-grid command-grid">
+          <div><span>QUEUED</span><strong id="command-queued">0</strong></div>
+          <div><span>DISPATCHED</span><strong id="command-dispatched">0</strong></div>
+          <div><span>ACKED</span><strong id="command-acked">0</strong></div>
+          <div><span>FAILED</span><strong id="command-failed">0</strong></div>
+          <div><span>EXPIRED</span><strong id="command-expired">0</strong></div>
+          <div><span>DUPLICATE</span><strong id="command-duplicate">0</strong></div>
+          <div><span>RATE LIMITED</span><strong id="command-rate-limited">0</strong></div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Created</th>
+              <th>Type</th>
+              <th>Status</th>
+              <th>Attempts</th>
+              <th>Dedupe</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody id="command-rows"></tbody>
+        </table>
+      </section>
+
       <section class="band two-col">
         <div>
           <div class="section-head">

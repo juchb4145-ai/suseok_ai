@@ -14,20 +14,24 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from storage.db import TradingDatabase
+from trading.broker.command_queue import CommandPriority, CommandStatus, dedupe_key_for_command
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import (
     BrokerConditionEvent,
     BrokerExecutionEvent,
+    BrokerOrderRequest,
     BrokerOrderResult,
     GatewayCommand,
     GatewayEvent,
+    new_message_id,
     utc_timestamp,
 )
+from trading.risk.safety_guard import OrderCommandSafetyGuard, OrderSafetyConfig, dedupe_key_for_order_request
 from trading.strategy.candidates import CandidateCollector
 from trading.strategy.models import CandidateState
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
-from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse
+from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
 from trading_app.websocket import DashboardConnectionManager
 
 
@@ -72,6 +76,7 @@ def api_status() -> dict[str, Any]:
             "timestamp": utc_timestamp(),
         },
         "gateway": gateway_state.snapshot().to_dict(),
+        "commands": gateway_state.command_snapshot(),
         "safety": {
             "default_mode": "OBSERVE",
             "live_requires_trading_allow_live": True,
@@ -83,7 +88,9 @@ def api_status() -> dict[str, Any]:
 
 @app.get("/api/gateway/status")
 def gateway_status() -> dict[str, Any]:
-    return gateway_state.snapshot().to_dict()
+    payload = gateway_state.snapshot().to_dict()
+    payload["commands"] = gateway_state.command_snapshot()
+    return payload
 
 
 @app.get("/api/candidates")
@@ -158,12 +165,41 @@ async def gateway_commands(
     _: None = Depends(verify_gateway_token),
 ) -> GatewayCommandBatch:
     deadline = asyncio.get_event_loop().time() + wait_sec
-    commands = gateway_state.pop_commands(limit)
+    commands = gateway_state.dispatch_commands(limit)
     while not commands and wait_sec > 0 and asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.25)
-        commands = gateway_state.pop_commands(limit)
+        commands = gateway_state.dispatch_commands(limit)
     payloads = [command.to_dict() for command in commands]
     return GatewayCommandBatch(commands=payloads, count=len(payloads), timestamp=utc_timestamp())
+
+
+@app.get("/api/gateway/commands/status")
+def gateway_commands_status() -> dict[str, Any]:
+    return gateway_state.command_snapshot()
+
+
+@app.get("/api/gateway/commands/history")
+def gateway_commands_history(
+    status: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    include_finished: bool = True,
+) -> dict[str, Any]:
+    return {
+        "summary": gateway_state.command_snapshot(),
+        "items": gateway_state.list_commands(status=status, limit=limit, include_finished=include_finished),
+    }
+
+
+@app.post("/api/gateway/commands/prune")
+def gateway_commands_prune(older_than_sec: int = Query(3600, ge=0, le=86400)) -> dict[str, Any]:
+    removed = gateway_state.prune_commands(older_than_sec=older_than_sec)
+    return {"removed": removed, "summary": gateway_state.command_snapshot()}
+
+
+@app.post("/api/gateway/commands/{command_id}/cancel")
+def gateway_command_cancel(command_id: str) -> dict[str, Any]:
+    cancelled = gateway_state.cancel_command(command_id)
+    return {"cancelled": cancelled, "command_id": command_id, "summary": gateway_state.command_snapshot()}
 
 
 @app.post("/api/gateway/commands")
@@ -172,8 +208,123 @@ def enqueue_gateway_command(
     _: None = Depends(verify_gateway_token),
 ) -> dict[str, Any]:
     command = command_in.to_gateway_command()
-    accepted = gateway_state.enqueue_command(command)
-    return {"accepted": accepted, "command": command.to_dict()}
+    result = gateway_state.enqueue_command(
+        command,
+        priority=command_in.priority,
+        ttl_sec=command_in.ttl_sec,
+        max_attempts=command_in.max_attempts,
+    )
+    return {
+        "accepted": result.accepted,
+        "reason": result.reason,
+        "duplicate_of": result.duplicate_of,
+        "command": command.to_dict(),
+        "record": result.record.to_dict() if result.record else None,
+    }
+
+
+@app.post("/api/orders/enqueue")
+def enqueue_order(order_in: OrderEnqueueRequest) -> dict[str, Any]:
+    settings = get_settings()
+    requested_mode = "DRY_RUN" if order_in.dry_run else settings.mode
+    request = BrokerOrderRequest(
+        account=order_in.account,
+        code=order_in.code,
+        quantity=order_in.quantity,
+        price=order_in.price,
+        side=order_in.side,
+        tag=order_in.tag,
+        order_type=order_in.order_type,
+        hoga=order_in.hoga,
+        idempotency_key=str(order_in.idempotency_key or ""),
+        metadata={
+            "strategy_name": order_in.strategy_name,
+            "candidate_id": order_in.candidate_id,
+            "reason": order_in.reason,
+        },
+    )
+    dedupe_key = dedupe_key_for_order_request(request)
+    gateway_status_payload = gateway_state.snapshot().to_dict()
+    duplicate = gateway_state.has_duplicate(dedupe_key)
+    guard = OrderCommandSafetyGuard(
+        OrderSafetyConfig(
+            mode=requested_mode,
+            live_order_enabled=settings.live_order_enabled,
+            max_order_amount=settings.max_order_amount,
+            max_daily_orders_per_code=settings.max_daily_orders_per_code,
+        )
+    )
+    safety = guard.validate(
+        request,
+        gateway_status=gateway_status_payload,
+        existing_order_command_count=_order_command_count(request.code, request.side, request.tag),
+        duplicate=duplicate,
+    )
+
+    if requested_mode == "OBSERVE":
+        return _order_enqueue_response(
+            accepted=False,
+            mode=requested_mode,
+            request=request,
+            dedupe_key=dedupe_key,
+            status="OBSERVE_ONLY",
+            reason="OBSERVE_MODE",
+            safety=safety.to_dict(),
+            command=None,
+        )
+    if requested_mode == "DRY_RUN":
+        return _order_enqueue_response(
+            accepted=True,
+            mode=requested_mode,
+            request=request,
+            dedupe_key=dedupe_key,
+            status="DRY_RUN_ACCEPTED",
+            reason="DRY_RUN_NO_GATEWAY_SEND_ORDER",
+            safety=safety.to_dict(),
+            command=None,
+        )
+    if not safety.ok:
+        return _order_enqueue_response(
+            accepted=False,
+            mode=requested_mode,
+            request=request,
+            dedupe_key=dedupe_key,
+            status="REJECTED",
+            reason=safety.reason,
+            safety=safety.to_dict(),
+            command=None,
+        )
+
+    command = GatewayCommand(
+        type="send_order",
+        command_id=new_message_id("cmd_order"),
+        idempotency_key=str(order_in.idempotency_key or ""),
+        payload={
+            **request.to_dict(),
+            "strategy_name": order_in.strategy_name,
+            "candidate_id": order_in.candidate_id,
+            "reason": order_in.reason,
+        },
+    )
+    result = gateway_state.enqueue_command(
+        command,
+        priority=CommandPriority.HIGH,
+        ttl_sec=settings.command_ttl_sec,
+        max_attempts=settings.command_max_attempts,
+        metadata={"api": "/api/orders/enqueue", "dedupe_key": dedupe_key},
+    )
+    return _order_enqueue_response(
+        accepted=result.accepted,
+        mode=requested_mode,
+        request=request,
+        dedupe_key=dedupe_key,
+        status=result.record.status.value if result.record else "REJECTED",
+        reason=result.reason or ("QUEUED" if result.accepted else "REJECTED"),
+        safety=safety.to_dict(),
+        command=command.to_dict(),
+        record=result.record.to_dict() if result.record else None,
+        duplicate_of=result.duplicate_of,
+    )
 
 
 @app.websocket("/ws/dashboard")
@@ -197,6 +348,8 @@ async def dashboard_ws(websocket: WebSocket) -> None:
 
 def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     status_payload = api_status()
+    commands_payload = dict(status_payload["commands"])
+    commands_payload["recent"] = gateway_state.list_commands(limit=12, include_finished=True)
     candidates_payload = build_candidates_snapshot(db)
     themes_payload = build_themes_snapshot(db)
     orders_payload = build_orders_snapshot(db)
@@ -206,6 +359,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "timestamp": utc_timestamp(),
         "core": status_payload["core"],
         "gateway": status_payload["gateway"],
+        "commands": commands_payload,
         "safety": status_payload["safety"],
         "candidates": candidates_payload,
         "themes": themes_payload,
@@ -386,10 +540,83 @@ def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
         db.save_execution(BrokerExecutionEvent.from_dict(event.payload))
     elif event.type == "order_result":
         db.save_order_result(BrokerOrderResult.from_dict(event.payload))
+    elif event.type == "command_started":
+        command_id = str(event.payload.get("command_id") or event.command_id or "")
+        if command_id:
+            db.save_log(f"[gateway][command_started] {event.payload.get('command_type', '')} {command_id}")
+    elif event.type == "command_ack":
+        _handle_command_ack(db, event)
+    elif event.type == "command_failed":
+        command_id = str(event.payload.get("command_id") or event.command_id or "")
+        retryable = bool(event.payload.get("retryable", False))
+        if command_id:
+            gateway_state.fail_command(command_id, str(event.payload.get("error") or ""), retryable=retryable)
+    elif event.type == "rate_limited":
+        db.save_log(
+            f"[gateway][rate_limited] {event.payload.get('command_type', '')} "
+            f"{event.payload.get('command_id', '')} wait={event.payload.get('wait_time_sec', '')}"
+        )
     elif event.type in {"gateway_log", "log"}:
         db.save_log(f"[gateway] {event.payload.get('message', '')}")
     elif event.type in {"gateway_error", "error"}:
         db.save_log(f"[gateway][WARN] {event.payload.get('message') or event.payload.get('error') or ''}")
+
+
+def _handle_command_ack(db: TradingDatabase, event: GatewayEvent) -> None:
+    payload = dict(event.payload or {})
+    command_id = str(payload.get("command_id") or event.command_id or "")
+    status = str(payload.get("status") or "ACKED")
+    command_type = str(payload.get("command_type") or "")
+    error = str(payload.get("message") or payload.get("error") or "")
+    if command_id:
+        if status == CommandStatus.FAILED.value:
+            gateway_state.fail_command(command_id, error, retryable=False)
+        else:
+            gateway_state.ack_command(command_id, status=status, result_payload=payload, error=error)
+    order_result = payload.get("order_result")
+    if command_type == "send_order" and isinstance(order_result, dict):
+        db.save_order_result(BrokerOrderResult.from_dict(order_result))
+
+
+def _order_command_count(code: str, side: str, tag: str) -> int:
+    count = 0
+    for record in gateway_state.list_commands(limit=500, include_finished=True):
+        command = dict(record.get("command") or {})
+        payload = dict(command.get("payload") or {})
+        if payload.get("code") != code or payload.get("side") != side:
+            continue
+        if tag and payload.get("tag") != tag:
+            continue
+        count += 1
+    return count
+
+
+def _order_enqueue_response(
+    *,
+    accepted: bool,
+    mode: str,
+    request: BrokerOrderRequest,
+    dedupe_key: str,
+    status: str,
+    reason: str,
+    safety: dict[str, Any],
+    command: dict[str, Any] | None,
+    record: dict[str, Any] | None = None,
+    duplicate_of: str = "",
+) -> dict[str, Any]:
+    return {
+        "accepted": bool(accepted),
+        "mode": mode,
+        "command_id": command.get("command_id") if command else "",
+        "idempotency_key": request.idempotency_key,
+        "dedupe_key": dedupe_key,
+        "status": status,
+        "reason": reason,
+        "safety_checks": safety,
+        "command": command,
+        "record": record,
+        "duplicate_of": duplicate_of,
+    }
 
 
 def _select_dicts(db: TradingDatabase, query: str, params: tuple = ()) -> list[dict[str, Any]]:

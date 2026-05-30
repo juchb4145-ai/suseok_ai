@@ -45,6 +45,7 @@ function renderRows(id, rows, emptyColumns) {
 function render(snapshot) {
   const core = snapshot.core || {};
   const gateway = snapshot.gateway || {};
+  const commands = snapshot.commands || {};
   const candidates = snapshot.candidates || { summary: {}, items: [] };
   const themes = snapshot.themes || { summary: {}, items: [] };
   const orders = snapshot.orders || { summary: {}, order_results: [], executions: [] };
@@ -64,6 +65,29 @@ function render(snapshot) {
 
   cls("gateway-state", `pill ${gateway.heartbeat_ok ? "ok" : gateway.connected ? "warn" : "bad"}`);
   cls("orderable-state", `pill ${gateway.orderable ? "ok" : "muted"}`);
+
+  text("command-queued", commands.queued_count || 0);
+  text("command-dispatched", commands.dispatched_count || 0);
+  text("command-acked", commands.acked_count || 0);
+  text("command-failed", commands.failed_count || 0);
+  text("command-expired", commands.expired_count || 0);
+  text("command-duplicate", commands.duplicate_rejected_count || 0);
+  text("command-rate-limited", commands.rate_limited_count || 0);
+  text("command-last-order", commands.last_order_command_at || "-");
+  renderRows(
+    "command-rows",
+    (commands.recent || []).slice(0, 12).map((item) =>
+      rowHtml([
+        item.created_at || "-",
+        item.command_type || "-",
+        item.status || "-",
+        `${item.attempts || 0}/${item.max_attempts || 0}`,
+        item.dedupe_key || item.idempotency_key || "-",
+        item.last_error || "-",
+      ]),
+    ),
+    6,
+  );
 
   text("candidate-total", candidates.summary.total || 0);
   text("candidate-ready", candidates.summary.ready || 0);

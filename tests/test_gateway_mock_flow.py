@@ -1,3 +1,5 @@
+import importlib
+
 from fastapi.testclient import TestClient
 
 from trading.broker.models import BrokerExecutionEvent, BrokerPriceTick
@@ -7,9 +9,10 @@ def test_gateway_events_update_core_snapshot(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
     monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
 
-    from trading_app.api import app
+    import trading_app.api as api
 
-    client = TestClient(app)
+    api = importlib.reload(api)
+    client = TestClient(api.app)
     headers = {"X-Local-Token": "test-token"}
 
     assert client.get("/health").json()["ok"] is True
@@ -76,9 +79,10 @@ def test_gateway_command_long_poll(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
     monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
 
-    from trading_app.api import app
+    import trading_app.api as api
 
-    client = TestClient(app)
+    api = importlib.reload(api)
+    client = TestClient(api.app)
     headers = {"X-Local-Token": "test-token"}
     response = client.post(
         "/api/gateway/commands",

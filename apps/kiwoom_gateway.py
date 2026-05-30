@@ -22,6 +22,7 @@ from trading.broker.models import (
     GatewayCommand,
     GatewayEvent,
 )
+from trading.broker.rate_limit import RateLimiter
 
 
 @dataclass
@@ -71,6 +72,7 @@ class GatewayRuntime:
         self.source = source
         self.events = GatewayEventQueue(max_size=2000, coalesce_price_ticks=True)
         self.commands: queue.Queue[GatewayCommand] = queue.Queue()
+        self.rate_limiter = RateLimiter.from_env()
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
         self.last_error = ""
@@ -187,6 +189,7 @@ def run_mock_gateway(args: argparse.Namespace) -> int:
                     "account": "MOCK-ACCOUNT",
                     "last_error": runtime.last_error,
                     "reconnect_count": runtime.reconnect_count,
+                    "rate_limit": runtime.rate_limiter.snapshot(),
                 },
             )
             runtime.emit(
@@ -223,6 +226,7 @@ def run_real_gateway(args: argparse.Namespace) -> int:
                 "account": "",
                 "last_error": runtime.last_error,
                 "reconnect_count": runtime.reconnect_count,
+                "rate_limit": runtime.rate_limiter.snapshot(),
             },
         )
     )
@@ -302,56 +306,92 @@ def _drain_real_commands(client, runtime: GatewayRuntime) -> None:
             command = runtime.commands.get_nowait()
         except queue.Empty:
             return
+        wait_time = runtime.rate_limiter.wait_time(command.type)
+        if wait_time > 0:
+            runtime.emit(
+                "rate_limited",
+                {
+                    "command_id": command.command_id,
+                    "command_type": command.type,
+                    "wait_time_sec": round(wait_time, 3),
+                },
+                command_id=command.command_id,
+            )
+            runtime.commands.put(command)
+            return
         try:
-            _execute_command(client, command)
+            runtime.emit("command_started", _command_event_payload(command), command_id=command.command_id)
+            result_payload = _execute_command(client, command)
+            runtime.rate_limiter.record(command.type)
+            runtime.emit(
+                "command_ack",
+                {
+                    **_command_event_payload(command),
+                    **result_payload,
+                    "status": result_payload.get("status", "ACKED"),
+                },
+                command_id=command.command_id,
+            )
         except Exception as exc:
             runtime.emit(
-                "gateway_error",
-                {"message": str(exc), "command_id": command.command_id, "command_type": command.type},
+                "command_failed",
+                {
+                    **_command_event_payload(command),
+                    "error": str(exc),
+                    "retryable": command.type not in {"send_order", "cancel_order", "modify_order"},
+                },
                 command_id=command.command_id,
             )
 
 
-def _execute_command(client, command: GatewayCommand) -> None:
+def _execute_command(client, command: GatewayCommand) -> dict[str, Any]:
     payload = dict(command.payload or {})
     if command.type == "login":
-        client.login()
+        result_code = int(client.login() or 0)
+        return _result_payload(result_code=result_code, message="login requested")
     elif command.type == "load_conditions":
-        client.load_conditions()
+        result_code = int(client.load_conditions() or 0)
+        return _result_payload(result_code=result_code, message="condition load requested", success_code=1)
     elif command.type == "send_condition":
-        client.send_condition(
+        result_code = int(client.send_condition(
             str(payload.get("screen_no") or "7600"),
             str(payload.get("condition_name") or ""),
             int(payload.get("condition_index") or 0),
             realtime=bool(payload.get("realtime", True)),
             search_type=payload.get("search_type"),
-        )
+        ) or 0)
+        return _result_payload(result_code=result_code, message="condition sent", success_code=1)
     elif command.type == "register_realtime":
         client.register_realtime(list(payload.get("codes") or []), screen_no=payload.get("screen_no"))
+        return _result_payload(result_code=0, message="realtime registered")
     elif command.type == "remove_realtime":
         client.remove_realtime(list(payload.get("codes") or []), screen_no=payload.get("screen_no"))
+        return _result_payload(result_code=0, message="realtime removed")
     elif command.type == "tr_request":
         for key, value in dict(payload.get("inputs") or {}).items():
             client.set_input_value(str(key), str(value))
-        client.comm_rq_data(
+        result_code = int(client.comm_rq_data(
             str(payload.get("rq_name") or ""),
             str(payload.get("tr_code") or ""),
             int(payload.get("prev_next") or 0),
             str(payload.get("screen_no") or "9000"),
-        )
+        ) or 0)
+        return _result_payload(result_code=result_code, message="tr requested")
     elif command.type == "send_order":
         request = BrokerOrderRequest.from_dict({**payload, "command_id": command.command_id})
-        client.send_order(request)
+        result = client.send_order(request)
+        return _order_result_payload(result)
     elif command.type == "cancel_order":
-        client.cancel_order(
+        result = client.cancel_order(
             str(payload.get("account") or ""),
             str(payload.get("code") or ""),
             int(payload.get("quantity") or 0),
             str(payload.get("original_order_no") or ""),
             str(payload.get("tag") or f"CANCEL_{command.command_id}"),
         )
+        return _order_result_payload(result)
     elif command.type == "modify_order":
-        client.modify_buy_order(
+        result = client.modify_buy_order(
             str(payload.get("account") or ""),
             str(payload.get("code") or ""),
             int(payload.get("quantity") or 0),
@@ -359,6 +399,13 @@ def _execute_command(client, command: GatewayCommand) -> None:
             str(payload.get("original_order_no") or ""),
             str(payload.get("tag") or f"MODIFY_{command.command_id}"),
         )
+        return _order_result_payload(result)
+    return {
+        "status": "REJECTED",
+        "message": f"unsupported command type: {command.type}",
+        "result_code": -1,
+        "raw": {},
+    }
 
 
 def _drain_mock_commands(runtime: GatewayRuntime) -> None:
@@ -367,11 +414,83 @@ def _drain_mock_commands(runtime: GatewayRuntime) -> None:
             command = runtime.commands.get_nowait()
         except queue.Empty:
             return
+        wait_time = runtime.rate_limiter.wait_time(command.type)
+        if wait_time > 0:
+            runtime.emit(
+                "rate_limited",
+                {
+                    "command_id": command.command_id,
+                    "command_type": command.type,
+                    "wait_time_sec": round(wait_time, 3),
+                },
+                command_id=command.command_id,
+            )
+            runtime.commands.put(command)
+            return
+        runtime.emit("command_started", _command_event_payload(command), command_id=command.command_id)
+        runtime.rate_limiter.record(command.type)
+        if command.type == "send_order":
+            request = BrokerOrderRequest.from_dict({**dict(command.payload or {}), "command_id": command.command_id})
+            result = {
+                "status": "ACKED",
+                "result_code": 0,
+                "message": "mock send_order accepted",
+                "order_no": f"MOCK-{command.command_id[-8:]}",
+                "order_result": {
+                    "ok": True,
+                    "code": 0,
+                    "message": "mock send_order accepted",
+                    "request": request.to_dict(),
+                    "order_no": f"MOCK-{command.command_id[-8:]}",
+                    "command_id": command.command_id,
+                    "idempotency_key": command.idempotency_key,
+                    "raw": {"mock": True},
+                },
+                "raw": {"mock": True},
+            }
+        else:
+            result = {"status": "ACKED", "result_code": 0, "message": f"mock {command.type} accepted", "raw": {"mock": True}}
+        runtime.emit(
+            "command_ack",
+            {**_command_event_payload(command), **result},
+            command_id=command.command_id,
+        )
         runtime.emit(
             "gateway_log",
             {"message": f"mock gateway received command {command.type}", "command": command.to_dict()},
             command_id=command.command_id,
         )
+
+
+def _command_event_payload(command: GatewayCommand) -> dict[str, Any]:
+    return {
+        "command_id": command.command_id,
+        "command_type": command.type,
+        "idempotency_key": command.idempotency_key,
+        "request_id": command.request_id,
+    }
+
+
+def _result_payload(*, result_code: int, message: str, success_code: int = 0, raw: dict[str, Any] | None = None) -> dict[str, Any]:
+    ok = int(result_code) == int(success_code)
+    return {
+        "status": "ACKED" if ok else "FAILED",
+        "result_code": int(result_code),
+        "message": message,
+        "raw": dict(raw or {}),
+    }
+
+
+def _order_result_payload(result) -> dict[str, Any]:
+    payload = result.to_dict() if hasattr(result, "to_dict") else dict(result)
+    return {
+        "status": "ACKED" if bool(payload.get("ok")) else "FAILED",
+        "result_code": int(payload.get("code") or 0),
+        "message": str(payload.get("message") or ""),
+        "order_no": str(payload.get("order_no") or ""),
+        "order_result": payload,
+        "raw": dict(payload.get("raw") or {}),
+    }
 
 
 def main() -> int:

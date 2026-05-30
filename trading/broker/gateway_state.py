@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from threading import Lock
 from typing import Any
 
+from trading.broker.command_queue import CommandPriority, CommandQueue, CommandRecord, CommandStatus, EnqueueResult
 from trading.broker.models import GatewayCommand, GatewayEvent, utc_timestamp
 
 
@@ -41,10 +42,9 @@ class GatewayStateStore:
     def __post_init__(self) -> None:
         self.status.heartbeat_timeout_sec = self.heartbeat_timeout_sec
         self._lock = Lock()
-        self._commands: list[GatewayCommand] = []
+        self._command_queue = CommandQueue()
         self._recent_events: list[GatewayEvent] = []
         self._seen_event_ids: set[str] = set()
-        self._seen_command_keys: set[str] = set()
         self._latest_ticks: dict[str, dict[str, Any]] = {}
 
     def record_event(self, event: GatewayEvent) -> bool:
@@ -82,35 +82,105 @@ class GatewayStateStore:
                     self._latest_ticks[code] = dict(event.payload)
             elif event.type in {"gateway_error", "error"}:
                 self.status.last_error = str(event.payload.get("message") or event.payload.get("error") or "")
+            elif event.type == "rate_limited":
+                self._command_queue.record_rate_limited()
 
             self._recent_events.append(event)
             if len(self._recent_events) > self.max_recent_events:
                 self._recent_events = self._recent_events[-self.max_recent_events :]
             return True
 
-    def enqueue_command(self, command: GatewayCommand) -> bool:
-        key = command.idempotency_key or command.command_id
+    def enqueue_command(
+        self,
+        command: GatewayCommand,
+        priority: CommandPriority | str | None = None,
+        ttl_sec: int | None = None,
+        max_attempts: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> EnqueueResult:
         with self._lock:
-            if key and key in self._seen_command_keys:
-                return False
-            if key:
-                self._seen_command_keys.add(key)
-            self._commands.append(command)
-            self.status.pending_command_count = len(self._commands)
-            return True
+            result = self._command_queue.enqueue(
+                command,
+                priority=priority,
+                ttl_sec=ttl_sec,
+                max_attempts=max_attempts,
+                now=now,
+                metadata=metadata,
+            )
+            self.status.pending_command_count = self._command_queue.snapshot()["queued_count"]
+            return result
+
+    def dispatch_commands(self, limit: int = 20, now: datetime | None = None) -> list[GatewayCommand]:
+        with self._lock:
+            commands = self._command_queue.dispatch(limit=limit, now=now)
+            self.status.pending_command_count = self._command_queue.snapshot()["queued_count"]
+            return list(commands)
 
     def pop_commands(self, limit: int = 20) -> list[GatewayCommand]:
+        return self.dispatch_commands(limit=limit)
+
+    def ack_command(
+        self,
+        command_id: str,
+        status: str = "ACKED",
+        result_payload: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> bool:
         with self._lock:
-            count = max(0, min(int(limit), len(self._commands)))
-            commands = self._commands[:count]
-            self._commands = self._commands[count:]
-            self.status.pending_command_count = len(self._commands)
-            return list(commands)
+            return self._command_queue.ack(
+                command_id,
+                status=CommandStatus(status),
+                result_payload=result_payload,
+                error=error,
+            )
+
+    def fail_command(self, command_id: str, error: str, retryable: bool = True) -> bool:
+        with self._lock:
+            return self._command_queue.fail(command_id, error, retryable=retryable)
+
+    def cancel_command(self, command_id: str) -> bool:
+        with self._lock:
+            return self._command_queue.cancel(command_id)
+
+    def expire_old_commands(self, now: datetime | None = None) -> int:
+        with self._lock:
+            count = self._command_queue.expire_old(now)
+            self.status.pending_command_count = self._command_queue.snapshot()["queued_count"]
+            return count
+
+    def prune_commands(self, older_than_sec: int = 3600) -> int:
+        with self._lock:
+            return self._command_queue.prune(older_than_sec=older_than_sec)
+
+    def list_commands(
+        self,
+        status: str | None = None,
+        limit: int = 100,
+        include_finished: bool = False,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                record.to_dict()
+                for record in self._command_queue.list(status=status, limit=limit, include_finished=include_finished)
+            ]
+
+    def command_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return self._command_queue.snapshot()
+
+    def has_duplicate(self, dedupe_key: str) -> bool:
+        with self._lock:
+            return self._command_queue.has_duplicate(dedupe_key)
+
+    def get_command(self, command_id: str) -> CommandRecord | None:
+        with self._lock:
+            return self._command_queue.get(command_id)
 
     def snapshot(self) -> GatewayStatusSnapshot:
         with self._lock:
             snapshot = GatewayStatusSnapshot(**self.status.to_dict())
-            snapshot.pending_command_count = len(self._commands)
+            snapshot.pending_command_count = self._command_queue.snapshot()["queued_count"]
             snapshot.heartbeat_age_sec = _age_seconds(snapshot.last_heartbeat_at)
             snapshot.heartbeat_ok = (
                 snapshot.connected

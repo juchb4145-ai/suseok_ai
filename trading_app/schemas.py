@@ -35,6 +35,9 @@ class GatewayCommandIn(BaseModel):
     command_id: Optional[str] = None
     request_id: str = ""
     idempotency_key: str = ""
+    priority: Optional[str] = None
+    ttl_sec: Optional[int] = None
+    max_attempts: Optional[int] = None
     payload: dict[str, Any] = Field(default_factory=dict)
 
     def to_gateway_command(self) -> GatewayCommand:
@@ -58,3 +61,19 @@ class GatewayCommandBatch(BaseModel):
     commands: list[dict[str, Any]]
     count: int
     timestamp: str
+
+
+class OrderEnqueueRequest(BaseModel):
+    account: str
+    code: str
+    side: str
+    quantity: int
+    price: int
+    order_type: int
+    hoga: str = "00"
+    tag: str = ""
+    strategy_name: str = ""
+    candidate_id: Optional[int] = None
+    reason: str = ""
+    idempotency_key: Optional[str] = None
+    dry_run: Optional[bool] = None

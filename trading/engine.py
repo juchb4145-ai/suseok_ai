@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""Legacy PyQt/manual trading engine.
+
+The 64bit Core must use `/api/orders/enqueue` and GatewayCommand records for
+real orders. This direct broker-client path remains only for the deprecated
+PyQt app.
+"""
+
 from typing import Protocol
 
 from trading.broker.models import BrokerExecutionEvent, BrokerOrderRequest, BrokerOrderResult

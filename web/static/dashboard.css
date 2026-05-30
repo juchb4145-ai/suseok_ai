@@ -130,6 +130,10 @@ h2 {
   margin: 12px 0;
 }
 
+.command-grid {
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+}
+
 .metric,
 .mini-grid div {
   min-width: 0;
