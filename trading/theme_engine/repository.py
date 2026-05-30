@@ -15,6 +15,8 @@ from trading.theme_engine.models import (
     ThemeMemberEvidence,
     ThemeMembership,
     ThemeRankItem,
+    ThemeSourceSyncResult,
+    ThemeSourceSyncRun,
     ThemeStatus,
 )
 from trading.theme_engine.normalizer import normalize_stock_code, normalize_theme_name
@@ -269,6 +271,27 @@ class ThemeEngineRepository:
         rows = self.conn.execute(query, params).fetchall()
         return [_row_to_membership(row) for row in rows]
 
+    def list_current_memberships(
+        self,
+        *,
+        active: bool | None = None,
+        trade_eligible: bool | None = None,
+    ) -> list[ThemeMembership]:
+        query = "SELECT * FROM theme_membership_current"
+        clauses = []
+        params: list[object] = []
+        if active is not None:
+            clauses.append("active = ?")
+            params.append(int(active))
+        if trade_eligible is not None:
+            clauses.append("trade_eligible = ?")
+            params.append(int(trade_eligible))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY trade_eligible DESC, membership_score DESC, source_count DESC, stock_code"
+        rows = self.conn.execute(query, params).fetchall()
+        return [_row_to_membership(row) for row in rows]
+
     def save_activity_snapshot(self, snapshot: ThemeActivitySnapshot) -> None:
         with self.conn:
             self.conn.execute(
@@ -372,6 +395,53 @@ class ThemeEngineRepository:
     def count_current_memberships(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) AS count FROM theme_membership_current").fetchone()
         return int(row["count"]) if row else 0
+
+    def save_source_sync_run(self, result: ThemeSourceSyncResult) -> ThemeSourceSyncRun:
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO theme_source_sync_runs(
+                    source, started_at, finished_at, status, theme_count,
+                    member_count, error_count, message, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result.source,
+                    result.started_at,
+                    result.finished_at,
+                    result.status,
+                    int(result.theme_count),
+                    int(result.member_count),
+                    int(result.error_count),
+                    result.message,
+                    json.dumps(result.details, ensure_ascii=False),
+                ),
+            )
+        row = self.conn.execute("SELECT * FROM theme_source_sync_runs WHERE id = ?", (int(cursor.lastrowid),)).fetchone()
+        return _row_to_sync_run(row)
+
+    def latest_source_sync_runs(self, limit: int = 20) -> list[ThemeSourceSyncRun]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM theme_source_sync_runs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        return [_row_to_sync_run(row) for row in rows]
+
+    def latest_source_sync_run(self, source: str | None = None) -> ThemeSourceSyncRun | None:
+        if source is None:
+            row = self.conn.execute(
+                "SELECT * FROM theme_source_sync_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT * FROM theme_source_sync_runs WHERE source = ? ORDER BY id DESC LIMIT 1",
+                (source,),
+            ).fetchone()
+        return _row_to_sync_run(row) if row else None
 
 
 def _enum_value(value) -> str:
@@ -516,4 +586,19 @@ def _row_to_cluster(row: sqlite3.Row) -> DynamicThemeCluster:
         first_seen_at=row["first_seen_at"],
         last_seen_at=row["last_seen_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _row_to_sync_run(row: sqlite3.Row) -> ThemeSourceSyncRun:
+    return ThemeSourceSyncRun(
+        id=int(row["id"]),
+        source=row["source"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        status=row["status"],
+        theme_count=int(row["theme_count"]),
+        member_count=int(row["member_count"]),
+        error_count=int(row["error_count"]),
+        message=row["message"],
+        details=dict(json.loads(row["details_json"] or "{}")),
     )

@@ -23,10 +23,12 @@ class DynamicThemeContextProvider:
         if not self.is_ready():
             enriched.metadata["theme_context_status"] = "not_ready"
             enriched.metadata["reason_code"] = "THEME_CONTEXT_NOT_READY"
+            enriched.metadata.update(_dry_run_payload("not_ready", reason="THEME_CONTEXT_NOT_READY"))
             return enriched
         if not contexts:
             enriched.metadata["theme_context_status"] = "no_active_theme"
             enriched.metadata["reason_code"] = "NO_ACTIVE_THEME"
+            enriched.metadata.update(_dry_run_payload("blocked", reason="NO_ACTIVE_THEME"))
             return enriched
         details = []
         for context in contexts:
@@ -40,6 +42,7 @@ class DynamicThemeContextProvider:
                     "relation_type": _value(context.relation_type),
                     "trade_eligible": context.trade_eligible,
                     "rank": context.rank,
+                    "rank_in_theme": context.rank_in_theme,
                 }
             )
         if not enriched.name:
@@ -47,6 +50,25 @@ class DynamicThemeContextProvider:
             enriched.name = first_name
         enriched.metadata["theme_context_status"] = "ready"
         enriched.metadata["dynamic_theme_context"] = details
+        primary = contexts[0]
+        activity = primary.activity
+        reason_codes = list(activity.details.get("reason_codes") or []) if activity else []
+        dry_run_status = "ready" if primary.trade_eligible else "wait"
+        if "LEADER_ONLY_THEME" in reason_codes or "LOW_BREADTH" in reason_codes:
+            dry_run_status = "wait"
+        enriched.metadata.update(
+            _dry_run_payload(
+                dry_run_status,
+                active_theme_id=primary.theme_id,
+                active_theme_name=primary.theme_name,
+                active_theme_score=activity.theme_score if activity else 0.0,
+                active_theme_rank=primary.rank,
+                stock_rank_in_theme=primary.rank_in_theme,
+                stock_membership_score=primary.membership_score,
+                theme_reason_codes=reason_codes,
+                reason="STRONG_ACTIVE_THEME" if dry_run_status == "ready" else (reason_codes[0] if reason_codes else "LOW_MEMBERSHIP_SCORE"),
+            )
+        )
         enriched.metadata.pop("reason_code", None)
         return enriched
 
@@ -59,6 +81,7 @@ class DynamicThemeContextProvider:
                 continue
             activity = self.get_theme_activity(membership.theme_id)
             rank = activity.rank if activity else 0
+            rank_in_theme = self._rank_in_theme(membership.theme_id, membership.stock_code)
             contexts.append(
                 ThemeContext(
                     theme_id=membership.theme_id,
@@ -72,6 +95,7 @@ class DynamicThemeContextProvider:
                     trade_eligible=membership.trade_eligible and theme.trade_eligible,
                     source_count=membership.source_count,
                     rank=rank,
+                    rank_in_theme=rank_in_theme,
                     leader_code=activity.leader_code if activity else "",
                     market="",
                     strategy_profile=None,
@@ -114,6 +138,40 @@ class DynamicThemeContextProvider:
     def is_ready(self) -> bool:
         return self.repository.count_current_memberships() > 0
 
+    def _rank_in_theme(self, theme_id: str, stock_code: str) -> int:
+        members = self.repository.get_members_by_theme(theme_id, active=True)
+        ranked = sorted(members, key=lambda item: (item.trade_eligible, item.membership_score, item.source_count), reverse=True)
+        for index, member in enumerate(ranked, start=1):
+            if member.stock_code == stock_code:
+                return index
+        return 0
+
 
 def _value(value) -> str:
     return value.value if hasattr(value, "value") else str(value or "")
+
+
+def _dry_run_payload(
+    status: str,
+    *,
+    active_theme_id: str = "",
+    active_theme_name: str = "",
+    active_theme_score: float = 0.0,
+    active_theme_rank: int = 0,
+    stock_rank_in_theme: int = 0,
+    stock_membership_score: float = 0.0,
+    theme_reason_codes: list[str] | None = None,
+    reason: str = "",
+) -> dict:
+    return {
+        "dynamic_theme_status": status,
+        "active_theme_id": active_theme_id,
+        "active_theme_name": active_theme_name,
+        "active_theme_score": active_theme_score,
+        "active_theme_rank": active_theme_rank,
+        "stock_rank_in_theme": stock_rank_in_theme,
+        "stock_membership_score": stock_membership_score,
+        "theme_reason_codes": list(theme_reason_codes or []),
+        "theme_gate_dry_run_status": status,
+        "theme_gate_dry_run_reason": reason,
+    }

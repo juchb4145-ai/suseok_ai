@@ -118,6 +118,7 @@ class StockSnapshot:
     momentum_5m: float = 0.0
     turnover_strength: float = 1.0
     ts: str = ""
+    updated_at: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -126,6 +127,8 @@ class ThemeActivitySnapshot:
     theme_id: str
     theme_name: str = ""
     theme_score: float = 0.0
+    status: ThemeStatus | str = ThemeStatus.CANDIDATE
+    trade_eligible: bool = False
     rank: int = 0
     rank_delta_1m: int = 0
     rank_delta_5m: int = 0
@@ -192,6 +195,33 @@ class ThemeSourcePayload:
     source_theme_id: str = ""
     aliases: list[str] = field(default_factory=list)
     raw_payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ThemeSourceSyncResult:
+    source: str
+    status: str = "success"
+    theme_count: int = 0
+    member_count: int = 0
+    error_count: int = 0
+    message: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
+    started_at: str = ""
+    finished_at: str = ""
+
+
+@dataclass
+class ThemeSourceSyncRun:
+    id: Optional[int] = None
+    source: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    status: str = ""
+    theme_count: int = 0
+    member_count: int = 0
+    error_count: int = 0
+    message: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

@@ -10,6 +10,7 @@ from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.ws.schemas import (
     build_error_payload,
     build_heartbeat_payload,
+    build_runtime_health_payload,
     build_stock_theme_state_payload,
     build_theme_detail_payload,
     build_theme_rank_payload,
@@ -24,21 +25,25 @@ except ImportError:  # pragma: no cover - optional dependency shell
     WebSocketDisconnect = Exception
 
 
-def create_app(db) -> Any:
+def create_app(db, runtime=None, broadcaster=None) -> Any:
     if FastAPI is None:
         raise RuntimeError("FastAPI is not installed. Install requirements-ws.txt to run the theme WS server.")
     repository = ThemeEngineRepository(db)
     provider = DynamicThemeContextProvider(repository)
     app = FastAPI(title="Dynamic Theme Engine")
-    clients: set[WebSocket] = set()
+    if broadcaster is None and runtime is not None:
+        broadcaster = getattr(runtime, "broadcaster", None)
 
     @app.get("/health")
     async def health():
+        if runtime is not None:
+            return runtime.health()
         return {"ok": True, "theme_engine": "running" if provider.is_ready() else "warming"}
 
     @app.get("/api/themes/rank")
     async def theme_rank(top_n: int = 20):
-        return build_theme_rank_payload(repository.get_latest_theme_rank(top_n), top_n=top_n)
+        rank = runtime.get_latest_rank(top_n) if runtime is not None else repository.get_latest_theme_rank(top_n)
+        return build_theme_rank_payload(rank, top_n=top_n)
 
     @app.get("/api/themes/{theme_id}")
     async def theme_detail(theme_id: str):
@@ -56,6 +61,12 @@ def create_app(db) -> Any:
     async def stock_themes(stock_code: str):
         return build_stock_theme_state_payload(provider.get_stock_theme_state(stock_code))
 
+    @app.get("/api/theme-runtime/health")
+    async def theme_runtime_health():
+        if runtime is None:
+            return build_runtime_health_payload({"running": False, "data_ready": provider.is_ready()})
+        return build_runtime_health_payload(runtime.health())
+
     @app.websocket("/ws/themes")
     async def ws_themes(websocket: WebSocket):
         token = websocket.query_params.get("token")
@@ -64,7 +75,8 @@ def create_app(db) -> Any:
             await websocket.close(code=1008)
             return
         await websocket.accept()
-        clients.add(websocket)
+        if broadcaster is not None:
+            await broadcaster.register(websocket)
         try:
             await websocket.send_json(build_heartbeat_payload())
             while True:
@@ -73,22 +85,27 @@ def create_app(db) -> Any:
                 if request["action"] != "subscribe":
                     await websocket.send_json(build_error_payload("unsupported action", code="BAD_REQUEST"))
                     continue
-                await _send_subscription_snapshot(websocket, request, repository, provider)
+                await _send_subscription_snapshot(websocket, request, repository, provider, runtime)
                 await asyncio.sleep(0)
         except WebSocketDisconnect:
             pass
         finally:
-            clients.discard(websocket)
+            if broadcaster is not None:
+                await broadcaster.unregister(websocket)
 
     return app
 
 
-async def _send_subscription_snapshot(websocket, request, repository, provider) -> None:
+async def _send_subscription_snapshot(websocket, request, repository, provider, runtime=None) -> None:
     channels = set(request["channels"])
     if "theme_rank" in channels:
+        rank = runtime.get_latest_rank(request["top_n"]) if runtime is not None else repository.get_latest_theme_rank(request["top_n"])
         await websocket.send_json(
-            build_theme_rank_payload(repository.get_latest_theme_rank(request["top_n"]), top_n=request["top_n"])
+            build_theme_rank_payload(rank, top_n=request["top_n"])
         )
+    if "runtime_health" in channels:
+        health = runtime.health() if runtime is not None else {"running": False, "data_ready": provider.is_ready()}
+        await websocket.send_json(build_runtime_health_payload(health))
     if "theme_detail" in channels:
         for theme_id in request["theme_ids"]:
             theme = repository.get_canonical_theme(theme_id)

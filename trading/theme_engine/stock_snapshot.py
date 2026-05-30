@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from trading.theme_engine.models import StockSnapshot
 from trading.theme_engine.normalizer import normalize_stock_code
 
@@ -23,6 +25,7 @@ def snapshot_from_strategy_tick(tick, stock_name: str = "") -> StockSnapshot:
         momentum_5m=float(metadata.get("momentum_5m") or 0.0),
         turnover_strength=float(metadata.get("turnover_strength") or 1.0),
         ts=str(getattr(tick, "timestamp", "") or ""),
+        updated_at=_now_text(),
         metadata=metadata,
     )
 
@@ -45,5 +48,10 @@ def snapshot_from_dict(data: dict) -> StockSnapshot:
         momentum_5m=float(data.get("momentum_5m", 0.0) or 0.0),
         turnover_strength=float(data.get("turnover_strength", 1.0) or 1.0),
         ts=str(data.get("ts") or ""),
+        updated_at=str(data.get("updated_at") or _now_text()),
         metadata=dict(data.get("metadata") or {}),
     )
+
+
+def _now_text() -> str:
+    return datetime.now().replace(microsecond=0).isoformat()

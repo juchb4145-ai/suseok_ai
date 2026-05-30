@@ -189,6 +189,18 @@ class TradingDatabase:
                 last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS theme_source_sync_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                theme_count INTEGER NOT NULL DEFAULT 0,
+                member_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
             CREATE TABLE IF NOT EXISTS candidates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trade_date TEXT NOT NULL,
@@ -372,6 +384,8 @@ class TradingDatabase:
                 ON theme_activity_snapshots(created_at, rank);
             CREATE INDEX IF NOT EXISTS idx_dynamic_theme_clusters_status
                 ON dynamic_theme_clusters(status);
+            CREATE INDEX IF NOT EXISTS idx_theme_source_sync_runs_source_started
+                ON theme_source_sync_runs(source, started_at);
             """
         )
         self._ensure_column("indicator_snapshots", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")

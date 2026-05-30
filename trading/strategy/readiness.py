@@ -16,6 +16,7 @@ from trading.strategy.models import BlockType, Candidate, CandidateState, Strate
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
 from trading.theme_engine.models import ThemeStatus
 from trading.theme_engine.repository import ThemeEngineRepository
+from trading.theme_engine.universe import ThemeUniverseBuilder
 
 if TYPE_CHECKING:
     from storage.db import TradingDatabase
@@ -36,6 +37,12 @@ class ReadinessReport:
     active_theme_count: int = 0
     watch_theme_count: int = 0
     candidate_theme_count: int = 0
+    theme_active_stock_count: int = 0
+    theme_last_sync_at: str = ""
+    theme_last_tick_at: str = ""
+    theme_ws_client_count: int = 0
+    top_theme_name: str = ""
+    top_theme_score: float = 0.0
     theme_engine_status: str = "stopped"
     theme_data_status: str = "warming"
     active_candidates_count: int = 0
@@ -75,11 +82,15 @@ def build_readiness_report(
     unresolved = [profile for profile in enabled_profiles if profile.last_resolved_index is None]
     theme_repository = ThemeEngineRepository(db)
     theme_provider = DynamicThemeContextProvider(theme_repository)
+    theme_universe = ThemeUniverseBuilder(theme_repository)
     canonical_themes = theme_repository.list_canonical_themes()
     active_themes = [theme for theme in canonical_themes if theme.status == ThemeStatus.ACTIVE]
     watch_themes = [theme for theme in canonical_themes if theme.status == ThemeStatus.WATCH]
     candidate_themes = [theme for theme in canonical_themes if theme.status == ThemeStatus.CANDIDATE]
     theme_ready = theme_provider.is_ready()
+    last_sync = theme_repository.latest_source_sync_run()
+    latest_rank = theme_repository.get_latest_theme_rank(1)
+    top_theme = latest_rank[0] if latest_rank else None
     candidates = _active_candidates(db, trade_date)
     dynamic_theme_by_code = {candidate.code: bool(theme_provider.themes_for_code(candidate.code)) for candidate in candidates}
     quality_counts = {
@@ -116,6 +127,10 @@ def build_readiness_report(
         active_theme_count=len(active_themes),
         watch_theme_count=len(watch_themes),
         candidate_theme_count=len(candidate_themes),
+        theme_active_stock_count=len(theme_universe.build_active_universe()),
+        theme_last_sync_at=last_sync.finished_at if last_sync else "",
+        top_theme_name=top_theme.theme_name if top_theme else "",
+        top_theme_score=top_theme.theme_score if top_theme else 0.0,
         theme_engine_status="running" if theme_ready else "stopped",
         theme_data_status="ready" if theme_ready else "warming",
         active_candidates_count=active_count,

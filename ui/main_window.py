@@ -238,6 +238,10 @@ class MainWindow(QMainWindow):
             "theme_engine": SummaryCard("테마 엔진", "warming", "-", "neutral"),
             "active_theme": SummaryCard("ACTIVE 테마", "0", "-", "neutral"),
             "watch_theme": SummaryCard("WATCH 테마", "0", "-", "neutral"),
+            "theme_stocks": SummaryCard("감시 종목", "0", "-", "neutral"),
+            "theme_sync": SummaryCard("마지막 테마 sync", "-", "-", "neutral"),
+            "theme_tick": SummaryCard("마지막 tick", "-", "-", "neutral"),
+            "top_theme": SummaryCard("Top Theme", "-", "-", "neutral"),
             "theme_candidates": SummaryCard("테마 후보", "0", "-", "neutral"),
             "subscription": SummaryCard("WS 구독", "-", "-", "neutral"),
             "warnings": SummaryCard("경고", "0", "last: -", "neutral"),
@@ -1420,16 +1424,26 @@ class MainWindow(QMainWindow):
         active_themes = int(getattr(current_snapshot, "active_theme_count", 0) or 0) if current_snapshot is not None else 0
         watch_themes = int(getattr(current_snapshot, "watch_theme_count", 0) or 0) if current_snapshot is not None else 0
         candidate_themes = int(getattr(current_snapshot, "candidate_theme_count", 0) or 0) if current_snapshot is not None else 0
+        active_stocks = int(getattr(current_snapshot, "theme_active_stock_count", 0) or 0) if current_snapshot is not None else 0
+        last_sync = getattr(current_snapshot, "theme_last_sync_at", "") if current_snapshot is not None else ""
+        last_tick = getattr(current_snapshot, "theme_last_tick_at", "") if current_snapshot is not None else ""
+        top_theme = getattr(current_snapshot, "top_theme_name", "") if current_snapshot is not None else ""
+        top_score = float(getattr(current_snapshot, "top_theme_score", 0.0) or 0.0) if current_snapshot is not None else 0.0
+        ws_clients = int(getattr(current_snapshot, "theme_ws_client_count", 0) or 0) if current_snapshot is not None else 0
         theme_tone = "success" if theme_status == "running" and active_themes else "warning" if theme_status == "running" else "neutral"
         self._set_dashboard_card("theme_engine", str(theme_status), f"data {theme_data}", theme_tone)
         self._set_dashboard_card("active_theme", str(active_themes), "trade radar", "success" if active_themes else "neutral")
         self._set_dashboard_card("watch_theme", str(watch_themes), "warming watch", "warning" if watch_themes else "neutral")
+        self._set_dashboard_card("theme_stocks", str(active_stocks), "active universe", "success" if active_stocks else "neutral")
+        self._set_dashboard_card("theme_sync", self._short_time_text(last_sync), "source sync", "neutral")
+        self._set_dashboard_card("theme_tick", self._short_time_text(last_tick), "runtime tick", "neutral")
+        self._set_dashboard_card("top_theme", top_theme or "-", f"score {top_score:.1f}" if top_theme else "-", "success" if top_score >= 70 else "neutral")
         self._set_dashboard_card("theme_candidates", str(candidate_themes), "canonical candidates", "neutral")
 
         subscription = ""
         if current_snapshot is not None:
             subscription = getattr(current_snapshot, "protected_subscription_usage", "") or str(getattr(current_snapshot, "subscription_active_count", 0) or "")
-        self._set_dashboard_card("subscription", subscription or "-", "WS clients / protected", self._subscription_tone(subscription))
+        self._set_dashboard_card("subscription", str(ws_clients or subscription or "-"), "WS clients / protected", self._subscription_tone(subscription))
 
         warnings = []
         if hasattr(self, "strategy_warning_view"):
@@ -1462,6 +1476,13 @@ class MainWindow(QMainWindow):
         if ratio >= 0.8:
             return "warning"
         return "success"
+
+    @staticmethod
+    def _short_time_text(value: str) -> str:
+        text = str(value or "")
+        if not text:
+            return "-"
+        return text[-8:] if len(text) >= 8 else text
 
     def _refresh_strategy_candidates_after_cycle(self, snapshot: StrategyRuntimeSnapshot) -> None:
         if self._should_auto_refresh_strategy_candidates(snapshot):

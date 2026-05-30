@@ -1,16 +1,34 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 from trading.theme_engine.models import StockSnapshot, StockThemeState, ThemeActivitySnapshot, ThemeMembership, ThemeRankItem
 from trading.theme_engine.ranker import RankHistory, ThemeRanker
 from trading.theme_engine.repository import ThemeEngineRepository
 
 
+@dataclass
+class ThemeScoringConfig:
+    low_breadth_threshold: float = 0.5
+    leader_only_breadth_threshold: float = 0.35
+    leader_gap_threshold: float = 3.0
+    low_turnover_threshold: float = 1_000_000_000.0
+    active_score_threshold: float = 70.0
+    active_breadth_threshold: float = 0.5
+    min_trade_eligible_for_active: int = 3
+
+
 class ThemeScoringEngine:
-    def __init__(self, repository: ThemeEngineRepository | None = None, rank_history: RankHistory | None = None) -> None:
+    def __init__(
+        self,
+        repository: ThemeEngineRepository | None = None,
+        rank_history: RankHistory | None = None,
+        config: ThemeScoringConfig | None = None,
+    ) -> None:
         self.repository = repository
         self.ranker = ThemeRanker(rank_history)
+        self.config = config or ThemeScoringConfig()
 
     def score_theme(
         self,
@@ -49,12 +67,28 @@ class ThemeScoringEngine:
             + 0.10 * momentum_score
         )
         reason_codes = []
-        if breadth < 0.35 and leader_gap >= 3.0:
+        if total_count < 2:
+            reason_codes.append("TOO_FEW_MEMBERS")
+        if len(valid) < total_count:
+            reason_codes.append("INSUFFICIENT_SNAPSHOT")
+        if turnover_total < self.config.low_turnover_threshold:
+            reason_codes.append("LOW_TURNOVER")
+        if breadth < self.config.leader_only_breadth_threshold and leader_gap >= self.config.leader_gap_threshold:
             reason_codes.append("LEADER_ONLY_THEME")
-        if breadth < 0.5:
-            reason_codes.append("WEAK_BREADTH")
+        if breadth < self.config.low_breadth_threshold:
+            reason_codes.append("LOW_BREADTH")
+        trade_eligible_count = sum(1 for member in active_members if member.trade_eligible)
+        active_dry_run = (
+            trade_eligible_count >= self.config.min_trade_eligible_for_active
+            and theme_score >= self.config.active_score_threshold
+            and breadth >= self.config.active_breadth_threshold
+            and "LEADER_ONLY_THEME" not in reason_codes
+            and "TOO_FEW_MEMBERS" not in reason_codes
+        )
         details = {
             "reason_codes": reason_codes,
+            "active_promotion_dry_run": "ACTIVE" if active_dry_run else "WATCH",
+            "trade_eligible_count": trade_eligible_count,
             "component_scores": {
                 "normalized_weighted_return": round(normalized_weighted_return, 4),
                 "normalized_turnover_strength": round(normalized_turnover_strength, 4),

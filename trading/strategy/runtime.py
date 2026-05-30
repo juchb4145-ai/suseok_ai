@@ -140,6 +140,12 @@ class StrategyRuntimeSnapshot:
     active_theme_count: int = 0
     watch_theme_count: int = 0
     candidate_theme_count: int = 0
+    theme_active_stock_count: int = 0
+    theme_last_sync_at: str = ""
+    theme_last_tick_at: str = ""
+    theme_ws_client_count: int = 0
+    top_theme_name: str = ""
+    top_theme_score: float = 0.0
     theme_engine_status: str = "stopped"
     theme_data_status: str = "warming"
     active_candidates_with_active_theme: int = 0
@@ -1383,6 +1389,12 @@ class StrategyRuntime:
         snapshot.active_theme_count = report.active_theme_count
         snapshot.watch_theme_count = report.watch_theme_count
         snapshot.candidate_theme_count = report.candidate_theme_count
+        snapshot.theme_active_stock_count = report.theme_active_stock_count
+        snapshot.theme_last_sync_at = report.theme_last_sync_at
+        snapshot.theme_last_tick_at = report.theme_last_tick_at
+        snapshot.theme_ws_client_count = report.theme_ws_client_count
+        snapshot.top_theme_name = report.top_theme_name
+        snapshot.top_theme_score = report.top_theme_score
         snapshot.theme_engine_status = report.theme_engine_status
         snapshot.theme_data_status = report.theme_data_status
         snapshot.active_candidates_with_active_theme = report.active_candidates_with_active_theme

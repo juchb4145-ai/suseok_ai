@@ -58,6 +58,12 @@ def build_heartbeat_payload(*, ts: str | None = None) -> dict[str, Any]:
     return {"type": "heartbeat", "ts": ts or _now_ts()}
 
 
+def build_runtime_health_payload(health: dict[str, Any], *, ts: str | None = None) -> dict[str, Any]:
+    payload = {"type": "runtime_health", "ts": ts or _now_ts()}
+    payload.update(dict(health or {}))
+    return payload
+
+
 def build_error_payload(message: str, *, code: str = "ERROR", ts: str | None = None) -> dict[str, Any]:
     return {"type": "error", "ts": ts or _now_ts(), "code": code, "message": message}
 
@@ -68,8 +74,8 @@ def _rank_item_dict(item) -> dict[str, Any]:
         "theme_id": item.theme_id,
         "theme_name": item.theme_name,
         "theme_score": item.theme_score,
-        "status": _value(item.status),
-        "trade_eligible": bool(item.trade_eligible),
+        "status": _value(getattr(item, "status", "")),
+        "trade_eligible": bool(getattr(item, "trade_eligible", False)),
         "rank_delta_1m": item.rank_delta_1m,
         "rank_delta_5m": item.rank_delta_5m,
         "weighted_return_pct": item.weighted_return_pct,
@@ -96,6 +102,8 @@ def _obj_dict(obj) -> dict[str, Any]:
                 continue
             if hasattr(value, "value"):
                 value = value.value
+            elif isinstance(value, list):
+                value = [_obj_dict(item) if hasattr(item, "__dict__") else item for item in value]
             elif hasattr(value, "__dict__"):
                 value = _obj_dict(value)
             result[key] = value
