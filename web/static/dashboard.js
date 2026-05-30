@@ -12,9 +12,9 @@ const tableConfigs = {
     statusId: "transportLatency-status",
     paginationId: "transportLatency-pagination",
     defaultLimit: 50,
-    detailTitle: (item) => `Transport sample ${item.sample_id || ""}`,
+    detailTitle: (item) => `전송 지연 샘플 ${item.sample_id || ""}`,
     detailEndpoint: (item) => item.sample_id ? `/api/gateway/transport/latency/${encodeURIComponent(item.sample_id)}` : "",
-    actionLabel: "Rebuild transport report",
+    actionLabel: "전송 리포트 재생성",
     actionEndpoint: (filters) => `/api/gateway/transport/latency/rebuild?persist=true&export=true${filters.trade_date ? `&trade_date=${encodeURIComponent(filters.trade_date)}` : ""}`,
     columns: [
       (item) => formatDateTime(item.created_at),
@@ -35,9 +35,9 @@ const tableConfigs = {
     statusId: "transportExperiments-status",
     paginationId: "transportExperiments-pagination",
     defaultLimit: 25,
-    detailTitle: (item) => `Experiment ${item.experiment_id || ""}`,
+    detailTitle: (item) => `실험 ${item.experiment_id || ""}`,
     detailEndpoint: (item) => item.experiment_id ? `/api/gateway/transport/experiments/${encodeURIComponent(item.experiment_id)}${item.scenario ? `?scenario=${encodeURIComponent(item.scenario)}` : ""}` : "",
-    actionLabel: "Rebuild comparison",
+    actionLabel: "비교 리포트 재생성",
     actionEndpoint: (filters) => {
       const params = buildQuery({ experiment_id: filters.experiment_id, scenario: filters.scenario, persist: true, export: true });
       return `/api/gateway/transport/experiments/rebuild?${params}`;
@@ -53,7 +53,7 @@ const tableConfigs = {
       (item) => formatMs((item.websocket_summary || {}).command_latency_p95_ms),
       (item) => formatMs((item.delta || {}).command_p95_delta_ms),
       (item) => badge(item.latest_recommendation || "-"),
-      (item) => item.real_gateway_switch_ready ? "YES" : "NO",
+      (item) => item.real_gateway_switch_ready ? "예" : "아니오",
     ],
   },
   dryRunOrders: {
@@ -62,7 +62,7 @@ const tableConfigs = {
     statusId: "dryRunOrders-status",
     paginationId: "dryRunOrders-pagination",
     defaultLimit: 50,
-    detailTitle: (item) => `DRY_RUN intent ${item.intent_id || ""}`,
+    detailTitle: (item) => `DRY_RUN 주문 의도 ${item.intent_id || ""}`,
     detailEndpoint: (item) => item.intent_id ? `/api/runtime/orders/dry-run/${encodeURIComponent(item.intent_id)}` : "",
     columns: [
       (item) => formatDateTime(item.created_at),
@@ -84,9 +84,9 @@ const tableConfigs = {
     statusId: "dryRunPerformance-status",
     paginationId: "dryRunPerformance-pagination",
     defaultLimit: 50,
-    detailTitle: (item) => `Lifecycle ${item.lifecycle_id || ""}`,
+    detailTitle: (item) => `성과 라이프사이클 ${item.lifecycle_id || ""}`,
     detailEndpoint: (item, filters) => item.lifecycle_id ? `/api/runtime/performance/dry-run/lifecycles/${encodeURIComponent(item.lifecycle_id)}${filters.trade_date ? `?trade_date=${encodeURIComponent(filters.trade_date)}` : ""}` : "",
-    actionLabel: "Rebuild performance report",
+    actionLabel: "성과 리포트 재생성",
     actionEndpoint: (filters) => `/api/runtime/performance/dry-run/rebuild?persist=true&export=true&format=all${filters.trade_date ? `&trade_date=${encodeURIComponent(filters.trade_date)}` : ""}`,
     columns: [
       (item) => item.code || "-",
@@ -107,7 +107,7 @@ const tableConfigs = {
     statusId: "falseSignals-status",
     paginationId: "falseSignals-pagination",
     defaultLimit: 50,
-    detailTitle: (item) => `False signal ${item.lifecycle_id || item.code || ""}`,
+    detailTitle: (item) => `오탐/미탐 신호 ${item.lifecycle_id || item.code || ""}`,
     detailEndpoint: (item, filters) => item.lifecycle_id ? `/api/runtime/performance/dry-run/lifecycles/${encodeURIComponent(item.lifecycle_id)}${filters.trade_date ? `?trade_date=${encodeURIComponent(filters.trade_date)}` : ""}` : "",
     columns: [
       (item) => item.code || "-",
@@ -127,7 +127,7 @@ const tableConfigs = {
     statusId: "gatewayCommands-status",
     paginationId: "gatewayCommands-pagination",
     defaultLimit: 50,
-    detailTitle: (item) => `Command ${item.command_id || ""}`,
+    detailTitle: (item) => `게이트웨이 명령 ${item.command_id || ""}`,
     detailEndpoint: (item) => item.command_id ? `/api/gateway/commands/${encodeURIComponent(item.command_id)}` : "",
     columns: [
       (item) => compactId(item.command_id || "-"),
@@ -259,17 +259,17 @@ function renderToolbar(tableKey) {
   const selectedLimit = Number(config.defaultLimit || 50);
   const option = (value) => `<option value="${value}" ${selectedLimit === value ? "selected" : ""}>${value}</option>`;
   toolbar.innerHTML = `
-    <button type="button" data-table-action="${tableKey}:apply">Apply</button>
-    <button type="button" data-table-action="${tableKey}:reset">Reset</button>
-    <button type="button" data-table-action="${tableKey}:reload">Reload</button>
-    <label class="inline-control">Page size
+    <button type="button" data-table-action="${tableKey}:apply">필터 적용</button>
+    <button type="button" data-table-action="${tableKey}:reset">초기화</button>
+    <button type="button" data-table-action="${tableKey}:reload">새로고침</button>
+    <label class="inline-control">페이지 크기
       <select data-table-action="${tableKey}:limit">
         ${option(25)}${option(50)}${option(100)}${option(200)}
       </select>
     </label>
-    <label class="inline-control"><input type="checkbox" data-table-action="${tableKey}:auto" /> Auto refresh</label>
-    ${config.actionEndpoint ? `<button type="button" data-table-action="${tableKey}:protected">${escapeHtml(config.actionLabel || "Rebuild")}</button>` : ""}
-    <span id="${tableKey}-freshness" class="freshness">not fetched</span>
+    <label class="inline-control"><input type="checkbox" data-table-action="${tableKey}:auto" /> 자동 새로고침</label>
+    ${config.actionEndpoint ? `<button type="button" data-table-action="${tableKey}:protected">${escapeHtml(config.actionLabel || "재생성")}</button>` : ""}
+    <span id="${tableKey}-freshness" class="freshness">아직 조회 안 함</span>
   `;
 }
 
@@ -315,14 +315,14 @@ async function runProtectedTableAction(tableKey) {
     if (token) localStorage.setItem("TRADING_CORE_TOKEN", token);
   }
   if (!token || !config.actionEndpoint) return;
-  setTableStatus(tableKey, "running", "warn");
+  setTableStatus(tableKey, "실행 중", "warn");
   const filters = tableFilters(tableKey);
   const response = await fetch(config.actionEndpoint(filters), {
     method: "POST",
     headers: { "X-Local-Token": token },
   });
   const payload = await response.json();
-  openDetailPanel(`${config.actionLabel || "Action"} result`, payload);
+  openDetailPanel(`${config.actionLabel || "작업"} 결과`, payload);
   await fetchTable(tableKey);
 }
 
@@ -342,7 +342,7 @@ async function fetchTable(tableKey) {
   const table = state.tables[tableKey];
   const seq = (table.requestSeq || 0) + 1;
   updateTableState(tableKey, { requestSeq: seq, loading: true, error: "" });
-  setTableStatus(tableKey, "loading", "warn");
+  setTableStatus(tableKey, "불러오는 중", "warn");
   const filters = tableFilters(tableKey);
   const params = { ...filters, limit: table.limit, offset: table.offset };
   try {
@@ -376,7 +376,7 @@ function renderTable(tableKey) {
   if (!body) return;
   const items = table.items || [];
   if (!items.length) {
-    body.innerHTML = `<tr><td class="empty" colspan="${config.columns.length}">No rows</td></tr>`;
+    body.innerHTML = `<tr><td class="empty" colspan="${config.columns.length}">표시할 데이터가 없습니다</td></tr>`;
   } else {
     body.innerHTML = items.map((item, index) => {
       const cells = config.columns.map((renderer) => `<td>${renderer(item)}</td>`).join("");
@@ -387,21 +387,21 @@ function renderTable(tableKey) {
     });
   }
   renderPagination(tableKey);
-  const fetched = table.lastFetchedAt ? table.lastFetchedAt.toLocaleTimeString() : "not fetched";
+  const fetched = table.lastFetchedAt ? table.lastFetchedAt.toLocaleTimeString() : "아직 조회 안 함";
   const stale = table.lastFetchedAt && Date.now() - table.lastFetchedAt.getTime() > 30000;
   const freshness = document.getElementById(`${tableKey}-freshness`);
   if (freshness) {
-    freshness.textContent = `${stale ? "stale " : ""}fetched ${fetched}`;
+    freshness.textContent = `${stale ? "오래됨 " : ""}조회 ${fetched}`;
     freshness.className = `freshness ${stale ? "stale" : ""}`;
   }
-  setTableStatus(tableKey, `${(table.pagination || {}).count ?? items.length} rows`, stale ? "warn" : "ok");
+  setTableStatus(tableKey, `${(table.pagination || {}).count ?? items.length}건`, stale ? "warn" : "ok");
 }
 
 function renderTableError(tableKey, message) {
   const config = tableConfigs[tableKey];
   const body = document.getElementById(config.bodyId);
   if (body) body.innerHTML = `<tr><td class="error-row" colspan="${config.columns.length}">${escapeHtml(message)}</td></tr>`;
-  setTableStatus(tableKey, "error", "bad");
+  setTableStatus(tableKey, "오류", "bad");
 }
 
 function renderPagination(tableKey) {
@@ -412,9 +412,9 @@ function renderPagination(tableKey) {
   const currentPage = Math.floor((page.offset || 0) / Math.max(1, page.limit || table.limit)) + 1;
   const totalText = page.total != null ? ` / ${page.total}` : "";
   node.innerHTML = `
-    <button type="button" ${page.has_prev ? "" : "disabled"} data-page="${tableKey}:prev">Prev</button>
-    <span>Page ${currentPage} (${page.count || 0}${totalText})</span>
-    <button type="button" ${page.has_next ? "" : "disabled"} data-page="${tableKey}:next">Next</button>
+    <button type="button" ${page.has_prev ? "" : "disabled"} data-page="${tableKey}:prev">이전</button>
+    <span>${currentPage}페이지 (${page.count || 0}${totalText})</span>
+    <button type="button" ${page.has_next ? "" : "disabled"} data-page="${tableKey}:next">다음</button>
   `;
   node.querySelectorAll("[data-page]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -436,7 +436,7 @@ async function openRowDetail(tableKey, index) {
     openDetailPanel(config.detailTitle(item), item);
     return;
   }
-  setTableStatus(tableKey, "detail", "warn");
+  setTableStatus(tableKey, "상세 조회", "warn");
   try {
     const payload = await apiGet(endpoint);
     openDetailPanel(config.detailTitle(item), payload);
@@ -470,14 +470,14 @@ function detailSummaryHtml(payload) {
   return keys
     .filter((key) => record && record[key] != null && record[key] !== "")
     .map((key) => `<div><span>${escapeHtml(key)}</span><strong>${escapeHtml(record[key])}</strong></div>`)
-    .join("") || '<span class="empty">No compact summary</span>';
+    .join("") || '<span class="empty">요약할 핵심 필드가 없습니다</span>';
 }
 
 function renderRows(id, rows, emptyColumns) {
   const body = document.getElementById(id);
   if (!body) return;
   if (!rows.length) {
-    body.innerHTML = `<tr><td class="empty" colspan="${emptyColumns}">No rows</td></tr>`;
+    body.innerHTML = `<tr><td class="empty" colspan="${emptyColumns}">표시할 데이터가 없습니다</td></tr>`;
     return;
   }
   body.innerHTML = rows.join("");
@@ -521,13 +521,13 @@ function render(snapshot) {
 
   text("snapshot-time", snapshot.timestamp || "");
   text("core-mode", core.mode || "OBSERVE");
-  text("core-state", core.service ? "OK" : "WAIT");
+  text("core-state", core.service ? "정상" : "대기");
   const gatewayState = gateway.connection_state || "DISCONNECTED";
   text("gateway-state", gatewayState);
   text("gateway-connection", gatewayState);
-  text("kiwoom-login", gateway.kiwoom_logged_in ? "YES" : "NO");
+  text("kiwoom-login", gateway.kiwoom_logged_in ? "예" : "아니오");
   text("heartbeat-age", gateway.heartbeat_age_sec == null ? "-" : `${fmtNumber(gateway.heartbeat_age_sec, 0)}s`);
-  text("orderable-state", gateway.orderable ? "ORDERABLE" : "ORDER BLOCKED");
+  text("orderable-state", gateway.orderable ? "주문 가능" : "주문 차단");
   cls("gateway-state", `pill ${gateway.heartbeat_ok ? "ok" : gateway.connected ? "warn" : "bad"}`);
   cls("orderable-state", `pill ${gateway.orderable ? "ok" : "muted"}`);
 
@@ -542,9 +542,9 @@ function render(snapshot) {
   text("transport-errors", transport.transport_error_count || 0);
   text("transport-reconnect", transport.reconnect_count || 0);
   text("transport-ws-decision", transport.websocket_recommendation || "KEEP_REST_LONG_POLL");
-  const transportWarnings = [transport.websocket_recommendation_reason || "", ...((transport.warning_flags || []).map((flag) => `WARN: ${flag}`))].filter(Boolean);
+  const transportWarnings = [transport.websocket_recommendation_reason || "", ...((transport.warning_flags || []).map((flag) => `경고: ${flag}`))].filter(Boolean);
   const transportNode = document.getElementById("transport-warning-lines");
-  if (transportNode) transportNode.innerHTML = transportWarnings.length ? transportWarnings.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">Transport healthy</span>';
+  if (transportNode) transportNode.innerHTML = transportWarnings.length ? transportWarnings.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">전송 상태가 안정적입니다</span>';
 
   text("transport-exp-id", transportExperiment.latest_experiment_id || "-");
   text("transport-exp-scenario", transportExperiment.latest_scenario || "-");
@@ -555,15 +555,15 @@ function render(snapshot) {
   text("transport-exp-rest-ack", formatMs(transportExperiment.rest_ack_p95_ms));
   text("transport-exp-ws-ack", formatMs(transportExperiment.websocket_ack_p95_ms));
   text("transport-exp-ack-delta", formatMs(transportExperiment.ack_p95_delta_ms));
-  text("transport-exp-ready", transportExperiment.real_gateway_switch_ready ? "YES" : "NO");
+  text("transport-exp-ready", transportExperiment.real_gateway_switch_ready ? "예" : "아니오");
   const expBlockerNode = document.getElementById("transport-exp-blockers");
   if (expBlockerNode) {
     const blockers = transportExperiment.blockers || [];
-    expBlockerNode.innerHTML = blockers.length ? blockers.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">No blockers from latest mock comparison</span>';
+    expBlockerNode.innerHTML = blockers.length ? blockers.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">최근 Mock 비교에서 확인된 차단 요인이 없습니다</span>';
   }
 
-  text("runtime-enabled", runtime.enabled ? "YES" : "NO");
-  text("runtime-running", runtime.running ? "YES" : "NO");
+  text("runtime-enabled", runtime.enabled ? "예" : "아니오");
+  text("runtime-running", runtime.running ? "예" : "아니오");
   text("runtime-mode", runtime.mode || "OBSERVE");
   text("runtime-last-cycle", runtime.last_cycle_at || "-");
   text("runtime-cycle-count", runtime.cycle_count || 0);
@@ -574,9 +574,9 @@ function render(snapshot) {
   text("runtime-gate-results", runtime.gate_result_count || 0);
   text("runtime-virtual-orders", runtime.virtual_order_count || 0);
   text("runtime-reviews", runtime.review_count || 0);
-  const runtimeWarnings = [runtime.last_error ? `ERROR: ${runtime.last_error}` : "", ...(runtime.warnings || [])].filter(Boolean);
+  const runtimeWarnings = [runtime.last_error ? `오류: ${runtime.last_error}` : "", ...(runtime.warnings || [])].filter(Boolean);
   const runtimeNode = document.getElementById("runtime-warning-lines");
-  if (runtimeNode) runtimeNode.innerHTML = runtimeWarnings.length ? runtimeWarnings.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">No runtime warnings</span>';
+  if (runtimeNode) runtimeNode.innerHTML = runtimeWarnings.length ? runtimeWarnings.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">Runtime 경고가 없습니다</span>';
 
   const drySummary = dryRunOrders.summary || {};
   text("dryrun-order-policy", runtime.dry_run_order_sink_enabled ? runtime.dry_run_order_policy || "enabled" : runtime.dry_run_order_policy || "disabled");
@@ -591,8 +591,8 @@ function render(snapshot) {
   text("dryrun-sell-duplicate", drySummary.exit_duplicate ?? runtime.dry_run_exit_duplicate_count ?? 0);
   text("dryrun-order-live-pass", drySummary.live_would_pass ?? runtime.dry_run_order_live_would_pass_count ?? 0);
   text("dryrun-order-live-reject", drySummary.live_would_reject ?? runtime.dry_run_order_live_would_reject_count ?? 0);
-  renderInlineCounts("dryrun-reject-reasons", drySummary.top_reject_reasons || [], "reason", "No reject reasons");
-  renderInlineCounts("dryrun-exit-type-lines", drySummary.exit_by_decision_type || [], "decision_type", "No exit decision types");
+  renderInlineCounts("dryrun-reject-reasons", drySummary.top_reject_reasons || [], "reason", "거부 사유가 없습니다");
+  renderInlineCounts("dryrun-exit-type-lines", drySummary.exit_by_decision_type || [], "decision_type", "청산 판단 유형이 없습니다");
 
   text("dryrun-performance-generated", dryRunPerformance.generated_at || "-");
   text("dryrun-perf-total", dryRunPerformance.total_lifecycle_count || 0);
@@ -603,9 +603,9 @@ function render(snapshot) {
   text("dryrun-perf-fn", dryRunPerformance.false_negative_count || 0);
   text("dryrun-perf-opp", dryRunPerformance.opportunity_loss_count || 0);
   text("dryrun-perf-live-pass-win", formatRate(dryRunPerformance.live_would_pass_win_rate));
-  renderInlineCounts("dryrun-perf-fp-lines", dryRunPerformance.top_false_positive_types || [], "type", "No false positive types");
-  renderInlineCounts("dryrun-perf-fn-lines", dryRunPerformance.top_false_negative_types || [], "type", "No false negative types");
-  renderInlineCounts("dryrun-perf-reject-rally-lines", dryRunPerformance.top_reject_reasons_with_rally || [], "reason", "No reject reasons with rally");
+  renderInlineCounts("dryrun-perf-fp-lines", dryRunPerformance.top_false_positive_types || [], "type", "오탐 유형이 없습니다");
+  renderInlineCounts("dryrun-perf-fn-lines", dryRunPerformance.top_false_negative_types || [], "type", "미탐 유형이 없습니다");
+  renderInlineCounts("dryrun-perf-reject-rally-lines", dryRunPerformance.top_reject_reasons_with_rally || [], "reason", "상승을 놓친 거부 사유가 없습니다");
 
   text("command-queued", commands.queued_count || 0);
   text("command-dispatched", commands.dispatched_count || 0);
@@ -630,7 +630,7 @@ function render(snapshot) {
   renderRows("theme-rows", firstItems(themes.items, 20).map((item) => rowHtml([item.rank || "-", item.theme_name || item.theme_id || "-", fmtNumber(item.theme_score), fmtNumber(item.breadth), fmtNumber(item.leader_gap), fmtNumber(item.top3_concentration)])), 6);
 
   const orderRows = [];
-  for (const item of firstItems(orders.executions || [], 20)) orderRows.push(rowHtml([item.created_at, item.code, item.side, item.filled_quantity, item.price, `remain ${item.remaining_quantity}`]));
+  for (const item of firstItems(orders.executions || [], 20)) orderRows.push(rowHtml([item.created_at, item.code, item.side, item.filled_quantity, item.price, `잔량 ${item.remaining_quantity}`]));
   for (const item of firstItems(orders.order_results || [], Math.max(0, 30 - orderRows.length))) {
     const request = item.request || {};
     orderRows.push(rowHtml([item.created_at, request.code || "-", request.side || "-", request.quantity || 0, request.price || 0, item.ok ? "OK" : item.message]));
@@ -644,7 +644,7 @@ function render(snapshot) {
   const logLines = [...(logs.warnings || []), ...firstItems(logs.core || [], 80), ...firstItems(logs.gateway || [], 20).map((item) => `${item.timestamp} ${item.type}`)];
   text("log-count", logLines.length);
   const logNode = document.getElementById("log-lines");
-  if (logNode) logNode.innerHTML = logLines.length ? logLines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">No logs</span>';
+  if (logNode) logNode.innerHTML = logLines.length ? logLines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">로그가 없습니다</span>';
 }
 
 async function pollSnapshot() {

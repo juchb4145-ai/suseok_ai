@@ -1,15 +1,15 @@
-# Kiwoom Trading System
+# Kiwoom 자동매매 시스템
 
-This repository is moving from a 32bit single-process PyQt/Kiwoom app to a split architecture:
+이 저장소는 32bit 단일 프로세스 PyQt/Kiwoom 앱에서 다음 분리 구조로 이전 중이다.
 
-- **32bit Kiwoom Gateway**: Kiwoom OpenAPI+ ActiveX/QAxWidget only.
-- **64bit Core/API/Web Dashboard**: strategy runtime, candidates, themes, reviews, risk checks, DB, API, and web UI.
+- **32bit Kiwoom Gateway**: Kiwoom OpenAPI+ ActiveX/QAxWidget 전용.
+- **64bit Core/API/Web Dashboard**: 전략 runtime, 후보, 테마, 리뷰, 리스크 검사, DB, API, 웹 UI 담당.
 
-The old PyQt desktop app is still available as a deprecated legacy entrypoint.
+기존 PyQt 데스크톱 앱은 deprecated legacy entrypoint로만 유지한다.
 
 ## 64bit Core/API
 
-Use a 64bit Python environment. The Core requirements intentionally do not include PyQt5.
+64bit Python 환경을 사용한다. Core requirements에는 의도적으로 PyQt5를 넣지 않는다.
 
 ```powershell
 python -m pip install -r requirements-64.txt
@@ -18,7 +18,7 @@ $env:TRADING_MODE = "OBSERVE"
 python -m uvicorn trading_app.api:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Common Core environment variables:
+주요 Core 환경변수:
 
 - `TRADING_CORE_TOKEN`: local Gateway/Core token.
 - `TRADING_DB_PATH`: SQLite path.
@@ -57,13 +57,13 @@ Common Core environment variables:
 - `TRADING_TRANSPORT_WEBSOCKET_RECOMMEND_EMPTY_POLL_RATE`: empty-poll tuning threshold, default `0.8`.
 - `TRADING_TRANSPORT_WEBSOCKET_EXPERIMENT_ENABLED`: reserved experimental flag, default `0`.
 
-Dashboard:
+대시보드:
 
 ```text
 http://127.0.0.1:8000/
 ```
 
-Core APIs:
+Core API:
 
 - `GET /health`
 - `GET /api/status`
@@ -177,9 +177,9 @@ False signal thresholds:
 - `TRADING_DRY_RUN_MIN_HOLD_MINUTES_FOR_FINAL` default `20`
 - `TRADING_DRY_RUN_PENDING_GRACE_MINUTES` default `30`
 
-Dashboard `/` shows entry/buy counts, exit/sell counts, recent sell intents, exit decision type summaries, and DRY_RUN performance false-positive/false-negative summaries.
+Dashboard `/`는 entry/buy 수, exit/sell 수, 최근 sell intent, 청산 판단 유형 요약, DRY_RUN 성과 오탐/미탐 요약을 보여준다.
 
-Gateway transport latency checks:
+Gateway 전송 지연 확인:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/status
@@ -211,22 +211,22 @@ Invoke-RestMethod -Method Post `
 Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/experiments/exp-001
 ```
 
-`/ws/gateway/transport` is mock-only in PR-9. It is separate from Dashboard `/ws/dashboard`, and it still uses the same Gateway command queue, dedupe ledger, persistence, and ack/fail handlers. The real 32bit Kiwoom Gateway remains on REST + long-poll by default.
+`/ws/gateway/transport`는 PR-9의 mock 전용 실험 채널이다. Dashboard `/ws/dashboard`와 별도이며, WebSocket 실험도 기존 Gateway 명령 큐, dedupe ledger, 영속화, ack/fail handler를 그대로 사용한다. 실제 32bit Kiwoom Gateway 기본값은 계속 REST + long-poll이다.
 
-Dashboard drilldowns:
+Dashboard 상세 탐색:
 
-- `/` keeps WebSocket snapshot cards for Core/Gateway/runtime summary.
-- Transport latency samples, WebSocket mock experiments, DRY_RUN order intents, DRY_RUN performance cases, false signals, and Gateway command history are loaded through paginated REST tables.
-- Each table supports filters, page size, Prev/Next, reload, optional auto refresh, stale markers, and row detail drawers.
-- Rebuild/export actions prompt for `TRADING_CORE_TOKEN`; no token is hardcoded in frontend code.
+- `/` 화면의 요약 카드는 Core/Gateway/runtime 상태를 WebSocket snapshot으로 갱신한다.
+- 전송 지연 샘플, WebSocket mock 실험, DRY_RUN 주문 의도, DRY_RUN 성과 사례, 오탐/미탐 신호, Gateway 명령 이력은 페이지네이션 REST 표로 조회한다.
+- 각 표는 필터, 페이지 크기, 이전/다음, 새로고침, 선택적 자동 새로고침, 오래된 데이터 표시, 행 상세 패널을 지원한다.
+- 리포트 재생성/export 작업은 `TRADING_CORE_TOKEN`을 입력받아 호출한다. 토큰은 프론트엔드 코드에 하드코딩하지 않는다.
 
-Operational order:
+운영자가 보는 순서:
 
-1. Check summary cards for mode, Gateway heartbeat, runtime, and command status.
-2. Use Gateway Command History for failed or stale commands.
-3. Use Transport Latency Samples for command/event/ack timing.
-4. Use WebSocket Mock Experiments only for REST-vs-WebSocket evidence, not switching.
-5. Use DRY_RUN Performance and False Signals for strategy diagnosis.
+1. 요약 카드에서 모드, Gateway heartbeat, runtime, 명령 상태를 확인한다.
+2. 실패하거나 오래된 명령은 Gateway 명령 이력에서 확인한다.
+3. 명령/event/ack 지연은 전송 지연 샘플에서 확인한다.
+4. WebSocket Mock 실험은 REST 대비 근거 확인용으로만 사용하고, 실제 전환 버튼으로 쓰지 않는다.
+5. 전략 진단은 DRY_RUN 성과 분석과 오탐/미탐 신호에서 확인한다.
 
 ## 32bit Kiwoom Gateway
 
@@ -313,13 +313,13 @@ py -3.9-32 apps/legacy_pyqt_app.py --mock
 More detail:
 
 - [Architecture](docs/architecture_32bit_gateway_64bit_core.md)
-- [Runbook](docs/runbook_32bit_gateway_64bit_core.md)
-- [Gateway Command Queue Runbook](docs/gateway_command_queue_runbook.md)
-- [Gateway Command Persistence Runbook](docs/gateway_command_persistence_runbook.md)
+- [32bit Gateway / 64bit Core Runbook](docs/runbook_32bit_gateway_64bit_core.md)
+- [Gateway 명령 큐 Runbook](docs/gateway_command_queue_runbook.md)
+- [Gateway 명령 영속화 Runbook](docs/gateway_command_persistence_runbook.md)
 - [Core StrategyRuntime Loop Runbook](docs/core_strategy_runtime_loop_runbook.md)
-- [Runtime DRY_RUN Order Enqueue Runbook](docs/runtime_dry_run_order_enqueue_runbook.md)
+- [Runtime DRY_RUN 주문 의도 Runbook](docs/runtime_dry_run_order_enqueue_runbook.md)
 - [Runtime DRY_RUN Exit/Sell Intent Runbook](docs/runtime_dry_run_exit_sell_intent_runbook.md)
-- [DRY_RUN Performance Report Runbook](docs/dry_run_performance_report_runbook.md)
-- [Gateway Transport Latency Runbook](docs/gateway_transport_latency_runbook.md)
-- [Gateway WebSocket Mock Experiment Runbook](docs/gateway_websocket_mock_experiment_runbook.md)
-- [Dashboard Pagination Runbook](docs/dashboard_pagination_runbook.md)
+- [DRY_RUN 성과 리포트 Runbook](docs/dry_run_performance_report_runbook.md)
+- [Gateway 전송 지연 Runbook](docs/gateway_transport_latency_runbook.md)
+- [Gateway WebSocket Mock 실험 Runbook](docs/gateway_websocket_mock_experiment_runbook.md)
+- [대시보드 페이지네이션 Runbook](docs/dashboard_pagination_runbook.md)

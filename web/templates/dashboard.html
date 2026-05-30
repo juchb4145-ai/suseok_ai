@@ -3,112 +3,112 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Trading Core Dashboard</title>
+    <title>자동매매 Core 대시보드</title>
     <link rel="stylesheet" href="/static/dashboard.css" />
   </head>
   <body>
     <header class="topbar">
       <div>
-        <h1>Trading Core</h1>
-        <p id="snapshot-time">snapshot pending</p>
+        <h1>자동매매 Core</h1>
+        <p id="snapshot-time">스냅샷 대기 중</p>
       </div>
       <div class="mode-strip">
         <span id="core-mode" class="pill">OBSERVE</span>
         <span id="gateway-state" class="pill muted">DISCONNECTED</span>
-        <span id="orderable-state" class="pill muted">ORDER BLOCKED</span>
+        <span id="orderable-state" class="pill muted">주문 차단</span>
       </div>
     </header>
 
     <main class="layout">
       <section class="band status-grid">
-        <div class="metric"><span>Core</span><strong id="core-state">OK</strong></div>
-        <div class="metric"><span>Gateway</span><strong id="gateway-connection">DISCONNECTED</strong></div>
-        <div class="metric"><span>Kiwoom Login</span><strong id="kiwoom-login">NO</strong></div>
+        <div class="metric"><span>Core 상태</span><strong id="core-state">OK</strong></div>
+        <div class="metric"><span>Gateway 연결</span><strong id="gateway-connection">DISCONNECTED</strong></div>
+        <div class="metric"><span>키움 로그인</span><strong id="kiwoom-login">NO</strong></div>
         <div class="metric"><span>Heartbeat</span><strong id="heartbeat-age">-</strong></div>
       </section>
 
       <section class="band">
         <div class="section-head">
-          <h2>Gateway Transport</h2>
+          <h2>게이트웨이 전송 상태</h2>
           <span id="transport-ws-decision" class="counter">KEEP_REST_LONG_POLL</span>
         </div>
         <div class="mini-grid command-grid">
-          <div><span>MODE</span><strong id="transport-mode">rest_long_poll</strong></div>
-          <div><span>EVENT P95</span><strong id="transport-event-p95">0ms</strong></div>
-          <div><span>COMMAND P95</span><strong id="transport-command-p95">0ms</strong></div>
+          <div><span>전송 방식</span><strong id="transport-mode">rest_long_poll</strong></div>
+          <div><span>이벤트 P95</span><strong id="transport-event-p95">0ms</strong></div>
+          <div><span>명령 P95</span><strong id="transport-command-p95">0ms</strong></div>
           <div><span>ACK P95</span><strong id="transport-ack-p95">0ms</strong></div>
-          <div><span>LONG POLL P95</span><strong id="transport-longpoll-p95">0ms</strong></div>
-          <div><span>EXECUTE P95</span><strong id="transport-execute-p95">0ms</strong></div>
-          <div><span>RATE WAIT P95</span><strong id="transport-rate-p95">0ms</strong></div>
-          <div><span>EMPTY POLL</span><strong id="transport-empty-rate">0.0%</strong></div>
-          <div><span>ERRORS</span><strong id="transport-errors">0</strong></div>
-          <div><span>RECONNECT</span><strong id="transport-reconnect">0</strong></div>
+          <div><span>롱폴 P95</span><strong id="transport-longpoll-p95">0ms</strong></div>
+          <div><span>실행 P95</span><strong id="transport-execute-p95">0ms</strong></div>
+          <div><span>제한대기 P95</span><strong id="transport-rate-p95">0ms</strong></div>
+          <div><span>빈 폴링</span><strong id="transport-empty-rate">0.0%</strong></div>
+          <div><span>오류</span><strong id="transport-errors">0</strong></div>
+          <div><span>재연결</span><strong id="transport-reconnect">0</strong></div>
         </div>
         <div id="transport-warning-lines" class="inline-log"></div>
       </section>
 
       <section class="band">
         <div class="section-head">
-          <h2>Gateway WebSocket Mock Experiment</h2>
+          <h2>게이트웨이 WebSocket Mock 실험</h2>
           <span id="transport-exp-decision" class="counter">NO_EXPERIMENT</span>
         </div>
         <div class="mini-grid command-grid">
-          <div><span>EXPERIMENT</span><strong id="transport-exp-id">-</strong></div>
-          <div><span>SCENARIO</span><strong id="transport-exp-scenario">-</strong></div>
-          <div><span>REST CMD P95</span><strong id="transport-exp-rest-cmd">0ms</strong></div>
-          <div><span>WS CMD P95</span><strong id="transport-exp-ws-cmd">0ms</strong></div>
-          <div><span>CMD DELTA</span><strong id="transport-exp-cmd-delta">0ms</strong></div>
+          <div><span>실험 ID</span><strong id="transport-exp-id">-</strong></div>
+          <div><span>시나리오</span><strong id="transport-exp-scenario">-</strong></div>
+          <div><span>REST 명령 P95</span><strong id="transport-exp-rest-cmd">0ms</strong></div>
+          <div><span>WS 명령 P95</span><strong id="transport-exp-ws-cmd">0ms</strong></div>
+          <div><span>명령 차이</span><strong id="transport-exp-cmd-delta">0ms</strong></div>
           <div><span>REST ACK P95</span><strong id="transport-exp-rest-ack">0ms</strong></div>
           <div><span>WS ACK P95</span><strong id="transport-exp-ws-ack">0ms</strong></div>
-          <div><span>ACK DELTA</span><strong id="transport-exp-ack-delta">0ms</strong></div>
-          <div><span>READY</span><strong id="transport-exp-ready">NO</strong></div>
+          <div><span>ACK 차이</span><strong id="transport-exp-ack-delta">0ms</strong></div>
+          <div><span>전환 준비</span><strong id="transport-exp-ready">NO</strong></div>
         </div>
         <div id="transport-exp-blockers" class="inline-log"></div>
       </section>
 
       <section class="band">
         <div class="section-head">
-          <h2>Strategy Runtime</h2>
+          <h2>전략 Runtime</h2>
           <div class="action-strip">
-            <button id="runtime-start" type="button">Start</button>
-            <button id="runtime-stop" type="button">Stop</button>
-            <button id="runtime-cycle" type="button">Run Once</button>
+            <button id="runtime-start" type="button">시작</button>
+            <button id="runtime-stop" type="button">중지</button>
+            <button id="runtime-cycle" type="button">1회 실행</button>
           </div>
         </div>
         <div class="mini-grid runtime-grid">
-          <div><span>ENABLED</span><strong id="runtime-enabled">NO</strong></div>
-          <div><span>RUNNING</span><strong id="runtime-running">NO</strong></div>
-          <div><span>MODE</span><strong id="runtime-mode">OBSERVE</strong></div>
-          <div><span>LAST CYCLE</span><strong id="runtime-last-cycle">-</strong></div>
-          <div><span>CYCLES</span><strong id="runtime-cycle-count">0</strong></div>
-          <div><span>FAILED</span><strong id="runtime-failed-count">0</strong></div>
-          <div><span>SKIPPED</span><strong id="runtime-skipped-count">0</strong></div>
-          <div><span>DURATION</span><strong id="runtime-duration">0ms</strong></div>
-          <div><span>ACTIVE CANDIDATES</span><strong id="runtime-active-candidates">0</strong></div>
-          <div><span>GATE RESULTS</span><strong id="runtime-gate-results">0</strong></div>
-          <div><span>VIRTUAL ORDERS</span><strong id="runtime-virtual-orders">0</strong></div>
-          <div><span>REVIEWS</span><strong id="runtime-reviews">0</strong></div>
+          <div><span>활성화</span><strong id="runtime-enabled">NO</strong></div>
+          <div><span>실행 중</span><strong id="runtime-running">NO</strong></div>
+          <div><span>모드</span><strong id="runtime-mode">OBSERVE</strong></div>
+          <div><span>최근 사이클</span><strong id="runtime-last-cycle">-</strong></div>
+          <div><span>사이클 수</span><strong id="runtime-cycle-count">0</strong></div>
+          <div><span>실패</span><strong id="runtime-failed-count">0</strong></div>
+          <div><span>건너뜀</span><strong id="runtime-skipped-count">0</strong></div>
+          <div><span>소요시간</span><strong id="runtime-duration">0ms</strong></div>
+          <div><span>활성 후보</span><strong id="runtime-active-candidates">0</strong></div>
+          <div><span>게이트 결과</span><strong id="runtime-gate-results">0</strong></div>
+          <div><span>가상 주문</span><strong id="runtime-virtual-orders">0</strong></div>
+          <div><span>리뷰</span><strong id="runtime-reviews">0</strong></div>
         </div>
         <div id="runtime-warning-lines" class="inline-log"></div>
       </section>
 
       <section class="band">
         <div class="section-head">
-          <h2>Runtime DRY_RUN Orders</h2>
+          <h2>Runtime DRY_RUN 주문 의도</h2>
           <span id="dryrun-order-policy" class="counter">disabled</span>
         </div>
         <div class="mini-grid command-grid">
-          <div><span>INTENTS</span><strong id="dryrun-order-total">0</strong></div>
-          <div><span>ENTRY / BUY</span><strong id="dryrun-order-entry-buy">0 / 0</strong></div>
-          <div><span>EXIT / SELL</span><strong id="dryrun-order-exit-sell">0 / 0</strong></div>
-          <div><span>ACCEPTED</span><strong id="dryrun-order-accepted">0</strong></div>
-          <div><span>REJECTED</span><strong id="dryrun-order-rejected">0</strong></div>
-          <div><span>DUPLICATE</span><strong id="dryrun-order-duplicate">0</strong></div>
-          <div><span>SELL ACCEPT</span><strong id="dryrun-sell-accepted">0</strong></div>
-          <div><span>SELL REJECT</span><strong id="dryrun-sell-rejected">0</strong></div>
-          <div><span>SELL DUP</span><strong id="dryrun-sell-duplicate">0</strong></div>
-          <div><span>LIVE WOULD PASS</span><strong id="dryrun-order-live-pass">0</strong></div>
-          <div><span>LIVE WOULD REJECT</span><strong id="dryrun-order-live-reject">0</strong></div>
+          <div><span>의도 수</span><strong id="dryrun-order-total">0</strong></div>
+          <div><span>진입 / 매수</span><strong id="dryrun-order-entry-buy">0 / 0</strong></div>
+          <div><span>청산 / 매도</span><strong id="dryrun-order-exit-sell">0 / 0</strong></div>
+          <div><span>승인</span><strong id="dryrun-order-accepted">0</strong></div>
+          <div><span>거부</span><strong id="dryrun-order-rejected">0</strong></div>
+          <div><span>중복</span><strong id="dryrun-order-duplicate">0</strong></div>
+          <div><span>매도 승인</span><strong id="dryrun-sell-accepted">0</strong></div>
+          <div><span>매도 거부</span><strong id="dryrun-sell-rejected">0</strong></div>
+          <div><span>매도 중복</span><strong id="dryrun-sell-duplicate">0</strong></div>
+          <div><span>LIVE 통과 예상</span><strong id="dryrun-order-live-pass">0</strong></div>
+          <div><span>LIVE 거부 예상</span><strong id="dryrun-order-live-reject">0</strong></div>
         </div>
         <div id="dryrun-reject-reasons" class="inline-log"></div>
         <div id="dryrun-exit-type-lines" class="inline-log"></div>
@@ -116,18 +116,18 @@
 
       <section class="band">
         <div class="section-head">
-          <h2>DRY_RUN Performance</h2>
+          <h2>DRY_RUN 성과 분석</h2>
           <span id="dryrun-performance-generated" class="counter">-</span>
         </div>
         <div class="mini-grid command-grid">
-          <div><span>LIFECYCLES</span><strong id="dryrun-perf-total">0</strong></div>
-          <div><span>COMPLETED</span><strong id="dryrun-perf-completed">0</strong></div>
-          <div><span>WIN RATE</span><strong id="dryrun-perf-win-rate">-</strong></div>
-          <div><span>AVG RETURN</span><strong id="dryrun-perf-avg-return">-</strong></div>
-          <div><span>FALSE POSITIVE</span><strong id="dryrun-perf-fp">0</strong></div>
-          <div><span>FALSE NEGATIVE</span><strong id="dryrun-perf-fn">0</strong></div>
-          <div><span>OPPORTUNITY LOSS</span><strong id="dryrun-perf-opp">0</strong></div>
-          <div><span>LIVE PASS WIN</span><strong id="dryrun-perf-live-pass-win">-</strong></div>
+          <div><span>라이프사이클</span><strong id="dryrun-perf-total">0</strong></div>
+          <div><span>완료</span><strong id="dryrun-perf-completed">0</strong></div>
+          <div><span>승률</span><strong id="dryrun-perf-win-rate">-</strong></div>
+          <div><span>평균 수익률</span><strong id="dryrun-perf-avg-return">-</strong></div>
+          <div><span>오탐</span><strong id="dryrun-perf-fp">0</strong></div>
+          <div><span>미탐</span><strong id="dryrun-perf-fn">0</strong></div>
+          <div><span>기회손실</span><strong id="dryrun-perf-opp">0</strong></div>
+          <div><span>LIVE 통과 승률</span><strong id="dryrun-perf-live-pass-win">-</strong></div>
         </div>
         <div id="dryrun-perf-fp-lines" class="inline-log"></div>
         <div id="dryrun-perf-fn-lines" class="inline-log"></div>
@@ -136,40 +136,40 @@
 
       <section class="band">
         <div class="section-head">
-          <h2>Gateway Command Queue</h2>
+          <h2>게이트웨이 명령 큐</h2>
           <span id="command-last-order" class="counter">-</span>
         </div>
         <div class="mini-grid command-grid">
-          <div><span>QUEUED</span><strong id="command-queued">0</strong></div>
-          <div><span>DISPATCHED</span><strong id="command-dispatched">0</strong></div>
+          <div><span>대기</span><strong id="command-queued">0</strong></div>
+          <div><span>전달됨</span><strong id="command-dispatched">0</strong></div>
           <div><span>ACKED</span><strong id="command-acked">0</strong></div>
-          <div><span>FAILED</span><strong id="command-failed">0</strong></div>
-          <div><span>EXPIRED</span><strong id="command-expired">0</strong></div>
-          <div><span>DUPLICATE</span><strong id="command-duplicate">0</strong></div>
-          <div><span>RATE LIMITED</span><strong id="command-rate-limited">0</strong></div>
-          <div><span>STALE</span><strong id="command-stale">0</strong></div>
+          <div><span>실패</span><strong id="command-failed">0</strong></div>
+          <div><span>만료</span><strong id="command-expired">0</strong></div>
+          <div><span>중복</span><strong id="command-duplicate">0</strong></div>
+          <div><span>속도 제한</span><strong id="command-rate-limited">0</strong></div>
+          <div><span>오래된 전달</span><strong id="command-stale">0</strong></div>
         </div>
       </section>
 
       <section class="band table-panel" data-table-section="transportLatency">
         <div class="section-head">
-          <h2>Transport Latency Samples</h2>
-          <span id="transportLatency-status" class="counter">idle</span>
+          <h2>전송 지연 샘플</h2>
+          <span id="transportLatency-status" class="counter">대기</span>
         </div>
         <div class="filter-grid">
-          <label>Trade Date<input data-table="transportLatency" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
-          <label>Direction<input data-table="transportLatency" data-filter="direction" placeholder="gateway_to_core" /></label>
-          <label>Message Type<input data-table="transportLatency" data-filter="message_type" placeholder="command_ack" /></label>
-          <label>Transport<input data-table="transportLatency" data-filter="transport_mode" placeholder="rest_long_poll" /></label>
-          <label>Experiment<input data-table="transportLatency" data-filter="experiment_id" /></label>
-          <label>Scenario<input data-table="transportLatency" data-filter="scenario" /></label>
-          <label>Command ID<input data-table="transportLatency" data-filter="command_id" /></label>
-          <label>Event ID<input data-table="transportLatency" data-filter="event_id" /></label>
+          <label>거래일<input data-table="transportLatency" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+          <label>방향<input data-table="transportLatency" data-filter="direction" placeholder="gateway_to_core" /></label>
+          <label>메시지 종류<input data-table="transportLatency" data-filter="message_type" placeholder="command_ack" /></label>
+          <label>전송 방식<input data-table="transportLatency" data-filter="transport_mode" placeholder="rest_long_poll" /></label>
+          <label>실험 ID<input data-table="transportLatency" data-filter="experiment_id" /></label>
+          <label>시나리오<input data-table="transportLatency" data-filter="scenario" /></label>
+          <label>명령 ID<input data-table="transportLatency" data-filter="command_id" /></label>
+          <label>이벤트 ID<input data-table="transportLatency" data-filter="event_id" /></label>
         </div>
         <div class="table-toolbar" data-table-toolbar="transportLatency"></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Time</th><th>Mode</th><th>Direction</th><th>Type</th><th>ID</th><th>Total</th><th>Long Poll</th><th>Execute</th><th>Ack</th><th>Error</th></tr></thead>
+            <thead><tr><th>시간</th><th>방식</th><th>방향</th><th>종류</th><th>ID</th><th>전체</th><th>롱폴</th><th>실행</th><th>ACK</th><th>오류</th></tr></thead>
             <tbody id="transportLatency-body"></tbody>
           </table>
         </div>
@@ -178,17 +178,17 @@
 
       <section class="band table-panel" data-table-section="transportExperiments">
         <div class="section-head">
-          <h2>WebSocket Mock Experiments</h2>
-          <span id="transportExperiments-status" class="counter">idle</span>
+          <h2>WebSocket Mock 실험 목록</h2>
+          <span id="transportExperiments-status" class="counter">대기</span>
         </div>
         <div class="filter-grid">
-          <label>Experiment<input data-table="transportExperiments" data-filter="experiment_id" /></label>
-          <label>Scenario<input data-table="transportExperiments" data-filter="scenario" /></label>
+          <label>실험 ID<input data-table="transportExperiments" data-filter="experiment_id" /></label>
+          <label>시나리오<input data-table="transportExperiments" data-filter="scenario" /></label>
         </div>
         <div class="table-toolbar" data-table-toolbar="transportExperiments"></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Experiment</th><th>Scenario</th><th>Started</th><th>Ended</th><th>REST</th><th>WS</th><th>REST Cmd</th><th>WS Cmd</th><th>Delta</th><th>Decision</th><th>Ready</th></tr></thead>
+            <thead><tr><th>실험 ID</th><th>시나리오</th><th>시작</th><th>종료</th><th>REST</th><th>WS</th><th>REST 명령</th><th>WS 명령</th><th>차이</th><th>판단</th><th>준비</th></tr></thead>
             <tbody id="transportExperiments-body"></tbody>
           </table>
         </div>
@@ -197,23 +197,23 @@
 
       <section class="band table-panel" data-table-section="dryRunOrders">
         <div class="section-head">
-          <h2>DRY_RUN Order Intents</h2>
-          <span id="dryRunOrders-status" class="counter">idle</span>
+          <h2>DRY_RUN 주문 의도 목록</h2>
+          <span id="dryRunOrders-status" class="counter">대기</span>
         </div>
         <div class="filter-grid">
-          <label>Trade Date<input data-table="dryRunOrders" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
-          <label>Status<input data-table="dryRunOrders" data-filter="status" /></label>
-          <label>Code<input data-table="dryRunOrders" data-filter="code" /></label>
-          <label>Side<input data-table="dryRunOrders" data-filter="side" placeholder="buy/sell" /></label>
-          <label>Phase<input data-table="dryRunOrders" data-filter="order_phase" placeholder="entry/exit" /></label>
-          <label>Candidate<input data-table="dryRunOrders" data-filter="candidate_id" /></label>
-          <label>Position<input data-table="dryRunOrders" data-filter="virtual_position_id" /></label>
-          <label>Exit Decision<input data-table="dryRunOrders" data-filter="exit_decision_id" /></label>
+          <label>거래일<input data-table="dryRunOrders" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+          <label>상태<input data-table="dryRunOrders" data-filter="status" /></label>
+          <label>종목코드<input data-table="dryRunOrders" data-filter="code" /></label>
+          <label>매수/매도<input data-table="dryRunOrders" data-filter="side" placeholder="buy/sell" /></label>
+          <label>단계<input data-table="dryRunOrders" data-filter="order_phase" placeholder="entry/exit" /></label>
+          <label>후보 ID<input data-table="dryRunOrders" data-filter="candidate_id" /></label>
+          <label>포지션 ID<input data-table="dryRunOrders" data-filter="virtual_position_id" /></label>
+          <label>청산 판단 ID<input data-table="dryRunOrders" data-filter="exit_decision_id" /></label>
         </div>
         <div class="table-toolbar" data-table-toolbar="dryRunOrders"></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Time</th><th>Code</th><th>Side</th><th>Phase</th><th>Qty</th><th>Price</th><th>Status</th><th>Reason</th><th>Live</th><th>Candidate</th><th>Virtual/Exit</th></tr></thead>
+            <thead><tr><th>시간</th><th>종목</th><th>매수/매도</th><th>단계</th><th>수량</th><th>가격</th><th>상태</th><th>사유</th><th>LIVE</th><th>후보</th><th>가상/청산</th></tr></thead>
             <tbody id="dryRunOrders-body"></tbody>
           </table>
         </div>
@@ -222,23 +222,23 @@
 
       <section class="band table-panel" data-table-section="dryRunPerformance">
         <div class="section-head">
-          <h2>DRY_RUN Performance Cases</h2>
-          <span id="dryRunPerformance-status" class="counter">idle</span>
+          <h2>DRY_RUN 성과 사례</h2>
+          <span id="dryRunPerformance-status" class="counter">대기</span>
         </div>
         <div class="filter-grid">
-          <label>Trade Date<input data-table="dryRunPerformance" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
-          <label>Strategy<input data-table="dryRunPerformance" data-filter="strategy_name" /></label>
-          <label>Code<input data-table="dryRunPerformance" data-filter="code" /></label>
-          <label>Theme<input data-table="dryRunPerformance" data-filter="theme_name" /></label>
-          <label>Side<input data-table="dryRunPerformance" data-filter="side" /></label>
-          <label>Phase<input data-table="dryRunPerformance" data-filter="order_phase" /></label>
-          <label>Rejected<select data-table="dryRunPerformance" data-filter="include_rejected"><option value="true">include</option><option value="false">exclude</option></select></label>
-          <label>Duplicates<select data-table="dryRunPerformance" data-filter="include_duplicates"><option value="false">exclude</option><option value="true">include</option></select></label>
+          <label>거래일<input data-table="dryRunPerformance" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+          <label>전략<input data-table="dryRunPerformance" data-filter="strategy_name" /></label>
+          <label>종목코드<input data-table="dryRunPerformance" data-filter="code" /></label>
+          <label>테마<input data-table="dryRunPerformance" data-filter="theme_name" /></label>
+          <label>매수/매도<input data-table="dryRunPerformance" data-filter="side" /></label>
+          <label>단계<input data-table="dryRunPerformance" data-filter="order_phase" /></label>
+          <label>거부 포함<select data-table="dryRunPerformance" data-filter="include_rejected"><option value="true">포함</option><option value="false">제외</option></select></label>
+          <label>중복 포함<select data-table="dryRunPerformance" data-filter="include_duplicates"><option value="false">제외</option><option value="true">포함</option></select></label>
         </div>
         <div class="table-toolbar" data-table-toolbar="dryRunPerformance"></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Code</th><th>Strategy</th><th>Theme</th><th>Quality</th><th>FP</th><th>FN/Opp</th><th>Return</th><th>Max 20m</th><th>Drawdown</th><th>Gate</th></tr></thead>
+            <thead><tr><th>종목</th><th>전략</th><th>테마</th><th>품질</th><th>오탐</th><th>미탐/기회</th><th>수익률</th><th>20분 최고</th><th>낙폭</th><th>게이트</th></tr></thead>
             <tbody id="dryRunPerformance-body"></tbody>
           </table>
         </div>
@@ -247,17 +247,17 @@
 
       <section class="band table-panel" data-table-section="falseSignals">
         <div class="section-head">
-          <h2>False Signals</h2>
-          <span id="falseSignals-status" class="counter">idle</span>
+          <h2>오탐/미탐 신호</h2>
+          <span id="falseSignals-status" class="counter">대기</span>
         </div>
         <div class="filter-grid">
-          <label>Trade Date<input data-table="falseSignals" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
-          <label>Type<select data-table="falseSignals" data-filter="type"><option value="all">all</option><option value="false_positive">false_positive</option><option value="false_negative">false_negative</option><option value="opportunity_loss">opportunity_loss</option></select></label>
+          <label>거래일<input data-table="falseSignals" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+          <label>분류<select data-table="falseSignals" data-filter="type"><option value="all">전체</option><option value="false_positive">오탐(false_positive)</option><option value="false_negative">미탐(false_negative)</option><option value="opportunity_loss">기회손실(opportunity_loss)</option></select></label>
         </div>
         <div class="table-toolbar" data-table-toolbar="falseSignals"></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Code</th><th>Signal</th><th>Subtype</th><th>Return</th><th>Max 20m</th><th>Drawdown</th><th>Reject</th><th>Gate</th><th>Lifecycle</th></tr></thead>
+            <thead><tr><th>종목</th><th>분류</th><th>세부 유형</th><th>수익률</th><th>20분 최고</th><th>낙폭</th><th>거부 사유</th><th>게이트</th><th>라이프사이클</th></tr></thead>
             <tbody id="falseSignals-body"></tbody>
           </table>
         </div>
@@ -266,20 +266,20 @@
 
       <section class="band table-panel" data-table-section="gatewayCommands">
         <div class="section-head">
-          <h2>Gateway Command History</h2>
-          <span id="gatewayCommands-status" class="counter">idle</span>
+          <h2>게이트웨이 명령 이력</h2>
+          <span id="gatewayCommands-status" class="counter">대기</span>
         </div>
         <div class="filter-grid">
-          <label>Status<input data-table="gatewayCommands" data-filter="status" /></label>
-          <label>Type<input data-table="gatewayCommands" data-filter="command_type" /></label>
-          <label>Trade Date<input data-table="gatewayCommands" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
-          <label>Command ID<input data-table="gatewayCommands" data-filter="command_id" /></label>
-          <label>Finished<select data-table="gatewayCommands" data-filter="include_finished"><option value="true">include</option><option value="false">active only</option></select></label>
+          <label>상태<input data-table="gatewayCommands" data-filter="status" /></label>
+          <label>명령 종류<input data-table="gatewayCommands" data-filter="command_type" /></label>
+          <label>거래일<input data-table="gatewayCommands" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+          <label>명령 ID<input data-table="gatewayCommands" data-filter="command_id" /></label>
+          <label>완료 명령<select data-table="gatewayCommands" data-filter="include_finished"><option value="true">포함</option><option value="false">진행 중만</option></select></label>
         </div>
         <div class="table-toolbar" data-table-toolbar="gatewayCommands"></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Command ID</th><th>Created</th><th>Type</th><th>Status</th><th>Attempts</th><th>Dedupe</th><th>Error</th></tr></thead>
+            <thead><tr><th>명령 ID</th><th>생성</th><th>종류</th><th>상태</th><th>시도</th><th>중복키</th><th>오류</th></tr></thead>
             <tbody id="gatewayCommands-body"></tbody>
           </table>
         </div>
@@ -288,38 +288,38 @@
 
       <section class="band two-col">
         <div>
-          <div class="section-head"><h2>Candidates / Gates</h2><span id="candidate-total" class="counter">0</span></div>
+          <div class="section-head"><h2>후보 / 게이트</h2><span id="candidate-total" class="counter">0</span></div>
           <div class="mini-grid">
-            <div><span>READY</span><strong id="candidate-ready">0</strong></div>
-            <div><span>BLOCKED</span><strong id="candidate-blocked">0</strong></div>
-            <div><span>WAIT</span><strong id="candidate-wait">0</strong></div>
+            <div><span>준비</span><strong id="candidate-ready">0</strong></div>
+            <div><span>차단</span><strong id="candidate-blocked">0</strong></div>
+            <div><span>대기</span><strong id="candidate-wait">0</strong></div>
           </div>
-          <div class="table-wrap"><table><thead><tr><th>Code</th><th>State</th><th>Theme</th><th>Hybrid</th><th>Reasons</th></tr></thead><tbody id="candidate-rows"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>종목</th><th>상태</th><th>테마</th><th>하이브리드</th><th>사유</th></tr></thead><tbody id="candidate-rows"></tbody></table></div>
         </div>
         <div>
-          <div class="section-head"><h2>Themes</h2><span id="top-theme" class="counter">-</span></div>
+          <div class="section-head"><h2>테마</h2><span id="top-theme" class="counter">-</span></div>
           <div class="mini-grid">
-            <div><span>ACTIVE</span><strong id="theme-active">0</strong></div>
+            <div><span>활성</span><strong id="theme-active">0</strong></div>
             <div><span>WATCH</span><strong id="theme-watch">0</strong></div>
-            <div><span>Top Score</span><strong id="theme-top-score">0</strong></div>
+            <div><span>최고 점수</span><strong id="theme-top-score">0</strong></div>
           </div>
-          <div class="table-wrap"><table><thead><tr><th>Rank</th><th>Theme</th><th>Score</th><th>Breadth</th><th>Leader Gap</th><th>Top3</th></tr></thead><tbody id="theme-rows"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>순위</th><th>테마</th><th>점수</th><th>확산도</th><th>대장주 격차</th><th>상위3 집중</th></tr></thead><tbody id="theme-rows"></tbody></table></div>
         </div>
       </section>
 
       <section class="band two-col">
         <div>
-          <div class="section-head"><h2>Orders / Positions</h2><span id="order-count" class="counter">0</span></div>
-          <div class="table-wrap"><table><thead><tr><th>Time</th><th>Code</th><th>Side</th><th>Qty</th><th>Price</th><th>Status</th></tr></thead><tbody id="order-rows"></tbody></table></div>
+          <div class="section-head"><h2>주문 / 포지션</h2><span id="order-count" class="counter">0</span></div>
+          <div class="table-wrap"><table><thead><tr><th>시간</th><th>종목</th><th>매수/매도</th><th>수량</th><th>가격</th><th>상태</th></tr></thead><tbody id="order-rows"></tbody></table></div>
         </div>
         <div>
-          <div class="section-head"><h2>Reviews</h2><span id="review-count" class="counter">0</span></div>
-          <div class="table-wrap"><table><thead><tr><th>Code</th><th>Status</th><th>5m</th><th>10m</th><th>20m</th><th>Flags</th></tr></thead><tbody id="review-rows"></tbody></table></div>
+          <div class="section-head"><h2>리뷰</h2><span id="review-count" class="counter">0</span></div>
+          <div class="table-wrap"><table><thead><tr><th>종목</th><th>상태</th><th>5분</th><th>10분</th><th>20분</th><th>플래그</th></tr></thead><tbody id="review-rows"></tbody></table></div>
         </div>
       </section>
 
       <section class="band">
-        <div class="section-head"><h2>Logs</h2><span id="log-count" class="counter">0</span></div>
+        <div class="section-head"><h2>로그</h2><span id="log-count" class="counter">0</span></div>
         <div id="log-lines" class="log"></div>
       </section>
     </main>
@@ -327,12 +327,12 @@
     <div id="detail-backdrop" class="detail-backdrop hidden"></div>
     <aside id="detail-drawer" class="detail-drawer" aria-hidden="true">
       <div class="detail-head">
-        <h2 id="detail-title">Detail</h2>
-        <button id="detail-close" type="button" aria-label="Close detail">Close</button>
+        <h2 id="detail-title">상세</h2>
+        <button id="detail-close" type="button" aria-label="상세 닫기">닫기</button>
       </div>
       <div id="detail-summary" class="detail-summary"></div>
       <details open>
-        <summary>Raw JSON</summary>
+        <summary>원본 JSON</summary>
         <pre id="detail-json" class="json-preview">{}</pre>
       </details>
     </aside>

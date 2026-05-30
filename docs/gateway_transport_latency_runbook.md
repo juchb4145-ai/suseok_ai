@@ -133,13 +133,13 @@ Invoke-RestMethod -Method Post `
 Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/experiments/exp-001
 ```
 
-Dashboard:
+대시보드:
 
-- Open `/`.
-- Use **Transport Latency Samples** for paginated sample browsing.
-- Filter by `command_id`, `event_id`, `direction`, `message_type`, `transport_mode`, `experiment_id`, or `scenario`.
-- Click a row to open the latency sample detail drawer.
-- Use **Gateway Command History** with the same `command_id` when command lifecycle context is needed.
+- `/`를 연다.
+- **전송 지연 샘플** 표에서 샘플을 페이지 단위로 탐색한다.
+- `command_id`, `event_id`, `direction`, `message_type`, `transport_mode`, `experiment_id`, `scenario`로 필터링한다.
+- 행을 클릭하면 지연 샘플 상세 패널이 열린다.
+- 명령 상태 전이가 필요하면 같은 `command_id`로 **게이트웨이 명령 이력**도 함께 확인한다.
 
 Exports are written to:
 

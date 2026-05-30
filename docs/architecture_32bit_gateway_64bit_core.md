@@ -273,10 +273,10 @@ PR-9:
 
 PR-10:
 
-- Dashboard summary cards remain WebSocket snapshot-driven.
-- Transport, experiment, DRY_RUN order, performance, false-signal, and command-history tables use REST pagination.
-- Row drilldowns fetch detail APIs instead of embedding large datasets in `/api/snapshot`.
-- No order execution or WebSocket transport switch controls are added to the dashboard.
+- Dashboard 요약 카드는 WebSocket snapshot 기반으로 유지한다.
+- 전송 지연, WebSocket mock 실험, DRY_RUN 주문, 성과, 오탐/미탐, 명령 이력 표는 REST 페이지네이션을 사용한다.
+- 행 상세보기는 `/api/snapshot`에 큰 데이터를 넣지 않고 각 상세 API를 호출한다.
+- 대시보드에는 주문 실행 버튼이나 WebSocket 전송 전환 버튼을 추가하지 않는다.
 
 PR-5:
 

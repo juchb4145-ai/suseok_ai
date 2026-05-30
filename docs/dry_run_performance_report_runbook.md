@@ -76,15 +76,15 @@ The report includes counts and samples for:
 
 `rebuild` and `export` require the local token because they create stored reports or files.
 
-## Dashboard
+## 대시보드
 
-PR-10 adds paginated dashboard drilldowns:
+PR-10은 대시보드에 페이지네이션 기반 상세 탐색을 추가한다.
 
-- **DRY_RUN Order Intents** for entry/buy and exit/sell intent browsing.
-- **DRY_RUN Performance Cases** for lifecycle-level performance rows.
-- **False Signals** for false positive, false negative, and opportunity-loss rows.
+- **DRY_RUN 주문 의도 목록**: entry/buy와 exit/sell 의도 확인
+- **DRY_RUN 성과 사례**: 라이프사이클 단위 성과 행 확인
+- **오탐/미탐 신호**: false positive, false negative, opportunity loss 행 확인
 
-Use filters to narrow by `trade_date`, `code`, `theme_name`, `strategy_name`, `side`, or `order_phase`. Click a row to open the detail drawer with compact fields and raw JSON. Summary cards continue to update through `/ws/dashboard`, while table pages fetch REST APIs independently.
+`trade_date`, `code`, `theme_name`, `strategy_name`, `side`, `order_phase` 필터로 범위를 좁힌다. 행을 클릭하면 핵심 필드와 원본 JSON을 보여주는 상세 패널이 열린다. 요약 카드는 계속 `/ws/dashboard`로 갱신되고, 표 데이터는 각 REST API에서 독립적으로 가져온다.
 
 ## Export Location
 
