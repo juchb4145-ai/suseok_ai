@@ -201,6 +201,41 @@ class TradingDatabase:
                 message TEXT NOT NULL DEFAULT '',
                 details_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS hybrid_gate_validation_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                stock_code TEXT NOT NULL,
+                stock_name TEXT NOT NULL DEFAULT '',
+                candidate_source TEXT NOT NULL DEFAULT '',
+                hybrid_status TEXT NOT NULL,
+                hybrid_score REAL NOT NULL DEFAULT 0,
+                hybrid_position_tier TEXT NOT NULL DEFAULT '',
+                hybrid_primary_reason TEXT NOT NULL DEFAULT '',
+                hybrid_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                theme_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                theme_status TEXT NOT NULL DEFAULT '',
+                theme_score REAL NOT NULL DEFAULT 0,
+                theme_rank INTEGER NOT NULL DEFAULT 0,
+                theme_rank_delta_1m INTEGER NOT NULL DEFAULT 0,
+                theme_rank_delta_5m INTEGER NOT NULL DEFAULT 0,
+                theme_breadth REAL NOT NULL DEFAULT 0,
+                rising_count INTEGER NOT NULL DEFAULT 0,
+                total_count INTEGER NOT NULL DEFAULT 0,
+                leader_gap REAL NOT NULL DEFAULT 0,
+                top3_concentration REAL NOT NULL DEFAULT 0,
+                rank_in_theme INTEGER NOT NULL DEFAULT 0,
+                leader_type TEXT NOT NULL DEFAULT '',
+                membership_score REAL NOT NULL DEFAULT 0,
+                relation_type TEXT NOT NULL DEFAULT '',
+                source_count INTEGER NOT NULL DEFAULT 0,
+                entry_timing_score REAL NOT NULL DEFAULT 0,
+                chase_risk TEXT NOT NULL DEFAULT '',
+                market_score REAL NOT NULL DEFAULT 0,
+                risk_score REAL NOT NULL DEFAULT 0,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
             CREATE TABLE IF NOT EXISTS candidates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trade_date TEXT NOT NULL,
@@ -386,6 +421,20 @@ class TradingDatabase:
                 ON dynamic_theme_clusters(status);
             CREATE INDEX IF NOT EXISTS idx_theme_source_sync_runs_source_started
                 ON theme_source_sync_runs(source, started_at);
+            CREATE INDEX IF NOT EXISTS idx_hybrid_validation_trade_date
+                ON hybrid_gate_validation_events(trade_date);
+            CREATE INDEX IF NOT EXISTS idx_hybrid_validation_stock_code
+                ON hybrid_gate_validation_events(stock_code);
+            CREATE INDEX IF NOT EXISTS idx_hybrid_validation_status
+                ON hybrid_gate_validation_events(hybrid_status);
+            CREATE INDEX IF NOT EXISTS idx_hybrid_validation_theme_id
+                ON hybrid_gate_validation_events(theme_id);
+            CREATE INDEX IF NOT EXISTS idx_hybrid_validation_score
+                ON hybrid_gate_validation_events(hybrid_score);
+            CREATE INDEX IF NOT EXISTS idx_hybrid_validation_membership
+                ON hybrid_gate_validation_events(membership_score);
+            CREATE INDEX IF NOT EXISTS idx_hybrid_validation_reason
+                ON hybrid_gate_validation_events(hybrid_primary_reason);
             """
         )
         self._ensure_column("indicator_snapshots", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")

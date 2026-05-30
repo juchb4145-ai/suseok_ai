@@ -14,6 +14,7 @@ from trading.strategy.gates import (
     ThemeStrengthGate,
 )
 from trading.strategy.hybrid_gate import HybridDynamicThemeGate, HybridGateConfig, HybridGateStatus, hybrid_decision_flat_fields
+from trading.strategy.hybrid_validation import HybridValidationConfig, build_validation_event
 from trading.strategy.indicators import IndicatorCalculator
 from trading.strategy.intraday import IntradayStateTracker
 from trading.strategy.market_index import MarketIndexStore
@@ -55,6 +56,7 @@ class GatePipeline:
         intraday_tracker: IntradayStateTracker,
         market_index_store: MarketIndexStore,
         settings: Optional[StrategyRuntimeSettings] = None,
+        hybrid_validation_repository=None,
     ) -> None:
         self.theme_context_provider = theme_context_provider
         self.market_data = market_data
@@ -64,6 +66,8 @@ class GatePipeline:
         self.market_index_store = market_index_store
         self.settings = settings or legacy_strategy_runtime_settings()
         self.hybrid_gate = HybridDynamicThemeGate(HybridGateConfig.from_settings(self.settings))
+        self.hybrid_validation_config = HybridValidationConfig.from_settings(self.settings)
+        self.hybrid_validation_repository = hybrid_validation_repository
 
     def evaluate(
         self,
@@ -235,6 +239,7 @@ class GatePipeline:
             "legacy_strategy_eligible": legacy_strategy_eligible,
             "legacy_block_type": legacy_block_type.value,
             "legacy_sub_status": legacy_sub_status,
+            "base_price": snapshot.price if snapshot else 0,
             **hybrid_flat,
         }, self.settings)
         details = standardize_details(
@@ -248,6 +253,20 @@ class GatePipeline:
             legacy_score=legacy_final_score,
             new_score=final_score,
         )
+        if self.hybrid_validation_repository is not None and self.hybrid_validation_config.enabled:
+            try:
+                event = build_validation_event(
+                    candidate=candidate,
+                    decision=hybrid_decision,
+                    ts=snapshot.created_at if snapshot else "",
+                )
+                event.details_json["base_price"] = snapshot.price if snapshot else 0
+                event.details_json["pipeline_details"] = dict(details)
+                self.hybrid_validation_repository.save_event(event)
+                details["hybrid_validation_event_saved"] = True
+            except Exception as exc:
+                details["hybrid_validation_event_saved"] = False
+                details["hybrid_validation_event_error"] = str(exc)
         final_decision = GateDecision(
             candidate_id=candidate.id,
             gate_name="FinalGrade",

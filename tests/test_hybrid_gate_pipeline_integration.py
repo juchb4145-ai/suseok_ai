@@ -1,6 +1,8 @@
 from copy import deepcopy
 
+from storage.db import TradingDatabase
 from trading.strategy.candles import CandleBuilder
+from trading.strategy.hybrid_validation import HybridValidationRepository
 from trading.strategy.indicators import IndicatorCalculator
 from trading.strategy.intraday import IntradayStateTracker
 from trading.strategy.market_data import MarketDataStore
@@ -59,6 +61,27 @@ def test_pipeline_can_apply_hybrid_decision_when_observe_only_false():
     assert result.details["hybrid_status"] == "READY"
 
 
+def test_pipeline_saves_hybrid_validation_event_when_repository_is_configured(tmp_path):
+    db = TradingDatabase(str(tmp_path / "hybrid_events.sqlite3"))
+    pipeline = _pipeline(hybrid_validation_repository=HybridValidationRepository(db))
+    result = pipeline._evaluate_candidate_theme(
+        Candidate(id=1, trade_date="2026-05-30", code="000001", name="MOCK-LEADER"),
+        _context(),
+        ThemeStrengthResult(theme_id="furiosa_ai", theme_name="퓨리오사AI", score=35, grade="C"),
+        _leadership(),
+        _MarketPass(),
+        _ThemePullbackPass(),
+        _StockPullbackPass(),
+    )
+
+    events = HybridValidationRepository(db).list_events(trade_date="2026-05-30")
+    assert result.details["hybrid_validation_event_saved"] is True
+    assert len(events) == 1
+    assert events[0].hybrid_status == "READY"
+    assert events[0].theme_id == "furiosa_ai"
+    db.close()
+
+
 def test_pipeline_apply_mode_can_block_with_hybrid_decision():
     settings_json = deepcopy(LEGACY_DEFAULT_SETTINGS)
     settings_json["hybrid_gate"]["observe_only"] = False
@@ -79,7 +102,7 @@ def test_pipeline_apply_mode_can_block_with_hybrid_decision():
     assert "LOW_MEMBERSHIP_SCORE" in result.details["hybrid_reason_codes"]
 
 
-def _pipeline(settings=None):
+def _pipeline(settings=None, hybrid_validation_repository=None):
     market_data = MarketDataStore()
     candle_builder = CandleBuilder()
     return GatePipeline(
@@ -90,6 +113,7 @@ def _pipeline(settings=None):
         intraday_tracker=IntradayStateTracker(),
         market_index_store=MarketIndexStore(),
         settings=settings,
+        hybrid_validation_repository=hybrid_validation_repository,
     )
 
 

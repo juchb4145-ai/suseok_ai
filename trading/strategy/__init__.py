@@ -28,6 +28,17 @@ from trading.strategy.hybrid_gate import (
     HybridGateStatus,
     HybridPositionTier,
 )
+from trading.strategy.hybrid_validation import (
+    HybridOutcomeLabel,
+    HybridReasonPerformance,
+    HybridScoreBandPerformance,
+    HybridValidationConfig,
+    HybridValidationEvent,
+    HybridValidationReportExporter,
+    HybridValidationRepository,
+    HybridValidationSummary,
+    HybridWatchPolicyPerformance,
+)
 from trading.strategy.holding import HoldingProvider, StaticHoldingProvider
 from trading.strategy.indicators import IndicatorCalculator, PreviousDayLevelProvider
 from trading.strategy.intraday import IntradayStateTracker
@@ -114,7 +125,16 @@ __all__ = [
     "HybridGateConfig",
     "HybridGateDecision",
     "HybridGateStatus",
+    "HybridOutcomeLabel",
     "HybridPositionTier",
+    "HybridReasonPerformance",
+    "HybridScoreBandPerformance",
+    "HybridValidationConfig",
+    "HybridValidationEvent",
+    "HybridValidationReportExporter",
+    "HybridValidationRepository",
+    "HybridValidationSummary",
+    "HybridWatchPolicyPerformance",
     "IndicatorSnapshot",
     "IndicatorCalculator",
     "IndexCodeMapper",

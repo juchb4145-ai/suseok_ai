@@ -61,6 +61,7 @@ def build_observe_runtime(client, db: TradingDatabase):
     from trading.strategy.runtime_settings import StrategyRuntimeSettingsRepository
     from trading.strategy.runtime import StrategyRuntime
     from trading.strategy.virtual_orders import VirtualOrderService
+    from trading.strategy.hybrid_validation import HybridValidationRepository
     from trading.theme_engine.context_provider import DynamicThemeContextProvider
     from trading.theme_engine.repository import ThemeEngineRepository
 
@@ -90,6 +91,7 @@ def build_observe_runtime(client, db: TradingDatabase):
         IntradayStateTracker(settings),
         market_index_store,
         settings,
+        hybrid_validation_repository=HybridValidationRepository(db),
     )
     condition_adapter = KiwoomConditionAdapter(client, ConditionProfileRepository(db))
     candidate_collector.attach(condition_adapter)
