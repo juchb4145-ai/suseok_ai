@@ -48,13 +48,22 @@ Responsibilities:
 - Candidate lifecycle and state.
 - Hybrid gate decisions.
 - Theme engine snapshots.
-- Strategy runtime orchestration.
+- Strategy runtime orchestration and OBSERVE loop execution.
 - Order decision and `OrderGuard`/risk checks before any real order command is queued.
 - DB persistence.
 - Review and performance validation.
 - Web dashboard API and WebSocket snapshots.
 
 The Core depends on `trading.broker.*` protocol models, not on `kiwoom.client`.
+
+`StrategyRuntime` now runs inside the 64bit Core API under `RuntimeSupervisor`. It uses an API-only factory and adapters:
+
+- Gateway `price_tick` events update Core market data and candles.
+- Realtime register/remove requests are enqueued as `GatewayCommand`.
+- Condition load/send/stop requests are enqueued as `GatewayCommand`.
+- Runtime order behavior stays OBSERVE/virtual only in PR-4.
+
+The 32bit Gateway remains Kiwoom communication only.
 
 ## Broker Domain Layer
 
@@ -175,6 +184,7 @@ WebSocket command transport is still deferred because PR-2/PR-3 priority is corr
 - Gateway status exposes heartbeat age, stale state, Kiwoom login state, and orderable flag.
 - `/api/orders/enqueue` is the only Core API path that can create a real `send_order` command.
 - `OBSERVE` never queues real order commands. `DRY_RUN` accepts only dry-run records. `LIVE` requires `TRADING_MODE=LIVE` and `TRADING_ALLOW_LIVE=1`.
+- Runtime auto orders are disabled in PR-4. StrategyRuntime remains OBSERVE even if Core trading mode is LIVE.
 
 ## Persistence and Performance
 
@@ -220,9 +230,17 @@ PR-3:
 - No automatic resend for `DISPATCHED` order commands.
 - DB-backed command history/detail/status APIs.
 
+PR-4:
+
+- StrategyRuntime loop inside 64bit Core API.
+- RuntimeSupervisor start/stop/manual cycle/status APIs.
+- Gateway event to market-data bridge.
+- Realtime/condition requests through GatewayCommand queue.
+- Runtime dashboard status.
+
 Next:
 
+- Runtime DRY_RUN order enqueue adapter.
 - Real TR response row extraction and request correlation.
-- StrategyRuntime process loop inside Core.
 - Gateway WebSocket channel when long-poll latency is measured as a bottleneck.
 - Dashboard screen hardening and richer order/position views.

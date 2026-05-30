@@ -41,6 +41,34 @@
 
       <section class="band">
         <div class="section-head">
+          <h2>Strategy Runtime</h2>
+          <div class="action-strip">
+            <button id="runtime-start" type="button">Start</button>
+            <button id="runtime-stop" type="button">Stop</button>
+            <button id="runtime-cycle" type="button">Run Once</button>
+          </div>
+        </div>
+        <div class="mini-grid runtime-grid">
+          <div><span>ENABLED</span><strong id="runtime-enabled">NO</strong></div>
+          <div><span>RUNNING</span><strong id="runtime-running">NO</strong></div>
+          <div><span>MODE</span><strong id="runtime-mode">OBSERVE</strong></div>
+          <div><span>LAST CYCLE</span><strong id="runtime-last-cycle">-</strong></div>
+          <div><span>CYCLES</span><strong id="runtime-cycle-count">0</strong></div>
+          <div><span>FAILED</span><strong id="runtime-failed-count">0</strong></div>
+          <div><span>SKIPPED</span><strong id="runtime-skipped-count">0</strong></div>
+          <div><span>DURATION</span><strong id="runtime-duration">0ms</strong></div>
+        </div>
+        <div class="mini-grid runtime-grid">
+          <div><span>ACTIVE CANDIDATES</span><strong id="runtime-active-candidates">0</strong></div>
+          <div><span>GATE RESULTS</span><strong id="runtime-gate-results">0</strong></div>
+          <div><span>VIRTUAL ORDERS</span><strong id="runtime-virtual-orders">0</strong></div>
+          <div><span>REVIEWS</span><strong id="runtime-reviews">0</strong></div>
+        </div>
+        <div id="runtime-warning-lines" class="inline-log"></div>
+      </section>
+
+      <section class="band">
+        <div class="section-head">
           <h2>Gateway Command Queue</h2>
           <span id="command-last-order" class="counter">-</span>
         </div>

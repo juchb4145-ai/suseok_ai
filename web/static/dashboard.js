@@ -46,6 +46,7 @@ function render(snapshot) {
   const core = snapshot.core || {};
   const gateway = snapshot.gateway || {};
   const commands = snapshot.commands || {};
+  const runtime = snapshot.runtime || {};
   const candidates = snapshot.candidates || { summary: {}, items: [] };
   const themes = snapshot.themes || { summary: {}, items: [] };
   const orders = snapshot.orders || { summary: {}, order_results: [], executions: [] };
@@ -65,6 +66,27 @@ function render(snapshot) {
 
   cls("gateway-state", `pill ${gateway.heartbeat_ok ? "ok" : gateway.connected ? "warn" : "bad"}`);
   cls("orderable-state", `pill ${gateway.orderable ? "ok" : "muted"}`);
+
+  text("runtime-enabled", runtime.enabled ? "YES" : "NO");
+  text("runtime-running", runtime.running ? "YES" : "NO");
+  text("runtime-mode", runtime.mode || "OBSERVE");
+  text("runtime-last-cycle", runtime.last_cycle_at || "-");
+  text("runtime-cycle-count", runtime.cycle_count || 0);
+  text("runtime-failed-count", runtime.failed_cycle_count || 0);
+  text("runtime-skipped-count", runtime.skipped_cycle_count || 0);
+  text("runtime-duration", `${runtime.last_cycle_duration_ms || 0}ms`);
+  text("runtime-active-candidates", runtime.active_candidate_count || 0);
+  text("runtime-gate-results", runtime.gate_result_count || 0);
+  text("runtime-virtual-orders", runtime.virtual_order_count || 0);
+  text("runtime-reviews", runtime.review_count || 0);
+  const runtimeWarnings = [
+    runtime.last_error ? `ERROR: ${runtime.last_error}` : "",
+    ...(runtime.warnings || []),
+  ].filter(Boolean);
+  const runtimeNode = document.getElementById("runtime-warning-lines");
+  if (runtimeNode) {
+    runtimeNode.innerHTML = runtimeWarnings.length ? runtimeWarnings.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">No runtime warnings</span>';
+  }
 
   text("command-queued", commands.queued_count || 0);
   text("command-dispatched", commands.dispatched_count || 0);
@@ -174,6 +196,20 @@ async function pollSnapshot() {
   render(await response.json());
 }
 
+async function runtimeCommand(action) {
+  let token = localStorage.getItem("TRADING_CORE_TOKEN") || "";
+  if (!token) {
+    token = window.prompt("TRADING_CORE_TOKEN") || "";
+    if (token) localStorage.setItem("TRADING_CORE_TOKEN", token);
+  }
+  if (!token) return;
+  await fetch(`/api/runtime/${action}`, {
+    method: "POST",
+    headers: { "X-Local-Token": token },
+  });
+  await pollSnapshot();
+}
+
 function startPolling() {
   if (state.pollTimer) return;
   pollSnapshot().catch(() => {});
@@ -197,3 +233,7 @@ function connectWebSocket() {
 
 connectWebSocket();
 setTimeout(startPolling, 2000);
+
+document.getElementById("runtime-start")?.addEventListener("click", () => runtimeCommand("start").catch(() => {}));
+document.getElementById("runtime-stop")?.addEventListener("click", () => runtimeCommand("stop").catch(() => {}));
+document.getElementById("runtime-cycle")?.addEventListener("click", () => runtimeCommand("cycle").catch(() => {}));

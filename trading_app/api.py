@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from collections import Counter
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ from trading.strategy.candidates import CandidateCollector
 from trading.strategy.models import CandidateState
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
+from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
 from trading_app.websocket import DashboardConnectionManager
 
@@ -39,7 +41,17 @@ from trading_app.websocket import DashboardConnectionManager
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = PROJECT_ROOT / "web"
 
-app = FastAPI(title="Trading Core API", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await runtime_supervisor.startup()
+    try:
+        yield
+    finally:
+        await runtime_supervisor.shutdown()
+
+
+app = FastAPI(title="Trading Core API", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(WEB_ROOT / "static")), name="static")
 templates = Jinja2Templates(directory=str(WEB_ROOT / "templates"))
 
@@ -59,6 +71,13 @@ def _build_gateway_state() -> GatewayStateStore:
 
 gateway_state = _build_gateway_state()
 dashboard_connections = DashboardConnectionManager()
+
+
+def _build_runtime_supervisor() -> RuntimeSupervisor:
+    return RuntimeSupervisor(settings=get_settings(), gateway_state=gateway_state)
+
+
+runtime_supervisor = _build_runtime_supervisor()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -91,6 +110,10 @@ def api_status() -> dict[str, Any]:
             "command_dedupe_retention_sec": settings.command_dedupe_retention_sec,
             "command_history_retention_sec": settings.command_history_retention_sec,
             "command_recovery_expire_stale_dispatched": settings.command_recovery_expire_stale_dispatched,
+            "runtime_enabled": settings.runtime_enabled,
+            "runtime_auto_start": settings.runtime_auto_start,
+            "runtime_mode": settings.runtime_mode,
+            "runtime_evaluation_interval_sec": settings.runtime_evaluation_interval_sec,
             "timestamp": utc_timestamp(),
         },
         "gateway": gateway_state.snapshot().to_dict(),
@@ -109,6 +132,41 @@ def gateway_status() -> dict[str, Any]:
     payload = gateway_state.snapshot().to_dict()
     payload["commands"] = gateway_state.command_snapshot()
     return payload
+
+
+@app.get("/api/runtime/status")
+def runtime_status() -> dict[str, Any]:
+    return runtime_supervisor.status()
+
+
+@app.post("/api/runtime/start")
+async def runtime_start(_: None = Depends(verify_gateway_token)) -> dict[str, Any]:
+    return await runtime_supervisor.start()
+
+
+@app.post("/api/runtime/stop")
+async def runtime_stop(_: None = Depends(verify_gateway_token)) -> dict[str, Any]:
+    return await runtime_supervisor.stop()
+
+
+@app.post("/api/runtime/restart")
+async def runtime_restart(_: None = Depends(verify_gateway_token)) -> dict[str, Any]:
+    return await runtime_supervisor.restart()
+
+
+@app.post("/api/runtime/cycle")
+async def runtime_cycle(_: None = Depends(verify_gateway_token)) -> dict[str, Any]:
+    return await runtime_supervisor.run_once(reason="manual")
+
+
+@app.get("/api/runtime/snapshot")
+def runtime_snapshot() -> dict[str, Any]:
+    return runtime_supervisor.snapshot()
+
+
+@app.get("/api/runtime/readiness")
+async def runtime_readiness() -> dict[str, Any]:
+    return await runtime_supervisor.readiness()
 
 
 @app.get("/api/candidates")
@@ -172,6 +230,7 @@ async def gateway_events(
             _persist_gateway_event(db, event)
         finally:
             close_database(db)
+        await runtime_supervisor.handle_gateway_event(event)
     await dashboard_connections.broadcast_json({"type": "snapshot", "snapshot": snapshot()})
     return {"accepted": accepted, "event_id": event.event_id, "type": event.type}
 
@@ -424,11 +483,13 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     orders_payload = build_orders_snapshot(db)
     reviews_payload = build_reviews_snapshot(db)
     logs_payload = build_logs_snapshot(db)
+    runtime_payload = _runtime_dashboard_payload(runtime_supervisor.status())
     return {
         "timestamp": utc_timestamp(),
         "core": status_payload["core"],
         "gateway": status_payload["gateway"],
         "commands": commands_payload,
+        "runtime": runtime_payload,
         "safety": status_payload["safety"],
         "candidates": candidates_payload,
         "themes": themes_payload,
@@ -662,6 +723,34 @@ def _handle_command_ack(db: TradingDatabase, event: GatewayEvent) -> None:
     order_result = payload.get("order_result")
     if command_type == "send_order" and isinstance(order_result, dict):
         db.save_order_result(BrokerOrderResult.from_dict(order_result))
+
+
+def _runtime_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
+    snapshot_payload = dict(status.get("latest_snapshot") or {})
+    readiness = dict(status.get("readiness") or {})
+    return {
+        "enabled": status.get("enabled", False),
+        "running": status.get("running", False),
+        "mode": status.get("mode", "OBSERVE"),
+        "order_policy": status.get("order_policy", "OBSERVE_VIRTUAL_ONLY"),
+        "last_cycle_at": status.get("last_cycle_at", ""),
+        "next_cycle_at": status.get("next_cycle_at", ""),
+        "cycle_count": status.get("cycle_count", 0),
+        "failed_cycle_count": status.get("failed_cycle_count", 0),
+        "skipped_cycle_count": status.get("skipped_cycle_count", 0),
+        "manual_cycle_count": status.get("manual_cycle_count", 0),
+        "last_cycle_duration_ms": status.get("last_cycle_duration_ms", 0),
+        "active_candidate_count": snapshot_payload.get("active_candidate_count", 0),
+        "gate_result_count": snapshot_payload.get("gate_result_count", 0),
+        "entry_plan_count": snapshot_payload.get("entry_plan_count", 0),
+        "virtual_order_count": snapshot_payload.get("virtual_order_count", 0),
+        "review_count": snapshot_payload.get("review_count", 0),
+        "market_session_status": readiness.get("market_session_status", ""),
+        "data_warmup_status": readiness.get("data_warmup_status", ""),
+        "gate_skip_reason": readiness.get("gate_skip_reason", ""),
+        "warnings": (status.get("warnings") or [])[-10:],
+        "last_error": status.get("last_error", ""),
+    }
 
 
 def _command_history_item(item: dict[str, Any], *, include_payload: bool) -> dict[str, Any]:

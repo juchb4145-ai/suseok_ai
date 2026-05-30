@@ -31,6 +31,13 @@ Common Core environment variables:
 - `TRADING_COMMAND_DEDUPE_RETENTION_SEC`: order command dedupe retention, default `86400`.
 - `TRADING_COMMAND_HISTORY_RETENTION_SEC`: finished command history retention target, default `604800`.
 - `TRADING_COMMAND_RECOVERY_EXPIRE_STALE_DISPATCHED`: mark stale dispatched commands expired on recovery when `1`.
+- `TRADING_RUNTIME_ENABLED`: enable Core StrategyRuntime supervisor, default `0`.
+- `TRADING_RUNTIME_AUTO_START`: start runtime on API startup, default `0`.
+- `TRADING_RUNTIME_MODE`: runtime policy, `OBSERVE` or `DRY_RUN`; runtime internals stay OBSERVE in PR-4.
+- `TRADING_RUNTIME_EVALUATION_INTERVAL_SEC`: runtime loop interval.
+- `TRADING_RUNTIME_CYCLE_TIMEOUT_SEC`: cycle timeout.
+- `TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS`: reserved for dry-run order adapter, default `0`.
+- `TRADING_RUNTIME_ALLOW_LIVE_ORDERS`: live auto order flag, default `0`; PR-4 still blocks runtime live orders.
 
 Dashboard:
 
@@ -58,6 +65,13 @@ Core APIs:
 - `POST /api/gateway/commands/{command_id}/cancel`
 - `POST /api/gateway/commands/prune`
 - `POST /api/orders/enqueue`
+- `GET /api/runtime/status`
+- `POST /api/runtime/start`
+- `POST /api/runtime/stop`
+- `POST /api/runtime/restart`
+- `POST /api/runtime/cycle`
+- `GET /api/runtime/snapshot`
+- `GET /api/runtime/readiness`
 
 Order enqueue example:
 
@@ -78,6 +92,23 @@ $body = @{
 } | ConvertTo-Json
 
 Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/orders/enqueue -Body $body -ContentType "application/json"
+```
+
+Runtime examples:
+
+```powershell
+$env:TRADING_RUNTIME_ENABLED = "0"
+python -m uvicorn trading_app.api:app --host 127.0.0.1 --port 8000
+
+$env:TRADING_RUNTIME_ENABLED = "1"
+$env:TRADING_RUNTIME_AUTO_START = "0"
+$env:TRADING_MODE = "OBSERVE"
+python -m uvicorn trading_app.api:app --host 127.0.0.1 --port 8000
+
+$env:TRADING_RUNTIME_ENABLED = "1"
+$env:TRADING_RUNTIME_AUTO_START = "1"
+$env:TRADING_RUNTIME_MODE = "OBSERVE"
+python -m uvicorn trading_app.api:app --host 127.0.0.1 --port 8000
 ```
 
 ## 32bit Kiwoom Gateway
@@ -128,6 +159,7 @@ py -3.9-32 apps/legacy_pyqt_app.py --mock
 - Gateway polling does not mean success. Only `command_ack status=ACKED` marks a command successful.
 - Duplicate `idempotency_key` or deterministic order dedupe keys are rejected while active or retained in SQLite.
 - Core restart restores valid `QUEUED` commands only. `DISPATCHED` order commands are not automatically resent.
+- StrategyRuntime auto LIVE orders are not enabled in PR-4. Runtime uses GatewayCommand for realtime/condition requests and virtual order/review for strategy flow.
 
 More detail:
 
@@ -135,3 +167,4 @@ More detail:
 - [Runbook](docs/runbook_32bit_gateway_64bit_core.md)
 - [Gateway Command Queue Runbook](docs/gateway_command_queue_runbook.md)
 - [Gateway Command Persistence Runbook](docs/gateway_command_persistence_runbook.md)
+- [Core StrategyRuntime Loop Runbook](docs/core_strategy_runtime_loop_runbook.md)

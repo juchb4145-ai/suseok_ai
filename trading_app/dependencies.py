@@ -28,6 +28,16 @@ class CoreSettings:
     command_dedupe_retention_sec: int = 86400
     command_history_retention_sec: int = 604800
     command_recovery_expire_stale_dispatched: bool = True
+    runtime_enabled: bool = False
+    runtime_auto_start: bool = False
+    runtime_mode: str = "OBSERVE"
+    runtime_evaluation_interval_sec: int = 5
+    runtime_cycle_timeout_sec: int = 30
+    runtime_allow_dry_run_orders: bool = False
+    runtime_allow_live_orders: bool = False
+    runtime_require_gateway_heartbeat: bool = True
+    runtime_require_kiwoom_login: bool = True
+    runtime_require_orderable_for_order: bool = True
 
     @property
     def live_order_enabled(self) -> bool:
@@ -38,6 +48,9 @@ def get_settings() -> CoreSettings:
     mode = os.environ.get("TRADING_MODE", "OBSERVE").strip().upper() or "OBSERVE"
     if mode not in {"OBSERVE", "DRY_RUN", "LIVE"}:
         mode = "OBSERVE"
+    runtime_mode = os.environ.get("TRADING_RUNTIME_MODE", "OBSERVE").strip().upper() or "OBSERVE"
+    if runtime_mode not in {"OBSERVE", "DRY_RUN"}:
+        runtime_mode = "OBSERVE"
     return CoreSettings(
         db_path=Path(os.environ.get("TRADING_DB_PATH", str(DEFAULT_DB_PATH))).expanduser(),
         local_token=os.environ.get("TRADING_CORE_TOKEN", DEFAULT_LOCAL_TOKEN),
@@ -53,6 +66,16 @@ def get_settings() -> CoreSettings:
             "TRADING_COMMAND_RECOVERY_EXPIRE_STALE_DISPATCHED", "1"
         )
         != "0",
+        runtime_enabled=_bool_env("TRADING_RUNTIME_ENABLED", False),
+        runtime_auto_start=_bool_env("TRADING_RUNTIME_AUTO_START", False),
+        runtime_mode=runtime_mode,
+        runtime_evaluation_interval_sec=_int_env("TRADING_RUNTIME_EVALUATION_INTERVAL_SEC", 5),
+        runtime_cycle_timeout_sec=_int_env("TRADING_RUNTIME_CYCLE_TIMEOUT_SEC", 30),
+        runtime_allow_dry_run_orders=_bool_env("TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS", False),
+        runtime_allow_live_orders=_bool_env("TRADING_RUNTIME_ALLOW_LIVE_ORDERS", False),
+        runtime_require_gateway_heartbeat=_bool_env("TRADING_RUNTIME_REQUIRE_GATEWAY_HEARTBEAT", True),
+        runtime_require_kiwoom_login=_bool_env("TRADING_RUNTIME_REQUIRE_KIWOOM_LOGIN", True),
+        runtime_require_orderable_for_order=_bool_env("TRADING_RUNTIME_REQUIRE_ORDERABLE_FOR_ORDER", True),
     )
 
 
@@ -99,3 +122,10 @@ def _int_env(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except ValueError:
         return default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}

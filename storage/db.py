@@ -429,6 +429,24 @@ class TradingDatabase:
                 expires_at TEXT NOT NULL DEFAULT '',
                 metadata_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS runtime_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                event_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS runtime_cycles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL DEFAULT '',
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL DEFAULT '{}',
+                warning_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT ''
+            );
             CREATE TABLE IF NOT EXISTS strategy_runtime_settings (
                 config_key TEXT PRIMARY KEY,
                 config_version INTEGER NOT NULL,
@@ -509,6 +527,12 @@ class TradingDatabase:
                 ON gateway_command_dedupe_keys(command_type, trade_date);
             CREATE INDEX IF NOT EXISTS idx_gateway_command_dedupe_expires_at
                 ON gateway_command_dedupe_keys(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_runtime_events_type_created_at
+                ON runtime_events(event_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_runtime_cycles_started_at
+                ON runtime_cycles(started_at);
+            CREATE INDEX IF NOT EXISTS idx_runtime_cycles_status
+                ON runtime_cycles(status);
             """
         )
         self._ensure_column("indicator_snapshots", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
@@ -629,6 +653,64 @@ class TradingDatabase:
             (limit,),
         ).fetchall()
         return [f"{row['created_at']} {row['message']}" for row in reversed(rows)]
+
+    def save_runtime_event(self, event_type: str, status: str = "", message: str = "", payload: Optional[dict] = None) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO runtime_events(event_type, status, message, payload_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (event_type, status, message, json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)),
+        )
+        self.conn.commit()
+
+    def save_runtime_cycle(
+        self,
+        *,
+        started_at: str,
+        finished_at: str,
+        duration_ms: int,
+        status: str,
+        snapshot: Optional[dict] = None,
+        warning_count: int = 0,
+        error: str = "",
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO runtime_cycles(
+                started_at, finished_at, duration_ms, status, snapshot_json, warning_count, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                started_at,
+                finished_at,
+                int(duration_ms or 0),
+                status,
+                json.dumps(snapshot or {}, ensure_ascii=False, sort_keys=True, default=str),
+                int(warning_count or 0),
+                error,
+            ),
+        )
+        self.conn.commit()
+
+    def latest_runtime_cycles(self, limit: int = 50) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT id, started_at, finished_at, duration_ms, status,
+                   snapshot_json, warning_count, error
+            FROM runtime_cycles
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                **{key: row[key] for key in row.keys() if key != "snapshot_json"},
+                "snapshot": json.loads(row["snapshot_json"] or "{}"),
+            }
+            for row in rows
+        ]
 
     def save_candidate(self, candidate: Candidate) -> Candidate:
         with self.conn:

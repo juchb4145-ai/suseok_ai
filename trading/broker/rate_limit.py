@@ -14,6 +14,8 @@ DEFAULT_INTERVALS = {
     "send_condition": 0.5,
     "register_realtime": 0.5,
     "remove_realtime": 0.5,
+    "remove_all_realtime": 0.5,
+    "stop_condition": 0.5,
     "login": 1.0,
     "load_conditions": 1.0,
     "*": 0.2,

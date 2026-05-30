@@ -65,6 +65,29 @@ h2 {
   gap: 8px;
 }
 
+.action-strip {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+button {
+  min-height: 32px;
+  border: 1px solid #b9c6d8;
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--ink);
+  font: inherit;
+  font-weight: 700;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #eef4ff;
+}
+
 .pill,
 .counter {
   display: inline-flex;
@@ -132,6 +155,10 @@ h2 {
 
 .command-grid {
   grid-template-columns: repeat(8, minmax(0, 1fr));
+}
+
+.runtime-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .metric,
@@ -208,6 +235,17 @@ td {
   font-family: Consolas, "Courier New", monospace;
   font-size: 12px;
   line-height: 1.55;
+}
+
+.inline-log {
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfcfe;
+  color: var(--muted);
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .empty {

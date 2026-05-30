@@ -9,6 +9,8 @@ def test_core_api_imports_without_pyqt(monkeypatch):
     def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name.startswith("PyQt5"):
             raise AssertionError(f"Core API imported PyQt module: {name}")
+        if name == "kiwoom.client" or name.startswith("kiwoom.client."):
+            raise AssertionError(f"Core API imported Kiwoom client module: {name}")
         return original_import(name, globals, locals, fromlist, level)
 
     for module_name in list(sys.modules):

@@ -48,6 +48,8 @@ DEFAULT_TTL_SEC = {
     "send_condition": 60,
     "register_realtime": 60,
     "remove_realtime": 60,
+    "remove_all_realtime": 60,
+    "stop_condition": 60,
     "load_conditions": 120,
     "login": 120,
 }
@@ -59,6 +61,8 @@ DEFAULT_MAX_ATTEMPTS = {
     "send_condition": 2,
     "register_realtime": 2,
     "remove_realtime": 2,
+    "remove_all_realtime": 2,
+    "stop_condition": 2,
     "load_conditions": 2,
     "login": 2,
 }

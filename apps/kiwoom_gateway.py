@@ -367,6 +367,21 @@ def _execute_command(client, command: GatewayCommand) -> dict[str, Any]:
     elif command.type == "remove_realtime":
         client.remove_realtime(list(payload.get("codes") or []), screen_no=payload.get("screen_no"))
         return _result_payload(result_code=0, message="realtime removed")
+    elif command.type == "remove_all_realtime":
+        if hasattr(client, "remove_all_realtime"):
+            client.remove_all_realtime()
+        else:
+            client.remove_realtime([], screen_no=payload.get("screen_no"))
+        return _result_payload(result_code=0, message="all realtime removed")
+    elif command.type == "stop_condition":
+        if not hasattr(client, "stop_condition"):
+            return _result_payload(result_code=-1, message="stop_condition unsupported")
+        client.stop_condition(
+            str(payload.get("screen_no") or "7600"),
+            str(payload.get("condition_name") or ""),
+            int(payload.get("condition_index") or 0),
+        )
+        return _result_payload(result_code=0, message="condition stopped")
     elif command.type == "tr_request":
         for key, value in dict(payload.get("inputs") or {}).items():
             client.set_input_value(str(key), str(value))
