@@ -14,7 +14,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from storage.db import TradingDatabase
-from trading.broker.command_queue import CommandPriority, CommandStatus, dedupe_key_for_command
+from trading.broker.command_persistence import SQLiteCommandStore
+from trading.broker.command_queue import ORDER_COMMAND_TYPES, CommandPriority, CommandStatus, dedupe_key_for_command
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import (
     BrokerConditionEvent,
@@ -42,7 +43,21 @@ app = FastAPI(title="Trading Core API", version="0.1.0")
 app.mount("/static", StaticFiles(directory=str(WEB_ROOT / "static")), name="static")
 templates = Jinja2Templates(directory=str(WEB_ROOT / "templates"))
 
-gateway_state = GatewayStateStore()
+
+def _build_gateway_state() -> GatewayStateStore:
+    settings = get_settings()
+    command_store = SQLiteCommandStore(
+        settings.db_path,
+        dedupe_retention_sec=settings.command_dedupe_retention_sec,
+        history_retention_sec=settings.command_history_retention_sec,
+    )
+    return GatewayStateStore(
+        command_store=command_store,
+        expire_stale_dispatched_on_recovery=settings.command_recovery_expire_stale_dispatched,
+    )
+
+
+gateway_state = _build_gateway_state()
 dashboard_connections = DashboardConnectionManager()
 
 
@@ -73,6 +88,9 @@ def api_status() -> dict[str, Any]:
             "live_order_enabled": settings.live_order_enabled,
             "order_guard_required": True,
             "db_path": str(settings.db_path),
+            "command_dedupe_retention_sec": settings.command_dedupe_retention_sec,
+            "command_history_retention_sec": settings.command_history_retention_sec,
+            "command_recovery_expire_stale_dispatched": settings.command_recovery_expire_stale_dispatched,
             "timestamp": utc_timestamp(),
         },
         "gateway": gateway_state.snapshot().to_dict(),
@@ -181,12 +199,39 @@ def gateway_commands_status() -> dict[str, Any]:
 @app.get("/api/gateway/commands/history")
 def gateway_commands_history(
     status: Optional[str] = None,
+    command_type: Optional[str] = None,
+    trade_date: Optional[str] = None,
     limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0, le=100000),
     include_finished: bool = True,
+    include_payload: bool = False,
 ) -> dict[str, Any]:
+    items = gateway_state.list_commands(
+        status=status,
+        command_type=command_type,
+        trade_date=trade_date,
+        limit=limit,
+        offset=offset,
+        include_finished=include_finished,
+    )
     return {
         "summary": gateway_state.command_snapshot(),
-        "items": gateway_state.list_commands(status=status, limit=limit, include_finished=include_finished),
+        "items": [_command_history_item(item, include_payload=include_payload) for item in items],
+    }
+
+
+@app.get("/api/gateway/commands/{command_id}/events")
+def gateway_command_events(command_id: str, limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
+    return {"command_id": command_id, "events": gateway_state.command_events(command_id, limit=limit)}
+
+
+@app.get("/api/gateway/commands/{command_id}")
+def gateway_command_detail(command_id: str) -> dict[str, Any]:
+    record = gateway_state.get_command(command_id)
+    return {
+        "found": record is not None,
+        "record": record.to_dict() if record else None,
+        "events": gateway_state.command_events(command_id, limit=200),
     }
 
 
@@ -198,8 +243,28 @@ def gateway_commands_prune(older_than_sec: int = Query(3600, ge=0, le=86400)) ->
 
 @app.post("/api/gateway/commands/{command_id}/cancel")
 def gateway_command_cancel(command_id: str) -> dict[str, Any]:
+    record = gateway_state.get_command(command_id)
+    if record is None:
+        return {
+            "cancelled": False,
+            "command_id": command_id,
+            "reason": "COMMAND_NOT_FOUND",
+            "summary": gateway_state.command_snapshot(),
+        }
+    if record.status != CommandStatus.QUEUED:
+        return {
+            "cancelled": False,
+            "command_id": command_id,
+            "reason": f"COMMAND_STATUS_{record.status.value}",
+            "summary": gateway_state.command_snapshot(),
+        }
     cancelled = gateway_state.cancel_command(command_id)
-    return {"cancelled": cancelled, "command_id": command_id, "summary": gateway_state.command_snapshot()}
+    return {
+        "cancelled": cancelled,
+        "command_id": command_id,
+        "reason": "CANCELLED" if cancelled else "CANCEL_FAILED",
+        "summary": gateway_state.command_snapshot(),
+    }
 
 
 @app.post("/api/gateway/commands")
@@ -246,6 +311,7 @@ def enqueue_order(order_in: OrderEnqueueRequest) -> dict[str, Any]:
     dedupe_key = dedupe_key_for_order_request(request)
     gateway_status_payload = gateway_state.snapshot().to_dict()
     duplicate = gateway_state.has_duplicate(dedupe_key)
+    duplicate_of = gateway_state.duplicate_of(dedupe_key) if duplicate else ""
     guard = OrderCommandSafetyGuard(
         OrderSafetyConfig(
             mode=requested_mode,
@@ -271,6 +337,7 @@ def enqueue_order(order_in: OrderEnqueueRequest) -> dict[str, Any]:
             reason="OBSERVE_MODE",
             safety=safety.to_dict(),
             command=None,
+            duplicate_of=duplicate_of,
         )
     if requested_mode == "DRY_RUN":
         return _order_enqueue_response(
@@ -282,6 +349,7 @@ def enqueue_order(order_in: OrderEnqueueRequest) -> dict[str, Any]:
             reason="DRY_RUN_NO_GATEWAY_SEND_ORDER",
             safety=safety.to_dict(),
             command=None,
+            duplicate_of=duplicate_of,
         )
     if not safety.ok:
         return _order_enqueue_response(
@@ -293,6 +361,7 @@ def enqueue_order(order_in: OrderEnqueueRequest) -> dict[str, Any]:
             reason=safety.reason,
             safety=safety.to_dict(),
             command=None,
+            duplicate_of=duplicate_of,
         )
 
     command = GatewayCommand(
@@ -323,7 +392,7 @@ def enqueue_order(order_in: OrderEnqueueRequest) -> dict[str, Any]:
         safety=safety.to_dict(),
         command=command.to_dict(),
         record=result.record.to_dict() if result.record else None,
-        duplicate_of=result.duplicate_of,
+        duplicate_of=result.duplicate_of or duplicate_of,
     )
 
 
@@ -543,12 +612,20 @@ def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
     elif event.type == "command_started":
         command_id = str(event.payload.get("command_id") or event.command_id or "")
         if command_id:
+            gateway_state.ack_command(
+                command_id,
+                status=CommandStatus.DISPATCHED.value,
+                result_payload=dict(event.payload or {}),
+            )
             db.save_log(f"[gateway][command_started] {event.payload.get('command_type', '')} {command_id}")
     elif event.type == "command_ack":
         _handle_command_ack(db, event)
     elif event.type == "command_failed":
         command_id = str(event.payload.get("command_id") or event.command_id or "")
+        command_type = str(event.payload.get("command_type") or "")
         retryable = bool(event.payload.get("retryable", False))
+        if command_type in ORDER_COMMAND_TYPES:
+            retryable = False
         if command_id:
             gateway_state.fail_command(command_id, str(event.payload.get("error") or ""), retryable=retryable)
     elif event.type == "rate_limited":
@@ -559,7 +636,16 @@ def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
     elif event.type in {"gateway_log", "log"}:
         db.save_log(f"[gateway] {event.payload.get('message', '')}")
     elif event.type in {"gateway_error", "error"}:
-        db.save_log(f"[gateway][WARN] {event.payload.get('message') or event.payload.get('error') or ''}")
+        message = str(event.payload.get("message") or event.payload.get("error") or "")
+        command_id = str(event.payload.get("command_id") or event.command_id or "")
+        if command_id:
+            gateway_state.append_command_event(
+                command_id,
+                event.type,
+                message=message,
+                payload=dict(event.payload or {}),
+            )
+        db.save_log(f"[gateway][WARN] {message}")
 
 
 def _handle_command_ack(db: TradingDatabase, event: GatewayEvent) -> None:
@@ -576,6 +662,23 @@ def _handle_command_ack(db: TradingDatabase, event: GatewayEvent) -> None:
     order_result = payload.get("order_result")
     if command_type == "send_order" and isinstance(order_result, dict):
         db.save_order_result(BrokerOrderResult.from_dict(order_result))
+
+
+def _command_history_item(item: dict[str, Any], *, include_payload: bool) -> dict[str, Any]:
+    if include_payload:
+        return item
+    command = dict(item.get("command") or {})
+    if "payload" in command:
+        payload = dict(command.get("payload") or {})
+        command["payload_summary"] = {
+            key: payload.get(key)
+            for key in ("account", "code", "side", "quantity", "price", "tag", "candidate_id")
+            if key in payload
+        }
+        command.pop("payload", None)
+    compact = dict(item)
+    compact["command"] = command
+    return compact
 
 
 def _order_command_count(code: str, side: str, tag: str) -> int:

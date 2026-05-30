@@ -138,6 +138,46 @@ class CommandRecord:
             "metadata": dict(self.metadata or {}),
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CommandRecord":
+        raw_command = _loads_mapping(data.get("command") or data.get("command_json"))
+        raw_payload = _loads_mapping(data.get("payload") or data.get("payload_json"))
+        if not raw_command:
+            raw_command = {
+                "type": data.get("command_type") or data.get("type") or "",
+                "command_id": data.get("command_id") or "",
+                "request_id": data.get("request_id") or "",
+                "source": data.get("source") or "core",
+                "idempotency_key": data.get("idempotency_key") or "",
+                "payload": raw_payload,
+            }
+        elif raw_payload and not raw_command.get("payload"):
+            raw_command["payload"] = raw_payload
+        command = GatewayCommand.from_dict(raw_command)
+        command_type = str(data.get("command_type") or command.type or "")
+        command_id = str(data.get("command_id") or command.command_id or "")
+        idempotency_key = str(data.get("idempotency_key") or command.idempotency_key or "")
+        return cls(
+            command=command,
+            status=_coerce_status(data.get("status")),
+            priority=_coerce_priority(data.get("priority")),
+            created_at=str(data.get("created_at") or command.timestamp or utc_timestamp()),
+            dispatched_at=str(data.get("dispatched_at") or ""),
+            acked_at=str(data.get("acked_at") or ""),
+            finished_at=str(data.get("finished_at") or ""),
+            expires_at=str(data.get("expires_at") or ""),
+            attempts=_safe_int(data.get("attempts"), 0),
+            max_attempts=max(1, _safe_int(data.get("max_attempts"), 1)),
+            last_error=str(data.get("last_error") or ""),
+            result_payload=_loads_mapping(data.get("result_payload") or data.get("result_payload_json")),
+            command_type=command_type,
+            command_id=command_id,
+            idempotency_key=idempotency_key,
+            dedupe_key=str(data.get("dedupe_key") or dedupe_key_for_command(command)),
+            source=str(data.get("source") or command.source or ""),
+            metadata=_loads_mapping(data.get("metadata") or data.get("metadata_json")),
+        )
+
     @property
     def finished(self) -> bool:
         return self.status in FINISHED_STATUSES
@@ -206,6 +246,19 @@ class CommandQueue:
         if record.command_type in ORDER_COMMAND_TYPES:
             self.last_order_command_at = record.created_at
         return EnqueueResult(True, record=record)
+
+    def restore(self, record: CommandRecord) -> None:
+        if not record.command_id:
+            return
+        if record.command_id not in self._records:
+            self._sequence.append(record.command_id)
+        self._records[record.command_id] = record
+        if not self.last_command_at or record.created_at > self.last_command_at:
+            self.last_command_at = record.created_at
+        if record.command_type in ORDER_COMMAND_TYPES and (
+            not self.last_order_command_at or record.created_at > self.last_order_command_at
+        ):
+            self.last_order_command_at = record.created_at
 
     def dispatch(self, limit: int = 20, now: datetime | None = None) -> list[GatewayCommand]:
         current = _clean_time(now)
@@ -347,6 +400,10 @@ class CommandQueue:
     def has_duplicate(self, dedupe_key: str) -> bool:
         return self._active_duplicate(dedupe_key) is not None
 
+    def duplicate_of(self, dedupe_key: str) -> str:
+        record = self._active_duplicate(dedupe_key)
+        return record.command_id if record else ""
+
     def record_rate_limited(self) -> None:
         self.rate_limited_count += 1
 
@@ -464,3 +521,36 @@ def _parse_time(value: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _loads_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if not value:
+        return {}
+    try:
+        loaded = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return dict(loaded) if isinstance(loaded, dict) else {}
+
+
+def _coerce_status(value: Any) -> CommandStatus:
+    try:
+        return CommandStatus(str(value or CommandStatus.QUEUED.value))
+    except ValueError:
+        return CommandStatus.QUEUED
+
+
+def _coerce_priority(value: Any) -> CommandPriority:
+    try:
+        return CommandPriority(str(value or CommandPriority.NORMAL.value))
+    except ValueError:
+        return CommandPriority.NORMAL
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default

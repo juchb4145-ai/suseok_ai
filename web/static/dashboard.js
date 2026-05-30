@@ -73,11 +73,13 @@ function render(snapshot) {
   text("command-expired", commands.expired_count || 0);
   text("command-duplicate", commands.duplicate_rejected_count || 0);
   text("command-rate-limited", commands.rate_limited_count || 0);
+  text("command-stale", commands.stale_dispatched_count || 0);
   text("command-last-order", commands.last_order_command_at || "-");
   renderRows(
     "command-rows",
     (commands.recent || []).slice(0, 12).map((item) =>
       rowHtml([
+        item.command_id || "-",
         item.created_at || "-",
         item.command_type || "-",
         item.status || "-",
@@ -86,7 +88,7 @@ function render(snapshot) {
         item.last_error || "-",
       ]),
     ),
-    6,
+    7,
   );
 
   text("candidate-total", candidates.summary.total || 0);

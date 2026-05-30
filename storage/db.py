@@ -383,6 +383,52 @@ class TradingDatabase:
                 blocked_but_later_rallied INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS gateway_commands (
+                command_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL DEFAULT '',
+                command_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL DEFAULT '',
+                dedupe_key TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                command_json TEXT NOT NULL DEFAULT '{}',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                result_payload_json TEXT NOT NULL DEFAULT '{}',
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                dispatched_at TEXT NOT NULL DEFAULT '',
+                acked_at TEXT NOT NULL DEFAULT '',
+                finished_at TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 1,
+                trade_date TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS gateway_command_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                command_id TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL,
+                status_from TEXT NOT NULL DEFAULT '',
+                status_to TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS gateway_command_dedupe_keys (
+                dedupe_key TEXT PRIMARY KEY,
+                command_id TEXT NOT NULL,
+                command_type TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
             CREATE TABLE IF NOT EXISTS strategy_runtime_settings (
                 config_key TEXT PRIMARY KEY,
                 config_version INTEGER NOT NULL,
@@ -441,6 +487,28 @@ class TradingDatabase:
                 ON hybrid_gate_validation_events(membership_score);
             CREATE INDEX IF NOT EXISTS idx_hybrid_validation_reason
                 ON hybrid_gate_validation_events(hybrid_primary_reason);
+            CREATE INDEX IF NOT EXISTS idx_gateway_commands_status_created_at
+                ON gateway_commands(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_gateway_commands_type_created_at
+                ON gateway_commands(command_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_gateway_commands_dedupe_key
+                ON gateway_commands(dedupe_key);
+            CREATE INDEX IF NOT EXISTS idx_gateway_commands_idempotency_key
+                ON gateway_commands(idempotency_key);
+            CREATE INDEX IF NOT EXISTS idx_gateway_commands_trade_date
+                ON gateway_commands(trade_date);
+            CREATE INDEX IF NOT EXISTS idx_gateway_commands_updated_at
+                ON gateway_commands(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_gateway_command_events_command_id
+                ON gateway_command_events(command_id, id);
+            CREATE INDEX IF NOT EXISTS idx_gateway_command_events_type_created_at
+                ON gateway_command_events(event_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_gateway_command_dedupe_command_id
+                ON gateway_command_dedupe_keys(command_id);
+            CREATE INDEX IF NOT EXISTS idx_gateway_command_dedupe_type_trade_date
+                ON gateway_command_dedupe_keys(command_type, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_gateway_command_dedupe_expires_at
+                ON gateway_command_dedupe_keys(expires_at);
             """
         )
         self._ensure_column("indicator_snapshots", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")

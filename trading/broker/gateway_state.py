@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from threading import Lock
+from threading import RLock
 from typing import Any
 
+from trading.broker.command_persistence import CommandStoreProtocol
 from trading.broker.command_queue import CommandPriority, CommandQueue, CommandRecord, CommandStatus, EnqueueResult
 from trading.broker.models import GatewayCommand, GatewayEvent, utc_timestamp
 
@@ -37,15 +38,34 @@ class GatewayStatusSnapshot:
 class GatewayStateStore:
     heartbeat_timeout_sec: int = 15
     max_recent_events: int = 200
+    command_store: CommandStoreProtocol | None = None
+    expire_stale_dispatched_on_recovery: bool = True
     status: GatewayStatusSnapshot = field(default_factory=GatewayStatusSnapshot)
 
     def __post_init__(self) -> None:
         self.status.heartbeat_timeout_sec = self.heartbeat_timeout_sec
-        self._lock = Lock()
+        self._lock = RLock()
         self._command_queue = CommandQueue()
         self._recent_events: list[GatewayEvent] = []
         self._seen_event_ids: set[str] = set()
         self._latest_ticks: dict[str, dict[str, Any]] = {}
+        self.recovered_queued_count = 0
+        self.recover_from_store()
+
+    def recover_from_store(self, now: datetime | None = None) -> int:
+        if self.command_store is None:
+            return 0
+        with self._lock:
+            expire_old = getattr(self.command_store, "expire_old_records", None)
+            if callable(expire_old):
+                expire_old(now, include_dispatched=self.expire_stale_dispatched_on_recovery)
+            recovered = self.command_store.load_recoverable_records(now=now)
+            self._command_queue = CommandQueue()
+            for record in recovered:
+                self._command_queue.restore(record)
+            self.recovered_queued_count = len(recovered)
+            self.status.pending_command_count = len(recovered)
+            return len(recovered)
 
     def record_event(self, event: GatewayEvent) -> bool:
         with self._lock:
@@ -84,6 +104,13 @@ class GatewayStateStore:
                 self.status.last_error = str(event.payload.get("message") or event.payload.get("error") or "")
             elif event.type == "rate_limited":
                 self._command_queue.record_rate_limited()
+                if self.command_store is not None:
+                    self.command_store.record_rate_limited(
+                        str(event.payload.get("command_id") or event.command_id or ""),
+                        str(event.payload.get("command_type") or ""),
+                        float(event.payload.get("wait_time_sec") or 0.0),
+                        payload=dict(event.payload or {}),
+                    )
 
             self._recent_events.append(event)
             if len(self._recent_events) > self.max_recent_events:
@@ -100,6 +127,32 @@ class GatewayStateStore:
         now: datetime | None = None,
     ) -> EnqueueResult:
         with self._lock:
+            if self.command_store is not None:
+                if not command.command_id:
+                    return EnqueueResult(False, reason="COMMAND_ID_REQUIRED")
+                record = CommandRecord.create(
+                    command,
+                    priority=priority,
+                    ttl_sec=ttl_sec,
+                    max_attempts=max_attempts,
+                    now=now,
+                    metadata=metadata,
+                )
+                enqueue_record = getattr(self.command_store, "enqueue_record", None)
+                if callable(enqueue_record):
+                    result = enqueue_record(record)
+                else:
+                    duplicate = self.command_store.has_active_or_retained_dedupe(record.dedupe_key, now=now)
+                    if duplicate:
+                        self.command_store.mark_duplicate_rejected(record.dedupe_key, record.command_id, "")
+                        result = EnqueueResult(False, reason="DUPLICATE_COMMAND", record=record)
+                    else:
+                        self.command_store.upsert_record(record)
+                        result = EnqueueResult(True, record=record)
+                if result.accepted and result.record is not None:
+                    self._command_queue.restore(result.record)
+                self.status.pending_command_count = self.command_snapshot()["queued_count"]
+                return result
             result = self._command_queue.enqueue(
                 command,
                 priority=priority,
@@ -113,7 +166,25 @@ class GatewayStateStore:
 
     def dispatch_commands(self, limit: int = 20, now: datetime | None = None) -> list[GatewayCommand]:
         with self._lock:
+            if self.command_store is not None:
+                expire_old = getattr(self.command_store, "expire_old_records", None)
+                if callable(expire_old):
+                    expire_old(now)
             commands = self._command_queue.dispatch(limit=limit, now=now)
+            if self.command_store is not None:
+                for command in commands:
+                    record = self._command_queue.get(command.command_id)
+                    if record is not None:
+                        self.command_store.upsert_record(record)
+                        self.command_store.append_event(
+                            record.command_id,
+                            "dispatch",
+                            status_from=CommandStatus.QUEUED.value,
+                            status_to=CommandStatus.DISPATCHED.value,
+                            message="dispatched to gateway polling response",
+                            payload=record.to_dict(),
+                            created_at=record.dispatched_at,
+                        )
             self.status.pending_command_count = self._command_queue.snapshot()["queued_count"]
             return list(commands)
 
@@ -128,29 +199,92 @@ class GatewayStateStore:
         error: str | None = None,
     ) -> bool:
         with self._lock:
-            return self._command_queue.ack(
+            acknowledged = self._command_queue.ack(
                 command_id,
                 status=CommandStatus(status),
                 result_payload=result_payload,
                 error=error,
             )
+            if self.command_store is not None:
+                stored = self.command_store.update_record_status(
+                    command_id,
+                    status,
+                    result_payload=result_payload,
+                    error=error,
+                    event_type="command_ack" if status != CommandStatus.DISPATCHED.value else "command_started",
+                    message=error or str((result_payload or {}).get("message") or ""),
+                )
+                return acknowledged or stored
+            return acknowledged
 
     def fail_command(self, command_id: str, error: str, retryable: bool = True) -> bool:
         with self._lock:
-            return self._command_queue.fail(command_id, error, retryable=retryable)
+            failed = self._command_queue.fail(command_id, error, retryable=retryable)
+            if self.command_store is not None:
+                record = self._command_queue.get(command_id)
+                if failed and record is not None:
+                    self.command_store.upsert_record(record)
+                    self.command_store.append_event(
+                        command_id,
+                        "command_failed",
+                        status_to=record.status.value,
+                        message=error,
+                        payload={"retryable": retryable},
+                    )
+                    return True
+                stored = self.command_store.update_record_status(
+                    command_id,
+                    CommandStatus.FAILED.value,
+                    error=error,
+                    event_type="command_failed",
+                    message=error,
+                )
+                return failed or stored
+            return failed
 
     def cancel_command(self, command_id: str) -> bool:
         with self._lock:
-            return self._command_queue.cancel(command_id)
+            cancelled = self._command_queue.cancel(command_id)
+            if self.command_store is not None:
+                record = self._command_queue.get(command_id)
+                if cancelled and record is not None:
+                    self.command_store.upsert_record(record)
+                    self.command_store.append_event(
+                        command_id,
+                        "cancelled",
+                        status_to=CommandStatus.CANCELLED.value,
+                        message="cancelled before dispatch",
+                    )
+                    return True
+                stored_record = self.command_store.get_record(command_id)
+                if stored_record and stored_record.status == CommandStatus.QUEUED:
+                    return self.command_store.update_record_status(
+                        command_id,
+                        CommandStatus.CANCELLED.value,
+                        event_type="cancelled",
+                        message="cancelled before dispatch",
+                    )
+                return False
+            return cancelled
 
     def expire_old_commands(self, now: datetime | None = None) -> int:
         with self._lock:
             count = self._command_queue.expire_old(now)
+            if self.command_store is not None:
+                store_count = getattr(self.command_store, "expire_old_records", lambda _now=None: 0)(now)
+                for record in self._command_queue.list(limit=10000, include_finished=True):
+                    if record.status == CommandStatus.EXPIRED:
+                        self.command_store.upsert_record(record)
+                count = max(count, int(store_count or 0))
             self.status.pending_command_count = self._command_queue.snapshot()["queued_count"]
             return count
 
     def prune_commands(self, older_than_sec: int = 3600) -> int:
         with self._lock:
+            if self.command_store is not None:
+                removed = self.command_store.prune_finished(older_than_sec=older_than_sec)
+                self.command_store.prune_dedupe_keys()
+                return removed
             return self._command_queue.prune(older_than_sec=older_than_sec)
 
     def list_commands(
@@ -158,8 +292,23 @@ class GatewayStateStore:
         status: str | None = None,
         limit: int = 100,
         include_finished: bool = False,
+        command_type: str | None = None,
+        trade_date: str | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         with self._lock:
+            if self.command_store is not None:
+                return [
+                    record.to_dict()
+                    for record in self.command_store.list_records(
+                        status=status,
+                        command_type=command_type,
+                        limit=limit,
+                        offset=offset,
+                        include_finished=include_finished,
+                        trade_date=trade_date,
+                    )
+                ]
             return [
                 record.to_dict()
                 for record in self._command_queue.list(status=status, limit=limit, include_finished=include_finished)
@@ -167,15 +316,62 @@ class GatewayStateStore:
 
     def command_snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return self._command_queue.snapshot()
+            if self.command_store is not None:
+                snapshot = self.command_store.snapshot()
+                snapshot["recovered_queued_count"] = self.recovered_queued_count
+                return snapshot
+            snapshot = self._command_queue.snapshot()
+            snapshot["stale_dispatched_count"] = snapshot.get("dispatched_count", 0)
+            snapshot["recovered_queued_count"] = 0
+            return snapshot
 
     def has_duplicate(self, dedupe_key: str) -> bool:
         with self._lock:
+            if self.command_store is not None:
+                return self.command_store.has_active_or_retained_dedupe(dedupe_key)
             return self._command_queue.has_duplicate(dedupe_key)
+
+    def duplicate_of(self, dedupe_key: str) -> str:
+        with self._lock:
+            if self.command_store is not None:
+                finder = getattr(self.command_store, "find_active_or_retained_dedupe", None)
+                if callable(finder):
+                    row = finder(dedupe_key)
+                    return str((row or {}).get("command_id") or "")
+            return self._command_queue.duplicate_of(dedupe_key)
 
     def get_command(self, command_id: str) -> CommandRecord | None:
         with self._lock:
+            if self.command_store is not None:
+                return self.command_store.get_record(command_id)
             return self._command_queue.get(command_id)
+
+    def command_events(self, command_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            if self.command_store is None:
+                return []
+            return self.command_store.list_events(command_id, limit=limit)
+
+    def append_command_event(
+        self,
+        command_id: str,
+        event_type: str,
+        *,
+        status_from: str = "",
+        status_to: str = "",
+        message: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        with self._lock:
+            if self.command_store is not None:
+                self.command_store.append_event(
+                    command_id,
+                    event_type,
+                    status_from=status_from,
+                    status_to=status_to,
+                    message=message,
+                    payload=payload,
+                )
 
     def snapshot(self) -> GatewayStatusSnapshot:
         with self._lock:

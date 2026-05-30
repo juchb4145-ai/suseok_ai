@@ -28,6 +28,9 @@ Common Core environment variables:
 - `TRADING_MAX_DAILY_ORDERS_PER_CODE`: per-code command cap.
 - `TRADING_ORDER_COMMAND_TTL_SEC`: order command expiry.
 - `TRADING_ORDER_COMMAND_MAX_ATTEMPTS`: order command max attempts.
+- `TRADING_COMMAND_DEDUPE_RETENTION_SEC`: order command dedupe retention, default `86400`.
+- `TRADING_COMMAND_HISTORY_RETENTION_SEC`: finished command history retention target, default `604800`.
+- `TRADING_COMMAND_RECOVERY_EXPIRE_STALE_DISPATCHED`: mark stale dispatched commands expired on recovery when `1`.
 
 Dashboard:
 
@@ -49,7 +52,9 @@ Core APIs:
 - `POST /api/gateway/events`
 - `GET /api/gateway/commands` Gateway polling only
 - `GET /api/gateway/commands/status`
-- `GET /api/gateway/commands/history`
+- `GET /api/gateway/commands/history?status=&command_type=&trade_date=&limit=&offset=&include_payload=false`
+- `GET /api/gateway/commands/{command_id}`
+- `GET /api/gateway/commands/{command_id}/events`
 - `POST /api/gateway/commands/{command_id}/cancel`
 - `POST /api/gateway/commands/prune`
 - `POST /api/orders/enqueue`
@@ -121,10 +126,12 @@ py -3.9-32 apps/legacy_pyqt_app.py --mock
 - Bind Core to `127.0.0.1` unless there is a reviewed deployment plan.
 - Core must pass order/risk guards before queueing any real order command.
 - Gateway polling does not mean success. Only `command_ack status=ACKED` marks a command successful.
-- Duplicate `idempotency_key` or deterministic order dedupe keys are rejected while active or already ACKED.
+- Duplicate `idempotency_key` or deterministic order dedupe keys are rejected while active or retained in SQLite.
+- Core restart restores valid `QUEUED` commands only. `DISPATCHED` order commands are not automatically resent.
 
 More detail:
 
 - [Architecture](docs/architecture_32bit_gateway_64bit_core.md)
 - [Runbook](docs/runbook_32bit_gateway_64bit_core.md)
 - [Gateway Command Queue Runbook](docs/gateway_command_queue_runbook.md)
+- [Gateway Command Persistence Runbook](docs/gateway_command_persistence_runbook.md)

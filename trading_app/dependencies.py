@@ -25,6 +25,9 @@ class CoreSettings:
     max_daily_orders_per_code: int = 5
     command_ttl_sec: int = 30
     command_max_attempts: int = 1
+    command_dedupe_retention_sec: int = 86400
+    command_history_retention_sec: int = 604800
+    command_recovery_expire_stale_dispatched: bool = True
 
     @property
     def live_order_enabled(self) -> bool:
@@ -44,6 +47,12 @@ def get_settings() -> CoreSettings:
         max_daily_orders_per_code=_int_env("TRADING_MAX_DAILY_ORDERS_PER_CODE", 5),
         command_ttl_sec=_int_env("TRADING_ORDER_COMMAND_TTL_SEC", 30),
         command_max_attempts=_int_env("TRADING_ORDER_COMMAND_MAX_ATTEMPTS", 1),
+        command_dedupe_retention_sec=_int_env("TRADING_COMMAND_DEDUPE_RETENTION_SEC", 86400),
+        command_history_retention_sec=_int_env("TRADING_COMMAND_HISTORY_RETENTION_SEC", 604800),
+        command_recovery_expire_stale_dispatched=os.environ.get(
+            "TRADING_COMMAND_RECOVERY_EXPIRE_STALE_DISPATCHED", "1"
+        )
+        != "0",
     )
 
 

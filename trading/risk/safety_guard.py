@@ -130,5 +130,11 @@ class OrderCommandSafetyGuard:
 
 
 def dedupe_key_for_order_request(request: BrokerOrderRequest) -> str:
-    command = GatewayCommand(type="send_order", payload=request.to_dict(), idempotency_key=request.idempotency_key)
+    payload = request.to_dict()
+    metadata = dict(request.metadata or {})
+    if metadata.get("candidate_id") is not None:
+        payload["candidate_id"] = metadata.get("candidate_id")
+    if metadata.get("strategy_order_id") is not None:
+        payload["strategy_order_id"] = metadata.get("strategy_order_id")
+    command = GatewayCommand(type="send_order", payload=payload, idempotency_key=request.idempotency_key)
     return dedupe_key_for_command(command)

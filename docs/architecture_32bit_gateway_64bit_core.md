@@ -118,7 +118,7 @@ Order-related commands must carry `command_id` or `idempotency_key` to prevent d
 
 ## Command Queue
 
-PR-2 replaces the simple in-memory list with a stateful command queue:
+PR-2 replaces the simple in-memory list with a stateful command queue. PR-3 persists this queue to SQLite because StrategyRuntime must not be allowed to generate live order commands before command state and idempotency survive Core restarts:
 
 - `QUEUED`
 - `DISPATCHED`
@@ -130,12 +130,27 @@ PR-2 replaces the simple in-memory list with a stateful command queue:
 
 Gateway polling moves commands from `QUEUED` to `DISPATCHED`. Gateway execution then reports `command_started`, `command_ack`, or `command_failed`. A command is successful only after `command_ack status=ACKED`.
 
-Order commands use deterministic dedupe keys when `idempotency_key` is absent. Duplicate keys already in `QUEUED`, `DISPATCHED`, or `ACKED` are rejected.
+Order commands use deterministic dedupe keys when `idempotency_key` is absent. Duplicate keys already active or retained in SQLite are rejected, including after Core API restart.
+
+Persistence tables:
+
+- `gateway_commands`
+- `gateway_command_events`
+- `gateway_command_dedupe_keys`
+
+Recovery policy:
+
+- valid `QUEUED` commands are restored and can be dispatched,
+- `DISPATCHED` commands are never restored to `QUEUED`,
+- `DISPATCHED` order commands are never automatically resent,
+- retained dedupe keys continue to block duplicate orders.
 
 Status APIs:
 
 - `GET /api/gateway/commands/status`
-- `GET /api/gateway/commands/history?status=&limit=`
+- `GET /api/gateway/commands/history?status=&command_type=&trade_date=&limit=&offset=`
+- `GET /api/gateway/commands/{command_id}`
+- `GET /api/gateway/commands/{command_id}/events`
 - `POST /api/gateway/commands/{command_id}/cancel`
 - `POST /api/gateway/commands/prune`
 
@@ -143,7 +158,7 @@ Status APIs:
 
 Gateway applies conservative local rate limits immediately before Kiwoom calls. Defaults can be overridden with `GATEWAY_RATE_LIMIT_*_SEC` environment variables. This keeps the Core queue simple while ensuring the 32bit process never bursts Kiwoom commands during reconnect or backlog drain.
 
-WebSocket command transport is still deferred because PR-2's priority is correctness: idempotency, ack, retry, expiration, and rate-limit observability. A WebSocket channel should be reconsidered when:
+WebSocket command transport is still deferred because PR-2/PR-3 priority is correctness: idempotency, ack, retry, expiration, rate-limit observability, and durable recovery. A WebSocket channel should be reconsidered when:
 
 - command latency from long-poll becomes a measured bottleneck,
 - command ack/event correlation is stable in production logs,
@@ -198,10 +213,16 @@ PR-2:
 - Command ack/fail/expire history.
 - Hardened `/api/orders/enqueue` safety gate.
 
+PR-3:
+
+- SQLite-backed command queue, event timeline, and dedupe ledger.
+- Core restart recovery for valid `QUEUED` commands.
+- No automatic resend for `DISPATCHED` order commands.
+- DB-backed command history/detail/status APIs.
+
 Next:
 
-- Persistent Gateway WebSocket if latency needs it.
 - Real TR response row extraction and request correlation.
 - StrategyRuntime process loop inside Core.
-- Command queue DB persistence.
+- Gateway WebSocket channel when long-poll latency is measured as a bottleneck.
 - Dashboard screen hardening and richer order/position views.

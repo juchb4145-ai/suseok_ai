@@ -2,9 +2,10 @@
 
 ## Command Flow
 
-PR-2 keeps the REST long-poll topology:
+PR-2 keeps the REST long-poll topology. PR-3 persists the Core-side command queue and history in SQLite:
 
 1. Core enqueues a `GatewayCommand`.
+   - Core writes `gateway_commands`, registers a dedupe key, and appends an `enqueue` event in one transaction.
 2. 32bit Gateway polls `GET /api/gateway/commands`.
 3. Core marks selected commands `DISPATCHED`.
 4. Gateway applies local rate limit before calling Kiwoom.
@@ -36,7 +37,7 @@ DISPATCHED -> EXPIRED
 - TR/condition/realtime commands can retry within their max attempts.
 - Commands past `expires_at` are marked `EXPIRED` and are not dispatched.
 
-Finished command records are in memory for dashboard/history and can be pruned:
+Finished command records are stored in SQLite for dashboard/history and can be pruned:
 
 ```powershell
 Invoke-RestMethod -Method Post "http://127.0.0.1:8000/api/gateway/commands/prune?older_than_sec=3600"
@@ -51,7 +52,8 @@ If `idempotency_key` is supplied, it is the dedupe key. Otherwise Core derives d
 - `modify_order`: `modify:{account}:{code}:{original_order_no}:{quantity}:{price}`
 - `tr_request`: `tr:{rq_name}:{tr_code}:{screen_no}:{request_id}`
 
-The queue rejects duplicates when an equal key is already `QUEUED`, `DISPATCHED`, or `ACKED`.
+The queue rejects duplicates when an equal key is already active or retained in `gateway_command_dedupe_keys`.
+Order command dedupe rows survive Core restarts and remain even if command history is pruned until `TRADING_COMMAND_DEDUPE_RETENTION_SEC` expires.
 
 ## Rate Limit
 
@@ -127,18 +129,25 @@ $env:TRADING_MAX_ORDER_AMOUNT = "3000000"
 $env:TRADING_MAX_DAILY_ORDERS_PER_CODE = "5"
 $env:TRADING_ORDER_COMMAND_TTL_SEC = "30"
 $env:TRADING_ORDER_COMMAND_MAX_ATTEMPTS = "1"
+$env:TRADING_COMMAND_DEDUPE_RETENTION_SEC = "86400"
+$env:TRADING_COMMAND_HISTORY_RETENTION_SEC = "604800"
+$env:TRADING_COMMAND_RECOVERY_EXPIRE_STALE_DISPATCHED = "1"
 ```
 
 ## Status APIs
 
 - Gateway polling: `GET /api/gateway/commands`
 - Queue summary: `GET /api/gateway/commands/status`
-- Queue history: `GET /api/gateway/commands/history?status=&limit=`
+- Queue history: `GET /api/gateway/commands/history?status=&command_type=&trade_date=&limit=&offset=&include_payload=false`
+- Command detail: `GET /api/gateway/commands/{command_id}`
+- Command timeline: `GET /api/gateway/commands/{command_id}/events`
 - Cancel queued command: `POST /api/gateway/commands/{command_id}/cancel`
 - Prune finished records: `POST /api/gateway/commands/prune`
 
-The dashboard shows queued/dispatched/acked/failed/expired/duplicate/rate-limited counts and recent command history.
+The dashboard shows queued/dispatched/acked/failed/expired/duplicate/rate-limited/stale counts and recent DB-backed command history.
 
 ## Reconnect Notes
 
-Gateway reconnects can re-poll only commands that Core still considers dispatchable. Order commands have `max_attempts=1` by default, and idempotency keys prevent the same order from being queued twice. If Gateway loses the ack after a real Kiwoom send, operators should inspect Kiwoom order/execution events and command history before manual retry.
+Gateway reconnects can re-poll only commands that Core still considers dispatchable. Core restart recovery reloads valid `QUEUED` commands only. `DISPATCHED` order commands are not automatically requeued or resent. Order commands have `max_attempts=1` by default, and idempotency/dedupe keys prevent the same order from being queued twice after restart. If Gateway loses the ack after a real Kiwoom send, operators should inspect Kiwoom order/execution events and command history before manual retry.
+
+See also: [Gateway Command Persistence Runbook](gateway_command_persistence_runbook.md).
