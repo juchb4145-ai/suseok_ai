@@ -7,6 +7,7 @@ from collections import Counter
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
+from trading.strategy.hybrid_gate import summarize_hybrid_gate_reviews
 from trading.strategy.models import ReviewFinalStatus, TradeReview
 
 
@@ -190,6 +191,8 @@ class ReviewExporter:
                 f"- legacy_fill_result=true and v2_would_fill=false: {summary['fill_diagnostics']['legacy_fill_true_v2_false_count']}",
             ]
         )
+        lines.extend(["", "## Hybrid Gate Summary", ""])
+        lines.extend(_hybrid_summary_rows(summary["hybrid_gate_summary"]))
         lines.extend(["", "## Details", ""])
         if reviews:
             lines.append("| Time | Code | Theme | Grade | Status | 20m High | 20m DD | Reason |")
@@ -234,6 +237,7 @@ def build_review_summary(reviews: list[TradeReview]) -> dict:
         "theme_leadership_diagnostics": _theme_leadership_diagnostics(reviews),
         "late_chase_diagnostics": _late_chase_diagnostics(reviews),
         "fill_diagnostics": _fill_diagnostics(reviews),
+        "hybrid_gate_summary": summarize_hybrid_gate_reviews(reviews),
     }
 
 
@@ -497,6 +501,50 @@ def _session_rows(rows: list[dict]) -> list[str]:
     return lines
 
 
+def _hybrid_summary_rows(summary: dict) -> list[str]:
+    if not summary or not summary.get("candidate_count"):
+        return ["_None._"]
+    lines = [
+        f"- Hybrid candidates: {summary.get('candidate_count', 0)}",
+        f"- READY but legacy not bought: {_cell(', '.join(summary.get('ready_but_legacy_not_bought') or []) or 0)}",
+        f"- Legacy ready but Hybrid BLOCKED: {_cell(', '.join(summary.get('legacy_ready_but_hybrid_blocked') or []) or 0)}",
+        f"- LEADER_ONLY_THEME blocked: {_cell(', '.join(summary.get('leader_only_blocked') or []) or 0)}",
+        f"- WATCH small-entry candidates: {_cell(', '.join(summary.get('watch_small_entry_candidates') or []) or 0)}",
+        "",
+        "### Hybrid Status Counts",
+        "",
+    ]
+    status_counts = summary.get("status_counts") or {}
+    if status_counts:
+        lines.extend(["| Status | Count |", "|---|---:|"])
+        for status, count in sorted(status_counts.items()):
+            lines.append(f"| {_cell(status)} | {_cell(count)} |")
+    else:
+        lines.append("_None._")
+    lines.extend(["", "### Hybrid WAIT Reasons", ""])
+    wait_reasons = summary.get("wait_reason_top") or []
+    if wait_reasons:
+        lines.extend(["| Reason | Count |", "|---|---:|"])
+        for item in wait_reasons[:10]:
+            lines.append(f"| {_cell(item.get('reason_code'))} | {_cell(item.get('count'))} |")
+    else:
+        lines.append("_None._")
+    lines.extend(["", "### Hybrid Score Buckets", ""])
+    lines.extend(_hybrid_bucket_rows("Theme Score", summary.get("theme_score_buckets") or {}))
+    lines.extend(["", "### Membership Score Buckets", ""])
+    lines.extend(_hybrid_bucket_rows("Membership Score", summary.get("membership_score_buckets") or {}))
+    return lines
+
+
+def _hybrid_bucket_rows(title: str, buckets: dict) -> list[str]:
+    if not buckets:
+        return ["_None._"]
+    lines = [f"| {title} | Count |", "|---|---:|"]
+    for key in ["0-39", "40-64", "65-74", "75+"]:
+        lines.append(f"| {_cell(key)} | {_cell(buckets.get(key, 0))} |")
+    return lines
+
+
 def _all_reason_codes(review: TradeReview) -> list[str]:
     details = dict(review.details or {})
     values = []
@@ -516,6 +564,7 @@ def _all_reason_codes(review: TradeReview) -> list[str]:
         values.append(review.missed_reason)
     if review.exit_reason:
         values.append(review.exit_reason)
+    values.extend(details.get("hybrid_reason_codes") or [])
     return _dedupe(values)
 
 

@@ -20,6 +20,14 @@ from trading.strategy.exit import (
 )
 from trading.strategy.export import REVIEW_EXPORT_COLUMNS, ReviewExporter
 from trading.strategy.gates import StockLeadershipGate, ThemeStrengthGate
+from trading.strategy.hybrid_gate import (
+    HybridDynamicThemeGate,
+    HybridGateComponent,
+    HybridGateConfig,
+    HybridGateDecision,
+    HybridGateStatus,
+    HybridPositionTier,
+)
 from trading.strategy.holding import HoldingProvider, StaticHoldingProvider
 from trading.strategy.indicators import IndicatorCalculator, PreviousDayLevelProvider
 from trading.strategy.intraday import IntradayStateTracker
@@ -101,6 +109,12 @@ __all__ = [
     "GatePipeline",
     "GatePipelineResult",
     "HoldingProvider",
+    "HybridDynamicThemeGate",
+    "HybridGateComponent",
+    "HybridGateConfig",
+    "HybridGateDecision",
+    "HybridGateStatus",
+    "HybridPositionTier",
     "IndicatorSnapshot",
     "IndicatorCalculator",
     "IndexCodeMapper",

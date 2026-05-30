@@ -13,6 +13,7 @@ from trading.strategy.gates import (
     ThemePullbackGate,
     ThemeStrengthGate,
 )
+from trading.strategy.hybrid_gate import HybridDynamicThemeGate, HybridGateConfig, HybridGateStatus, hybrid_decision_flat_fields
 from trading.strategy.indicators import IndicatorCalculator
 from trading.strategy.intraday import IntradayStateTracker
 from trading.strategy.market_index import MarketIndexStore
@@ -62,6 +63,7 @@ class GatePipeline:
         self.intraday_tracker = intraday_tracker
         self.market_index_store = market_index_store
         self.settings = settings or legacy_strategy_runtime_settings()
+        self.hybrid_gate = HybridDynamicThemeGate(HybridGateConfig.from_settings(self.settings))
 
     def evaluate(
         self,
@@ -164,18 +166,47 @@ class GatePipeline:
             leadership_decision,
             stock_pullback_decision,
         ]
+        hybrid_decision = self.hybrid_gate.evaluate(
+            candidate=candidate,
+            theme_context=mapping,
+            theme_result=theme_result,
+            leadership_result=leadership_result,
+            market_decision=market_decision,
+            theme_strength_decision=theme_strength_decision,
+            theme_pullback_decision=theme_pullback_decision,
+            leadership_decision=leadership_decision,
+            stock_pullback_decision=stock_pullback_decision,
+        )
         comparison_reason_codes = _comparison_reason_codes(decisions)
-        final_score = _final_score(decisions, self.settings)
-        grade, strategy_eligible, block_type, can_recover, recheck_after_sec, cap_rules, sub_status = _final_grade(
+        legacy_final_score = _final_score(decisions, self.settings)
+        legacy_grade, legacy_strategy_eligible, legacy_block_type, legacy_can_recover, legacy_recheck_after_sec, legacy_cap_rules, legacy_sub_status = _final_grade(
             candidate,
             mapping,
             theme_result,
             leadership_result,
             decisions,
-            final_score,
+            legacy_final_score,
             self.settings,
         )
+        grade = legacy_grade
+        strategy_eligible = legacy_strategy_eligible
+        block_type = legacy_block_type
+        can_recover = legacy_can_recover
+        recheck_after_sec = legacy_recheck_after_sec
+        cap_rules = list(legacy_cap_rules)
+        sub_status = legacy_sub_status
+        final_score = legacy_final_score
+        hybrid_live_applied = False
+        if self.hybrid_gate.config.hybrid_gate_enabled and not self.hybrid_gate.config.hybrid_gate_observe_only:
+            grade, strategy_eligible, block_type, can_recover, recheck_after_sec, cap_rules, sub_status = _hybrid_live_result(
+                hybrid_decision,
+                fallback_grade=legacy_grade,
+            )
+            final_score = hybrid_decision.score
+            hybrid_live_applied = True
         weights = _gate_weights(self.settings)
+        hybrid_payload = hybrid_decision.to_dict()
+        hybrid_flat = hybrid_decision_flat_fields(hybrid_decision)
         details = attach_settings_details({
             "theme_id": mapping.theme_id,
             "theme_name": mapping.theme_name,
@@ -197,6 +228,14 @@ class GatePipeline:
             "late_chase_score": stock_pullback_decision.details.get("late_chase_score"),
             "comparison_reason_codes": comparison_reason_codes,
             "secondary_reason_codes": comparison_reason_codes,
+            "hybrid_result": hybrid_payload,
+            "hybrid_live_applied": hybrid_live_applied,
+            "legacy_final_grade": legacy_grade,
+            "legacy_final_score": legacy_final_score,
+            "legacy_strategy_eligible": legacy_strategy_eligible,
+            "legacy_block_type": legacy_block_type.value,
+            "legacy_sub_status": legacy_sub_status,
+            **hybrid_flat,
         }, self.settings)
         details = standardize_details(
             details,
@@ -206,7 +245,7 @@ class GatePipeline:
             created_at=snapshot.created_at if snapshot else "",
             legacy_result=strategy_eligible,
             new_result=strategy_eligible,
-            legacy_score=final_score,
+            legacy_score=legacy_final_score,
             new_score=final_score,
         )
         final_decision = GateDecision(
@@ -304,6 +343,28 @@ def _final_score(decisions: list[GateDecision], settings: Optional[StrategyRunti
     weights = _gate_weights(settings)
     score = sum(decision.score * weights.get(decision.gate_name, 0.0) for decision in decisions)
     return round(score, 4)
+
+
+def _hybrid_live_result(
+    hybrid_decision,
+    *,
+    fallback_grade: str,
+) -> tuple[str, bool, BlockType, bool, int, list[str], str]:
+    status = hybrid_decision.status.value if hasattr(hybrid_decision.status, "value") else str(hybrid_decision.status)
+    position_tier = (
+        hybrid_decision.position_tier.value
+        if hasattr(hybrid_decision.position_tier, "value")
+        else str(hybrid_decision.position_tier)
+    )
+    reason_codes = list(hybrid_decision.reason_codes)
+    if status == HybridGateStatus.READY.value:
+        grade = "A" if position_tier == "normal_first_entry" else "B+"
+        return grade, True, BlockType.NONE, False, 0, reason_codes, "HYBRID_READY"
+    if status == HybridGateStatus.WAIT.value:
+        return fallback_grade if fallback_grade != "C" else "B", False, BlockType.TEMPORARY, True, 60, reason_codes, "HYBRID_WAIT"
+    if status == HybridGateStatus.BLOCKED.value:
+        return "C", False, BlockType.FINAL, False, 0, reason_codes, "HYBRID_BLOCKED"
+    return fallback_grade if fallback_grade != "A" else "B", False, BlockType.NONE, False, 0, reason_codes, "HYBRID_OBSERVE"
 
 
 def _final_grade(

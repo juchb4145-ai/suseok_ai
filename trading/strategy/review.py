@@ -65,6 +65,7 @@ class TradeReviewService:
         }, self.settings)
         details.update(_partial_exit_details(virtual_position, decisions, self.settings))
         details.update(_reason_code_details(gate_result, decisions))
+        details.update(_hybrid_details(gate_result))
         _attach_virtual_order_details(details, virtual_order)
 
         horizon_start, horizon_reason = _horizon_start(candidate, gate_result, entry_plan, virtual_order, virtual_position, final_status)
@@ -319,6 +320,49 @@ def _reason_code_details(
         "exit_reason_code_fields": reason_code_fields(exit_reason_codes),
         "comparison_reason_code_fields": reason_code_fields(comparison_reason_codes),
     }
+
+
+def _hybrid_details(gate_result: Optional[GatePipelineResult]) -> dict:
+    if gate_result is None:
+        return {}
+    details = dict(gate_result.details or {})
+    result = details.get("hybrid_result")
+    payload = dict(result) if isinstance(result, dict) else {}
+    flat_keys = [
+        "hybrid_status",
+        "hybrid_score",
+        "hybrid_position_tier",
+        "hybrid_primary_reason",
+        "hybrid_reason_codes",
+        "dynamic_theme_id",
+        "dynamic_theme_name",
+        "dynamic_theme_status",
+        "dynamic_theme_score",
+        "dynamic_theme_rank",
+        "theme_breadth",
+        "leader_gap",
+        "top3_concentration",
+        "rank_in_theme",
+        "membership_score",
+        "entry_timing_score",
+        "chase_risk",
+        "hybrid_observe_only",
+        "hybrid_live_applied",
+    ]
+    hybrid = {key: details.get(key) for key in flat_keys if key in details}
+    if payload:
+        hybrid["hybrid_result"] = payload
+        hybrid.setdefault("hybrid_status", payload.get("status"))
+        hybrid.setdefault("hybrid_score", payload.get("score"))
+        hybrid.setdefault("hybrid_position_tier", payload.get("position_tier"))
+        hybrid.setdefault("hybrid_primary_reason", payload.get("primary_reason"))
+        hybrid.setdefault("hybrid_reason_codes", list(payload.get("reason_codes") or []))
+    if hybrid.get("hybrid_reason_codes"):
+        comparison = list(details.get("comparison_reason_codes") or [])
+        comparison.extend(hybrid.get("hybrid_reason_codes") or [])
+        hybrid["comparison_reason_codes"] = _dedupe(comparison)
+        hybrid["comparison_reason_code_fields"] = reason_code_fields(hybrid["comparison_reason_codes"])
+    return hybrid
 
 
 def _partial_exit_details(
