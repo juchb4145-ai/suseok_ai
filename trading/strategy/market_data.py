@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from trading.strategy.candidates import normalize_code
 
@@ -15,7 +15,11 @@ class StrategyTick:
     cum_volume: int = 0
     best_ask: int = 0
     best_bid: int = 0
+    trade_value: float = 0.0
+    execution_strength: float = 0.0
+    spread_ticks: int = 0
     timestamp: datetime = datetime.min
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_realtime(
@@ -26,7 +30,11 @@ class StrategyTick:
         cum_volume=0,
         best_ask=0,
         best_bid=0,
+        trade_value=0,
+        execution_strength=0,
+        spread_ticks=0,
         timestamp: Optional[datetime] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> "StrategyTick":
         return cls(
             code=normalize_code(code),
@@ -35,7 +43,11 @@ class StrategyTick:
             cum_volume=_clean_abs_int(cum_volume),
             best_ask=_clean_abs_int(best_ask),
             best_bid=_clean_abs_int(best_bid),
+            trade_value=max(0.0, _clean_float(trade_value)),
+            execution_strength=max(0.0, _clean_float(execution_strength)),
+            spread_ticks=_clean_abs_int(spread_ticks),
             timestamp=(timestamp or datetime.now()).replace(microsecond=0),
+            metadata=dict(metadata or {}),
         )
 
 

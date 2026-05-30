@@ -134,3 +134,21 @@ def test_entry_plan_contains_review_context_and_does_not_mutate_result():
     assert plan.cancel_condition["gate_result_key"] == "1:111111:robot:A"
     assert result.snapshot.to_dict() == before_snapshot
     assert result.decisions[0].details == before_decision_details
+
+
+def test_entry_plan_carries_late_chase_comparison_metadata():
+    result = gate_result()
+    result.decisions[0].details["late_chase_diagnostics"] = {
+        "late_chase_score": 100.0,
+        "late_chase_level": "soft_block",
+        "reason_codes": ["LATE_CHASE", "SOFT_BLOCK_ONLY"],
+    }
+    result.decisions[0].details["late_chase_score"] = 100.0
+    result.decisions[0].details["late_chase_level"] = "soft_block"
+    result.decisions[0].details["comparison_reason_codes"] = ["LATE_CHASE", "SOFT_BLOCK_ONLY"]
+
+    plan = EntryPlanBuilder().build(result)
+
+    assert plan.cancel_condition["late_chase_diagnostics"]["late_chase_level"] == "soft_block"
+    assert plan.cancel_condition["late_chase_score"] == 100.0
+    assert plan.cancel_condition["comparison_reason_codes"] == ["LATE_CHASE", "SOFT_BLOCK_ONLY"]

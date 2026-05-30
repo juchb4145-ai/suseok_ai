@@ -1,6 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from storage.db import TradingDatabase
+from trading.strategy.candles import CandleBuilder
 from trading.strategy.gates import ThemeStrengthGate
 from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.strategy.models import Candidate, CandidateState, StrategyProfile
@@ -21,6 +22,25 @@ def tick(store, code, price=10_000, change_rate=5.0, cum_volume=1_000):
             timestamp=datetime(2026, 5, 29, 9, 0),
         )
     )
+
+
+def feed_series(store, builder, code, prices, volumes=None, change_rate=1.0, start=None):
+    start = start or datetime(2026, 5, 29, 9, 0)
+    cum_volume = 1_000
+    volumes = volumes or [100] * len(prices)
+    for index, price in enumerate(prices):
+        cum_volume += volumes[index]
+        at = start + timedelta(minutes=index, seconds=1)
+        realtime = StrategyTick.from_realtime(
+            code,
+            price=price,
+            change_rate=change_rate,
+            cum_volume=cum_volume,
+            timestamp=at,
+        )
+        store.update_tick(realtime)
+        builder.update(realtime)
+    builder.flush(code, start + timedelta(minutes=len(prices), seconds=1))
 
 
 def map_stock(repo, code, theme_id, profile=StrategyProfile.KOSDAQ_THEME_PROFILE, signal=False, priority=50):
@@ -150,4 +170,73 @@ def test_expired_and_removed_candidates_are_not_active(tmp_path):
     results = ThemeStrengthGate(repo, store).evaluate([candidate("111111", CandidateState.EXPIRED)])
 
     assert results == []
+    db.close()
+
+
+def test_theme_diagnostics_v2_caps_one_spike_distortion(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    repo = ThemeRepository(db)
+    store = MarketDataStore()
+    for code in ["111111", "222222", "333333"]:
+        map_stock(repo, code, "robot")
+    tick(store, "111111", change_rate=30.0, cum_volume=10_000)
+    tick(store, "222222", change_rate=1.0, cum_volume=9_000)
+    tick(store, "333333", change_rate=0.5, cum_volume=8_000)
+
+    result = ThemeStrengthGate(repo, store).evaluate(
+        [candidate("111111"), candidate("222222"), candidate("333333")]
+    )[0]
+    diagnostics = result.details["theme_diagnostics_v2"]
+
+    assert diagnostics["theme_trimmed_avg_change_pct"] == 1.0
+    assert diagnostics["theme_capped_avg_change_pct"] < 5.0
+    assert diagnostics["theme_capped_avg_change_pct"] < ((30.0 + 1.0 + 0.5) / 3)
+    db.close()
+
+
+def test_theme_sync_weak_is_recorded_without_changing_grade(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    repo = ThemeRepository(db)
+    store = MarketDataStore()
+    for code in ["111111", "222222", "333333", "444444"]:
+        map_stock(repo, code, "robot")
+    tick(store, "111111", change_rate=5.0, cum_volume=10_000)
+    tick(store, "222222", change_rate=-1.0, cum_volume=9_000)
+    tick(store, "333333", change_rate=-2.0, cum_volume=8_000)
+    tick(store, "444444", change_rate=-1.5, cum_volume=7_000)
+
+    result = ThemeStrengthGate(repo, store).evaluate(
+        [candidate("111111"), candidate("222222"), candidate("333333"), candidate("444444")]
+    )[0]
+
+    assert "THEME_SYNC_WEAK" in result.details["comparison_reason_codes"]
+    assert "SOFT_BLOCK_ONLY" in result.details["comparison_reason_codes"]
+    assert result.details["theme_diagnostics_v2"]["theme_sync_score"] < 50
+    assert result.grade == "B"
+    db.close()
+
+
+def test_theme_trade_value_growth_and_input_missing_are_diagnostic_only(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    repo = ThemeRepository(db)
+    store = MarketDataStore()
+    builder = CandleBuilder()
+    for code in ["111111", "222222", "333333"]:
+        map_stock(repo, code, "robot")
+        feed_series(
+            store,
+            builder,
+            code,
+            [10_000 + index * 10 for index in range(10)],
+            volumes=[100] * 5 + [300] * 5,
+            change_rate=2.0,
+        )
+
+    result = ThemeStrengthGate(repo, store, builder).evaluate(
+        [candidate("111111"), candidate("222222"), candidate("333333")]
+    )[0]
+    diagnostics = result.details["theme_diagnostics_v2"]
+
+    assert diagnostics["theme_trade_value_growth_pct"] > 0
+    assert "theme_trade_value_growth_missing" not in diagnostics["input_missing_fields"]
     db.close()

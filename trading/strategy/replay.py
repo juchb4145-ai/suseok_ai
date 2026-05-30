@@ -52,6 +52,9 @@ class TickReplayRunner:
                 cum_volume=row.get("cum_volume", 0),
                 best_ask=row.get("best_ask", 0),
                 best_bid=row.get("best_bid", 0),
+                trade_value=row.get("trade_value", 0),
+                execution_strength=row.get("execution_strength", 0),
+                spread_ticks=row.get("spread_ticks", 0),
                 timestamp=_parse_timestamp(row.get("timestamp")),
             )
             if not tick.code or tick.price <= 0:

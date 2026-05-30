@@ -152,6 +152,11 @@ class MarketIndexStore:
         tick = self.market_data.latest_tick(clean_code)
         day_high, day_low = self.market_data.day_high_low(clean_code)
         day_mid = ((day_high + day_low) / 2.0) if day_high > 0 and day_low > 0 else None
+        metadata = dict(self._metadata.get(clean_code, {}))
+        metadata["index_return_pct_5m"] = self.return_pct(index_code, 5)
+        metadata["index_return_pct_20m"] = self.return_pct(index_code, 20)
+        metadata["index_slope_5m_pct"] = metadata["index_return_pct_5m"]
+        metadata["index_slope_20m_pct"] = metadata["index_return_pct_20m"]
         return MarketIndexState(
             index_code=self._display_codes.get(clean_code, str(index_code or "").strip().upper()),
             price=tick.price if tick else 0,
@@ -162,8 +167,20 @@ class MarketIndexStore:
             direction_5m=self._direction_5m(clean_code),
             mid_position=self._mid_position(tick.price if tick else 0, day_mid),
             low_break_recent=self._low_break_recent.get(clean_code, False),
-            metadata=dict(self._metadata.get(clean_code, {})),
+            metadata=metadata,
         )
+
+    def return_pct(self, index_code: str, minutes: int) -> Optional[float]:
+        clean_code = self._storage_code(index_code)
+        candles = self.candle_builder.completed_candles(clean_code, 1)
+        if len(candles) < minutes:
+            return None
+        window = candles[-minutes:]
+        first = window[0].open
+        last = window[-1].close
+        if first <= 0:
+            return None
+        return round(((last - first) / first) * 100.0, 6)
 
     def _direction_5m(self, code: str) -> str:
         candles = self.candle_builder.completed_candles(code, 5)

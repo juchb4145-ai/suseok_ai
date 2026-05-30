@@ -51,6 +51,23 @@ def feed_stock(store, builder, code, high=10_000, low=9_500, current=9_750, cum_
         builder.update(tick)
 
 
+def feed_series(store, builder, code, prices, volumes, change_rate=5.0, cum_base=1_000):
+    start = datetime(2026, 5, 29, 9, 0)
+    cumulative = cum_base
+    for index, (price, volume) in enumerate(zip(prices, volumes)):
+        cumulative += volume
+        tick = StrategyTick.from_realtime(
+            code,
+            price=price,
+            change_rate=change_rate,
+            cum_volume=cumulative,
+            timestamp=start + timedelta(minutes=index, seconds=1),
+        )
+        store.update_tick(tick)
+        builder.update(tick)
+    builder.flush(code, start + timedelta(minutes=len(prices), seconds=1))
+
+
 def feed_kospi_wait_stock(store, builder, code):
     start = datetime(2026, 5, 29, 9, 0)
     points = [
@@ -81,6 +98,10 @@ def result_for(results, code, theme_id):
     return next(result for result in results if result.code == code and result.theme_id == theme_id)
 
 
+def stock_pullback_details(result):
+    return next(dec for dec in result.decisions if dec.gate_name == "StockPullbackEntryGate").details
+
+
 def test_strategy_eligible_is_not_actual_order_permission_and_pipeline_does_not_persist_or_mutate(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     repo = ThemeRepository(db)
@@ -98,6 +119,14 @@ def test_strategy_eligible_is_not_actual_order_permission_and_pipeline_does_not_
 
     assert target.final_grade == "A"
     assert target.strategy_eligible is True
+    assert target.details["legacy_result"] is True
+    assert target.details["new_result"] is True
+    assert target.details["legacy_score"] == target.final_score
+    assert target.details["new_score"] == target.final_score
+    assert target.details["comparison_mode"] == "legacy_only"
+    assert "theme_diagnostics_v2" in target.details
+    assert "leadership_diagnostics_v2" in target.details
+    assert isinstance(target.details["comparison_reason_codes"], list)
     assert target.details["actual_order_allowed"] is False
     assert target.details["entry_plan_created"] is False
     assert candidates[0].state == CandidateState.WATCHING
@@ -372,6 +401,10 @@ def test_data_insufficient_is_temporary_and_distinct_from_final_block(tmp_path):
     assert target.can_recover is True
     assert target.details["sub_status"] == "DATA_INSUFFICIENT"
     assert "DATA_INSUFFICIENT_CAP" in target.details["cap_rules_applied"]
+    diagnostics = stock_pullback_details(target)["late_chase_diagnostics"]
+    assert diagnostics["late_chase_level"] == "none"
+    assert "INPUT_MISSING" in diagnostics["reason_codes"]
+    assert "snapshot_missing" in diagnostics["input_missing_fields"]
     db.close()
 
 
@@ -397,4 +430,124 @@ def test_hard_cap_overrides_high_score_on_chase_risk(tmp_path):
     assert target.final_grade == "C"
     assert "CHASE_RISK_CAP" in target.details["cap_rules_applied"]
     assert target.final_score > 55
+    db.close()
+
+
+def test_late_chase_guardrail_does_not_soft_block_reaccelerating_breakout(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    repo = ThemeRepository(db)
+    store = MarketDataStore()
+    builder = CandleBuilder()
+    index_store = MarketIndexStore()
+    for index, code in enumerate(["111111", "222222", "333333"]):
+        map_stock(repo, code, "robot", priority=90 - index)
+        if code == "111111":
+            feed_series(
+                store,
+                builder,
+                code,
+                prices=[9_800, 9_840, 9_880, 9_920, 9_960, 10_000],
+                volumes=[100, 140, 180, 240, 320, 500],
+            )
+        else:
+            feed_stock(store, builder, code, low=9_800, current=9_900, cum_base=2_000 - index * 100)
+    feed_index(index_store, "KOSDAQ")
+
+    target = result_for(
+        build_pipeline(repo, store, builder, index_store, {"111111": (9_900, 9_700)}).evaluate(
+            [candidate("111111"), candidate("222222"), candidate("333333")]
+        ),
+        "111111",
+        "robot",
+    )
+    diagnostics = stock_pullback_details(target)["late_chase_diagnostics"]
+
+    assert diagnostics["near_session_high"] is True
+    assert diagnostics["volume_reacceleration_confirmed"] is True
+    assert diagnostics["support_distance_excessive"] is False
+    assert diagnostics["late_chase_level"] == "none"
+    assert "LATE_CHASE" not in diagnostics["reason_codes"]
+    assert target.details["legacy_result"] == target.strategy_eligible
+    db.close()
+
+
+def test_late_chase_warning_when_risks_are_partial(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    repo = ThemeRepository(db)
+    store = MarketDataStore()
+    builder = CandleBuilder()
+    index_store = MarketIndexStore()
+    for index, code in enumerate(["111111", "222222", "333333"]):
+        map_stock(repo, code, "robot", priority=90 - index)
+        if code == "111111":
+            feed_series(
+                store,
+                builder,
+                code,
+                prices=[9_500, 9_900, 9_900, 9_900, 9_900, 10_000],
+                volumes=[1_000, 1_000, 900, 800, 700, 100],
+            )
+        else:
+            feed_stock(store, builder, code, low=9_800, current=9_900, cum_base=2_000 - index * 100)
+    feed_index(index_store, "KOSDAQ")
+
+    target = result_for(
+        build_pipeline(repo, store, builder, index_store, {"111111": (9_500, 9_300)}).evaluate(
+            [candidate("111111"), candidate("222222"), candidate("333333")]
+        ),
+        "111111",
+        "robot",
+    )
+    diagnostics = stock_pullback_details(target)["late_chase_diagnostics"]
+
+    assert diagnostics["near_session_high"] is True
+    assert diagnostics["volume_deceleration"] is True
+    assert diagnostics["support_distance_excessive"] is False
+    assert diagnostics["late_chase_level"] == "warning"
+    assert "LATE_CHASE" not in diagnostics["reason_codes"]
+    db.close()
+
+
+def test_late_chase_soft_block_is_recorded_for_far_support_decelerating_large_candle(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    repo = ThemeRepository(db)
+    store = MarketDataStore()
+    builder = CandleBuilder()
+    index_store = MarketIndexStore()
+    for index, code in enumerate(["111111", "222222", "333333"]):
+        map_stock(repo, code, "robot", priority=90 - index)
+        if code == "111111":
+            feed_series(
+                store,
+                builder,
+                code,
+                prices=[9_000, 9_000, 9_000, 9_000, 9_600, 10_000],
+                volumes=[1_000, 900, 800, 700, 600, 100],
+            )
+        else:
+            feed_stock(store, builder, code, low=9_800, current=9_900, cum_base=2_000 - index * 100)
+    feed_index(index_store, "KOSDAQ")
+
+    target = result_for(
+        build_pipeline(repo, store, builder, index_store, {"111111": (9_000, 8_500)}).evaluate(
+            [candidate("111111"), candidate("222222"), candidate("333333")]
+        ),
+        "111111",
+        "robot",
+    )
+    details = stock_pullback_details(target)
+    diagnostics = details["late_chase_diagnostics"]
+
+    assert diagnostics["near_session_high"] is True
+    assert diagnostics["support_distance_excessive"] is True
+    assert diagnostics["volume_deceleration"] is True
+    assert diagnostics["after_large_3m_candle"] is True
+    assert diagnostics["late_chase_level"] == "soft_block"
+    assert "LATE_CHASE" in diagnostics["reason_codes"]
+    assert "SOFT_BLOCK_ONLY" in details["comparison_reason_codes"]
+    assert target.details["late_chase_diagnostics"]["late_chase_level"] == "soft_block"
+    assert "LATE_CHASE" in target.details["comparison_reason_codes"]
+    assert target.final_grade == "C"
+    assert "CHASE_RISK_CAP" in target.details["cap_rules_applied"]
+    assert target.details["legacy_result"] == target.strategy_eligible
     db.close()

@@ -207,7 +207,8 @@ class TradingDatabase:
                 submitted_at TEXT NOT NULL DEFAULT '',
                 filled_at TEXT NOT NULL DEFAULT '',
                 cancelled_at TEXT NOT NULL DEFAULT '',
-                unfilled_reason TEXT NOT NULL DEFAULT ''
+                unfilled_reason TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS virtual_positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -255,6 +256,15 @@ class TradingDatabase:
                 config_key TEXT PRIMARY KEY,
                 config_version INTEGER NOT NULL,
                 config_json TEXT NOT NULL,
+                strategy_name TEXT NOT NULL DEFAULT '',
+                profile_name TEXT NOT NULL DEFAULT '',
+                profile_version TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                effective_from TEXT NOT NULL DEFAULT '',
+                effective_to TEXT NOT NULL DEFAULT '',
+                settings_json TEXT NOT NULL DEFAULT '{}',
+                description TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -273,7 +283,10 @@ class TradingDatabase:
         self._ensure_column("indicator_snapshots", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("virtual_orders", "leg_index", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column("virtual_orders", "weight_pct", "REAL NOT NULL DEFAULT 100")
+        self._ensure_column("virtual_orders", "details_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("virtual_positions", "details_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_strategy_runtime_settings_columns()
+        self._seed_legacy_strategy_runtime_settings()
         self._ensure_trade_review_columns()
         self.conn.execute(
             """
@@ -665,8 +678,8 @@ class TradingDatabase:
                     INSERT INTO virtual_orders(
                         candidate_id, entry_plan_id, leg_index, weight_pct, status,
                         limit_price, virtual_fill_price, fill_policy, submitted_at,
-                        filled_at, cancelled_at, unfilled_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        filled_at, cancelled_at, unfilled_reason, details_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     self._virtual_order_params(order),
                 )
@@ -686,7 +699,8 @@ class TradingDatabase:
                         submitted_at = ?,
                         filled_at = ?,
                         cancelled_at = ?,
-                        unfilled_reason = ?
+                        unfilled_reason = ?,
+                        details_json = ?
                     WHERE id = ?
                     """,
                     self._virtual_order_params(order) + (order.id,),
@@ -864,6 +878,76 @@ class TradingDatabase:
             row = self.conn.execute(
                 "SELECT * FROM strategy_runtime_settings WHERE config_key = ?",
                 (config_key,),
+            ).fetchone()
+            return dict(row)
+
+    def load_strategy_runtime_settings_profile(
+        self,
+        strategy_name: str,
+        profile_name: str,
+        profile_version: str,
+        *,
+        now: str = "",
+    ) -> Optional[dict]:
+        params = [strategy_name, profile_name, profile_version]
+        query = """
+            SELECT * FROM strategy_runtime_settings
+            WHERE strategy_name = ?
+              AND profile_name = ?
+              AND profile_version = ?
+              AND enabled = 1
+        """
+        if now:
+            query += """
+              AND (effective_from = '' OR effective_from <= ?)
+              AND (effective_to = '' OR effective_to > ?)
+            """
+            params.extend([now, now])
+        query += " ORDER BY updated_at DESC LIMIT 1"
+        row = self.conn.execute(query, params).fetchone()
+        return dict(row) if row else None
+
+    def save_strategy_runtime_settings_profile(self, payload: dict) -> dict:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO strategy_runtime_settings(
+                    config_key, config_version, config_json,
+                    strategy_name, profile_name, profile_version, mode, enabled,
+                    effective_from, effective_to, settings_json, description, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(config_key) DO UPDATE SET
+                    config_version=excluded.config_version,
+                    config_json=excluded.config_json,
+                    strategy_name=excluded.strategy_name,
+                    profile_name=excluded.profile_name,
+                    profile_version=excluded.profile_version,
+                    mode=excluded.mode,
+                    enabled=excluded.enabled,
+                    effective_from=excluded.effective_from,
+                    effective_to=excluded.effective_to,
+                    settings_json=excluded.settings_json,
+                    description=excluded.description,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    payload["config_key"],
+                    int(payload.get("config_version") or 1),
+                    payload.get("config_json") or "{}",
+                    payload.get("strategy_name") or "",
+                    payload.get("profile_name") or "",
+                    payload.get("profile_version") or "",
+                    payload.get("mode") or "",
+                    int(payload.get("enabled", 1)),
+                    payload.get("effective_from") or "",
+                    payload.get("effective_to") or "",
+                    payload.get("settings_json") or "{}",
+                    payload.get("description") or "",
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM strategy_runtime_settings WHERE config_key = ?",
+                (payload["config_key"],),
             ).fetchone()
             return dict(row)
 
@@ -1132,6 +1216,7 @@ class TradingDatabase:
             order.filled_at,
             order.cancelled_at,
             order.unfilled_reason,
+            json.dumps(order.details, ensure_ascii=False),
         )
 
     @staticmethod
@@ -1365,6 +1450,7 @@ class TradingDatabase:
             filled_at=row["filled_at"],
             cancelled_at=row["cancelled_at"],
             unfilled_reason=row["unfilled_reason"],
+            details=dict(json.loads(row["details_json"] if "details_json" in keys else "{}")),
         )
 
     @staticmethod
@@ -1459,6 +1545,55 @@ class TradingDatabase:
         }
         for name, definition in columns.items():
             self._ensure_column("trade_reviews", name, definition)
+
+    def _ensure_strategy_runtime_settings_columns(self) -> None:
+        columns = {
+            "strategy_name": "TEXT NOT NULL DEFAULT ''",
+            "profile_name": "TEXT NOT NULL DEFAULT ''",
+            "profile_version": "TEXT NOT NULL DEFAULT ''",
+            "mode": "TEXT NOT NULL DEFAULT ''",
+            "enabled": "INTEGER NOT NULL DEFAULT 1",
+            "effective_from": "TEXT NOT NULL DEFAULT ''",
+            "effective_to": "TEXT NOT NULL DEFAULT ''",
+            "settings_json": "TEXT NOT NULL DEFAULT '{}'",
+            "description": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in columns.items():
+            self._ensure_column("strategy_runtime_settings", name, definition)
+
+    def _seed_legacy_strategy_runtime_settings(self) -> None:
+        from trading.strategy.runtime_settings import legacy_profile_payload
+
+        payload = legacy_profile_payload()
+        exists = self.conn.execute(
+            "SELECT 1 FROM strategy_runtime_settings WHERE config_key = ?",
+            (payload["config_key"],),
+        ).fetchone()
+        if exists:
+            return
+        self.conn.execute(
+            """
+            INSERT INTO strategy_runtime_settings(
+                config_key, config_version, config_json,
+                strategy_name, profile_name, profile_version, mode, enabled,
+                effective_from, effective_to, settings_json, description
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload["config_key"],
+                int(payload.get("config_version") or 1),
+                payload.get("config_json") or "{}",
+                payload.get("strategy_name") or "",
+                payload.get("profile_name") or "",
+                payload.get("profile_version") or "",
+                payload.get("mode") or "",
+                int(payload.get("enabled", 1)),
+                payload.get("effective_from") or "",
+                payload.get("effective_to") or "",
+                payload.get("settings_json") or "{}",
+                payload.get("description") or "",
+            ),
+        )
 
     def _ensure_column(self, table_name: str, column_name: str, column_definition: str) -> None:
         rows = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()

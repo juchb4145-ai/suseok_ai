@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 
 from storage.db import TradingDatabase
@@ -200,6 +201,14 @@ def test_blocked_review_horizon_and_gate_snapshot_false_negative():
     assert review.details["gate_decisions_snapshot"][0]["gate_name"] == "MarketIndexGate"
     assert "MARKET_WAIT" in review.details["blocking_reason_codes"]
     assert "MARKET_INDEX_TEMPORARY_CAP" in review.details["blocking_reason_codes"]
+    assert review.details["feature_version"] == "reason_details_v1"
+    assert review.details["strategy_feature_version"] == "observe_p1a_legacy_compare_v1"
+    assert review.details["comparison_mode"] == "legacy_only"
+    assert review.details["session_bucket"] == "OPEN_0_10"
+    assert review.details["legacy_result"] == review.details["new_result"] == review.final_status
+    assert review.details["primary_reason_code"] == "MARKET_WAIT"
+    assert review.details["secondary_reason_codes"] == ["MARKET_INDEX_TEMPORARY_CAP"]
+    assert review.details["gate_decisions_snapshot"][0]["primary_reason_code"] == "MARKET_WAIT"
 
 
 def test_unfilled_later_rallied_is_separate_false_negative_type():
@@ -420,6 +429,175 @@ def test_review_export_groups_false_positive_and_negative_by_reason_code(tmp_pat
     assert "SUPPORT_RECLAIMED" in text
     assert "SUPPORT_LOSS" in text
     db.close()
+
+
+def test_comparison_reason_codes_flow_to_review_and_report(tmp_path):
+    from trading.strategy.export import ReviewExporter
+
+    strategy_result = gate_result(block_type=BlockType.TEMPORARY, eligible=False)
+    strategy_result.decisions[0].details["comparison_reason_codes"] = ["THEME_SYNC_WEAK", "LATE_CHASE", "SOFT_BLOCK_ONLY"]
+    strategy_result.decisions[0].details["theme_diagnostics_v2"] = {"theme_sync_score": 25.0}
+    strategy_result.decisions.insert(
+        1,
+        GateDecision(
+            gate_name="StockPullbackEntryGate",
+            passed=False,
+            block_type=BlockType.TEMPORARY,
+            reason_codes=["WAIT_PULLBACK_CONFIRMATION"],
+            details={
+                "comparison_reason_codes": ["LATE_CHASE", "SOFT_BLOCK_ONLY"],
+                "late_chase_diagnostics": {"late_chase_level": "soft_block", "late_chase_score": 100.0},
+            },
+        ),
+    )
+
+    review = TradeReviewService().build_review(
+        candidate(),
+        strategy_result,
+        candle_builder=builder_with_candle(high=10_400),
+        created_at=datetime(2026, 5, 29, 9, 3),
+    )
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    db.save_trade_review(review)
+    md_path = ReviewExporter().export_markdown(db.list_trade_reviews(), tmp_path / "comparison.md")
+    text = md_path.read_text(encoding="utf-8")
+
+    assert "THEME_SYNC_WEAK" in review.details["comparison_reason_codes"]
+    assert "LATE_CHASE" in review.details["comparison_reason_codes"]
+    assert "SOFT_BLOCK_ONLY" in review.details["secondary_reason_codes"]
+    assert review.details["late_chase_diagnostics"]["late_chase_level"] == "soft_block"
+    assert "THEME_SYNC_WEAK" in text
+    assert "LATE_CHASE" in text
+    db.close()
+
+
+def test_fill_diagnostics_flow_to_review_and_report(tmp_path):
+    from trading.strategy.export import ReviewExporter
+
+    virtual_order = order(VirtualOrderStatus.UNFILLED)
+    virtual_order.details = {
+        "comparison_reason_codes": ["FILL_LIQUIDITY_WEAK"],
+        "fill_diagnostics_v2": {
+            "fill_model_version": "v2_observe",
+            "legacy_fill_result": True,
+            "v2_would_fill": False,
+            "fill_confidence_level": "low",
+            "v2_non_fill_reason_codes": ["FILL_LIQUIDITY_WEAK", "FILL_INPUT_INSUFFICIENT"],
+        },
+    }
+
+    review = TradeReviewService().build_review(
+        candidate(),
+        gate_result(),
+        virtual_order=virtual_order,
+        candle_builder=builder_with_candle(high=10_400),
+        created_at=datetime(2026, 5, 29, 9, 3),
+    )
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    db.save_trade_review(review)
+    md_path = ReviewExporter().export_markdown(db.list_trade_reviews(), tmp_path / "fill.md")
+    text = md_path.read_text(encoding="utf-8")
+
+    assert review.details["fill_diagnostics_v2"]["fill_confidence_level"] == "low"
+    assert "FILL_LIQUIDITY_WEAK" in review.details["comparison_reason_codes"]
+    assert "FILL_INPUT_INSUFFICIENT" in review.details["comparison_reason_codes"]
+    assert "FILL_LIQUIDITY_WEAK" in text
+    db.close()
+
+
+def test_review_summary_aggregates_reason_session_matrix_and_p1_diagnostics(tmp_path):
+    from trading.strategy.export import ReviewExporter
+
+    reviews = [
+        TradeReview(
+            candidate_id=1,
+            trade_date="2026-05-29",
+            code="111111",
+            theme_id="robot",
+            review_key="ready-new-blocked",
+            final_status=ReviewFinalStatus.VIRTUAL_FILLED.value,
+            virtual_order_status=VirtualOrderStatus.FILLED.value,
+            max_return_20m=0.8,
+            max_drawdown_20m=-4.2,
+            false_positive_flag=True,
+            details={
+                "session_bucket": "OPEN_0_10",
+                "legacy_result": True,
+                "new_result": False,
+                "comparison_reason_codes": ["FILL_LIQUIDITY_WEAK"],
+                "fill_diagnostics_v2": {
+                    "fill_confidence_level": "low",
+                    "legacy_fill_result": True,
+                    "v2_would_fill": False,
+                    "v2_non_fill_reason_codes": ["FILL_LIQUIDITY_WEAK"],
+                },
+            },
+        ),
+        TradeReview(
+            candidate_id=2,
+            trade_date="2026-05-29",
+            code="222222",
+            theme_id="robot",
+            review_key="blocked-new-ready",
+            final_status=ReviewFinalStatus.BLOCKED_TEMP.value,
+            max_return_20m=5.5,
+            max_drawdown_20m=-0.8,
+            false_negative_flag=True,
+            details={
+                "session_bucket": "OPEN_10_90",
+                "legacy_result": False,
+                "new_result": True,
+                "comparison_reason_codes": ["LATE_CHASE", "SOFT_BLOCK_ONLY", "THEME_SYNC_WEAK"],
+                "late_chase_diagnostics": {
+                    "late_chase_level": "soft_block",
+                    "near_session_high": True,
+                    "volume_reacceleration_confirmed": False,
+                },
+                "leadership_diagnostics_v2": {"leader_persistence_score": 35},
+            },
+        ),
+        TradeReview(
+            candidate_id=3,
+            trade_date="2026-05-29",
+            code="333333",
+            theme_id="auto",
+            review_key="missing-details",
+            final_status=ReviewFinalStatus.BLOCKED_FINAL.value,
+            details={},
+        ),
+    ]
+
+    exporter = ReviewExporter()
+    summary = exporter.build_summary(reviews)
+    reason_rows = {row["key"]: row for row in summary["reason_code_performance"]}
+    matrix_rows = {row["key"]: row for row in summary["legacy_new_matrix"]}
+    session_rows = {row["key"]: row for row in summary["session_bucket_performance"]}
+
+    assert reason_rows["LATE_CHASE"]["candidate_count"] == 1
+    assert reason_rows["LATE_CHASE"]["soft_block_count"] == 1
+    assert reason_rows["LATE_CHASE"]["opportunity_missed_count"] == 1
+    assert matrix_rows["legacy_ready_new_blocked"]["count"] == 1
+    assert matrix_rows["legacy_blocked_new_ready"]["positive_rate"] == 1.0
+    assert session_rows["OPEN_0_10"]["candidate_count"] == 1
+    assert session_rows["OPEN_10_90"]["false_negative_count"] == 1
+    assert summary["late_chase_diagnostics"]["late_chase_count"] == 1
+    assert summary["late_chase_diagnostics"]["soft_block_max_return_20m_avg"] == 5.5
+    assert summary["fill_diagnostics"]["legacy_fill_true_v2_false_count"] == 1
+    assert summary["fill_diagnostics"]["confidence_level_performance"][0]["key"] == "low"
+
+    md_path = exporter.export_markdown(reviews, tmp_path / "daily.md")
+    json_path = exporter.export_json(reviews, tmp_path / "daily.json")
+    csv_path = exporter.export_summary_csv(reviews, tmp_path / "daily_summary.csv")
+    markdown = md_path.read_text(encoding="utf-8")
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert "Reason Code Performance" in markdown
+    assert "Legacy vs New Matrix" in markdown
+    assert "Session Bucket Performance" in markdown
+    assert "Late Chase Diagnostics" in markdown
+    assert "Fill Diagnostics" in markdown
+    assert payload["summary"]["fill_diagnostics"]["legacy_fill_true_v2_false_count"] == 1
+    assert csv_path.read_text(encoding="utf-8-sig").splitlines()[0].startswith("section,key,candidate_count")
 
 
 def test_tick_replay_is_deterministic_with_same_timestamp_order():

@@ -75,6 +75,8 @@ def test_pr_1_9_review_export_replay_paths_do_not_reference_real_order_path():
     for path in [
         "trading/strategy/review.py",
         "trading/strategy/export.py",
+        "trading/strategy/reason_codes.py",
+        "trading/strategy/session.py",
         "trading/strategy/replay.py",
         "trading/strategy/runtime.py",
         "trading/strategy/config.py",

@@ -847,7 +847,9 @@ class StrategyRuntime:
                 if plan is None:
                     snapshot.warnings.append(f"VIRTUAL_ORDER_PLAN_MISSING:{order.id}")
                     continue
-                result = self.virtual_order_service.evaluate_fill(order, plan, self.candle_builder, now)
+                market_data = getattr(self.gate_pipeline, "market_data", None)
+                latest_tick = market_data.latest_tick(str(plan.cancel_condition.get("code") or "")) if market_data is not None else None
+                result = self.virtual_order_service.evaluate_fill(order, plan, self.candle_builder, now, latest_tick=latest_tick)
                 if result.changed:
                     saved_order = self.db.save_virtual_order(result.order)
                     snapshot.virtual_order_status_change_count += 1
@@ -1480,6 +1482,17 @@ def _gate_result_record(result: GatePipelineResult, evaluated_at: str) -> dict:
         "strategy_eligible": result.strategy_eligible,
         "block_type": result.block_type.value,
         "reason_codes": _result_reason_codes(result),
+        "comparison_reason_codes": list(result.details.get("comparison_reason_codes") or []),
+        "primary_reason_code": result.details.get("primary_reason_code", ""),
+        "secondary_reason_codes": list(result.details.get("secondary_reason_codes") or []),
+        "feature_version": result.details.get("feature_version", ""),
+        "strategy_feature_version": result.details.get("strategy_feature_version", ""),
+        "session_bucket": result.details.get("session_bucket", ""),
+        "comparison_mode": result.details.get("comparison_mode", ""),
+        "legacy_result": result.details.get("legacy_result"),
+        "new_result": result.details.get("new_result"),
+        "legacy_score": result.details.get("legacy_score"),
+        "new_score": result.details.get("new_score"),
         "sub_status": result.details.get("sub_status", ""),
         "score": result.final_score,
         "evaluated_at": evaluated_at,
@@ -1493,6 +1506,17 @@ def _block_record(result: GatePipelineResult) -> dict:
         "final_grade": result.final_grade,
         "block_type": result.block_type.value,
         "reason_codes": _result_reason_codes(result),
+        "comparison_reason_codes": list(result.details.get("comparison_reason_codes") or []),
+        "primary_reason_code": result.details.get("primary_reason_code", ""),
+        "secondary_reason_codes": list(result.details.get("secondary_reason_codes") or []),
+        "feature_version": result.details.get("feature_version", ""),
+        "strategy_feature_version": result.details.get("strategy_feature_version", ""),
+        "session_bucket": result.details.get("session_bucket", ""),
+        "comparison_mode": result.details.get("comparison_mode", ""),
+        "legacy_result": result.details.get("legacy_result"),
+        "new_result": result.details.get("new_result"),
+        "legacy_score": result.details.get("legacy_score"),
+        "new_score": result.details.get("new_score"),
         "sub_status": result.details.get("sub_status", ""),
     }
 

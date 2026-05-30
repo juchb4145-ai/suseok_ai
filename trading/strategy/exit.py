@@ -16,6 +16,12 @@ from trading.strategy.models import (
     VirtualOrderStatus,
     VirtualPosition,
 )
+from trading.strategy.reason_codes import standardize_details
+from trading.strategy.runtime_settings import (
+    StrategyRuntimeSettings,
+    attach_settings_details,
+    legacy_strategy_runtime_settings,
+)
 
 
 TAKE_PROFIT = "TAKE_PROFIT"
@@ -33,6 +39,10 @@ class ExitPolicy:
     take_profit_exit_percent: int
     max_hold_minutes: int
     min_expected_return_pct: float
+    support_loss_consecutive_closes_below: int = 2
+    trailing_recent_low_window: int = 3
+    support_dedupe_pct: float = 0.25
+    recent_high_failure_window: int = 3
 
 
 @dataclass
@@ -71,13 +81,22 @@ class VirtualPositionService:
         }
         if order.status != VirtualOrderStatus.FILLED:
             details["rejected_reason"] = "virtual_order_not_filled"
-            return PositionOpenResult(None, rejected_reason="virtual_order_not_filled", details=details)
+            return PositionOpenResult(
+                None,
+                rejected_reason="virtual_order_not_filled",
+                details=_standard_details(details, ["virtual_order_not_filled"], now=now, result=False),
+            )
 
         existing = self._find_position_by_order(order)
         if existing is not None:
             details["duplicate_rejected"] = True
             details["rejected_reason"] = "duplicate_virtual_position"
-            return PositionOpenResult(existing, duplicate=True, rejected_reason="duplicate_virtual_position", details=details)
+            return PositionOpenResult(
+                existing,
+                duplicate=True,
+                rejected_reason="duplicate_virtual_position",
+                details=_standard_details(details, ["duplicate_virtual_position"], now=now, result=False),
+            )
 
         opened_at = order.filled_at or (now or datetime.now()).replace(microsecond=0).isoformat()
         entry_price = order.virtual_fill_price or order.limit_price or plan.limit_price
@@ -91,7 +110,7 @@ class VirtualPositionService:
             details["aggregated"] = True
             details["leg_index"] = order.leg_index
             details["weight_pct"] = order.weight_pct
-            return PositionOpenResult(position, aggregated=True, details=details)
+            return PositionOpenResult(position, aggregated=True, details=_standard_details(details, now=opened_at, result=True))
 
         position = VirtualPosition(
             candidate_id=order.candidate_id,
@@ -108,7 +127,7 @@ class VirtualPositionService:
             position = self.db.save_virtual_position(position)
         if position.virtual_order_id is not None:
             self._positions_by_order[position.virtual_order_id] = position
-        return PositionOpenResult(position, opened=True, details=details)
+        return PositionOpenResult(position, opened=True, details=_standard_details(details, now=opened_at, result=True))
 
     def update_performance(
         self,
@@ -125,10 +144,10 @@ class VirtualPositionService:
         }
         if not clean_code:
             details["insufficient_reason"].append("code_missing")
-            return PerformanceUpdateResult(position, changed=False, details=details)
+            return PerformanceUpdateResult(position, changed=False, details=_standard_details(details, ["code_missing"], result=False))
         if position.entry_price <= 0 or not position.opened_at:
             details["insufficient_reason"].append("position_entry_missing")
-            return PerformanceUpdateResult(position, changed=False, details=details)
+            return PerformanceUpdateResult(position, changed=False, details=_standard_details(details, ["position_entry_missing"], result=False))
 
         opened_at = _parse_time(position.opened_at)
         candles, same_candle_excluded = _post_open_completed_candles(candle_builder, clean_code, opened_at)
@@ -136,7 +155,7 @@ class VirtualPositionService:
         details["used_completed_candles"] = len(candles)
         if not candles:
             details["insufficient_reason"].append("post_open_candles_missing")
-            return PerformanceUpdateResult(position, changed=False, details=details)
+            return PerformanceUpdateResult(position, changed=False, details=_standard_details(details, ["post_open_candles_missing"], result=False))
 
         max_high = max(candle.high for candle in candles)
         min_low = min(candle.low for candle in candles)
@@ -155,7 +174,7 @@ class VirtualPositionService:
         details["max_drawdown_pct"] = position.max_drawdown_pct
         if changed and self.db is not None:
             position = self.db.save_virtual_position(position)
-        return PerformanceUpdateResult(position, changed=changed, details=details)
+        return PerformanceUpdateResult(position, changed=changed, details=_standard_details(details, result=changed))
 
     def _find_position_by_order(self, order: VirtualOrder) -> Optional[VirtualPosition]:
         if order.id is None:
@@ -181,7 +200,8 @@ class VirtualPositionService:
 
 
 class ExitDecisionEngine:
-    def __init__(self) -> None:
+    def __init__(self, settings: Optional[StrategyRuntimeSettings] = None) -> None:
+        self.settings = settings or legacy_strategy_runtime_settings()
         self.last_details: dict = {}
 
     def evaluate(
@@ -193,11 +213,11 @@ class ExitDecisionEngine:
         now: Optional[datetime] = None,
     ) -> list[ExitDecision]:
         evaluated_at = (now or datetime.now()).replace(microsecond=0)
-        self.last_details = {
+        self.last_details = attach_settings_details({
             "evaluated_at": evaluated_at.isoformat(),
             "reason_codes": [],
             "virtual_only": True,
-        }
+        }, self.settings)
         if position is None:
             self.last_details["reason_codes"].append("position_missing")
             return []
@@ -212,7 +232,7 @@ class ExitDecisionEngine:
             return []
 
         profile = _snapshot_profile(snapshot)
-        policy = _policy_for_profile(profile)
+        policy = _policy_for_profile(profile, self.settings)
         opened_at = _parse_time(position.opened_at)
         candles, same_candle_excluded = _post_open_completed_candles(candle_builder, snapshot.code, opened_at)
         self.last_details.update(
@@ -296,6 +316,7 @@ class ExitDecisionEngine:
                 "trigger_candle_start_at": trigger.start_at.isoformat(),
                 "sequence_ambiguous": False,
                 "same_candle_multiple_triggers": False,
+                **self.settings.settings_details(),
             },
             created_at=created_at.isoformat(),
         )
@@ -313,7 +334,7 @@ class ExitDecisionEngine:
             self.last_details["reason_codes"].append("duplicate_final_exit")
             return None
 
-        basis = _support_basis(snapshot)
+        basis = _support_basis(snapshot, policy)
         self.last_details["support_basis"] = basis
         if not basis:
             self.last_details["reason_codes"].append(DATA_INSUFFICIENT_EXIT_BASIS)
@@ -322,9 +343,11 @@ class ExitDecisionEngine:
             self.last_details["reason_codes"].append("support_loss_candles_insufficient")
             return None
 
+        required_closes = max(1, int(policy.support_loss_consecutive_closes_below))
         for basis_name, basis_price in basis:
-            for previous, current in zip(candles, candles[1:]):
-                if previous.close < basis_price and current.close < basis_price:
+            for window in _rolling_windows(candles, required_closes):
+                if all(candle.close < basis_price for candle in window):
+                    current = window[-1]
                     return ExitDecision(
                         virtual_position_id=position.id,
                         decision_type=SUPPORT_LOSS,
@@ -338,13 +361,14 @@ class ExitDecisionEngine:
                             "code": snapshot.code,
                             "support_basis": basis_name,
                             "support_basis_price": basis_price,
-                            "consecutive_closes_below": 2,
+                            "consecutive_closes_below": required_closes,
                             "full_exit": True,
                             "position_closed": True,
                             "virtual_exit_price": current.close,
                             "trigger_candle_start_at": current.start_at.isoformat(),
                             "sequence_ambiguous": False,
                             "same_candle_multiple_triggers": False,
+                            **self.settings.settings_details(),
                         },
                         created_at=created_at.isoformat(),
                     )
@@ -362,7 +386,7 @@ class ExitDecisionEngine:
         if _has_final_exit(existing_decisions):
             self.last_details["reason_codes"].append("duplicate_final_exit")
             return None
-        floor_basis = _trailing_floor_basis(snapshot, candles)
+        floor_basis = _trailing_floor_basis(snapshot, candles, policy)
         self.last_details["trailing_floor_basis"] = floor_basis
         if not floor_basis:
             self.last_details["reason_codes"].append(DATA_INSUFFICIENT_EXIT_BASIS)
@@ -403,6 +427,7 @@ class ExitDecisionEngine:
                 "position_closed": True,
                 "virtual_exit_price": current.close,
                 "trigger_candle_start_at": current.start_at.isoformat(),
+                **self.settings.settings_details(),
             },
             created_at=created_at.isoformat(),
         )
@@ -424,11 +449,11 @@ class ExitDecisionEngine:
         if created_at < max_hold_until:
             return None
 
-        basis = _support_basis(snapshot)
+        basis = _support_basis(snapshot, policy)
         latest_close = candles[-1].close if candles else snapshot.price
         close_below_basis = any(latest_close < basis_price for _, basis_price in basis)
         return_below_minimum = position.max_return_pct < policy.min_expected_return_pct
-        recent_high_failed = _recent_high_update_failed(candles)
+        recent_high_failed = _recent_high_update_failed(candles, policy.recent_high_failure_window)
         momentum_failed = close_below_basis or return_below_minimum or recent_high_failed
         details = {
             "virtual_only": True,
@@ -446,6 +471,7 @@ class ExitDecisionEngine:
             "virtual_exit_price": latest_close,
             "trigger_candle_start_at": candles[-1].start_at.isoformat() if candles else "",
         }
+        attach_settings_details(details, self.settings)
         if not momentum_failed:
             self.last_details["time_exit_momentum"] = details
             return None
@@ -462,22 +488,34 @@ class ExitDecisionEngine:
         )
 
 
-def _policy_for_profile(profile: StrategyProfile) -> ExitPolicy:
+def _policy_for_profile(
+    profile: StrategyProfile,
+    settings: Optional[StrategyRuntimeSettings] = None,
+) -> ExitPolicy:
+    active_settings = settings or legacy_strategy_runtime_settings()
+    profile_key = _exit_profile_key(profile)
+    defaults = "exit_policy_thresholds.kosdaq"
     if profile in {StrategyProfile.KOSPI_LEADER_PROFILE, StrategyProfile.SEMICONDUCTOR_SIGNAL_PROFILE}:
-        return ExitPolicy(
-            strategy_profile=profile,
-            take_profit_pct=3.0,
-            take_profit_exit_percent=70,
-            max_hold_minutes=60,
-            min_expected_return_pct=0.6,
-        )
+        defaults = f"exit_policy_thresholds.{profile_key}"
     return ExitPolicy(
-        strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE,
-        take_profit_pct=5.0,
-        take_profit_exit_percent=70,
-        max_hold_minutes=40,
-        min_expected_return_pct=1.0,
+        strategy_profile=profile if profile in {StrategyProfile.KOSPI_LEADER_PROFILE, StrategyProfile.SEMICONDUCTOR_SIGNAL_PROFILE} else StrategyProfile.KOSDAQ_THEME_PROFILE,
+        take_profit_pct=active_settings.number(f"{defaults}.take_profit_pct", 3.0 if defaults.endswith(("kospi", "semiconductor_signal")) else 5.0),
+        take_profit_exit_percent=active_settings.integer(f"{defaults}.take_profit_exit_percent", 70),
+        max_hold_minutes=active_settings.integer(f"{defaults}.max_hold_minutes", 60 if defaults.endswith(("kospi", "semiconductor_signal")) else 40),
+        min_expected_return_pct=active_settings.number(f"{defaults}.min_expected_return_pct", 0.6 if defaults.endswith(("kospi", "semiconductor_signal")) else 1.0),
+        support_loss_consecutive_closes_below=active_settings.integer("exit_policy_thresholds.support_loss_consecutive_closes_below", 2),
+        trailing_recent_low_window=active_settings.integer("exit_policy_thresholds.trailing_recent_low_window", 3),
+        support_dedupe_pct=active_settings.number("exit_policy_thresholds.support_dedupe_pct", 0.25),
+        recent_high_failure_window=active_settings.integer("exit_policy_thresholds.recent_high_failure_window", 3),
     )
+
+
+def _exit_profile_key(profile: StrategyProfile) -> str:
+    if profile == StrategyProfile.SEMICONDUCTOR_SIGNAL_PROFILE:
+        return "semiconductor_signal"
+    if profile == StrategyProfile.KOSPI_LEADER_PROFILE:
+        return "kospi"
+    return "kosdaq"
 
 
 def _snapshot_profile(snapshot: IndicatorSnapshot) -> StrategyProfile:
@@ -490,7 +528,7 @@ def _snapshot_profile(snapshot: IndicatorSnapshot) -> StrategyProfile:
     return StrategyProfile.KOSDAQ_THEME_PROFILE
 
 
-def _support_basis(snapshot: IndicatorSnapshot) -> list[tuple[str, float]]:
+def _support_basis(snapshot: IndicatorSnapshot, policy: Optional[ExitPolicy] = None) -> list[tuple[str, float]]:
     basis: list[tuple[str, float]] = []
     if snapshot.vwap is not None:
         basis.append(("vwap", float(snapshot.vwap)))
@@ -502,31 +540,36 @@ def _support_basis(snapshot: IndicatorSnapshot) -> list[tuple[str, float]]:
         basis.append(("day_mid", float(snapshot.day_mid)))
     if snapshot.ema20_5m is not None and snapshot.metadata.get("ema20_5m_ready") is True:
         basis.append(("ema20_5m", float(snapshot.ema20_5m)))
-    return _dedupe_basis(basis)
+    return _dedupe_basis(basis, policy.support_dedupe_pct if policy is not None else 0.25)
 
 
-def _trailing_floor_basis(snapshot: IndicatorSnapshot, candles: list[Candle]) -> list[tuple[str, float]]:
+def _trailing_floor_basis(
+    snapshot: IndicatorSnapshot,
+    candles: list[Candle],
+    policy: Optional[ExitPolicy] = None,
+) -> list[tuple[str, float]]:
     basis = [
         (name, price)
-        for name, price in _support_basis(snapshot)
+        for name, price in _support_basis(snapshot, policy)
         if price <= snapshot.price
     ]
-    recent = candles[-3:]
+    window = policy.trailing_recent_low_window if policy is not None else 3
+    recent = candles[-max(1, int(window)):]
     if recent:
         recent_low = min(candle.low for candle in recent)
         if recent_low > 0 and recent_low <= snapshot.price:
             basis.append(("recent_3m_low", float(recent_low)))
-    return _dedupe_basis(basis)
+    return _dedupe_basis(basis, policy.support_dedupe_pct if policy is not None else 0.25)
 
 
-def _dedupe_basis(values: list[tuple[str, float]]) -> list[tuple[str, float]]:
+def _dedupe_basis(values: list[tuple[str, float]], threshold_pct: float = 0.25) -> list[tuple[str, float]]:
     result: list[tuple[str, float]] = []
     for name, price in values:
         if price <= 0:
             continue
         duplicate = False
         for _, kept_price in result:
-            if abs((price - kept_price) / kept_price) * 100.0 <= 0.25:
+            if abs((price - kept_price) / kept_price) * 100.0 <= threshold_pct:
                 duplicate = True
                 break
         if not duplicate:
@@ -582,11 +625,19 @@ def _apply_full_close(position: VirtualPosition, decision: ExitDecision) -> None
         position.details = details
 
 
-def _recent_high_update_failed(candles: list[Candle]) -> bool:
-    if len(candles) < 3:
+def _recent_high_update_failed(candles: list[Candle], window: int = 3) -> bool:
+    window = max(2, int(window))
+    if len(candles) < window:
         return False
-    prior_high = max(candle.high for candle in candles[-3:-1])
+    prior_high = max(candle.high for candle in candles[-window:-1])
     return candles[-1].high <= prior_high
+
+
+def _rolling_windows(candles: list[Candle], size: int) -> list[list[Candle]]:
+    size = max(1, int(size))
+    if len(candles) < size:
+        return []
+    return [candles[index : index + size] for index in range(0, len(candles) - size + 1)]
 
 
 def _plan_quantity(plan: EntryPlan) -> int:
@@ -601,7 +652,8 @@ def _plan_quantity(plan: EntryPlan) -> int:
 
 def _initial_position_details(order: VirtualOrder, plan: EntryPlan) -> dict:
     weight = _order_weight(order)
-    return {
+    fill_diagnostics = _order_fill_diagnostics(order)
+    details = {
         "entry_plan_id": plan.id,
         "filled_legs": [int(order.leg_index or 1)],
         "filled_order_ids": [order.id] if order.id is not None else [],
@@ -610,6 +662,16 @@ def _initial_position_details(order: VirtualOrder, plan: EntryPlan) -> dict:
         "trailing_floor": None,
         "trailing_floor_basis": "",
     }
+    if fill_diagnostics:
+        details["fill_diagnostics_v2"] = fill_diagnostics
+        details["fill_diagnostics_by_leg"] = [
+            {
+                "leg_index": int(order.leg_index or 1),
+                "order_id": order.id,
+                "fill_diagnostics_v2": fill_diagnostics,
+            }
+        ]
+    return _standard_details(details, now=order.filled_at, result=True)
 
 
 def _aggregate_position_fill(
@@ -626,6 +688,16 @@ def _aggregate_position_fill(
         filled_legs.append(leg_index)
     if order.id is not None and order.id not in filled_order_ids:
         filled_order_ids.append(order.id)
+    fill_diagnostics = _order_fill_diagnostics(order)
+    fill_diagnostics_by_leg = list(details.get("fill_diagnostics_by_leg") or [])
+    if fill_diagnostics:
+        fill_diagnostics_by_leg.append(
+            {
+                "leg_index": leg_index,
+                "order_id": order.id,
+                "fill_diagnostics_v2": fill_diagnostics,
+            }
+        )
     old_weight = _float(details.get("filled_weight_pct"), default=100.0 if not details else 0.0)
     new_weight = _order_weight(order)
     total_weight = old_weight + new_weight
@@ -641,14 +713,23 @@ def _aggregate_position_fill(
             "remaining_weight_pct": max(0.0, round(100.0 - total_weight, 6)),
         }
     )
+    if fill_diagnostics:
+        details["fill_diagnostics_v2"] = fill_diagnostics
+        details["fill_diagnostics_by_leg"] = fill_diagnostics_by_leg
     details.setdefault("trailing_floor", None)
     details.setdefault("trailing_floor_basis", "")
-    position.details = details
+    position.details = _standard_details(details, now=order.filled_at, result=True)
     return position
 
 
 def _order_weight(order: VirtualOrder) -> float:
     return max(0.0, _float(order.weight_pct, default=100.0))
+
+
+def _order_fill_diagnostics(order: VirtualOrder) -> dict:
+    details = dict(order.details or {})
+    diagnostics = details.get("fill_diagnostics_v2")
+    return dict(diagnostics) if isinstance(diagnostics, dict) else {}
 
 
 def _float(value, default: float = 0.0) -> float:
@@ -668,3 +749,14 @@ def _parse_time(value: str) -> datetime:
     if not value:
         return datetime.min
     return datetime.fromisoformat(value)
+
+
+def _standard_details(details: dict, reason_codes=None, *, now=None, result=None) -> dict:
+    return standardize_details(
+        details,
+        reason_codes,
+        passed=result,
+        created_at=now,
+        legacy_result=result,
+        new_result=result,
+    )

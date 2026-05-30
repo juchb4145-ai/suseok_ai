@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any, Optional, TypeVar, Union, get_args, get_origin, get_type_hints
 
+from trading.strategy.reason_codes import normalize_reason_codes, standardize_details
+
 
 class CandidateState(str, Enum):
     DETECTED = "DETECTED"
@@ -167,6 +169,16 @@ class GateDecision(SerializableDataclass):
     details: dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
 
+    def __post_init__(self) -> None:
+        self.reason_codes = normalize_reason_codes(self.reason_codes)
+        self.details = standardize_details(
+            self.details,
+            self.reason_codes,
+            passed=self.passed,
+            score=self.score,
+            created_at=self.created_at,
+        )
+
 
 @dataclass
 class EntryPlan(SerializableDataclass):
@@ -201,6 +213,7 @@ class VirtualOrder(SerializableDataclass):
     filled_at: str = ""
     cancelled_at: str = ""
     unfilled_reason: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -231,6 +244,15 @@ class ExitDecision(SerializableDataclass):
     reason_codes: list[str] = field(default_factory=list)
     details: dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
+
+    def __post_init__(self) -> None:
+        self.reason_codes = normalize_reason_codes(self.reason_codes)
+        self.details = standardize_details(
+            self.details,
+            self.reason_codes,
+            passed=self.filled,
+            created_at=self.created_at,
+        )
 
 
 @dataclass

@@ -58,11 +58,13 @@ def build_observe_runtime(client, db: TradingDatabase):
     from trading.strategy.realtime import RealTimeSubscriptionManager
     from trading.strategy.review import TradeReviewService
     from trading.strategy.config import StrategyRuntimeConfigRepository
+    from trading.strategy.runtime_settings import StrategyRuntimeSettingsRepository
     from trading.strategy.runtime import StrategyRuntime
     from trading.strategy.themes import ThemeRepository
     from trading.strategy.virtual_orders import VirtualOrderService
 
     config_result = StrategyRuntimeConfigRepository(db).load()
+    settings = StrategyRuntimeSettingsRepository(db).load()
     condition_seed_result = ensure_default_condition_profiles(db)
     config = config_result.config
     market_data = MarketDataStore()
@@ -84,8 +86,9 @@ def build_observe_runtime(client, db: TradingDatabase):
         market_data,
         candle_builder,
         indicator_calculator,
-        IntradayStateTracker(),
+        IntradayStateTracker(settings),
         market_index_store,
+        settings,
     )
     condition_adapter = KiwoomConditionAdapter(client, ConditionProfileRepository(db))
     candidate_collector.attach(condition_adapter)
@@ -95,11 +98,11 @@ def build_observe_runtime(client, db: TradingDatabase):
         subscription_manager=RealTimeSubscriptionManager(client, max_codes=config.realtime_subscription_limit),
         candle_builder=candle_builder,
         gate_pipeline=gate_pipeline,
-        entry_plan_builder=EntryPlanBuilder(),
-        virtual_order_service=VirtualOrderService(db=db),
+        entry_plan_builder=EntryPlanBuilder(settings=settings),
+        virtual_order_service=VirtualOrderService(db=db, settings=settings),
         virtual_position_service=VirtualPositionService(db=db),
-        exit_decision_engine=ExitDecisionEngine(),
-        trade_review_service=TradeReviewService(),
+        exit_decision_engine=ExitDecisionEngine(settings),
+        trade_review_service=TradeReviewService(settings),
         config=config,
         condition_adapter=condition_adapter,
         holding_provider=StaticHoldingProvider(set(config.holding_watch_codes)),
@@ -107,7 +110,7 @@ def build_observe_runtime(client, db: TradingDatabase):
     readiness_report = build_readiness_report(db, subscription_manager=runtime.subscription_manager)
     runtime.readiness_report = readiness_report
     runtime.startup_warnings = dedupe_warnings(
-        list(config_result.warnings) + condition_seed_result.warnings + readiness_report.warnings
+        list(config_result.warnings) + settings.validation_warnings + condition_seed_result.warnings + readiness_report.warnings
     )
     return runtime
 

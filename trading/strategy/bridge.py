@@ -36,6 +36,9 @@ class StrategyMarketDataBridge:
         cum_volume=0,
         best_ask=0,
         best_bid=0,
+        trade_value=0,
+        execution_strength=0,
+        spread_ticks=0,
         instrument_type: Optional[str] = None,
         name: str = "",
         day_high=0,
@@ -61,6 +64,9 @@ class StrategyMarketDataBridge:
             cum_volume=cum_volume,
             best_ask=best_ask,
             best_bid=best_bid,
+            trade_value=trade_value,
+            execution_strength=execution_strength,
+            spread_ticks=spread_ticks,
         )
 
     def _route_stock_tick(
@@ -72,6 +78,9 @@ class StrategyMarketDataBridge:
         cum_volume=0,
         best_ask=0,
         best_bid=0,
+        trade_value=0,
+        execution_strength=0,
+        spread_ticks=0,
     ) -> bool:
         tick = StrategyTick.from_realtime(
             code=code,
@@ -80,6 +89,9 @@ class StrategyMarketDataBridge:
             cum_volume=cum_volume,
             best_ask=best_ask,
             best_bid=best_bid,
+            trade_value=trade_value,
+            execution_strength=execution_strength,
+            spread_ticks=spread_ticks,
             timestamp=self.clock(),
         )
         if not self.market_data.update_tick(tick):

@@ -12,7 +12,7 @@ def candle(minute, low=10_000, close=10_000, volume=100):
         interval_min=1,
         start_at=datetime(2026, 5, 29, 9, minute),
         open=10_000,
-        high=10_200,
+        high=max(10_200, close),
         low=low,
         close=close,
         volume=volume,
@@ -58,6 +58,34 @@ def test_insufficient_volume_history_sets_ready_false():
     assert result.volume_reaccel is False
     assert result.metadata["volume_reaccel_ready"] is False
     assert "volume_reaccel_history_short" in result.metadata["insufficient_reason"]
+
+
+def test_volume_deceleration_uses_recent_volume_drop():
+    tracker = IntradayStateTracker()
+    candles = [candle(0, volume=200), candle(1, volume=180), candle(2, volume=120)]
+
+    result = tracker.apply(snapshot(), candles, latest())
+
+    assert result.metadata["volume_deceleration_ready"] is True
+    assert result.metadata["volume_deceleration"] is True
+    assert result.metadata["volume_deceleration_ratio"] < 0.8
+
+
+def test_large_candle_state_marks_recent_three_or_five_minute_extension():
+    tracker = IntradayStateTracker()
+    candles = [
+        candle(0, close=10_000, volume=100),
+        candle(1, close=10_100, volume=120),
+        candle(2, close=10_200, volume=130),
+        candle(3, close=10_300, volume=140),
+        candle(4, close=10_400, volume=150),
+    ]
+
+    result = tracker.apply(snapshot(price=10_400, day_high=10_400), candles, latest(10_400))
+
+    assert result.metadata["after_large_5m_candle"] is True
+    assert result.metadata["large_candle_body_pct"] >= 2.0
+    assert result.metadata["candle_close_position"] >= 0.75
 
 
 def test_failed_low_break_rebound_requires_break_and_recovery():

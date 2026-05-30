@@ -19,6 +19,13 @@ from trading.strategy.models import (
     VirtualPosition,
 )
 from trading.strategy.pipeline import GatePipelineResult
+from trading.strategy.reason_codes import reason_code_fields, standardize_details
+from trading.strategy.runtime_settings import (
+    StrategyRuntimeSettings,
+    attach_settings_details,
+    legacy_strategy_runtime_settings,
+)
+from trading.strategy.session import session_bucket_at
 
 
 FALSE_NEGATIVE_RALLY_THRESHOLD_PCT = 3.0
@@ -26,6 +33,9 @@ FALSE_POSITIVE_DRAWDOWN_THRESHOLD_PCT = -3.0
 
 
 class TradeReviewService:
+    def __init__(self, settings: Optional[StrategyRuntimeSettings] = None) -> None:
+        self.settings = settings or legacy_strategy_runtime_settings()
+
     def build_review(
         self,
         candidate: Candidate,
@@ -45,16 +55,17 @@ class TradeReviewService:
         theme_id = _theme_id(candidate, gate_result, entry_plan)
         gate_result_key = _gate_result_key(candidate, gate_result, entry_plan)
         review_key = gate_result_key or f"{candidate.id}:{theme_id}:phase1"
-        details = {
+        details = attach_settings_details({
             "gate_decisions_snapshot": _gate_snapshot(gate_result.decisions if gate_result else []),
             "candidate_state": candidate.state.value,
             "candidate_block_type": candidate.block_type.value,
             "entry_plan_created": entry_plan is not None,
             "horizon_start_at": "",
             "horizon_start_reason": "",
-        }
-        details.update(_partial_exit_details(virtual_position, decisions))
+        }, self.settings)
+        details.update(_partial_exit_details(virtual_position, decisions, self.settings))
         details.update(_reason_code_details(gate_result, decisions))
+        _attach_virtual_order_details(details, virtual_order)
 
         horizon_start, horizon_reason = _horizon_start(candidate, gate_result, entry_plan, virtual_order, virtual_position, final_status)
         details["horizon_start_at"] = horizon_start.isoformat() if horizon_start else ""
@@ -68,12 +79,28 @@ class TradeReviewService:
             timeout_at = _parse_time(virtual_order.submitted_at) + timedelta(seconds=max(0, entry_plan.order_timeout_sec))
             details["timeout_at_metrics"] = _horizon_metrics(candle_builder, candidate.code, timeout_at, base_price)
 
-        false_negative_type = _false_negative_type(final_status, metrics)
+        false_negative_type = _false_negative_type(final_status, metrics, self.settings)
         details["false_negative_type"] = false_negative_type
-        false_positive = _false_positive(final_status, virtual_position, details, metrics)
-        details["false_positive_type"] = _false_positive_type(false_positive, final_status, virtual_position, details, decisions, metrics)
+        false_positive = _false_positive(final_status, virtual_position, details, metrics, self.settings)
+        details["false_positive_type"] = _false_positive_type(
+            false_positive,
+            final_status,
+            virtual_position,
+            details,
+            decisions,
+            metrics,
+            self.settings,
+        )
         final_grade = gate_result.final_grade if gate_result else ""
         exit_reason = _exit_reason(final_status, virtual_position, decisions)
+        details["session_bucket"] = session_bucket_at(horizon_start or now)
+        details = standardize_details(
+            details,
+            _review_reason_codes(details, final_status, exit_reason),
+            created_at=now,
+            legacy_result=final_status,
+            new_result=final_status,
+        )
         review = TradeReview(
             candidate_id=candidate.id,
             trade_date=candidate.trade_date,
@@ -234,6 +261,8 @@ def _gate_snapshot(decisions: list[GateDecision]) -> list[dict]:
             "passed": decision.passed,
             "block_type": decision.block_type.value,
             "reason_codes": list(decision.reason_codes),
+            "primary_reason_code": decision.details.get("primary_reason_code", ""),
+            "secondary_reason_codes": list(decision.details.get("secondary_reason_codes") or []),
             "details": dict(decision.details),
         }
         for decision in decisions
@@ -246,9 +275,12 @@ def _reason_code_details(
 ) -> dict:
     blocking_reason_codes: list[str] = []
     entry_condition_codes: list[str] = []
+    comparison_reason_codes: list[str] = []
     dynamic_pullback_policy = {}
+    late_chase_diagnostics = {}
     if gate_result is not None:
         for decision in gate_result.decisions:
+            comparison_reason_codes.extend(str(code) for code in decision.details.get("comparison_reason_codes", []))
             sub_status = decision.details.get("sub_status")
             if not decision.passed or decision.block_type != BlockType.NONE:
                 blocking_reason_codes.extend(str(code) for code in decision.reason_codes)
@@ -258,6 +290,7 @@ def _reason_code_details(
                 blocking_reason_codes.extend(str(code) for code in decision.reason_codes)
             if decision.gate_name == "StockPullbackEntryGate":
                 dynamic_pullback_policy = dict(decision.details.get("dynamic_pullback_policy") or {})
+                late_chase_diagnostics = dict(decision.details.get("late_chase_diagnostics") or {})
                 if decision.passed:
                     if decision.details.get("support_touched"):
                         entry_condition_codes.append("SUPPORT_TOUCHED")
@@ -278,11 +311,22 @@ def _reason_code_details(
         "blocking_reason_codes": _dedupe(blocking_reason_codes),
         "entry_condition_codes": _dedupe(entry_condition_codes),
         "exit_reason_codes": _dedupe(exit_reason_codes),
+        "comparison_reason_codes": _dedupe(comparison_reason_codes),
         "dynamic_pullback_policy": dynamic_pullback_policy,
+        "late_chase_diagnostics": late_chase_diagnostics,
+        "blocking_reason_code_fields": reason_code_fields(blocking_reason_codes),
+        "entry_condition_code_fields": reason_code_fields(entry_condition_codes),
+        "exit_reason_code_fields": reason_code_fields(exit_reason_codes),
+        "comparison_reason_code_fields": reason_code_fields(comparison_reason_codes),
     }
 
 
-def _partial_exit_details(virtual_position: Optional[VirtualPosition], decisions: list[ExitDecision]) -> dict:
+def _partial_exit_details(
+    virtual_position: Optional[VirtualPosition],
+    decisions: list[ExitDecision],
+    settings: Optional[StrategyRuntimeSettings] = None,
+) -> dict:
+    active_settings = settings or legacy_strategy_runtime_settings()
     partial = next((decision for decision in decisions if decision.decision_type == TAKE_PROFIT and decision.details.get("partial_exit")), None)
     full = _latest_full_exit(decisions)
     details = {
@@ -296,7 +340,10 @@ def _partial_exit_details(virtual_position: Optional[VirtualPosition], decisions
         if partial_return is None and virtual_position and virtual_position.entry_price > 0:
             partial_return = _return_pct(partial.trigger_price, virtual_position.entry_price)
         partial_return = float(partial_return or 0.0)
-        exit_percent = float(partial.details.get("exit_percent") or 70.0)
+        exit_percent = float(
+            partial.details.get("exit_percent")
+            or active_settings.number("review_label_thresholds.partial_take_profit_default_exit_percent", 70.0)
+        )
         full_return = details["full_close_return_pct"]
         if full_return is None and full is not None and virtual_position and virtual_position.entry_price > 0:
             full_return = _return_pct(full.trigger_price, virtual_position.entry_price)
@@ -309,9 +356,33 @@ def _partial_exit_details(virtual_position: Optional[VirtualPosition], decisions
     return details
 
 
-def _false_negative_type(final_status: str, metrics: dict[str, Optional[float]]) -> str:
+def _attach_virtual_order_details(details: dict, virtual_order: Optional[VirtualOrder]) -> None:
+    if virtual_order is None:
+        return
+    order_details = dict(virtual_order.details or {})
+    diagnostics = order_details.get("fill_diagnostics_v2")
+    if isinstance(diagnostics, dict):
+        details["fill_diagnostics_v2"] = dict(diagnostics)
+    comparison_codes = list(details.get("comparison_reason_codes") or [])
+    comparison_codes.extend(order_details.get("comparison_reason_codes") or [])
+    if isinstance(diagnostics, dict):
+        comparison_codes.extend(diagnostics.get("v2_non_fill_reason_codes") or [])
+    comparison_codes = _dedupe(comparison_codes)
+    details["comparison_reason_codes"] = comparison_codes
+    details["comparison_reason_code_fields"] = reason_code_fields(comparison_codes)
+
+
+def _false_negative_type(
+    final_status: str,
+    metrics: dict[str, Optional[float]],
+    settings: Optional[StrategyRuntimeSettings] = None,
+) -> str:
+    active_settings = settings or legacy_strategy_runtime_settings()
     max_return = metrics.get("max_return_20m")
-    if max_return is None or max_return < FALSE_NEGATIVE_RALLY_THRESHOLD_PCT:
+    if max_return is None or max_return < active_settings.number(
+        "review_label_thresholds.false_negative_rally_threshold_pct",
+        FALSE_NEGATIVE_RALLY_THRESHOLD_PCT,
+    ):
         return ""
     if final_status in {ReviewFinalStatus.BLOCKED_TEMP.value, ReviewFinalStatus.BLOCKED_FINAL.value, ReviewFinalStatus.DATA_INSUFFICIENT.value}:
         return "BLOCKED_LATER_RALLIED"
@@ -329,7 +400,9 @@ def _false_positive(
     virtual_position: Optional[VirtualPosition],
     details: dict,
     metrics: dict[str, Optional[float]],
+    settings: Optional[StrategyRuntimeSettings] = None,
 ) -> bool:
+    active_settings = settings or legacy_strategy_runtime_settings()
     if virtual_position is None:
         return False
     if details.get("partial_take_profit_hit"):
@@ -338,7 +411,10 @@ def _false_positive(
     if virtual_position.closed_at and virtual_position.realized_return_pct < 0:
         return True
     drawdown = metrics.get("max_drawdown_20m")
-    return drawdown is not None and drawdown <= FALSE_POSITIVE_DRAWDOWN_THRESHOLD_PCT
+    return drawdown is not None and drawdown <= active_settings.number(
+        "review_label_thresholds.false_positive_drawdown_threshold_pct",
+        FALSE_POSITIVE_DRAWDOWN_THRESHOLD_PCT,
+    )
 
 
 def _false_positive_type(
@@ -348,6 +424,7 @@ def _false_positive_type(
     details: dict,
     decisions: list[ExitDecision],
     metrics: dict[str, Optional[float]],
+    settings: Optional[StrategyRuntimeSettings] = None,
 ) -> str:
     if not false_positive:
         return ""
@@ -359,7 +436,11 @@ def _false_positive_type(
     if virtual_position is not None and virtual_position.closed_at and virtual_position.realized_return_pct < 0:
         return f"{virtual_position.close_reason or final_status}_LOSS"
     drawdown = metrics.get("max_drawdown_20m")
-    if drawdown is not None and drawdown <= FALSE_POSITIVE_DRAWDOWN_THRESHOLD_PCT:
+    active_settings = settings or legacy_strategy_runtime_settings()
+    if drawdown is not None and drawdown <= active_settings.number(
+        "review_label_thresholds.false_positive_drawdown_threshold_pct",
+        FALSE_POSITIVE_DRAWDOWN_THRESHOLD_PCT,
+    ):
         return "DRAWDOWN_AFTER_ENTRY"
     return "FALSE_POSITIVE"
 
@@ -488,6 +569,17 @@ def _dedupe(values) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def _review_reason_codes(details: dict, final_status: str, exit_reason: str) -> list[str]:
+    values = []
+    values.extend(details.get("blocking_reason_codes") or [])
+    values.extend(details.get("entry_condition_codes") or [])
+    values.extend(details.get("exit_reason_codes") or [])
+    values.extend(details.get("comparison_reason_codes") or [])
+    if not values:
+        values.append(exit_reason or final_status)
+    return _dedupe(values)
 
 
 def _parse_time(value: str) -> datetime:

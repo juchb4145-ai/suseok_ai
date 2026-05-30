@@ -44,11 +44,13 @@ def plan(
     )
 
 
-def builder_with_completed_candle(code="111111", start=None, low=9_990):
+def builder_with_completed_candle(code="111111", start=None, low=9_990, close=None, final_volume=1_100):
     start = start or datetime(2026, 5, 29, 9, 1)
+    close = low if close is None else close
     builder = CandleBuilder()
     builder.update(StrategyTick.from_realtime(code, 10_100, cum_volume=1_000, timestamp=start + timedelta(seconds=1)))
-    builder.update(StrategyTick.from_realtime(code, low, cum_volume=1_100, timestamp=start + timedelta(seconds=20)))
+    builder.update(StrategyTick.from_realtime(code, low, cum_volume=min(1_100, final_volume), timestamp=start + timedelta(seconds=20)))
+    builder.update(StrategyTick.from_realtime(code, close, cum_volume=final_volume, timestamp=start + timedelta(seconds=45)))
     builder.flush(code, start + timedelta(minutes=1))
     return builder
 
@@ -59,6 +61,8 @@ def test_not_submittable_plan_is_rejected_without_virtual_order():
     assert result.order is None
     assert result.submitted is False
     assert result.rejected_reason == "not_submittable"
+    assert result.details["primary_reason_code"] == "not_submittable"
+    assert result.details["comparison_mode"] == "legacy_only"
 
 
 def test_duplicate_submitted_virtual_order_is_not_created():
@@ -141,7 +145,122 @@ def test_active_candle_low_is_not_used_for_fill():
 
     assert result.filled is False
     assert result.details["include_active_candle"] is False
+    assert result.details["legacy_result"] is False
+    assert result.details["new_result"] is False
     assert order.status == VirtualOrderStatus.SUBMITTED
+
+
+def test_fill_diagnostics_high_confidence_keeps_legacy_fill_result():
+    builder = builder_with_completed_candle(low=9_990, close=10_080, final_volume=2_000)
+    service = VirtualOrderService()
+    entry_plan = plan()
+    order = service.submit_virtual_order(entry_plan, datetime(2026, 5, 29, 9, 0)).order
+    latest_tick = StrategyTick.from_realtime(
+        "111111",
+        10_080,
+        cum_volume=2_000,
+        spread_ticks=1,
+        trade_value=5_000_000,
+        execution_strength=130,
+        timestamp=datetime(2026, 5, 29, 9, 1, 50),
+    )
+
+    result = service.evaluate_fill(order, entry_plan, builder, datetime(2026, 5, 29, 9, 2), latest_tick=latest_tick)
+    diagnostics = result.details["fill_diagnostics_v2"]
+
+    assert result.filled is True
+    assert order.status == VirtualOrderStatus.FILLED
+    assert diagnostics["legacy_fill_result"] is True
+    assert diagnostics["v2_would_fill"] is True
+    assert diagnostics["fill_confidence_level"] == "high"
+    assert diagnostics["spread_risk"] is False
+    assert result.details["legacy_result"] is True
+    assert result.details["new_result"] is True
+
+
+def test_fill_diagnostics_low_liquidity_records_v2_non_fill_without_changing_legacy_fill():
+    builder = builder_with_completed_candle(low=9_990, close=10_080, final_volume=1_020)
+    service = VirtualOrderService()
+    entry_plan = plan()
+    order = service.submit_virtual_order(entry_plan, datetime(2026, 5, 29, 9, 0)).order
+    latest_tick = StrategyTick.from_realtime(
+        "111111",
+        10_080,
+        spread_ticks=1,
+        execution_strength=130,
+        timestamp=datetime(2026, 5, 29, 9, 1, 50),
+    )
+
+    result = service.evaluate_fill(order, entry_plan, builder, datetime(2026, 5, 29, 9, 2), latest_tick=latest_tick)
+    diagnostics = result.details["fill_diagnostics_v2"]
+
+    assert result.filled is True
+    assert order.status == VirtualOrderStatus.FILLED
+    assert diagnostics["fill_confidence_level"] == "low"
+    assert diagnostics["v2_would_fill"] is False
+    assert diagnostics["liquidity_risk"] is True
+    assert "FILL_LIQUIDITY_WEAK" in diagnostics["v2_non_fill_reason_codes"]
+    assert "FILL_LIQUIDITY_WEAK" in result.details["comparison_reason_codes"]
+    assert result.details["legacy_result"] is True
+    assert result.details["new_result"] is False
+
+
+def test_fill_diagnostics_records_spread_risk():
+    builder = builder_with_completed_candle(low=9_990, close=10_080, final_volume=2_000)
+    service = VirtualOrderService()
+    entry_plan = plan()
+    order = service.submit_virtual_order(entry_plan, datetime(2026, 5, 29, 9, 0)).order
+    latest_tick = StrategyTick.from_realtime(
+        "111111",
+        10_080,
+        spread_ticks=5,
+        trade_value=5_000_000,
+        execution_strength=130,
+        timestamp=datetime(2026, 5, 29, 9, 1, 50),
+    )
+
+    result = service.evaluate_fill(order, entry_plan, builder, datetime(2026, 5, 29, 9, 2), latest_tick=latest_tick)
+    diagnostics = result.details["fill_diagnostics_v2"]
+
+    assert diagnostics["spread_ticks"] == 5
+    assert diagnostics["spread_risk"] is True
+    assert "SPREAD_TOO_WIDE" in diagnostics["v2_non_fill_reason_codes"]
+    assert "SPREAD_TOO_WIDE" in result.details["comparison_reason_codes"]
+
+
+def test_fill_diagnostics_missing_execution_strength_records_input_insufficient():
+    builder = builder_with_completed_candle(low=9_990, close=10_080, final_volume=2_000)
+    service = VirtualOrderService()
+    entry_plan = plan()
+    order = service.submit_virtual_order(entry_plan, datetime(2026, 5, 29, 9, 0)).order
+    latest_tick = StrategyTick.from_realtime(
+        "111111",
+        10_080,
+        spread_ticks=1,
+        trade_value=5_000_000,
+        timestamp=datetime(2026, 5, 29, 9, 1, 50),
+    )
+
+    result = service.evaluate_fill(order, entry_plan, builder, datetime(2026, 5, 29, 9, 2), latest_tick=latest_tick)
+    diagnostics = result.details["fill_diagnostics_v2"]
+
+    assert "execution_strength_missing" in diagnostics["input_missing_fields"]
+    assert "FILL_INPUT_INSUFFICIENT" in diagnostics["v2_non_fill_reason_codes"]
+    assert "INPUT_MISSING" in diagnostics["v2_non_fill_reason_codes"]
+
+
+def test_v2_apply_default_disabled_so_low_confidence_does_not_change_virtual_fill():
+    builder = builder_with_completed_candle(low=9_990, close=10_080, final_volume=1_020)
+    service = VirtualOrderService()
+    entry_plan = plan()
+    order = service.submit_virtual_order(entry_plan, datetime(2026, 5, 29, 9, 0)).order
+
+    result = service.evaluate_fill(order, entry_plan, builder, datetime(2026, 5, 29, 9, 2))
+
+    assert service.v2_apply is False
+    assert result.filled is True
+    assert order.status == VirtualOrderStatus.FILLED
+    assert result.details["fill_diagnostics_v2"]["v2_would_fill"] is False
 
 
 def test_timeout_unfilled_order_does_not_fill_later():
