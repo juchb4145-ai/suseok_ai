@@ -1616,9 +1616,25 @@ class TradingDatabase:
         ).fetchall()
         return [_row_to_gateway_transport_latency_sample(row) for row in rows]
 
-    def list_gateway_transport_experiments(self, *, limit: int = 50, offset: int = 0) -> list[dict]:
+    def list_gateway_transport_experiments(
+        self,
+        *,
+        experiment_id: Optional[str] = None,
+        scenario: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses = ["experiment_id != ''"]
+        params: list[object] = []
+        if experiment_id:
+            clauses.append("experiment_id = ?")
+            params.append(experiment_id)
+        if scenario:
+            clauses.append("scenario = ?")
+            params.append(scenario)
+        where = " AND ".join(clauses)
         rows = self.conn.execute(
-            """
+            f"""
             SELECT
                 experiment_id,
                 scenario,
@@ -1627,12 +1643,12 @@ class TradingDatabase:
                 MIN(created_at) AS started_at,
                 MAX(created_at) AS ended_at
             FROM gateway_transport_latency_samples
-            WHERE experiment_id != ''
+            WHERE {where}
             GROUP BY experiment_id, scenario
             ORDER BY ended_at DESC
             LIMIT ? OFFSET ?
             """,
-            (max(1, int(limit or 50)), max(0, int(offset or 0))),
+            tuple(params + [max(1, int(limit or 50)), max(0, int(offset or 0))]),
         ).fetchall()
         return [
             {

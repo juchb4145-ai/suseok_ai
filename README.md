@@ -213,6 +213,21 @@ Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/experiments/exp-00
 
 `/ws/gateway/transport` is mock-only in PR-9. It is separate from Dashboard `/ws/dashboard`, and it still uses the same Gateway command queue, dedupe ledger, persistence, and ack/fail handlers. The real 32bit Kiwoom Gateway remains on REST + long-poll by default.
 
+Dashboard drilldowns:
+
+- `/` keeps WebSocket snapshot cards for Core/Gateway/runtime summary.
+- Transport latency samples, WebSocket mock experiments, DRY_RUN order intents, DRY_RUN performance cases, false signals, and Gateway command history are loaded through paginated REST tables.
+- Each table supports filters, page size, Prev/Next, reload, optional auto refresh, stale markers, and row detail drawers.
+- Rebuild/export actions prompt for `TRADING_CORE_TOKEN`; no token is hardcoded in frontend code.
+
+Operational order:
+
+1. Check summary cards for mode, Gateway heartbeat, runtime, and command status.
+2. Use Gateway Command History for failed or stale commands.
+3. Use Transport Latency Samples for command/event/ack timing.
+4. Use WebSocket Mock Experiments only for REST-vs-WebSocket evidence, not switching.
+5. Use DRY_RUN Performance and False Signals for strategy diagnosis.
+
 ## 32bit Kiwoom Gateway
 
 Use 32bit Python 3.9.13 with Kiwoom OpenAPI+ installed and OCX registered.
@@ -307,3 +322,4 @@ More detail:
 - [DRY_RUN Performance Report Runbook](docs/dry_run_performance_report_runbook.md)
 - [Gateway Transport Latency Runbook](docs/gateway_transport_latency_runbook.md)
 - [Gateway WebSocket Mock Experiment Runbook](docs/gateway_websocket_mock_experiment_runbook.md)
+- [Dashboard Pagination Runbook](docs/dashboard_pagination_runbook.md)

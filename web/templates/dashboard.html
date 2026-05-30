@@ -21,22 +21,10 @@
 
     <main class="layout">
       <section class="band status-grid">
-        <div class="metric">
-          <span>Core</span>
-          <strong id="core-state">OK</strong>
-        </div>
-        <div class="metric">
-          <span>Gateway</span>
-          <strong id="gateway-connection">DISCONNECTED</strong>
-        </div>
-        <div class="metric">
-          <span>Kiwoom Login</span>
-          <strong id="kiwoom-login">NO</strong>
-        </div>
-        <div class="metric">
-          <span>Heartbeat</span>
-          <strong id="heartbeat-age">-</strong>
-        </div>
+        <div class="metric"><span>Core</span><strong id="core-state">OK</strong></div>
+        <div class="metric"><span>Gateway</span><strong id="gateway-connection">DISCONNECTED</strong></div>
+        <div class="metric"><span>Kiwoom Login</span><strong id="kiwoom-login">NO</strong></div>
+        <div class="metric"><span>Heartbeat</span><strong id="heartbeat-age">-</strong></div>
       </section>
 
       <section class="band">
@@ -57,18 +45,6 @@
           <div><span>RECONNECT</span><strong id="transport-reconnect">0</strong></div>
         </div>
         <div id="transport-warning-lines" class="inline-log"></div>
-        <table>
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>Direction</th>
-              <th>Type</th>
-              <th>Command</th>
-              <th>Error</th>
-            </tr>
-          </thead>
-          <tbody id="transport-error-rows"></tbody>
-        </table>
       </section>
 
       <section class="band">
@@ -108,8 +84,6 @@
           <div><span>FAILED</span><strong id="runtime-failed-count">0</strong></div>
           <div><span>SKIPPED</span><strong id="runtime-skipped-count">0</strong></div>
           <div><span>DURATION</span><strong id="runtime-duration">0ms</strong></div>
-        </div>
-        <div class="mini-grid runtime-grid">
           <div><span>ACTIVE CANDIDATES</span><strong id="runtime-active-candidates">0</strong></div>
           <div><span>GATE RESULTS</span><strong id="runtime-gate-results">0</strong></div>
           <div><span>VIRTUAL ORDERS</span><strong id="runtime-virtual-orders">0</strong></div>
@@ -138,40 +112,6 @@
         </div>
         <div id="dryrun-reject-reasons" class="inline-log"></div>
         <div id="dryrun-exit-type-lines" class="inline-log"></div>
-        <table>
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>Code</th>
-              <th>Side</th>
-              <th>Qty</th>
-              <th>Price</th>
-              <th>Status</th>
-              <th>Reason</th>
-              <th>Live</th>
-              <th>Candidate</th>
-              <th>Virtual Order</th>
-            </tr>
-          </thead>
-          <tbody id="dryrun-order-rows"></tbody>
-        </table>
-        <table>
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>Code</th>
-              <th>Decision</th>
-              <th>Qty</th>
-              <th>Price</th>
-              <th>Status</th>
-              <th>Reason</th>
-              <th>Live</th>
-              <th>Position</th>
-              <th>Exit Decision</th>
-            </tr>
-          </thead>
-          <tbody id="dryrun-sell-order-rows"></tbody>
-        </table>
       </section>
 
       <section class="band">
@@ -192,21 +132,6 @@
         <div id="dryrun-perf-fp-lines" class="inline-log"></div>
         <div id="dryrun-perf-fn-lines" class="inline-log"></div>
         <div id="dryrun-perf-reject-rally-lines" class="inline-log"></div>
-        <table>
-          <thead>
-            <tr>
-              <th>Code</th>
-              <th>Class</th>
-              <th>FP</th>
-              <th>FN/Opp</th>
-              <th>Return</th>
-              <th>Max 20m</th>
-              <th>Drawdown</th>
-              <th>Gate</th>
-            </tr>
-          </thead>
-          <tbody id="dryrun-perf-case-rows"></tbody>
-        </table>
       </section>
 
       <section class="band">
@@ -224,121 +149,193 @@
           <div><span>RATE LIMITED</span><strong id="command-rate-limited">0</strong></div>
           <div><span>STALE</span><strong id="command-stale">0</strong></div>
         </div>
-        <table>
-          <thead>
-            <tr>
-              <th>Command ID</th>
-              <th>Created</th>
-              <th>Type</th>
-              <th>Status</th>
-              <th>Attempts</th>
-              <th>Dedupe</th>
-              <th>Error</th>
-            </tr>
-          </thead>
-          <tbody id="command-rows"></tbody>
-        </table>
+      </section>
+
+      <section class="band table-panel" data-table-section="transportLatency">
+        <div class="section-head">
+          <h2>Transport Latency Samples</h2>
+          <span id="transportLatency-status" class="counter">idle</span>
+        </div>
+        <div class="filter-grid">
+          <label>Trade Date<input data-table="transportLatency" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+          <label>Direction<input data-table="transportLatency" data-filter="direction" placeholder="gateway_to_core" /></label>
+          <label>Message Type<input data-table="transportLatency" data-filter="message_type" placeholder="command_ack" /></label>
+          <label>Transport<input data-table="transportLatency" data-filter="transport_mode" placeholder="rest_long_poll" /></label>
+          <label>Experiment<input data-table="transportLatency" data-filter="experiment_id" /></label>
+          <label>Scenario<input data-table="transportLatency" data-filter="scenario" /></label>
+          <label>Command ID<input data-table="transportLatency" data-filter="command_id" /></label>
+          <label>Event ID<input data-table="transportLatency" data-filter="event_id" /></label>
+        </div>
+        <div class="table-toolbar" data-table-toolbar="transportLatency"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>Mode</th><th>Direction</th><th>Type</th><th>ID</th><th>Total</th><th>Long Poll</th><th>Execute</th><th>Ack</th><th>Error</th></tr></thead>
+            <tbody id="transportLatency-body"></tbody>
+          </table>
+        </div>
+        <div id="transportLatency-pagination" class="pagination"></div>
+      </section>
+
+      <section class="band table-panel" data-table-section="transportExperiments">
+        <div class="section-head">
+          <h2>WebSocket Mock Experiments</h2>
+          <span id="transportExperiments-status" class="counter">idle</span>
+        </div>
+        <div class="filter-grid">
+          <label>Experiment<input data-table="transportExperiments" data-filter="experiment_id" /></label>
+          <label>Scenario<input data-table="transportExperiments" data-filter="scenario" /></label>
+        </div>
+        <div class="table-toolbar" data-table-toolbar="transportExperiments"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Experiment</th><th>Scenario</th><th>Started</th><th>Ended</th><th>REST</th><th>WS</th><th>REST Cmd</th><th>WS Cmd</th><th>Delta</th><th>Decision</th><th>Ready</th></tr></thead>
+            <tbody id="transportExperiments-body"></tbody>
+          </table>
+        </div>
+        <div id="transportExperiments-pagination" class="pagination"></div>
+      </section>
+
+      <section class="band table-panel" data-table-section="dryRunOrders">
+        <div class="section-head">
+          <h2>DRY_RUN Order Intents</h2>
+          <span id="dryRunOrders-status" class="counter">idle</span>
+        </div>
+        <div class="filter-grid">
+          <label>Trade Date<input data-table="dryRunOrders" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+          <label>Status<input data-table="dryRunOrders" data-filter="status" /></label>
+          <label>Code<input data-table="dryRunOrders" data-filter="code" /></label>
+          <label>Side<input data-table="dryRunOrders" data-filter="side" placeholder="buy/sell" /></label>
+          <label>Phase<input data-table="dryRunOrders" data-filter="order_phase" placeholder="entry/exit" /></label>
+          <label>Candidate<input data-table="dryRunOrders" data-filter="candidate_id" /></label>
+          <label>Position<input data-table="dryRunOrders" data-filter="virtual_position_id" /></label>
+          <label>Exit Decision<input data-table="dryRunOrders" data-filter="exit_decision_id" /></label>
+        </div>
+        <div class="table-toolbar" data-table-toolbar="dryRunOrders"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>Code</th><th>Side</th><th>Phase</th><th>Qty</th><th>Price</th><th>Status</th><th>Reason</th><th>Live</th><th>Candidate</th><th>Virtual/Exit</th></tr></thead>
+            <tbody id="dryRunOrders-body"></tbody>
+          </table>
+        </div>
+        <div id="dryRunOrders-pagination" class="pagination"></div>
+      </section>
+
+      <section class="band table-panel" data-table-section="dryRunPerformance">
+        <div class="section-head">
+          <h2>DRY_RUN Performance Cases</h2>
+          <span id="dryRunPerformance-status" class="counter">idle</span>
+        </div>
+        <div class="filter-grid">
+          <label>Trade Date<input data-table="dryRunPerformance" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+          <label>Strategy<input data-table="dryRunPerformance" data-filter="strategy_name" /></label>
+          <label>Code<input data-table="dryRunPerformance" data-filter="code" /></label>
+          <label>Theme<input data-table="dryRunPerformance" data-filter="theme_name" /></label>
+          <label>Side<input data-table="dryRunPerformance" data-filter="side" /></label>
+          <label>Phase<input data-table="dryRunPerformance" data-filter="order_phase" /></label>
+          <label>Rejected<select data-table="dryRunPerformance" data-filter="include_rejected"><option value="true">include</option><option value="false">exclude</option></select></label>
+          <label>Duplicates<select data-table="dryRunPerformance" data-filter="include_duplicates"><option value="false">exclude</option><option value="true">include</option></select></label>
+        </div>
+        <div class="table-toolbar" data-table-toolbar="dryRunPerformance"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Code</th><th>Strategy</th><th>Theme</th><th>Quality</th><th>FP</th><th>FN/Opp</th><th>Return</th><th>Max 20m</th><th>Drawdown</th><th>Gate</th></tr></thead>
+            <tbody id="dryRunPerformance-body"></tbody>
+          </table>
+        </div>
+        <div id="dryRunPerformance-pagination" class="pagination"></div>
+      </section>
+
+      <section class="band table-panel" data-table-section="falseSignals">
+        <div class="section-head">
+          <h2>False Signals</h2>
+          <span id="falseSignals-status" class="counter">idle</span>
+        </div>
+        <div class="filter-grid">
+          <label>Trade Date<input data-table="falseSignals" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+          <label>Type<select data-table="falseSignals" data-filter="type"><option value="all">all</option><option value="false_positive">false_positive</option><option value="false_negative">false_negative</option><option value="opportunity_loss">opportunity_loss</option></select></label>
+        </div>
+        <div class="table-toolbar" data-table-toolbar="falseSignals"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Code</th><th>Signal</th><th>Subtype</th><th>Return</th><th>Max 20m</th><th>Drawdown</th><th>Reject</th><th>Gate</th><th>Lifecycle</th></tr></thead>
+            <tbody id="falseSignals-body"></tbody>
+          </table>
+        </div>
+        <div id="falseSignals-pagination" class="pagination"></div>
+      </section>
+
+      <section class="band table-panel" data-table-section="gatewayCommands">
+        <div class="section-head">
+          <h2>Gateway Command History</h2>
+          <span id="gatewayCommands-status" class="counter">idle</span>
+        </div>
+        <div class="filter-grid">
+          <label>Status<input data-table="gatewayCommands" data-filter="status" /></label>
+          <label>Type<input data-table="gatewayCommands" data-filter="command_type" /></label>
+          <label>Trade Date<input data-table="gatewayCommands" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+          <label>Command ID<input data-table="gatewayCommands" data-filter="command_id" /></label>
+          <label>Finished<select data-table="gatewayCommands" data-filter="include_finished"><option value="true">include</option><option value="false">active only</option></select></label>
+        </div>
+        <div class="table-toolbar" data-table-toolbar="gatewayCommands"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Command ID</th><th>Created</th><th>Type</th><th>Status</th><th>Attempts</th><th>Dedupe</th><th>Error</th></tr></thead>
+            <tbody id="gatewayCommands-body"></tbody>
+          </table>
+        </div>
+        <div id="gatewayCommands-pagination" class="pagination"></div>
       </section>
 
       <section class="band two-col">
         <div>
-          <div class="section-head">
-            <h2>후보 / 게이트</h2>
-            <span id="candidate-total" class="counter">0</span>
-          </div>
+          <div class="section-head"><h2>Candidates / Gates</h2><span id="candidate-total" class="counter">0</span></div>
           <div class="mini-grid">
             <div><span>READY</span><strong id="candidate-ready">0</strong></div>
             <div><span>BLOCKED</span><strong id="candidate-blocked">0</strong></div>
             <div><span>WAIT</span><strong id="candidate-wait">0</strong></div>
           </div>
-          <table>
-            <thead>
-              <tr>
-                <th>Code</th>
-                <th>State</th>
-                <th>Theme</th>
-                <th>Hybrid</th>
-                <th>Reasons</th>
-              </tr>
-            </thead>
-            <tbody id="candidate-rows"></tbody>
-          </table>
+          <div class="table-wrap"><table><thead><tr><th>Code</th><th>State</th><th>Theme</th><th>Hybrid</th><th>Reasons</th></tr></thead><tbody id="candidate-rows"></tbody></table></div>
         </div>
         <div>
-          <div class="section-head">
-            <h2>테마</h2>
-            <span id="top-theme" class="counter">-</span>
-          </div>
+          <div class="section-head"><h2>Themes</h2><span id="top-theme" class="counter">-</span></div>
           <div class="mini-grid">
             <div><span>ACTIVE</span><strong id="theme-active">0</strong></div>
             <div><span>WATCH</span><strong id="theme-watch">0</strong></div>
             <div><span>Top Score</span><strong id="theme-top-score">0</strong></div>
           </div>
-          <table>
-            <thead>
-              <tr>
-                <th>Rank</th>
-                <th>Theme</th>
-                <th>Score</th>
-                <th>Breadth</th>
-                <th>Leader Gap</th>
-                <th>Top3</th>
-              </tr>
-            </thead>
-            <tbody id="theme-rows"></tbody>
-          </table>
+          <div class="table-wrap"><table><thead><tr><th>Rank</th><th>Theme</th><th>Score</th><th>Breadth</th><th>Leader Gap</th><th>Top3</th></tr></thead><tbody id="theme-rows"></tbody></table></div>
         </div>
       </section>
 
       <section class="band two-col">
         <div>
-          <div class="section-head">
-            <h2>주문 / 포지션</h2>
-            <span id="order-count" class="counter">0</span>
-          </div>
-          <table>
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>Code</th>
-                <th>Side</th>
-                <th>Qty</th>
-                <th>Price</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody id="order-rows"></tbody>
-          </table>
+          <div class="section-head"><h2>Orders / Positions</h2><span id="order-count" class="counter">0</span></div>
+          <div class="table-wrap"><table><thead><tr><th>Time</th><th>Code</th><th>Side</th><th>Qty</th><th>Price</th><th>Status</th></tr></thead><tbody id="order-rows"></tbody></table></div>
         </div>
         <div>
-          <div class="section-head">
-            <h2>리뷰 / 성과</h2>
-            <span id="review-count" class="counter">0</span>
-          </div>
-          <table>
-            <thead>
-              <tr>
-                <th>Code</th>
-                <th>Status</th>
-                <th>5m</th>
-                <th>10m</th>
-                <th>20m</th>
-                <th>Flags</th>
-              </tr>
-            </thead>
-            <tbody id="review-rows"></tbody>
-          </table>
+          <div class="section-head"><h2>Reviews</h2><span id="review-count" class="counter">0</span></div>
+          <div class="table-wrap"><table><thead><tr><th>Code</th><th>Status</th><th>5m</th><th>10m</th><th>20m</th><th>Flags</th></tr></thead><tbody id="review-rows"></tbody></table></div>
         </div>
       </section>
 
       <section class="band">
-        <div class="section-head">
-          <h2>로그</h2>
-          <span id="log-count" class="counter">0</span>
-        </div>
+        <div class="section-head"><h2>Logs</h2><span id="log-count" class="counter">0</span></div>
         <div id="log-lines" class="log"></div>
       </section>
     </main>
+
+    <div id="detail-backdrop" class="detail-backdrop hidden"></div>
+    <aside id="detail-drawer" class="detail-drawer" aria-hidden="true">
+      <div class="detail-head">
+        <h2 id="detail-title">Detail</h2>
+        <button id="detail-close" type="button" aria-label="Close detail">Close</button>
+      </div>
+      <div id="detail-summary" class="detail-summary"></div>
+      <details open>
+        <summary>Raw JSON</summary>
+        <pre id="detail-json" class="json-preview">{}</pre>
+      </details>
+    </aside>
 
     <script src="/static/dashboard.js"></script>
   </body>

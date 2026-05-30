@@ -76,6 +76,16 @@ The report includes counts and samples for:
 
 `rebuild` and `export` require the local token because they create stored reports or files.
 
+## Dashboard
+
+PR-10 adds paginated dashboard drilldowns:
+
+- **DRY_RUN Order Intents** for entry/buy and exit/sell intent browsing.
+- **DRY_RUN Performance Cases** for lifecycle-level performance rows.
+- **False Signals** for false positive, false negative, and opportunity-loss rows.
+
+Use filters to narrow by `trade_date`, `code`, `theme_name`, `strategy_name`, `side`, or `order_phase`. Click a row to open the detail drawer with compact fields and raw JSON. Summary cards continue to update through `/ws/dashboard`, while table pages fetch REST APIs independently.
+
 ## Export Location
 
 Generated files are written under:

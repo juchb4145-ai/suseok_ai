@@ -133,6 +133,14 @@ Invoke-RestMethod -Method Post `
 Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/experiments/exp-001
 ```
 
+Dashboard:
+
+- Open `/`.
+- Use **Transport Latency Samples** for paginated sample browsing.
+- Filter by `command_id`, `event_id`, `direction`, `message_type`, `transport_mode`, `experiment_id`, or `scenario`.
+- Click a row to open the latency sample detail drawer.
+- Use **Gateway Command History** with the same `command_id` when command lifecycle context is needed.
+
 Exports are written to:
 
 ```text

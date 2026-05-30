@@ -145,6 +145,20 @@ This script assumes the Core server is already running and uses persisted latenc
 
 The WebSocket decision endpoint now includes the latest mock comparison when available. `real_gateway_switch_ready` remains `false` in PR-9.
 
+## Dashboard
+
+PR-10 adds a paginated **WebSocket Mock Experiments** table to `/`.
+
+Use it to:
+
+- filter by `experiment_id` or `scenario`,
+- compare REST and WebSocket sample counts,
+- compare REST command p95 and WebSocket command p95,
+- inspect command p95 delta and recommendation,
+- open experiment detail JSON in the drawer.
+
+The dashboard intentionally has no button to switch the real Gateway transport. The table is only for experiment analysis.
+
 ## Recommendation Labels
 
 - `KEEP_REST_LONG_POLL`

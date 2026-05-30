@@ -271,6 +271,13 @@ PR-9:
 - Dashboard mock experiment summary.
 - Real Kiwoom Gateway remains REST long-poll by default.
 
+PR-10:
+
+- Dashboard summary cards remain WebSocket snapshot-driven.
+- Transport, experiment, DRY_RUN order, performance, false-signal, and command-history tables use REST pagination.
+- Row drilldowns fetch detail APIs instead of embedding large datasets in `/api/snapshot`.
+- No order execution or WebSocket transport switch controls are added to the dashboard.
+
 PR-5:
 
 - `OrderEnqueueService` shared by API and runtime.

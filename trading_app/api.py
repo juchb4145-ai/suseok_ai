@@ -119,6 +119,47 @@ def _transport_analyzer(db: TradingDatabase) -> TransportLatencyAnalyzer:
     return TransportLatencyAnalyzer(db, config=_transport_config_from_settings())
 
 
+def _pagination_payload(
+    *,
+    limit: int,
+    offset: int,
+    count: int,
+    total: Optional[int] = None,
+    has_next: Optional[bool] = None,
+) -> dict[str, Any]:
+    normalized_limit = max(1, int(limit or 1))
+    normalized_offset = max(0, int(offset or 0))
+    normalized_count = max(0, int(count or 0))
+    if has_next is None:
+        has_next = (normalized_offset + normalized_count) < int(total) if total is not None else normalized_count >= normalized_limit
+    prev_offset = max(0, normalized_offset - normalized_limit)
+    payload = {
+        "limit": normalized_limit,
+        "offset": normalized_offset,
+        "count": normalized_count,
+        "has_next": bool(has_next),
+        "has_prev": normalized_offset > 0,
+        "next_offset": normalized_offset + normalized_limit if has_next else normalized_offset,
+        "prev_offset": prev_offset,
+    }
+    if total is not None:
+        payload["total"] = int(total)
+    return payload
+
+
+def _trim_page(rows: list[Any], *, limit: int, offset: int, total: Optional[int] = None) -> tuple[list[Any], dict[str, Any]]:
+    normalized_limit = max(1, int(limit or 1))
+    trimmed = rows[:normalized_limit]
+    pagination = _pagination_payload(
+        limit=normalized_limit,
+        offset=offset,
+        count=len(trimmed),
+        total=total,
+        has_next=len(rows) > normalized_limit if total is None else None,
+    )
+    return trimmed, pagination
+
+
 def _transport_status_payload(db: TradingDatabase) -> dict[str, Any]:
     settings = get_settings()
     report = _transport_analyzer(db).build_report(limit=1000)
@@ -241,9 +282,10 @@ def gateway_transport_latency(
             transport_mode=transport_mode,
             experiment_id=experiment_id,
             scenario=scenario,
-            limit=limit,
+            limit=limit + 1,
             offset=offset,
         )
+        samples, pagination = _trim_page(samples, limit=limit, offset=offset)
         report = _transport_analyzer(db).build_report(
             trade_date=trade_date,
             direction=direction,
@@ -253,10 +295,22 @@ def gateway_transport_latency(
             scenario=scenario,
             limit=10000,
         )
-        return {"summary": report.get("summary", {}), "samples": samples, "filters": report.get("filters", {})}
+        filters = {
+            **dict(report.get("filters") or {}),
+            "command_id": command_id or "",
+            "event_id": event_id or "",
+            "limit": limit,
+            "offset": offset,
+        }
+        return {
+            "summary": report.get("summary", {}),
+            "samples": samples,
+            "items": samples,
+            "pagination": pagination,
+            "filters": filters,
+        }
     finally:
         close_database(db)
-
 
 @app.get("/api/gateway/transport/latency/summary")
 def gateway_transport_latency_summary(
@@ -308,7 +362,9 @@ def gateway_transport_latency_reports(
 ) -> dict[str, Any]:
     db = open_database()
     try:
-        return {"items": db.list_gateway_transport_latency_reports(limit=limit, offset=offset)}
+        items = db.list_gateway_transport_latency_reports(limit=limit + 1, offset=offset)
+        items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {"items": items, "pagination": pagination, "filters": {"limit": limit, "offset": offset}}
     finally:
         close_database(db)
 
@@ -344,8 +400,20 @@ def gateway_transport_latency_export(
         close_database(db)
 
 
+@app.get("/api/gateway/transport/latency/{sample_id}")
+def gateway_transport_latency_sample_detail(sample_id: str) -> dict[str, Any]:
+    db = open_database()
+    try:
+        sample = db.get_gateway_transport_latency_sample(sample_id)
+        return {"found": sample is not None, "sample_id": sample_id, "record": sample}
+    finally:
+        close_database(db)
+
+
 @app.get("/api/gateway/transport/experiments")
 def gateway_transport_experiments(
+    experiment_id: Optional[str] = None,
+    scenario: Optional[str] = None,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0, le=100000),
 ) -> dict[str, Any]:
@@ -353,7 +421,14 @@ def gateway_transport_experiments(
     try:
         analyzer = _transport_analyzer(db)
         items = []
-        for item in db.list_gateway_transport_experiments(limit=limit, offset=offset):
+        rows = db.list_gateway_transport_experiments(
+            experiment_id=experiment_id,
+            scenario=scenario,
+            limit=limit + 1,
+            offset=offset,
+        )
+        rows, pagination = _trim_page(rows, limit=limit, offset=offset)
+        for item in rows:
             comparison = analyzer.build_transport_comparison_report(
                 experiment_id=item.get("experiment_id"),
                 scenario=item.get("scenario"),
@@ -363,9 +438,22 @@ def gateway_transport_experiments(
                     **item,
                     "latest_recommendation": comparison.get("websocket_recommendation", {}).get("recommendation", ""),
                     "sample_counts": comparison.get("sample_counts", {}),
+                    "rest_summary": comparison.get("rest_summary", {}),
+                    "websocket_summary": comparison.get("websocket_summary", {}),
+                    "delta": comparison.get("delta", {}),
+                    "real_gateway_switch_ready": comparison.get("websocket_recommendation", {}).get("real_gateway_switch_ready", False),
                 }
             )
-        return {"items": items}
+        return {
+            "items": items,
+            "pagination": pagination,
+            "filters": {
+                "experiment_id": experiment_id or "",
+                "scenario": scenario or "",
+                "limit": limit,
+                "offset": offset,
+            },
+        }
     finally:
         close_database(db)
 
@@ -485,7 +573,7 @@ def runtime_dry_run_orders(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
-    return _order_service().list_dry_run_orders(
+    payload = _order_service().list_dry_run_orders(
         trade_date=trade_date,
         status=status,
         code=code,
@@ -494,9 +582,27 @@ def runtime_dry_run_orders(
         order_phase=order_phase,
         virtual_position_id=virtual_position_id,
         exit_decision_id=exit_decision_id,
-        limit=limit,
+        limit=limit + 1,
         offset=offset,
     )
+    items, pagination = _trim_page(list(payload.get("items") or []), limit=limit, offset=offset)
+    return {
+        **payload,
+        "items": items,
+        "pagination": pagination,
+        "filters": {
+            "trade_date": trade_date or "",
+            "status": status or "",
+            "code": code or "",
+            "candidate_id": candidate_id,
+            "side": side or "",
+            "order_phase": order_phase or "",
+            "virtual_position_id": virtual_position_id,
+            "exit_decision_id": exit_decision_id,
+            "limit": limit,
+            "offset": offset,
+        },
+    }
 
 
 @app.get("/api/runtime/orders/dry-run/{intent_id}")
@@ -523,7 +629,7 @@ def runtime_dry_run_performance(
 ) -> dict[str, Any]:
     db = open_database()
     try:
-        return _performance_analyzer(db).build_report(
+        report = _performance_analyzer(db).build_report(
             trade_date=trade_date,
             strategy_name=strategy_name,
             code=code,
@@ -535,6 +641,14 @@ def runtime_dry_run_performance(
             limit=limit,
             offset=offset,
         )
+        total = int(report.get("total_items") or len(report.get("items") or []))
+        report["pagination"] = _pagination_payload(
+            limit=limit,
+            offset=offset,
+            count=len(report.get("items") or []),
+            total=total,
+        )
+        return report
     finally:
         close_database(db)
 
@@ -570,7 +684,9 @@ def runtime_dry_run_performance_reports(
 ) -> dict[str, Any]:
     db = open_database()
     try:
-        return {"items": db.list_dry_run_performance_reports(limit=limit, offset=offset)}
+        items = db.list_dry_run_performance_reports(limit=limit + 1, offset=offset)
+        items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {"items": items, "pagination": pagination, "filters": {"limit": limit, "offset": offset}}
     finally:
         close_database(db)
 
@@ -628,12 +744,31 @@ def runtime_dry_run_false_signals(
             items = [item for item in items if item.get("opportunity_loss_type")]
         start = max(0, int(offset or 0))
         end = start + max(1, int(limit or 100))
+        page_items = items[start:end]
         return {
             "summary": report.get("false_signal_summary", {}),
             "type": type,
             "total": len(items),
-            "items": items[start:end],
+            "items": page_items,
+            "pagination": _pagination_payload(limit=limit, offset=offset, count=len(page_items), total=len(items)),
+            "filters": {"trade_date": trade_date or "", "type": type, "limit": limit, "offset": offset},
         }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/performance/dry-run/lifecycles/{lifecycle_id}")
+def runtime_dry_run_performance_lifecycle_detail(
+    lifecycle_id: str,
+    trade_date: Optional[str] = None,
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _performance_analyzer(db).build_report(trade_date=trade_date, limit=10000)
+        for item in report.get("items") or []:
+            if str(item.get("lifecycle_id") or "") == lifecycle_id:
+                return {"found": True, "lifecycle_id": lifecycle_id, "item": item, "report_id": report.get("report_id")}
+        return {"found": False, "lifecycle_id": lifecycle_id, "item": None, "report_id": report.get("report_id")}
     finally:
         close_database(db)
 
@@ -824,22 +959,40 @@ def gateway_commands_history(
     status: Optional[str] = None,
     command_type: Optional[str] = None,
     trade_date: Optional[str] = None,
+    command_id: Optional[str] = None,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0, le=100000),
     include_finished: bool = True,
     include_payload: bool = False,
 ) -> dict[str, Any]:
-    items = gateway_state.list_commands(
-        status=status,
-        command_type=command_type,
-        trade_date=trade_date,
-        limit=limit,
-        offset=offset,
-        include_finished=include_finished,
-    )
+    if command_id:
+        record = gateway_state.get_command(command_id)
+        items = [record.to_dict()] if record is not None else []
+        pagination = _pagination_payload(limit=limit, offset=offset, count=len(items), total=len(items))
+    else:
+        rows = gateway_state.list_commands(
+            status=status,
+            command_type=command_type,
+            trade_date=trade_date,
+            limit=limit + 1,
+            offset=offset,
+            include_finished=include_finished,
+        )
+        items, pagination = _trim_page(rows, limit=limit, offset=offset)
     return {
         "summary": gateway_state.command_snapshot(),
         "items": [_command_history_item(item, include_payload=include_payload) for item in items],
+        "pagination": pagination,
+        "filters": {
+            "status": status or "",
+            "command_type": command_type or "",
+            "trade_date": trade_date or "",
+            "command_id": command_id or "",
+            "include_finished": include_finished,
+            "include_payload": include_payload,
+            "limit": limit,
+            "offset": offset,
+        },
     }
 
 

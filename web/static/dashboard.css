@@ -88,6 +88,11 @@ button:hover {
   background: #eef4ff;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .pill,
 .counter {
   display: inline-flex;
@@ -125,6 +130,24 @@ button:hover {
   border-color: var(--line);
   background: #f2f4f7;
   color: var(--muted);
+}
+
+.counter.ok {
+  border-color: #a6d8c1;
+  background: #eaf7f1;
+  color: var(--green);
+}
+
+.counter.warn {
+  border-color: #f2c98f;
+  background: #fff5e6;
+  color: var(--amber);
+}
+
+.counter.bad {
+  border-color: #f1b4ae;
+  background: #fff0ee;
+  color: var(--red);
 }
 
 .layout {
@@ -205,6 +228,11 @@ table {
   table-layout: fixed;
 }
 
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
 th,
 td {
   border-bottom: 1px solid var(--line);
@@ -222,6 +250,190 @@ th {
 
 td {
   font-size: 13px;
+}
+
+.clickable-row {
+  cursor: pointer;
+}
+
+.clickable-row:hover {
+  background: #f5f9ff;
+}
+
+.filter-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 10px 0 12px;
+}
+
+.filter-grid label,
+.inline-control {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.filter-grid input,
+.filter-grid select,
+.inline-control select {
+  min-height: 32px;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  padding: 5px 8px;
+}
+
+.table-toolbar,
+.pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.pagination span,
+.freshness {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.freshness.stale {
+  color: var(--amber);
+  font-weight: 700;
+}
+
+.badge {
+  display: inline-flex;
+  max-width: 100%;
+  min-height: 22px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.badge.ok {
+  border-color: #a6d8c1;
+  background: #eaf7f1;
+  color: var(--green);
+}
+
+.badge.warn {
+  border-color: #f2c98f;
+  background: #fff5e6;
+  color: var(--amber);
+}
+
+.badge.bad {
+  border-color: #f1b4ae;
+  background: #fff0ee;
+  color: var(--red);
+}
+
+.badge.muted {
+  background: #f2f4f7;
+  color: var(--muted);
+}
+
+.mono {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+}
+
+.error-row {
+  color: var(--red);
+  font-weight: 700;
+}
+
+.detail-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9;
+  background: rgba(16, 24, 40, 0.28);
+}
+
+.detail-backdrop.hidden {
+  display: none;
+}
+
+.detail-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10;
+  width: min(760px, 100%);
+  transform: translateX(100%);
+  transition: transform 160ms ease;
+  border-left: 1px solid var(--line);
+  background: #ffffff;
+  box-shadow: -12px 0 28px rgba(16, 24, 40, 0.16);
+  padding: 16px;
+  overflow: auto;
+}
+
+.detail-drawer.open {
+  transform: translateX(0);
+}
+
+.detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.detail-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.detail-summary div {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  background: #fbfcfe;
+}
+
+.detail-summary span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.detail-summary strong {
+  display: block;
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.json-preview {
+  max-height: 60vh;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #101828;
+  color: #eef4ff;
+  padding: 12px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .log {
@@ -264,7 +476,8 @@ td {
   }
 
   .status-grid,
-  .mini-grid {
+  .mini-grid,
+  .filter-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -283,7 +496,9 @@ td {
   }
 
   .status-grid,
-  .mini-grid {
+  .mini-grid,
+  .filter-grid,
+  .detail-summary {
     grid-template-columns: 1fr;
   }
 }
