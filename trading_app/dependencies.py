@@ -52,6 +52,18 @@ class CoreSettings:
     dry_run_good_trade_threshold_pct: float = 2.0
     dry_run_min_hold_minutes_for_final: int = 20
     dry_run_pending_grace_minutes: int = 30
+    transport_metrics_enabled: bool = True
+    transport_metrics_sample_price_tick_rate: float = 0.01
+    transport_metrics_sample_heartbeat_rate: float = 0.1
+    transport_metrics_retention_sec: int = 604800
+    transport_latency_p95_warn_ms: int = 1000
+    transport_latency_p99_warn_ms: int = 3000
+    transport_command_p95_warn_ms: int = 1000
+    transport_event_p95_warn_ms: int = 500
+    transport_ack_p95_warn_ms: int = 1000
+    transport_websocket_recommend_p95_ms: int = 1000
+    transport_websocket_recommend_empty_poll_rate: float = 0.8
+    transport_websocket_experiment_enabled: bool = False
 
     @property
     def live_order_enabled(self) -> bool:
@@ -104,6 +116,21 @@ def get_settings() -> CoreSettings:
         dry_run_good_trade_threshold_pct=_float_env("TRADING_DRY_RUN_GOOD_TRADE_THRESHOLD_PCT", 2.0),
         dry_run_min_hold_minutes_for_final=_int_env("TRADING_DRY_RUN_MIN_HOLD_MINUTES_FOR_FINAL", 20),
         dry_run_pending_grace_minutes=_int_env("TRADING_DRY_RUN_PENDING_GRACE_MINUTES", 30),
+        transport_metrics_enabled=_bool_env("TRADING_TRANSPORT_METRICS_ENABLED", True),
+        transport_metrics_sample_price_tick_rate=_float_env("TRADING_TRANSPORT_METRICS_SAMPLE_PRICE_TICK_RATE", 0.01),
+        transport_metrics_sample_heartbeat_rate=_float_env("TRADING_TRANSPORT_METRICS_SAMPLE_HEARTBEAT_RATE", 0.1),
+        transport_metrics_retention_sec=_int_env("TRADING_TRANSPORT_METRICS_RETENTION_SEC", 604800),
+        transport_latency_p95_warn_ms=_int_env("TRADING_TRANSPORT_LATENCY_P95_WARN_MS", 1000),
+        transport_latency_p99_warn_ms=_int_env("TRADING_TRANSPORT_LATENCY_P99_WARN_MS", 3000),
+        transport_command_p95_warn_ms=_int_env("TRADING_TRANSPORT_COMMAND_P95_WARN_MS", 1000),
+        transport_event_p95_warn_ms=_int_env("TRADING_TRANSPORT_EVENT_P95_WARN_MS", 500),
+        transport_ack_p95_warn_ms=_int_env("TRADING_TRANSPORT_ACK_P95_WARN_MS", 1000),
+        transport_websocket_recommend_p95_ms=_int_env("TRADING_TRANSPORT_WEBSOCKET_RECOMMEND_P95_MS", 1000),
+        transport_websocket_recommend_empty_poll_rate=_float_env(
+            "TRADING_TRANSPORT_WEBSOCKET_RECOMMEND_EMPTY_POLL_RATE",
+            0.8,
+        ),
+        transport_websocket_experiment_enabled=_bool_env("TRADING_TRANSPORT_WEBSOCKET_EXPERIMENT_ENABLED", False),
     )
 
 

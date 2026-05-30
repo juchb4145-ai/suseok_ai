@@ -146,6 +146,26 @@ $env:TRADING_COMMAND_RECOVERY_EXPIRE_STALE_DISPATCHED = "1"
 
 The dashboard shows queued/dispatched/acked/failed/expired/duplicate/rate-limited/stale counts and recent DB-backed command history.
 
+## Command Queue + Transport Latency
+
+PR-8 adds transport timing around the same command lifecycle. Use these APIs with the queue status:
+
+- `GET /api/gateway/transport/status`
+- `GET /api/gateway/transport/latency?command_id=<id>`
+- `GET /api/gateway/transport/latency/summary?group_by=message_type`
+- `GET /api/gateway/transport/websocket-decision`
+
+When a command stays `DISPATCHED` for too long:
+
+1. Check `GET /api/gateway/commands/{command_id}` and its event timeline.
+2. Check `/api/gateway/transport/latency?command_id=<id>`.
+3. If `long_poll_wait_ms` is high, tune Gateway `--poll-wait-sec` or consider a mock WebSocket experiment.
+4. If `rate_limit_wait_ms` is high, the Gateway is pacing Kiwoom calls and WebSocket will not help.
+5. If `gateway_execute_ms` is high, inspect Kiwoom/COM execution.
+6. If `ack_round_trip_ms` is high but execution is low, inspect Gateway -> Core REST POST.
+
+The transport report is exported to `reports/gateway_transport_latency/<trade_date>/`.
+
 ## Reconnect Notes
 
 Gateway reconnects can re-poll only commands that Core still considers dispatchable. Core restart recovery reloads valid `QUEUED` commands only. `DISPATCHED` order commands are not automatically requeued or resent. Order commands have `max_attempts=1` by default, and idempotency/dedupe keys prevent the same order from being queued twice after restart. If Gateway loses the ack after a real Kiwoom send, operators should inspect Kiwoom order/execution events and command history before manual retry.

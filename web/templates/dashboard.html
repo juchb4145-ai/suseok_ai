@@ -41,6 +41,38 @@
 
       <section class="band">
         <div class="section-head">
+          <h2>Gateway Transport</h2>
+          <span id="transport-ws-decision" class="counter">KEEP_REST_LONG_POLL</span>
+        </div>
+        <div class="mini-grid command-grid">
+          <div><span>MODE</span><strong id="transport-mode">rest_long_poll</strong></div>
+          <div><span>EVENT P95</span><strong id="transport-event-p95">0ms</strong></div>
+          <div><span>COMMAND P95</span><strong id="transport-command-p95">0ms</strong></div>
+          <div><span>ACK P95</span><strong id="transport-ack-p95">0ms</strong></div>
+          <div><span>LONG POLL P95</span><strong id="transport-longpoll-p95">0ms</strong></div>
+          <div><span>EXECUTE P95</span><strong id="transport-execute-p95">0ms</strong></div>
+          <div><span>RATE WAIT P95</span><strong id="transport-rate-p95">0ms</strong></div>
+          <div><span>EMPTY POLL</span><strong id="transport-empty-rate">0.0%</strong></div>
+          <div><span>ERRORS</span><strong id="transport-errors">0</strong></div>
+          <div><span>RECONNECT</span><strong id="transport-reconnect">0</strong></div>
+        </div>
+        <div id="transport-warning-lines" class="inline-log"></div>
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Direction</th>
+              <th>Type</th>
+              <th>Command</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody id="transport-error-rows"></tbody>
+        </table>
+      </section>
+
+      <section class="band">
+        <div class="section-head">
           <h2>Strategy Runtime</h2>
           <div class="action-strip">
             <button id="runtime-start" type="button">Start</button>

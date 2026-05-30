@@ -67,6 +67,7 @@ function render(snapshot) {
   const core = snapshot.core || {};
   const gateway = snapshot.gateway || {};
   const commands = snapshot.commands || {};
+  const transport = snapshot.transport || {};
   const runtime = snapshot.runtime || {};
   const dryRunOrders = snapshot.dry_run_orders || runtime.dry_run_orders || { summary: {}, items: [] };
   const dryRunPerformance = snapshot.dry_run_performance || runtime.dry_run_performance || {};
@@ -89,6 +90,39 @@ function render(snapshot) {
 
   cls("gateway-state", `pill ${gateway.heartbeat_ok ? "ok" : gateway.connected ? "warn" : "bad"}`);
   cls("orderable-state", `pill ${gateway.orderable ? "ok" : "muted"}`);
+
+  text("transport-mode", transport.mode || "rest_long_poll");
+  text("transport-event-p95", `${fmtNumber(transport.event_latency_p95_ms, 1)}ms`);
+  text("transport-command-p95", `${fmtNumber(transport.command_latency_p95_ms, 1)}ms`);
+  text("transport-ack-p95", `${fmtNumber(transport.ack_latency_p95_ms, 1)}ms`);
+  text("transport-longpoll-p95", `${fmtNumber(transport.long_poll_wait_p95_ms, 1)}ms`);
+  text("transport-execute-p95", `${fmtNumber(transport.gateway_execute_p95_ms, 1)}ms`);
+  text("transport-rate-p95", `${fmtNumber(transport.rate_limit_wait_p95_ms, 1)}ms`);
+  text("transport-empty-rate", formatRate(transport.empty_poll_rate || 0));
+  text("transport-errors", transport.transport_error_count || 0);
+  text("transport-reconnect", transport.reconnect_count || 0);
+  text("transport-ws-decision", transport.websocket_recommendation || "KEEP_REST_LONG_POLL");
+  const transportWarnings = [
+    transport.websocket_recommendation_reason || "",
+    ...((transport.warning_flags || []).map((flag) => `WARN: ${flag}`)),
+  ].filter(Boolean);
+  const transportNode = document.getElementById("transport-warning-lines");
+  if (transportNode) {
+    transportNode.innerHTML = transportWarnings.length ? transportWarnings.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">Transport healthy</span>';
+  }
+  renderRows(
+    "transport-error-rows",
+    (transport.recent_errors || []).slice(0, 10).map((item) =>
+      rowHtml([
+        item.created_at || "-",
+        item.direction || "-",
+        item.message_type || "-",
+        item.command_id || item.event_id || "-",
+        item.error || "-",
+      ]),
+    ),
+    5,
+  );
 
   text("runtime-enabled", runtime.enabled ? "YES" : "NO");
   text("runtime-running", runtime.running ? "YES" : "NO");

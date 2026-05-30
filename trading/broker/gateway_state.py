@@ -29,6 +29,7 @@ class GatewayStatusSnapshot:
     deduped_event_count: int = 0
     reconnect_count: int = 0
     gateway_client_id: str = ""
+    last_heartbeat_payload: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -81,6 +82,7 @@ class GatewayStateStore:
 
             if event.type == "heartbeat":
                 self.status.last_heartbeat_at = event.timestamp or utc_timestamp()
+                self.status.last_heartbeat_payload = dict(event.payload or {})
                 self.status.last_error = str(event.payload.get("last_error") or "")
                 self.status.kiwoom_logged_in = bool(event.payload.get("kiwoom_logged_in", self.status.kiwoom_logged_in))
                 self.status.orderable = bool(event.payload.get("orderable", self.status.orderable))

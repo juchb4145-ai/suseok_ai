@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
 from collections import Counter
 from dataclasses import asdict, is_dataclass
@@ -26,6 +27,16 @@ from trading.broker.models import (
     GatewayEvent,
     utc_timestamp,
 )
+from trading.broker.transport_metrics import (
+    TransportLatencySample,
+    ensure_transport_trace,
+    monotonic_ms,
+    payload_size_bytes,
+    should_sample_transport_message,
+    trace_from_payload,
+    utc_now_ms,
+    wall_ms,
+)
 from trading.strategy.candidates import CandidateCollector
 from trading.strategy.models import CandidateState
 from trading.theme_engine.repository import ThemeEngineRepository
@@ -34,6 +45,7 @@ from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, config_fr
 from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
+from trading_app.transport_latency import TransportLatencyAnalyzer, TransportLatencyConfig
 from trading_app.websocket import DashboardConnectionManager
 
 
@@ -88,6 +100,52 @@ def _performance_analyzer(db: TradingDatabase) -> DryRunPerformanceAnalyzer:
     return DryRunPerformanceAnalyzer(db, config=config_from_settings(get_settings()))
 
 
+def _transport_config_from_settings() -> TransportLatencyConfig:
+    settings = get_settings()
+    return TransportLatencyConfig(
+        p95_warn_ms=settings.transport_latency_p95_warn_ms,
+        p99_warn_ms=settings.transport_latency_p99_warn_ms,
+        command_p95_warn_ms=settings.transport_command_p95_warn_ms,
+        event_p95_warn_ms=settings.transport_event_p95_warn_ms,
+        ack_p95_warn_ms=settings.transport_ack_p95_warn_ms,
+        websocket_recommend_p95_ms=settings.transport_websocket_recommend_p95_ms,
+        websocket_recommend_empty_poll_rate=settings.transport_websocket_recommend_empty_poll_rate,
+    )
+
+
+def _transport_analyzer(db: TradingDatabase) -> TransportLatencyAnalyzer:
+    return TransportLatencyAnalyzer(db, config=_transport_config_from_settings())
+
+
+def _transport_status_payload(db: TradingDatabase) -> dict[str, Any]:
+    settings = get_settings()
+    report = _transport_analyzer(db).build_report(limit=1000)
+    summary = dict(report.get("summary") or {})
+    recommendation = dict(report.get("websocket_recommendation") or {})
+    latest_reports = db.list_gateway_transport_latency_reports(limit=1)
+    recent_errors = db.latest_gateway_transport_errors(limit=10)
+    gateway_snapshot = gateway_state.snapshot().to_dict()
+    heartbeat_payload = gateway_snapshot.get("last_heartbeat_payload") or {}
+    return {
+        "transport_mode": heartbeat_payload.get("transport_mode") or "rest_long_poll",
+        "metrics_enabled": settings.transport_metrics_enabled,
+        "latest_summary": summary,
+        "warning_flags": summary.get("warning_flags", []),
+        "websocket_recommendation": recommendation,
+        "recent_errors": recent_errors,
+        "latest_report_id": latest_reports[0].get("report_id") if latest_reports else "",
+        "gateway": {
+            "reconnect_count": gateway_snapshot.get("reconnect_count", 0),
+            "network_last_error": heartbeat_payload.get("gateway_network_last_error") or heartbeat_payload.get("last_error") or "",
+            "last_poll_ms": heartbeat_payload.get("gateway_last_poll_ms"),
+            "last_event_post_ms": heartbeat_payload.get("gateway_last_event_post_ms"),
+            "poll_interval_sec": heartbeat_payload.get("gateway_poll_interval_sec"),
+            "event_queue_size": heartbeat_payload.get("gateway_event_queue_size"),
+            "command_queue_size": heartbeat_payload.get("gateway_command_queue_size"),
+        },
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
     return templates.TemplateResponse(request, "dashboard.html", {})
@@ -107,6 +165,11 @@ def health() -> HealthResponse:
 @app.get("/api/status")
 def api_status() -> dict[str, Any]:
     settings = get_settings()
+    db = open_database()
+    try:
+        transport_payload = _transport_status_payload(db)
+    finally:
+        close_database(db)
     return {
         "core": {
             "service": "trading-core-api",
@@ -126,6 +189,7 @@ def api_status() -> dict[str, Any]:
         },
         "gateway": gateway_state.snapshot().to_dict(),
         "commands": gateway_state.command_snapshot(),
+        "transport": _transport_dashboard_payload(transport_payload),
         "safety": {
             "default_mode": "OBSERVE",
             "live_requires_trading_allow_live": True,
@@ -140,6 +204,146 @@ def gateway_status() -> dict[str, Any]:
     payload = gateway_state.snapshot().to_dict()
     payload["commands"] = gateway_state.command_snapshot()
     return payload
+
+
+@app.get("/api/gateway/transport/status")
+def gateway_transport_status() -> dict[str, Any]:
+    db = open_database()
+    try:
+        return _transport_status_payload(db)
+    finally:
+        close_database(db)
+
+
+@app.get("/api/gateway/transport/latency")
+def gateway_transport_latency(
+    trade_date: Optional[str] = None,
+    direction: Optional[str] = None,
+    message_type: Optional[str] = None,
+    command_id: Optional[str] = None,
+    event_id: Optional[str] = None,
+    transport_mode: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0, le=100000),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        samples = db.list_gateway_transport_latency_samples(
+            trade_date=trade_date,
+            direction=direction,
+            message_type=message_type,
+            command_id=command_id,
+            event_id=event_id,
+            transport_mode=transport_mode,
+            limit=limit,
+            offset=offset,
+        )
+        report = _transport_analyzer(db).build_report(
+            trade_date=trade_date,
+            direction=direction,
+            message_type=message_type,
+            transport_mode=transport_mode,
+            limit=10000,
+        )
+        return {"summary": report.get("summary", {}), "samples": samples, "filters": report.get("filters", {})}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/gateway/transport/latency/summary")
+def gateway_transport_latency_summary(
+    trade_date: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=604800),
+    group_by: Optional[str] = None,
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _transport_analyzer(db).build_report(trade_date=trade_date, limit=10000)
+        summary = dict(report.get("summary") or {})
+        if group_by:
+            key = {
+                "direction": "by_direction",
+                "message_type": "by_message_type",
+                "command_type": "by_command_type",
+                "event_type": "by_event_type",
+            }.get(group_by, "")
+            summary["group_by"] = group_by
+            summary["groups"] = summary.get(key, {})
+        summary["window_sec"] = window_sec
+        return {"summary": summary, "websocket_recommendation": report.get("websocket_recommendation", {})}
+    finally:
+        close_database(db)
+
+
+@app.post("/api/gateway/transport/latency/rebuild")
+def gateway_transport_latency_rebuild(
+    trade_date: Optional[str] = None,
+    persist: bool = True,
+    export: bool = False,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        analyzer = _transport_analyzer(db)
+        report = analyzer.build_report(trade_date=trade_date, limit=10000)
+        saved = db.save_gateway_transport_latency_report(report) if persist else None
+        export_paths = analyzer.export_report(report) if export else {}
+        return {"report": report, "saved": saved, "export_paths": export_paths}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/gateway/transport/latency/reports")
+def gateway_transport_latency_reports(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0, le=100000),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return {"items": db.list_gateway_transport_latency_reports(limit=limit, offset=offset)}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/gateway/transport/latency/reports/{report_id}")
+def gateway_transport_latency_report_detail(report_id: str) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = db.get_gateway_transport_latency_report(report_id)
+        return {"found": report is not None, "report": report}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/gateway/transport/latency/export")
+def gateway_transport_latency_export(
+    trade_date: Optional[str] = None,
+    format: str = "json",
+    persist: bool = False,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    if format not in {"json", "csv", "md", "all"}:
+        format = "json"
+    db = open_database()
+    try:
+        analyzer = _transport_analyzer(db)
+        report = analyzer.build_report(trade_date=trade_date, limit=10000)
+        if persist:
+            db.save_gateway_transport_latency_report(report)
+        formats = ["json", "csv", "md"] if format == "all" else [format]
+        return {"report_id": report["report_id"], "export_paths": analyzer.export_report(report, formats=formats)}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/gateway/transport/websocket-decision")
+def gateway_transport_websocket_decision(trade_date: Optional[str] = None) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _transport_analyzer(db).build_report(trade_date=trade_date, limit=10000)
+        return report.get("websocket_recommendation", {})
+    finally:
+        close_database(db)
 
 
 @app.get("/api/runtime/status")
@@ -401,17 +605,67 @@ async def gateway_events(
     event_in: GatewayEventIn,
     _: None = Depends(verify_gateway_token),
 ) -> dict[str, Any]:
-    event = event_in.to_gateway_event()
+    core_received_at = utc_now_ms()
+    core_received_monotonic = monotonic_ms()
+    event = _event_with_trace(
+        event_in.to_gateway_event(),
+        {
+            "core_event_received_at_utc": core_received_at,
+            "core_event_received_monotonic_ms": core_received_monotonic,
+        },
+    )
     accepted = gateway_state.record_event(event)
+    persist_ms = 0.0
+    runtime_forward_ms = 0.0
     if accepted:
         db = open_database()
         try:
+            persist_started = time.perf_counter()
             _persist_gateway_event(db, event)
+            persist_ms = (time.perf_counter() - persist_started) * 1000.0
+            event = _event_with_trace(
+                event,
+                {
+                    "core_event_persisted_at_utc": utc_now_ms(),
+                    "core_event_persisted_monotonic_ms": monotonic_ms(),
+                },
+            )
+            _save_gateway_event_transport_sample(
+                db,
+                event,
+                accepted=True,
+                core_receive_ms=wall_ms(trace_from_payload(event.payload).get("gateway_event_post_end_at_utc"), core_received_at),
+                core_persist_ms=persist_ms,
+            )
         finally:
             close_database(db)
+        runtime_started = time.perf_counter()
         await runtime_supervisor.handle_gateway_event(event)
+        runtime_forward_ms = (time.perf_counter() - runtime_started) * 1000.0
+    else:
+        db = open_database()
+        try:
+            _save_gateway_event_transport_sample(
+                db,
+                event,
+                accepted=False,
+                core_receive_ms=wall_ms(trace_from_payload(event.payload).get("gateway_event_post_end_at_utc"), core_received_at),
+                core_persist_ms=persist_ms,
+                error="DUPLICATE_OR_REJECTED_EVENT",
+            )
+        finally:
+            close_database(db)
     await dashboard_connections.broadcast_json({"type": "snapshot", "snapshot": snapshot()})
-    return {"accepted": accepted, "event_id": event.event_id, "type": event.type}
+    return {
+        "accepted": accepted,
+        "event_id": event.event_id,
+        "type": event.type,
+        "transport": {
+            "core_receive_ms": wall_ms(trace_from_payload(event.payload).get("gateway_event_post_end_at_utc"), core_received_at),
+            "core_persist_ms": persist_ms,
+            "runtime_forward_ms": runtime_forward_ms,
+        },
+    }
 
 
 @app.get("/api/gateway/commands", response_model=GatewayCommandBatch)
@@ -420,12 +674,49 @@ async def gateway_commands(
     wait_sec: float = Query(0.0, ge=0.0, le=15.0),
     _: None = Depends(verify_gateway_token),
 ) -> GatewayCommandBatch:
+    poll_received_at = utc_now_ms()
+    poll_started = time.perf_counter()
     deadline = asyncio.get_event_loop().time() + wait_sec
     commands = gateway_state.dispatch_commands(limit)
     while not commands and wait_sec > 0 and asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.25)
         commands = gateway_state.dispatch_commands(limit)
-    payloads = [command.to_dict() for command in commands]
+    response_at = utc_now_ms()
+    long_poll_wait_ms = (time.perf_counter() - poll_started) * 1000.0
+    payloads = [
+        _command_dict_with_trace(
+            command,
+            {
+                "core_command_long_poll_request_at_utc": poll_received_at,
+                "core_command_long_poll_response_at_utc": response_at,
+                "core_command_long_poll_response_monotonic_ms": monotonic_ms(),
+                "long_poll_wait_ms": long_poll_wait_ms,
+                "long_poll_wait_sec": wait_sec,
+            },
+        )
+        for command in commands
+    ]
+    db = open_database()
+    try:
+        if payloads:
+            for payload in payloads:
+                _save_command_poll_transport_sample(
+                    db,
+                    payload,
+                    long_poll_wait_ms=long_poll_wait_ms,
+                    poll_received_at=poll_received_at,
+                    response_at=response_at,
+                )
+        else:
+            _save_empty_command_poll_transport_sample(
+                db,
+                long_poll_wait_ms=long_poll_wait_ms,
+                wait_sec=wait_sec,
+                poll_received_at=poll_received_at,
+                response_at=response_at,
+            )
+    finally:
+        close_database(db)
     return GatewayCommandBatch(commands=payloads, count=len(payloads), timestamp=utc_timestamp())
 
 
@@ -559,6 +850,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     orders_payload = build_orders_snapshot(db)
     reviews_payload = build_reviews_snapshot(db)
     logs_payload = build_logs_snapshot(db)
+    transport_payload = dict(status_payload.get("transport") or _transport_dashboard_payload(_transport_status_payload(db)))
     runtime_payload = _runtime_dashboard_payload(runtime_supervisor.status())
     dry_run_orders_payload = {
         "summary": db.runtime_order_intent_summary(),
@@ -602,6 +894,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "core": status_payload["core"],
         "gateway": status_payload["gateway"],
         "commands": commands_payload,
+        "transport": transport_payload,
         "runtime": runtime_payload,
         "dry_run_orders": dry_run_orders_payload,
         "dry_run_performance": dry_run_performance_payload,
@@ -773,6 +1066,153 @@ def build_logs_snapshot(db: TradingDatabase, *, limit: int = 100) -> dict[str, A
     }
 
 
+def _event_with_trace(event: GatewayEvent, trace_updates: dict[str, Any]) -> GatewayEvent:
+    payload = ensure_transport_trace(
+        event.payload,
+        trace_id=trace_from_payload(event.payload).get("trace_id") or f"trace:{event.event_id}",
+        process="core",
+        extra=trace_updates,
+    )
+    data = event.to_dict()
+    data["payload"] = payload
+    return GatewayEvent.from_dict(data)
+
+
+def _command_dict_with_trace(command: GatewayCommand, trace_updates: dict[str, Any]) -> dict[str, Any]:
+    data = command.to_dict()
+    trace = trace_from_payload(data.get("payload") or {})
+    payload = ensure_transport_trace(
+        data.get("payload") or {},
+        trace_id=trace.get("trace_id") or f"trace:{command.command_id}",
+        process="core",
+        extra={
+            "core_command_created_at_utc": command.timestamp,
+            "core_command_dispatched_at_utc": trace_updates.get("core_command_long_poll_response_at_utc"),
+            **trace_updates,
+        },
+    )
+    data["payload"] = payload
+    return data
+
+
+def _save_gateway_event_transport_sample(
+    db: TradingDatabase,
+    event: GatewayEvent,
+    *,
+    accepted: bool,
+    core_receive_ms: Optional[float],
+    core_persist_ms: Optional[float],
+    error: str = "",
+) -> None:
+    settings = get_settings()
+    if not settings.transport_metrics_enabled:
+        return
+    sample_key = event.event_id or event.command_id or event.request_id
+    if not should_sample_transport_message(
+        message_type=event.type,
+        sample_key=sample_key,
+        price_tick_rate=settings.transport_metrics_sample_price_tick_rate,
+        heartbeat_rate=settings.transport_metrics_sample_heartbeat_rate,
+    ):
+        return
+    trace = trace_from_payload(event.payload)
+    sample = TransportLatencySample.from_gateway_event_trace(
+        event_type=event.type,
+        event_id=event.event_id,
+        request_id=event.request_id,
+        command_id=event.command_id or str(event.payload.get("command_id") or ""),
+        source=event.source,
+        trace=trace,
+        payload_size=payload_size_bytes(event.to_dict()),
+        success=accepted and not error,
+        error=error or str(event.payload.get("error") or ""),
+        core_receive_ms=core_receive_ms,
+        core_persist_ms=core_persist_ms,
+        metadata={
+            "status": event.payload.get("status"),
+            "result_code": event.payload.get("result_code"),
+            "transport_mode": event.payload.get("transport_mode") or trace.get("transport_mode") or "rest_long_poll",
+        },
+    )
+    db.save_gateway_transport_latency_sample(sample.to_dict())
+
+
+def _save_command_poll_transport_sample(
+    db: TradingDatabase,
+    command_payload: dict[str, Any],
+    *,
+    long_poll_wait_ms: float,
+    poll_received_at: str,
+    response_at: str,
+) -> None:
+    settings = get_settings()
+    if not settings.transport_metrics_enabled:
+        return
+    payload = dict(command_payload.get("payload") or {})
+    trace = trace_from_payload(payload)
+    total_wall = wall_ms(command_payload.get("timestamp"), response_at) or long_poll_wait_ms
+    core_dispatch_wait = max(0.0, total_wall - long_poll_wait_ms) if total_wall is not None else None
+    sample = TransportLatencySample(
+        sample_id=f"lat_poll_{command_payload.get('command_id')}_{int(time.time() * 1000)}",
+        trace_id=str(trace.get("trace_id") or f"trace:{command_payload.get('command_id')}"),
+        trade_date=str(response_at)[:10],
+        direction="core_to_gateway",
+        message_type=str(command_payload.get("type") or ""),
+        command_id=str(command_payload.get("command_id") or ""),
+        request_id=str(command_payload.get("request_id") or ""),
+        source=str(command_payload.get("source") or "core"),
+        created_at=str(command_payload.get("timestamp") or poll_received_at),
+        completed_at=response_at,
+        payload_size_bytes=payload_size_bytes(command_payload),
+        stage_ms={
+            "long_poll_wait_ms": long_poll_wait_ms,
+            "core_dispatch_wait_ms": core_dispatch_wait,
+        },
+        total_wall_ms=total_wall,
+        core_dispatch_wait_ms=core_dispatch_wait,
+        long_poll_wait_ms=long_poll_wait_ms,
+        metadata={
+            **trace,
+            "command_count": 1,
+            "poll_received_at": poll_received_at,
+        },
+    )
+    db.save_gateway_transport_latency_sample(sample.to_dict())
+
+
+def _save_empty_command_poll_transport_sample(
+    db: TradingDatabase,
+    *,
+    long_poll_wait_ms: float,
+    wait_sec: float,
+    poll_received_at: str,
+    response_at: str,
+) -> None:
+    settings = get_settings()
+    if not settings.transport_metrics_enabled:
+        return
+    now_key = int(time.time() * 1000000)
+    sample = TransportLatencySample(
+        sample_id=f"lat_empty_poll_{now_key}",
+        trace_id=f"trace:empty_poll:{now_key}",
+        trade_date=str(response_at)[:10],
+        direction="core_to_gateway",
+        message_type="command_poll_empty",
+        source="core",
+        created_at=poll_received_at,
+        completed_at=response_at,
+        stage_ms={"long_poll_wait_ms": long_poll_wait_ms},
+        total_wall_ms=long_poll_wait_ms,
+        long_poll_wait_ms=long_poll_wait_ms,
+        metadata={
+            "wait_sec": wait_sec,
+            "command_count": 0,
+            "transport_mode": "rest_long_poll",
+        },
+    )
+    db.save_gateway_transport_latency_sample(sample.to_dict())
+
+
 def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
     if event.type == "condition_event":
         condition_event = BrokerConditionEvent.from_dict(event.payload)
@@ -885,6 +1325,35 @@ def _runtime_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
         "gate_skip_reason": readiness.get("gate_skip_reason", ""),
         "warnings": (status.get("warnings") or [])[-10:],
         "last_error": status.get("last_error", ""),
+    }
+
+
+def _transport_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
+    summary = dict(status.get("latest_summary") or {})
+    recommendation = dict(status.get("websocket_recommendation") or {})
+    gateway = dict(status.get("gateway") or {})
+    reason = ""
+    reasons = recommendation.get("reasons") or []
+    if reasons:
+        reason = str(reasons[0])
+    return {
+        "mode": status.get("transport_mode", "rest_long_poll"),
+        "metrics_enabled": status.get("metrics_enabled", True),
+        "event_latency_p95_ms": summary.get("event_latency_p95_ms", 0),
+        "command_latency_p95_ms": summary.get("command_latency_p95_ms", 0),
+        "ack_latency_p95_ms": summary.get("ack_latency_p95_ms", 0),
+        "long_poll_wait_p95_ms": summary.get("long_poll_wait_p95_ms", 0),
+        "gateway_execute_p95_ms": summary.get("gateway_execute_p95_ms", 0),
+        "rate_limit_wait_p95_ms": summary.get("rate_limit_wait_p95_ms", 0),
+        "empty_poll_rate": summary.get("empty_poll_rate", 0),
+        "reconnect_count": gateway.get("reconnect_count", 0),
+        "transport_error_count": summary.get("transport_error_count", 0),
+        "websocket_recommended": bool(recommendation.get("should_switch")),
+        "websocket_recommendation": recommendation.get("recommendation", "KEEP_REST_LONG_POLL"),
+        "websocket_recommendation_reason": reason,
+        "latest_report_id": status.get("latest_report_id", ""),
+        "warning_flags": summary.get("warning_flags", []),
+        "recent_errors": status.get("recent_errors", [])[:10],
     }
 
 

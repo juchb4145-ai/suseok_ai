@@ -429,6 +429,49 @@ class TradingDatabase:
                 expires_at TEXT NOT NULL DEFAULT '',
                 metadata_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS gateway_transport_latency_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sample_id TEXT UNIQUE NOT NULL,
+                trace_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                direction TEXT NOT NULL,
+                message_type TEXT NOT NULL DEFAULT '',
+                event_id TEXT NOT NULL DEFAULT '',
+                command_id TEXT NOT NULL DEFAULT '',
+                request_id TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                success INTEGER NOT NULL DEFAULT 1,
+                error TEXT NOT NULL DEFAULT '',
+                transport_mode TEXT NOT NULL DEFAULT 'rest_long_poll',
+                payload_size_bytes INTEGER NOT NULL DEFAULT 0,
+                total_wall_ms REAL,
+                gateway_queue_wait_ms REAL,
+                gateway_post_ms REAL,
+                core_receive_ms REAL,
+                core_persist_ms REAL,
+                core_dispatch_wait_ms REAL,
+                long_poll_wait_ms REAL,
+                gateway_receive_wait_ms REAL,
+                gateway_local_queue_wait_ms REAL,
+                rate_limit_wait_ms REAL,
+                gateway_execute_ms REAL,
+                ack_round_trip_ms REAL,
+                clock_skew_warning INTEGER NOT NULL DEFAULT 0,
+                stage_ms_json TEXT NOT NULL DEFAULT '{}',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS gateway_transport_latency_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                transport_mode TEXT NOT NULL DEFAULT 'rest_long_poll',
+                status TEXT NOT NULL DEFAULT '',
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                recommendation_json TEXT NOT NULL DEFAULT '{}',
+                generated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS runtime_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -626,6 +669,20 @@ class TradingDatabase:
                 ON gateway_command_dedupe_keys(command_type, trade_date);
             CREATE INDEX IF NOT EXISTS idx_gateway_command_dedupe_expires_at
                 ON gateway_command_dedupe_keys(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_gateway_transport_latency_trade_date_created_at
+                ON gateway_transport_latency_samples(trade_date, created_at);
+            CREATE INDEX IF NOT EXISTS idx_gateway_transport_latency_direction_created_at
+                ON gateway_transport_latency_samples(direction, created_at);
+            CREATE INDEX IF NOT EXISTS idx_gateway_transport_latency_message_type_created_at
+                ON gateway_transport_latency_samples(message_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_gateway_transport_latency_command_id
+                ON gateway_transport_latency_samples(command_id);
+            CREATE INDEX IF NOT EXISTS idx_gateway_transport_latency_event_id
+                ON gateway_transport_latency_samples(event_id);
+            CREATE INDEX IF NOT EXISTS idx_gateway_transport_latency_transport_mode
+                ON gateway_transport_latency_samples(transport_mode);
+            CREATE INDEX IF NOT EXISTS idx_gateway_transport_latency_reports_trade_date
+                ON gateway_transport_latency_reports(trade_date, generated_at);
             CREATE INDEX IF NOT EXISTS idx_runtime_events_type_created_at
                 ON runtime_events(event_type, created_at);
             CREATE INDEX IF NOT EXISTS idx_runtime_cycles_started_at
@@ -1386,6 +1443,202 @@ class TradingDatabase:
             (report_id, max(1, int(limit or 1000)), max(0, int(offset or 0))),
         ).fetchall()
         return [_row_to_dry_run_performance_item(row) for row in rows]
+
+    def save_gateway_transport_latency_sample(self, sample: dict) -> dict:
+        sample_id = str(sample.get("sample_id") or "")
+        if not sample_id:
+            raise ValueError("sample_id is required")
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO gateway_transport_latency_samples(
+                    sample_id, trace_id, trade_date, direction, message_type,
+                    event_id, command_id, request_id, source, success, error,
+                    transport_mode, payload_size_bytes, total_wall_ms,
+                    gateway_queue_wait_ms, gateway_post_ms, core_receive_ms,
+                    core_persist_ms, core_dispatch_wait_ms, long_poll_wait_ms,
+                    gateway_receive_wait_ms, gateway_local_queue_wait_ms,
+                    rate_limit_wait_ms, gateway_execute_ms, ack_round_trip_ms,
+                    clock_skew_warning, stage_ms_json, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sample_id) DO UPDATE SET
+                    success=excluded.success,
+                    error=excluded.error,
+                    payload_size_bytes=excluded.payload_size_bytes,
+                    total_wall_ms=excluded.total_wall_ms,
+                    gateway_queue_wait_ms=excluded.gateway_queue_wait_ms,
+                    gateway_post_ms=excluded.gateway_post_ms,
+                    core_receive_ms=excluded.core_receive_ms,
+                    core_persist_ms=excluded.core_persist_ms,
+                    core_dispatch_wait_ms=excluded.core_dispatch_wait_ms,
+                    long_poll_wait_ms=excluded.long_poll_wait_ms,
+                    gateway_receive_wait_ms=excluded.gateway_receive_wait_ms,
+                    gateway_local_queue_wait_ms=excluded.gateway_local_queue_wait_ms,
+                    rate_limit_wait_ms=excluded.rate_limit_wait_ms,
+                    gateway_execute_ms=excluded.gateway_execute_ms,
+                    ack_round_trip_ms=excluded.ack_round_trip_ms,
+                    clock_skew_warning=excluded.clock_skew_warning,
+                    stage_ms_json=excluded.stage_ms_json,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    sample_id,
+                    str(sample.get("trace_id") or ""),
+                    str(sample.get("trade_date") or str(sample.get("created_at") or "")[:10]),
+                    str(sample.get("direction") or ""),
+                    str(sample.get("message_type") or ""),
+                    str(sample.get("event_id") or ""),
+                    str(sample.get("command_id") or ""),
+                    str(sample.get("request_id") or ""),
+                    str(sample.get("source") or ""),
+                    int(bool(sample.get("success", True))),
+                    str(sample.get("error") or ""),
+                    str(sample.get("transport_mode") or "rest_long_poll"),
+                    int(sample.get("payload_size_bytes") or 0),
+                    sample.get("total_wall_ms"),
+                    sample.get("gateway_queue_wait_ms"),
+                    sample.get("gateway_post_ms"),
+                    sample.get("core_receive_ms"),
+                    sample.get("core_persist_ms"),
+                    sample.get("core_dispatch_wait_ms"),
+                    sample.get("long_poll_wait_ms"),
+                    sample.get("gateway_receive_wait_ms"),
+                    sample.get("gateway_local_queue_wait_ms"),
+                    sample.get("rate_limit_wait_ms"),
+                    sample.get("gateway_execute_ms"),
+                    sample.get("ack_round_trip_ms"),
+                    int(bool(sample.get("clock_skew_warning"))),
+                    json.dumps(sample.get("stage_ms") or {}, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(sample.get("metadata") or {}, ensure_ascii=False, sort_keys=True, default=str),
+                    str(sample.get("created_at") or ""),
+                ),
+            )
+        return self.get_gateway_transport_latency_sample(sample_id) or {"sample_id": sample_id}
+
+    def get_gateway_transport_latency_sample(self, sample_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM gateway_transport_latency_samples WHERE sample_id = ?",
+            (sample_id,),
+        ).fetchone()
+        return _row_to_gateway_transport_latency_sample(row) if row else None
+
+    def list_gateway_transport_latency_samples(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        direction: Optional[str] = None,
+        message_type: Optional[str] = None,
+        command_id: Optional[str] = None,
+        event_id: Optional[str] = None,
+        transport_mode: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(trade_date)
+        if direction:
+            clauses.append("direction = ?")
+            params.append(direction)
+        if message_type:
+            clauses.append("message_type = ?")
+            params.append(message_type)
+        if command_id:
+            clauses.append("command_id = ?")
+            params.append(command_id)
+        if event_id:
+            clauses.append("event_id = ?")
+            params.append(event_id)
+        if transport_mode:
+            clauses.append("transport_mode = ?")
+            params.append(transport_mode)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM gateway_transport_latency_samples
+            {where}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_gateway_transport_latency_sample(row) for row in rows]
+
+    def latest_gateway_transport_errors(self, limit: int = 10) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM gateway_transport_latency_samples
+            WHERE success = 0 OR error != ''
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit or 10)),),
+        ).fetchall()
+        return [_row_to_gateway_transport_latency_sample(row) for row in rows]
+
+    def save_gateway_transport_latency_report(self, report: dict) -> dict:
+        report_id = str(report.get("report_id") or "")
+        if not report_id:
+            raise ValueError("report_id is required")
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO gateway_transport_latency_reports(
+                    report_id, trade_date, transport_mode, status, summary_json,
+                    recommendation_json, generated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_id) DO UPDATE SET
+                    trade_date=excluded.trade_date,
+                    transport_mode=excluded.transport_mode,
+                    status=excluded.status,
+                    summary_json=excluded.summary_json,
+                    recommendation_json=excluded.recommendation_json,
+                    generated_at=excluded.generated_at
+                """,
+                (
+                    report_id,
+                    str(report.get("trade_date") or ""),
+                    str(report.get("transport_mode") or "rest_long_poll"),
+                    str(report.get("status") or "READY"),
+                    json.dumps(report.get("summary") or {}, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(report.get("websocket_recommendation") or {}, ensure_ascii=False, sort_keys=True, default=str),
+                    str(report.get("generated_at") or ""),
+                ),
+            )
+        return self.get_gateway_transport_latency_report(report_id) or {"report_id": report_id}
+
+    def list_gateway_transport_latency_reports(self, *, limit: int = 50, offset: int = 0) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM gateway_transport_latency_reports
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (max(1, int(limit or 50)), max(0, int(offset or 0))),
+        ).fetchall()
+        return [_row_to_gateway_transport_latency_report(row) for row in rows]
+
+    def get_gateway_transport_latency_report(self, report_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM gateway_transport_latency_reports WHERE report_id = ?",
+            (report_id,),
+        ).fetchone()
+        return _row_to_gateway_transport_latency_report(row) if row else None
+
+    def prune_gateway_transport_latency_samples(self, older_than_sec: int) -> int:
+        if older_than_sec <= 0:
+            return 0
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                DELETE FROM gateway_transport_latency_samples
+                WHERE created_at < datetime('now', ?)
+                """,
+                (f"-{int(older_than_sec)} seconds",),
+            )
+        return int(cursor.rowcount or 0)
 
     def save_candidate(self, candidate: Candidate) -> Candidate:
         with self.conn:
@@ -2694,6 +2947,29 @@ def _row_to_dry_run_performance_item(row: sqlite3.Row) -> dict:
     item.setdefault("quality_bucket", row["quality_bucket"])
     item.setdefault("created_at", row["created_at"])
     return item
+
+
+def _row_to_gateway_transport_latency_sample(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["success"] = bool(data.get("success"))
+    data["clock_skew_warning"] = bool(data.get("clock_skew_warning"))
+    data["stage_ms"] = _safe_json_loads(data.get("stage_ms_json"), {})
+    data["metadata"] = _safe_json_loads(data.get("metadata_json"), {})
+    return data
+
+
+def _row_to_gateway_transport_latency_report(row: sqlite3.Row) -> dict:
+    return {
+        "id": int(row["id"]),
+        "report_id": row["report_id"],
+        "trade_date": row["trade_date"],
+        "transport_mode": row["transport_mode"],
+        "status": row["status"],
+        "summary": _safe_json_loads(row["summary_json"], {}),
+        "websocket_recommendation": _safe_json_loads(row["recommendation_json"], {}),
+        "generated_at": row["generated_at"],
+        "created_at": row["created_at"],
+    }
 
 
 def _safe_json_loads(value: object, default):

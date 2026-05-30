@@ -87,8 +87,8 @@ Two options were considered:
 
 | Option | Pros | Cons | Current decision |
 | --- | --- | --- | --- |
-| FastAPI WebSocket Gateway channel | Lower latency, bidirectional, natural command stream | More reconnection, heartbeat, and Qt-thread coordination to harden before live orders | Revisit after command queue metrics are stable |
-| REST event ingest + command long-poll | Simple, debuggable, easier with QAx event loop, resilient to short disconnects | Slightly higher latency, more HTTP requests | Keep through PR-2 |
+| FastAPI WebSocket Gateway channel | Lower latency, bidirectional, natural command stream | More reconnection, heartbeat, and Qt-thread coordination to harden before live orders | Measure first, then test only if PR-8 metrics justify it |
+| REST event ingest + command long-poll | Simple, debuggable, easier with QAx event loop, resilient to short disconnects | Slightly higher latency, more HTTP requests | Keep as default through PR-8 |
 
 Current communication:
 
@@ -99,6 +99,8 @@ Dashboard updates use:
 
 - `GET /api/snapshot`
 - `WS /ws/dashboard`
+
+PR-8 adds transport latency metrics to the REST/long-poll path. Gateway transport WebSocket and Dashboard WebSocket are separate channels: the Dashboard WebSocket only pushes browser snapshots and does not move Kiwoom commands.
 
 ## Message Envelope
 
@@ -174,6 +176,8 @@ WebSocket command transport is still deferred because PR-2/PR-3 priority is corr
 - reconnection semantics are tested against Kiwoom login/session loss,
 - dashboard users need sub-second command status updates beyond current polling.
 
+PR-8 records `gateway_transport_latency_samples` and `gateway_transport_latency_reports` so this decision is numeric. WebSocket is considered only when command p95 is high and `long_poll_wait_ms` is the dominant source. If `rate_limit_wait_ms`, `gateway_execute_ms`, or Core DB persistence dominates, WebSocket is not expected to fix the issue.
+
 ## Safety Defaults
 
 - Default mode is `OBSERVE`.
@@ -193,6 +197,7 @@ WebSocket command transport is still deferred because PR-2/PR-3 priority is corr
 - Raw ticks are not inserted one by one by the PR-1 Core API.
 - UI receives snapshots instead of raw tick streams.
 - Gateway queue can coalesce repeated `price_tick` events by code within each flush batch.
+- Transport latency samples are stored with sampling. Command/ack/condition/execution/order events are retained, while noisy `price_tick` and `heartbeat` metrics use configurable sampling rates.
 - Long logs and dashboard tables are capped to recent rows.
 
 ## Legacy
@@ -238,6 +243,14 @@ PR-4:
 - Gateway event to market-data bridge.
 - Realtime/condition requests through GatewayCommand queue.
 - Runtime dashboard status.
+
+PR-8:
+
+- REST event ingest and command long-poll latency metrics.
+- Event, command dispatch, Gateway execution, rate-limit wait, and ack round-trip samples.
+- SQLite-backed transport latency reports and WebSocket decision advisor.
+- Dashboard transport latency card.
+- WebSocket remains off by default.
 
 PR-5:
 

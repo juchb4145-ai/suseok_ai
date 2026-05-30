@@ -46,6 +46,16 @@ Common Core environment variables:
 - `TRADING_RUNTIME_DRY_RUN_ORDER_TYPE_SELL`: runtime dry-run sell order type, default `2`.
 - `TRADING_RUNTIME_DRY_RUN_REQUIRE_ACCOUNT`: require explicit account for runtime dry-run intents, default `0`.
 - `TRADING_RUNTIME_DRY_RUN_RESPECT_WEIGHT_PCT`: apply split-leg weight to dry-run quantity, default `1`.
+- `TRADING_TRANSPORT_METRICS_ENABLED`: Gateway/Core transport latency metrics, default `1`.
+- `TRADING_TRANSPORT_METRICS_SAMPLE_PRICE_TICK_RATE`: sampled `price_tick` metric rate, default `0.01`.
+- `TRADING_TRANSPORT_METRICS_SAMPLE_HEARTBEAT_RATE`: sampled heartbeat metric rate, default `0.1`.
+- `TRADING_TRANSPORT_METRICS_RETENTION_SEC`: transport sample retention target, default `604800`.
+- `TRADING_TRANSPORT_EVENT_P95_WARN_MS`: event latency warning threshold, default `500`.
+- `TRADING_TRANSPORT_COMMAND_P95_WARN_MS`: command latency warning threshold, default `1000`.
+- `TRADING_TRANSPORT_ACK_P95_WARN_MS`: ack latency warning threshold, default `1000`.
+- `TRADING_TRANSPORT_WEBSOCKET_RECOMMEND_P95_MS`: WebSocket experiment threshold, default `1000`.
+- `TRADING_TRANSPORT_WEBSOCKET_RECOMMEND_EMPTY_POLL_RATE`: empty-poll tuning threshold, default `0.8`.
+- `TRADING_TRANSPORT_WEBSOCKET_EXPERIMENT_ENABLED`: reserved experimental flag, default `0`.
 
 Dashboard:
 
@@ -83,6 +93,14 @@ Core APIs:
 - `GET /api/runtime/orders/dry-run`
 - `GET /api/runtime/orders/dry-run/summary`
 - `GET /api/runtime/orders/dry-run/{intent_id}`
+- `GET /api/gateway/transport/status`
+- `GET /api/gateway/transport/latency`
+- `GET /api/gateway/transport/latency/summary`
+- `POST /api/gateway/transport/latency/rebuild`
+- `GET /api/gateway/transport/latency/reports`
+- `GET /api/gateway/transport/latency/reports/{report_id}`
+- `GET /api/gateway/transport/latency/export`
+- `GET /api/gateway/transport/websocket-decision`
 
 Order enqueue example:
 
@@ -161,13 +179,26 @@ False signal thresholds:
 
 Dashboard `/` shows entry/buy counts, exit/sell counts, recent sell intents, exit decision type summaries, and DRY_RUN performance false-positive/false-negative summaries.
 
+Gateway transport latency checks:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/status
+Invoke-RestMethod "http://127.0.0.1:8000/api/gateway/transport/latency/summary?group_by=message_type"
+Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/websocket-decision
+
+$headers = @{ "X-Local-Token" = $env:TRADING_CORE_TOKEN }
+Invoke-RestMethod -Method Post "http://127.0.0.1:8000/api/gateway/transport/latency/rebuild?persist=true&export=true" -Headers $headers
+```
+
+Transport reports are written to `reports/gateway_transport_latency/<trade_date>/` as JSON, CSV, and Markdown. PR-8 keeps Gateway transport on REST + long-poll by default; WebSocket is only a later experiment if latency reports show long-poll wait is the bottleneck.
+
 ## 32bit Kiwoom Gateway
 
 Use 32bit Python 3.9.13 with Kiwoom OpenAPI+ installed and OCX registered.
 
 ```powershell
 py -3.9-32 -m pip install -r requirements-32.txt
-py -3.9-32 apps/kiwoom_gateway.py --core-url http://127.0.0.1:8000 --token change-me-local-token
+py -3.9-32 apps/kiwoom_gateway.py --core-url http://127.0.0.1:8000 --token change-me-local-token --transport rest --poll-wait-sec 1.0 --network-interval-sec 0.5
 ```
 
 Gateway rate-limit overrides:
@@ -186,6 +217,16 @@ Mock Gateway smoke test:
 ```powershell
 py -3.9-32 apps/kiwoom_gateway.py --mock --once --core-url http://127.0.0.1:8000 --token change-me-local-token
 ```
+
+Gateway transport options:
+
+- `--transport rest`: default production path.
+- `--transport websocket-experimental`: reserved for future mock experiments; not a production default.
+- `--poll-wait-sec`: command long-poll wait duration.
+- `--network-interval-sec`: network worker interval hint.
+- `--metrics-enabled`: emit transport trace metadata.
+- `--metrics-sample-price-tick-rate`: noisy tick metric sampling rate.
+- `--metrics-sample-heartbeat-rate`: heartbeat metric sampling rate.
 
 ## Legacy PyQt App
 
@@ -221,3 +262,4 @@ More detail:
 - [Runtime DRY_RUN Order Enqueue Runbook](docs/runtime_dry_run_order_enqueue_runbook.md)
 - [Runtime DRY_RUN Exit/Sell Intent Runbook](docs/runtime_dry_run_exit_sell_intent_runbook.md)
 - [DRY_RUN Performance Report Runbook](docs/dry_run_performance_report_runbook.md)
+- [Gateway Transport Latency Runbook](docs/gateway_transport_latency_runbook.md)

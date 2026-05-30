@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 from pathlib import Path
 import sys
@@ -23,6 +24,14 @@ from trading.broker.models import (
     GatewayEvent,
 )
 from trading.broker.rate_limit import RateLimiter
+from trading.broker.transport_metrics import (
+    ensure_transport_trace,
+    monotonic_ms,
+    monotonic_delta_ms,
+    payload_size_bytes,
+    trace_from_payload,
+    utc_now_ms,
+)
 
 
 @dataclass
@@ -30,6 +39,16 @@ class RestCoreClient:
     core_url: str
     token: str
     timeout_sec: float = 5.0
+    transport_mode: str = "rest_long_poll"
+    metrics_enabled: bool = True
+    last_event_post_ms: float = 0.0
+    last_poll_ms: float = 0.0
+    last_poll_command_count: int = 0
+    last_poll_error: str = ""
+    poll_count: int = 0
+    empty_poll_count: int = 0
+    post_count: int = 0
+    post_error_count: int = 0
     _session: Any = field(default=None, init=False, repr=False)
 
     @property
@@ -45,25 +64,73 @@ class RestCoreClient:
         return {"X-Local-Token": self.token}
 
     def post_event(self, event: GatewayEvent) -> dict[str, Any]:
-        response = self.session.post(
-            f"{self.core_url.rstrip('/')}/api/gateway/events",
-            json=event.to_dict(),
-            headers=self.headers,
-            timeout=self.timeout_sec,
+        post_start = time.perf_counter()
+        event = _event_with_gateway_trace(
+            event,
+            {
+                "gateway_event_post_start_at_utc": utc_now_ms(),
+                "gateway_event_post_start_monotonic_ms": monotonic_ms(),
+                "gateway_event_payload_size_bytes": payload_size_bytes(event.to_dict()),
+                "transport_mode": self.transport_mode,
+            },
         )
-        response.raise_for_status()
-        return dict(response.json())
+        payload = event.to_dict()
+        try:
+            response = self.session.post(
+                f"{self.core_url.rstrip('/')}/api/gateway/events",
+                json=payload,
+                headers=self.headers,
+                timeout=self.timeout_sec,
+            )
+            self.last_event_post_ms = (time.perf_counter() - post_start) * 1000.0
+            self.post_count += 1
+            response.raise_for_status()
+            return dict(response.json())
+        except Exception as exc:
+            self.last_event_post_ms = (time.perf_counter() - post_start) * 1000.0
+            self.post_error_count += 1
+            self.last_poll_error = str(exc)
+            raise
 
     def poll_commands(self, *, limit: int = 20, wait_sec: float = 1.0) -> list[GatewayCommand]:
-        response = self.session.get(
-            f"{self.core_url.rstrip('/')}/api/gateway/commands",
-            params={"limit": limit, "wait_sec": wait_sec},
-            headers=self.headers,
-            timeout=max(self.timeout_sec, wait_sec + 2.0),
-        )
-        response.raise_for_status()
-        payload = response.json()
-        return [GatewayCommand.from_dict(item) for item in payload.get("commands", [])]
+        poll_start = time.perf_counter()
+        self.poll_count += 1
+        try:
+            response = self.session.get(
+                f"{self.core_url.rstrip('/')}/api/gateway/commands",
+                params={"limit": limit, "wait_sec": wait_sec},
+                headers=self.headers,
+                timeout=max(self.timeout_sec, wait_sec + 2.0),
+            )
+            self.last_poll_ms = (time.perf_counter() - poll_start) * 1000.0
+            response.raise_for_status()
+            payload = response.json()
+            items = list(payload.get("commands", []) or [])
+            self.last_poll_command_count = len(items)
+            if not items:
+                self.empty_poll_count += 1
+            received_at = utc_now_ms()
+            commands = []
+            for item in items:
+                command = GatewayCommand.from_dict(item)
+                commands.append(
+                    _command_with_gateway_trace(
+                        command,
+                        {
+                            "gateway_command_polled_at_utc": received_at,
+                            "gateway_command_received_at_utc": received_at,
+                            "gateway_command_poll_duration_ms": self.last_poll_ms,
+                            "gateway_command_response_payload_size_bytes": payload_size_bytes(payload),
+                            "transport_mode": self.transport_mode,
+                        },
+                    )
+                )
+            self.last_poll_error = ""
+            return commands
+        except Exception as exc:
+            self.last_poll_ms = (time.perf_counter() - poll_start) * 1000.0
+            self.last_poll_error = str(exc)
+            raise
 
 
 class GatewayRuntime:
@@ -77,13 +144,38 @@ class GatewayRuntime:
         self._worker: threading.Thread | None = None
         self.last_error = ""
         self.reconnect_count = 0
+        self.network_interval_sec = 0.5
+        self.drained_event_count = 0
+        self.coalesced_tick_count = 0
 
     def emit(self, event_type: str, payload: dict[str, Any] | None = None, **kwargs) -> None:
-        self.events.put(GatewayEvent(type=event_type, payload=dict(payload or {}), source=self.source, **kwargs))
+        created_at = utc_now_ms()
+        traced_payload = ensure_transport_trace(
+            dict(payload or {}),
+            trace_id=f"trace:{kwargs.get('command_id') or event_type}:{time.time_ns()}",
+            process="gateway",
+            extra={
+                "gateway_event_created_at_utc": created_at,
+                "gateway_event_created_monotonic_ms": monotonic_ms(),
+                "gateway_event_type": event_type,
+                "transport_mode": self.core_client.transport_mode,
+            },
+        )
+        event = GatewayEvent(type=event_type, payload=traced_payload, source=self.source, **kwargs)
+        event = _event_with_gateway_trace(
+            event,
+            {
+                "gateway_event_enqueued_at_utc": utc_now_ms(),
+                "gateway_event_enqueued_monotonic_ms": monotonic_ms(),
+                "gateway_event_queue_size": len(self.events),
+            },
+        )
+        self.events.put(event)
 
     def start_network_worker(self, *, interval_sec: float = 0.5) -> None:
         if self._worker and self._worker.is_alive():
             return
+        self.network_interval_sec = interval_sec
         self._stop.clear()
         self._worker = threading.Thread(
             target=self._network_loop,
@@ -101,15 +193,52 @@ class GatewayRuntime:
     def _network_loop(self, *, interval_sec: float) -> None:
         while not self._stop.is_set():
             try:
-                for event in self.events.drain(limit=100):
+                drained = self.events.drain(limit=100)
+                self.drained_event_count += len(drained)
+                for event in drained:
                     self.core_client.post_event(event)
                 for command in self.core_client.poll_commands(wait_sec=interval_sec):
-                    self.commands.put(command)
+                    self.commands.put(
+                        _command_with_gateway_trace(
+                            command,
+                            {
+                                "gateway_command_local_queued_at_utc": utc_now_ms(),
+                                "gateway_command_local_queued_monotonic_ms": monotonic_ms(),
+                                "gateway_command_queue_size": self.commands.qsize(),
+                            },
+                        )
+                    )
                 self.last_error = ""
             except Exception as exc:
                 self.last_error = str(exc)
                 self.reconnect_count += 1
                 time.sleep(min(5.0, max(1.0, interval_sec)))
+
+    def transport_snapshot(self) -> dict[str, Any]:
+        return {
+            "transport_mode": self.core_client.transport_mode,
+            "gateway_network_last_error": self.last_error or self.core_client.last_poll_error,
+            "gateway_reconnect_count": self.reconnect_count,
+            "gateway_poll_interval_sec": self.network_interval_sec,
+            "gateway_last_poll_ms": round(self.core_client.last_poll_ms, 3),
+            "gateway_last_event_post_ms": round(self.core_client.last_event_post_ms, 3),
+            "gateway_event_queue_size": len(self.events),
+            "gateway_command_queue_size": self.commands.qsize(),
+            "gateway_poll_count": self.core_client.poll_count,
+            "gateway_empty_poll_count": self.core_client.empty_poll_count,
+            "gateway_event_post_count": self.core_client.post_count,
+            "gateway_event_post_error_count": self.core_client.post_error_count,
+            "gateway_last_poll_command_count": self.core_client.last_poll_command_count,
+            "gateway_transport_metrics": {
+                "last_poll_ms": round(self.core_client.last_poll_ms, 3),
+                "last_event_post_ms": round(self.core_client.last_event_post_ms, 3),
+                "empty_poll_rate": (
+                    self.core_client.empty_poll_count / self.core_client.poll_count
+                    if self.core_client.poll_count
+                    else 0.0
+                ),
+            },
+        }
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,7 +248,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mock", action="store_true", help="Send mock events instead of loading Kiwoom ActiveX.")
     parser.add_argument("--once", action="store_true", help="Send one mock batch and exit.")
     parser.add_argument("--interval-sec", type=float, default=1.0, help="Heartbeat/mock interval.")
+    parser.add_argument("--transport", choices=["rest", "websocket-experimental"], default=os.environ.get("TRADING_GATEWAY_TRANSPORT", "rest"))
+    parser.add_argument("--poll-wait-sec", type=float, default=float(os.environ.get("TRADING_GATEWAY_POLL_WAIT_SEC", "1.0")))
+    parser.add_argument("--network-interval-sec", type=float, default=float(os.environ.get("TRADING_GATEWAY_NETWORK_INTERVAL_SEC", "0.5")))
+    parser.add_argument("--ws-url", default=os.environ.get("TRADING_GATEWAY_WS_URL", ""))
+    parser.add_argument("--metrics-enabled", action="store_true", default=os.environ.get("TRADING_TRANSPORT_METRICS_ENABLED", "1") != "0")
+    parser.add_argument("--metrics-sample-price-tick-rate", type=float, default=float(os.environ.get("TRADING_TRANSPORT_METRICS_SAMPLE_PRICE_TICK_RATE", "0.01")))
+    parser.add_argument("--metrics-sample-heartbeat-rate", type=float, default=float(os.environ.get("TRADING_TRANSPORT_METRICS_SAMPLE_HEARTBEAT_RATE", "0.1")))
     return parser.parse_args()
+
+
+def _build_core_client(args: argparse.Namespace) -> RestCoreClient:
+    if args.transport == "websocket-experimental":
+        print("websocket-experimental is reserved for a future mock experiment; falling back to REST long-poll.")
+    transport_mode = "rest_long_poll"
+    return RestCoreClient(
+        core_url=args.core_url,
+        token=args.token,
+        transport_mode=transport_mode,
+        metrics_enabled=bool(args.metrics_enabled),
+    )
 
 
 def send_mock_events(core_url: str, token: str) -> list[dict[str, Any]]:
@@ -176,8 +324,8 @@ def run_mock_gateway(args: argparse.Namespace) -> int:
         print(json.dumps(results, ensure_ascii=False, indent=2))
         return 0
 
-    runtime = GatewayRuntime(RestCoreClient(args.core_url, args.token), source="mock_kiwoom_gateway")
-    runtime.start_network_worker(interval_sec=args.interval_sec)
+    runtime = GatewayRuntime(_build_core_client(args), source="mock_kiwoom_gateway")
+    runtime.start_network_worker(interval_sec=args.poll_wait_sec or args.interval_sec)
     try:
         while True:
             runtime.emit(
@@ -190,6 +338,7 @@ def run_mock_gateway(args: argparse.Namespace) -> int:
                     "last_error": runtime.last_error,
                     "reconnect_count": runtime.reconnect_count,
                     "rate_limit": runtime.rate_limiter.snapshot(),
+                    **runtime.transport_snapshot(),
                 },
             )
             runtime.emit(
@@ -211,9 +360,9 @@ def run_real_gateway(args: argparse.Namespace) -> int:
 
     app = QApplication(sys.argv[:1])
     client = KiwoomClient()
-    runtime = GatewayRuntime(RestCoreClient(args.core_url, args.token), source="kiwoom_gateway")
+    runtime = GatewayRuntime(_build_core_client(args), source="kiwoom_gateway")
     _wire_kiwoom_signals(client, runtime)
-    runtime.start_network_worker(interval_sec=args.interval_sec)
+    runtime.start_network_worker(interval_sec=args.poll_wait_sec or args.network_interval_sec or args.interval_sec)
 
     heartbeat_timer = QTimer()
     heartbeat_timer.timeout.connect(
@@ -227,6 +376,7 @@ def run_real_gateway(args: argparse.Namespace) -> int:
                 "last_error": runtime.last_error,
                 "reconnect_count": runtime.reconnect_count,
                 "rate_limit": runtime.rate_limiter.snapshot(),
+                **runtime.transport_snapshot(),
             },
         )
     )
@@ -310,23 +460,53 @@ def _drain_real_commands(client, runtime: GatewayRuntime) -> None:
         if wait_time > 0:
             runtime.emit(
                 "rate_limited",
-                {
-                    "command_id": command.command_id,
-                    "command_type": command.type,
-                    "wait_time_sec": round(wait_time, 3),
-                },
+                _command_event_payload(
+                    command,
+                    {
+                        "wait_time_sec": round(wait_time, 3),
+                        "rate_limit_wait_ms": round(wait_time * 1000.0, 3),
+                    },
+                ),
                 command_id=command.command_id,
             )
             runtime.commands.put(command)
             return
         try:
-            runtime.emit("command_started", _command_event_payload(command), command_id=command.command_id)
+            start_monotonic = monotonic_ms()
+            runtime.emit(
+                "command_started",
+                _command_event_payload(
+                    command,
+                    {
+                        "gateway_command_started_at_utc": utc_now_ms(),
+                        "gateway_command_started_monotonic_ms": start_monotonic,
+                        "gateway_local_queue_wait_ms": monotonic_delta_ms(
+                            trace_from_payload(command.payload).get("gateway_command_local_queued_monotonic_ms"),
+                            start_monotonic,
+                        ),
+                    },
+                ),
+                command_id=command.command_id,
+            )
+            execute_start = monotonic_ms()
+            execute_started_at = utc_now_ms()
             result_payload = _execute_command(client, command)
+            execute_finished_at = utc_now_ms()
+            execute_ms = monotonic_delta_ms(execute_start, monotonic_ms())
             runtime.rate_limiter.record(command.type)
             runtime.emit(
                 "command_ack",
                 {
-                    **_command_event_payload(command),
+                    **_command_event_payload(
+                        command,
+                        {
+                            "gateway_kiwoom_call_started_at_utc": execute_started_at,
+                            "gateway_kiwoom_call_finished_at_utc": execute_finished_at,
+                            "gateway_execute_ms": execute_ms,
+                            "gateway_command_ack_created_at_utc": utc_now_ms(),
+                            "gateway_command_ack_created_monotonic_ms": monotonic_ms(),
+                        },
+                    ),
                     **result_payload,
                     "status": result_payload.get("status", "ACKED"),
                 },
@@ -336,7 +516,13 @@ def _drain_real_commands(client, runtime: GatewayRuntime) -> None:
             runtime.emit(
                 "command_failed",
                 {
-                    **_command_event_payload(command),
+                    **_command_event_payload(
+                        command,
+                        {
+                            "gateway_command_failed_at_utc": utc_now_ms(),
+                            "gateway_command_ack_created_at_utc": utc_now_ms(),
+                        },
+                    ),
                     "error": str(exc),
                     "retryable": command.type not in {"send_order", "cancel_order", "modify_order"},
                 },
@@ -433,17 +619,36 @@ def _drain_mock_commands(runtime: GatewayRuntime) -> None:
         if wait_time > 0:
             runtime.emit(
                 "rate_limited",
-                {
-                    "command_id": command.command_id,
-                    "command_type": command.type,
-                    "wait_time_sec": round(wait_time, 3),
-                },
+                _command_event_payload(
+                    command,
+                    {
+                        "wait_time_sec": round(wait_time, 3),
+                        "rate_limit_wait_ms": round(wait_time * 1000.0, 3),
+                    },
+                ),
                 command_id=command.command_id,
             )
             runtime.commands.put(command)
             return
-        runtime.emit("command_started", _command_event_payload(command), command_id=command.command_id)
+        start_monotonic = monotonic_ms()
+        runtime.emit(
+            "command_started",
+            _command_event_payload(
+                command,
+                {
+                    "gateway_command_started_at_utc": utc_now_ms(),
+                    "gateway_command_started_monotonic_ms": start_monotonic,
+                    "gateway_local_queue_wait_ms": monotonic_delta_ms(
+                        trace_from_payload(command.payload).get("gateway_command_local_queued_monotonic_ms"),
+                        start_monotonic,
+                    ),
+                },
+            ),
+            command_id=command.command_id,
+        )
         runtime.rate_limiter.record(command.type)
+        execute_start = monotonic_ms()
+        execute_started_at = utc_now_ms()
         if command.type == "send_order":
             request = BrokerOrderRequest.from_dict({**dict(command.payload or {}), "command_id": command.command_id})
             result = {
@@ -465,9 +670,23 @@ def _drain_mock_commands(runtime: GatewayRuntime) -> None:
             }
         else:
             result = {"status": "ACKED", "result_code": 0, "message": f"mock {command.type} accepted", "raw": {"mock": True}}
+        execute_finished_at = utc_now_ms()
+        execute_ms = monotonic_delta_ms(execute_start, monotonic_ms())
         runtime.emit(
             "command_ack",
-            {**_command_event_payload(command), **result},
+            {
+                **_command_event_payload(
+                    command,
+                    {
+                        "gateway_kiwoom_call_started_at_utc": execute_started_at,
+                        "gateway_kiwoom_call_finished_at_utc": execute_finished_at,
+                        "gateway_execute_ms": execute_ms,
+                        "gateway_command_ack_created_at_utc": utc_now_ms(),
+                        "gateway_command_ack_created_monotonic_ms": monotonic_ms(),
+                    },
+                ),
+                **result,
+            },
             command_id=command.command_id,
         )
         runtime.emit(
@@ -477,12 +696,40 @@ def _drain_mock_commands(runtime: GatewayRuntime) -> None:
         )
 
 
-def _command_event_payload(command: GatewayCommand) -> dict[str, Any]:
+def _event_with_gateway_trace(event: GatewayEvent, trace_updates: dict[str, Any]) -> GatewayEvent:
+    payload = ensure_transport_trace(
+        event.payload,
+        trace_id=trace_from_payload(event.payload).get("trace_id") or f"trace:{event.event_id}",
+        process="gateway",
+        extra=trace_updates,
+    )
+    data = event.to_dict()
+    data["payload"] = payload
+    return GatewayEvent.from_dict(data)
+
+
+def _command_with_gateway_trace(command: GatewayCommand, trace_updates: dict[str, Any]) -> GatewayCommand:
+    payload = ensure_transport_trace(
+        command.payload,
+        trace_id=trace_from_payload(command.payload).get("trace_id") or f"trace:{command.command_id}",
+        process="gateway",
+        extra=trace_updates,
+    )
+    data = command.to_dict()
+    data["payload"] = payload
+    return GatewayCommand.from_dict(data)
+
+
+def _command_event_payload(command: GatewayCommand, trace_updates: dict[str, Any] | None = None) -> dict[str, Any]:
+    trace = trace_from_payload(command.payload)
+    if trace_updates:
+        trace.update(trace_updates)
     return {
         "command_id": command.command_id,
         "command_type": command.type,
         "idempotency_key": command.idempotency_key,
         "request_id": command.request_id,
+        "transport_trace": trace,
     }
 
 
