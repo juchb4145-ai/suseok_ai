@@ -1,0 +1,65 @@
+{
+  "source": "royalroader",
+  "captured_at": "2026-05-31T13:00:00+09:00",
+  "trade_date": "2026-05-29",
+  "ranking_basis": "change_rate",
+  "themes": [
+    {
+      "external_theme_name": "전력설비",
+      "canonical_theme_hint": "전력설비",
+      "rank": 1,
+      "score": 91.2,
+      "top_stocks": [
+        {
+          "stock_code": "000002",
+          "stock_name": "파워케이블",
+          "rank": 2,
+          "change_rate": 8.4,
+          "turnover": 2300000000
+        },
+        {
+          "stock_code": "A000001",
+          "stock_name": "전력리더",
+          "rank": 1,
+          "change_rate": 12.3,
+          "turnover": 1234567890
+        }
+      ],
+      "members": [
+        {
+          "stock_code": "000002",
+          "stock_name": "파워케이블"
+        },
+        {
+          "stock_code": "1",
+          "stock_name": "전력리더"
+        },
+        {
+          "stock_code": "000003",
+          "stock_name": "변압기"
+        }
+      ]
+    },
+    {
+      "external_theme_name": "AI반도체",
+      "canonical_theme_hint": "AI반도체",
+      "rank": 2,
+      "score": 83.5,
+      "top_stocks": [
+        {
+          "stock_code": "5930",
+          "stock_name": "AI칩",
+          "rank": 1,
+          "change_rate": 6.7,
+          "turnover": 5500000000
+        }
+      ],
+      "members": [
+        {
+          "stock_code": "005930",
+          "stock_name": "AI칩"
+        }
+      ]
+    }
+  ]
+}

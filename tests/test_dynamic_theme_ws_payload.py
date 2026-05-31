@@ -17,6 +17,11 @@ def test_theme_rank_payload_schema():
                 theme_score=84.5,
                 status=ThemeStatus.ACTIVE,
                 trade_eligible=True,
+                details={
+                    "reason_codes": ["LOW_SNAPSHOT_COVERAGE"],
+                    "top_stocks": [{"rank": rank, "stock_code": f"{rank:06d}"} for rank in range(1, 7)],
+                    "snapshot_quality": {"snapshot_coverage": 0.4},
+                },
             )
         ],
         top_n=20,
@@ -26,6 +31,9 @@ def test_theme_rank_payload_schema():
     assert payload["type"] == "theme_rank"
     assert payload["themes"][0]["theme_id"] == "furiosa_ai"
     assert payload["themes"][0]["status"] == "ACTIVE"
+    assert payload["themes"][0]["reason_codes"] == ["LOW_SNAPSHOT_COVERAGE"]
+    assert len(payload["themes"][0]["top_stocks"]) == 5
+    assert payload["themes"][0]["snapshot_quality"] == {"snapshot_coverage": 0.4}
 
 
 def test_stock_theme_state_and_heartbeat_payloads():

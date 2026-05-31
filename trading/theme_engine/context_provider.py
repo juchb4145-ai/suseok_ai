@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-from trading.strategy.candidates import add_unique
-from trading.strategy.models import Candidate
 from trading.theme_engine.models import StockThemeState, ThemeActivitySnapshot, ThemeContext, ThemeMembership, ThemeStatus
 from trading.theme_engine.normalizer import normalize_stock_code
 from trading.theme_engine.repository import ThemeEngineRepository
+
+if TYPE_CHECKING:
+    from trading.strategy.models import Candidate
 
 
 class DynamicThemeContextProvider:
@@ -32,7 +33,7 @@ class DynamicThemeContextProvider:
             return enriched
         details = []
         for context in contexts:
-            add_unique(enriched.theme_ids, context.theme_id)
+            _add_unique(enriched.theme_ids, context.theme_id)
             details.append(
                 {
                     "theme_id": context.theme_id,
@@ -149,6 +150,11 @@ class DynamicThemeContextProvider:
 
 def _value(value) -> str:
     return value.value if hasattr(value, "value") else str(value or "")
+
+
+def _add_unique(items: list, value) -> None:
+    if value not in items:
+        items.append(value)
 
 
 def _dry_run_payload(

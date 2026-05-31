@@ -1,0 +1,5 @@
+trade_date,source,theme_name,canonical_theme_hint,theme_rank,stock_code,stock_name,stock_rank,change_rate,turnover,is_top_stock
+2026-05-29,royalroader,전력설비,전력설비,1,000002,파워케이블,2,8.4,2300000000,
+2026-05-29,royalroader,전력설비,전력설비,1,A000001,전력리더,1,12.3,1234567890,
+2026-05-29,royalroader,전력설비,전력설비,1,000003,변압기,6,-0.5,900000000,false
+2026-05-29,royalroader,AI반도체,AI반도체,2,5930,AI칩,1,6.7,5500000000,true

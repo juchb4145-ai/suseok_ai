@@ -69,6 +69,7 @@ def build_error_payload(message: str, *, code: str = "ERROR", ts: str | None = N
 
 
 def _rank_item_dict(item) -> dict[str, Any]:
+    details = dict(getattr(item, "details", {}) or {})
     return {
         "rank": item.rank,
         "theme_id": item.theme_id,
@@ -89,6 +90,9 @@ def _rank_item_dict(item) -> dict[str, Any]:
         "leader_return_pct": item.leader_return_pct,
         "leader_gap": item.leader_gap,
         "top3_concentration": item.top3_concentration,
+        "reason_codes": list(details.get("reason_codes") or []),
+        "top_stocks": list(details.get("top_stocks") or [])[:5],
+        "snapshot_quality": dict(details.get("snapshot_quality") or {}),
     }
 
 
