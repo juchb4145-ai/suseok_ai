@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from trading.broker.gateway_client import GatewayEventQueue
 from trading.broker.gateway_transport import WebSocketRealCoreClient, WebSocketPilotPolicy
+from trading.broker.data_quality import RealtimeDataQualityTracker
 from trading.broker.models import (
     BrokerExecutionEvent,
     BrokerOrderRequest,
@@ -173,11 +174,15 @@ class GatewayRuntime:
         self.network_interval_sec = 0.5
         self.drained_event_count = 0
         self.coalesced_tick_count = 0
+        self.data_quality = RealtimeDataQualityTracker()
 
     def emit(self, event_type: str, payload: dict[str, Any] | None = None, **kwargs) -> None:
+        raw_payload = dict(payload or {})
+        if event_type == "price_tick":
+            self.data_quality.observe_price_tick(raw_payload)
         created_at = utc_now_ms()
         traced_payload = ensure_transport_trace(
-            dict(payload or {}),
+            raw_payload,
             trace_id=f"trace:{kwargs.get('command_id') or event_type}:{time.time_ns()}",
             process="gateway",
             extra={
@@ -276,6 +281,7 @@ class GatewayRuntime:
                     else 0.0
                 ),
             },
+            "realtime_data_quality": self.data_quality.snapshot(),
         }
 
 
@@ -498,23 +504,30 @@ def _wire_kiwoom_signals(client, runtime: GatewayRuntime) -> None:
             {"logged_in": bool(ok), "code": int(code), "message": str(message or "")},
         )
     )
-    client.price_received.connect(
-        lambda code, price, change_rate=0.0, volume=0, best_ask=0, best_bid=0, **kwargs: runtime.emit(
-            "price_tick",
-            BrokerPriceTick(
-                code=str(code),
-                price=int(price or 0),
-                change_rate=float(change_rate or 0.0),
-                volume=int(volume or 0),
-                best_ask=int(best_ask or 0),
-                best_bid=int(best_bid or 0),
-                instrument_type=str(kwargs.get("instrument_type") or "stock"),
-                name=str(kwargs.get("name") or ""),
-                day_high=int(kwargs.get("day_high") or 0),
-                day_low=int(kwargs.get("day_low") or 0),
-            ).to_dict(),
+    rich_signal = getattr(client, "price_tick_received", None)
+    if rich_signal is not None and callable(getattr(rich_signal, "connect", None)):
+        rich_signal.connect(lambda tick: runtime.emit("price_tick", _price_tick_payload(tick)))
+    else:
+        client.price_received.connect(
+            lambda code, price, change_rate=0.0, volume=0, best_ask=0, best_bid=0, **kwargs: runtime.emit(
+                "price_tick",
+                _price_tick_payload(
+                    BrokerPriceTick(
+                        code=str(code),
+                        price=int(price or 0),
+                        change_rate=float(change_rate or 0.0),
+                        volume=int(volume or 0),
+                        best_ask=int(best_ask or 0),
+                        best_bid=int(best_bid or 0),
+                        instrument_type=str(kwargs.get("instrument_type") or "stock"),
+                        name=str(kwargs.get("name") or ""),
+                        day_high=int(kwargs.get("day_high") or 0),
+                        day_low=int(kwargs.get("day_low") or 0),
+                        metadata=dict(kwargs.get("metadata") or {}),
+                    )
+                ),
+            )
         )
-    )
     client.order_result.connect(lambda result: runtime.emit("order_result", result.to_dict()))
     client.execution_received.connect(lambda event: runtime.emit("execution_event", event.to_dict()))
     client.message_received.connect(lambda message: runtime.emit("gateway_log", {"message": str(message or "")}))
@@ -546,6 +559,28 @@ def _wire_kiwoom_signals(client, runtime: GatewayRuntime) -> None:
             if code.strip()
         ]
     )
+
+
+def _price_tick_payload(tick: BrokerPriceTick | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(tick, BrokerPriceTick):
+        payload = tick.to_dict()
+    else:
+        payload = BrokerPriceTick.from_dict(dict(tick or {})).to_dict()
+        metadata = dict(dict(tick or {}).get("metadata") or {})
+        if metadata:
+            payload["metadata"] = metadata
+    payload["cum_volume"] = payload.get("volume", 0)
+    payload.setdefault("instrument_type", "stock")
+    payload.setdefault("metadata", {})
+    metadata = dict(payload.get("metadata") or {})
+    if payload.get("trade_time"):
+        metadata.setdefault("trade_time", payload.get("trade_time"))
+    if payload.get("day_high"):
+        metadata.setdefault("session_high", payload.get("day_high"))
+    if payload.get("day_low"):
+        metadata.setdefault("session_low", payload.get("day_low"))
+    payload["metadata"] = metadata
+    return payload
 
 
 def _drain_real_commands(client, runtime: GatewayRuntime) -> None:

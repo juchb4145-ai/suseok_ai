@@ -61,11 +61,17 @@ class GatewayEventMarketDataBridge:
                     name=str(payload.get("name") or ""),
                     day_high=payload.get("day_high", 0),
                     day_low=payload.get("day_low", 0),
+                    trade_time=str(payload.get("trade_time") or ""),
+                    open_price=payload.get("open_price", 0),
+                    metadata=_tick_metadata(payload),
                 )
             )
         except Exception as exc:
             self._warn(f"PRICE_TICK_BRIDGE_FAILED:{code}:{exc}")
             return False
+
+    def data_quality_snapshot(self) -> dict[str, Any]:
+        return self._bridge.data_quality_snapshot()
 
     def _warn(self, warning: str) -> None:
         if self.warning_sink is not None:
@@ -246,3 +252,22 @@ def _clean_codes(codes: Iterable[str]) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def _tick_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(payload.get("metadata") or {})
+    reason_codes = set(str(value) for value in metadata.get("reason_codes") or [] if str(value or "").strip())
+    reason_codes.update(str(value) for value in payload.get("reason_codes") or [] if str(value or "").strip())
+    if reason_codes:
+        metadata["reason_codes"] = sorted(reason_codes)
+    if payload.get("day_high"):
+        metadata.setdefault("session_high", payload.get("day_high"))
+        metadata.setdefault("day_high", payload.get("day_high"))
+    if payload.get("day_low"):
+        metadata.setdefault("session_low", payload.get("day_low"))
+        metadata.setdefault("day_low", payload.get("day_low"))
+    if payload.get("trade_time"):
+        metadata.setdefault("trade_time", str(payload.get("trade_time") or ""))
+    if payload.get("spread_price"):
+        metadata.setdefault("spread_price", payload.get("spread_price"))
+    return metadata

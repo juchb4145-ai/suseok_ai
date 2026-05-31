@@ -42,6 +42,46 @@ def test_gateway_event_queue_coalesces_price_ticks():
     assert events[0].payload["price"] == 70100
 
 
+def test_broker_price_tick_from_dict_keeps_backward_compatibility():
+    tick = BrokerPriceTick.from_dict({"code": "005930", "price": "-70000", "volume": "1000"})
+
+    assert tick.code == "005930"
+    assert tick.price == 70000
+    assert tick.volume == 1000
+    assert tick.trade_value == 0.0
+    assert tick.execution_strength == 0.0
+    assert tick.spread_ticks == 0
+    assert tick.metadata == {}
+
+
+def test_broker_price_tick_from_dict_accepts_rich_fields_and_cum_volume_alias():
+    tick = BrokerPriceTick.from_dict(
+        {
+            "code": "005930",
+            "price": "70000",
+            "cum_volume": "1200",
+            "trade_value": "84000000",
+            "execution_strength": "123.4",
+            "spread_ticks": "1",
+            "trade_time": "093015",
+            "open_price": "69500",
+            "day_high": "71000",
+            "day_low": "69000",
+            "metadata": {"reason_codes": ["SPREAD_APPROXIMATED"]},
+        }
+    )
+
+    assert tick.volume == 1200
+    assert tick.trade_value == 84_000_000
+    assert tick.execution_strength == 123.4
+    assert tick.spread_ticks == 1
+    assert tick.trade_time == "093015"
+    assert tick.open_price == 69500
+    assert tick.day_high == 71000
+    assert tick.day_low == 69000
+    assert tick.metadata["reason_codes"] == ["SPREAD_APPROXIMATED"]
+
+
 def test_gateway_state_dedupes_events_and_commands():
     state = GatewayStateStore()
     event = GatewayEvent(type="heartbeat", event_id="evt-1", payload={"kiwoom_logged_in": True})

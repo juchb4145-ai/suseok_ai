@@ -85,6 +85,46 @@ def test_bridge_routes_stock_ticks_only_to_market_data_store():
     assert index_store.state("005930").price == 0
 
 
+def test_bridge_preserves_rich_tick_metadata_and_realtime_features():
+    clock = MutableClock(datetime(2026, 5, 29, 9, 0, 1))
+    stock_store = MarketDataStore()
+    bridge = StrategyMarketDataBridge(stock_store, CandleBuilder(), clock=clock)
+
+    assert bridge.on_realtime_tick(
+        "005930",
+        price=80_000,
+        change_rate=1.2,
+        cum_volume=1_000,
+        best_ask=80_100,
+        best_bid=80_000,
+        trade_value=80_000_000,
+        execution_strength=123.4,
+        spread_ticks=1,
+        day_high=81_000,
+        day_low=79_500,
+        trade_time="093001",
+        metadata={"reason_codes": ["SPREAD_APPROXIMATED"], "raw_fids_present": [10, 14, 228]},
+    ) is True
+
+    latest = stock_store.latest_tick("005930")
+    assert latest.trade_value == 80_000_000
+    assert latest.execution_strength == 123.4
+    assert latest.spread_ticks == 1
+    assert latest.metadata["session_high"] == 81_000
+    assert latest.metadata["session_low"] == 79_500
+    assert latest.metadata["trade_time"] == "093001"
+    assert latest.metadata["raw_fids_present"] == [10, 14, 228]
+    assert latest.metadata["momentum_1m"] == 0.0
+    assert latest.metadata["turnover_strength"] == 1.0
+    assert "MOMENTUM_WARMUP" in latest.metadata["reason_codes"]
+    assert "SPREAD_APPROXIMATED" in latest.metadata["reason_codes"]
+
+    quality = bridge.data_quality_snapshot()
+    assert quality["total_price_ticks"] == 1
+    assert quality["field_coverage"]["trade_value"] == 1.0
+    assert quality["field_coverage"]["momentum"] == 1.0
+
+
 def test_bridge_can_infer_index_type_from_mapper_without_polluting_stock_candles():
     client = MockKiwoomClient()
     clock = MutableClock(datetime(2026, 5, 29, 9, 0, 1))

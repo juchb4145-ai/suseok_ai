@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from trading.broker.models import (
     BrokerConditionEvent as ConditionCandidateEvent,
     BrokerExecutionEvent as ExecutionEvent,
     BrokerOrderRequest as OrderRequest,
     BrokerOrderResult as OrderResult,
+    BrokerPriceTick,
     ConditionInfo,
     ConditionLoadState,
     Signal,
@@ -16,8 +17,28 @@ from trading.broker.models import (
 FID_CURRENT_PRICE = 10
 FID_CHANGE_RATE = 12
 FID_ACC_VOLUME = 13
+FID_ACC_TRADE_VALUE = 14
+FID_OPEN_PRICE = 16
+FID_HIGH_PRICE = 17
+FID_LOW_PRICE = 18
+FID_TRADE_TIME = 20
 FID_BEST_ASK = 27
 FID_BEST_BID = 28
+FID_EXECUTION_STRENGTH = 228
+
+REALTIME_STOCK_FIDS = [
+    FID_CURRENT_PRICE,
+    FID_CHANGE_RATE,
+    FID_ACC_VOLUME,
+    FID_ACC_TRADE_VALUE,
+    FID_OPEN_PRICE,
+    FID_HIGH_PRICE,
+    FID_LOW_PRICE,
+    FID_TRADE_TIME,
+    FID_BEST_ASK,
+    FID_BEST_BID,
+    FID_EXECUTION_STRENGTH,
+]
 
 
 ERROR_MESSAGES = {
@@ -63,6 +84,7 @@ class KiwoomClient:
 
         self.connected = Signal()
         self.price_received = Signal()
+        self.price_tick_received = Signal()
         self.order_result = Signal()
         self.execution_received = Signal()
         self.message_received = Signal()
@@ -107,7 +129,7 @@ class KiwoomClient:
 
     def register_realtime(self, codes: Iterable[str], screen_no: Optional[str] = None) -> None:
         code_list = [code for code in codes if code]
-        fids = "10;12;13;27;28"
+        fids = realtime_stock_fid_string()
         for index in range(0, len(code_list), 100):
             chunk = code_list[index : index + 100]
             chunk_screen_no = screen_no or f"{5000 + index // 100:04d}"
@@ -339,12 +361,78 @@ class KiwoomClient:
         )
 
     def _on_receive_real_data(self, code: str, real_type: str, real_data: str) -> None:
-        current = self._real_int(code, FID_CURRENT_PRICE)
-        change_rate = self._real_float(code, FID_CHANGE_RATE)
-        volume = self._real_int(code, FID_ACC_VOLUME)
-        best_ask = self._real_int(code, FID_BEST_ASK)
-        best_bid = self._real_int(code, FID_BEST_BID)
+        raw_values = {fid: self._real_raw(code, fid) for fid in REALTIME_STOCK_FIDS}
+        reason_codes: list[str] = []
+        parse_fallback = False
+
+        current, ok = _parse_real_int(raw_values.get(FID_CURRENT_PRICE))
+        parse_fallback = parse_fallback or not ok
+        change_rate, ok = _parse_real_float(raw_values.get(FID_CHANGE_RATE), abs_value=False)
+        parse_fallback = parse_fallback or not ok
+        volume, ok = _parse_real_int(raw_values.get(FID_ACC_VOLUME))
+        parse_fallback = parse_fallback or not ok
+        trade_value, ok = _parse_real_float(raw_values.get(FID_ACC_TRADE_VALUE), abs_value=True)
+        parse_fallback = parse_fallback or not ok
+        open_price, ok = _parse_real_int(raw_values.get(FID_OPEN_PRICE))
+        parse_fallback = parse_fallback or not ok
+        day_high, ok = _parse_real_int(raw_values.get(FID_HIGH_PRICE))
+        parse_fallback = parse_fallback or not ok
+        day_low, ok = _parse_real_int(raw_values.get(FID_LOW_PRICE))
+        parse_fallback = parse_fallback or not ok
+        best_ask, ok = _parse_real_int(raw_values.get(FID_BEST_ASK))
+        parse_fallback = parse_fallback or not ok
+        best_bid, ok = _parse_real_int(raw_values.get(FID_BEST_BID))
+        parse_fallback = parse_fallback or not ok
+        execution_strength, ok = _parse_real_float(raw_values.get(FID_EXECUTION_STRENGTH), abs_value=False)
+        parse_fallback = parse_fallback or not ok
+        execution_strength = max(0.0, execution_strength)
+        trade_time = str(raw_values.get(FID_TRADE_TIME) or "").strip()
+
+        if trade_value <= 0:
+            reason_codes.append("TRADE_VALUE_MISSING")
+            if current > 0 and volume > 0:
+                trade_value = float(current * volume)
+                reason_codes.append("TURNOVER_ESTIMATED")
+        if execution_strength <= 0:
+            reason_codes.append("EXECUTION_STRENGTH_MISSING")
+        if day_high <= 0 or day_low <= 0:
+            reason_codes.append("DAY_HIGH_LOW_MISSING")
+        if best_ask <= 0 or best_bid <= 0:
+            reason_codes.append("BEST_BID_ASK_MISSING")
+        if parse_fallback:
+            reason_codes.append("REAL_PARSE_FALLBACK")
+
+        spread_price = max(0, best_ask - best_bid) if best_ask > 0 and best_bid > 0 else 0
+        spread_ticks = _spread_ticks(best_bid, best_ask)
+        if spread_price > 0:
+            reason_codes.append("SPREAD_APPROXIMATED")
+
+        metadata = {
+            "real_type": str(real_type or ""),
+            "trade_time": trade_time,
+            "raw_fids_present": [fid for fid, value in raw_values.items() if _has_real_value(value)],
+            "reason_codes": sorted(set(reason_codes)),
+            "spread_price": spread_price,
+        }
         self.price_received.emit(code, current, change_rate, volume, best_ask, best_bid)
+        self.price_tick_received.emit(
+            BrokerPriceTick(
+                code=str(code or ""),
+                price=current,
+                change_rate=change_rate,
+                volume=volume,
+                best_ask=best_ask,
+                best_bid=best_bid,
+                trade_value=trade_value,
+                execution_strength=execution_strength,
+                spread_ticks=spread_ticks,
+                trade_time=trade_time,
+                open_price=open_price,
+                day_high=day_high,
+                day_low=day_low,
+                metadata=metadata,
+            )
+        )
 
     def _on_receive_chejan_data(self, gubun: str, item_count: int, fid_list: str) -> None:
         order_no = self._chejan(9203)
@@ -371,14 +459,14 @@ class KiwoomClient:
             )
 
     def _real_int(self, code: str, fid: int) -> int:
-        return self._parse_int(self.ocx.dynamicCall("GetCommRealData(QString, int)", code, fid))
+        return self._parse_int(self._real_raw(code, fid))
 
     def _real_float(self, code: str, fid: int) -> float:
-        raw = str(self.ocx.dynamicCall("GetCommRealData(QString, int)", code, fid) or "").strip()
-        try:
-            return float(raw.replace("+", "").replace("%", ""))
-        except ValueError:
-            return 0.0
+        value, _ = _parse_real_float(self._real_raw(code, fid), abs_value=False)
+        return value
+
+    def _real_raw(self, code: str, fid: int) -> str:
+        return str(self.ocx.dynamicCall("GetCommRealData(QString, int)", code, fid) or "").strip()
 
     def _chejan(self, fid: int) -> str:
         return str(self.ocx.dynamicCall("GetChejanData(int)", fid) or "").strip()
@@ -396,6 +484,7 @@ class MockKiwoomClient:
     def __init__(self) -> None:
         self.connected = Signal()
         self.price_received = Signal()
+        self.price_tick_received = Signal()
         self.order_result = Signal()
         self.execution_received = Signal()
         self.message_received = Signal()
@@ -674,25 +763,55 @@ class MockKiwoomClient:
         change_rate: float = 0.0,
         volume: int = 0,
         *,
+        best_ask: Optional[int] = None,
+        best_bid: Optional[int] = None,
+        trade_value: float = 0.0,
+        execution_strength: float = 0.0,
+        spread_ticks: int = 0,
+        trade_time: str = "",
+        open_price: int = 0,
         instrument_type: str = "stock",
         name: str = "",
         day_high: int = 0,
         day_low: int = 0,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> None:
+        ask = int(best_ask if best_ask is not None else price + 1)
+        bid = int(best_bid if best_bid is not None else price - 1)
         if instrument_type == "stock" and not name and not day_high and not day_low:
-            self.price_received.emit(code, price, change_rate, volume, price + 1, price - 1)
-            return
-        self.price_received.emit(
-            code,
-            price,
-            change_rate,
-            volume,
-            price + 1,
-            price - 1,
-            instrument_type=instrument_type,
-            name=name,
-            day_high=day_high,
-            day_low=day_low,
+            self.price_received.emit(code, price, change_rate, volume, ask, bid)
+        else:
+            self.price_received.emit(
+                code,
+                price,
+                change_rate,
+                volume,
+                ask,
+                bid,
+                instrument_type=instrument_type,
+                name=name,
+                day_high=day_high,
+                day_low=day_low,
+            )
+        self.price_tick_received.emit(
+            BrokerPriceTick(
+                code=str(code or ""),
+                price=int(price or 0),
+                change_rate=float(change_rate or 0.0),
+                volume=int(volume or 0),
+                best_ask=ask,
+                best_bid=bid,
+                trade_value=float(trade_value or 0.0),
+                execution_strength=float(execution_strength or 0.0),
+                spread_ticks=int(spread_ticks or 0),
+                trade_time=str(trade_time or ""),
+                open_price=int(open_price or 0),
+                instrument_type=str(instrument_type or "stock"),
+                name=str(name or ""),
+                day_high=int(day_high or 0),
+                day_low=int(day_low or 0),
+                metadata=dict(metadata or {}),
+            )
         )
 
     def _condition_index(self, condition_name: str) -> int:
@@ -738,6 +857,62 @@ def parse_condition_name_list(raw: str) -> list[ConditionInfo]:
             continue
         conditions.append(ConditionInfo(index=index, name=name))
     return conditions
+
+
+def realtime_stock_fid_string() -> str:
+    return ";".join(str(fid) for fid in REALTIME_STOCK_FIDS)
+
+
+def _parse_real_int(value: Any) -> tuple[int, bool]:
+    text = str(value or "").strip().replace(",", "").replace("+", "")
+    if not text:
+        return 0, True
+    try:
+        return abs(int(float(text))), True
+    except (TypeError, ValueError):
+        return 0, False
+
+
+def _parse_real_float(value: Any, *, abs_value: bool) -> tuple[float, bool]:
+    text = str(value or "").strip().replace(",", "").replace("+", "").replace("%", "")
+    if not text:
+        return 0.0, True
+    try:
+        parsed = float(text)
+    except (TypeError, ValueError):
+        return 0.0, False
+    return (abs(parsed) if abs_value else parsed), True
+
+
+def _has_real_value(value: Any) -> bool:
+    return str(value or "").strip() != ""
+
+
+def _spread_ticks(best_bid: int, best_ask: int) -> int:
+    if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
+        return 0
+    reference = best_bid or best_ask
+    tick_size = _krx_stock_tick_size(reference)
+    if tick_size <= 0:
+        return 0
+    return max(0, int(round((best_ask - best_bid) / tick_size)))
+
+
+def _krx_stock_tick_size(price: int) -> int:
+    price = abs(int(price or 0))
+    if price < 2_000:
+        return 1
+    if price < 5_000:
+        return 5
+    if price < 20_000:
+        return 10
+    if price < 50_000:
+        return 50
+    if price < 200_000:
+        return 100
+    if price < 500_000:
+        return 500
+    return 1_000
 
 
 def _mock_tr_key(tr_code: str, inputs: dict[str, str]) -> str:

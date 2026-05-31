@@ -29,6 +29,44 @@ def test_gateway_price_tick_updates_stock_market_data():
     assert tick.cum_volume == 1000
 
 
+def test_gateway_price_tick_passes_rich_payload_to_strategy_tick():
+    market_data = MarketDataStore()
+    bridge = GatewayEventMarketDataBridge(market_data, CandleBuilder(), MarketIndexStore())
+
+    assert bridge.handle_price_tick(
+        {
+            "code": "005930",
+            "price": 70000,
+            "change_rate": 1.2,
+            "volume": 1200,
+            "cum_volume": 1200,
+            "trade_value": 84_000_000,
+            "execution_strength": 123.4,
+            "best_ask": 70100,
+            "best_bid": 70000,
+            "spread_ticks": 1,
+            "day_high": 71000,
+            "day_low": 69000,
+            "trade_time": "093015",
+            "metadata": {"reason_codes": ["SPREAD_APPROXIMATED"], "raw_fids_present": [10, 14, 228]},
+        }
+    ) is True
+
+    tick = market_data.latest_tick("005930")
+    assert tick.trade_value == 84_000_000
+    assert tick.execution_strength == 123.4
+    assert tick.spread_ticks == 1
+    assert tick.metadata["session_high"] == 71000
+    assert tick.metadata["session_low"] == 69000
+    assert tick.metadata["trade_time"] == "093015"
+    assert tick.metadata["raw_fids_present"] == [10, 14, 228]
+    assert "SPREAD_APPROXIMATED" in tick.metadata["reason_codes"]
+
+    quality = bridge.data_quality_snapshot()
+    assert quality["total_price_ticks"] == 1
+    assert quality["field_coverage"]["execution_strength"] == 1.0
+
+
 def test_gateway_price_tick_updates_index_store():
     market_index_store = MarketIndexStore()
     bridge = GatewayEventMarketDataBridge(MarketDataStore(), CandleBuilder(), market_index_store)

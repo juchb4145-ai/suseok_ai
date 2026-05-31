@@ -136,25 +136,38 @@ class BrokerPriceTick:
     volume: int = 0
     best_ask: int = 0
     best_bid: int = 0
+    trade_value: float = 0.0
+    execution_strength: float = 0.0
+    spread_ticks: int = 0
+    trade_time: str = ""
+    open_price: int = 0
     instrument_type: str = "stock"
     name: str = ""
     day_high: int = 0
     day_low: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
     timestamp: str = field(default_factory=utc_timestamp)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "BrokerPriceTick":
+        volume = data.get("volume", data.get("cum_volume", 0))
         return cls(
             code=str(data.get("code") or ""),
-            price=abs(int(data.get("price") or 0)),
-            change_rate=float(data.get("change_rate") or 0.0),
-            volume=int(data.get("volume") or 0),
-            best_ask=abs(int(data.get("best_ask") or 0)),
-            best_bid=abs(int(data.get("best_bid") or 0)),
+            price=_abs_int(data.get("price")),
+            change_rate=_float(data.get("change_rate")),
+            volume=_abs_int(volume),
+            best_ask=_abs_int(data.get("best_ask")),
+            best_bid=_abs_int(data.get("best_bid")),
+            trade_value=max(0.0, _float(data.get("trade_value"))),
+            execution_strength=max(0.0, _float(data.get("execution_strength"))),
+            spread_ticks=_abs_int(data.get("spread_ticks")),
+            trade_time=str(data.get("trade_time") or ""),
+            open_price=_abs_int(data.get("open_price")),
             instrument_type=str(data.get("instrument_type") or "stock"),
             name=str(data.get("name") or ""),
-            day_high=abs(int(data.get("day_high") or 0)),
-            day_low=abs(int(data.get("day_low") or 0)),
+            day_high=_abs_int(data.get("day_high")),
+            day_low=_abs_int(data.get("day_low")),
+            metadata=dict(data.get("metadata") or {}),
             timestamp=str(data.get("timestamp") or utc_timestamp()),
         )
 
@@ -331,3 +344,27 @@ def _to_dict(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _to_dict(item) for key, item in value.items()}
     return value
+
+
+def _abs_int(value: Any) -> int:
+    if value is None:
+        return 0
+    raw = str(value).strip().replace(",", "").replace("+", "")
+    if not raw:
+        return 0
+    try:
+        return abs(int(float(raw)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float(value: Any) -> float:
+    if value is None:
+        return 0.0
+    raw = str(value).strip().replace(",", "").replace("+", "").replace("%", "")
+    if not raw:
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
