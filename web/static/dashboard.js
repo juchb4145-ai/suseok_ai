@@ -17,16 +17,16 @@ const tableConfigs = {
     actionLabel: "전송 리포트 재생성",
     actionEndpoint: (filters) => `/api/gateway/transport/latency/rebuild?persist=true&export=true${filters.trade_date ? `&trade_date=${encodeURIComponent(filters.trade_date)}` : ""}`,
     columns: [
-      (item) => formatDateTime(item.created_at),
+      (item) => textCell(formatDateTime(item.created_at)),
       (item) => badge(item.transport_mode || "-"),
-      (item) => item.direction || "-",
-      (item) => item.message_type || "-",
+      (item) => textCell(item.direction || "-"),
+      (item) => textCell(item.message_type || "-"),
       (item) => compactId(item.command_id || item.event_id || "-"),
-      (item) => formatMs(item.total_wall_ms),
-      (item) => formatMs(item.long_poll_wait_ms),
-      (item) => formatMs(item.gateway_execute_ms),
-      (item) => formatMs(item.ack_round_trip_ms),
-      (item) => item.error || "-",
+      (item) => textCell(formatMs(item.total_wall_ms)),
+      (item) => textCell(formatMs(item.long_poll_wait_ms)),
+      (item) => textCell(formatMs(item.gateway_execute_ms)),
+      (item) => textCell(formatMs(item.ack_round_trip_ms)),
+      (item) => textCell(item.error || "-"),
     ],
   },
   transportExperiments: {
@@ -35,7 +35,7 @@ const tableConfigs = {
     statusId: "transportExperiments-status",
     paginationId: "transportExperiments-pagination",
     defaultLimit: 25,
-    detailTitle: (item) => `실험 ${item.experiment_id || ""}`,
+    detailTitle: (item) => `WebSocket Mock 실험 ${item.experiment_id || ""}`,
     detailEndpoint: (item) => item.experiment_id ? `/api/gateway/transport/experiments/${encodeURIComponent(item.experiment_id)}${item.scenario ? `?scenario=${encodeURIComponent(item.scenario)}` : ""}` : "",
     actionLabel: "비교 리포트 재생성",
     actionEndpoint: (filters) => {
@@ -44,16 +44,16 @@ const tableConfigs = {
     },
     columns: [
       (item) => compactId(item.experiment_id || "-"),
-      (item) => item.scenario || "-",
-      (item) => formatDateTime(item.started_at),
-      (item) => formatDateTime(item.ended_at),
-      (item) => (item.sample_counts || {}).rest_long_poll ?? "-",
-      (item) => (item.sample_counts || {}).websocket_mock ?? "-",
-      (item) => formatMs((item.rest_summary || {}).command_latency_p95_ms),
-      (item) => formatMs((item.websocket_summary || {}).command_latency_p95_ms),
-      (item) => formatMs((item.delta || {}).command_p95_delta_ms),
+      (item) => textCell(item.scenario || "-"),
+      (item) => textCell(formatDateTime(item.started_at)),
+      (item) => textCell(formatDateTime(item.ended_at)),
+      (item) => textCell((item.sample_counts || {}).rest_long_poll ?? "-"),
+      (item) => textCell((item.sample_counts || {}).websocket_mock ?? "-"),
+      (item) => textCell(formatMs((item.rest_summary || {}).command_latency_p95_ms)),
+      (item) => textCell(formatMs((item.websocket_summary || {}).command_latency_p95_ms)),
+      (item) => textCell(formatMs((item.delta || {}).command_p95_delta_ms)),
       (item) => badge(item.latest_recommendation || "-"),
-      (item) => item.real_gateway_switch_ready ? "예" : "아니오",
+      (item) => textCell(item.real_gateway_switch_ready ? "예" : "아니오"),
     ],
   },
   dryRunOrders: {
@@ -65,17 +65,17 @@ const tableConfigs = {
     detailTitle: (item) => `DRY_RUN 주문 의도 ${item.intent_id || ""}`,
     detailEndpoint: (item) => item.intent_id ? `/api/runtime/orders/dry-run/${encodeURIComponent(item.intent_id)}` : "",
     columns: [
-      (item) => formatDateTime(item.created_at),
-      (item) => item.code || "-",
-      (item) => item.side || "-",
-      (item) => item.order_phase || "-",
-      (item) => item.quantity ?? 0,
-      (item) => item.price ?? 0,
+      (item) => textCell(formatDateTime(item.created_at)),
+      (item) => textCell(item.code || "-"),
+      (item) => textCell(item.side || "-"),
+      (item) => textCell(item.order_phase || "-"),
+      (item) => textCell(item.quantity ?? 0),
+      (item) => textCell(item.price ?? 0),
       (item) => badge(item.status || "-"),
-      (item) => item.reason || "-",
+      (item) => textCell(item.reason || "-"),
       (item) => item.live_would_pass ? badge("PASS", "ok") : badge(item.live_reject_reason || "REJECT", "warn"),
-      (item) => item.candidate_id ?? "-",
-      (item) => [item.virtual_order_id, item.virtual_position_id, item.exit_decision_id].filter(Boolean).join(" / ") || "-",
+      (item) => textCell(item.candidate_id ?? "-"),
+      (item) => textCell([item.virtual_order_id, item.virtual_position_id, item.exit_decision_id].filter(Boolean).join(" / ") || "-"),
     ],
   },
   dryRunPerformance: {
@@ -89,16 +89,16 @@ const tableConfigs = {
     actionLabel: "성과 리포트 재생성",
     actionEndpoint: (filters) => `/api/runtime/performance/dry-run/rebuild?persist=true&export=true&format=all${filters.trade_date ? `&trade_date=${encodeURIComponent(filters.trade_date)}` : ""}`,
     columns: [
-      (item) => item.code || "-",
-      (item) => item.strategy_name || "-",
-      (item) => item.theme_name || "-",
+      (item) => textCell(item.code || "-"),
+      (item) => textCell(item.strategy_name || "-"),
+      (item) => textCell(item.theme_name || "-"),
       (item) => badge(item.quality_bucket || item.signal_classification || "-"),
-      (item) => item.dry_run_false_positive_type || "-",
-      (item) => item.dry_run_false_negative_type || item.opportunity_loss_type || "-",
-      (item) => formatPercentValue(item.realized_return_pct),
-      (item) => formatPercentValue(item.max_return_20m),
-      (item) => formatPercentValue(item.max_drawdown_20m),
-      (item) => item.gate_reason || "-",
+      (item) => textCell(item.dry_run_false_positive_type || "-"),
+      (item) => textCell(item.dry_run_false_negative_type || item.opportunity_loss_type || "-"),
+      (item) => textCell(formatPercentValue(item.realized_return_pct)),
+      (item) => textCell(formatPercentValue(item.max_return_20m)),
+      (item) => textCell(formatPercentValue(item.max_drawdown_20m)),
+      (item) => textCell(item.gate_reason || "-"),
     ],
   },
   falseSignals: {
@@ -110,14 +110,14 @@ const tableConfigs = {
     detailTitle: (item) => `오탐/미탐 신호 ${item.lifecycle_id || item.code || ""}`,
     detailEndpoint: (item, filters) => item.lifecycle_id ? `/api/runtime/performance/dry-run/lifecycles/${encodeURIComponent(item.lifecycle_id)}${filters.trade_date ? `?trade_date=${encodeURIComponent(filters.trade_date)}` : ""}` : "",
     columns: [
-      (item) => item.code || "-",
+      (item) => textCell(item.code || "-"),
       (item) => badge(item.signal_classification || "-"),
-      (item) => item.dry_run_false_positive_type || item.dry_run_false_negative_type || item.opportunity_loss_type || "-",
-      (item) => formatPercentValue(item.realized_return_pct),
-      (item) => formatPercentValue(item.max_return_20m),
-      (item) => formatPercentValue(item.max_drawdown_20m),
-      (item) => item.entry_live_reject_reason || item.entry_decision_safety_reason || "-",
-      (item) => item.gate_reason || "-",
+      (item) => textCell(item.dry_run_false_positive_type || item.dry_run_false_negative_type || item.opportunity_loss_type || "-"),
+      (item) => textCell(formatPercentValue(item.realized_return_pct)),
+      (item) => textCell(formatPercentValue(item.max_return_20m)),
+      (item) => textCell(formatPercentValue(item.max_drawdown_20m)),
+      (item) => textCell(item.entry_live_reject_reason || item.entry_decision_safety_reason || "-"),
+      (item) => textCell(item.gate_reason || "-"),
       (item) => compactId(item.lifecycle_id || "-"),
     ],
   },
@@ -141,18 +141,18 @@ const tableConfigs = {
       return `/api/runtime/threshold-ab/dry-run/rebuild?${params}`;
     },
     columns: [
-      (item) => item.label_ko || item.candidate_id || "-",
-      (item) => categoryKo(item.category),
-      (item) => item.parameter_name || "-",
-      (item) => escapeHtml(item.baseline_value ?? "-"),
-      (item) => escapeHtml(item.candidate_value ?? "-"),
+      (item) => textCell(item.label_ko || item.candidate_id || "-"),
+      (item) => textCell(categoryKo(item.category)),
+      (item) => textCell(item.parameter_name || "-"),
+      (item) => textCell(item.baseline_value ?? "-"),
+      (item) => textCell(item.candidate_value ?? "-"),
       (item) => badge(gradeKo(((item.result || {}).recommendation || {}).grade || item.grade || item.recommendation_grade || "-")),
-      (item) => (((item.result || {}).recommendation || {}).sample_count ?? item.sample_count ?? 0),
-      (item) => item.expected_effect_ko || "-",
-      (item) => item.expected_risk_ko || "-",
-      (item) => (((item.result || {}).delta || {}).avoided_false_positive_count ?? item.avoided_false_positive_count ?? 0),
-      (item) => (((item.result || {}).delta || {}).newly_created_false_negative_count ?? item.newly_created_false_negative_count ?? 0),
-      (item) => formatRate((((item.result || {}).recommendation || {}).confidence ?? item.confidence)),
+      (item) => textCell((((item.result || {}).recommendation || {}).sample_count ?? item.sample_count ?? 0)),
+      (item) => textCell(item.expected_effect_ko || "-"),
+      (item) => textCell(item.expected_risk_ko || "-"),
+      (item) => textCell((((item.result || {}).delta || {}).avoided_false_positive_count ?? item.avoided_false_positive_count ?? 0)),
+      (item) => textCell((((item.result || {}).delta || {}).newly_created_false_negative_count ?? item.newly_created_false_negative_count ?? 0)),
+      (item) => textCell(formatRate((((item.result || {}).recommendation || {}).confidence ?? item.confidence))),
     ],
   },
   gatewayCommands: {
@@ -161,16 +161,16 @@ const tableConfigs = {
     statusId: "gatewayCommands-status",
     paginationId: "gatewayCommands-pagination",
     defaultLimit: 50,
-    detailTitle: (item) => `게이트웨이 명령 ${item.command_id || ""}`,
+    detailTitle: (item) => `Gateway 명령 ${item.command_id || ""}`,
     detailEndpoint: (item) => item.command_id ? `/api/gateway/commands/${encodeURIComponent(item.command_id)}` : "",
     columns: [
       (item) => compactId(item.command_id || "-"),
-      (item) => formatDateTime(item.created_at),
-      (item) => item.command_type || "-",
+      (item) => textCell(formatDateTime(item.created_at)),
+      (item) => textCell(item.command_type || "-"),
       (item) => badge(item.status || "-"),
-      (item) => `${item.attempts || 0}/${item.max_attempts || 0}`,
+      (item) => textCell(`${item.attempts || 0}/${item.max_attempts || 0}`),
       (item) => compactId(item.dedupe_key || item.idempotency_key || "-"),
-      (item) => item.last_error || "-",
+      (item) => textCell(item.last_error || "-"),
     ],
   },
 };
@@ -190,6 +190,8 @@ const categoryLabelsKo = {
   session: "시간대",
   safety: "안전장치",
 };
+
+const TOKEN_STORAGE_KEY = "TRADING_CORE_TOKEN";
 
 function gradeKo(value) {
   return gradeLabelsKo[value] || value || "-";
@@ -218,16 +220,20 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+function textCell(value) {
+  return escapeHtml(value == null || value === "" ? "-" : value);
+}
+
 function badge(value, tone = "") {
   const normalized = String(value || "-");
   let badgeTone = tone;
   if (!badgeTone) {
-    if (/ACKED|ACCEPT|PASS|READY|OK|TRUE_POSITIVE/i.test(normalized)) badgeTone = "ok";
-    else if (/FAIL|REJECT|EXPIRED|BLOCK|LOSS|FALSE/i.test(normalized)) badgeTone = "bad";
-    else if (/DUP|WAIT|PENDING|WARN/i.test(normalized)) badgeTone = "warn";
+    if (/ACKED|ACCEPT|PASS|READY|OK|TRUE_POSITIVE|정상|통과|승인|강한/i.test(normalized)) badgeTone = "ok";
+    else if (/FAIL|REJECT|EXPIRED|BLOCK|LOSS|FALSE|오류|실패|거부|차단|위험/i.test(normalized)) badgeTone = "bad";
+    else if (/DUP|WAIT|PENDING|WARN|주의|대기|관찰/i.test(normalized)) badgeTone = "warn";
     else badgeTone = "muted";
   }
-  return `<span class="badge ${badgeTone}">${escapeHtml(normalized)}</span>`;
+  return `<span class="badge ${badgeTone}" title="${escapeHtml(normalized)}">${escapeHtml(normalized)}</span>`;
 }
 
 function compactId(value) {
@@ -268,6 +274,10 @@ function formatDateTime(value) {
   return String(value).replace("T", " ").replace("+00:00", "Z");
 }
 
+function yesNo(value) {
+  return value ? "예" : "아니오";
+}
+
 function buildQuery(params) {
   const search = new URLSearchParams();
   Object.entries(params || {}).forEach(([key, value]) => {
@@ -275,6 +285,70 @@ function buildQuery(params) {
     search.set(key, String(value));
   });
   return search.toString();
+}
+
+function getStoredToken() {
+  return localStorage.getItem(TOKEN_STORAGE_KEY) || "";
+}
+
+function rememberToken(token) {
+  if (token) localStorage.setItem(TOKEN_STORAGE_KEY, token);
+}
+
+function forgetStoredToken() {
+  localStorage.removeItem(TOKEN_STORAGE_KEY);
+}
+
+function promptForToken(message = "TRADING_CORE_TOKEN") {
+  const token = window.prompt(message) || "";
+  rememberToken(token);
+  return token;
+}
+
+function isInvalidTokenResponse(response, payload) {
+  const detail = String((payload || {}).detail || (payload || {}).error || "");
+  return response.status === 401 || response.status === 403 || /invalid local gateway token/i.test(detail);
+}
+
+async function parseResponsePayload(response) {
+  try {
+    return await response.json();
+  } catch (_) {
+    try {
+      return { detail: await response.text() };
+    } catch (__) {
+      return {};
+    }
+  }
+}
+
+async function postWithLocalToken(endpoint, token) {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "X-Local-Token": token },
+  });
+  const payload = await parseResponsePayload(response);
+  return { response, payload };
+}
+
+async function runWithLocalTokenRetry(requestFn) {
+  let token = getStoredToken() || promptForToken();
+  if (!token) return null;
+
+  let result = await requestFn(token);
+  if (!result.response.ok && isInvalidTokenResponse(result.response, result.payload)) {
+    forgetStoredToken();
+    token = promptForToken("TRADING_CORE_TOKEN이 맞지 않습니다. 새 토큰을 입력하세요.");
+    if (!token) return null;
+    result = await requestFn(token);
+  }
+
+  if (!result.response.ok) {
+    if (isInvalidTokenResponse(result.response, result.payload)) forgetStoredToken();
+    throw new Error(result.payload.detail || result.payload.error || `${result.response.status} ${result.response.statusText}`);
+  }
+
+  return result.payload;
 }
 
 async function apiGet(endpoint, params = {}, tableKey = "") {
@@ -325,63 +399,77 @@ function renderToolbar(tableKey) {
         ${option(25)}${option(50)}${option(100)}${option(200)}
       </select>
     </label>
-    <label class="inline-control"><input type="checkbox" data-table-action="${tableKey}:auto" /> 자동 새로고침</label>
-    ${config.actionEndpoint ? `<button type="button" data-table-action="${tableKey}:protected">${escapeHtml(config.actionLabel || "재생성")}</button>` : ""}
-    <span id="${tableKey}-freshness" class="freshness">아직 조회 안 함</span>
+    <label class="inline-control inline-check"><input type="checkbox" data-table-action="${tableKey}:auto" /> 자동 새로고침</label>
+    ${config.actionEndpoint ? `<button type="button" data-table-action="${tableKey}:protected">${escapeHtml(config.actionLabel || "보호 작업")}</button>` : ""}
+    <span id="${tableKey}-freshness" class="freshness">아직 조회 전</span>
   `;
 }
 
 function bindTableControls(tableKey) {
   document.querySelectorAll(`[data-table-action^="${tableKey}:"]`).forEach((node) => {
     const action = node.dataset.tableAction.split(":")[1];
-    node.addEventListener("click", () => handleTableAction(tableKey, action, node).catch((error) => setTableStatus(tableKey, error.message, "bad")));
     if (action === "limit") {
       node.addEventListener("change", () => {
         updateTableState(tableKey, { limit: Number(node.value), offset: 0 });
         fetchTable(tableKey).catch((error) => setTableStatus(tableKey, error.message, "bad"));
       });
+      return;
     }
     if (action === "auto") {
       node.addEventListener("change", () => toggleAutoRefresh(tableKey, node.checked));
+      return;
     }
+    node.addEventListener("click", () => handleTableAction(tableKey, action, node).catch((error) => setTableStatus(tableKey, error.message, "bad")));
   });
 }
 
-async function handleTableAction(tableKey, action) {
+async function handleTableAction(tableKey, action, node) {
   if (action === "apply") {
     updateTableState(tableKey, { offset: 0 });
     await fetchTable(tableKey);
   } else if (action === "reset") {
-    document.querySelectorAll(`[data-table="${tableKey}"][data-filter]`).forEach((node) => {
-      if (node.tagName === "SELECT") node.selectedIndex = 0;
-      else node.value = "";
+    document.querySelectorAll(`[data-table="${tableKey}"][data-filter]`).forEach((filterNode) => {
+      if (filterNode.tagName === "SELECT") filterNode.selectedIndex = 0;
+      else filterNode.value = "";
     });
     updateTableState(tableKey, { offset: 0 });
     await fetchTable(tableKey);
   } else if (action === "reload") {
     await fetchTable(tableKey);
   } else if (action === "protected") {
-    await runProtectedTableAction(tableKey);
+    await runProtectedTableAction(tableKey, node);
   }
 }
 
-async function runProtectedTableAction(tableKey) {
+async function runProtectedTableAction(tableKey, button) {
   const config = tableConfigs[tableKey];
-  let token = localStorage.getItem("TRADING_CORE_TOKEN") || "";
-  if (!token) {
-    token = window.prompt("TRADING_CORE_TOKEN") || "";
-    if (token) localStorage.setItem("TRADING_CORE_TOKEN", token);
+  if (!config.actionEndpoint) return;
+  const originalText = button?.textContent || "";
+  if (button) {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    button.textContent = "실행 중";
   }
-  if (!token || !config.actionEndpoint) return;
   setTableStatus(tableKey, "실행 중", "warn");
-  const filters = tableFilters(tableKey);
-  const response = await fetch(config.actionEndpoint(filters), {
-    method: "POST",
-    headers: { "X-Local-Token": token },
-  });
-  const payload = await response.json();
-  openDetailPanel(`${config.actionLabel || "작업"} 결과`, payload);
-  await fetchTable(tableKey);
+  try {
+    const filters = tableFilters(tableKey);
+    const payload = await runWithLocalTokenRetry((token) => postWithLocalToken(config.actionEndpoint(filters), token));
+    if (!payload) {
+      setTableStatus(tableKey, "취소", "muted");
+      return;
+    }
+    openDetailPanel(`${config.actionLabel || "작업"} 결과`, payload);
+    await fetchTable(tableKey);
+  } catch (error) {
+    openDetailPanel(`${config.actionLabel || "작업"} 오류`, { error: error.message });
+    setTableStatus(tableKey, "오류", "bad");
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+      button.textContent = originalText;
+    }
+  }
 }
 
 function toggleAutoRefresh(tableKey, enabled) {
@@ -406,7 +494,7 @@ async function fetchTable(tableKey) {
   try {
     const payload = await apiGet(config.endpoint, params, tableKey);
     if (state.tables[tableKey].requestSeq !== seq) return;
-    const items = normalizeItems(payload);
+    const items = normalizeItems(payload, tableKey);
     const pagination = payload.pagination || { limit: table.limit, offset: table.offset, count: items.length, has_next: items.length >= table.limit, has_prev: table.offset > 0 };
     updateTableState(tableKey, {
       loading: false,
@@ -423,8 +511,12 @@ async function fetchTable(tableKey) {
   }
 }
 
-function normalizeItems(payload) {
-  return payload.items || payload.samples || [];
+function normalizeItems(payload, tableKey = "") {
+  if (tableKey === "thresholdAB" && Array.isArray(payload.candidates)) {
+    const results = payload.results || {};
+    return payload.candidates.map((item) => ({ ...item, result: results[String(item.candidate_id || "")] || item.result || {} }));
+  }
+  return payload.items || payload.samples || payload.candidates || [];
 }
 
 function renderTable(tableKey) {
@@ -445,11 +537,17 @@ function renderTable(tableKey) {
     });
   }
   renderPagination(tableKey);
-  const fetched = table.lastFetchedAt ? table.lastFetchedAt.toLocaleTimeString() : "아직 조회 안 함";
+  updateFreshness(tableKey);
+}
+
+function updateFreshness(tableKey) {
+  const table = state.tables[tableKey];
+  const items = table.items || [];
+  const fetched = table.lastFetchedAt ? table.lastFetchedAt.toLocaleTimeString() : "아직 조회 전";
   const stale = table.lastFetchedAt && Date.now() - table.lastFetchedAt.getTime() > 30000;
   const freshness = document.getElementById(`${tableKey}-freshness`);
   if (freshness) {
-    freshness.textContent = `${stale ? "오래됨 " : ""}조회 ${fetched}`;
+    freshness.textContent = `${stale ? "오래된 데이터 - " : ""}조회 ${fetched}`;
     freshness.className = `freshness ${stale ? "stale" : ""}`;
   }
   setTableStatus(tableKey, `${(table.pagination || {}).count ?? items.length}건`, stale ? "warn" : "ok");
@@ -523,12 +621,18 @@ function closeDetailPanel() {
 }
 
 function detailSummaryHtml(payload) {
-  const record = payload.record || payload.item || payload.report || payload;
+  const record = payload.record || payload.item || payload.report || payload.candidate || payload;
   const keys = ["command_id", "intent_id", "candidate_id", "report_id", "sample_id", "experiment_id", "lifecycle_id", "status", "command_type", "code", "reason", "error"];
   return keys
     .filter((key) => record && record[key] != null && record[key] !== "")
-    .map((key) => `<div><span>${escapeHtml(key)}</span><strong>${escapeHtml(record[key])}</strong></div>`)
+    .map((key) => `<div><span>${escapeHtml(key)}</span><strong>${escapeHtml(summaryValue(record[key]))}</strong></div>`)
     .join("") || '<span class="empty">요약할 핵심 필드가 없습니다</span>';
+}
+
+function summaryValue(value) {
+  if (value == null) return "-";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
 }
 
 function renderRows(id, rows, emptyColumns) {
@@ -566,7 +670,7 @@ function renderThresholdRecommendations(id, rows) {
   if (!node) return;
   const lines = firstItems(rows || [], 5).map((item) => {
     const delta = item.delta || {};
-    return `${item.label_ko || item.candidate_id || "-"} · ${gradeKo(item.grade)} · FP -${delta.avoided_false_positive_count || 0} / FN +${delta.newly_created_false_negative_count || 0}`;
+    return `${item.label_ko || item.candidate_id || "-"} - ${gradeKo(item.grade)} - FP -${delta.avoided_false_positive_count || 0} / FN +${delta.newly_created_false_negative_count || 0}`;
   });
   node.innerHTML = lines.length ? lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">아직 추천 후보가 없습니다. DRY_RUN 표본이 더 쌓이면 자동으로 표시됩니다.</span>';
 }
@@ -599,8 +703,7 @@ function renderOpsAlerts(payload) {
     node.innerHTML = '<div class="alert-item ok"><strong>정상</strong><span>현재 긴급 운영 알림이 없습니다. OBSERVE/DRY_RUN 수집을 계속해도 됩니다.</span></div>';
     return;
   }
-  node.innerHTML = alerts
-    .slice(0, 8)
+  node.innerHTML = firstItems(alerts, 8)
     .map((alert) => {
       const tone = alert.severity === "critical" ? "bad" : alert.severity === "warning" ? "warn" : "info";
       return `
@@ -632,13 +735,14 @@ function render(snapshot) {
   const logs = snapshot.logs || { core: [], gateway: [], warnings: [] };
   const opsAlerts = snapshot.ops_alerts || { summary: {}, alerts: [] };
 
-  text("snapshot-time", snapshot.timestamp || "");
+  text("snapshot-time", snapshot.timestamp || "대기 중");
   text("core-mode", core.mode || "OBSERVE");
+  cls("core-mode", `pill ${core.mode === "LIVE" ? "warn" : core.mode === "DRY_RUN" ? "ok" : "muted"}`);
   text("core-state", core.service ? "정상" : "대기");
   const gatewayState = gateway.connection_state || "DISCONNECTED";
   text("gateway-state", gatewayState);
   text("gateway-connection", gatewayState);
-  text("kiwoom-login", gateway.kiwoom_logged_in ? "예" : "아니오");
+  text("kiwoom-login", yesNo(gateway.kiwoom_logged_in));
   text("heartbeat-age", gateway.heartbeat_age_sec == null ? "-" : `${fmtNumber(gateway.heartbeat_age_sec, 0)}s`);
   text("orderable-state", gateway.orderable ? "주문 가능" : "주문 차단");
   cls("gateway-state", `pill ${gateway.heartbeat_ok ? "ok" : gateway.connected ? "warn" : "bad"}`);
@@ -658,7 +762,7 @@ function render(snapshot) {
   text("transport-ws-decision", transport.websocket_recommendation || "KEEP_REST_LONG_POLL");
   const realPilot = transport.real_gateway_websocket_pilot || {};
   text("transport-real-pilot-state", realPilot.enabled ? `${realPilot.connected ? "연결됨" : "미연결"} / ${realPilot.state || "-"}` : "비활성");
-  text("transport-real-pilot-session", compactId(realPilot.ws_session_id || "-").replace(/<[^>]+>/g, ""));
+  text("transport-real-pilot-session", compactPlain(realPilot.ws_session_id || "-"));
   text("transport-real-pilot-reconnect", realPilot.reconnect_count || 0);
   text("transport-real-pilot-blocked-orders", realPilot.blocked_order_command_count || 0);
   text("transport-real-pilot-session-loss", realPilot.session_loss_count || 0);
@@ -678,15 +782,15 @@ function render(snapshot) {
   text("transport-exp-rest-ack", formatMs(transportExperiment.rest_ack_p95_ms));
   text("transport-exp-ws-ack", formatMs(transportExperiment.websocket_ack_p95_ms));
   text("transport-exp-ack-delta", formatMs(transportExperiment.ack_p95_delta_ms));
-  text("transport-exp-ready", transportExperiment.real_gateway_switch_ready ? "예" : "아니오");
+  text("transport-exp-ready", yesNo(transportExperiment.real_gateway_switch_ready));
   const expBlockerNode = document.getElementById("transport-exp-blockers");
   if (expBlockerNode) {
     const blockers = transportExperiment.blockers || [];
     expBlockerNode.innerHTML = blockers.length ? blockers.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">최근 Mock 비교에서 확인된 차단 요인이 없습니다</span>';
   }
 
-  text("runtime-enabled", runtime.enabled ? "예" : "아니오");
-  text("runtime-running", runtime.running ? "예" : "아니오");
+  text("runtime-enabled", yesNo(runtime.enabled));
+  text("runtime-running", yesNo(runtime.running));
   text("runtime-mode", runtime.mode || "OBSERVE");
   text("runtime-last-cycle", runtime.last_cycle_at || "-");
   text("runtime-cycle-count", runtime.cycle_count || 0);
@@ -782,23 +886,36 @@ function render(snapshot) {
   if (logNode) logNode.innerHTML = logLines.length ? logLines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">로그가 없습니다</span>';
 }
 
+function compactPlain(value) {
+  const textValue = String(value || "-");
+  if (textValue.length <= 24) return textValue;
+  return `${textValue.substring(0, 10)}...${textValue.substring(textValue.length - 8)}`;
+}
+
 async function pollSnapshot() {
   const response = await fetch("/api/snapshot");
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   render(await response.json());
 }
 
-async function runtimeCommand(action) {
-  let token = localStorage.getItem("TRADING_CORE_TOKEN") || "";
-  if (!token) {
-    token = window.prompt("TRADING_CORE_TOKEN") || "";
-    if (token) localStorage.setItem("TRADING_CORE_TOKEN", token);
+async function runtimeCommand(action, button) {
+  const originalText = button?.textContent || "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "실행 중";
   }
-  if (!token) return;
-  await fetch(`/api/runtime/${action}`, {
-    method: "POST",
-    headers: { "X-Local-Token": token },
-  });
-  await pollSnapshot();
+  try {
+    const payload = await runWithLocalTokenRetry((token) => postWithLocalToken(`/api/runtime/${action}`, token));
+    if (!payload) return;
+    await pollSnapshot();
+  } catch (error) {
+    openDetailPanel("Runtime 작업 오류", { action, error: error.message });
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
 }
 
 function startPolling() {
@@ -822,6 +939,16 @@ function connectWebSocket() {
   ws.onerror = () => startPolling();
 }
 
+function initTabs() {
+  document.querySelectorAll("[data-tab-target]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const target = button.dataset.tabTarget;
+      document.querySelectorAll("[data-tab-target]").forEach((item) => item.classList.toggle("active", item === button));
+      document.querySelectorAll("[data-tab-panel]").forEach((panel) => panel.classList.toggle("active", panel.dataset.tabPanel === target));
+    });
+  });
+}
+
 function initTables() {
   Object.entries(tableConfigs).forEach(([tableKey, config]) => {
     state.tables[tableKey] = { limit: config.defaultLimit || 50, offset: 0, requestSeq: 0 };
@@ -832,12 +959,13 @@ function initTables() {
 }
 
 function initDashboard() {
+  initTabs();
   connectWebSocket();
   setTimeout(startPolling, 2000);
   initTables();
-  document.getElementById("runtime-start")?.addEventListener("click", () => runtimeCommand("start").catch(() => {}));
-  document.getElementById("runtime-stop")?.addEventListener("click", () => runtimeCommand("stop").catch(() => {}));
-  document.getElementById("runtime-cycle")?.addEventListener("click", () => runtimeCommand("cycle").catch(() => {}));
+  document.getElementById("runtime-start")?.addEventListener("click", (event) => runtimeCommand("start", event.currentTarget).catch(() => {}));
+  document.getElementById("runtime-stop")?.addEventListener("click", (event) => runtimeCommand("stop", event.currentTarget).catch(() => {}));
+  document.getElementById("runtime-cycle")?.addEventListener("click", (event) => runtimeCommand("cycle", event.currentTarget).catch(() => {}));
   document.getElementById("detail-close")?.addEventListener("click", closeDetailPanel);
   document.getElementById("detail-backdrop")?.addEventListener("click", closeDetailPanel);
 }
