@@ -11,6 +11,7 @@ from trading.strategy.candles import CandleBuilder
 from trading.strategy.conditions import ConditionProfileRepository, RegisteredCondition
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import IndexCodeMapper, MarketIndexStore
+from trading.theme_engine.runtime import RealTimeThemeRuntime
 
 
 WarningSink = Callable[[str], None]
@@ -72,6 +73,44 @@ class GatewayEventMarketDataBridge:
 
     def data_quality_snapshot(self) -> dict[str, Any]:
         return self._bridge.data_quality_snapshot()
+
+    def _warn(self, warning: str) -> None:
+        if self.warning_sink is not None:
+            self.warning_sink(warning)
+
+
+class GatewayEventThemeRuntimeBridge:
+    def __init__(
+        self,
+        theme_runtime: RealTimeThemeRuntime,
+        *,
+        warning_sink: WarningSink | None = None,
+        index_code_mapper: IndexCodeMapper | None = None,
+    ) -> None:
+        self.theme_runtime = theme_runtime
+        self.warning_sink = warning_sink
+        self.index_code_mapper = index_code_mapper or IndexCodeMapper()
+
+    def handle_event(self, event: GatewayEvent) -> bool:
+        if event.type != "price_tick":
+            return False
+        return self.handle_price_tick(dict(event.payload or {}))
+
+    def handle_price_tick(self, payload: dict[str, Any]) -> bool:
+        code = str(payload.get("code") or payload.get("stock_code") or "").strip()
+        if not code:
+            self._warn("THEME_PRICE_TICK_CODE_MISSING")
+            return False
+        instrument_type = str(payload.get("instrument_type") or "").strip().lower()
+        if instrument_type == "index" or (not instrument_type and self.index_code_mapper.is_index_code(code)):
+            return False
+        try:
+            snapshot = self.theme_runtime.realtime_adapter.from_kiwoom_real_data(code, payload)
+            self.theme_runtime.on_stock_snapshot(snapshot)
+            return True
+        except Exception as exc:
+            self._warn(f"THEME_RUNTIME_TICK_FAILED:{code}:{exc}")
+            return False
 
     def _warn(self, warning: str) -> None:
         if self.warning_sink is not None:

@@ -294,6 +294,9 @@ class RuntimeSupervisor:
         if self._bundle is None:
             return
         self._bundle.market_data_bridge.handle_event(event)
+        theme_bridge = getattr(self._bundle, "theme_runtime_bridge", None)
+        if theme_bridge is not None:
+            theme_bridge.handle_event(event)
 
     def _build_readiness_in_worker(self) -> dict[str, Any]:
         db = TradingDatabase(str(self.settings.db_path))

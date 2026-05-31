@@ -1,91 +1,66 @@
 # Dynamic Theme Engine
 
-## Why CSV mappings were retired
+## Source Policy
 
-`theme_mappings.csv` was a static review artifact. It could not discover new
-intraday narratives, could not explain why a stock belonged to a theme, and
-made stale manual mappings look authoritative. The dynamic engine replaces it
-with source evidence, canonical theme resolution, membership scoring, activity
-scoring, and explicit readiness states.
+The theme universe source is Naver Finance only:
 
-## Why Kiwoom alone is not enough
+```text
+https://finance.naver.com/sise/theme.naver?field=change_rate&ordering=desc
+```
 
-Kiwoom theme groups are useful but incomplete. New themes often appear first in
-licensed external datasets, news/event streams, or intraday co-movement before
-they exist in Kiwoom groups. FuriosaAI is the reference case: it can be absent
-from Kiwoom while external/news sources and live clustering still identify
-related stocks.
+Naver is used only for theme names, detail links, stock membership, and optional
+membership reason text. Naver change rate, volume, turnover, listed leader
+stocks, and page ranking are not persisted as scoring inputs and are not used
+for intraday buy decisions.
+
+Kiwoom theme catalog APIs, static CSV mappings, fixture production sources, and
+dynamic cluster source creation are retired from the runtime path.
 
 ## Architecture
 
-- `KiwoomThemeSource`: adapter shell for `GetThemeGroupList`,
-  `GetThemeGroupCode`, `GetMasterCodeName`, `opt90001`, and `opt90002`.
-- `ExternalThemeSourceBase`: interface for licensed sources such as Infostock,
-  themelab-style feeds, or approved news APIs.
-- News/Event source adapters: future adapters emit the same
-  `ThemeSourcePayload` and `ThemeMemberEvidence` objects.
-- `DynamicThemeClusterDetector`: detects intraday co-movement when no source
-  theme exists yet.
-- `ThemeCanonicalResolver`: merges source names and aliases into
-  `canonical_themes`.
-- `ThemeEvidenceService`: persists source member evidence.
-- `ThemeMembershipBuilder`: builds `theme_membership_current` with confidence,
-  source count, relation type, and freshness weighting.
-- `ThemeScoringEngine`: writes `theme_activity_snapshots`, leader diagnostics,
-  breadth, turnover strength, and leader-only risk.
-- WebSocket API: exposes rank, detail, stock state, heartbeat, and error
-  payloads without requiring FastAPI for core tests.
-- GatePipeline integration: uses `DynamicThemeContextProvider`; no static
-  fallback is allowed.
+- `NaverThemeUniverseSource`: crawls Naver theme list/detail pages and emits
+  `ThemeSourcePayload` plus `ThemeMemberEvidence`.
+- `ThemeSourceSyncService`: runs the Naver source and supports replace sync
+  that purges retired source evidence before rebuilding memberships.
+- `ThemeCanonicalResolver`: resolves Naver theme names into canonical themes.
+- `ThemeMembershipBuilder`: builds `theme_membership_current`.
+- `KiwoomRealtimeThemeAdapter`: converts Kiwoom realtime price ticks into
+  `StockSnapshot`.
+- `RealTimeThemeRuntime`: combines membership with Kiwoom realtime snapshots,
+  ranks themes, and stores activity snapshots.
+- `GatePipeline`: reads `DynamicThemeContextProvider` and records hybrid
+  READY/WAIT/BLOCKED/OBSERVE decisions in OBSERVE/DRY_RUN validation fields.
 
-## Theme states
+## Sync
 
-- `CANDIDATE`: created from a source or cluster but not yet trusted.
-- `WATCH`: enough evidence to monitor and score.
-- `ACTIVE`: strong enough for strategy priority, subject to trade eligibility.
-- `STALE`: old or no longer active.
+Manual CLI sync:
 
-## Trading integration
+```powershell
+python -m trading.theme_engine.sync_naver_universe --db data/trader.sqlite3
+```
 
-Only `ACTIVE` or `WATCH` contexts with `trade_eligible=True` should improve a
-candidate. `LEADER_ONLY_THEME` is recorded when breadth is weak and a single
-leader explains most of the move. `NO_ACTIVE_THEME` and
-`THEME_CONTEXT_NOT_READY` block or wait without falling back to legacy mappings.
-Actual order execution, stop loss, and sell logic are unchanged.
+Manual API sync:
+
+```text
+POST /api/themes/sync/naver?replace=true&max_pages=20
+```
+
+The API requires the local gateway token. `replace=true` is the default and
+removes old Naver evidence plus retired `kiwoom`, `fixture`, and internal source
+evidence before rebuilding the current universe.
+
+## Realtime Scoring
+
+Theme strength, breadth, leader, co-leader, follower, and late-laggard
+classification are derived from Kiwoom realtime price ticks only. The Naver
+source never supplies intraday score inputs.
 
 ## Demo
 
 ```powershell
-python -m trading.theme_engine.demo --db data/theme_engine_demo.sqlite3 --fixture tests/fixtures/theme_engine/furiosa_ai.json
+python -m trading.theme_engine.demo `
+  --db data/theme_engine_demo.sqlite3 `
+  --list-html tests/fixtures/naver_theme/list.html `
+  --detail-dir tests/fixtures/naver_theme `
+  --ticks tests/fixtures/theme_engine/furiosa_ticks.json
 ```
-
-The demo creates a fresh DB, syncs fixture source themes, resolves aliases,
-stores evidence, builds current membership, scores mock ticks, and prints a
-`theme_rank` JSON payload.
-
-## WebSocket payload
-
-```json
-{
-  "type": "theme_rank",
-  "top_n": 20,
-  "themes": [
-    {
-      "rank": 1,
-      "theme_id": "furiosa_ai",
-      "theme_name": "퓨리오사AI",
-      "theme_score": 84.5,
-      "status": "ACTIVE",
-      "trade_eligible": true
-    }
-  ]
-}
-```
-
-## Next PR
-
-- Harden live Kiwoom `opt90001`/`opt90002` sync.
-- Connect licensed external source adapters.
-- Add news keyword/event source adapters.
-- Build UI theme ranking and detail views.
-- Run GatePipeline weight A/B tests with dynamic theme scores.

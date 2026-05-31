@@ -1,4 +1,5 @@
 from storage.db import TradingDatabase
+from tests.theme_naver_helpers import repo_with_naver_fixture
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import BrokerPriceTick, GatewayEvent, utc_timestamp
 from trading.strategy.candles import CandleBuilder
@@ -6,10 +7,12 @@ from trading.strategy.conditions import ConditionProfile, ConditionProfileReposi
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import MarketIndexStore
 from trading.strategy.models import StrategyProfile
+from trading.theme_engine.runtime import RealTimeThemeRuntime
 from trading_app.runtime_adapters import (
     GatewayCommandConditionAdapter,
     GatewayCommandRealtimeClient,
     GatewayEventMarketDataBridge,
+    GatewayEventThemeRuntimeBridge,
 )
 
 
@@ -74,6 +77,29 @@ def test_gateway_price_tick_updates_index_store():
     assert bridge.handle_price_tick({"code": "001", "price": 330000, "instrument_type": "index", "name": "KOSPI"}) is True
 
     assert market_index_store.state("KOSPI").price == 330000
+
+
+def test_gateway_price_tick_updates_theme_runtime_from_kiwoom_tick(tmp_path):
+    db, repo = repo_with_naver_fixture(tmp_path)
+    try:
+        runtime = RealTimeThemeRuntime(repo, scoring_interval_sec=0, db_snapshot_interval_sec=0, ws_push_interval_sec=0)
+        bridge = GatewayEventThemeRuntimeBridge(runtime)
+
+        assert bridge.handle_price_tick(
+            {
+                "code": "000001",
+                "price": 1000,
+                "change_rate": 8.0,
+                "cum_volume": 1000,
+                "trade_value": 1000000,
+                "execution_strength": 150,
+            }
+        ) is True
+
+        assert runtime.realtime_adapter.latest_snapshot("000001") is not None
+        assert runtime.get_latest_rank(1)[0].leader_code == "000001"
+    finally:
+        db.close()
 
 
 def test_realtime_adapter_enqueues_gateway_commands():

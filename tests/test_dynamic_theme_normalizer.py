@@ -17,3 +17,4 @@ def test_normalize_theme_name_keeps_alias_variants_stable():
 
 def test_suggest_theme_id_has_furiosa_special_case():
     assert suggest_theme_id("퓨리오사AI") == "furiosa_ai"
+    assert suggest_theme_id("FuriosaAI") == "furiosa_ai"

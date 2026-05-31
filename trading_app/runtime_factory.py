@@ -27,10 +27,12 @@ from trading.strategy.runtime_settings import StrategyRuntimeSettingsRepository
 from trading.strategy.virtual_orders import VirtualOrderService
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
 from trading.theme_engine.repository import ThemeEngineRepository
+from trading.theme_engine.runtime import RealTimeThemeRuntime
 from trading_app.dependencies import CoreSettings
 from trading_app.runtime_adapters import (
     GatewayCommandConditionAdapter,
     GatewayCommandRealtimeClient,
+    GatewayEventThemeRuntimeBridge,
     GatewayEventMarketDataBridge,
 )
 from trading_app.order_enqueue_service import OrderEnqueueService
@@ -42,6 +44,8 @@ class CoreRuntimeBundle:
     runtime: StrategyRuntime
     market_data_bridge: GatewayEventMarketDataBridge
     db: TradingDatabase
+    theme_runtime: Any = None
+    theme_runtime_bridge: Any = None
     order_sink: Any = None
 
 
@@ -78,7 +82,8 @@ def build_core_strategy_runtime(
         require_kiwoom_login=settings.runtime_require_kiwoom_login,
     )
     candidate_collector = CandidateCollector(db, client=condition_adapter)
-    theme_context_provider = DynamicThemeContextProvider(ThemeEngineRepository(db))
+    theme_repository = ThemeEngineRepository(db)
+    theme_context_provider = DynamicThemeContextProvider(theme_repository)
     indicator_calculator = IndicatorCalculator(market_data, candle_builder)
     gate_pipeline = GatePipeline(
         theme_context_provider,
@@ -91,6 +96,8 @@ def build_core_strategy_runtime(
         hybrid_validation_repository=HybridValidationRepository(db),
     )
     realtime_client = GatewayCommandRealtimeClient(gateway_state, warning_sink=warning_sink)
+    theme_runtime = RealTimeThemeRuntime(theme_repository)
+    theme_runtime_bridge = GatewayEventThemeRuntimeBridge(theme_runtime, warning_sink=warning_sink)
     order_sink = _build_order_sink(settings, gateway_state, warning_sink)
     runtime = StrategyRuntime(
         db=db,
@@ -116,7 +123,14 @@ def build_core_strategy_runtime(
         + condition_seed_result.warnings
         + readiness_report.warnings
     )
-    return CoreRuntimeBundle(runtime=runtime, market_data_bridge=market_data_bridge, db=db, order_sink=order_sink)
+    return CoreRuntimeBundle(
+        runtime=runtime,
+        market_data_bridge=market_data_bridge,
+        theme_runtime=theme_runtime,
+        theme_runtime_bridge=theme_runtime_bridge,
+        db=db,
+        order_sink=order_sink,
+    )
 
 
 def _build_order_sink(

@@ -1,16 +1,8 @@
-from pathlib import Path
-
 from storage.db import TradingDatabase
+from tests.theme_naver_helpers import repo_with_naver_fixture
 from trading.strategy.models import Candidate
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
-from trading.theme_engine.evidence import ThemeEvidenceService
-from trading.theme_engine.membership import ThemeMembershipBuilder
 from trading.theme_engine.repository import ThemeEngineRepository
-from trading.theme_engine.resolver import ThemeCanonicalResolver
-from trading.theme_engine.sources.fixture import FixtureThemeSource
-
-
-FIXTURE = Path("tests/fixtures/theme_engine/furiosa_ai.json")
 
 
 def test_context_provider_reports_not_ready_without_membership(tmp_path):
@@ -24,10 +16,7 @@ def test_context_provider_reports_not_ready_without_membership(tmp_path):
 
 
 def test_context_provider_enriches_candidate_from_current_membership(tmp_path):
-    db = TradingDatabase(str(tmp_path / "themes.sqlite3"))
-    repo = ThemeEngineRepository(db)
-    ThemeEvidenceService(repo, ThemeCanonicalResolver(repo)).sync_source(FixtureThemeSource(FIXTURE))
-    ThemeMembershipBuilder(repo).build_all_current_memberships()
+    db, repo = repo_with_naver_fixture(tmp_path)
     provider = DynamicThemeContextProvider(repo)
 
     enriched = provider.enrich_candidate(Candidate(code="000001"))

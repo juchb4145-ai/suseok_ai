@@ -35,6 +35,19 @@ def test_subscription_limit_returns_only_successfully_registered_candidate_codes
     assert len(registered) == 1
 
 
+def test_theme_universe_source_is_non_protected_and_below_candidate_priority():
+    client = MockKiwoomClient()
+    manager = RealTimeSubscriptionManager(client, max_codes=1)
+    manager.ensure_subscription("000001", "theme_universe")
+
+    registered = manager.watch_candidates([candidate("000002")])
+
+    assert registered == ["000002"]
+    assert client.registered_codes == {"000002"}
+    assert manager.records["000001"].protected is False
+    assert manager.records["000001"].priority < manager.records["000002"].priority
+
+
 def test_expired_candidate_does_not_unregister_remaining_leading_subscription():
     client = MockKiwoomClient()
     manager = RealTimeSubscriptionManager(client, max_codes=10)

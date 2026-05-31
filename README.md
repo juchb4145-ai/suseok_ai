@@ -87,6 +87,7 @@ Core API:
 - `GET /api/gateway/status`
 - `GET /api/candidates`
 - `GET /api/themes`
+- `POST /api/themes/sync/naver?replace=true&max_pages=20`
 - `GET /api/orders`
 - `GET /api/reviews`
 - `GET /api/snapshot`

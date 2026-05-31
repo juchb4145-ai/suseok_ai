@@ -1,6 +1,5 @@
-from pathlib import Path
-
 from storage.db import TradingDatabase
+from tests.theme_naver_helpers import repo_with_naver_fixture
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.gates import StockLeadershipGate, ThemeStrengthGate
 from trading.strategy.indicators import IndicatorCalculator
@@ -10,21 +9,10 @@ from trading.strategy.market_index import MarketIndexStore
 from trading.strategy.models import Candidate, CandidateState
 from trading.strategy.pipeline import GatePipeline
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
-from trading.theme_engine.evidence import ThemeEvidenceService
-from trading.theme_engine.membership import ThemeMembershipBuilder
-from trading.theme_engine.repository import ThemeEngineRepository
-from trading.theme_engine.resolver import ThemeCanonicalResolver
-from trading.theme_engine.sources.fixture import FixtureThemeSource
-
-
-FIXTURE = Path("tests/fixtures/theme_engine/furiosa_ai.json")
 
 
 def _provider_and_market(tmp_path):
-    db = TradingDatabase(str(tmp_path / "themes.sqlite3"))
-    repo = ThemeEngineRepository(db)
-    ThemeEvidenceService(repo, ThemeCanonicalResolver(repo)).sync_source(FixtureThemeSource(FIXTURE))
-    ThemeMembershipBuilder(repo).build_all_current_memberships()
+    db, repo = repo_with_naver_fixture(tmp_path)
     provider = DynamicThemeContextProvider(repo)
     market = MarketDataStore()
     for code, rate, value in [("000001", 8.7, 120_000_000_000), ("000002", 5.9, 65_000_000_000), ("000003", 4.2, 28_000_000_000)]:

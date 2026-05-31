@@ -6,7 +6,6 @@ from typing import Optional
 
 from trading.theme_engine.models import (
     CanonicalTheme,
-    DynamicThemeCluster,
     RelationType,
     SourceTheme,
     ThemeActivitySnapshot,
@@ -253,6 +252,65 @@ class ThemeEngineRepository:
         ).fetchone()
         return _row_to_membership(row)
 
+    def delete_current_memberships_for_theme(self, theme_id: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM theme_membership_current WHERE theme_id = ?", (theme_id,))
+
+    def purge_sources(self, sources: list[str] | tuple[str, ...] | set[str]) -> dict[str, int]:
+        source_names = sorted({str(source or "").strip() for source in sources if str(source or "").strip()})
+        if not source_names:
+            return {
+                "source_count": 0,
+                "affected_theme_count": 0,
+                "evidence_deleted": 0,
+                "catalog_deleted": 0,
+                "alias_deleted": 0,
+                "membership_deleted": 0,
+            }
+        placeholders = ",".join("?" for _ in source_names)
+        affected_rows = self.conn.execute(
+            f"SELECT DISTINCT theme_id FROM theme_member_evidence WHERE source IN ({placeholders})",
+            tuple(source_names),
+        ).fetchall()
+        affected_theme_ids = sorted({str(row["theme_id"]) for row in affected_rows if str(row["theme_id"] or "")})
+        with self.conn:
+            evidence_deleted = self.conn.execute(
+                f"DELETE FROM theme_member_evidence WHERE source IN ({placeholders})",
+                tuple(source_names),
+            ).rowcount
+            catalog_deleted = self.conn.execute(
+                f"DELETE FROM source_theme_catalog WHERE source IN ({placeholders})",
+                tuple(source_names),
+            ).rowcount
+            alias_deleted = self.conn.execute(
+                f"DELETE FROM theme_aliases WHERE source IN ({placeholders})",
+                tuple(source_names),
+            ).rowcount
+            membership_deleted = 0
+            if affected_theme_ids:
+                theme_placeholders = ",".join("?" for _ in affected_theme_ids)
+                membership_deleted = self.conn.execute(
+                    f"DELETE FROM theme_membership_current WHERE theme_id IN ({theme_placeholders})",
+                    tuple(affected_theme_ids),
+                ).rowcount
+                self.conn.execute(
+                    f"""
+                    UPDATE canonical_themes
+                    SET status = ?, trade_eligible = 0, confidence = 0, updated_at = CURRENT_TIMESTAMP
+                    WHERE theme_id IN ({theme_placeholders})
+                      AND theme_id NOT IN (SELECT DISTINCT theme_id FROM theme_member_evidence)
+                    """,
+                    (ThemeStatus.STALE.value, *affected_theme_ids),
+                )
+        return {
+            "source_count": len(source_names),
+            "affected_theme_count": len(affected_theme_ids),
+            "evidence_deleted": int(evidence_deleted),
+            "catalog_deleted": int(catalog_deleted),
+            "alias_deleted": int(alias_deleted),
+            "membership_deleted": int(membership_deleted),
+        }
+
     def get_members_by_theme(self, theme_id: str, active: bool = True) -> list[ThemeMembership]:
         query = "SELECT * FROM theme_membership_current WHERE theme_id = ?"
         params: list[object] = [theme_id]
@@ -357,40 +415,6 @@ class ThemeEngineRepository:
             (int(top_n),),
         ).fetchall()
         return [_row_to_rank_item(row) for row in rows]
-
-    def save_dynamic_cluster(self, cluster: DynamicThemeCluster) -> DynamicThemeCluster:
-        with self.conn:
-            self.conn.execute(
-                """
-                INSERT INTO dynamic_theme_clusters(
-                    cluster_id, matched_theme_id, status, stock_codes_json,
-                    keywords_json, score, reason, last_seen_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                ON CONFLICT(cluster_id) DO UPDATE SET
-                    matched_theme_id=excluded.matched_theme_id,
-                    status=excluded.status,
-                    stock_codes_json=excluded.stock_codes_json,
-                    keywords_json=excluded.keywords_json,
-                    score=excluded.score,
-                    reason=excluded.reason,
-                    last_seen_at=CURRENT_TIMESTAMP,
-                    updated_at=CURRENT_TIMESTAMP
-                """,
-                (
-                    cluster.cluster_id,
-                    cluster.matched_theme_id,
-                    _enum_value(cluster.status),
-                    json.dumps(cluster.stock_codes, ensure_ascii=False),
-                    json.dumps(cluster.keywords, ensure_ascii=False),
-                    float(cluster.score),
-                    cluster.reason,
-                ),
-            )
-        row = self.conn.execute(
-            "SELECT * FROM dynamic_theme_clusters WHERE cluster_id = ?",
-            (cluster.cluster_id,),
-        ).fetchone()
-        return _row_to_cluster(row)
 
     def count_current_memberships(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) AS count FROM theme_membership_current").fetchone()
@@ -571,21 +595,6 @@ def _row_to_rank_item(row: sqlite3.Row) -> ThemeRankItem:
         leader_gap=float(row["leader_gap"]),
         top3_concentration=float(row["top3_concentration"]),
         details=details,
-    )
-
-
-def _row_to_cluster(row: sqlite3.Row) -> DynamicThemeCluster:
-    return DynamicThemeCluster(
-        cluster_id=row["cluster_id"],
-        matched_theme_id=row["matched_theme_id"],
-        status=ThemeStatus(row["status"]),
-        stock_codes=list(json.loads(row["stock_codes_json"] or "[]")),
-        keywords=list(json.loads(row["keywords_json"] or "[]")),
-        score=float(row["score"]),
-        reason=row["reason"],
-        first_seen_at=row["first_seen_at"],
-        last_seen_at=row["last_seen_at"],
-        updated_at=row["updated_at"],
     )
 
 

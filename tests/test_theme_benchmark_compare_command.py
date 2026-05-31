@@ -5,7 +5,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-THEME_FIXTURE = ROOT / "tests" / "fixtures" / "theme_engine" / "furiosa_ai.json"
+NAVER_LIST = ROOT / "tests" / "fixtures" / "naver_theme" / "list.html"
+NAVER_DETAIL_DIR = ROOT / "tests" / "fixtures" / "naver_theme"
+TICKS = ROOT / "tests" / "fixtures" / "theme_engine" / "furiosa_ticks.json"
 SAMPLE_EXTERNAL = ROOT / "tests" / "fixtures" / "theme_benchmark" / "sample_royalroader.json"
 
 
@@ -13,8 +15,12 @@ def test_compare_command_replays_fixture_and_compares_sample_external(tmp_path):
     out_dir = tmp_path / "reports" / "theme_benchmark"
     result = _run_compare(
         tmp_path,
-        "--fixture",
-        str(THEME_FIXTURE),
+        "--list-html",
+        str(NAVER_LIST),
+        "--detail-dir",
+        str(NAVER_DETAIL_DIR),
+        "--ticks",
+        str(TICKS),
         "--db",
         str(tmp_path / "theme_replay.sqlite3"),
         "--trade-date",
@@ -84,8 +90,12 @@ def test_compare_command_skips_when_external_missing(tmp_path):
     out_dir = tmp_path / "reports" / "theme_benchmark"
     result = _run_compare(
         tmp_path,
-        "--fixture",
-        str(THEME_FIXTURE),
+        "--list-html",
+        str(NAVER_LIST),
+        "--detail-dir",
+        str(NAVER_DETAIL_DIR),
+        "--ticks",
+        str(TICKS),
         "--db",
         str(tmp_path / "theme_replay.sqlite3"),
         "--trade-date",
@@ -132,8 +142,12 @@ def test_compare_command_does_not_fail_on_low_overlap(tmp_path):
 
     result = _run_compare(
         tmp_path,
-        "--fixture",
-        str(THEME_FIXTURE),
+        "--list-html",
+        str(NAVER_LIST),
+        "--detail-dir",
+        str(NAVER_DETAIL_DIR),
+        "--ticks",
+        str(TICKS),
         "--db",
         str(tmp_path / "theme_replay.sqlite3"),
         "--trade-date",
@@ -157,8 +171,12 @@ def test_compare_command_fails_on_external_parse_error(tmp_path):
 
     result = _run_compare(
         tmp_path,
-        "--fixture",
-        str(THEME_FIXTURE),
+        "--list-html",
+        str(NAVER_LIST),
+        "--detail-dir",
+        str(NAVER_DETAIL_DIR),
+        "--ticks",
+        str(TICKS),
         "--db",
         str(tmp_path / "theme_replay.sqlite3"),
         "--trade-date",

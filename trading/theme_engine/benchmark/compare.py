@@ -10,9 +10,11 @@ from trading.theme_engine.benchmark.comparator import compare_theme_benchmarks
 from trading.theme_engine.benchmark.internal_export import export_internal_theme_benchmark
 from trading.theme_engine.benchmark.loader import load_external_theme_benchmark
 from trading.theme_engine.benchmark.report import write_benchmark_reports
+from trading.theme_engine.naver_local_session import LocalNaverFixtureSession
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime import DynamicThemeEngineRuntime
-from trading.theme_engine.sources.fixture import FixtureThemeSource
+from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSourceSyncService
+from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThemeUniverseSource
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,7 +44,9 @@ def main(argv: list[str] | None = None) -> int:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare internal replay and external theme benchmark snapshots.")
     parser.add_argument("--internal", help="Existing internal benchmark snapshot JSON.")
-    parser.add_argument("--fixture", help="Fixture JSON to replay into an internal benchmark snapshot.")
+    parser.add_argument("--list-html", help="Naver theme list HTML fixture to replay.")
+    parser.add_argument("--detail-dir", help="Directory containing detail_{no}.html fixtures.")
+    parser.add_argument("--ticks", help="Realtime tick JSON fixture.")
     parser.add_argument("--db", help="Fresh SQLite database path for fixture replay.")
     parser.add_argument("--trade-date", help="Trade date for replay/report, YYYY-MM-DD.")
     parser.add_argument("--external", help="External benchmark JSON or CSV snapshot. Missing/omitted file skips comparison.")
@@ -51,30 +55,40 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _load_or_replay_internal(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
-    if args.fixture:
+    if args.list_html:
         if not args.db:
-            raise ValueError("--db is required with --fixture")
+            raise ValueError("--db is required with --list-html")
         if not args.trade_date:
-            raise ValueError("--trade-date is required with --fixture")
-        snapshot = _replay_fixture(Path(args.fixture), Path(args.db), args.trade_date)
+            raise ValueError("--trade-date is required with --list-html")
+        if not args.detail_dir or not args.ticks:
+            raise ValueError("--detail-dir and --ticks are required with --list-html")
+        snapshot = _replay_naver(Path(args.list_html), Path(args.detail_dir), Path(args.ticks), Path(args.db), args.trade_date)
         internal_path = out_dir / f"internal_{args.trade_date}.json"
         internal_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return snapshot
     if args.internal:
         return dict(json.loads(Path(args.internal).read_text(encoding="utf-8")))
-    raise ValueError("--internal or --fixture is required")
+    raise ValueError("--internal or --list-html is required")
 
 
-def _replay_fixture(fixture_path: Path, db_path: Path, trade_date: str) -> dict[str, Any]:
+def _replay_naver(list_html: Path, detail_dir: Path, ticks_path: Path, db_path: Path, trade_date: str) -> dict[str, Any]:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     _remove_existing_db(db_path)
-    source = FixtureThemeSource(fixture_path)
     db = TradingDatabase(str(db_path))
     try:
         repository = ThemeEngineRepository(db)
+        source = NaverThemeUniverseSource(
+            session=LocalNaverFixtureSession(list_html, detail_dir),
+            max_pages=1,
+            request_delay_sec=0,
+        )
+        ThemeSourceSyncService(repository, [source]).sync_source(
+            NAVER_THEME_SOURCE_NAME,
+            replace=True,
+            purge_sources=RETIRED_THEME_SOURCE_NAMES,
+        )
         runtime = DynamicThemeEngineRuntime(repository)
-        runtime.sync_source(source)
-        ranked = runtime.score_fixture_ticks(source.mock_snapshots())
+        ranked = runtime.score_ticks(json.loads(ticks_path.read_text(encoding="utf-8")))
         return dict(export_internal_theme_benchmark(ranked, trade_date=trade_date))
     finally:
         db.close()

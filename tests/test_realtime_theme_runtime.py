@@ -1,25 +1,21 @@
+import json
 from pathlib import Path
 
-from storage.db import TradingDatabase
+from tests.theme_naver_helpers import repo_with_naver_fixture
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime import RealTimeThemeRuntime
-from trading.theme_engine.source_sync import ThemeSourceSyncService
-from trading.theme_engine.sources.fixture import FixtureThemeSource
 from trading.theme_engine.stock_snapshot import snapshot_from_dict
 
 
-FIXTURE = Path("tests/fixtures/theme_engine/furiosa_ai.json")
+TICKS = Path("tests/fixtures/theme_engine/furiosa_ticks.json")
 
 
 def test_realtime_theme_runtime_recalculates_rank_and_health(tmp_path):
-    db = TradingDatabase(str(tmp_path / "theme.sqlite3"))
-    repo = ThemeEngineRepository(db)
-    source = FixtureThemeSource(FIXTURE)
-    ThemeSourceSyncService(repo, [source]).sync_all_sources()
+    db, repo = repo_with_naver_fixture(tmp_path)
     runtime = RealTimeThemeRuntime(repo, scoring_interval_sec=0, db_snapshot_interval_sec=0, ws_push_interval_sec=0)
 
     runtime.start()
-    for tick in source.mock_snapshots():
+    for tick in json.loads(TICKS.read_text(encoding="utf-8")):
         runtime.on_stock_snapshot(snapshot_from_dict(tick))
 
     rank = runtime.get_latest_rank()

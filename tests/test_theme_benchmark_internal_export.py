@@ -5,7 +5,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURE = ROOT / "tests" / "fixtures" / "theme_engine" / "furiosa_ai.json"
+NAVER_LIST = ROOT / "tests" / "fixtures" / "naver_theme" / "list.html"
+NAVER_DETAIL_DIR = ROOT / "tests" / "fixtures" / "naver_theme"
+TICKS = ROOT / "tests" / "fixtures" / "theme_engine" / "furiosa_ticks.json"
 
 
 def test_fixture_replay_exports_internal_benchmark_snapshot(tmp_path):
@@ -17,8 +19,12 @@ def test_fixture_replay_exports_internal_benchmark_snapshot(tmp_path):
             sys.executable,
             "-m",
             "trading.theme_engine.benchmark.replay",
-            "--fixture",
-            str(FIXTURE),
+            "--list-html",
+            str(NAVER_LIST),
+            "--detail-dir",
+            str(NAVER_DETAIL_DIR),
+            "--ticks",
+            str(TICKS),
             "--db",
             str(db_path),
             "--trade-date",

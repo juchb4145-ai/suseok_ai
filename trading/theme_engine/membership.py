@@ -26,6 +26,7 @@ class ThemeMembershipBuilder:
 
     def build_current_membership(self, theme_id: str) -> list[ThemeMembership]:
         evidences = self.repository.list_member_evidence(theme_id)
+        self.repository.delete_current_memberships_for_theme(theme_id)
         by_stock: dict[str, list] = {}
         for evidence in evidences:
             by_stock.setdefault(evidence.stock_code, []).append(evidence)

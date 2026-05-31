@@ -1,33 +1,24 @@
 import json
 from pathlib import Path
 
-from storage.db import TradingDatabase
-from trading.theme_engine.evidence import ThemeEvidenceService
-from trading.theme_engine.membership import ThemeMembershipBuilder
+from tests.theme_naver_helpers import repo_with_naver_fixture
 from trading.theme_engine.models import ThemeMembership
-from trading.theme_engine.repository import ThemeEngineRepository
-from trading.theme_engine.resolver import ThemeCanonicalResolver
 from trading.theme_engine.scorer import ThemeScoringEngine
-from trading.theme_engine.sources.fixture import FixtureThemeSource
 from trading.theme_engine.stock_snapshot import snapshot_from_dict
 
 
-FIXTURE = Path("tests/fixtures/theme_engine/furiosa_ai.json")
+TICKS = Path("tests/fixtures/theme_engine/furiosa_ticks.json")
+LEADER_ONLY_TICKS = Path("tests/fixtures/theme_engine/furiosa_leader_only_ticks.json")
 
 
 def _repo_with_fixture(tmp_path):
-    db = TradingDatabase(str(tmp_path / "themes.sqlite3"))
-    repo = ThemeEngineRepository(db)
-    ThemeEvidenceService(repo, ThemeCanonicalResolver(repo)).sync_source(FixtureThemeSource(FIXTURE))
-    ThemeMembershipBuilder(repo).build_all_current_memberships()
-    return db, repo
+    return repo_with_naver_fixture(tmp_path)
 
 
 def test_scorer_calculates_breadth_leader_and_clamps_score(tmp_path):
     db, repo = _repo_with_fixture(tmp_path)
-    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     memberships = repo.get_members_by_theme("furiosa_ai")
-    snapshots = [snapshot_from_dict(item) for item in payload["mock_ticks"]]
+    snapshots = [snapshot_from_dict(item) for item in json.loads(TICKS.read_text(encoding="utf-8"))]
 
     ranked = ThemeScoringEngine(repo).score_and_rank([("furiosa_ai", "퓨리오사AI", memberships)], snapshots)
 
@@ -44,9 +35,8 @@ def test_scorer_calculates_breadth_leader_and_clamps_score(tmp_path):
 
 def test_scorer_flags_leader_only_theme(tmp_path):
     db, repo = _repo_with_fixture(tmp_path)
-    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     memberships = repo.get_members_by_theme("furiosa_ai")
-    snapshots = [snapshot_from_dict(item) for item in payload["leader_only_ticks"]]
+    snapshots = [snapshot_from_dict(item) for item in json.loads(LEADER_ONLY_TICKS.read_text(encoding="utf-8"))]
 
     item = ThemeScoringEngine().score_theme("furiosa_ai", "퓨리오사AI", memberships, snapshots)
 
@@ -56,9 +46,9 @@ def test_scorer_flags_leader_only_theme(tmp_path):
 
 
 def test_scorer_records_scored_members_without_snapshots():
-    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     memberships = _memberships()
-    snapshots = [snapshot_from_dict(item) for item in payload["mock_ticks"][:3]]
+    ticks = json.loads(TICKS.read_text(encoding="utf-8"))
+    snapshots = [snapshot_from_dict(item) for item in ticks[:3]]
 
     item = ThemeScoringEngine().score_theme("furiosa_ai", "Furiosa AI", memberships, snapshots)
 
@@ -68,9 +58,9 @@ def test_scorer_records_scored_members_without_snapshots():
 
 
 def test_scorer_flags_low_snapshot_coverage():
-    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     memberships = _memberships()
-    snapshots = [snapshot_from_dict(item) for item in payload["mock_ticks"][:2]]
+    ticks = json.loads(TICKS.read_text(encoding="utf-8"))
+    snapshots = [snapshot_from_dict(item) for item in ticks[:2]]
 
     item = ThemeScoringEngine().score_theme("furiosa_ai", "?⑤━?ㅼ궗AI", memberships, snapshots)
 
@@ -82,12 +72,12 @@ def test_scorer_flags_low_snapshot_coverage():
 
 
 def test_scorer_flags_estimated_turnover_heavy():
-    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     memberships = _memberships()
+    ticks_payload = json.loads(TICKS.read_text(encoding="utf-8"))
     ticks = [
-        {**payload["mock_ticks"][0], "metadata": {"reason_codes": ["TURNOVER_ESTIMATED"]}},
-        {**payload["mock_ticks"][1], "metadata": {"reason_codes": ["TURNOVER_ESTIMATED"]}},
-        payload["mock_ticks"][2],
+        {**ticks_payload[0], "metadata": {"reason_codes": ["TURNOVER_ESTIMATED"]}},
+        {**ticks_payload[1], "metadata": {"reason_codes": ["TURNOVER_ESTIMATED"]}},
+        ticks_payload[2],
     ]
     snapshots = [snapshot_from_dict(item) for item in ticks]
 
@@ -101,9 +91,8 @@ def test_scorer_flags_estimated_turnover_heavy():
 
 def test_repository_restores_extended_activity_details(tmp_path):
     db, repo = _repo_with_fixture(tmp_path)
-    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     memberships = repo.get_members_by_theme("furiosa_ai")
-    snapshots = [snapshot_from_dict(item) for item in payload["leader_only_ticks"]]
+    snapshots = [snapshot_from_dict(item) for item in json.loads(LEADER_ONLY_TICKS.read_text(encoding="utf-8"))]
 
     item = ThemeScoringEngine().score_theme("furiosa_ai", "?⑤━?ㅼ궗AI", memberships, snapshots)
     repo.save_activity_snapshot(item)

@@ -237,6 +237,7 @@ class StockLeadershipGate:
     def _evaluate_mapping(self, candidate: Candidate, mapping: ThemeContext, candidates: list[Candidate]) -> StockLeadershipResult:
         scope = "same_dynamic_theme"
         scope_entries = self._scope_entries(mapping, candidates, scope)
+        activity_ranked_codes = _activity_ranked_codes(mapping)
         ranked = sorted(
             scope_entries,
             key=lambda entry: (
@@ -247,17 +248,18 @@ class StockLeadershipGate:
             reverse=True,
         )
         code = normalize_code(candidate.code)
-        rank = next((index + 1 for index, entry in enumerate(ranked) if entry.candidate.code == code), 0)
+        activity_rank = _activity_rank_for_code(activity_ranked_codes, code)
+        rank = activity_rank or next((index + 1 for index, entry in enumerate(ranked) if entry.candidate.code == code), 0)
         role = _dynamic_leadership_role(rank)
         tick = self.market_data.latest_tick(code)
-        turnover = _turnover(tick)
-        rank_count = max(1, len(ranked))
+        turnover = _turnover(tick) or _activity_turnover_for_code(mapping, code)
+        rank_count = max(1, len(activity_ranked_codes) or len(ranked))
         turnover_rank_score = _rank_score(
             self.settings.number("leadership_thresholds.turnover_rank_score_max", 35.0),
             rank,
             rank_count,
         )
-        change_rank = _change_rate_rank(code, ranked)
+        change_rank = _activity_change_rank_for_code(mapping, code) or _change_rate_rank(code, ranked)
         change_rate_rank_score = _rank_score(
             self.settings.number("leadership_thresholds.change_rate_rank_score_max", 25.0),
             change_rank,
@@ -281,7 +283,7 @@ class StockLeadershipGate:
         diagnostics_v2 = {
             "feature_version": "dynamic_leadership_v1",
             "leader_trade_value_rank": rank,
-            "scope_candidate_codes": [entry.candidate.code for entry in ranked],
+            "scope_candidate_codes": activity_ranked_codes or [entry.candidate.code for entry in ranked],
             "membership_score": mapping.membership_score,
             "relation_type": str(mapping.relation_type.value if hasattr(mapping.relation_type, "value") else mapping.relation_type),
             "trade_eligible": mapping.trade_eligible,
@@ -308,7 +310,7 @@ class StockLeadershipGate:
                 "leadership_rank": rank,
                 "leadership_role": role,
                 "score_components": score_components,
-                "scope_candidate_codes": [entry.candidate.code for entry in ranked],
+                "scope_candidate_codes": activity_ranked_codes or [entry.candidate.code for entry in ranked],
                 "turnover": turnover,
                 "change_rate": tick.change_rate if tick else 0.0,
                 "insufficient_reason": insufficient_reason,
@@ -1646,6 +1648,57 @@ def _dynamic_leadership_role(rank: int) -> str:
     if rank >= 6:
         return "late_laggard"
     return "unranked"
+
+
+def _activity_ranked_codes(mapping: ThemeContext) -> list[str]:
+    activity = mapping.activity
+    if activity is None:
+        return []
+    top_stocks = list(activity.details.get("top_stocks") or [])
+    ranked = sorted(
+        [dict(item) for item in top_stocks if isinstance(item, dict)],
+        key=lambda item: int(item.get("rank") or 0),
+    )
+    return [normalize_code(str(item.get("stock_code") or "")) for item in ranked if str(item.get("stock_code") or "")]
+
+
+def _activity_rank_for_code(ranked_codes: list[str], code: str) -> int:
+    clean_code = normalize_code(code)
+    return next((index + 1 for index, ranked_code in enumerate(ranked_codes) if ranked_code == clean_code), 0)
+
+
+def _activity_turnover_for_code(mapping: ThemeContext, code: str) -> int:
+    item = _activity_top_stock(mapping, code)
+    if not item:
+        return 0
+    try:
+        return int(float(item.get("turnover") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _activity_change_rank_for_code(mapping: ThemeContext, code: str) -> int:
+    activity = mapping.activity
+    if activity is None:
+        return 0
+    top_stocks = [dict(item) for item in list(activity.details.get("top_stocks") or []) if isinstance(item, dict)]
+    ranked = sorted(top_stocks, key=lambda item: float(item.get("change_rate") or -999.0), reverse=True)
+    clean_code = normalize_code(code)
+    return next(
+        (index + 1 for index, item in enumerate(ranked) if normalize_code(str(item.get("stock_code") or "")) == clean_code),
+        0,
+    )
+
+
+def _activity_top_stock(mapping: ThemeContext, code: str) -> dict:
+    activity = mapping.activity
+    if activity is None:
+        return {}
+    clean_code = normalize_code(code)
+    for item in list(activity.details.get("top_stocks") or []):
+        if isinstance(item, dict) and normalize_code(str(item.get("stock_code") or "")) == clean_code:
+            return dict(item)
+    return {}
 
 
 def _change_rate_rank(code: str, entries: list[_ThemeEntry]) -> int:

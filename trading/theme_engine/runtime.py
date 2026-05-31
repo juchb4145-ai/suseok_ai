@@ -30,7 +30,7 @@ class DynamicThemeEngineRuntime:
         self.evidence_service.sync_source(source)
         self.membership_builder.build_all_current_memberships()
 
-    def score_fixture_ticks(self, ticks: list[dict]):
+    def score_ticks(self, ticks: list[dict]):
         snapshots = [snapshot_from_dict(item) for item in ticks]
         themes = self.repository.list_canonical_themes()
         inputs = [

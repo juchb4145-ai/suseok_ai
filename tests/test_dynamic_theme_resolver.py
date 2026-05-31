@@ -7,7 +7,7 @@ def test_external_theme_not_in_kiwoom_is_created(tmp_path):
     db = TradingDatabase(str(tmp_path / "themes.sqlite3"))
     resolver = ThemeCanonicalResolver(ThemeEngineRepository(db))
 
-    theme = resolver.match_or_create_theme("external_fixture", "퓨리오사AI")
+    theme = resolver.match_or_create_theme("naver_theme_universe", "퓨리오사AI")
 
     assert theme.theme_id == "furiosa_ai"
     assert theme.display_name == "퓨리오사AI"
@@ -19,11 +19,11 @@ def test_aliases_resolve_to_same_canonical_theme(tmp_path):
     repo = ThemeEngineRepository(db)
     resolver = ThemeCanonicalResolver(repo)
 
-    theme = resolver.match_or_create_theme("themelab_fixture", "퓨리오사AI")
+    theme = resolver.match_or_create_theme("naver_theme_universe", "퓨리오사AI")
     resolver.add_alias(theme.theme_id, "FuriosaAI")
     resolver.add_alias(theme.theme_id, "퓨리오사/창투사")
 
-    matched = resolver.match_or_create_theme("infostock_fixture", "퓨리오사AI/창투사")
+    matched = resolver.match_or_create_theme("naver_theme_universe", "퓨리오사AI/창투사")
 
     assert matched.theme_id == theme.theme_id
     assert resolver.resolve_alias("FuriosaAI") == theme.theme_id

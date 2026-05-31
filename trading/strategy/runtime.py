@@ -43,6 +43,8 @@ from trading.strategy.readiness import ReadinessReport, build_readiness_report, 
 from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.review import TradeReviewService
 from trading.strategy.virtual_orders import VirtualOrderService
+from trading.theme_engine.repository import ThemeEngineRepository
+from trading.theme_engine.universe import ThemeUniverseBuilder
 
 
 ACTIVE_RUNTIME_STATES = {
@@ -1093,6 +1095,7 @@ class StrategyRuntime:
     def _reconcile_subscriptions(self, candidates: list[Candidate], snapshot: StrategyRuntimeSnapshot) -> None:
         try:
             self._sync_virtual_activity_subscriptions()
+            self._sync_theme_universe_subscriptions(snapshot)
             for raw_index_code in self.config.index_watch_codes.values():
                 self.subscription_manager.ensure_subscription(raw_index_code, "index", protected=True)
             for code in self.config.leader_watch_codes:
@@ -1122,6 +1125,19 @@ class StrategyRuntime:
             snapshot.warnings.append(f"RECONCILED_SUBSCRIPTIONS={len(watched)}")
         except Exception as exc:
             snapshot.warnings.append(f"SUBSCRIPTION_RECONCILE_FAILED:{exc}")
+
+    def _sync_theme_universe_subscriptions(self, snapshot: StrategyRuntimeSnapshot) -> None:
+        try:
+            target_codes = set(ThemeUniverseBuilder(ThemeEngineRepository(self.db)).build_active_universe())
+            for code, record in list(self.subscription_manager.records.items()):
+                if "theme_universe" in record.sources and code not in target_codes:
+                    self.subscription_manager.remove_subscription(code, "theme_universe")
+            for code in sorted(target_codes):
+                self.subscription_manager.ensure_subscription(code, "theme_universe", protected=False)
+            if target_codes:
+                snapshot.warnings.append(f"THEME_UNIVERSE_SUBSCRIPTIONS={len(target_codes)}")
+        except Exception as exc:
+            snapshot.warnings.append(f"THEME_UNIVERSE_SUBSCRIPTION_FAILED:{exc}")
 
     def _sync_virtual_activity_subscriptions(self) -> None:
         stale_sources = {"virtual_order", "virtual_position"}

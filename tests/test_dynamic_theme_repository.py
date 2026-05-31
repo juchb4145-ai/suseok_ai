@@ -1,5 +1,5 @@
 from storage.db import TradingDatabase
-from trading.theme_engine.models import CanonicalTheme, SourceTheme, ThemeMemberEvidence, ThemeMembership, ThemeStatus
+from trading.theme_engine.models import CanonicalTheme, SourceTheme, ThemeMemberEvidence, ThemeMembership
 from trading.theme_engine.normalizer import normalize_theme_name
 from trading.theme_engine.repository import ThemeEngineRepository
 
@@ -12,8 +12,8 @@ def test_repository_upserts_core_theme_tables(tmp_path):
     repo.upsert_alias(saved.theme_id, "퓨리오사 AI")
     source = repo.upsert_source_theme(
         SourceTheme(
-            source="fixture",
-            source_theme_id="f1",
+            source="naver_theme_universe",
+            source_theme_id="576",
             source_theme_name="퓨리오사 AI",
             normalized_name=normalize_theme_name("퓨리오사 AI"),
             matched_theme_id=saved.theme_id,
@@ -21,7 +21,14 @@ def test_repository_upserts_core_theme_tables(tmp_path):
         )
     )
     evidence = repo.add_member_evidence(
-        ThemeMemberEvidence(saved.theme_id, "A000001", "MOCK-TSINV", "fixture", relation_type="investor", confidence=0.9)
+        ThemeMemberEvidence(
+            saved.theme_id,
+            "A000001",
+            "MOCK-TSINV",
+            "naver_theme_universe",
+            relation_type="investor",
+            confidence=0.9,
+        )
     )
     membership = repo.upsert_current_membership(
         ThemeMembership(saved.theme_id, "000001", "MOCK-TSINV", 0.9, "investor", 1, True, True)

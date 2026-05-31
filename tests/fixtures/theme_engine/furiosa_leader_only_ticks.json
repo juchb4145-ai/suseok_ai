@@ -1,0 +1,35 @@
+[
+  {
+    "stock_code": "000001",
+    "stock_name": "MOCK-TSINV",
+    "change_rate": 9.2,
+    "turnover": 180000000000,
+    "execution_strength": 180,
+    "momentum_1m": 2.0,
+    "momentum_3m": 3.5,
+    "momentum_5m": 6.0,
+    "turnover_strength": 4.6
+  },
+  {
+    "stock_code": "000002",
+    "stock_name": "MOCK-DSC",
+    "change_rate": -0.4,
+    "turnover": 12000000000,
+    "execution_strength": 80,
+    "momentum_1m": -0.1,
+    "momentum_3m": 0.0,
+    "momentum_5m": 0.2,
+    "turnover_strength": 0.9
+  },
+  {
+    "stock_code": "000003",
+    "stock_name": "MOCK-LB",
+    "change_rate": -0.7,
+    "turnover": 9000000000,
+    "execution_strength": 74,
+    "momentum_1m": -0.2,
+    "momentum_3m": -0.2,
+    "momentum_5m": 0.1,
+    "turnover_strength": 0.7
+  }
+]

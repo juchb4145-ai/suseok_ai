@@ -15,6 +15,7 @@ SOURCE_PRIORITIES = {
     "virtual_order": 84,
     "holding": 80,
     "candidate_watch": 50,
+    "theme_universe": 45,
 }
 PROTECTED_SOURCES = {
     "index",

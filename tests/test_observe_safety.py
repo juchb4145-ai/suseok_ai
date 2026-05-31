@@ -1,6 +1,12 @@
+import os
+
+from trading.broker.gateway_state import GatewayStateStore
 from kiwoom.client import MockKiwoomClient, OrderRequest
 from trading.strategy.models import OrderMode
 from trading.strategy.safety import ActualOrderGuard
+from trading_app.dependencies import get_settings
+from trading_app.runtime_factory import _build_order_sink
+from trading_app.runtime_order_sink import NoopRuntimeOrderSink
 
 
 def test_observe_guard_blocks_real_orders():
@@ -138,3 +144,30 @@ def test_theme_template_generator_is_separate_from_observe_runtime_paths():
         source = open(path, encoding="utf-8").read()
         assert "generate_theme_mappings" not in source
         assert "theme_mappings_auto" not in source
+
+
+def test_retired_theme_source_modules_are_removed():
+    for path in [
+        "trading/theme_engine/sources/kiwoom.py",
+        "trading/theme_engine/sources/fixture.py",
+        "trading/theme_engine/cluster_detector.py",
+    ]:
+        assert not os.path.exists(path)
+
+
+def test_live_env_and_runtime_allow_live_orders_still_use_noop_runtime_sink(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "runtime_live_guard.sqlite3"))
+    monkeypatch.setenv("TRADING_MODE", "LIVE")
+    monkeypatch.setenv("TRADING_ALLOW_LIVE", "1")
+    monkeypatch.setenv("TRADING_RUNTIME_MODE", "LIVE")
+    monkeypatch.setenv("TRADING_RUNTIME_ALLOW_LIVE_ORDERS", "1")
+    warnings = []
+
+    settings = get_settings()
+    sink = _build_order_sink(settings, GatewayStateStore(), warnings.append)
+
+    assert settings.live_order_enabled is True
+    assert settings.runtime_mode == "OBSERVE"
+    assert isinstance(sink, NoopRuntimeOrderSink)
+    assert sink.reason == "OBSERVE_VIRTUAL_ONLY"
+    assert warnings == ["RUNTIME_LIVE_ORDERS_DISABLED_IN_PR5"]

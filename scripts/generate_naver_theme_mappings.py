@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-MESSAGE = "theme_mappings.csv is retired. Use DynamicThemeEngine source sync instead."
+MESSAGE = "theme_mappings.csv is retired. Use NaverThemeUniverseSource sync instead."
 
 
 def main() -> int:

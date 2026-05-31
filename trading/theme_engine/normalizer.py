@@ -31,7 +31,7 @@ def normalize_theme_name(name: str) -> str:
     value = re.sub(r"\bai\b", "ai", value)
     value = re.sub(r"[\s/_\-\(\)\[\]\{\}·,.:;|+&]+", "", value)
     value = re.sub(r"[^0-9a-z가-힣]", "", value)
-    if "퓨리오사" in value and "창투사" in value:
+    if "퓨리오사" in value and "창투" in value:
         value = value.replace("ai", "")
     return value
 
@@ -40,7 +40,7 @@ def suggest_theme_id(name: str) -> str:
     normalized = normalize_theme_name(name)
     if not normalized:
         return "theme_unknown"
-    if "퓨리오사" in normalized and "ai" in normalized:
+    if ("퓨리오사" in normalized and "ai" in normalized) or "furiosaai" in normalized:
         return "furiosa_ai"
     asciiish = unicodedata.normalize("NFKD", normalized).encode("ascii", "ignore").decode("ascii")
     asciiish = re.sub(r"[^0-9a-z]+", "_", asciiish.lower()).strip("_")

@@ -82,7 +82,7 @@ class DynamicThemeContextProvider:
                 continue
             activity = self.get_theme_activity(membership.theme_id)
             rank = activity.rank if activity else 0
-            rank_in_theme = self._rank_in_theme(membership.theme_id, membership.stock_code)
+            rank_in_theme = self._rank_in_theme(membership.theme_id, membership.stock_code, activity)
             contexts.append(
                 ThemeContext(
                     theme_id=membership.theme_id,
@@ -139,7 +139,11 @@ class DynamicThemeContextProvider:
     def is_ready(self) -> bool:
         return self.repository.count_current_memberships() > 0
 
-    def _rank_in_theme(self, theme_id: str, stock_code: str) -> int:
+    def _rank_in_theme(self, theme_id: str, stock_code: str, activity: ThemeActivitySnapshot | None = None) -> int:
+        top_stocks = list((activity.details if activity else {}).get("top_stocks") or [])
+        for item in top_stocks:
+            if normalize_stock_code(str(item.get("stock_code") or "")) == normalize_stock_code(stock_code):
+                return int(item.get("rank") or 0)
         members = self.repository.get_members_by_theme(theme_id, active=True)
         ranked = sorted(members, key=lambda item: (item.trade_eligible, item.membership_score, item.source_count), reverse=True)
         for index, member in enumerate(ranked, start=1):

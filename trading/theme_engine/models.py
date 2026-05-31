@@ -29,7 +29,6 @@ class ThemeEvidenceType(str, Enum):
     NEWS = "news"
     EVENT = "event"
     CLUSTER = "cluster"
-    MANUAL_FIXTURE = "manual_fixture"
 
 
 @dataclass
@@ -222,20 +221,6 @@ class ThemeSourceSyncRun:
     error_count: int = 0
     message: str = ""
     details: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class DynamicThemeCluster:
-    cluster_id: str
-    matched_theme_id: str = ""
-    status: ThemeStatus | str = ThemeStatus.CANDIDATE
-    stock_codes: list[str] = field(default_factory=list)
-    keywords: list[str] = field(default_factory=list)
-    score: float = 0.0
-    reason: str = ""
-    first_seen_at: str = ""
-    last_seen_at: str = ""
-    updated_at: str = ""
 
 
 @dataclass

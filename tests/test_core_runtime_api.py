@@ -2,6 +2,7 @@ import importlib
 
 from fastapi.testclient import TestClient
 from storage.db import TradingDatabase
+from tests.theme_naver_helpers import naver_source
 
 
 def _client(tmp_path, monkeypatch, *, enabled="0", auto_start="0"):
@@ -64,3 +65,21 @@ def test_runtime_start_requires_token(tmp_path, monkeypatch):
         response = client.post("/api/runtime/start")
 
     assert response.status_code == 401
+
+
+def test_naver_theme_sync_api_requires_token_and_syncs_universe(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    monkeypatch.setattr(api, "NaverThemeUniverseSource", lambda max_pages=20: naver_source())
+    with TestClient(api.app) as client:
+        rejected = client.post("/api/themes/sync/naver")
+        accepted = client.post("/api/themes/sync/naver", headers={"X-Local-Token": "test-token"})
+
+    assert rejected.status_code == 401
+    payload = accepted.json()
+    assert payload["source"] == "naver_theme_universe"
+    assert payload["status"] == "success"
+    assert payload["member_count"] == 5

@@ -5,18 +5,20 @@ import json
 from pathlib import Path
 
 from storage.db import TradingDatabase
+from trading.theme_engine.naver_local_session import LocalNaverFixtureSession
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime import RealTimeThemeRuntime
-from trading.theme_engine.source_sync import ThemeSourceSyncService
-from trading.theme_engine.sources.fixture import FixtureThemeSource
+from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSourceSyncService
+from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThemeUniverseSource
 from trading.theme_engine.stock_snapshot import snapshot_from_dict
 from trading.theme_engine.ws.schemas import build_runtime_health_payload, build_theme_rank_payload
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Replay fixture ticks through the realtime dynamic theme runtime.")
+    parser = argparse.ArgumentParser(description="Replay Naver universe ticks through the realtime theme runtime.")
     parser.add_argument("--db", required=True)
-    parser.add_argument("--fixture", required=True)
+    parser.add_argument("--list-html", default="")
+    parser.add_argument("--detail-dir", default="")
     parser.add_argument("--ticks", default="")
     parser.add_argument("--print-rank", action="store_true")
     parser.add_argument("--print-health", action="store_true")
@@ -27,13 +29,19 @@ def main() -> int:
     args = parse_args()
     db = TradingDatabase(args.db)
     repo = ThemeEngineRepository(db)
-    fixture = FixtureThemeSource(args.fixture)
-    sync_service = ThemeSourceSyncService(repo, [fixture])
-    sync_results = sync_service.sync_all_sources()
+    session = LocalNaverFixtureSession(args.list_html, args.detail_dir) if args.list_html and args.detail_dir else None
+    source = NaverThemeUniverseSource(session=session, max_pages=1 if session else 20, request_delay_sec=0 if session else 0.1)
+    sync_results = [
+        ThemeSourceSyncService(repo, [source]).sync_source(
+            NAVER_THEME_SOURCE_NAME,
+            replace=True,
+            purge_sources=RETIRED_THEME_SOURCE_NAMES,
+        )
+    ]
 
     runtime = RealTimeThemeRuntime(repo, scoring_interval_sec=0, db_snapshot_interval_sec=0, ws_push_interval_sec=0)
     runtime.start()
-    ticks = _load_ticks(args.ticks, fixture)
+    ticks = _load_ticks(args.ticks)
     for item in ticks:
         runtime.on_stock_snapshot(snapshot_from_dict(item))
     runtime.recalculate_all_themes()
@@ -52,10 +60,10 @@ def main() -> int:
     return 0
 
 
-def _load_ticks(path: str, fixture: FixtureThemeSource) -> list[dict]:
+def _load_ticks(path: str) -> list[dict]:
     if path:
         return list(json.loads(Path(path).read_text(encoding="utf-8")))
-    return fixture.mock_snapshots()
+    return []
 
 
 if __name__ == "__main__":

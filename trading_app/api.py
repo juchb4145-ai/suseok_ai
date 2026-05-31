@@ -43,6 +43,8 @@ from trading.broker.ws_messages import GatewayWsMessage
 from trading.strategy.candidates import CandidateCollector
 from trading.strategy.models import CandidateState
 from trading.theme_engine.repository import ThemeEngineRepository
+from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSourceSyncService
+from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThemeUniverseSource
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
 from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, config_from_settings
 from trading_app.dry_run_threshold_ab import DryRunThresholdABAnalyzer, config_from_settings as threshold_ab_config_from_settings
@@ -1083,6 +1085,26 @@ def themes(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
     db = open_database()
     try:
         return build_themes_snapshot(db, limit=limit)
+    finally:
+        close_database(db)
+
+
+@app.post("/api/themes/sync/naver")
+def sync_naver_themes(
+    replace: bool = True,
+    max_pages: int = Query(20, ge=1, le=100),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        repository = ThemeEngineRepository(db)
+        source = NaverThemeUniverseSource(max_pages=max_pages)
+        result = ThemeSourceSyncService(repository, [source]).sync_source(
+            NAVER_THEME_SOURCE_NAME,
+            replace=replace,
+            purge_sources=RETIRED_THEME_SOURCE_NAMES,
+        )
+        return _dataclass_dict(result)
     finally:
         close_database(db)
 
