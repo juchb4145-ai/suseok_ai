@@ -7,6 +7,7 @@ real orders. This direct broker-client path remains only for the deprecated
 PyQt app.
 """
 
+import os
 from typing import Protocol
 
 from trading.broker.models import BrokerExecutionEvent, BrokerOrderRequest, BrokerOrderResult
@@ -36,11 +37,17 @@ class ClientProtocol(Protocol):
 
 
 class TradingEngine:
-    def __init__(self, client: ClientProtocol, db: TradingDatabase) -> None:
+    def __init__(self, client: ClientProtocol, db: TradingDatabase, *, legacy_live_allowed: bool | None = None) -> None:
         self.client = client
         self.db = db
         self.account = ""
         self.ordering_enabled = False
+        self.legacy_live_allowed = (
+            bool(legacy_live_allowed)
+            if legacy_live_allowed is not None
+            else os.environ.get("TRADING_ALLOW_LEGACY_LIVE", "0") == "1"
+        )
+        self.legacy_live_blocked_count = 0
         self.items: dict[str, WatchItem] = {item.code: item for item in db.load_watch_items()}
         self.log_handlers: list[callable] = []
         self.item_handlers: list[callable] = []
@@ -87,6 +94,8 @@ class TradingEngine:
         remaining = max(0, leg.ordered_quantity - leg.filled_quantity)
         if remaining <= 0:
             return False, "취소할 미체결 수량이 없습니다."
+        if self._legacy_order_blocked("cancel_order", code):
+            return False, "LEGACY_LIVE_ORDER_BLOCKED"
         result = self.client.cancel_order(
             account=self.account,
             code=item.code,
@@ -109,6 +118,8 @@ class TradingEngine:
         remaining = max(0, leg.ordered_quantity - leg.filled_quantity)
         if remaining <= 0:
             return False, "정정할 미체결 수량이 없습니다."
+        if self._legacy_order_blocked("modify_order", code):
+            return False, "LEGACY_LIVE_ORDER_BLOCKED"
         result = self.client.modify_buy_order(
             account=self.account,
             code=item.code,
@@ -176,6 +187,8 @@ class TradingEngine:
             leg.status = LegStatus.WATCHING
             if is_within_ticks(item.current_price, leg.target_price, item.tick_threshold):
                 quantity = calculate_order_quantity(item.budget, leg.weight_percent, leg.target_price)
+                if self._legacy_order_blocked("send_order", item.code):
+                    continue
                 request = BrokerOrderRequest(
                     account=self.account,
                     code=item.code,
@@ -201,6 +214,8 @@ class TradingEngine:
             return
         quantity = calculate_take_profit_quantity(item.holding_quantity, item.take_profit_sell_percent)
         if quantity <= 0:
+            return
+        if self._legacy_order_blocked("send_order", item.code):
             return
         request = BrokerOrderRequest(
             account=self.account,
@@ -312,6 +327,13 @@ class TradingEngine:
     def alert(self, message: str) -> None:
         for handler in self.alert_handlers:
             handler(message)
+
+    def _legacy_order_blocked(self, action: str, code: str) -> bool:
+        if self.legacy_live_allowed:
+            return False
+        self.legacy_live_blocked_count += 1
+        self.log(f"[legacy][WARN] LEGACY_LIVE_ORDER_BLOCKED:{action}:{code}")
+        return True
 
     def emit_item_changed(self, item: WatchItem) -> None:
         for handler in self.item_handlers:

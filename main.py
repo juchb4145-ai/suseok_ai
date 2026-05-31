@@ -134,7 +134,8 @@ def main() -> int:
     app = QApplication(sys.argv)
     db = TradingDatabase(args.db)
     client = MockKiwoomClient() if args.mock else KiwoomClient()
-    engine = TradingEngine(client=client, db=db)
+    legacy_live_allowed = bool(args.mock or os.environ.get("TRADING_ALLOW_LEGACY_LIVE", "0") == "1")
+    engine = TradingEngine(client=client, db=db, legacy_live_allowed=legacy_live_allowed)
     strategy_runtime_unavailable_reason = ""
     try:
         strategy_runtime = build_observe_runtime(client, db)

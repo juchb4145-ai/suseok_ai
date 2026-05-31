@@ -54,6 +54,21 @@ def test_websocket_pilot_feature_flags_select_real_client(monkeypatch):
     assert client.snapshot()["ws_pilot_live_order_blocked"] is True
 
 
+def test_websocket_transport_keepalive_is_not_kiwoom_status(monkeypatch):
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_REAL_PILOT", "1")
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL", "1")
+    client = _build_core_client(_args(transport="websocket-pilot"))
+
+    message = client._heartbeat_message()
+    client.stop()
+
+    assert message.type == "transport_heartbeat"
+    assert message.payload["transport_keepalive"] is True
+    assert "kiwoom_logged_in" not in message.payload
+    assert "orderable" not in message.payload
+    assert "account" not in message.payload
+
+
 def test_websocket_real_client_receives_command_batch_without_ack(monkeypatch):
     monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_REAL_PILOT", "1")
     monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL", "1")

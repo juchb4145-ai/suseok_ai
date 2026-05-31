@@ -7,7 +7,7 @@ from trading.models import BuyLeg, LegStatus, WatchItem
 def make_engine(tmp_path):
     client = MockKiwoomClient()
     db = TradingDatabase(str(tmp_path / "test.sqlite3"))
-    engine = TradingEngine(client, db)
+    engine = TradingEngine(client, db, legacy_live_allowed=True)
     engine.set_account("1234567890")
     engine.set_ordering_enabled(True)
     return engine, client
@@ -90,4 +90,31 @@ def test_take_profit_sells_configured_percent_once(tmp_path):
     sell_orders = [order for order in client.orders if order.side == "sell"]
     assert len(sell_orders) == 1
     assert sell_orders[0].quantity == 7
+    engine.db.close()
+
+
+def test_legacy_engine_blocks_live_direct_send_order_by_default(tmp_path):
+    client = MockKiwoomClient()
+    db = TradingDatabase(str(tmp_path / "test.sqlite3"))
+    engine = TradingEngine(client, db)
+    logs = []
+    engine.log_handlers.append(logs.append)
+    engine.set_account("1234567890")
+    engine.set_ordering_enabled(True)
+    item = WatchItem(
+        code="005930",
+        name="?쇱꽦?꾩옄",
+        budget=1_000_000,
+        stop_loss_price=45_000,
+        tick_threshold=1,
+        auto_buy_enabled=True,
+        legs=[BuyLeg(1, 50_000, 100.0), BuyLeg(2), BuyLeg(3)],
+    )
+    engine.add_or_update_item(item)
+
+    client.emit_price("005930", 50_000)
+
+    assert client.orders == []
+    assert engine.legacy_live_blocked_count == 1
+    assert any("LEGACY_LIVE_ORDER_BLOCKED:send_order:005930" in line for line in logs)
     engine.db.close()

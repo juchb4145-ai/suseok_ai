@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -162,7 +162,12 @@ class OrderEnqueueService:
         safety = self._live_guard(requested_mode).validate(
             broker_request,
             gateway_status=gateway_status_payload,
-            existing_order_command_count=self._order_command_count(broker_request.code, broker_request.side, broker_request.tag),
+            existing_order_command_count=self._order_command_count(
+                broker_request.code,
+                broker_request.side,
+                broker_request.tag,
+                order_type=broker_request.order_type,
+            ),
             duplicate=duplicate,
         )
         if requested_mode == "OBSERVE":
@@ -268,7 +273,12 @@ class OrderEnqueueService:
             live_safety = self._live_guard("LIVE").validate(
                 broker_request,
                 gateway_status=self.gateway_state.snapshot().to_dict(),
-                existing_order_command_count=self._order_command_count(broker_request.code, broker_request.side, broker_request.tag),
+                existing_order_command_count=self._order_command_count(
+                    broker_request.code,
+                    broker_request.side,
+                    broker_request.tag,
+                    order_type=broker_request.order_type,
+                ),
                 duplicate=self.gateway_state.has_duplicate(dedupe_key),
             )
             status = DRY_RUN_ACCEPTED if decision_safety.ok else DRY_RUN_REJECTED
@@ -552,6 +562,7 @@ class OrderEnqueueService:
                 live_order_enabled=self.settings.live_order_enabled,
                 max_order_amount=self.settings.max_order_amount,
                 max_daily_orders_per_code=self.settings.max_daily_orders_per_code,
+                allow_zero_price=False,
             )
         )
 
@@ -565,17 +576,21 @@ class OrderEnqueueService:
             "account": request.account,
         }
 
-    def _order_command_count(self, code: str, side: str, tag: str) -> int:
-        count = 0
-        for record in self.gateway_state.list_commands(limit=500, include_finished=True):
-            command = dict(record.get("command") or {})
-            payload = dict(command.get("payload") or {})
-            if payload.get("code") != code or payload.get("side") != side:
-                continue
-            if tag and payload.get("tag") != tag:
-                continue
-            count += 1
-        return count
+    def _order_command_count(self, code: str, side: str, tag: str, *, order_type: int | None = None) -> int:
+        trade_date = _kst_trade_date(str(self.clock()))
+        counter = getattr(self.gateway_state, "daily_order_command_count", None)
+        if callable(counter):
+            return int(
+                counter(
+                    trade_date=trade_date,
+                    code=code,
+                    side=side,
+                    tag=tag,
+                    order_type=order_type,
+                )
+                or 0
+            )
+        return 0
 
     @staticmethod
     def _dry_run_intent_count(db: TradingDatabase, code: str, side: str, tag: str) -> int:
@@ -609,3 +624,16 @@ def _dry_run_reject_reason(request: RuntimeOrderIntentRequest, fallback: str) ->
     if fallback == "QUANTITY_INVALID" and quantity_reason in {"QUANTITY_ZERO", "QUANTITY_BELOW_MIN"}:
         return quantity_reason
     return fallback
+
+
+def _kst_trade_date(timestamp: str) -> str:
+    text = str(timestamp or "")
+    if not text:
+        return datetime.now(timezone(timedelta(hours=9))).date().isoformat()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text[:10]
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone(timedelta(hours=9))).date().isoformat()

@@ -165,3 +165,68 @@ def test_gateway_transport_ws_unknown_ack_does_not_crash(tmp_path, monkeypatch):
             ).to_dict()
         )
         assert _recv_until(ws, "event_ack")["payload"]["accepted"] is True
+
+
+def test_transport_heartbeat_does_not_override_kiwoom_login(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+
+    with client.websocket_connect("/ws/gateway/transport?token=test-token") as ws:
+        ws.receive_json()
+        ws.send_json(
+            GatewayWsMessage(
+                type="hello",
+                source="kiwoom_gateway",
+                payload={
+                    "transport_mode": "websocket_real_pilot",
+                    "pilot_enabled": True,
+                    "live_order_enabled": False,
+                },
+                metadata={"transport_mode": "websocket_real_pilot"},
+                sequence=1,
+            ).to_dict()
+        )
+        _recv_until(ws, "hello_ack")
+        ws.send_json(
+            GatewayWsMessage(
+                type="heartbeat",
+                source="kiwoom_gateway",
+                payload={
+                    "transport_mode": "websocket_real_pilot",
+                    "kiwoom_logged_in": True,
+                    "orderable": True,
+                    "account": "1234567890",
+                    "mode": "DRY_RUN",
+                },
+                metadata={"transport_mode": "websocket_real_pilot"},
+                sequence=2,
+            ).to_dict()
+        )
+        _recv_until(ws, "event_ack")
+        assert client.get("/api/gateway/status").json()["kiwoom_logged_in"] is True
+
+        ws.send_json(
+            GatewayWsMessage(
+                type="transport_heartbeat",
+                source="kiwoom_gateway",
+                payload={
+                    "transport_mode": "websocket_real_pilot",
+                    "transport_keepalive": True,
+                    "kiwoom_logged_in": False,
+                    "orderable": False,
+                    "account": "",
+                    "ws_pilot_enabled": True,
+                    "ws_connection_state": "AUTHENTICATED",
+                    "ws_reconnect_count": 0,
+                },
+                metadata={"transport_mode": "websocket_real_pilot"},
+                sequence=3,
+            ).to_dict()
+        )
+        ack = _recv_until(ws, "event_ack")
+        assert ack["payload"]["transport_only"] is True
+
+    status = client.get("/api/gateway/status").json()
+    assert status["kiwoom_logged_in"] is True
+    assert status["orderable"] is True
+    assert status["account"] == "1234567890"
+    assert status["last_heartbeat_payload"]["kiwoom_logged_in"] is True

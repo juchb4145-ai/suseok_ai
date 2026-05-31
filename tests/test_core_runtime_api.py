@@ -2,6 +2,7 @@ import importlib
 
 from fastapi.testclient import TestClient
 from storage.db import TradingDatabase
+from trading.broker.models import GatewayEvent
 from tests.theme_naver_helpers import naver_source
 
 
@@ -31,7 +32,10 @@ def test_runtime_start_cycle_stop_api(tmp_path, monkeypatch):
     with _client(tmp_path, monkeypatch, enabled="1") as client:
         started = client.post("/api/runtime/start", headers={"X-Local-Token": "test-token"}).json()
         cycled = client.post("/api/runtime/cycle", headers={"X-Local-Token": "test-token"}).json()
-        commands = client.get("/api/gateway/commands/history?include_finished=true&include_payload=true").json()
+        commands = client.get(
+            "/api/gateway/commands/history?include_finished=true&include_payload=true",
+            headers={"X-Local-Token": "test-token"},
+        ).json()
         snapshot = client.get("/api/runtime/snapshot").json()
         stopped = client.post("/api/runtime/stop", headers={"X-Local-Token": "test-token"}).json()
 
@@ -58,6 +62,37 @@ def test_runtime_snapshot_is_in_dashboard_and_websocket(tmp_path, monkeypatch):
 
     assert "runtime" in snapshot
     assert "runtime" in ws_payload["snapshot"]
+
+
+def test_dashboard_logs_display_kst(tmp_path, monkeypatch):
+    db_path = tmp_path / "trader.sqlite3"
+    monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    db = TradingDatabase(str(db_path))
+    try:
+        db.conn.execute(
+            "INSERT INTO logs(created_at, message) VALUES (?, ?)",
+            ("2026-05-31 09:41:37", "[gateway][rate_limited] register_realtime"),
+        )
+        db.conn.commit()
+        api.gateway_state.record_event(
+            GatewayEvent(
+                type="heartbeat",
+                timestamp="2026-05-31T09:41:38+00:00",
+                payload={"kiwoom_logged_in": True},
+            )
+        )
+
+        logs = api.build_logs_snapshot(db, limit=10)
+    finally:
+        db.close()
+
+    assert logs["timezone"] == "Asia/Seoul"
+    assert logs["core"][0].startswith("2026-05-31 18:41:37 KST ")
+    assert logs["gateway"][0]["timestamp"] == "2026-05-31 18:41:38 KST"
 
 
 def test_runtime_start_requires_token(tmp_path, monkeypatch):

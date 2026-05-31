@@ -3,13 +3,33 @@ import importlib
 from fastapi.testclient import TestClient
 
 
-def _client(tmp_path, monkeypatch):
+def _client(tmp_path, monkeypatch, *, mode="OBSERVE", allow_live="0"):
     monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
     monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    monkeypatch.setenv("TRADING_MODE", mode)
+    monkeypatch.setenv("TRADING_ALLOW_LIVE", allow_live)
     import trading_app.api as api
 
     api = importlib.reload(api)
     return TestClient(api.app)
+
+
+def _healthy_gateway(client):
+    client.post(
+        "/api/gateway/events",
+        json={
+            "type": "heartbeat",
+            "event_id": "evt-heartbeat",
+            "source": "test-gateway",
+            "payload": {
+                "kiwoom_logged_in": True,
+                "orderable": True,
+                "mode": "LIVE",
+                "account": "1234567890",
+            },
+        },
+        headers={"X-Local-Token": "test-token"},
+    )
 
 
 def test_command_ack_marks_record_acked(tmp_path, monkeypatch):
@@ -78,30 +98,34 @@ def test_command_failed_marks_record_failed(tmp_path, monkeypatch):
 
 
 def test_mock_gateway_command_ack_flow(tmp_path, monkeypatch):
-    client = _client(tmp_path, monkeypatch)
+    client = _client(tmp_path, monkeypatch, mode="LIVE", allow_live="1")
     headers = {"X-Local-Token": "test-token"}
-    client.post(
-        "/api/gateway/commands",
+    _healthy_gateway(client)
+
+    response = client.post(
+        "/api/orders/enqueue",
         json={
-            "type": "send_order",
-            "command_id": "cmd-mock-order",
-            "payload": {
-                "account": "1234567890",
-                "code": "005930",
-                "side": "buy",
-                "quantity": 1,
-                "price": 70000,
-                "order_type": 1,
-                "tag": "MOCK",
-            },
+            "account": "1234567890",
+            "code": "005930",
+            "side": "buy",
+            "quantity": 1,
+            "price": 70000,
+            "order_type": 1,
+            "hoga": "00",
+            "tag": "MOCK",
+            "strategy_name": "test",
+            "candidate_id": 1,
+            "reason": "mock order",
+            "idempotency_key": "mock-order",
         },
         headers=headers,
     )
+    assert response.json()["accepted"] is True
 
     command = client.get("/api/gateway/commands", headers=headers).json()["commands"][0]
-    assert command["command_id"] == "cmd-mock-order"
+    assert command["type"] == "send_order"
     ack_payload = {
-        "command_id": "cmd-mock-order",
+        "command_id": command["command_id"],
         "command_type": "send_order",
         "status": "ACKED",
         "result_code": 0,
@@ -111,7 +135,7 @@ def test_mock_gateway_command_ack_flow(tmp_path, monkeypatch):
             "code": 0,
             "message": "mock send_order accepted",
             "request": command["payload"],
-            "command_id": "cmd-mock-order",
+            "command_id": command["command_id"],
             "raw": {"mock": True},
         },
     }

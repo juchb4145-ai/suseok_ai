@@ -45,7 +45,7 @@ class OrderSafetyConfig:
     live_order_enabled: bool = False
     max_order_amount: int = 3_000_000
     max_daily_orders_per_code: int = 5
-    allow_zero_price: bool = True
+    allow_zero_price: bool = False
 
 
 class OrderCommandSafetyGuard:

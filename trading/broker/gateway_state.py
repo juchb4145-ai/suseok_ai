@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import Any
 
 from trading.broker.command_persistence import CommandStoreProtocol
-from trading.broker.command_queue import CommandPriority, CommandQueue, CommandRecord, CommandStatus, EnqueueResult
+from trading.broker.command_queue import ORDER_COMMAND_TYPES, CommandPriority, CommandQueue, CommandRecord, CommandStatus, EnqueueResult
 from trading.broker.models import GatewayCommand, GatewayEvent, utc_timestamp
 
 
@@ -327,6 +327,38 @@ class GatewayStateStore:
             snapshot["recovered_queued_count"] = 0
             return snapshot
 
+    def daily_order_command_count(
+        self,
+        *,
+        trade_date: str,
+        code: str,
+        side: str,
+        tag: str = "",
+        order_type: int | None = None,
+    ) -> int:
+        with self._lock:
+            if self.command_store is not None:
+                counter = getattr(self.command_store, "count_order_commands", None)
+                if callable(counter):
+                    return int(
+                        counter(
+                            trade_date=trade_date,
+                            code=code,
+                            side=side,
+                            tag=tag,
+                            order_type=order_type,
+                        )
+                        or 0
+                    )
+            return _in_memory_order_command_count(
+                self._command_queue.list(limit=10000, include_finished=True),
+                trade_date=trade_date,
+                code=code,
+                side=side,
+                tag=tag,
+                order_type=order_type,
+            )
+
     def has_duplicate(self, dedupe_key: str) -> bool:
         with self._lock:
             if self.command_store is not None:
@@ -408,3 +440,49 @@ def _age_seconds(timestamp: str) -> float | None:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return max(0.0, (datetime.now(timezone.utc) - value.astimezone(timezone.utc)).total_seconds())
+
+
+def _in_memory_order_command_count(
+    records: list[CommandRecord],
+    *,
+    trade_date: str,
+    code: str,
+    side: str,
+    tag: str = "",
+    order_type: int | None = None,
+) -> int:
+    count = 0
+    for record in records:
+        if record.command_type not in ORDER_COMMAND_TYPES:
+            continue
+        if _kst_trade_date(record.created_at) != trade_date:
+            continue
+        payload = dict(record.command.payload or {})
+        if str(payload.get("code") or "") != str(code or ""):
+            continue
+        if str(payload.get("side") or "") != str(side or ""):
+            continue
+        if tag and str(payload.get("tag") or "") != str(tag):
+            continue
+        if order_type is not None:
+            try:
+                payload_order_type = int(payload.get("order_type") or 0)
+            except (TypeError, ValueError):
+                payload_order_type = -1
+            if payload_order_type != int(order_type):
+                continue
+        count += 1
+    return count
+
+
+def _kst_trade_date(timestamp: str) -> str:
+    text = str(timestamp or "")
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text[:10]
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone(timedelta(hours=9))).date().isoformat()

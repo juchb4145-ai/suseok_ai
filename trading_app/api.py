@@ -6,11 +6,11 @@ import time
 from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -72,6 +72,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Trading Core API", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(WEB_ROOT / "static")), name="static")
 templates = Jinja2Templates(directory=str(WEB_ROOT / "templates"))
+KST = timezone(timedelta(hours=9), "KST")
 
 
 def _build_gateway_state() -> GatewayStateStore:
@@ -1271,6 +1272,7 @@ def gateway_commands_status() -> dict[str, Any]:
 
 @app.get("/api/gateway/commands/history")
 def gateway_commands_history(
+    request: Request,
     status: Optional[str] = None,
     command_type: Optional[str] = None,
     trade_date: Optional[str] = None,
@@ -1279,7 +1281,15 @@ def gateway_commands_history(
     offset: int = Query(0, ge=0, le=100000),
     include_finished: bool = True,
     include_payload: bool = False,
+    authorization: Optional[str] = Header(default=None),
+    x_local_token: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
+    _verify_if_payload_requested(
+        include_payload,
+        request,
+        authorization=authorization,
+        x_local_token=x_local_token,
+    )
     if command_id:
         record = gateway_state.get_command(command_id)
         items = [record.to_dict()] if record is not None else []
@@ -1312,28 +1322,62 @@ def gateway_commands_history(
 
 
 @app.get("/api/gateway/commands/{command_id}/events")
-def gateway_command_events(command_id: str, limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
-    return {"command_id": command_id, "events": gateway_state.command_events(command_id, limit=limit)}
+def gateway_command_events(
+    command_id: str,
+    request: Request,
+    limit: int = Query(100, ge=1, le=500),
+    include_payload: bool = False,
+    authorization: Optional[str] = Header(default=None),
+    x_local_token: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    _verify_if_payload_requested(
+        include_payload,
+        request,
+        authorization=authorization,
+        x_local_token=x_local_token,
+    )
+    events = gateway_state.command_events(command_id, limit=limit)
+    return {"command_id": command_id, "events": [_command_event_item(event, include_payload=include_payload) for event in events]}
 
 
 @app.get("/api/gateway/commands/{command_id}")
-def gateway_command_detail(command_id: str) -> dict[str, Any]:
+def gateway_command_detail(
+    command_id: str,
+    request: Request,
+    include_payload: bool = False,
+    authorization: Optional[str] = Header(default=None),
+    x_local_token: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    _verify_if_payload_requested(
+        include_payload,
+        request,
+        authorization=authorization,
+        x_local_token=x_local_token,
+    )
     record = gateway_state.get_command(command_id)
+    record_payload = _command_history_item(record.to_dict(), include_payload=include_payload) if record else None
+    events = gateway_state.command_events(command_id, limit=200)
     return {
         "found": record is not None,
-        "record": record.to_dict() if record else None,
-        "events": gateway_state.command_events(command_id, limit=200),
+        "record": record_payload,
+        "events": [_command_event_item(event, include_payload=include_payload) for event in events],
     }
 
 
 @app.post("/api/gateway/commands/prune")
-def gateway_commands_prune(older_than_sec: int = Query(3600, ge=0, le=86400)) -> dict[str, Any]:
+def gateway_commands_prune(
+    older_than_sec: int = Query(3600, ge=0, le=86400),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
     removed = gateway_state.prune_commands(older_than_sec=older_than_sec)
     return {"removed": removed, "summary": gateway_state.command_snapshot()}
 
 
 @app.post("/api/gateway/commands/{command_id}/cancel")
-def gateway_command_cancel(command_id: str) -> dict[str, Any]:
+def gateway_command_cancel(
+    command_id: str,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
     record = gateway_state.get_command(command_id)
     if record is None:
         return {
@@ -1364,6 +1408,11 @@ def enqueue_gateway_command(
     _: None = Depends(verify_gateway_token),
 ) -> dict[str, Any]:
     command = command_in.to_gateway_command()
+    if command.type in ORDER_COMMAND_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="ORDER_COMMAND_REQUIRES_ORDER_ENQUEUE",
+        )
     result = gateway_state.enqueue_command(
         command,
         priority=command_in.priority,
@@ -1380,7 +1429,10 @@ def enqueue_gateway_command(
 
 
 @app.post("/api/orders/enqueue")
-def enqueue_order(order_in: OrderEnqueueRequest) -> dict[str, Any]:
+def enqueue_order(
+    order_in: OrderEnqueueRequest,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
     return _order_service().enqueue_order(order_in).to_dict()
 
 
@@ -1526,6 +1578,26 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                         trace_id=message.trace_id,
                         source="core",
                         payload={"commands": payloads, "count": len(payloads), "timestamp": sent_at},
+                        metadata=metadata,
+                        sequence=sequence,
+                    ).to_dict()
+                )
+            elif message.type == "transport_heartbeat":
+                event = _gateway_event_from_ws_message(message, metadata=metadata)
+                _record_ws_message_side_effects(event, metadata)
+                await websocket.send_json(
+                    GatewayWsMessage(
+                        type="event_ack",
+                        trace_id=message.trace_id,
+                        source="core",
+                        event_id=event.event_id,
+                        command_id=event.command_id,
+                        payload={
+                            "accepted": True,
+                            "event_id": event.event_id,
+                            "type": event.type,
+                            "transport_only": True,
+                        },
                         metadata=metadata,
                         sequence=sequence,
                     ).to_dict()
@@ -1807,13 +1879,46 @@ def build_reviews_snapshot(db: TradingDatabase, *, limit: int = 100) -> dict[str
 
 
 def build_logs_snapshot(db: TradingDatabase, *, limit: int = 100) -> dict[str, Any]:
-    logs = db.recent_logs(limit=limit)
-    gateway_events = [event.to_dict() for event in gateway_state.recent_events(limit=50)]
+    logs = [_log_line_to_kst(line) for line in db.recent_logs(limit=limit)]
+    gateway_events = [_gateway_event_log_item(event) for event in gateway_state.recent_events(limit=50)]
     return {
         "core": logs,
         "gateway": gateway_events,
         "warnings": [line for line in logs if "WARN" in line.upper() or "ERROR" in line.upper()],
+        "timezone": "Asia/Seoul",
     }
+
+
+def _gateway_event_log_item(event: GatewayEvent) -> dict[str, Any]:
+    item = event.to_dict()
+    item["timestamp"] = _timestamp_to_kst_display(item.get("timestamp"))
+    return item
+
+
+def _log_line_to_kst(line: str) -> str:
+    text = str(line or "")
+    if len(text) < 19:
+        return text
+    converted = _timestamp_to_kst_display(text[:19])
+    if not converted:
+        return text
+    return f"{converted}{text[19:]}"
+
+
+def _timestamp_to_kst_display(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
 
 
 def _event_with_trace(event: GatewayEvent, trace_updates: dict[str, Any]) -> GatewayEvent:
@@ -2385,7 +2490,40 @@ def _command_history_item(item: dict[str, Any], *, include_payload: bool) -> dic
         command.pop("payload", None)
     compact = dict(item)
     compact["command"] = command
+    result_payload = dict(compact.get("result_payload") or {})
+    if result_payload:
+        compact["result_payload_summary"] = {
+            key: result_payload.get(key)
+            for key in ("ok", "code", "message", "command_id", "result_code", "reason", "error")
+            if key in result_payload
+        }
+        compact.pop("result_payload", None)
     return compact
+
+
+def _command_event_item(item: dict[str, Any], *, include_payload: bool) -> dict[str, Any]:
+    if include_payload:
+        return item
+    compact = dict(item)
+    payload = dict(compact.get("payload") or {})
+    compact["payload_summary"] = {
+        key: payload.get(key)
+        for key in ("command_id", "command_type", "status", "message", "reason", "error", "result_code")
+        if key in payload
+    }
+    compact.pop("payload", None)
+    return compact
+
+
+def _verify_if_payload_requested(
+    include_payload: bool,
+    request: Request,
+    *,
+    authorization: Optional[str] = None,
+    x_local_token: Optional[str] = None,
+) -> None:
+    if include_payload:
+        verify_gateway_token(request, authorization=authorization, x_local_token=x_local_token)
 
 
 def _select_dicts(db: TradingDatabase, query: str, params: tuple = ()) -> list[dict[str, Any]]:

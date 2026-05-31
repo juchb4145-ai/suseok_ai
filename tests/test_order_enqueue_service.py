@@ -5,6 +5,9 @@ from fastapi.testclient import TestClient
 from storage.db import TradingDatabase
 
 
+HEADERS = {"X-Local-Token": "test-token"}
+
+
 def _client(tmp_path, monkeypatch, *, mode="OBSERVE"):
     monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
     monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
@@ -39,7 +42,7 @@ def _order_payload(**overrides):
 def test_api_dry_run_order_creates_intent_without_gateway_command(tmp_path, monkeypatch):
     client, _ = _client(tmp_path, monkeypatch)
 
-    response = client.post("/api/orders/enqueue", json=_order_payload())
+    response = client.post("/api/orders/enqueue", json=_order_payload(), headers=HEADERS)
     payload = response.json()
 
     assert payload["accepted"] is True
@@ -70,12 +73,12 @@ def test_api_dry_run_order_creates_intent_without_gateway_command(tmp_path, monk
 def test_api_dry_run_order_duplicate_survives_core_reload(tmp_path, monkeypatch):
     client, api = _client(tmp_path, monkeypatch)
 
-    first = client.post("/api/orders/enqueue", json=_order_payload()).json()
+    first = client.post("/api/orders/enqueue", json=_order_payload(), headers=HEADERS).json()
     assert first["accepted"] is True
 
     api = importlib.reload(api)
     client = TestClient(api.app)
-    second = client.post("/api/orders/enqueue", json=_order_payload()).json()
+    second = client.post("/api/orders/enqueue", json=_order_payload(), headers=HEADERS).json()
 
     assert second["accepted"] is False
     assert second["status"] == "DUPLICATE"
@@ -91,6 +94,7 @@ def test_api_dry_run_rejected_intent_is_stored(tmp_path, monkeypatch):
     payload = client.post(
         "/api/orders/enqueue",
         json=_order_payload(idempotency_key="bad-price", price=0),
+        headers=HEADERS,
     ).json()
 
     assert payload["accepted"] is False

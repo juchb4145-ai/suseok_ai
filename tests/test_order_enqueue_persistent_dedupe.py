@@ -3,6 +3,9 @@ import importlib
 from fastapi.testclient import TestClient
 
 
+HEADERS = {"X-Local-Token": "test-token"}
+
+
 def _client(tmp_path, monkeypatch, *, mode="LIVE", allow_live="1"):
     monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
     monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
@@ -28,7 +31,7 @@ def _healthy_gateway(client):
                 "account": "1234567890",
             },
         },
-        headers={"X-Local-Token": "test-token"},
+        headers=HEADERS,
     )
 
 
@@ -53,12 +56,12 @@ def _order_payload(**overrides):
 def test_same_idempotency_key_is_rejected_after_core_reload(tmp_path, monkeypatch):
     first_client = _client(tmp_path, monkeypatch)
     _healthy_gateway(first_client)
-    first = first_client.post("/api/orders/enqueue", json=_order_payload(idempotency_key="order-once")).json()
+    first = first_client.post("/api/orders/enqueue", json=_order_payload(idempotency_key="order-once"), headers=HEADERS).json()
     assert first["accepted"] is True
 
     second_client = _client(tmp_path, monkeypatch)
     _healthy_gateway(second_client)
-    second = second_client.post("/api/orders/enqueue", json=_order_payload(idempotency_key="order-once")).json()
+    second = second_client.post("/api/orders/enqueue", json=_order_payload(idempotency_key="order-once"), headers=HEADERS).json()
 
     assert second["accepted"] is False
     assert second["reason"] == "DUPLICATE_ORDER_COMMAND"
@@ -68,12 +71,12 @@ def test_same_idempotency_key_is_rejected_after_core_reload(tmp_path, monkeypatc
 def test_same_deterministic_dedupe_key_is_rejected_after_core_reload(tmp_path, monkeypatch):
     first_client = _client(tmp_path, monkeypatch)
     _healthy_gateway(first_client)
-    first = first_client.post("/api/orders/enqueue", json=_order_payload()).json()
+    first = first_client.post("/api/orders/enqueue", json=_order_payload(), headers=HEADERS).json()
     assert first["accepted"] is True
 
     second_client = _client(tmp_path, monkeypatch)
     _healthy_gateway(second_client)
-    second = second_client.post("/api/orders/enqueue", json=_order_payload()).json()
+    second = second_client.post("/api/orders/enqueue", json=_order_payload(), headers=HEADERS).json()
 
     assert second["accepted"] is False
     assert second["reason"] == "DUPLICATE_ORDER_COMMAND"
@@ -83,9 +86,8 @@ def test_same_deterministic_dedupe_key_is_rejected_after_core_reload(tmp_path, m
 def test_command_history_detail_and_events_are_db_backed(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch)
     _healthy_gateway(client)
-    headers = {"X-Local-Token": "test-token"}
-    command_id = client.post("/api/orders/enqueue", json=_order_payload(idempotency_key="inspect")).json()["command_id"]
-    command = client.get("/api/gateway/commands", headers=headers).json()["commands"][0]
+    command_id = client.post("/api/orders/enqueue", json=_order_payload(idempotency_key="inspect"), headers=HEADERS).json()["command_id"]
+    command = client.get("/api/gateway/commands", headers=HEADERS).json()["commands"][0]
     client.post(
         "/api/gateway/events",
         json={
@@ -99,7 +101,7 @@ def test_command_history_detail_and_events_are_db_backed(tmp_path, monkeypatch):
                 "result_code": 0,
             },
         },
-        headers=headers,
+        headers=HEADERS,
     )
 
     reloaded = _client(tmp_path, monkeypatch)
@@ -119,9 +121,8 @@ def test_command_history_detail_and_events_are_db_backed(tmp_path, monkeypatch):
 def test_prune_api_removes_finished_history_but_keeps_order_dedupe(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch)
     _healthy_gateway(client)
-    headers = {"X-Local-Token": "test-token"}
-    first = client.post("/api/orders/enqueue", json=_order_payload(idempotency_key="prune-safe")).json()
-    command = client.get("/api/gateway/commands", headers=headers).json()["commands"][0]
+    first = client.post("/api/orders/enqueue", json=_order_payload(idempotency_key="prune-safe"), headers=HEADERS).json()
+    command = client.get("/api/gateway/commands", headers=HEADERS).json()["commands"][0]
     client.post(
         "/api/gateway/events",
         json={
@@ -134,11 +135,11 @@ def test_prune_api_removes_finished_history_but_keeps_order_dedupe(tmp_path, mon
                 "message": "ok",
             },
         },
-        headers=headers,
+        headers=HEADERS,
     )
 
-    pruned = client.post("/api/gateway/commands/prune?older_than_sec=0").json()
-    duplicate = client.post("/api/orders/enqueue", json=_order_payload(idempotency_key="prune-safe")).json()
+    pruned = client.post("/api/gateway/commands/prune?older_than_sec=0", headers=HEADERS).json()
+    duplicate = client.post("/api/orders/enqueue", json=_order_payload(idempotency_key="prune-safe"), headers=HEADERS).json()
 
     assert pruned["removed"] == 1
     assert duplicate["accepted"] is False

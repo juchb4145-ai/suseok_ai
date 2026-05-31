@@ -3,6 +3,9 @@ import importlib
 from fastapi.testclient import TestClient
 
 
+HEADERS = {"X-Local-Token": "test-token"}
+
+
 def _client(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
     monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
@@ -38,8 +41,8 @@ def test_dry_run_sell_api_summary_and_filters(tmp_path, monkeypatch):
         "idempotency_key": "sell-once",
     }
 
-    buy_response = client.post("/api/orders/enqueue", json=buy).json()
-    sell_response = client.post("/api/orders/enqueue", json=sell).json()
+    buy_response = client.post("/api/orders/enqueue", json=buy, headers=HEADERS).json()
+    sell_response = client.post("/api/orders/enqueue", json=sell, headers=HEADERS).json()
 
     assert buy_response["command"] is None
     assert sell_response["command"] is None

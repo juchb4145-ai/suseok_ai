@@ -64,6 +64,16 @@ class CommandStoreProtocol(Protocol):
 
     def snapshot(self, *, status: str | None = None, trade_date: str | None = None) -> dict[str, Any]: ...
 
+    def count_order_commands(
+        self,
+        *,
+        trade_date: str,
+        code: str,
+        side: str,
+        tag: str = "",
+        order_type: int | None = None,
+    ) -> int: ...
+
     def has_active_or_retained_dedupe(self, dedupe_key: str, now: datetime | None = None) -> bool: ...
 
     def register_dedupe(self, record: CommandRecord, retention_sec: int | None = None) -> bool: ...
@@ -363,6 +373,45 @@ class SQLiteCommandStore:
                 "stale_dispatched_count": counts.get(CommandStatus.DISPATCHED.value, 0),
                 "total_count": total,
             }
+
+    def count_order_commands(
+        self,
+        *,
+        trade_date: str,
+        code: str,
+        side: str,
+        tag: str = "",
+        order_type: int | None = None,
+    ) -> int:
+        normalized_code = str(code or "")
+        normalized_side = str(side or "")
+        normalized_tag = str(tag or "")
+        normalized_order_type = int(order_type) if order_type is not None else None
+        if not trade_date or not normalized_code or not normalized_side:
+            return 0
+        placeholders = ",".join("?" for _ in ORDER_COMMAND_TYPES)
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT payload_json FROM gateway_commands
+                WHERE trade_date = ?
+                  AND command_type IN ({placeholders})
+                """,
+                (str(trade_date), *sorted(ORDER_COMMAND_TYPES)),
+            ).fetchall()
+        count = 0
+        for row in rows:
+            payload = _loads(row["payload_json"])
+            if str(payload.get("code") or "") != normalized_code:
+                continue
+            if str(payload.get("side") or "") != normalized_side:
+                continue
+            if normalized_tag and str(payload.get("tag") or "") != normalized_tag:
+                continue
+            if normalized_order_type is not None and _safe_int(payload.get("order_type"), -1) != normalized_order_type:
+                continue
+            count += 1
+        return count
 
     def has_active_or_retained_dedupe(self, dedupe_key: str, now: datetime | None = None) -> bool:
         with self._lock:
@@ -701,7 +750,23 @@ def _dedupe_expires_at(record: CommandRecord, retention_sec: int) -> str:
 
 
 def _trade_date(timestamp: str) -> str:
-    return str(timestamp or "")[:10]
+    text = str(timestamp or "")
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text[:10]
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone(timedelta(hours=9))).date().isoformat()
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _now() -> datetime:

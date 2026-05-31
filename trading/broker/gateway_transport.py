@@ -430,14 +430,11 @@ class WebSocketRealCoreClient:
 
     def _heartbeat_message(self) -> GatewayWsMessage:
         return GatewayWsMessage(
-            type="heartbeat",
+            type="transport_heartbeat",
             source=self.source,
             payload={
                 "transport_mode": self.transport_mode,
-                "mode": "OBSERVE",
-                "orderable": False,
-                "kiwoom_logged_in": False,
-                "account": "",
+                "transport_keepalive": True,
                 **self.snapshot(),
             },
             sequence=self._next_sequence(),
