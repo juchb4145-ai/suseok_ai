@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from contextlib import asynccontextmanager
 from collections import Counter
-from dataclasses import asdict, is_dataclass
+from contextlib import asynccontextmanager
+from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -45,6 +45,7 @@ from trading.strategy.models import CandidateState
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
 from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, config_from_settings
+from trading_app.dry_run_threshold_ab import DryRunThresholdABAnalyzer, config_from_settings as threshold_ab_config_from_settings
 from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.runtime_supervisor import RuntimeSupervisor
@@ -136,6 +137,67 @@ def _transport_config_from_settings() -> TransportLatencyConfig:
 
 def _transport_analyzer(db: TradingDatabase) -> TransportLatencyAnalyzer:
     return TransportLatencyAnalyzer(db, config=_transport_config_from_settings())
+
+
+def _threshold_ab_analyzer(*, min_sample_count: Optional[int] = None) -> DryRunThresholdABAnalyzer:
+    config = threshold_ab_config_from_settings(get_settings())
+    if min_sample_count is not None:
+        config = replace(config, min_sample_count=int(min_sample_count))
+    return DryRunThresholdABAnalyzer(config=config)
+
+
+def _filter_threshold_ab_report(
+    report: dict[str, Any],
+    *,
+    category: Optional[str] = None,
+    recommendation_grade: Optional[str] = None,
+    parameter_name: Optional[str] = None,
+    include_risky: bool = True,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    candidates = list(report.get("candidates") or [])
+    results = dict(report.get("results") or {})
+    normalized_category = (category or "").strip()
+    normalized_grade = (recommendation_grade or "").strip()
+    normalized_parameter = (parameter_name or "").strip()
+
+    def keep(candidate: dict[str, Any]) -> bool:
+        result = dict(results.get(str(candidate.get("candidate_id") or "")) or {})
+        grade = str((result.get("recommendation") or {}).get("grade") or candidate.get("recommendation_grade") or "")
+        if normalized_category and str(candidate.get("category") or "") != normalized_category:
+            return False
+        if normalized_grade and grade != normalized_grade:
+            return False
+        if not include_risky and grade in {"RISKY_CANDIDATE", "DO_NOT_APPLY"}:
+            return False
+        if normalized_parameter and normalized_parameter not in str(candidate.get("parameter_name") or ""):
+            return False
+        return True
+
+    filtered = [candidate for candidate in candidates if keep(candidate)]
+    start = max(0, int(offset or 0))
+    page_limit = max(1, int(limit or 100))
+    report = dict(report)
+    report["all_candidate_count"] = int(report.get("total_candidates") or len(candidates))
+    report["total_candidates"] = len(filtered)
+    report["candidates"] = filtered[start : start + page_limit]
+    report["pagination"] = _pagination_payload(
+        limit=page_limit,
+        offset=start,
+        count=len(report["candidates"]),
+        total=len(filtered),
+    )
+    report["filters"] = {
+        **dict(report.get("filters") or {}),
+        "category": normalized_category,
+        "recommendation_grade": normalized_grade,
+        "parameter_name": normalized_parameter,
+        "include_risky": include_risky,
+        "limit": page_limit,
+        "offset": start,
+    }
+    return report
 
 
 def _pagination_payload(
@@ -835,6 +897,159 @@ def runtime_dry_run_false_signals(
         close_database(db)
 
 
+@app.get("/api/runtime/threshold-ab/dry-run")
+def runtime_threshold_ab_dry_run(
+    trade_date: Optional[str] = None,
+    strategy_name: Optional[str] = None,
+    code: Optional[str] = None,
+    theme_name: Optional[str] = None,
+    session_bucket: Optional[str] = None,
+    category: Optional[str] = None,
+    recommendation_grade: Optional[str] = None,
+    parameter_name: Optional[str] = None,
+    min_sample_count: Optional[int] = None,
+    include_risky: bool = True,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        performance_report = _performance_analyzer(db).build_report(
+            trade_date=trade_date,
+            strategy_name=strategy_name,
+            code=code,
+            theme_name=theme_name,
+            session_bucket=session_bucket,
+            limit=10000,
+            offset=0,
+        )
+        analyzer = _threshold_ab_analyzer(min_sample_count=min_sample_count)
+        filters = {
+            "trade_date": trade_date or "",
+            "strategy_name": strategy_name or "",
+            "code": code or "",
+            "theme_name": theme_name or "",
+            "session_bucket": session_bucket or "",
+            "category": category or "",
+            "recommendation_grade": recommendation_grade or "",
+            "parameter_name": parameter_name or "",
+            "min_sample_count": min_sample_count,
+            "include_risky": include_risky,
+        }
+        report = analyzer.build_report(
+            performance_report,
+            trade_date=trade_date,
+            filters=filters,
+            limit=10000,
+            offset=0,
+            include_risky=include_risky,
+        )
+        return _filter_threshold_ab_report(
+            report,
+            category=category,
+            recommendation_grade=recommendation_grade,
+            parameter_name=parameter_name,
+            include_risky=include_risky,
+            limit=limit,
+            offset=offset,
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/threshold-ab/dry-run/rebuild")
+def rebuild_runtime_threshold_ab_dry_run(
+    trade_date: Optional[str] = None,
+    persist: bool = True,
+    export: bool = False,
+    format: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+    min_sample_count: Optional[int] = None,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        performance_report = _performance_analyzer(db).build_report(trade_date=trade_date, limit=10000)
+        analyzer = _threshold_ab_analyzer(min_sample_count=min_sample_count)
+        report = analyzer.build_report(
+            performance_report,
+            trade_date=trade_date,
+            filters={"trade_date": trade_date or "", "min_sample_count": min_sample_count},
+            limit=10000,
+            offset=0,
+        )
+        persisted = db.save_dry_run_threshold_ab_report(report) if persist else None
+        exports = analyzer.export_report(report, fmt=format) if export else {}
+        return {
+            "report_id": report["report_id"],
+            "persisted": persisted is not None,
+            "exported": exports,
+            "report": report,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/threshold-ab/dry-run/reports")
+def runtime_threshold_ab_reports(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_dry_run_threshold_ab_reports(limit=limit + 1, offset=offset)
+        items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {"items": items, "pagination": pagination, "filters": {"limit": limit, "offset": offset}}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/threshold-ab/dry-run/reports/{report_id}")
+def runtime_threshold_ab_report_detail(report_id: str) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = db.get_dry_run_threshold_ab_report(report_id)
+        if report is None:
+            return {"report_id": report_id, "found": False}
+        report["found"] = True
+        return report
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/threshold-ab/dry-run/candidates/{candidate_id}")
+def runtime_threshold_ab_candidate_detail(
+    candidate_id: str,
+    trade_date: Optional[str] = None,
+    report_id: Optional[str] = None,
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        if report_id:
+            report = db.get_dry_run_threshold_ab_report(report_id) or {}
+        else:
+            performance_report = _performance_analyzer(db).build_report(trade_date=trade_date, limit=10000)
+            report = _threshold_ab_analyzer().build_report(
+                performance_report,
+                trade_date=trade_date,
+                filters={"trade_date": trade_date or ""},
+                limit=10000,
+            )
+        candidates = list(report.get("candidates") or [])
+        candidate = next((item for item in candidates if item.get("candidate_id") == candidate_id), None)
+        result = dict((report.get("results") or {}).get(candidate_id) or {})
+        return {
+            "found": candidate is not None,
+            "candidate_id": candidate_id,
+            "candidate": candidate,
+            "result": result,
+            "affected_lifecycles": result.get("affected_lifecycles", []),
+            "report_id": report.get("report_id", report_id or ""),
+            "disclaimer_ko": "실제 적용이 아니라 DRY_RUN 사후 분석 후보입니다.",
+        }
+    finally:
+        close_database(db)
+
+
 @app.get("/api/runtime/performance/dry-run/lifecycles/{lifecycle_id}")
 def runtime_dry_run_performance_lifecycle_detail(
     lifecycle_id: str,
@@ -1347,7 +1562,8 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "items": db.list_runtime_order_intents(limit=20),
         "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=20),
     }
-    dry_run_performance_report = _performance_analyzer(db).build_report(limit=10)
+    dry_run_performance_report = _performance_analyzer(db).build_report(limit=10000)
+    threshold_ab_report = _threshold_ab_analyzer().build_report(dry_run_performance_report, limit=10, offset=0)
     dry_run_performance_payload = {
         "generated_at": dry_run_performance_report.get("generated_at", ""),
         "trade_date": dry_run_performance_report.get("trade_date", ""),
@@ -1377,8 +1593,18 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
             if item.get("dry_run_false_positive_type") or item.get("opportunity_loss_type")
         ][:10],
     }
+    threshold_ab_payload = {
+        "generated_at": threshold_ab_report.get("generated_at", ""),
+        "trade_date": threshold_ab_report.get("trade_date", ""),
+        "report_id": threshold_ab_report.get("report_id", ""),
+        "summary": threshold_ab_report.get("summary", {}),
+        "recommendations": list(threshold_ab_report.get("recommendations") or [])[:5],
+        "candidates": list(threshold_ab_report.get("candidates") or [])[:5],
+        "disclaimer_ko": threshold_ab_report.get("disclaimer_ko", ""),
+    }
     runtime_payload["dry_run_orders"] = dry_run_orders_payload
     runtime_payload["dry_run_performance"] = dry_run_performance_payload
+    runtime_payload["threshold_ab"] = threshold_ab_payload
     ops_alerts_payload = build_ops_alerts(
         core=status_payload["core"],
         gateway=status_payload["gateway"],
@@ -1398,6 +1624,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "runtime": runtime_payload,
         "dry_run_orders": dry_run_orders_payload,
         "dry_run_performance": dry_run_performance_payload,
+        "threshold_ab": threshold_ab_payload,
         "ops_alerts": ops_alerts_payload,
         "safety": status_payload["safety"],
         "candidates": candidates_payload,

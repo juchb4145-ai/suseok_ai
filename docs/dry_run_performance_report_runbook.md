@@ -109,6 +109,17 @@ Recommendations are intentionally phrased as review prompts, not automatic param
 - Rejected-live rallies: inspect SafetyGuard/Gateway availability
 - High SUPPORT_LOSS count: revisit entry price and stop policy
 
+## Threshold A/B 제안으로 이어지는 흐름
+
+PR-12는 이 성과 리포트의 lifecycle 데이터를 다시 사용해 게이트/리스크 기준 후보를 만든다.
+
+- FP가 많은 `LATE_CHASE`, `CHASE_RISK`, `LATE_LAGGARD`는 차단/감점 강화 후보가 될 수 있다.
+- 막았지만 상승한 `LOW_BREADTH`는 테마 점수가 충분할 때 WATCH 허용 후보가 될 수 있다.
+- `theme_score`, `hybrid_score`, `gate_score` 구간별 성과 차이가 크면 최소 기준 조정 후보가 될 수 있다.
+- `live_safety`로 막혔지만 상승한 사례는 안전장치 완화가 아니라 운영 상태 점검 후보로 분류한다.
+
+자세한 사용법은 [DRY_RUN 기준 A/B 제안 Runbook](dry_run_threshold_ab_runbook.md)을 참고한다. A/B 제안은 실제 설정을 자동 변경하지 않는다.
+
 ## Safety
 
 This is an analysis-only PR. It never enables LIVE automation, never calls Kiwoom, and never enqueues Gateway `send_order`.

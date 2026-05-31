@@ -64,6 +64,13 @@ class CoreSettings:
     transport_websocket_recommend_p95_ms: int = 1000
     transport_websocket_recommend_empty_poll_rate: float = 0.8
     transport_websocket_experiment_enabled: bool = False
+    threshold_ab_min_sample_count: int = 10
+    threshold_ab_strong_fp_reduction_min: int = 3
+    threshold_ab_max_fn_increase: int = 1
+    threshold_ab_max_opportunity_loss_increase: int = 1
+    threshold_ab_confidence_min: float = 0.5
+    threshold_ab_export_root: Path = PROJECT_ROOT / "reports" / "dry_run_threshold_ab"
+    threshold_ab_enable_apply: bool = False
 
     @property
     def live_order_enabled(self) -> bool:
@@ -131,6 +138,15 @@ def get_settings() -> CoreSettings:
             0.8,
         ),
         transport_websocket_experiment_enabled=_bool_env("TRADING_TRANSPORT_WEBSOCKET_EXPERIMENT_ENABLED", False),
+        threshold_ab_min_sample_count=_int_env("TRADING_THRESHOLD_AB_MIN_SAMPLE_COUNT", 10),
+        threshold_ab_strong_fp_reduction_min=_int_env("TRADING_THRESHOLD_AB_STRONG_FP_REDUCTION_MIN", 3),
+        threshold_ab_max_fn_increase=_int_env("TRADING_THRESHOLD_AB_MAX_FN_INCREASE", 1),
+        threshold_ab_max_opportunity_loss_increase=_int_env("TRADING_THRESHOLD_AB_MAX_OPPORTUNITY_LOSS_INCREASE", 1),
+        threshold_ab_confidence_min=_float_env("TRADING_THRESHOLD_AB_CONFIDENCE_MIN", 0.5),
+        threshold_ab_export_root=Path(
+            os.environ.get("TRADING_THRESHOLD_AB_EXPORT_ROOT", str(PROJECT_ROOT / "reports" / "dry_run_threshold_ab"))
+        ).expanduser(),
+        threshold_ab_enable_apply=_bool_env("TRADING_THRESHOLD_AB_ENABLE_APPLY", False),
     )
 
 

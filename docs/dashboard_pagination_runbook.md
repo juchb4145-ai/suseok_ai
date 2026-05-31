@@ -65,6 +65,13 @@ DRY_RUN 성과 사례:
 - 상세: `lifecycle_id`가 있으면 라이프사이클 상세 API 사용
 - 보는 법: `false_positive`, `false_negative`, `opportunity_loss`를 나눠서 게이트 사유와 safety reject 사유를 함께 본다.
 
+게이트/리스크 A/B 후보:
+
+- API: `GET /api/runtime/threshold-ab/dry-run`
+- 필터: `trade_date`, `category`, `recommendation_grade`, `parameter_name`, `min_sample_count`, `include_risky`
+- 상세: `GET /api/runtime/threshold-ab/dry-run/candidates/{candidate_id}`
+- 보는 법: 후보 기준이 줄일 수 있는 FP, 새로 만들 수 있는 FN, 기회손실 변화를 함께 본다. “강한 후보”라도 실제 적용이 아니라 다음 검증 후보로만 본다.
+
 게이트웨이 명령 이력:
 
 - API: `GET /api/gateway/commands/history`
@@ -95,6 +102,7 @@ DRY_RUN 성과 사례:
 - 전송 지연 리포트 재생성/export
 - WebSocket Mock 비교 리포트 재생성/export
 - DRY_RUN 성과 리포트 재생성/export
+- DRY_RUN 기준 A/B 제안 리포트 재생성/export
 
 이 작업들은 token 보호 API를 호출한다. 대시보드는 `TRADING_CORE_TOKEN`을 입력받아 `localStorage`에 저장하지만, 토큰을 프론트엔드 코드에 하드코딩하지 않는다. 공용 PC나 원격 접속 환경에서는 브라우저 저장소를 정리해야 한다.
 
@@ -114,6 +122,13 @@ DRY_RUN 성과:
 2. DRY_RUN 성과 사례 표를 연다.
 3. `code`, `theme_name`, `strategy_name`으로 필터링한다.
 4. 라이프사이클 상세를 열어 연결된 주문 의도, 가상 포지션, 리뷰 정보를 확인한다.
+
+DRY_RUN 기준 제안:
+
+1. `DRY_RUN 기준 제안` 요약에서 강한 후보/관찰 후보/위험 후보 수를 본다.
+2. `게이트/리스크 A/B 후보` 표에서 `category=risk`, `recommendation_grade=STRONG_CANDIDATE`처럼 좁혀 본다.
+3. 행 상세를 열어 영향받은 lifecycle 샘플과 기대효과/예상리스크를 확인한다.
+4. 실제 적용은 하지 않고, 별도 승인/적용 PR의 입력 자료로만 사용한다.
 
 오탐/미탐:
 
@@ -136,5 +151,6 @@ PR-10 대시보드는 다음을 하지 않는다.
 - LIVE 자동주문 활성화
 - 주문 실행 버튼 추가
 - Gateway 전송 방식을 WebSocket으로 전환
+- threshold 후보를 실제 전략 설정에 자동 적용
 - raw tick 전체 렌더링
 - React/Vite 같은 대형 프론트엔드 의존성 도입

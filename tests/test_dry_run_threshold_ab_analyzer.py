@@ -1,0 +1,138 @@
+from pathlib import Path
+
+from trading_app.dry_run_threshold_ab import DryRunThresholdABAnalyzer, ThresholdABConfig
+
+
+def _item(identifier: str, **overrides) -> dict:
+    payload = {
+        "lifecycle_id": identifier,
+        "trade_date": "2026-05-30",
+        "code": "005930",
+        "theme_name": "AI",
+        "strategy_name": "KOSDAQ_THEME_PROFILE",
+        "session_bucket": "OPEN",
+        "gate_reason": "READY",
+        "entry_intent_id": f"entry-{identifier}",
+        "entry_intent_status": "DRY_RUN_ACCEPTED",
+        "entry_live_would_pass": True,
+        "entry_live_reject_reason": "",
+        "realized_return_pct": 1.5,
+        "max_return_20m": 3.2,
+        "max_drawdown_20m": -0.5,
+        "dry_run_false_positive_type": "",
+        "dry_run_false_negative_type": "",
+        "opportunity_loss_type": "",
+        "signal_classification": "true_positive",
+        "quality_bucket": "GOOD",
+        "theme_score": 82.0,
+        "hybrid_score": 84.0,
+        "gate_score": 80.0,
+        "details": {},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _report(items: list[dict]) -> dict:
+    return {
+        "trade_date": "2026-05-30",
+        "items": items,
+        "summary": {"total_lifecycle_count": len(items)},
+        "false_signal_summary": {},
+        "grouped": {},
+    }
+
+
+def test_late_chase_false_positive_generates_risk_candidate():
+    items = [
+        _item(
+            "late-1",
+            gate_reason="LATE_CHASE",
+            realized_return_pct=-2.0,
+            max_drawdown_20m=-4.0,
+            dry_run_false_positive_type="LATE_CHASE_FALSE_POSITIVE",
+            signal_classification="false_positive",
+            theme_score=45.0,
+            hybrid_score=50.0,
+            gate_score=48.0,
+        ),
+        _item("good-1"),
+    ]
+    analyzer = DryRunThresholdABAnalyzer(config=ThresholdABConfig(min_sample_count=1, strong_fp_reduction_min=1))
+
+    report = analyzer.build_report(_report(items), limit=100)
+
+    candidate = next(item for item in report["candidates"] if item["candidate_id"] == "risk:late_chase:block")
+    result = report["results"][candidate["candidate_id"]]
+    assert candidate["label_ko"] == "추격매수 위험 차단 강화"
+    assert result["delta"]["avoided_false_positive_count"] == 1
+    assert result["recommendation"]["grade"] in {"STRONG_CANDIDATE", "WATCH_CANDIDATE"}
+
+
+def test_low_breadth_rallied_generates_watch_allow_candidate():
+    items = [
+        _item(
+            "low-breadth-1",
+            gate_reason="LOW_BREADTH",
+            entry_intent_status="DRY_RUN_REJECTED",
+            entry_live_would_pass=False,
+            entry_live_reject_reason="GATEWAY_NOT_CONNECTED",
+            dry_run_false_negative_type="DRY_RUN_REJECTED_BUT_RALLIED",
+            opportunity_loss_type="SAFETY_REJECT_REASON_OPPORTUNITY_LOSS",
+            signal_classification="false_negative",
+            max_return_20m=5.0,
+            theme_score=78.0,
+        ),
+        _item("good-2"),
+    ]
+    analyzer = DryRunThresholdABAnalyzer(config=ThresholdABConfig(min_sample_count=1))
+
+    report = analyzer.build_report(_report(items), limit=100)
+
+    candidate = next(item for item in report["candidates"] if item["candidate_id"] == "gate:low_breadth:watch_allow")
+    result = report["results"][candidate["candidate_id"]]
+    assert candidate["category"] == "gate"
+    assert result["delta"]["newly_allowed_count"] == 1
+    assert "기회손실" in candidate["expected_effect_ko"]
+
+
+def test_score_threshold_and_low_sample_grading():
+    items = [
+        _item(
+            "weak-score-1",
+            theme_score=35,
+            hybrid_score=42,
+            gate_score=38,
+            realized_return_pct=-1.5,
+            dry_run_false_positive_type="LIVE_WOULD_PASS_BUT_NEGATIVE_RETURN",
+            signal_classification="false_positive",
+        ),
+        _item("strong-score-1", theme_score=90, hybrid_score=88, gate_score=85),
+    ]
+    analyzer = DryRunThresholdABAnalyzer(config=ThresholdABConfig(min_sample_count=10))
+
+    report = analyzer.build_report(_report(items), limit=100)
+
+    theme_candidates = [item for item in report["candidates"] if item["parameter_name"] == "theme_score_min"]
+    assert theme_candidates
+    result = report["results"][theme_candidates[0]["candidate_id"]]
+    assert result["recommendation"]["grade"] == "DATA_INSUFFICIENT"
+
+
+def test_export_markdown_csv_json_are_korean(tmp_path):
+    items = [_item("export-1", gate_reason="LATE_CHASE", dry_run_false_positive_type="LATE_CHASE_FALSE_POSITIVE", realized_return_pct=-2.0)]
+    analyzer = DryRunThresholdABAnalyzer(
+        config=ThresholdABConfig(min_sample_count=1, export_root=Path(tmp_path) / "reports")
+    )
+    report = analyzer.build_report(_report(items), limit=100)
+
+    exports = analyzer.export_report(report, fmt="all")
+
+    assert set(exports) == {"json", "csv", "md"}
+    for path in exports.values():
+        assert Path(path).exists()
+    markdown = Path(exports["md"]).read_text(encoding="utf-8")
+    assert "DRY_RUN 기반 게이트/리스크 기준 A/B 제안 리포트" in markdown
+    assert "실제 전략 설정에 자동 적용하지 않습니다" in markdown
+    csv_text = Path(exports["csv"]).read_text(encoding="utf-8-sig")
+    assert "label_ko" in csv_text

@@ -606,6 +606,39 @@ class TradingDatabase:
                 item_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS dry_run_threshold_ab_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                candidates_json TEXT NOT NULL DEFAULT '[]',
+                scenarios_json TEXT NOT NULL DEFAULT '[]',
+                results_json TEXT NOT NULL DEFAULT '{}',
+                recommendations_json TEXT NOT NULL DEFAULT '[]',
+                filters_json TEXT NOT NULL DEFAULT '{}',
+                generated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS dry_run_threshold_ab_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT '',
+                parameter_name TEXT NOT NULL DEFAULT '',
+                label_ko TEXT NOT NULL DEFAULT '',
+                baseline_value TEXT NOT NULL DEFAULT '',
+                candidate_value TEXT NOT NULL DEFAULT '',
+                recommendation_grade TEXT NOT NULL DEFAULT '',
+                expected_net_benefit_score REAL,
+                avoided_false_positive_count INTEGER DEFAULT 0,
+                newly_created_false_negative_count INTEGER DEFAULT 0,
+                opportunity_loss_delta INTEGER DEFAULT 0,
+                sample_count INTEGER DEFAULT 0,
+                confidence REAL,
+                candidate_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS strategy_runtime_settings (
                 config_key TEXT PRIMARY KEY,
                 config_version INTEGER NOT NULL,
@@ -736,6 +769,14 @@ class TradingDatabase:
                 ON dry_run_performance_items(dry_run_false_positive_type);
             CREATE INDEX IF NOT EXISTS idx_dry_run_performance_items_false_negative_type
                 ON dry_run_performance_items(dry_run_false_negative_type);
+            CREATE INDEX IF NOT EXISTS idx_dry_run_threshold_ab_reports_trade_date
+                ON dry_run_threshold_ab_reports(trade_date, generated_at);
+            CREATE INDEX IF NOT EXISTS idx_dry_run_threshold_ab_candidates_report_id
+                ON dry_run_threshold_ab_candidates(report_id);
+            CREATE INDEX IF NOT EXISTS idx_dry_run_threshold_ab_candidates_category
+                ON dry_run_threshold_ab_candidates(category);
+            CREATE INDEX IF NOT EXISTS idx_dry_run_threshold_ab_candidates_grade
+                ON dry_run_threshold_ab_candidates(recommendation_grade);
             """
         )
         self._ensure_column("indicator_snapshots", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
@@ -1462,6 +1503,127 @@ class TradingDatabase:
             (report_id, max(1, int(limit or 1000)), max(0, int(offset or 0))),
         ).fetchall()
         return [_row_to_dry_run_performance_item(row) for row in rows]
+
+    def save_dry_run_threshold_ab_report(self, report: dict) -> dict:
+        report_id = str(report.get("report_id") or "")
+        if not report_id:
+            raise ValueError("report_id is required")
+        summary = dict(report.get("summary") or {})
+        candidates = list(report.get("candidates") or [])
+        scenarios = list(report.get("scenarios") or [])
+        results = dict(report.get("results") or {})
+        recommendations = list(report.get("recommendations") or [])
+        filters = dict(report.get("filters") or {})
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO dry_run_threshold_ab_reports(
+                    report_id, trade_date, status, summary_json, candidates_json,
+                    scenarios_json, results_json, recommendations_json, filters_json, generated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_id) DO UPDATE SET
+                    trade_date=excluded.trade_date,
+                    status=excluded.status,
+                    summary_json=excluded.summary_json,
+                    candidates_json=excluded.candidates_json,
+                    scenarios_json=excluded.scenarios_json,
+                    results_json=excluded.results_json,
+                    recommendations_json=excluded.recommendations_json,
+                    filters_json=excluded.filters_json,
+                    generated_at=excluded.generated_at
+                """,
+                (
+                    report_id,
+                    str(report.get("trade_date") or filters.get("trade_date") or ""),
+                    str(report.get("status") or "READY"),
+                    json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(candidates, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(scenarios, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(results, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(recommendations, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(filters, ensure_ascii=False, sort_keys=True, default=str),
+                    str(report.get("generated_at") or ""),
+                ),
+            )
+            self.conn.execute("DELETE FROM dry_run_threshold_ab_candidates WHERE report_id = ?", (report_id,))
+            for candidate in candidates:
+                result = results.get(str(candidate.get("candidate_id") or ""), {})
+                recommendation = dict(result.get("recommendation") or {})
+                delta = dict(result.get("delta") or {})
+                self.conn.execute(
+                    """
+                    INSERT INTO dry_run_threshold_ab_candidates(
+                        report_id, candidate_id, category, parameter_name, label_ko,
+                        baseline_value, candidate_value, recommendation_grade,
+                        expected_net_benefit_score, avoided_false_positive_count,
+                        newly_created_false_negative_count, opportunity_loss_delta,
+                        sample_count, confidence, candidate_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        report_id,
+                        str(candidate.get("candidate_id") or ""),
+                        str(candidate.get("category") or ""),
+                        str(candidate.get("parameter_name") or ""),
+                        str(candidate.get("label_ko") or ""),
+                        str(candidate.get("baseline_value") or ""),
+                        str(candidate.get("candidate_value") or ""),
+                        str(recommendation.get("grade") or candidate.get("recommendation_grade") or ""),
+                        recommendation.get("expected_net_benefit_score"),
+                        int(delta.get("avoided_false_positive_count") or 0),
+                        int(delta.get("newly_created_false_negative_count") or 0),
+                        int(delta.get("opportunity_loss_delta") or 0),
+                        int(recommendation.get("sample_count") or 0),
+                        recommendation.get("confidence"),
+                        json.dumps({**candidate, "result": result}, ensure_ascii=False, sort_keys=True, default=str),
+                    ),
+                )
+        return self.get_dry_run_threshold_ab_report(report_id) or {"report_id": report_id}
+
+    def list_dry_run_threshold_ab_reports(self, *, limit: int = 50, offset: int = 0) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT id, report_id, trade_date, status, summary_json,
+                   recommendations_json, filters_json, generated_at, created_at
+            FROM dry_run_threshold_ab_reports
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (max(1, int(limit or 50)), max(0, int(offset or 0))),
+        ).fetchall()
+        return [_row_to_dry_run_threshold_ab_report(row, include_details=False) for row in rows]
+
+    def get_dry_run_threshold_ab_report(self, report_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM dry_run_threshold_ab_reports WHERE report_id = ?",
+            (report_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = _row_to_dry_run_threshold_ab_report(row, include_details=True)
+        payload["candidate_rows"] = self.list_dry_run_threshold_ab_candidates(report_id, limit=10000)
+        return payload
+
+    def list_dry_run_threshold_ab_candidates(self, report_id: str, *, limit: int = 1000, offset: int = 0) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM dry_run_threshold_ab_candidates
+            WHERE report_id = ?
+            ORDER BY
+                CASE recommendation_grade
+                    WHEN 'STRONG_CANDIDATE' THEN 0
+                    WHEN 'WATCH_CANDIDATE' THEN 1
+                    WHEN 'RISKY_CANDIDATE' THEN 2
+                    WHEN 'DATA_INSUFFICIENT' THEN 3
+                    ELSE 4
+                END,
+                expected_net_benefit_score DESC,
+                id ASC
+            LIMIT ? OFFSET ?
+            """,
+            (report_id, max(1, int(limit or 1000)), max(0, int(offset or 0))),
+        ).fetchall()
+        return [_row_to_dry_run_threshold_ab_candidate(row) for row in rows]
 
     def save_gateway_transport_latency_sample(self, sample: dict) -> dict:
         sample_id = str(sample.get("sample_id") or "")
@@ -3097,6 +3259,48 @@ def _row_to_dry_run_performance_item(row: sqlite3.Row) -> dict:
     item.setdefault("quality_bucket", row["quality_bucket"])
     item.setdefault("created_at", row["created_at"])
     return item
+
+
+def _row_to_dry_run_threshold_ab_report(row: sqlite3.Row, *, include_details: bool) -> dict:
+    payload = {
+        "id": int(row["id"]),
+        "report_id": row["report_id"],
+        "trade_date": row["trade_date"],
+        "status": row["status"],
+        "summary": _safe_json_loads(row["summary_json"], {}),
+        "recommendations": _safe_json_loads(row["recommendations_json"], []),
+        "filters": _safe_json_loads(row["filters_json"], {}),
+        "generated_at": row["generated_at"],
+        "created_at": row["created_at"],
+    }
+    if include_details:
+        payload["candidates"] = _safe_json_loads(row["candidates_json"], [])
+        payload["scenarios"] = _safe_json_loads(row["scenarios_json"], [])
+        payload["results"] = _safe_json_loads(row["results_json"], {})
+    return payload
+
+
+def _row_to_dry_run_threshold_ab_candidate(row: sqlite3.Row) -> dict:
+    payload = _safe_json_loads(row["candidate_json"], {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("id", int(row["id"]))
+    payload.setdefault("report_id", row["report_id"])
+    payload.setdefault("candidate_id", row["candidate_id"])
+    payload.setdefault("category", row["category"])
+    payload.setdefault("parameter_name", row["parameter_name"])
+    payload.setdefault("label_ko", row["label_ko"])
+    payload.setdefault("baseline_value", row["baseline_value"])
+    payload.setdefault("candidate_value", row["candidate_value"])
+    payload.setdefault("recommendation_grade", row["recommendation_grade"])
+    payload.setdefault("expected_net_benefit_score", row["expected_net_benefit_score"])
+    payload.setdefault("avoided_false_positive_count", row["avoided_false_positive_count"])
+    payload.setdefault("newly_created_false_negative_count", row["newly_created_false_negative_count"])
+    payload.setdefault("opportunity_loss_delta", row["opportunity_loss_delta"])
+    payload.setdefault("sample_count", row["sample_count"])
+    payload.setdefault("confidence", row["confidence"])
+    payload.setdefault("created_at", row["created_at"])
+    return payload
 
 
 def _row_to_gateway_transport_latency_sample(row: sqlite3.Row) -> dict:

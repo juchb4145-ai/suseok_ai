@@ -160,6 +160,25 @@
 
       <section class="band">
         <div class="section-head">
+          <h2>DRY_RUN 기준 제안</h2>
+          <span id="threshold-ab-report-id" class="counter">실제 적용 아님</span>
+        </div>
+        <p class="help-text">DRY_RUN 성과 리포트를 바탕으로 “바꿔볼 만한 기준”만 제안합니다. 전략 설정에는 자동 반영되지 않습니다.</p>
+        <div class="mini-grid command-grid">
+          <div><span>후보 전체</span><strong id="threshold-ab-total">0</strong></div>
+          <div><span>강한 후보</span><strong id="threshold-ab-strong">0</strong></div>
+          <div><span>관찰 후보</span><strong id="threshold-ab-watch">0</strong></div>
+          <div><span>위험 후보</span><strong id="threshold-ab-risky">0</strong></div>
+          <div><span>데이터 부족</span><strong id="threshold-ab-insufficient">0</strong></div>
+          <div><span>예상 FP 감소</span><strong id="threshold-ab-fp-reduction">0</strong></div>
+          <div><span>예상 FN 증가</span><strong id="threshold-ab-fn-increase">0</strong></div>
+          <div><span>예상 기회손실 변화</span><strong id="threshold-ab-opp-delta">0</strong></div>
+        </div>
+        <div id="threshold-ab-recommendations" class="inline-log"></div>
+      </section>
+
+      <section class="band">
+        <div class="section-head">
           <h2>게이트웨이 명령 큐</h2>
           <span id="command-last-order" class="counter">-</span>
         </div>
@@ -286,6 +305,32 @@
           </table>
         </div>
         <div id="falseSignals-pagination" class="pagination"></div>
+      </section>
+
+      <section class="band table-panel" data-table-section="thresholdAB">
+        <div class="section-head">
+          <div>
+            <h2>게이트/리스크 A/B 후보</h2>
+            <p class="help-text">기존 기준과 후보 기준을 같은 DRY_RUN 표본에 사후 재적용해 비교합니다. 여기서 바로 적용하지 않습니다.</p>
+          </div>
+          <span id="thresholdAB-status" class="counter">대기</span>
+        </div>
+        <div class="filter-grid">
+          <label>거래일<input data-table="thresholdAB" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+          <label>분류<select data-table="thresholdAB" data-filter="category"><option value="">전체</option><option value="gate">게이트</option><option value="risk">리스크</option><option value="theme">테마</option><option value="session">시간대</option><option value="safety">안전장치</option></select></label>
+          <label>추천등급<select data-table="thresholdAB" data-filter="recommendation_grade"><option value="">전체</option><option value="STRONG_CANDIDATE">강한 후보</option><option value="WATCH_CANDIDATE">관찰 후보</option><option value="RISKY_CANDIDATE">위험 후보</option><option value="DATA_INSUFFICIENT">데이터 부족</option><option value="DO_NOT_APPLY">적용 비추천</option></select></label>
+          <label>기준명<input data-table="thresholdAB" data-filter="parameter_name" placeholder="theme_score_min" /></label>
+          <label>최소 표본<input data-table="thresholdAB" data-filter="min_sample_count" placeholder="10" /></label>
+          <label>위험 후보<select data-table="thresholdAB" data-filter="include_risky"><option value="true">포함</option><option value="false">제외</option></select></label>
+        </div>
+        <div class="table-toolbar" data-table-toolbar="thresholdAB"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>한글명</th><th>분류</th><th>기준명</th><th>기존값</th><th>후보값</th><th>추천등급</th><th>표본수</th><th>기대효과</th><th>예상리스크</th><th>FP 감소</th><th>FN 증가</th><th>신뢰도</th></tr></thead>
+            <tbody id="thresholdAB-body"></tbody>
+          </table>
+        </div>
+        <div id="thresholdAB-pagination" class="pagination"></div>
       </section>
 
       <section class="band table-panel" data-table-section="gatewayCommands">

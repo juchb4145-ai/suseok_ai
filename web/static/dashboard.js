@@ -121,6 +121,40 @@ const tableConfigs = {
       (item) => compactId(item.lifecycle_id || "-"),
     ],
   },
+  thresholdAB: {
+    endpoint: "/api/runtime/threshold-ab/dry-run",
+    bodyId: "thresholdAB-body",
+    statusId: "thresholdAB-status",
+    paginationId: "thresholdAB-pagination",
+    defaultLimit: 50,
+    detailTitle: (item) => `기준 제안 후보 ${item.label_ko || item.candidate_id || ""}`,
+    detailEndpoint: (item, filters) => item.candidate_id ? `/api/runtime/threshold-ab/dry-run/candidates/${encodeURIComponent(item.candidate_id)}${filters.trade_date ? `?trade_date=${encodeURIComponent(filters.trade_date)}` : ""}` : "",
+    actionLabel: "A/B 제안 리포트 재생성",
+    actionEndpoint: (filters) => {
+      const params = buildQuery({
+        trade_date: filters.trade_date,
+        min_sample_count: filters.min_sample_count,
+        persist: true,
+        export: true,
+        format: "all",
+      });
+      return `/api/runtime/threshold-ab/dry-run/rebuild?${params}`;
+    },
+    columns: [
+      (item) => item.label_ko || item.candidate_id || "-",
+      (item) => categoryKo(item.category),
+      (item) => item.parameter_name || "-",
+      (item) => escapeHtml(item.baseline_value ?? "-"),
+      (item) => escapeHtml(item.candidate_value ?? "-"),
+      (item) => badge(gradeKo(((item.result || {}).recommendation || {}).grade || item.grade || item.recommendation_grade || "-")),
+      (item) => (((item.result || {}).recommendation || {}).sample_count ?? item.sample_count ?? 0),
+      (item) => item.expected_effect_ko || "-",
+      (item) => item.expected_risk_ko || "-",
+      (item) => (((item.result || {}).delta || {}).avoided_false_positive_count ?? item.avoided_false_positive_count ?? 0),
+      (item) => (((item.result || {}).delta || {}).newly_created_false_negative_count ?? item.newly_created_false_negative_count ?? 0),
+      (item) => formatRate((((item.result || {}).recommendation || {}).confidence ?? item.confidence)),
+    ],
+  },
   gatewayCommands: {
     endpoint: "/api/gateway/commands/history",
     bodyId: "gatewayCommands-body",
@@ -140,6 +174,30 @@ const tableConfigs = {
     ],
   },
 };
+
+const gradeLabelsKo = {
+  STRONG_CANDIDATE: "강한 후보",
+  WATCH_CANDIDATE: "관찰 후보",
+  RISKY_CANDIDATE: "위험 후보",
+  DATA_INSUFFICIENT: "데이터 부족",
+  DO_NOT_APPLY: "적용 비추천",
+};
+
+const categoryLabelsKo = {
+  gate: "게이트",
+  risk: "리스크",
+  theme: "테마",
+  session: "시간대",
+  safety: "안전장치",
+};
+
+function gradeKo(value) {
+  return gradeLabelsKo[value] || value || "-";
+}
+
+function categoryKo(value) {
+  return categoryLabelsKo[value] || value || "-";
+}
 
 function text(id, value) {
   const node = document.getElementById(id);
@@ -466,7 +524,7 @@ function closeDetailPanel() {
 
 function detailSummaryHtml(payload) {
   const record = payload.record || payload.item || payload.report || payload;
-  const keys = ["command_id", "intent_id", "sample_id", "experiment_id", "lifecycle_id", "status", "command_type", "code", "reason", "error"];
+  const keys = ["command_id", "intent_id", "candidate_id", "report_id", "sample_id", "experiment_id", "lifecycle_id", "status", "command_type", "code", "reason", "error"];
   return keys
     .filter((key) => record && record[key] != null && record[key] !== "")
     .map((key) => `<div><span>${escapeHtml(key)}</span><strong>${escapeHtml(record[key])}</strong></div>`)
@@ -501,6 +559,16 @@ function renderInlineCounts(id, rows, key, emptyText) {
   if (!node) return;
   const lines = (rows || []).map((item) => `${item[key] || "-"}: ${item.count || 0}`);
   node.innerHTML = lines.length ? lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
+function renderThresholdRecommendations(id, rows) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const lines = firstItems(rows || [], 5).map((item) => {
+    const delta = item.delta || {};
+    return `${item.label_ko || item.candidate_id || "-"} · ${gradeKo(item.grade)} · FP -${delta.avoided_false_positive_count || 0} / FN +${delta.newly_created_false_negative_count || 0}`;
+  });
+  node.innerHTML = lines.length ? lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">아직 추천 후보가 없습니다. DRY_RUN 표본이 더 쌓이면 자동으로 표시됩니다.</span>';
 }
 
 function renderOpsAlerts(payload) {
@@ -556,6 +624,7 @@ function render(snapshot) {
   const runtime = snapshot.runtime || {};
   const dryRunOrders = snapshot.dry_run_orders || runtime.dry_run_orders || { summary: {} };
   const dryRunPerformance = snapshot.dry_run_performance || runtime.dry_run_performance || {};
+  const thresholdAB = snapshot.threshold_ab || runtime.threshold_ab || { summary: {}, recommendations: [] };
   const candidates = snapshot.candidates || { summary: {}, items: [] };
   const themes = snapshot.themes || { summary: {}, items: [] };
   const orders = snapshot.orders || { summary: {}, order_results: [], executions: [] };
@@ -660,6 +729,18 @@ function render(snapshot) {
   renderInlineCounts("dryrun-perf-fp-lines", dryRunPerformance.top_false_positive_types || [], "type", "오탐 유형이 없습니다");
   renderInlineCounts("dryrun-perf-fn-lines", dryRunPerformance.top_false_negative_types || [], "type", "미탐 유형이 없습니다");
   renderInlineCounts("dryrun-perf-reject-rally-lines", dryRunPerformance.top_reject_reasons_with_rally || [], "reason", "상승을 놓친 거부 사유가 없습니다");
+
+  const thresholdSummary = thresholdAB.summary || {};
+  text("threshold-ab-report-id", thresholdAB.report_id || "실제 적용 아님");
+  text("threshold-ab-total", thresholdSummary.candidate_count || 0);
+  text("threshold-ab-strong", thresholdSummary.strong_candidate_count || 0);
+  text("threshold-ab-watch", thresholdSummary.watch_candidate_count || 0);
+  text("threshold-ab-risky", thresholdSummary.risky_candidate_count || 0);
+  text("threshold-ab-insufficient", thresholdSummary.data_insufficient_count || 0);
+  text("threshold-ab-fp-reduction", thresholdSummary.total_avoided_false_positive_count || 0);
+  text("threshold-ab-fn-increase", thresholdSummary.total_new_false_negative_count || 0);
+  text("threshold-ab-opp-delta", thresholdSummary.total_opportunity_loss_delta || 0);
+  renderThresholdRecommendations("threshold-ab-recommendations", thresholdAB.recommendations || []);
 
   text("command-queued", commands.queued_count || 0);
   text("command-dispatched", commands.dispatched_count || 0);

@@ -56,6 +56,13 @@ python -m uvicorn trading_app.api:app --host 127.0.0.1 --port 8000 --reload
 - `TRADING_TRANSPORT_WEBSOCKET_RECOMMEND_P95_MS`: WebSocket experiment threshold, default `1000`.
 - `TRADING_TRANSPORT_WEBSOCKET_RECOMMEND_EMPTY_POLL_RATE`: empty-poll tuning threshold, default `0.8`.
 - `TRADING_TRANSPORT_WEBSOCKET_EXPERIMENT_ENABLED`: reserved experimental flag, default `0`.
+- `TRADING_THRESHOLD_AB_MIN_SAMPLE_COUNT`: DRY_RUN 기준 A/B 후보 최소 표본 수, default `10`.
+- `TRADING_THRESHOLD_AB_STRONG_FP_REDUCTION_MIN`: 강한 후보로 보기 위한 FP 감소 수, default `3`.
+- `TRADING_THRESHOLD_AB_MAX_FN_INCREASE`: 허용할 FN 증가 수, default `1`.
+- `TRADING_THRESHOLD_AB_MAX_OPPORTUNITY_LOSS_INCREASE`: 허용할 기회손실 증가 수, default `1`.
+- `TRADING_THRESHOLD_AB_CONFIDENCE_MIN`: 강한 후보 최소 신뢰도, default `0.5`.
+- `TRADING_THRESHOLD_AB_EXPORT_ROOT`: A/B 제안 리포트 export root, default `reports/dry_run_threshold_ab`.
+- `TRADING_THRESHOLD_AB_ENABLE_APPLY`: 후보 적용 기능 플래그, default `0`; 이번 구조에서는 적용하지 않는다.
 
 대시보드:
 
@@ -103,6 +110,11 @@ Core API:
 - `GET /api/runtime/orders/dry-run`
 - `GET /api/runtime/orders/dry-run/summary`
 - `GET /api/runtime/orders/dry-run/{intent_id}`
+- `GET /api/runtime/threshold-ab/dry-run`
+- `POST /api/runtime/threshold-ab/dry-run/rebuild`
+- `GET /api/runtime/threshold-ab/dry-run/reports`
+- `GET /api/runtime/threshold-ab/dry-run/reports/{report_id}`
+- `GET /api/runtime/threshold-ab/dry-run/candidates/{candidate_id}`
 - `GET /api/gateway/transport/status`
 - `GET /api/gateway/transport/latency`
 - `GET /api/gateway/transport/latency/summary`
@@ -187,7 +199,21 @@ False signal thresholds:
 - `TRADING_DRY_RUN_MIN_HOLD_MINUTES_FOR_FINAL` default `20`
 - `TRADING_DRY_RUN_PENDING_GRACE_MINUTES` default `30`
 
-Dashboard `/`는 entry/buy 수, exit/sell 수, 최근 sell intent, 청산 판단 유형 요약, DRY_RUN 성과 오탐/미탐 요약을 보여준다.
+DRY_RUN 기준 A/B 제안:
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8000/api/runtime/threshold-ab/dry-run?trade_date=2026-05-30"
+
+$headers = @{ "X-Local-Token" = $env:TRADING_CORE_TOKEN }
+Invoke-RestMethod -Method Post `
+  "http://127.0.0.1:8000/api/runtime/threshold-ab/dry-run/rebuild?trade_date=2026-05-30&persist=true&export=true&format=all" `
+  -Headers $headers
+Invoke-RestMethod http://127.0.0.1:8000/api/runtime/threshold-ab/dry-run/reports
+```
+
+A/B 제안 리포트는 `reports/dry_run_threshold_ab/<trade_date>/`에 JSON, CSV, Markdown으로 저장된다. 이 리포트는 `theme_score`, `hybrid_score`, `LATE_CHASE`, `LOW_BREADTH` 같은 기준 후보를 제안만 하며, `strategy_runtime_settings`를 자동 수정하지 않는다.
+
+Dashboard `/`는 entry/buy 수, exit/sell 수, 최근 sell intent, 청산 판단 유형 요약, DRY_RUN 성과 오탐/미탐 요약, 게이트/리스크 A/B 후보를 보여준다.
 
 Gateway 전송 지연 확인:
 
@@ -226,7 +252,7 @@ Invoke-RestMethod http://127.0.0.1:8000/api/gateway/transport/experiments/exp-00
 Dashboard 상세 탐색:
 
 - `/` 화면의 요약 카드는 Core/Gateway/runtime 상태를 WebSocket snapshot으로 갱신한다.
-- 전송 지연 샘플, WebSocket mock 실험, DRY_RUN 주문 의도, DRY_RUN 성과 사례, 오탐/미탐 신호, Gateway 명령 이력은 페이지네이션 REST 표로 조회한다.
+- 전송 지연 샘플, WebSocket mock 실험, DRY_RUN 주문 의도, DRY_RUN 성과 사례, 오탐/미탐 신호, 게이트/리스크 A/B 후보, Gateway 명령 이력은 페이지네이션 REST 표로 조회한다.
 - 각 표는 필터, 페이지 크기, 이전/다음, 새로고침, 선택적 자동 새로고침, 오래된 데이터 표시, 행 상세 패널을 지원한다.
 - 리포트 재생성/export 작업은 `TRADING_CORE_TOKEN`을 입력받아 호출한다. 토큰은 프론트엔드 코드에 하드코딩하지 않는다.
 
@@ -237,6 +263,7 @@ Dashboard 상세 탐색:
 3. 명령/event/ack 지연은 전송 지연 샘플에서 확인한다.
 4. WebSocket Mock 실험은 REST 대비 근거 확인용으로만 사용하고, 실제 전환 버튼으로 쓰지 않는다.
 5. 전략 진단은 DRY_RUN 성과 분석과 오탐/미탐 신호에서 확인한다.
+6. 기준 변경 후보는 `DRY_RUN 기준 제안`에서 보되, 실제 적용은 별도 승인 PR 전까지 하지 않는다.
 
 ## 32bit Kiwoom Gateway
 
@@ -369,6 +396,7 @@ More detail:
 - [Runtime DRY_RUN 주문 의도 Runbook](docs/runtime_dry_run_order_enqueue_runbook.md)
 - [Runtime DRY_RUN Exit/Sell Intent Runbook](docs/runtime_dry_run_exit_sell_intent_runbook.md)
 - [DRY_RUN 성과 리포트 Runbook](docs/dry_run_performance_report_runbook.md)
+- [DRY_RUN 기준 A/B 제안 Runbook](docs/dry_run_threshold_ab_runbook.md)
 - [Gateway 전송 지연 Runbook](docs/gateway_transport_latency_runbook.md)
 - [Gateway WebSocket Mock 실험 Runbook](docs/gateway_websocket_mock_experiment_runbook.md)
 - [Gateway WebSocket Real Pilot Runbook](docs/gateway_websocket_real_pilot_runbook.md)

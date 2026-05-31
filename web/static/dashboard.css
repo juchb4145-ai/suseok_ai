@@ -226,6 +226,13 @@ button:disabled {
   margin-bottom: 10px;
 }
 
+.help-text {
+  margin: 4px 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
