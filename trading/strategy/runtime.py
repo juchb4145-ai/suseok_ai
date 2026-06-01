@@ -44,6 +44,7 @@ from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.review import TradeReviewService
 from trading.strategy.virtual_orders import VirtualOrderService
 from trading.theme_engine.repository import ThemeEngineRepository
+from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline
 from trading.theme_engine.universe import ThemeUniverseBuilder
 
 
@@ -76,6 +77,14 @@ class StrategyRuntimeConfig:
     review_save_enabled: bool = True
     max_candidates_to_watch: int = 100
     realtime_subscription_limit: int = 80
+    theme_engine_mode: str = "themelab_flow"
+    theme_lab_pipeline_interval_sec: int = 3
+    theme_lab_condition_names: dict[str, str] = field(
+        default_factory=lambda: {"alive": "테마랩_생존_-1", "strong": "테마랩_강세_3", "leader": "테마랩_주도_5"}
+    )
+    theme_lab_condition_purposes: dict[str, str] = field(
+        default_factory=lambda: {"alive": "theme_lab_alive", "strong": "theme_lab_strong", "leader": "theme_lab_leader"}
+    )
 
     def validate(self) -> list[str]:
         warnings: list[str] = []
@@ -108,6 +117,11 @@ class StrategyRuntimeConfig:
             raise ValueError("max_candidates_to_watch must be >= 0")
         if self.realtime_subscription_limit < 1:
             raise ValueError("realtime_subscription_limit must be >= 1")
+        self.theme_engine_mode = str(self.theme_engine_mode or "").strip().lower()
+        if self.theme_engine_mode not in {"legacy", "themelab_flow"}:
+            raise ValueError("theme_engine_mode must be legacy or themelab_flow")
+        if not 1 <= int(self.theme_lab_pipeline_interval_sec) <= 3600:
+            raise ValueError("theme_lab_pipeline_interval_sec must be between 1 and 3600")
         if self.realtime_subscription_limit < self.max_candidates_to_watch:
             warnings.append("REALTIME_LIMIT_BELOW_MAX_CANDIDATES")
         return warnings
@@ -214,6 +228,7 @@ class StrategyRuntime:
         condition_adapter=None,
         holding_provider: Optional[HoldingProvider] = None,
         order_sink=None,
+        theme_lab_pipeline: Optional[ThemeLabRuntimePipeline] = None,
     ) -> None:
         self.db = db
         self.candidate_collector = candidate_collector
@@ -230,6 +245,7 @@ class StrategyRuntime:
         self.condition_adapter = condition_adapter
         self.holding_provider = holding_provider or StaticHoldingProvider()
         self.order_sink = order_sink
+        self.theme_lab_pipeline = theme_lab_pipeline
         self.started = False
         self._warnings: list[str] = []
         self.startup_warnings: list[str] = []
@@ -269,6 +285,7 @@ class StrategyRuntime:
 
         def recover_state():
             trade_date = current.date().isoformat()
+            self._run_theme_lab_flow(snapshot, current)
             self._apply_flow_diagnostics(snapshot, current, trade_date, [])
             if snapshot.gate_skip_reason != GATE_SKIP_MARKET_SESSION_CLOSED:
                 self._rollover_previous_trade_date_candidates(trade_date, current, snapshot)
@@ -343,6 +360,7 @@ class StrategyRuntime:
                 return snapshot
 
             trade_date = timed("trade_date", self.candidate_collector._trade_date)
+            timed("theme_lab_flow", lambda: self._run_theme_lab_flow(snapshot, current))
             timed("flow_diagnostics_empty", lambda: self._apply_flow_diagnostics(snapshot, current, trade_date, []))
             if snapshot.gate_skip_reason == GATE_SKIP_MARKET_SESSION_CLOSED:
                 snapshot.candidate_count = timed("candidate_count", lambda: len(self.db.list_candidates(trade_date)))
@@ -1078,6 +1096,8 @@ class StrategyRuntime:
         return True
 
     def _evaluate_gates(self, candidates: list[Candidate], snapshot: StrategyRuntimeSnapshot) -> list[GatePipelineResult]:
+        if self._theme_lab_flow_active():
+            return []
         entry_candidates = [candidate for candidate in candidates if self._candidate_entry_evaluable(candidate)]
         if not entry_candidates:
             return []
@@ -1127,7 +1147,10 @@ class StrategyRuntime:
     def _reconcile_subscriptions(self, candidates: list[Candidate], snapshot: StrategyRuntimeSnapshot) -> None:
         try:
             self._sync_virtual_activity_subscriptions()
-            self._sync_theme_universe_subscriptions(snapshot)
+            if self._theme_lab_flow_active():
+                self._sync_theme_lab_watchset_subscriptions(snapshot)
+            else:
+                self._sync_theme_universe_subscriptions(snapshot)
             for raw_index_code in self.config.index_watch_codes.values():
                 self.subscription_manager.ensure_subscription(raw_index_code, "index", protected=True)
             for code in self.config.leader_watch_codes:
@@ -1139,6 +1162,8 @@ class StrategyRuntime:
             for code in self._holding_codes(snapshot):
                 self.subscription_manager.ensure_subscription(code, "holding", protected=True)
             desired_candidates = candidates[: self.config.max_candidates_to_watch]
+            if self._theme_lab_flow_active():
+                desired_candidates = []
             snapshot.candidate_subscription_selected_count = len(desired_candidates)
             watched = self.subscription_manager.watch_candidates(desired_candidates)
             for candidate in desired_candidates:
@@ -1157,6 +1182,36 @@ class StrategyRuntime:
             snapshot.warnings.append(f"RECONCILED_SUBSCRIPTIONS={len(watched)}")
         except Exception as exc:
             snapshot.warnings.append(f"SUBSCRIPTION_RECONCILE_FAILED:{exc}")
+
+    def _run_theme_lab_flow(self, snapshot: StrategyRuntimeSnapshot, now: datetime) -> None:
+        if not self._theme_lab_flow_active():
+            return
+        if self.theme_lab_pipeline is None:
+            snapshot.warnings.append("THEME_LAB_FLOW_NOT_WIRED")
+            return
+        result = self.theme_lab_pipeline.run_if_due(now)
+        snapshot.warnings.extend(self.theme_lab_pipeline.drain_warnings())
+        if result is None:
+            return
+        snapshot.gate_result_count = len(result.gate_decisions)
+        if not result.watchset:
+            snapshot.warnings.append("THEME_LAB_WATCHSET_EMPTY")
+
+    def _sync_theme_lab_watchset_subscriptions(self, snapshot: StrategyRuntimeSnapshot) -> None:
+        if self.theme_lab_pipeline is None:
+            snapshot.warnings.append("THEME_LAB_FLOW_NOT_WIRED")
+            return
+        target_codes = set(self.theme_lab_pipeline.watchset_codes())
+        for code, record in list(self.subscription_manager.records.items()):
+            if "theme_lab_watchset" in record.sources and code not in target_codes:
+                self.subscription_manager.remove_subscription(code, "theme_lab_watchset")
+        for code in sorted(target_codes):
+            self.subscription_manager.ensure_subscription(code, "theme_lab_watchset", protected=False)
+        if target_codes:
+            snapshot.warnings.append(f"THEME_LAB_WATCHSET_SUBSCRIPTIONS={len(target_codes)}")
+
+    def _theme_lab_flow_active(self) -> bool:
+        return self.config.theme_engine_mode == "themelab_flow" and self.theme_lab_pipeline is not None
 
     def _sync_theme_universe_subscriptions(self, snapshot: StrategyRuntimeSnapshot) -> None:
         try:
@@ -1575,6 +1630,9 @@ class StrategyRuntime:
                 candidate_subscription_selected_count=snapshot.candidate_subscription_selected_count,
                 candidate_subscription_skipped_discovery_count=snapshot.candidate_subscription_skipped_discovery_count,
                 candidate_subscription_skipped_unmapped_count=snapshot.candidate_subscription_skipped_unmapped_count,
+                theme_engine_mode=self.config.theme_engine_mode,
+                theme_lab_flow_wired=self.theme_lab_pipeline is not None,
+                condition_adapter=self.condition_adapter,
             )
         except Exception as exc:
             snapshot.warnings.append(f"READINESS_REPORT_FAILED:{exc}")

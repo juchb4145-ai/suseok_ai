@@ -219,6 +219,7 @@ class GatewayCommandConditionAdapter:
         require_kiwoom_login: bool = True,
         max_realtime_conditions: int = 10,
         condition_screen_base: int = 7600,
+        purpose_filter: set[str] | None = None,
     ) -> None:
         self.gateway_state = gateway_state
         self.repository = repository
@@ -227,9 +228,11 @@ class GatewayCommandConditionAdapter:
         self.require_kiwoom_login = require_kiwoom_login
         self.max_realtime_conditions = max(0, int(max_realtime_conditions))
         self.condition_screen_base = int(condition_screen_base)
+        self.purpose_filter = set(purpose_filter or set())
         self.condition_candidate_included = Signal()
         self.condition_candidate_removed = Signal()
         self.registered_conditions: dict[tuple[str, int], RegisteredCondition] = {}
+        self.condition_event_counts: dict[str, dict[str, int | str]] = {}
         self.warnings: list[str] = []
 
     def start(self, now: datetime | None = None) -> list[str]:
@@ -242,6 +245,8 @@ class GatewayCommandConditionAdapter:
             key=f"runtime:load_conditions:{(now or datetime.now()).date().isoformat()}",
         )
         profiles = sorted(self.repository.enabled_profiles(), key=lambda profile: profile.priority, reverse=True)
+        if self.purpose_filter:
+            profiles = [profile for profile in profiles if profile.purpose in self.purpose_filter]
         selected = profiles[: self.max_realtime_conditions]
         for skipped in profiles[self.max_realtime_conditions :]:
             self._warn(f"CONDITION_PROFILE_SKIPPED_LIMIT:{skipped.condition_name}")

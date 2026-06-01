@@ -7,7 +7,7 @@ from storage.db import TradingDatabase
 from trading.broker.gateway_state import GatewayStateStore
 from trading.strategy.candidates import CandidateCollector
 from trading.strategy.candles import CandleBuilder
-from trading.strategy.conditions import ConditionProfileRepository, ensure_default_condition_profiles
+from trading.strategy.conditions import ConditionProfileRepository, ensure_default_condition_profiles, ensure_theme_lab_condition_profiles
 from trading.strategy.config import StrategyRuntimeConfigRepository
 from trading.strategy.entry import EntryPlanBuilder
 from trading.strategy.exit import ExitDecisionEngine, VirtualPositionService
@@ -28,6 +28,7 @@ from trading.strategy.virtual_orders import VirtualOrderService
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime import RealTimeThemeRuntime
+from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline
 from trading_app.dependencies import CoreSettings
 from trading_app.runtime_adapters import (
     GatewayCommandConditionAdapter,
@@ -60,6 +61,11 @@ def build_core_strategy_runtime(
     runtime_settings = StrategyRuntimeSettingsRepository(db).load()
     condition_seed_result = ensure_default_condition_profiles(db)
     config = config_result.config
+    theme_lab_condition_seed_result = ensure_theme_lab_condition_profiles(
+        db,
+        condition_names=config.theme_lab_condition_names,
+        condition_purposes=config.theme_lab_condition_purposes,
+    )
     config.order_mode = OrderMode.OBSERVE
     if settings.runtime_evaluation_interval_sec > 0:
         config.evaluation_interval_sec = settings.runtime_evaluation_interval_sec
@@ -80,6 +86,7 @@ def build_core_strategy_runtime(
         warning_sink=warning_sink,
         require_gateway_heartbeat=settings.runtime_require_gateway_heartbeat,
         require_kiwoom_login=settings.runtime_require_kiwoom_login,
+        purpose_filter=set(config.theme_lab_condition_purposes.values()) if config.theme_engine_mode == "themelab_flow" else None,
     )
     candidate_collector = CandidateCollector(db, client=condition_adapter)
     theme_repository = ThemeEngineRepository(db)
@@ -99,6 +106,14 @@ def build_core_strategy_runtime(
     theme_runtime = RealTimeThemeRuntime(theme_repository)
     theme_runtime_bridge = GatewayEventThemeRuntimeBridge(theme_runtime, warning_sink=warning_sink)
     order_sink = _build_order_sink(settings, gateway_state, warning_sink)
+    theme_lab_pipeline = None
+    if config.theme_engine_mode == "themelab_flow":
+        theme_lab_pipeline = ThemeLabRuntimePipeline(
+            db=db,
+            market_data=market_data,
+            market_index_store=market_index_store,
+            interval_sec=config.theme_lab_pipeline_interval_sec,
+        )
     runtime = StrategyRuntime(
         db=db,
         candidate_collector=candidate_collector,
@@ -114,13 +129,21 @@ def build_core_strategy_runtime(
         condition_adapter=condition_adapter,
         holding_provider=StaticHoldingProvider(set(config.holding_watch_codes)),
         order_sink=order_sink,
+        theme_lab_pipeline=theme_lab_pipeline,
     )
-    readiness_report = build_readiness_report(db, subscription_manager=runtime.subscription_manager)
+    readiness_report = build_readiness_report(
+        db,
+        subscription_manager=runtime.subscription_manager,
+        theme_engine_mode=config.theme_engine_mode,
+        theme_lab_flow_wired=theme_lab_pipeline is not None,
+        condition_adapter=condition_adapter,
+    )
     runtime.readiness_report = readiness_report
     runtime.startup_warnings = dedupe_warnings(
         list(config_result.warnings)
         + runtime_settings.validation_warnings
         + condition_seed_result.warnings
+        + theme_lab_condition_seed_result.warnings
         + readiness_report.warnings
     )
     return CoreRuntimeBundle(

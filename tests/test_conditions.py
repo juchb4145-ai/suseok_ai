@@ -89,7 +89,7 @@ def test_ensure_default_condition_profiles_seeds_missing_only(tmp_path):
     result = ensure_default_condition_profiles(db)
 
     profiles = {profile.condition_name: profile for profile in db.list_condition_profiles(enabled=None)}
-    assert result.inserted == 2
+    assert result.inserted == len(DEFAULT_CONDITION_PROFILES) - 1
     assert result.existing == 1
     assert set(profiles) == {profile.condition_name for profile in DEFAULT_CONDITION_PROFILES}
     assert profiles[existing_name].enabled is False
@@ -163,6 +163,18 @@ def test_default_condition_names_round_trip_with_unicode_escape(tmp_path):
         assert expected in names
         escaped = expected.encode("unicode_escape").decode("ascii")
         assert escaped.encode("ascii").decode("unicode_escape") == expected
+    db.close()
+
+
+def test_theme_lab_condition_profiles_and_purposes_are_seeded(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+
+    ensure_default_condition_profiles(db)
+
+    profiles = {(profile.condition_name, profile.purpose) for profile in db.list_condition_profiles(enabled=None)}
+    assert ("테마랩_생존_-1", "theme_lab_alive") in profiles
+    assert ("테마랩_강세_3", "theme_lab_strong") in profiles
+    assert ("테마랩_주도_5", "theme_lab_leader") in profiles
     db.close()
 
 

@@ -29,6 +29,10 @@ CONFIG_FIELDS = {
     "review_save_enabled",
     "max_candidates_to_watch",
     "realtime_subscription_limit",
+    "theme_engine_mode",
+    "theme_lab_pipeline_interval_sec",
+    "theme_lab_condition_names",
+    "theme_lab_condition_purposes",
 }
 
 
@@ -146,6 +150,10 @@ def config_to_dict(config: StrategyRuntimeConfig) -> dict[str, Any]:
         "review_save_enabled": bool(config.review_save_enabled),
         "max_candidates_to_watch": int(config.max_candidates_to_watch),
         "realtime_subscription_limit": int(config.realtime_subscription_limit),
+        "theme_engine_mode": str(config.theme_engine_mode),
+        "theme_lab_pipeline_interval_sec": int(config.theme_lab_pipeline_interval_sec),
+        "theme_lab_condition_names": dict(config.theme_lab_condition_names),
+        "theme_lab_condition_purposes": dict(config.theme_lab_condition_purposes),
     }
 
 
@@ -173,6 +181,13 @@ def config_from_dict(raw: dict[str, Any]) -> StrategyRuntimeConfig:
             merged["realtime_subscription_limit"],
             "realtime_subscription_limit",
         ),
+        theme_engine_mode=_coerce_theme_engine_mode(merged["theme_engine_mode"]),
+        theme_lab_pipeline_interval_sec=_coerce_int(
+            merged["theme_lab_pipeline_interval_sec"],
+            "theme_lab_pipeline_interval_sec",
+        ),
+        theme_lab_condition_names=_coerce_theme_lab_condition_names(merged["theme_lab_condition_names"]),
+        theme_lab_condition_purposes=_coerce_theme_lab_condition_purposes(merged["theme_lab_condition_purposes"]),
     )
 
 
@@ -191,12 +206,21 @@ def _validate_and_normalize(config: StrategyRuntimeConfig) -> list[str]:
         config.realtime_subscription_limit,
         "realtime_subscription_limit",
     )
+    config.theme_engine_mode = _coerce_theme_engine_mode(config.theme_engine_mode)
+    config.theme_lab_pipeline_interval_sec = _coerce_int(
+        config.theme_lab_pipeline_interval_sec,
+        "theme_lab_pipeline_interval_sec",
+    )
+    config.theme_lab_condition_names = _coerce_theme_lab_condition_names(config.theme_lab_condition_names)
+    config.theme_lab_condition_purposes = _coerce_theme_lab_condition_purposes(config.theme_lab_condition_purposes)
     if not 1 <= config.evaluation_interval_sec <= 3600:
         raise ValueError("evaluation_interval_sec must be between 1 and 3600")
     if config.max_candidates_to_watch < 0:
         raise ValueError("max_candidates_to_watch must be >= 0")
     if config.realtime_subscription_limit < 1:
         raise ValueError("realtime_subscription_limit must be >= 1")
+    if not 1 <= config.theme_lab_pipeline_interval_sec <= 3600:
+        raise ValueError("theme_lab_pipeline_interval_sec must be between 1 and 3600")
     config.index_watch_codes = _coerce_index_watch_codes(config.index_watch_codes)
     config.leader_watch_codes = _coerce_stock_codes(config.leader_watch_codes, "leader_watch_codes")
     config.semiconductor_signal_codes = _coerce_stock_codes(
@@ -287,6 +311,46 @@ def _coerce_stock_codes(value: Any, field_name: str) -> list[str]:
         if code not in result:
             result.append(code)
     return result
+
+
+def _coerce_theme_engine_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    if mode not in {"legacy", "themelab_flow"}:
+        raise ValueError("theme_engine_mode must be legacy or themelab_flow")
+    return mode
+
+
+def _coerce_theme_lab_condition_names(value: Any) -> dict[str, str]:
+    return _coerce_theme_lab_mapping(
+        value,
+        "theme_lab_condition_names",
+        {"alive": "테마랩_생존_-1", "strong": "테마랩_강세_3", "leader": "테마랩_주도_5"},
+    )
+
+
+def _coerce_theme_lab_condition_purposes(value: Any) -> dict[str, str]:
+    return _coerce_theme_lab_mapping(
+        value,
+        "theme_lab_condition_purposes",
+        {"alive": "theme_lab_alive", "strong": "theme_lab_strong", "leader": "theme_lab_leader"},
+    )
+
+
+def _coerce_theme_lab_mapping(value: Any, field_name: str, defaults: dict[str, str]) -> dict[str, str]:
+    if value is None:
+        return dict(defaults)
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be a mapping")
+    result = dict(defaults)
+    for key, raw in value.items():
+        logical = str(key or "").strip().lower()
+        if logical not in defaults:
+            raise ValueError(f"{field_name} only supports alive/strong/leader")
+        text = str(raw or "").strip()
+        if not text:
+            raise ValueError(f"{field_name}.{logical} must not be empty")
+        result[logical] = text
+    return {key: result[key] for key in ("alive", "strong", "leader")}
 
 
 def _enum_value(value: Any) -> str:

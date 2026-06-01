@@ -15,6 +15,7 @@ SOURCE_PRIORITIES = {
     "virtual_order": 84,
     "holding": 80,
     "candidate_watch": 50,
+    "theme_lab_watchset": 55,
     "theme_universe": 45,
 }
 PROTECTED_SOURCES = {
@@ -33,6 +34,7 @@ FALLBACK_SOURCE_ORDER = {
     "virtual_position": 3,
     "virtual_order": 4,
     "candidate_watch": 5,
+    "theme_lab_watchset": 5,
 }
 
 

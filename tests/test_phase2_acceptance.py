@@ -414,6 +414,7 @@ def test_phase2_main_build_runtime_uses_saved_config_and_adapter_standard_event(
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     StrategyRuntimeConfigRepository(db).save(
         StrategyRuntimeConfig(
+            theme_engine_mode="legacy",
             leader_watch_codes=["035420"],
             holding_watch_codes=["000270"],
             realtime_subscription_limit=1,

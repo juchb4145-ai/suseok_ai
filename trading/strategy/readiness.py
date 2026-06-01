@@ -61,6 +61,7 @@ class ReadinessReport:
     candidate_subscription_skipped_discovery_count: int = 0
     candidate_subscription_skipped_unmapped_count: int = 0
     protected_subscription_usage: str = ""
+    condition_registration_status: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -76,6 +77,9 @@ def build_readiness_report(
     candidate_subscription_selected_count: int = 0,
     candidate_subscription_skipped_discovery_count: int = 0,
     candidate_subscription_skipped_unmapped_count: int = 0,
+    theme_engine_mode: str = "themelab_flow",
+    theme_lab_flow_wired: bool = False,
+    condition_adapter=None,
 ) -> ReadinessReport:
     profiles = db.list_condition_profiles(enabled=None)
     enabled_profiles = [profile for profile in profiles if profile.enabled]
@@ -116,6 +120,20 @@ def build_readiness_report(
         warnings.append("INVALID_CODE_ACTIVE_CANDIDATES")
     for profile in unresolved:
         warnings.append(f"CONDITION_PROFILE_UNRESOLVED:{profile.condition_name}")
+    if theme_engine_mode == "themelab_flow":
+        if not theme_lab_flow_wired:
+            warnings.append("THEME_LAB_FLOW_NOT_WIRED")
+        lab_profiles = {profile.purpose: profile for profile in profiles}
+        for key, purpose in {
+            "ALIVE": "theme_lab_alive",
+            "STRONG": "theme_lab_strong",
+            "LEADER": "theme_lab_leader",
+        }.items():
+            profile = lab_profiles.get(purpose)
+            if profile is None or profile.last_resolved_index is None:
+                warnings.append(f"THEME_LAB_CONDITION_{key}_UNRESOLVED")
+        if theme_repository.count_current_memberships() <= 0:
+            warnings.append("THEME_LAB_MAPPING_EMPTY")
     if _broad_candidates_only(candidates):
         warnings.append("BROAD_CANDIDATES_ONLY")
     if gate_skip_reason:
@@ -149,6 +167,7 @@ def build_readiness_report(
         candidate_subscription_skipped_discovery_count=int(candidate_subscription_skipped_discovery_count),
         candidate_subscription_skipped_unmapped_count=int(candidate_subscription_skipped_unmapped_count),
         protected_subscription_usage=_protected_subscription_usage(subscription_manager),
+        condition_registration_status=_condition_registration_status(profiles, condition_adapter),
         warnings=dedupe_warnings(warnings),
     )
 
@@ -241,3 +260,30 @@ def _protected_subscription_usage(subscription_manager) -> str:
     protected_count = sum(1 for record in records.values() if getattr(record, "protected", False))
     max_codes = int(getattr(subscription_manager, "max_codes", 0) or 0)
     return f"{protected_count}/{max_codes}" if max_codes else str(protected_count)
+
+
+def _condition_registration_status(profiles, condition_adapter) -> list[dict]:
+    registered = getattr(condition_adapter, "registered_conditions", {}) if condition_adapter is not None else {}
+    event_counts = getattr(condition_adapter, "condition_event_counts", {}) if condition_adapter is not None else {}
+    by_name = {condition.condition_name: condition for condition in registered.values()} if isinstance(registered, dict) else {}
+    statuses: list[dict] = []
+    for profile in profiles:
+        condition = by_name.get(profile.condition_name)
+        counts = event_counts.get(profile.condition_name, {}) if isinstance(event_counts, dict) else {}
+        warning = ""
+        if profile.enabled and profile.last_resolved_index is None:
+            warning = "CONDITION_PROFILE_UNRESOLVED"
+        statuses.append(
+            {
+                "condition_name": profile.condition_name,
+                "purpose": profile.purpose,
+                "resolved_index": profile.last_resolved_index,
+                "registered": condition is not None,
+                "screen_no": condition.screen_no if condition is not None else "",
+                "last_event_at": str(counts.get("last_event_at") or ""),
+                "include_count": int(counts.get("include_count") or 0),
+                "remove_count": int(counts.get("remove_count") or 0),
+                "warning": warning,
+            }
+        )
+    return statuses

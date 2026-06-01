@@ -45,7 +45,12 @@ def build_observe_runtime(client, db: TradingDatabase):
     from trading.strategy.bridge import StrategyMarketDataBridge
     from trading.strategy.candidates import CandidateCollector
     from trading.strategy.candles import CandleBuilder
-    from trading.strategy.conditions import ConditionProfileRepository, KiwoomConditionAdapter, ensure_default_condition_profiles
+    from trading.strategy.conditions import (
+        ConditionProfileRepository,
+        KiwoomConditionAdapter,
+        ensure_default_condition_profiles,
+        ensure_theme_lab_condition_profiles,
+    )
     from trading.strategy.entry import EntryPlanBuilder
     from trading.strategy.exit import ExitDecisionEngine, VirtualPositionService
     from trading.strategy.holding import StaticHoldingProvider
@@ -62,6 +67,7 @@ def build_observe_runtime(client, db: TradingDatabase):
     from trading.strategy.runtime import StrategyRuntime
     from trading.strategy.virtual_orders import VirtualOrderService
     from trading.strategy.hybrid_validation import HybridValidationRepository
+    from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline
     from trading.theme_engine.context_provider import DynamicThemeContextProvider
     from trading.theme_engine.repository import ThemeEngineRepository
 
@@ -69,6 +75,11 @@ def build_observe_runtime(client, db: TradingDatabase):
     settings = StrategyRuntimeSettingsRepository(db).load()
     condition_seed_result = ensure_default_condition_profiles(db)
     config = config_result.config
+    theme_lab_condition_seed_result = ensure_theme_lab_condition_profiles(
+        db,
+        condition_names=config.theme_lab_condition_names,
+        condition_purposes=config.theme_lab_condition_purposes,
+    )
     market_data = MarketDataStore()
     candle_builder = CandleBuilder()
     market_index_store = MarketIndexStore()
@@ -93,8 +104,21 @@ def build_observe_runtime(client, db: TradingDatabase):
         settings,
         hybrid_validation_repository=HybridValidationRepository(db),
     )
-    condition_adapter = KiwoomConditionAdapter(client, ConditionProfileRepository(db))
+    lab_purposes = set(config.theme_lab_condition_purposes.values())
+    condition_adapter = KiwoomConditionAdapter(
+        client,
+        ConditionProfileRepository(db),
+        purpose_filter=lab_purposes if config.theme_engine_mode == "themelab_flow" else None,
+    )
     candidate_collector.attach(condition_adapter)
+    theme_lab_pipeline = None
+    if config.theme_engine_mode == "themelab_flow":
+        theme_lab_pipeline = ThemeLabRuntimePipeline(
+            db=db,
+            market_data=market_data,
+            market_index_store=market_index_store,
+            interval_sec=config.theme_lab_pipeline_interval_sec,
+        )
     runtime = StrategyRuntime(
         db=db,
         candidate_collector=candidate_collector,
@@ -109,11 +133,22 @@ def build_observe_runtime(client, db: TradingDatabase):
         config=config,
         condition_adapter=condition_adapter,
         holding_provider=StaticHoldingProvider(set(config.holding_watch_codes)),
+        theme_lab_pipeline=theme_lab_pipeline,
     )
-    readiness_report = build_readiness_report(db, subscription_manager=runtime.subscription_manager)
+    readiness_report = build_readiness_report(
+        db,
+        subscription_manager=runtime.subscription_manager,
+        theme_engine_mode=config.theme_engine_mode,
+        theme_lab_flow_wired=theme_lab_pipeline is not None,
+        condition_adapter=condition_adapter,
+    )
     runtime.readiness_report = readiness_report
     runtime.startup_warnings = dedupe_warnings(
-        list(config_result.warnings) + settings.validation_warnings + condition_seed_result.warnings + readiness_report.warnings
+        list(config_result.warnings)
+        + settings.validation_warnings
+        + condition_seed_result.warnings
+        + theme_lab_condition_seed_result.warnings
+        + readiness_report.warnings
     )
     return runtime
 

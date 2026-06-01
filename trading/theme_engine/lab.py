@@ -512,7 +512,7 @@ class WatchSetManager:
                 promoted = [
                     (hit, "THEME_TOP_TURNOVER")
                     for hit in sorted(eligible_hits, key=lambda hit: _turnover(snapshot_by_symbol.get(hit.symbol)), reverse=True)[:2]
-                    if _turnover(snapshot_by_symbol.get(hit.symbol)) > 0
+                    if _turnover(snapshot_by_symbol.get(hit.symbol)) > 0 and (hit.strong_hit or hit.leader_hit)
                 ]
             per_theme_count = 0
             for hit, reason in promoted:

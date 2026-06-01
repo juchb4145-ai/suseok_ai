@@ -242,6 +242,19 @@ class TradingDatabase:
                 risk_score REAL NOT NULL DEFAULT 0,
                 details_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS theme_lab_flow_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                calculated_at TEXT NOT NULL,
+                market_status_json TEXT NOT NULL DEFAULT '{}',
+                theme_rankings_json TEXT NOT NULL DEFAULT '[]',
+                theme_condition_snapshots_json TEXT NOT NULL DEFAULT '[]',
+                condition_hit_snapshots_json TEXT NOT NULL DEFAULT '[]',
+                watchset_snapshots_json TEXT NOT NULL DEFAULT '[]',
+                gate_decisions_json TEXT NOT NULL DEFAULT '[]',
+                data_quality_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
             CREATE TABLE IF NOT EXISTS candidates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trade_date TEXT NOT NULL,
@@ -2032,6 +2045,30 @@ class TradingDatabase:
                 WHERE condition_name = ?
                 """,
                 (int(condition_index), condition_name),
+            )
+
+    def save_theme_lab_flow_result(self, calculated_at: str, payload: dict) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO theme_lab_flow_snapshots(
+                    calculated_at, market_status_json, theme_rankings_json,
+                    theme_condition_snapshots_json, condition_hit_snapshots_json,
+                    watchset_snapshots_json, gate_decisions_json, data_quality_json,
+                    payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(calculated_at or ""),
+                    json.dumps(payload.get("market_status") or {}, ensure_ascii=False, sort_keys=True),
+                    json.dumps(payload.get("theme_rankings") or [], ensure_ascii=False, sort_keys=True),
+                    json.dumps(payload.get("theme_condition_snapshots") or [], ensure_ascii=False, sort_keys=True),
+                    json.dumps(payload.get("condition_hit_snapshots") or [], ensure_ascii=False, sort_keys=True),
+                    json.dumps(payload.get("watchset_snapshots") or [], ensure_ascii=False, sort_keys=True),
+                    json.dumps(payload.get("gate_decisions") or [], ensure_ascii=False, sort_keys=True),
+                    json.dumps(payload.get("data_quality") or {}, ensure_ascii=False, sort_keys=True),
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                ),
             )
 
     def save_entry_plan(self, plan: EntryPlan) -> EntryPlan:

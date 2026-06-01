@@ -62,11 +62,35 @@ DEFAULT_CONDITION_PROFILES = [
         priority=70,
         purpose="theme_broad_candidate",
     ),
+    ConditionProfile(
+        condition_name="테마랩_생존_-1",
+        strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+        enabled=True,
+        priority=200,
+        purpose="theme_lab_alive",
+    ),
+    ConditionProfile(
+        condition_name="테마랩_강세_3",
+        strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+        enabled=True,
+        priority=199,
+        purpose="theme_lab_strong",
+    ),
+    ConditionProfile(
+        condition_name="테마랩_주도_5",
+        strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+        enabled=True,
+        priority=198,
+        purpose="theme_lab_leader",
+    ),
 ]
 KNOWN_CONDITION_PURPOSES = {
     "kosdaq_pullback_candidate",
     "kospi_leader_candidate",
     "theme_broad_candidate",
+    "theme_lab_alive",
+    "theme_lab_strong",
+    "theme_lab_leader",
 }
 
 
@@ -124,6 +148,59 @@ def ensure_default_condition_profiles(db: "TradingDatabase") -> ConditionProfile
     return result
 
 
+def ensure_theme_lab_condition_profiles(
+    db: "TradingDatabase",
+    *,
+    condition_names: dict[str, str] | None = None,
+    condition_purposes: dict[str, str] | None = None,
+) -> ConditionProfileSeedResult:
+    names = {
+        "alive": "테마랩_생존_-1",
+        "strong": "테마랩_강세_3",
+        "leader": "테마랩_주도_5",
+        **dict(condition_names or {}),
+    }
+    purposes = {
+        "alive": "theme_lab_alive",
+        "strong": "theme_lab_strong",
+        "leader": "theme_lab_leader",
+        **dict(condition_purposes or {}),
+    }
+    priorities = {"alive": 200, "strong": 199, "leader": 198}
+    repository = ConditionProfileRepository(db)
+    result = ConditionProfileSeedResult()
+    existing_profiles = {profile.condition_name: profile for profile in db.list_condition_profiles(enabled=None)}
+    for key in ("alive", "strong", "leader"):
+        profile = ConditionProfile(
+            condition_name=str(names[key]),
+            strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+            enabled=True,
+            priority=priorities[key],
+            purpose=str(purposes[key]),
+        )
+        existing = existing_profiles.get(profile.condition_name)
+        if existing is None:
+            repository.upsert_profile(profile)
+            result.inserted += 1
+            continue
+        if existing.strategy_profile != profile.strategy_profile or existing.purpose != profile.purpose:
+            repository.upsert_profile(
+                ConditionProfile(
+                    id=existing.id,
+                    condition_name=existing.condition_name,
+                    strategy_profile=profile.strategy_profile,
+                    enabled=existing.enabled,
+                    priority=existing.priority,
+                    purpose=profile.purpose,
+                    last_resolved_index=existing.last_resolved_index,
+                )
+            )
+            result.warnings.append(f"CONDITION_PROFILE_DEFAULT_UPDATED:{existing.condition_name}")
+        result.existing += 1
+    result.warnings = _dedupe(result.warnings)
+    return result
+
+
 class KiwoomConditionAdapter:
     def __init__(
         self,
@@ -135,6 +212,7 @@ class KiwoomConditionAdapter:
         condition_screen_base: int = 7600,
         load_timeout_sec: int = 5,
         dedupe_window_sec: int = 3,
+        purpose_filter: set[str] | None = None,
     ) -> None:
         self.client = client
         self.repository = repository
@@ -143,11 +221,13 @@ class KiwoomConditionAdapter:
         self.condition_screen_base = int(condition_screen_base)
         self.load_timeout_sec = max(1, int(load_timeout_sec))
         self.dedupe_window_sec = max(0, int(dedupe_window_sec))
+        self.purpose_filter = set(purpose_filter or set())
         self.condition_candidate_included = Signal()
         self.condition_candidate_removed = Signal()
         self.warnings: list[str] = []
         self.registered_conditions: dict[tuple[str, int], RegisteredCondition] = {}
         self.screen_to_condition: dict[str, tuple[str, int]] = {}
+        self.condition_event_counts: dict[str, dict[str, int | str]] = {}
         self._recent_events: dict[tuple[str, str, int, str, str], datetime] = {}
         self._load_requested_at: Optional[datetime] = None
         self._load_succeeded = False
@@ -252,6 +332,8 @@ class KiwoomConditionAdapter:
             by_name.setdefault(condition.name, []).append(condition)
 
         profiles = sorted(self.repository.enabled_profiles(), key=lambda profile: profile.priority, reverse=True)
+        if self.purpose_filter:
+            profiles = [profile for profile in profiles if profile.purpose in self.purpose_filter]
         selected = profiles[: self.max_realtime_conditions]
         for skipped in profiles[self.max_realtime_conditions :]:
             self._warn(f"CONDITION_PROFILE_SKIPPED_LIMIT:{skipped.condition_name}")
@@ -321,6 +403,13 @@ class KiwoomConditionAdapter:
             self.condition_candidate_included.emit(event)
         else:
             self.condition_candidate_removed.emit(event)
+        counts = self.condition_event_counts.setdefault(
+            condition.condition_name,
+            {"include_count": 0, "remove_count": 0, "last_event_at": ""},
+        )
+        key_name = "include_count" if event_type == "include" else "remove_count"
+        counts[key_name] = int(counts.get(key_name, 0) or 0) + 1
+        counts["last_event_at"] = now.isoformat()
         return True
 
     def _warn(self, warning: str) -> None:
