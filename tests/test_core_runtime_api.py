@@ -4,7 +4,7 @@ import importlib
 from fastapi.testclient import TestClient
 from storage.db import TradingDatabase
 from trading.broker.models import GatewayEvent
-from trading.strategy.models import Candidate, CandidateState
+from trading.strategy.models import BlockType, Candidate, CandidateState
 from tests.theme_naver_helpers import naver_source
 
 
@@ -136,6 +136,54 @@ def test_candidates_api_normalizes_quality_reason(tmp_path, monkeypatch):
         payload = client.get("/api/candidates?trade_date=2026-06-01&limit=1").json()
 
     assert payload["items"][0]["reason_codes"] == ["NO_ACTIVE_THEME"]
+
+
+def test_candidates_api_counts_recoverable_blocks_as_wait(tmp_path, monkeypatch):
+    db_path = tmp_path / "trader.sqlite3"
+    db = TradingDatabase(str(db_path))
+    try:
+        db.save_candidate(
+            Candidate(
+                trade_date="2026-06-01",
+                code="000003",
+                state=CandidateState.BLOCKED,
+                block_type=BlockType.TEMPORARY,
+                can_recover=True,
+                detected_at="2026-06-01T09:00:00",
+                last_seen_at="2026-06-01T09:01:00",
+                metadata={
+                    "gate_results_by_theme": {
+                        "theme-a": {
+                            "theme_id": "theme-a",
+                            "reason_codes": ["INDEX_WEAK", "MARKET_INDEX_TEMPORARY_CAP"],
+                        }
+                    }
+                },
+            )
+        )
+        db.save_candidate(
+            Candidate(
+                trade_date="2026-06-01",
+                code="000004",
+                state=CandidateState.BLOCKED,
+                block_type=BlockType.FINAL,
+                can_recover=False,
+                detected_at="2026-06-01T09:00:00",
+                last_seen_at="2026-06-01T09:02:00",
+            )
+        )
+    finally:
+        db.close()
+
+    with _client(tmp_path, monkeypatch) as client:
+        payload = client.get("/api/candidates?trade_date=2026-06-01&limit=2").json()
+
+    assert payload["summary"]["wait"] == 1
+    assert payload["summary"]["blocked"] == 1
+    items_by_code = {item["code"]: item for item in payload["items"]}
+    assert items_by_code["000003"]["state"] == "BLOCKED"
+    assert items_by_code["000003"]["display_state"] == "WAIT"
+    assert items_by_code["000004"]["display_state"] == "BLOCKED"
 
 
 def test_dashboard_event_push_is_coalesced(tmp_path, monkeypatch):

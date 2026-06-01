@@ -860,7 +860,7 @@ function render(snapshot) {
   text("candidate-ready", candidates.summary.ready || 0);
   text("candidate-blocked", candidates.summary.blocked || 0);
   text("candidate-wait", candidates.summary.wait || 0);
-  renderRows("candidate-rows", firstItems(candidates.items, 20).map((item) => rowHtml([`${item.code} ${item.name || ""}`, item.state, item.theme_id || "-", `${fmtNumber(item.hybrid_score)} / T ${fmtNumber(item.theme_score)} / M ${fmtNumber(item.membership_score)}`, (item.reason_codes || []).join(", ")])), 5);
+  renderRows("candidate-rows", firstItems(candidates.items, 20).map((item) => rowHtml([`${item.code} ${item.name || ""}`, item.display_state || item.state, item.theme_id || "-", `${fmtNumber(item.hybrid_score)} / T ${fmtNumber(item.theme_score)} / M ${fmtNumber(item.membership_score)}`, (item.reason_codes || []).join(", ")])), 5);
 
   text("theme-active", themes.summary.active || 0);
   text("theme-watch", themes.summary.watch || 0);

@@ -41,7 +41,7 @@ from trading.broker.transport_metrics import (
 )
 from trading.broker.ws_messages import GatewayWsMessage
 from trading.strategy.candidates import CandidateCollector
-from trading.strategy.models import CandidateState
+from trading.strategy.models import BlockType, CandidateState
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSourceSyncService
 from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThemeUniverseSource
@@ -1806,8 +1806,7 @@ def build_candidates_snapshot(
         trade_date = datetime.now().date().isoformat()
     candidates = db.list_candidates(trade_date=trade_date)
     candidates = sorted(candidates, key=lambda item: item.last_seen_at or item.detected_at or "", reverse=True)
-    state_counts = Counter(candidate.state.value for candidate in candidates)
-    wait_count = state_counts.get(CandidateState.DETECTED.value, 0) + state_counts.get(CandidateState.WATCHING.value, 0)
+    display_state_counts = Counter(_candidate_display_state(candidate) for candidate in candidates)
     block_reasons = Counter()
     items = []
     for candidate in candidates[:limit]:
@@ -1843,6 +1842,7 @@ def build_candidates_snapshot(
                 "code": candidate.code,
                 "name": candidate.name,
                 "state": candidate.state.value,
+                "display_state": _candidate_display_state(candidate),
                 "block_type": candidate.block_type.value,
                 "can_recover": candidate.can_recover,
                 "theme_id": metadata.get("best_theme_id") or gate_record.get("theme_id", ""),
@@ -1859,11 +1859,11 @@ def build_candidates_snapshot(
         "trade_date": trade_date,
         "summary": {
             "total": len(candidates),
-            "ready": state_counts.get(CandidateState.READY.value, 0),
-            "blocked": state_counts.get(CandidateState.BLOCKED.value, 0),
-            "wait": wait_count,
-            "expired": state_counts.get(CandidateState.EXPIRED.value, 0),
-            "removed": state_counts.get(CandidateState.REMOVED.value, 0),
+            "ready": display_state_counts.get(CandidateState.READY.value, 0),
+            "blocked": display_state_counts.get(CandidateState.BLOCKED.value, 0),
+            "wait": display_state_counts.get("WAIT", 0),
+            "expired": display_state_counts.get(CandidateState.EXPIRED.value, 0),
+            "removed": display_state_counts.get(CandidateState.REMOVED.value, 0),
             "top_block_reasons": [
                 {"reason": reason, "count": count}
                 for reason, count in block_reasons.most_common(10)
@@ -1871,6 +1871,17 @@ def build_candidates_snapshot(
         },
         "items": items,
     }
+
+
+def _candidate_display_state(candidate) -> str:
+    if candidate.state in {CandidateState.DETECTED, CandidateState.WATCHING}:
+        return "WAIT"
+    if (
+        candidate.state == CandidateState.BLOCKED
+        and (candidate.block_type == BlockType.TEMPORARY or candidate.can_recover)
+    ):
+        return "WAIT"
+    return candidate.state.value
 
 
 def build_themes_snapshot(db: TradingDatabase, *, limit: int = 50) -> dict[str, Any]:
