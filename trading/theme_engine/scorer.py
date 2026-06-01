@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""Legacy dynamic theme scorer.
+
+ThemeLabFlowEngine in ``trading.theme_engine.lab`` is the primary
+market -> theme -> stock compression path for new ThemeLab-based decisions.
+This module remains for compatibility with existing reports and tests.
+"""
+
 import math
 from dataclasses import dataclass
 
