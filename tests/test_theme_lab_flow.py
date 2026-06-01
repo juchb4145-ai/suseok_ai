@@ -6,6 +6,12 @@ from trading.theme_engine.lab import (
     LiquidityFilterConfig,
     MarketStatus,
     MarketStrengthSnapshot,
+    PositionAdjustmentConfig,
+    PriceLocationConfig,
+    PriceLocationEvaluator,
+    PriceLocationInput,
+    PriceLocationResult,
+    PriceLocationStatus,
     StockRole,
     ThemeBreadthEngine,
     ThemeLabConditionClassifier,
@@ -14,6 +20,10 @@ from trading.theme_engine.lab import (
     ThemeLabHybridGate,
     ThemeLabThemeStatus,
     ThemeStatusThresholds,
+    TradeabilityRiskConfig,
+    TradeabilityRiskFilter,
+    TradeabilityRiskInput,
+    TradeabilityRiskLevel,
     WatchSetLimits,
     WatchSetManager,
     WatchSetSnapshot,
@@ -124,6 +134,7 @@ def test_leader_only_theme_blocks_laggard_ready():
         market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
         theme=result,
         watch=watch,
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
     )
 
     assert result.theme_status == ThemeLabThemeStatus.LEADER_ONLY_THEME
@@ -169,11 +180,17 @@ def test_hybrid_gate_blocks_risk_off_and_late_laggard():
         stock_role=StockRole.LEADER,
     )
 
-    risk_off = gate.evaluate(market=MarketStrengthSnapshot(MarketStatus.RISK_OFF), theme=theme, watch=watch)
+    risk_off = gate.evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.RISK_OFF),
+        theme=theme,
+        watch=watch,
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
+    )
     late = gate.evaluate(
         market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
         theme=theme,
         watch=WatchSetSnapshot(**{**watch.__dict__, "stock_role": StockRole.LATE_LAGGARD}),
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
     )
 
     assert risk_off.status == LabGateStatus.BLOCKED
@@ -218,10 +235,408 @@ def test_missing_prev_close_without_change_rate_records_quality_and_blocks_ready
         [_snapshot("000001", 0, current_price=100, metadata={})],
     )[0]
     watch = WatchSetSnapshot(calculated_at="", symbol="000001", primary_theme="t", condition_level=3, stock_role=StockRole.LEADER)
-    decision = ThemeLabHybridGate().evaluate(market=MarketStrengthSnapshot(MarketStatus.SELECTIVE), theme=theme, watch=watch)
+    decision = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=theme,
+        watch=watch,
+        price_location=_price_location(PriceLocationStatus.UNKNOWN, data_quality_flags=("MISSING_CURRENT_PRICE",)),
+    )
 
     assert decision.status == LabGateStatus.BLOCKED
     assert "DATA_QUALITY_BLOCK" in decision.reason_codes
+
+
+def test_vi_active_is_always_hard_block():
+    result = TradeabilityRiskFilter().evaluate(
+        _risk_input(stock_role=StockRole.LEADER, vi_active=True, return_pct=7.0)
+    )
+
+    assert result.risk_level == TradeabilityRiskLevel.HARD_BLOCK
+    assert result.position_size_multiplier == 0.0
+    assert "VI_ACTIVE" in result.reason_codes
+
+
+def test_vi_cooldown_leader_with_turnover_is_not_blocked():
+    result = TradeabilityRiskFilter().evaluate(
+        _risk_input(
+            stock_role=StockRole.LEADER,
+            seconds_since_vi_release=60,
+            turnover_krw=5_000_000_000,
+            return_pct=9.0,
+        )
+    )
+
+    assert result.risk_level in {TradeabilityRiskLevel.SOFT_BLOCK, TradeabilityRiskLevel.RISK_ADJUST}
+    assert result.risk_level != TradeabilityRiskLevel.HARD_BLOCK
+    assert result.recheck_after_sec == 30
+
+
+def test_twelve_pct_leader_can_be_ready_small_when_quality_is_good():
+    theme = _leading_theme()
+    watch = WatchSetSnapshot(
+        calculated_at="",
+        symbol="000001",
+        primary_theme="t",
+        return_pct=12.0,
+        turnover_krw=5_000_000_000,
+        condition_level=3,
+        stock_role=StockRole.LEADER,
+    )
+    snapshot = _snapshot("000001", 12.0, turnover=5_000_000_000, metadata={"prev_close": 100}, current_price=112)
+    snapshot.momentum_3m = 1.2
+    gate = ThemeLabHybridGate(
+        TradeabilityRiskFilter(TradeabilityRiskConfig(leader_max_buy_return_pct=12.0))
+    ).evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=theme,
+        watch=watch,
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
+        snapshot=snapshot,
+    )
+
+    assert gate.status == LabGateStatus.READY_SMALL
+    assert gate.risk_level == TradeabilityRiskLevel.RISK_ADJUST
+    assert 0 < gate.position_size_multiplier < 1.0
+
+
+def test_twelve_pct_follower_cannot_be_ready():
+    theme = _leading_theme()
+    watch = WatchSetSnapshot(
+        calculated_at="",
+        symbol="000002",
+        primary_theme="t",
+        return_pct=12.0,
+        turnover_krw=2_000_000_000,
+        condition_level=3,
+        stock_role=StockRole.FOLLOWER,
+    )
+    gate = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=theme,
+        watch=watch,
+        price_location=_price_location(PriceLocationStatus.CHASE_HIGH),
+        snapshot=_snapshot("000002", 12.0, turnover=2_000_000_000),
+    )
+
+    assert gate.status in {LabGateStatus.WAIT, LabGateStatus.BLOCKED}
+    assert gate.status not in {LabGateStatus.READY, LabGateStatus.READY_SMALL}
+
+
+def test_high_chase_leader_with_momentum_can_be_ready_small():
+    theme = _leading_theme()
+    watch = WatchSetSnapshot(
+        calculated_at="",
+        symbol="000001",
+        primary_theme="t",
+        return_pct=9.0,
+        turnover_krw=5_000_000_000,
+        condition_level=3,
+        stock_role=StockRole.LEADER,
+    )
+    snapshot = _snapshot(
+        "000001",
+        9.0,
+        turnover=5_000_000_000,
+        current_price=109,
+        metadata={"prev_close": 100, "pullback_from_high_pct": 0.1},
+    )
+    snapshot.momentum_1m = 0.5
+    gate = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=theme,
+        watch=watch,
+        price_location=_price_location(PriceLocationStatus.CHASE_HIGH, reason_codes=("HIGH_CHASE_LEADER",)),
+        snapshot=snapshot,
+    )
+
+    assert gate.status == LabGateStatus.READY_SMALL
+    assert "HIGH_CHASE_LEADER" in gate.risk_reason_codes
+
+
+def test_high_chase_follower_waits_or_blocks():
+    theme = _leading_theme()
+    watch = WatchSetSnapshot(
+        calculated_at="",
+        symbol="000002",
+        primary_theme="t",
+        return_pct=7.0,
+        turnover_krw=1_000_000_000,
+        condition_level=3,
+        stock_role=StockRole.FOLLOWER,
+    )
+    gate = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=theme,
+        watch=watch,
+        price_location=_price_location(PriceLocationStatus.CHASE_HIGH),
+        snapshot=_snapshot("000002", 7.0, metadata={"pullback_from_high_pct": 0.1}),
+    )
+
+    assert gate.status in {LabGateStatus.WAIT, LabGateStatus.BLOCKED}
+    assert gate.status not in {LabGateStatus.READY, LabGateStatus.READY_SMALL}
+
+
+def test_late_laggard_cannot_be_ready_small():
+    theme = _leading_theme()
+    watch = WatchSetSnapshot(
+        calculated_at="",
+        symbol="000009",
+        primary_theme="t",
+        return_pct=6.0,
+        turnover_krw=1_000_000_000,
+        condition_level=3,
+        stock_role=StockRole.LATE_LAGGARD,
+    )
+    gate = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=theme,
+        watch=watch,
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
+        snapshot=_snapshot("000009", 6.0),
+    )
+
+    assert gate.status == LabGateStatus.BLOCKED
+    assert gate.position_size_multiplier == 0.0
+    assert gate.status != LabGateStatus.READY_SMALL
+
+
+def test_risk_adjust_multiplier_is_smaller_than_one():
+    result = TradeabilityRiskFilter(TradeabilityRiskConfig(leader_max_buy_return_pct=12.0)).evaluate(
+        _risk_input(
+            stock_role=StockRole.LEADER,
+            return_pct=12.0,
+            momentum_3m=1.0,
+            theme_status=ThemeLabThemeStatus.LEADING_THEME,
+        )
+    )
+
+    assert result.risk_level == TradeabilityRiskLevel.RISK_ADJUST
+    assert 0 < result.position_size_multiplier < 1.0
+
+
+def test_price_location_leader_good_pullback_can_be_ready():
+    theme = _leading_theme()
+    watch = _watch(role=StockRole.LEADER, return_pct=6.0)
+    price = _price_location(PriceLocationStatus.GOOD_PULLBACK)
+    decision = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=theme,
+        watch=watch,
+        price_location=price,
+        snapshot=_snapshot("000001", 6.0, current_price=106, session_high=108, metadata={"prev_close": 100}),
+    )
+
+    assert decision.status == LabGateStatus.READY
+
+
+def test_price_location_leader_breakout_continuation_can_be_ready_small():
+    decision = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=_leading_theme(),
+        watch=_watch(role=StockRole.LEADER, return_pct=9.0),
+        price_location=_price_location(PriceLocationStatus.BREAKOUT_CONTINUATION),
+        snapshot=_snapshot("000001", 9.0, current_price=109, session_high=111, metadata={"prev_close": 100}),
+    )
+
+    assert decision.status == LabGateStatus.READY_SMALL
+    assert decision.position_size_multiplier < 1.0
+
+
+def test_price_location_leader_chase_high_is_not_hard_block_when_flow_is_good():
+    decision = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=_leading_theme(),
+        watch=_watch(role=StockRole.LEADER, return_pct=9.0),
+        price_location=_price_location(PriceLocationStatus.CHASE_HIGH),
+        snapshot=_snapshot("000001", 9.0, current_price=109, turnover=5_000_000_000, metadata={"prev_close": 100}),
+    )
+
+    assert decision.status in {LabGateStatus.READY_SMALL, LabGateStatus.WAIT}
+    assert decision.status != LabGateStatus.BLOCKED
+
+
+def test_price_location_follower_chase_high_cannot_be_ready():
+    decision = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=_leading_theme(),
+        watch=_watch(role=StockRole.FOLLOWER, return_pct=7.0),
+        price_location=_price_location(PriceLocationStatus.CHASE_HIGH),
+        snapshot=_snapshot("000002", 7.0),
+    )
+
+    assert decision.status not in {LabGateStatus.READY, LabGateStatus.READY_SMALL}
+
+
+def test_price_location_follower_vwap_overextended_cannot_be_ready():
+    decision = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=_leading_theme(),
+        watch=_watch(role=StockRole.FOLLOWER, return_pct=7.0),
+        price_location=_price_location(PriceLocationStatus.VWAP_OVEREXTENDED),
+        snapshot=_snapshot("000002", 7.0),
+    )
+
+    assert decision.status not in {LabGateStatus.READY, LabGateStatus.READY_SMALL}
+
+
+def test_price_location_follower_good_pullback_can_be_ready_small():
+    decision = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=_leading_theme(),
+        watch=_watch(role=StockRole.FOLLOWER, return_pct=4.0),
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
+        snapshot=_snapshot("000002", 4.0),
+    )
+
+    assert decision.status == LabGateStatus.READY_SMALL
+    assert decision.position_size_multiplier < 1.0
+
+
+def test_price_location_late_laggard_blocks_even_good_pullback():
+    decision = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=_leading_theme(),
+        watch=_watch(role=StockRole.LATE_LAGGARD, return_pct=4.0),
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
+        snapshot=_snapshot("000009", 4.0),
+    )
+
+    assert decision.status == LabGateStatus.BLOCKED
+
+
+def test_price_location_failed_breakout_with_negative_momentum_waits_or_blocks():
+    price = PriceLocationEvaluator().evaluate(
+        PriceLocationInput(
+            symbol="000001",
+            current_price=99,
+            return_pct=5,
+            session_high=105,
+            vwap=100,
+            breakout_level=100,
+            recent_candles_1m=({"high": 105, "low": 98, "close": 99},),
+            momentum_1m=-0.5,
+            momentum_3m=-0.2,
+            stock_role=StockRole.LEADER,
+            theme_status=ThemeLabThemeStatus.LEADING_THEME,
+            market_status=MarketStatus.SELECTIVE,
+        )
+    )
+    decision = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=_leading_theme(),
+        watch=_watch(role=StockRole.LEADER, return_pct=5.0),
+        price_location=price,
+        snapshot=_snapshot("000001", 5.0),
+    )
+
+    assert price.status == PriceLocationStatus.FAILED_BREAKOUT
+    assert decision.status in {LabGateStatus.WAIT, LabGateStatus.BLOCKED}
+
+
+def test_price_location_deep_pullback_below_vwap_with_weak_momentum_is_not_ready():
+    price = PriceLocationEvaluator().evaluate(
+        PriceLocationInput(
+            symbol="000001",
+            current_price=94,
+            return_pct=3,
+            session_high=100,
+            vwap=96,
+            momentum_1m=-0.1,
+            momentum_3m=-0.5,
+            stock_role=StockRole.LEADER,
+            theme_status=ThemeLabThemeStatus.LEADING_THEME,
+            market_status=MarketStatus.SELECTIVE,
+        )
+    )
+    decision = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=_leading_theme(),
+        watch=_watch(role=StockRole.LEADER, return_pct=3.0),
+        price_location=price,
+        snapshot=_snapshot("000001", 3.0),
+    )
+
+    assert price.status == PriceLocationStatus.DEEP_PULLBACK
+    assert decision.status not in {LabGateStatus.READY, LabGateStatus.READY_SMALL}
+
+
+def test_price_location_missing_vwap_does_not_calculate_vwap_gap():
+    price = PriceLocationEvaluator().evaluate(
+        PriceLocationInput(
+            symbol="000001",
+            current_price=100,
+            return_pct=3,
+            session_high=102,
+            momentum_1m=0.2,
+            momentum_3m=0.1,
+            stock_role=StockRole.LEADER,
+            theme_status=ThemeLabThemeStatus.LEADING_THEME,
+            market_status=MarketStatus.SELECTIVE,
+        )
+    )
+
+    assert price.vwap_gap_pct is None
+    assert "MISSING_VWAP" in price.data_quality_flags
+
+
+def test_price_location_missing_session_high_keeps_pullback_unknown():
+    price = PriceLocationEvaluator().evaluate(
+        PriceLocationInput(
+            symbol="000001",
+            current_price=100,
+            return_pct=3,
+            vwap=99,
+            momentum_1m=0.2,
+            stock_role=StockRole.LEADER,
+            theme_status=ThemeLabThemeStatus.LEADING_THEME,
+            market_status=MarketStatus.SELECTIVE,
+        )
+    )
+
+    assert price.pullback_from_high_pct is None
+    assert price.status == PriceLocationStatus.UNKNOWN
+    assert "MISSING_SESSION_HIGH" in price.data_quality_flags
+
+
+def test_unknown_price_location_waits_or_observes_not_always_blocked():
+    decision = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=_leading_theme(),
+        watch=_watch(role=StockRole.LEADER, return_pct=5.0),
+        price_location=_price_location(PriceLocationStatus.UNKNOWN, reason_codes=("PRICE_LOCATION_UNKNOWN",)),
+        snapshot=_snapshot("000001", 5.0),
+    )
+
+    assert decision.status in {LabGateStatus.WAIT, LabGateStatus.OBSERVE}
+
+
+def test_price_location_score_alone_does_not_make_ready():
+    weak_theme = ThemeBreadthEngine().calculate(
+        [("t", "테마", [_member("t", "000001"), _member("t", "000002")])],
+        [_snapshot("000001", 1.0), _snapshot("000002", -2.0)],
+    )[0]
+    decision = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=weak_theme,
+        watch=_watch(role=StockRole.LEADER, return_pct=6.0),
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK, score=95.0),
+        snapshot=_snapshot("000001", 6.0),
+    )
+
+    assert decision.status != LabGateStatus.READY
+
+
+def test_ready_small_has_position_multiplier_below_one():
+    decision = ThemeLabHybridGate().evaluate(
+        market=MarketStrengthSnapshot(MarketStatus.SELECTIVE),
+        theme=_leading_theme(),
+        watch=_watch(role=StockRole.LEADER, return_pct=8.0),
+        price_location=_price_location(PriceLocationStatus.BREAKOUT_CONTINUATION),
+        snapshot=_snapshot("000001", 8.0),
+    )
+
+    assert decision.status == LabGateStatus.READY_SMALL
+    assert 0 < decision.position_size_multiplier < 1.0
 
 
 def _member(theme_id: str, code: str) -> ThemeMembership:
@@ -235,6 +650,7 @@ def _snapshot(
     name: str = "",
     turnover: float = 1_000_000,
     current_price: float = 0.0,
+    session_high: float | None = None,
     metadata: dict | None = None,
 ) -> StockSnapshot:
     return StockSnapshot(
@@ -244,6 +660,75 @@ def _snapshot(
         change_rate=change_rate,
         turnover=turnover,
         volume=1000,
-        session_high=current_price,
+        session_high=current_price if session_high is None else session_high,
         metadata=dict(metadata or {}),
+    )
+
+
+def _leading_theme():
+    return ThemeBreadthEngine(
+        ThemeLabConfig(theme_status=ThemeStatusThresholds(min_strong_count_for_leading=2, min_leader_count_for_leading=1))
+    ).calculate(
+        [("t", "테마", [_member("t", "000001"), _member("t", "000002"), _member("t", "000003")])],
+        [_snapshot("000001", 12.0, turnover=5_000_000_000), _snapshot("000002", 6.0), _snapshot("000003", 4.0)],
+    )[0]
+
+
+def _watch(*, role: StockRole, return_pct: float, symbol: str = "000001") -> WatchSetSnapshot:
+    return WatchSetSnapshot(
+        calculated_at="",
+        symbol=symbol,
+        primary_theme="t",
+        return_pct=return_pct,
+        turnover_krw=5_000_000_000,
+        condition_level=3 if return_pct >= 5 else 2,
+        stock_role=role,
+    )
+
+
+def _price_location(
+    status: PriceLocationStatus,
+    *,
+    score: float | None = None,
+    reason_codes: tuple[str, ...] = (),
+    data_quality_flags: tuple[str, ...] = (),
+) -> PriceLocationResult:
+    return PriceLocationResult(
+        symbol="000001",
+        status=status,
+        score=score if score is not None else 80.0,
+        reason_codes=reason_codes or (status.value,),
+        data_quality_flags=data_quality_flags,
+    )
+
+
+def _risk_input(
+    *,
+    stock_role: StockRole,
+    theme_status: ThemeLabThemeStatus = ThemeLabThemeStatus.LEADING_THEME,
+    return_pct: float = 0.0,
+    vi_active: bool = False,
+    seconds_since_vi_release: int = 0,
+    upper_limit_gap_pct: float = 100.0,
+    pullback_from_high_pct: float = 100.0,
+    momentum_1m: float = 0.0,
+    momentum_3m: float = 0.0,
+    turnover_krw: float = 1_000_000_000,
+    trade_strength: float = 120.0,
+    leader_momentum_status: str = "",
+) -> TradeabilityRiskInput:
+    return TradeabilityRiskInput(
+        market_status=MarketStatus.SELECTIVE,
+        theme_status=theme_status,
+        stock_role=stock_role,
+        return_pct=return_pct,
+        condition_level=3,
+        vi_active=vi_active,
+        seconds_since_vi_release=seconds_since_vi_release,
+        upper_limit_gap_pct=upper_limit_gap_pct,
+        pullback_from_high_pct=pullback_from_high_pct,
+        momentum_1m=momentum_1m,
+        momentum_3m=momentum_3m,
+        turnover_krw=turnover_krw,
+        trade_strength=trade_strength,
     )
