@@ -161,10 +161,24 @@ class RestCoreClient:
 
 
 class GatewayRuntime:
-    def __init__(self, core_client: RestCoreClient, *, source: str = "kiwoom_gateway") -> None:
+    def __init__(
+        self,
+        core_client: RestCoreClient,
+        *,
+        source: str = "kiwoom_gateway",
+        event_queue_size: int | None = None,
+        event_drain_limit: int | None = None,
+    ) -> None:
         self.core_client = core_client
         self.source = source
-        self.events = GatewayEventQueue(max_size=2000, coalesce_price_ticks=True)
+        self.event_drain_limit = _positive_int(
+            event_drain_limit,
+            _positive_int(os.environ.get("TRADING_GATEWAY_EVENT_DRAIN_LIMIT"), 300),
+        )
+        self.events = GatewayEventQueue(
+            max_size=_positive_int(event_queue_size, _positive_int(os.environ.get("TRADING_GATEWAY_EVENT_QUEUE_SIZE"), 2000)),
+            coalesce_price_ticks=True,
+        )
         self.commands: queue.Queue[GatewayCommand] = queue.Queue()
         self.rate_limiter = RateLimiter.from_env()
         self._stop = threading.Event()
@@ -230,7 +244,7 @@ class GatewayRuntime:
     def _network_loop(self, *, interval_sec: float) -> None:
         while not self._stop.is_set():
             try:
-                drained = self.events.drain(limit=100)
+                drained = self.events.drain(limit=self.event_drain_limit)
                 self.drained_event_count += len(drained)
                 for event in drained:
                     self.core_client.post_event(event)
@@ -271,6 +285,7 @@ class GatewayRuntime:
             "gateway_event_post_count": self.core_client.post_count,
             "gateway_event_post_error_count": self.core_client.post_error_count,
             "gateway_last_poll_command_count": self.core_client.last_poll_command_count,
+            "gateway_event_drain_limit": self.event_drain_limit,
             **client_snapshot,
             "gateway_transport_metrics": {
                 "last_poll_ms": round(self.core_client.last_poll_ms, 3),
@@ -299,6 +314,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--poll-wait-sec", type=float, default=float(os.environ.get("TRADING_GATEWAY_POLL_WAIT_SEC", "1.0")))
     parser.add_argument("--network-interval-sec", type=float, default=float(os.environ.get("TRADING_GATEWAY_NETWORK_INTERVAL_SEC", "0.5")))
+    parser.add_argument("--event-drain-limit", type=int, default=_positive_int(os.environ.get("TRADING_GATEWAY_EVENT_DRAIN_LIMIT"), 300))
+    parser.add_argument("--event-queue-size", type=int, default=_positive_int(os.environ.get("TRADING_GATEWAY_EVENT_QUEUE_SIZE"), 2000))
     parser.add_argument("--ws-url", default=os.environ.get("TRADING_GATEWAY_WS_URL", ""))
     parser.add_argument("--metrics-enabled", action="store_true", default=os.environ.get("TRADING_TRANSPORT_METRICS_ENABLED", "1") != "0")
     parser.add_argument("--metrics-sample-price-tick-rate", type=float, default=float(os.environ.get("TRADING_TRANSPORT_METRICS_SAMPLE_PRICE_TICK_RATE", "0.01")))
@@ -403,7 +420,12 @@ def run_mock_gateway(args: argparse.Namespace) -> int:
         print(json.dumps(results, ensure_ascii=False, indent=2))
         return 0
 
-    runtime = GatewayRuntime(_build_core_client(args), source="mock_kiwoom_gateway")
+    runtime = GatewayRuntime(
+        _build_core_client(args),
+        source="mock_kiwoom_gateway",
+        event_queue_size=args.event_queue_size,
+        event_drain_limit=args.event_drain_limit,
+    )
     runtime.start_network_worker(interval_sec=args.poll_wait_sec or args.interval_sec)
     try:
         while True:
@@ -439,7 +461,12 @@ def run_real_gateway(args: argparse.Namespace) -> int:
 
     app = QApplication(sys.argv[:1])
     client = KiwoomClient()
-    runtime = GatewayRuntime(_build_core_client(args), source="kiwoom_gateway")
+    runtime = GatewayRuntime(
+        _build_core_client(args),
+        source="kiwoom_gateway",
+        event_queue_size=args.event_queue_size,
+        event_drain_limit=args.event_drain_limit,
+    )
     _wire_kiwoom_signals(client, runtime)
     runtime.start_network_worker(interval_sec=args.poll_wait_sec or args.network_interval_sec or args.interval_sec)
 
@@ -470,6 +497,14 @@ def _kiwoom_connect_state(client) -> bool:
         return bool(client.get_accounts())
     except Exception:
         return False
+
+
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return parsed if parsed > 0 else int(default)
 
 
 def _kiwoom_accounts(client) -> list[str]:

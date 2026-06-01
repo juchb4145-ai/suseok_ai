@@ -92,7 +92,7 @@ def build_readiness_report(
     latest_rank = theme_repository.get_latest_theme_rank(1)
     top_theme = latest_rank[0] if latest_rank else None
     candidates = _active_candidates(db, trade_date)
-    dynamic_theme_by_code = {candidate.code: bool(theme_provider.themes_for_code(candidate.code)) for candidate in candidates}
+    dynamic_theme_by_code = _active_theme_presence_by_code(db, candidates)
     quality_counts = {
         QUALITY_ACTIONABLE: 0,
         QUALITY_DISCOVERY_ONLY: 0,
@@ -176,6 +176,42 @@ def _active_candidates(db: "TradingDatabase", trade_date: Optional[str]) -> list
             result.append(candidate)
         elif _has_open_virtual_activity(db, candidate):
             result.append(candidate)
+    return result
+
+
+def _active_theme_presence_by_code(
+    db: "TradingDatabase",
+    candidates: list[Candidate],
+    *,
+    default_when_not_ready: bool = False,
+) -> dict[str, bool]:
+    codes = sorted({str(candidate.code or "").strip() for candidate in candidates if str(candidate.code or "").strip()})
+    result = {code: False for code in codes}
+    if not codes:
+        return result
+    conn = getattr(db, "conn", None)
+    if conn is None:
+        return result
+    ready_row = conn.execute("SELECT COUNT(*) AS count FROM theme_membership_current").fetchone()
+    if not int((ready_row or {})["count"] if ready_row else 0):
+        return {code: bool(default_when_not_ready) for code in codes}
+    active_statuses = (ThemeStatus.ACTIVE.value, ThemeStatus.WATCH.value)
+    for start in range(0, len(codes), 500):
+        chunk = codes[start : start + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT m.stock_code
+            FROM theme_membership_current m
+            JOIN canonical_themes c ON c.theme_id = m.theme_id
+            WHERE m.active = 1
+              AND c.status IN (?, ?)
+              AND m.stock_code IN ({placeholders})
+            """,
+            (*active_statuses, *chunk),
+        ).fetchall()
+        for row in rows:
+            result[str(row["stock_code"])] = True
     return result
 
 

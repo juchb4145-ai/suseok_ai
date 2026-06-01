@@ -37,6 +37,8 @@ def test_transport_latency_analyzer_builds_percentiles_and_groups(tmp_path):
 
         assert report["summary"]["count"] == 4
         assert report["summary"]["event_latency_p95_ms"] > 0
+        assert report["summary"]["active_command_count"] == 1
+        assert report["summary"]["non_heartbeat_event_count"] == 2
         assert "gateway_to_core" in report["summary"]["by_direction"]
         assert "tr_request" in report["summary"]["by_message_type"]
     finally:

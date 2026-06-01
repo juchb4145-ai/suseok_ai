@@ -2,6 +2,7 @@ import importlib
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from trading_app.ops_alerts import build_ops_alerts
 
 
 def _client(tmp_path, monkeypatch):
@@ -61,3 +62,54 @@ def test_dashboard_snapshot_contains_ops_alerts(tmp_path, monkeypatch):
     assert "ops_alerts" in snapshot
     assert "summary" in snapshot["ops_alerts"]
     assert "alerts" in snapshot["ops_alerts"]
+
+
+def test_ops_alerts_downgrades_heartbeat_only_event_latency():
+    payload = build_ops_alerts(
+        gateway={"connected": True, "heartbeat_ok": True, "kiwoom_logged_in": True, "orderable": True},
+        transport={
+            "warning_flags": ["EVENT_P95_HIGH"],
+            "event_latency_p95_ms": 900,
+            "non_heartbeat_event_count": 0,
+        },
+    )
+
+    assert not any(item["id"] == "TRANSPORT_EVENT_P95_HIGH" for item in payload["alerts"])
+    assert any(item["id"] == "TRANSPORT_HEARTBEAT_P95_HIGH" and item["severity"] == "info" for item in payload["alerts"])
+
+
+def test_ops_alerts_uses_recent_transport_rate_limit_count():
+    payload = build_ops_alerts(
+        gateway={"connected": True, "heartbeat_ok": True, "kiwoom_logged_in": True, "orderable": True},
+        commands={"rate_limited_count": 261},
+        transport={"rate_limited_count": 0},
+    )
+
+    assert not any(item["id"] == "COMMAND_RATE_LIMITED" for item in payload["alerts"])
+
+
+def test_ops_alerts_ignore_empty_poll_command_latency():
+    payload = build_ops_alerts(
+        gateway={"connected": True, "heartbeat_ok": True, "kiwoom_logged_in": True, "orderable": True},
+        transport={
+            "warning_flags": ["COMMAND_P95_HIGH"],
+            "command_latency_p95_ms": 1200,
+            "active_command_count": 0,
+            "empty_poll_rate": 1.0,
+        },
+    )
+
+    assert not any(item["id"] == "TRANSPORT_COMMAND_P95_HIGH" for item in payload["alerts"])
+
+
+def test_ops_alerts_report_command_latency_when_commands_are_active():
+    payload = build_ops_alerts(
+        gateway={"connected": True, "heartbeat_ok": True, "kiwoom_logged_in": True, "orderable": True},
+        transport={
+            "warning_flags": ["COMMAND_P95_HIGH"],
+            "command_latency_p95_ms": 1200,
+            "active_command_count": 2,
+        },
+    )
+
+    assert any(item["id"] == "TRANSPORT_COMMAND_P95_HIGH" for item in payload["alerts"])

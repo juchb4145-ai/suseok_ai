@@ -138,6 +138,27 @@ def test_cycle_exception_is_captured(tmp_path):
     assert "cycle boom" in status["last_error"]
 
 
+def test_blank_cycle_exception_uses_type_name(tmp_path):
+    class BlankFailureRuntime(_FakeRuntime):
+        def cycle(self):
+            self.cycle_calls += 1
+            raise TimeoutError()
+
+    runtime = BlankFailureRuntime()
+    supervisor, _ = _supervisor(tmp_path, runtime)
+
+    async def scenario():
+        await supervisor.start()
+        status = await supervisor.run_once()
+        await supervisor.shutdown()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert status["failed_cycle_count"] == 1
+    assert status["last_error"] == "TimeoutError"
+
+
 def test_gateway_event_is_forwarded_to_runtime_bridge(tmp_path):
     runtime = _FakeRuntime()
     supervisor, bridge = _supervisor(tmp_path, runtime)
@@ -145,8 +166,33 @@ def test_gateway_event_is_forwarded_to_runtime_bridge(tmp_path):
     async def scenario():
         await supervisor.start()
         await supervisor.handle_gateway_event(GatewayEvent(type="price_tick", payload={"code": "005930", "price": 70000}))
+        queued = supervisor.status()
+        await supervisor.run_once()
         await supervisor.shutdown()
+        return queued
 
-    asyncio.run(scenario())
+    queued = asyncio.run(scenario())
 
+    assert queued["pending_price_tick_count"] == 1
     assert bridge.events[0].type == "price_tick"
+
+
+def test_gateway_price_ticks_are_coalesced_until_cycle(tmp_path):
+    runtime = _FakeRuntime()
+    supervisor, bridge = _supervisor(tmp_path, runtime)
+
+    async def scenario():
+        await supervisor.start()
+        await supervisor.handle_gateway_event(GatewayEvent(type="price_tick", payload={"code": "005930", "price": 70000}))
+        await supervisor.handle_gateway_event(GatewayEvent(type="price_tick", payload={"code": "005930", "price": 70100}))
+        queued = supervisor.status()
+        cycled = await supervisor.run_once()
+        await supervisor.shutdown()
+        return queued, cycled
+
+    queued, cycled = asyncio.run(scenario())
+
+    assert queued["pending_price_tick_count"] == 1
+    assert cycled["latest_snapshot"]["runtime_forwarded_price_tick_count"] == 1
+    assert len(bridge.events) == 1
+    assert bridge.events[0].payload["price"] == 70100

@@ -98,6 +98,7 @@ class KiwoomClient:
         self.tr_data_received = Signal()
         self.condition_load_state = ConditionLoadState.IDLE
         self._conditions: list[ConditionInfo] = []
+        self._realtime_screen_codes: dict[str, set[str]] = {}
 
         self.ocx = QAxWidget("KHOPENAPI.KHOpenAPICtrl.1")
         if self.ocx.isNull():
@@ -130,10 +131,12 @@ class KiwoomClient:
     def register_realtime(self, codes: Iterable[str], screen_no: Optional[str] = None) -> None:
         code_list = [code for code in codes if code]
         fids = realtime_stock_fid_string()
+        screen_map = self._realtime_screen_code_map()
         for index in range(0, len(code_list), 100):
             chunk = code_list[index : index + 100]
             chunk_screen_no = screen_no or f"{5000 + index // 100:04d}"
-            opt_type = "0"
+            screen_codes = screen_map.setdefault(chunk_screen_no, set())
+            opt_type = "1" if screen_codes else "0"
             result = self.ocx.dynamicCall(
                 "SetRealReg(QString, QString, QString, QString)",
                 chunk_screen_no,
@@ -143,14 +146,35 @@ class KiwoomClient:
             )
             if int(result or 0) < 0:
                 raise RuntimeError(f"실시간 등록 실패: {ERROR_MESSAGES.get(int(result), result)}")
+            screen_codes.update(chunk)
 
     def remove_realtime(self, codes: Iterable[str], screen_no: Optional[str] = None) -> None:
         target_screen = screen_no or "ALL"
+        screen_map = self._realtime_screen_code_map()
         for code in [code for code in codes if code]:
             self.ocx.dynamicCall("SetRealRemove(QString, QString)", target_screen, code)
+            if target_screen == "ALL":
+                for screen_codes in screen_map.values():
+                    screen_codes.discard(code)
+            else:
+                screen_codes = screen_map.get(target_screen)
+                if screen_codes is not None:
+                    screen_codes.discard(code)
+                    if not screen_codes:
+                        screen_map.pop(target_screen, None)
+        if target_screen == "ALL":
+            self._realtime_screen_codes = {screen: codes for screen, codes in screen_map.items() if codes}
 
     def remove_all_realtime(self) -> None:
         self.ocx.dynamicCall("SetRealRemove(QString, QString)", "ALL", "ALL")
+        self._realtime_screen_code_map().clear()
+
+    def _realtime_screen_code_map(self) -> dict[str, set[str]]:
+        screen_map = getattr(self, "_realtime_screen_codes", None)
+        if not isinstance(screen_map, dict):
+            screen_map = {}
+            self._realtime_screen_codes = screen_map
+        return screen_map
 
     def load_conditions(self) -> int:
         self.condition_load_state = ConditionLoadState.LOADING

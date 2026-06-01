@@ -169,11 +169,24 @@ class RealTimeSubscriptionManager:
         return (source_order, 0 if record.protected else 1, -record.priority, record.code)
 
     def _register_records(self, records: list[SubscriptionRecord]) -> None:
+        screen_to_codes = {screen_no: set(codes) for screen_no, codes in self.screen_to_codes.items()}
+        batches: dict[str, list[str]] = {}
         for record in sorted(records, key=self._registration_sort_key):
-            screen_no = self._screen_for_new_code()
-            self.client.register_realtime([record.code], screen_no=screen_no)
-            self.code_to_screen[record.code] = screen_no
-            self.screen_to_codes.setdefault(screen_no, set()).add(record.code)
+            screen_no = self._screen_for_new_code(screen_to_codes)
+            screen_to_codes.setdefault(screen_no, set()).add(record.code)
+            batches.setdefault(screen_no, []).append(record.code)
+
+        for screen_no, codes in batches.items():
+            self.client.register_realtime(codes, screen_no=screen_no)
+            for code in codes:
+                self.code_to_screen[code] = screen_no
+            self.screen_to_codes.setdefault(screen_no, set()).update(codes)
+
+        for screen_no, codes in batches.items():
+            for code in codes:
+                record = self.records.get(code)
+                if record is not None:
+                    record.screen_no = screen_no
 
     def _remove_codes(self, codes: Iterable[str]) -> None:
         codes = [code for code in codes if code]
@@ -200,11 +213,12 @@ class RealTimeSubscriptionManager:
                 if not codes_for_screen:
                     self.screen_to_codes.pop(screen_no, None)
 
-    def _screen_for_new_code(self) -> str:
+    def _screen_for_new_code(self, screen_to_codes: Optional[dict[str, set[str]]] = None) -> str:
+        screen_to_codes = screen_to_codes if screen_to_codes is not None else self.screen_to_codes
         screen_number = self.screen_base
         while True:
             screen_no = f"{screen_number:04d}"
-            if len(self.screen_to_codes.get(screen_no, set())) < self.screen_size:
+            if len(screen_to_codes.get(screen_no, set())) < self.screen_size:
                 return screen_no
             screen_number += 1
 

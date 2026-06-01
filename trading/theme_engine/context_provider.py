@@ -14,6 +14,33 @@ if TYPE_CHECKING:
 class DynamicThemeContextProvider:
     def __init__(self, repository: ThemeEngineRepository) -> None:
         self.repository = repository
+        self._cache_ready = False
+        self._theme_by_id = {}
+        self._activity_by_theme = {}
+        self._memberships_by_stock = {}
+        self._memberships_by_theme = {}
+
+    def refresh_cache(self) -> None:
+        self._theme_by_id = {theme.theme_id: theme for theme in self.repository.list_canonical_themes()}
+        activity_by_theme = {}
+        for snapshot in self.repository.latest_activity_snapshots(limit=500):
+            activity_by_theme.setdefault(snapshot.theme_id, snapshot)
+        memberships_by_stock = {}
+        memberships_by_theme = {}
+        for membership in self.repository.list_current_memberships(active=True):
+            memberships_by_stock.setdefault(normalize_stock_code(membership.stock_code), []).append(membership)
+            memberships_by_theme.setdefault(membership.theme_id, []).append(membership)
+        self._activity_by_theme = activity_by_theme
+        self._memberships_by_stock = memberships_by_stock
+        self._memberships_by_theme = memberships_by_theme
+        self._cache_ready = True
+
+    def clear_cache(self) -> None:
+        self._cache_ready = False
+        self._theme_by_id = {}
+        self._activity_by_theme = {}
+        self._memberships_by_stock = {}
+        self._memberships_by_theme = {}
 
     def enrich_candidate(self, candidate: Candidate) -> Candidate:
         enriched = replace(candidate)
@@ -74,10 +101,11 @@ class DynamicThemeContextProvider:
         return enriched
 
     def themes_for_code(self, stock_code: str) -> list[ThemeContext]:
-        memberships = self.repository.get_themes_by_stock(normalize_stock_code(stock_code), active=True)
+        self._ensure_cache()
+        memberships = list(self._memberships_by_stock.get(normalize_stock_code(stock_code), []))
         contexts = []
         for membership in memberships:
-            theme = self.repository.get_canonical_theme(membership.theme_id)
+            theme = self._theme_by_id.get(membership.theme_id)
             if theme is None or theme.status not in {ThemeStatus.WATCH, ThemeStatus.ACTIVE}:
                 continue
             activity = self.get_theme_activity(membership.theme_id)
@@ -106,13 +134,12 @@ class DynamicThemeContextProvider:
         return sorted(contexts, key=lambda item: (item.trade_eligible, item.membership_score, -(item.rank or 9999)), reverse=True)
 
     def members_for_theme(self, theme_id: str) -> list[ThemeMembership]:
-        return self.repository.get_members_by_theme(theme_id, active=True)
+        self._ensure_cache()
+        return list(self._memberships_by_theme.get(theme_id, []))
 
     def get_theme_activity(self, theme_id: str) -> Optional[ThemeActivitySnapshot]:
-        for snapshot in self.repository.latest_activity_snapshots(limit=500):
-            if snapshot.theme_id == theme_id:
-                return snapshot
-        return None
+        self._ensure_cache()
+        return self._activity_by_theme.get(theme_id)
 
     def get_stock_theme_state(self, stock_code: str) -> StockThemeState:
         clean_code = normalize_stock_code(stock_code)
@@ -137,6 +164,8 @@ class DynamicThemeContextProvider:
         )
 
     def is_ready(self) -> bool:
+        if self._cache_ready:
+            return bool(self._memberships_by_stock)
         return self.repository.count_current_memberships() > 0
 
     def _rank_in_theme(self, theme_id: str, stock_code: str, activity: ThemeActivitySnapshot | None = None) -> int:
@@ -144,12 +173,17 @@ class DynamicThemeContextProvider:
         for item in top_stocks:
             if normalize_stock_code(str(item.get("stock_code") or "")) == normalize_stock_code(stock_code):
                 return int(item.get("rank") or 0)
-        members = self.repository.get_members_by_theme(theme_id, active=True)
+        self._ensure_cache()
+        members = list(self._memberships_by_theme.get(theme_id, []))
         ranked = sorted(members, key=lambda item: (item.trade_eligible, item.membership_score, item.source_count), reverse=True)
         for index, member in enumerate(ranked, start=1):
             if member.stock_code == stock_code:
                 return index
         return 0
+
+    def _ensure_cache(self) -> None:
+        if not self._cache_ready:
+            self.refresh_cache()
 
 
 def _value(value) -> str:

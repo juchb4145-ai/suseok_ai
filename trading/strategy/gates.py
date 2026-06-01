@@ -224,19 +224,33 @@ class StockLeadershipGate:
 
     def evaluate(self, candidate: Candidate, candidates: list[Candidate]) -> list[StockLeadershipResult]:
         clean_code = normalize_code(candidate.code)
+        entries_by_theme = self._theme_groups(candidates)
         mappings = self.context_provider.themes_for_code(clean_code)
-        return [self._evaluate_mapping(candidate, mapping, candidates) for mapping in mappings]
+        return [self._evaluate_mapping(candidate, mapping, entries_by_theme.get(mapping.theme_id, [])) for mapping in mappings]
 
     def evaluate_all(self, candidates: list[Candidate]) -> list[StockLeadershipResult]:
         results: list[StockLeadershipResult] = []
+        entries_by_theme = self._theme_groups(candidates)
         for candidate in candidates:
             if candidate.state in ACTIVE_STATES:
-                results.extend(self.evaluate(candidate, candidates))
+                for mapping in self.context_provider.themes_for_code(candidate.code):
+                    results.append(self._evaluate_mapping(candidate, mapping, entries_by_theme.get(mapping.theme_id, [])))
         return results
 
-    def _evaluate_mapping(self, candidate: Candidate, mapping: ThemeContext, candidates: list[Candidate]) -> StockLeadershipResult:
+    def _theme_groups(self, candidates: list[Candidate]) -> dict[str, list[_ThemeEntry]]:
+        groups: dict[str, list[_ThemeEntry]] = {}
+        for candidate in candidates:
+            if candidate.state not in ACTIVE_STATES:
+                continue
+            enriched = self.context_provider.enrich_candidate(candidate)
+            tick = self.market_data.latest_tick(enriched.code)
+            turnover = _turnover(tick)
+            for mapping in self.context_provider.themes_for_code(enriched.code):
+                groups.setdefault(mapping.theme_id, []).append(_ThemeEntry(enriched, mapping, tick, turnover))
+        return groups
+
+    def _evaluate_mapping(self, candidate: Candidate, mapping: ThemeContext, scope_entries: list[_ThemeEntry]) -> StockLeadershipResult:
         scope = "same_dynamic_theme"
-        scope_entries = self._scope_entries(mapping, candidates, scope)
         activity_ranked_codes = _activity_ranked_codes(mapping)
         ranked = sorted(
             scope_entries,
@@ -319,19 +333,6 @@ class StockLeadershipGate:
                 "secondary_reason_codes": comparison_reason_codes,
             }, self.settings),
         )
-
-    def _scope_entries(self, mapping: ThemeContext, candidates: list[Candidate], scope: str) -> list[_ThemeEntry]:
-        entries: list[_ThemeEntry] = []
-        for candidate in candidates:
-            if candidate.state not in ACTIVE_STATES:
-                continue
-            enriched = self.context_provider.enrich_candidate(candidate)
-            for member_mapping in self.context_provider.themes_for_code(enriched.code):
-                if member_mapping.theme_id != mapping.theme_id:
-                    continue
-                tick = self.market_data.latest_tick(enriched.code)
-                entries.append(_ThemeEntry(enriched, member_mapping, tick, _turnover(tick)))
-        return entries
 
 
 class MarketIndexGate:

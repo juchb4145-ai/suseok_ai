@@ -54,6 +54,10 @@ LEGACY_DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "hybrid_validation": {
         "enabled": True,
+        "event_sample_rate": 1.0,
+        "persist_pipeline_details": True,
+        "max_details_json_bytes": 0,
+        "always_save_statuses": "READY",
         "outcome_windows": [5, 10, 25, 60],
         "good_ready_return_threshold": 3.0,
         "bad_ready_mae_threshold": -2.5,

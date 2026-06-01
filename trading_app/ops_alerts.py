@@ -115,7 +115,7 @@ def build_ops_alerts(
             )
         )
 
-    _append_command_alerts(alerts, commands)
+    _append_command_alerts(alerts, commands, transport)
     _append_transport_alerts(alerts, transport)
     _append_runtime_alerts(alerts, runtime)
     _append_performance_alerts(alerts, dry_run_performance)
@@ -147,12 +147,13 @@ def build_ops_alerts(
     }
 
 
-def _append_command_alerts(alerts: list[OpsAlert], commands: dict[str, Any]) -> None:
+def _append_command_alerts(alerts: list[OpsAlert], commands: dict[str, Any], transport: dict[str, Any] | None = None) -> None:
     failed = _int(commands.get("failed_count"))
     rejected = _int(commands.get("rejected_count"))
     expired = _int(commands.get("expired_count"))
     stale = _int(commands.get("stale_dispatched_count"))
-    rate_limited = _int(commands.get("rate_limited_count"))
+    transport = dict(transport or {})
+    rate_limited = _int(transport.get("rate_limited_count")) if "rate_limited_count" in transport else _int(commands.get("rate_limited_count"))
     duplicate_rejected = _int(commands.get("duplicate_rejected_count"))
 
     if stale:
@@ -234,6 +235,8 @@ def _append_transport_alerts(alerts: list[OpsAlert], transport: dict[str, Any]) 
     real_pilot = dict(transport.get("real_gateway_websocket_pilot") or {})
     error_count = _int(transport.get("transport_error_count"))
     reconnect_count = _int(transport.get("reconnect_count"))
+    active_command_count = _int(transport.get("active_command_count"))
+    non_heartbeat_event_count = _int(transport.get("non_heartbeat_event_count"))
     event_p95 = _float(transport.get("event_latency_p95_ms"))
     command_p95 = _float(transport.get("command_latency_p95_ms"))
     ack_p95 = _float(transport.get("ack_latency_p95_ms"))
@@ -251,18 +254,31 @@ def _append_transport_alerts(alerts: list[OpsAlert], transport: dict[str, Any]) 
             )
         )
     if "EVENT_P95_HIGH" in warning_flags:
-        alerts.append(
-            OpsAlert(
-                "TRANSPORT_EVENT_P95_HIGH",
-                "warning",
-                "Transport",
-                "이벤트 지연 P95 높음",
-                f"event latency p95가 {event_p95:.1f}ms입니다.",
-                "heartbeat 위주 샘플인지, 실제 price/condition 이벤트 지연인지 latency table에서 확인하세요.",
-                {"event_latency_p95_ms": event_p95},
+        if non_heartbeat_event_count:
+            alerts.append(
+                OpsAlert(
+                    "TRANSPORT_EVENT_P95_HIGH",
+                    "warning",
+                    "Transport",
+                    "이벤트 지연 P95 높음",
+                    f"event latency p95가 {event_p95:.1f}ms입니다.",
+                    "heartbeat 위주 샘플인지, 실제 price/condition 이벤트 지연인지 latency table에서 확인하세요.",
+                    {"event_latency_p95_ms": event_p95, "non_heartbeat_event_count": non_heartbeat_event_count},
+                )
             )
+        else:
+            alerts.append(
+                OpsAlert(
+                    "TRANSPORT_HEARTBEAT_P95_HIGH",
+                    "info",
+                    "Transport",
+                    "heartbeat 지연 샘플 높음",
+                    f"최근 샘플이 heartbeat 위주이고 p95가 {event_p95:.1f}ms입니다.",
+                    "price/condition 이벤트가 들어온 뒤에도 반복되는지 latency table에서 확인하세요.",
+                    {"event_latency_p95_ms": event_p95, "non_heartbeat_event_count": non_heartbeat_event_count},
+                )
         )
-    if "COMMAND_P95_HIGH" in warning_flags:
+    if "COMMAND_P95_HIGH" in warning_flags and active_command_count:
         alerts.append(
             OpsAlert(
                 "TRANSPORT_COMMAND_P95_HIGH",

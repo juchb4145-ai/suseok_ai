@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
 from trading.theme_engine.evidence import ThemeEvidenceService
 from trading.theme_engine.membership import ThemeMembershipBuilder
-from trading.theme_engine.models import StockSnapshot, ThemeActivitySnapshot
+from trading.theme_engine.models import CanonicalTheme, StockSnapshot, ThemeActivitySnapshot, ThemeMembership, ThemeStatus
 from trading.theme_engine.realtime_adapter import KiwoomRealtimeThemeAdapter
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.resolver import ThemeCanonicalResolver
@@ -71,31 +71,46 @@ class RealTimeThemeRuntime:
         self._last_ws_push_at = datetime.min
         self._latest_rank: list[ThemeActivitySnapshot] = []
         self._active_universe: list[str] = []
+        self._theme_by_id: dict[str, CanonicalTheme] = {}
+        self._memberships_by_stock: dict[str, list[ThemeMembership]] = {}
+        self._memberships_by_theme: dict[str, list[ThemeMembership]] = {}
 
     def start(self) -> None:
         self.running = True
-        self._active_universe = self.universe_builder.build_active_universe()
+        self._refresh_universe_cache()
+        self._active_universe = self._active_codes_from_cache()
 
     def stop(self) -> None:
         self.running = False
 
     def on_stock_snapshot(self, snapshot: StockSnapshot) -> None:
+        self.on_stock_snapshots([snapshot])
+
+    def on_stock_snapshots(self, snapshots: list[StockSnapshot]) -> None:
+        if not snapshots:
+            return
         if not self.running:
             self.start()
-        self.realtime_adapter.update_snapshot(snapshot)
-        self.last_tick_at = snapshot.updated_at or _now_text()
-        for membership in self.universe_builder.themes_by_stock(snapshot.stock_code):
-            self.recalculate_theme(membership.theme_id)
+        affected_theme_ids: set[str] = set()
+        for snapshot in snapshots:
+            self.realtime_adapter.update_snapshot(snapshot)
+            self.last_tick_at = snapshot.updated_at or _now_text()
+            for membership in self._themes_by_stock(snapshot.stock_code):
+                affected_theme_ids.add(membership.theme_id)
+        for theme_id in sorted(affected_theme_ids):
+            self.recalculate_theme(theme_id)
 
     def recalculate_theme(self, theme_id: str) -> ThemeActivitySnapshot | None:
         now = datetime.now()
         previous = self._last_score_at_by_theme.get(theme_id)
         if previous is not None and now - previous < self.scoring_interval:
             return next((item for item in self._latest_rank if item.theme_id == theme_id), None)
-        theme = self.repository.get_canonical_theme(theme_id)
+        theme = self._theme_by_id.get(theme_id) or self.repository.get_canonical_theme(theme_id)
         if theme is None:
             return None
-        memberships = self.repository.get_members_by_theme(theme_id, active=True)
+        memberships = self._memberships_by_theme.get(theme_id)
+        if memberships is None:
+            memberships = self.repository.get_members_by_theme(theme_id, active=True)
         stock_codes = [item.stock_code for item in memberships]
         snapshots = self.realtime_adapter.latest_snapshots(stock_codes)
         scored = self.scorer.score_theme(theme_id, theme.display_name, memberships, snapshots)
@@ -108,10 +123,12 @@ class RealTimeThemeRuntime:
         return scored
 
     def recalculate_all_themes(self) -> list[ThemeActivitySnapshot]:
-        themes = self.repository.list_canonical_themes()
+        if not self._theme_by_id:
+            self._refresh_universe_cache()
+        themes = list(self._theme_by_id.values()) or self.repository.list_canonical_themes()
         snapshots = self.realtime_adapter.all_snapshots()
         inputs = [
-            (theme.theme_id, theme.display_name, self.repository.get_members_by_theme(theme.theme_id, active=True))
+            (theme.theme_id, theme.display_name, self._memberships_by_theme.get(theme.theme_id) or self.repository.get_members_by_theme(theme.theme_id, active=True))
             for theme in themes
         ]
         ranked = self.scorer.score_and_rank(inputs, snapshots)
@@ -139,8 +156,10 @@ class RealTimeThemeRuntime:
 
     def health(self) -> dict:
         latest_sync = self.repository.latest_source_sync_run()
-        active_theme_count = len([theme for theme in self.repository.list_canonical_themes() if str(theme.status.value if hasattr(theme.status, "value") else theme.status) == "ACTIVE"])
-        active_stocks = self.universe_builder.build_active_universe()
+        if not self._theme_by_id:
+            self._refresh_universe_cache()
+        active_theme_count = len([theme for theme in self._theme_by_id.values() if _status_value(theme.status) == ThemeStatus.ACTIVE.value])
+        active_stocks = self._active_universe or self._active_codes_from_cache()
         data_ready = bool(active_stocks and self.last_tick_at and self.get_latest_rank(1))
         return {
             "running": self.running,
@@ -153,6 +172,50 @@ class RealTimeThemeRuntime:
             "error_count": self.error_count + self.broadcaster.error_count,
             "data_ready": data_ready,
         }
+
+    def _refresh_universe_cache(self) -> None:
+        self._theme_by_id = {theme.theme_id: theme for theme in self.repository.list_canonical_themes()}
+        memberships_by_stock: dict[str, list[ThemeMembership]] = {}
+        memberships_by_theme: dict[str, list[ThemeMembership]] = {}
+        for membership in self.repository.list_current_memberships(active=True):
+            if membership.membership_score < self.universe_builder.config.min_membership_score:
+                continue
+            theme = self._theme_by_id.get(membership.theme_id)
+            if theme is None or _status_value(theme.status) not in {ThemeStatus.WATCH.value, ThemeStatus.ACTIVE.value}:
+                continue
+            memberships_by_stock.setdefault(membership.stock_code, []).append(membership)
+            memberships_by_theme.setdefault(membership.theme_id, []).append(membership)
+        self._memberships_by_stock = memberships_by_stock
+        self._memberships_by_theme = memberships_by_theme
+
+    def _themes_by_stock(self, stock_code: str) -> list[ThemeMembership]:
+        if not self._memberships_by_stock:
+            self._refresh_universe_cache()
+        return list(self._memberships_by_stock.get(str(stock_code or "").strip(), []))
+
+    def _active_codes_from_cache(self) -> list[str]:
+        memberships = [membership for items in self._memberships_by_stock.values() for membership in items]
+        ordered = sorted(
+            memberships,
+            key=lambda item: (
+                _theme_status_priority(self._theme_by_id.get(item.theme_id)),
+                item.trade_eligible,
+                item.membership_score,
+                item.source_count,
+                item.stock_code,
+            ),
+            reverse=True,
+        )
+        codes: list[str] = []
+        seen: set[str] = set()
+        for item in ordered:
+            if item.stock_code in seen:
+                continue
+            seen.add(item.stock_code)
+            codes.append(item.stock_code)
+            if len(codes) >= self.universe_builder.config.max_size:
+                break
+        return codes
 
     def _merge_rank(self, changed: list[ThemeActivitySnapshot]) -> None:
         by_theme = {item.theme_id: item for item in self._latest_rank}
@@ -173,3 +236,18 @@ class RealTimeThemeRuntime:
 
 def _now_text() -> str:
     return datetime.now().replace(microsecond=0).isoformat()
+
+
+def _status_value(status) -> str:
+    return str(status.value if hasattr(status, "value") else status or "")
+
+
+def _theme_status_priority(theme: CanonicalTheme | None) -> int:
+    if theme is None:
+        return 0
+    value = _status_value(theme.status)
+    if value == ThemeStatus.ACTIVE.value:
+        return 2
+    if value == ThemeStatus.WATCH.value:
+        return 1
+    return 0

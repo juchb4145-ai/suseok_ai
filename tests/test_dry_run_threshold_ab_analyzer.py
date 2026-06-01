@@ -119,6 +119,18 @@ def test_score_threshold_and_low_sample_grading():
     assert result["recommendation"]["grade"] == "DATA_INSUFFICIENT"
 
 
+def test_score_threshold_skips_unknown_above_win_rate_without_crashing():
+    items = [
+        _item("weak-score-unknown", theme_score=50, hybrid_score=50, gate_score=50, realized_return_pct=None),
+        _item("strong-score-unknown", theme_score=90, hybrid_score=90, gate_score=90, realized_return_pct=None),
+    ]
+    analyzer = DryRunThresholdABAnalyzer(config=ThresholdABConfig(min_sample_count=1))
+
+    report = analyzer.build_report(_report(items), limit=100)
+
+    assert report["status"] == "READY"
+
+
 def test_export_markdown_csv_json_are_korean(tmp_path):
     items = [_item("export-1", gate_reason="LATE_CHASE", dry_run_false_positive_type="LATE_CHASE_FALSE_POSITIVE", realized_return_pct=-2.0)]
     analyzer = DryRunThresholdABAnalyzer(

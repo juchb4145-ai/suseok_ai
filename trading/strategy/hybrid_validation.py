@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -187,6 +188,10 @@ class HybridValidationSummary:
 @dataclass
 class HybridValidationConfig:
     enabled: bool = True
+    event_sample_rate: float = 1.0
+    persist_pipeline_details: bool = True
+    max_details_json_bytes: int = 0
+    always_save_statuses: str = "READY"
     outcome_windows: list[int] = field(default_factory=lambda: [5, 10, 25, 60])
     good_ready_return_threshold: float = 3.0
     bad_ready_mae_threshold: float = -2.5
@@ -214,6 +219,10 @@ class HybridValidationConfig:
         active = settings or legacy_strategy_runtime_settings()
         return cls(
             enabled=_bool_setting(active, "hybrid_validation.enabled", True),
+            event_sample_rate=_clamp_rate(active.number("hybrid_validation.event_sample_rate", 1.0)),
+            persist_pipeline_details=_bool_setting(active, "hybrid_validation.persist_pipeline_details", True),
+            max_details_json_bytes=max(0, active.integer("hybrid_validation.max_details_json_bytes", 0)),
+            always_save_statuses=str(active.value("hybrid_validation.always_save_statuses", "READY") or ""),
             outcome_windows=[int(value) for value in active.list_value("hybrid_validation.outcome_windows", [5, 10, 25, 60])],
             good_ready_return_threshold=active.number("hybrid_validation.good_ready_return_threshold", 3.0),
             bad_ready_mae_threshold=active.number("hybrid_validation.bad_ready_mae_threshold", -2.5),
@@ -276,6 +285,56 @@ class HybridValidationRepository:
         query += " ORDER BY id"
         rows = self.conn.execute(query, params).fetchall()
         return [_row_to_event(row) for row in rows]
+
+
+def should_save_validation_event(
+    candidate: Candidate,
+    decision: HybridGateDecision,
+    *,
+    config: Optional[HybridValidationConfig] = None,
+    ts: str = "",
+) -> bool:
+    active_config = config or HybridValidationConfig()
+    status = _value(getattr(decision, "status", ""))
+    if status in _csv_set(active_config.always_save_statuses):
+        return True
+    rate = _clamp_rate(active_config.event_sample_rate)
+    if rate >= 1.0:
+        return True
+    if rate <= 0.0:
+        return False
+    sample_key = "|".join(
+        [
+            str(candidate.trade_date or ""),
+            str(candidate.code or ""),
+            status,
+            str(getattr(decision, "primary_reason", "") or ""),
+            str(ts or "")[:16],
+        ]
+    )
+    digest = hashlib.sha256(sample_key.encode("utf-8")).hexdigest()
+    bucket = int(digest[:8], 16) / 0xFFFFFFFF
+    return bucket < rate
+
+
+def attach_validation_event_details(
+    event: HybridValidationEvent,
+    *,
+    base_price: int | float = 0,
+    pipeline_details: dict[str, Any] | None = None,
+    config: Optional[HybridValidationConfig] = None,
+) -> HybridValidationEvent:
+    active_config = config or HybridValidationConfig()
+    details = dict(event.details_json or {})
+    details["base_price"] = base_price
+    if pipeline_details:
+        if active_config.persist_pipeline_details:
+            details["pipeline_details"] = dict(pipeline_details)
+        else:
+            details["pipeline_summary"] = _pipeline_details_summary(pipeline_details)
+            details["pipeline_details_omitted"] = True
+    event.details_json = _cap_details_json(details, active_config.max_details_json_bytes)
+    return event
 
 
 def build_validation_event(
@@ -1021,6 +1080,70 @@ def _trade_date_from_ts(value: str) -> str:
 def _bool_setting(settings: StrategyRuntimeSettings, path: str, default: bool) -> bool:
     value = settings.value(path, default)
     return value if type(value) is bool else bool(default)
+
+
+def _value(value: Any) -> str:
+    return str(value.value if hasattr(value, "value") else value or "")
+
+
+def _clamp_rate(value: Any) -> float:
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        rate = 1.0
+    return max(0.0, min(1.0, rate))
+
+
+def _csv_set(value: str) -> set[str]:
+    return {item.strip().upper() for item in str(value or "").split(",") if item.strip()}
+
+
+def _pipeline_details_summary(details: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "legacy_final_grade",
+        "legacy_final_score",
+        "legacy_strategy_eligible",
+        "legacy_block_type",
+        "legacy_sub_status",
+        "final_score",
+        "final_grade",
+        "hybrid_status",
+        "hybrid_score",
+        "hybrid_position_tier",
+        "hybrid_primary_reason",
+        "hybrid_reason_codes",
+        "comparison_reason_codes",
+        "secondary_reason_codes",
+        "sub_status",
+        "quality_status",
+    ]
+    return {key: details.get(key) for key in keys if key in details}
+
+
+def _cap_details_json(details: dict[str, Any], max_bytes: int) -> dict[str, Any]:
+    if max_bytes <= 0:
+        return details
+    payload = json.dumps(details, ensure_ascii=False, default=str)
+    if len(payload.encode("utf-8")) <= max_bytes:
+        return details
+    compact = dict(details)
+    if "pipeline_details" in compact:
+        compact["pipeline_summary"] = _pipeline_details_summary(dict(compact.get("pipeline_details") or {}))
+        compact.pop("pipeline_details", None)
+        compact["pipeline_details_truncated"] = True
+    payload = json.dumps(compact, ensure_ascii=False, default=str)
+    if len(payload.encode("utf-8")) <= max_bytes:
+        return compact
+    keep = {
+        "hybrid_result": compact.get("hybrid_result"),
+        "legacy_result": compact.get("legacy_result"),
+        "new_result": compact.get("new_result"),
+        "base_price": compact.get("base_price"),
+        "pipeline_summary": compact.get("pipeline_summary", {}),
+        "details_truncated": True,
+        "details_original_bytes": len(payload.encode("utf-8")),
+    }
+    return {key: value for key, value in keep.items() if value is not None}
 
 
 def _avg(values: Iterable[Optional[float]]) -> Optional[float]:

@@ -1,8 +1,10 @@
+import asyncio
 import importlib
 
 from fastapi.testclient import TestClient
 from storage.db import TradingDatabase
 from trading.broker.models import GatewayEvent
+from trading.strategy.models import Candidate, CandidateState
 from tests.theme_naver_helpers import naver_source
 
 
@@ -64,7 +66,146 @@ def test_runtime_snapshot_is_in_dashboard_and_websocket(tmp_path, monkeypatch):
     assert "runtime" in ws_payload["snapshot"]
 
 
+def test_candidates_api_uses_dynamic_theme_score_alias(tmp_path, monkeypatch):
+    db_path = tmp_path / "trader.sqlite3"
+    db = TradingDatabase(str(db_path))
+    try:
+        db.save_candidate(
+            Candidate(
+                trade_date="2026-06-01",
+                code="000001",
+                state=CandidateState.WATCHING,
+                detected_at="2026-06-01T09:00:00",
+                last_seen_at="2026-06-01T09:01:00",
+                metadata={
+                    "gate_results_by_theme": {
+                        "theme-a": {
+                            "theme_id": "theme-a",
+                            "dynamic_theme_score": 72.5,
+                            "membership_score": 0.88,
+                            "hybrid_score": 64.2,
+                            "score": 12.3,
+                            "reason_codes": ["CHASE_RISK"],
+                            "primary_reason_code": "CHASE_RISK_CAP",
+                            "comparison_reason_codes": ["INPUT_MISSING"],
+                            "secondary_reason_codes": ["INPUT_MISSING"],
+                        }
+                    }
+                },
+            )
+        )
+    finally:
+        db.close()
+
+    with _client(tmp_path, monkeypatch) as client:
+        payload = client.get("/api/candidates?trade_date=2026-06-01&limit=1").json()
+
+    item = payload["items"][0]
+    assert item["theme_score"] == 72.5
+    assert item["membership_score"] == 0.88
+    assert item["hybrid_score"] == 64.2
+    assert item["reason_codes"] == ["CHASE_RISK", "CHASE_RISK_CAP"]
+
+
+def test_candidates_api_normalizes_quality_reason(tmp_path, monkeypatch):
+    db_path = tmp_path / "trader.sqlite3"
+    db = TradingDatabase(str(db_path))
+    try:
+        db.save_candidate(
+            Candidate(
+                trade_date="2026-06-01",
+                code="000002",
+                state=CandidateState.WATCHING,
+                detected_at="2026-06-01T09:00:00",
+                last_seen_at="2026-06-01T09:01:00",
+                metadata={
+                    "quality_reason": "no_active_dynamic_theme",
+                    "gate_results_by_theme": {
+                        "theme-a": {
+                            "theme_id": "theme-a",
+                            "reason_codes": ["NO_ACTIVE_THEME"],
+                        }
+                    },
+                },
+            )
+        )
+    finally:
+        db.close()
+
+    with _client(tmp_path, monkeypatch) as client:
+        payload = client.get("/api/candidates?trade_date=2026-06-01&limit=1").json()
+
+    assert payload["items"][0]["reason_codes"] == ["NO_ACTIVE_THEME"]
+
+
+def test_dashboard_event_push_is_coalesced(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    calls = []
+
+    class FakeDashboardConnections:
+        @property
+        def client_count(self):
+            return 1
+
+        async def broadcast_json(self, payload):
+            calls.append(payload)
+
+    async def run_scenario():
+        monkeypatch.setattr(api, "dashboard_connections", FakeDashboardConnections())
+        monkeypatch.setattr(api, "_build_dashboard_snapshot_payload", lambda: {"gateway": {}})
+        monkeypatch.setattr(api, "DASHBOARD_EVENT_PUSH_MIN_INTERVAL_SEC", 0.01)
+        api._dashboard_snapshot_task = None
+        api._dashboard_snapshot_last_sent_monotonic = 0.0
+
+        await api._schedule_dashboard_snapshot_broadcast()
+        await api._schedule_dashboard_snapshot_broadcast()
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run_scenario())
+
+    assert len(calls) == 1
+    assert calls[0]["snapshot"]["gateway"]["dashboard_ws_client_count"] == 1
+
+
 def test_dashboard_logs_display_kst(tmp_path, monkeypatch):
+    db_path = tmp_path / "trader.sqlite3"
+    monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    monkeypatch.setattr(api, "LOG_LIVE_WINDOW_SEC", 10**9)
+    db = TradingDatabase(str(db_path))
+    try:
+        db.conn.execute(
+            "INSERT INTO logs(created_at, message) VALUES (?, ?)",
+            ("2026-05-31 09:41:37", "[gateway][rate_limited] register_realtime"),
+        )
+        db.conn.commit()
+        api.gateway_state.record_event(
+            GatewayEvent(
+                type="command_ack",
+                timestamp="2026-05-31T09:41:38+00:00",
+                payload={"command_type": "register_realtime", "status": "ACKED"},
+            )
+        )
+
+        logs = api.build_logs_snapshot(db, limit=10)
+    finally:
+        db.close()
+
+    assert logs["timezone"] == "Asia/Seoul"
+    assert logs["core"][0].startswith("2026-05-31 18:41:37 KST ")
+    assert logs["gateway"][0]["timestamp"] == "2026-05-31 18:41:38 KST"
+    assert logs["items"][0]["source"] == "gateway"
+    assert logs["items"][0]["line"] == "2026-05-31 18:41:38 KST [gateway_event] command_ack"
+
+
+def test_dashboard_logs_hide_stale_lines(tmp_path, monkeypatch):
     db_path = tmp_path / "trader.sqlite3"
     monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
     monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
@@ -75,9 +216,28 @@ def test_dashboard_logs_display_kst(tmp_path, monkeypatch):
     try:
         db.conn.execute(
             "INSERT INTO logs(created_at, message) VALUES (?, ?)",
-            ("2026-05-31 09:41:37", "[gateway][rate_limited] register_realtime"),
+            ("2026-05-31 09:41:37", "[gateway][rate_limited] stale"),
         )
         db.conn.commit()
+
+        logs = api.build_logs_snapshot(db, limit=10)
+    finally:
+        db.close()
+
+    assert logs["core"] == []
+    assert logs["stale_core_log_count"] == 1
+
+
+def test_dashboard_logs_hide_gateway_heartbeat(tmp_path, monkeypatch):
+    db_path = tmp_path / "trader.sqlite3"
+    monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    monkeypatch.setattr(api, "LOG_LIVE_WINDOW_SEC", 10**9)
+    db = TradingDatabase(str(db_path))
+    try:
         api.gateway_state.record_event(
             GatewayEvent(
                 type="heartbeat",
@@ -90,9 +250,43 @@ def test_dashboard_logs_display_kst(tmp_path, monkeypatch):
     finally:
         db.close()
 
-    assert logs["timezone"] == "Asia/Seoul"
-    assert logs["core"][0].startswith("2026-05-31 18:41:37 KST ")
-    assert logs["gateway"][0]["timestamp"] == "2026-05-31 18:41:38 KST"
+    assert logs["gateway"] == []
+    assert logs["items"] == []
+    assert logs["hidden_gateway_event_counts"] == {"heartbeat": 1}
+
+
+def test_dashboard_logs_hide_price_tick_noise(tmp_path, monkeypatch):
+    db_path = tmp_path / "trader.sqlite3"
+    monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    monkeypatch.setattr(api, "LOG_LIVE_WINDOW_SEC", 10**9)
+    db = TradingDatabase(str(db_path))
+    try:
+        api.gateway_state.record_event(
+            GatewayEvent(
+                type="price_tick",
+                timestamp="2026-05-31T09:41:38+00:00",
+                payload={"code": "005930", "price": 70000},
+            )
+        )
+        api.gateway_state.record_event(
+            GatewayEvent(
+                type="command_ack",
+                timestamp="2026-05-31T09:41:39+00:00",
+                payload={"command_type": "register_realtime", "status": "ACKED"},
+            )
+        )
+
+        logs = api.build_logs_snapshot(db, limit=10)
+    finally:
+        db.close()
+
+    assert logs["gateway"][0]["type"] == "command_ack"
+    assert [item["type"] for item in logs["items"]] == ["command_ack"]
+    assert logs["hidden_gateway_event_counts"] == {"price_tick": 1}
 
 
 def test_runtime_start_requires_token(tmp_path, monkeypatch):

@@ -880,10 +880,15 @@ function render(snapshot) {
   text("review-count", reviews.summary.total || 0);
   renderRows("review-rows", firstItems(reviews.items, 30).map((item) => rowHtml([item.code || item.candidate_id || "-", item.final_status || "-", fmtNumber(item.max_return_5m || 0), fmtNumber(item.max_return_10m || 0), fmtNumber(item.max_return_20m || 0), [item.false_positive_flag ? "false_positive" : "", item.false_negative_flag ? "false_negative" : "", item.blocked_but_later_rallied ? "blocked_rallied" : "", item.expired_but_later_rallied ? "expired_rallied" : ""].filter(Boolean).join(", ")])), 6);
 
-  const logLines = [...(logs.warnings || []), ...firstItems(logs.core || [], 80), ...firstItems(logs.gateway || [], 20).map((item) => `${item.timestamp} ${item.type}`)];
+  const logLines = (logs.items || []).length
+    ? firstItems(logs.items || [], 100).map((item) => item.line || `${item.timestamp || ""} ${item.type || ""}`.trim())
+    : [...firstItems(logs.core || [], 80), ...firstItems(logs.gateway || [], 20).map((item) => `${item.timestamp} ${item.type}`)];
   text("log-count", logLines.length);
   const logNode = document.getElementById("log-lines");
-  if (logNode) logNode.innerHTML = logLines.length ? logLines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">로그가 없습니다</span>';
+  if (logNode) {
+    const staleText = logs.stale_core_log_count ? ` <span class="muted">(${escapeHtml(logs.stale_core_log_count)}개 이전 로그 숨김)</span>` : "";
+    logNode.innerHTML = logLines.length ? logLines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : `<span class="empty">최근 로그가 없습니다${staleText}</span>`;
+  }
 }
 
 function compactPlain(value) {

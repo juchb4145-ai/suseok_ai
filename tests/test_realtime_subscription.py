@@ -35,6 +35,28 @@ def test_subscription_limit_returns_only_successfully_registered_candidate_codes
     assert len(registered) == 1
 
 
+def test_subscription_batches_new_codes_by_screen():
+    class RecordingClient(MockKiwoomClient):
+        def __init__(self):
+            super().__init__()
+            self.register_calls = []
+
+        def register_realtime(self, codes, screen_no=None):
+            code_list = list(codes)
+            self.register_calls.append((code_list, screen_no))
+            super().register_realtime(code_list, screen_no=screen_no)
+
+    client = RecordingClient()
+    manager = RealTimeSubscriptionManager(client, max_codes=10, screen_size=100)
+
+    registered = manager.watch_candidates([candidate("005930"), candidate("000660"), candidate("035420")])
+
+    assert len(client.register_calls) == 1
+    assert client.register_calls[0][1] == "7000"
+    assert set(client.register_calls[0][0]) == {"005930", "000660", "035420"}
+    assert set(registered) == {"005930", "000660", "035420"}
+
+
 def test_theme_universe_source_is_non_protected_and_below_candidate_priority():
     client = MockKiwoomClient()
     manager = RealTimeSubscriptionManager(client, max_codes=1)

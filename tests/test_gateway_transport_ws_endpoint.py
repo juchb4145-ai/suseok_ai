@@ -152,6 +152,32 @@ def test_gateway_transport_ws_command_failed_marks_failed(tmp_path, monkeypatch)
     assert client.get("/api/gateway/commands/status").json()["failed_count"] == 1
 
 
+def test_gateway_transport_ws_rate_limited_log_includes_trace_wait(tmp_path, monkeypatch):
+    client, db_path = _client(tmp_path, monkeypatch)
+
+    with client.websocket_connect("/ws/gateway/transport?token=test-token") as ws:
+        ws.receive_json()
+        ws.send_json(
+            GatewayWsMessage(
+                type="rate_limited",
+                command_id="cmd-rate-limited",
+                payload={
+                    "command_id": "cmd-rate-limited",
+                    "command_type": "remove_realtime",
+                    "transport_trace": {"wait_time_sec": 0.25},
+                },
+            ).to_dict()
+        )
+        _recv_until(ws, "event_ack")
+
+    db = TradingDatabase(str(db_path))
+    try:
+        logs = "\n".join(db.recent_logs(limit=10))
+    finally:
+        db.close()
+    assert "[gateway][rate_limited] remove_realtime cmd-rate-limited wait=0.25" in logs
+
+
 def test_gateway_transport_ws_unknown_ack_does_not_crash(tmp_path, monkeypatch):
     client, _ = _client(tmp_path, monkeypatch)
 

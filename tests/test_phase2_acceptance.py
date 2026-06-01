@@ -498,6 +498,39 @@ def test_phase2_condition_adapter_disabled_failure_and_missing_paths_are_safe(tm
     db3.close()
 
 
+def test_runtime_retries_condition_adapter_when_startup_gateway_was_not_ready(tmp_path):
+    class RetryAdapter:
+        def __init__(self):
+            self.start_calls = 0
+            self.registered_conditions = {}
+
+        def start(self, now):
+            self.start_calls += 1
+            if self.start_calls == 1:
+                return ["GATEWAY_HEARTBEAT_REQUIRED_FOR_CONDITIONS"]
+            self.registered_conditions[("phase2", 1)] = object()
+            return []
+
+        def stop(self):
+            self.registered_conditions.clear()
+            return []
+
+    adapter = RetryAdapter()
+    runtime, db, _client, _clock = build_acceptance_runtime(tmp_path)
+    runtime.condition_adapter = adapter
+
+    start_snapshot = runtime.start(NOW)
+    cycle_snapshot = runtime.cycle(NOW + timedelta(seconds=5))
+    next_cycle = runtime.cycle(NOW + timedelta(seconds=10))
+
+    assert adapter.start_calls == 2
+    assert "GATEWAY_HEARTBEAT_REQUIRED_FOR_CONDITIONS" in start_snapshot.warnings
+    assert not any("GATEWAY_HEARTBEAT_REQUIRED_FOR_CONDITIONS" in warning for warning in cycle_snapshot.warnings)
+    assert adapter.start_calls == 2
+    assert next_cycle.started is True
+    db.close()
+
+
 def test_phase2_no_order_static_safety_for_acceptance_paths(monkeypatch, tmp_path):
     runtime, db, client, _clock = build_acceptance_runtime(tmp_path)
     calls = []

@@ -79,6 +79,17 @@ def test_gateway_price_tick_updates_index_store():
     assert market_index_store.state("KOSPI").price == 330000
 
 
+def test_gateway_price_tick_routes_known_index_even_when_payload_says_stock():
+    market_data = MarketDataStore()
+    market_index_store = MarketIndexStore()
+    bridge = GatewayEventMarketDataBridge(market_data, CandleBuilder(), market_index_store)
+
+    assert bridge.handle_price_tick({"code": "101", "price": 950, "instrument_type": "stock", "name": "KOSDAQ"}) is True
+
+    assert market_index_store.state("KOSDAQ").price == 950
+    assert market_data.latest_tick("101") is None
+
+
 def test_gateway_price_tick_updates_theme_runtime_from_kiwoom_tick(tmp_path):
     db, repo = repo_with_naver_fixture(tmp_path)
     try:
@@ -98,6 +109,19 @@ def test_gateway_price_tick_updates_theme_runtime_from_kiwoom_tick(tmp_path):
 
         assert runtime.realtime_adapter.latest_snapshot("000001") is not None
         assert runtime.get_latest_rank(1)[0].leader_code == "000001"
+    finally:
+        db.close()
+
+
+def test_theme_runtime_ignores_known_index_even_when_payload_says_stock(tmp_path):
+    db, repo = repo_with_naver_fixture(tmp_path)
+    try:
+        runtime = RealTimeThemeRuntime(repo, scoring_interval_sec=0, db_snapshot_interval_sec=0, ws_push_interval_sec=0)
+        bridge = GatewayEventThemeRuntimeBridge(runtime)
+
+        assert bridge.handle_price_tick({"code": "001", "price": 330000, "instrument_type": "stock"}) is False
+
+        assert runtime.realtime_adapter.latest_snapshot("001") is None
     finally:
         db.close()
 

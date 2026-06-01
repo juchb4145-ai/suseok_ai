@@ -299,6 +299,12 @@ class TransportLatencyAnalyzer:
         ack_samples = [sample for sample in samples if sample.get("direction") == "gateway_ack_to_core"]
         empty_poll_count = sum(1 for sample in samples if sample.get("message_type") == "command_poll_empty")
         poll_count = sum(1 for sample in samples if str(sample.get("message_type") or "").startswith("command_poll") or sample.get("direction") == "core_to_gateway")
+        active_command_count = sum(1 for sample in command_samples if sample.get("message_type") != "command_poll_empty")
+        non_heartbeat_event_count = sum(
+            1
+            for sample in event_samples
+            if str(sample.get("message_type") or "") not in {"heartbeat", "transport_heartbeat", "login_status"}
+        )
         errors = [sample for sample in samples if sample.get("error") or not sample.get("success", True)]
         rate_limited = [
             sample
@@ -318,6 +324,8 @@ class TransportLatencyAnalyzer:
             "rate_limit_wait_p95_ms": _summary_value(samples, "rate_limit_wait_ms", 95),
             "empty_poll_count": empty_poll_count,
             "command_poll_count": poll_count,
+            "active_command_count": active_command_count,
+            "non_heartbeat_event_count": non_heartbeat_event_count,
             "empty_poll_rate": (empty_poll_count / poll_count) if poll_count else 0.0,
             "event_post_count": len(event_samples),
             "transport_error_count": len(errors),

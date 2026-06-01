@@ -18,6 +18,7 @@ from trading_app.runtime_factory import CoreRuntimeBundle, build_core_strategy_r
 
 
 RuntimeBuilder = Callable[..., CoreRuntimeBundle]
+MAX_PENDING_PRICE_TICKS = 2000
 
 
 class RuntimeSupervisor:
@@ -41,6 +42,8 @@ class RuntimeSupervisor:
         self.last_cycle_duration_ms = 0
         self.last_snapshot: dict[str, Any] = {}
         self.last_error = ""
+        self.worker_stage = "idle"
+        self.last_cycle_timings: dict[str, float] = {}
         self.warnings: list[str] = []
         self.cycle_count = 0
         self.failed_cycle_count = 0
@@ -51,6 +54,9 @@ class RuntimeSupervisor:
         self.loop_task: asyncio.Task | None = None
         self._cycle_lock = asyncio.Lock()
         self._state_lock = RLock()
+        self._event_lock = RLock()
+        self._pending_price_ticks: dict[str, GatewayEvent] = {}
+        self._dropped_price_tick_count = 0
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strategy-runtime")
         self._bundle: CoreRuntimeBundle | None = None
         self._shutdown = False
@@ -88,10 +94,11 @@ class RuntimeSupervisor:
         try:
             snapshot = await loop.run_in_executor(self._executor, self._start_in_worker)
         except Exception as exc:
+            error = _exception_message(exc)
             with self._state_lock:
-                self.last_error = str(exc)
+                self.last_error = error
                 self.failed_cycle_count += 1
-            self._log_runtime_event("start_failed", "failed", str(exc))
+            self._log_runtime_event("start_failed", "failed", error)
             return self.status()
         now = _utc_now()
         with self._state_lock:
@@ -123,10 +130,11 @@ class RuntimeSupervisor:
         try:
             snapshot = await loop.run_in_executor(self._executor, self._stop_in_worker)
         except Exception as exc:
+            error = _exception_message(exc)
             snapshot = {}
             with self._state_lock:
-                self.last_error = str(exc)
-            self._log_runtime_event("stop_failed", "failed", str(exc))
+                self.last_error = error
+            self._log_runtime_event("stop_failed", "failed", error)
         now = _utc_now()
         with self._state_lock:
             self.running = False
@@ -164,15 +172,16 @@ class RuntimeSupervisor:
                     timeout=max(1, int(self.settings.runtime_cycle_timeout_sec)),
                 )
             except Exception as exc:
+                error = _exception_message(exc)
                 duration_ms = int(round((perf_counter() - started) * 1000))
                 with self._state_lock:
                     self.failed_cycle_count += 1
-                    self.last_error = str(exc)
+                    self.last_error = error
                     self.last_cycle_at = started_at
                     self.last_cycle_duration_ms = duration_ms
                     self.next_cycle_at = _after_seconds(_utc_now(), self._interval_sec()) if self.running else ""
-                self._log_runtime_cycle(started_at, _utc_now(), duration_ms, "failed", {}, str(exc))
-                self._log_runtime_event("cycle_failed", "failed", str(exc))
+                self._log_runtime_cycle(started_at, _utc_now(), duration_ms, "failed", {}, error)
+                self._log_runtime_event("cycle_failed", "failed", error)
                 return self.status()
             duration_ms = int(round((perf_counter() - started) * 1000))
             snapshot["cycle_duration_ms"] = snapshot.get("cycle_duration_ms") or duration_ms
@@ -202,9 +211,10 @@ class RuntimeSupervisor:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            error = _exception_message(exc)
             with self._state_lock:
-                self.last_error = str(exc)
-            self._log_runtime_event("loop_failed", "failed", str(exc))
+                self.last_error = error
+            self._log_runtime_event("loop_failed", "failed", error)
 
     def status(self) -> dict[str, Any]:
         gateway = self.gateway_state.snapshot().to_dict()
@@ -229,6 +239,8 @@ class RuntimeSupervisor:
                 "skipped_cycle_count": self.skipped_cycle_count,
                 "manual_cycle_count": self.manual_cycle_count,
                 "last_error": self.last_error,
+                "worker_stage": self.worker_stage,
+                "last_cycle_timings": dict(self.last_cycle_timings),
                 "warnings": warnings,
                 "latest_snapshot": snapshot,
                 "readiness": _readiness_summary(snapshot, warnings),
@@ -240,6 +252,8 @@ class RuntimeSupervisor:
                 },
                 "commands": command_summary,
                 "dry_run_orders": dry_run_order_summary,
+                "pending_price_tick_count": self._pending_price_tick_count(),
+                "dropped_price_tick_count": self._dropped_price_tick_count,
                 "db_path": str(self.settings.db_path),
             }
 
@@ -250,11 +264,7 @@ class RuntimeSupervisor:
     async def handle_gateway_event(self, event: GatewayEvent) -> None:
         if not self.enabled or self._bundle is None or event.type != "price_tick":
             return
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
-        except Exception as exc:
-            self._warn(f"RUNTIME_GATEWAY_EVENT_FAILED:{event.type}:{exc}")
+        self._queue_price_tick(event)
 
     async def readiness(self) -> dict[str, Any]:
         if self._bundle is not None:
@@ -271,24 +281,42 @@ class RuntimeSupervisor:
         self._executor.shutdown(wait=True, cancel_futures=True)
 
     def _start_in_worker(self) -> dict[str, Any]:
+        self._set_worker_stage("start")
         runtime = self._bundle.runtime if self._bundle is not None else self.build_runtime()
-        snapshot = runtime.start()
-        return _jsonable(snapshot)
+        try:
+            snapshot = _call_with_optional_timing(runtime.start, self._record_cycle_timing)
+            return _jsonable(snapshot)
+        finally:
+            self._set_worker_stage("idle")
 
     def _stop_in_worker(self) -> dict[str, Any]:
+        self._set_worker_stage("stop")
         snapshot: dict[str, Any] = {}
-        if self._bundle is not None:
-            try:
-                snapshot = _jsonable(self._bundle.runtime.stop())
-            finally:
-                self._bundle.db.close()
-                self._bundle = None
-        return snapshot
+        try:
+            if self._bundle is not None:
+                try:
+                    snapshot = _jsonable(self._bundle.runtime.stop())
+                finally:
+                    self._bundle.db.close()
+                    self._bundle = None
+                    self._clear_pending_price_ticks()
+            return snapshot
+        finally:
+            self._set_worker_stage("idle")
 
     def _cycle_in_worker(self) -> dict[str, Any]:
         if self._bundle is None:
             raise RuntimeError("runtime is not built")
-        return _jsonable(self._bundle.runtime.cycle())
+        self._reset_cycle_timings()
+        try:
+            self._set_worker_stage("drain_price_ticks")
+            forwarded_count = self._drain_price_ticks_in_worker()
+            self._set_worker_stage("runtime_cycle")
+            snapshot = _jsonable(_call_with_optional_timing(self._bundle.runtime.cycle, self._record_cycle_timing))
+            snapshot["runtime_forwarded_price_tick_count"] = forwarded_count
+            return snapshot
+        finally:
+            self._set_worker_stage("idle")
 
     def _handle_gateway_event_in_worker(self, event: GatewayEvent) -> None:
         if self._bundle is None:
@@ -297,6 +325,68 @@ class RuntimeSupervisor:
         theme_bridge = getattr(self._bundle, "theme_runtime_bridge", None)
         if theme_bridge is not None:
             theme_bridge.handle_event(event)
+
+    def _queue_price_tick(self, event: GatewayEvent) -> None:
+        key = _price_tick_key(event)
+        if not key:
+            return
+        with self._event_lock:
+            if key not in self._pending_price_ticks and len(self._pending_price_ticks) >= MAX_PENDING_PRICE_TICKS:
+                oldest_key = next(iter(self._pending_price_ticks), "")
+                if oldest_key:
+                    self._pending_price_ticks.pop(oldest_key, None)
+                    self._dropped_price_tick_count += 1
+            self._pending_price_ticks[key] = event
+
+    def _drain_price_ticks_in_worker(self) -> int:
+        with self._event_lock:
+            events = list(self._pending_price_ticks.values())
+            self._pending_price_ticks.clear()
+        if self._bundle is None:
+            return 0
+        forwarded_count = 0
+        for event in events:
+            try:
+                if self._bundle.market_data_bridge.handle_event(event):
+                    forwarded_count += 1
+            except Exception as exc:
+                self._warn(f"RUNTIME_GATEWAY_EVENT_FAILED:{event.type}:{exc}")
+        theme_bridge = getattr(self._bundle, "theme_runtime_bridge", None)
+        if theme_bridge is not None:
+            try:
+                batch_handler = getattr(theme_bridge, "handle_events", None)
+                if callable(batch_handler):
+                    batch_handler(events)
+                else:
+                    for event in events:
+                        theme_bridge.handle_event(event)
+            except Exception as exc:
+                self._warn(f"RUNTIME_GATEWAY_EVENT_FAILED:theme_batch:{exc}")
+        return forwarded_count
+
+    def _clear_pending_price_ticks(self) -> None:
+        with self._event_lock:
+            self._pending_price_ticks.clear()
+
+    def _pending_price_tick_count(self) -> int:
+        with self._event_lock:
+            return len(self._pending_price_ticks)
+
+    def _set_worker_stage(self, stage: str) -> None:
+        with self._state_lock:
+            self.worker_stage = str(stage or "idle")
+
+    def _reset_cycle_timings(self) -> None:
+        with self._state_lock:
+            self.last_cycle_timings = {}
+
+    def _record_cycle_timing(self, label: str, seconds: float) -> None:
+        text = str(label or "")
+        if text.endswith(":start"):
+            self._set_worker_stage(f"runtime_cycle:{text[:-6]}")
+            return
+        with self._state_lock:
+            self.last_cycle_timings[text] = round(float(seconds or 0.0), 6)
 
     def _build_readiness_in_worker(self) -> dict[str, Any]:
         db = TradingDatabase(str(self.settings.db_path))
@@ -391,6 +481,30 @@ def _dry_run_order_summary(db_path) -> dict[str, Any]:
             db.close()
     except Exception:
         return {}
+
+
+def _exception_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    if message:
+        return message
+    return type(exc).__name__
+
+
+def _price_tick_key(event: GatewayEvent) -> str:
+    payload = dict(event.payload or {})
+    key = str(payload.get("code") or payload.get("stock_code") or "").strip()
+    if key:
+        return key
+    return str(event.event_id or event.command_id or "").strip()
+
+
+def _call_with_optional_timing(callback: Callable[..., Any], timing_callback: Callable[[str, float], None]) -> Any:
+    try:
+        return callback(timing_callback=timing_callback)
+    except TypeError as exc:
+        if "timing_callback" not in str(exc):
+            raise
+        return callback()
 
 
 def _utc_now() -> str:

@@ -73,6 +73,9 @@ app = FastAPI(title="Trading Core API", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(WEB_ROOT / "static")), name="static")
 templates = Jinja2Templates(directory=str(WEB_ROOT / "templates"))
 KST = timezone(timedelta(hours=9), "KST")
+TRANSPORT_LIVE_WINDOW_SEC = 15 * 60
+LOG_LIVE_WINDOW_SEC = 5 * 60
+DASHBOARD_EVENT_PUSH_MIN_INTERVAL_SEC = 1.0
 
 
 def _build_gateway_state() -> GatewayStateStore:
@@ -100,6 +103,16 @@ gateway_ws_transport_state: dict[str, Any] = {
     "reconnect_count": 0,
     "fallback_state": "",
     "fallback_reason": "",
+    "fallback_detail": "",
+    "fallback_at": "",
+    "last_error": "",
+    "last_error_type": "",
+    "last_error_stage": "",
+    "last_error_at": "",
+    "last_error_reconnect_count": 0,
+    "last_close_code": "",
+    "last_close_reason": "",
+    "last_diagnostic_log_signature": "",
     "blocked_order_command_count": 0,
     "session_loss_count": 0,
     "duplicate_ack_count": 0,
@@ -107,6 +120,8 @@ gateway_ws_transport_state: dict[str, Any] = {
     "last_ws_event_at": "",
     "last_ws_ack_at": "",
 }
+_dashboard_snapshot_task: asyncio.Task | None = None
+_dashboard_snapshot_last_sent_monotonic = 0.0
 
 
 def _build_runtime_supervisor() -> RuntimeSupervisor:
@@ -246,9 +261,18 @@ def _trim_page(rows: list[Any], *, limit: int, offset: int, total: Optional[int]
 
 def _transport_status_payload(db: TradingDatabase) -> dict[str, Any]:
     settings = get_settings()
-    report = _transport_analyzer(db).build_report(limit=1000)
-    summary = dict(report.get("summary") or {})
-    recommendation = dict(report.get("websocket_recommendation") or {})
+    analyzer = _transport_analyzer(db)
+    historical_report = analyzer.build_report(limit=1000)
+    historical_summary = dict(historical_report.get("summary") or {})
+    recent_samples = _recent_transport_samples(db.list_gateway_transport_latency_samples(limit=1000), max_age_sec=TRANSPORT_LIVE_WINDOW_SEC)
+    live_summary = analyzer.aggregate_summary(recent_samples)
+    summary = dict(live_summary if recent_samples else historical_summary)
+    summary["summary_window"] = "live" if recent_samples else "historical_fallback"
+    summary["live_window_sec"] = TRANSPORT_LIVE_WINDOW_SEC
+    summary["live_sample_count"] = live_summary.get("count", 0)
+    summary["historical_sample_count"] = historical_summary.get("count", 0)
+    summary["historical_sample_window_sec"] = historical_summary.get("sample_window_sec", 0)
+    recommendation = analyzer.advisor.evaluate(summary)
     latest_reports = db.list_gateway_transport_latency_reports(limit=1)
     recent_errors = db.latest_gateway_transport_errors(limit=10)
     gateway_snapshot = gateway_state.snapshot().to_dict()
@@ -258,6 +282,7 @@ def _transport_status_payload(db: TradingDatabase) -> dict[str, Any]:
         "transport_mode": heartbeat_payload.get("transport_mode") or "rest_long_poll",
         "metrics_enabled": settings.transport_metrics_enabled,
         "latest_summary": summary,
+        "historical_summary": historical_summary,
         "warning_flags": summary.get("warning_flags", []),
         "websocket_recommendation": recommendation,
         "recent_errors": recent_errors,
@@ -1200,7 +1225,7 @@ async def _process_gateway_event(event: GatewayEvent) -> dict[str, Any]:
             )
         finally:
             close_database(db)
-    await dashboard_connections.broadcast_json({"type": "snapshot", "snapshot": snapshot()})
+    await _schedule_dashboard_snapshot_broadcast()
     return {
         "accepted": accepted,
         "event_id": event.event_id,
@@ -1211,6 +1236,46 @@ async def _process_gateway_event(event: GatewayEvent) -> dict[str, Any]:
             "runtime_forward_ms": runtime_forward_ms,
         },
     }
+
+
+async def _schedule_dashboard_snapshot_broadcast() -> None:
+    global _dashboard_snapshot_task
+    if dashboard_connections.client_count <= 0:
+        return
+    task = _dashboard_snapshot_task
+    if task is not None and not task.done():
+        return
+    elapsed = time.monotonic() - _dashboard_snapshot_last_sent_monotonic
+    delay = max(0.0, DASHBOARD_EVENT_PUSH_MIN_INTERVAL_SEC - elapsed)
+    _dashboard_snapshot_task = asyncio.create_task(_broadcast_dashboard_snapshot_after(delay))
+    _dashboard_snapshot_task.add_done_callback(_consume_dashboard_snapshot_task)
+
+
+async def _broadcast_dashboard_snapshot_after(delay_sec: float) -> None:
+    global _dashboard_snapshot_last_sent_monotonic
+    if delay_sec > 0:
+        await asyncio.sleep(delay_sec)
+    if dashboard_connections.client_count <= 0:
+        return
+    payload = await asyncio.to_thread(_build_dashboard_snapshot_payload)
+    payload["gateway"]["dashboard_ws_client_count"] = dashboard_connections.client_count
+    await dashboard_connections.broadcast_json({"type": "snapshot", "snapshot": payload})
+    _dashboard_snapshot_last_sent_monotonic = time.monotonic()
+
+
+def _consume_dashboard_snapshot_task(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except Exception:
+        pass
+
+
+def _build_dashboard_snapshot_payload() -> dict[str, Any]:
+    db = open_database()
+    try:
+        return build_dashboard_snapshot(db)
+    finally:
+        close_database(db)
 
 
 @app.get("/api/gateway/commands", response_model=GatewayCommandBatch)
@@ -1441,11 +1506,7 @@ async def dashboard_ws(websocket: WebSocket) -> None:
     await dashboard_connections.connect(websocket)
     try:
         while True:
-            db = open_database()
-            try:
-                payload = build_dashboard_snapshot(db)
-            finally:
-                close_database(db)
+            payload = await asyncio.to_thread(_build_dashboard_snapshot_payload)
             payload["gateway"]["dashboard_ws_client_count"] = dashboard_connections.client_count
             await dashboard_connections.send_json(websocket, {"type": "snapshot", "snapshot": payload})
             await asyncio.sleep(2.0)
@@ -1561,17 +1622,18 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                     )
                     for command in commands
                 ]
-                db = open_database()
-                try:
-                    for payload in payloads:
-                        _save_ws_command_transport_sample(
-                            db,
-                            payload,
-                            sent_at=sent_at,
-                            metadata=metadata,
-                        )
-                finally:
-                    close_database(db)
+                if payloads and get_settings().transport_metrics_enabled:
+                    db = open_database()
+                    try:
+                        for payload in payloads:
+                            _save_ws_command_transport_sample(
+                                db,
+                                payload,
+                                sent_at=sent_at,
+                                metadata=metadata,
+                            )
+                    finally:
+                        close_database(db)
                 await websocket.send_json(
                     GatewayWsMessage(
                         type="core_command_batch",
@@ -1585,6 +1647,7 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
             elif message.type == "transport_heartbeat":
                 event = _gateway_event_from_ws_message(message, metadata=metadata)
                 _record_ws_message_side_effects(event, metadata)
+                _maybe_record_ws_pilot_diagnostic_log(dict(event.payload or {}))
                 await websocket.send_json(
                     GatewayWsMessage(
                         type="event_ack",
@@ -1751,6 +1814,27 @@ def build_candidates_snapshot(
         metadata = dict(candidate.metadata or {})
         gate_record = _best_gate_record(metadata)
         reason_codes = _reason_codes(metadata, gate_record)
+        theme_score = _number(
+            _first_present(
+                metadata.get("theme_score"),
+                metadata.get("dynamic_theme_score"),
+                gate_record.get("theme_score"),
+                gate_record.get("dynamic_theme_score"),
+            )
+        )
+        membership_score = _number(
+            _first_present(
+                metadata.get("membership_score"),
+                gate_record.get("membership_score"),
+            )
+        )
+        hybrid_score = _number(
+            _first_present(
+                metadata.get("hybrid_score"),
+                gate_record.get("hybrid_score"),
+                gate_record.get("score"),
+            )
+        )
         block_reasons.update(reason_codes)
         items.append(
             {
@@ -1762,9 +1846,9 @@ def build_candidates_snapshot(
                 "block_type": candidate.block_type.value,
                 "can_recover": candidate.can_recover,
                 "theme_id": metadata.get("best_theme_id") or gate_record.get("theme_id", ""),
-                "theme_score": _number(metadata.get("theme_score", gate_record.get("theme_score", 0))),
-                "membership_score": _number(metadata.get("membership_score", gate_record.get("membership_score", 0))),
-                "hybrid_score": _number(metadata.get("hybrid_score", gate_record.get("score", 0))),
+                "theme_score": theme_score,
+                "membership_score": membership_score,
+                "hybrid_score": hybrid_score,
                 "reason_codes": reason_codes,
                 "detected_at": candidate.detected_at,
                 "last_seen_at": candidate.last_seen_at,
@@ -1879,20 +1963,76 @@ def build_reviews_snapshot(db: TradingDatabase, *, limit: int = 100) -> dict[str
 
 
 def build_logs_snapshot(db: TradingDatabase, *, limit: int = 100) -> dict[str, Any]:
-    logs = [_log_line_to_kst(line) for line in db.recent_logs(limit=limit)]
-    gateway_events = [_gateway_event_log_item(event) for event in gateway_state.recent_events(limit=50)]
+    raw_logs = db.recent_logs(limit=limit)
+    recent_logs = _recent_log_lines(raw_logs, max_age_sec=LOG_LIVE_WINDOW_SEC)
+    core_items = [_core_log_item(line) for line in recent_logs]
+    recent_gateway_events = [
+        event
+        for event in reversed(gateway_state.recent_events(limit=50))
+        if _is_recent_timestamp(event.timestamp, max_age_sec=LOG_LIVE_WINDOW_SEC)
+    ]
+    hidden_gateway_event_counts = _hidden_gateway_event_counts(recent_gateway_events)
+    gateway_items = [
+        _gateway_event_log_item(event)
+        for event in recent_gateway_events
+        if not _is_noisy_gateway_log(event)
+    ]
+    items = sorted(
+        [item for item in [*core_items, *gateway_items] if item.get("timestamp_utc")],
+        key=lambda item: str(item.get("timestamp_utc") or ""),
+        reverse=True,
+    )
     return {
-        "core": logs,
-        "gateway": gateway_events,
-        "warnings": [line for line in logs if "WARN" in line.upper() or "ERROR" in line.upper()],
+        "core": [str(item.get("line") or "") for item in sorted(core_items, key=lambda item: str(item.get("timestamp_utc") or ""), reverse=True)],
+        "gateway": [dict(item.get("event") or {}) for item in sorted(gateway_items, key=lambda item: str(item.get("timestamp_utc") or ""), reverse=True)],
+        "items": items,
+        "warnings": [str(item.get("line") or "") for item in core_items if "WARN" in str(item.get("line") or "").upper() or "ERROR" in str(item.get("line") or "").upper()],
         "timezone": "Asia/Seoul",
+        "live_window_sec": LOG_LIVE_WINDOW_SEC,
+        "stale_core_log_count": max(0, len(raw_logs) - len(recent_logs)),
+        "hidden_gateway_event_counts": hidden_gateway_event_counts,
+    }
+
+
+def _core_log_item(line: str) -> dict[str, Any]:
+    parsed = _parse_timestamp_utc(str(line or "")[:19])
+    display = _log_line_to_kst(line)
+    return {
+        "source": "core",
+        "timestamp": _timestamp_to_kst_display(parsed) if parsed is not None else "",
+        "timestamp_utc": parsed.isoformat() if parsed is not None else "",
+        "type": "log",
+        "line": display,
     }
 
 
 def _gateway_event_log_item(event: GatewayEvent) -> dict[str, Any]:
+    parsed = _parse_timestamp_utc(event.timestamp)
     item = event.to_dict()
-    item["timestamp"] = _timestamp_to_kst_display(item.get("timestamp"))
-    return item
+    item["timestamp"] = _timestamp_to_kst_display(parsed) if parsed is not None else _timestamp_to_kst_display(item.get("timestamp"))
+    line = f"{item.get('timestamp')} [gateway_event] {item.get('type') or ''}".strip()
+    return {
+        "source": "gateway",
+        "timestamp": item["timestamp"],
+        "timestamp_utc": parsed.isoformat() if parsed is not None else "",
+        "type": item.get("type") or "",
+        "line": line,
+        "event": item,
+    }
+
+
+def _is_noisy_gateway_log(event: GatewayEvent) -> bool:
+    return str(event.type or "") in {"heartbeat", "transport_heartbeat", "price_tick"}
+
+
+def _hidden_gateway_event_counts(events: list[GatewayEvent]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for event in events:
+        if not _is_noisy_gateway_log(event):
+            continue
+        event_type = str(event.type or "")
+        counts[event_type] = counts.get(event_type, 0) + 1
+    return counts
 
 
 def _log_line_to_kst(line: str) -> str:
@@ -1905,20 +2045,39 @@ def _log_line_to_kst(line: str) -> str:
     return f"{converted}{text[19:]}"
 
 
+def _recent_log_lines(lines: list[str], *, max_age_sec: int) -> list[str]:
+    return [line for line in lines if _is_recent_timestamp(str(line or "")[:19], max_age_sec=max_age_sec)]
+
+
+def _is_recent_timestamp(value: Any, *, max_age_sec: int) -> bool:
+    parsed = _parse_timestamp_utc(value)
+    if parsed is None:
+        return False
+    age_sec = (datetime.now(timezone.utc) - parsed).total_seconds()
+    return age_sec <= max(1, int(max_age_sec))
+
+
 def _timestamp_to_kst_display(value: Any) -> str:
+    parsed = _parse_timestamp_utc(value)
+    if parsed is None:
+        return str(value or "").strip()
+    return parsed.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+
+
+def _parse_timestamp_utc(value: Any) -> datetime | None:
     text = str(value or "").strip()
     if not text:
-        return ""
+        return None
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         try:
             parsed = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            return text
+            return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+    return parsed.astimezone(timezone.utc)
 
 
 def _event_with_trace(event: GatewayEvent, trace_updates: dict[str, Any]) -> GatewayEvent:
@@ -2069,6 +2228,8 @@ def _save_empty_command_poll_transport_sample(
 
 
 def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
+    if event.type in {"heartbeat", "transport_heartbeat"}:
+        _record_ws_pilot_diagnostic_log(db, dict(event.payload or {}))
     if event.type == "condition_event":
         condition_event = BrokerConditionEvent.from_dict(event.payload)
         collector = CandidateCollector(db)
@@ -2100,9 +2261,11 @@ def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
         if command_id:
             gateway_state.fail_command(command_id, str(event.payload.get("error") or ""), retryable=retryable)
     elif event.type == "rate_limited":
+        trace = trace_from_payload(event.payload)
+        wait_time = event.payload.get("wait_time_sec", trace.get("wait_time_sec", ""))
         db.save_log(
             f"[gateway][rate_limited] {event.payload.get('command_type', '')} "
-            f"{event.payload.get('command_id', '')} wait={event.payload.get('wait_time_sec', '')}"
+            f"{event.payload.get('command_id', '')} wait={wait_time}"
         )
     elif event.type in {"gateway_log", "log"}:
         db.save_log(f"[gateway] {event.payload.get('message', '')}")
@@ -2217,6 +2380,12 @@ def _transport_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
     return {
         "mode": status.get("transport_mode", "rest_long_poll"),
         "metrics_enabled": status.get("metrics_enabled", True),
+        "live_window_sec": summary.get("live_window_sec", 0),
+        "sample_count": summary.get("count", 0),
+        "historical_sample_count": summary.get("historical_sample_count", 0),
+        "historical_sample_window_sec": summary.get("historical_sample_window_sec", 0),
+        "active_command_count": summary.get("active_command_count", _active_command_count(summary)),
+        "non_heartbeat_event_count": summary.get("non_heartbeat_event_count", _non_heartbeat_event_count(summary)),
         "event_latency_p95_ms": summary.get("event_latency_p95_ms", 0),
         "command_latency_p95_ms": summary.get("command_latency_p95_ms", 0),
         "ack_latency_p95_ms": summary.get("ack_latency_p95_ms", 0),
@@ -2226,6 +2395,7 @@ def _transport_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
         "empty_poll_rate": summary.get("empty_poll_rate", 0),
         "reconnect_count": gateway.get("reconnect_count", 0),
         "transport_error_count": summary.get("transport_error_count", 0),
+        "rate_limited_count": summary.get("rate_limited_count", 0),
         "websocket_recommended": bool(recommendation.get("should_switch")),
         "websocket_recommendation": recommendation.get("recommendation", "KEEP_REST_LONG_POLL"),
         "websocket_recommendation_reason": reason,
@@ -2285,6 +2455,39 @@ def _transport_experiment_dashboard_payload(db: TradingDatabase) -> dict[str, An
     }
 
 
+def _recent_transport_samples(samples: list[dict[str, Any]], *, max_age_sec: int) -> list[dict[str, Any]]:
+    now = datetime.now(timezone.utc)
+    recent: list[dict[str, Any]] = []
+    for sample in samples:
+        created_at = _parse_timestamp_utc(sample.get("created_at"))
+        if created_at is None:
+            continue
+        if (now - created_at).total_seconds() <= max(1, int(max_age_sec)):
+            recent.append(sample)
+    return recent
+
+
+def _non_heartbeat_event_count(summary: dict[str, Any]) -> int:
+    by_message_type = dict(summary.get("by_event_type") or {})
+    noisy = {"heartbeat", "transport_heartbeat", "login_status"}
+    count = 0
+    for message_type, stats in by_message_type.items():
+        if str(message_type or "") in noisy:
+            continue
+        if isinstance(stats, dict):
+            count += int(stats.get("count") or 0)
+    return count
+
+
+def _active_command_count(summary: dict[str, Any]) -> int:
+    by_command_type = dict(summary.get("by_command_type") or {})
+    count = 0
+    for stats in by_command_type.values():
+        if isinstance(stats, dict):
+            count += int(stats.get("count") or 0)
+    return count
+
+
 def _valid_gateway_ws_token(websocket: WebSocket) -> bool:
     expected = get_settings().local_token
     provided = str(websocket.query_params.get("token") or websocket.headers.get("x-local-token") or "")
@@ -2311,7 +2514,7 @@ def _update_gateway_ws_transport_state(patch: dict[str, Any]) -> None:
     gateway_ws_transport_state.update({key: value for key, value in patch.items() if value is not None})
 
 
-def _record_ws_message_side_effects(event: GatewayEvent, metadata: dict[str, Any]) -> None:
+def _record_ws_message_side_effects(event: GatewayEvent, metadata: dict[str, Any], db: TradingDatabase | None = None) -> None:
     if metadata.get("transport_mode") != TRANSPORT_MODE_WEBSOCKET_REAL_PILOT:
         return
     patch: dict[str, Any] = {
@@ -2331,6 +2534,15 @@ def _record_ws_message_side_effects(event: GatewayEvent, metadata: dict[str, Any
         ("ws_reconnect_count", "reconnect_count"),
         ("ws_fallback_state", "fallback_state"),
         ("ws_fallback_reason", "fallback_reason"),
+        ("ws_fallback_detail", "fallback_detail"),
+        ("ws_fallback_at", "fallback_at"),
+        ("ws_last_error", "last_error"),
+        ("ws_last_error_type", "last_error_type"),
+        ("ws_last_error_stage", "last_error_stage"),
+        ("ws_last_error_at", "last_error_at"),
+        ("ws_last_error_reconnect_count", "last_error_reconnect_count"),
+        ("ws_last_close_code", "last_close_code"),
+        ("ws_last_close_reason", "last_close_reason"),
         ("pilot_blocked_order_command_count", "blocked_order_command_count"),
         ("ws_session_loss_count", "session_loss_count"),
         ("ws_duplicate_ack_count", "duplicate_ack_count"),
@@ -2339,6 +2551,75 @@ def _record_ws_message_side_effects(event: GatewayEvent, metadata: dict[str, Any
         if source_key in payload:
             patch[target_key] = payload.get(source_key)
     _update_gateway_ws_transport_state(patch)
+    if db is not None:
+        _record_ws_pilot_diagnostic_log(db, payload)
+
+
+def _maybe_record_ws_pilot_diagnostic_log(payload: dict[str, Any]) -> None:
+    signature = _ws_pilot_diagnostic_signature(payload)
+    if not signature:
+        return
+    if signature == str(gateway_ws_transport_state.get("last_diagnostic_log_signature") or ""):
+        return
+    db = open_database()
+    try:
+        _record_ws_pilot_diagnostic_log(db, payload)
+    finally:
+        close_database(db)
+
+
+def _record_ws_pilot_diagnostic_log(db: TradingDatabase, payload: dict[str, Any]) -> None:
+    signature = _ws_pilot_diagnostic_signature(payload)
+    if not signature:
+        return
+    if signature == str(gateway_ws_transport_state.get("last_diagnostic_log_signature") or ""):
+        return
+    gateway_ws_transport_state["last_diagnostic_log_signature"] = signature
+    diagnostic = _ws_pilot_diagnostic_fields(payload)
+    parts = [
+        f"state={diagnostic['state'] or '-'}",
+        f"reconnect={diagnostic['reconnect_count'] or '0'}",
+        f"fallback={diagnostic['fallback_reason'] or '-'}",
+        f"stage={diagnostic['last_error_stage'] or '-'}",
+        f"error_type={diagnostic['last_error_type'] or '-'}",
+    ]
+    if diagnostic["last_close_code"]:
+        parts.append(f"close={diagnostic['last_close_code']}")
+    detail = diagnostic["fallback_detail"] or diagnostic["last_error"] or diagnostic["last_close_reason"]
+    if detail:
+        parts.append(f"detail={_truncate_log_detail(detail)}")
+    db.save_log(f"[gateway][ws_real_pilot][WARN] {' '.join(parts)}")
+
+
+def _truncate_log_detail(value: str, *, limit: int = 500) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ")
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
+def _ws_pilot_diagnostic_signature(payload: dict[str, Any]) -> str:
+    if not payload.get("ws_pilot_enabled") and payload.get("transport_mode") != TRANSPORT_MODE_WEBSOCKET_REAL_PILOT:
+        return ""
+    diagnostic = _ws_pilot_diagnostic_fields(payload)
+    if not any(diagnostic[key] for key in ("fallback_reason", "fallback_detail", "last_error", "last_error_type", "last_close_code")):
+        return ""
+    return "|".join(diagnostic.values())
+
+
+def _ws_pilot_diagnostic_fields(payload: dict[str, Any]) -> dict[str, str]:
+    return {
+        "state": str(payload.get("ws_connection_state") or ""),
+        "reconnect_count": str(payload.get("ws_reconnect_count") or ""),
+        "fallback_reason": str(payload.get("ws_fallback_reason") or ""),
+        "fallback_detail": str(payload.get("ws_fallback_detail") or ""),
+        "last_error": str(payload.get("ws_last_error") or ""),
+        "last_error_type": str(payload.get("ws_last_error_type") or ""),
+        "last_error_stage": str(payload.get("ws_last_error_stage") or ""),
+        "last_error_at": str(payload.get("ws_last_error_at") or ""),
+        "last_close_code": str(payload.get("ws_last_close_code") or ""),
+        "last_close_reason": str(payload.get("ws_last_close_reason") or ""),
+    }
 
 
 def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2363,6 +2644,17 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         "reconnect_count": int(heartbeat.get("ws_reconnect_count") or state.get("reconnect_count") or 0),
         "fallback_state": heartbeat.get("ws_fallback_state") or state.get("fallback_state") or "",
         "fallback_reason": heartbeat.get("ws_fallback_reason") or state.get("fallback_reason") or "",
+        "fallback_detail": heartbeat.get("ws_fallback_detail") or state.get("fallback_detail") or "",
+        "fallback_at": heartbeat.get("ws_fallback_at") or state.get("fallback_at") or "",
+        "last_error": heartbeat.get("ws_last_error") or state.get("last_error") or "",
+        "last_error_type": heartbeat.get("ws_last_error_type") or state.get("last_error_type") or "",
+        "last_error_stage": heartbeat.get("ws_last_error_stage") or state.get("last_error_stage") or "",
+        "last_error_at": heartbeat.get("ws_last_error_at") or state.get("last_error_at") or "",
+        "last_error_reconnect_count": int(
+            heartbeat.get("ws_last_error_reconnect_count") or state.get("last_error_reconnect_count") or 0
+        ),
+        "last_close_code": heartbeat.get("ws_last_close_code") or state.get("last_close_code") or "",
+        "last_close_reason": heartbeat.get("ws_last_close_reason") or state.get("last_close_reason") or "",
         "blocked_order_command_count": int(
             heartbeat.get("pilot_blocked_order_command_count") or state.get("blocked_order_command_count") or 0
         ),
@@ -2553,14 +2845,13 @@ def _best_gate_record(metadata: dict[str, Any]) -> dict[str, Any]:
 
 def _reason_codes(metadata: dict[str, Any], gate_record: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
-    for key in ("reason_codes", "secondary_reason_codes", "comparison_reason_codes"):
-        values = gate_record.get(key) or metadata.get(key) or []
-        reasons.extend(str(value) for value in list(values))
+    values = gate_record.get("reason_codes") or metadata.get("reason_codes") or []
+    reasons.extend(str(value) for value in list(values))
     primary = gate_record.get("primary_reason_code") or metadata.get("primary_reason_code")
     if primary:
         reasons.append(str(primary))
     if metadata.get("quality_reason"):
-        reasons.append(str(metadata["quality_reason"]))
+        reasons.append(_display_quality_reason(metadata["quality_reason"]))
     return _dedupe(reasons)
 
 
@@ -2572,11 +2863,25 @@ def _dedupe(values: list[str]) -> list[str]:
     return result
 
 
+def _display_quality_reason(value: Any) -> str:
+    text = str(value or "")
+    if text == "no_active_dynamic_theme":
+        return "NO_ACTIVE_THEME"
+    return text
+
+
 def _number(value: Any) -> float:
     try:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return 0
 
 
 def _dataclass_dict(value: Any) -> dict[str, Any]:

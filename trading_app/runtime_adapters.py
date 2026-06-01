@@ -28,11 +28,12 @@ class GatewayEventMarketDataBridge:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.warning_sink = warning_sink
+        self.index_code_mapper = IndexCodeMapper()
         self._bridge = StrategyMarketDataBridge(
             market_data,
             candle_builder,
             market_index_store=market_index_store,
-            index_code_mapper=IndexCodeMapper(),
+            index_code_mapper=self.index_code_mapper,
             clock=clock,
         )
 
@@ -58,7 +59,7 @@ class GatewayEventMarketDataBridge:
                     trade_value=payload.get("trade_value", 0),
                     execution_strength=payload.get("execution_strength", 0),
                     spread_ticks=payload.get("spread_ticks", 0),
-                    instrument_type=payload.get("instrument_type"),
+                    instrument_type=self._instrument_type(code, payload.get("instrument_type")),
                     name=str(payload.get("name") or ""),
                     day_high=payload.get("day_high", 0),
                     day_low=payload.get("day_low", 0),
@@ -73,6 +74,11 @@ class GatewayEventMarketDataBridge:
 
     def data_quality_snapshot(self) -> dict[str, Any]:
         return self._bridge.data_quality_snapshot()
+
+    def _instrument_type(self, code: str, instrument_type: Any) -> Any:
+        if self.index_code_mapper.is_index_code(code):
+            return "index"
+        return instrument_type
 
     def _warn(self, warning: str) -> None:
         if self.warning_sink is not None:
@@ -96,13 +102,45 @@ class GatewayEventThemeRuntimeBridge:
             return False
         return self.handle_price_tick(dict(event.payload or {}))
 
+    def handle_events(self, events: Iterable[GatewayEvent]) -> int:
+        snapshots = []
+        for event in events:
+            if event.type != "price_tick":
+                continue
+            payload = dict(event.payload or {})
+            code = str(payload.get("code") or payload.get("stock_code") or "").strip()
+            if not code or self.index_code_mapper.is_index_code(code):
+                continue
+            instrument_type = str(payload.get("instrument_type") or "").strip().lower()
+            if instrument_type == "index":
+                continue
+            try:
+                snapshots.append(self.theme_runtime.realtime_adapter.from_kiwoom_real_data(code, payload))
+            except Exception as exc:
+                self._warn(f"THEME_RUNTIME_TICK_FAILED:{code}:{exc}")
+        if not snapshots:
+            return 0
+        try:
+            batch_handler = getattr(self.theme_runtime, "on_stock_snapshots", None)
+            if callable(batch_handler):
+                batch_handler(snapshots)
+            else:
+                for snapshot in snapshots:
+                    self.theme_runtime.on_stock_snapshot(snapshot)
+            return len(snapshots)
+        except Exception as exc:
+            self._warn(f"THEME_RUNTIME_BATCH_FAILED:{exc}")
+            return 0
+
     def handle_price_tick(self, payload: dict[str, Any]) -> bool:
         code = str(payload.get("code") or payload.get("stock_code") or "").strip()
         if not code:
             self._warn("THEME_PRICE_TICK_CODE_MISSING")
             return False
+        if self.index_code_mapper.is_index_code(code):
+            return False
         instrument_type = str(payload.get("instrument_type") or "").strip().lower()
-        if instrument_type == "index" or (not instrument_type and self.index_code_mapper.is_index_code(code)):
+        if instrument_type == "index":
             return False
         try:
             snapshot = self.theme_runtime.realtime_adapter.from_kiwoom_real_data(code, payload)

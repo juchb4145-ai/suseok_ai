@@ -38,6 +38,8 @@ def test_pipeline_records_hybrid_decision_without_changing_legacy_result():
     assert result.details["hybrid_status"] == "READY"
     assert result.details["hybrid_observe_only"] is True
     assert result.details["hybrid_live_applied"] is False
+    assert result.details["theme_score"] == 92
+    assert result.details["membership_score"] == 0.9
     assert not hasattr(pipeline, "theme_repository")
 
 
@@ -79,6 +81,60 @@ def test_pipeline_saves_hybrid_validation_event_when_repository_is_configured(tm
     assert len(events) == 1
     assert events[0].hybrid_status == "READY"
     assert events[0].theme_id == "furiosa_ai"
+    db.close()
+
+
+def test_pipeline_can_sample_out_hybrid_validation_events(tmp_path):
+    db = TradingDatabase(str(tmp_path / "hybrid_events_sampled.sqlite3"))
+    settings_json = deepcopy(LEGACY_DEFAULT_SETTINGS)
+    settings_json["hybrid_validation"]["event_sample_rate"] = 0.0
+    settings_json["hybrid_validation"]["always_save_statuses"] = ""
+    pipeline = _pipeline(
+        settings=StrategyRuntimeSettings.from_settings_json(settings_json),
+        hybrid_validation_repository=HybridValidationRepository(db),
+    )
+
+    result = pipeline._evaluate_candidate_theme(
+        Candidate(id=1, trade_date="2026-05-30", code="000001", name="MOCK-LEADER"),
+        _context(),
+        ThemeStrengthResult(theme_id="furiosa_ai", theme_name="?⑤━?ㅼ궗AI", score=35, grade="C"),
+        _leadership(),
+        _MarketPass(),
+        _ThemePullbackPass(),
+        _StockPullbackPass(),
+    )
+
+    assert result.details["hybrid_validation_event_saved"] is False
+    assert result.details["hybrid_validation_event_skip_reason"] == "sampled_out"
+    assert HybridValidationRepository(db).list_events(trade_date="2026-05-30") == []
+    db.close()
+
+
+def test_pipeline_can_omit_large_pipeline_details_from_hybrid_validation_events(tmp_path):
+    db = TradingDatabase(str(tmp_path / "hybrid_events_compact.sqlite3"))
+    settings_json = deepcopy(LEGACY_DEFAULT_SETTINGS)
+    settings_json["hybrid_validation"]["persist_pipeline_details"] = False
+    pipeline = _pipeline(
+        settings=StrategyRuntimeSettings.from_settings_json(settings_json),
+        hybrid_validation_repository=HybridValidationRepository(db),
+    )
+
+    result = pipeline._evaluate_candidate_theme(
+        Candidate(id=1, trade_date="2026-05-30", code="000001", name="MOCK-LEADER"),
+        _context(),
+        ThemeStrengthResult(theme_id="furiosa_ai", theme_name="?⑤━?ㅼ궗AI", score=35, grade="C"),
+        _leadership(),
+        _MarketPass(),
+        _ThemePullbackPass(),
+        _StockPullbackPass(),
+    )
+    events = HybridValidationRepository(db).list_events(trade_date="2026-05-30")
+
+    assert result.details["hybrid_validation_event_saved"] is True
+    assert len(events) == 1
+    assert "pipeline_details" not in events[0].details_json
+    assert events[0].details_json["pipeline_details_omitted"] is True
+    assert events[0].details_json["pipeline_summary"]["legacy_final_grade"] == "C"
     db.close()
 
 

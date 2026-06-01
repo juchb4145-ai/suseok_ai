@@ -14,7 +14,12 @@ from trading.strategy.gates import (
     ThemeStrengthGate,
 )
 from trading.strategy.hybrid_gate import HybridDynamicThemeGate, HybridGateConfig, HybridGateStatus, hybrid_decision_flat_fields
-from trading.strategy.hybrid_validation import HybridValidationConfig, build_validation_event
+from trading.strategy.hybrid_validation import (
+    HybridValidationConfig,
+    attach_validation_event_details,
+    build_validation_event,
+    should_save_validation_event,
+)
 from trading.strategy.indicators import IndicatorCalculator
 from trading.strategy.intraday import IntradayStateTracker
 from trading.strategy.market_index import MarketIndexStore
@@ -75,6 +80,9 @@ class GatePipeline:
         *,
         entry_candidates: Optional[list[Candidate]] = None,
     ) -> list[GatePipelineResult]:
+        refresh_context = getattr(self.theme_context_provider, "refresh_cache", None)
+        if callable(refresh_context):
+            refresh_context()
         active_candidates = [candidate for candidate in candidates if candidate.state in ACTIVE_STATES]
         enriched_candidates = [self.theme_context_provider.enrich_candidate(candidate) for candidate in active_candidates]
         entry_source = entry_candidates if entry_candidates is not None else active_candidates
@@ -214,6 +222,7 @@ class GatePipeline:
         details = attach_settings_details({
             "theme_id": mapping.theme_id,
             "theme_name": mapping.theme_name,
+            "theme_score": hybrid_flat.get("dynamic_theme_score", 0.0),
             "score_components": {
                 "MarketIndexGate": market_decision.score * weights["MarketIndexGate"],
                 "ThemeStrengthGate": theme_strength_decision.score * weights["ThemeStrengthGate"],
@@ -255,15 +264,25 @@ class GatePipeline:
         )
         if self.hybrid_validation_repository is not None and self.hybrid_validation_config.enabled:
             try:
-                event = build_validation_event(
-                    candidate=candidate,
-                    decision=hybrid_decision,
-                    ts=snapshot.created_at if snapshot else "",
-                )
-                event.details_json["base_price"] = snapshot.price if snapshot else 0
-                event.details_json["pipeline_details"] = dict(details)
-                self.hybrid_validation_repository.save_event(event)
-                details["hybrid_validation_event_saved"] = True
+                event_ts = snapshot.created_at if snapshot else ""
+                if should_save_validation_event(
+                    candidate,
+                    hybrid_decision,
+                    config=self.hybrid_validation_config,
+                    ts=event_ts,
+                ):
+                    event = build_validation_event(candidate=candidate, decision=hybrid_decision, ts=event_ts)
+                    attach_validation_event_details(
+                        event,
+                        base_price=snapshot.price if snapshot else 0,
+                        pipeline_details=details,
+                        config=self.hybrid_validation_config,
+                    )
+                    self.hybrid_validation_repository.save_event(event)
+                    details["hybrid_validation_event_saved"] = True
+                else:
+                    details["hybrid_validation_event_saved"] = False
+                    details["hybrid_validation_event_skip_reason"] = "sampled_out"
             except Exception as exc:
                 details["hybrid_validation_event_saved"] = False
                 details["hybrid_validation_event_error"] = str(exc)

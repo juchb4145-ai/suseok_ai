@@ -492,7 +492,9 @@ class DryRunThresholdABAnalyzer:
                 continue
             below_fp_rate = _ratio(sum(1 for item in below if item.get("dry_run_false_positive_type")), len(below))
             above_win_rate = _win_rate(above)
-            if below_fp_rate >= 0.25 or above_win_rate >= 0.5:
+            if (below_fp_rate is not None and below_fp_rate >= 0.25) or (
+                above_win_rate is not None and above_win_rate >= 0.5
+            ):
                 candidates.append(
                     ThresholdCandidate(
                         candidate_id=f"{category}:{field}:min_{threshold}",

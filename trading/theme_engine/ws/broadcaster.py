@@ -32,12 +32,14 @@ class ThemeWebSocketBroadcaster:
         loop.create_task(self.publish_async(payload))
 
     async def publish_async(self, payload: dict) -> None:
-        dead = []
-        for client in list(self.clients):
-            try:
-                await client.send_json(payload)
-            except Exception:
-                self.error_count += 1
-                dead.append(client)
+        clients = list(self.clients)
+        if not clients:
+            return
+        results = await asyncio.gather(
+            *(client.send_json(payload) for client in clients),
+            return_exceptions=True,
+        )
+        dead = [client for client, result in zip(clients, results) if isinstance(result, Exception)]
+        self.error_count += len(dead)
         for client in dead:
             self.clients.discard(client)

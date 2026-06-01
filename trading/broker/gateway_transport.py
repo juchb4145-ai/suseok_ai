@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -71,6 +72,7 @@ class WebSocketPilotPolicy:
     allow_order_commands: bool = False
     allowed_commands: set[str] = field(default_factory=lambda: set(DEFAULT_PILOT_ALLOWED_COMMANDS))
     max_queue_size: int = 2000
+    outbound_send_burst_size: int = 100
     heartbeat_interval_sec: float = 5.0
     reconnect_base_sec: float = 0.5
     reconnect_max_sec: float = 10.0
@@ -94,6 +96,7 @@ class WebSocketPilotPolicy:
             block_order_commands=_bool_env("TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS", True),
             allow_order_commands=_bool_env("TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS", False),
             allowed_commands=allowed,
+            outbound_send_burst_size=_int_env("TRADING_GATEWAY_WEBSOCKET_OUTBOUND_SEND_BURST_SIZE", 100),
         )
 
     def command_allowed(self, command_type: str) -> bool:
@@ -130,7 +133,16 @@ class WebSocketRealCoreClient:
         self.connection_state = "DISCONNECTED"
         self.fallback_state = ""
         self.fallback_reason = ""
+        self.fallback_detail = ""
+        self.fallback_at = ""
         self.last_error = ""
+        self.last_error_type = ""
+        self.last_error_stage = ""
+        self.last_error_at = ""
+        self.last_error_reconnect_count = 0
+        self.last_close_code = ""
+        self.last_close_reason = ""
+        self._ws_stage = "idle"
         self.last_send_ms = 0.0
         self.last_receive_ms = 0.0
         self.last_event_post_ms = 0.0
@@ -250,6 +262,15 @@ class WebSocketRealCoreClient:
             "ws_command_queue_size": self._commands.qsize(),
             "ws_fallback_state": self.fallback_state,
             "ws_fallback_reason": self.fallback_reason,
+            "ws_fallback_detail": self.fallback_detail,
+            "ws_fallback_at": self.fallback_at,
+            "ws_last_error": self.last_error,
+            "ws_last_error_type": self.last_error_type,
+            "ws_last_error_stage": self.last_error_stage,
+            "ws_last_error_at": self.last_error_at,
+            "ws_last_error_reconnect_count": self.last_error_reconnect_count,
+            "ws_last_close_code": self.last_close_code,
+            "ws_last_close_reason": self.last_close_reason,
             "ws_error_count": self.error_count,
             "ws_session_loss_count": self.session_loss_count,
             "ws_duplicate_ack_count": self.duplicate_ack_count,
@@ -264,13 +285,15 @@ class WebSocketRealCoreClient:
         try:
             asyncio.run(self._run_forever())
         except Exception as exc:
-            self.last_error = str(exc)
+            self._record_ws_error(exc, stage=self._ws_stage or "thread")
             self._maybe_fallback("websocket_thread_failed", str(exc))
 
     async def _run_forever(self) -> None:
         try:
+            self._ws_stage = "import_websockets"
             import websockets
         except Exception as exc:
+            self._record_ws_error(exc, stage="import_websockets")
             self._maybe_fallback("websockets_dependency_missing", str(exc))
             return
 
@@ -278,21 +301,26 @@ class WebSocketRealCoreClient:
             try:
                 self.connection_state = "CONNECTING"
                 url = _append_token(self.ws_url, self.token)
+                self._ws_stage = "connect"
                 async with websockets.connect(url, ping_interval=10, close_timeout=2) as ws:
                     self.ws_connection_id = f"ws_conn_{uuid4().hex}"
                     self.connection_state = "CONNECTED"
+                    self._ws_stage = "hello_send"
                     await self._send_ws(ws, self._hello_message())
                     hello_deadline = time.monotonic() + 5.0
                     while time.monotonic() < hello_deadline and self.connection_state != "AUTHENTICATED":
+                        self._ws_stage = "hello_recv"
                         raw = await asyncio.wait_for(ws.recv(), timeout=max(0.1, hello_deadline - time.monotonic()))
+                        self._ws_stage = "hello_handle"
                         self._handle_incoming(GatewayWsMessage.from_dict(json.loads(raw)))
                     if self.connection_state != "AUTHENTICATED":
                         raise RuntimeError("hello_ack timeout")
+                    self._ws_stage = "connection_loop"
                     await self._connection_loop(ws)
             except Exception as exc:
                 self.error_count += 1
-                self.last_error = str(exc)
-                if "hello" in str(exc).lower() and self.policy.fallback_on_auth_failure:
+                self._record_ws_error(exc, stage=self._ws_stage or self.connection_state.lower())
+                if "hello" in self.last_error.lower() and self.policy.fallback_on_auth_failure:
                     self._maybe_fallback("auth_failure", str(exc))
                     return
                 self.reconnect_count += 1
@@ -305,20 +333,27 @@ class WebSocketRealCoreClient:
     async def _connection_loop(self, ws) -> None:
         next_heartbeat = 0.0
         while not self._stop.is_set() and not self.fallback_active:
-            while True:
+            sent_count = 0
+            send_limit = max(1, int(self.policy.outbound_send_burst_size or 100))
+            while sent_count < send_limit:
                 try:
                     message = self._outbound.get_nowait()
                 except queue.Empty:
                     break
+                self._ws_stage = f"send:{message.type}"
                 await self._send_ws(ws, message)
+                sent_count += 1
             now = time.monotonic()
             if now >= next_heartbeat:
+                self._ws_stage = "send:transport_heartbeat"
                 await self._send_ws(ws, self._heartbeat_message())
                 next_heartbeat = now + max(1.0, self.policy.heartbeat_interval_sec)
             try:
+                self._ws_stage = "recv"
                 raw = await asyncio.wait_for(ws.recv(), timeout=0.05)
             except asyncio.TimeoutError:
                 continue
+            self._ws_stage = "handle_incoming"
             self._handle_incoming(GatewayWsMessage.from_dict(json.loads(raw)))
 
     async def _send_ws(self, ws, message: GatewayWsMessage) -> None:
@@ -335,6 +370,7 @@ class WebSocketRealCoreClient:
                 return
             self.ws_session_id = str(message.payload.get("websocket_session_id") or message.metadata.get("websocket_session_id") or self.ws_session_id)
             self.connection_state = "AUTHENTICATED"
+            self._clear_ws_error()
             return
         if message.type == "pong":
             return
@@ -451,6 +487,13 @@ class WebSocketRealCoreClient:
             "ws_reconnect_count": self.reconnect_count,
             "ws_connection_state": self.connection_state,
             "ws_fallback_reason": self.fallback_reason,
+            "ws_fallback_detail": self.fallback_detail,
+            "ws_last_error": self.last_error,
+            "ws_last_error_type": self.last_error_type,
+            "ws_last_error_stage": self.last_error_stage,
+            "ws_last_error_at": self.last_error_at,
+            "ws_last_close_code": self.last_close_code,
+            "ws_last_close_reason": self.last_close_reason,
         }
 
     def _next_sequence(self) -> int:
@@ -459,7 +502,10 @@ class WebSocketRealCoreClient:
             return self._sequence
 
     def _maybe_fallback(self, reason: str, detail: str = "") -> None:
-        self.last_error = detail or reason
+        self.fallback_detail = _redact_sensitive(detail or reason)
+        self.fallback_at = utc_now_ms()
+        if detail and not self.last_error:
+            self.last_error = self.fallback_detail
         if self.policy.fallback_to_rest and self.fallback_client is not None:
             self.connection_state = "FALLBACK_REST"
             self.fallback_state = "FALLBACK_REST"
@@ -468,6 +514,30 @@ class WebSocketRealCoreClient:
         self.connection_state = "DEGRADED"
         self.fallback_state = "STOPPED"
         self.fallback_reason = reason
+
+    def _record_ws_error(self, exc: Exception, *, stage: str) -> None:
+        self.last_error = _redact_sensitive(str(exc) or repr(exc))
+        self.last_error_type = type(exc).__name__
+        self.last_error_stage = str(stage or "unknown")
+        self.last_error_at = utc_now_ms()
+        self.last_error_reconnect_count = self.reconnect_count
+        close_code = getattr(exc, "code", None) or getattr(exc, "close_code", None)
+        close_reason = getattr(exc, "reason", None) or getattr(exc, "close_reason", None)
+        if close_code is None:
+            received = getattr(exc, "rcvd", None)
+            close_code = getattr(received, "code", None)
+            close_reason = close_reason or getattr(received, "reason", None)
+        self.last_close_code = "" if close_code is None else str(close_code)
+        self.last_close_reason = _redact_sensitive(close_reason or "")
+
+    def _clear_ws_error(self) -> None:
+        self.last_error = ""
+        self.last_error_type = ""
+        self.last_error_stage = ""
+        self.last_error_at = ""
+        self.last_error_reconnect_count = 0
+        self.last_close_code = ""
+        self.last_close_reason = ""
 
     def _backoff_seconds(self) -> float:
         base = min(self.policy.reconnect_max_sec, self.policy.reconnect_base_sec * (2 ** max(0, self.reconnect_count - 1)))
@@ -501,6 +571,13 @@ def _command_with_trace(command: GatewayCommand, trace_updates: dict[str, Any]) 
 def _append_token(ws_url: str, token: str) -> str:
     separator = "&" if "?" in ws_url else "?"
     return f"{ws_url}{separator}{urlencode({'token': token})}"
+
+
+def _redact_sensitive(value: object) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    return re.sub(r"(?i)(token=|x-local-token=|authorization:\s*bearer\s+)[^&\s]+", r"\1<redacted>", text)
 
 
 def _ws_url_from_core_url(core_url: str) -> str:

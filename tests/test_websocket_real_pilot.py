@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from apps.kiwoom_gateway import RestCoreClient, _build_core_client, _websocket_pilot_command_rejection
+from storage.db import TradingDatabase
 from trading.broker.gateway_transport import WebSocketRealCoreClient
 from trading.broker.models import GatewayCommand
 from trading.broker.transport_metrics import TRANSPORT_MODE_WEBSOCKET_REAL_PILOT
@@ -67,6 +68,48 @@ def test_websocket_transport_keepalive_is_not_kiwoom_status(monkeypatch):
     assert "kiwoom_logged_in" not in message.payload
     assert "orderable" not in message.payload
     assert "account" not in message.payload
+
+
+def test_websocket_real_client_snapshots_error_diagnostics(monkeypatch):
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_REAL_PILOT", "1")
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL", "1")
+    client = _build_core_client(_args(transport="websocket-pilot"))
+
+    client._record_ws_error(RuntimeError("connect failed token=super-secret"), stage="connect")
+    client._maybe_fallback("reconnect_limit", "connect failed token=super-secret")
+    snapshot = client.snapshot()
+    client.stop()
+
+    assert snapshot["ws_last_error_type"] == "RuntimeError"
+    assert snapshot["ws_last_error_stage"] == "connect"
+    assert snapshot["ws_fallback_reason"] == "reconnect_limit"
+    assert "super-secret" not in snapshot["ws_last_error"]
+    assert "super-secret" not in snapshot["ws_fallback_detail"]
+
+
+def test_websocket_real_client_clears_stale_error_after_auth(monkeypatch):
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_REAL_PILOT", "1")
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL", "1")
+    client = _build_core_client(_args(transport="websocket-pilot"))
+
+    client.connection_state = "CONNECTED"
+    client._record_ws_error(ConnectionRefusedError("connect refused"), stage="connect")
+    client._handle_incoming(
+        GatewayWsMessage(
+            type="hello_ack",
+            payload={
+                "transport_mode": TRANSPORT_MODE_WEBSOCKET_REAL_PILOT,
+                "websocket_session_id": "ws-session-ok",
+            },
+        )
+    )
+    snapshot = client.snapshot()
+    client.stop()
+
+    assert snapshot["ws_connection_state"] == "AUTHENTICATED"
+    assert snapshot["ws_last_error"] == ""
+    assert snapshot["ws_last_error_type"] == ""
+    assert snapshot["ws_last_error_stage"] == ""
 
 
 def test_websocket_real_client_receives_command_batch_without_ack(monkeypatch):
@@ -152,6 +195,13 @@ def test_core_ws_endpoint_accepts_real_pilot_mode_and_status(tmp_path, monkeypat
                     "ws_pilot_enabled": True,
                     "ws_connection_state": "AUTHENTICATED",
                     "ws_reconnect_count": 2,
+                    "ws_fallback_reason": "reconnect_limit",
+                    "ws_fallback_detail": "server closed connection",
+                    "ws_last_error": "server closed connection",
+                    "ws_last_error_type": "ConnectionClosedError",
+                    "ws_last_error_stage": "recv",
+                    "ws_last_error_at": "2026-06-01T00:00:01.000+00:00",
+                    "ws_last_close_code": "1006",
                     "pilot_blocked_order_command_count": 1,
                     "kiwoom_logged_in": True,
                     "orderable": False,
@@ -166,7 +216,18 @@ def test_core_ws_endpoint_accepts_real_pilot_mode_and_status(tmp_path, monkeypat
     status = client.get("/api/gateway/transport/status").json()["real_gateway_websocket_pilot"]
     assert status["enabled"] is True
     assert status["reconnect_count"] == 2
+    assert status["fallback_reason"] == "reconnect_limit"
+    assert status["last_error_type"] == "ConnectionClosedError"
+    assert status["last_error_stage"] == "recv"
+    assert status["last_close_code"] == "1006"
     assert status["blocked_order_command_count"] == 1
+    db = TradingDatabase(str(db_path))
+    try:
+        logs = "\n".join(db.recent_logs(limit=20))
+    finally:
+        db.close()
+    assert "[gateway][ws_real_pilot][WARN]" in logs
+    assert "stage=recv" in logs
 
     decision = client.get("/api/gateway/transport/websocket-decision").json()
     assert "real_pilot_summary" in decision
