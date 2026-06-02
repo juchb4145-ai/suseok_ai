@@ -145,6 +145,7 @@ class DryRunRuntimeOrderSink(RuntimeOrderSink):
                 candidate_id=candidate.id,
                 order_phase=order_phase,
                 leg_index=virtual_order.leg_index,
+                candidate_instance_id=str(bridge_metadata.get("candidate_instance_id") or ""),
             )
         request = RuntimeOrderIntentRequest(
             source=source,
@@ -213,6 +214,7 @@ class DryRunRuntimeOrderSink(RuntimeOrderSink):
         quantity_payload = self._exit_quantity_payload(virtual_position, exit_decision)
         price = int(quantity_payload["price"] or 0)
         details = dict(exit_decision.details or {})
+        position_details = dict(virtual_position.details or {})
         request = RuntimeOrderIntentRequest(
             source="strategy_runtime",
             dry_run=True,
@@ -247,6 +249,10 @@ class DryRunRuntimeOrderSink(RuntimeOrderSink):
             runtime_cycle_at=runtime_cycle_at,
             metadata={
                 **dict(context or {}),
+                "candidate_instance_id": details.get("candidate_instance_id") or position_details.get("candidate_instance_id") or "",
+                "candidate_instance_ids": list(position_details.get("candidate_instance_ids") or []),
+                "candidate_generation_seq": details.get("candidate_generation_seq") or position_details.get("candidate_generation_seq") or 0,
+                "decision_cycle_id": details.get("decision_cycle_id") or position_details.get("decision_cycle_id") or "",
                 "decision_type": exit_decision.decision_type,
                 "reason_codes": list(exit_decision.reason_codes or []),
                 "partial_exit": bool(details.get("partial_exit")),
@@ -423,11 +429,15 @@ def _theme_lab_bridge_metadata(
         return {}
     cancel = dict(entry_plan.cancel_condition or {})
     leg = _split_leg(entry_plan, virtual_order.leg_index)
+    candidate_metadata = dict(candidate.metadata or {})
     metadata = {
         "source": THEMELAB_SOURCE,
         "code": candidate.code,
         "trade_date": candidate.trade_date,
         "candidate_id": candidate.id,
+        "candidate_instance_id": _first_text(details.get("candidate_instance_id"), bridge.get("candidate_instance_id"), cancel.get("candidate_instance_id"), candidate_metadata.get("candidate_instance_id")),
+        "candidate_generation_seq": _first_text(details.get("candidate_generation_seq"), bridge.get("candidate_generation_seq"), cancel.get("candidate_generation_seq"), candidate_metadata.get("candidate_generation_seq")),
+        "decision_cycle_id": _first_text(details.get("decision_cycle_id"), bridge.get("decision_cycle_id"), cancel.get("decision_cycle_id"), candidate_metadata.get("decision_cycle_id")),
         "theme_id": gate_result.theme_id,
         "theme_name": details.get("theme_name") or bridge.get("theme_name") or "",
         "lab_gate_status": details.get("lab_gate_status") or bridge.get("lab_gate_status") or "",
@@ -438,6 +448,15 @@ def _theme_lab_bridge_metadata(
         "risk_reason_codes": list(details.get("risk_reason_codes") or bridge.get("risk_reason_codes") or []),
         "reason_codes": list(details.get("reason_codes") or bridge.get("reason_codes") or []),
         "support_price": cancel.get("support_price") or bridge.get("support_price") or details.get("support_price") or 0,
+        "support_missing_reason": cancel.get("support_missing_reason") or bridge.get("support_missing_reason") or details.get("support_missing_reason") or "",
+        "support_taxonomy": cancel.get("support_taxonomy") or bridge.get("support_taxonomy") or details.get("support_taxonomy") or "",
+        "support_coverage": dict(cancel.get("support_coverage") or bridge.get("support_coverage") or details.get("support_coverage") or {}),
+        "support_reclaimed": bool(cancel.get("support_reclaimed") or bridge.get("support_reclaimed") or details.get("support_reclaimed")),
+        "recent_support_price_present": bool(cancel.get("recent_support_price_present") or bridge.get("recent_support_price_present") or details.get("recent_support_price_present")),
+        "vwap_present": bool(cancel.get("vwap_present") or bridge.get("vwap_present") or details.get("vwap_present")),
+        "vwap_ready": bool(cancel.get("vwap_ready") or bridge.get("vwap_ready") or details.get("vwap_ready")),
+        "minute_bar_present": bool(cancel.get("minute_bar_present") or bridge.get("minute_bar_present") or details.get("minute_bar_present")),
+        "minute_bar_count": _first_text(cancel.get("minute_bar_count"), bridge.get("minute_bar_count"), details.get("minute_bar_count"), 0),
         "limit_price": int(virtual_order.limit_price or entry_plan.limit_price or 0),
         "limit_vs_current_pct": cancel.get("limit_vs_current_pct"),
         "max_chase_pct": cancel.get("max_chase_pct"),
@@ -459,3 +478,10 @@ def _split_leg(entry_plan: EntryPlan, leg_index: int | None) -> dict[str, Any]:
         except (TypeError, ValueError):
             continue
     return {}
+
+
+def _first_text(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return ""

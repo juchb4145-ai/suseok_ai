@@ -25,6 +25,11 @@ def _item(identifier: str, **overrides) -> dict:
         "signal_classification": "true_positive",
         "exit_decision_id": f"exit-{identifier}",
         "quality_bucket": "GOOD",
+        "candidate_instance_id": f"ci-{identifier}",
+        "matched_by": "candidate_instance_id",
+        "link_confidence": "HIGH",
+        "attribution_confidence": "HIGH",
+        "legacy_low_confidence_sample": False,
         "theme_score": 82.0,
         "hybrid_score": 84.0,
         "gate_score": 80.0,
@@ -260,3 +265,113 @@ def test_safety_candidate_is_operational_review_only():
     result = report["results"][safety_candidates[0]["candidate_id"]]
     assert result["recommendation"]["grade"] == "OPERATIONAL_REVIEW_ONLY"
     assert "OPERATIONAL_REVIEW_ONLY" in result["recommendation"]["blocked_by_guardrail_reason"]
+
+
+def test_legacy_low_confidence_samples_are_excluded_from_threshold_recommendation():
+    items = [
+        _item(
+            "legacy-late",
+            candidate_instance_id="",
+            matched_by="candidate_id",
+            link_confidence="MEDIUM",
+            attribution_confidence="MEDIUM",
+            legacy_low_confidence_sample=True,
+            gate_reason="LATE_CHASE",
+            realized_return_pct=-2.0,
+            dry_run_false_positive_type="LATE_CHASE_FALSE_POSITIVE",
+            signal_classification="false_positive",
+        )
+    ]
+    analyzer = DryRunThresholdABAnalyzer(config=_loose_config())
+
+    report = analyzer.build_report(_report(items), limit=100)
+
+    assert report["candidates"] == []
+    assert report["summary"]["attribution_quality"]["total_samples"] == 1
+    assert report["summary"]["attribution_quality"]["eligible_samples"] == 0
+    assert report["summary"]["attribution_quality"]["excluded_legacy_samples"] == 1
+
+
+def test_low_and_ambiguous_samples_block_recommendation_grade():
+    items = [
+        _item(
+            f"late-good-{index}",
+            trade_date=f"2026-06-0{index}",
+            gate_reason="LATE_CHASE",
+            realized_return_pct=-2.0,
+            dry_run_false_positive_type="LATE_CHASE_FALSE_POSITIVE",
+            signal_classification="false_positive",
+        )
+        for index in range(1, 5)
+    ]
+    items.append(
+        _item(
+            "late-low",
+            gate_reason="LATE_CHASE",
+            matched_by="weak_code_date_fallback",
+            link_confidence="LOW",
+            attribution_confidence="LOW",
+            realized_return_pct=-2.0,
+            dry_run_false_positive_type="LATE_CHASE_FALSE_POSITIVE",
+            signal_classification="false_positive",
+        )
+    )
+    analyzer = DryRunThresholdABAnalyzer(
+        config=_loose_config(min_sample_count=4, min_trade_days=4, strong_fp_reduction_min=1)
+    )
+
+    report = analyzer.build_report(_report(items), limit=100)
+    result = report["results"]["risk:late_chase:block"]
+
+    assert result["recommendation"]["total_samples"] == 5
+    assert result["recommendation"]["eligible_samples"] == 4
+    assert result["recommendation"]["excluded_low_confidence_samples"] == 1
+    assert result["recommendation"]["eligible_sample_ratio"] == 0.8
+    assert result["recommendation"]["grade"] != "DATA_INSUFFICIENT_ATTRIBUTION_CONFIDENCE"
+
+    ambiguous_items = items[:-1] + [
+        _item(
+            "late-ambiguous",
+            gate_reason="LATE_CHASE",
+            matched_by="ambiguous_code_date_fallback",
+            attribution_confidence="AMBIGUOUS",
+            realized_return_pct=-2.0,
+            dry_run_false_positive_type="LATE_CHASE_FALSE_POSITIVE",
+            signal_classification="false_positive",
+        )
+    ]
+    blocked_report = analyzer.build_report(_report(ambiguous_items), limit=100)
+    blocked = blocked_report["results"]["risk:late_chase:block"]
+    assert blocked["recommendation"]["excluded_ambiguous_samples"] == 1
+    assert blocked["recommendation"]["eligible_sample_ratio"] == 0.8
+
+
+def test_eligible_sample_ratio_below_guardrail_blocks_threshold_change():
+    items = [
+        _item(
+            "late-high",
+            gate_reason="LATE_CHASE",
+            realized_return_pct=-2.0,
+            dry_run_false_positive_type="LATE_CHASE_FALSE_POSITIVE",
+            signal_classification="false_positive",
+        ),
+        _item(
+            "late-low",
+            gate_reason="LATE_CHASE",
+            matched_by="weak_code_date_fallback",
+            link_confidence="LOW",
+            attribution_confidence="LOW",
+            realized_return_pct=-2.0,
+            dry_run_false_positive_type="LATE_CHASE_FALSE_POSITIVE",
+            signal_classification="false_positive",
+        ),
+    ]
+    analyzer = DryRunThresholdABAnalyzer(config=_loose_config(min_sample_count=1, min_trade_days=1, strong_fp_reduction_min=1))
+
+    report = analyzer.build_report(_report(items), limit=100)
+    result = report["results"]["risk:late_chase:block"]
+
+    assert result["recommendation"]["eligible_samples"] == 1
+    assert result["recommendation"]["eligible_sample_ratio"] == 0.5
+    assert result["recommendation"]["grade"] == "DATA_INSUFFICIENT_ATTRIBUTION_CONFIDENCE"
+    assert "ATTRIBUTION_CONFIDENCE_RATIO" in result["recommendation"]["blocked_by_guardrail_reason"]

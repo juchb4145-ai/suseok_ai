@@ -67,7 +67,20 @@ def test_support_missing_plan_is_diagnostic_only_and_not_submittable():
     assert plan.base_price_source == "current_price_fallback"
     assert plan.cancel_condition["submittable"] is False
     assert plan.cancel_condition["diagnostic_only"] is True
-    assert plan.cancel_condition["reason"] == "support_missing"
+    assert plan.cancel_condition["reason"] == "SUPPORT_DATA_MISSING"
+    assert plan.cancel_condition["support_missing_reason"] == "SUPPORT_DATA_MISSING"
+
+
+def test_support_structurally_missing_is_split_from_data_missing():
+    result = gate_result(support_price=None)
+    result.decisions[0].details["vwap"] = 9_700
+    result.decisions[0].details["vwap_ready"] = True
+
+    plan = EntryPlanBuilder().build(result, datetime(2026, 5, 29, 9, 0))
+
+    assert plan.cancel_condition["submittable"] is False
+    assert plan.cancel_condition["diagnostic_only"] is True
+    assert plan.cancel_condition["reason"] == "SUPPORT_STRUCTURALLY_MISSING"
 
 
 def test_max_chase_exceeded_marks_plan_not_submittable():
@@ -125,7 +138,7 @@ def test_split_plan_marks_later_legs_unsubmittable_when_supports_are_missing():
     assert [leg["weight_pct"] for leg in plan.split_plan] == [60, 25, 15]
     assert plan.split_plan[0]["submittable"] is True
     assert plan.split_plan[1]["submittable"] is False
-    assert plan.split_plan[2]["reason"] == "support_missing"
+    assert plan.split_plan[2]["reason"] == "SUPPORT_STRUCTURALLY_MISSING"
 
 
 def test_support_not_ready_plan_is_diagnostic_only_and_not_submittable():

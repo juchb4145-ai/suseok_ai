@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 from trading.strategy.candles import Candle, CandleBuilder, minute_start
 from trading.strategy.market_data import StrategyTick
@@ -43,6 +44,8 @@ CONTEXT_RISK_EXIT_TYPES = {
 }
 DRY_RUN_EXIT_INTENT_TYPES = {TAKE_PROFIT, SUPPORT_LOSS, TIME_EXIT, TRAILING_STOP, *CONTEXT_RISK_EXIT_TYPES}
 FINAL_EXIT_TYPES = {SUPPORT_LOSS, TIME_EXIT, TRAILING_STOP, *CONTEXT_RISK_EXIT_TYPES}
+CONFIRMATION_CYCLE_MIN = 1
+CONFIRMATION_CYCLE_MAX = 5
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,80 @@ class ExitContextRiskSnapshot:
     current_return_pct: Optional[float] = None
     risk_reason_codes: tuple[str, ...] = ()
     calculated_at: str = ""
+    context_history_available: bool = False
+    context_history_count: int = 0
+    theme_score_delta: Optional[float] = None
+    theme_status_transition: str = ""
+    leader_count_delta: Optional[int] = None
+    strong_count_delta: Optional[int] = None
+    leader_vwap_break_transition: str = ""
+    breadth_before: str = ""
+    breadth_deterioration: bool = False
+    index_status_before: str = ""
+    index_status_deterioration: bool = False
+    market_risk_off_transition: str = ""
+    theme_weak_consecutive_count: int = 0
+    exit_confidence: str = ""
+    context_limited_reason: str = ""
+
+
+@dataclass(frozen=True)
+class ContextRiskExitConfirmationConfig:
+    theme_weak_confirmation_cycles: int = 2
+    leader_collapse_confirmation_cycles: int = 1
+    index_weak_confirmation_cycles: int = 1
+    breadth_collapse_confirmation_cycles: int = 1
+    config_source: str = "default"
+    fallback_reasons: tuple[str, ...] = ()
+
+    @classmethod
+    def from_env(cls) -> "ContextRiskExitConfirmationConfig":
+        defaults = cls()
+        values: dict[str, int] = {}
+        fallback_reasons: list[str] = []
+        env_map = {
+            "theme_weak_confirmation_cycles": ("TRADING_THEME_WEAK_CONFIRMATION_CYCLES", defaults.theme_weak_confirmation_cycles),
+            "leader_collapse_confirmation_cycles": ("TRADING_LEADER_COLLAPSE_CONFIRMATION_CYCLES", defaults.leader_collapse_confirmation_cycles),
+            "index_weak_confirmation_cycles": ("TRADING_INDEX_WEAK_CONFIRMATION_CYCLES", defaults.index_weak_confirmation_cycles),
+            "breadth_collapse_confirmation_cycles": ("TRADING_BREADTH_COLLAPSE_CONFIRMATION_CYCLES", defaults.breadth_collapse_confirmation_cycles),
+        }
+        saw_env = False
+        for field_name, (env_name, default) in env_map.items():
+            raw = os.environ.get(env_name)
+            if raw is not None:
+                saw_env = True
+            value, fallback_reason = _confirmation_cycle_env(env_name, default)
+            values[field_name] = value
+            if fallback_reason:
+                fallback_reasons.append(fallback_reason)
+        if fallback_reasons:
+            source = "env_invalid_fallback"
+        elif saw_env:
+            source = "env"
+        else:
+            source = "default"
+        return cls(**values, config_source=source, fallback_reasons=tuple(fallback_reasons))
+
+    def for_decision(self, decision_type: str) -> int:
+        if decision_type == THEME_WEAK_EXIT:
+            return self.theme_weak_confirmation_cycles
+        if decision_type == LEADER_COLLAPSE_EXIT:
+            return self.leader_collapse_confirmation_cycles
+        if decision_type == INDEX_WEAK_EXIT:
+            return self.index_weak_confirmation_cycles
+        if decision_type == BREADTH_COLLAPSE_EXIT:
+            return self.breadth_collapse_confirmation_cycles
+        return 1
+
+    def to_details(self) -> dict[str, Any]:
+        return {
+            "theme_weak_confirmation_cycles": self.theme_weak_confirmation_cycles,
+            "leader_collapse_confirmation_cycles": self.leader_collapse_confirmation_cycles,
+            "index_weak_confirmation_cycles": self.index_weak_confirmation_cycles,
+            "breadth_collapse_confirmation_cycles": self.breadth_collapse_confirmation_cycles,
+            "config_source": self.config_source,
+            "fallback_reasons": list(self.fallback_reasons),
+        }
 
 
 class VirtualPositionService:
@@ -119,6 +196,7 @@ class VirtualPositionService:
             "virtual_order_status": order.status.value,
             "candidate_id": order.candidate_id,
             "entry_plan_id": plan.id,
+            **_identity_from_order_plan(order, plan),
         }
         if order.status != VirtualOrderStatus.FILLED:
             details["rejected_reason"] = "virtual_order_not_filled"
@@ -241,8 +319,14 @@ class VirtualPositionService:
 
 
 class ExitContextRiskEngine:
-    def __init__(self, settings: Optional[StrategyRuntimeSettings] = None) -> None:
+    def __init__(
+        self,
+        settings: Optional[StrategyRuntimeSettings] = None,
+        confirmation_config: Optional[ContextRiskExitConfirmationConfig] = None,
+    ) -> None:
         self.settings = settings or legacy_strategy_runtime_settings()
+        self.confirmation_config = confirmation_config or ContextRiskExitConfirmationConfig.from_env()
+        self.last_details: dict = {}
 
     def evaluate(
         self,
@@ -257,9 +341,27 @@ class ExitContextRiskEngine:
             return None
         if _has_final_exit(existing_decisions):
             return None
+        self.last_details = {}
         latest = candles[-1] if candles else None
         decision_type, reasons = self._decision_type(context)
         if not decision_type:
+            return None
+        confirmation = self._confirmation(decision_type, context)
+        if not confirmation["allowed"]:
+            self.last_details = {
+                "context_risk_candidate": decision_type,
+                "context_history_available": context.context_history_available,
+                "context_history_count": context.context_history_count,
+                "exit_confidence": confirmation["exit_confidence"],
+                "context_limited_reason": confirmation["reason"],
+                "reason_codes": list(reasons) + [confirmation["reason"]],
+                "required_confirmation_cycles": confirmation["required_confirmation_cycles"],
+                "observed_confirmation_cycles": confirmation["observed_confirmation_cycles"],
+                "confirmation_passed": False,
+                "config_source": confirmation["config_source"],
+                "confirmation_config": self.confirmation_config.to_details(),
+                "config_fallback_reasons": list(self.confirmation_config.fallback_reasons),
+            }
             return None
         if _has_context_risk_decision(existing_decisions, decision_type):
             return None
@@ -278,24 +380,56 @@ class ExitContextRiskEngine:
             "theme_name": context.theme_name,
             "theme_status_before": context.theme_status_before,
             "theme_status_after": context.theme_status_after,
+            "theme_status_current": context.theme_status_after,
             "theme_score": context.theme_score,
             "previous_theme_score": context.previous_theme_score,
+            "theme_score_before": context.previous_theme_score,
+            "theme_score_current": context.theme_score,
+            "theme_score_delta": context.theme_score_delta,
+            "theme_status_transition": context.theme_status_transition,
             "leader_symbol": context.leader_symbol,
             "leader_return_pct": context.leader_return_pct,
             "leader_support_broken": bool(context.leader_support_broken),
             "leader_vwap_broken": bool(context.leader_vwap_broken),
             "leader_count": context.leader_count,
             "previous_leader_count": context.previous_leader_count,
+            "leader_count_before": context.previous_leader_count,
+            "leader_count_current": context.leader_count,
+            "leader_count_delta": context.leader_count_delta,
             "strong_count": context.strong_count,
             "previous_strong_count": context.previous_strong_count,
+            "strong_count_before": context.previous_strong_count,
+            "strong_count_current": context.strong_count,
+            "strong_count_delta": context.strong_count_delta,
             "index_market": context.index_market,
             "index_status": context.index_status,
+            "index_status_before": context.index_status_before,
+            "index_status_current": context.index_status,
+            "index_status_deterioration": context.index_status_deterioration,
             "index_return_pct": context.index_return_pct,
             "market_status": context.market_status,
+            "market_risk_status": context.market_status,
             "breadth_status": context.breadth_status,
+            "breadth_before": context.breadth_before,
+            "breadth_current": context.breadth_status,
+            "breadth_deterioration": context.breadth_deterioration,
             "stock_role": context.stock_role,
             "current_return_pct": round(float(current_return), 6),
             "risk_reason_codes": list(context.risk_reason_codes or ()),
+            "context_history_available": context.context_history_available,
+            "context_history_count": context.context_history_count,
+            "exit_confidence": confirmation["exit_confidence"],
+            "context_limited_reason": context.context_limited_reason or confirmation["reason"],
+            "required_confirmation_cycles": confirmation["required_confirmation_cycles"],
+            "observed_confirmation_cycles": confirmation["observed_confirmation_cycles"],
+            "confirmation_passed": confirmation["allowed"],
+            "config_source": confirmation["config_source"],
+            "confirmation_config": self.confirmation_config.to_details(),
+            "config_fallback_reasons": list(self.confirmation_config.fallback_reasons),
+            "primary_exit_reason": decision_type,
+            "secondary_exit_reasons": [reason for reason in reasons if reason != _primary_reason_for_decision(decision_type)],
+            "exit_reason_priority": _exit_reason_priority(decision_type),
+            "exit_reason_confidence": confirmation["exit_confidence"],
             "partial_exit": not full_exit,
             "full_exit": full_exit,
             "exit_percent": exit_percent,
@@ -306,6 +440,7 @@ class ExitContextRiskEngine:
             "sequence_ambiguous": False,
             "same_candle_multiple_triggers": False,
             "calculated_at": context.calculated_at,
+            **_position_identity(position),
             **self.settings.settings_details(),
         }
         return ExitDecision(
@@ -318,6 +453,33 @@ class ExitContextRiskEngine:
             details=details,
             created_at=created_at.isoformat(),
         )
+
+    def _confirmation(self, decision_type: str, context: ExitContextRiskSnapshot) -> dict[str, Any]:
+        required = self.confirmation_config.for_decision(decision_type)
+        observed = _observed_confirmation_cycles(decision_type, context)
+        base = {
+            "required_confirmation_cycles": required,
+            "observed_confirmation_cycles": observed,
+            "config_source": self.confirmation_config.config_source,
+        }
+        if decision_type == MARKET_RISK_OFF_EXIT:
+            return {**base, "required_confirmation_cycles": 0, "observed_confirmation_cycles": 0, "allowed": True, "exit_confidence": "HIGH", "reason": ""}
+        if decision_type == THEME_WEAK_EXIT:
+            if context.context_history_count <= 0:
+                return {**base, "allowed": False, "exit_confidence": "LOW", "reason": "DATA_LIMITED_CONTEXT"}
+            if observed >= required:
+                return {**base, "allowed": True, "exit_confidence": "HIGH" if required >= 2 else "MEDIUM", "reason": ""}
+            return {**base, "allowed": False, "exit_confidence": "LOW", "reason": "LOW_CONFIDENCE_EXIT"}
+        if decision_type == LEADER_COLLAPSE_EXIT:
+            hard_break = bool(context.leader_vwap_broken or context.leader_support_broken)
+            if observed >= required:
+                return {**base, "allowed": True, "exit_confidence": "MEDIUM" if hard_break else "LOW_MEDIUM", "reason": ""}
+            return {**base, "allowed": False, "exit_confidence": "LOW", "reason": "DATA_LIMITED_CONTEXT"}
+        if decision_type in {INDEX_WEAK_EXIT, BREADTH_COLLAPSE_EXIT}:
+            if observed >= required:
+                return {**base, "allowed": True, "exit_confidence": "MEDIUM", "reason": ""}
+            return {**base, "allowed": False, "exit_confidence": "LOW", "reason": "DATA_LIMITED_CONTEXT"}
+        return {**base, "allowed": True, "exit_confidence": context.exit_confidence or "MEDIUM", "reason": ""}
 
     def _decision_type(self, context: ExitContextRiskSnapshot) -> tuple[str, list[str]]:
         reasons = [str(code) for code in (context.risk_reason_codes or ()) if str(code)]
@@ -355,10 +517,17 @@ class ExitContextRiskEngine:
 
 
 class ExitDecisionEngine:
-    def __init__(self, settings: Optional[StrategyRuntimeSettings] = None) -> None:
+    def __init__(
+        self,
+        settings: Optional[StrategyRuntimeSettings] = None,
+        context_risk_confirmation_config: Optional[ContextRiskExitConfirmationConfig] = None,
+    ) -> None:
         self.settings = settings or legacy_strategy_runtime_settings()
         self.last_details: dict = {}
-        self.context_risk_engine = ExitContextRiskEngine(settings=self.settings)
+        self.context_risk_engine = ExitContextRiskEngine(
+            settings=self.settings,
+            confirmation_config=context_risk_confirmation_config,
+        )
 
     def evaluate(
         self,
@@ -413,6 +582,8 @@ class ExitDecisionEngine:
             evaluated_at,
             context_risk,
         )
+        if self.context_risk_engine.last_details:
+            self.last_details["context_risk"] = dict(self.context_risk_engine.last_details)
         if _has_partial_take_profit(existing_decisions):
             trailing_stop = self._trailing_stop_decision(position, snapshot, policy, candles, existing_decisions, evaluated_at)
             if take_profit is not None:
@@ -476,6 +647,7 @@ class ExitDecisionEngine:
                 "virtual_only": True,
                 "strategy_profile": policy.strategy_profile.value,
                 "code": snapshot.code,
+                **_position_identity(position),
                 "target_return_pct": policy.take_profit_pct,
                 "exit_percent": policy.take_profit_exit_percent,
                 "partial_exit": policy.take_profit_exit_percent < 100,
@@ -528,6 +700,7 @@ class ExitDecisionEngine:
                             "virtual_only": True,
                             "strategy_profile": policy.strategy_profile.value,
                             "code": snapshot.code,
+                            **_position_identity(position),
                             "support_basis": basis_name,
                             "support_basis_price": basis_price,
                             "consecutive_closes_below": required_closes,
@@ -589,6 +762,7 @@ class ExitDecisionEngine:
                 "virtual_only": True,
                 "strategy_profile": policy.strategy_profile.value,
                 "code": snapshot.code,
+                **_position_identity(position),
                 "trailing_floor": trailing_floor,
                 "trailing_floor_basis": basis_name,
                 "consecutive_closes_below": 2,
@@ -628,6 +802,7 @@ class ExitDecisionEngine:
             "virtual_only": True,
             "strategy_profile": policy.strategy_profile.value,
             "code": snapshot.code,
+            **_position_identity(position),
             "max_hold_minutes": policy.max_hold_minutes,
             "min_expected_return_pct": policy.min_expected_return_pct,
             "max_hold_until": max_hold_until.replace(microsecond=0).isoformat(),
@@ -772,6 +947,30 @@ def _has_context_risk_decision(existing_decisions: list[ExitDecision], decision_
     )
 
 
+def _confirmation_cycle_env(name: str, default: int) -> tuple[int, str]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default, ""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default, f"{name}=invalid:{raw}"
+    if value < CONFIRMATION_CYCLE_MIN or value > CONFIRMATION_CYCLE_MAX:
+        return default, f"{name}=out_of_range:{value}"
+    return value, ""
+
+
+def _observed_confirmation_cycles(decision_type: str, context: ExitContextRiskSnapshot) -> int:
+    if decision_type == THEME_WEAK_EXIT:
+        return max(0, int(context.theme_weak_consecutive_count or 0))
+    if decision_type == LEADER_COLLAPSE_EXIT:
+        hard_break = bool(context.leader_vwap_broken or context.leader_support_broken)
+        return max(int(context.context_history_count or 0), 1 if hard_break else 0)
+    if decision_type in {INDEX_WEAK_EXIT, BREADTH_COLLAPSE_EXIT}:
+        return max(int(context.context_history_count or 0), 1 if context.current_return_pct is not None else 0)
+    return int(context.context_history_count or 0)
+
+
 def _has_final_exit(existing_decisions: list[ExitDecision]) -> bool:
     return any(
         decision.decision_type in FINAL_EXIT_TYPES
@@ -820,6 +1019,31 @@ def _append_reason(reasons: list[str], reason: str) -> list[str]:
     return result
 
 
+def _primary_reason_for_decision(decision_type: str) -> str:
+    return {
+        MARKET_RISK_OFF_EXIT: "MARKET_RISK_OFF",
+        INDEX_WEAK_EXIT: "INDEX_WEAK",
+        THEME_WEAK_EXIT: "THEME_WEAK",
+        LEADER_COLLAPSE_EXIT: "LEADER_COLLAPSE",
+        BREADTH_COLLAPSE_EXIT: "BREADTH_COLLAPSE",
+    }.get(decision_type, decision_type)
+
+
+def _exit_reason_priority(decision_type: str) -> int:
+    priority = {
+        MARKET_RISK_OFF_EXIT: 100,
+        SUPPORT_LOSS: 90,
+        TRAILING_STOP: 80,
+        LEADER_COLLAPSE_EXIT: 75,
+        THEME_WEAK_EXIT: 70,
+        INDEX_WEAK_EXIT: 60,
+        BREADTH_COLLAPSE_EXIT: 55,
+        TAKE_PROFIT: 50,
+        TIME_EXIT: 40,
+    }
+    return priority.get(decision_type, 0)
+
+
 def _optional_float(value) -> Optional[float]:
     try:
         return float(value)
@@ -855,8 +1079,11 @@ def _plan_quantity(plan: EntryPlan) -> int:
 def _initial_position_details(order: VirtualOrder, plan: EntryPlan) -> dict:
     weight = _order_weight(order)
     fill_diagnostics = _order_fill_diagnostics(order)
+    identity = _identity_from_order_plan(order, plan)
     details = {
         "entry_plan_id": plan.id,
+        **identity,
+        "candidate_instance_ids": [identity["candidate_instance_id"]] if identity.get("candidate_instance_id") else [],
         "filled_legs": [int(order.leg_index or 1)],
         "filled_order_ids": [order.id] if order.id is not None else [],
         "filled_weight_pct": weight,
@@ -883,6 +1110,10 @@ def _aggregate_position_fill(
     entry_price: int,
 ) -> VirtualPosition:
     details = dict(position.details or {})
+    identity = _identity_from_order_plan(order, plan)
+    instance_ids = [str(value) for value in details.get("candidate_instance_ids") or [] if str(value)]
+    if identity.get("candidate_instance_id") and identity["candidate_instance_id"] not in instance_ids:
+        instance_ids.append(identity["candidate_instance_id"])
     filled_legs = [int(value) for value in details.get("filled_legs") or []]
     filled_order_ids = [int(value) for value in details.get("filled_order_ids") or []]
     leg_index = int(order.leg_index or 1)
@@ -909,6 +1140,10 @@ def _aggregate_position_fill(
     details.update(
         {
             "entry_plan_id": details.get("entry_plan_id") or plan.id,
+            "candidate_instance_id": details.get("candidate_instance_id") or identity.get("candidate_instance_id", ""),
+            "candidate_instance_ids": instance_ids,
+            "candidate_generation_seq": details.get("candidate_generation_seq") or identity.get("candidate_generation_seq", 0),
+            "decision_cycle_id": details.get("decision_cycle_id") or identity.get("decision_cycle_id", ""),
             "filled_legs": sorted(filled_legs),
             "filled_order_ids": filled_order_ids,
             "filled_weight_pct": round(min(100.0, total_weight), 6),
@@ -932,6 +1167,33 @@ def _order_fill_diagnostics(order: VirtualOrder) -> dict:
     details = dict(order.details or {})
     diagnostics = details.get("fill_diagnostics_v2")
     return dict(diagnostics) if isinstance(diagnostics, dict) else {}
+
+
+def _identity_from_order_plan(order: VirtualOrder, plan: EntryPlan) -> dict:
+    order_details = dict(order.details or {})
+    cancel = dict(plan.cancel_condition or {})
+    return {
+        "candidate_instance_id": str(_first_value(order_details.get("candidate_instance_id"), cancel.get("candidate_instance_id")) or ""),
+        "candidate_generation_seq": _first_value(order_details.get("candidate_generation_seq"), cancel.get("candidate_generation_seq"), 0),
+        "decision_cycle_id": str(_first_value(order_details.get("decision_cycle_id"), cancel.get("decision_cycle_id")) or ""),
+    }
+
+
+def _position_identity(position: VirtualPosition) -> dict:
+    details = dict(position.details or {})
+    return {
+        "candidate_instance_id": str(details.get("candidate_instance_id") or ""),
+        "candidate_instance_ids": list(details.get("candidate_instance_ids") or []),
+        "candidate_generation_seq": details.get("candidate_generation_seq", 0),
+        "decision_cycle_id": str(details.get("decision_cycle_id") or ""),
+    }
+
+
+def _first_value(*values):
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
 
 
 def _float(value, default: float = 0.0) -> float:

@@ -59,6 +59,8 @@ class TradeReviewService:
             "gate_decisions_snapshot": _gate_snapshot(gate_result.decisions if gate_result else []),
             "candidate_state": candidate.state.value,
             "candidate_block_type": candidate.block_type.value,
+            **_candidate_instance_details(candidate, gate_result, entry_plan, virtual_order, virtual_position),
+            **_entry_plan_support_details(entry_plan),
             "entry_plan_created": entry_plan is not None,
             "horizon_start_at": "",
             "horizon_start_reason": "",
@@ -513,6 +515,66 @@ def _theme_id(candidate: Candidate, gate_result: Optional[GatePipelineResult], e
     return candidate.theme_ids[0] if candidate.theme_ids else ""
 
 
+def _candidate_instance_details(
+    candidate: Candidate,
+    gate_result: Optional[GatePipelineResult],
+    entry_plan: Optional[EntryPlan],
+    virtual_order: Optional[VirtualOrder],
+    virtual_position: Optional[VirtualPosition],
+) -> dict:
+    candidate_metadata = dict(candidate.metadata or {})
+    gate_details = dict(gate_result.details or {}) if gate_result is not None else {}
+    cancel = dict(entry_plan.cancel_condition or {}) if entry_plan is not None else {}
+    order_details = dict(virtual_order.details or {}) if virtual_order is not None else {}
+    position_details = dict(virtual_position.details or {}) if virtual_position is not None else {}
+    instance_id = _first_text(
+        position_details.get("candidate_instance_id"),
+        order_details.get("candidate_instance_id"),
+        cancel.get("candidate_instance_id"),
+        gate_details.get("candidate_instance_id"),
+        candidate_metadata.get("candidate_instance_id"),
+    )
+    instance_ids = list(position_details.get("candidate_instance_ids") or [])
+    if instance_id and instance_id not in instance_ids:
+        instance_ids.append(instance_id)
+    return {
+        "candidate_instance_id": instance_id,
+        "candidate_instance_ids": instance_ids,
+        "candidate_generation_seq": _first_text(
+            position_details.get("candidate_generation_seq"),
+            order_details.get("candidate_generation_seq"),
+            cancel.get("candidate_generation_seq"),
+            gate_details.get("candidate_generation_seq"),
+            candidate_metadata.get("candidate_generation_seq"),
+        ),
+        "decision_cycle_id": _first_text(
+            position_details.get("decision_cycle_id"),
+            order_details.get("decision_cycle_id"),
+            cancel.get("decision_cycle_id"),
+            gate_details.get("decision_cycle_id"),
+            candidate_metadata.get("decision_cycle_id"),
+        ),
+    }
+
+
+def _entry_plan_support_details(entry_plan: Optional[EntryPlan]) -> dict:
+    if entry_plan is None:
+        return {}
+    cancel = dict(entry_plan.cancel_condition or {})
+    coverage = dict(cancel.get("support_coverage") or {})
+    return {
+        "support_missing_reason": str(cancel.get("support_missing_reason") or cancel.get("support_taxonomy") or ""),
+        "support_taxonomy": str(cancel.get("support_taxonomy") or cancel.get("support_missing_reason") or ""),
+        "support_coverage": coverage,
+        "support_reclaimed": bool(cancel.get("support_reclaimed")),
+        "recent_support_price_present": bool(coverage.get("recent_support_price_present", cancel.get("recent_support_price_present", False))),
+        "vwap_present": bool(coverage.get("vwap_present", cancel.get("vwap_present", False))),
+        "vwap_ready": bool(coverage.get("vwap_ready", cancel.get("vwap_ready", False))),
+        "minute_bar_present": bool(coverage.get("minute_bar_present", cancel.get("minute_bar_present", False))),
+        "minute_bar_count": coverage.get("minute_bar_count", cancel.get("minute_bar_count", 0)),
+    }
+
+
 def _theme_name(gate_result: Optional[GatePipelineResult], entry_plan: Optional[EntryPlan]) -> str:
     if gate_result is not None:
         return str(gate_result.details.get("theme_name") or "")
@@ -562,6 +624,13 @@ def _plan_or_order_price(entry_plan: Optional[EntryPlan], virtual_order: Optiona
     if entry_plan is not None:
         return entry_plan.limit_price
     return 0
+
+
+def _first_text(*values) -> str:
+    for value in values:
+        if value not in (None, ""):
+            return str(value)
+    return ""
 
 
 def _exit_reason(final_status: str, virtual_position: Optional[VirtualPosition], decisions: list[ExitDecision]) -> str:

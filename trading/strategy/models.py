@@ -234,6 +234,36 @@ class VirtualPosition(SerializableDataclass):
 
 
 @dataclass
+class PositionContextSnapshot(SerializableDataclass):
+    id: Optional[int] = None
+    position_id: Optional[int] = None
+    candidate_id: Optional[int] = None
+    candidate_instance_id: str = ""
+    code: str = ""
+    trade_date: str = ""
+    captured_at: str = ""
+    capture_reason: str = ""
+    theme_id: str = ""
+    theme_name: str = ""
+    theme_score: Optional[float] = None
+    theme_status: str = ""
+    leader_count: Optional[int] = None
+    strong_count: Optional[int] = None
+    breadth_status: str = ""
+    leader_code: str = ""
+    leader_return_pct: Optional[float] = None
+    leader_vwap_status: str = ""
+    leader_support_broken: bool = False
+    index_market: str = ""
+    index_status: str = ""
+    index_return_pct: Optional[float] = None
+    market_status: str = ""
+    market_risk_status: str = ""
+    risk_reason_codes: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ExitDecision(SerializableDataclass):
     id: Optional[int] = None
     virtual_position_id: Optional[int] = None

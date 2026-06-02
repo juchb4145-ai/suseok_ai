@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Any, Iterable, Optional
 
 from trading.strategy.candidates import CandidateLifecycle, is_valid_stock_code, normalize_code
+from trading.strategy.candidate_identity import CandidateGenerationConfig, CandidateInstanceDecision, build_candidate_instance_id, decide_candidate_instance, identity_metadata
 from trading.strategy.models import (
     BlockType,
     Candidate,
@@ -26,11 +27,15 @@ from trading.strategy.support_readiness import (
     READY_EARLY_SMALL,
     READY_FULL,
     SUPPORT_NOT_READY,
+    SUPPORT_DATA_MISSING,
+    SUPPORT_STRUCTURALLY_MISSING,
     SUPPORT_SOURCE_FALLBACK_USED,
     WAIT_DATA,
     WAIT_DATA_SUPPORT_NOT_READY,
     latest_tick_readiness,
     support_metadata,
+    support_coverage,
+    support_missing_taxonomy,
     support_source_readiness,
 )
 from trading.theme_engine.lab import (
@@ -113,11 +118,13 @@ class ThemeLabDryRunLifecycleBridge:
         market_data,
         default_ttl_minutes: int = 30,
         settings: StrategyRuntimeSettings | None = None,
+        generation_config: CandidateGenerationConfig | None = None,
     ) -> None:
         self.db = db
         self.market_data = market_data
         self.default_ttl_minutes = max(1, int(default_ttl_minutes or 30))
         self.settings = settings or legacy_strategy_runtime_settings()
+        self.generation_config = generation_config or CandidateGenerationConfig.from_env()
 
     def build(
         self,
@@ -128,6 +135,7 @@ class ThemeLabDryRunLifecycleBridge:
     ) -> ThemeLabBridgeBuildResult:
         warnings: list[str] = []
         candidate_saves = 0
+        decision_cycle_id = f"{SOURCE}:{trade_date}:{now.replace(microsecond=0).isoformat()}"
         watch_by_code = {normalize_code(item.symbol): item for item in result.watchset}
         themes_by_id = {str(item.theme_id): item for item in result.themes}
         gate_results: list[GatePipelineResult] = []
@@ -149,13 +157,14 @@ class ThemeLabDryRunLifecycleBridge:
                 theme,
                 trade_date=trade_date,
                 now=now,
+                decision_cycle_id=decision_cycle_id,
             )
             if saved:
                 candidate_saves += 1
             if candidate.id is None:
                 warnings.append(f"THEME_LAB_BRIDGE_CANDIDATE_ID_MISSING:{code}")
                 continue
-            gate_results.append(self._gate_result(candidate, decision, watch, theme, now))
+            gate_results.append(self._gate_result(candidate, decision, watch, theme, now, decision_cycle_id=decision_cycle_id))
 
         return ThemeLabBridgeBuildResult(
             gate_results=gate_results,
@@ -171,17 +180,71 @@ class ThemeLabDryRunLifecycleBridge:
         *,
         trade_date: str,
         now: datetime,
+        decision_cycle_id: str,
     ) -> tuple[Candidate, bool]:
         now_text = now.replace(microsecond=0).isoformat()
         expires_at = (now.replace(microsecond=0) + timedelta(minutes=self.default_ttl_minutes)).isoformat()
         existing = self.db.load_candidate(trade_date, code)
-        metadata = _candidate_bridge_metadata(watch, theme)
+        strategy_profile = _strategy_profile_from_watch(watch, self._latest_tick_metadata(code))
+        theme_id = str(watch.primary_theme or (watch.themes[0] if watch.themes else ""))
+        base_metadata = _candidate_bridge_metadata(watch, theme)
+        existing_metadata = dict(existing.metadata or {}) if existing is not None else {}
+        if existing is not None and existing.state in {CandidateState.REMOVED, CandidateState.EXPIRED}:
+            existing_metadata["candidate_generation_force_new_reason"] = "previous_lifecycle_closed"
+        first_seen_at = str(existing_metadata.get("candidate_instance_first_seen_at") or (existing.detected_at if existing else "") or now_text)
+        identity = decide_candidate_instance(
+            trade_date=trade_date,
+            code=code,
+            source=SOURCE,
+            strategy_name=strategy_profile.value if strategy_profile else "",
+            theme_id=theme_id,
+            first_seen_at=first_seen_at,
+            theme_name=theme.theme_name if theme is not None else "",
+            existing_metadata=existing_metadata,
+            now=now,
+            config=self.generation_config,
+        )
+        generation_changed = identity.generation_reason not in {"initial_generation", "same_generation", "same_generation_min_gap_guardrail", "same_generation_max_generation_guardrail"}
+        if generation_changed:
+            first_seen_at = now_text
+            identity = CandidateInstanceDecision(
+                candidate_instance_id=build_candidate_instance_id(
+                    trade_date=trade_date,
+                    code=code,
+                    source=SOURCE,
+                    strategy_name=strategy_profile.value if strategy_profile else "",
+                    theme_id=theme_id,
+                    first_seen_at=first_seen_at,
+                    candidate_generation_seq=identity.candidate_generation_seq,
+                ),
+                candidate_generation_seq=identity.candidate_generation_seq,
+                generation_reason=identity.generation_reason,
+                previous_candidate_instance_id=identity.previous_candidate_instance_id,
+                previous_seen_at=identity.previous_seen_at,
+                minutes_since_previous_signal=identity.minutes_since_previous_signal,
+                blocked_generation_reason=identity.blocked_generation_reason,
+                excessive_generation_blocked=identity.excessive_generation_blocked,
+            )
+        metadata = {
+            **base_metadata,
+            **identity_metadata(
+                identity,
+                source=SOURCE,
+                strategy_name=strategy_profile.value if strategy_profile else "",
+                theme_id=theme_id,
+                first_seen_at=first_seen_at,
+                last_seen_at=now_text,
+                theme_name=theme.theme_name if theme is not None else "",
+                config=self.generation_config,
+            ),
+            "decision_cycle_id": decision_cycle_id,
+        }
         if existing is None:
             candidate = Candidate(
                 trade_date=trade_date,
                 code=code,
                 name=watch.name,
-                strategy_profile=_strategy_profile_from_watch(watch, self._latest_tick_metadata(code)),
+                strategy_profile=strategy_profile,
                 sources=[CandidateSourceType.THEME_WATCH],
                 state=CandidateState.DETECTED,
                 detected_at=now_text,
@@ -234,7 +297,7 @@ class ThemeLabDryRunLifecycleBridge:
             existing.name = watch.name
             changed = True
         if existing.strategy_profile is None:
-            existing.strategy_profile = _strategy_profile_from_watch(watch, self._latest_tick_metadata(code))
+            existing.strategy_profile = strategy_profile
             changed = True
         existing.last_seen_at = now_text
         existing.expires_at = expires_at
@@ -244,6 +307,22 @@ class ThemeLabDryRunLifecycleBridge:
             existing.metadata = merged_metadata
             changed = True
         if changed:
+            if generation_changed:
+                saved = self.db.save_candidate_with_events(
+                    existing,
+                    [
+                        _candidate_event(
+                            "candidate_generation_changed",
+                            existing,
+                            existing.state,
+                            existing.state,
+                            identity.generation_reason,
+                            metadata,
+                            now_text,
+                        )
+                    ],
+                )
+                return saved, True
             return self.db.save_candidate(existing), True
         return existing, False
 
@@ -254,6 +333,8 @@ class ThemeLabDryRunLifecycleBridge:
         watch: WatchSetSnapshot,
         theme: ThemeConditionSnapshot | None,
         now: datetime,
+        *,
+        decision_cycle_id: str,
     ) -> GatePipelineResult:
         tick = self.market_data.latest_tick(candidate.code) if self.market_data is not None else None
         tick_metadata = dict(tick.metadata or {}) if tick is not None else {}
@@ -269,7 +350,7 @@ class ThemeLabDryRunLifecycleBridge:
         snapshot = self._indicator_snapshot(candidate, decision, watch, now)
         stock_details = _stock_pullback_details(candidate, decision, watch, snapshot, tick_metadata, mapping)
         created_at = now.replace(microsecond=0).isoformat()
-        lab_details = _base_details(candidate, decision, watch, theme, mapping, stock_details, created_at)
+        lab_details = _base_details(candidate, decision, watch, theme, mapping, stock_details, created_at, decision_cycle_id=decision_cycle_id)
         lab_decision = GateDecision(
             candidate_id=candidate.id,
             gate_name="ThemeLabBridgeGate",
@@ -339,6 +420,7 @@ class ThemeLabDryRunLifecycleBridge:
     ) -> IndicatorSnapshot:
         tick = self.market_data.latest_tick(candidate.code) if self.market_data is not None else None
         metadata = dict(tick.metadata or {}) if tick is not None else {}
+        candidate_metadata = dict(candidate.metadata or {})
         day_high, day_low = self.market_data.day_high_low(candidate.code) if self.market_data is not None else (0, 0)
         return IndicatorSnapshot(
             candidate_id=candidate.id,
@@ -361,6 +443,9 @@ class ThemeLabDryRunLifecycleBridge:
             metadata={
                 **metadata,
                 "source": SOURCE,
+                "candidate_instance_id": candidate_metadata.get("candidate_instance_id", ""),
+                "candidate_generation_seq": candidate_metadata.get("candidate_generation_seq", 0),
+                "decision_cycle_id": candidate_metadata.get("decision_cycle_id", ""),
                 "watch_return_pct": watch.return_pct,
                 "price_location_status": decision.price_location_status.value,
                 "price_location_reason_codes": list(decision.price_location_reason_codes),
@@ -633,12 +718,13 @@ def _selected_support_profile(
         saw_not_ready = True
     if first_existing is not None:
         return first_existing
+    taxonomy = support_missing_taxonomy(metadata, support_candidates)
     return {
         "source": "",
         "price": 0.0,
         "ready": False,
-        "reason": SUPPORT_NOT_READY,
-        "reason_codes": [SUPPORT_NOT_READY],
+        "reason": taxonomy,
+        "reason_codes": [taxonomy],
         "fallback_used": False,
     }
 
@@ -652,6 +738,7 @@ def _stock_pullback_details(
     mapping: ThemeLabBridgeMapping,
 ) -> dict[str, Any]:
     support_candidates = _support_candidates(tick_metadata)
+    coverage = support_coverage(tick_metadata, support_candidates)
     if mapping.selected_support_source:
         nearest_support = mapping.selected_support_source
         nearest_support_price = mapping.selected_support_price
@@ -666,10 +753,10 @@ def _stock_pullback_details(
         "selected_support_source": "",
         "selected_support_price": 0,
         "selected_support_ready": False,
-        "selected_support_ready_reason": SUPPORT_NOT_READY,
+        "selected_support_ready_reason": support_missing_taxonomy(tick_metadata, support_candidates),
         "support_ready": False,
-        "support_ready_reason": SUPPORT_NOT_READY,
-        "support_readiness_reason_codes": [SUPPORT_NOT_READY],
+        "support_ready_reason": support_missing_taxonomy(tick_metadata, support_candidates),
+        "support_readiness_reason_codes": [support_missing_taxonomy(tick_metadata, support_candidates)],
         "support_source_fallback_used": False,
     }
     if mapping.selected_support_source:
@@ -686,6 +773,13 @@ def _stock_pullback_details(
         "nearest_support": nearest_support,
         "nearest_support_price": nearest_support_price,
         "support_candidates": support_candidates,
+        "support_coverage": coverage,
+        "support_missing_reason": "" if nearest_support_price else support_missing_taxonomy(tick_metadata, support_candidates),
+        "recent_support_price_present": coverage["recent_support_price_present"],
+        "vwap_present": coverage["vwap_present"],
+        "vwap_ready": coverage["vwap_ready"],
+        "minute_bar_present": coverage["minute_bar_present"],
+        "minute_bar_count": coverage["minute_bar_count"],
         "ready_type": mapping.ready_type,
         "latest_tick_ready": mapping.latest_tick_ready,
         "latest_tick_age_sec": mapping.latest_tick_age_sec,
@@ -721,12 +815,29 @@ def _base_details(
     mapping: ThemeLabBridgeMapping,
     stock_details: dict[str, Any],
     created_at: str,
+    *,
+    decision_cycle_id: str = "",
 ) -> dict[str, Any]:
     theme_name = theme.theme_name if theme is not None else ""
     theme_score = theme.condition_score if theme is not None else 0.0
     support_price = int(stock_details.get("nearest_support_price") or 0)
+    metadata = dict(candidate.metadata or {})
+    candidate_instance_id = str(metadata.get("candidate_instance_id") or "")
+    candidate_generation_seq = metadata.get("candidate_generation_seq", 0)
+    generation_reason = str(metadata.get("generation_reason") or metadata.get("candidate_generation_reason") or "")
+    decision_cycle_id = str(decision_cycle_id or metadata.get("decision_cycle_id") or "")
     details = {
         "source": SOURCE,
+        "candidate_instance_id": candidate_instance_id,
+        "candidate_generation_seq": candidate_generation_seq,
+        "generation_reason": generation_reason,
+        "candidate_generation_reason": generation_reason,
+        "previous_candidate_instance_id": metadata.get("previous_candidate_instance_id", ""),
+        "previous_seen_at": metadata.get("previous_seen_at", ""),
+        "minutes_since_previous_signal": metadata.get("minutes_since_previous_signal"),
+        "blocked_generation_reason": metadata.get("blocked_generation_reason", ""),
+        "excessive_generation_blocked": bool(metadata.get("excessive_generation_blocked")),
+        "decision_cycle_id": decision_cycle_id,
         "theme_id": str(watch.primary_theme or (watch.themes[0] if watch.themes else "")),
         "theme_name": theme_name,
         "theme_score": theme_score,
@@ -763,6 +874,13 @@ def _base_details(
         "latest_tick_ready": bool(stock_details.get("latest_tick_ready", True)),
         "latest_tick_age_sec": stock_details.get("latest_tick_age_sec"),
         "support_candidates": dict(stock_details.get("support_candidates") or {}),
+        "support_coverage": dict(stock_details.get("support_coverage") or {}),
+        "support_missing_reason": stock_details.get("support_missing_reason", ""),
+        "recent_support_price_present": bool(stock_details.get("recent_support_price_present")),
+        "vwap_present": bool(stock_details.get("vwap_present")),
+        "vwap_ready": bool(stock_details.get("vwap_ready")),
+        "minute_bar_present": bool(stock_details.get("minute_bar_present")),
+        "minute_bar_count": stock_details.get("minute_bar_count", 0),
         "stock_role": watch.stock_role.value,
         "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
         "theme_lab_bridge": {
@@ -770,6 +888,15 @@ def _base_details(
             "code": candidate.code,
             "trade_date": candidate.trade_date,
             "candidate_id": candidate.id,
+            "candidate_instance_id": candidate_instance_id,
+            "candidate_generation_seq": candidate_generation_seq,
+            "generation_reason": generation_reason,
+            "previous_candidate_instance_id": metadata.get("previous_candidate_instance_id", ""),
+            "previous_seen_at": metadata.get("previous_seen_at", ""),
+            "minutes_since_previous_signal": metadata.get("minutes_since_previous_signal"),
+            "blocked_generation_reason": metadata.get("blocked_generation_reason", ""),
+            "excessive_generation_blocked": bool(metadata.get("excessive_generation_blocked")),
+            "decision_cycle_id": decision_cycle_id,
             "theme_id": str(watch.primary_theme or (watch.themes[0] if watch.themes else "")),
             "theme_name": theme_name,
             "lab_gate_status": decision.status.value,
@@ -784,6 +911,14 @@ def _base_details(
             "selected_support_source": stock_details.get("selected_support_source", ""),
             "selected_support_ready": bool(stock_details.get("selected_support_ready")),
             "support_ready_reason": stock_details.get("support_ready_reason", ""),
+            "support_missing_reason": stock_details.get("support_missing_reason", ""),
+            "support_coverage": dict(stock_details.get("support_coverage") or {}),
+            "support_reclaimed": bool(stock_details.get("support_reclaimed")),
+            "recent_support_price_present": bool(stock_details.get("recent_support_price_present")),
+            "vwap_present": bool(stock_details.get("vwap_present")),
+            "vwap_ready": bool(stock_details.get("vwap_ready")),
+            "minute_bar_present": bool(stock_details.get("minute_bar_present")),
+            "minute_bar_count": stock_details.get("minute_bar_count", 0),
             "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
         },
     }
@@ -807,8 +942,10 @@ def themelab_entry_idempotency_key(
     candidate_id: int | None,
     order_phase: str,
     leg_index: int | None,
+    candidate_instance_id: str = "",
 ) -> str:
-    return f"{SOURCE}:{trade_date}:{normalize_code(code)}:{candidate_id or ''}:{order_phase}:{leg_index or ''}"
+    identity = str(candidate_instance_id or candidate_id or "")
+    return f"{SOURCE}:{trade_date}:{normalize_code(code)}:{identity}:{order_phase}:{leg_index or ''}"
 
 
 def _candidate_bridge_metadata(watch: WatchSetSnapshot, theme: ThemeConditionSnapshot | None) -> dict[str, Any]:
@@ -907,6 +1044,7 @@ def _support_candidates(metadata: dict[str, Any]) -> dict[str, float]:
         "envelope_mid",
         "day_mid",
         "ema20_5m",
+        "manual_support",
     ):
         value = _positive_float(metadata.get(name))
         if value > 0:

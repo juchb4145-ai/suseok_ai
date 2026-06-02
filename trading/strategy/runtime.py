@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from inspect import Parameter, signature
@@ -36,6 +37,7 @@ from trading.strategy.models import (
     ExitDecision,
     FillPolicy,
     OrderMode,
+    PositionContextSnapshot,
     ReviewFinalStatus,
     StrategyProfile,
     TradeReview,
@@ -213,6 +215,8 @@ class StrategyRuntimeSnapshot:
     candidate_subscription_skipped_unmapped_count: int = 0
     protected_subscription_usage: str = ""
     reason_summary: dict = field(default_factory=dict)
+    candidate_generation_summary: dict = field(default_factory=dict)
+    context_history_prune_summary: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -375,6 +379,7 @@ class StrategyRuntime:
                 return snapshot
 
             trade_date = timed("trade_date", self.candidate_collector._trade_date)
+            timed("prune_position_context_history", lambda: self._prune_position_context_history(snapshot, current))
             timed("theme_lab_flow", lambda: self._run_theme_lab_flow(snapshot, current))
             timed("flow_diagnostics_empty", lambda: self._apply_flow_diagnostics(snapshot, current, trade_date, []))
             if snapshot.gate_skip_reason == GATE_SKIP_MARKET_SESSION_CLOSED:
@@ -438,6 +443,7 @@ class StrategyRuntime:
             return snapshot
         finally:
             self._apply_reason_summary(snapshot)
+            self._apply_context_history_prune_snapshot(snapshot)
             snapshot.cycle_duration_ms = int(round((perf_counter() - started) * 1000))
 
     def _process_gate_result(
@@ -989,6 +995,17 @@ class StrategyRuntime:
                     context.entry_plan = plan
                     context.virtual_order = order
                     context.virtual_position = opened.position
+                    candidate = self.db.load_candidate_by_id(order.candidate_id)
+                    if opened.opened and candidate is not None:
+                        entry_context = self._exit_context_risk_snapshot(
+                            candidate,
+                            context,
+                            opened.position,
+                            _snapshot_for_exit(context),
+                            capture_reason="ENTRY",
+                            captured_at=now,
+                        )
+                        self._save_position_context_snapshot(opened.position, candidate, entry_context, "ENTRY", now)
                     if opened.opened:
                         snapshot.open_position_count += 1
                         snapshot.db_write_count_per_cycle += 1
@@ -1023,7 +1040,15 @@ class StrategyRuntime:
                         context.entry_plan = self.db.load_entry_plan(order.entry_plan_id)
                 snapshot_for_exit = _snapshot_for_exit(context)
                 existing_decisions = self.db.list_exit_decisions(position.id) if position.id is not None else []
-                context_risk = self._exit_context_risk_snapshot(candidate, context, position, snapshot_for_exit)
+                context_risk = self._exit_context_risk_snapshot(
+                    candidate,
+                    context,
+                    position,
+                    snapshot_for_exit,
+                    capture_reason="HOLDING_EVAL",
+                    captured_at=now,
+                )
+                self._save_position_context_snapshot(position, candidate, context_risk, "HOLDING_EVAL", now)
                 new_decisions = self.exit_decision_engine.evaluate(
                     position,
                     snapshot_for_exit,
@@ -1032,6 +1057,15 @@ class StrategyRuntime:
                     now,
                     context_risk=context_risk,
                 )
+                exit_context_risk = self._exit_context_risk_snapshot(
+                    candidate,
+                    context,
+                    position,
+                    snapshot_for_exit,
+                    capture_reason="EXIT_EVAL",
+                    captured_at=now,
+                )
+                self._save_position_context_snapshot(position, candidate, exit_context_risk, "EXIT_EVAL", now)
                 position_details_changed = bool(self.exit_decision_engine.last_details.get("position_details_changed"))
                 saved_decisions: list[ExitDecision] = []
                 for decision in new_decisions:
@@ -1596,9 +1630,13 @@ class StrategyRuntime:
         context: "_ReviewContext",
         position: VirtualPosition,
         snapshot: Optional["IndicatorSnapshot"],
+        *,
+        capture_reason: str = "EXIT_EVAL",
+        captured_at: Optional[datetime] = None,
     ) -> Optional[ExitContextRiskSnapshot]:
         if not self.config.exit_context_risk_enabled or candidate is None or snapshot is None:
             return None
+        captured = (captured_at or datetime.now()).replace(microsecond=0)
         theme_payload = self._latest_theme_lab_payload()
         theme_id = _position_theme_id(candidate, context)
         theme_name = _position_theme_name(candidate, context)
@@ -1611,46 +1649,130 @@ class StrategyRuntime:
         leader_count = _int_or_none((theme or {}).get("leader_count"))
         strong_count = _int_or_none((theme or {}).get("strong_count"))
         previous_details = dict(position.details or {})
+        history = self.db.list_position_context_history(position.id, limit=100) if position.id is not None else []
+        previous_context = history[-1] if history else None
         current_return_pct = _runtime_return_pct(snapshot.price, position.entry_price)
+        previous_theme_score = _float_or_none(previous_context.theme_score if previous_context else previous_details.get("exit_context_theme_score"))
+        previous_leader_count = _int_or_none(previous_context.leader_count if previous_context else previous_details.get("exit_context_leader_count"))
+        previous_strong_count = _int_or_none(previous_context.strong_count if previous_context else previous_details.get("exit_context_strong_count"))
+        breadth_status = _breadth_status(theme, previous_details)
+        previous_breadth_status = str(previous_context.breadth_status if previous_context else "")
+        previous_index_status = str(previous_context.index_status if previous_context else "")
+        previous_market_status = str(previous_context.market_status if previous_context else "")
+        previous_theme_status = str(previous_context.theme_status if previous_context else previous_details.get("exit_context_theme_status") or "")
+        leader_vwap_broken = bool((watch or {}).get("leader_vwap_broken"))
+        previous_leader_vwap_status = str(previous_context.leader_vwap_status if previous_context else "")
+        leader_vwap_status = "BROKEN" if leader_vwap_broken else "OK"
         risk_reasons = _context_risk_reasons(
             theme_status_after=theme_status_after,
             theme_score=theme_score,
-            previous_theme_score=_float_or_none(previous_details.get("exit_context_theme_score")),
+            previous_theme_score=previous_theme_score,
             leader_count=leader_count,
-            previous_leader_count=_int_or_none(previous_details.get("exit_context_leader_count")),
+            previous_leader_count=previous_leader_count,
             strong_count=strong_count,
-            previous_strong_count=_int_or_none(previous_details.get("exit_context_strong_count")),
+            previous_strong_count=previous_strong_count,
             leader_return_pct=_float_or_none((theme or {}).get("top_leader_return_pct")),
             index_status=index_status,
             market_status=str((theme_payload.get("market_status") or {}).get("market_status") or ""),
-            breadth_status=_breadth_status(theme, previous_details),
+            breadth_status=breadth_status,
         )
+        theme_weak_count = _consecutive_theme_weak_count(history, theme_status_after)
+        context_count = len(history)
+        context_available = context_count > 0
         return ExitContextRiskSnapshot(
             enabled=True,
             theme_id=theme_id,
             theme_name=theme_name,
-            theme_status_before=str(previous_details.get("exit_context_theme_status") or ""),
+            theme_status_before=previous_theme_status,
             theme_status_after=theme_status_after,
             theme_score=theme_score,
-            previous_theme_score=_float_or_none(previous_details.get("exit_context_theme_score")),
+            previous_theme_score=previous_theme_score,
             leader_symbol=str((theme or {}).get("top_leader_symbol") or ""),
             leader_return_pct=_float_or_none((theme or {}).get("top_leader_return_pct")),
             leader_support_broken=bool((watch or {}).get("leader_support_broken")),
-            leader_vwap_broken=bool((watch or {}).get("leader_vwap_broken")),
+            leader_vwap_broken=leader_vwap_broken,
             leader_count=leader_count,
-            previous_leader_count=_int_or_none(previous_details.get("exit_context_leader_count")),
+            previous_leader_count=previous_leader_count,
             strong_count=strong_count,
-            previous_strong_count=_int_or_none(previous_details.get("exit_context_strong_count")),
+            previous_strong_count=previous_strong_count,
             index_market=market,
             index_status=index_status,
             index_return_pct=index_return_pct,
             market_status=str((theme_payload.get("market_status") or {}).get("market_status") or ""),
-            breadth_status=_breadth_status(theme, previous_details),
+            breadth_status=breadth_status,
             stock_role=str((watch or {}).get("stock_role") or candidate.metadata.get("theme_lab_stock_role") or ""),
             current_return_pct=current_return_pct,
             risk_reason_codes=tuple(risk_reasons),
             calculated_at=str(theme_payload.get("calculated_at") or ""),
+            context_history_available=context_available,
+            context_history_count=context_count,
+            theme_score_delta=_delta(theme_score, previous_theme_score),
+            theme_status_transition=_transition(previous_theme_status, theme_status_after),
+            leader_count_delta=_int_delta(leader_count, previous_leader_count),
+            strong_count_delta=_int_delta(strong_count, previous_strong_count),
+            leader_vwap_break_transition=_transition(previous_leader_vwap_status, leader_vwap_status),
+            breadth_before=previous_breadth_status,
+            breadth_deterioration=_status_deteriorated(previous_breadth_status, breadth_status, weak_values={"LOW_BREADTH", "BREADTH_COLLAPSE", "COLLAPSE"}),
+            index_status_before=previous_index_status,
+            index_status_deterioration=_status_deteriorated(previous_index_status, index_status, weak_values={"INDEX_WEAK", "RISK_OFF", "WEAK"}),
+            market_risk_off_transition=_transition(previous_market_status, str((theme_payload.get("market_status") or {}).get("market_status") or "")),
+            theme_weak_consecutive_count=theme_weak_count,
+            exit_confidence="HIGH" if context_count >= 2 else ("MEDIUM" if context_count == 1 else "LOW"),
+            context_limited_reason="" if context_count > 0 else "DATA_LIMITED_CONTEXT",
         )
+
+    def _save_position_context_snapshot(
+        self,
+        position: VirtualPosition,
+        candidate: Optional[Candidate],
+        context: Optional[ExitContextRiskSnapshot],
+        capture_reason: str,
+        captured_at: datetime,
+    ) -> None:
+        if context is None or position.id is None or candidate is None:
+            return
+        details = dict(position.details or {})
+        try:
+            self.db.save_position_context_snapshot(
+                PositionContextSnapshot(
+                    position_id=position.id,
+                    candidate_id=position.candidate_id,
+                    candidate_instance_id=str(details.get("candidate_instance_id") or candidate.metadata.get("candidate_instance_id") or ""),
+                    code=candidate.code,
+                    trade_date=candidate.trade_date,
+                    captured_at=captured_at.replace(microsecond=0).isoformat(),
+                    capture_reason=capture_reason,
+                    theme_id=context.theme_id,
+                    theme_name=context.theme_name,
+                    theme_score=context.theme_score,
+                    theme_status=context.theme_status_after,
+                    leader_count=context.leader_count,
+                    strong_count=context.strong_count,
+                    breadth_status=context.breadth_status,
+                    leader_code=context.leader_symbol,
+                    leader_return_pct=context.leader_return_pct,
+                    leader_vwap_status="BROKEN" if context.leader_vwap_broken else "OK",
+                    leader_support_broken=context.leader_support_broken,
+                    index_market=context.index_market,
+                    index_status=context.index_status,
+                    index_return_pct=context.index_return_pct,
+                    market_status=context.market_status,
+                    market_risk_status="RISK_OFF" if str(context.market_status or "").upper() == "RISK_OFF" else "",
+                    risk_reason_codes=list(context.risk_reason_codes or ()),
+                    metadata={
+                        "capture_reason": capture_reason,
+                        "theme_score_before": context.previous_theme_score,
+                        "theme_score_delta": context.theme_score_delta,
+                        "theme_status_transition": context.theme_status_transition,
+                        "leader_count_delta": context.leader_count_delta,
+                        "strong_count_delta": context.strong_count_delta,
+                        "context_history_count": context.context_history_count,
+                        "exit_confidence": context.exit_confidence,
+                    },
+                )
+            )
+        except Exception:
+            pass
 
     def _latest_theme_lab_payload(self) -> dict:
         if self.theme_lab_pipeline is not None:
@@ -1694,7 +1816,47 @@ class StrategyRuntime:
             warnings=dedupe_warnings(self._warnings),
         )
         self._apply_order_sink_snapshot(snapshot)
+        self._apply_candidate_generation_summary(snapshot)
+        self._apply_context_history_prune_snapshot(snapshot)
         return snapshot
+
+    def _prune_position_context_history(self, snapshot: StrategyRuntimeSnapshot, current: datetime) -> None:
+        if not _env_bool("TRADING_CONTEXT_HISTORY_PRUNE_ENABLED", True):
+            return
+        retention_days = _env_int("TRADING_CONTEXT_HISTORY_RETENTION_DAYS", 20)
+        batch_size = _env_int("TRADING_CONTEXT_HISTORY_PRUNE_BATCH_SIZE", 1000)
+        cutoff = (current - timedelta(days=max(1, retention_days))).replace(microsecond=0).isoformat()
+        summary_retention_days = _env_int("TRADING_CONTEXT_HISTORY_SUMMARY_RETENTION_DAYS", 180)
+        summary = self.db.prune_position_context_history(
+            cutoff_at=cutoff,
+            batch_size=batch_size,
+            created_at=current.replace(microsecond=0).isoformat(),
+            details={
+                "retention_days": retention_days,
+                "summary_retention_days": summary_retention_days,
+                "batch_size": batch_size,
+                "source": "strategy_runtime",
+            },
+        )
+        snapshot.context_history_prune_summary = summary
+
+    def _apply_context_history_prune_snapshot(self, snapshot: StrategyRuntimeSnapshot) -> None:
+        if snapshot.context_history_prune_summary:
+            return
+        if not hasattr(self.db, "latest_position_context_prune_summary"):
+            return
+        try:
+            snapshot.context_history_prune_summary = self.db.latest_position_context_prune_summary()
+        except Exception as exc:
+            snapshot.context_history_prune_summary = {"error": f"CONTEXT_HISTORY_PRUNE_SNAPSHOT_FAILED:{exc}"}
+
+    def _apply_candidate_generation_summary(self, snapshot: StrategyRuntimeSnapshot) -> None:
+        try:
+            trade_date = self.candidate_collector._trade_date()
+            candidates = self.db.list_candidates(trade_date)
+            snapshot.candidate_generation_summary = _candidate_generation_summary(candidates)
+        except Exception as exc:
+            snapshot.candidate_generation_summary = {"error": f"CANDIDATE_GENERATION_SUMMARY_FAILED:{exc}"}
 
     def _emit_entry_order_intent(
         self,
@@ -1895,6 +2057,52 @@ def _snapshot_for_exit(context: _ReviewContext):
     return None
 
 
+def _candidate_generation_summary(candidates: list[Candidate]) -> dict:
+    generations_by_code: dict[str, set[int]] = {}
+    reason_counts: dict[str, int] = {}
+    excessive_count = 0
+    for candidate in candidates:
+        metadata = dict(candidate.metadata or {})
+        key = f"{candidate.trade_date}:{candidate.code}"
+        try:
+            seq = int(metadata.get("candidate_generation_seq") or 0)
+        except (TypeError, ValueError):
+            seq = 0
+        if seq:
+            generations_by_code.setdefault(key, set()).add(seq)
+        reason = str(metadata.get("generation_reason") or metadata.get("candidate_generation_reason") or "")
+        if reason:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        if metadata.get("excessive_generation_blocked") or reason in {"same_generation_min_gap_guardrail", "same_generation_max_generation_guardrail"}:
+            excessive_count += 1
+    generation_counts = [len(values) for values in generations_by_code.values()]
+    return {
+        "multi_generation_code_count": sum(1 for count in generation_counts if count > 1),
+        "avg_generation_per_code": round(sum(generation_counts) / len(generation_counts), 4) if generation_counts else None,
+        "max_generation_per_code": max(generation_counts) if generation_counts else 0,
+        "stale_re_detect_count": reason_counts.get("stale_re_detected", 0),
+        "theme_change_generation_count": reason_counts.get("theme_changed", 0),
+        "source_change_generation_count": reason_counts.get("source_changed", 0),
+        "strategy_change_generation_count": reason_counts.get("strategy_changed", 0),
+        "previous_lifecycle_closed_generation_count": reason_counts.get("previous_lifecycle_closed", 0),
+        "excessive_generation_count": excessive_count,
+    }
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 def _runtime_candidate_display_state(candidate: Candidate) -> str:
     if candidate.state in {CandidateState.DETECTED, CandidateState.WATCHING}:
         return "WAIT"
@@ -2039,6 +2247,42 @@ def _context_risk_reasons(
     if str(breadth_status or "").upper() in {"BREADTH_COLLAPSE", "COLLAPSE", "LOW_BREADTH"}:
         reasons.append("BREADTH_COLLAPSE")
     return list(dict.fromkeys(reasons))
+
+
+def _consecutive_theme_weak_count(history: list[PositionContextSnapshot], current_status: str) -> int:
+    count = 1 if str(current_status or "").upper() in {"WEAK_THEME", "THEME_WEAK"} else 0
+    for item in reversed(history):
+        if str(item.theme_status or "").upper() in {"WEAK_THEME", "THEME_WEAK"}:
+            count += 1
+        else:
+            break
+    return count
+
+
+def _delta(current: Optional[float], previous: Optional[float]) -> Optional[float]:
+    if current is None or previous is None:
+        return None
+    return round(float(current) - float(previous), 6)
+
+
+def _int_delta(current: Optional[int], previous: Optional[int]) -> Optional[int]:
+    if current is None or previous is None:
+        return None
+    return int(current) - int(previous)
+
+
+def _transition(previous: str, current: str) -> str:
+    previous_text = str(previous or "")
+    current_text = str(current or "")
+    if not previous_text and not current_text:
+        return ""
+    return f"{previous_text or 'UNKNOWN'}->{current_text or 'UNKNOWN'}"
+
+
+def _status_deteriorated(previous: str, current: str, *, weak_values: set[str]) -> bool:
+    previous_text = str(previous or "").upper()
+    current_text = str(current or "").upper()
+    return current_text in weak_values and previous_text not in weak_values
 
 
 def _runtime_return_pct(price: int, entry_price: int) -> Optional[float]:

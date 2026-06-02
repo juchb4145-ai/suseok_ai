@@ -80,6 +80,9 @@ class VirtualOrderService:
             "virtual_status": VirtualOrderStatus.SUBMITTED.value,
             "theme_id": plan.cancel_condition.get("theme_id", ""),
             "entry_type": plan.entry_type,
+            "candidate_instance_id": plan.cancel_condition.get("candidate_instance_id", ""),
+            "candidate_generation_seq": plan.cancel_condition.get("candidate_generation_seq", 0),
+            "decision_cycle_id": plan.cancel_condition.get("decision_cycle_id", ""),
         }, self.settings)
         if not plan.cancel_condition.get("submittable", True):
             reason = str(plan.cancel_condition.get("reason") or "not_submittable")
@@ -130,10 +133,11 @@ class VirtualOrderService:
             fill_policy=plan.fill_policy,
             submitted_at=submitted_at,
             unfilled_reason="",
+            details=_standard_details(details, now=submitted_at, result=True),
         )
         self._submitted_orders.append(order)
         self._submitted_keys[self._key(plan, leg_index)] = order
-        return VirtualOrderSubmissionResult(order, submitted=True, details=_standard_details(details, now=submitted_at, result=True))
+        return VirtualOrderSubmissionResult(order, submitted=True, details=dict(order.details or {}))
 
     def evaluate_fill(
         self,

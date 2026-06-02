@@ -48,3 +48,18 @@ plus `reason_family`.
 - `THEME_WEAK` maps to `BLOCK_THEME`.
 - `DATA_INSUFFICIENT` maps to `WAIT_DATA` for recoverable wait states and
   `BLOCK_DATA` for final blocked states.
+
+## Support Diagnostics
+
+Support-related diagnostic-only reasons are split so reports can distinguish
+strategy structure from data quality. These reasons do not permit buy intents.
+
+| reason_code | Meaning |
+| --- | --- |
+| `SUPPORT_DATA_MISSING` | Required support inputs are missing, such as recent support, VWAP, and minute-bar coverage. |
+| `SUPPORT_STRUCTURALLY_MISSING` | Data exists, but no usable support level is present for a pullback entry. |
+| `SUPPORT_NOT_READY` | A support candidate exists but is not ready or not reliable enough yet. |
+
+DRY_RUN reports aggregate support coverage for `recent_support_price`, `vwap`,
+`minute_bar`, and `support_reclaimed` so threshold tuning does not confuse
+missing data with a structurally invalid setup.

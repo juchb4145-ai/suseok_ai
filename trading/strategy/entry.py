@@ -14,7 +14,10 @@ from trading.strategy.runtime_settings import (
 from trading.strategy.support_readiness import (
     READY_EARLY_SMALL,
     SUPPORT_NOT_READY,
+    SUPPORT_STRUCTURALLY_MISSING,
     WAIT_DATA_SUPPORT_NOT_READY,
+    support_coverage,
+    support_missing_taxonomy,
     support_source_readiness,
 )
 
@@ -59,6 +62,8 @@ class EntryPlanBuilder:
         support_price = _support_price(stock_details)
         support_candidates = _support_candidates(stock_details)
         support_readiness = _support_readiness(stock_details)
+        support_taxonomy = ""
+        support_coverage_details = _support_coverage(stock_details, support_candidates)
         ready_type = str(stock_details.get("ready_type") or result.details.get("ready_type") or "")
         current_price = snapshot.price
         submittable = True
@@ -71,11 +76,13 @@ class EntryPlanBuilder:
             base_price_source = "current_price_fallback"
             submittable = False
             diagnostic_only = True
-            reason = "support_missing"
+            support_taxonomy = _support_missing_taxonomy(stock_details, support_candidates)
+            reason = support_taxonomy
         elif not support_readiness["ready"]:
             submittable = False
             diagnostic_only = True
-            reason = str(support_readiness["reason"] or WAIT_DATA_SUPPORT_NOT_READY)
+            support_taxonomy = SUPPORT_NOT_READY
+            reason = str(support_readiness["reason"] or SUPPORT_NOT_READY)
 
         split_plan = self._build_split_plan(result.final_grade, stock_details, current_price, ready_type)
         position_size_multiplier = _position_size_multiplier(result)
@@ -94,6 +101,13 @@ class EntryPlanBuilder:
             "submittable": submittable,
             "diagnostic_only": diagnostic_only,
             "reason": reason,
+            "legacy_reason": "support_missing" if support_taxonomy else "",
+            "support_missing_reason": support_taxonomy,
+            "support_taxonomy": support_taxonomy,
+            "support_coverage": support_coverage_details,
+            "candidate_instance_id": result.details.get("candidate_instance_id", ""),
+            "candidate_generation_seq": result.details.get("candidate_generation_seq", 0),
+            "decision_cycle_id": result.details.get("decision_cycle_id", ""),
             "theme_id": result.theme_id,
             "theme_name": result.details.get("theme_name", ""),
             "strategy_profile": profile.value if profile else "",
@@ -155,6 +169,7 @@ class EntryPlanBuilder:
             supports.setdefault(nearest_name, float(nearest_price))
         lower_supports = _lower_supports(supports, nearest_name, nearest_price)
         first_support_readiness = _support_readiness(details)
+        first_support_taxonomy = _support_missing_taxonomy(details, supports)
         plan: list[dict] = []
         for index, weight in enumerate(weights, start=1):
             if index == 1:
@@ -167,7 +182,7 @@ class EntryPlanBuilder:
                 if lower_index < len(lower_supports):
                     support_name, support_price = lower_supports[lower_index]
             submittable = support_price > 0
-            reason = "" if submittable else "support_missing"
+            reason = "" if submittable else (first_support_taxonomy if index == 1 else SUPPORT_STRUCTURALLY_MISSING)
             if index == 1 and submittable and not first_support_readiness["ready"]:
                 submittable = False
                 reason = str(first_support_readiness["reason"] or WAIT_DATA_SUPPORT_NOT_READY)
@@ -280,6 +295,20 @@ def _support_readiness(details: dict) -> dict:
         "reason": reason or explicit.reason or SUPPORT_NOT_READY,
         "reason_codes": reason_codes,
     }
+
+
+def _support_coverage(details: dict, support_candidates: dict[str, float]) -> dict:
+    existing = details.get("support_coverage")
+    if isinstance(existing, dict):
+        return dict(existing)
+    return support_coverage(details, support_candidates)
+
+
+def _support_missing_taxonomy(details: dict, support_candidates: dict[str, float]) -> str:
+    existing = str(details.get("support_missing_reason") or details.get("support_taxonomy") or "")
+    if existing:
+        return existing
+    return support_missing_taxonomy(details, support_candidates)
 
 
 def _lower_supports(

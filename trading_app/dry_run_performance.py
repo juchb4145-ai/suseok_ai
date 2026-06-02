@@ -35,6 +35,12 @@ class DryRunTradeLifecycle:
     name: str = ""
     strategy_name: str = ""
     candidate_id: Optional[int] = None
+    candidate_instance_id: str = ""
+    candidate_generation_seq: Optional[int] = None
+    matched_by: str = ""
+    link_confidence: str = ""
+    attribution_confidence: str = ""
+    legacy_low_confidence_sample: bool = False
     theme_name: str = ""
     theme_score: Optional[float] = None
     gate_status: str = ""
@@ -94,6 +100,16 @@ class DryRunTradeLifecycle:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class AttributionLink:
+    key: str
+    matched_by: str
+    link_confidence: str
+    issue: str = ""
+    candidate_instance_id: str = ""
+    candidate_generation_seq: Optional[int] = None
 
 
 class DryRunFalseSignalClassifier:
@@ -252,6 +268,7 @@ class DryRunPerformanceAnalyzer:
         grouped = self.aggregate_grouped(items)
         false_signal_summary = self.aggregate_false_signals(items)
         data_quality = self.data_quality(items)
+        prune_summary = self.db.latest_position_context_prune_summary() if hasattr(self.db, "latest_position_context_prune_summary") else {}
         recommendations = self.recommendations(summary, grouped, false_signal_summary)
         start = max(0, int(offset or 0))
         end = start + max(1, int(limit or 100))
@@ -261,7 +278,7 @@ class DryRunPerformanceAnalyzer:
             "generated_at": generated_at,
             "trade_date": trade_date or "",
             "filters": filters,
-            "summary": {**summary, "data_quality": data_quality},
+            "summary": {**summary, "data_quality": data_quality, "context_history_prune": prune_summary},
             "false_signal_summary": false_signal_summary,
             "grouped": grouped,
             "recommendations": recommendations,
@@ -310,26 +327,40 @@ class DryRunPerformanceAnalyzer:
         for decision in self.db.list_exit_decisions_for_analysis():
             if decision.virtual_position_id is not None:
                 decisions_by_position.setdefault(decision.virtual_position_id, []).append(decision)
+        context_history_by_position: dict[int, list[Any]] = {}
+        if hasattr(self.db, "list_position_context_history_for_analysis"):
+            histories = self.db.list_position_context_history_for_analysis(
+                trade_date=trade_date,
+                position_ids=positions.keys(),
+                limit=10000,
+            )
+            for snapshot in histories:
+                if snapshot.position_id is not None:
+                    context_history_by_position.setdefault(int(snapshot.position_id), []).append(snapshot)
         candidates = {
             candidate.id: candidate
             for candidate in self.db.list_candidates(trade_date=trade_date)
             if candidate.id is not None
         }
+        instance_ids_by_code_date = _candidate_instances_by_code_date(intents, reviews, positions.values(), candidates.values())
+        candidate_key_by_code_date = _single_candidate_key_by_code_date(intents, reviews, candidates.values())
         groups: dict[str, dict[str, list[Any]]] = {}
 
-        def bucket(key: str) -> dict[str, list[Any]]:
-            return groups.setdefault(key, {"intents": [], "reviews": []})
+        def bucket(link: AttributionLink) -> dict[str, list[Any]]:
+            group = groups.setdefault(link.key, {"intents": [], "reviews": [], "links": []})
+            group["links"].append(link)
+            return group
 
         review_key_by_id = {
-            int(review.id): _lifecycle_key_for_review(review, position_by_order)
+            int(review.id): _lifecycle_link_for_review(review, position_by_order, instance_ids_by_code_date, candidate_key_by_code_date).key
             for review in reviews
             if review.id is not None
         }
 
         for intent in intents:
-            bucket(_lifecycle_key_for_intent(intent, position_by_order, review_key_by_id))["intents"].append(intent)
+            bucket(_lifecycle_link_for_intent(intent, position_by_order, review_key_by_id, instance_ids_by_code_date, candidate_key_by_code_date))["intents"].append(intent)
         for review in reviews:
-            bucket(_lifecycle_key_for_review(review, position_by_order))["reviews"].append(review)
+            bucket(_lifecycle_link_for_review(review, position_by_order, instance_ids_by_code_date, candidate_key_by_code_date))["reviews"].append(review)
 
         lifecycles: list[DryRunTradeLifecycle] = []
         for key, group in groups.items():
@@ -341,7 +372,9 @@ class DryRunPerformanceAnalyzer:
                 position_by_order,
                 positions_by_candidate,
                 decisions_by_position,
+                context_history_by_position,
                 candidates,
+                list(group.get("links") or []),
             )
             classification = self.classifier.classify(lifecycle)
             lifecycle.dry_run_false_positive_type = classification["dry_run_false_positive_type"]
@@ -362,7 +395,9 @@ class DryRunPerformanceAnalyzer:
         position_by_order: dict[int, Any],
         positions_by_candidate: dict[int, list[Any]],
         decisions_by_position: dict[int, list[Any]],
+        context_history_by_position: dict[int, list[Any]],
         candidates: dict[int, Any],
+        attribution_links: list[AttributionLink],
     ) -> DryRunTradeLifecycle:
         entry_intents = [intent for intent in intents if _intent_phase(intent) == "entry" or str(intent.get("side")) == "buy"]
         exit_intents = [intent for intent in intents if _intent_phase(intent) == "exit" or str(intent.get("side")) == "sell"]
@@ -380,6 +415,27 @@ class DryRunPerformanceAnalyzer:
         )
         candidate = candidates.get(int(candidate_id)) if candidate_id is not None else None
         position_decisions = decisions_by_position.get(int(position.id), []) if position and position.id is not None else []
+        position_context_history = context_history_by_position.get(int(position.id), []) if position and position.id is not None else []
+        context_capture_reasons = _unique(str(snapshot.capture_reason or "") for snapshot in position_context_history)
+        context_risk_exit_details = [
+            {
+                "decision_type": str(decision.decision_type or ""),
+                "exit_confidence": str((decision.details or {}).get("exit_confidence") or ""),
+                "context_limited_reason": str((decision.details or {}).get("context_limited_reason") or ""),
+                "context_history_count": _first_int((decision.details or {}).get("context_history_count")),
+                "theme_score_delta": _optional_float((decision.details or {}).get("theme_score_delta")),
+                "leader_count_delta": _first_int((decision.details or {}).get("leader_count_delta")),
+                "index_status_deterioration": bool((decision.details or {}).get("index_status_deterioration")),
+                "required_confirmation_cycles": _first_int((decision.details or {}).get("required_confirmation_cycles")),
+                "observed_confirmation_cycles": _first_int((decision.details or {}).get("observed_confirmation_cycles")),
+                "confirmation_passed": bool((decision.details or {}).get("confirmation_passed")),
+                "config_source": str((decision.details or {}).get("config_source") or ""),
+                "config_fallback_reasons": list((decision.details or {}).get("config_fallback_reasons") or []),
+                "reason_codes": list(decision.reason_codes or []),
+            }
+            for decision in position_decisions
+            if _is_context_risk_exit(str(decision.decision_type or ""), dict(decision.details or {}))
+        ]
         exit_decision_types = _unique(
             [str(intent.get("exit_decision_type") or "") for intent in exit_intents]
             + [str(decision.decision_type or "") for decision in position_decisions]
@@ -397,6 +453,34 @@ class DryRunPerformanceAnalyzer:
         entry_request = dict(entry.get("request") or {}) if entry else {}
         entry_metadata = dict(entry.get("metadata") or {}) if entry else {}
         review_details = dict(review.details or {}) if review else {}
+        position_details = dict(position.details or {}) if position else {}
+        candidate_metadata = dict(candidate.metadata or {}) if candidate else {}
+        best_link = _best_attribution_link(attribution_links)
+        candidate_instance_id = _first_text(
+            best_link.candidate_instance_id if best_link else "",
+            entry_metadata.get("candidate_instance_id"),
+            review_details.get("candidate_instance_id"),
+            position_details.get("candidate_instance_id"),
+            candidate_metadata.get("candidate_instance_id"),
+            *[_payload_candidate_instance_id(intent) for intent in exit_intents],
+        )
+        candidate_generation_seq = _first_int(
+            best_link.candidate_generation_seq if best_link else None,
+            entry_metadata.get("candidate_generation_seq"),
+            review_details.get("candidate_generation_seq"),
+            position_details.get("candidate_generation_seq"),
+            candidate_metadata.get("candidate_generation_seq"),
+        )
+        generation_reason = _first_text(
+            entry_metadata.get("generation_reason"),
+            entry_metadata.get("candidate_generation_reason"),
+            review_details.get("generation_reason"),
+            review_details.get("candidate_generation_reason"),
+            position_details.get("generation_reason"),
+            position_details.get("candidate_generation_reason"),
+            candidate_metadata.get("generation_reason"),
+            candidate_metadata.get("candidate_generation_reason"),
+        )
         trade_date = str(
             _first_not_none(
                 entry.get("trade_date") if entry else None,
@@ -435,6 +519,12 @@ class DryRunPerformanceAnalyzer:
             name=str(_first_not_none(review.name if review else None, candidate.name if candidate else None) or ""),
             strategy_name=str(_first_not_none(entry.get("strategy_name") if entry else None, review.strategy_profile if review else None) or ""),
             candidate_id=int(candidate_id) if candidate_id is not None else None,
+            candidate_instance_id=candidate_instance_id,
+            candidate_generation_seq=candidate_generation_seq,
+            matched_by=best_link.matched_by if best_link else "",
+            link_confidence=best_link.link_confidence if best_link else "",
+            attribution_confidence=_attribution_confidence(best_link),
+            legacy_low_confidence_sample=_legacy_low_confidence_sample(candidate_instance_id, best_link),
             theme_name=str(_first_not_none(entry_request.get("theme_name"), review.theme_name if review else None, entry_metadata.get("theme_name")) or ""),
             theme_score=_optional_float(_first_not_none(entry_request.get("theme_score"), entry_metadata.get("theme_score"), review_details.get("theme_score"))),
             gate_status=str(_first_not_none(entry.get("gate_status") if entry else None, review_details.get("gate_status")) or ""),
@@ -484,10 +574,60 @@ class DryRunPerformanceAnalyzer:
                 "entry_intent_count": len(entry_intents),
                 "exit_intent_count": len(exit_intents),
                 "entry_intent_ids": [intent.get("intent_id") for intent in entry_intents],
+                "support_missing_reason": _first_text(entry_metadata.get("support_missing_reason"), entry_metadata.get("support_taxonomy"), review_details.get("support_missing_reason"), review_details.get("support_taxonomy")),
+                "support_coverage": _support_coverage_details(entry_metadata, review_details),
+                "support_reclaimed": bool(_first_not_none(entry_metadata.get("support_reclaimed"), review_details.get("support_reclaimed"), False)),
+                "generation_reason": generation_reason,
+                "previous_candidate_instance_id": _first_text(
+                    entry_metadata.get("previous_candidate_instance_id"),
+                    review_details.get("previous_candidate_instance_id"),
+                    position_details.get("previous_candidate_instance_id"),
+                    candidate_metadata.get("previous_candidate_instance_id"),
+                ),
+                "previous_seen_at": _first_text(
+                    entry_metadata.get("previous_seen_at"),
+                    review_details.get("previous_seen_at"),
+                    position_details.get("previous_seen_at"),
+                    candidate_metadata.get("previous_seen_at"),
+                ),
+                "minutes_since_previous_signal": _first_float(
+                    entry_metadata.get("minutes_since_previous_signal"),
+                    review_details.get("minutes_since_previous_signal"),
+                    position_details.get("minutes_since_previous_signal"),
+                    candidate_metadata.get("minutes_since_previous_signal"),
+                ),
+                "blocked_generation_reason": _first_text(
+                    entry_metadata.get("blocked_generation_reason"),
+                    review_details.get("blocked_generation_reason"),
+                    position_details.get("blocked_generation_reason"),
+                    candidate_metadata.get("blocked_generation_reason"),
+                ),
+                "excessive_generation_blocked": bool(
+                    _first_not_none(
+                        entry_metadata.get("excessive_generation_blocked"),
+                        review_details.get("excessive_generation_blocked"),
+                        position_details.get("excessive_generation_blocked"),
+                        candidate_metadata.get("excessive_generation_blocked"),
+                        False,
+                    )
+                ),
                 "review_false_positive_flag": bool(review.false_positive_flag) if review else False,
                 "review_false_negative_flag": bool(review.false_negative_flag) if review else False,
                 "review_false_positive_type": review_details.get("false_positive_type", "") if review else "",
                 "review_false_negative_type": review_details.get("false_negative_type", "") if review else "",
+                "candidate_instance_ids": _unique(
+                    [candidate_instance_id]
+                    + [str(value) for value in position_details.get("candidate_instance_ids") or []]
+                    + [_payload_candidate_instance_id(intent) for intent in intents]
+                    + ([str(review_details.get("candidate_instance_id") or "")] if review else [])
+                ),
+                "attribution_links": [asdict(link) for link in attribution_links],
+                "position_context_history_count": len(position_context_history),
+                "position_context_capture_reasons": context_capture_reasons,
+                "position_context_has_entry": "ENTRY" in context_capture_reasons,
+                "position_context_has_holding": "HOLDING_EVAL" in context_capture_reasons,
+                "position_context_has_exit": "EXIT_EVAL" in context_capture_reasons,
+                "context_risk_exit_details": context_risk_exit_details,
             },
         )
         lifecycle.data_quality_issue_reasons = _data_quality_issue_reasons(
@@ -511,6 +651,8 @@ class DryRunPerformanceAnalyzer:
         live_pass_items = [item for item in items if bool(item.get("entry_live_would_pass"))]
         live_pass_completed = [item for item in live_pass_items if _is_completed(item)]
         live_pass_wins = [item for item in live_pass_completed if (_optional_float(item.get("realized_return_pct")) or 0.0) > 0.0]
+        generation_summary = _generation_summary(items)
+        position_context_summary = _position_context_history_summary(items)
         return {
             "total_lifecycle_count": len(items),
             "entry_intent_count": sum(1 for item in items if item.get("entry_intent_id")),
@@ -519,6 +661,16 @@ class DryRunPerformanceAnalyzer:
             "open_lifecycle_count": sum(1 for item in items if item.get("quality_bucket") in {"PENDING", "INSUFFICIENT_DATA"}),
             "orphan_entry_count": sum(1 for item in items if "ORPHAN_ENTRY" in item.get("data_quality_issues", [])),
             "orphan_exit_count": sum(1 for item in items if "ORPHAN_EXIT" in item.get("data_quality_issues", [])),
+            "exact_candidate_instance_match_count": _count_lifecycles_with_match(items, "candidate_instance_id"),
+            "candidate_id_match_count": _count_lifecycles_with_match(items, "candidate_id"),
+            "weak_code_date_fallback_count": _count_lifecycles_with_match(items, "weak_code_date_fallback"),
+            "ambiguous_candidate_link_count": sum(1 for item in items if "AMBIGUOUS_CANDIDATE_LINK" in item.get("data_quality_issues", [])),
+            "link_confidence_distribution": _top_counts(((item.get("link_confidence") or "UNKNOWN") for item in items), key="confidence"),
+            "attribution_confidence_distribution": _top_counts(((item.get("attribution_confidence") or "UNKNOWN") for item in items), key="confidence"),
+            "legacy_low_confidence_sample_count": sum(1 for item in items if item.get("legacy_low_confidence_sample")),
+            "multi_generation_code_count": _multi_generation_code_count(items),
+            **generation_summary,
+            **position_context_summary,
             "review_missing_count": sum(1 for item in items if "REVIEW_MISSING" in item.get("data_quality_issues", [])),
             "position_missing_count": sum(1 for item in items if "POSITION_MISSING" in item.get("data_quality_issues", [])),
             "avg_realized_return_pct": _avg(realized_values),
@@ -630,6 +782,9 @@ class DryRunPerformanceAnalyzer:
             "missing_quantity_reasons": _issue_reasons(reason_counts, "MISSING_QUANTITY"),
             "orphan_entry_reasons": _issue_reasons(reason_counts, "ORPHAN_ENTRY"),
             "orphan_exit_reasons": _issue_reasons(reason_counts, "ORPHAN_EXIT"),
+            "support_missing_reasons": _support_missing_reason_counts(items),
+            "support_coverage": _support_coverage_summary(items),
+            "support_vwap_coverage": _support_vwap_coverage_summary(items, rally_threshold_pct=self.config.fn_rally_threshold_pct),
         }
 
     def recommendations(self, summary: dict, grouped: dict, false_signal_summary: dict) -> list[str]:
@@ -675,6 +830,10 @@ class DryRunPerformanceAnalyzer:
             "theme_name",
             "session_bucket",
             "candidate_id",
+            "candidate_instance_id",
+            "candidate_generation_seq",
+            "matched_by",
+            "link_confidence",
             "entry_intent_id",
             "entry_intent_status",
             "entry_live_would_pass",
@@ -732,6 +891,42 @@ class DryRunPerformanceAnalyzer:
             f"- Live would pass: {summary.get('live_would_pass_count', 0)}",
             f"- Live would reject: {summary.get('live_would_reject_count', 0)}",
             "",
+            "## Attribution Quality",
+            f"- Exact candidate instance matches: {summary.get('exact_candidate_instance_match_count', 0)}",
+            f"- Candidate ID matches: {summary.get('candidate_id_match_count', 0)}",
+            f"- Weak code/date fallbacks: {summary.get('weak_code_date_fallback_count', 0)}",
+            f"- Ambiguous candidate links: {summary.get('ambiguous_candidate_link_count', 0)}",
+            f"- Multi-generation codes: {summary.get('multi_generation_code_count', 0)}",
+            f"- Legacy low-confidence samples: {summary.get('legacy_low_confidence_sample_count', 0)}",
+            *_markdown_count_lines(summary.get("link_confidence_distribution", []), "confidence"),
+            *_markdown_count_lines(summary.get("attribution_confidence_distribution", []), "confidence"),
+            "",
+            "## Candidate Generation Summary",
+            f"- Multi-generation codes: {summary.get('multi_generation_code_count', 0)}",
+            f"- Avg generation per code: {summary.get('avg_generation_per_code', '-')}",
+            f"- Max generation per code: {summary.get('max_generation_per_code', 0)}",
+            f"- Stale re-detect generations: {summary.get('stale_re_detect_count', 0)}",
+            f"- Theme-change generations: {summary.get('theme_change_generation_count', 0)}",
+            f"- Source-change generations: {summary.get('source_change_generation_count', 0)}",
+            f"- Strategy-change generations: {summary.get('strategy_change_generation_count', 0)}",
+            f"- Previous-lifecycle-closed generations: {summary.get('previous_lifecycle_closed_generation_count', 0)}",
+            f"- Excessive generation blocks: {summary.get('excessive_generation_count', 0)}",
+            "",
+            "## Position Context History",
+            f"- Positions with ENTRY context: {summary.get('positions_with_entry_context_count', 0)}",
+            f"- Positions with HOLDING context: {summary.get('positions_with_holding_context_count', 0)}",
+            f"- Positions with EXIT context: {summary.get('positions_with_exit_context_count', 0)}",
+            f"- Context coverage: {_pct(summary.get('position_context_coverage_pct'))}",
+            f"- DATA_LIMITED_CONTEXT: {summary.get('data_limited_context_count', 0)}",
+            f"- LOW_CONFIDENCE_EXIT: {summary.get('low_confidence_exit_count', 0)}",
+            f"- Index deterioration: {summary.get('index_status_deterioration_count', 0)}",
+            "### Context History Count Distribution",
+            *_markdown_count_lines(summary.get("context_history_count_distribution", []), "history_count"),
+            "### Context Risk Exit Confidence",
+            *_markdown_context_confidence_lines(summary.get("context_risk_exit_confidence_by_type", {})),
+            "### Context History Pruning",
+            *_markdown_prune_lines(summary.get("context_history_prune", {})),
+            "",
             "## False Signals",
             f"- False positives: {summary.get('false_positive_count', 0)}",
             f"- False negatives: {summary.get('false_negative_count', 0)}",
@@ -763,6 +958,9 @@ class DryRunPerformanceAnalyzer:
             "",
             "## Data Quality",
             *_markdown_quality_lines(summary.get("data_quality", {})),
+            "",
+            "## Support/VWAP Coverage",
+            *_markdown_support_vwap_coverage_lines((summary.get("data_quality", {}) or {}).get("support_vwap_coverage", {})),
         ]
         path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
         return path
@@ -799,47 +997,112 @@ def _lifecycle_key_for_intent(
     position_by_order: dict[int, Any],
     review_key_by_id: Optional[dict[int, str]] = None,
 ) -> str:
+    return _lifecycle_link_for_intent(intent, position_by_order, review_key_by_id, {}).key
+
+
+def _lifecycle_link_for_intent(
+    intent: dict,
+    position_by_order: dict[int, Any],
+    review_key_by_id: Optional[dict[int, str]] = None,
+    instance_ids_by_code_date: Optional[dict[str, set[str]]] = None,
+    candidate_key_by_code_date: Optional[dict[str, str]] = None,
+) -> AttributionLink:
     virtual_position_id = intent.get("virtual_position_id")
     if virtual_position_id is not None:
-        return f"vp:{virtual_position_id}"
+        return AttributionLink(f"vp:{virtual_position_id}", "virtual_position_id", "HIGH", candidate_instance_id=_payload_candidate_instance_id(intent), candidate_generation_seq=_payload_candidate_generation_seq(intent))
     virtual_order_id = intent.get("virtual_order_id")
     if virtual_order_id is not None and int(virtual_order_id) in position_by_order:
-        return f"vp:{position_by_order[int(virtual_order_id)].id}"
+        return AttributionLink(f"vp:{position_by_order[int(virtual_order_id)].id}", "virtual_order_to_position", "HIGH", candidate_instance_id=_payload_candidate_instance_id(intent), candidate_generation_seq=_payload_candidate_generation_seq(intent))
     if virtual_order_id is not None:
-        return f"vo:{virtual_order_id}"
+        return AttributionLink(f"vo:{virtual_order_id}", "virtual_order_id", "MEDIUM", candidate_instance_id=_payload_candidate_instance_id(intent), candidate_generation_seq=_payload_candidate_generation_seq(intent))
     trade_review_id = intent.get("trade_review_id")
     if trade_review_id is not None and review_key_by_id and int(trade_review_id) in review_key_by_id:
-        return review_key_by_id[int(trade_review_id)]
+        return AttributionLink(review_key_by_id[int(trade_review_id)], "trade_review_id", "HIGH", candidate_instance_id=_payload_candidate_instance_id(intent), candidate_generation_seq=_payload_candidate_generation_seq(intent))
     if trade_review_id is not None:
-        return f"review:{trade_review_id}"
-    candidate_key = _candidate_code_date_key(intent.get("trade_date"), intent.get("code"), intent.get("candidate_id"))
-    if candidate_key:
-        return candidate_key
+        return AttributionLink(f"review:{trade_review_id}", "trade_review_id", "MEDIUM", candidate_instance_id=_payload_candidate_instance_id(intent), candidate_generation_seq=_payload_candidate_generation_seq(intent))
+    candidate_instance_id = _payload_candidate_instance_id(intent)
+    if candidate_instance_id:
+        return AttributionLink(f"ci:{candidate_instance_id}", "candidate_instance_id", "HIGH", candidate_instance_id=candidate_instance_id, candidate_generation_seq=_payload_candidate_generation_seq(intent))
+    candidate_id = intent.get("candidate_id")
+    if candidate_id is not None:
+        return AttributionLink(f"cand_id:{intent.get('trade_date') or ''}:{candidate_id}", "candidate_id", "MEDIUM")
+    candidate_link = _candidate_fallback_link(intent.get("trade_date"), intent.get("code"), intent.get("candidate_id"), intent, instance_ids_by_code_date or {}, candidate_key_by_code_date or {})
+    if candidate_link:
+        return candidate_link
     prefix = "orphan_exit" if _intent_phase(intent) == "exit" or intent.get("side") == "sell" else "orphan_entry"
-    return f"{prefix}:{intent.get('intent_id', '')}"
+    return AttributionLink(f"{prefix}:{intent.get('intent_id', '')}", prefix, "LOW")
 
 
 def _lifecycle_key_for_review(review: Any, position_by_order: dict[int, Any]) -> str:
+    return _lifecycle_link_for_review(review, position_by_order, {}).key
+
+
+def _lifecycle_link_for_review(
+    review: Any,
+    position_by_order: dict[int, Any],
+    instance_ids_by_code_date: Optional[dict[str, set[str]]] = None,
+    candidate_key_by_code_date: Optional[dict[str, str]] = None,
+) -> AttributionLink:
     if review.virtual_position_id is not None:
-        return f"vp:{review.virtual_position_id}"
+        return AttributionLink(f"vp:{review.virtual_position_id}", "virtual_position_id", "HIGH", candidate_instance_id=_review_candidate_instance_id(review), candidate_generation_seq=_review_candidate_generation_seq(review))
     if review.virtual_order_id is not None and int(review.virtual_order_id) in position_by_order:
-        return f"vp:{position_by_order[int(review.virtual_order_id)].id}"
-    candidate_key = _candidate_code_date_key(review.trade_date, review.code, review.candidate_id)
-    if candidate_key:
-        return candidate_key
-    return f"review:{review.id}"
+        return AttributionLink(f"vp:{position_by_order[int(review.virtual_order_id)].id}", "virtual_order_to_position", "HIGH", candidate_instance_id=_review_candidate_instance_id(review), candidate_generation_seq=_review_candidate_generation_seq(review))
+    candidate_instance_id = _review_candidate_instance_id(review)
+    if candidate_instance_id:
+        return AttributionLink(f"ci:{candidate_instance_id}", "candidate_instance_id", "HIGH", candidate_instance_id=candidate_instance_id, candidate_generation_seq=_review_candidate_generation_seq(review))
+    if review.candidate_id is not None:
+        return AttributionLink(f"cand_id:{review.trade_date or ''}:{review.candidate_id}", "candidate_id", "MEDIUM")
+    candidate_link = _candidate_fallback_link(review.trade_date, review.code, review.candidate_id, {"review_id": review.id}, instance_ids_by_code_date or {}, candidate_key_by_code_date or {})
+    if candidate_link:
+        return candidate_link
+    return AttributionLink(f"review:{review.id}", "trade_review_id", "MEDIUM")
 
 
 def _candidate_code_date_key(trade_date: Any, code: Any, candidate_id: Any = None) -> str:
     date_text = str(trade_date or "")
     code_text = str(code or "")
-    if date_text and code_text:
-        return f"cand_code:{date_text}:{code_text}"
     if date_text and candidate_id is not None:
         return f"cand_id:{date_text}:{candidate_id}"
     if candidate_id is not None:
         return f"cand_id::{candidate_id}"
+    if date_text and code_text:
+        return f"cand_code:{date_text}:{code_text}"
     return ""
+
+
+def _candidate_fallback_link(
+    trade_date: Any,
+    code: Any,
+    candidate_id: Any,
+    payload: dict,
+    instance_ids_by_code_date: dict[str, set[str]],
+    candidate_key_by_code_date: dict[str, str],
+) -> Optional[AttributionLink]:
+    date_text = str(trade_date or "")
+    code_text = str(code or "")
+    if date_text and candidate_id is not None:
+        return AttributionLink(f"cand_id:{date_text}:{candidate_id}", "candidate_id", "MEDIUM")
+    if candidate_id is not None:
+        return AttributionLink(f"cand_id::{candidate_id}", "candidate_id", "MEDIUM")
+    if not date_text or not code_text:
+        return None
+    code_date = _code_date_key(date_text, code_text)
+    instance_ids = instance_ids_by_code_date.get(code_date, set())
+    if len(instance_ids) > 1:
+        unique_id = payload.get("intent_id") or payload.get("review_id") or payload.get("id") or ""
+        return AttributionLink(
+            f"ambiguous:{date_text}:{code_text}:{unique_id}",
+            "ambiguous_code_date_fallback",
+            "LOW",
+            issue="AMBIGUOUS_CANDIDATE_LINK",
+        )
+    candidate_key = candidate_key_by_code_date.get(code_date, "")
+    if candidate_key:
+        return AttributionLink(candidate_key, "weak_code_date_fallback", "LOW")
+    window_key = _time_window_fallback_key(payload, date_text, code_text)
+    if window_key:
+        return AttributionLink(window_key, "code_date_time_window_source_strategy", "LOW_MEDIUM")
+    return AttributionLink(f"cand_code:{date_text}:{code_text}", "weak_code_date_fallback", "LOW")
 
 
 def _position_for_group(
@@ -946,6 +1209,11 @@ def _data_quality_issue_reasons(
         issues["MISSING_HORIZON_METRICS"] = "TRADE_REVIEW_MAX_RETURN_20M_MISSING"
     if has_position and not lifecycle.closed_at and has_entry:
         issues["STALE_OPEN_POSITION"] = "POSITION_OPEN_WITH_ENTRY_INTENT"
+    if lifecycle.matched_by == "ambiguous_code_date_fallback":
+        issues["AMBIGUOUS_CANDIDATE_LINK"] = "MULTIPLE_CANDIDATE_INSTANCES_FOR_CODE_DATE"
+    support_reason = str((lifecycle.details or {}).get("support_missing_reason") or "")
+    if support_reason == "SUPPORT_DATA_MISSING":
+        issues["SUPPORT_DATA_MISSING"] = "SUPPORT_DIAGNOSTIC_ONLY_DATA_MISSING"
     return issues
 
 
@@ -997,6 +1265,380 @@ def _top_counts(values: Iterable[Any], *, key: str = "type", limit: int = 10) ->
             continue
         counts[text] = counts.get(text, 0) + 1
     return [{key: value, "count": count} for value, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)[:limit]]
+
+
+def _support_coverage_details(*payloads: dict) -> dict[str, Any]:
+    for payload in payloads:
+        coverage = payload.get("support_coverage") if isinstance(payload, dict) else None
+        if isinstance(coverage, dict):
+            return dict(coverage)
+    merged: dict[str, Any] = {}
+    for key in ("recent_support_price_present", "vwap_present", "vwap_ready", "minute_bar_present", "minute_bar_count"):
+        for payload in payloads:
+            if isinstance(payload, dict) and payload.get(key) not in (None, ""):
+                merged[key] = payload.get(key)
+                break
+    return merged
+
+
+def _support_missing_reason_counts(items: list[dict]) -> list[dict[str, Any]]:
+    return _top_counts(
+        (
+            (item.get("details") or {}).get("support_missing_reason")
+            for item in items
+            if (item.get("details") or {}).get("support_missing_reason")
+        ),
+        key="reason",
+    )
+
+
+def _support_coverage_summary(items: list[dict]) -> dict[str, Any]:
+    rows = [dict((item.get("details") or {}).get("support_coverage") or {}) for item in items]
+    total = len(rows)
+    return {
+        "sample_count": total,
+        "recent_support_price_present_count": sum(1 for row in rows if row.get("recent_support_price_present")),
+        "vwap_present_count": sum(1 for row in rows if row.get("vwap_present")),
+        "vwap_ready_count": sum(1 for row in rows if row.get("vwap_ready")),
+        "stale_vwap_count": sum(1 for row in rows if row.get("vwap_stale")),
+        "minute_bar_present_count": sum(1 for row in rows if row.get("minute_bar_present")),
+        "support_reclaimed_count": sum(1 for item in items if (item.get("details") or {}).get("support_reclaimed")),
+        "minute_bar_quality_status_counts": _top_counts((row.get("minute_bar_quality_status") for row in rows), key="status"),
+        "support_source_distribution": _support_source_distribution(rows),
+    }
+
+
+def _support_vwap_coverage_summary(items: list[dict], *, rally_threshold_pct: float) -> dict[str, Any]:
+    rows = [dict((item.get("details") or {}).get("support_coverage") or {}) for item in items]
+    total = len(rows)
+    support_metadata_count = sum(1 for row in rows if row.get("support_source_present_count", 0) or row.get("support_candidate_count", 0))
+    vwap_count = sum(1 for row in rows if row.get("vwap_present"))
+    minute_count = sum(1 for row in rows if row.get("minute_bar_present"))
+    support_reasons = _support_missing_reason_counts(items)
+    diagnostic_items = [item for item in items if _support_missing_reason(item)]
+    rallied = [item for item in diagnostic_items if (_optional_float(item.get("max_return_20m")) or 0.0) >= float(rally_threshold_pct)]
+    reason_rallied_counts = {
+        "SUPPORT_STRUCTURALLY_MISSING_AND_RALLIED": sum(1 for item in rallied if _support_missing_reason(item) == "SUPPORT_STRUCTURALLY_MISSING"),
+        "SUPPORT_DATA_MISSING_AND_RALLIED": sum(1 for item in rallied if _support_missing_reason(item) == "SUPPORT_DATA_MISSING"),
+        "SUPPORT_NOT_READY_AND_RALLIED": sum(1 for item in rallied if _support_missing_reason(item) == "SUPPORT_NOT_READY"),
+    }
+    return {
+        "sample_count": total,
+        "support_metadata_coverage_pct": _ratio(support_metadata_count, total),
+        "vwap_metadata_coverage_pct": _ratio(vwap_count, total),
+        "minute_bar_coverage_pct": _ratio(minute_count, total),
+        "support_missing_count_by_reason": support_reasons,
+        "support_source_distribution": _support_source_distribution(rows),
+        "minute_bar_quality_status_counts": _top_counts((row.get("minute_bar_quality_status") for row in rows), key="status"),
+        "stale_vwap_count": sum(1 for row in rows if row.get("vwap_stale")),
+        "diagnostic_only_due_to_support_count": len(diagnostic_items),
+        "diagnostic_only_later_rallied_count": len(rallied),
+        **reason_rallied_counts,
+    }
+
+
+def _support_missing_reason(item: dict) -> str:
+    return str((item.get("details") or {}).get("support_missing_reason") or "")
+
+
+def _support_source_distribution(rows: list[dict]) -> list[dict[str, Any]]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        presence = row.get("support_source_presence")
+        if isinstance(presence, dict):
+            for source, present in presence.items():
+                if present:
+                    counts[str(source)] = counts.get(str(source), 0) + 1
+            continue
+        for source in row.get("support_source_present") or []:
+            counts[str(source)] = counts.get(str(source), 0) + 1
+    return [{"source": source, "count": count} for source, count in sorted(counts.items(), key=lambda pair: pair[1], reverse=True)]
+
+
+def _candidate_instances_by_code_date(
+    intents: Iterable[dict],
+    reviews: Iterable[Any],
+    positions: Iterable[Any],
+    candidates: Iterable[Any],
+) -> dict[str, set[str]]:
+    grouped: dict[str, set[str]] = {}
+    for intent in intents:
+        instance_id = _payload_candidate_instance_id(intent)
+        if instance_id:
+            _add_instance(grouped, intent.get("trade_date"), intent.get("code"), instance_id)
+    for review in reviews:
+        instance_id = _review_candidate_instance_id(review)
+        if instance_id:
+            _add_instance(grouped, review.trade_date, review.code, instance_id)
+    for position in positions:
+        details = dict(position.details or {})
+        for instance_id in [details.get("candidate_instance_id"), *(details.get("candidate_instance_ids") or [])]:
+            if instance_id:
+                _add_instance(grouped, getattr(position, "trade_date", ""), getattr(position, "code", ""), str(instance_id))
+    for candidate in candidates:
+        metadata = dict(candidate.metadata or {})
+        instance_id = str(metadata.get("candidate_instance_id") or "")
+        if instance_id:
+            _add_instance(grouped, candidate.trade_date, candidate.code, instance_id)
+    return grouped
+
+
+def _single_candidate_key_by_code_date(intents: Iterable[dict], reviews: Iterable[Any], candidates: Iterable[Any]) -> dict[str, str]:
+    grouped: dict[str, set[str]] = {}
+    for intent in intents:
+        candidate_id = intent.get("candidate_id")
+        if candidate_id is not None:
+            grouped.setdefault(_code_date_key(str(intent.get("trade_date") or ""), str(intent.get("code") or "")), set()).add(f"cand_id:{intent.get('trade_date') or ''}:{candidate_id}")
+    for review in reviews:
+        if review.candidate_id is not None:
+            grouped.setdefault(_code_date_key(str(review.trade_date or ""), str(review.code or "")), set()).add(f"cand_id:{review.trade_date or ''}:{review.candidate_id}")
+    for candidate in candidates:
+        if candidate.id is not None:
+            grouped.setdefault(_code_date_key(str(candidate.trade_date or ""), str(candidate.code or "")), set()).add(f"cand_id:{candidate.trade_date or ''}:{candidate.id}")
+    return {
+        key: next(iter(values))
+        for key, values in grouped.items()
+        if key != ":" and len(values) == 1
+    }
+
+
+def _add_instance(grouped: dict[str, set[str]], trade_date: Any, code: Any, instance_id: str) -> None:
+    date_text = str(trade_date or "")
+    code_text = str(code or "")
+    if date_text and code_text and instance_id:
+        grouped.setdefault(_code_date_key(date_text, code_text), set()).add(str(instance_id))
+
+
+def _code_date_key(trade_date: str, code: str) -> str:
+    return f"{trade_date}:{code}"
+
+
+def _payload_candidate_instance_id(payload: dict | None) -> str:
+    for source in _payload_dicts(payload):
+        value = source.get("candidate_instance_id")
+        if value:
+            return str(value)
+        bridge = source.get("theme_lab_bridge")
+        if isinstance(bridge, dict) and bridge.get("candidate_instance_id"):
+            return str(bridge.get("candidate_instance_id"))
+    return ""
+
+
+def _payload_candidate_generation_seq(payload: dict | None) -> Optional[int]:
+    for source in _payload_dicts(payload):
+        value = source.get("candidate_generation_seq")
+        if value not in (None, ""):
+            return _first_int(value)
+        bridge = source.get("theme_lab_bridge")
+        if isinstance(bridge, dict) and bridge.get("candidate_generation_seq") not in (None, ""):
+            return _first_int(bridge.get("candidate_generation_seq"))
+    return None
+
+
+def _payload_dicts(payload: dict | None) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    result = [payload]
+    for key in ("metadata", "request", "details", "safety", "live_safety"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            result.append(value)
+    return result
+
+
+def _review_candidate_instance_id(review: Any) -> str:
+    return _payload_candidate_instance_id({"details": dict(getattr(review, "details", {}) or {})})
+
+
+def _review_candidate_generation_seq(review: Any) -> Optional[int]:
+    return _payload_candidate_generation_seq({"details": dict(getattr(review, "details", {}) or {})})
+
+
+def _time_window_fallback_key(payload: dict, trade_date: str, code: str) -> str:
+    source = _first_text(payload.get("source"), _nested_value(payload, "metadata", "source"), _nested_value(payload, "request", "source"))
+    strategy = _first_text(payload.get("strategy_name"), _nested_value(payload, "metadata", "strategy_name"), _nested_value(payload, "request", "strategy_name"))
+    created_at = _first_text(payload.get("created_at"), _nested_value(payload, "response", "created_at"), _nested_value(payload, "metadata", "runtime_cycle_at"), _nested_value(payload, "request", "runtime_cycle_at"))
+    if not (source and strategy and created_at):
+        return ""
+    return f"cand_window:{trade_date}:{code}:{source}:{strategy}:{created_at[:13]}"
+
+
+def _nested_value(payload: dict, key: str, nested: str) -> Any:
+    value = payload.get(key)
+    if isinstance(value, dict):
+        return value.get(nested)
+    return None
+
+
+def _best_attribution_link(links: list[AttributionLink]) -> Optional[AttributionLink]:
+    if not links:
+        return None
+    rank = {"HIGH": 3, "MEDIUM": 2, "LOW_MEDIUM": 1, "LOW": 0}
+    return sorted(links, key=lambda item: rank.get(item.link_confidence, -1), reverse=True)[0]
+
+
+def _attribution_confidence(link: Optional[AttributionLink]) -> str:
+    if link is None:
+        return "LOW"
+    if link.matched_by == "ambiguous_code_date_fallback" or link.issue == "AMBIGUOUS_CANDIDATE_LINK":
+        return "AMBIGUOUS"
+    if link.matched_by in {"candidate_instance_id", "virtual_position_id", "virtual_order_to_position"}:
+        return "HIGH"
+    if link.matched_by == "candidate_id":
+        return "MEDIUM"
+    if link.matched_by == "weak_code_date_fallback":
+        return "LOW"
+    return str(link.link_confidence or "LOW").upper()
+
+
+def _legacy_low_confidence_sample(candidate_instance_id: str, link: Optional[AttributionLink]) -> bool:
+    if candidate_instance_id:
+        return False
+    matched_by = str(link.matched_by if link else "")
+    return matched_by in {"", "weak_code_date_fallback", "code_date_time_window_source_strategy", "candidate_id"}
+
+
+def _multi_generation_code_count(items: list[dict]) -> int:
+    grouped: dict[str, set[str]] = {}
+    for item in items:
+        key = _code_date_key(str(item.get("trade_date") or ""), str(item.get("code") or ""))
+        instance_id = str(item.get("candidate_instance_id") or "")
+        if key != ":" and instance_id:
+            grouped.setdefault(key, set()).add(instance_id)
+    return sum(1 for values in grouped.values() if len(values) > 1)
+
+
+def _generation_summary(items: list[dict]) -> dict[str, Any]:
+    generations_by_code: dict[str, set[int]] = {}
+    generation_reasons: list[str] = []
+    excessive_count = 0
+    for item in items:
+        key = _code_date_key(str(item.get("trade_date") or ""), str(item.get("code") or ""))
+        seq = _first_int(item.get("candidate_generation_seq"))
+        if key != ":" and seq is not None:
+            generations_by_code.setdefault(key, set()).add(seq)
+        details = dict(item.get("details") or {})
+        reason = str(details.get("generation_reason") or details.get("candidate_generation_reason") or "")
+        if reason:
+            generation_reasons.append(reason)
+        if details.get("excessive_generation_blocked") or reason in {"same_generation_min_gap_guardrail", "same_generation_max_generation_guardrail"}:
+            excessive_count += 1
+    generation_counts = [len(values) for values in generations_by_code.values()]
+    return {
+        "avg_generation_per_code": round(sum(generation_counts) / len(generation_counts), 4) if generation_counts else None,
+        "max_generation_per_code": max(generation_counts) if generation_counts else 0,
+        "stale_re_detect_count": sum(1 for reason in generation_reasons if reason == "stale_re_detected"),
+        "theme_change_generation_count": sum(1 for reason in generation_reasons if reason == "theme_changed"),
+        "source_change_generation_count": sum(1 for reason in generation_reasons if reason == "source_changed"),
+        "strategy_change_generation_count": sum(1 for reason in generation_reasons if reason == "strategy_changed"),
+        "previous_lifecycle_closed_generation_count": sum(1 for reason in generation_reasons if reason == "previous_lifecycle_closed"),
+        "manual_reset_generation_count": sum(1 for reason in generation_reasons if reason == "manual_reset"),
+        "session_reset_generation_count": sum(1 for reason in generation_reasons if reason == "session_reset"),
+        "excessive_generation_count": excessive_count,
+    }
+
+
+def _position_context_history_summary(items: list[dict]) -> dict[str, Any]:
+    position_items = [item for item in items if item.get("virtual_position_id") is not None]
+    context_items = [item for item in position_items if int(((item.get("details") or {}).get("position_context_history_count") or 0)) > 0]
+    context_exit_details = [
+        detail
+        for item in items
+        for detail in ((item.get("details") or {}).get("context_risk_exit_details") or [])
+        if isinstance(detail, dict)
+    ]
+    confidence_by_type: dict[str, list[dict[str, Any]]] = {}
+    for decision_type in ("THEME_WEAK_EXIT", "LEADER_COLLAPSE_EXIT", "INDEX_WEAK_EXIT", "MARKET_RISK_OFF_EXIT", "BREADTH_COLLAPSE_EXIT"):
+        confidence_by_type[decision_type] = _top_counts(
+            (detail.get("exit_confidence") or "UNKNOWN" for detail in context_exit_details if detail.get("decision_type") == decision_type),
+            key="confidence",
+        )
+    data_limited_count = sum(
+        1
+        for detail in context_exit_details
+        if detail.get("context_limited_reason") == "DATA_LIMITED_CONTEXT"
+        or "DATA_LIMITED_CONTEXT" in [str(value) for value in detail.get("reason_codes") or []]
+    )
+    low_confidence_count = sum(
+        1
+        for detail in context_exit_details
+        if detail.get("context_limited_reason") == "LOW_CONFIDENCE_EXIT" or str(detail.get("exit_confidence") or "").upper() == "LOW"
+    )
+    return {
+        "positions_with_entry_context_count": sum(1 for item in position_items if (item.get("details") or {}).get("position_context_has_entry")),
+        "positions_with_holding_context_count": sum(1 for item in position_items if (item.get("details") or {}).get("position_context_has_holding")),
+        "positions_with_exit_context_count": sum(1 for item in position_items if (item.get("details") or {}).get("position_context_has_exit")),
+        "position_context_coverage_pct": _ratio(len(context_items), len(position_items)),
+        "data_limited_context_count": data_limited_count,
+        "low_confidence_exit_count": low_confidence_count,
+        "context_history_count_distribution": _top_counts(
+            ((item.get("details") or {}).get("position_context_history_count", 0) for item in position_items),
+            key="history_count",
+        ),
+        "context_risk_exit_confidence_distribution": _top_counts(
+            (detail.get("exit_confidence") or "UNKNOWN" for detail in context_exit_details),
+            key="confidence",
+        ),
+        "context_risk_exit_confidence_by_type": confidence_by_type,
+        "theme_score_delta_distribution": _top_counts(
+            (_theme_score_delta_bucket(detail.get("theme_score_delta")) for detail in context_exit_details),
+            key="bucket",
+        ),
+        "leader_count_delta_distribution": _top_counts(
+            (_leader_count_delta_bucket(detail.get("leader_count_delta")) for detail in context_exit_details),
+            key="bucket",
+        ),
+        "index_status_deterioration_count": sum(1 for detail in context_exit_details if detail.get("index_status_deterioration")),
+        "market_risk_off_exit_count": sum(1 for detail in context_exit_details if detail.get("decision_type") == "MARKET_RISK_OFF_EXIT"),
+    }
+
+
+def _is_context_risk_exit(decision_type: str, details: dict[str, Any]) -> bool:
+    return decision_type in {
+        "THEME_WEAK_EXIT",
+        "LEADER_COLLAPSE_EXIT",
+        "INDEX_WEAK_EXIT",
+        "MARKET_RISK_OFF_EXIT",
+        "BREADTH_COLLAPSE_EXIT",
+    } or bool(details.get("exit_confidence") or details.get("context_limited_reason"))
+
+
+def _theme_score_delta_bucket(value: Any) -> str:
+    parsed = _optional_float(value)
+    if parsed is None:
+        return "UNKNOWN"
+    if parsed <= -10:
+        return "<=-10"
+    if parsed <= -5:
+        return "-10..-5"
+    if parsed < 0:
+        return "-5..0"
+    return ">=0"
+
+
+def _leader_count_delta_bucket(value: Any) -> str:
+    parsed = _first_int(value)
+    if parsed is None:
+        return "UNKNOWN"
+    if parsed <= -3:
+        return "<=-3"
+    if parsed < 0:
+        return "-2..-1"
+    if parsed == 0:
+        return "0"
+    return ">=1"
+
+
+def _count_lifecycles_with_match(items: list[dict], matched_by: str) -> int:
+    count = 0
+    for item in items:
+        if item.get("matched_by") == matched_by:
+            count += 1
+            continue
+        links = ((item.get("details") or {}).get("attribution_links") or [])
+        if any(link.get("matched_by") == matched_by for link in links if isinstance(link, dict)):
+            count += 1
+    return count
 
 
 def _issue_reasons(reason_counts: dict[str, dict[str, int]], issue: str) -> list[dict[str, Any]]:
@@ -1097,6 +1739,11 @@ def _first_not_none(*values):
         if value is not None and value != "":
             return value
     return None
+
+
+def _first_text(*values) -> str:
+    value = _first_not_none(*values)
+    return str(value) if value is not None else ""
 
 
 def _first_float(*values) -> Optional[float]:
@@ -1213,16 +1860,20 @@ def _markdown_group_lines(rows: list[dict]) -> list[str]:
 
 def _markdown_quality_lines(data_quality: dict) -> list[str]:
     issues = data_quality.get("issues") or []
-    if not issues:
-        return ["- no major data quality issue"]
     output = [
         f"- Missing review: {data_quality.get('missing_review_count', 0)}",
         f"- Missing position: {data_quality.get('missing_position_count', 0)}",
         f"- Orphan entry: {data_quality.get('orphan_entry_count', 0)}",
         f"- Orphan exit: {data_quality.get('orphan_exit_count', 0)}",
         "",
+        "### Support Coverage",
+        *_markdown_support_coverage_lines(data_quality),
+        "",
         "### Data Quality Issues",
     ]
+    if not issues:
+        output.append("- no major data quality issue")
+        return output
     for item in issues:
         output.append(f"- {item.get('issue')}: {item.get('count')}")
         for reason in (item.get("reasons") or [])[:5]:
@@ -1235,3 +1886,66 @@ def _markdown_quality_lines(data_quality: dict) -> list[str]:
             )
             output.append(f"  - samples: {sample_text}")
     return output
+
+
+def _markdown_support_coverage_lines(data_quality: dict) -> list[str]:
+    coverage = dict(data_quality.get("support_coverage") or {})
+    reasons = data_quality.get("support_missing_reasons") or []
+    output = [
+        f"- sample_count: {coverage.get('sample_count', 0)}",
+        f"- recent_support_price_present: {coverage.get('recent_support_price_present_count', 0)}",
+        f"- vwap_present: {coverage.get('vwap_present_count', 0)}",
+        f"- vwap_ready: {coverage.get('vwap_ready_count', 0)}",
+        f"- minute_bar_present: {coverage.get('minute_bar_present_count', 0)}",
+        f"- support_reclaimed: {coverage.get('support_reclaimed_count', 0)}",
+    ]
+    if reasons:
+        output.append("- support_missing_reasons: " + ", ".join(f"{row.get('reason')}={row.get('count', 0)}" for row in reasons))
+    return output
+
+
+def _markdown_support_vwap_coverage_lines(summary: dict) -> list[str]:
+    if not summary:
+        return ["- no support coverage samples"]
+    output = [
+        f"- support_metadata_coverage_pct: {_pct(summary.get('support_metadata_coverage_pct'))}",
+        f"- vwap_metadata_coverage_pct: {_pct(summary.get('vwap_metadata_coverage_pct'))}",
+        f"- minute_bar_coverage_pct: {_pct(summary.get('minute_bar_coverage_pct'))}",
+        f"- stale_vwap_count: {summary.get('stale_vwap_count', 0)}",
+        f"- diagnostic_only_due_to_support_count: {summary.get('diagnostic_only_due_to_support_count', 0)}",
+        f"- diagnostic_only_later_rallied_count: {summary.get('diagnostic_only_later_rallied_count', 0)}",
+        f"- SUPPORT_STRUCTURALLY_MISSING_AND_RALLIED: {summary.get('SUPPORT_STRUCTURALLY_MISSING_AND_RALLIED', 0)}",
+        f"- SUPPORT_DATA_MISSING_AND_RALLIED: {summary.get('SUPPORT_DATA_MISSING_AND_RALLIED', 0)}",
+        f"- SUPPORT_NOT_READY_AND_RALLIED: {summary.get('SUPPORT_NOT_READY_AND_RALLIED', 0)}",
+        "### Support Missing Reasons",
+        *_markdown_count_lines(summary.get("support_missing_count_by_reason", []), "reason"),
+        "### Support Source Distribution",
+        *_markdown_count_lines(summary.get("support_source_distribution", []), "source"),
+        "### Minute Bar Quality",
+        *_markdown_count_lines(summary.get("minute_bar_quality_status_counts", []), "status"),
+    ]
+    return output
+
+
+def _markdown_context_confidence_lines(by_type: dict) -> list[str]:
+    if not by_type:
+        return ["- none"]
+    output: list[str] = []
+    for decision_type, rows in by_type.items():
+        if not rows:
+            output.append(f"- {decision_type}: none")
+            continue
+        values = ", ".join(f"{row.get('confidence')}={row.get('count', 0)}" for row in rows)
+        output.append(f"- {decision_type}: {values}")
+    return output
+
+
+def _markdown_prune_lines(summary: dict) -> list[str]:
+    if not summary:
+        return ["- no prune run recorded"]
+    return [
+        f"- pruned_context_history_rows: {summary.get('pruned_context_history_rows', 0)}",
+        f"- retained_context_history_rows: {summary.get('retained_context_history_rows', 0)}",
+        f"- oldest_retained_context_at: {summary.get('oldest_retained_context_at', '')}",
+        f"- prune_error_count: {summary.get('prune_error_count', 0)}",
+    ]

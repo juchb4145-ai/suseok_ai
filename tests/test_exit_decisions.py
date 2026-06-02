@@ -6,12 +6,14 @@ from trading.strategy.exit import (
     DATA_INSUFFICIENT_EXIT_BASIS,
     INDEX_WEAK_EXIT,
     LEADER_COLLAPSE_EXIT,
+    MARKET_RISK_OFF_EXIT,
     SUPPORT_LOSS,
     TAKE_PROFIT,
     THEME_WEAK_EXIT,
     TIME_EXIT,
     TRAILING_STOP,
     ExitContextRiskSnapshot,
+    ContextRiskExitConfirmationConfig,
     ExitDecisionEngine,
     VirtualPositionService,
 )
@@ -21,6 +23,7 @@ from trading.strategy.models import (
     ExitDecision,
     FillPolicy,
     IndicatorSnapshot,
+    PositionContextSnapshot,
     StrategyProfile,
     VirtualOrder,
     VirtualOrderStatus,
@@ -214,7 +217,7 @@ def test_context_risk_flag_off_preserves_existing_exit_result():
     assert decisions == []
 
 
-def test_theme_weak_context_risk_creates_full_exit_for_losing_position():
+def test_theme_weak_context_without_history_is_limited_not_forced_exit():
     builder = candle_builder((datetime(2026, 5, 29, 9, 1), 10_000, 10_100, 9_850, 9_900))
     pos = position()
     context = ExitContextRiskSnapshot(
@@ -233,13 +236,108 @@ def test_theme_weak_context_risk_creates_full_exit_for_losing_position():
         risk_reason_codes=("THEME_WEAK",),
     )
 
+    engine = ExitDecisionEngine()
+    decisions = engine.evaluate(pos, snapshot(price=9_900), builder, [], datetime(2026, 5, 29, 9, 2), context_risk=context)
+
+    assert decisions == []
+    assert engine.last_details["context_risk"]["reason_codes"][-1] == "DATA_LIMITED_CONTEXT"
+    assert engine.last_details["context_risk"]["required_confirmation_cycles"] == 2
+    assert engine.last_details["context_risk"]["observed_confirmation_cycles"] == 0
+    assert engine.last_details["context_risk"]["confirmation_passed"] is False
+
+
+def test_theme_weak_confirmed_context_risk_creates_full_exit_for_losing_position():
+    builder = candle_builder((datetime(2026, 5, 29, 9, 1), 10_000, 10_100, 9_850, 9_900))
+    pos = position()
+    context = ExitContextRiskSnapshot(
+        enabled=True,
+        theme_id="robot",
+        theme_name="robotics",
+        theme_status_before="WEAK_THEME",
+        theme_status_after="WEAK_THEME",
+        theme_score=12.0,
+        previous_theme_score=20.0,
+        theme_score_delta=-8.0,
+        theme_status_transition="WEAK_THEME->WEAK_THEME",
+        leader_symbol="222222",
+        leader_return_pct=-1.0,
+        index_market="KOSDAQ",
+        index_return_pct=-0.4,
+        breadth_status="LOW_BREADTH",
+        current_return_pct=-1.0,
+        risk_reason_codes=("THEME_WEAK",),
+        context_history_available=True,
+        context_history_count=2,
+        theme_weak_consecutive_count=2,
+    )
+
     decisions = ExitDecisionEngine().evaluate(pos, snapshot(price=9_900), builder, [], datetime(2026, 5, 29, 9, 2), context_risk=context)
 
     assert [decision.decision_type for decision in decisions] == [THEME_WEAK_EXIT]
-    assert decisions[0].details["theme_status_before"] == "LEADING_THEME"
+    assert decisions[0].details["theme_status_before"] == "WEAK_THEME"
     assert decisions[0].details["theme_status_after"] == "WEAK_THEME"
+    assert decisions[0].details["theme_score_before"] == 20.0
+    assert decisions[0].details["theme_score_current"] == 12.0
+    assert decisions[0].details["theme_score_delta"] == -8.0
+    assert decisions[0].details["context_history_count"] == 2
+    assert decisions[0].details["exit_confidence"] == "HIGH"
+    assert decisions[0].details["required_confirmation_cycles"] == 2
+    assert decisions[0].details["observed_confirmation_cycles"] == 2
+    assert decisions[0].details["confirmation_passed"] is True
     assert decisions[0].details["position_closed"] is True
     assert pos.close_reason == THEME_WEAK_EXIT
+
+
+def test_theme_weak_one_cycle_is_low_confidence_under_default_confirmation():
+    builder = candle_builder((datetime(2026, 5, 29, 9, 1), 10_000, 10_100, 9_850, 9_900))
+    context = ExitContextRiskSnapshot(
+        enabled=True,
+        theme_status_after="WEAK_THEME",
+        current_return_pct=-1.0,
+        risk_reason_codes=("THEME_WEAK",),
+        context_history_available=True,
+        context_history_count=1,
+        theme_weak_consecutive_count=1,
+    )
+
+    engine = ExitDecisionEngine()
+    decisions = engine.evaluate(position(), snapshot(price=9_900), builder, [], datetime(2026, 5, 29, 9, 2), context_risk=context)
+
+    assert decisions == []
+    assert engine.last_details["context_risk"]["context_limited_reason"] == "LOW_CONFIDENCE_EXIT"
+    assert engine.last_details["context_risk"]["required_confirmation_cycles"] == 2
+    assert engine.last_details["context_risk"]["observed_confirmation_cycles"] == 1
+
+
+def test_theme_weak_config_one_cycle_creates_exit(monkeypatch):
+    monkeypatch.setenv("TRADING_THEME_WEAK_CONFIRMATION_CYCLES", "1")
+    builder = candle_builder((datetime(2026, 5, 29, 9, 1), 10_000, 10_100, 9_850, 9_900))
+    context = ExitContextRiskSnapshot(
+        enabled=True,
+        theme_status_after="WEAK_THEME",
+        current_return_pct=-1.0,
+        risk_reason_codes=("THEME_WEAK",),
+        context_history_available=True,
+        context_history_count=1,
+        theme_weak_consecutive_count=1,
+    )
+
+    decisions = ExitDecisionEngine().evaluate(position(), snapshot(price=9_900), builder, [], datetime(2026, 5, 29, 9, 2), context_risk=context)
+
+    assert [decision.decision_type for decision in decisions] == [THEME_WEAK_EXIT]
+    assert decisions[0].details["required_confirmation_cycles"] == 1
+    assert decisions[0].details["observed_confirmation_cycles"] == 1
+    assert decisions[0].details["config_source"] == "env"
+
+
+def test_invalid_confirmation_config_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("TRADING_THEME_WEAK_CONFIRMATION_CYCLES", "9")
+
+    config = ContextRiskExitConfirmationConfig.from_env()
+
+    assert config.theme_weak_confirmation_cycles == 2
+    assert config.config_source == "env_invalid_fallback"
+    assert config.fallback_reasons
 
 
 def test_leader_collapse_context_risk_creates_exit():
@@ -276,6 +374,68 @@ def test_kosdaq_risk_off_context_risk_creates_index_weak_exit():
     assert decisions[0].details["index_market"] == "KOSDAQ"
 
 
+def test_market_risk_off_priority_preserves_secondary_reasons():
+    builder = candle_builder((datetime(2026, 5, 29, 9, 1), 10_000, 10_100, 9_850, 9_900))
+    context = ExitContextRiskSnapshot(
+        enabled=True,
+        theme_status_after="WEAK_THEME",
+        index_market="KOSDAQ",
+        index_status="RISK_OFF",
+        market_status="RISK_OFF",
+        index_return_pct=-2.8,
+        current_return_pct=-1.0,
+        risk_reason_codes=("INDEX_WEAK", "THEME_WEAK", "MARKET_RISK_OFF"),
+    )
+
+    decisions = ExitDecisionEngine().evaluate(position(), snapshot(price=9_900), builder, [], datetime(2026, 5, 29, 9, 2), context_risk=context)
+
+    assert [decision.decision_type for decision in decisions] == [MARKET_RISK_OFF_EXIT]
+    assert decisions[0].details["primary_exit_reason"] == MARKET_RISK_OFF_EXIT
+    assert "INDEX_WEAK" in decisions[0].details["secondary_exit_reasons"]
+    assert "THEME_WEAK" in decisions[0].details["secondary_exit_reasons"]
+    assert decisions[0].details["required_confirmation_cycles"] == 0
+    assert decisions[0].details["confirmation_passed"] is True
+
+
+def test_position_context_history_persists_candidate_instance_id(tmp_path):
+    db = TradingDatabase(str(tmp_path / "context.sqlite3"))
+    try:
+        saved = db.save_position_context_snapshot(
+            PositionContextSnapshot(
+                position_id=1,
+                candidate_id=10,
+                candidate_instance_id="ci-123",
+                code="111111",
+                trade_date="2026-05-29",
+                captured_at="2026-05-29T09:00:30",
+                capture_reason="ENTRY",
+                theme_id="robot",
+                theme_name="Robotics",
+                theme_score=80.0,
+                theme_status="LEADING_THEME",
+                leader_count=2,
+                strong_count=5,
+                breadth_status="OK",
+                leader_code="222222",
+                leader_return_pct=4.2,
+                leader_vwap_status="OK",
+                index_market="KOSDAQ",
+                index_status="",
+                index_return_pct=0.2,
+                market_status="EXPANSION",
+                risk_reason_codes=["ENTRY"],
+            )
+        )
+        history = db.list_position_context_history(1)
+    finally:
+        db.close()
+
+    assert saved.id is not None
+    assert len(history) == 1
+    assert history[0].capture_reason == "ENTRY"
+    assert history[0].candidate_instance_id == "ci-123"
+
+
 def test_take_profit_and_theme_weak_same_candle_are_sequence_ambiguous():
     builder = candle_builder((datetime(2026, 5, 29, 9, 1), 10_000, 10_600, 9_900, 10_550))
     context = ExitContextRiskSnapshot(
@@ -284,6 +444,9 @@ def test_take_profit_and_theme_weak_same_candle_are_sequence_ambiguous():
         current_return_pct=5.5,
         stock_role="LATE_LAGGARD",
         risk_reason_codes=("THEME_WEAK",),
+        context_history_available=True,
+        context_history_count=2,
+        theme_weak_consecutive_count=2,
     )
 
     decisions = ExitDecisionEngine().evaluate(position(), snapshot(price=10_550), builder, [], datetime(2026, 5, 29, 9, 2), context_risk=context)

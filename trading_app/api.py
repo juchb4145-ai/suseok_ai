@@ -1756,6 +1756,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         },
         "top_false_positive_types": dry_run_performance_report.get("false_signal_summary", {}).get("top_false_positive_types", []),
         "top_false_negative_types": dry_run_performance_report.get("false_signal_summary", {}).get("top_false_negative_types", []),
+        "support_vwap_coverage": dry_run_performance_report.get("summary", {}).get("data_quality", {}).get("support_vwap_coverage", {}),
         "top_reject_reasons_with_rally": dry_run_performance_report.get("false_signal_summary", {}).get(
             "top_live_reject_reasons_with_rally",
             [],
@@ -1897,8 +1898,63 @@ def build_candidates_snapshot(
                 for reason, count in block_reasons.most_common(10)
             ],
             "reason_summary": reason_summary(items),
+            "support_coverage_summary": _candidate_support_coverage_summary(candidates),
         },
         "items": items,
+    }
+
+
+def _candidate_support_coverage_summary(candidates) -> dict[str, Any]:
+    rows = []
+    reasons = Counter()
+    minute_status = Counter()
+    source_counts = Counter()
+    for candidate in candidates:
+        metadata = dict(candidate.metadata or {})
+        gate_record = _best_gate_record(metadata)
+        coverage = dict(
+            _first_present(
+                metadata.get("support_coverage"),
+                gate_record.get("support_coverage"),
+                (gate_record.get("theme_lab_bridge") or {}).get("support_coverage") if isinstance(gate_record.get("theme_lab_bridge"), dict) else None,
+                {},
+            )
+            or {}
+        )
+        if coverage:
+            rows.append(coverage)
+        reason = str(
+            _first_present(
+                metadata.get("support_missing_reason"),
+                metadata.get("support_taxonomy"),
+                gate_record.get("support_missing_reason"),
+                gate_record.get("support_taxonomy"),
+            )
+            or ""
+        )
+        if reason:
+            reasons[reason] += 1
+        status = str(coverage.get("minute_bar_quality_status") or "")
+        if status:
+            minute_status[status] += 1
+        presence = coverage.get("support_source_presence")
+        if isinstance(presence, dict):
+            for source, present in presence.items():
+                if present:
+                    source_counts[str(source)] += 1
+    total = len(rows)
+    return {
+        "sample_count": total,
+        "support_metadata_coverage_pct": _ratio(
+            sum(1 for row in rows if row.get("support_source_present_count", 0) or row.get("support_candidate_count", 0)),
+            total,
+        ),
+        "vwap_metadata_coverage_pct": _ratio(sum(1 for row in rows if row.get("vwap_present")), total),
+        "minute_bar_coverage_pct": _ratio(sum(1 for row in rows if row.get("minute_bar_present")), total),
+        "stale_vwap_count": sum(1 for row in rows if row.get("vwap_stale")),
+        "support_missing_count_by_reason": [{"reason": key, "count": value} for key, value in reasons.most_common(10)],
+        "support_source_distribution": [{"source": key, "count": value} for key, value in source_counts.most_common(10)],
+        "minute_bar_quality_status_counts": [{"status": key, "count": value} for key, value in minute_status.most_common(10)],
     }
 
 
@@ -2916,6 +2972,12 @@ def _number(value: Any) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _ratio(numerator: int, denominator: int) -> Optional[float]:
+    if denominator <= 0:
+        return None
+    return round(float(numerator) / float(denominator), 4)
 
 
 def _first_present(*values: Any) -> Any:

@@ -66,7 +66,9 @@ def test_ready_good_pullback_creates_dry_run_intent_without_gateway_command(tmp_
     assert len(db.list_virtual_orders(candidate.id)) == 1
     assert len(intents) == 1
     assert intents[0]["source"] == "themelab_flow"
-    assert intents[0]["idempotency_key"] == f"themelab_flow:2026-06-01:000001:{candidate.id}:entry:1"
+    assert intents[0]["idempotency_key"] == f"themelab_flow:2026-06-01:000001:{candidate.metadata['candidate_instance_id']}:entry:1"
+    assert intents[0]["metadata"]["candidate_instance_id"] == candidate.metadata["candidate_instance_id"]
+    assert intents[0]["metadata"]["decision_cycle_id"].startswith("themelab_flow:2026-06-01:")
     assert intents[0]["metadata"]["price_location_status"] == "GOOD_PULLBACK"
     assert intents[0]["metadata"]["support_price"] == 9950
     assert intents[0]["metadata"]["limit_price"] > 0
@@ -302,7 +304,16 @@ def test_theme_weak_blocks_without_intent(tmp_path):
 @pytest.mark.parametrize(
     ("metadata", "expected_reason"),
     [
-        ({"prev_close": 10000}, "support_missing"),
+        ({"prev_close": 10000}, "SUPPORT_DATA_MISSING"),
+        (
+            {
+                "prev_close": 10000,
+                "vwap": 9950,
+                "vwap_ready": True,
+                "vwap_stale": True,
+            },
+            "SUPPORT_STALE_VWAP",
+        ),
         (
             {
                 "prev_close": 10000,
@@ -331,9 +342,10 @@ def test_entry_plan_diagnostic_only_blocks_intent_for_missing_support_or_chase(t
 
     candidate = db.load_candidate("2026-06-01", "000001")
     plans = db.list_entry_plans(candidate.id)
-    if expected_reason == "support_missing":
+    if expected_reason in {"SUPPORT_DATA_MISSING", "SUPPORT_STALE_VWAP"}:
         assert plans == []
         assert candidate.metadata["gate_results_by_theme"]["ai"]["sub_status"] == "WAIT_DATA"
+        assert expected_reason in candidate.metadata["gate_results_by_theme"]["ai"]["reason_codes"]
     else:
         assert plans[0].cancel_condition["diagnostic_only"] is True
         assert plans[0].cancel_condition["reason"] == expected_reason
@@ -401,6 +413,33 @@ def test_legacy_mode_ignores_theme_lab_bridge(tmp_path):
     runtime.cycle(NOW + timedelta(seconds=3))
 
     assert db.list_candidates("2026-06-01") == []
+
+
+def test_same_code_theme_change_creates_new_candidate_instance_generation(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+    first = db.load_candidate("2026-06-01", "000001")
+    first_instance = first.metadata["candidate_instance_id"]
+
+    runtime.theme_lab_pipeline.result = _flow_result(
+        LabGateStatus.READY,
+        PriceLocationStatus.GOOD_PULLBACK,
+        theme_id="robotics",
+        theme_name="Robotics",
+    )
+    runtime.cycle(NOW + timedelta(minutes=25))
+    second = db.load_candidate("2026-06-01", "000001")
+
+    assert second.id == first.id
+    assert second.metadata["candidate_instance_id"] != first_instance
+    assert second.metadata["candidate_generation_seq"] == 2
+    assert second.metadata["candidate_generation_reason"] == "theme_changed"
 
 
 class StaticThemeLabPipeline:
@@ -536,11 +575,13 @@ def _flow_result(
     reasons: tuple[str, ...] = (),
     theme_status: ThemeLabThemeStatus = ThemeLabThemeStatus.LEADING_THEME,
     multiplier: float = 1.0,
+    theme_id: str = "ai",
+    theme_name: str = "AI",
 ) -> ThemeLabFlowResult:
     theme = ThemeConditionSnapshot(
         calculated_at=NOW.isoformat(),
-        theme_id="ai",
-        theme_name="AI",
+        theme_id=theme_id,
+        theme_name=theme_name,
         raw_total_members=1,
         eligible_total_members=1,
         alive_count=1,
@@ -556,8 +597,8 @@ def _flow_result(
         calculated_at=NOW.isoformat(),
         symbol="000001",
         name="leader",
-        themes=("ai",),
-        primary_theme="ai",
+        themes=(theme_id,),
+        primary_theme=theme_id,
         return_pct=5.0,
         turnover_krw=100_000_000,
         condition_level=3,

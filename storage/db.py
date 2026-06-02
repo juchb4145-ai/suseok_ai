@@ -16,6 +16,7 @@ from trading.strategy.models import (
     EntryPlan,
     FillPolicy,
     IndicatorSnapshot,
+    PositionContextSnapshot,
     ReviewFinalStatus,
     StrategyProfile,
     ExitDecision,
@@ -379,6 +380,44 @@ class TradingDatabase:
                 reason_codes_json TEXT NOT NULL DEFAULT '[]',
                 details_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS position_context_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id INTEGER,
+                candidate_id INTEGER,
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                capture_reason TEXT NOT NULL DEFAULT '',
+                theme_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                theme_score REAL,
+                theme_status TEXT NOT NULL DEFAULT '',
+                leader_count INTEGER,
+                strong_count INTEGER,
+                breadth_status TEXT NOT NULL DEFAULT '',
+                leader_code TEXT NOT NULL DEFAULT '',
+                leader_return_pct REAL,
+                leader_vwap_status TEXT NOT NULL DEFAULT '',
+                leader_support_broken INTEGER NOT NULL DEFAULT 0,
+                index_market TEXT NOT NULL DEFAULT '',
+                index_status TEXT NOT NULL DEFAULT '',
+                index_return_pct REAL,
+                market_status TEXT NOT NULL DEFAULT '',
+                market_risk_status TEXT NOT NULL DEFAULT '',
+                risk_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS position_context_history_prune_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                cutoff_at TEXT NOT NULL DEFAULT '',
+                pruned_context_history_rows INTEGER NOT NULL DEFAULT 0,
+                retained_context_history_rows INTEGER NOT NULL DEFAULT 0,
+                oldest_retained_context_at TEXT NOT NULL DEFAULT '',
+                prune_error_count INTEGER NOT NULL DEFAULT 0,
+                details_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS trade_reviews (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -790,6 +829,16 @@ class TradingDatabase:
                 ON dry_run_threshold_ab_candidates(category);
             CREATE INDEX IF NOT EXISTS idx_dry_run_threshold_ab_candidates_grade
                 ON dry_run_threshold_ab_candidates(recommendation_grade);
+            """
+        )
+        self.conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_position_context_history_position
+                ON position_context_history(position_id, captured_at, id);
+            CREATE INDEX IF NOT EXISTS idx_position_context_history_trade_date
+                ON position_context_history(trade_date, captured_at);
+            CREATE INDEX IF NOT EXISTS idx_position_context_history_captured_at
+                ON position_context_history(captured_at);
             """
         )
         self._ensure_column("indicator_snapshots", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
@@ -2242,6 +2291,184 @@ class TradingDatabase:
             saved = self._save_virtual_position_no_commit(position)
         return saved
 
+    def save_position_context_snapshot(self, snapshot: PositionContextSnapshot) -> PositionContextSnapshot:
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO position_context_history(
+                    position_id, candidate_id, candidate_instance_id, code, trade_date,
+                    captured_at, capture_reason, theme_id, theme_name, theme_score,
+                    theme_status, leader_count, strong_count, breadth_status,
+                    leader_code, leader_return_pct, leader_vwap_status, leader_support_broken,
+                    index_market, index_status, index_return_pct, market_status,
+                    market_risk_status, risk_reason_codes_json, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                self._position_context_params(snapshot),
+            )
+        row = self.conn.execute("SELECT * FROM position_context_history WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return self._row_to_position_context_snapshot(row)
+
+    def list_position_context_history(self, position_id: int, *, limit: int = 100) -> list[PositionContextSnapshot]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM position_context_history
+            WHERE position_id = ?
+            ORDER BY captured_at ASC, id ASC
+            LIMIT ?
+            """,
+            (position_id, int(limit or 100)),
+        ).fetchall()
+        return [self._row_to_position_context_snapshot(row) for row in rows]
+
+    def latest_position_context_snapshot(
+        self,
+        position_id: int,
+        *,
+        before_at: str = "",
+        capture_reason: str = "",
+    ) -> Optional[PositionContextSnapshot]:
+        clauses = ["position_id = ?"]
+        params: list[object] = [position_id]
+        if before_at:
+            clauses.append("captured_at < ?")
+            params.append(before_at)
+        if capture_reason:
+            clauses.append("capture_reason = ?")
+            params.append(capture_reason)
+        row = self.conn.execute(
+            f"""
+            SELECT * FROM position_context_history
+            WHERE {' AND '.join(clauses)}
+            ORDER BY captured_at DESC, id DESC
+            LIMIT 1
+            """,
+            tuple(params),
+        ).fetchone()
+        return self._row_to_position_context_snapshot(row) if row else None
+
+    def list_position_context_history_for_analysis(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        position_ids: Optional[Iterable[int]] = None,
+        limit: int = 10000,
+    ) -> list[PositionContextSnapshot]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(trade_date)
+        ids = [int(value) for value in (position_ids or []) if value is not None]
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            clauses.append(f"position_id IN ({placeholders})")
+            params.extend(ids)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM position_context_history
+            {where}
+            ORDER BY captured_at ASC, id ASC
+            LIMIT ?
+            """,
+            tuple(params + [int(limit or 10000)]),
+        ).fetchall()
+        return [self._row_to_position_context_snapshot(row) for row in rows]
+
+    def prune_position_context_history(
+        self,
+        *,
+        cutoff_at: str,
+        batch_size: int = 1000,
+        created_at: str = "",
+        details: Optional[dict] = None,
+    ) -> dict:
+        pruned = 0
+        error_count = 0
+        try:
+            with self.conn:
+                cursor = self.conn.execute(
+                    """
+                    DELETE FROM position_context_history
+                    WHERE id IN (
+                        SELECT id FROM position_context_history
+                        WHERE captured_at < ?
+                        ORDER BY captured_at ASC, id ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (cutoff_at, max(1, int(batch_size or 1000))),
+                )
+                pruned = int(cursor.rowcount if cursor.rowcount is not None else 0)
+        except Exception:
+            error_count = 1
+        retained_row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS retained_count, MIN(captured_at) AS oldest_retained
+            FROM position_context_history
+            """
+        ).fetchone()
+        summary = {
+            "created_at": created_at or "",
+            "cutoff_at": cutoff_at,
+            "pruned_context_history_rows": pruned,
+            "retained_context_history_rows": int(retained_row["retained_count"] or 0) if retained_row else 0,
+            "oldest_retained_context_at": str(retained_row["oldest_retained"] or "") if retained_row else "",
+            "prune_error_count": error_count,
+        }
+        self.save_position_context_prune_run({**summary, "details": dict(details or {})})
+        return summary
+
+    def save_position_context_prune_run(self, summary: dict) -> dict:
+        payload = dict(summary or {})
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO position_context_history_prune_runs(
+                    created_at, cutoff_at, pruned_context_history_rows,
+                    retained_context_history_rows, oldest_retained_context_at,
+                    prune_error_count, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(payload.get("created_at") or ""),
+                    str(payload.get("cutoff_at") or ""),
+                    int(payload.get("pruned_context_history_rows") or 0),
+                    int(payload.get("retained_context_history_rows") or 0),
+                    str(payload.get("oldest_retained_context_at") or ""),
+                    int(payload.get("prune_error_count") or 0),
+                    json.dumps(payload.get("details") or {}, ensure_ascii=False, sort_keys=True, default=str),
+                ),
+            )
+        return {**payload, "id": cursor.lastrowid}
+
+    def latest_position_context_prune_summary(self) -> dict:
+        row = self.conn.execute(
+            """
+            SELECT * FROM position_context_history_prune_runs
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return {
+                "pruned_context_history_rows": 0,
+                "retained_context_history_rows": 0,
+                "oldest_retained_context_at": "",
+                "prune_error_count": 0,
+            }
+        return {
+            "id": int(row["id"]),
+            "created_at": row["created_at"],
+            "cutoff_at": row["cutoff_at"],
+            "pruned_context_history_rows": int(row["pruned_context_history_rows"] or 0),
+            "retained_context_history_rows": int(row["retained_context_history_rows"] or 0),
+            "oldest_retained_context_at": row["oldest_retained_context_at"],
+            "prune_error_count": int(row["prune_error_count"] or 0),
+            "details": dict(json.loads(row["details_json"] or "{}")),
+        }
+
     def load_open_virtual_position(self, candidate_id: int) -> Optional[VirtualPosition]:
         row = self.conn.execute(
             """
@@ -2652,6 +2879,36 @@ class TradingDatabase:
         row = self.conn.execute("SELECT * FROM exit_decisions WHERE id = ?", (cursor.lastrowid,)).fetchone()
         return self._row_to_exit_decision(row)
 
+    @staticmethod
+    def _position_context_params(snapshot: PositionContextSnapshot) -> tuple:
+        return (
+            snapshot.position_id,
+            snapshot.candidate_id,
+            snapshot.candidate_instance_id,
+            snapshot.code,
+            snapshot.trade_date,
+            snapshot.captured_at,
+            snapshot.capture_reason,
+            snapshot.theme_id,
+            snapshot.theme_name,
+            snapshot.theme_score,
+            snapshot.theme_status,
+            snapshot.leader_count,
+            snapshot.strong_count,
+            snapshot.breadth_status,
+            snapshot.leader_code,
+            snapshot.leader_return_pct,
+            snapshot.leader_vwap_status,
+            int(snapshot.leader_support_broken),
+            snapshot.index_market,
+            snapshot.index_status,
+            snapshot.index_return_pct,
+            snapshot.market_status,
+            snapshot.market_risk_status,
+            json.dumps(snapshot.risk_reason_codes, ensure_ascii=False),
+            json.dumps(snapshot.metadata, ensure_ascii=False),
+        )
+
     def _save_trade_review_no_commit(self, review: TradeReview) -> TradeReview:
         if not review.trade_date:
             review.trade_date = ""
@@ -2991,6 +3248,37 @@ class TradingDatabase:
             reason_codes=list(json.loads(row["reason_codes_json"])),
             details=dict(json.loads(row["details_json"])),
             created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _row_to_position_context_snapshot(row: sqlite3.Row) -> PositionContextSnapshot:
+        return PositionContextSnapshot(
+            id=int(row["id"]),
+            position_id=int(row["position_id"]) if row["position_id"] is not None else None,
+            candidate_id=int(row["candidate_id"]) if row["candidate_id"] is not None else None,
+            candidate_instance_id=row["candidate_instance_id"],
+            code=row["code"],
+            trade_date=row["trade_date"],
+            captured_at=row["captured_at"],
+            capture_reason=row["capture_reason"],
+            theme_id=row["theme_id"],
+            theme_name=row["theme_name"],
+            theme_score=float(row["theme_score"]) if row["theme_score"] is not None else None,
+            theme_status=row["theme_status"],
+            leader_count=int(row["leader_count"]) if row["leader_count"] is not None else None,
+            strong_count=int(row["strong_count"]) if row["strong_count"] is not None else None,
+            breadth_status=row["breadth_status"],
+            leader_code=row["leader_code"],
+            leader_return_pct=float(row["leader_return_pct"]) if row["leader_return_pct"] is not None else None,
+            leader_vwap_status=row["leader_vwap_status"],
+            leader_support_broken=bool(row["leader_support_broken"]),
+            index_market=row["index_market"],
+            index_status=row["index_status"],
+            index_return_pct=float(row["index_return_pct"]) if row["index_return_pct"] is not None else None,
+            market_status=row["market_status"],
+            market_risk_status=row["market_risk_status"],
+            risk_reason_codes=list(json.loads(row["risk_reason_codes_json"] or "[]")),
+            metadata=dict(json.loads(row["metadata_json"] or "{}")),
         )
 
     @staticmethod

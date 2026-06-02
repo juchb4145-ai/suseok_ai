@@ -25,6 +25,7 @@ GRADE_LABELS_KO.update(
     {
         "OBSERVE_CANDIDATE": "관찰 후보",
         "DATA_INSUFFICIENT_FOR_THRESHOLD_CHANGE": "기준 변경 표본 부족",
+        "DATA_INSUFFICIENT_ATTRIBUTION_CONFIDENCE": "귀속 신뢰도 부족",
         "OPERATIONAL_REVIEW_ONLY": "운영 검토 전용",
     }
 )
@@ -50,6 +51,7 @@ class ThresholdABConfig:
     max_fn_increase: int = 1
     max_opportunity_loss_increase: int = 1
     confidence_min: float = 0.5
+    min_eligible_sample_ratio: float = 0.8
     export_root: Path = REPORT_ROOT
     enable_apply: bool = False
 
@@ -132,8 +134,11 @@ class DryRunThresholdABAnalyzer:
         include_risky: bool = True,
     ) -> dict[str, Any]:
         full_items = list(performance_report.get("all_items") or performance_report.get("items") or [])
-        candidates = self.build_candidates(performance_report)
-        results = [self.simulate_candidate(full_items, candidate).to_dict() for candidate in candidates]
+        attribution_quality = _attribution_quality(full_items)
+        eligible_items = _eligible_attribution_items(full_items)
+        eligible_report = {**performance_report, "items": eligible_items, "all_items": eligible_items}
+        candidates = self.build_candidates(eligible_report)
+        results = [self.simulate_candidate(eligible_items, candidate, total_items=full_items).to_dict() for candidate in candidates]
         result_by_id = {str(result.get("candidate_id") or ""): result for result in results}
         recommendations = self._build_recommendations(candidates, results, include_risky=include_risky)
         scenarios = [
@@ -147,7 +152,7 @@ class DryRunThresholdABAnalyzer:
                 filters=dict(filters or {}),
             ).to_dict()
         ]
-        summary = self._summary(results, candidates)
+        summary = {**self._summary(results, candidates), "attribution_quality": attribution_quality}
         start = max(0, int(offset or 0))
         end = start + max(1, int(limit or 100))
         visible_candidates = []
@@ -164,6 +169,13 @@ class DryRunThresholdABAnalyzer:
                     "recommendation_grade": recommendation.get("grade", ""),
                     "expected_net_benefit_score": recommendation.get("expected_net_benefit_score", 0),
                     "sample_count": recommendation.get("sample_count", 0),
+                    "total_samples": recommendation.get("total_samples", 0),
+                    "eligible_samples": recommendation.get("eligible_samples", 0),
+                    "excluded_legacy_samples": recommendation.get("excluded_legacy_samples", 0),
+                    "excluded_low_confidence_samples": recommendation.get("excluded_low_confidence_samples", 0),
+                    "excluded_ambiguous_samples": recommendation.get("excluded_ambiguous_samples", 0),
+                    "eligible_sample_ratio": recommendation.get("eligible_sample_ratio", 0),
+                    "attribution_confidence_distribution": recommendation.get("attribution_confidence_distribution", []),
                     "sample_trade_days": recommendation.get("sample_trade_days", 0),
                     "completed_lifecycle_count": recommendation.get("completed_lifecycle_count", 0),
                     "entry_intent_count": recommendation.get("entry_intent_count", 0),
@@ -217,7 +229,9 @@ class DryRunThresholdABAnalyzer:
             unique.setdefault(candidate.candidate_id, candidate)
         return list(unique.values())
 
-    def simulate_candidate(self, report_items: list[dict], candidate: ThresholdCandidate) -> ThresholdABResult:
+    def simulate_candidate(self, report_items: list[dict], candidate: ThresholdCandidate, *, total_items: Optional[list[dict]] = None) -> ThresholdABResult:
+        total_items = list(total_items or report_items)
+        attribution_quality = _attribution_quality(total_items, candidate=candidate)
         baseline_selected = [item for item in report_items if _baseline_selected(item)]
         baseline_metrics = _metrics(baseline_selected)
         affected = [item for item in report_items if _candidate_matches(candidate, item)]
@@ -277,7 +291,7 @@ class DryRunThresholdABAnalyzer:
             net_benefit=net_benefit,
             config=self.config,
         )
-        guardrail = _sample_guardrail(affected, candidate, self.config)
+        guardrail = _sample_guardrail(affected, candidate, self.config, attribution_quality=attribution_quality)
         grade = _guardrail_grade(raw_grade, guardrail, candidate)
         warnings = []
         if guardrail["blocked_by_guardrail_reason"]:
@@ -293,6 +307,7 @@ class DryRunThresholdABAnalyzer:
             "expected_net_benefit_score": net_benefit,
             "confidence": confidence,
             "sample_count": sample_count,
+            **attribution_quality,
             **guardrail,
             "reason_ko": candidate.reason_ko,
             "apply_enabled": False,
@@ -326,6 +341,12 @@ class DryRunThresholdABAnalyzer:
             "candidate_value",
             "recommendation_grade",
             "sample_count",
+            "total_samples",
+            "eligible_samples",
+            "excluded_legacy_samples",
+            "excluded_low_confidence_samples",
+            "excluded_ambiguous_samples",
+            "eligible_sample_ratio",
             "sample_trade_days",
             "completed_lifecycle_count",
             "entry_intent_count",
@@ -362,6 +383,12 @@ class DryRunThresholdABAnalyzer:
                         "candidate_value": candidate.get("candidate_value", ""),
                         "recommendation_grade": recommendation.get("grade", ""),
                         "sample_count": recommendation.get("sample_count", 0),
+                        "total_samples": recommendation.get("total_samples", 0),
+                        "eligible_samples": recommendation.get("eligible_samples", 0),
+                        "excluded_legacy_samples": recommendation.get("excluded_legacy_samples", 0),
+                        "excluded_low_confidence_samples": recommendation.get("excluded_low_confidence_samples", 0),
+                        "excluded_ambiguous_samples": recommendation.get("excluded_ambiguous_samples", 0),
+                        "eligible_sample_ratio": recommendation.get("eligible_sample_ratio", 0),
                         "sample_trade_days": recommendation.get("sample_trade_days", 0),
                         "completed_lifecycle_count": recommendation.get("completed_lifecycle_count", 0),
                         "entry_intent_count": recommendation.get("entry_intent_count", 0),
@@ -415,10 +442,21 @@ class DryRunThresholdABAnalyzer:
                 f"- entry_intent_count_min: {summary.get('guardrail_policy', {}).get('min_entry_intents', 0)}",
                 f"- exit_decision_count_min: {summary.get('guardrail_policy', {}).get('min_exit_decisions', 0)}",
                 f"- signal_sample_count_min: {summary.get('guardrail_policy', {}).get('min_signal_samples', 0)}",
-                f"- DATA_INSUFFICIENT_FOR_THRESHOLD_CHANGE: {summary.get('data_insufficient_for_threshold_change_count', 0)}",
-                f"- OPERATIONAL_REVIEW_ONLY: {summary.get('operational_review_only_count', 0)}",
-            ]
-        )
+            f"- DATA_INSUFFICIENT_FOR_THRESHOLD_CHANGE: {summary.get('data_insufficient_for_threshold_change_count', 0)}",
+            f"- DATA_INSUFFICIENT_ATTRIBUTION_CONFIDENCE: {summary.get('data_insufficient_attribution_confidence_count', 0)}",
+            f"- OPERATIONAL_REVIEW_ONLY: {summary.get('operational_review_only_count', 0)}",
+            "",
+            "## Attribution Confidence Guardrail",
+            "- legacy/low-confidence samples are reported for diagnostics only",
+            "- they are not used for threshold recommendation",
+            f"- total_samples: {(summary.get('attribution_quality') or {}).get('total_samples', 0)}",
+            f"- eligible_samples: {(summary.get('attribution_quality') or {}).get('eligible_samples', 0)}",
+            f"- excluded_legacy_samples: {(summary.get('attribution_quality') or {}).get('excluded_legacy_samples', 0)}",
+            f"- excluded_low_confidence_samples: {(summary.get('attribution_quality') or {}).get('excluded_low_confidence_samples', 0)}",
+            f"- excluded_ambiguous_samples: {(summary.get('attribution_quality') or {}).get('excluded_ambiguous_samples', 0)}",
+            f"- eligible_sample_ratio: {(summary.get('attribution_quality') or {}).get('eligible_sample_ratio', 0)}",
+        ]
+    )
         for item in report.get("recommendations", [])[:10]:
             lines.extend(
                 [
@@ -672,6 +710,7 @@ class DryRunThresholdABAnalyzer:
             "risky_candidate_count": grades.count("RISKY_CANDIDATE"),
             "data_insufficient_count": grades.count("DATA_INSUFFICIENT"),
             "data_insufficient_for_threshold_change_count": grades.count("DATA_INSUFFICIENT_FOR_THRESHOLD_CHANGE"),
+            "data_insufficient_attribution_confidence_count": grades.count("DATA_INSUFFICIENT_ATTRIBUTION_CONFIDENCE"),
             "operational_review_only_count": grades.count("OPERATIONAL_REVIEW_ONLY"),
             "do_not_apply_count": grades.count("DO_NOT_APPLY"),
             "total_avoided_false_positive_count": sum(int((result.get("delta") or {}).get("avoided_false_positive_count") or 0) for result in results),
@@ -685,6 +724,7 @@ class DryRunThresholdABAnalyzer:
                 "min_exit_decisions": self.config.min_exit_decisions,
                 "min_signal_samples": self.config.min_signal_samples,
                 "min_sample_count": self.config.min_sample_count,
+                "min_eligible_sample_ratio": self.config.min_eligible_sample_ratio,
             },
         }
 
@@ -707,6 +747,12 @@ class DryRunThresholdABAnalyzer:
                     "expected_net_benefit_score": recommendation.get("expected_net_benefit_score", 0),
                     "confidence": recommendation.get("confidence", candidate.confidence),
                     "sample_count": recommendation.get("sample_count", 0),
+                    "total_samples": recommendation.get("total_samples", 0),
+                    "eligible_samples": recommendation.get("eligible_samples", 0),
+                    "excluded_legacy_samples": recommendation.get("excluded_legacy_samples", 0),
+                    "excluded_low_confidence_samples": recommendation.get("excluded_low_confidence_samples", 0),
+                    "excluded_ambiguous_samples": recommendation.get("excluded_ambiguous_samples", 0),
+                    "eligible_sample_ratio": recommendation.get("eligible_sample_ratio", 0),
                     "sample_trade_days": recommendation.get("sample_trade_days", 0),
                     "completed_lifecycle_count": recommendation.get("completed_lifecycle_count", 0),
                     "entry_intent_count": recommendation.get("entry_intent_count", 0),
@@ -743,6 +789,7 @@ GRADE_SORT = {
     "RISKY_CANDIDATE": 2,
     "OPERATIONAL_REVIEW_ONLY": 3,
     "DATA_INSUFFICIENT_FOR_THRESHOLD_CHANGE": 4,
+    "DATA_INSUFFICIENT_ATTRIBUTION_CONFIDENCE": 4,
     "DATA_INSUFFICIENT": 5,
     "DO_NOT_APPLY": 6,
 }
@@ -760,9 +807,67 @@ def config_from_settings(settings: Any) -> ThresholdABConfig:
         max_fn_increase=int(getattr(settings, "threshold_ab_max_fn_increase", 1)),
         max_opportunity_loss_increase=int(getattr(settings, "threshold_ab_max_opportunity_loss_increase", 1)),
         confidence_min=float(getattr(settings, "threshold_ab_confidence_min", 0.5)),
+        min_eligible_sample_ratio=float(getattr(settings, "threshold_ab_min_eligible_sample_ratio", 0.8)),
         export_root=Path(getattr(settings, "threshold_ab_export_root", REPORT_ROOT)),
         enable_apply=bool(getattr(settings, "threshold_ab_enable_apply", False)),
     )
+
+
+def _eligible_attribution_items(items: list[dict]) -> list[dict]:
+    return [item for item in items if _attribution_eligible(item)]
+
+
+def _attribution_eligible(item: dict) -> bool:
+    if bool(item.get("legacy_low_confidence_sample")):
+        return False
+    confidence = _item_attribution_confidence(item)
+    if confidence in {"LOW", "AMBIGUOUS"}:
+        return False
+    if str(item.get("matched_by") or "") == "weak_code_date_fallback":
+        return False
+    return confidence in {"HIGH", "MEDIUM"}
+
+
+def _item_attribution_confidence(item: dict) -> str:
+    confidence = str(item.get("attribution_confidence") or "").upper()
+    if confidence:
+        return confidence
+    matched_by = str(item.get("matched_by") or "")
+    link_confidence = str(item.get("link_confidence") or "").upper()
+    if matched_by in {"candidate_instance_id", "virtual_position_id", "virtual_order_to_position"}:
+        return "HIGH"
+    if matched_by == "candidate_id":
+        return "MEDIUM"
+    if matched_by == "ambiguous_code_date_fallback" or "AMBIGUOUS_CANDIDATE_LINK" in (item.get("data_quality_issues") or []):
+        return "AMBIGUOUS"
+    if matched_by == "weak_code_date_fallback":
+        return "LOW"
+    return link_confidence or "LOW"
+
+
+def _attribution_quality(items: list[dict], *, candidate: Optional[ThresholdCandidate] = None) -> dict[str, Any]:
+    relevant = [item for item in items if candidate is None or _candidate_matches(candidate, item)]
+    total = len(relevant)
+    eligible = [item for item in relevant if _attribution_eligible(item)]
+    legacy = [item for item in relevant if bool(item.get("legacy_low_confidence_sample"))]
+    low = [item for item in relevant if _item_attribution_confidence(item) == "LOW" or str(item.get("matched_by") or "") == "weak_code_date_fallback"]
+    ambiguous = [item for item in relevant if _item_attribution_confidence(item) == "AMBIGUOUS"]
+    distribution: dict[str, int] = {}
+    for item in relevant:
+        confidence = _item_attribution_confidence(item)
+        distribution[confidence] = distribution.get(confidence, 0) + 1
+    return {
+        "total_samples": total,
+        "eligible_samples": len(eligible),
+        "excluded_legacy_samples": len(legacy),
+        "excluded_low_confidence_samples": len(low),
+        "excluded_ambiguous_samples": len(ambiguous),
+        "eligible_sample_ratio": _ratio(len(eligible), total) if total else 0.0,
+        "attribution_confidence_distribution": [
+            {"confidence": key, "count": count}
+            for key, count in sorted(distribution.items(), key=lambda pair: pair[0])
+        ],
+    }
 
 
 def _baseline_selected(item: dict) -> bool:
@@ -840,7 +945,14 @@ def _grade(
     return "DO_NOT_APPLY"
 
 
-def _sample_guardrail(items: list[dict], candidate: ThresholdCandidate, config: ThresholdABConfig) -> dict[str, Any]:
+def _sample_guardrail(
+    items: list[dict],
+    candidate: ThresholdCandidate,
+    config: ThresholdABConfig,
+    *,
+    attribution_quality: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    attribution_quality = dict(attribution_quality or {})
     trade_day_counts: dict[str, int] = {}
     for item in items:
         trade_date = str(item.get("trade_date") or "")
@@ -873,6 +985,10 @@ def _sample_guardrail(items: list[dict], candidate: ThresholdCandidate, config: 
         reasons.append("MIN_SIGNAL_SAMPLES")
     if len(items) < config.min_sample_count:
         reasons.append("MIN_SAMPLE_COUNT")
+    if float(attribution_quality.get("eligible_sample_ratio") or 0.0) < float(config.min_eligible_sample_ratio or 0.8):
+        reasons.append("ATTRIBUTION_CONFIDENCE_RATIO")
+    if len(items) >= config.min_sample_count and int(attribution_quality.get("eligible_samples") or 0) < config.min_sample_count:
+        reasons.append("ATTRIBUTION_ELIGIBLE_SAMPLE_COUNT")
     if candidate.category == "safety" or _contains_any(f"{candidate.parameter_name} {candidate.reason} {candidate.expected_risk}", ["safety", "live_safety"]):
         reasons.append("OPERATIONAL_REVIEW_ONLY")
     return {
@@ -891,6 +1007,8 @@ def _guardrail_grade(raw_grade: str, guardrail: dict[str, Any], candidate: Thres
     blocked_reason = str(guardrail.get("blocked_by_guardrail_reason") or "")
     if "OPERATIONAL_REVIEW_ONLY" in blocked_reason or candidate.category == "safety":
         return "OPERATIONAL_REVIEW_ONLY"
+    if "ATTRIBUTION_CONFIDENCE_RATIO" in blocked_reason or "ATTRIBUTION_ELIGIBLE_SAMPLE_COUNT" in blocked_reason:
+        return "DATA_INSUFFICIENT_ATTRIBUTION_CONFIDENCE"
     if blocked_reason:
         return "DATA_INSUFFICIENT_FOR_THRESHOLD_CHANGE"
     if raw_grade == "WATCH_CANDIDATE":
