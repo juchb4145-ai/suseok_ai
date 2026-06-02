@@ -28,8 +28,21 @@ TAKE_PROFIT = "TAKE_PROFIT"
 SUPPORT_LOSS = "SUPPORT_LOSS"
 TIME_EXIT = "TIME_EXIT"
 TRAILING_STOP = "TRAILING_STOP"
+THEME_WEAK_EXIT = "THEME_WEAK_EXIT"
+LEADER_COLLAPSE_EXIT = "LEADER_COLLAPSE_EXIT"
+INDEX_WEAK_EXIT = "INDEX_WEAK_EXIT"
+MARKET_RISK_OFF_EXIT = "MARKET_RISK_OFF_EXIT"
+BREADTH_COLLAPSE_EXIT = "BREADTH_COLLAPSE_EXIT"
 DATA_INSUFFICIENT_EXIT_BASIS = "DATA_INSUFFICIENT_EXIT_BASIS"
-FINAL_EXIT_TYPES = {SUPPORT_LOSS, TIME_EXIT, TRAILING_STOP}
+CONTEXT_RISK_EXIT_TYPES = {
+    THEME_WEAK_EXIT,
+    LEADER_COLLAPSE_EXIT,
+    INDEX_WEAK_EXIT,
+    MARKET_RISK_OFF_EXIT,
+    BREADTH_COLLAPSE_EXIT,
+}
+DRY_RUN_EXIT_INTENT_TYPES = {TAKE_PROFIT, SUPPORT_LOSS, TIME_EXIT, TRAILING_STOP, *CONTEXT_RISK_EXIT_TYPES}
+FINAL_EXIT_TYPES = {SUPPORT_LOSS, TIME_EXIT, TRAILING_STOP, *CONTEXT_RISK_EXIT_TYPES}
 
 
 @dataclass(frozen=True)
@@ -60,6 +73,34 @@ class PerformanceUpdateResult:
     position: VirtualPosition
     changed: bool = False
     details: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ExitContextRiskSnapshot:
+    enabled: bool = False
+    theme_id: str = ""
+    theme_name: str = ""
+    theme_status_before: str = ""
+    theme_status_after: str = ""
+    theme_score: Optional[float] = None
+    previous_theme_score: Optional[float] = None
+    leader_symbol: str = ""
+    leader_return_pct: Optional[float] = None
+    leader_support_broken: bool = False
+    leader_vwap_broken: bool = False
+    leader_count: Optional[int] = None
+    previous_leader_count: Optional[int] = None
+    strong_count: Optional[int] = None
+    previous_strong_count: Optional[int] = None
+    index_market: str = ""
+    index_status: str = ""
+    index_return_pct: Optional[float] = None
+    market_status: str = ""
+    breadth_status: str = ""
+    stock_role: str = ""
+    current_return_pct: Optional[float] = None
+    risk_reason_codes: tuple[str, ...] = ()
+    calculated_at: str = ""
 
 
 class VirtualPositionService:
@@ -199,10 +240,125 @@ class VirtualPositionService:
         return self.db.load_open_virtual_position(order.candidate_id)
 
 
+class ExitContextRiskEngine:
+    def __init__(self, settings: Optional[StrategyRuntimeSettings] = None) -> None:
+        self.settings = settings or legacy_strategy_runtime_settings()
+
+    def evaluate(
+        self,
+        position: VirtualPosition,
+        snapshot: IndicatorSnapshot,
+        candles: list[Candle],
+        existing_decisions: list[ExitDecision],
+        created_at: datetime,
+        context: Optional[ExitContextRiskSnapshot],
+    ) -> Optional[ExitDecision]:
+        if context is None or not context.enabled:
+            return None
+        if _has_final_exit(existing_decisions):
+            return None
+        latest = candles[-1] if candles else None
+        decision_type, reasons = self._decision_type(context)
+        if not decision_type:
+            return None
+        if _has_context_risk_decision(existing_decisions, decision_type):
+            return None
+        current_return = context.current_return_pct
+        if current_return is None:
+            current_return = _return_pct(snapshot.price, position.entry_price)
+        laggard = str(context.stock_role or "").upper() == "LATE_LAGGARD"
+        full_exit = bool(laggard or current_return <= 0)
+        exit_percent = 100 if full_exit else 50
+        exit_price = int((latest.close if latest is not None else snapshot.price) or snapshot.price or position.entry_price)
+        details = {
+            "virtual_only": True,
+            "strategy_profile": _snapshot_profile(snapshot).value,
+            "code": snapshot.code,
+            "theme_id": context.theme_id,
+            "theme_name": context.theme_name,
+            "theme_status_before": context.theme_status_before,
+            "theme_status_after": context.theme_status_after,
+            "theme_score": context.theme_score,
+            "previous_theme_score": context.previous_theme_score,
+            "leader_symbol": context.leader_symbol,
+            "leader_return_pct": context.leader_return_pct,
+            "leader_support_broken": bool(context.leader_support_broken),
+            "leader_vwap_broken": bool(context.leader_vwap_broken),
+            "leader_count": context.leader_count,
+            "previous_leader_count": context.previous_leader_count,
+            "strong_count": context.strong_count,
+            "previous_strong_count": context.previous_strong_count,
+            "index_market": context.index_market,
+            "index_status": context.index_status,
+            "index_return_pct": context.index_return_pct,
+            "market_status": context.market_status,
+            "breadth_status": context.breadth_status,
+            "stock_role": context.stock_role,
+            "current_return_pct": round(float(current_return), 6),
+            "risk_reason_codes": list(context.risk_reason_codes or ()),
+            "partial_exit": not full_exit,
+            "full_exit": full_exit,
+            "exit_percent": exit_percent,
+            "position_closed": full_exit,
+            "trailing_strengthened": not full_exit,
+            "virtual_exit_price": exit_price,
+            "trigger_candle_start_at": latest.start_at.isoformat() if latest is not None else "",
+            "sequence_ambiguous": False,
+            "same_candle_multiple_triggers": False,
+            "calculated_at": context.calculated_at,
+            **self.settings.settings_details(),
+        }
+        return ExitDecision(
+            virtual_position_id=position.id,
+            decision_type=decision_type,
+            trigger_price=exit_price,
+            filled=True,
+            fill_policy=FillPolicy.NORMAL,
+            reason_codes=reasons,
+            details=details,
+            created_at=created_at.isoformat(),
+        )
+
+    def _decision_type(self, context: ExitContextRiskSnapshot) -> tuple[str, list[str]]:
+        reasons = [str(code) for code in (context.risk_reason_codes or ()) if str(code)]
+        theme_status = str(context.theme_status_after or "").upper()
+        index_status = str(context.index_status or "").upper()
+        market_status = str(context.market_status or "").upper()
+        breadth_status = str(context.breadth_status or "").upper()
+        if market_status == "RISK_OFF" or "MARKET_RISK_OFF" in reasons:
+            return MARKET_RISK_OFF_EXIT, _append_reason(reasons, "MARKET_RISK_OFF")
+        if index_status in {"INDEX_WEAK", "RISK_OFF", "WEAK"} or "INDEX_WEAK" in reasons:
+            return INDEX_WEAK_EXIT, _append_reason(reasons, "INDEX_WEAK")
+        if (
+            theme_status in {"WEAK_THEME", "THEME_WEAK"}
+            or "THEME_WEAK" in reasons
+            or "WEAK_THEME" in reasons
+            or "THEME_SCORE_DROP" in reasons
+        ):
+            return THEME_WEAK_EXIT, _append_reason(reasons, "THEME_WEAK")
+        if (
+            context.leader_support_broken
+            or context.leader_vwap_broken
+            or _optional_float(context.leader_return_pct) is not None
+            and float(context.leader_return_pct or 0.0) <= -5.0
+            or "LEADER_COLLAPSE" in reasons
+        ):
+            return LEADER_COLLAPSE_EXIT, _append_reason(reasons, "LEADER_COLLAPSE")
+        if (
+            breadth_status in {"BREADTH_COLLAPSE", "COLLAPSE", "LOW_BREADTH"}
+            or "BREADTH_COLLAPSE" in reasons
+            or "LEADER_COUNT_DROP" in reasons
+            or "STRONG_COUNT_DROP" in reasons
+        ):
+            return BREADTH_COLLAPSE_EXIT, _append_reason(reasons, "BREADTH_COLLAPSE")
+        return "", reasons
+
+
 class ExitDecisionEngine:
     def __init__(self, settings: Optional[StrategyRuntimeSettings] = None) -> None:
         self.settings = settings or legacy_strategy_runtime_settings()
         self.last_details: dict = {}
+        self.context_risk_engine = ExitContextRiskEngine(settings=self.settings)
 
     def evaluate(
         self,
@@ -211,6 +367,7 @@ class ExitDecisionEngine:
         candle_builder: CandleBuilder,
         existing_decisions: list[ExitDecision],
         now: Optional[datetime] = None,
+        context_risk: Optional[ExitContextRiskSnapshot] = None,
     ) -> list[ExitDecision]:
         evaluated_at = (now or datetime.now()).replace(microsecond=0)
         self.last_details = attach_settings_details({
@@ -248,6 +405,14 @@ class ExitDecisionEngine:
 
         decisions: list[ExitDecision] = []
         take_profit = self._take_profit_decision(position, snapshot, policy, candles, existing_decisions, evaluated_at)
+        context_risk_decision = self.context_risk_engine.evaluate(
+            position,
+            snapshot,
+            candles,
+            existing_decisions,
+            evaluated_at,
+            context_risk,
+        )
         if _has_partial_take_profit(existing_decisions):
             trailing_stop = self._trailing_stop_decision(position, snapshot, policy, candles, existing_decisions, evaluated_at)
             if take_profit is not None:
@@ -255,23 +420,27 @@ class ExitDecisionEngine:
             if trailing_stop is not None:
                 _apply_full_close(position, trailing_stop)
                 decisions.append(trailing_stop)
+            elif context_risk_decision is not None:
+                if context_risk_decision.details.get("position_closed") is True:
+                    _apply_full_close(position, context_risk_decision)
+                decisions.append(context_risk_decision)
             return decisions
 
         support_loss = self._support_loss_decision(position, snapshot, policy, candles, existing_decisions, evaluated_at)
 
-        if take_profit is not None and support_loss is not None:
-            take_candle = take_profit.details.get("trigger_candle_start_at")
-            support_candle = support_loss.details.get("trigger_candle_start_at")
-            if take_candle and take_candle == support_candle:
-                for decision in (take_profit, support_loss):
-                    decision.details["sequence_ambiguous"] = True
-                    decision.details["same_candle_multiple_triggers"] = True
+        _mark_same_candle_ambiguity(take_profit, support_loss)
+        _mark_same_candle_ambiguity(take_profit, context_risk_decision)
 
         if take_profit is not None:
             decisions.append(take_profit)
         if support_loss is not None:
             _apply_full_close(position, support_loss)
             decisions.append(support_loss)
+            return decisions
+        if context_risk_decision is not None:
+            if context_risk_decision.details.get("position_closed") is True:
+                _apply_full_close(position, context_risk_decision)
+            decisions.append(context_risk_decision)
             return decisions
 
         time_exit = self._time_exit_decision(position, snapshot, policy, candles, existing_decisions, evaluated_at)
@@ -595,6 +764,14 @@ def _has_existing_decision(existing_decisions: list[ExitDecision], decision_type
     )
 
 
+def _has_context_risk_decision(existing_decisions: list[ExitDecision], decision_type: str) -> bool:
+    return any(
+        decision.decision_type == decision_type
+        and decision.filled
+        for decision in existing_decisions
+    )
+
+
 def _has_final_exit(existing_decisions: list[ExitDecision]) -> bool:
     return any(
         decision.decision_type in FINAL_EXIT_TYPES
@@ -623,6 +800,31 @@ def _apply_full_close(position: VirtualPosition, decision: ExitDecision) -> None
     if details:
         details["remaining_weight_pct"] = 0.0
         position.details = details
+
+
+def _mark_same_candle_ambiguity(first: Optional[ExitDecision], second: Optional[ExitDecision]) -> None:
+    if first is None or second is None:
+        return
+    first_candle = first.details.get("trigger_candle_start_at")
+    second_candle = second.details.get("trigger_candle_start_at")
+    if first_candle and first_candle == second_candle:
+        for decision in (first, second):
+            decision.details["sequence_ambiguous"] = True
+            decision.details["same_candle_multiple_triggers"] = True
+
+
+def _append_reason(reasons: list[str], reason: str) -> list[str]:
+    result = list(reasons)
+    if reason not in result:
+        result.append(reason)
+    return result
+
+
+def _optional_float(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _recent_high_update_failed(candles: list[Candle], window: int = 3) -> bool:

@@ -2,7 +2,7 @@ from pathlib import Path
 
 from storage.db import TradingDatabase
 from trading.broker.gateway_state import GatewayStateStore
-from trading.strategy.exit import SUPPORT_LOSS, TAKE_PROFIT, TIME_EXIT, TRAILING_STOP
+from trading.strategy.exit import SUPPORT_LOSS, TAKE_PROFIT, THEME_WEAK_EXIT, TIME_EXIT, TRAILING_STOP
 from trading.strategy.models import (
     Candidate,
     CandidateSourceType,
@@ -124,7 +124,7 @@ def test_exit_sell_intent_is_saved_without_gateway_command(tmp_path):
 
 
 def test_full_exit_decision_types_sell_full_quantity(tmp_path):
-    for decision_type in [SUPPORT_LOSS, TIME_EXIT, TRAILING_STOP]:
+    for decision_type in [SUPPORT_LOSS, TIME_EXIT, TRAILING_STOP, THEME_WEAK_EXIT]:
         sink, _, _ = _sink(tmp_path / decision_type)
         result = sink.on_exit_order_decision(
             candidate=_candidate(),
@@ -135,6 +135,37 @@ def test_full_exit_decision_types_sell_full_quantity(tmp_path):
         assert result["accepted"] is True
         assert result["request"]["quantity"] == 12
         assert result["request"]["exit_decision_type"] == decision_type
+
+
+def test_context_risk_exit_sell_intent_is_saved_without_gateway_command(tmp_path):
+    sink, gateway_state, settings = _sink(tmp_path)
+
+    result = sink.on_exit_order_decision(
+        candidate=_candidate(),
+        virtual_position=_position(quantity=5, closed_at="2026-05-30T09:15:00", close_reason=THEME_WEAK_EXIT),
+        exit_decision=_decision(
+            THEME_WEAK_EXIT,
+            exit_percent=100,
+            theme_status_before="LEADING_THEME",
+            theme_status_after="WEAK_THEME",
+            index_market="KOSPI",
+            risk_reason_codes=["THEME_WEAK"],
+        ),
+        runtime_cycle_at="2026-05-30T09:16:00",
+    )
+
+    assert result["accepted"] is True
+    assert result["command"] is None
+    assert result["request"]["side"] == "sell"
+    assert result["request"]["quantity"] == 5
+    assert result["request"]["exit_decision_type"] == THEME_WEAK_EXIT
+    assert gateway_state.command_snapshot()["queued_count"] == 0
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        row = db.get_runtime_order_intent(result["intent_id"])
+    finally:
+        db.close()
+    assert row["exit_decision_type"] == THEME_WEAK_EXIT
 
 
 def test_exit_sell_intent_invalid_price_and_quantity_are_recorded(tmp_path):

@@ -69,6 +69,7 @@ def build_core_strategy_runtime(
     config.order_mode = OrderMode.OBSERVE
     if settings.runtime_evaluation_interval_sec > 0:
         config.evaluation_interval_sec = settings.runtime_evaluation_interval_sec
+    config.exit_context_risk_enabled = bool(settings.exit_context_risk_enabled)
 
     market_data = MarketDataStore()
     candle_builder = CandleBuilder()

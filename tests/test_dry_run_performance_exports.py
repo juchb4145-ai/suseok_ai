@@ -82,7 +82,8 @@ def test_report_persistence_and_exports(tmp_path):
         for path in exports.values():
             assert Path(path).exists()
         assert "lifecycle_id" in Path(exports["csv"]).read_text(encoding="utf-8-sig")
-        assert "DRY_RUN Performance Report" in Path(exports["md"]).read_text(encoding="utf-8")
+        markdown = Path(exports["md"]).read_text(encoding="utf-8")
+        assert "DRY_RUN Performance Report" in markdown
+        assert "Data Quality Issues" in markdown or "no major data quality issue" in markdown
     finally:
         db.close()
-

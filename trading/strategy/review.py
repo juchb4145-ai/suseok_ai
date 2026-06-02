@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from trading.strategy.candles import Candle, CandleBuilder, minute_start
-from trading.strategy.exit import SUPPORT_LOSS, TAKE_PROFIT, TIME_EXIT, TRAILING_STOP
+from trading.strategy.exit import CONTEXT_RISK_EXIT_TYPES, SUPPORT_LOSS, TAKE_PROFIT, TIME_EXIT, TRAILING_STOP
 from trading.strategy.models import (
     BlockType,
     Candidate,
@@ -155,6 +155,8 @@ def _final_status(
             return ReviewFinalStatus.VIRTUAL_CLOSED_TIME_EXIT.value
         if full_exit.decision_type == TRAILING_STOP:
             return ReviewFinalStatus.VIRTUAL_CLOSED_TRAILING_STOP.value
+        if full_exit.decision_type in CONTEXT_RISK_EXIT_TYPES:
+            return ReviewFinalStatus.VIRTUAL_CLOSED_TIME_EXIT.value
         return ReviewFinalStatus.VIRTUAL_CLOSED_TAKE_PROFIT.value
     if any(decision.decision_type == TAKE_PROFIT and decision.details.get("partial_exit") for decision in exit_decisions):
         return ReviewFinalStatus.VIRTUAL_PARTIAL_TAKE_PROFIT.value

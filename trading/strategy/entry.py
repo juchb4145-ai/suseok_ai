@@ -66,6 +66,9 @@ class EntryPlanBuilder:
             reason = "support_missing"
 
         split_plan = self._build_split_plan(result.final_grade, stock_details, current_price)
+        position_size_multiplier = _position_size_multiplier(result)
+        if 0 < position_size_multiplier < 1:
+            split_plan = _scale_split_plan(split_plan, position_size_multiplier)
         tick_offset = self.settings.integer("entry_plan_thresholds.tick_offset", 1)
         limit_price = int(split_plan[0].get("limit_price") or self.tick_provider.add_ticks(int(support_price), tick_offset))
         limit_vs_current_pct = _pct(current_price - limit_price, limit_price)
@@ -91,6 +94,7 @@ class EntryPlanBuilder:
             "max_chase_pct": max_chase_pct,
             "split_policy": {
                 "weights": _split_weights(result.final_grade, self.settings),
+                "position_size_multiplier": position_size_multiplier,
                 "one_new_leg_per_cycle": True,
                 "later_legs_require_previous_fill": True,
             },
@@ -228,6 +232,30 @@ def _split_weights(final_grade: str, settings: Optional[StrategyRuntimeSettings]
     if grade in {"B+", "B+_SIGNAL"}:
         return [int(value) for value in active_settings.list_value("entry_plan_thresholds.split_weights.B_PLUS", [50, 30, 20])]
     return [int(value) for value in active_settings.list_value("entry_plan_thresholds.split_weights.default", [60, 25, 15])]
+
+
+def _position_size_multiplier(result: GatePipelineResult) -> float:
+    value = result.details.get("position_size_multiplier")
+    if value is None:
+        value = result.details.get("theme_lab_bridge", {}).get("position_size_multiplier") if isinstance(result.details.get("theme_lab_bridge"), dict) else None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if number <= 0:
+        return 1.0
+    return min(1.0, number)
+
+
+def _scale_split_plan(split_plan: list[dict], multiplier: float) -> list[dict]:
+    scaled: list[dict] = []
+    for leg in split_plan:
+        item = dict(leg)
+        item["original_weight_pct"] = item.get("weight_pct", 0)
+        item["weight_pct"] = round(float(item.get("weight_pct") or 0.0) * multiplier, 4)
+        item["position_size_multiplier"] = multiplier
+        scaled.append(item)
+    return scaled
 
 
 def _profile_key(profile: Optional[StrategyProfile]) -> str:

@@ -4,9 +4,10 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from trading.strategy.exit import SUPPORT_LOSS, TAKE_PROFIT, TIME_EXIT, TRAILING_STOP
+from trading.strategy.exit import FINAL_EXIT_TYPES
 from trading.strategy.models import Candidate, EntryPlan, ExitDecision, VirtualOrder, VirtualPosition
 from trading.strategy.pipeline import GatePipelineResult
+from trading.strategy.themelab_adapter import ORDER_PHASE_ENTRY, SOURCE as THEMELAB_SOURCE, themelab_entry_idempotency_key
 from trading_app.dependencies import CoreSettings
 from trading_app.order_enqueue_service import OrderEnqueueService, RuntimeOrderIntentRequest
 
@@ -133,8 +134,20 @@ class DryRunRuntimeOrderSink(RuntimeOrderSink):
     ) -> dict[str, Any]:
         self.total_count += 1
         quantity_payload = self._quantity_payload(virtual_order)
+        bridge_metadata = _theme_lab_bridge_metadata(candidate, gate_result, entry_plan, virtual_order)
+        source = str(bridge_metadata.get("source") or "strategy_runtime")
+        order_phase = ORDER_PHASE_ENTRY
+        idempotency_key = ""
+        if source == THEMELAB_SOURCE:
+            idempotency_key = themelab_entry_idempotency_key(
+                trade_date=str(bridge_metadata.get("trade_date") or candidate.trade_date or ""),
+                code=candidate.code,
+                candidate_id=candidate.id,
+                order_phase=order_phase,
+                leg_index=virtual_order.leg_index,
+            )
         request = RuntimeOrderIntentRequest(
-            source="strategy_runtime",
+            source=source,
             dry_run=True,
             account=self.settings.runtime_dry_run_account,
             code=candidate.code,
@@ -150,6 +163,7 @@ class DryRunRuntimeOrderSink(RuntimeOrderSink):
             virtual_order_id=virtual_order.id,
             leg_index=virtual_order.leg_index,
             entry_type=entry_plan.entry_type,
+            order_phase=order_phase,
             reason="runtime_entry_virtual_order_submitted",
             gate_reason=str(gate_result.details.get("primary_reason_code") or gate_result.final_grade or ""),
             gate_status="READY" if gate_result.strategy_eligible else "BLOCKED",
@@ -158,7 +172,9 @@ class DryRunRuntimeOrderSink(RuntimeOrderSink):
             theme_name=str(gate_result.details.get("theme_name") or ""),
             theme_score=_optional_float(gate_result.details.get("theme_score")),
             runtime_cycle_at=runtime_cycle_at,
+            idempotency_key=idempotency_key or None,
             metadata={
+                **bridge_metadata,
                 "base_amount": self.settings.runtime_dry_run_position_amount,
                 "weight_pct": virtual_order.weight_pct,
                 "respect_weight_pct": self.settings.runtime_dry_run_respect_weight_pct,
@@ -167,6 +183,7 @@ class DryRunRuntimeOrderSink(RuntimeOrderSink):
                 "virtual_order_status": virtual_order.status.value if hasattr(virtual_order.status, "value") else str(virtual_order.status),
                 "gate_result_key": gate_result.details.get("gate_result_key", ""),
                 "theme_id": gate_result.theme_id,
+                "split_plan": list(entry_plan.split_plan or []),
             },
         )
         try:
@@ -241,6 +258,15 @@ class DryRunRuntimeOrderSink(RuntimeOrderSink):
                 "quantity_calculation_reason": quantity_payload["reason"],
                 "exit_percent_source": quantity_payload["exit_percent_source"],
                 "price_source": quantity_payload["price_source"],
+                "theme_status_before": details.get("theme_status_before", ""),
+                "theme_status_after": details.get("theme_status_after", ""),
+                "theme_score": details.get("theme_score"),
+                "leader_symbol": details.get("leader_symbol", ""),
+                "leader_return_pct": details.get("leader_return_pct"),
+                "index_market": details.get("index_market", ""),
+                "index_return_pct": details.get("index_return_pct"),
+                "breadth_status": details.get("breadth_status", ""),
+                "risk_reason_codes": list(details.get("risk_reason_codes") or []),
             },
         )
         try:
@@ -300,11 +326,7 @@ class DryRunRuntimeOrderSink(RuntimeOrderSink):
         details = dict(decision.details or {})
         position_quantity = max(0, int(position.quantity or 0))
         partial_exit = bool(details.get("partial_exit"))
-        full_exit = bool(details.get("full_exit") or details.get("position_closed")) or decision.decision_type in {
-            SUPPORT_LOSS,
-            TIME_EXIT,
-            TRAILING_STOP,
-        }
+        full_exit = bool(details.get("full_exit") or details.get("position_closed")) or decision.decision_type in FINAL_EXIT_TYPES
         exit_percent_source = ""
         if partial_exit:
             exit_percent = _optional_float(details.get("exit_percent"))
@@ -387,3 +409,53 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _theme_lab_bridge_metadata(
+    candidate: Candidate,
+    gate_result: GatePipelineResult,
+    entry_plan: EntryPlan,
+    virtual_order: VirtualOrder,
+) -> dict[str, Any]:
+    details = dict(gate_result.details or {})
+    bridge = dict(details.get("theme_lab_bridge") or {})
+    if str(bridge.get("source") or "") != THEMELAB_SOURCE:
+        return {}
+    cancel = dict(entry_plan.cancel_condition or {})
+    leg = _split_leg(entry_plan, virtual_order.leg_index)
+    metadata = {
+        "source": THEMELAB_SOURCE,
+        "code": candidate.code,
+        "trade_date": candidate.trade_date,
+        "candidate_id": candidate.id,
+        "theme_id": gate_result.theme_id,
+        "theme_name": details.get("theme_name") or bridge.get("theme_name") or "",
+        "lab_gate_status": details.get("lab_gate_status") or bridge.get("lab_gate_status") or "",
+        "final_gate_status": details.get("final_gate_status") or bridge.get("final_gate_status") or "",
+        "order_eligibility": details.get("order_eligibility") or bridge.get("order_eligibility") or "",
+        "price_location_status": details.get("price_location_status") or bridge.get("price_location_status") or "",
+        "risk_level": details.get("risk_level") or bridge.get("risk_level") or "",
+        "risk_reason_codes": list(details.get("risk_reason_codes") or bridge.get("risk_reason_codes") or []),
+        "reason_codes": list(details.get("reason_codes") or bridge.get("reason_codes") or []),
+        "support_price": cancel.get("support_price") or bridge.get("support_price") or details.get("support_price") or 0,
+        "limit_price": int(virtual_order.limit_price or entry_plan.limit_price or 0),
+        "limit_vs_current_pct": cancel.get("limit_vs_current_pct"),
+        "max_chase_pct": cancel.get("max_chase_pct"),
+        "split_leg": virtual_order.leg_index,
+        "weight_pct": virtual_order.weight_pct,
+    }
+    if leg:
+        metadata["split_leg_plan"] = dict(leg)
+    return metadata
+
+
+def _split_leg(entry_plan: EntryPlan, leg_index: int | None) -> dict[str, Any]:
+    if leg_index is None:
+        return {}
+    for leg in entry_plan.split_plan or []:
+        try:
+            if int(leg.get("leg") or 0) == int(leg_index):
+                return dict(leg)
+        except (TypeError, ValueError):
+            continue
+    return {}

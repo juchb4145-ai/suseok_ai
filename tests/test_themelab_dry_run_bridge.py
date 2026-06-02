@@ -1,0 +1,462 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from kiwoom.client import MockKiwoomClient
+from storage.db import TradingDatabase
+from trading.broker.gateway_state import GatewayStateStore
+from trading.strategy.candidates import CandidateCollector
+from trading.strategy.candles import CandleBuilder
+from trading.strategy.entry import EntryPlanBuilder
+from trading.strategy.exit import ExitDecisionEngine, VirtualPositionService
+from trading.strategy.holding import StaticHoldingProvider
+from trading.strategy.indicators import IndicatorCalculator
+from trading.strategy.intraday import IntradayStateTracker
+from trading.strategy.market_data import MarketDataStore, StrategyTick
+from trading.strategy.market_index import IndexTick, MarketIndexStore
+from trading.strategy.models import BlockType, CandidateState
+from trading.strategy.pipeline import GatePipeline
+from trading.strategy.realtime import RealTimeSubscriptionManager
+from trading.strategy.review import TradeReviewService
+from trading.strategy.runtime import StrategyRuntime, StrategyRuntimeConfig
+from trading.strategy.runtime_settings import legacy_strategy_runtime_settings
+from trading.strategy.virtual_orders import VirtualOrderService
+from trading.theme_engine.context_provider import DynamicThemeContextProvider
+from trading.theme_engine.lab import (
+    LabGateDecision,
+    LabGateStatus,
+    MarketStatus,
+    MarketStrengthSnapshot,
+    PriceLocationStatus,
+    StockRole,
+    ThemeConditionSnapshot,
+    ThemeLabFlowResult,
+    ThemeLabThemeStatus,
+    TradeabilityRiskLevel,
+    WatchSetSnapshot,
+)
+from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeStatus
+from trading.theme_engine.repository import ThemeEngineRepository
+from trading_app.dependencies import CoreSettings
+from trading_app.order_enqueue_service import OrderEnqueueService
+from trading_app.runtime_order_sink import DryRunRuntimeOrderSink, NoopRuntimeOrderSink
+
+
+NOW = datetime(2026, 6, 1, 9, 5, 0)
+
+
+def test_ready_good_pullback_creates_dry_run_intent_without_gateway_command(tmp_path):
+    runtime, db, gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    snapshot = runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    intents = db.list_runtime_order_intents(candidate_id=candidate.id)
+
+    assert candidate.state == CandidateState.READY
+    assert len(db.list_entry_plans(candidate.id)) == 1
+    assert len(db.list_virtual_orders(candidate.id)) == 1
+    assert len(intents) == 1
+    assert intents[0]["source"] == "themelab_flow"
+    assert intents[0]["idempotency_key"] == f"themelab_flow:2026-06-01:000001:{candidate.id}:entry:1"
+    assert intents[0]["metadata"]["price_location_status"] == "GOOD_PULLBACK"
+    assert intents[0]["metadata"]["support_price"] == 9950
+    assert intents[0]["metadata"]["limit_price"] > 0
+    assert intents[0]["metadata"]["split_leg"] == 1
+    assert gateway_state.command_snapshot()["queued_count"] == 0
+    assert snapshot.dry_run_entry_order_intent_count >= 1
+
+
+def test_ready_pullback_reclaim_creates_dry_run_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.PULLBACK_RECLAIM),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    assert db.list_runtime_order_intents(candidate_id=candidate.id)[0]["metadata"]["price_location_status"] == "PULLBACK_RECLAIM"
+
+
+def test_ready_small_leader_good_pullback_creates_scaled_small_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.READY_SMALL,
+            PriceLocationStatus.GOOD_PULLBACK,
+            role=StockRole.LEADER,
+            risk=TradeabilityRiskLevel.RISK_ADJUST,
+            multiplier=0.5,
+        ),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    intent = db.list_runtime_order_intents(candidate_id=candidate.id)[0]
+    assert intent["metadata"]["order_eligibility"] == "BUY_ELIGIBLE_SMALL_PULLBACK"
+    assert intent["metadata"]["weight_pct"] == 25.0
+
+
+@pytest.mark.parametrize(
+    ("status", "price_location", "expected_final"),
+    [
+        (LabGateStatus.READY_SMALL, PriceLocationStatus.CHASE_HIGH, "OBSERVE_CHASE"),
+        (LabGateStatus.READY_SMALL, PriceLocationStatus.BREAKOUT_CONTINUATION, "OBSERVE_BREAKOUT_CONTINUATION"),
+        (LabGateStatus.READY, PriceLocationStatus.VWAP_OVEREXTENDED, "OBSERVE_VWAP_OVEREXTENDED"),
+    ],
+)
+def test_chase_and_extension_locations_do_not_create_intents(tmp_path, status, price_location, expected_final):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(status, price_location, risk=TradeabilityRiskLevel.RISK_ADJUST),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+    assert candidate.metadata["gate_results_by_theme"]["ai"]["sub_status"] == expected_final
+
+
+def test_data_insufficient_waits_without_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.WAIT,
+            PriceLocationStatus.UNKNOWN,
+            reasons=("DATA_INSUFFICIENT", "INDICATOR_DATA_INSUFFICIENT"),
+        ),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    assert candidate.state == CandidateState.WATCHING
+    assert candidate.metadata["gate_results_by_theme"]["ai"]["sub_status"] == "WAIT_DATA"
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
+def test_theme_weak_blocks_without_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.BLOCKED,
+            PriceLocationStatus.GOOD_PULLBACK,
+            reasons=("THEME_WEAK",),
+            theme_status=ThemeLabThemeStatus.WEAK_THEME,
+        ),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    assert candidate.state == CandidateState.BLOCKED
+    assert candidate.block_type == BlockType.FINAL
+    assert candidate.metadata["sub_status"] == "BLOCK_THEME"
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected_reason"),
+    [
+        ({"prev_close": 10000}, "support_missing"),
+        ({"prev_close": 10000, "recent_support_price": 9000}, "max_chase_exceeded"),
+    ],
+)
+def test_entry_plan_diagnostic_only_blocks_intent_for_missing_support_or_chase(tmp_path, metadata, expected_reason):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=True,
+        tick_metadata=metadata,
+        price=11000 if expected_reason == "max_chase_exceeded" else 10000,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    plans = db.list_entry_plans(candidate.id)
+    assert plans[0].cancel_condition["diagnostic_only"] is True
+    assert plans[0].cancel_condition["reason"] == expected_reason
+    assert db.list_virtual_orders(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
+def test_observe_sink_records_lifecycle_but_no_buy_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=False,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    assert candidate.state == CandidateState.READY
+    assert db.list_virtual_orders(candidate.id)
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
+def test_second_cycle_dedupes_same_themelab_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+    runtime.cycle(NOW + timedelta(seconds=6))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    assert len(db.list_runtime_order_intents(candidate_id=candidate.id)) == 1
+    events = db.list_runtime_order_intent_events(db.list_runtime_order_intents(candidate_id=candidate.id)[0]["intent_id"])
+    assert any(event["event_type"] == "duplicate_rejected" for event in events)
+
+
+def test_bridge_disabled_keeps_themelab_scanner_only(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=True,
+        bridge_enabled=False,
+    )
+
+    runtime.start(NOW)
+    snapshot = runtime.cycle(NOW + timedelta(seconds=3))
+
+    assert db.list_candidates("2026-06-01") == []
+    assert "THEME_LAB_DRY_RUN_BRIDGE_DISABLED" in snapshot.warnings
+
+
+def test_legacy_mode_ignores_theme_lab_bridge(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=True,
+        legacy=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    assert db.list_candidates("2026-06-01") == []
+
+
+class StaticThemeLabPipeline:
+    def __init__(self, result: ThemeLabFlowResult) -> None:
+        self.result = result
+        self.last_result = None
+        self.last_run_at = None
+        self.interval_sec = 3
+
+    def run_if_due(self, now: datetime):
+        self.last_run_at = now.replace(microsecond=0)
+        self.last_result = self.result
+        return self.result
+
+    def drain_warnings(self):
+        return []
+
+    def watchset_codes(self):
+        return [item.symbol for item in self.result.watchset]
+
+
+def _runtime(
+    tmp_path,
+    result: ThemeLabFlowResult,
+    *,
+    dry_run_orders: bool,
+    bridge_enabled: bool = True,
+    legacy: bool = False,
+    tick_metadata: dict | None = None,
+    price: int = 10000,
+):
+    db_path = Path(tmp_path) / "trader.sqlite3"
+    db = TradingDatabase(str(db_path))
+    client = MockKiwoomClient()
+    settings = legacy_strategy_runtime_settings()
+    market_data = MarketDataStore()
+    candle_builder = CandleBuilder()
+    market_index_store = MarketIndexStore()
+    market_index_store.update_index_tick(IndexTick.from_realtime("KOSPI", "KOSPI", 2500, 0.1, timestamp=NOW))
+    market_index_store.update_index_tick(IndexTick.from_realtime("KOSDAQ", "KOSDAQ", 850, 0.2, timestamp=NOW))
+    metadata = {"prev_close": 10000, "recent_support_price": 9950} if tick_metadata is None else dict(tick_metadata)
+    market_data.update_tick(
+        StrategyTick.from_realtime(
+            "000001",
+            price,
+            change_rate=5.0,
+            cum_volume=10_000,
+            trade_value=100_000_000,
+            execution_strength=120.0,
+            timestamp=NOW,
+            metadata=metadata,
+        )
+    )
+    _seed_theme(db)
+    gateway_state = GatewayStateStore()
+    core_settings = CoreSettings(
+        db_path=db_path,
+        local_token="test-token",
+        mode="OBSERVE",
+        runtime_mode="DRY_RUN" if dry_run_orders else "OBSERVE",
+        runtime_allow_dry_run_orders=dry_run_orders,
+        runtime_dry_run_position_amount=1_000_000,
+    )
+    order_sink = (
+        DryRunRuntimeOrderSink(
+            settings=core_settings,
+            service=OrderEnqueueService(settings=core_settings, gateway_state=gateway_state, db_path=db_path),
+        )
+        if dry_run_orders
+        else NoopRuntimeOrderSink()
+    )
+    theme_context_provider = DynamicThemeContextProvider(ThemeEngineRepository(db))
+    gate_pipeline = GatePipeline(
+        theme_context_provider,
+        market_data,
+        candle_builder,
+        IndicatorCalculator(market_data, candle_builder),
+        IntradayStateTracker(settings),
+        market_index_store,
+        settings,
+    )
+    config = StrategyRuntimeConfig(
+        theme_engine_mode="legacy" if legacy else "themelab_flow",
+        theme_lab_dry_run_bridge_enabled=bridge_enabled,
+    )
+    runtime = StrategyRuntime(
+        db=db,
+        candidate_collector=CandidateCollector(
+            db,
+            client=None,
+            trade_date_provider=lambda: "2026-06-01",
+            default_ttl_minutes=30,
+        ),
+        subscription_manager=RealTimeSubscriptionManager(client, max_codes=80),
+        candle_builder=candle_builder,
+        gate_pipeline=gate_pipeline,
+        entry_plan_builder=EntryPlanBuilder(settings=settings),
+        virtual_order_service=VirtualOrderService(db=db, settings=settings),
+        virtual_position_service=VirtualPositionService(db=db),
+        exit_decision_engine=ExitDecisionEngine(settings),
+        trade_review_service=TradeReviewService(settings),
+        config=config,
+        holding_provider=StaticHoldingProvider(),
+        order_sink=order_sink,
+        theme_lab_pipeline=StaticThemeLabPipeline(result),
+    )
+    return runtime, db, gateway_state
+
+
+def _flow_result(
+    status: LabGateStatus,
+    price_location: PriceLocationStatus,
+    *,
+    role: StockRole = StockRole.LEADER,
+    risk: TradeabilityRiskLevel = TradeabilityRiskLevel.PASS,
+    reasons: tuple[str, ...] = (),
+    theme_status: ThemeLabThemeStatus = ThemeLabThemeStatus.LEADING_THEME,
+    multiplier: float = 1.0,
+) -> ThemeLabFlowResult:
+    theme = ThemeConditionSnapshot(
+        calculated_at=NOW.isoformat(),
+        theme_id="ai",
+        theme_name="AI",
+        raw_total_members=1,
+        eligible_total_members=1,
+        alive_count=1,
+        strong_count=1,
+        leader_count=1,
+        alive_ratio=1.0,
+        strong_ratio=1.0,
+        leader_ratio=1.0,
+        condition_score=85.0,
+        theme_status=theme_status,
+    )
+    watch = WatchSetSnapshot(
+        calculated_at=NOW.isoformat(),
+        symbol="000001",
+        name="leader",
+        themes=("ai",),
+        primary_theme="ai",
+        return_pct=5.0,
+        turnover_krw=100_000_000,
+        condition_level=3,
+        stock_role=role,
+        gate_status=status,
+        final_gate_status=status,
+        risk_level=risk,
+        risk_reason_codes=reasons,
+        position_size_multiplier=multiplier,
+        price_location_status=price_location,
+        price_location_score=80.0,
+        price_location_reason_codes=(price_location.value,),
+    )
+    decision = LabGateDecision(
+        symbol="000001",
+        status=status,
+        reason_codes=reasons,
+        blocked_reason="THEME_WEAK" if theme_status == ThemeLabThemeStatus.WEAK_THEME else "",
+        risk_level=risk,
+        risk_reason_codes=reasons,
+        position_size_multiplier=multiplier,
+        recheck_after_sec=30,
+        price_location_status=price_location,
+        price_location_score=80.0,
+        price_location_reason_codes=(price_location.value,),
+    )
+    return ThemeLabFlowResult(
+        market=MarketStrengthSnapshot(MarketStatus.EXPANSION, kospi_return_pct=0.1, kosdaq_return_pct=0.2),
+        themes=(theme,),
+        watchset=(watch,),
+        gate_decisions=(decision,),
+        data_quality={},
+    )
+
+
+def _seed_theme(db: TradingDatabase) -> None:
+    repo = ThemeEngineRepository(db)
+    repo.upsert_canonical_theme(
+        CanonicalTheme(
+            theme_id="ai",
+            canonical_name="AI",
+            display_name="AI",
+            status=ThemeStatus.ACTIVE,
+            trade_eligible=True,
+        )
+    )
+    repo.upsert_current_membership(
+        ThemeMembership(
+            theme_id="ai",
+            stock_code="000001",
+            stock_name="leader",
+            membership_score=1.0,
+            active=True,
+            trade_eligible=True,
+        )
+    )

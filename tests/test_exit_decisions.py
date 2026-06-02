@@ -4,10 +4,14 @@ from storage.db import TradingDatabase
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.exit import (
     DATA_INSUFFICIENT_EXIT_BASIS,
+    INDEX_WEAK_EXIT,
+    LEADER_COLLAPSE_EXIT,
     SUPPORT_LOSS,
     TAKE_PROFIT,
+    THEME_WEAK_EXIT,
     TIME_EXIT,
     TRAILING_STOP,
+    ExitContextRiskSnapshot,
     ExitDecisionEngine,
     VirtualPositionService,
 )
@@ -194,6 +198,98 @@ def test_pre_open_high_does_not_create_take_profit():
     decisions = ExitDecisionEngine().evaluate(position(), snapshot(), builder, [], datetime(2026, 5, 29, 9, 2))
 
     assert decisions == []
+
+
+def test_context_risk_flag_off_preserves_existing_exit_result():
+    builder = candle_builder((datetime(2026, 5, 29, 9, 1), 10_000, 10_100, 9_900, 10_000))
+    context = ExitContextRiskSnapshot(
+        enabled=False,
+        theme_status_after="WEAK_THEME",
+        risk_reason_codes=("THEME_WEAK",),
+        current_return_pct=-1.0,
+    )
+
+    decisions = ExitDecisionEngine().evaluate(position(), snapshot(), builder, [], datetime(2026, 5, 29, 9, 2), context_risk=context)
+
+    assert decisions == []
+
+
+def test_theme_weak_context_risk_creates_full_exit_for_losing_position():
+    builder = candle_builder((datetime(2026, 5, 29, 9, 1), 10_000, 10_100, 9_850, 9_900))
+    pos = position()
+    context = ExitContextRiskSnapshot(
+        enabled=True,
+        theme_id="robot",
+        theme_name="robotics",
+        theme_status_before="LEADING_THEME",
+        theme_status_after="WEAK_THEME",
+        theme_score=12.0,
+        leader_symbol="222222",
+        leader_return_pct=-1.0,
+        index_market="KOSDAQ",
+        index_return_pct=-0.4,
+        breadth_status="LOW_BREADTH",
+        current_return_pct=-1.0,
+        risk_reason_codes=("THEME_WEAK",),
+    )
+
+    decisions = ExitDecisionEngine().evaluate(pos, snapshot(price=9_900), builder, [], datetime(2026, 5, 29, 9, 2), context_risk=context)
+
+    assert [decision.decision_type for decision in decisions] == [THEME_WEAK_EXIT]
+    assert decisions[0].details["theme_status_before"] == "LEADING_THEME"
+    assert decisions[0].details["theme_status_after"] == "WEAK_THEME"
+    assert decisions[0].details["position_closed"] is True
+    assert pos.close_reason == THEME_WEAK_EXIT
+
+
+def test_leader_collapse_context_risk_creates_exit():
+    builder = candle_builder((datetime(2026, 5, 29, 9, 1), 10_000, 10_100, 9_850, 9_900))
+    context = ExitContextRiskSnapshot(
+        enabled=True,
+        theme_status_after="LEADING_THEME",
+        leader_symbol="222222",
+        leader_return_pct=-6.0,
+        leader_vwap_broken=True,
+        current_return_pct=-1.0,
+    )
+
+    decisions = ExitDecisionEngine().evaluate(position(), snapshot(price=9_900), builder, [], datetime(2026, 5, 29, 9, 2), context_risk=context)
+
+    assert [decision.decision_type for decision in decisions] == [LEADER_COLLAPSE_EXIT]
+    assert "LEADER_COLLAPSE" in decisions[0].reason_codes
+
+
+def test_kosdaq_risk_off_context_risk_creates_index_weak_exit():
+    builder = candle_builder((datetime(2026, 5, 29, 9, 1), 10_000, 10_100, 9_850, 9_900))
+    context = ExitContextRiskSnapshot(
+        enabled=True,
+        theme_status_after="LEADING_THEME",
+        index_market="KOSDAQ",
+        index_status="RISK_OFF",
+        index_return_pct=-2.8,
+        current_return_pct=-1.0,
+    )
+
+    decisions = ExitDecisionEngine().evaluate(position(), snapshot(price=9_900), builder, [], datetime(2026, 5, 29, 9, 2), context_risk=context)
+
+    assert [decision.decision_type for decision in decisions] == [INDEX_WEAK_EXIT]
+    assert decisions[0].details["index_market"] == "KOSDAQ"
+
+
+def test_take_profit_and_theme_weak_same_candle_are_sequence_ambiguous():
+    builder = candle_builder((datetime(2026, 5, 29, 9, 1), 10_000, 10_600, 9_900, 10_550))
+    context = ExitContextRiskSnapshot(
+        enabled=True,
+        theme_status_after="WEAK_THEME",
+        current_return_pct=5.5,
+        stock_role="LATE_LAGGARD",
+        risk_reason_codes=("THEME_WEAK",),
+    )
+
+    decisions = ExitDecisionEngine().evaluate(position(), snapshot(price=10_550), builder, [], datetime(2026, 5, 29, 9, 2), context_risk=context)
+
+    assert [decision.decision_type for decision in decisions] == [TAKE_PROFIT, THEME_WEAK_EXIT]
+    assert all(decision.details["sequence_ambiguous"] is True for decision in decisions)
 
 
 def test_support_loss_full_closes_position():

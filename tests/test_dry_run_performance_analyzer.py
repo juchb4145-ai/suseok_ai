@@ -187,7 +187,7 @@ def test_no_entry_intent_but_review_rallied_is_false_negative(tmp_path):
 
     item = report["items"][0]
     assert item["entry_intent_id"] == ""
-    assert item["dry_run_false_negative_type"] == "GATE_BLOCKED_BUT_RALLIED"
+    assert item["dry_run_false_negative_type"] == "NO_ENTRY_INTENT_BUT_RALLIED"
     assert report["summary"]["false_negative_count"] == 1
 
 
@@ -245,4 +245,109 @@ def test_orphan_exit_and_missing_review_are_reported_as_data_quality(tmp_path):
 
     item = report["items"][0]
     assert "ORPHAN_EXIT" in item["data_quality_issues"]
+    assert item["data_quality_issue_reasons"]["ORPHAN_EXIT"] == "EXIT_INTENT_ONLY_CANDIDATE_FALLBACK"
     assert report["summary"]["data_quality"]["orphan_exit_count"] == 1
+
+
+def test_candidate_code_trade_date_fallback_links_entry_exit_and_review(tmp_path):
+    db = _db(tmp_path)
+    try:
+        db.save_runtime_order_intent(
+            _intent(
+                "entry-fallback",
+                candidate_id=7,
+                virtual_order_id=None,
+                virtual_position_id=None,
+                trade_review_id=None,
+            )
+        )
+        db.save_runtime_order_intent(
+            _intent(
+                "exit-fallback",
+                side="sell",
+                order_phase="exit",
+                candidate_id=None,
+                virtual_order_id=None,
+                virtual_position_id=None,
+                trade_review_id=None,
+                exit_decision_type="TRAILING_STOP",
+            )
+        )
+        db.save_trade_review(
+            _review(
+                candidate_id=7,
+                virtual_order_id=None,
+                virtual_position_id=None,
+                final_status=ReviewFinalStatus.VIRTUAL_CLOSED_TRAILING_STOP.value,
+            )
+        )
+        report = DryRunPerformanceAnalyzer(db).build_report(trade_date="2026-05-30")
+    finally:
+        db.close()
+
+    assert report["summary"]["total_lifecycle_count"] == 1
+    item = report["items"][0]
+    assert item["entry_intent_id"] == "entry-fallback"
+    assert item["exit_intent_ids"] == ["exit-fallback"]
+    assert item["trade_review_id"] is not None
+
+
+def test_virtual_position_candidate_fallback_prevents_position_missing(tmp_path):
+    db = _db(tmp_path)
+    try:
+        position = db.save_virtual_position(
+            VirtualPosition(
+                candidate_id=1,
+                virtual_order_id=None,
+                entry_price=10000,
+                quantity=10,
+                opened_at="2026-05-30T09:02:00",
+                closed_at="2026-05-30T09:15:00",
+                close_price=10300,
+                close_reason="TAKE_PROFIT",
+                max_return_pct=3.0,
+                max_drawdown_pct=-0.5,
+                realized_return_pct=3.0,
+            )
+        )
+        db.save_runtime_order_intent(_intent("entry-position-fallback", virtual_order_id=None, virtual_position_id=None))
+        db.save_trade_review(_review(virtual_order_id=None, virtual_position_id=position.id, final_status=ReviewFinalStatus.VIRTUAL_CLOSED_TAKE_PROFIT.value))
+        report = DryRunPerformanceAnalyzer(db).build_report(trade_date="2026-05-30")
+    finally:
+        db.close()
+
+    item = report["items"][0]
+    assert item["virtual_position_id"] == position.id
+    assert "POSITION_MISSING" not in item["data_quality_issues"]
+
+
+def test_missing_price_and_quantity_are_split_by_reason(tmp_path):
+    db = _db(tmp_path)
+    try:
+        db.save_runtime_order_intent(
+            _intent(
+                "entry-bad-fields",
+                status="DRY_RUN_REJECTED",
+                reason="PRICE_INVALID",
+                price=0,
+                quantity=0,
+                order_amount=0,
+                safety={"ok": False, "reason": "PRICE_INVALID"},
+                metadata={
+                    "session_bucket": "OPEN",
+                    "quantity_calculation_reason": "PRICE_INVALID",
+                    "source": "themelab_flow",
+                    "order_eligibility": "BUY_ELIGIBLE_PULLBACK",
+                },
+                virtual_order_id=None,
+                virtual_position_id=None,
+            )
+        )
+        report = DryRunPerformanceAnalyzer(db).build_report(trade_date="2026-05-30")
+    finally:
+        db.close()
+
+    item = report["items"][0]
+    assert item["data_quality_issue_reasons"]["MISSING_PRICE"].startswith("QUANTITY_CALCULATION:")
+    assert item["data_quality_issue_reasons"]["MISSING_QUANTITY"].startswith("QUANTITY_CALCULATION:")
+    assert report["summary"]["data_quality"]["missing_price_reasons"][0]["reason"] == "QUANTITY_CALCULATION:PRICE_INVALID"

@@ -11,6 +11,7 @@ from typing import Any, Iterable, Optional
 from storage.db import TradingDatabase
 from trading.broker.models import new_message_id, utc_timestamp
 from trading.strategy.models import ReviewFinalStatus
+from trading.strategy.reason_taxonomy import normalize_reason_status, reason_status_family, reason_summary
 
 
 REPORT_ROOT = Path(__file__).resolve().parents[1] / "reports" / "dry_run_performance"
@@ -38,6 +39,8 @@ class DryRunTradeLifecycle:
     theme_score: Optional[float] = None
     gate_status: str = ""
     gate_reason: str = ""
+    reason_status: str = ""
+    reason_family: str = ""
     gate_score: Optional[float] = None
     hybrid_score: Optional[float] = None
     session_bucket: str = ""
@@ -84,6 +87,7 @@ class DryRunTradeLifecycle:
     hold_minutes: Optional[float] = None
     data_status: str = "OK"
     data_quality_issues: list[str] = field(default_factory=list)
+    data_quality_issue_reasons: dict[str, str] = field(default_factory=dict)
     review_false_positive_mismatch: bool = False
     review_false_negative_mismatch: bool = False
     details: dict[str, Any] = field(default_factory=dict)
@@ -153,7 +157,11 @@ class DryRunFalseSignalClassifier:
             false_negative_type = false_negative_type or "LIVE_REJECTED_BUT_RALLIED"
             opportunity_loss_type = opportunity_loss_type or "LIVE_REJECTED_BUT_RALLIED"
             signal_classification = "false_negative"
-        if lifecycle.blocked_but_later_rallied:
+        if not entry_exists and lifecycle.trade_review_id and max_return is not None and max_return >= self.config.fn_rally_threshold_pct:
+            false_negative_type = false_negative_type or "NO_ENTRY_INTENT_BUT_RALLIED"
+            opportunity_loss_type = opportunity_loss_type or "NO_ENTRY_INTENT_BUT_RALLIED"
+            signal_classification = "false_negative"
+        if lifecycle.blocked_but_later_rallied and entry_exists:
             false_negative_type = false_negative_type or "GATE_BLOCKED_BUT_RALLIED"
             opportunity_loss_type = opportunity_loss_type or "GATE_BLOCKED_BUT_RALLIED"
             signal_classification = "false_negative"
@@ -161,11 +169,6 @@ class DryRunFalseSignalClassifier:
             false_negative_type = false_negative_type or "EXPIRED_BUT_RALLIED"
             opportunity_loss_type = opportunity_loss_type or "EXPIRED_BUT_RALLIED"
             signal_classification = "false_negative"
-        if not entry_exists and lifecycle.trade_review_id and max_return is not None and max_return >= self.config.fn_rally_threshold_pct:
-            false_negative_type = false_negative_type or "NO_ENTRY_INTENT_BUT_RALLIED"
-            opportunity_loss_type = opportunity_loss_type or "NO_ENTRY_INTENT_BUT_RALLIED"
-            signal_classification = "false_negative"
-
         if signal_classification == "pending":
             if lifecycle.data_status == "OK" and (not entry_exists or entry_rejected) and (max_return is None or max_return < self.config.fn_rally_threshold_pct):
                 signal_classification = "true_negative"
@@ -299,6 +302,10 @@ class DryRunPerformanceAnalyzer:
             for position in positions.values()
             if position.virtual_order_id is not None
         }
+        positions_by_candidate: dict[int, list[Any]] = {}
+        for position in positions.values():
+            if position.candidate_id is not None:
+                positions_by_candidate.setdefault(int(position.candidate_id), []).append(position)
         decisions_by_position: dict[int, list[Any]] = {}
         for decision in self.db.list_exit_decisions_for_analysis():
             if decision.virtual_position_id is not None:
@@ -313,8 +320,14 @@ class DryRunPerformanceAnalyzer:
         def bucket(key: str) -> dict[str, list[Any]]:
             return groups.setdefault(key, {"intents": [], "reviews": []})
 
+        review_key_by_id = {
+            int(review.id): _lifecycle_key_for_review(review, position_by_order)
+            for review in reviews
+            if review.id is not None
+        }
+
         for intent in intents:
-            bucket(_lifecycle_key_for_intent(intent, position_by_order))["intents"].append(intent)
+            bucket(_lifecycle_key_for_intent(intent, position_by_order, review_key_by_id))["intents"].append(intent)
         for review in reviews:
             bucket(_lifecycle_key_for_review(review, position_by_order))["reviews"].append(review)
 
@@ -326,6 +339,7 @@ class DryRunPerformanceAnalyzer:
                 list(group.get("reviews") or []),
                 positions,
                 position_by_order,
+                positions_by_candidate,
                 decisions_by_position,
                 candidates,
             )
@@ -346,6 +360,7 @@ class DryRunPerformanceAnalyzer:
         reviews: list[Any],
         positions: dict[int, Any],
         position_by_order: dict[int, Any],
+        positions_by_candidate: dict[int, list[Any]],
         decisions_by_position: dict[int, list[Any]],
         candidates: dict[int, Any],
     ) -> DryRunTradeLifecycle:
@@ -356,7 +371,7 @@ class DryRunPerformanceAnalyzer:
         review = sorted(reviews, key=lambda item: int(item.id or 0), reverse=True)[0] if reviews else None
         entry = entry_intents[0] if entry_intents else None
 
-        position = _position_for_group(entry, exit_intents, review, positions, position_by_order)
+        position = _position_for_group(entry, exit_intents, review, positions, position_by_order, positions_by_candidate)
         candidate_id = _first_not_none(
             entry.get("candidate_id") if entry else None,
             review.candidate_id if review else None,
@@ -400,6 +415,19 @@ class DryRunPerformanceAnalyzer:
             )
             or ""
         )
+        gate_reason = str(_first_not_none(entry.get("gate_reason") if entry else None, review_details.get("primary_reason_code"), review_details.get("gate_reason")) or "")
+        taxonomy_codes = [
+            gate_reason,
+            str(entry_safety.get("reason") or ""),
+            str(entry_live_safety.get("reason") or ""),
+            *[str(value) for value in (review_details.get("blocking_reason_codes") or [])],
+            *[str(value) for value in (review_details.get("secondary_reason_codes") or [])],
+        ]
+        reason_status = normalize_reason_status(
+            reason_codes=taxonomy_codes,
+            display_state=str(_first_not_none(entry.get("gate_status") if entry else None, review_details.get("gate_status")) or ""),
+            existing_status=str(entry_metadata.get("sub_status") or review_details.get("sub_status") or ""),
+        )
         lifecycle = DryRunTradeLifecycle(
             lifecycle_id=key,
             trade_date=trade_date,
@@ -410,7 +438,9 @@ class DryRunPerformanceAnalyzer:
             theme_name=str(_first_not_none(entry_request.get("theme_name"), review.theme_name if review else None, entry_metadata.get("theme_name")) or ""),
             theme_score=_optional_float(_first_not_none(entry_request.get("theme_score"), entry_metadata.get("theme_score"), review_details.get("theme_score"))),
             gate_status=str(_first_not_none(entry.get("gate_status") if entry else None, review_details.get("gate_status")) or ""),
-            gate_reason=str(_first_not_none(entry.get("gate_reason") if entry else None, review_details.get("primary_reason_code"), review_details.get("gate_reason")) or ""),
+            gate_reason=gate_reason,
+            reason_status=reason_status,
+            reason_family=reason_status_family(reason_status),
             gate_score=_optional_float(_first_not_none(entry_request.get("gate_score"), entry_metadata.get("gate_score"), review_details.get("gate_score"))),
             hybrid_score=_optional_float(_first_not_none(entry_request.get("hybrid_score"), entry_metadata.get("hybrid_score"), review_details.get("hybrid_score"))),
             session_bucket=str(_first_not_none(review_details.get("session_bucket"), entry_metadata.get("session_bucket")) or ""),
@@ -460,7 +490,15 @@ class DryRunPerformanceAnalyzer:
                 "review_false_negative_type": review_details.get("false_negative_type", "") if review else "",
             },
         )
-        lifecycle.data_quality_issues = _data_quality_issues(lifecycle, bool(entry), bool(exit_intents), bool(review), bool(position), position_decisions)
+        lifecycle.data_quality_issue_reasons = _data_quality_issue_reasons(
+            lifecycle,
+            entry,
+            exit_intents,
+            review,
+            position,
+            position_decisions,
+        )
+        lifecycle.data_quality_issues = list(lifecycle.data_quality_issue_reasons)
         lifecycle.data_status = "OK" if not lifecycle.data_quality_issues else lifecycle.data_quality_issues[0]
         return lifecycle
 
@@ -540,6 +578,8 @@ class DryRunPerformanceAnalyzer:
             "by_strategy_name": _group_stats(items, "strategy_name"),
             "by_theme_name": _group_stats(items, "theme_name"),
             "by_gate_reason": _group_stats(items, "gate_reason"),
+            "by_reason_status": _group_stats(items, "reason_status"),
+            "by_reason_family": _group_stats(items, "reason_family"),
             "by_gate_status": _group_stats(items, "gate_status"),
             "by_session_bucket": _group_stats(items, "session_bucket"),
             "by_code": _group_stats(items, "code"),
@@ -547,31 +587,49 @@ class DryRunPerformanceAnalyzer:
             "by_decision_safety_reason": _group_stats(items, "entry_decision_safety_reason"),
             "by_score_bucket": _group_stats(items, "score_bucket"),
             "by_exit_decision_type": _multi_group_stats(items, "exit_decision_types", "decision_type"),
+            "reason_summary": reason_summary(items),
         }
 
     def data_quality(self, items: list[dict]) -> dict[str, Any]:
         issues: dict[str, dict[str, Any]] = {}
+        reason_counts: dict[str, dict[str, int]] = {}
         for item in items:
+            issue_reasons = dict(item.get("data_quality_issue_reasons") or {})
             for issue in item.get("data_quality_issues") or []:
                 bucket = issues.setdefault(issue, {"count": 0, "samples": []})
                 bucket["count"] += 1
+                reason = str(issue_reasons.get(issue) or "UNKNOWN")
+                reason_bucket = reason_counts.setdefault(issue, {})
+                reason_bucket[reason] = reason_bucket.get(reason, 0) + 1
                 if len(bucket["samples"]) < 5:
                     bucket["samples"].append(
                         {
                             "code": item.get("code", ""),
                             "intent_id": item.get("entry_intent_id") or (item.get("exit_intent_ids") or [""])[0],
                             "lifecycle_id": item.get("lifecycle_id", ""),
+                            "reason": reason,
                         }
                     )
         return {
             "issues": [
-                {"issue": issue, **payload}
+                {
+                    "issue": issue,
+                    **payload,
+                    "reasons": [
+                        {"reason": reason, "count": count}
+                        for reason, count in sorted(reason_counts.get(issue, {}).items(), key=lambda pair: pair[1], reverse=True)
+                    ],
+                }
                 for issue, payload in sorted(issues.items(), key=lambda pair: pair[1]["count"], reverse=True)
             ],
             "missing_review_count": issues.get("REVIEW_MISSING", {}).get("count", 0),
             "missing_position_count": issues.get("POSITION_MISSING", {}).get("count", 0),
             "orphan_entry_count": issues.get("ORPHAN_ENTRY", {}).get("count", 0),
             "orphan_exit_count": issues.get("ORPHAN_EXIT", {}).get("count", 0),
+            "missing_price_reasons": _issue_reasons(reason_counts, "MISSING_PRICE"),
+            "missing_quantity_reasons": _issue_reasons(reason_counts, "MISSING_QUANTITY"),
+            "orphan_entry_reasons": _issue_reasons(reason_counts, "ORPHAN_ENTRY"),
+            "orphan_exit_reasons": _issue_reasons(reason_counts, "ORPHAN_EXIT"),
         }
 
     def recommendations(self, summary: dict, grouped: dict, false_signal_summary: dict) -> list[str]:
@@ -638,6 +696,8 @@ class DryRunPerformanceAnalyzer:
             "quality_bucket",
             "gate_status",
             "gate_reason",
+            "reason_status",
+            "reason_family",
             "hybrid_score",
             "theme_score",
         ]
@@ -686,6 +746,9 @@ class DryRunPerformanceAnalyzer:
             "## Gate Reason Performance",
             *_markdown_group_lines(grouped.get("by_gate_reason", [])[:10]),
             "",
+            "## Runtime Reason Taxonomy",
+            *_markdown_group_lines(grouped.get("by_reason_status", [])[:10]),
+            "",
             "## Theme Performance",
             *_markdown_group_lines(grouped.get("by_theme_name", [])[:10]),
             "",
@@ -731,7 +794,11 @@ def config_from_settings(settings: Any) -> DryRunPerformanceConfig:
     )
 
 
-def _lifecycle_key_for_intent(intent: dict, position_by_order: dict[int, Any]) -> str:
+def _lifecycle_key_for_intent(
+    intent: dict,
+    position_by_order: dict[int, Any],
+    review_key_by_id: Optional[dict[int, str]] = None,
+) -> str:
     virtual_position_id = intent.get("virtual_position_id")
     if virtual_position_id is not None:
         return f"vp:{virtual_position_id}"
@@ -741,11 +808,13 @@ def _lifecycle_key_for_intent(intent: dict, position_by_order: dict[int, Any]) -
     if virtual_order_id is not None:
         return f"vo:{virtual_order_id}"
     trade_review_id = intent.get("trade_review_id")
+    if trade_review_id is not None and review_key_by_id and int(trade_review_id) in review_key_by_id:
+        return review_key_by_id[int(trade_review_id)]
     if trade_review_id is not None:
         return f"review:{trade_review_id}"
-    candidate_id = intent.get("candidate_id")
-    if candidate_id is not None or intent.get("code"):
-        return f"cand:{intent.get('trade_date', '')}:{candidate_id or ''}:{intent.get('code', '')}"
+    candidate_key = _candidate_code_date_key(intent.get("trade_date"), intent.get("code"), intent.get("candidate_id"))
+    if candidate_key:
+        return candidate_key
     prefix = "orphan_exit" if _intent_phase(intent) == "exit" or intent.get("side") == "sell" else "orphan_entry"
     return f"{prefix}:{intent.get('intent_id', '')}"
 
@@ -755,9 +824,22 @@ def _lifecycle_key_for_review(review: Any, position_by_order: dict[int, Any]) ->
         return f"vp:{review.virtual_position_id}"
     if review.virtual_order_id is not None and int(review.virtual_order_id) in position_by_order:
         return f"vp:{position_by_order[int(review.virtual_order_id)].id}"
-    if review.candidate_id is not None or review.code:
-        return f"cand:{review.trade_date}:{review.candidate_id or ''}:{review.code}"
+    candidate_key = _candidate_code_date_key(review.trade_date, review.code, review.candidate_id)
+    if candidate_key:
+        return candidate_key
     return f"review:{review.id}"
+
+
+def _candidate_code_date_key(trade_date: Any, code: Any, candidate_id: Any = None) -> str:
+    date_text = str(trade_date or "")
+    code_text = str(code or "")
+    if date_text and code_text:
+        return f"cand_code:{date_text}:{code_text}"
+    if date_text and candidate_id is not None:
+        return f"cand_id:{date_text}:{candidate_id}"
+    if candidate_id is not None:
+        return f"cand_id::{candidate_id}"
+    return ""
 
 
 def _position_for_group(
@@ -766,6 +848,7 @@ def _position_for_group(
     review: Any,
     positions: dict[int, Any],
     position_by_order: dict[int, Any],
+    positions_by_candidate: Optional[dict[int, list[Any]]] = None,
 ):
     ids = []
     if entry:
@@ -785,6 +868,18 @@ def _position_for_group(
     for value in order_ids:
         if value is not None and int(value) in position_by_order:
             return position_by_order[int(value)]
+    candidate_ids = []
+    if entry:
+        candidate_ids.append(entry.get("candidate_id"))
+    if review:
+        candidate_ids.append(review.candidate_id)
+    candidate_ids.extend(intent.get("candidate_id") for intent in exit_intents)
+    for value in candidate_ids:
+        if value is None or positions_by_candidate is None:
+            continue
+        candidates = positions_by_candidate.get(int(value)) or []
+        if candidates:
+            return sorted(candidates, key=lambda item: int(item.id or 0), reverse=True)[0]
     return None
 
 
@@ -792,42 +887,65 @@ def _intent_phase(intent: dict) -> str:
     return str(intent.get("order_phase") or ("exit" if str(intent.get("side") or "") == "sell" else "entry"))
 
 
-def _data_quality_issues(
+def _data_quality_issue_reasons(
     lifecycle: DryRunTradeLifecycle,
-    has_entry: bool,
-    has_exit: bool,
-    has_review: bool,
-    has_position: bool,
+    entry: Optional[dict],
+    exit_intents: list[dict],
+    review: Any,
+    position: Any,
     position_decisions: list[Any],
-) -> list[str]:
-    issues: list[str] = []
+) -> dict[str, str]:
+    issues: dict[str, str] = {}
+    has_entry = entry is not None
+    has_exit = bool(exit_intents)
+    has_review = review is not None
+    has_position = position is not None
+    entry_metadata = dict(entry.get("metadata") or {}) if entry else {}
+    entry_safety = dict(entry.get("safety") or {}) if entry else {}
+    entry_request = dict(entry.get("request") or {}) if entry else {}
     if has_entry and not has_review:
-        issues.append("REVIEW_MISSING")
+        issues["REVIEW_MISSING"] = "ENTRY_INTENT_WITHOUT_TRADE_REVIEW"
     if has_entry and not has_position:
-        issues.append("POSITION_MISSING")
+        if entry and entry.get("virtual_order_id") is None:
+            issues["POSITION_MISSING"] = "ENTRY_INTENT_WITHOUT_VIRTUAL_ORDER_ID"
+        elif entry and str(entry.get("status") or "") in {"DRY_RUN_REJECTED", "REJECTED", "DUPLICATE"}:
+            issues["POSITION_MISSING"] = "ENTRY_NOT_ACCEPTED_NO_POSITION_EXPECTED"
+        else:
+            issues["POSITION_MISSING"] = "NO_POSITION_MATCHED_BY_POSITION_OR_ORDER_OR_CANDIDATE"
     if has_entry and not has_exit and lifecycle.final_status in {
         ReviewFinalStatus.VIRTUAL_CLOSED_SUPPORT_LOSS.value,
         ReviewFinalStatus.VIRTUAL_CLOSED_TAKE_PROFIT.value,
         ReviewFinalStatus.VIRTUAL_CLOSED_TIME_EXIT.value,
         ReviewFinalStatus.VIRTUAL_CLOSED_TRAILING_STOP.value,
     }:
-        issues.append("EXIT_INTENT_MISSING")
+        issues["EXIT_INTENT_MISSING"] = "CLOSED_REVIEW_WITHOUT_EXIT_INTENT"
     if has_exit and not has_entry:
-        issues.append("ORPHAN_EXIT")
+        if any(intent.get("virtual_position_id") for intent in exit_intents):
+            issues["ORPHAN_EXIT"] = "EXIT_INTENT_POSITION_HAS_NO_ENTRY_INTENT"
+        elif any(intent.get("candidate_id") or intent.get("code") for intent in exit_intents):
+            issues["ORPHAN_EXIT"] = "EXIT_INTENT_ONLY_CANDIDATE_FALLBACK"
+        else:
+            issues["ORPHAN_EXIT"] = "EXIT_INTENT_WITHOUT_LINK_KEYS"
     if has_entry and not has_position and not has_review:
-        issues.append("ORPHAN_ENTRY")
+        if entry and entry.get("virtual_order_id") is None:
+            issues["ORPHAN_ENTRY"] = "ENTRY_INTENT_WITHOUT_VIRTUAL_ORDER_OR_REVIEW"
+        else:
+            issues["ORPHAN_ENTRY"] = "ENTRY_INTENT_UNMATCHED_TO_POSITION_AND_REVIEW"
     if has_exit and not position_decisions:
-        issues.append("EXIT_DECISION_MISSING")
+        if any(intent.get("exit_decision_id") for intent in exit_intents):
+            issues["EXIT_DECISION_MISSING"] = "EXIT_DECISION_ID_NOT_FOUND"
+        else:
+            issues["EXIT_DECISION_MISSING"] = "EXIT_INTENT_WITHOUT_EXIT_DECISION_ID"
     if lifecycle.entry_price <= 0:
-        issues.append("MISSING_PRICE")
+        issues["MISSING_PRICE"] = _missing_price_reason(entry, entry_metadata, entry_request)
     if has_entry and lifecycle.entry_quantity <= 0:
-        issues.append("MISSING_QUANTITY")
+        issues["MISSING_QUANTITY"] = _missing_quantity_reason(entry, entry_metadata, entry_safety)
     if has_entry and lifecycle.entry_live_reject_reason == "" and not lifecycle.entry_live_would_pass:
-        issues.append("MISSING_LIVE_SAFETY_JSON")
+        issues["MISSING_LIVE_SAFETY_JSON"] = "LIVE_SAFETY_EMPTY_OR_MISSING_REASON"
     if has_review and lifecycle.max_return_20m is None:
-        issues.append("MISSING_HORIZON_METRICS")
+        issues["MISSING_HORIZON_METRICS"] = "TRADE_REVIEW_MAX_RETURN_20M_MISSING"
     if has_position and not lifecycle.closed_at and has_entry:
-        issues.append("STALE_OPEN_POSITION")
+        issues["STALE_OPEN_POSITION"] = "POSITION_OPEN_WITH_ENTRY_INTENT"
     return issues
 
 
@@ -879,6 +997,42 @@ def _top_counts(values: Iterable[Any], *, key: str = "type", limit: int = 10) ->
             continue
         counts[text] = counts.get(text, 0) + 1
     return [{key: value, "count": count} for value, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)[:limit]]
+
+
+def _issue_reasons(reason_counts: dict[str, dict[str, int]], issue: str) -> list[dict[str, Any]]:
+    return [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(reason_counts.get(issue, {}).items(), key=lambda pair: pair[1], reverse=True)
+    ]
+
+
+def _missing_price_reason(entry: Optional[dict], metadata: dict, request: dict) -> str:
+    if entry is None:
+        return "NO_ENTRY_INTENT_PRICE_SOURCE"
+    for key in ("price_source", "quantity_calculation_reason", "reject_reason"):
+        value = metadata.get(key) or request.get(key)
+        if value:
+            label = "QUANTITY_CALCULATION" if key == "quantity_calculation_reason" else key.upper()
+            return f"{label}:{value}"
+    safety = dict(entry.get("safety") or {})
+    if safety.get("reason"):
+        return f"SAFETY:{safety.get('reason')}"
+    if entry.get("reason"):
+        return f"INTENT_REASON:{entry.get('reason')}"
+    return "ENTRY_INTENT_PRICE_ZERO"
+
+
+def _missing_quantity_reason(entry: Optional[dict], metadata: dict, safety: dict) -> str:
+    if entry is None:
+        return "NO_ENTRY_INTENT_QUANTITY_SOURCE"
+    quantity_reason = str(metadata.get("quantity_calculation_reason") or "")
+    if quantity_reason:
+        return f"QUANTITY_CALCULATION:{quantity_reason}"
+    if safety.get("reason"):
+        return f"SAFETY:{safety.get('reason')}"
+    if entry.get("reason"):
+        return f"INTENT_REASON:{entry.get('reason')}"
+    return "ENTRY_INTENT_QUANTITY_ZERO"
 
 
 def _is_completed(item: dict) -> bool:
@@ -1061,4 +1215,23 @@ def _markdown_quality_lines(data_quality: dict) -> list[str]:
     issues = data_quality.get("issues") or []
     if not issues:
         return ["- no major data quality issue"]
-    return [f"- {item.get('issue')}: {item.get('count')}" for item in issues]
+    output = [
+        f"- Missing review: {data_quality.get('missing_review_count', 0)}",
+        f"- Missing position: {data_quality.get('missing_position_count', 0)}",
+        f"- Orphan entry: {data_quality.get('orphan_entry_count', 0)}",
+        f"- Orphan exit: {data_quality.get('orphan_exit_count', 0)}",
+        "",
+        "### Data Quality Issues",
+    ]
+    for item in issues:
+        output.append(f"- {item.get('issue')}: {item.get('count')}")
+        for reason in (item.get("reasons") or [])[:5]:
+            output.append(f"  - reason={reason.get('reason')}: {reason.get('count')}")
+        samples = item.get("samples") or []
+        if samples:
+            sample_text = ", ".join(
+                f"{sample.get('code') or '?'}:{sample.get('intent_id') or sample.get('lifecycle_id') or '?'}"
+                for sample in samples[:3]
+            )
+            output.append(f"  - samples: {sample_text}")
+    return output

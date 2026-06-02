@@ -21,6 +21,14 @@ GRADE_LABELS_KO = {
     "DO_NOT_APPLY": "적용 비추천",
 }
 
+GRADE_LABELS_KO.update(
+    {
+        "OBSERVE_CANDIDATE": "관찰 후보",
+        "DATA_INSUFFICIENT_FOR_THRESHOLD_CHANGE": "기준 변경 표본 부족",
+        "OPERATIONAL_REVIEW_ONLY": "운영 검토 전용",
+    }
+)
+
 CATEGORY_LABELS_KO = {
     "gate": "게이트",
     "risk": "리스크",
@@ -33,6 +41,11 @@ CATEGORY_LABELS_KO = {
 @dataclass(frozen=True)
 class ThresholdABConfig:
     min_sample_count: int = 10
+    min_trade_days: int = 5
+    min_completed_lifecycles: int = 30
+    min_entry_intents: int = 30
+    min_exit_decisions: int = 10
+    min_signal_samples: int = 5
     strong_fp_reduction_min: int = 3
     max_fn_increase: int = 1
     max_opportunity_loss_increase: int = 1
@@ -151,6 +164,14 @@ class DryRunThresholdABAnalyzer:
                     "recommendation_grade": recommendation.get("grade", ""),
                     "expected_net_benefit_score": recommendation.get("expected_net_benefit_score", 0),
                     "sample_count": recommendation.get("sample_count", 0),
+                    "sample_trade_days": recommendation.get("sample_trade_days", 0),
+                    "completed_lifecycle_count": recommendation.get("completed_lifecycle_count", 0),
+                    "entry_intent_count": recommendation.get("entry_intent_count", 0),
+                    "exit_decision_count": recommendation.get("exit_decision_count", 0),
+                    "signal_sample_count": recommendation.get("signal_sample_count", 0),
+                    "guardrail_passed": recommendation.get("guardrail_passed", False),
+                    "blocked_by_guardrail_reason": recommendation.get("blocked_by_guardrail_reason", ""),
+                    "candidate_trade_day_counts": recommendation.get("candidate_trade_day_counts", {}),
                     "confidence": recommendation.get("confidence", candidate.confidence),
                     "avoided_false_positive_count": delta.get("avoided_false_positive_count", 0),
                     "newly_created_false_negative_count": delta.get("newly_created_false_negative_count", 0),
@@ -247,7 +268,7 @@ class DryRunThresholdABAnalyzer:
             + (delta["avg_realized_return_delta"] or 0.0) * 0.5,
             4,
         )
-        grade = _grade(
+        raw_grade = _grade(
             sample_count=sample_count,
             confidence=confidence,
             avoided_fp=avoided_fp,
@@ -256,7 +277,11 @@ class DryRunThresholdABAnalyzer:
             net_benefit=net_benefit,
             config=self.config,
         )
+        guardrail = _sample_guardrail(affected, candidate, self.config)
+        grade = _guardrail_grade(raw_grade, guardrail, candidate)
         warnings = []
+        if guardrail["blocked_by_guardrail_reason"]:
+            warnings.append(f"THRESHOLD_AB_GUARDRAIL:{guardrail['blocked_by_guardrail_reason']}")
         if sample_count < self.config.min_sample_count:
             warnings.append("표본 수가 적어 관찰이 더 필요합니다.")
         if newly_created_fn > 0 or opportunity_loss_delta > 0:
@@ -264,9 +289,11 @@ class DryRunThresholdABAnalyzer:
         recommendation = {
             "grade": grade,
             "grade_ko": GRADE_LABELS_KO.get(grade, grade),
+            "raw_grade": raw_grade,
             "expected_net_benefit_score": net_benefit,
             "confidence": confidence,
             "sample_count": sample_count,
+            **guardrail,
             "reason_ko": candidate.reason_ko,
             "apply_enabled": False,
             "apply_note_ko": "이번 PR에서는 실제 설정 적용을 하지 않습니다.",
@@ -299,6 +326,13 @@ class DryRunThresholdABAnalyzer:
             "candidate_value",
             "recommendation_grade",
             "sample_count",
+            "sample_trade_days",
+            "completed_lifecycle_count",
+            "entry_intent_count",
+            "exit_decision_count",
+            "signal_sample_count",
+            "guardrail_passed",
+            "blocked_by_guardrail_reason",
             "confidence",
             "avoided_false_positive_count",
             "newly_created_false_negative_count",
@@ -328,6 +362,13 @@ class DryRunThresholdABAnalyzer:
                         "candidate_value": candidate.get("candidate_value", ""),
                         "recommendation_grade": recommendation.get("grade", ""),
                         "sample_count": recommendation.get("sample_count", 0),
+                        "sample_trade_days": recommendation.get("sample_trade_days", 0),
+                        "completed_lifecycle_count": recommendation.get("completed_lifecycle_count", 0),
+                        "entry_intent_count": recommendation.get("entry_intent_count", 0),
+                        "exit_decision_count": recommendation.get("exit_decision_count", 0),
+                        "signal_sample_count": recommendation.get("signal_sample_count", 0),
+                        "guardrail_passed": recommendation.get("guardrail_passed", False),
+                        "blocked_by_guardrail_reason": recommendation.get("blocked_by_guardrail_reason", ""),
                         "confidence": recommendation.get("confidence", 0),
                         "avoided_false_positive_count": delta.get("avoided_false_positive_count", 0),
                         "newly_created_false_negative_count": delta.get("newly_created_false_negative_count", 0),
@@ -365,6 +406,19 @@ class DryRunThresholdABAnalyzer:
             "",
             "## 추천 Top 10",
         ]
+        lines.extend(
+            [
+                "",
+                "## Guardrails",
+                f"- sample_trade_days_min: {summary.get('guardrail_policy', {}).get('min_trade_days', 0)}",
+                f"- completed_lifecycle_count_min: {summary.get('guardrail_policy', {}).get('min_completed_lifecycles', 0)}",
+                f"- entry_intent_count_min: {summary.get('guardrail_policy', {}).get('min_entry_intents', 0)}",
+                f"- exit_decision_count_min: {summary.get('guardrail_policy', {}).get('min_exit_decisions', 0)}",
+                f"- signal_sample_count_min: {summary.get('guardrail_policy', {}).get('min_signal_samples', 0)}",
+                f"- DATA_INSUFFICIENT_FOR_THRESHOLD_CHANGE: {summary.get('data_insufficient_for_threshold_change_count', 0)}",
+                f"- OPERATIONAL_REVIEW_ONLY: {summary.get('operational_review_only_count', 0)}",
+            ]
+        )
         for item in report.get("recommendations", [])[:10]:
             lines.extend(
                 [
@@ -375,6 +429,23 @@ class DryRunThresholdABAnalyzer:
                 ]
             )
         lines.extend(["", "## 후보 상세"])
+        lines.extend(["", "## Guardrail Candidate Fields"])
+        for candidate in report.get("candidates", [])[:10]:
+            result = (report.get("results") or {}).get(candidate.get("candidate_id"), {})
+            recommendation = result.get("recommendation") or {}
+            lines.extend(
+                [
+                    f"- {candidate.get('candidate_id', '')}",
+                    f"  - sample_trade_days: {recommendation.get('sample_trade_days', 0)}",
+                    f"  - completed_lifecycle_count: {recommendation.get('completed_lifecycle_count', 0)}",
+                    f"  - entry_intent_count: {recommendation.get('entry_intent_count', 0)}",
+                    f"  - exit_decision_count: {recommendation.get('exit_decision_count', 0)}",
+                    f"  - signal_sample_count: {recommendation.get('signal_sample_count', 0)}",
+                    f"  - guardrail_passed: {recommendation.get('guardrail_passed', False)}",
+                    f"  - blocked_by_guardrail_reason: {recommendation.get('blocked_by_guardrail_reason', '')}",
+                    f"  - candidate_trade_day_counts: {json.dumps(recommendation.get('candidate_trade_day_counts', {}), ensure_ascii=False, sort_keys=True)}",
+                ]
+            )
         for candidate in report.get("candidates", [])[:50]:
             result = (report.get("results") or {}).get(candidate.get("candidate_id"), {})
             recommendation = result.get("recommendation") or {}
@@ -597,13 +668,24 @@ class DryRunThresholdABAnalyzer:
             "candidate_count": len(candidates),
             "strong_candidate_count": grades.count("STRONG_CANDIDATE"),
             "watch_candidate_count": grades.count("WATCH_CANDIDATE"),
+            "observe_candidate_count": grades.count("OBSERVE_CANDIDATE"),
             "risky_candidate_count": grades.count("RISKY_CANDIDATE"),
             "data_insufficient_count": grades.count("DATA_INSUFFICIENT"),
+            "data_insufficient_for_threshold_change_count": grades.count("DATA_INSUFFICIENT_FOR_THRESHOLD_CHANGE"),
+            "operational_review_only_count": grades.count("OPERATIONAL_REVIEW_ONLY"),
             "do_not_apply_count": grades.count("DO_NOT_APPLY"),
             "total_avoided_false_positive_count": sum(int((result.get("delta") or {}).get("avoided_false_positive_count") or 0) for result in results),
             "total_new_false_negative_count": sum(int((result.get("delta") or {}).get("newly_created_false_negative_count") or 0) for result in results),
             "total_opportunity_loss_delta": sum(int((result.get("delta") or {}).get("opportunity_loss_delta") or 0) for result in results),
             "apply_enabled": False,
+            "guardrail_policy": {
+                "min_trade_days": self.config.min_trade_days,
+                "min_completed_lifecycles": self.config.min_completed_lifecycles,
+                "min_entry_intents": self.config.min_entry_intents,
+                "min_exit_decisions": self.config.min_exit_decisions,
+                "min_signal_samples": self.config.min_signal_samples,
+                "min_sample_count": self.config.min_sample_count,
+            },
         }
 
     def _build_recommendations(self, candidates: list[ThresholdCandidate], results: list[dict], *, include_risky: bool) -> list[dict[str, Any]]:
@@ -625,6 +707,14 @@ class DryRunThresholdABAnalyzer:
                     "expected_net_benefit_score": recommendation.get("expected_net_benefit_score", 0),
                     "confidence": recommendation.get("confidence", candidate.confidence),
                     "sample_count": recommendation.get("sample_count", 0),
+                    "sample_trade_days": recommendation.get("sample_trade_days", 0),
+                    "completed_lifecycle_count": recommendation.get("completed_lifecycle_count", 0),
+                    "entry_intent_count": recommendation.get("entry_intent_count", 0),
+                    "exit_decision_count": recommendation.get("exit_decision_count", 0),
+                    "signal_sample_count": recommendation.get("signal_sample_count", 0),
+                    "guardrail_passed": recommendation.get("guardrail_passed", False),
+                    "blocked_by_guardrail_reason": recommendation.get("blocked_by_guardrail_reason", ""),
+                    "candidate_trade_day_counts": recommendation.get("candidate_trade_day_counts", {}),
                     "delta": result.get("delta", {}),
                     "warnings": result.get("warnings", []),
                 }
@@ -648,16 +738,24 @@ class DryRunThresholdABAnalyzer:
 
 GRADE_SORT = {
     "STRONG_CANDIDATE": 0,
+    "OBSERVE_CANDIDATE": 1,
     "WATCH_CANDIDATE": 1,
     "RISKY_CANDIDATE": 2,
-    "DATA_INSUFFICIENT": 3,
-    "DO_NOT_APPLY": 4,
+    "OPERATIONAL_REVIEW_ONLY": 3,
+    "DATA_INSUFFICIENT_FOR_THRESHOLD_CHANGE": 4,
+    "DATA_INSUFFICIENT": 5,
+    "DO_NOT_APPLY": 6,
 }
 
 
 def config_from_settings(settings: Any) -> ThresholdABConfig:
     return ThresholdABConfig(
         min_sample_count=int(getattr(settings, "threshold_ab_min_sample_count", 10)),
+        min_trade_days=int(getattr(settings, "threshold_ab_min_trade_days", 5)),
+        min_completed_lifecycles=int(getattr(settings, "threshold_ab_min_completed_lifecycles", 30)),
+        min_entry_intents=int(getattr(settings, "threshold_ab_min_entry_intents", 30)),
+        min_exit_decisions=int(getattr(settings, "threshold_ab_min_exit_decisions", 10)),
+        min_signal_samples=int(getattr(settings, "threshold_ab_min_signal_samples", 5)),
         strong_fp_reduction_min=int(getattr(settings, "threshold_ab_strong_fp_reduction_min", 3)),
         max_fn_increase=int(getattr(settings, "threshold_ab_max_fn_increase", 1)),
         max_opportunity_loss_increase=int(getattr(settings, "threshold_ab_max_opportunity_loss_increase", 1)),
@@ -740,6 +838,72 @@ def _grade(
     if net_benefit > 0 or avoided_fp > 0 or opportunity_loss_delta < 0:
         return "WATCH_CANDIDATE"
     return "DO_NOT_APPLY"
+
+
+def _sample_guardrail(items: list[dict], candidate: ThresholdCandidate, config: ThresholdABConfig) -> dict[str, Any]:
+    trade_day_counts: dict[str, int] = {}
+    for item in items:
+        trade_date = str(item.get("trade_date") or "")
+        if trade_date:
+            trade_day_counts[trade_date] = trade_day_counts.get(trade_date, 0) + 1
+    completed = sum(1 for item in items if item.get("realized_return_pct") is not None or item.get("final_status"))
+    entry_intents = sum(1 for item in items if item.get("entry_intent_id") or item.get("entry_intent_status"))
+    exit_decisions = sum(
+        _exit_decision_count(item)
+        for item in items
+    )
+    signal_samples = sum(
+        1
+        for item in items
+        if item.get("signal_classification")
+        or item.get("dry_run_false_positive_type")
+        or item.get("dry_run_false_negative_type")
+        or item.get("opportunity_loss_type")
+    )
+    reasons: list[str] = []
+    if len(trade_day_counts) < config.min_trade_days:
+        reasons.append("MIN_TRADE_DAYS")
+    if completed < config.min_completed_lifecycles:
+        reasons.append("MIN_COMPLETED_LIFECYCLES")
+    if entry_intents < config.min_entry_intents:
+        reasons.append("MIN_ENTRY_INTENTS")
+    if exit_decisions < config.min_exit_decisions:
+        reasons.append("MIN_EXIT_DECISIONS")
+    if signal_samples < config.min_signal_samples:
+        reasons.append("MIN_SIGNAL_SAMPLES")
+    if len(items) < config.min_sample_count:
+        reasons.append("MIN_SAMPLE_COUNT")
+    if candidate.category == "safety" or _contains_any(f"{candidate.parameter_name} {candidate.reason} {candidate.expected_risk}", ["safety", "live_safety"]):
+        reasons.append("OPERATIONAL_REVIEW_ONLY")
+    return {
+        "sample_trade_days": len(trade_day_counts),
+        "completed_lifecycle_count": completed,
+        "entry_intent_count": entry_intents,
+        "exit_decision_count": exit_decisions,
+        "signal_sample_count": signal_samples,
+        "guardrail_passed": not reasons,
+        "blocked_by_guardrail_reason": ",".join(reasons),
+        "candidate_trade_day_counts": dict(sorted(trade_day_counts.items())),
+    }
+
+
+def _guardrail_grade(raw_grade: str, guardrail: dict[str, Any], candidate: ThresholdCandidate) -> str:
+    blocked_reason = str(guardrail.get("blocked_by_guardrail_reason") or "")
+    if "OPERATIONAL_REVIEW_ONLY" in blocked_reason or candidate.category == "safety":
+        return "OPERATIONAL_REVIEW_ONLY"
+    if blocked_reason:
+        return "DATA_INSUFFICIENT_FOR_THRESHOLD_CHANGE"
+    if raw_grade == "WATCH_CANDIDATE":
+        return "OBSERVE_CANDIDATE"
+    return raw_grade
+
+
+def _exit_decision_count(item: dict) -> int:
+    for key in ("exit_decision_ids", "exit_decision_types", "exit_reasons"):
+        value = item.get(key)
+        if isinstance(value, list):
+            return len([part for part in value if part])
+    return 1 if item.get("exit_decision_id") or item.get("exit_decision_type") or item.get("exit_reason") else 0
 
 
 def _confidence(sample_count: int, min_sample_count: int) -> float:

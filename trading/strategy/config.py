@@ -30,9 +30,11 @@ CONFIG_FIELDS = {
     "max_candidates_to_watch",
     "realtime_subscription_limit",
     "theme_engine_mode",
+    "theme_lab_dry_run_bridge_enabled",
     "theme_lab_pipeline_interval_sec",
     "theme_lab_condition_names",
     "theme_lab_condition_purposes",
+    "exit_context_risk_enabled",
 }
 
 
@@ -151,9 +153,11 @@ def config_to_dict(config: StrategyRuntimeConfig) -> dict[str, Any]:
         "max_candidates_to_watch": int(config.max_candidates_to_watch),
         "realtime_subscription_limit": int(config.realtime_subscription_limit),
         "theme_engine_mode": str(config.theme_engine_mode),
+        "theme_lab_dry_run_bridge_enabled": bool(config.theme_lab_dry_run_bridge_enabled),
         "theme_lab_pipeline_interval_sec": int(config.theme_lab_pipeline_interval_sec),
         "theme_lab_condition_names": dict(config.theme_lab_condition_names),
         "theme_lab_condition_purposes": dict(config.theme_lab_condition_purposes),
+        "exit_context_risk_enabled": bool(config.exit_context_risk_enabled),
     }
 
 
@@ -182,12 +186,20 @@ def config_from_dict(raw: dict[str, Any]) -> StrategyRuntimeConfig:
             "realtime_subscription_limit",
         ),
         theme_engine_mode=_coerce_theme_engine_mode(merged["theme_engine_mode"]),
+        theme_lab_dry_run_bridge_enabled=_coerce_bool(
+            merged["theme_lab_dry_run_bridge_enabled"],
+            "theme_lab_dry_run_bridge_enabled",
+        ),
         theme_lab_pipeline_interval_sec=_coerce_int(
             merged["theme_lab_pipeline_interval_sec"],
             "theme_lab_pipeline_interval_sec",
         ),
         theme_lab_condition_names=_coerce_theme_lab_condition_names(merged["theme_lab_condition_names"]),
         theme_lab_condition_purposes=_coerce_theme_lab_condition_purposes(merged["theme_lab_condition_purposes"]),
+        exit_context_risk_enabled=_coerce_bool(
+            merged["exit_context_risk_enabled"],
+            "exit_context_risk_enabled",
+        ),
     )
 
 
@@ -207,12 +219,20 @@ def _validate_and_normalize(config: StrategyRuntimeConfig) -> list[str]:
         "realtime_subscription_limit",
     )
     config.theme_engine_mode = _coerce_theme_engine_mode(config.theme_engine_mode)
+    config.theme_lab_dry_run_bridge_enabled = _coerce_bool(
+        config.theme_lab_dry_run_bridge_enabled,
+        "theme_lab_dry_run_bridge_enabled",
+    )
     config.theme_lab_pipeline_interval_sec = _coerce_int(
         config.theme_lab_pipeline_interval_sec,
         "theme_lab_pipeline_interval_sec",
     )
     config.theme_lab_condition_names = _coerce_theme_lab_condition_names(config.theme_lab_condition_names)
     config.theme_lab_condition_purposes = _coerce_theme_lab_condition_purposes(config.theme_lab_condition_purposes)
+    config.exit_context_risk_enabled = _coerce_bool(
+        config.exit_context_risk_enabled,
+        "exit_context_risk_enabled",
+    )
     if not 1 <= config.evaluation_interval_sec <= 3600:
         raise ValueError("evaluation_interval_sec must be between 1 and 3600")
     if config.max_candidates_to_watch < 0:

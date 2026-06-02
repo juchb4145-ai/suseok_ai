@@ -46,6 +46,7 @@ class CoreSettings:
     runtime_dry_run_order_type_sell: int = 2
     runtime_dry_run_require_account: bool = False
     runtime_dry_run_respect_weight_pct: bool = True
+    exit_context_risk_enabled: bool = False
     dry_run_fp_loss_threshold_pct: float = -1.0
     dry_run_fp_drawdown_threshold_pct: float = -3.0
     dry_run_fn_rally_threshold_pct: float = 3.0
@@ -65,6 +66,11 @@ class CoreSettings:
     transport_websocket_recommend_empty_poll_rate: float = 0.8
     transport_websocket_experiment_enabled: bool = False
     threshold_ab_min_sample_count: int = 10
+    threshold_ab_min_trade_days: int = 5
+    threshold_ab_min_completed_lifecycles: int = 30
+    threshold_ab_min_entry_intents: int = 30
+    threshold_ab_min_exit_decisions: int = 10
+    threshold_ab_min_signal_samples: int = 5
     threshold_ab_strong_fp_reduction_min: int = 3
     threshold_ab_max_fn_increase: int = 1
     threshold_ab_max_opportunity_loss_increase: int = 1
@@ -117,6 +123,7 @@ def get_settings() -> CoreSettings:
         runtime_dry_run_order_type_sell=_int_env("TRADING_RUNTIME_DRY_RUN_ORDER_TYPE_SELL", 2),
         runtime_dry_run_require_account=_bool_env("TRADING_RUNTIME_DRY_RUN_REQUIRE_ACCOUNT", False),
         runtime_dry_run_respect_weight_pct=_bool_env("TRADING_RUNTIME_DRY_RUN_RESPECT_WEIGHT_PCT", True),
+        exit_context_risk_enabled=_bool_env("TRADING_EXIT_CONTEXT_RISK_ENABLED", False),
         dry_run_fp_loss_threshold_pct=_float_env("TRADING_DRY_RUN_FP_LOSS_THRESHOLD_PCT", -1.0),
         dry_run_fp_drawdown_threshold_pct=_float_env("TRADING_DRY_RUN_FP_DRAWDOWN_THRESHOLD_PCT", -3.0),
         dry_run_fn_rally_threshold_pct=_float_env("TRADING_DRY_RUN_FN_RALLY_THRESHOLD_PCT", 3.0),
@@ -139,6 +146,11 @@ def get_settings() -> CoreSettings:
         ),
         transport_websocket_experiment_enabled=_bool_env("TRADING_TRANSPORT_WEBSOCKET_EXPERIMENT_ENABLED", False),
         threshold_ab_min_sample_count=_int_env("TRADING_THRESHOLD_AB_MIN_SAMPLE_COUNT", 10),
+        threshold_ab_min_trade_days=_int_env("TRADING_THRESHOLD_AB_MIN_TRADE_DAYS", 5),
+        threshold_ab_min_completed_lifecycles=_int_env("TRADING_THRESHOLD_AB_MIN_COMPLETED_LIFECYCLES", 30),
+        threshold_ab_min_entry_intents=_int_env("TRADING_THRESHOLD_AB_MIN_ENTRY_INTENTS", 30),
+        threshold_ab_min_exit_decisions=_int_env("TRADING_THRESHOLD_AB_MIN_EXIT_DECISIONS", 10),
+        threshold_ab_min_signal_samples=_int_env("TRADING_THRESHOLD_AB_MIN_SIGNAL_SAMPLES", 5),
         threshold_ab_strong_fp_reduction_min=_int_env("TRADING_THRESHOLD_AB_STRONG_FP_REDUCTION_MIN", 3),
         threshold_ab_max_fn_increase=_int_env("TRADING_THRESHOLD_AB_MAX_FN_INCREASE", 1),
         threshold_ab_max_opportunity_loss_increase=_int_env("TRADING_THRESHOLD_AB_MAX_OPPORTUNITY_LOSS_INCREASE", 1),

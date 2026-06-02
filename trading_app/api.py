@@ -42,6 +42,7 @@ from trading.broker.transport_metrics import (
 from trading.broker.ws_messages import GatewayWsMessage
 from trading.strategy.candidates import CandidateCollector
 from trading.strategy.models import BlockType, CandidateState
+from trading.strategy.reason_taxonomy import normalize_reason_status, reason_status_family, reason_summary
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSourceSyncService
 from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThemeUniverseSource
@@ -1829,6 +1830,14 @@ def build_candidates_snapshot(
         metadata = dict(candidate.metadata or {})
         gate_record = _best_gate_record(metadata)
         reason_codes = _reason_codes(metadata, gate_record)
+        display_state = _candidate_display_state(candidate)
+        reason_status = normalize_reason_status(
+            reason_codes=reason_codes,
+            display_state=display_state,
+            existing_status=metadata.get("sub_status") or gate_record.get("sub_status") or "",
+            block_type=candidate.block_type.value,
+            can_recover=candidate.can_recover,
+        )
         theme_score = _number(
             _first_present(
                 metadata.get("theme_score"),
@@ -1858,7 +1867,10 @@ def build_candidates_snapshot(
                 "code": candidate.code,
                 "name": candidate.name,
                 "state": candidate.state.value,
-                "display_state": _candidate_display_state(candidate),
+                "display_state": display_state,
+                "reason_status": reason_status,
+                "reason_family": reason_status_family(reason_status),
+                "sub_status": reason_status,
                 "block_type": candidate.block_type.value,
                 "can_recover": candidate.can_recover,
                 "theme_id": metadata.get("best_theme_id") or gate_record.get("theme_id", ""),
@@ -1884,6 +1896,7 @@ def build_candidates_snapshot(
                 {"reason": reason, "count": count}
                 for reason, count in block_reasons.most_common(10)
             ],
+            "reason_summary": reason_summary(items),
         },
         "items": items,
     }
@@ -2387,6 +2400,7 @@ def _runtime_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
         "last_dry_run_order_reject_reason": snapshot_payload.get("last_dry_run_order_reject_reason", ""),
         "last_dry_run_exit_order_intent_at": snapshot_payload.get("last_dry_run_exit_order_intent_at", ""),
         "last_dry_run_exit_order_reject_reason": snapshot_payload.get("last_dry_run_exit_order_reject_reason", ""),
+        "reason_summary": snapshot_payload.get("reason_summary", {}),
         "market_session_status": readiness.get("market_session_status", ""),
         "data_warmup_status": readiness.get("data_warmup_status", ""),
         "gate_skip_reason": readiness.get("gate_skip_reason", ""),

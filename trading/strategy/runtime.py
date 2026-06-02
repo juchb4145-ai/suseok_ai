@@ -20,7 +20,12 @@ from trading.strategy.candidates import (
 )
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.entry import EntryPlanBuilder
-from trading.strategy.exit import SUPPORT_LOSS, TAKE_PROFIT, TIME_EXIT, TRAILING_STOP, ExitDecisionEngine, VirtualPositionService
+from trading.strategy.exit import (
+    DRY_RUN_EXIT_INTENT_TYPES,
+    ExitContextRiskSnapshot,
+    ExitDecisionEngine,
+    VirtualPositionService,
+)
 from trading.strategy.holding import HoldingProvider, StaticHoldingProvider
 from trading.strategy.models import (
     BlockType,
@@ -41,7 +46,9 @@ from trading.strategy.models import (
 from trading.strategy.pipeline import GatePipeline, GatePipelineResult
 from trading.strategy.readiness import ReadinessReport, _active_theme_presence_by_code, build_readiness_report, dedupe_warnings
 from trading.strategy.realtime import RealTimeSubscriptionManager
+from trading.strategy.reason_taxonomy import normalize_reason_status, reason_status_family, reason_summary
 from trading.strategy.review import TradeReviewService
+from trading.strategy.themelab_adapter import ThemeLabDryRunLifecycleBridge
 from trading.strategy.virtual_orders import VirtualOrderService
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline
@@ -78,7 +85,9 @@ class StrategyRuntimeConfig:
     max_candidates_to_watch: int = 100
     realtime_subscription_limit: int = 80
     theme_engine_mode: str = "themelab_flow"
+    theme_lab_dry_run_bridge_enabled: bool = True
     theme_lab_pipeline_interval_sec: int = 3
+    exit_context_risk_enabled: bool = False
     theme_lab_condition_names: dict[str, str] = field(
         default_factory=lambda: {"alive": "테마랩_생존_-1", "strong": "테마랩_강세_3", "leader": "테마랩_주도_5"}
     )
@@ -120,6 +129,10 @@ class StrategyRuntimeConfig:
         self.theme_engine_mode = str(self.theme_engine_mode or "").strip().lower()
         if self.theme_engine_mode not in {"legacy", "themelab_flow"}:
             raise ValueError("theme_engine_mode must be legacy or themelab_flow")
+        if type(self.theme_lab_dry_run_bridge_enabled) is not bool:
+            raise ValueError("theme_lab_dry_run_bridge_enabled must be bool")
+        if type(self.exit_context_risk_enabled) is not bool:
+            raise ValueError("exit_context_risk_enabled must be bool")
         if not 1 <= int(self.theme_lab_pipeline_interval_sec) <= 3600:
             raise ValueError("theme_lab_pipeline_interval_sec must be between 1 and 3600")
         if self.realtime_subscription_limit < self.max_candidates_to_watch:
@@ -199,6 +212,7 @@ class StrategyRuntimeSnapshot:
     candidate_subscription_skipped_discovery_count: int = 0
     candidate_subscription_skipped_unmapped_count: int = 0
     protected_subscription_usage: str = ""
+    reason_summary: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -246,6 +260,7 @@ class StrategyRuntime:
         self.holding_provider = holding_provider or StaticHoldingProvider()
         self.order_sink = order_sink
         self.theme_lab_pipeline = theme_lab_pipeline
+        self._theme_lab_bridge_results: list[GatePipelineResult] = []
         self.started = False
         self._warnings: list[str] = []
         self.startup_warnings: list[str] = []
@@ -422,6 +437,7 @@ class StrategyRuntime:
             snapshot.warnings = timed("dedupe_warnings", lambda: dedupe_warnings(snapshot.warnings))
             return snapshot
         finally:
+            self._apply_reason_summary(snapshot)
             snapshot.cycle_duration_ms = int(round((perf_counter() - started) * 1000))
 
     def _process_gate_result(
@@ -1007,7 +1023,15 @@ class StrategyRuntime:
                         context.entry_plan = self.db.load_entry_plan(order.entry_plan_id)
                 snapshot_for_exit = _snapshot_for_exit(context)
                 existing_decisions = self.db.list_exit_decisions(position.id) if position.id is not None else []
-                new_decisions = self.exit_decision_engine.evaluate(position, snapshot_for_exit, self.candle_builder, existing_decisions, now)
+                context_risk = self._exit_context_risk_snapshot(candidate, context, position, snapshot_for_exit)
+                new_decisions = self.exit_decision_engine.evaluate(
+                    position,
+                    snapshot_for_exit,
+                    self.candle_builder,
+                    existing_decisions,
+                    now,
+                    context_risk=context_risk,
+                )
                 position_details_changed = bool(self.exit_decision_engine.last_details.get("position_details_changed"))
                 saved_decisions: list[ExitDecision] = []
                 for decision in new_decisions:
@@ -1097,7 +1121,8 @@ class StrategyRuntime:
 
     def _evaluate_gates(self, candidates: list[Candidate], snapshot: StrategyRuntimeSnapshot) -> list[GatePipelineResult]:
         if self._theme_lab_flow_active():
-            return []
+            candidate_ids = {candidate.id for candidate in candidates if candidate.id is not None}
+            return [result for result in self._theme_lab_bridge_results if result.candidate_id in candidate_ids]
         entry_candidates = [candidate for candidate in candidates if self._candidate_entry_evaluable(candidate)]
         if not entry_candidates:
             return []
@@ -1184,6 +1209,7 @@ class StrategyRuntime:
             snapshot.warnings.append(f"SUBSCRIPTION_RECONCILE_FAILED:{exc}")
 
     def _run_theme_lab_flow(self, snapshot: StrategyRuntimeSnapshot, now: datetime) -> None:
+        self._theme_lab_bridge_results = []
         if not self._theme_lab_flow_active():
             return
         if self.theme_lab_pipeline is None:
@@ -1191,11 +1217,60 @@ class StrategyRuntime:
             return
         result = self.theme_lab_pipeline.run_if_due(now)
         snapshot.warnings.extend(self.theme_lab_pipeline.drain_warnings())
+        bridge_result = result
         if result is None:
+            bridge_result = self._fresh_theme_lab_result(now)
+        if result is None and bridge_result is None:
             return
-        snapshot.gate_result_count = len(result.gate_decisions)
-        if not result.watchset:
+        active_result = bridge_result or result
+        if active_result is None:
+            return
+        snapshot.gate_result_count = len(active_result.gate_decisions)
+        if not active_result.watchset:
             snapshot.warnings.append("THEME_LAB_WATCHSET_EMPTY")
+        if not self.config.theme_lab_dry_run_bridge_enabled:
+            snapshot.warnings.append("THEME_LAB_DRY_RUN_BRIDGE_DISABLED")
+            return
+        if self._market_session_status(now) == MARKET_SESSION_CLOSED:
+            snapshot.warnings.append("THEME_LAB_BRIDGE_SKIPPED_MARKET_CLOSED")
+            return
+        market_data = getattr(self.gate_pipeline, "market_data", None)
+        if market_data is None:
+            snapshot.warnings.append("THEME_LAB_BRIDGE_MARKET_DATA_MISSING")
+            return
+        try:
+            bridge = ThemeLabDryRunLifecycleBridge(
+                db=self.db,
+                market_data=market_data,
+                default_ttl_minutes=getattr(self.candidate_collector, "default_ttl_minutes", 30),
+            )
+            built = bridge.build(
+                active_result,
+                trade_date=self.candidate_collector._trade_date(),
+                now=now,
+            )
+            self._theme_lab_bridge_results = built.gate_results
+            snapshot.candidate_save_count += built.candidate_save_count
+            snapshot.db_write_count_per_cycle += built.candidate_save_count
+            snapshot.warnings.extend(built.warnings or [])
+        except Exception as exc:
+            snapshot.warnings.append(f"THEME_LAB_BRIDGE_FAILED:{exc}")
+
+    def _fresh_theme_lab_result(self, now: datetime):
+        if self.theme_lab_pipeline is None:
+            return None
+        last_result = getattr(self.theme_lab_pipeline, "last_result", None)
+        last_run_at = getattr(self.theme_lab_pipeline, "last_run_at", None)
+        if last_result is None or last_run_at is None:
+            return None
+        interval = max(1, int(getattr(self.theme_lab_pipeline, "interval_sec", self.config.theme_lab_pipeline_interval_sec) or 1))
+        try:
+            age_sec = (_clean_time(now) - _clean_time(last_run_at)).total_seconds()
+        except Exception:
+            return None
+        if age_sec <= max(interval * 2, int(self.config.evaluation_interval_sec) * 2, 5):
+            return last_result
+        return None
 
     def _sync_theme_lab_watchset_subscriptions(self, snapshot: StrategyRuntimeSnapshot) -> None:
         if self.theme_lab_pipeline is None:
@@ -1514,6 +1589,103 @@ class StrategyRuntime:
         except Exception:
             return False
 
+    def _exit_context_risk_snapshot(
+        self,
+        candidate: Optional[Candidate],
+        context: "_ReviewContext",
+        position: VirtualPosition,
+        snapshot: Optional["IndicatorSnapshot"],
+    ) -> Optional[ExitContextRiskSnapshot]:
+        if not self.config.exit_context_risk_enabled or candidate is None or snapshot is None:
+            return None
+        theme_payload = self._latest_theme_lab_payload()
+        theme_id = _position_theme_id(candidate, context)
+        theme_name = _position_theme_name(candidate, context)
+        theme = _find_theme_snapshot(theme_payload, theme_id, theme_name)
+        watch = _find_watch_snapshot(theme_payload, candidate.code)
+        market = _candidate_index_market(candidate, snapshot)
+        index_status, index_return_pct = self._index_risk_status(market)
+        theme_status_after = str((theme or {}).get("theme_status") or (watch or {}).get("theme_lab_theme_status") or "")
+        theme_score = _float_or_none((theme or {}).get("condition_score") or (theme or {}).get("theme_score"))
+        leader_count = _int_or_none((theme or {}).get("leader_count"))
+        strong_count = _int_or_none((theme or {}).get("strong_count"))
+        previous_details = dict(position.details or {})
+        current_return_pct = _runtime_return_pct(snapshot.price, position.entry_price)
+        risk_reasons = _context_risk_reasons(
+            theme_status_after=theme_status_after,
+            theme_score=theme_score,
+            previous_theme_score=_float_or_none(previous_details.get("exit_context_theme_score")),
+            leader_count=leader_count,
+            previous_leader_count=_int_or_none(previous_details.get("exit_context_leader_count")),
+            strong_count=strong_count,
+            previous_strong_count=_int_or_none(previous_details.get("exit_context_strong_count")),
+            leader_return_pct=_float_or_none((theme or {}).get("top_leader_return_pct")),
+            index_status=index_status,
+            market_status=str((theme_payload.get("market_status") or {}).get("market_status") or ""),
+            breadth_status=_breadth_status(theme, previous_details),
+        )
+        return ExitContextRiskSnapshot(
+            enabled=True,
+            theme_id=theme_id,
+            theme_name=theme_name,
+            theme_status_before=str(previous_details.get("exit_context_theme_status") or ""),
+            theme_status_after=theme_status_after,
+            theme_score=theme_score,
+            previous_theme_score=_float_or_none(previous_details.get("exit_context_theme_score")),
+            leader_symbol=str((theme or {}).get("top_leader_symbol") or ""),
+            leader_return_pct=_float_or_none((theme or {}).get("top_leader_return_pct")),
+            leader_support_broken=bool((watch or {}).get("leader_support_broken")),
+            leader_vwap_broken=bool((watch or {}).get("leader_vwap_broken")),
+            leader_count=leader_count,
+            previous_leader_count=_int_or_none(previous_details.get("exit_context_leader_count")),
+            strong_count=strong_count,
+            previous_strong_count=_int_or_none(previous_details.get("exit_context_strong_count")),
+            index_market=market,
+            index_status=index_status,
+            index_return_pct=index_return_pct,
+            market_status=str((theme_payload.get("market_status") or {}).get("market_status") or ""),
+            breadth_status=_breadth_status(theme, previous_details),
+            stock_role=str((watch or {}).get("stock_role") or candidate.metadata.get("theme_lab_stock_role") or ""),
+            current_return_pct=current_return_pct,
+            risk_reason_codes=tuple(risk_reasons),
+            calculated_at=str(theme_payload.get("calculated_at") or ""),
+        )
+
+    def _latest_theme_lab_payload(self) -> dict:
+        if self.theme_lab_pipeline is not None:
+            last_result = getattr(self.theme_lab_pipeline, "last_result", None)
+            if last_result is not None:
+                try:
+                    from trading.theme_engine.runtime_pipeline import _result_payload
+
+                    return _result_payload(last_result)
+                except Exception:
+                    pass
+        try:
+            payload = self.db.latest_theme_lab_flow_result()
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    def _index_risk_status(self, market: str) -> tuple[str, Optional[float]]:
+        market_index_store = getattr(self.gate_pipeline, "market_index_store", None)
+        if market_index_store is None:
+            return "", None
+        try:
+            state = market_index_store.state(market)
+        except Exception:
+            return "", None
+        change = _float_or_none(getattr(state, "change_rate", None))
+        weak_threshold = -1.0 if market == "KOSDAQ" else -0.8
+        risk_off_threshold = -2.5 if market == "KOSDAQ" else -2.0
+        if change is not None and change <= risk_off_threshold:
+            return "RISK_OFF", change
+        if change is not None and change <= weak_threshold:
+            return "INDEX_WEAK", change
+        if getattr(state, "low_break_recent", False) or str(getattr(state, "direction_5m", "")).upper() == "DOWN":
+            return "INDEX_WEAK", change
+        return "", change
+
     def _snapshot(self, current: datetime) -> StrategyRuntimeSnapshot:
         snapshot = StrategyRuntimeSnapshot(
             started=self.started,
@@ -1564,7 +1736,7 @@ class StrategyRuntime:
             return
         if not bool(decision.filled):
             return
-        if decision.decision_type not in {TAKE_PROFIT, SUPPORT_LOSS, TIME_EXIT, TRAILING_STOP}:
+        if decision.decision_type not in DRY_RUN_EXIT_INTENT_TYPES:
             return
         if not decision.details.get("virtual_exit_price") and not decision.trigger_price:
             return
@@ -1612,6 +1784,37 @@ class StrategyRuntime:
         snapshot.last_dry_run_exit_order_reject_reason = str(payload.get("last_dry_run_exit_order_reject_reason") or "")
         snapshot.dry_run_order_policy = str(payload.get("dry_run_order_policy") or "")
         snapshot.dry_run_order_sink_enabled = bool(payload.get("dry_run_order_sink_enabled"))
+
+    def _apply_reason_summary(self, snapshot: StrategyRuntimeSnapshot) -> None:
+        try:
+            trade_date = self.candidate_collector._trade_date()
+            rows = []
+            for candidate in self.db.list_candidates(trade_date=trade_date):
+                metadata = dict(candidate.metadata or {})
+                gate_record = _best_gate_record_from_metadata(metadata)
+                reason_codes = _runtime_reason_codes(metadata, gate_record)
+                display_state = _runtime_candidate_display_state(candidate)
+                reason_status = normalize_reason_status(
+                    reason_codes=reason_codes,
+                    display_state=display_state,
+                    existing_status=metadata.get("sub_status") or gate_record.get("sub_status") or "",
+                    block_type=candidate.block_type.value,
+                    can_recover=candidate.can_recover,
+                )
+                rows.append(
+                    {
+                        "state": candidate.state.value,
+                        "display_state": display_state,
+                        "reason_status": reason_status,
+                        "reason_family": reason_status_family(reason_status),
+                        "reason_codes": reason_codes,
+                        "block_type": candidate.block_type.value,
+                        "can_recover": candidate.can_recover,
+                    }
+                )
+            snapshot.reason_summary = reason_summary(rows)
+        except Exception as exc:
+            snapshot.reason_summary = {"error": f"REASON_SUMMARY_FAILED:{exc}"}
 
     def _refresh_readiness_snapshot(
         self,
@@ -1689,6 +1892,172 @@ def _snapshot_for_exit(context: _ReviewContext):
     if context.gate_result is not None:
         return context.gate_result.snapshot
     return None
+
+
+def _runtime_candidate_display_state(candidate: Candidate) -> str:
+    if candidate.state in {CandidateState.DETECTED, CandidateState.WATCHING}:
+        return "WAIT"
+    if (
+        candidate.state == CandidateState.BLOCKED
+        and (candidate.block_type == BlockType.TEMPORARY or candidate.can_recover)
+    ):
+        return "WAIT"
+    return candidate.state.value
+
+
+def _best_gate_record_from_metadata(metadata: dict) -> dict:
+    records = metadata.get("gate_results_by_theme")
+    if isinstance(records, dict):
+        rows = [dict(item or {}) for item in records.values() if isinstance(item, dict)]
+        if rows:
+            return sorted(rows, key=lambda item: float(item.get("score") or item.get("final_score") or 0.0), reverse=True)[0]
+    record = metadata.get("gate_result")
+    return dict(record or {}) if isinstance(record, dict) else {}
+
+
+def _runtime_reason_codes(metadata: dict, gate_record: dict) -> list[str]:
+    values = gate_record.get("reason_codes") or metadata.get("reason_codes") or []
+    if isinstance(values, str):
+        values = [part.strip() for part in values.split(",")]
+    result: list[str] = []
+    for value in values or []:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    sub_status = str(metadata.get("sub_status") or gate_record.get("sub_status") or "").strip()
+    if sub_status and sub_status not in result:
+        result.insert(0, sub_status)
+    return result
+
+
+def _position_theme_id(candidate: Candidate, context: _ReviewContext) -> str:
+    if context.entry_plan is not None:
+        value = context.entry_plan.cancel_condition.get("theme_id")
+        if value:
+            return str(value)
+    if candidate.theme_ids:
+        return str(candidate.theme_ids[0])
+    return str(candidate.metadata.get("theme_lab_primary_theme") or "")
+
+
+def _position_theme_name(candidate: Candidate, context: _ReviewContext) -> str:
+    if context.entry_plan is not None:
+        value = context.entry_plan.cancel_condition.get("theme_name")
+        if value:
+            return str(value)
+    return str(candidate.metadata.get("theme_name") or candidate.metadata.get("theme_lab_primary_theme") or "")
+
+
+def _find_theme_snapshot(payload: dict, theme_id: str, theme_name: str) -> dict:
+    target = {str(theme_id or ""), str(theme_name or "")} - {""}
+    for key in ("theme_condition_snapshots", "theme_rankings"):
+        for item in payload.get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            names = {
+                str(item.get("theme_id") or ""),
+                str(item.get("theme_name") or ""),
+                str(item.get("name") or ""),
+            } - {""}
+            if target and target & names:
+                return dict(item)
+    return {}
+
+
+def _find_watch_snapshot(payload: dict, code: str) -> dict:
+    clean_code = normalize_code(code)
+    for item in payload.get("watchset_snapshots") or []:
+        if not isinstance(item, dict):
+            continue
+        if normalize_code(str(item.get("symbol") or item.get("code") or "")) == clean_code:
+            return dict(item)
+    return {}
+
+
+def _candidate_index_market(candidate: Candidate, snapshot) -> str:
+    raw = str(candidate.market or snapshot.metadata.get("market") or "").upper()
+    if "KOSPI" in raw:
+        return "KOSPI"
+    if "KOSDAQ" in raw:
+        return "KOSDAQ"
+    if candidate.strategy_profile in {StrategyProfile.KOSPI_LEADER_PROFILE, StrategyProfile.SEMICONDUCTOR_SIGNAL_PROFILE}:
+        return "KOSPI"
+    return "KOSDAQ"
+
+
+def _breadth_status(theme: dict, previous_details: dict) -> str:
+    if not theme:
+        return ""
+    alive_ratio = _float_or_none(theme.get("alive_ratio"))
+    leader_count = _int_or_none(theme.get("leader_count"))
+    strong_count = _int_or_none(theme.get("strong_count"))
+    previous_leader_count = _int_or_none(previous_details.get("exit_context_leader_count"))
+    previous_strong_count = _int_or_none(previous_details.get("exit_context_strong_count"))
+    if alive_ratio is not None and alive_ratio < 0.35:
+        return "BREADTH_COLLAPSE"
+    if previous_leader_count is not None and leader_count is not None and leader_count < previous_leader_count:
+        return "BREADTH_COLLAPSE"
+    if previous_strong_count is not None and strong_count is not None and strong_count < previous_strong_count:
+        return "BREADTH_COLLAPSE"
+    if alive_ratio is not None and alive_ratio < 0.5:
+        return "LOW_BREADTH"
+    return ""
+
+
+def _context_risk_reasons(
+    *,
+    theme_status_after: str,
+    theme_score: Optional[float],
+    previous_theme_score: Optional[float],
+    leader_count: Optional[int],
+    previous_leader_count: Optional[int],
+    strong_count: Optional[int],
+    previous_strong_count: Optional[int],
+    leader_return_pct: Optional[float],
+    index_status: str,
+    market_status: str,
+    breadth_status: str,
+) -> list[str]:
+    reasons: list[str] = []
+    if str(market_status or "").upper() == "RISK_OFF":
+        reasons.append("MARKET_RISK_OFF")
+    if str(index_status or "").upper() in {"INDEX_WEAK", "RISK_OFF", "WEAK"}:
+        reasons.append("INDEX_WEAK")
+    if str(theme_status_after or "").upper() in {"WEAK_THEME", "THEME_WEAK"}:
+        reasons.append("THEME_WEAK")
+    if previous_theme_score is not None and theme_score is not None and previous_theme_score > 0:
+        drop_pct = ((previous_theme_score - theme_score) / previous_theme_score) * 100.0
+        if drop_pct >= 30.0:
+            reasons.append("THEME_SCORE_DROP")
+    if leader_return_pct is not None and leader_return_pct <= -5.0:
+        reasons.append("LEADER_COLLAPSE")
+    if previous_leader_count is not None and leader_count is not None and leader_count < previous_leader_count:
+        reasons.append("LEADER_COUNT_DROP")
+    if previous_strong_count is not None and strong_count is not None and strong_count < previous_strong_count:
+        reasons.append("STRONG_COUNT_DROP")
+    if str(breadth_status or "").upper() in {"BREADTH_COLLAPSE", "COLLAPSE", "LOW_BREADTH"}:
+        reasons.append("BREADTH_COLLAPSE")
+    return list(dict.fromkeys(reasons))
+
+
+def _runtime_return_pct(price: int, entry_price: int) -> Optional[float]:
+    if entry_price <= 0 or price <= 0:
+        return None
+    return round(((int(price) - int(entry_price)) / int(entry_price)) * 100.0, 6)
+
+
+def _float_or_none(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _without_resolved_condition_warnings(warnings: list[str]) -> list[str]:

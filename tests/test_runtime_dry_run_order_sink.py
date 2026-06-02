@@ -109,7 +109,63 @@ def test_dry_run_order_sink_records_intent_and_never_enqueues_gateway_command(tm
         db.close()
     assert row["virtual_order_id"] == 31
     assert row["candidate_id"] == 11
+    assert row["trade_date"] == "2026-05-30"
+    assert row["code"] == "005930"
+    assert row["side"] == "buy"
+    assert row["order_phase"] == "entry"
+    assert row["price"] == 70000
+    assert row["quantity"] > 0
+    assert row["strategy_name"] == "SEMICONDUCTOR_SIGNAL_PROFILE"
     assert row["metadata"]["calculated_order_amount"] == 500000
+
+
+def test_rejected_dry_run_intent_keeps_reject_reason_and_decision_metadata(tmp_path):
+    settings = _settings(tmp_path)
+    gateway_state = GatewayStateStore()
+    service = OrderEnqueueService(settings=settings, gateway_state=gateway_state, db_path=settings.db_path)
+    sink = DryRunRuntimeOrderSink(settings=settings, service=service)
+    gate_result = _gate_result()
+    gate_result.details["theme_lab_bridge"] = {
+        "source": "themelab_flow",
+        "trade_date": "2026-05-30",
+        "candidate_id": 11,
+        "theme_id": "theme-a",
+        "theme_name": "AI",
+        "lab_gate_status": "READY",
+        "final_gate_status": "READY_PULLBACK",
+        "order_eligibility": "BUY_ELIGIBLE_PULLBACK",
+        "price_location_status": "GOOD_PULLBACK",
+        "risk_level": "PASS",
+        "reason_codes": ["READY_PULLBACK"],
+    }
+
+    result = sink.on_entry_order_decision(
+        candidate=_candidate(),
+        gate_result=gate_result,
+        entry_plan=_plan(),
+        virtual_order=_order(limit_price=0, weight_pct=50.0),
+        runtime_cycle_at="2026-05-30T09:02:00",
+    )
+
+    assert result["accepted"] is False
+    assert result["status"] == "DRY_RUN_REJECTED"
+    assert result["reason"] in {"PRICE_INVALID", "PRICE_INVALID_OR_MARKET_ORDER_UNSUPPORTED", "QUANTITY_INVALID"}
+    assert result["command"] is None
+
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        row = db.get_runtime_order_intent(result["intent_id"])
+    finally:
+        db.close()
+    assert row["source"] == "themelab_flow"
+    assert row["trade_date"] == "2026-05-30"
+    assert row["code"] == "005930"
+    assert row["side"] == "buy"
+    assert row["order_phase"] == "entry"
+    assert row["price"] == 70000
+    assert row["quantity"] == 0
+    assert row["metadata"]["order_eligibility"] == "BUY_ELIGIBLE_PULLBACK"
+    assert row["metadata"]["quantity_calculation_reason"] == "PRICE_INVALID"
 
 
 def test_dry_run_order_sink_dedupes_same_virtual_order(tmp_path):
