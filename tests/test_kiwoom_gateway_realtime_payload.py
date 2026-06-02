@@ -1,5 +1,5 @@
 from apps.kiwoom_gateway import GatewayRuntime, _wire_kiwoom_signals
-from trading.broker.models import BrokerPriceTick, Signal
+from trading.broker.models import BrokerPriceTick, ConditionInfo, Signal
 
 
 class FakeCoreClient:
@@ -26,6 +26,8 @@ class SignalClient:
         self.order_result = Signal()
         self.execution_received = Signal()
         self.message_received = Signal()
+        self.condition_load_result = Signal()
+        self.condition_loaded = Signal()
         self.condition_real_received = Signal()
         self.condition_tr_received = Signal()
 
@@ -84,3 +86,17 @@ def test_gateway_runtime_keeps_old_price_received_fallback_path():
     assert payload["best_ask"] == 70100
     assert payload["best_bid"] == 70000
     assert payload["trade_value"] == 0.0
+
+
+def test_gateway_runtime_emits_condition_load_events():
+    runtime = GatewayRuntime(FakeCoreClient())
+    client = SignalClient(rich=True)
+    _wire_kiwoom_signals(client, runtime)
+
+    client.condition_load_result.emit(True, "ok")
+    client.condition_loaded.emit([ConditionInfo(index=1, name="테마랩_생존_-1")])
+
+    events = runtime.events.drain()
+    assert [event.type for event in events] == ["condition_load_result", "condition_loaded"]
+    assert events[0].payload["success"] is True
+    assert events[1].payload["conditions"] == [{"index": 1, "name": "테마랩_생존_-1"}]

@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ThemeLabFlow Trading Terminal</title>
+    <link rel="stylesheet" href="/static/themelab.css" />
+  </head>
+  <body>
+    <main class="terminal-shell">
+      <header class="market-header">
+        <div>
+          <h1>ThemeLabFlow</h1>
+          <p id="flow-updated">대시보드 연결 중</p>
+        </div>
+        <div id="market-strip" class="market-strip"></div>
+      </header>
+
+      <section class="flow-grid">
+        <aside class="panel theme-panel">
+          <div class="panel-head">
+            <h2>Theme Rank</h2>
+            <span id="theme-count" class="counter">0</span>
+          </div>
+          <div id="theme-rank-list" class="rank-list"></div>
+        </aside>
+
+        <section class="panel chart-panel">
+          <div class="panel-head chart-head">
+            <div>
+              <h2 id="chart-title">Chart Focus</h2>
+              <p id="chart-subtitle">분봉 데이터 수신 전입니다.</p>
+            </div>
+            <div class="segmented">
+              <button class="active" type="button">1m</button>
+              <button type="button">3m</button>
+              <button type="button">5m</button>
+            </div>
+          </div>
+          <div id="chart-stage" class="chart-stage">
+            <div class="empty-chart">
+              <strong>분봉 데이터 없음</strong>
+              <span>ChartUniverse 대상만 여기에 표시됩니다.</span>
+            </div>
+          </div>
+        </section>
+
+        <aside class="panel gate-panel">
+          <div class="panel-head">
+            <h2>Gate Detail</h2>
+            <span id="gate-status" class="badge observe">OBSERVE</span>
+          </div>
+          <p id="gate-summary" class="gate-summary">선택된 WatchSet 종목이 없습니다.</p>
+          <dl id="gate-metrics" class="metric-list"></dl>
+          <div>
+            <h3>막힌 이유 / 누락 데이터</h3>
+            <div id="gate-reasons" class="reason-list"></div>
+          </div>
+        </aside>
+      </section>
+
+      <section class="bottom-grid">
+        <section class="panel watch-panel">
+          <div class="panel-head">
+            <h2>WatchSet</h2>
+            <div id="watch-filters" class="filter-row">
+              <button class="active" data-status="ALL" type="button">전체</button>
+              <button data-status="READY" type="button">READY</button>
+              <button data-status="READY_SMALL" type="button">READY_SMALL</button>
+              <button data-status="WAIT" type="button">WAIT</button>
+              <button data-status="BLOCKED" type="button">BLOCKED</button>
+              <button data-status="OBSERVE" type="button">OBSERVE</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>상태</th><th>종목</th><th>테마</th><th>역할</th><th>등락</th><th>대금</th><th>가격 위치</th><th>리스크</th><th>비중</th><th>사유</th>
+                </tr>
+              </thead>
+              <tbody id="watchset-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <aside class="panel ops-panel">
+          <div class="panel-head">
+            <h2>Order Candidates</h2>
+            <span id="order-count" class="counter">0</span>
+          </div>
+          <div id="order-candidates" class="order-list"></div>
+        </aside>
+      </section>
+
+      <section class="quality-grid">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>조건식 상태</h2>
+            <span id="condition-summary" class="counter">0/3</span>
+          </div>
+          <div id="condition-list" class="quality-list"></div>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Data Quality</h2>
+            <span id="data-quality-status" class="badge observe">UNKNOWN</span>
+          </div>
+          <div id="data-quality-list" class="quality-list"></div>
+        </section>
+      </section>
+    </main>
+    <script src="/static/themelab.js"></script>
+  </body>
+</html>

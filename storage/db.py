@@ -2071,6 +2071,31 @@ class TradingDatabase:
                 ),
             )
 
+    def latest_theme_lab_flow_result(self) -> dict:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM theme_lab_flow_snapshots
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return {}
+        payload = _safe_json_loads(row["payload_json"], {})
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.setdefault("market_status", _safe_json_loads(row["market_status_json"], {}))
+        payload.setdefault("theme_rankings", _safe_json_loads(row["theme_rankings_json"], []))
+        payload.setdefault("theme_condition_snapshots", _safe_json_loads(row["theme_condition_snapshots_json"], []))
+        payload.setdefault("condition_hit_snapshots", _safe_json_loads(row["condition_hit_snapshots_json"], []))
+        payload.setdefault("watchset_snapshots", _safe_json_loads(row["watchset_snapshots_json"], []))
+        payload.setdefault("gate_decisions", _safe_json_loads(row["gate_decisions_json"], []))
+        payload.setdefault("data_quality", _safe_json_loads(row["data_quality_json"], {}))
+        payload["created_at"] = row["created_at"]
+        payload["calculated_at"] = row["calculated_at"]
+        return payload
+
     def save_entry_plan(self, plan: EntryPlan) -> EntryPlan:
         with self.conn:
             if plan.id is None:

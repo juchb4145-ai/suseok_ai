@@ -164,3 +164,45 @@ def test_condition_adapter_warns_when_index_is_not_ready(tmp_path):
         assert any(item["command_type"] == "load_conditions" for item in commands)
     finally:
         db.close()
+
+
+def test_condition_adapter_resolves_indexes_from_gateway_condition_loaded(tmp_path):
+    db = TradingDatabase(str(tmp_path / "runtime.sqlite3"))
+    try:
+        repository = ConditionProfileRepository(db)
+        repository.upsert_profile(
+            ConditionProfile(
+                condition_name="테마랩_생존_-1",
+                strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+                enabled=True,
+                priority=200,
+                purpose="theme_lab_alive",
+                last_resolved_index=None,
+            )
+        )
+        state = GatewayStateStore()
+        adapter = GatewayCommandConditionAdapter(
+            state,
+            repository,
+            purpose_filter={"theme_lab_alive"},
+        )
+
+        handled = adapter.handle_event(
+            GatewayEvent(
+                type="condition_loaded",
+                payload={"conditions": [{"index": 83, "name": "테마랩_생존_-1"}]},
+            )
+        )
+
+        assert handled is True
+        assert repository.enabled_profiles()[0].last_resolved_index == 83
+        assert ("테마랩_생존_-1", 83) in adapter.registered_conditions
+        commands = state.list_commands(limit=10, include_finished=True)
+        assert any(
+            item["command_type"] == "send_condition"
+            and item["command"]["payload"]["condition_name"] == "테마랩_생존_-1"
+            and item["command"]["payload"]["condition_index"] == 83
+            for item in commands
+        )
+    finally:
+        db.close()

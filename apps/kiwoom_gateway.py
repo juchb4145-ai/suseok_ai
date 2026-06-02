@@ -566,6 +566,23 @@ def _wire_kiwoom_signals(client, runtime: GatewayRuntime) -> None:
     client.order_result.connect(lambda result: runtime.emit("order_result", result.to_dict()))
     client.execution_received.connect(lambda event: runtime.emit("execution_event", event.to_dict()))
     client.message_received.connect(lambda message: runtime.emit("gateway_log", {"message": str(message or "")}))
+    client.condition_load_result.connect(
+        lambda success, message="": runtime.emit(
+            "condition_load_result",
+            {"success": bool(success), "message": str(message or "")},
+        )
+    )
+    client.condition_loaded.connect(
+        lambda conditions: runtime.emit(
+            "condition_loaded",
+            {
+                "conditions": [
+                    {"index": int(getattr(condition, "index", -1)), "name": str(getattr(condition, "name", ""))}
+                    for condition in list(conditions or [])
+                ]
+            },
+        )
+    )
     client.condition_real_received.connect(
         lambda code, event_type, condition_name, condition_index: runtime.emit(
             "condition_event",

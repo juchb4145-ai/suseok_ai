@@ -201,7 +201,9 @@ class ConditionHitSnapshot:
     calculated_at: str
     symbol: str
     name: str = ""
+    current_price: float = 0.0
     return_pct: float = 0.0
+    turnover_krw: float = 0.0
     alive_hit: bool = False
     strong_hit: bool = False
     leader_hit: bool = False
@@ -419,6 +421,7 @@ class ThemeLabConditionClassifier:
         current_price: float | None = None,
         prev_close: float | None = None,
         change_rate_pct: float | None = None,
+        turnover_krw: float | None = None,
         name: str = "",
         excluded: bool = False,
         excluded_reason: str = "",
@@ -431,7 +434,9 @@ class ThemeLabConditionClassifier:
                 calculated_at=calculated_at,
                 symbol=normalize_stock_code(symbol),
                 name=name,
+                current_price=float(current_price or 0),
                 return_pct=return_pct,
+                turnover_krw=float(turnover_krw or 0),
                 excluded=True,
                 excluded_reason=excluded_reason,
             )
@@ -444,6 +449,8 @@ class ThemeLabConditionClassifier:
                 calculated_at=calculated_at,
                 symbol=normalize_stock_code(symbol),
                 name=name,
+                current_price=float(current_price or 0),
+                turnover_krw=float(turnover_krw or 0),
                 excluded=False,
                 data_quality_flags=tuple(data_quality or ["MISSING_RETURN_PCT"]),
             )
@@ -459,7 +466,9 @@ class ThemeLabConditionClassifier:
             calculated_at=calculated_at,
             symbol=normalize_stock_code(symbol),
             name=name,
+            current_price=float(current_price or 0),
             return_pct=round(return_pct, 4),
+            turnover_krw=float(turnover_krw or 0),
             alive_hit=alive,
             strong_hit=strong,
             leader_hit=leader,
@@ -514,12 +523,13 @@ class ThemeBreadthEngine:
                 _add_flag(flags, "EXCLUSION_METADATA_FALLBACK")
             current_price = snapshot.current_price if snapshot else None
             prev_close = _prev_close(snapshot)
-            change_rate = snapshot.change_rate if snapshot and not current_price else None
+            change_rate = snapshot.change_rate if snapshot else None
             hit = self.classifier.classify(
                 symbol=symbol,
                 current_price=current_price,
                 prev_close=prev_close,
                 change_rate_pct=change_rate,
+                turnover_krw=snapshot.turnover if snapshot else 0,
                 name=(snapshot.stock_name if snapshot else "") or member.stock_name,
                 excluded=exclusion.excluded,
                 excluded_reason=exclusion.reason,

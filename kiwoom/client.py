@@ -397,6 +397,11 @@ class KiwoomClient:
         parse_fallback = parse_fallback or not ok
         trade_value, ok = _parse_real_float(raw_values.get(FID_ACC_TRADE_VALUE), abs_value=True)
         parse_fallback = parse_fallback or not ok
+        trade_value_unit = ""
+        if trade_value > 0:
+            # Kiwoom FID 14 (누적거래대금) is delivered in million KRW units.
+            trade_value *= 1_000_000
+            trade_value_unit = "million_krw"
         open_price, ok = _parse_real_int(raw_values.get(FID_OPEN_PRICE))
         parse_fallback = parse_fallback or not ok
         day_high, ok = _parse_real_int(raw_values.get(FID_HIGH_PRICE))
@@ -438,6 +443,8 @@ class KiwoomClient:
             "reason_codes": sorted(set(reason_codes)),
             "spread_price": spread_price,
         }
+        if trade_value_unit:
+            metadata["trade_value_unit"] = trade_value_unit
         self.price_received.emit(code, current, change_rate, volume, best_ask, best_bid)
         self.price_tick_received.emit(
             BrokerPriceTick(

@@ -262,7 +262,13 @@ class RuntimeSupervisor:
             return dict(self.last_snapshot or {})
 
     async def handle_gateway_event(self, event: GatewayEvent) -> None:
-        if not self.enabled or self._bundle is None or event.type != "price_tick":
+        if not self.enabled or self._bundle is None:
+            return
+        if event.type in {"condition_load_result", "condition_loaded"}:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
+            return
+        if event.type != "price_tick":
             return
         self._queue_price_tick(event)
 
@@ -321,6 +327,11 @@ class RuntimeSupervisor:
     def _handle_gateway_event_in_worker(self, event: GatewayEvent) -> None:
         if self._bundle is None:
             return
+        condition_adapter = getattr(self._bundle.runtime, "condition_adapter", None)
+        if condition_adapter is not None:
+            handler = getattr(condition_adapter, "handle_event", None)
+            if callable(handler) and handler(event):
+                return
         self._bundle.market_data_bridge.handle_event(event)
         theme_bridge = getattr(self._bundle, "theme_runtime_bridge", None)
         if theme_bridge is not None:

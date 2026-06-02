@@ -83,7 +83,7 @@ def test_kiwoom_real_data_parses_rich_tick_and_keeps_legacy_signal():
         FID_CURRENT_PRICE: "-70,000",
         FID_CHANGE_RATE: "+1.25",
         FID_ACC_VOLUME: "1,200",
-        FID_ACC_TRADE_VALUE: "84,000,000",
+        FID_ACC_TRADE_VALUE: "84",
         FID_OPEN_PRICE: "69,500",
         FID_HIGH_PRICE: "71,000",
         FID_LOW_PRICE: "69,000",
@@ -113,6 +113,7 @@ def test_kiwoom_real_data_parses_rich_tick_and_keeps_legacy_signal():
     assert tick.trade_time == "093015"
     assert tick.spread_ticks == 1
     assert tick.metadata["real_type"] == "stock_trade"
+    assert tick.metadata["trade_value_unit"] == "million_krw"
     assert FID_ACC_TRADE_VALUE in tick.metadata["raw_fids_present"]
     assert "SPREAD_APPROXIMATED" in tick.metadata["reason_codes"]
 

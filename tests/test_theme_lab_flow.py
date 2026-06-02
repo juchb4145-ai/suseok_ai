@@ -246,6 +246,18 @@ def test_missing_prev_close_without_change_rate_records_quality_and_blocks_ready
     assert "DATA_QUALITY_BLOCK" in decision.reason_codes
 
 
+def test_theme_breadth_uses_tick_change_rate_when_prev_close_missing():
+    theme = ThemeBreadthEngine().calculate(
+        [("t", "테마", [_member("t", "000001")])],
+        [_snapshot("000001", 4.2, current_price=104.2, metadata={})],
+    )[0]
+
+    assert theme.alive_count == 1
+    assert theme.strong_count == 1
+    assert theme.leader_count == 0
+    assert theme.member_hits[0].return_pct == 4.2
+
+
 def test_vi_active_is_always_hard_block():
     result = TradeabilityRiskFilter().evaluate(
         _risk_input(stock_role=StockRole.LEADER, vi_active=True, return_pct=7.0)

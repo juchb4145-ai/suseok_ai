@@ -52,6 +52,7 @@ from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
+from trading_app.themelab_dashboard import build_theme_lab_dashboard_snapshot
 from trading_app.transport_latency import TransportLatencyAnalyzer, TransportLatencyConfig
 from trading_app.websocket import DashboardConnectionManager
 
@@ -303,6 +304,11 @@ def _transport_status_payload(db: TradingDatabase) -> dict[str, Any]:
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
     return templates.TemplateResponse(request, "dashboard.html", {})
+
+
+@app.get("/themelab", response_class=HTMLResponse)
+def theme_lab_dashboard(request: Request):
+    return templates.TemplateResponse(request, "themelab.html", {})
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -1162,6 +1168,15 @@ def snapshot() -> dict[str, Any]:
         close_database(db)
 
 
+@app.get("/api/themelab/snapshot")
+def theme_lab_snapshot() -> dict[str, Any]:
+    db = open_database()
+    try:
+        return build_theme_lab_dashboard_snapshot(db)
+    finally:
+        close_database(db)
+
+
 @app.post("/api/gateway/events")
 async def gateway_events(
     event_in: GatewayEventIn,
@@ -1789,6 +1804,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "orders": orders_payload,
         "reviews": reviews_payload,
         "logs": logs_payload,
+        "theme_lab": build_theme_lab_dashboard_snapshot(db),
         "market_data": {
             "latest_ticks": gateway_state.latest_ticks(limit=30),
             "raw_tick_rendering": "disabled",

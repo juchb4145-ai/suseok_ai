@@ -1638,6 +1638,9 @@ class StrategyRuntime:
             snapshot.warnings.append(f"READINESS_REPORT_FAILED:{exc}")
             return
         self.readiness_report = report
+        if report.unresolved_condition_profiles_count <= 0:
+            snapshot.warnings = _without_resolved_condition_warnings(snapshot.warnings)
+            self._warnings = _without_resolved_condition_warnings(self._warnings)
         snapshot.condition_profiles_count = report.condition_profiles_count
         snapshot.unresolved_condition_profiles_count = report.unresolved_condition_profiles_count
         snapshot.active_theme_count = report.active_theme_count
@@ -1686,6 +1689,17 @@ def _snapshot_for_exit(context: _ReviewContext):
     if context.gate_result is not None:
         return context.gate_result.snapshot
     return None
+
+
+def _without_resolved_condition_warnings(warnings: list[str]) -> list[str]:
+    stale_prefixes = (
+        "CONDITION_PROFILE_UNRESOLVED:",
+        "CONDITION_INDEX_NOT_READY:",
+        "THEME_LAB_CONDITION_ALIVE_UNRESOLVED",
+        "THEME_LAB_CONDITION_STRONG_UNRESOLVED",
+        "THEME_LAB_CONDITION_LEADER_UNRESOLVED",
+    )
+    return [warning for warning in warnings if not str(warning or "").startswith(stale_prefixes)]
 
 
 def _context_dry_run_order_results(context: _ReviewContext) -> list[dict]:

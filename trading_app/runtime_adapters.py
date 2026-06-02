@@ -5,7 +5,7 @@ from typing import Any, Callable, Iterable
 
 from trading.broker.command_queue import CommandPriority
 from trading.broker.gateway_state import GatewayStateStore
-from trading.broker.models import GatewayCommand, GatewayEvent, Signal, new_message_id
+from trading.broker.models import ConditionInfo, GatewayCommand, GatewayEvent, Signal, new_message_id
 from trading.strategy.bridge import StrategyMarketDataBridge
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.conditions import ConditionProfileRepository, RegisteredCondition
@@ -234,9 +234,11 @@ class GatewayCommandConditionAdapter:
         self.registered_conditions: dict[tuple[str, int], RegisteredCondition] = {}
         self.condition_event_counts: dict[str, dict[str, int | str]] = {}
         self.warnings: list[str] = []
+        self._load_succeeded = False
 
     def start(self, now: datetime | None = None) -> list[str]:
         self.warnings = []
+        self._load_succeeded = False
         if not self._gateway_ready():
             return list(self.warnings)
         self._enqueue(
@@ -295,6 +297,74 @@ class GatewayCommandConditionAdapter:
     def get_code_name(self, code: str) -> str:
         return ""
 
+    def handle_event(self, event: GatewayEvent, now: datetime | None = None) -> bool:
+        if event.type == "condition_load_result":
+            self._handle_condition_load_result(dict(event.payload or {}))
+            return True
+        if event.type == "condition_loaded":
+            self._handle_condition_loaded(dict(event.payload or {}), now=now)
+            return True
+        return False
+
+    def _handle_condition_load_result(self, payload: dict[str, Any]) -> None:
+        success = bool(payload.get("success"))
+        self._load_succeeded = success
+        if not success:
+            self._warn(f"CONDITION_LOAD_FAILED:{payload.get('message') or ''}")
+
+    def _handle_condition_loaded(self, payload: dict[str, Any], now: datetime | None = None) -> None:
+        conditions = _condition_infos(payload.get("conditions") or [])
+        if not conditions:
+            self._warn("CONDITION_LOADED_EMPTY")
+            return
+        self._load_succeeded = True
+        self._register_resolved_conditions(conditions, now=now)
+
+    def _register_resolved_conditions(self, conditions: list[ConditionInfo], now: datetime | None = None) -> None:
+        by_name: dict[str, list[ConditionInfo]] = {}
+        for condition in conditions:
+            by_name.setdefault(condition.name, []).append(condition)
+
+        profiles = sorted(self.repository.enabled_profiles(), key=lambda profile: profile.priority, reverse=True)
+        if self.purpose_filter:
+            profiles = [profile for profile in profiles if profile.purpose in self.purpose_filter]
+        selected = profiles[: self.max_realtime_conditions]
+        for skipped in profiles[self.max_realtime_conditions :]:
+            self._warn(f"CONDITION_PROFILE_SKIPPED_LIMIT:{skipped.condition_name}")
+
+        current = now or datetime.now()
+        for index, profile in enumerate(selected):
+            matches = by_name.get(profile.condition_name, [])
+            if not matches:
+                self._warn(f"CONDITION_PROFILE_UNRESOLVED:{profile.condition_name}")
+                continue
+            unique_indices = sorted({int(match.index) for match in matches})
+            if len(unique_indices) != 1:
+                self._warn(f"CONDITION_PROFILE_AMBIGUOUS:{profile.condition_name}")
+                continue
+            condition_index = unique_indices[0]
+            self.repository.update_last_resolved_index(profile.condition_name, condition_index)
+            screen_no = f"{self.condition_screen_base + index:04d}"
+            self._enqueue(
+                "send_condition",
+                payload={
+                    "screen_no": screen_no,
+                    "condition_name": profile.condition_name,
+                    "condition_index": condition_index,
+                    "realtime": True,
+                    "search_type": 1,
+                },
+                key=f"runtime:send_condition:{profile.condition_name}:{condition_index}:{screen_no}",
+            )
+            self.registered_conditions[(profile.condition_name, condition_index)] = RegisteredCondition(
+                condition_name=profile.condition_name,
+                condition_index=condition_index,
+                screen_no=screen_no,
+                strategy_profile=profile.strategy_profile,
+                purpose=profile.purpose,
+                registered_at=current.replace(microsecond=0).isoformat(),
+            )
+
     def _gateway_ready(self) -> bool:
         snapshot = self.gateway_state.snapshot()
         if self.require_gateway_heartbeat and not snapshot.heartbeat_ok:
@@ -333,6 +403,20 @@ def _clean_codes(codes: Iterable[str]) -> list[str]:
         text = str(code or "").strip().upper()
         if text and text not in result:
             result.append(text)
+    return result
+
+
+def _condition_infos(raw_conditions: Iterable[Any]) -> list[ConditionInfo]:
+    result: list[ConditionInfo] = []
+    for raw in raw_conditions:
+        if isinstance(raw, ConditionInfo):
+            result.append(raw)
+            continue
+        item = dict(raw or {})
+        name = str(item.get("name") or item.get("condition_name") or "").strip()
+        if not name:
+            continue
+        result.append(ConditionInfo(index=int(item.get("index", item.get("condition_index", -1)) or -1), name=name))
     return result
 
 
