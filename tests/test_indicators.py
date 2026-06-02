@@ -111,6 +111,18 @@ def test_base_line_120_and_envelope_mid_use_completed_5m_sma():
     assert snapshot.metadata["volatility_5m_ready"] is True
 
 
+def test_base_line_120_short_history_has_value_but_not_ready_reason():
+    store, builder = build_5m_history(80)
+    calculator = IndicatorCalculator(store, builder)
+
+    snapshot = calculator.build_snapshot(1, "005930")
+
+    assert snapshot.base_line_120 is not None
+    assert snapshot.metadata["base_line_120_candle_count"] == 80
+    assert snapshot.metadata["base_line_120_ready"] is False
+    assert "base_line_120_insufficient_candles" in snapshot.metadata["insufficient_reason"]
+
+
 def test_build_snapshot_returns_none_without_latest_tick():
     calculator = IndicatorCalculator(MarketDataStore(), CandleBuilder())
 

@@ -11,6 +11,12 @@ from trading.strategy.runtime_settings import (
     attach_settings_details,
     legacy_strategy_runtime_settings,
 )
+from trading.strategy.support_readiness import (
+    READY_EARLY_SMALL,
+    SUPPORT_NOT_READY,
+    WAIT_DATA_SUPPORT_NOT_READY,
+    support_source_readiness,
+)
 
 
 class TickSizeProvider:
@@ -52,6 +58,8 @@ class EntryPlanBuilder:
         order_timeout_sec = _order_timeout_sec(profile, self.settings)
         support_price = _support_price(stock_details)
         support_candidates = _support_candidates(stock_details)
+        support_readiness = _support_readiness(stock_details)
+        ready_type = str(stock_details.get("ready_type") or result.details.get("ready_type") or "")
         current_price = snapshot.price
         submittable = True
         diagnostic_only = False
@@ -64,8 +72,12 @@ class EntryPlanBuilder:
             submittable = False
             diagnostic_only = True
             reason = "support_missing"
+        elif not support_readiness["ready"]:
+            submittable = False
+            diagnostic_only = True
+            reason = str(support_readiness["reason"] or WAIT_DATA_SUPPORT_NOT_READY)
 
-        split_plan = self._build_split_plan(result.final_grade, stock_details, current_price)
+        split_plan = self._build_split_plan(result.final_grade, stock_details, current_price, ready_type)
         position_size_multiplier = _position_size_multiplier(result)
         if 0 < position_size_multiplier < 1:
             split_plan = _scale_split_plan(split_plan, position_size_multiplier)
@@ -86,9 +98,15 @@ class EntryPlanBuilder:
             "theme_name": result.details.get("theme_name", ""),
             "strategy_profile": profile.value if profile else "",
             "final_grade": result.final_grade,
+            "ready_type": ready_type,
             "current_price_at_plan": current_price,
             "support_price": support_price,
             "support_candidates": support_candidates,
+            "selected_support_source": support_readiness["source"],
+            "selected_support_price": support_readiness["price"],
+            "selected_support_ready": support_readiness["ready"],
+            "selected_support_ready_reason": support_readiness["reason"],
+            "support_readiness_reason_codes": list(support_readiness["reason_codes"]),
             "limit_vs_current_pct": limit_vs_current_pct,
             "limit_vs_support_pct": limit_vs_support_pct,
             "max_chase_pct": max_chase_pct,
@@ -97,6 +115,7 @@ class EntryPlanBuilder:
                 "position_size_multiplier": position_size_multiplier,
                 "one_new_leg_per_cycle": True,
                 "later_legs_require_previous_fill": True,
+                "early_small_first_leg_only": ready_type == READY_EARLY_SMALL,
             },
             "dynamic_pullback_policy": dict(stock_details.get("dynamic_pullback_policy") or {}),
             "late_chase_diagnostics": dict(stock_details.get("late_chase_diagnostics") or {}),
@@ -127,7 +146,7 @@ class EntryPlanBuilder:
             created_at=(now or datetime.now()).replace(microsecond=0).isoformat(),
         )
 
-    def _build_split_plan(self, final_grade: str, details: dict, current_price: int) -> list[dict]:
+    def _build_split_plan(self, final_grade: str, details: dict, current_price: int, ready_type: str = "") -> list[dict]:
         weights = _split_weights(final_grade, self.settings)
         nearest_name = str(details.get("nearest_support") or "")
         nearest_price = _support_price(details)
@@ -135,6 +154,7 @@ class EntryPlanBuilder:
         if nearest_name and nearest_price > 0:
             supports.setdefault(nearest_name, float(nearest_price))
         lower_supports = _lower_supports(supports, nearest_name, nearest_price)
+        first_support_readiness = _support_readiness(details)
         plan: list[dict] = []
         for index, weight in enumerate(weights, start=1):
             if index == 1:
@@ -147,6 +167,13 @@ class EntryPlanBuilder:
                 if lower_index < len(lower_supports):
                     support_name, support_price = lower_supports[lower_index]
             submittable = support_price > 0
+            reason = "" if submittable else "support_missing"
+            if index == 1 and submittable and not first_support_readiness["ready"]:
+                submittable = False
+                reason = str(first_support_readiness["reason"] or WAIT_DATA_SUPPORT_NOT_READY)
+            if index > 1 and ready_type == READY_EARLY_SMALL:
+                submittable = False
+                reason = "early_small_later_leg_pending"
             tick_offset = self.settings.integer("entry_plan_thresholds.tick_offset", 1) if submittable else 0
             limit_price = self.tick_provider.add_ticks(int(support_price), tick_offset) if submittable else 0
             plan.append(
@@ -160,8 +187,9 @@ class EntryPlanBuilder:
                     "submittable": submittable,
                     "requires_previous_leg": index > 1,
                     "confirmation_required": index > 1 and not submittable,
+                    "pending_after_first_fill": index > 1 and ready_type == READY_EARLY_SMALL,
                     "current_price_at_plan": current_price,
-                    "reason": "" if submittable else "support_missing",
+                    "reason": reason,
                 }
             )
         return plan
@@ -207,6 +235,51 @@ def _support_candidates(details: dict) -> dict[str, float]:
         if price > 0:
             result[str(name)] = price
     return result
+
+
+def _support_readiness(details: dict) -> dict:
+    source = str(details.get("selected_support_source") or details.get("nearest_support") or "")
+    price = int(float(details.get("selected_support_price") or details.get("nearest_support_price") or 0))
+    readiness_keys = {
+        "selected_support_ready",
+        "support_ready",
+        "selected_support_ready_reason",
+        "support_ready_reason",
+        "support_readiness_reason_codes",
+    }
+    if not any(key in details for key in readiness_keys):
+        return {
+            "source": source,
+            "price": price,
+            "ready": True,
+            "reason": "",
+            "reason_codes": [],
+        }
+    ready = bool(details.get("selected_support_ready", details.get("support_ready", False)))
+    reason = str(details.get("selected_support_ready_reason") or details.get("support_ready_reason") or "")
+    reason_codes = list(details.get("support_readiness_reason_codes") or [])
+    if not ready and not reason:
+        reason = WAIT_DATA_SUPPORT_NOT_READY
+    if not ready and not reason_codes:
+        reason_codes = [reason or SUPPORT_NOT_READY]
+    if ready:
+        return {
+            "source": source,
+            "price": price,
+            "ready": True,
+            "reason": "",
+            "reason_codes": [],
+        }
+    explicit = support_source_readiness(source, details)
+    if explicit.reason_codes:
+        reason_codes = list(dict.fromkeys(reason_codes + list(explicit.reason_codes)))
+    return {
+        "source": source,
+        "price": price,
+        "ready": False,
+        "reason": reason or explicit.reason or SUPPORT_NOT_READY,
+        "reason_codes": reason_codes,
+    }
 
 
 def _lower_supports(

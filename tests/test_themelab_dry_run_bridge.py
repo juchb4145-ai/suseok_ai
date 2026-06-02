@@ -155,6 +155,128 @@ def test_data_insufficient_waits_without_intent(tmp_path):
     assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 
 
+def test_base_line_120_insufficient_candles_waits_without_plan(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=True,
+        tick_metadata={
+            "prev_close": 10000,
+            "base_line_120": 9950,
+            "base_line_120_ready": False,
+            "base_line_120_candle_count": 80,
+        },
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    assert candidate.metadata["gate_results_by_theme"]["ai"]["sub_status"] == "WAIT_DATA"
+    assert "BASE_LINE_120_INSUFFICIENT_CANDLES" in candidate.metadata["gate_results_by_theme"]["ai"]["reason_codes"]
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
+def test_base_line_120_insufficient_but_vwap_ready_allows_early_small_first_leg(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=True,
+        tick_metadata={
+            "prev_close": 10000,
+            "vwap": 9950,
+            "vwap_ready": True,
+            "base_line_120": 9800,
+            "base_line_120_ready": False,
+            "base_line_120_candle_count": 80,
+        },
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    plan = db.list_entry_plans(candidate.id)[0]
+    assert candidate.state == CandidateState.READY
+    assert plan.cancel_condition["ready_type"] == "READY_EARLY_SMALL"
+    assert plan.split_plan[0]["submittable"] is True
+    assert plan.split_plan[1]["submittable"] is False
+    assert plan.split_plan[2]["reason"] == "early_small_later_leg_pending"
+    assert len(db.list_runtime_order_intents(candidate_id=candidate.id)) == 1
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected_reason"),
+    [
+        (
+            {"prev_close": 10000, "vwap": 9950, "vwap_ready": False},
+            "VWAP_NOT_READY",
+        ),
+        (
+            {
+                "prev_close": 10000,
+                "recent_swing_low": 9950,
+                "recent_swing_low_ready": True,
+                "recent_swing_low_candle_count": 2,
+            },
+            "RECENT_SWING_LOW_NOT_READY",
+        ),
+        (
+            {"prev_close": 10000, "opening_range": 9950, "opening_range_ready": False},
+            "OPENING_RANGE_NOT_READY",
+        ),
+        (
+            {"prev_close": 10000, "prev_day_level": 9950, "prev_day_level_ready": False},
+            "PREV_DAY_LEVEL_NOT_READY",
+        ),
+    ],
+)
+def test_unready_support_sources_wait_without_intent(tmp_path, metadata, expected_reason):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=True,
+        tick_metadata=metadata,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata.get("gate_results_by_theme", {}).get("ai") or runtime._theme_lab_bridge_results[0].details
+    assert details["sub_status"] == "WAIT_DATA"
+    assert expected_reason in details["reason_codes"]
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
+@pytest.mark.parametrize(
+    ("runtime_kwargs", "expected_reason"),
+    [
+        ({"with_tick": False}, "LATEST_TICK_MISSING"),
+        ({"tick_timestamp": NOW - timedelta(seconds=40)}, "LATEST_TICK_STALE"),
+    ],
+)
+def test_latest_tick_missing_or_stale_waits_without_intent(tmp_path, runtime_kwargs, expected_reason):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=True,
+        **runtime_kwargs,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata.get("gate_results_by_theme", {}).get("ai") or runtime._theme_lab_bridge_results[0].details
+    assert details["sub_status"] == "WAIT_DATA"
+    assert expected_reason in details["reason_codes"]
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
 def test_theme_weak_blocks_without_intent(tmp_path):
     runtime, db, _gateway_state = _runtime(
         tmp_path,
@@ -181,7 +303,18 @@ def test_theme_weak_blocks_without_intent(tmp_path):
     ("metadata", "expected_reason"),
     [
         ({"prev_close": 10000}, "support_missing"),
-        ({"prev_close": 10000, "recent_support_price": 9000}, "max_chase_exceeded"),
+        (
+            {
+                "prev_close": 10000,
+                "recent_support_price": 9000,
+                "recent_support_ready": True,
+                "recent_support_candle_count": 3,
+                "base_line_120": 8800,
+                "base_line_120_ready": True,
+                "base_line_120_candle_count": 120,
+            },
+            "max_chase_exceeded",
+        ),
     ],
 )
 def test_entry_plan_diagnostic_only_blocks_intent_for_missing_support_or_chase(tmp_path, metadata, expected_reason):
@@ -198,8 +331,12 @@ def test_entry_plan_diagnostic_only_blocks_intent_for_missing_support_or_chase(t
 
     candidate = db.load_candidate("2026-06-01", "000001")
     plans = db.list_entry_plans(candidate.id)
-    assert plans[0].cancel_condition["diagnostic_only"] is True
-    assert plans[0].cancel_condition["reason"] == expected_reason
+    if expected_reason == "support_missing":
+        assert plans == []
+        assert candidate.metadata["gate_results_by_theme"]["ai"]["sub_status"] == "WAIT_DATA"
+    else:
+        assert plans[0].cancel_condition["diagnostic_only"] is True
+        assert plans[0].cancel_condition["reason"] == expected_reason
     assert db.list_virtual_orders(candidate.id) == []
     assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 
@@ -294,6 +431,8 @@ def _runtime(
     legacy: bool = False,
     tick_metadata: dict | None = None,
     price: int = 10000,
+    tick_timestamp: datetime = NOW,
+    with_tick: bool = True,
 ):
     db_path = Path(tmp_path) / "trader.sqlite3"
     db = TradingDatabase(str(db_path))
@@ -304,19 +443,34 @@ def _runtime(
     market_index_store = MarketIndexStore()
     market_index_store.update_index_tick(IndexTick.from_realtime("KOSPI", "KOSPI", 2500, 0.1, timestamp=NOW))
     market_index_store.update_index_tick(IndexTick.from_realtime("KOSDAQ", "KOSDAQ", 850, 0.2, timestamp=NOW))
-    metadata = {"prev_close": 10000, "recent_support_price": 9950} if tick_metadata is None else dict(tick_metadata)
-    market_data.update_tick(
-        StrategyTick.from_realtime(
-            "000001",
-            price,
-            change_rate=5.0,
-            cum_volume=10_000,
-            trade_value=100_000_000,
-            execution_strength=120.0,
-            timestamp=NOW,
-            metadata=metadata,
-        )
+    metadata = (
+        {
+            "prev_close": 10000,
+            "recent_support_price": 9950,
+            "recent_support_ready": True,
+            "recent_support_candle_count": 3,
+            "vwap": 9950,
+            "vwap_ready": True,
+            "base_line_120": 9800,
+            "base_line_120_ready": True,
+            "base_line_120_candle_count": 120,
+        }
+        if tick_metadata is None
+        else dict(tick_metadata)
     )
+    if with_tick:
+        market_data.update_tick(
+            StrategyTick.from_realtime(
+                "000001",
+                price,
+                change_rate=5.0,
+                cum_volume=10_000,
+                trade_value=100_000_000,
+                execution_strength=120.0,
+                timestamp=tick_timestamp,
+                metadata=metadata,
+            )
+        )
     _seed_theme(db)
     gateway_state = GatewayStateStore()
     core_settings = CoreSettings(

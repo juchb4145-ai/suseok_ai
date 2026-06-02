@@ -1243,6 +1243,7 @@ class StrategyRuntime:
                 db=self.db,
                 market_data=market_data,
                 default_ttl_minutes=getattr(self.candidate_collector, "default_ttl_minutes", 30),
+                settings=getattr(self.entry_plan_builder, "settings", None),
             )
             built = bridge.build(
                 active_result,

@@ -212,6 +212,9 @@ LEGACY_DEFAULT_SETTINGS: dict[str, Any] = {
         },
         "restricted_reason_code": "SESSION_PROFILE_RESTRICTED",
     },
+    "data_readiness": {
+        "max_latest_tick_age_sec": 30,
+    },
     "fill_model_thresholds": {
         "confidence_high": 75.0,
         "confidence_medium": 50.0,

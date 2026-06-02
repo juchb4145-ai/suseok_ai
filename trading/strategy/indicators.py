@@ -47,6 +47,15 @@ class IndicatorCalculator:
             "vwap_price_basis": "close",
             "pullback_pct_basis": "negative_below_day_high",
         }
+        _copy_tick_readiness_metadata(latest_tick.metadata, metadata)
+        if latest_tick.timestamp is not None and latest_tick.timestamp != datetime.min:
+            metadata["latest_tick_at"] = latest_tick.timestamp.replace(microsecond=0).isoformat()
+            reference_time = (now or datetime.now()).replace(microsecond=0)
+            metadata["latest_tick_age_sec"] = max(
+                0.0,
+                (reference_time - latest_tick.timestamp.replace(microsecond=0)).total_seconds(),
+            )
+            metadata["latest_tick_ready"] = True
         insufficient = metadata["insufficient_reason"]
         assert isinstance(insufficient, list)
 
@@ -135,6 +144,8 @@ class IndicatorCalculator:
         if not candles:
             _append_insufficient(metadata, f"{metadata_key}_missing")
             return None
+        if len(candles) < period:
+            _append_insufficient(metadata, f"{metadata_key}_insufficient_candles")
         closes = [float(candle.close) for candle in candles[-period:]]
         return sum(closes) / len(closes)
 
@@ -172,3 +183,29 @@ def _append_insufficient(metadata: dict[str, object], reason: str) -> None:
     reasons = metadata.setdefault("insufficient_reason", [])
     if isinstance(reasons, list) and reason not in reasons:
         reasons.append(reason)
+
+
+def _copy_tick_readiness_metadata(source: dict[str, object], target: dict[str, object]) -> None:
+    for key in (
+        "recent_support_price",
+        "support_price",
+        "recent_support_ready",
+        "recent_support_candle_count",
+        "recent_swing_low",
+        "recent_swing_low_ready",
+        "recent_swing_low_candle_count",
+        "prev_day_level",
+        "prev_day_level_ready",
+        "opening_range",
+        "opening_range_price",
+        "opening_range_low",
+        "opening_range_ready",
+        "base_line_120_ready",
+        "base_line_120_candle_count",
+        "envelope_mid_ready",
+        "envelope_mid_candle_count",
+        "latest_tick_ready",
+        "latest_tick_age_sec",
+    ):
+        if key in source:
+            target[key] = source[key]

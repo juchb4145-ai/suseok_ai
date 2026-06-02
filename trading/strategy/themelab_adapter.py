@@ -17,6 +17,22 @@ from trading.strategy.models import (
 )
 from trading.strategy.pipeline import GatePipelineResult
 from trading.strategy.reason_codes import normalize_reason_codes, standardize_details
+from trading.strategy.runtime_settings import StrategyRuntimeSettings, legacy_strategy_runtime_settings
+from trading.strategy.support_readiness import (
+    BASE_LINE_120,
+    EARLY_READY_SUPPORT_SOURCES,
+    LATEST_TICK_MISSING,
+    OBSERVE,
+    READY_EARLY_SMALL,
+    READY_FULL,
+    SUPPORT_NOT_READY,
+    SUPPORT_SOURCE_FALLBACK_USED,
+    WAIT_DATA,
+    WAIT_DATA_SUPPORT_NOT_READY,
+    latest_tick_readiness,
+    support_metadata,
+    support_source_readiness,
+)
 from trading.theme_engine.lab import (
     LabGateDecision,
     LabGateStatus,
@@ -77,6 +93,14 @@ class ThemeLabBridgeMapping:
     final_grade: str
     final_score: float
     reason_codes: list[str]
+    ready_type: str = ""
+    selected_support_source: str = ""
+    selected_support_price: int = 0
+    selected_support_ready: bool = False
+    selected_support_ready_reason: str = ""
+    support_source_fallback_used: bool = False
+    latest_tick_ready: bool = True
+    latest_tick_age_sec: float | None = None
 
 
 class ThemeLabDryRunLifecycleBridge:
@@ -88,10 +112,12 @@ class ThemeLabDryRunLifecycleBridge:
         db,
         market_data,
         default_ttl_minutes: int = 30,
+        settings: StrategyRuntimeSettings | None = None,
     ) -> None:
         self.db = db
         self.market_data = market_data
         self.default_ttl_minutes = max(1, int(default_ttl_minutes or 30))
+        self.settings = settings or legacy_strategy_runtime_settings()
 
     def build(
         self,
@@ -229,9 +255,19 @@ class ThemeLabDryRunLifecycleBridge:
         theme: ThemeConditionSnapshot | None,
         now: datetime,
     ) -> GatePipelineResult:
-        mapping = _map_decision(decision, watch, theme)
+        tick = self.market_data.latest_tick(candidate.code) if self.market_data is not None else None
+        tick_metadata = dict(tick.metadata or {}) if tick is not None else {}
+        mapping = _map_decision(
+            decision,
+            watch,
+            theme,
+            tick_metadata=tick_metadata,
+            tick=tick,
+            now=now,
+            settings=self.settings,
+        )
         snapshot = self._indicator_snapshot(candidate, decision, watch, now)
-        stock_details = _stock_pullback_details(candidate, decision, watch, snapshot, self._latest_tick_metadata(candidate.code), mapping)
+        stock_details = _stock_pullback_details(candidate, decision, watch, snapshot, tick_metadata, mapping)
         created_at = now.replace(microsecond=0).isoformat()
         lab_details = _base_details(candidate, decision, watch, theme, mapping, stock_details, created_at)
         lab_decision = GateDecision(
@@ -323,6 +359,7 @@ class ThemeLabDryRunLifecycleBridge:
             failed_low_break_rebound=bool(metadata.get("failed_low_break_rebound")),
             chase_risk=decision.price_location_status in OBSERVE_ONLY_LOCATIONS,
             metadata={
+                **metadata,
                 "source": SOURCE,
                 "watch_return_pct": watch.return_pct,
                 "price_location_status": decision.price_location_status.value,
@@ -339,12 +376,20 @@ def _map_decision(
     decision: LabGateDecision,
     watch: WatchSetSnapshot,
     theme: ThemeConditionSnapshot | None,
+    *,
+    tick_metadata: dict[str, Any] | None = None,
+    tick: Any = None,
+    now: datetime | None = None,
+    settings: StrategyRuntimeSettings | None = None,
 ) -> ThemeLabBridgeMapping:
+    metadata = dict(tick_metadata or {})
+    active_settings = settings or legacy_strategy_runtime_settings()
     reason_codes = _reason_codes(decision, watch, theme)
     recheck_after_sec = int(decision.recheck_after_sec or 60)
     risk_allowed = decision.risk_level in BUY_ALLOWED_RISKS
     price_location = decision.price_location_status
     role = watch.stock_role
+    latest = latest_tick_readiness(tick, now or datetime.now(), active_settings)
 
     if _has_any(reason_codes, DATA_INSUFFICIENT_CODES):
         return ThemeLabBridgeMapping(
@@ -357,6 +402,8 @@ def _map_decision(
             "C",
             max(0.0, float(decision.price_location_score or 0.0)),
             _dedupe(["DATA_INSUFFICIENT", "WAIT_DATA"] + reason_codes),
+            latest_tick_ready=latest.ready,
+            latest_tick_age_sec=latest.age_sec,
         )
     if _is_theme_weak(reason_codes, theme):
         return ThemeLabBridgeMapping(
@@ -369,6 +416,8 @@ def _map_decision(
             "C",
             max(0.0, float(decision.price_location_score or 0.0)),
             _dedupe(["THEME_WEAK", "BLOCK_THEME"] + reason_codes),
+            latest_tick_ready=latest.ready,
+            latest_tick_age_sec=latest.age_sec,
         )
     if price_location in OBSERVE_ONLY_LOCATIONS:
         final_status = {
@@ -386,22 +435,65 @@ def _map_decision(
             "B",
             max(0.0, float(decision.price_location_score or 0.0)),
             _dedupe([final_status, price_location.value] + reason_codes),
+            ready_type=OBSERVE,
+            latest_tick_ready=latest.ready,
+            latest_tick_age_sec=latest.age_sec,
         )
+    if not latest.ready:
+        return ThemeLabBridgeMapping(
+            WAIT_DATA,
+            "NOT_ELIGIBLE_DATA",
+            False,
+            BlockType.TEMPORARY,
+            True,
+            recheck_after_sec,
+            "C",
+            max(0.0, float(decision.price_location_score or 0.0)),
+            _dedupe(["DATA_INSUFFICIENT", WAIT_DATA, latest.reason or LATEST_TICK_MISSING] + list(latest.reason_codes) + reason_codes),
+            ready_type=WAIT_DATA,
+            latest_tick_ready=False,
+            latest_tick_age_sec=latest.age_sec,
+        )
+    support = _selected_support_profile(price_location, _support_candidates(metadata), metadata)
     if (
         decision.status == LabGateStatus.READY
         and price_location in READY_PULLBACK_LOCATIONS
         and risk_allowed
     ):
+        if not support["ready"]:
+            return _wait_data_for_support(
+                decision,
+                recheck_after_sec,
+                reason_codes,
+                support,
+                latest,
+            )
+        base_line_ready = support_source_readiness(BASE_LINE_120, metadata).ready
+        ready_type = READY_FULL
+        final_status = "READY_PULLBACK"
+        order_eligibility = "BUY_ELIGIBLE_PULLBACK"
+        if not base_line_ready and support["source"] in EARLY_READY_SUPPORT_SOURCES:
+            ready_type = READY_EARLY_SMALL
+            final_status = READY_EARLY_SMALL
+            order_eligibility = "BUY_ELIGIBLE_EARLY_SMALL"
+        support_reason_codes = [SUPPORT_SOURCE_FALLBACK_USED] if support["fallback_used"] else []
         return ThemeLabBridgeMapping(
-            "READY_PULLBACK",
-            "BUY_ELIGIBLE_PULLBACK",
+            final_status,
+            order_eligibility,
             True,
             BlockType.NONE,
             False,
             0,
             "A",
             max(80.0, float(decision.price_location_score or 0.0)),
-            _dedupe(["READY_PULLBACK"] + reason_codes),
+            _dedupe([final_status, ready_type] + support_reason_codes + reason_codes),
+            ready_type=ready_type,
+            selected_support_source=support["source"],
+            selected_support_price=int(support["price"]),
+            selected_support_ready=True,
+            support_source_fallback_used=bool(support["fallback_used"]),
+            latest_tick_ready=True,
+            latest_tick_age_sec=latest.age_sec,
         )
     if (
         decision.status == LabGateStatus.READY_SMALL
@@ -409,6 +501,15 @@ def _map_decision(
         and role in LEADER_ROLES
         and risk_allowed
     ):
+        if not support["ready"]:
+            return _wait_data_for_support(
+                decision,
+                recheck_after_sec,
+                reason_codes,
+                support,
+                latest,
+            )
+        support_reason_codes = [SUPPORT_SOURCE_FALLBACK_USED] if support["fallback_used"] else []
         return ThemeLabBridgeMapping(
             "READY_SMALL_PULLBACK",
             "BUY_ELIGIBLE_SMALL_PULLBACK",
@@ -418,7 +519,14 @@ def _map_decision(
             0,
             "B+",
             max(70.0, float(decision.price_location_score or 0.0)),
-            _dedupe(["READY_SMALL_PULLBACK"] + reason_codes),
+            _dedupe(["READY_SMALL_PULLBACK", READY_EARLY_SMALL] + support_reason_codes + reason_codes),
+            ready_type=READY_EARLY_SMALL,
+            selected_support_source=support["source"],
+            selected_support_price=int(support["price"]),
+            selected_support_ready=True,
+            support_source_fallback_used=bool(support["fallback_used"]),
+            latest_tick_ready=True,
+            latest_tick_age_sec=latest.age_sec,
         )
     if decision.status == LabGateStatus.WAIT or decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK:
         return ThemeLabBridgeMapping(
@@ -431,6 +539,8 @@ def _map_decision(
             "B",
             max(0.0, float(decision.price_location_score or 0.0)),
             _dedupe(["WAIT"] + reason_codes),
+            latest_tick_ready=latest.ready,
+            latest_tick_age_sec=latest.age_sec,
         )
     if decision.status == LabGateStatus.BLOCKED or decision.risk_level == TradeabilityRiskLevel.HARD_BLOCK:
         return ThemeLabBridgeMapping(
@@ -443,6 +553,8 @@ def _map_decision(
             "C",
             max(0.0, float(decision.price_location_score or 0.0)),
             _dedupe(["BLOCKED"] + reason_codes),
+            latest_tick_ready=latest.ready,
+            latest_tick_age_sec=latest.age_sec,
         )
     return ThemeLabBridgeMapping(
         "OBSERVE",
@@ -454,7 +566,81 @@ def _map_decision(
         "B",
         max(0.0, float(decision.price_location_score or 0.0)),
         _dedupe(["OBSERVE"] + reason_codes),
+        ready_type=OBSERVE,
+        latest_tick_ready=latest.ready,
+        latest_tick_age_sec=latest.age_sec,
     )
+
+
+def _wait_data_for_support(
+    decision: LabGateDecision,
+    recheck_after_sec: int,
+    reason_codes: list[str],
+    support: dict[str, Any],
+    latest,
+) -> ThemeLabBridgeMapping:
+    support_reason_codes = list(support.get("reason_codes") or [])
+    reason = str(support.get("reason") or SUPPORT_NOT_READY)
+    return ThemeLabBridgeMapping(
+        WAIT_DATA,
+        "NOT_ELIGIBLE_SUPPORT_DATA",
+        False,
+        BlockType.TEMPORARY,
+        True,
+        recheck_after_sec,
+        "C",
+        max(0.0, float(decision.price_location_score or 0.0)),
+        _dedupe(["DATA_INSUFFICIENT", WAIT_DATA, WAIT_DATA_SUPPORT_NOT_READY, reason] + support_reason_codes + reason_codes),
+        ready_type=WAIT_DATA,
+        selected_support_source=str(support.get("source") or ""),
+        selected_support_price=int(float(support.get("price") or 0)),
+        selected_support_ready=False,
+        selected_support_ready_reason=reason,
+        support_source_fallback_used=bool(support.get("fallback_used")),
+        latest_tick_ready=latest.ready,
+        latest_tick_age_sec=latest.age_sec,
+    )
+
+
+def _selected_support_profile(
+    price_location: PriceLocationStatus,
+    support_candidates: dict[str, float],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    preferred = ["recent_support_price", "support_price", "recent_swing_low", "opening_range", "prev_day_level"]
+    if price_location == PriceLocationStatus.VWAP_RECLAIM:
+        preferred = ["vwap"] + preferred
+    preferred += ["vwap", "base_line_120", "envelope_mid", "day_mid", "ema20_5m"]
+    first_existing: dict[str, Any] | None = None
+    saw_not_ready = False
+    for name in _dedupe(preferred):
+        price = support_candidates.get(name)
+        if not price or price <= 0:
+            continue
+        readiness = support_source_readiness(name, metadata)
+        profile = {
+            "source": name,
+            "price": float(price),
+            "ready": readiness.ready,
+            "reason": readiness.reason,
+            "reason_codes": list(readiness.reason_codes),
+            "fallback_used": saw_not_ready,
+        }
+        if first_existing is None:
+            first_existing = profile
+        if readiness.ready:
+            return profile
+        saw_not_ready = True
+    if first_existing is not None:
+        return first_existing
+    return {
+        "source": "",
+        "price": 0.0,
+        "ready": False,
+        "reason": SUPPORT_NOT_READY,
+        "reason_codes": [SUPPORT_NOT_READY],
+        "fallback_used": False,
+    }
 
 
 def _stock_pullback_details(
@@ -466,7 +652,31 @@ def _stock_pullback_details(
     mapping: ThemeLabBridgeMapping,
 ) -> dict[str, Any]:
     support_candidates = _support_candidates(tick_metadata)
-    nearest_support, nearest_support_price = _nearest_support(decision.price_location_status, support_candidates)
+    if mapping.selected_support_source:
+        nearest_support = mapping.selected_support_source
+        nearest_support_price = mapping.selected_support_price
+    else:
+        nearest_support, nearest_support_price = _nearest_support(decision.price_location_status, support_candidates)
+    support_details = support_metadata(
+        source=nearest_support,
+        price=nearest_support_price,
+        metadata=tick_metadata,
+        fallback_used=mapping.support_source_fallback_used,
+    ) if nearest_support else {
+        "selected_support_source": "",
+        "selected_support_price": 0,
+        "selected_support_ready": False,
+        "selected_support_ready_reason": SUPPORT_NOT_READY,
+        "support_ready": False,
+        "support_ready_reason": SUPPORT_NOT_READY,
+        "support_readiness_reason_codes": [SUPPORT_NOT_READY],
+        "support_source_fallback_used": False,
+    }
+    if mapping.selected_support_source:
+        support_details["selected_support_ready"] = mapping.selected_support_ready
+        support_details["support_ready"] = mapping.selected_support_ready
+        support_details["selected_support_ready_reason"] = mapping.selected_support_ready_reason
+        support_details["support_ready_reason"] = mapping.selected_support_ready_reason
     position_size_multiplier = max(0.0, float(decision.position_size_multiplier or 0.0))
     if position_size_multiplier <= 0:
         position_size_multiplier = 1.0
@@ -476,6 +686,10 @@ def _stock_pullback_details(
         "nearest_support": nearest_support,
         "nearest_support_price": nearest_support_price,
         "support_candidates": support_candidates,
+        "ready_type": mapping.ready_type,
+        "latest_tick_ready": mapping.latest_tick_ready,
+        "latest_tick_age_sec": mapping.latest_tick_age_sec,
+        **support_details,
         "support_reclaimed": decision.price_location_status in READY_PULLBACK_LOCATIONS,
         "support_touched": decision.price_location_status in READY_PULLBACK_LOCATIONS,
         "failed_low_break_rebound": bool(tick_metadata.get("failed_low_break_rebound")),
@@ -519,6 +733,7 @@ def _base_details(
         "dynamic_theme_score": theme_score,
         "final_gate_status": mapping.final_gate_status,
         "order_eligibility": mapping.order_eligibility,
+        "ready_type": mapping.ready_type,
         "lab_gate_status": decision.status.value,
         "price_location_status": decision.price_location_status.value,
         "price_location_score": decision.price_location_score,
@@ -537,6 +752,16 @@ def _base_details(
         "support_price": support_price,
         "nearest_support": stock_details.get("nearest_support", ""),
         "nearest_support_price": support_price,
+        "selected_support_source": stock_details.get("selected_support_source", ""),
+        "selected_support_price": stock_details.get("selected_support_price", support_price),
+        "selected_support_ready": bool(stock_details.get("selected_support_ready")),
+        "selected_support_ready_reason": stock_details.get("selected_support_ready_reason", ""),
+        "support_ready": bool(stock_details.get("support_ready")),
+        "support_ready_reason": stock_details.get("support_ready_reason", ""),
+        "support_readiness_reason_codes": list(stock_details.get("support_readiness_reason_codes") or []),
+        "support_source_fallback_used": bool(stock_details.get("support_source_fallback_used")),
+        "latest_tick_ready": bool(stock_details.get("latest_tick_ready", True)),
+        "latest_tick_age_sec": stock_details.get("latest_tick_age_sec"),
         "support_candidates": dict(stock_details.get("support_candidates") or {}),
         "stock_role": watch.stock_role.value,
         "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
@@ -550,11 +775,15 @@ def _base_details(
             "lab_gate_status": decision.status.value,
             "final_gate_status": mapping.final_gate_status,
             "order_eligibility": mapping.order_eligibility,
+            "ready_type": mapping.ready_type,
             "price_location_status": decision.price_location_status.value,
             "risk_level": decision.risk_level.value,
             "risk_reason_codes": list(decision.risk_reason_codes),
             "reason_codes": list(mapping.reason_codes),
             "support_price": support_price,
+            "selected_support_source": stock_details.get("selected_support_source", ""),
+            "selected_support_ready": bool(stock_details.get("selected_support_ready")),
+            "support_ready_reason": stock_details.get("support_ready_reason", ""),
             "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
         },
     }
@@ -668,6 +897,11 @@ def _support_candidates(metadata: dict[str, Any]) -> dict[str, float]:
     for name in (
         "recent_support_price",
         "support_price",
+        "recent_swing_low",
+        "opening_range",
+        "opening_range_price",
+        "opening_range_low",
+        "prev_day_level",
         "vwap",
         "base_line_120",
         "envelope_mid",
@@ -676,7 +910,8 @@ def _support_candidates(metadata: dict[str, Any]) -> dict[str, float]:
     ):
         value = _positive_float(metadata.get(name))
         if value > 0:
-            candidates[name] = value
+            canonical_name = "opening_range" if name in {"opening_range_price", "opening_range_low"} else name
+            candidates.setdefault(canonical_name, value)
     return candidates
 
 
@@ -684,7 +919,7 @@ def _nearest_support(
     price_location: PriceLocationStatus,
     support_candidates: dict[str, float],
 ) -> tuple[str, int]:
-    preferred = ["recent_support_price", "support_price"]
+    preferred = ["recent_support_price", "support_price", "recent_swing_low", "opening_range", "prev_day_level"]
     if price_location == PriceLocationStatus.VWAP_RECLAIM:
         preferred = ["vwap"] + preferred
     for name in preferred + ["vwap", "base_line_120", "envelope_mid", "day_mid", "ema20_5m"]:

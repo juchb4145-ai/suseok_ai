@@ -17,6 +17,7 @@ from trading.strategy.runtime_settings import (
     attach_settings_details,
     legacy_strategy_runtime_settings,
 )
+from trading.strategy.support_readiness import support_metadata, support_source_readiness
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
 from trading.theme_engine.models import StockLeadershipResult, ThemeContext, ThemeStrengthResult
 
@@ -725,14 +726,38 @@ def support_status_for_snapshot(
     settings: Optional[StrategyRuntimeSettings] = None,
 ) -> dict:
     active_settings = settings or legacy_strategy_runtime_settings()
-    supports = _support_candidates(snapshot, active_settings)
+    raw_supports = _support_candidates(snapshot, active_settings)
+    readiness_metadata = _snapshot_support_readiness_metadata(snapshot)
+    readiness_by_source = {}
+    for name in raw_supports:
+        readiness = support_source_readiness(name, readiness_metadata)
+        readiness_by_source[name] = {
+            "ready": _support_ready_for_snapshot(name, readiness_metadata, readiness),
+            "reason": readiness.reason,
+            "reason_codes": list(readiness.reason_codes),
+        }
+    supports = {
+        name: price
+        for name, price in raw_supports.items()
+        if readiness_by_source.get(name, {}).get("ready", True)
+    }
     if not supports:
+        selected_name = next(iter(raw_supports), "")
+        selected_price = raw_supports.get(selected_name, 0.0) if selected_name else 0.0
+        selected_metadata = support_metadata(
+            source=selected_name,
+            price=selected_price,
+            metadata=readiness_metadata,
+        ) if selected_name else {}
         return {
             "nearest_support": None,
+            "nearest_support_price": 0,
             "support_distance_pct": None,
             "support_touched": False,
             "support_reclaimed": False,
-            "support_candidates": {},
+            "support_candidates": raw_supports,
+            "support_readiness_by_source": readiness_by_source,
+            **selected_metadata,
         }
     current_price = snapshot.price
     above_supports = {
@@ -756,13 +781,27 @@ def support_status_for_snapshot(
     support_reclaimed = current_price >= nearest_price and (
         not candles or candles[-1].close >= nearest_price or snapshot.price >= nearest_price
     )
+    selected_metadata = support_metadata(
+        source=nearest_name,
+        price=nearest_price,
+        metadata=readiness_metadata,
+    )
+    selected_ready = readiness_by_source.get(nearest_name, {}).get("ready", True)
+    if selected_ready:
+        selected_metadata["selected_support_ready"] = True
+        selected_metadata["selected_support_ready_reason"] = ""
+        selected_metadata["support_ready"] = True
+        selected_metadata["support_ready_reason"] = ""
+        selected_metadata["support_readiness_reason_codes"] = []
     return {
         "nearest_support": nearest_name,
         "nearest_support_price": nearest_price,
         "support_distance_pct": distance,
         "support_touched": bool(distance <= threshold_pct and support_touched),
         "support_reclaimed": bool(distance <= threshold_pct and support_reclaimed),
-        "support_candidates": supports,
+        "support_candidates": raw_supports,
+        "support_readiness_by_source": readiness_by_source,
+        **selected_metadata,
     }
 
 
@@ -953,6 +992,11 @@ def _snapshot_for(
 def _support_candidates(snapshot: IndicatorSnapshot, settings: Optional[StrategyRuntimeSettings] = None) -> dict:
     active_settings = settings or legacy_strategy_runtime_settings()
     candidates = {
+        "recent_support_price": snapshot.metadata.get("recent_support_price"),
+        "support_price": snapshot.metadata.get("support_price"),
+        "recent_swing_low": snapshot.metadata.get("recent_swing_low"),
+        "opening_range": snapshot.metadata.get("opening_range") or snapshot.metadata.get("opening_range_price") or snapshot.metadata.get("opening_range_low"),
+        "prev_day_level": snapshot.metadata.get("prev_day_level"),
         "vwap": snapshot.vwap,
         "base_line_120": snapshot.base_line_120,
         "envelope_mid": snapshot.envelope_mid,
@@ -966,6 +1010,28 @@ def _support_candidates(snapshot: IndicatorSnapshot, settings: Optional[Strategy
         active_settings.number("pullback_thresholds.support_dedupe_pct", SUPPORT_DEDUPE_PCT),
         snapshot.price,
     )
+
+
+def _snapshot_support_readiness_metadata(snapshot: IndicatorSnapshot) -> dict:
+    metadata = dict(snapshot.metadata or {})
+    if snapshot.vwap is not None and "vwap" not in metadata:
+        metadata["vwap"] = snapshot.vwap
+    if snapshot.base_line_120 is not None and "base_line_120" not in metadata:
+        metadata["base_line_120"] = snapshot.base_line_120
+    if snapshot.envelope_mid is not None and "envelope_mid" not in metadata:
+        metadata["envelope_mid"] = snapshot.envelope_mid
+    if snapshot.prev_high > 0 and "prev_day_level" not in metadata:
+        metadata["prev_day_level"] = snapshot.prev_high
+    return metadata
+
+
+def _support_ready_for_snapshot(source: str, metadata: dict, readiness=None) -> bool:
+    if source == "base_line_120":
+        return bool((readiness or support_source_readiness(source, metadata)).ready)
+    ready_key = f"{source}_ready"
+    if ready_key in metadata or source in {"envelope_mid", "recent_support_price", "support_price", "recent_swing_low", "prev_day_level", "opening_range"}:
+        return bool((readiness or support_source_readiness(source, metadata)).ready)
+    return True
 
 
 def _dedupe_price_levels(candidates: dict[str, float], threshold_pct: float, current_price: int) -> dict[str, float]:

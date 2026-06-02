@@ -2,8 +2,9 @@ from copy import deepcopy
 from datetime import datetime
 
 from trading.strategy.entry import EntryPlanBuilder, TickSizeProvider
-from trading.strategy.models import GateDecision, IndicatorSnapshot, StrategyProfile
+from trading.strategy.models import GateDecision, IndicatorSnapshot, StrategyProfile, VirtualOrderStatus
 from trading.strategy.pipeline import GatePipelineResult
+from trading.strategy.virtual_orders import VirtualOrderService
 
 
 class FixedTickProvider(TickSizeProvider):
@@ -18,6 +19,9 @@ def gate_result(
     price=9_750,
     final_grade="A",
     support_candidates=None,
+    ready_type="",
+    support_ready=True,
+    support_ready_reason="",
 ):
     return GatePipelineResult(
         candidate_id=1,
@@ -34,13 +38,19 @@ def gate_result(
                     "profile": profile.value,
                     "nearest_support": "vwap",
                     "nearest_support_price": support_price,
+                    "selected_support_source": "vwap",
+                    "selected_support_price": support_price or 0,
+                    "selected_support_ready": support_ready,
+                    "selected_support_ready_reason": support_ready_reason,
+                    "support_readiness_reason_codes": [support_ready_reason] if support_ready_reason else [],
                     "support_distance_pct": 0.2,
                     "support_candidates": support_candidates or {},
+                    "ready_type": ready_type,
                 },
             )
         ],
         snapshot=IndicatorSnapshot(candidate_id=1, code="111111", price=price),
-        details={"theme_name": "Robot", "cap_rules_applied": []},
+        details={"theme_name": "Robot", "cap_rules_applied": [], "ready_type": ready_type},
     )
 
 
@@ -116,6 +126,60 @@ def test_split_plan_marks_later_legs_unsubmittable_when_supports_are_missing():
     assert plan.split_plan[0]["submittable"] is True
     assert plan.split_plan[1]["submittable"] is False
     assert plan.split_plan[2]["reason"] == "support_missing"
+
+
+def test_support_not_ready_plan_is_diagnostic_only_and_not_submittable():
+    result = gate_result(support_ready=False, support_ready_reason="VWAP_NOT_READY")
+
+    plan = EntryPlanBuilder().build(result)
+
+    assert plan.cancel_condition["submittable"] is False
+    assert plan.cancel_condition["diagnostic_only"] is True
+    assert plan.cancel_condition["reason"] == "VWAP_NOT_READY"
+    assert plan.split_plan[0]["submittable"] is False
+    assert plan.split_plan[0]["reason"] == "VWAP_NOT_READY"
+
+
+def test_ready_early_small_only_first_leg_is_submittable():
+    plan = EntryPlanBuilder().build(
+        gate_result(
+            final_grade="A",
+            ready_type="READY_EARLY_SMALL",
+            support_candidates={
+                "vwap": 9_700,
+                "base_line_120": 9_600,
+                "envelope_mid": 9_500,
+            },
+        )
+    )
+
+    assert plan.cancel_condition["ready_type"] == "READY_EARLY_SMALL"
+    assert plan.split_plan[0]["submittable"] is True
+    assert plan.split_plan[1]["submittable"] is False
+    assert plan.split_plan[1]["pending_after_first_fill"] is True
+    assert plan.split_plan[2]["reason"] == "early_small_later_leg_pending"
+
+
+def test_ready_early_small_does_not_submit_second_leg_after_first_fill():
+    plan = EntryPlanBuilder().build(
+        gate_result(
+            ready_type="READY_EARLY_SMALL",
+            support_candidates={
+                "vwap": 9_700,
+                "base_line_120": 9_600,
+                "envelope_mid": 9_500,
+            },
+        )
+    )
+    service = VirtualOrderService()
+    first = service.submit_virtual_order(plan, datetime(2026, 5, 29, 9, 0))
+    first.order.status = VirtualOrderStatus.FILLED
+
+    second = service.submit_virtual_order(plan, datetime(2026, 5, 29, 9, 5))
+
+    assert first.submitted is True
+    assert second.submitted is False
+    assert second.rejected_reason == "no_submittable_leg"
 
 
 def test_entry_plan_contains_review_context_and_does_not_mutate_result():
