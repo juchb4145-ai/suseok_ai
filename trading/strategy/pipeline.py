@@ -239,6 +239,10 @@ class GatePipeline:
             "late_chase_diagnostics": stock_pullback_decision.details.get("late_chase_diagnostics", {}),
             "late_chase_level": stock_pullback_decision.details.get("late_chase_level", ""),
             "late_chase_score": stock_pullback_decision.details.get("late_chase_score"),
+            "late_chase_block_type": stock_pullback_decision.details.get("late_chase_block_type", ""),
+            "late_chase_recoverable": bool(stock_pullback_decision.details.get("late_chase_recoverable")),
+            "late_chase_recheck_after_sec": stock_pullback_decision.details.get("late_chase_recheck_after_sec", 0),
+            "late_chase_recovery_conditions": list(stock_pullback_decision.details.get("late_chase_recovery_conditions") or []),
             "comparison_reason_codes": comparison_reason_codes,
             "secondary_reason_codes": comparison_reason_codes,
             "hybrid_result": hybrid_payload,
@@ -442,6 +446,15 @@ def _final_grade(
         cap_rules.append("FINAL_BLOCK_CAP")
         return "C", False, BlockType.FINAL, False, 0, cap_rules, "FINAL_BLOCK"
     if stock_pullback.block_type == BlockType.TEMPORARY:
+        if stock_pullback.details.get("sub_status") == "LATE_CHASE_TEMP_WAIT":
+            cap_rules.extend(
+                normalize_reason_codes(
+                    list(stock_pullback.reason_codes)
+                    + ["LATE_CHASE", "SOFT_BLOCK_ONLY", "LATE_CHASE_TEMP_WAIT"]
+                )
+            )
+            recheck_after_sec = int(stock_pullback.recheck_after_sec or stock_pullback.details.get("late_chase_recheck_after_sec") or 60)
+            return "B", False, BlockType.TEMPORARY, bool(stock_pullback.can_recover), recheck_after_sec, cap_rules, "LATE_CHASE_TEMP_WAIT"
         cap_rules.append("STOCK_PULLBACK_WAIT_CAP")
         return "B", False, BlockType.TEMPORARY, True, 60, cap_rules, "WAIT_PULLBACK_CONFIRMATION"
 

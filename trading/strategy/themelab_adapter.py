@@ -614,8 +614,13 @@ def _map_decision(
             latest_tick_age_sec=latest.age_sec,
         )
     if decision.status == LabGateStatus.WAIT or decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK:
+        wait_reasons = ["WAIT"] + reason_codes
+        final_status = "WAIT"
+        if decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK:
+            final_status = "LATE_CHASE_TEMP_WAIT"
+            wait_reasons.extend(["LATE_CHASE", "SOFT_BLOCK_ONLY", "LATE_CHASE_TEMP_WAIT"])
         return ThemeLabBridgeMapping(
-            "WAIT",
+            final_status,
             "NOT_ELIGIBLE_WAIT",
             False,
             BlockType.TEMPORARY,
@@ -623,7 +628,7 @@ def _map_decision(
             recheck_after_sec,
             "B",
             max(0.0, float(decision.price_location_score or 0.0)),
-            _dedupe(["WAIT"] + reason_codes),
+            _dedupe(wait_reasons),
             latest_tick_ready=latest.ready,
             latest_tick_age_sec=latest.age_sec,
         )
@@ -801,8 +806,18 @@ def _stock_pullback_details(
             "price_location_status": decision.price_location_status.value,
             "risk_level": decision.risk_level.value,
         },
-        "late_chase_level": "soft_block" if decision.price_location_status in OBSERVE_ONLY_LOCATIONS else "",
-        "late_chase_score": 100.0 if decision.price_location_status in OBSERVE_ONLY_LOCATIONS else 0.0,
+        "late_chase_level": "soft_block" if decision.price_location_status in OBSERVE_ONLY_LOCATIONS or decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK else "",
+        "late_chase_score": 100.0 if decision.price_location_status in OBSERVE_ONLY_LOCATIONS or decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK else 0.0,
+        "late_chase_block_type": "temporary_wait" if decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK else ("observe_only" if decision.price_location_status in OBSERVE_ONLY_LOCATIONS else ""),
+        "late_chase_recoverable": decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK,
+        "late_chase_recheck_after_sec": int(decision.recheck_after_sec or 60) if decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK else 0,
+        "late_chase_recovery_conditions": [
+            "support_distance_no_longer_excessive",
+            "volume_reacceleration_confirmed",
+            "not_after_large_candle_or_new_pullback_confirmed",
+            "selected_support_ready",
+            "latest_tick_ready",
+        ] if decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK else [],
         "comparison_reason_codes": list(mapping.reason_codes),
     }
 
@@ -881,6 +896,13 @@ def _base_details(
         "vwap_ready": bool(stock_details.get("vwap_ready")),
         "minute_bar_present": bool(stock_details.get("minute_bar_present")),
         "minute_bar_count": stock_details.get("minute_bar_count", 0),
+        "late_chase_diagnostics": dict(stock_details.get("late_chase_diagnostics") or {}),
+        "late_chase_level": stock_details.get("late_chase_level", ""),
+        "late_chase_score": stock_details.get("late_chase_score"),
+        "late_chase_block_type": stock_details.get("late_chase_block_type", ""),
+        "late_chase_recoverable": bool(stock_details.get("late_chase_recoverable")),
+        "late_chase_recheck_after_sec": stock_details.get("late_chase_recheck_after_sec", 0),
+        "late_chase_recovery_conditions": list(stock_details.get("late_chase_recovery_conditions") or []),
         "stock_role": watch.stock_role.value,
         "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
         "theme_lab_bridge": {
@@ -919,6 +941,10 @@ def _base_details(
             "vwap_ready": bool(stock_details.get("vwap_ready")),
             "minute_bar_present": bool(stock_details.get("minute_bar_present")),
             "minute_bar_count": stock_details.get("minute_bar_count", 0),
+            "late_chase_level": stock_details.get("late_chase_level", ""),
+            "late_chase_block_type": stock_details.get("late_chase_block_type", ""),
+            "late_chase_recoverable": bool(stock_details.get("late_chase_recoverable")),
+            "late_chase_recheck_after_sec": stock_details.get("late_chase_recheck_after_sec", 0),
             "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
         },
     }

@@ -113,6 +113,36 @@ def test_ready_small_leader_good_pullback_creates_scaled_small_intent(tmp_path):
     assert intent["metadata"]["weight_pct"] == 25.0
 
 
+def test_themelab_good_pullback_soft_block_waits_without_entry_plan_or_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.READY,
+            PriceLocationStatus.GOOD_PULLBACK,
+            risk=TradeabilityRiskLevel.SOFT_BLOCK,
+            reasons=("HIGH_CHASE_RISK",),
+        ),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+    assert candidate.state == CandidateState.BLOCKED
+    assert candidate.block_type == BlockType.TEMPORARY
+    assert candidate.can_recover is True
+    assert details["sub_status"] == "LATE_CHASE_TEMP_WAIT"
+    assert details["risk_level"] == "SOFT_BLOCK"
+    assert details["late_chase_level"] == "soft_block"
+    assert details["late_chase_block_type"] == "temporary_wait"
+    assert "SOFT_BLOCK_ONLY" in details["reason_codes"]
+    assert "LATE_CHASE_TEMP_WAIT" in details["reason_codes"]
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
 @pytest.mark.parametrize(
     ("status", "price_location", "expected_final"),
     [

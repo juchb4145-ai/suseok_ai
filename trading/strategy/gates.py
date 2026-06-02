@@ -44,6 +44,15 @@ LEADER_FOLLOWER_GAP_THRESHOLD = 8.0
 LATE_CHASE_NEAR_HIGH_PCT = 0.5
 LATE_CHASE_WARNING_SCORE = 25.0
 LATE_CHASE_SOFT_BLOCK_SCORE = 80.0
+LATE_CHASE_TEMP_WAIT = "LATE_CHASE_TEMP_WAIT"
+LATE_CHASE_WARNING = "LATE_CHASE_WARNING"
+LATE_CHASE_RECOVERY_CONDITIONS = [
+    "support_distance_no_longer_excessive",
+    "volume_reacceleration_confirmed",
+    "not_after_large_candle_or_new_pullback_confirmed",
+    "selected_support_ready",
+    "latest_tick_ready",
+]
 
 
 @dataclass
@@ -623,6 +632,23 @@ class StockPullbackEntryGate:
                 ),
                 snapshot,
             )
+        if _late_chase_should_temporary_wait(details):
+            details["sub_status"] = LATE_CHASE_TEMP_WAIT
+            reason_codes = _late_chase_temp_wait_reason_codes(details)
+            return (
+                _decision(
+                    "StockPullbackEntryGate",
+                    False,
+                    self.settings.number("pullback_thresholds.stock_pullback_wait_score", 55.0),
+                    BlockType.TEMPORARY,
+                    reason_codes,
+                    details,
+                    can_recover=bool(details.get("late_chase_recoverable")),
+                    recheck_after_sec=int(details.get("late_chase_recheck_after_sec") or 60),
+                    settings=self.settings,
+                ),
+                snapshot,
+            )
 
         if profile == StrategyProfile.KOSPI_LEADER_PROFILE:
             return self._evaluate_kospi(candidate, snapshot, details)
@@ -817,11 +843,72 @@ def _attach_late_chase_details(
     details["late_chase_diagnostics"] = diagnostics
     details["late_chase_level"] = diagnostics["late_chase_level"]
     details["late_chase_score"] = diagnostics["late_chase_score"]
+    policy = _late_chase_policy(active_settings)
+    level = str(diagnostics.get("late_chase_level") or "none")
+    action = "none"
     comparison_codes = list(details.get("comparison_reason_codes") or [])
     comparison_codes.extend(diagnostics.get("reason_codes") or [])
+    if policy["enabled"] and level == "soft_block" and policy["soft_block_action"] == "temporary_wait":
+        action = "temporary_wait"
+        comparison_codes.extend([ReasonCode.LATE_CHASE.value, ReasonCode.SOFT_BLOCK_ONLY.value, LATE_CHASE_TEMP_WAIT])
+        details["late_chase_recoverable"] = bool(policy["allow_recover"])
+        details["late_chase_recheck_after_sec"] = int(policy["recheck_after_sec"])
+        details["late_chase_recovery_conditions"] = list(LATE_CHASE_RECOVERY_CONDITIONS)
+    elif policy["enabled"] and level == "warning" and policy["warning_action"] == "tag_only":
+        action = "tag_only"
+        comparison_codes.append(LATE_CHASE_WARNING)
+        details["late_chase_recoverable"] = False
+        details["late_chase_recheck_after_sec"] = 0
+        details["late_chase_recovery_conditions"] = []
+    else:
+        details["late_chase_recoverable"] = False
+        details["late_chase_recheck_after_sec"] = 0
+        details["late_chase_recovery_conditions"] = []
+    details["late_chase_policy"] = dict(policy)
+    details["late_chase_block_type"] = action
     details["comparison_reason_codes"] = normalize_reason_codes(comparison_codes)
     details["secondary_reason_codes"] = normalize_reason_codes(
         list(details.get("secondary_reason_codes") or []) + details["comparison_reason_codes"]
+    )
+
+
+def _late_chase_policy(settings: StrategyRuntimeSettings) -> dict:
+    recheck = settings.integer("late_chase_policy.recheck_after_sec", 60)
+    if recheck <= 0:
+        recheck = 60
+    return {
+        "enabled": _setting_bool(settings.value("late_chase_policy.enabled", True), True),
+        "soft_block_action": str(settings.value("late_chase_policy.soft_block_action", "temporary_wait") or "temporary_wait"),
+        "warning_action": str(settings.value("late_chase_policy.warning_action", "tag_only") or "tag_only"),
+        "recheck_after_sec": recheck,
+        "allow_recover": _setting_bool(settings.value("late_chase_policy.allow_recover", True), True),
+    }
+
+
+def _setting_bool(value, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _late_chase_should_temporary_wait(details: dict) -> bool:
+    return (
+        str(details.get("late_chase_level") or "") == "soft_block"
+        and str(details.get("late_chase_block_type") or "") == "temporary_wait"
+    )
+
+
+def _late_chase_temp_wait_reason_codes(details: dict) -> list[str]:
+    return normalize_reason_codes(
+        list(details.get("comparison_reason_codes") or [])
+        + [ReasonCode.LATE_CHASE.value, ReasonCode.SOFT_BLOCK_ONLY.value, LATE_CHASE_TEMP_WAIT]
     )
 
 

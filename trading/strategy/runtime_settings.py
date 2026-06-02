@@ -158,6 +158,13 @@ LEGACY_DEFAULT_SETTINGS: dict[str, Any] = {
         "score_no_volume_reacceleration": 15.0,
         "reaccel_near_high_cap_score": 20.0,
     },
+    "late_chase_policy": {
+        "enabled": True,
+        "soft_block_action": "temporary_wait",
+        "warning_action": "tag_only",
+        "recheck_after_sec": 60,
+        "allow_recover": True,
+    },
     "entry_plan_thresholds": {
         "max_chase_pct": {
             "kosdaq": 0.7,
