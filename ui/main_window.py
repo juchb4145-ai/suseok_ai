@@ -57,6 +57,11 @@ from ui.table_models import (
     WatchItemFilterProxyModel,
     WatchItemTableModel,
 )
+from ui.themelab_dashboard import (
+    ThemeLabConditionStatus,
+    ThemeLabDashboardWidget,
+    build_theme_lab_dashboard_state,
+)
 from ui.ui_state import (
     restore_splitter_state,
     restore_table_state,
@@ -374,10 +379,15 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log_view, 1)
         tabs.addTab(self._build_watch_tab(), "매수종목/상태")
         tabs.addTab(self._build_strategy_tab(), "전략 후보")
+        tabs.addTab(self._build_themelab_dashboard_tab(), "ThemeLabFlow")
         tabs.addTab(self._build_review_tab(), "전략 리뷰")
         tabs.addTab(log_tab, "로그")
         tabs.insertTab(2, self._build_strategy_settings_tab(), "전략 설정")
         return tabs
+
+    def _build_themelab_dashboard_tab(self) -> QWidget:
+        self.themelab_dashboard = ThemeLabDashboardWidget()
+        return self.themelab_dashboard
 
     def _build_watch_tab(self) -> QWidget:
         box = QWidget()
@@ -840,6 +850,7 @@ class MainWindow(QMainWindow):
             self.log_view.append(line)
         self.refresh_table()
         self.refresh_strategy_candidates()
+        self.refresh_themelab_dashboard()
         self.refresh_review_table()
         self.load_strategy_settings()
         if self.mock_mode:
@@ -883,6 +894,7 @@ class MainWindow(QMainWindow):
         self.strategy_timer.start(interval_ms)
         self._display_strategy_snapshot(snapshot, perf_counter() - started)
         self.refresh_strategy_candidates()
+        self.refresh_themelab_dashboard()
         self._strategy_last_auto_refresh_at = perf_counter()
         self._update_strategy_buttons()
 
@@ -920,6 +932,7 @@ class MainWindow(QMainWindow):
         if snapshot is not None:
             self._strategy_last_snapshot = snapshot
             self._display_strategy_snapshot(snapshot, 0.0)
+            self.refresh_themelab_dashboard()
         else:
             self.strategy_status_label.setText("OBSERVE stopped")
         self._update_strategy_buttons()
@@ -979,6 +992,7 @@ class MainWindow(QMainWindow):
         else:
             self.strategy_warning_view.clear()
         self._update_dashboard(snapshot)
+        self.refresh_themelab_dashboard()
 
     def _display_strategy_readiness(self, snapshot: StrategyRuntimeSnapshot) -> None:
         lines = [
@@ -1055,11 +1069,46 @@ class MainWindow(QMainWindow):
         self.strategy_candidate_refresh_status_label.setText(message)
         self.statusBar().showMessage(message, 3000)
         self._update_dashboard()
+        self.refresh_themelab_dashboard()
         if selected_candidate_id is not None and self._select_strategy_candidate(selected_candidate_id):
             self._display_selected_candidate_detail()
         else:
             self.strategy_candidate_table.clearSelection()
             self.strategy_candidate_detail_panel.show_empty()
+
+    def refresh_themelab_dashboard(self) -> None:
+        if not hasattr(self, "themelab_dashboard"):
+            return
+        pipeline = getattr(self.strategy_runtime, "theme_lab_pipeline", None)
+        result = getattr(pipeline, "last_result", None)
+        conditions = self._theme_lab_condition_statuses()
+        state = build_theme_lab_dashboard_state(result, condition_statuses=conditions)
+        self.themelab_dashboard.set_state(state)
+
+    def _theme_lab_condition_statuses(self) -> tuple[ThemeLabConditionStatus, ...]:
+        config = getattr(self.strategy_runtime, "config", None)
+        names = getattr(config, "theme_lab_condition_names", {}) if config is not None else {}
+        purposes = getattr(config, "theme_lab_condition_purposes", {}) if config is not None else {}
+        defaults = (
+            ("alive", "테마랩_생존_-1", "theme_lab_alive"),
+            ("strong", "테마랩_강세_3", "theme_lab_strong"),
+            ("leader", "테마랩_주도_5", "theme_lab_leader"),
+        )
+        statuses: list[ThemeLabConditionStatus] = []
+        for key, default_name, default_purpose in defaults:
+            name = str(names.get(key) or default_name)
+            purpose = str(purposes.get(key) or default_purpose)
+            warning = "" if self.strategy_runtime is not None else "STRATEGY_RUNTIME_UNAVAILABLE"
+            statuses.append(
+                ThemeLabConditionStatus(
+                    condition_name=name,
+                    purpose=purpose,
+                    resolved_index="UNKNOWN",
+                    registered=False,
+                    warning=warning or "등록 상태 데이터 없음",
+                )
+            )
+        return tuple(statuses)
 
     def _apply_strategy_candidate_filters(self) -> None:
         self.strategy_candidate_proxy_model.set_search_text(self.strategy_candidate_filter_bar.search_text())
