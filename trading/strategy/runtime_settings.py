@@ -165,6 +165,17 @@ LEGACY_DEFAULT_SETTINGS: dict[str, Any] = {
         "recheck_after_sec": 60,
         "allow_recover": True,
     },
+    "market_side_gate": {
+        "enabled": True,
+        "unknown_market_action": "strict_fallback",
+        "weak_action": "temporary_wait",
+        "risk_off_action": "temporary_wait",
+        "global_risk_off_action": "temporary_wait",
+        "recheck_after_sec": 60,
+        "allow_recover": True,
+        "use_side_breadth_if_available": True,
+        "allow_market_heuristic": False,
+    },
     "entry_plan_thresholds": {
         "max_chase_pct": {
             "kosdaq": 0.7,

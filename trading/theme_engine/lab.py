@@ -24,6 +24,12 @@ class MarketStatus(str, Enum):
     RISK_OFF = "RISK_OFF"
 
 
+class MarketSide(str, Enum):
+    KOSPI = "KOSPI"
+    KOSDAQ = "KOSDAQ"
+    UNKNOWN = "UNKNOWN"
+
+
 class StockRole(str, Enum):
     LEADER = "LEADER"
     CO_LEADER = "CO_LEADER"
@@ -118,6 +124,19 @@ class MarketStatusThresholds:
 
 
 @dataclass(frozen=True)
+class MarketSideGateConfig:
+    enabled: bool = True
+    unknown_market_action: str = "strict_fallback"
+    weak_action: str = "temporary_wait"
+    risk_off_action: str = "temporary_wait"
+    global_risk_off_action: str = "temporary_wait"
+    recheck_after_sec: int = 60
+    allow_recover: bool = True
+    use_side_breadth_if_available: bool = True
+    allow_market_heuristic: bool = False
+
+
+@dataclass(frozen=True)
 class TradeabilityRiskConfig:
     vi_cooldown_sec: int = 180
     leader_max_buy_return_pct: float = 15.0
@@ -171,6 +190,7 @@ class ThemeLabConfig:
     tradeability_risk: TradeabilityRiskConfig = field(default_factory=TradeabilityRiskConfig)
     price_location: PriceLocationConfig = field(default_factory=PriceLocationConfig)
     position_adjustment: PositionAdjustmentConfig = field(default_factory=PositionAdjustmentConfig)
+    market_side_gate: MarketSideGateConfig = field(default_factory=MarketSideGateConfig)
 
 
 @dataclass(frozen=True)
@@ -246,6 +266,30 @@ class MarketStrengthSnapshot:
     market_leader_count: int = 0
     market_turnover_krw: float = 0.0
     data_quality_flags: tuple[str, ...] = ()
+    kospi_status: MarketStatus | None = None
+    kosdaq_status: MarketStatus | None = None
+    kospi_index_return_pct: float | None = None
+    kosdaq_index_return_pct: float | None = None
+    kospi_index_ready: bool = True
+    kosdaq_index_ready: bool = True
+    side_statuses: dict[str, Any] = field(default_factory=dict)
+    market_side_data_quality_flags: tuple[str, ...] = ()
+
+    def status_for_side(self, side: MarketSide | str) -> MarketStatus | None:
+        normalized = normalize_market_side(side)
+        if normalized == MarketSide.KOSPI:
+            return self.kospi_status or self.market_status
+        if normalized == MarketSide.KOSDAQ:
+            return self.kosdaq_status or self.market_status
+        return None
+
+    def index_return_for_side(self, side: MarketSide | str) -> float | None:
+        normalized = normalize_market_side(side)
+        if normalized == MarketSide.KOSPI:
+            return self.kospi_index_return_pct if self.kospi_index_return_pct is not None else self.kospi_return_pct
+        if normalized == MarketSide.KOSDAQ:
+            return self.kosdaq_index_return_pct if self.kosdaq_index_return_pct is not None else self.kosdaq_return_pct
+        return None
 
 
 @dataclass(frozen=True)
@@ -260,6 +304,18 @@ class WatchSetSnapshot:
     condition_level: int = 0
     stock_role: StockRole = StockRole.WEAK_MEMBER
     watch_reason: str = ""
+    candidate_market: str = MarketSide.UNKNOWN.value
+    candidate_market_source: str = ""
+    candidate_market_status: str = ""
+    candidate_market_action: str = ""
+    candidate_index_return_pct: float | None = None
+    global_market_status: str = ""
+    kospi_market_status: str = ""
+    kosdaq_market_status: str = ""
+    kospi_return_pct: float | None = None
+    kosdaq_return_pct: float | None = None
+    market_side_reason_codes: tuple[str, ...] = ()
+    market_side_data_quality_flags: tuple[str, ...] = ()
     gate_status: LabGateStatus = LabGateStatus.OBSERVE
     removal_reason: str = ""
     risk_level: TradeabilityRiskLevel = TradeabilityRiskLevel.PASS
@@ -298,6 +354,18 @@ class LabGateDecision:
     price_location_status: PriceLocationStatus = PriceLocationStatus.UNKNOWN
     price_location_score: float = 0.0
     price_location_reason_codes: tuple[str, ...] = ()
+    candidate_market: str = MarketSide.UNKNOWN.value
+    candidate_market_source: str = ""
+    candidate_market_status: str = ""
+    candidate_market_action: str = ""
+    candidate_index_return_pct: float | None = None
+    global_market_status: str = ""
+    kospi_market_status: str = ""
+    kosdaq_market_status: str = ""
+    kospi_return_pct: float | None = None
+    kosdaq_return_pct: float | None = None
+    market_side_reason_codes: tuple[str, ...] = ()
+    market_side_data_quality_flags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -625,15 +693,57 @@ class MarketStrengthEngine:
         leader_count = sum(1 for item in stock_values if item.change_rate >= 5.0)
         turnover = sum(max(0.0, item.turnover) for item in stock_values)
         status = self._status(kospi_return_pct, kosdaq_return_pct, strong_count, leader_count, advancers, decliners)
+        kospi_status, kospi_reason_codes, kospi_flags = self._side_status(
+            MarketSide.KOSPI,
+            kospi_return_pct,
+            strong_count,
+            leader_count,
+            advancers,
+            decliners,
+        )
+        kosdaq_status, kosdaq_reason_codes, kosdaq_flags = self._side_status(
+            MarketSide.KOSDAQ,
+            kosdaq_return_pct,
+            strong_count,
+            leader_count,
+            advancers,
+            decliners,
+        )
+        side_flags = _dedupe_tuple(kospi_flags + kosdaq_flags)
+        rounded_kospi = round(kospi_return_pct, 4)
+        rounded_kosdaq = round(kosdaq_return_pct, 4)
         return MarketStrengthSnapshot(
             market_status=status,
-            kospi_return_pct=round(kospi_return_pct, 4),
-            kosdaq_return_pct=round(kosdaq_return_pct, 4),
+            kospi_return_pct=rounded_kospi,
+            kosdaq_return_pct=rounded_kosdaq,
             advancers=advancers,
             decliners=decliners,
             market_strong_count=strong_count,
             market_leader_count=leader_count,
             market_turnover_krw=round(turnover, 4),
+            kospi_status=kospi_status,
+            kosdaq_status=kosdaq_status,
+            kospi_index_return_pct=rounded_kospi,
+            kosdaq_index_return_pct=rounded_kosdaq,
+            kospi_index_ready=True,
+            kosdaq_index_ready=True,
+            side_statuses={
+                MarketSide.KOSPI.value: {
+                    "status": kospi_status.value,
+                    "index_return_pct": rounded_kospi,
+                    "index_return_ready": True,
+                    "reason_codes": list(kospi_reason_codes),
+                    "data_quality_flags": list(kospi_flags),
+                },
+                MarketSide.KOSDAQ.value: {
+                    "status": kosdaq_status.value,
+                    "index_return_pct": rounded_kosdaq,
+                    "index_return_ready": True,
+                    "reason_codes": list(kosdaq_reason_codes),
+                    "data_quality_flags": list(kosdaq_flags),
+                },
+            },
+            market_side_data_quality_flags=side_flags,
         )
 
     def _status(
@@ -658,6 +768,46 @@ class MarketStrengthEngine:
             return MarketStatus.CHOPPY
         return MarketStatus.WEAK
 
+    def _side_status(
+        self,
+        side: MarketSide,
+        index_return_pct: float,
+        strong_count: int,
+        leader_count: int,
+        advancers: int,
+        decliners: int,
+    ) -> tuple[MarketStatus, tuple[str, ...], tuple[str, ...]]:
+        cfg = self.config
+        if side == MarketSide.KOSPI:
+            if index_return_pct <= cfg.risk_off_kospi_pct:
+                return MarketStatus.RISK_OFF, ("KOSPI_MARKET_RISK_OFF",), ()
+            if index_return_pct <= cfg.weak_kospi_pct:
+                return MarketStatus.WEAK, ("KOSPI_MARKET_WEAK",), ()
+        elif side == MarketSide.KOSDAQ:
+            if index_return_pct <= cfg.risk_off_kosdaq_pct:
+                return MarketStatus.RISK_OFF, ("KOSDAQ_MARKET_RISK_OFF",), ()
+            if index_return_pct <= cfg.weak_kosdaq_pct:
+                return MarketStatus.WEAK, ("KOSDAQ_MARKET_WEAK",), ()
+
+        status = self._breadth_status(strong_count, leader_count, advancers, decliners)
+        return status, (), ("SIDE_BREADTH_FALLBACK_GLOBAL",)
+
+    def _breadth_status(
+        self,
+        strong_count: int,
+        leader_count: int,
+        advancers: int,
+        decliners: int,
+    ) -> MarketStatus:
+        cfg = self.config
+        if strong_count >= cfg.expansion_strong_count and leader_count >= cfg.expansion_leader_count:
+            return MarketStatus.EXPANSION
+        if strong_count >= cfg.selective_strong_count and leader_count >= cfg.selective_leader_count:
+            return MarketStatus.SELECTIVE
+        if strong_count >= cfg.choppy_strong_count or advancers >= decliners:
+            return MarketStatus.CHOPPY
+        return MarketStatus.WEAK
+
 
 class WatchSetManager:
     def __init__(self, limits: WatchSetLimits | None = None) -> None:
@@ -668,9 +818,11 @@ class WatchSetManager:
         ranked_themes: Iterable[ThemeConditionSnapshot],
         snapshots: dict[str, StockSnapshot] | list[StockSnapshot],
         *,
+        metadata_by_symbol: dict[str, InstrumentMetadata] | None = None,
         calculated_at: str = "",
     ) -> list[WatchSetSnapshot]:
         snapshot_by_symbol = _snapshot_map(snapshots)
+        instrument_by_symbol = _instrument_metadata_map(metadata_by_symbol)
         selected: dict[str, WatchSetSnapshot] = {}
         for theme in list(ranked_themes)[: self.limits.top_theme_count]:
             if theme.theme_status not in {
@@ -702,6 +854,12 @@ class WatchSetManager:
                 existing = selected.get(hit.symbol)
                 themes = tuple(dict.fromkeys(((existing.themes if existing else ()) + (theme.theme_id,))))
                 condition_level = 3 if hit.leader_hit else 2 if hit.strong_hit else 1 if hit.alive_hit else 0
+                market_side, market_source, market_reason_codes = _infer_candidate_market(
+                    snapshot=snapshot,
+                    instrument_metadata=instrument_by_symbol.get(hit.symbol),
+                    theme=theme,
+                    existing=existing,
+                )
                 selected[hit.symbol] = WatchSetSnapshot(
                     calculated_at=calculated_at,
                     symbol=hit.symbol,
@@ -712,6 +870,9 @@ class WatchSetManager:
                     turnover_krw=_turnover(snapshot),
                     condition_level=max(condition_level, existing.condition_level if existing else 0),
                     watch_reason=reason if existing is None else existing.watch_reason,
+                    candidate_market=market_side.value,
+                    candidate_market_source=market_source,
+                    market_side_reason_codes=market_reason_codes,
                 )
                 per_theme_count += 1
         return list(selected.values())
@@ -1068,9 +1229,11 @@ class ThemeLabHybridGate:
         self,
         risk_filter: TradeabilityRiskFilter | None = None,
         position_config: PositionAdjustmentConfig | None = None,
+        market_side_config: MarketSideGateConfig | None = None,
     ) -> None:
         self.risk_filter = risk_filter or TradeabilityRiskFilter()
         self.position_config = position_config or PositionAdjustmentConfig()
+        self.market_side_config = market_side_config or MarketSideGateConfig()
 
     def evaluate(
         self,
@@ -1086,89 +1249,138 @@ class ThemeLabHybridGate:
         role = watch.stock_role
         risk = self.risk_filter.evaluate(_risk_input(market, theme, watch, snapshot, flags))
         risk = _risk_adjusted_for_price_location(risk, role, price_location, self.position_config)
+        market_context = _market_side_context(market, watch)
+
+        def finalize(decision: LabGateDecision, *, action: str = "", reason_codes: tuple[str, ...] = ()) -> LabGateDecision:
+            context = dict(market_context)
+            if action:
+                context["candidate_market_action"] = action
+            if reason_codes:
+                context["market_side_reason_codes"] = _dedupe_tuple(
+                    tuple(context.get("market_side_reason_codes") or ()) + tuple(reason_codes)
+                )
+            return LabGateDecision(**{**decision.__dict__, **context})
+
         if risk.risk_level == TradeabilityRiskLevel.HARD_BLOCK:
-            return LabGateDecision(
-                watch.symbol,
-                LabGateStatus.BLOCKED,
-                risk.reason_codes,
-                risk.reason_codes[0] if risk.reason_codes else "HARD_BLOCK",
-                risk.risk_level,
-                risk.reason_codes,
-                risk.position_size_multiplier,
-                risk.recheck_after_sec,
-                price_location.status,
-                price_location.score,
-                price_location.reason_codes,
-            )
-        if market.market_status == MarketStatus.RISK_OFF:
-            return LabGateDecision(
-                watch.symbol,
-                LabGateStatus.BLOCKED,
-                ("RISK_OFF",),
-                "RISK_OFF",
-                risk.risk_level,
-                risk.reason_codes,
-                0.0,
-                0,
-                price_location.status,
-                price_location.score,
-                price_location.reason_codes,
-            )
-        if theme.theme_status == ThemeLabThemeStatus.LEADER_ONLY_THEME and role not in {StockRole.LEADER, StockRole.CO_LEADER}:
-            return LabGateDecision(
-                watch.symbol,
-                LabGateStatus.BLOCKED,
-                ("LEADER_ONLY_THEME_LAGGARD_BLOCK",),
-                "LEADER_ONLY_THEME_LAGGARD_BLOCK",
-                risk.risk_level,
-                risk.reason_codes,
-                0.0,
-                risk.recheck_after_sec,
-                price_location.status,
-                price_location.score,
-                price_location.reason_codes,
-            )
-        if market.market_status == MarketStatus.WEAK:
-            return LabGateDecision(
-                watch.symbol,
-                LabGateStatus.OBSERVE,
-                ("WEAK_MARKET_OBSERVE",),
-                "",
-                risk.risk_level,
-                risk.reason_codes,
-                risk.position_size_multiplier,
-                risk.recheck_after_sec,
-                price_location.status,
-                price_location.score,
-                price_location.reason_codes,
+            return finalize(
+                LabGateDecision(
+                    watch.symbol,
+                    LabGateStatus.BLOCKED,
+                    risk.reason_codes,
+                    risk.reason_codes[0] if risk.reason_codes else "HARD_BLOCK",
+                    risk.risk_level,
+                    risk.reason_codes,
+                    risk.position_size_multiplier,
+                    risk.recheck_after_sec,
+                    price_location.status,
+                    price_location.score,
+                    price_location.reason_codes,
+                )
             )
         if risk.risk_level == TradeabilityRiskLevel.SOFT_BLOCK:
-            return LabGateDecision(
-                watch.symbol,
-                LabGateStatus.WAIT,
-                risk.reason_codes or ("RISK_SOFT_BLOCK",),
-                "",
-                risk.risk_level,
-                risk.reason_codes,
-                0.0,
-                risk.recheck_after_sec,
-                price_location.status,
-                price_location.score,
-                price_location.reason_codes,
+            return finalize(
+                LabGateDecision(
+                    watch.symbol,
+                    LabGateStatus.WAIT,
+                    risk.reason_codes or ("RISK_SOFT_BLOCK",),
+                    "",
+                    risk.risk_level,
+                    risk.reason_codes,
+                    0.0,
+                    risk.recheck_after_sec,
+                    price_location.status,
+                    price_location.score,
+                    price_location.reason_codes,
+                ),
+                action="TEMPORARY_WAIT",
+            )
+        if market.market_status == MarketStatus.RISK_OFF:
+            reasons = ("GLOBAL_MARKET_RISK_OFF", "WAIT_MARKET_RECOVERY")
+            if not self.market_side_config.enabled or str(self.market_side_config.global_risk_off_action).lower() != "temporary_wait":
+                return finalize(
+                    LabGateDecision(
+                        watch.symbol,
+                        LabGateStatus.BLOCKED,
+                        reasons,
+                        "GLOBAL_MARKET_RISK_OFF",
+                        risk.risk_level,
+                        risk.reason_codes,
+                        0.0,
+                        0,
+                        price_location.status,
+                        price_location.score,
+                        price_location.reason_codes,
+                    ),
+                    action="FINAL_BLOCK",
+                    reason_codes=reasons,
+                )
+            return finalize(
+                LabGateDecision(
+                    watch.symbol,
+                    LabGateStatus.WAIT,
+                    reasons,
+                    "",
+                    risk.risk_level,
+                    risk.reason_codes,
+                    0.0,
+                    self.market_side_config.recheck_after_sec,
+                    price_location.status,
+                    price_location.score,
+                    price_location.reason_codes,
+                ),
+                action="TEMPORARY_WAIT",
+                reason_codes=reasons,
+            )
+        market_wait_reasons = _candidate_market_wait_reasons(market, watch, self.market_side_config)
+        if market_wait_reasons:
+            return finalize(
+                LabGateDecision(
+                    watch.symbol,
+                    LabGateStatus.WAIT,
+                    market_wait_reasons,
+                    "",
+                    risk.risk_level,
+                    risk.reason_codes,
+                    0.0,
+                    self.market_side_config.recheck_after_sec,
+                    price_location.status,
+                    price_location.score,
+                    price_location.reason_codes,
+                ),
+                action="TEMPORARY_WAIT",
+                reason_codes=market_wait_reasons,
+            )
+        if theme.theme_status == ThemeLabThemeStatus.LEADER_ONLY_THEME and role not in {StockRole.LEADER, StockRole.CO_LEADER}:
+            return finalize(
+                LabGateDecision(
+                    watch.symbol,
+                    LabGateStatus.BLOCKED,
+                    ("LEADER_ONLY_THEME_LAGGARD_BLOCK",),
+                    "LEADER_ONLY_THEME_LAGGARD_BLOCK",
+                    risk.risk_level,
+                    risk.reason_codes,
+                    0.0,
+                    risk.recheck_after_sec,
+                    price_location.status,
+                    price_location.score,
+                    price_location.reason_codes,
+                )
             )
         if _price_location_hard_blocks(role, price_location):
-            return LabGateDecision(
-                watch.symbol,
-                LabGateStatus.BLOCKED,
-                price_location.reason_codes or (price_location.status.value,),
-                price_location.status.value,
-                risk.risk_level,
-                risk.reason_codes,
-                0.0,
-                _price_location_recheck_sec(price_location),
-                price_location.status,
-                price_location.score,
-                price_location.reason_codes,
+            return finalize(
+                LabGateDecision(
+                    watch.symbol,
+                    LabGateStatus.BLOCKED,
+                    price_location.reason_codes or (price_location.status.value,),
+                    price_location.status.value,
+                    risk.risk_level,
+                    risk.reason_codes,
+                    0.0,
+                    _price_location_recheck_sec(price_location),
+                    price_location.status,
+                    price_location.score,
+                    price_location.reason_codes,
+                )
             )
         base_ready = _theme_market_role_ready(market, theme, role)
         ready_location = price_location.status in {
@@ -1194,24 +1406,42 @@ class ThemeLabHybridGate:
                 base_ready = True
         if base_ready and ready_location and risk.risk_level in {TradeabilityRiskLevel.PASS, TradeabilityRiskLevel.RISK_ADJUST}:
             if role == StockRole.FOLLOWER:
-                return LabGateDecision(
-                    watch.symbol,
-                    LabGateStatus.READY_SMALL,
-                    ("THEME_LAB_FOLLOWER_READY_SMALL",) + price_location.reason_codes + risk.reason_codes,
-                    "",
-                    TradeabilityRiskLevel.RISK_ADJUST if risk.risk_level == TradeabilityRiskLevel.PASS else risk.risk_level,
-                    risk.reason_codes,
-                    min(risk.position_size_multiplier, self.position_config.ready_small_multiplier_follower),
-                    risk.recheck_after_sec,
-                    price_location.status,
-                    price_location.score,
-                    price_location.reason_codes,
+                return finalize(
+                    LabGateDecision(
+                        watch.symbol,
+                        LabGateStatus.READY_SMALL,
+                        ("THEME_LAB_FOLLOWER_READY_SMALL",) + price_location.reason_codes + risk.reason_codes,
+                        "",
+                        TradeabilityRiskLevel.RISK_ADJUST if risk.risk_level == TradeabilityRiskLevel.PASS else risk.risk_level,
+                        risk.reason_codes,
+                        min(risk.position_size_multiplier, self.position_config.ready_small_multiplier_follower),
+                        risk.recheck_after_sec,
+                        price_location.status,
+                        price_location.score,
+                        price_location.reason_codes,
+                    )
                 )
             if risk.risk_level == TradeabilityRiskLevel.RISK_ADJUST:
-                return LabGateDecision(
+                return finalize(
+                    LabGateDecision(
+                        watch.symbol,
+                        LabGateStatus.READY_SMALL,
+                        ("THEME_LAB_READY_SMALL",) + risk.reason_codes,
+                        "",
+                        risk.risk_level,
+                        risk.reason_codes,
+                        risk.position_size_multiplier,
+                        risk.recheck_after_sec,
+                        price_location.status,
+                        price_location.score,
+                        price_location.reason_codes,
+                    )
+                )
+            return finalize(
+                LabGateDecision(
                     watch.symbol,
-                    LabGateStatus.READY_SMALL,
-                    ("THEME_LAB_READY_SMALL",) + risk.reason_codes,
+                    LabGateStatus.READY,
+                    ("THEME_LAB_READY",),
                     "",
                     risk.risk_level,
                     risk.reason_codes,
@@ -1221,38 +1451,44 @@ class ThemeLabHybridGate:
                     price_location.score,
                     price_location.reason_codes,
                 )
-            return LabGateDecision(
-                watch.symbol,
-                LabGateStatus.READY,
-                ("THEME_LAB_READY",),
-                "",
-                risk.risk_level,
-                risk.reason_codes,
-                risk.position_size_multiplier,
-                risk.recheck_after_sec,
-                price_location.status,
-                price_location.score,
-                price_location.reason_codes,
             )
         if base_ready and _leader_like(role) and ready_small_location and risk.risk_level == TradeabilityRiskLevel.RISK_ADJUST:
-            return LabGateDecision(
-                watch.symbol,
-                LabGateStatus.READY_SMALL,
-                ("PRICE_LOCATION_READY_SMALL",) + price_location.reason_codes + risk.reason_codes,
-                "",
-                risk.risk_level,
-                risk.reason_codes,
-                risk.position_size_multiplier,
-                risk.recheck_after_sec,
-                price_location.status,
-                price_location.score,
-                price_location.reason_codes,
+            return finalize(
+                LabGateDecision(
+                    watch.symbol,
+                    LabGateStatus.READY_SMALL,
+                    ("PRICE_LOCATION_READY_SMALL",) + price_location.reason_codes + risk.reason_codes,
+                    "",
+                    risk.risk_level,
+                    risk.reason_codes,
+                    risk.position_size_multiplier,
+                    risk.recheck_after_sec,
+                    price_location.status,
+                    price_location.score,
+                    price_location.reason_codes,
+                )
             )
         if watch.condition_level >= 2:
-            return LabGateDecision(
+            return finalize(
+                LabGateDecision(
+                    watch.symbol,
+                    LabGateStatus.WAIT,
+                    ("WATCHSET_WAIT_CONFIRMATION",) + price_location.reason_codes + risk.reason_codes,
+                    "",
+                    risk.risk_level,
+                    risk.reason_codes,
+                    risk.position_size_multiplier,
+                    risk.recheck_after_sec or _price_location_recheck_sec(price_location),
+                    price_location.status,
+                    price_location.score,
+                    price_location.reason_codes,
+                )
+            )
+        return finalize(
+            LabGateDecision(
                 watch.symbol,
-                LabGateStatus.WAIT,
-                ("WATCHSET_WAIT_CONFIRMATION",) + price_location.reason_codes + risk.reason_codes,
+                LabGateStatus.OBSERVE,
+                ("THEME_LAB_OBSERVE",) + price_location.reason_codes,
                 "",
                 risk.risk_level,
                 risk.reason_codes,
@@ -1262,18 +1498,6 @@ class ThemeLabHybridGate:
                 price_location.score,
                 price_location.reason_codes,
             )
-        return LabGateDecision(
-            watch.symbol,
-            LabGateStatus.OBSERVE,
-            ("THEME_LAB_OBSERVE",) + price_location.reason_codes,
-            "",
-            risk.risk_level,
-            risk.reason_codes,
-            risk.position_size_multiplier,
-            risk.recheck_after_sec or _price_location_recheck_sec(price_location),
-            price_location.status,
-            price_location.score,
-            price_location.reason_codes,
         )
 
 
@@ -1289,6 +1513,7 @@ class ThemeLabFlowEngine:
         self.gate = ThemeLabHybridGate(
             TradeabilityRiskFilter(self.config.tradeability_risk),
             self.config.position_adjustment,
+            self.config.market_side_gate,
         )
 
     def run_pipeline(
@@ -1309,7 +1534,12 @@ class ThemeLabFlowEngine:
             calculated_at=calculated_at,
         )
         ranked_themes = self.ranker.rank(themes, top_n=self.config.watchset_limits.top_theme_count)
-        watchset = self.watchset_manager.build(ranked_themes, snapshots, calculated_at=calculated_at)
+        watchset = self.watchset_manager.build(
+            ranked_themes,
+            snapshots,
+            metadata_by_symbol=metadata_by_symbol,
+            calculated_at=calculated_at,
+        )
         theme_by_id = {theme.theme_id: theme for theme in ranked_themes}
         enriched_watchset: list[WatchSetSnapshot] = []
         decisions: list[LabGateDecision] = []
@@ -1320,6 +1550,12 @@ class ThemeLabFlowEngine:
             role = self.role_detector.detect(watch, theme, snapshots)
             enriched = WatchSetSnapshot(**{**watch.__dict__, "stock_role": role})
             snapshot = _snapshot_map(snapshots).get(enriched.symbol)
+            enriched = WatchSetSnapshot(
+                **{
+                    **enriched.__dict__,
+                    **_market_side_context(market, enriched),
+                }
+            )
             price_location = self.price_location_evaluator.evaluate(_price_location_input(market, theme, enriched, snapshot))
             decision = self.gate.evaluate(
                 market=market,
@@ -1354,6 +1590,20 @@ class ThemeLabFlowEngine:
                     "pullback_reclaim": price_location.pullback_reclaim,
                     "breakout_continuation": price_location.breakout_continuation,
                     "price_location_data_quality_flags": price_location.data_quality_flags,
+                    "candidate_market": decision.candidate_market or enriched.candidate_market,
+                    "candidate_market_source": decision.candidate_market_source or enriched.candidate_market_source,
+                    "candidate_market_status": decision.candidate_market_status or enriched.candidate_market_status,
+                    "candidate_market_action": decision.candidate_market_action or enriched.candidate_market_action,
+                    "candidate_index_return_pct": decision.candidate_index_return_pct
+                    if decision.candidate_index_return_pct is not None
+                    else enriched.candidate_index_return_pct,
+                    "global_market_status": decision.global_market_status or enriched.global_market_status,
+                    "kospi_market_status": decision.kospi_market_status or enriched.kospi_market_status,
+                    "kosdaq_market_status": decision.kosdaq_market_status or enriched.kosdaq_market_status,
+                    "kospi_return_pct": decision.kospi_return_pct if decision.kospi_return_pct is not None else enriched.kospi_return_pct,
+                    "kosdaq_return_pct": decision.kosdaq_return_pct if decision.kosdaq_return_pct is not None else enriched.kosdaq_return_pct,
+                    "market_side_reason_codes": decision.market_side_reason_codes or enriched.market_side_reason_codes,
+                    "market_side_data_quality_flags": decision.market_side_data_quality_flags or enriched.market_side_data_quality_flags,
                 }
             )
             enriched_watchset.append(enriched)
@@ -1395,6 +1645,134 @@ def classify_theme_status(
     if alive_ratio >= cfg.min_alive_ratio_for_spreading:
         return ThemeLabThemeStatus.WATCH_THEME
     return ThemeLabThemeStatus.WEAK_THEME
+
+
+def normalize_market_side(value: Any) -> MarketSide:
+    if isinstance(value, MarketSide):
+        return value
+    text = str(value or "").strip().upper()
+    if not text:
+        return MarketSide.UNKNOWN
+    if text in {"KOSPI", "KS", "KSE"} or "코스피" in text or "유가증권" in text:
+        return MarketSide.KOSPI
+    if text in {"KOSDAQ", "KQ"} or "코스닥" in text:
+        return MarketSide.KOSDAQ
+    if "KOSDAQ" in text:
+        return MarketSide.KOSDAQ
+    if "KOSPI" in text:
+        return MarketSide.KOSPI
+    return MarketSide.UNKNOWN
+
+
+def _infer_candidate_market(
+    *,
+    snapshot: StockSnapshot | None = None,
+    instrument_metadata: InstrumentMetadata | None = None,
+    theme: ThemeConditionSnapshot | None = None,
+    existing: WatchSetSnapshot | None = None,
+) -> tuple[MarketSide, str, tuple[str, ...]]:
+    snapshot_metadata = dict(snapshot.metadata if snapshot else {})
+    for key in ("market", "exchange", "market_type"):
+        side = normalize_market_side(snapshot_metadata.get(key))
+        if side != MarketSide.UNKNOWN:
+            return side, f"snapshot.metadata.{key}", ()
+
+    if instrument_metadata is not None:
+        raw = dict(instrument_metadata.raw or {})
+        for key in ("market", "exchange", "market_type"):
+            side = normalize_market_side(raw.get(key))
+            if side != MarketSide.UNKNOWN:
+                return side, f"metadata_by_symbol.raw.{key}", ()
+
+    for owner, source_prefix in ((theme, "theme"), (existing, "existing_watch")):
+        if owner is None:
+            continue
+        raw = getattr(owner, "market", "")
+        side = normalize_market_side(raw)
+        if side != MarketSide.UNKNOWN:
+            return side, f"{source_prefix}.market", ()
+
+    return MarketSide.UNKNOWN, "", ("MARKET_CLASSIFICATION_MISSING",)
+
+
+def _instrument_metadata_map(metadata_by_symbol: dict[str, InstrumentMetadata] | None) -> dict[str, InstrumentMetadata]:
+    result: dict[str, InstrumentMetadata] = {}
+    for key, value in (metadata_by_symbol or {}).items():
+        symbol = normalize_stock_code(key or value.symbol)
+        if symbol:
+            result[symbol] = value
+    return result
+
+
+def _market_status_value(status: MarketStatus | str | None) -> str:
+    if isinstance(status, MarketStatus):
+        return status.value
+    return str(status or "")
+
+
+def _dedupe_tuple(values: Iterable[str]) -> tuple[str, ...]:
+    result: list[str] = []
+    for value in values:
+        text = str(value or "")
+        if text and text not in result:
+            result.append(text)
+    return tuple(result)
+
+
+def _market_side_context(market: MarketStrengthSnapshot, watch: WatchSetSnapshot) -> dict[str, Any]:
+    side = normalize_market_side(watch.candidate_market)
+    kospi_status = market.status_for_side(MarketSide.KOSPI)
+    kosdaq_status = market.status_for_side(MarketSide.KOSDAQ)
+    side_status = market.status_for_side(side)
+    reason_codes = tuple(watch.market_side_reason_codes or ())
+    if side == MarketSide.UNKNOWN and "MARKET_CLASSIFICATION_MISSING" not in reason_codes:
+        reason_codes = reason_codes + ("MARKET_CLASSIFICATION_MISSING",)
+    return {
+        "candidate_market": side.value,
+        "candidate_market_source": watch.candidate_market_source,
+        "candidate_market_status": _market_status_value(side_status) if side_status is not None else "UNKNOWN",
+        "candidate_market_action": "PASS" if side != MarketSide.UNKNOWN else "UNKNOWN_PASS",
+        "candidate_index_return_pct": market.index_return_for_side(side),
+        "global_market_status": _market_status_value(market.market_status),
+        "kospi_market_status": _market_status_value(kospi_status),
+        "kosdaq_market_status": _market_status_value(kosdaq_status),
+        "kospi_return_pct": market.index_return_for_side(MarketSide.KOSPI),
+        "kosdaq_return_pct": market.index_return_for_side(MarketSide.KOSDAQ),
+        "market_side_reason_codes": reason_codes,
+        "market_side_data_quality_flags": _dedupe_tuple(
+            tuple(watch.market_side_data_quality_flags or ()) + tuple(market.market_side_data_quality_flags or ())
+        ),
+    }
+
+
+def _candidate_market_wait_reasons(
+    market: MarketStrengthSnapshot,
+    watch: WatchSetSnapshot,
+    config: MarketSideGateConfig,
+) -> tuple[str, ...]:
+    if not config.enabled:
+        return ()
+    side = normalize_market_side(watch.candidate_market)
+    if side in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
+        status = market.status_for_side(side)
+        if status == MarketStatus.RISK_OFF:
+            if str(config.risk_off_action).lower() != "temporary_wait":
+                return ()
+            return ("CANDIDATE_MARKET_RISK_OFF", f"{side.value}_MARKET_RISK_OFF", "WAIT_MARKET_RECOVERY")
+        if status == MarketStatus.WEAK:
+            if str(config.weak_action).lower() != "temporary_wait":
+                return ()
+            return ("CANDIDATE_MARKET_WEAK", f"{side.value}_MARKET_WEAK", "WAIT_MARKET_RECOVERY")
+        return ()
+
+    kospi_status = market.status_for_side(MarketSide.KOSPI)
+    kosdaq_status = market.status_for_side(MarketSide.KOSDAQ)
+    weak_or_risk = {MarketStatus.WEAK, MarketStatus.RISK_OFF}
+    if kospi_status in weak_or_risk or kosdaq_status in weak_or_risk:
+        if str(config.unknown_market_action).lower() != "strict_fallback":
+            return ()
+        return ("MARKET_CLASSIFICATION_MISSING", "MARKET_CLASSIFICATION_FALLBACK_STRICT", "WAIT_MARKET_RECOVERY")
+    return ()
 
 
 def _risk_input(

@@ -41,6 +41,7 @@ from trading.strategy.support_readiness import (
 from trading.theme_engine.lab import (
     LabGateDecision,
     LabGateStatus,
+    MarketSide,
     PriceLocationStatus,
     StockRole,
     ThemeConditionSnapshot,
@@ -48,6 +49,7 @@ from trading.theme_engine.lab import (
     ThemeLabThemeStatus,
     TradeabilityRiskLevel,
     WatchSetSnapshot,
+    normalize_market_side,
 )
 
 
@@ -56,6 +58,14 @@ ORDER_PHASE_ENTRY = "entry"
 LATE_CHASE_TEMP_WAIT = "LATE_CHASE_TEMP_WAIT"
 RISK_SOFT_BLOCK_TEMP_WAIT = "RISK_SOFT_BLOCK_TEMP_WAIT"
 LATE_CHASE_SOFT_BLOCK_CODES = {"HIGH_CHASE_RISK", "LATE_CHASE", "CHASE_RISK"}
+MARKET_WEAK_WAIT_CODES = {"CANDIDATE_MARKET_WEAK", "KOSDAQ_MARKET_WEAK", "KOSPI_MARKET_WEAK"}
+MARKET_RISK_OFF_WAIT_CODES = {
+    "GLOBAL_MARKET_RISK_OFF",
+    "CANDIDATE_MARKET_RISK_OFF",
+    "KOSDAQ_MARKET_RISK_OFF",
+    "KOSPI_MARKET_RISK_OFF",
+}
+MARKET_CLASSIFICATION_WAIT_CODES = {"MARKET_CLASSIFICATION_MISSING", "MARKET_CLASSIFICATION_FALLBACK_STRICT"}
 
 READY_PULLBACK_LOCATIONS = {
     PriceLocationStatus.GOOD_PULLBACK,
@@ -189,6 +199,7 @@ class ThemeLabDryRunLifecycleBridge:
         expires_at = (now.replace(microsecond=0) + timedelta(minutes=self.default_ttl_minutes)).isoformat()
         existing = self.db.load_candidate(trade_date, code)
         strategy_profile = _strategy_profile_from_watch(watch, self._latest_tick_metadata(code))
+        candidate_market = _candidate_market_for_candidate(watch)
         theme_id = str(watch.primary_theme or (watch.themes[0] if watch.themes else ""))
         base_metadata = _candidate_bridge_metadata(watch, theme)
         existing_metadata = dict(existing.metadata or {}) if existing is not None else {}
@@ -247,6 +258,7 @@ class ThemeLabDryRunLifecycleBridge:
                 trade_date=trade_date,
                 code=code,
                 name=watch.name,
+                market=candidate_market,
                 strategy_profile=strategy_profile,
                 sources=[CandidateSourceType.THEME_WATCH],
                 state=CandidateState.DETECTED,
@@ -301,6 +313,9 @@ class ThemeLabDryRunLifecycleBridge:
             changed = True
         if existing.strategy_profile is None:
             existing.strategy_profile = strategy_profile
+            changed = True
+        if candidate_market and existing.market != candidate_market:
+            existing.market = candidate_market
             changed = True
         existing.last_seen_at = now_text
         existing.expires_at = expires_at
@@ -452,6 +467,7 @@ class ThemeLabDryRunLifecycleBridge:
                 "watch_return_pct": watch.return_pct,
                 "price_location_status": decision.price_location_status.value,
                 "price_location_reason_codes": list(decision.price_location_reason_codes),
+                **_market_side_fields(decision, watch),
             },
         )
 
@@ -507,6 +523,37 @@ def _map_decision(
             latest_tick_ready=latest.ready,
             latest_tick_age_sec=latest.age_sec,
         )
+    if not latest.ready:
+        return ThemeLabBridgeMapping(
+            WAIT_DATA,
+            "NOT_ELIGIBLE_DATA",
+            False,
+            BlockType.TEMPORARY,
+            True,
+            recheck_after_sec,
+            "C",
+            max(0.0, float(decision.price_location_score or 0.0)),
+            _dedupe(["DATA_INSUFFICIENT", WAIT_DATA, latest.reason or LATEST_TICK_MISSING] + list(latest.reason_codes) + reason_codes),
+            ready_type=WAIT_DATA,
+            latest_tick_ready=False,
+            latest_tick_age_sec=latest.age_sec,
+        )
+    market_wait_status = _market_wait_status(reason_codes)
+    if market_wait_status:
+        return ThemeLabBridgeMapping(
+            market_wait_status,
+            "NOT_ELIGIBLE_MARKET",
+            False,
+            BlockType.TEMPORARY,
+            True,
+            recheck_after_sec,
+            "B",
+            max(0.0, float(decision.price_location_score or 0.0)),
+            _dedupe([market_wait_status, "NOT_ELIGIBLE_MARKET"] + reason_codes),
+            ready_type="WAIT_MARKET_RECOVERY",
+            latest_tick_ready=latest.ready,
+            latest_tick_age_sec=latest.age_sec,
+        )
     if price_location in OBSERVE_ONLY_LOCATIONS:
         final_status = {
             PriceLocationStatus.CHASE_HIGH: "OBSERVE_CHASE",
@@ -525,21 +572,6 @@ def _map_decision(
             _dedupe([final_status, price_location.value] + reason_codes),
             ready_type=OBSERVE,
             latest_tick_ready=latest.ready,
-            latest_tick_age_sec=latest.age_sec,
-        )
-    if not latest.ready:
-        return ThemeLabBridgeMapping(
-            WAIT_DATA,
-            "NOT_ELIGIBLE_DATA",
-            False,
-            BlockType.TEMPORARY,
-            True,
-            recheck_after_sec,
-            "C",
-            max(0.0, float(decision.price_location_score or 0.0)),
-            _dedupe(["DATA_INSUFFICIENT", WAIT_DATA, latest.reason or LATEST_TICK_MISSING] + list(latest.reason_codes) + reason_codes),
-            ready_type=WAIT_DATA,
-            latest_tick_ready=False,
             latest_tick_age_sec=latest.age_sec,
         )
     support = _selected_support_profile(price_location, _support_candidates(metadata), metadata)
@@ -703,6 +735,17 @@ def _is_late_chase_soft_block(reason_codes: Iterable[str]) -> bool:
     return bool({str(code).upper() for code in reason_codes} & LATE_CHASE_SOFT_BLOCK_CODES)
 
 
+def _market_wait_status(reason_codes: Iterable[str]) -> str:
+    upper_codes = {str(code).upper() for code in reason_codes}
+    if upper_codes & MARKET_CLASSIFICATION_WAIT_CODES and "MARKET_CLASSIFICATION_FALLBACK_STRICT" in upper_codes:
+        return "WAIT_MARKET_CLASSIFICATION_UNKNOWN"
+    if upper_codes & MARKET_RISK_OFF_WAIT_CODES:
+        return "WAIT_CANDIDATE_MARKET_RISK_OFF"
+    if upper_codes & MARKET_WEAK_WAIT_CODES:
+        return "WAIT_CANDIDATE_MARKET_WEAK"
+    return ""
+
+
 def _selected_support_profile(
     price_location: PriceLocationStatus,
     support_candidates: dict[str, float],
@@ -745,6 +788,35 @@ def _selected_support_profile(
     }
 
 
+def _candidate_market_for_candidate(watch: WatchSetSnapshot) -> str:
+    side = normalize_market_side(watch.candidate_market)
+    return side.value if side != MarketSide.UNKNOWN else ""
+
+
+def _market_side_fields(decision: LabGateDecision | None, watch: WatchSetSnapshot) -> dict[str, Any]:
+    def _value(name: str, default: Any = "") -> Any:
+        if decision is not None:
+            value = getattr(decision, name, None)
+            if value not in (None, "", ()):
+                return value
+        return getattr(watch, name, default)
+
+    return {
+        "candidate_market": str(_value("candidate_market", "")),
+        "candidate_market_source": str(_value("candidate_market_source", "")),
+        "candidate_market_status": str(_value("candidate_market_status", "")),
+        "candidate_market_action": str(_value("candidate_market_action", "")),
+        "candidate_index_return_pct": _value("candidate_index_return_pct", None),
+        "global_market_status": str(_value("global_market_status", "")),
+        "kospi_market_status": str(_value("kospi_market_status", "")),
+        "kosdaq_market_status": str(_value("kosdaq_market_status", "")),
+        "kospi_return_pct": _value("kospi_return_pct", None),
+        "kosdaq_return_pct": _value("kosdaq_return_pct", None),
+        "market_side_reason_codes": list(_value("market_side_reason_codes", ())),
+        "market_side_data_quality_flags": list(_value("market_side_data_quality_flags", ())),
+    }
+
+
 def _stock_pullback_details(
     candidate: Candidate,
     decision: LabGateDecision,
@@ -757,6 +829,7 @@ def _stock_pullback_details(
     coverage = support_coverage(tick_metadata, support_candidates)
     is_late_chase_wait = mapping.final_gate_status == LATE_CHASE_TEMP_WAIT
     is_risk_soft_block_wait = mapping.final_gate_status == RISK_SOFT_BLOCK_TEMP_WAIT
+    market_fields = _market_side_fields(decision, watch)
     if mapping.selected_support_source:
         nearest_support = mapping.selected_support_source
         nearest_support_price = mapping.selected_support_price
@@ -812,6 +885,7 @@ def _stock_pullback_details(
         "price_location_score": decision.price_location_score,
         "price_location_reason_codes": list(decision.price_location_reason_codes),
         "stock_role": watch.stock_role.value,
+        **market_fields,
         "position_size_multiplier": position_size_multiplier,
         "dynamic_pullback_policy": {"source": SOURCE},
         "late_chase_diagnostics": {
@@ -856,6 +930,7 @@ def _base_details(
     candidate_generation_seq = metadata.get("candidate_generation_seq", 0)
     generation_reason = str(metadata.get("generation_reason") or metadata.get("candidate_generation_reason") or "")
     decision_cycle_id = str(decision_cycle_id or metadata.get("decision_cycle_id") or "")
+    market_fields = _market_side_fields(decision, watch)
     details = {
         "source": SOURCE,
         "candidate_instance_id": candidate_instance_id,
@@ -881,6 +956,7 @@ def _base_details(
         "price_location_reason_codes": list(decision.price_location_reason_codes),
         "risk_level": decision.risk_level.value,
         "risk_reason_codes": list(decision.risk_reason_codes),
+        **market_fields,
         "reason_codes": list(mapping.reason_codes),
         "cap_rules_applied": list(mapping.reason_codes),
         "primary_reason_code": mapping.reason_codes[0] if mapping.reason_codes else "",
@@ -945,6 +1021,7 @@ def _base_details(
             "price_location_status": decision.price_location_status.value,
             "risk_level": decision.risk_level.value,
             "risk_reason_codes": list(decision.risk_reason_codes),
+            **market_fields,
             "reason_codes": list(mapping.reason_codes),
             "support_price": support_price,
             "selected_support_source": stock_details.get("selected_support_source", ""),
@@ -1002,6 +1079,7 @@ def _candidate_bridge_metadata(watch: WatchSetSnapshot, theme: ThemeConditionSna
         "theme_lab_condition_level": int(watch.condition_level or 0),
         "theme_lab_theme_status": theme.theme_status.value if theme is not None else "",
         "theme_lab_last_seen": watch.calculated_at,
+        **_market_side_fields(None, watch),
     }
 
 
@@ -1033,8 +1111,8 @@ def _strategy_profile_from_watch(watch: WatchSetSnapshot, metadata: dict[str, An
             return StrategyProfile(raw)
         except ValueError:
             pass
-    market = str(metadata.get("market") or metadata.get("market_type") or "").upper()
-    if "KOSPI" in market:
+    market = normalize_market_side(metadata.get("market") or metadata.get("market_type") or watch.candidate_market)
+    if market == MarketSide.KOSPI:
         return StrategyProfile.KOSPI_LEADER_PROFILE
     if watch.stock_role in LEADER_ROLES:
         return StrategyProfile.KOSDAQ_THEME_PROFILE

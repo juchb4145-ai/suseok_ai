@@ -29,6 +29,7 @@ from trading.theme_engine.lab import (
     LabGateDecision,
     LabGateStatus,
     MarketStatus,
+    MarketSide,
     MarketStrengthSnapshot,
     PriceLocationStatus,
     StockRole,
@@ -167,6 +168,37 @@ def test_themelab_generic_soft_block_does_not_pollute_late_chase_bucket(tmp_path
     assert details["late_chase_level"] == ""
     assert "RISK_SOFT_BLOCK_TEMP_WAIT" in details["reason_codes"]
     assert "LATE_CHASE_TEMP_WAIT" not in details["reason_codes"]
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
+def test_candidate_market_weak_wait_is_recoverable_without_entry_plan_or_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.WAIT,
+            PriceLocationStatus.GOOD_PULLBACK,
+            reasons=("CANDIDATE_MARKET_WEAK", "KOSDAQ_MARKET_WEAK", "WAIT_MARKET_RECOVERY"),
+            candidate_market=MarketSide.KOSDAQ.value,
+            candidate_market_status=MarketStatus.WEAK.value,
+        ),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+    assert candidate.market == MarketSide.KOSDAQ.value
+    assert candidate.state == CandidateState.BLOCKED
+    assert candidate.block_type == BlockType.TEMPORARY
+    assert candidate.can_recover is True
+    assert details["sub_status"] == "WAIT_CANDIDATE_MARKET_WEAK"
+    assert details["order_eligibility"] == "NOT_ELIGIBLE_MARKET"
+    assert details["candidate_market"] == MarketSide.KOSDAQ.value
+    assert details["candidate_market_status"] == MarketStatus.WEAK.value
+    assert "KOSDAQ_MARKET_WEAK" in details["reason_codes"]
     assert db.list_entry_plans(candidate.id) == []
     assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 
@@ -635,6 +667,8 @@ def _flow_result(
     multiplier: float = 1.0,
     theme_id: str = "ai",
     theme_name: str = "AI",
+    candidate_market: str = MarketSide.KOSDAQ.value,
+    candidate_market_status: str = MarketStatus.EXPANSION.value,
 ) -> ThemeLabFlowResult:
     theme = ThemeConditionSnapshot(
         calculated_at=NOW.isoformat(),
@@ -669,6 +703,17 @@ def _flow_result(
         price_location_status=price_location,
         price_location_score=80.0,
         price_location_reason_codes=(price_location.value,),
+        candidate_market=candidate_market,
+        candidate_market_source="test",
+        candidate_market_status=candidate_market_status,
+        candidate_market_action="TEMPORARY_WAIT" if status == LabGateStatus.WAIT and "MARKET" in " ".join(reasons) else "PASS",
+        candidate_index_return_pct=-1.2 if candidate_market_status == MarketStatus.WEAK.value else 0.2,
+        global_market_status=MarketStatus.SELECTIVE.value,
+        kospi_market_status=MarketStatus.SELECTIVE.value,
+        kosdaq_market_status=candidate_market_status if candidate_market == MarketSide.KOSDAQ.value else MarketStatus.SELECTIVE.value,
+        kospi_return_pct=0.1,
+        kosdaq_return_pct=-1.2 if candidate_market_status == MarketStatus.WEAK.value else 0.2,
+        market_side_reason_codes=reasons if any("MARKET" in reason for reason in reasons) else (),
     )
     decision = LabGateDecision(
         symbol="000001",
@@ -682,9 +727,28 @@ def _flow_result(
         price_location_status=price_location,
         price_location_score=80.0,
         price_location_reason_codes=(price_location.value,),
+        candidate_market=candidate_market,
+        candidate_market_source="test",
+        candidate_market_status=candidate_market_status,
+        candidate_market_action="TEMPORARY_WAIT" if status == LabGateStatus.WAIT and "MARKET" in " ".join(reasons) else "PASS",
+        candidate_index_return_pct=-1.2 if candidate_market_status == MarketStatus.WEAK.value else 0.2,
+        global_market_status=MarketStatus.SELECTIVE.value,
+        kospi_market_status=MarketStatus.SELECTIVE.value,
+        kosdaq_market_status=candidate_market_status if candidate_market == MarketSide.KOSDAQ.value else MarketStatus.SELECTIVE.value,
+        kospi_return_pct=0.1,
+        kosdaq_return_pct=-1.2 if candidate_market_status == MarketStatus.WEAK.value else 0.2,
+        market_side_reason_codes=reasons if any("MARKET" in reason for reason in reasons) else (),
     )
     return ThemeLabFlowResult(
-        market=MarketStrengthSnapshot(MarketStatus.EXPANSION, kospi_return_pct=0.1, kosdaq_return_pct=0.2),
+        market=MarketStrengthSnapshot(
+            MarketStatus.SELECTIVE,
+            kospi_return_pct=0.1,
+            kosdaq_return_pct=-1.2 if candidate_market_status == MarketStatus.WEAK.value else 0.2,
+            kospi_status=MarketStatus.SELECTIVE,
+            kosdaq_status=MarketStatus.WEAK if candidate_market_status == MarketStatus.WEAK.value else MarketStatus.EXPANSION,
+            kospi_index_return_pct=0.1,
+            kosdaq_index_return_pct=-1.2 if candidate_market_status == MarketStatus.WEAK.value else 0.2,
+        ),
         themes=(theme,),
         watchset=(watch,),
         gate_decisions=(decision,),

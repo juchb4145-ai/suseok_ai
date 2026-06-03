@@ -5,7 +5,9 @@ from trading.theme_engine.lab import (
     LabGateStatus,
     LiquidityFilterConfig,
     MarketStatus,
+    MarketSide,
     MarketStrengthSnapshot,
+    MarketStrengthEngine,
     PositionAdjustmentConfig,
     PriceLocationConfig,
     PriceLocationEvaluator,
@@ -165,7 +167,7 @@ def test_watchset_promotes_condition_two_or_three_and_respects_limits():
     assert all(item.condition_level >= 2 for item in watchset)
 
 
-def test_hybrid_gate_blocks_risk_off_and_late_laggard():
+def test_hybrid_gate_waits_risk_off_and_blocks_late_laggard():
     theme = ThemeBreadthEngine().calculate(
         [("t", "테마", [_member("t", "000001"), _member("t", "000002"), _member("t", "000003")])],
         [_snapshot("000001", 6), _snapshot("000002", 4), _snapshot("000003", 3)],
@@ -193,8 +195,177 @@ def test_hybrid_gate_blocks_risk_off_and_late_laggard():
         price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
     )
 
-    assert risk_off.status == LabGateStatus.BLOCKED
+    assert risk_off.status == LabGateStatus.WAIT
+    assert "GLOBAL_MARKET_RISK_OFF" in risk_off.reason_codes
     assert late.status == LabGateStatus.BLOCKED
+
+
+def test_market_strength_calculates_side_statuses_separately():
+    market = MarketStrengthEngine().calculate(
+        [_snapshot("000001", 1.0), _snapshot("000002", -0.2)],
+        kospi_return_pct=0.2,
+        kosdaq_return_pct=-1.2,
+    )
+
+    assert market.market_status == MarketStatus.CHOPPY
+    assert market.kospi_status == MarketStatus.CHOPPY
+    assert market.kosdaq_status == MarketStatus.WEAK
+    assert market.side_statuses[MarketSide.KOSDAQ.value]["reason_codes"] == ["KOSDAQ_MARKET_WEAK"]
+
+
+def test_candidate_side_market_gate_blocks_only_matching_weak_side():
+    theme = _leading_theme()
+    market = MarketStrengthSnapshot(
+        MarketStatus.SELECTIVE,
+        kospi_return_pct=0.3,
+        kosdaq_return_pct=-1.2,
+        kospi_status=MarketStatus.SELECTIVE,
+        kosdaq_status=MarketStatus.WEAK,
+        kospi_index_return_pct=0.3,
+        kosdaq_index_return_pct=-1.2,
+    )
+    gate = ThemeLabHybridGate()
+
+    kosdaq = gate.evaluate(
+        market=market,
+        theme=theme,
+        watch=WatchSetSnapshot(
+            calculated_at="",
+            symbol="000001",
+            primary_theme="t",
+            return_pct=5.0,
+            condition_level=3,
+            stock_role=StockRole.LEADER,
+            candidate_market=MarketSide.KOSDAQ.value,
+            candidate_market_source="snapshot.metadata.market",
+        ),
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
+    )
+    kospi = gate.evaluate(
+        market=market,
+        theme=theme,
+        watch=WatchSetSnapshot(
+            calculated_at="",
+            symbol="000002",
+            primary_theme="t",
+            return_pct=5.0,
+            condition_level=3,
+            stock_role=StockRole.LEADER,
+            candidate_market=MarketSide.KOSPI.value,
+            candidate_market_source="snapshot.metadata.market",
+        ),
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
+    )
+
+    assert kosdaq.status == LabGateStatus.WAIT
+    assert "CANDIDATE_MARKET_WEAK" in kosdaq.reason_codes
+    assert "KOSDAQ_MARKET_WEAK" in kosdaq.reason_codes
+    assert kosdaq.candidate_market_status == MarketStatus.WEAK.value
+    assert kospi.status == LabGateStatus.READY
+    assert kospi.candidate_market_status == MarketStatus.SELECTIVE.value
+
+
+def test_unknown_market_strict_fallback_waits_when_either_side_is_weak():
+    theme = _leading_theme()
+    market = MarketStrengthSnapshot(
+        MarketStatus.SELECTIVE,
+        kospi_status=MarketStatus.SELECTIVE,
+        kosdaq_status=MarketStatus.WEAK,
+    )
+
+    decision = ThemeLabHybridGate().evaluate(
+        market=market,
+        theme=theme,
+        watch=WatchSetSnapshot(
+            calculated_at="",
+            symbol="000001",
+            primary_theme="t",
+            return_pct=5.0,
+            condition_level=3,
+            stock_role=StockRole.LEADER,
+            candidate_market=MarketSide.UNKNOWN.value,
+        ),
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
+    )
+
+    assert decision.status == LabGateStatus.WAIT
+    assert "MARKET_CLASSIFICATION_MISSING" in decision.reason_codes
+    assert "MARKET_CLASSIFICATION_FALLBACK_STRICT" in decision.reason_codes
+
+
+def test_unknown_market_records_missing_but_can_pass_when_both_sides_are_healthy():
+    theme = _leading_theme()
+    market = MarketStrengthSnapshot(
+        MarketStatus.SELECTIVE,
+        kospi_status=MarketStatus.SELECTIVE,
+        kosdaq_status=MarketStatus.CHOPPY,
+    )
+
+    decision = ThemeLabHybridGate().evaluate(
+        market=market,
+        theme=theme,
+        watch=WatchSetSnapshot(
+            calculated_at="",
+            symbol="000001",
+            primary_theme="t",
+            return_pct=5.0,
+            condition_level=3,
+            stock_role=StockRole.LEADER,
+            candidate_market=MarketSide.UNKNOWN.value,
+        ),
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
+    )
+
+    assert decision.status == LabGateStatus.READY
+    assert "MARKET_CLASSIFICATION_MISSING" not in decision.reason_codes
+    assert "MARKET_CLASSIFICATION_MISSING" in decision.market_side_reason_codes
+
+
+def test_ready_small_is_blocked_when_candidate_side_market_is_weak():
+    theme = _leading_theme()
+    market = MarketStrengthSnapshot(
+        MarketStatus.SELECTIVE,
+        kospi_status=MarketStatus.SELECTIVE,
+        kosdaq_status=MarketStatus.WEAK,
+    )
+
+    decision = ThemeLabHybridGate().evaluate(
+        market=market,
+        theme=theme,
+        watch=WatchSetSnapshot(
+            calculated_at="",
+            symbol="000001",
+            primary_theme="t",
+            return_pct=9.0,
+            condition_level=3,
+            stock_role=StockRole.LEADER,
+            candidate_market=MarketSide.KOSDAQ.value,
+        ),
+        price_location=_price_location(PriceLocationStatus.BREAKOUT_CONTINUATION, reason_codes=("BREAKOUT_CONTINUATION_READY_SMALL",)),
+        snapshot=_snapshot("000001", 9.0, turnover=5_000_000_000, metadata={"pullback_from_high_pct": 1.0}),
+    )
+
+    assert decision.status == LabGateStatus.WAIT
+    assert "KOSDAQ_MARKET_WEAK" in decision.reason_codes
+
+
+def test_watchset_infers_candidate_market_from_snapshot_metadata():
+    config = ThemeLabConfig(
+        theme_status=ThemeStatusThresholds(
+            min_eligible_members=1,
+            min_strong_count_for_leading=1,
+            min_leader_count_for_leading=1,
+        )
+    )
+    theme = ThemeBreadthEngine(config).calculate(
+        [("t", "테마", [_member("t", "000001")])],
+        [_snapshot("000001", 5.5, turnover=3_000_000, metadata={"market": "KQ"})],
+    )[0]
+
+    watchset = WatchSetManager().build([theme], [_snapshot("000001", 5.5, metadata={"market": "KQ"})])
+
+    assert watchset[0].candidate_market == MarketSide.KOSDAQ.value
+    assert watchset[0].candidate_market_source == "snapshot.metadata.market"
 
 
 def test_pipeline_outputs_market_theme_watchset_gate_and_quality_summary():
