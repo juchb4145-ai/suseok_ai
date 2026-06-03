@@ -65,6 +65,19 @@ MARKET_RISK_OFF_WAIT_CODES = {
     "KOSDAQ_MARKET_RISK_OFF",
     "KOSPI_MARKET_RISK_OFF",
 }
+MARKET_CONFIRMATION_PENDING_CODES = {
+    "WAIT_MARKET_CONFIRMATION_PENDING",
+    "MARKET_WEAK_CONFIRMATION_PENDING",
+    "MARKET_RISK_OFF_CONFIRMATION_PENDING",
+    "CANDIDATE_MARKET_WEAK_UNCONFIRMED",
+    "CANDIDATE_MARKET_RISK_OFF_UNCONFIRMED",
+    "SIDE_BREADTH_SOURCE_CONFLICT",
+}
+MARKET_RECOVERY_PENDING_CODES = {
+    "WAIT_MARKET_RECOVERY_PENDING",
+    "MARKET_RECOVERY_CONFIRMATION_PENDING",
+    "MARKET_WAIT_HYSTERESIS_HOLD",
+}
 MARKET_CLASSIFICATION_WAIT_CODES = {"MARKET_CLASSIFICATION_MISSING", "MARKET_CLASSIFICATION_FALLBACK_STRICT"}
 
 READY_PULLBACK_LOCATIONS = {
@@ -550,7 +563,7 @@ def _map_decision(
             "B",
             max(0.0, float(decision.price_location_score or 0.0)),
             _dedupe([market_wait_status, "NOT_ELIGIBLE_MARKET"] + reason_codes),
-            ready_type="WAIT_MARKET_RECOVERY",
+            ready_type=market_wait_status,
             latest_tick_ready=latest.ready,
             latest_tick_age_sec=latest.age_sec,
         )
@@ -739,6 +752,10 @@ def _market_wait_status(reason_codes: Iterable[str]) -> str:
     upper_codes = {str(code).upper() for code in reason_codes}
     if upper_codes & MARKET_CLASSIFICATION_WAIT_CODES and "MARKET_CLASSIFICATION_FALLBACK_STRICT" in upper_codes:
         return "WAIT_MARKET_CLASSIFICATION_UNKNOWN"
+    if upper_codes & MARKET_RECOVERY_PENDING_CODES:
+        return "WAIT_MARKET_RECOVERY_PENDING"
+    if upper_codes & MARKET_CONFIRMATION_PENDING_CODES:
+        return "WAIT_MARKET_CONFIRMATION_PENDING"
     if upper_codes & MARKET_RISK_OFF_WAIT_CODES:
         return "WAIT_CANDIDATE_MARKET_RISK_OFF"
     if upper_codes & MARKET_WEAK_WAIT_CODES:
@@ -817,6 +834,26 @@ def _market_side_fields(decision: LabGateDecision | None, watch: WatchSetSnapsho
         "candidate_breadth_sample_count": int(_value("candidate_breadth_sample_count", 0) or 0),
         "candidate_breadth_source": str(_value("candidate_breadth_source", "")),
         "candidate_valid_quote_ratio": _value("candidate_valid_quote_ratio", None),
+        "candidate_breadth_trust_level": str(_value("candidate_breadth_trust_level", "")),
+        "candidate_breadth_gate_usable": bool(_value("candidate_breadth_gate_usable", False)),
+        "candidate_breadth_diagnostic_only": bool(_value("candidate_breadth_diagnostic_only", False)),
+        "candidate_market_raw_status": str(_value("candidate_market_raw_status", "")),
+        "candidate_market_confirmed_status": str(_value("candidate_market_confirmed_status", "")),
+        "candidate_market_confirmation_pending": bool(_value("candidate_market_confirmation_pending", False)),
+        "candidate_market_recovery_pending": bool(_value("candidate_market_recovery_pending", False)),
+        "market_side_weak_consecutive_cycles": int(_value("market_side_weak_consecutive_cycles", 0) or 0),
+        "market_side_risk_off_consecutive_cycles": int(_value("market_side_risk_off_consecutive_cycles", 0) or 0),
+        "market_side_healthy_consecutive_cycles": int(_value("market_side_healthy_consecutive_cycles", 0) or 0),
+        "market_side_wait_started_at": str(_value("market_side_wait_started_at", "")),
+        "market_side_cycle_id": str(_value("market_side_cycle_id", "")),
+        "market_side_last_confirmed_at": str(_value("market_side_last_confirmed_at", "")),
+        "market_side_last_recovered_at": str(_value("market_side_last_recovered_at", "")),
+        "market_side_recovered_at": str(_value("market_side_recovered_at", "")),
+        "market_side_cycles_to_recover": int(_value("market_side_cycles_to_recover", 0) or 0),
+        "market_side_recovered_to_ready": bool(_value("market_side_recovered_to_ready", False)),
+        "market_side_never_recovered": bool(_value("market_side_never_recovered", False)),
+        "market_side_blocked_buy_intent_count": int(_value("market_side_blocked_buy_intent_count", 0) or 0),
+        "market_side_recheck_after_sec": int(_value("market_side_recheck_after_sec", 0) or 0),
         "kospi_breadth_pct": _value("kospi_breadth_pct", None),
         "kosdaq_breadth_pct": _value("kosdaq_breadth_pct", None),
         "kospi_breadth_ready": bool(_value("kospi_breadth_ready", False)),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from typing import Any, Iterable
@@ -155,6 +155,26 @@ class MarketSideBreadthConfig:
     fallback_to_index_return: bool = True
     fallback_to_global_breadth: bool = True
     candidate_universe_fallback_gate_weight: str = "diagnostic_only"
+    side_breadth_source_conflict_threshold_pct: float = 0.15
+
+
+@dataclass(frozen=True)
+class MarketSideGateConfirmationConfig:
+    enabled: bool = True
+    weak_confirm_cycles: int = 2
+    risk_off_confirm_cycles: int = 2
+    extreme_risk_off_confirm_cycles: int = 1
+    recover_confirm_cycles: int = 2
+    confirmation_window_sec: int = 180
+    recheck_after_sec: int = 60
+    confirmation_pending_blocks_entry: bool = True
+    hold_wait_until_recovered: bool = True
+    index_hard_risk_off_immediate: bool = True
+    global_risk_off_immediate: bool = True
+    source_conflict_blocks_entry: bool = True
+    unknown_market_uses_existing_strict_fallback: bool = True
+    extreme_breadth_risk_off_pct: float = 0.20
+    extreme_turnover_weighted_return_pct: float = -1.5
 
 
 @dataclass(frozen=True)
@@ -213,6 +233,7 @@ class ThemeLabConfig:
     position_adjustment: PositionAdjustmentConfig = field(default_factory=PositionAdjustmentConfig)
     market_side_gate: MarketSideGateConfig = field(default_factory=MarketSideGateConfig)
     market_side_breadth: MarketSideBreadthConfig = field(default_factory=MarketSideBreadthConfig)
+    market_side_gate_confirmation: MarketSideGateConfirmationConfig = field(default_factory=MarketSideGateConfirmationConfig)
 
 
 @dataclass(frozen=True)
@@ -324,13 +345,32 @@ class MarketStrengthSnapshot:
     kosdaq_turnover_weighted_return_pct: float | None = None
     side_breadth_data_quality_flags: tuple[str, ...] = ()
     side_breadth_reason_codes: tuple[str, ...] = ()
+    kospi_breadth_trust_level: str = ""
+    kosdaq_breadth_trust_level: str = ""
+    kospi_breadth_gate_usable: bool = False
+    kosdaq_breadth_gate_usable: bool = False
+    kospi_breadth_diagnostic_only: bool = False
+    kosdaq_breadth_diagnostic_only: bool = False
+    kospi_breadth_source_reason: str = ""
+    kosdaq_breadth_source_reason: str = ""
+    kospi_breadth_source_priority: int = 0
+    kosdaq_breadth_source_priority: int = 0
+    side_confirmation_states: dict[str, Any] = field(default_factory=dict)
+    kospi_raw_status: MarketStatus | None = None
+    kosdaq_raw_status: MarketStatus | None = None
+    kospi_confirmed_status: MarketStatus | None = None
+    kosdaq_confirmed_status: MarketStatus | None = None
+    kospi_confirmation_pending: bool = False
+    kosdaq_confirmation_pending: bool = False
+    kospi_recovery_pending: bool = False
+    kosdaq_recovery_pending: bool = False
 
     def status_for_side(self, side: MarketSide | str) -> MarketStatus | None:
         normalized = normalize_market_side(side)
         if normalized == MarketSide.KOSPI:
-            return self.kospi_status or self.market_status
+            return self.kospi_confirmed_status or self.kospi_status or self.market_status
         if normalized == MarketSide.KOSDAQ:
-            return self.kosdaq_status or self.market_status
+            return self.kosdaq_confirmed_status or self.kosdaq_status or self.market_status
         return None
 
     def index_return_for_side(self, side: MarketSide | str) -> float | None:
@@ -369,6 +409,26 @@ class WatchSetSnapshot:
     candidate_breadth_sample_count: int = 0
     candidate_breadth_source: str = ""
     candidate_valid_quote_ratio: float | None = None
+    candidate_breadth_trust_level: str = ""
+    candidate_breadth_gate_usable: bool = False
+    candidate_breadth_diagnostic_only: bool = False
+    candidate_market_raw_status: str = ""
+    candidate_market_confirmed_status: str = ""
+    candidate_market_confirmation_pending: bool = False
+    candidate_market_recovery_pending: bool = False
+    market_side_weak_consecutive_cycles: int = 0
+    market_side_risk_off_consecutive_cycles: int = 0
+    market_side_healthy_consecutive_cycles: int = 0
+    market_side_wait_started_at: str = ""
+    market_side_cycle_id: str = ""
+    market_side_last_confirmed_at: str = ""
+    market_side_last_recovered_at: str = ""
+    market_side_recovered_at: str = ""
+    market_side_cycles_to_recover: int = 0
+    market_side_recovered_to_ready: bool = False
+    market_side_never_recovered: bool = False
+    market_side_blocked_buy_intent_count: int = 0
+    market_side_recheck_after_sec: int = 0
     kospi_breadth_pct: float | None = None
     kosdaq_breadth_pct: float | None = None
     kospi_breadth_ready: bool = False
@@ -432,6 +492,26 @@ class LabGateDecision:
     candidate_breadth_sample_count: int = 0
     candidate_breadth_source: str = ""
     candidate_valid_quote_ratio: float | None = None
+    candidate_breadth_trust_level: str = ""
+    candidate_breadth_gate_usable: bool = False
+    candidate_breadth_diagnostic_only: bool = False
+    candidate_market_raw_status: str = ""
+    candidate_market_confirmed_status: str = ""
+    candidate_market_confirmation_pending: bool = False
+    candidate_market_recovery_pending: bool = False
+    market_side_weak_consecutive_cycles: int = 0
+    market_side_risk_off_consecutive_cycles: int = 0
+    market_side_healthy_consecutive_cycles: int = 0
+    market_side_wait_started_at: str = ""
+    market_side_cycle_id: str = ""
+    market_side_last_confirmed_at: str = ""
+    market_side_last_recovered_at: str = ""
+    market_side_recovered_at: str = ""
+    market_side_cycles_to_recover: int = 0
+    market_side_recovered_to_ready: bool = False
+    market_side_never_recovered: bool = False
+    market_side_blocked_buy_intent_count: int = 0
+    market_side_recheck_after_sec: int = 0
     kospi_breadth_pct: float | None = None
     kosdaq_breadth_pct: float | None = None
     kospi_breadth_ready: bool = False
@@ -757,6 +837,11 @@ class _SideBreadthStats:
     sample_count: int = 0
     total_count: int = 0
     source: str = ""
+    trust_level: str = ""
+    gate_usable: bool = False
+    diagnostic_only: bool = False
+    source_reason: str = ""
+    source_priority: int = 0
     advancing_count: int = 0
     declining_count: int = 0
     flat_count: int = 0
@@ -848,7 +933,13 @@ class MarketStrengthEngine:
                     "breadth_ready": kospi_stats.ready,
                     "breadth_sample_count": kospi_stats.sample_count,
                     "breadth_source": kospi_stats.source,
+                    "breadth_trust_level": kospi_stats.trust_level,
+                    "breadth_gate_usable": kospi_stats.gate_usable,
+                    "breadth_diagnostic_only": kospi_stats.diagnostic_only,
+                    "breadth_source_reason": kospi_stats.source_reason,
+                    "breadth_source_priority": kospi_stats.source_priority,
                     "valid_quote_ratio": kospi_stats.valid_quote_ratio,
+                    "turnover_weighted_return_pct": kospi_stats.turnover_weighted_return_pct,
                     "reason_codes": list(_dedupe_tuple(kospi_reason_codes + kospi_stats.reason_codes)),
                     "data_quality_flags": list(_dedupe_tuple(kospi_flags + kospi_stats.data_quality_flags)),
                 },
@@ -860,7 +951,13 @@ class MarketStrengthEngine:
                     "breadth_ready": kosdaq_stats.ready,
                     "breadth_sample_count": kosdaq_stats.sample_count,
                     "breadth_source": kosdaq_stats.source,
+                    "breadth_trust_level": kosdaq_stats.trust_level,
+                    "breadth_gate_usable": kosdaq_stats.gate_usable,
+                    "breadth_diagnostic_only": kosdaq_stats.diagnostic_only,
+                    "breadth_source_reason": kosdaq_stats.source_reason,
+                    "breadth_source_priority": kosdaq_stats.source_priority,
                     "valid_quote_ratio": kosdaq_stats.valid_quote_ratio,
+                    "turnover_weighted_return_pct": kosdaq_stats.turnover_weighted_return_pct,
                     "reason_codes": list(_dedupe_tuple(kosdaq_reason_codes + kosdaq_stats.reason_codes)),
                     "data_quality_flags": list(_dedupe_tuple(kosdaq_flags + kosdaq_stats.data_quality_flags)),
                 },
@@ -894,6 +991,20 @@ class MarketStrengthEngine:
             kosdaq_turnover_weighted_return_pct=kosdaq_stats.turnover_weighted_return_pct,
             side_breadth_data_quality_flags=side_flags,
             side_breadth_reason_codes=side_reason_codes,
+            kospi_breadth_trust_level=kospi_stats.trust_level,
+            kosdaq_breadth_trust_level=kosdaq_stats.trust_level,
+            kospi_breadth_gate_usable=kospi_stats.gate_usable,
+            kosdaq_breadth_gate_usable=kosdaq_stats.gate_usable,
+            kospi_breadth_diagnostic_only=kospi_stats.diagnostic_only,
+            kosdaq_breadth_diagnostic_only=kosdaq_stats.diagnostic_only,
+            kospi_breadth_source_reason=kospi_stats.source_reason,
+            kosdaq_breadth_source_reason=kosdaq_stats.source_reason,
+            kospi_breadth_source_priority=kospi_stats.source_priority,
+            kosdaq_breadth_source_priority=kosdaq_stats.source_priority,
+            kospi_raw_status=kospi_status,
+            kosdaq_raw_status=kosdaq_status,
+            kospi_confirmed_status=kospi_status,
+            kosdaq_confirmed_status=kosdaq_status,
         )
 
     def _status(
@@ -950,7 +1061,7 @@ class MarketStrengthEngine:
                     reason_codes.append("INDEX_WEAK_BREADTH_OK")
                 return MarketStatus.WEAK, tuple(["KOSDAQ_MARKET_WEAK"] + reason_codes), ()
 
-        if self.side_breadth_config.enabled and breadth.ready and breadth.breadth_pct is not None:
+        if self.side_breadth_config.enabled and breadth.ready and breadth.gate_usable and breadth.breadth_pct is not None:
             status, breadth_reasons = self._status_from_side_breadth(side, breadth, index_return_pct)
             return status, breadth_reasons, ()
 
@@ -1012,13 +1123,60 @@ class MarketStrengthEngine:
         calculated_at: str = "",
     ) -> dict[MarketSide, _SideBreadthStats]:
         buckets: dict[MarketSide, list[StockSnapshot]] = {MarketSide.KOSPI: [], MarketSide.KOSDAQ: []}
+        watch_buckets: dict[MarketSide, list[StockSnapshot]] = {MarketSide.KOSPI: [], MarketSide.KOSDAQ: []}
+        candidate_buckets: dict[MarketSide, list[StockSnapshot]] = {MarketSide.KOSPI: [], MarketSide.KOSDAQ: []}
         for snapshot in stock_values:
             side = _market_side_for_breadth_sample(snapshot, metadata_by_symbol)
             if side in buckets:
-                buckets[side].append(snapshot)
+                source = _breadth_universe_source(snapshot)
+                if source == "watch_universe":
+                    watch_buckets[side].append(snapshot)
+                elif source == "candidate_universe":
+                    candidate_buckets[side].append(snapshot)
+                else:
+                    buckets[side].append(snapshot)
+        symbol_buckets: dict[MarketSide, list[StockSnapshot]] = {MarketSide.KOSPI: [], MarketSide.KOSDAQ: []}
+        for snapshot in _symbol_master_quote_snapshots(metadata_by_symbol):
+            side = _market_side_for_breadth_sample(snapshot, metadata_by_symbol)
+            if side in symbol_buckets:
+                symbol_buckets[side].append(snapshot)
         return {
-            side: self._calculate_side_breadth(side, items, calculated_at=calculated_at)
-            for side, items in buckets.items()
+            side: self._resolve_side_breadth_source(
+                self._calculate_side_breadth(
+                    side,
+                    buckets[side],
+                    calculated_at=calculated_at,
+                    source="realtime_snapshot_universe",
+                    trust_level="HIGH",
+                    source_priority=1,
+                ),
+                self._calculate_side_breadth(
+                    side,
+                    symbol_buckets[side],
+                    calculated_at=calculated_at,
+                    source="symbol_master_quote_universe",
+                    trust_level="MEDIUM",
+                    source_priority=2,
+                ),
+                self._calculate_side_breadth(
+                    side,
+                    watch_buckets[side],
+                    calculated_at=calculated_at,
+                    source="watch_universe",
+                    trust_level="LOW",
+                    source_priority=3,
+                ),
+                self._calculate_side_breadth(
+                    side,
+                    candidate_buckets[side],
+                    calculated_at=calculated_at,
+                    source="candidate_universe",
+                    trust_level="DIAGNOSTIC_ONLY",
+                    source_priority=4,
+                    diagnostic_only=True,
+                ),
+            )
+            for side in (MarketSide.KOSPI, MarketSide.KOSDAQ)
         }
 
     def _calculate_side_breadth(
@@ -1027,9 +1185,12 @@ class MarketStrengthEngine:
         snapshots: list[StockSnapshot],
         *,
         calculated_at: str = "",
+        source: str = "realtime_snapshot_universe",
+        trust_level: str = "HIGH",
+        source_priority: int = 1,
+        diagnostic_only: bool = False,
     ) -> _SideBreadthStats:
         cfg = self.side_breadth_config
-        source = "SIDE_BREADTH_SOURCE_REALTIME_UNIVERSE" if snapshots else ""
         min_sample = cfg.min_sample_count_kospi if side == MarketSide.KOSPI else cfg.min_sample_count_kosdaq
         valid_items: list[StockSnapshot] = []
         stale_count = 0
@@ -1055,9 +1216,15 @@ class MarketStrengthEngine:
                 4,
             )
         breadth_pct = round(advancing / sample_count, 4) if sample_count else None
-        reason_codes: list[str] = [source] if source else []
+        reason_codes: list[str] = []
+        source_reason = _side_breadth_source_reason(source)
+        if source_reason:
+            reason_codes.append(source_reason)
         data_flags: list[str] = []
         if not snapshots:
+            source = "global_fallback"
+            trust_level = "LOW"
+            source_reason = "SIDE_BREADTH_FALLBACK_GLOBAL"
             reason_codes.append("SIDE_BREADTH_FALLBACK_GLOBAL")
             data_flags.append("SIDE_BREADTH_NOT_READY")
         if sample_count < min_sample:
@@ -1074,6 +1241,11 @@ class MarketStrengthEngine:
             and sample_count >= min_sample
             and valid_quote_ratio >= cfg.valid_quote_ratio_min
         )
+        gate_usable = ready and trust_level in {"HIGH", "MEDIUM"} and not diagnostic_only
+        if ready and trust_level == "LOW":
+            reason_codes.append("SIDE_BREADTH_LOW_TRUST")
+        if diagnostic_only or trust_level == "DIAGNOSTIC_ONLY":
+            reason_codes.append("SIDE_BREADTH_DIAGNOSTIC_ONLY")
         if not ready:
             data_flags.append("SIDE_BREADTH_NOT_READY")
         return _SideBreadthStats(
@@ -1083,6 +1255,11 @@ class MarketStrengthEngine:
             sample_count=sample_count,
             total_count=total_count,
             source=source,
+            trust_level=trust_level,
+            gate_usable=gate_usable,
+            diagnostic_only=diagnostic_only or trust_level == "DIAGNOSTIC_ONLY",
+            source_reason=source_reason,
+            source_priority=source_priority,
             advancing_count=advancing,
             declining_count=declining,
             flat_count=flat,
@@ -1095,6 +1272,43 @@ class MarketStrengthEngine:
             reason_codes=_dedupe_tuple(reason_codes),
             data_quality_flags=_dedupe_tuple(data_flags),
         )
+
+    def _resolve_side_breadth_source(
+        self,
+        *stats: _SideBreadthStats,
+    ) -> _SideBreadthStats:
+        if not stats:
+            raise ValueError("side breadth source candidates are required")
+        candidates = [item for item in stats if item.sample_count > 0]
+        if not candidates:
+            return stats[0]
+        selected = sorted(candidates, key=lambda item: (item.gate_usable, -item.source_priority), reverse=True)[0]
+        conflicts = [
+            other
+            for other in candidates
+            if other is not selected
+            and selected.breadth_pct is not None
+            and other.breadth_pct is not None
+            and abs(float(selected.breadth_pct) - float(other.breadth_pct)) >= self.side_breadth_config.side_breadth_source_conflict_threshold_pct
+        ]
+        if conflicts:
+            reason_codes = _dedupe_tuple(selected.reason_codes + ("SIDE_BREADTH_SOURCE_CONFLICT",))
+            data_flags = _dedupe_tuple(selected.data_quality_flags + ("SIDE_BREADTH_SOURCE_CONFLICT",))
+            gate_usable = selected.gate_usable
+            ready = selected.ready
+            if any(selected.trust_level == other.trust_level == "HIGH" for other in conflicts):
+                gate_usable = False
+                ready = False
+                reason_codes = _dedupe_tuple(reason_codes + ("WAIT_MARKET_CONFIRMATION_PENDING",))
+            return replace(
+                selected,
+                ready=ready,
+                gate_usable=gate_usable,
+                reason_codes=reason_codes,
+                data_quality_flags=data_flags,
+                source_reason="SIDE_BREADTH_SOURCE_CONFLICT",
+            )
+        return selected
 
     def _breadth_status(
         self,
@@ -1111,6 +1325,321 @@ class MarketStrengthEngine:
         if strong_count >= cfg.choppy_strong_count or advancers >= decliners:
             return MarketStatus.CHOPPY
         return MarketStatus.WEAK
+
+
+@dataclass
+class _MarketSideConfirmationState:
+    side: MarketSide
+    current_raw_status: MarketStatus = MarketStatus.CHOPPY
+    confirmed_status: MarketStatus = MarketStatus.CHOPPY
+    previous_confirmed_status: MarketStatus = MarketStatus.CHOPPY
+    weak_consecutive_cycles: int = 0
+    risk_off_consecutive_cycles: int = 0
+    healthy_consecutive_cycles: int = 0
+    last_status_changed_at: str = ""
+    last_confirmed_at: str = ""
+    last_recovered_at: str = ""
+    wait_started_at: str = ""
+    cycle_id: str = ""
+    confirmation_pending: bool = False
+    recovery_pending: bool = False
+    last_breadth_pct: float | None = None
+    last_index_return_pct: float | None = None
+    last_source: str = ""
+    last_trust_level: str = ""
+    last_data_quality_flags: tuple[str, ...] = ()
+    source_conflict: bool = False
+    reason_codes: tuple[str, ...] = ()
+    blocked_buy_intent_count: int = 0
+
+    def to_dict(self, *, recheck_after_sec: int) -> dict[str, Any]:
+        cycles_to_recover = 0
+        if self.last_recovered_at and self.healthy_consecutive_cycles:
+            cycles_to_recover = self.healthy_consecutive_cycles
+        return {
+            "side": self.side.value,
+            "current_raw_status": self.current_raw_status.value,
+            "confirmed_status": self.confirmed_status.value,
+            "previous_confirmed_status": self.previous_confirmed_status.value,
+            "weak_consecutive_cycles": self.weak_consecutive_cycles,
+            "risk_off_consecutive_cycles": self.risk_off_consecutive_cycles,
+            "healthy_consecutive_cycles": self.healthy_consecutive_cycles,
+            "last_status_changed_at": self.last_status_changed_at,
+            "last_confirmed_at": self.last_confirmed_at,
+            "last_recovered_at": self.last_recovered_at,
+            "wait_started_at": self.wait_started_at,
+            "cycle_id": self.cycle_id,
+            "confirmation_pending": self.confirmation_pending,
+            "recovery_pending": self.recovery_pending,
+            "last_breadth_pct": self.last_breadth_pct,
+            "last_index_return_pct": self.last_index_return_pct,
+            "last_source": self.last_source,
+            "last_trust_level": self.last_trust_level,
+            "last_data_quality_flags": list(self.last_data_quality_flags),
+            "source_conflict": self.source_conflict,
+            "reason_codes": list(self.reason_codes),
+            "recheck_after_sec": int(recheck_after_sec or 0),
+            "market_wait_started_at": self.wait_started_at,
+            "market_wait_recovered_at": self.last_recovered_at,
+            "cycles_to_recover": cycles_to_recover,
+            "recovered_to_ready": bool(self.last_recovered_at and not self.confirmation_pending and not self.recovery_pending),
+            "never_recovered": bool(self.wait_started_at and not self.last_recovered_at),
+            "blocked_buy_intent_count": self.blocked_buy_intent_count,
+        }
+
+
+class MarketSideConfirmationTracker:
+    def __init__(self, config: MarketSideGateConfirmationConfig | None = None) -> None:
+        self.config = config or MarketSideGateConfirmationConfig()
+        self._states: dict[MarketSide, _MarketSideConfirmationState] = {}
+
+    def apply(self, market: MarketStrengthSnapshot, *, calculated_at: str = "") -> MarketStrengthSnapshot:
+        if not self.config.enabled:
+            return market
+        side_statuses = {str(key): dict(value or {}) for key, value in dict(market.side_statuses or {}).items()}
+        side_confirmation_states: dict[str, Any] = {}
+        updates: dict[str, Any] = {}
+        for side in (MarketSide.KOSPI, MarketSide.KOSDAQ):
+            state = self._update_side(side, market, side_statuses.get(side.value) or {}, calculated_at)
+            self._states[side] = state
+            side_dict = state.to_dict(recheck_after_sec=self.config.recheck_after_sec)
+            side_confirmation_states[side.value] = side_dict
+            current_detail = dict(side_statuses.get(side.value) or {})
+            current_detail.update(
+                {
+                    "raw_status": state.current_raw_status.value,
+                    "confirmed_status": state.confirmed_status.value,
+                    "status": state.confirmed_status.value,
+                    "confirmation_pending": state.confirmation_pending,
+                    "recovery_pending": state.recovery_pending,
+                    "weak_consecutive_cycles": state.weak_consecutive_cycles,
+                    "risk_off_consecutive_cycles": state.risk_off_consecutive_cycles,
+                    "healthy_consecutive_cycles": state.healthy_consecutive_cycles,
+                    "wait_started_at": state.wait_started_at,
+                    "cycle_id": state.cycle_id,
+                    "last_confirmed_at": state.last_confirmed_at,
+                    "last_recovered_at": state.last_recovered_at,
+                    "recovered_at": state.last_recovered_at,
+                    "cycles_to_recover": side_dict.get("cycles_to_recover", 0),
+                    "recovered_to_ready": side_dict.get("recovered_to_ready", False),
+                    "never_recovered": side_dict.get("never_recovered", False),
+                    "blocked_buy_intent_count": state.blocked_buy_intent_count,
+                    "recheck_after_sec": self.config.recheck_after_sec,
+                    "reason_codes": list(
+                        _dedupe_tuple(tuple(current_detail.get("reason_codes") or ()) + state.reason_codes)
+                    ),
+                    "data_quality_flags": list(
+                        _dedupe_tuple(tuple(current_detail.get("data_quality_flags") or ()) + state.last_data_quality_flags)
+                    ),
+                }
+            )
+            side_statuses[side.value] = current_detail
+            prefix = side.value.lower()
+            updates[f"{prefix}_raw_status"] = state.current_raw_status
+            updates[f"{prefix}_confirmed_status"] = state.confirmed_status
+            updates[f"{prefix}_confirmation_pending"] = state.confirmation_pending
+            updates[f"{prefix}_recovery_pending"] = state.recovery_pending
+            updates[f"{prefix}_status"] = state.confirmed_status
+        reason_codes: list[str] = list(market.side_breadth_reason_codes or ())
+        data_flags: list[str] = list(market.side_breadth_data_quality_flags or ())
+        for state in self._states.values():
+            reason_codes.extend(state.reason_codes)
+            data_flags.extend(state.last_data_quality_flags)
+        return MarketStrengthSnapshot(
+            **{
+                **market.__dict__,
+                **updates,
+                "side_statuses": side_statuses,
+                "side_confirmation_states": side_confirmation_states,
+                "market_side_data_quality_flags": _dedupe_tuple(tuple(market.market_side_data_quality_flags or ()) + tuple(data_flags)),
+                "side_breadth_reason_codes": _dedupe_tuple(reason_codes),
+                "side_breadth_data_quality_flags": _dedupe_tuple(data_flags),
+            }
+        )
+
+    def _update_side(
+        self,
+        side: MarketSide,
+        market: MarketStrengthSnapshot,
+        side_detail: dict[str, Any],
+        calculated_at: str,
+    ) -> _MarketSideConfirmationState:
+        now_text = str(calculated_at or "")
+        previous = self._previous_state(side, market)
+        raw_status = self._raw_status_for_side(side, market, side_detail)
+        if self._outside_confirmation_window(previous, now_text):
+            base_status = raw_status if raw_status not in {MarketStatus.WEAK, MarketStatus.RISK_OFF} else MarketStatus.CHOPPY
+            previous = _MarketSideConfirmationState(side=side, confirmed_status=base_status, previous_confirmed_status=base_status)
+        if raw_status != previous.current_raw_status:
+            previous.weak_consecutive_cycles = 0
+            previous.risk_off_consecutive_cycles = 0
+            previous.healthy_consecutive_cycles = 0
+            previous.last_status_changed_at = now_text
+
+        source_conflict = "SIDE_BREADTH_SOURCE_CONFLICT" in set(side_detail.get("reason_codes") or ()) | set(side_detail.get("data_quality_flags") or ())
+        data_flags = _dedupe_tuple(tuple(side_detail.get("data_quality_flags") or ()))
+        reason_codes: list[str] = []
+        confirmed_status = previous.confirmed_status
+        wait_started_at = previous.wait_started_at
+        last_confirmed_at = previous.last_confirmed_at
+        last_recovered_at = previous.last_recovered_at
+        confirmation_pending = False
+        recovery_pending = False
+        blocked_buy_intent_count = previous.blocked_buy_intent_count
+        weak_cycles = previous.weak_consecutive_cycles
+        risk_off_cycles = previous.risk_off_consecutive_cycles
+        healthy_cycles = previous.healthy_consecutive_cycles
+
+        if source_conflict and self.config.source_conflict_blocks_entry:
+            confirmation_pending = True
+            reason_codes.extend(("SIDE_BREADTH_SOURCE_CONFLICT", "WAIT_MARKET_CONFIRMATION_PENDING"))
+            wait_started_at = wait_started_at or now_text
+        elif raw_status == MarketStatus.WEAK:
+            weak_cycles += 1
+            risk_off_cycles = 0
+            healthy_cycles = 0
+            required = max(1, int(self.config.weak_confirm_cycles or 1))
+            if weak_cycles >= required:
+                confirmed_status = MarketStatus.WEAK
+                last_confirmed_at = last_confirmed_at or now_text
+                wait_started_at = wait_started_at or now_text
+                reason_codes.extend(("MARKET_WEAK_CONFIRMED", "WAIT_CANDIDATE_MARKET_WEAK"))
+            else:
+                confirmation_pending = bool(self.config.confirmation_pending_blocks_entry)
+                wait_started_at = wait_started_at or now_text
+                reason_codes.extend(
+                    (
+                        "MARKET_WEAK_CONFIRMATION_PENDING",
+                        "CANDIDATE_MARKET_WEAK_UNCONFIRMED",
+                        "WAIT_MARKET_CONFIRMATION_PENDING",
+                    )
+                )
+        elif raw_status == MarketStatus.RISK_OFF:
+            weak_cycles = 0
+            risk_off_cycles += 1
+            healthy_cycles = 0
+            immediate = self._risk_off_immediate(market, side_detail) or self._extreme_risk_off(side_detail)
+            required = max(1, int(self.config.extreme_risk_off_confirm_cycles if immediate else self.config.risk_off_confirm_cycles))
+            if risk_off_cycles >= required:
+                confirmed_status = MarketStatus.RISK_OFF
+                last_confirmed_at = last_confirmed_at or now_text
+                wait_started_at = wait_started_at or now_text
+                reason_codes.extend(("MARKET_RISK_OFF_CONFIRMED", "WAIT_CANDIDATE_MARKET_RISK_OFF"))
+            else:
+                confirmation_pending = bool(self.config.confirmation_pending_blocks_entry)
+                wait_started_at = wait_started_at or now_text
+                reason_codes.extend(
+                    (
+                        "MARKET_RISK_OFF_CONFIRMATION_PENDING",
+                        "CANDIDATE_MARKET_RISK_OFF_UNCONFIRMED",
+                        "WAIT_MARKET_CONFIRMATION_PENDING",
+                    )
+                )
+        else:
+            weak_cycles = 0
+            risk_off_cycles = 0
+            if previous.confirmed_status in {MarketStatus.WEAK, MarketStatus.RISK_OFF} and self.config.hold_wait_until_recovered:
+                healthy_cycles += 1
+                required = max(1, int(self.config.recover_confirm_cycles or 1))
+                if healthy_cycles >= required:
+                    confirmed_status = raw_status
+                    wait_started_at = ""
+                    last_recovered_at = now_text
+                    last_confirmed_at = now_text
+                    reason_codes.extend(("MARKET_WAIT_RECOVERED", "MARKET_RECOVERY_CONFIRMED"))
+                else:
+                    confirmed_status = previous.confirmed_status
+                    recovery_pending = True
+                    wait_started_at = wait_started_at or previous.wait_started_at or now_text
+                    reason_codes.extend(
+                        (
+                            "MARKET_RECOVERY_CONFIRMATION_PENDING",
+                            "MARKET_WAIT_HYSTERESIS_HOLD",
+                            "WAIT_MARKET_RECOVERY_PENDING",
+                        )
+                    )
+            else:
+                healthy_cycles += 1
+                confirmed_status = raw_status
+                wait_started_at = ""
+                if previous.confirmation_pending or previous.recovery_pending:
+                    reason_codes.append("MARKET_WAIT_STATE_RESET")
+
+        blocks_entry = confirmation_pending or recovery_pending or confirmed_status in {MarketStatus.WEAK, MarketStatus.RISK_OFF}
+        if blocks_entry:
+            blocked_buy_intent_count += 1
+
+        return _MarketSideConfirmationState(
+            side=side,
+            current_raw_status=raw_status,
+            confirmed_status=confirmed_status,
+            previous_confirmed_status=previous.confirmed_status,
+            weak_consecutive_cycles=weak_cycles,
+            risk_off_consecutive_cycles=risk_off_cycles,
+            healthy_consecutive_cycles=healthy_cycles,
+            last_status_changed_at=previous.last_status_changed_at or now_text,
+            last_confirmed_at=last_confirmed_at,
+            last_recovered_at=last_recovered_at,
+            wait_started_at=wait_started_at,
+            cycle_id=now_text,
+            confirmation_pending=confirmation_pending,
+            recovery_pending=recovery_pending,
+            last_breadth_pct=_float_or_none(side_detail.get("breadth_pct")),
+            last_index_return_pct=_float_or_none(side_detail.get("index_return_pct")),
+            last_source=str(side_detail.get("breadth_source") or ""),
+            last_trust_level=str(side_detail.get("breadth_trust_level") or ""),
+            last_data_quality_flags=data_flags,
+            source_conflict=source_conflict,
+            reason_codes=_dedupe_tuple(reason_codes),
+            blocked_buy_intent_count=blocked_buy_intent_count,
+        )
+
+    def _previous_state(self, side: MarketSide, market: MarketStrengthSnapshot) -> _MarketSideConfirmationState:
+        existing = self._states.get(side)
+        if existing is not None:
+            return existing
+        raw = self._raw_status_for_side(side, market, dict((market.side_statuses or {}).get(side.value) or {}))
+        confirmed = raw if raw not in {MarketStatus.WEAK, MarketStatus.RISK_OFF} else MarketStatus.CHOPPY
+        return _MarketSideConfirmationState(side=side, current_raw_status=raw, confirmed_status=confirmed, previous_confirmed_status=confirmed)
+
+    def _raw_status_for_side(
+        self,
+        side: MarketSide,
+        market: MarketStrengthSnapshot,
+        side_detail: dict[str, Any],
+    ) -> MarketStatus:
+        if side == MarketSide.KOSPI:
+            value = market.kospi_raw_status or market.kospi_status
+        elif side == MarketSide.KOSDAQ:
+            value = market.kosdaq_raw_status or market.kosdaq_status
+        else:
+            value = None
+        return _market_status_from_value(side_detail.get("raw_status") or side_detail.get("status") or value or market.market_status)
+
+    def _outside_confirmation_window(self, previous: _MarketSideConfirmationState, calculated_at: str) -> bool:
+        window = int(self.config.confirmation_window_sec or 0)
+        if window <= 0 or not calculated_at or not previous.last_status_changed_at:
+            return False
+        now = _parse_datetime_or_none(calculated_at)
+        then = _parse_datetime_or_none(previous.last_status_changed_at)
+        if now is None or then is None:
+            return False
+        return (now.replace(tzinfo=None) - then.replace(tzinfo=None)).total_seconds() > window
+
+    def _risk_off_immediate(self, market: MarketStrengthSnapshot, side_detail: dict[str, Any]) -> bool:
+        if self.config.global_risk_off_immediate and market.market_status == MarketStatus.RISK_OFF:
+            return True
+        if not self.config.index_hard_risk_off_immediate:
+            return False
+        reasons = {str(code) for code in side_detail.get("reason_codes") or ()}
+        return bool(reasons & {"KOSPI_MARKET_RISK_OFF", "KOSDAQ_MARKET_RISK_OFF"})
+
+    def _extreme_risk_off(self, side_detail: dict[str, Any]) -> bool:
+        breadth = _float_or_none(side_detail.get("breadth_pct"))
+        if breadth is None or breadth > float(self.config.extreme_breadth_risk_off_pct):
+            return False
+        weighted = _float_or_none(side_detail.get("turnover_weighted_return_pct"))
+        return weighted is None or weighted <= float(self.config.extreme_turnover_weighted_return_pct)
 
 
 class WatchSetManager:
@@ -1809,6 +2338,7 @@ class ThemeLabFlowEngine:
     def __init__(self, config: ThemeLabConfig | None = None) -> None:
         self.config = config or ThemeLabConfig()
         self.market_engine = MarketStrengthEngine(self.config.market_status, self.config.market_side_breadth)
+        self.market_side_confirmation = MarketSideConfirmationTracker(self.config.market_side_gate_confirmation)
         self.breadth_engine = ThemeBreadthEngine(self.config)
         self.ranker = ThemeLabRanker()
         self.watchset_manager = WatchSetManager(self.config.watchset_limits)
@@ -1837,6 +2367,7 @@ class ThemeLabFlowEngine:
             kosdaq_return_pct=kosdaq_return_pct,
             calculated_at=calculated_at,
         )
+        market = self.market_side_confirmation.apply(market, calculated_at=calculated_at)
         themes = self.breadth_engine.calculate(
             theme_inputs,
             snapshots,
@@ -1912,6 +2443,36 @@ class ThemeLabFlowEngine:
                     "kosdaq_market_status": decision.kosdaq_market_status or enriched.kosdaq_market_status,
                     "kospi_return_pct": decision.kospi_return_pct if decision.kospi_return_pct is not None else enriched.kospi_return_pct,
                     "kosdaq_return_pct": decision.kosdaq_return_pct if decision.kosdaq_return_pct is not None else enriched.kosdaq_return_pct,
+                    "candidate_breadth_pct": decision.candidate_breadth_pct
+                    if decision.candidate_breadth_pct is not None
+                    else enriched.candidate_breadth_pct,
+                    "candidate_breadth_ready": decision.candidate_breadth_ready,
+                    "candidate_breadth_sample_count": decision.candidate_breadth_sample_count,
+                    "candidate_breadth_source": decision.candidate_breadth_source or enriched.candidate_breadth_source,
+                    "candidate_valid_quote_ratio": decision.candidate_valid_quote_ratio
+                    if decision.candidate_valid_quote_ratio is not None
+                    else enriched.candidate_valid_quote_ratio,
+                    "candidate_breadth_trust_level": decision.candidate_breadth_trust_level or enriched.candidate_breadth_trust_level,
+                    "candidate_breadth_gate_usable": decision.candidate_breadth_gate_usable,
+                    "candidate_breadth_diagnostic_only": decision.candidate_breadth_diagnostic_only,
+                    "candidate_market_raw_status": decision.candidate_market_raw_status or enriched.candidate_market_raw_status,
+                    "candidate_market_confirmed_status": decision.candidate_market_confirmed_status or enriched.candidate_market_confirmed_status,
+                    "candidate_market_confirmation_pending": decision.candidate_market_confirmation_pending,
+                    "candidate_market_recovery_pending": decision.candidate_market_recovery_pending,
+                    "market_side_weak_consecutive_cycles": decision.market_side_weak_consecutive_cycles,
+                    "market_side_risk_off_consecutive_cycles": decision.market_side_risk_off_consecutive_cycles,
+                    "market_side_healthy_consecutive_cycles": decision.market_side_healthy_consecutive_cycles,
+                    "market_side_wait_started_at": decision.market_side_wait_started_at or enriched.market_side_wait_started_at,
+                    "market_side_cycle_id": decision.market_side_cycle_id or enriched.market_side_cycle_id,
+                    "market_side_last_confirmed_at": decision.market_side_last_confirmed_at or enriched.market_side_last_confirmed_at,
+                    "market_side_last_recovered_at": decision.market_side_last_recovered_at or enriched.market_side_last_recovered_at,
+                    "market_side_recovered_at": decision.market_side_recovered_at or enriched.market_side_recovered_at,
+                    "market_side_cycles_to_recover": decision.market_side_cycles_to_recover or enriched.market_side_cycles_to_recover,
+                    "market_side_recovered_to_ready": decision.market_side_recovered_to_ready,
+                    "market_side_never_recovered": decision.market_side_never_recovered,
+                    "market_side_blocked_buy_intent_count": decision.market_side_blocked_buy_intent_count
+                    or enriched.market_side_blocked_buy_intent_count,
+                    "market_side_recheck_after_sec": decision.market_side_recheck_after_sec or enriched.market_side_recheck_after_sec,
                     "market_side_reason_codes": decision.market_side_reason_codes or enriched.market_side_reason_codes,
                     "market_side_data_quality_flags": decision.market_side_data_quality_flags or enriched.market_side_data_quality_flags,
                 }
@@ -1995,6 +2556,74 @@ def _market_side_for_breadth_sample(
             if side != MarketSide.UNKNOWN:
                 return side
     return MarketSide.UNKNOWN
+
+
+def _symbol_master_quote_snapshots(metadata_by_symbol: dict[str, InstrumentMetadata]) -> list[StockSnapshot]:
+    result: list[StockSnapshot] = []
+    seen: set[str] = set()
+    for key, metadata in metadata_by_symbol.items():
+        raw = dict(metadata.raw or {})
+        side = MarketSide.UNKNOWN
+        for market_key in ("market", "exchange", "market_type"):
+            side = normalize_market_side(raw.get(market_key))
+            if side != MarketSide.UNKNOWN:
+                break
+        if side == MarketSide.UNKNOWN:
+            continue
+        symbol = normalize_stock_code(metadata.symbol or key)
+        if not symbol or symbol in seen:
+            continue
+        change_rate = _first_float(raw, ("change_rate", "change_rate_pct", "return_pct", "quote_return_pct"))
+        current_price = _first_float(raw, ("current_price", "price", "last_price"))
+        if change_rate is None or current_price is None:
+            continue
+        seen.add(symbol)
+        result.append(
+            StockSnapshot(
+                stock_code=symbol,
+                stock_name=metadata.name,
+                current_price=float(current_price),
+                change_rate=float(change_rate),
+                turnover=float(_first_float(raw, ("turnover", "trade_value", "today_turnover_krw")) or metadata.today_turnover_krw or 0.0),
+                volume=int(_first_float(raw, ("volume", "recent_volume")) or metadata.recent_volume or 0),
+                ts=str(raw.get("ts") or raw.get("quote_ts") or raw.get("latest_tick_at") or ""),
+                updated_at=str(raw.get("updated_at") or raw.get("quote_ts") or raw.get("latest_tick_at") or ""),
+                metadata={
+                    **raw,
+                    "market": side.value,
+                },
+            )
+        )
+    return result
+
+
+def _side_breadth_source_reason(source: str) -> str:
+    return {
+        "realtime_snapshot_universe": "SIDE_BREADTH_SOURCE_REALTIME_UNIVERSE",
+        "symbol_master_quote_universe": "SIDE_BREADTH_SOURCE_SYMBOL_UNIVERSE",
+        "watch_universe": "SIDE_BREADTH_SOURCE_WATCH_UNIVERSE",
+        "candidate_universe": "SIDE_BREADTH_SOURCE_CANDIDATE_UNIVERSE",
+        "global_fallback": "SIDE_BREADTH_FALLBACK_GLOBAL",
+        "index_return_only": "SIDE_BREADTH_FALLBACK_INDEX_RETURN",
+    }.get(str(source or ""), "")
+
+
+def _breadth_universe_source(snapshot: StockSnapshot) -> str:
+    metadata = dict(snapshot.metadata or {})
+    raw_source = str(metadata.get("breadth_source") or metadata.get("universe_source") or "").strip().lower()
+    if raw_source in {"watch", "watch_universe", "watchlist"}:
+        return "watch_universe"
+    if raw_source in {"candidate", "candidate_universe", "candidates"}:
+        return "candidate_universe"
+    return "realtime_snapshot_universe"
+
+
+def _first_float(metadata: dict[str, Any], keys: Iterable[str]) -> float | None:
+    for key in keys:
+        value = _float_or_none(metadata.get(key))
+        if value is not None:
+            return value
+    return None
 
 
 def _quote_valid_for_breadth(snapshot: StockSnapshot, calculated_at: str, max_quote_age_sec: int) -> tuple[bool, str]:
@@ -2082,6 +2711,16 @@ def _market_status_value(status: MarketStatus | str | None) -> str:
     return str(status or "")
 
 
+def _market_status_from_value(status: MarketStatus | str | None) -> MarketStatus:
+    if isinstance(status, MarketStatus):
+        return status
+    text = str(status or "").strip().upper()
+    try:
+        return MarketStatus(text)
+    except ValueError:
+        return MarketStatus.CHOPPY
+
+
 def _dedupe_tuple(values: Iterable[str]) -> tuple[str, ...]:
     result: list[str] = []
     for value in values:
@@ -2098,7 +2737,12 @@ def _market_side_context(market: MarketStrengthSnapshot, watch: WatchSetSnapshot
     side_status = market.status_for_side(side)
     reason_codes = tuple(watch.market_side_reason_codes or ())
     side_detail = dict(market.side_statuses.get(side.value) or {}) if side != MarketSide.UNKNOWN else {}
-    reason_codes = _dedupe_tuple(reason_codes + tuple(side_detail.get("reason_codes") or ()))
+    side_state = dict(market.side_confirmation_states.get(side.value) or {}) if side != MarketSide.UNKNOWN else {}
+    reason_codes = _dedupe_tuple(
+        reason_codes
+        + tuple(side_detail.get("reason_codes") or ())
+        + tuple(side_state.get("reason_codes") or ())
+    )
     if side == MarketSide.UNKNOWN and "MARKET_CLASSIFICATION_MISSING" not in reason_codes:
         reason_codes = reason_codes + ("MARKET_CLASSIFICATION_MISSING",)
     data_quality_flags = _dedupe_tuple(
@@ -2106,11 +2750,14 @@ def _market_side_context(market: MarketStrengthSnapshot, watch: WatchSetSnapshot
         + tuple(market.market_side_data_quality_flags or ())
         + tuple(market.side_breadth_data_quality_flags or ())
         + tuple(side_detail.get("data_quality_flags") or ())
+        + tuple(side_state.get("last_data_quality_flags") or ())
     )
+    raw_status = str(side_state.get("current_raw_status") or side_detail.get("raw_status") or side_detail.get("status") or "")
+    confirmed_status = str(side_state.get("confirmed_status") or _market_status_value(side_status) or "")
     return {
         "candidate_market": side.value,
         "candidate_market_source": watch.candidate_market_source,
-        "candidate_market_status": _market_status_value(side_status) if side_status is not None else "UNKNOWN",
+        "candidate_market_status": confirmed_status or (_market_status_value(side_status) if side_status is not None else "UNKNOWN"),
         "candidate_market_action": "PASS" if side != MarketSide.UNKNOWN else "UNKNOWN_PASS",
         "candidate_index_return_pct": market.index_return_for_side(side),
         "global_market_status": _market_status_value(market.market_status),
@@ -2123,6 +2770,26 @@ def _market_side_context(market: MarketStrengthSnapshot, watch: WatchSetSnapshot
         "candidate_breadth_sample_count": int(side_detail.get("breadth_sample_count") or 0),
         "candidate_breadth_source": str(side_detail.get("breadth_source") or ""),
         "candidate_valid_quote_ratio": side_detail.get("valid_quote_ratio"),
+        "candidate_breadth_trust_level": str(side_detail.get("breadth_trust_level") or ""),
+        "candidate_breadth_gate_usable": bool(side_detail.get("breadth_gate_usable")),
+        "candidate_breadth_diagnostic_only": bool(side_detail.get("breadth_diagnostic_only")),
+        "candidate_market_raw_status": raw_status,
+        "candidate_market_confirmed_status": confirmed_status,
+        "candidate_market_confirmation_pending": bool(side_state.get("confirmation_pending")),
+        "candidate_market_recovery_pending": bool(side_state.get("recovery_pending")),
+        "market_side_weak_consecutive_cycles": int(side_state.get("weak_consecutive_cycles") or 0),
+        "market_side_risk_off_consecutive_cycles": int(side_state.get("risk_off_consecutive_cycles") or 0),
+        "market_side_healthy_consecutive_cycles": int(side_state.get("healthy_consecutive_cycles") or 0),
+        "market_side_wait_started_at": str(side_state.get("wait_started_at") or ""),
+        "market_side_cycle_id": str(side_state.get("cycle_id") or ""),
+        "market_side_last_confirmed_at": str(side_state.get("last_confirmed_at") or ""),
+        "market_side_last_recovered_at": str(side_state.get("last_recovered_at") or ""),
+        "market_side_recovered_at": str(side_state.get("market_wait_recovered_at") or side_state.get("last_recovered_at") or ""),
+        "market_side_cycles_to_recover": int(side_state.get("cycles_to_recover") or 0),
+        "market_side_recovered_to_ready": bool(side_state.get("recovered_to_ready")),
+        "market_side_never_recovered": bool(side_state.get("never_recovered")),
+        "market_side_blocked_buy_intent_count": int(side_state.get("blocked_buy_intent_count") or 0),
+        "market_side_recheck_after_sec": int(side_state.get("recheck_after_sec") or 0),
         "kospi_breadth_pct": market.kospi_breadth_pct,
         "kosdaq_breadth_pct": market.kosdaq_breadth_pct,
         "kospi_breadth_ready": market.kospi_breadth_ready,
@@ -2145,16 +2812,32 @@ def _candidate_market_wait_reasons(
         return ()
     side = normalize_market_side(watch.candidate_market)
     if side in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
-        status = market.status_for_side(side)
-        side_reasons = tuple((market.side_statuses.get(side.value) or {}).get("reason_codes") or ())
+        side_state = dict(market.side_confirmation_states.get(side.value) or {})
+        side_reasons = _dedupe_tuple(
+            tuple((market.side_statuses.get(side.value) or {}).get("reason_codes") or ())
+            + tuple(side_state.get("reason_codes") or ())
+        )
+        if side_state.get("source_conflict"):
+            return _dedupe_tuple(("WAIT_MARKET_CONFIRMATION_PENDING", "SIDE_BREADTH_SOURCE_CONFLICT") + side_reasons)
+        if side_state.get("confirmation_pending"):
+            return _dedupe_tuple(("WAIT_MARKET_CONFIRMATION_PENDING",) + side_reasons)
+        if side_state.get("recovery_pending"):
+            return _dedupe_tuple(("WAIT_MARKET_RECOVERY_PENDING", "MARKET_WAIT_HYSTERESIS_HOLD") + side_reasons)
+        status = _market_status_from_value(side_state.get("confirmed_status") or market.status_for_side(side))
         if status == MarketStatus.RISK_OFF:
             if str(config.risk_off_action).lower() != "temporary_wait":
                 return ()
-            return _dedupe_tuple(("CANDIDATE_MARKET_RISK_OFF", f"{side.value}_MARKET_RISK_OFF", "WAIT_MARKET_RECOVERY") + side_reasons)
+            return _dedupe_tuple(
+                ("CANDIDATE_MARKET_RISK_OFF", f"{side.value}_MARKET_RISK_OFF", "MARKET_RISK_OFF_CONFIRMED", "WAIT_CANDIDATE_MARKET_RISK_OFF")
+                + side_reasons
+            )
         if status == MarketStatus.WEAK:
             if str(config.weak_action).lower() != "temporary_wait":
                 return ()
-            return _dedupe_tuple(("CANDIDATE_MARKET_WEAK", f"{side.value}_MARKET_WEAK", "WAIT_MARKET_RECOVERY") + side_reasons)
+            return _dedupe_tuple(
+                ("CANDIDATE_MARKET_WEAK", f"{side.value}_MARKET_WEAK", "MARKET_WEAK_CONFIRMED", "WAIT_CANDIDATE_MARKET_WEAK")
+                + side_reasons
+            )
         return ()
 
     kospi_status = market.status_for_side(MarketSide.KOSPI)

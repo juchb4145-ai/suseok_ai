@@ -211,6 +211,64 @@ def test_candidate_market_weak_wait_is_recoverable_without_entry_plan_or_intent(
     assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 
 
+def test_market_confirmation_pending_wait_is_recoverable_without_entry_plan_or_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.WAIT,
+            PriceLocationStatus.GOOD_PULLBACK,
+            reasons=(
+                "WAIT_MARKET_CONFIRMATION_PENDING",
+                "MARKET_WEAK_CONFIRMATION_PENDING",
+                "CANDIDATE_MARKET_WEAK_UNCONFIRMED",
+            ),
+            candidate_market=MarketSide.KOSDAQ.value,
+            candidate_market_status=MarketStatus.CHOPPY.value,
+            candidate_market_raw_status=MarketStatus.WEAK.value,
+            candidate_market_confirmed_status=MarketStatus.CHOPPY.value,
+            candidate_market_confirmation_pending=True,
+            market_side_reason_codes=(
+                "WAIT_MARKET_CONFIRMATION_PENDING",
+                "MARKET_WEAK_CONFIRMATION_PENDING",
+                "CANDIDATE_MARKET_WEAK_UNCONFIRMED",
+            ),
+            candidate_breadth_pct=0.25,
+            candidate_breadth_ready=True,
+            candidate_breadth_sample_count=120,
+            candidate_breadth_trust_level="HIGH",
+            candidate_breadth_gate_usable=True,
+            market_side_weak_consecutive_cycles=1,
+            market_side_wait_started_at=NOW.isoformat(),
+            market_side_cycle_id=NOW.isoformat(),
+            market_side_never_recovered=True,
+            market_side_blocked_buy_intent_count=1,
+            market_side_recheck_after_sec=60,
+        ),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+    assert candidate.state == CandidateState.BLOCKED
+    assert candidate.block_type == BlockType.TEMPORARY
+    assert candidate.can_recover is True
+    assert details["sub_status"] == "WAIT_MARKET_CONFIRMATION_PENDING"
+    assert details["order_eligibility"] == "NOT_ELIGIBLE_MARKET"
+    assert details["candidate_market_confirmation_pending"] is True
+    assert details["candidate_market_raw_status"] == MarketStatus.WEAK.value
+    assert details["candidate_market_confirmed_status"] == MarketStatus.CHOPPY.value
+    assert details["market_side_weak_consecutive_cycles"] == 1
+    assert details["market_side_cycle_id"] == NOW.isoformat()
+    assert details["market_side_never_recovered"] is True
+    assert details["market_side_blocked_buy_intent_count"] == 1
+    assert "CANDIDATE_MARKET_WEAK_UNCONFIRMED" in details["reason_codes"]
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
 @pytest.mark.parametrize(
     ("status", "price_location", "expected_final"),
     [
@@ -677,10 +735,30 @@ def _flow_result(
     theme_name: str = "AI",
     candidate_market: str = MarketSide.KOSDAQ.value,
     candidate_market_status: str = MarketStatus.EXPANSION.value,
+    candidate_market_raw_status: str = "",
+    candidate_market_confirmed_status: str = "",
+    candidate_market_confirmation_pending: bool = False,
+    candidate_market_recovery_pending: bool = False,
     market_side_reason_codes: tuple[str, ...] | None = None,
     candidate_breadth_pct: float | None = None,
     candidate_breadth_ready: bool = False,
     candidate_breadth_sample_count: int = 0,
+    candidate_breadth_trust_level: str = "",
+    candidate_breadth_gate_usable: bool = False,
+    candidate_breadth_diagnostic_only: bool = False,
+    market_side_weak_consecutive_cycles: int = 0,
+    market_side_risk_off_consecutive_cycles: int = 0,
+    market_side_healthy_consecutive_cycles: int = 0,
+    market_side_wait_started_at: str = "",
+    market_side_cycle_id: str = "",
+    market_side_last_confirmed_at: str = "",
+    market_side_last_recovered_at: str = "",
+    market_side_recovered_at: str = "",
+    market_side_cycles_to_recover: int = 0,
+    market_side_recovered_to_ready: bool = False,
+    market_side_never_recovered: bool = False,
+    market_side_blocked_buy_intent_count: int = 0,
+    market_side_recheck_after_sec: int = 0,
 ) -> ThemeLabFlowResult:
     theme = ThemeConditionSnapshot(
         calculated_at=NOW.isoformat(),
@@ -730,6 +808,26 @@ def _flow_result(
         candidate_breadth_sample_count=candidate_breadth_sample_count,
         candidate_breadth_source="SIDE_BREADTH_SOURCE_REALTIME_UNIVERSE" if candidate_breadth_ready else "",
         candidate_valid_quote_ratio=1.0 if candidate_breadth_ready else None,
+        candidate_breadth_trust_level=candidate_breadth_trust_level,
+        candidate_breadth_gate_usable=candidate_breadth_gate_usable,
+        candidate_breadth_diagnostic_only=candidate_breadth_diagnostic_only,
+        candidate_market_raw_status=candidate_market_raw_status,
+        candidate_market_confirmed_status=candidate_market_confirmed_status,
+        candidate_market_confirmation_pending=candidate_market_confirmation_pending,
+        candidate_market_recovery_pending=candidate_market_recovery_pending,
+        market_side_weak_consecutive_cycles=market_side_weak_consecutive_cycles,
+        market_side_risk_off_consecutive_cycles=market_side_risk_off_consecutive_cycles,
+        market_side_healthy_consecutive_cycles=market_side_healthy_consecutive_cycles,
+        market_side_wait_started_at=market_side_wait_started_at,
+        market_side_cycle_id=market_side_cycle_id,
+        market_side_last_confirmed_at=market_side_last_confirmed_at,
+        market_side_last_recovered_at=market_side_last_recovered_at,
+        market_side_recovered_at=market_side_recovered_at,
+        market_side_cycles_to_recover=market_side_cycles_to_recover,
+        market_side_recovered_to_ready=market_side_recovered_to_ready,
+        market_side_never_recovered=market_side_never_recovered,
+        market_side_blocked_buy_intent_count=market_side_blocked_buy_intent_count,
+        market_side_recheck_after_sec=market_side_recheck_after_sec,
         market_side_reason_codes=market_side_reason_codes
         if market_side_reason_codes is not None
         else (reasons if any("MARKET" in reason for reason in reasons) else ()),
@@ -761,6 +859,26 @@ def _flow_result(
         candidate_breadth_sample_count=candidate_breadth_sample_count,
         candidate_breadth_source="SIDE_BREADTH_SOURCE_REALTIME_UNIVERSE" if candidate_breadth_ready else "",
         candidate_valid_quote_ratio=1.0 if candidate_breadth_ready else None,
+        candidate_breadth_trust_level=candidate_breadth_trust_level,
+        candidate_breadth_gate_usable=candidate_breadth_gate_usable,
+        candidate_breadth_diagnostic_only=candidate_breadth_diagnostic_only,
+        candidate_market_raw_status=candidate_market_raw_status,
+        candidate_market_confirmed_status=candidate_market_confirmed_status,
+        candidate_market_confirmation_pending=candidate_market_confirmation_pending,
+        candidate_market_recovery_pending=candidate_market_recovery_pending,
+        market_side_weak_consecutive_cycles=market_side_weak_consecutive_cycles,
+        market_side_risk_off_consecutive_cycles=market_side_risk_off_consecutive_cycles,
+        market_side_healthy_consecutive_cycles=market_side_healthy_consecutive_cycles,
+        market_side_wait_started_at=market_side_wait_started_at,
+        market_side_cycle_id=market_side_cycle_id,
+        market_side_last_confirmed_at=market_side_last_confirmed_at,
+        market_side_last_recovered_at=market_side_last_recovered_at,
+        market_side_recovered_at=market_side_recovered_at,
+        market_side_cycles_to_recover=market_side_cycles_to_recover,
+        market_side_recovered_to_ready=market_side_recovered_to_ready,
+        market_side_never_recovered=market_side_never_recovered,
+        market_side_blocked_buy_intent_count=market_side_blocked_buy_intent_count,
+        market_side_recheck_after_sec=market_side_recheck_after_sec,
         market_side_reason_codes=market_side_reason_codes
         if market_side_reason_codes is not None
         else (reasons if any("MARKET" in reason for reason in reasons) else ()),

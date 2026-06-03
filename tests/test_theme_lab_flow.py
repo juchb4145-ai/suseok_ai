@@ -7,6 +7,7 @@ from trading.theme_engine.lab import (
     MarketStatus,
     MarketSide,
     MarketSideBreadthConfig,
+    MarketSideGateConfirmationConfig,
     MarketStrengthSnapshot,
     MarketStrengthEngine,
     PositionAdjustmentConfig,
@@ -334,6 +335,26 @@ def test_side_breadth_valid_quote_ratio_low_falls_back_to_index_return():
     assert market.kosdaq_status == MarketStatus.CHOPPY
 
 
+def test_candidate_universe_side_breadth_is_diagnostic_only_not_gate_usable():
+    market = MarketStrengthEngine(
+        side_breadth_config=MarketSideBreadthConfig(min_sample_count_kosdaq=2, valid_quote_ratio_min=0.5)
+    ).calculate(
+        [
+            _snapshot("000001", -2.0, current_price=98, metadata={"market": "KOSDAQ", "breadth_source": "candidate_universe"}),
+            _snapshot("000002", -1.5, current_price=98.5, metadata={"market": "KOSDAQ", "breadth_source": "candidate_universe"}),
+        ],
+        kosdaq_return_pct=0.2,
+    )
+
+    assert market.kosdaq_breadth_ready is True
+    assert market.kosdaq_breadth_source == "candidate_universe"
+    assert market.kosdaq_breadth_trust_level == "DIAGNOSTIC_ONLY"
+    assert market.kosdaq_breadth_gate_usable is False
+    assert market.kosdaq_breadth_diagnostic_only is True
+    assert "SIDE_BREADTH_DIAGNOSTIC_ONLY" in market.side_breadth_reason_codes
+    assert market.kosdaq_status == MarketStatus.CHOPPY
+
+
 def test_candidate_side_market_gate_blocks_only_matching_weak_side():
     theme = _leading_theme()
     market = MarketStrengthSnapshot(
@@ -468,6 +489,192 @@ def test_ready_small_is_blocked_when_candidate_side_market_is_weak():
 
     assert decision.status == LabGateStatus.WAIT
     assert "KOSDAQ_MARKET_WEAK" in decision.reason_codes
+
+
+def test_market_side_weak_first_cycle_waits_for_confirmation():
+    engine = ThemeLabFlowEngine(
+        ThemeLabConfig(
+            watchset_limits=WatchSetLimits(max_watchset_size=10, max_watch_per_theme=5, top_theme_count=3),
+            theme_status=ThemeStatusThresholds(min_strong_count_for_leading=1, min_leader_count_for_leading=1),
+            market_side_breadth=MarketSideBreadthConfig(
+                min_sample_count_kosdaq=4,
+                min_sample_count_kospi=2,
+                breadth_weak_pct=0.38,
+                breadth_risk_off_pct=0.20,
+            ),
+            market_side_gate_confirmation=MarketSideGateConfirmationConfig(weak_confirm_cycles=2, recover_confirm_cycles=2),
+        )
+    )
+
+    result = engine.run_pipeline(
+        theme_inputs=[("ai", "AI", [_member("ai", "000001"), _member("ai", "000002"), _member("ai", "000003"), _member("ai", "000004")])],
+        snapshots=_kosdaq_weak_snapshots(),
+        kospi_return_pct=0.2,
+        kosdaq_return_pct=0.0,
+        calculated_at="2026-06-01T09:05:00",
+    )
+    decision = next(item for item in result.gate_decisions if item.symbol == "000001")
+
+    assert result.market.kosdaq_raw_status == MarketStatus.WEAK
+    assert result.market.kosdaq_confirmed_status != MarketStatus.WEAK
+    assert decision.status == LabGateStatus.WAIT
+    assert decision.candidate_market_confirmation_pending is True
+    assert "WAIT_MARKET_CONFIRMATION_PENDING" in decision.reason_codes
+    assert "CANDIDATE_MARKET_WEAK_UNCONFIRMED" in decision.reason_codes
+    assert "WAIT_CANDIDATE_MARKET_WEAK" not in decision.reason_codes
+
+
+def test_market_side_weak_second_cycle_confirms_candidate_wait():
+    engine = ThemeLabFlowEngine(
+        ThemeLabConfig(
+            watchset_limits=WatchSetLimits(max_watchset_size=10, max_watch_per_theme=5, top_theme_count=3),
+            theme_status=ThemeStatusThresholds(min_strong_count_for_leading=1, min_leader_count_for_leading=1),
+            market_side_breadth=MarketSideBreadthConfig(
+                min_sample_count_kosdaq=4,
+                min_sample_count_kospi=2,
+                breadth_weak_pct=0.38,
+                breadth_risk_off_pct=0.20,
+            ),
+            market_side_gate_confirmation=MarketSideGateConfirmationConfig(weak_confirm_cycles=2, recover_confirm_cycles=2),
+        )
+    )
+    engine.run_pipeline(
+        theme_inputs=[("ai", "AI", [_member("ai", "000001"), _member("ai", "000002"), _member("ai", "000003"), _member("ai", "000004")])],
+        snapshots=_kosdaq_weak_snapshots(),
+        kospi_return_pct=0.2,
+        kosdaq_return_pct=0.0,
+        calculated_at="2026-06-01T09:05:00",
+    )
+
+    result = engine.run_pipeline(
+        theme_inputs=[("ai", "AI", [_member("ai", "000001"), _member("ai", "000002"), _member("ai", "000003"), _member("ai", "000004")])],
+        snapshots=_kosdaq_weak_snapshots(),
+        kospi_return_pct=0.2,
+        kosdaq_return_pct=0.0,
+        calculated_at="2026-06-01T09:06:00",
+    )
+    decision = next(item for item in result.gate_decisions if item.symbol == "000001")
+
+    assert result.market.kosdaq_confirmed_status == MarketStatus.WEAK
+    assert result.market.side_confirmation_states[MarketSide.KOSDAQ.value]["weak_consecutive_cycles"] == 2
+    assert decision.status == LabGateStatus.WAIT
+    assert decision.candidate_market_confirmation_pending is False
+    assert "WAIT_CANDIDATE_MARKET_WEAK" in decision.reason_codes
+    assert "MARKET_WEAK_CONFIRMED" in decision.reason_codes
+
+
+def test_market_side_index_hard_risk_off_confirms_immediately():
+    engine = ThemeLabFlowEngine(
+        ThemeLabConfig(
+            watchset_limits=WatchSetLimits(max_watchset_size=10, max_watch_per_theme=5, top_theme_count=3),
+            theme_status=ThemeStatusThresholds(min_strong_count_for_leading=1, min_leader_count_for_leading=1),
+            market_side_breadth=MarketSideBreadthConfig(min_sample_count_kosdaq=4, min_sample_count_kospi=2),
+            market_side_gate_confirmation=MarketSideGateConfirmationConfig(risk_off_confirm_cycles=2),
+        )
+    )
+
+    result = engine.run_pipeline(
+        theme_inputs=[("ai", "AI", [_member("ai", "000001"), _member("ai", "000002"), _member("ai", "000003"), _member("ai", "000004")])],
+        snapshots=_kosdaq_weak_snapshots(),
+        kospi_return_pct=0.2,
+        kosdaq_return_pct=-3.0,
+        calculated_at="2026-06-01T09:05:00",
+    )
+    decision = next(item for item in result.gate_decisions if item.symbol == "000001")
+
+    assert result.market.kosdaq_confirmed_status == MarketStatus.RISK_OFF
+    assert decision.candidate_market_confirmation_pending is False
+    assert "WAIT_CANDIDATE_MARKET_RISK_OFF" in decision.reason_codes
+    assert "MARKET_RISK_OFF_CONFIRMED" in decision.reason_codes
+
+
+def test_market_side_recovery_requires_confirmed_healthy_cycles():
+    engine = ThemeLabFlowEngine(
+        ThemeLabConfig(
+            watchset_limits=WatchSetLimits(max_watchset_size=10, max_watch_per_theme=5, top_theme_count=3),
+            theme_status=ThemeStatusThresholds(min_strong_count_for_leading=1, min_leader_count_for_leading=1),
+            market_side_breadth=MarketSideBreadthConfig(
+                min_sample_count_kosdaq=4,
+                min_sample_count_kospi=2,
+                breadth_weak_pct=0.38,
+                breadth_risk_off_pct=0.20,
+            ),
+            market_side_gate_confirmation=MarketSideGateConfirmationConfig(weak_confirm_cycles=2, recover_confirm_cycles=2),
+        )
+    )
+    theme_inputs = [("ai", "AI", [_member("ai", "000001"), _member("ai", "000002"), _member("ai", "000003"), _member("ai", "000004")])]
+    engine.run_pipeline(theme_inputs=theme_inputs, snapshots=_kosdaq_weak_snapshots(), calculated_at="2026-06-01T09:05:00")
+    engine.run_pipeline(theme_inputs=theme_inputs, snapshots=_kosdaq_weak_snapshots(), calculated_at="2026-06-01T09:06:00")
+
+    pending = engine.run_pipeline(
+        theme_inputs=theme_inputs,
+        snapshots=_kosdaq_healthy_snapshots(),
+        kospi_return_pct=0.2,
+        kosdaq_return_pct=0.2,
+        calculated_at="2026-06-01T09:07:00",
+    )
+    pending_decision = next(item for item in pending.gate_decisions if item.symbol == "000001")
+    recovered = engine.run_pipeline(
+        theme_inputs=theme_inputs,
+        snapshots=_kosdaq_healthy_snapshots(),
+        kospi_return_pct=0.2,
+        kosdaq_return_pct=0.2,
+        calculated_at="2026-06-01T09:08:00",
+    )
+    recovered_decision = next(item for item in recovered.gate_decisions if item.symbol == "000001")
+
+    assert pending_decision.status == LabGateStatus.WAIT
+    assert pending_decision.candidate_market_recovery_pending is True
+    assert "WAIT_MARKET_RECOVERY_PENDING" in pending_decision.reason_codes
+    assert "MARKET_WAIT_HYSTERESIS_HOLD" in pending_decision.reason_codes
+    assert recovered.market.kosdaq_confirmed_status in {MarketStatus.EXPANSION, MarketStatus.SELECTIVE, MarketStatus.CHOPPY}
+    assert recovered_decision.candidate_market_recovery_pending is False
+    assert "WAIT_MARKET_RECOVERY_PENDING" not in recovered_decision.reason_codes
+    assert "MARKET_RECOVERY_CONFIRMED" in recovered_decision.market_side_reason_codes
+    assert recovered_decision.market_side_last_recovered_at == "2026-06-01T09:08:00"
+
+
+def test_side_breadth_source_conflict_blocks_entry_as_confirmation_pending():
+    engine = ThemeLabFlowEngine(
+        ThemeLabConfig(
+            watchset_limits=WatchSetLimits(max_watchset_size=10, max_watch_per_theme=5, top_theme_count=3),
+            theme_status=ThemeStatusThresholds(min_strong_count_for_leading=1, min_leader_count_for_leading=1),
+            market_side_breadth=MarketSideBreadthConfig(
+                min_sample_count_kosdaq=4,
+                min_sample_count_kospi=2,
+                side_breadth_source_conflict_threshold_pct=0.15,
+            ),
+            market_side_gate_confirmation=MarketSideGateConfirmationConfig(source_conflict_blocks_entry=True),
+        )
+    )
+    metadata = {
+        f"00000{i}": InstrumentMetadata(
+            symbol=f"00000{i}",
+            raw={
+                "market": "KOSDAQ",
+                "current_price": 100,
+                "change_rate": -1.0,
+                "turnover": 1_000_000,
+            },
+        )
+        for i in range(1, 5)
+    }
+
+    result = engine.run_pipeline(
+        theme_inputs=[("ai", "AI", [_member("ai", "000001"), _member("ai", "000002"), _member("ai", "000003"), _member("ai", "000004")])],
+        snapshots=_kosdaq_healthy_snapshots(),
+        metadata_by_symbol=metadata,
+        kospi_return_pct=0.2,
+        kosdaq_return_pct=0.2,
+        calculated_at="2026-06-01T09:05:00",
+    )
+    decision = next(item for item in result.gate_decisions if item.symbol == "000001")
+
+    assert "SIDE_BREADTH_SOURCE_CONFLICT" in result.market.side_breadth_reason_codes
+    assert decision.status == LabGateStatus.WAIT
+    assert decision.candidate_market_confirmation_pending is True
+    assert "WAIT_MARKET_CONFIRMATION_PENDING" in decision.reason_codes
+    assert "SIDE_BREADTH_SOURCE_CONFLICT" in decision.reason_codes
 
 
 def test_watchset_infers_candidate_market_from_snapshot_metadata():
@@ -964,6 +1171,28 @@ def test_ready_small_has_position_multiplier_below_one():
 
     assert decision.status == LabGateStatus.READY_SMALL
     assert 0 < decision.position_size_multiplier < 1.0
+
+
+def _kosdaq_weak_snapshots() -> list[StockSnapshot]:
+    return [
+        _snapshot("000001", 5.0, current_price=105, session_high=108, turnover=5_000_000, metadata={"market": "KOSDAQ", "prev_close": 100}),
+        _snapshot("000002", -1.0, current_price=99, turnover=4_000_000, metadata={"market": "KOSDAQ", "prev_close": 100}),
+        _snapshot("000003", -1.2, current_price=98.8, turnover=3_000_000, metadata={"market": "KOSDAQ", "prev_close": 100}),
+        _snapshot("000004", -0.7, current_price=99.3, turnover=2_000_000, metadata={"market": "KOSDAQ", "prev_close": 100}),
+        _snapshot("100001", 0.5, current_price=100.5, metadata={"market": "KOSPI", "prev_close": 100}),
+        _snapshot("100002", 0.2, current_price=100.2, metadata={"market": "KOSPI", "prev_close": 100}),
+    ]
+
+
+def _kosdaq_healthy_snapshots() -> list[StockSnapshot]:
+    return [
+        _snapshot("000001", 5.0, current_price=105, session_high=108, turnover=5_000_000, metadata={"market": "KOSDAQ", "prev_close": 100}),
+        _snapshot("000002", 1.0, current_price=101, turnover=4_000_000, metadata={"market": "KOSDAQ", "prev_close": 100}),
+        _snapshot("000003", 1.2, current_price=101.2, turnover=3_000_000, metadata={"market": "KOSDAQ", "prev_close": 100}),
+        _snapshot("000004", 0.7, current_price=100.7, turnover=2_000_000, metadata={"market": "KOSDAQ", "prev_close": 100}),
+        _snapshot("100001", 0.5, current_price=100.5, metadata={"market": "KOSPI", "prev_close": 100}),
+        _snapshot("100002", 0.2, current_price=100.2, metadata={"market": "KOSPI", "prev_close": 100}),
+    ]
 
 
 def _member(theme_id: str, code: str) -> ThemeMembership:
