@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any, Iterable
 
@@ -137,6 +138,26 @@ class MarketSideGateConfig:
 
 
 @dataclass(frozen=True)
+class MarketSideBreadthConfig:
+    enabled: bool = True
+    min_sample_count_kospi: int = 80
+    min_sample_count_kosdaq: int = 120
+    max_quote_age_sec: int = 60
+    advancing_threshold_pct: float = 0.0
+    declining_threshold_pct: float = 0.0
+    strong_return_threshold_pct: float = 1.0
+    weak_return_threshold_pct: float = -1.0
+    breadth_weak_pct: float = 0.38
+    breadth_risk_off_pct: float = 0.28
+    breadth_expansion_pct: float = 0.58
+    valid_quote_ratio_min: float = 0.60
+    use_turnover_weighted_return: bool = True
+    fallback_to_index_return: bool = True
+    fallback_to_global_breadth: bool = True
+    candidate_universe_fallback_gate_weight: str = "diagnostic_only"
+
+
+@dataclass(frozen=True)
 class TradeabilityRiskConfig:
     vi_cooldown_sec: int = 180
     leader_max_buy_return_pct: float = 15.0
@@ -191,6 +212,7 @@ class ThemeLabConfig:
     price_location: PriceLocationConfig = field(default_factory=PriceLocationConfig)
     position_adjustment: PositionAdjustmentConfig = field(default_factory=PositionAdjustmentConfig)
     market_side_gate: MarketSideGateConfig = field(default_factory=MarketSideGateConfig)
+    market_side_breadth: MarketSideBreadthConfig = field(default_factory=MarketSideBreadthConfig)
 
 
 @dataclass(frozen=True)
@@ -274,6 +296,34 @@ class MarketStrengthSnapshot:
     kosdaq_index_ready: bool = True
     side_statuses: dict[str, Any] = field(default_factory=dict)
     market_side_data_quality_flags: tuple[str, ...] = ()
+    kospi_breadth_pct: float | None = None
+    kosdaq_breadth_pct: float | None = None
+    kospi_breadth_ready: bool = False
+    kosdaq_breadth_ready: bool = False
+    kospi_breadth_sample_count: int = 0
+    kosdaq_breadth_sample_count: int = 0
+    kospi_breadth_source: str = ""
+    kosdaq_breadth_source: str = ""
+    kospi_advancing_count: int = 0
+    kosdaq_advancing_count: int = 0
+    kospi_declining_count: int = 0
+    kosdaq_declining_count: int = 0
+    kospi_flat_count: int = 0
+    kosdaq_flat_count: int = 0
+    kospi_strong_count: int = 0
+    kosdaq_strong_count: int = 0
+    kospi_weak_count: int = 0
+    kosdaq_weak_count: int = 0
+    kospi_stale_count: int = 0
+    kosdaq_stale_count: int = 0
+    kospi_valid_quote_ratio: float = 0.0
+    kosdaq_valid_quote_ratio: float = 0.0
+    kospi_turnover_sum: float = 0.0
+    kosdaq_turnover_sum: float = 0.0
+    kospi_turnover_weighted_return_pct: float | None = None
+    kosdaq_turnover_weighted_return_pct: float | None = None
+    side_breadth_data_quality_flags: tuple[str, ...] = ()
+    side_breadth_reason_codes: tuple[str, ...] = ()
 
     def status_for_side(self, side: MarketSide | str) -> MarketStatus | None:
         normalized = normalize_market_side(side)
@@ -314,6 +364,19 @@ class WatchSetSnapshot:
     kosdaq_market_status: str = ""
     kospi_return_pct: float | None = None
     kosdaq_return_pct: float | None = None
+    candidate_breadth_pct: float | None = None
+    candidate_breadth_ready: bool = False
+    candidate_breadth_sample_count: int = 0
+    candidate_breadth_source: str = ""
+    candidate_valid_quote_ratio: float | None = None
+    kospi_breadth_pct: float | None = None
+    kosdaq_breadth_pct: float | None = None
+    kospi_breadth_ready: bool = False
+    kosdaq_breadth_ready: bool = False
+    kospi_breadth_sample_count: int = 0
+    kosdaq_breadth_sample_count: int = 0
+    kospi_valid_quote_ratio: float | None = None
+    kosdaq_valid_quote_ratio: float | None = None
     market_side_reason_codes: tuple[str, ...] = ()
     market_side_data_quality_flags: tuple[str, ...] = ()
     gate_status: LabGateStatus = LabGateStatus.OBSERVE
@@ -364,6 +427,19 @@ class LabGateDecision:
     kosdaq_market_status: str = ""
     kospi_return_pct: float | None = None
     kosdaq_return_pct: float | None = None
+    candidate_breadth_pct: float | None = None
+    candidate_breadth_ready: bool = False
+    candidate_breadth_sample_count: int = 0
+    candidate_breadth_source: str = ""
+    candidate_valid_quote_ratio: float | None = None
+    kospi_breadth_pct: float | None = None
+    kosdaq_breadth_pct: float | None = None
+    kospi_breadth_ready: bool = False
+    kosdaq_breadth_ready: bool = False
+    kospi_breadth_sample_count: int = 0
+    kosdaq_breadth_sample_count: int = 0
+    kospi_valid_quote_ratio: float | None = None
+    kosdaq_valid_quote_ratio: float | None = None
     market_side_reason_codes: tuple[str, ...] = ()
     market_side_data_quality_flags: tuple[str, ...] = ()
 
@@ -673,20 +749,53 @@ class ThemeLabRanker:
         return ranked[:top_n] if top_n is not None else ranked
 
 
+@dataclass(frozen=True)
+class _SideBreadthStats:
+    side: MarketSide
+    breadth_pct: float | None = None
+    ready: bool = False
+    sample_count: int = 0
+    total_count: int = 0
+    source: str = ""
+    advancing_count: int = 0
+    declining_count: int = 0
+    flat_count: int = 0
+    strong_count: int = 0
+    weak_count: int = 0
+    stale_count: int = 0
+    valid_quote_ratio: float = 0.0
+    turnover_sum: float = 0.0
+    turnover_weighted_return_pct: float | None = None
+    reason_codes: tuple[str, ...] = ()
+    data_quality_flags: tuple[str, ...] = ()
+
+
 class MarketStrengthEngine:
-    def __init__(self, config: MarketStatusThresholds | None = None) -> None:
+    def __init__(
+        self,
+        config: MarketStatusThresholds | None = None,
+        side_breadth_config: MarketSideBreadthConfig | None = None,
+    ) -> None:
         self.config = config or MarketStatusThresholds()
+        self.side_breadth_config = side_breadth_config or MarketSideBreadthConfig()
 
     def calculate(
         self,
         snapshots: dict[str, StockSnapshot] | list[StockSnapshot],
         *,
+        metadata_by_symbol: dict[str, InstrumentMetadata] | None = None,
         kospi_return_pct: float = 0.0,
         kosdaq_return_pct: float = 0.0,
+        calculated_at: str = "",
     ) -> MarketStrengthSnapshot:
-        values = list(_snapshot_map(snapshots).values())
+        snapshot_map = _snapshot_map(snapshots)
+        values = list(snapshot_map.values())
         unique = {normalize_stock_code(item.stock_code): item for item in values if normalize_stock_code(item.stock_code)}
         stock_values = list(unique.values())
+        metadata_map = _metadata_map(metadata_by_symbol or {})
+        side_stats = self._side_breadth_stats(stock_values, metadata_map, calculated_at=calculated_at)
+        kospi_stats = side_stats[MarketSide.KOSPI]
+        kosdaq_stats = side_stats[MarketSide.KOSDAQ]
         advancers = sum(1 for item in stock_values if item.change_rate > 0)
         decliners = sum(1 for item in stock_values if item.change_rate < 0)
         strong_count = sum(1 for item in stock_values if item.change_rate >= 3.0)
@@ -696,6 +805,7 @@ class MarketStrengthEngine:
         kospi_status, kospi_reason_codes, kospi_flags = self._side_status(
             MarketSide.KOSPI,
             kospi_return_pct,
+            kospi_stats,
             strong_count,
             leader_count,
             advancers,
@@ -704,12 +814,14 @@ class MarketStrengthEngine:
         kosdaq_status, kosdaq_reason_codes, kosdaq_flags = self._side_status(
             MarketSide.KOSDAQ,
             kosdaq_return_pct,
+            kosdaq_stats,
             strong_count,
             leader_count,
             advancers,
             decliners,
         )
-        side_flags = _dedupe_tuple(kospi_flags + kosdaq_flags)
+        side_flags = _dedupe_tuple(kospi_flags + kosdaq_flags + kospi_stats.data_quality_flags + kosdaq_stats.data_quality_flags)
+        side_reason_codes = _dedupe_tuple(kospi_reason_codes + kosdaq_reason_codes + kospi_stats.reason_codes + kosdaq_stats.reason_codes)
         rounded_kospi = round(kospi_return_pct, 4)
         rounded_kosdaq = round(kosdaq_return_pct, 4)
         return MarketStrengthSnapshot(
@@ -732,18 +844,56 @@ class MarketStrengthEngine:
                     "status": kospi_status.value,
                     "index_return_pct": rounded_kospi,
                     "index_return_ready": True,
-                    "reason_codes": list(kospi_reason_codes),
-                    "data_quality_flags": list(kospi_flags),
+                    "breadth_pct": kospi_stats.breadth_pct,
+                    "breadth_ready": kospi_stats.ready,
+                    "breadth_sample_count": kospi_stats.sample_count,
+                    "breadth_source": kospi_stats.source,
+                    "valid_quote_ratio": kospi_stats.valid_quote_ratio,
+                    "reason_codes": list(_dedupe_tuple(kospi_reason_codes + kospi_stats.reason_codes)),
+                    "data_quality_flags": list(_dedupe_tuple(kospi_flags + kospi_stats.data_quality_flags)),
                 },
                 MarketSide.KOSDAQ.value: {
                     "status": kosdaq_status.value,
                     "index_return_pct": rounded_kosdaq,
                     "index_return_ready": True,
-                    "reason_codes": list(kosdaq_reason_codes),
-                    "data_quality_flags": list(kosdaq_flags),
+                    "breadth_pct": kosdaq_stats.breadth_pct,
+                    "breadth_ready": kosdaq_stats.ready,
+                    "breadth_sample_count": kosdaq_stats.sample_count,
+                    "breadth_source": kosdaq_stats.source,
+                    "valid_quote_ratio": kosdaq_stats.valid_quote_ratio,
+                    "reason_codes": list(_dedupe_tuple(kosdaq_reason_codes + kosdaq_stats.reason_codes)),
+                    "data_quality_flags": list(_dedupe_tuple(kosdaq_flags + kosdaq_stats.data_quality_flags)),
                 },
             },
             market_side_data_quality_flags=side_flags,
+            kospi_breadth_pct=kospi_stats.breadth_pct,
+            kosdaq_breadth_pct=kosdaq_stats.breadth_pct,
+            kospi_breadth_ready=kospi_stats.ready,
+            kosdaq_breadth_ready=kosdaq_stats.ready,
+            kospi_breadth_sample_count=kospi_stats.sample_count,
+            kosdaq_breadth_sample_count=kosdaq_stats.sample_count,
+            kospi_breadth_source=kospi_stats.source,
+            kosdaq_breadth_source=kosdaq_stats.source,
+            kospi_advancing_count=kospi_stats.advancing_count,
+            kosdaq_advancing_count=kosdaq_stats.advancing_count,
+            kospi_declining_count=kospi_stats.declining_count,
+            kosdaq_declining_count=kosdaq_stats.declining_count,
+            kospi_flat_count=kospi_stats.flat_count,
+            kosdaq_flat_count=kosdaq_stats.flat_count,
+            kospi_strong_count=kospi_stats.strong_count,
+            kosdaq_strong_count=kosdaq_stats.strong_count,
+            kospi_weak_count=kospi_stats.weak_count,
+            kosdaq_weak_count=kosdaq_stats.weak_count,
+            kospi_stale_count=kospi_stats.stale_count,
+            kosdaq_stale_count=kosdaq_stats.stale_count,
+            kospi_valid_quote_ratio=kospi_stats.valid_quote_ratio,
+            kosdaq_valid_quote_ratio=kosdaq_stats.valid_quote_ratio,
+            kospi_turnover_sum=round(kospi_stats.turnover_sum, 4),
+            kosdaq_turnover_sum=round(kosdaq_stats.turnover_sum, 4),
+            kospi_turnover_weighted_return_pct=kospi_stats.turnover_weighted_return_pct,
+            kosdaq_turnover_weighted_return_pct=kosdaq_stats.turnover_weighted_return_pct,
+            side_breadth_data_quality_flags=side_flags,
+            side_breadth_reason_codes=side_reason_codes,
         )
 
     def _status(
@@ -772,25 +922,179 @@ class MarketStrengthEngine:
         self,
         side: MarketSide,
         index_return_pct: float,
+        breadth: _SideBreadthStats,
         strong_count: int,
         leader_count: int,
         advancers: int,
         decliners: int,
     ) -> tuple[MarketStatus, tuple[str, ...], tuple[str, ...]]:
         cfg = self.config
+        reason_codes: list[str] = []
+        data_quality: list[str] = []
         if side == MarketSide.KOSPI:
             if index_return_pct <= cfg.risk_off_kospi_pct:
-                return MarketStatus.RISK_OFF, ("KOSPI_MARKET_RISK_OFF",), ()
+                if breadth.ready and breadth.breadth_pct is not None and breadth.breadth_pct > self.side_breadth_config.breadth_weak_pct:
+                    reason_codes.append("INDEX_WEAK_BREADTH_OK")
+                return MarketStatus.RISK_OFF, tuple(["KOSPI_MARKET_RISK_OFF"] + reason_codes), ()
             if index_return_pct <= cfg.weak_kospi_pct:
-                return MarketStatus.WEAK, ("KOSPI_MARKET_WEAK",), ()
+                if breadth.ready and breadth.breadth_pct is not None and breadth.breadth_pct > self.side_breadth_config.breadth_weak_pct:
+                    reason_codes.append("INDEX_WEAK_BREADTH_OK")
+                return MarketStatus.WEAK, tuple(["KOSPI_MARKET_WEAK"] + reason_codes), ()
         elif side == MarketSide.KOSDAQ:
             if index_return_pct <= cfg.risk_off_kosdaq_pct:
-                return MarketStatus.RISK_OFF, ("KOSDAQ_MARKET_RISK_OFF",), ()
+                if breadth.ready and breadth.breadth_pct is not None and breadth.breadth_pct > self.side_breadth_config.breadth_weak_pct:
+                    reason_codes.append("INDEX_WEAK_BREADTH_OK")
+                return MarketStatus.RISK_OFF, tuple(["KOSDAQ_MARKET_RISK_OFF"] + reason_codes), ()
             if index_return_pct <= cfg.weak_kosdaq_pct:
-                return MarketStatus.WEAK, ("KOSDAQ_MARKET_WEAK",), ()
+                if breadth.ready and breadth.breadth_pct is not None and breadth.breadth_pct > self.side_breadth_config.breadth_weak_pct:
+                    reason_codes.append("INDEX_WEAK_BREADTH_OK")
+                return MarketStatus.WEAK, tuple(["KOSDAQ_MARKET_WEAK"] + reason_codes), ()
+
+        if self.side_breadth_config.enabled and breadth.ready and breadth.breadth_pct is not None:
+            status, breadth_reasons = self._status_from_side_breadth(side, breadth, index_return_pct)
+            return status, breadth_reasons, ()
+
+        if self.side_breadth_config.enabled:
+            data_quality.append("SIDE_BREADTH_NOT_READY")
+            if str(self.side_breadth_config.fallback_to_index_return).lower() == "true":
+                return self._index_return_side_status(side, index_return_pct), ("SIDE_BREADTH_FALLBACK_INDEX_RETURN",), tuple(data_quality)
+            if str(self.side_breadth_config.fallback_to_global_breadth).lower() == "true":
+                status = self._breadth_status(strong_count, leader_count, advancers, decliners)
+                return status, ("SIDE_BREADTH_FALLBACK_GLOBAL",), tuple(data_quality)
 
         status = self._breadth_status(strong_count, leader_count, advancers, decliners)
         return status, (), ("SIDE_BREADTH_FALLBACK_GLOBAL",)
+
+    def _index_return_side_status(self, side: MarketSide, index_return_pct: float) -> MarketStatus:
+        cfg = self.config
+        if side == MarketSide.KOSPI:
+            if index_return_pct <= cfg.risk_off_kospi_pct:
+                return MarketStatus.RISK_OFF
+            if index_return_pct <= cfg.weak_kospi_pct:
+                return MarketStatus.WEAK
+        if side == MarketSide.KOSDAQ:
+            if index_return_pct <= cfg.risk_off_kosdaq_pct:
+                return MarketStatus.RISK_OFF
+            if index_return_pct <= cfg.weak_kosdaq_pct:
+                return MarketStatus.WEAK
+        return MarketStatus.CHOPPY
+
+    def _status_from_side_breadth(
+        self,
+        side: MarketSide,
+        breadth: _SideBreadthStats,
+        index_return_pct: float,
+    ) -> tuple[MarketStatus, tuple[str, ...]]:
+        cfg = self.side_breadth_config
+        side_prefix = side.value
+        breadth_pct = float(breadth.breadth_pct or 0.0)
+        if breadth_pct <= cfg.breadth_risk_off_pct:
+            return MarketStatus.RISK_OFF, (
+                f"{side_prefix}_SIDE_BREADTH_RISK_OFF",
+                "SIDE_BREADTH_WEAK_INDEX_OK",
+            )
+        if breadth_pct <= cfg.breadth_weak_pct:
+            return MarketStatus.WEAK, (
+                f"{side_prefix}_SIDE_BREADTH_WEAK",
+                "SIDE_BREADTH_WEAK_INDEX_OK",
+            )
+        if breadth_pct >= cfg.breadth_expansion_pct and breadth.strong_count > 0:
+            return MarketStatus.EXPANSION, (f"{side_prefix}_SIDE_BREADTH_EXPANSION",)
+        if breadth.strong_count > 0 or (breadth.turnover_weighted_return_pct or 0.0) > 0:
+            return MarketStatus.SELECTIVE, (f"{side_prefix}_SIDE_BREADTH_SELECTIVE",)
+        return MarketStatus.CHOPPY, (f"{side_prefix}_SIDE_BREADTH_CHOPPY",)
+
+    def _side_breadth_stats(
+        self,
+        stock_values: Iterable[StockSnapshot],
+        metadata_by_symbol: dict[str, InstrumentMetadata],
+        *,
+        calculated_at: str = "",
+    ) -> dict[MarketSide, _SideBreadthStats]:
+        buckets: dict[MarketSide, list[StockSnapshot]] = {MarketSide.KOSPI: [], MarketSide.KOSDAQ: []}
+        for snapshot in stock_values:
+            side = _market_side_for_breadth_sample(snapshot, metadata_by_symbol)
+            if side in buckets:
+                buckets[side].append(snapshot)
+        return {
+            side: self._calculate_side_breadth(side, items, calculated_at=calculated_at)
+            for side, items in buckets.items()
+        }
+
+    def _calculate_side_breadth(
+        self,
+        side: MarketSide,
+        snapshots: list[StockSnapshot],
+        *,
+        calculated_at: str = "",
+    ) -> _SideBreadthStats:
+        cfg = self.side_breadth_config
+        source = "SIDE_BREADTH_SOURCE_REALTIME_UNIVERSE" if snapshots else ""
+        min_sample = cfg.min_sample_count_kospi if side == MarketSide.KOSPI else cfg.min_sample_count_kosdaq
+        valid_items: list[StockSnapshot] = []
+        stale_count = 0
+        for snapshot in snapshots:
+            valid, reason = _quote_valid_for_breadth(snapshot, calculated_at, cfg.max_quote_age_sec)
+            if valid:
+                valid_items.append(snapshot)
+            elif reason == "STALE_QUOTE":
+                stale_count += 1
+        total_count = len(snapshots)
+        sample_count = len(valid_items)
+        valid_quote_ratio = round(sample_count / total_count, 4) if total_count else 0.0
+        advancing = sum(1 for item in valid_items if item.change_rate > cfg.advancing_threshold_pct)
+        declining = sum(1 for item in valid_items if item.change_rate < cfg.declining_threshold_pct)
+        flat = max(0, sample_count - advancing - declining)
+        strong = sum(1 for item in valid_items if item.change_rate >= cfg.strong_return_threshold_pct)
+        weak = sum(1 for item in valid_items if item.change_rate <= cfg.weak_return_threshold_pct)
+        turnover_sum = sum(max(0.0, float(item.turnover or 0.0)) for item in valid_items)
+        weighted_return = None
+        if cfg.use_turnover_weighted_return and turnover_sum > 0:
+            weighted_return = round(
+                sum(max(0.0, float(item.turnover or 0.0)) * float(item.change_rate or 0.0) for item in valid_items) / turnover_sum,
+                4,
+            )
+        breadth_pct = round(advancing / sample_count, 4) if sample_count else None
+        reason_codes: list[str] = [source] if source else []
+        data_flags: list[str] = []
+        if not snapshots:
+            reason_codes.append("SIDE_BREADTH_FALLBACK_GLOBAL")
+            data_flags.append("SIDE_BREADTH_NOT_READY")
+        if sample_count < min_sample:
+            reason_codes.append("SIDE_BREADTH_SAMPLE_TOO_SMALL")
+            data_flags.append("SIDE_BREADTH_SAMPLE_TOO_SMALL")
+        if total_count and valid_quote_ratio < cfg.valid_quote_ratio_min:
+            reason_codes.append("SIDE_BREADTH_VALID_QUOTE_RATIO_LOW")
+            data_flags.append("SIDE_BREADTH_VALID_QUOTE_RATIO_LOW")
+        if stale_count:
+            data_flags.append("STALE_QUOTE")
+        ready = (
+            cfg.enabled
+            and bool(snapshots)
+            and sample_count >= min_sample
+            and valid_quote_ratio >= cfg.valid_quote_ratio_min
+        )
+        if not ready:
+            data_flags.append("SIDE_BREADTH_NOT_READY")
+        return _SideBreadthStats(
+            side=side,
+            breadth_pct=breadth_pct,
+            ready=ready,
+            sample_count=sample_count,
+            total_count=total_count,
+            source=source,
+            advancing_count=advancing,
+            declining_count=declining,
+            flat_count=flat,
+            strong_count=strong,
+            weak_count=weak,
+            stale_count=stale_count,
+            valid_quote_ratio=valid_quote_ratio,
+            turnover_sum=turnover_sum,
+            turnover_weighted_return_pct=weighted_return,
+            reason_codes=_dedupe_tuple(reason_codes),
+            data_quality_flags=_dedupe_tuple(data_flags),
+        )
 
     def _breadth_status(
         self,
@@ -1504,7 +1808,7 @@ class ThemeLabHybridGate:
 class ThemeLabFlowEngine:
     def __init__(self, config: ThemeLabConfig | None = None) -> None:
         self.config = config or ThemeLabConfig()
-        self.market_engine = MarketStrengthEngine(self.config.market_status)
+        self.market_engine = MarketStrengthEngine(self.config.market_status, self.config.market_side_breadth)
         self.breadth_engine = ThemeBreadthEngine(self.config)
         self.ranker = ThemeLabRanker()
         self.watchset_manager = WatchSetManager(self.config.watchset_limits)
@@ -1526,7 +1830,13 @@ class ThemeLabFlowEngine:
         kosdaq_return_pct: float = 0.0,
         calculated_at: str = "",
     ) -> ThemeLabFlowResult:
-        market = self.market_engine.calculate(snapshots, kospi_return_pct=kospi_return_pct, kosdaq_return_pct=kosdaq_return_pct)
+        market = self.market_engine.calculate(
+            snapshots,
+            metadata_by_symbol=metadata_by_symbol,
+            kospi_return_pct=kospi_return_pct,
+            kosdaq_return_pct=kosdaq_return_pct,
+            calculated_at=calculated_at,
+        )
         themes = self.breadth_engine.calculate(
             theme_inputs,
             snapshots,
@@ -1613,7 +1923,10 @@ class ThemeLabFlowEngine:
             themes=tuple(ranked_themes),
             watchset=tuple(enriched_watchset),
             gate_decisions=tuple(decisions),
-            data_quality=_quality_summary(ranked_themes),
+            data_quality={
+                **_quality_summary(ranked_themes),
+                **_market_classification_summary(enriched_watchset, decisions),
+            },
         )
 
 
@@ -1662,6 +1975,65 @@ def normalize_market_side(value: Any) -> MarketSide:
     if "KOSPI" in text:
         return MarketSide.KOSPI
     return MarketSide.UNKNOWN
+
+
+def _market_side_for_breadth_sample(
+    snapshot: StockSnapshot,
+    metadata_by_symbol: dict[str, InstrumentMetadata],
+) -> MarketSide:
+    symbol = normalize_stock_code(snapshot.stock_code)
+    metadata = dict(snapshot.metadata or {})
+    for key in ("market", "exchange", "market_type"):
+        side = normalize_market_side(metadata.get(key))
+        if side != MarketSide.UNKNOWN:
+            return side
+    instrument = metadata_by_symbol.get(symbol) or metadata_by_symbol.get(snapshot.stock_code)
+    if instrument is not None:
+        raw = dict(instrument.raw or {})
+        for key in ("market", "exchange", "market_type"):
+            side = normalize_market_side(raw.get(key))
+            if side != MarketSide.UNKNOWN:
+                return side
+    return MarketSide.UNKNOWN
+
+
+def _quote_valid_for_breadth(snapshot: StockSnapshot, calculated_at: str, max_quote_age_sec: int) -> tuple[bool, str]:
+    metadata = dict(snapshot.metadata or {})
+    if _metadata_bool(metadata, "stale_quote") or _metadata_bool(metadata, "quote_stale") or _metadata_bool(metadata, "latest_tick_stale"):
+        return False, "STALE_QUOTE"
+    if _positive_float_or_none(snapshot.current_price) is None and _positive_float_or_none(metadata.get("current_price")) is None:
+        return False, "MISSING_CURRENT_PRICE"
+    age = _quote_age_sec(snapshot, metadata, calculated_at)
+    if age is not None and age > max_quote_age_sec:
+        return False, "STALE_QUOTE"
+    return True, ""
+
+
+def _quote_age_sec(snapshot: StockSnapshot, metadata: dict[str, Any], calculated_at: str) -> float | None:
+    raw_age = metadata.get("quote_age_sec") or metadata.get("latest_tick_age_sec")
+    if raw_age not in (None, ""):
+        try:
+            return max(0.0, float(raw_age))
+        except (TypeError, ValueError):
+            return None
+    now = _parse_datetime_or_none(calculated_at)
+    raw_ts = metadata.get("quote_ts") or metadata.get("tick_ts") or metadata.get("latest_tick_at") or snapshot.updated_at or snapshot.ts
+    ts = _parse_datetime_or_none(raw_ts)
+    if now is None or ts is None:
+        return None
+    return max(0.0, (now.replace(tzinfo=None) - ts.replace(tzinfo=None)).total_seconds())
+
+
+def _parse_datetime_or_none(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def _infer_candidate_market(
@@ -1725,8 +2097,16 @@ def _market_side_context(market: MarketStrengthSnapshot, watch: WatchSetSnapshot
     kosdaq_status = market.status_for_side(MarketSide.KOSDAQ)
     side_status = market.status_for_side(side)
     reason_codes = tuple(watch.market_side_reason_codes or ())
+    side_detail = dict(market.side_statuses.get(side.value) or {}) if side != MarketSide.UNKNOWN else {}
+    reason_codes = _dedupe_tuple(reason_codes + tuple(side_detail.get("reason_codes") or ()))
     if side == MarketSide.UNKNOWN and "MARKET_CLASSIFICATION_MISSING" not in reason_codes:
         reason_codes = reason_codes + ("MARKET_CLASSIFICATION_MISSING",)
+    data_quality_flags = _dedupe_tuple(
+        tuple(watch.market_side_data_quality_flags or ())
+        + tuple(market.market_side_data_quality_flags or ())
+        + tuple(market.side_breadth_data_quality_flags or ())
+        + tuple(side_detail.get("data_quality_flags") or ())
+    )
     return {
         "candidate_market": side.value,
         "candidate_market_source": watch.candidate_market_source,
@@ -1738,10 +2118,21 @@ def _market_side_context(market: MarketStrengthSnapshot, watch: WatchSetSnapshot
         "kosdaq_market_status": _market_status_value(kosdaq_status),
         "kospi_return_pct": market.index_return_for_side(MarketSide.KOSPI),
         "kosdaq_return_pct": market.index_return_for_side(MarketSide.KOSDAQ),
+        "candidate_breadth_pct": side_detail.get("breadth_pct"),
+        "candidate_breadth_ready": bool(side_detail.get("breadth_ready")),
+        "candidate_breadth_sample_count": int(side_detail.get("breadth_sample_count") or 0),
+        "candidate_breadth_source": str(side_detail.get("breadth_source") or ""),
+        "candidate_valid_quote_ratio": side_detail.get("valid_quote_ratio"),
+        "kospi_breadth_pct": market.kospi_breadth_pct,
+        "kosdaq_breadth_pct": market.kosdaq_breadth_pct,
+        "kospi_breadth_ready": market.kospi_breadth_ready,
+        "kosdaq_breadth_ready": market.kosdaq_breadth_ready,
+        "kospi_breadth_sample_count": market.kospi_breadth_sample_count,
+        "kosdaq_breadth_sample_count": market.kosdaq_breadth_sample_count,
+        "kospi_valid_quote_ratio": market.kospi_valid_quote_ratio,
+        "kosdaq_valid_quote_ratio": market.kosdaq_valid_quote_ratio,
         "market_side_reason_codes": reason_codes,
-        "market_side_data_quality_flags": _dedupe_tuple(
-            tuple(watch.market_side_data_quality_flags or ()) + tuple(market.market_side_data_quality_flags or ())
-        ),
+        "market_side_data_quality_flags": data_quality_flags,
     }
 
 
@@ -1755,14 +2146,15 @@ def _candidate_market_wait_reasons(
     side = normalize_market_side(watch.candidate_market)
     if side in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
         status = market.status_for_side(side)
+        side_reasons = tuple((market.side_statuses.get(side.value) or {}).get("reason_codes") or ())
         if status == MarketStatus.RISK_OFF:
             if str(config.risk_off_action).lower() != "temporary_wait":
                 return ()
-            return ("CANDIDATE_MARKET_RISK_OFF", f"{side.value}_MARKET_RISK_OFF", "WAIT_MARKET_RECOVERY")
+            return _dedupe_tuple(("CANDIDATE_MARKET_RISK_OFF", f"{side.value}_MARKET_RISK_OFF", "WAIT_MARKET_RECOVERY") + side_reasons)
         if status == MarketStatus.WEAK:
             if str(config.weak_action).lower() != "temporary_wait":
                 return ()
-            return ("CANDIDATE_MARKET_WEAK", f"{side.value}_MARKET_WEAK", "WAIT_MARKET_RECOVERY")
+            return _dedupe_tuple(("CANDIDATE_MARKET_WEAK", f"{side.value}_MARKET_WEAK", "WAIT_MARKET_RECOVERY") + side_reasons)
         return ()
 
     kospi_status = market.status_for_side(MarketSide.KOSPI)
@@ -2156,3 +2548,31 @@ def _quality_summary(themes: Iterable[ThemeConditionSnapshot]) -> dict[str, int]
             if "STALE_QUOTE" in hit.data_quality_flags:
                 summary["stale_quote_count"] += 1
     return summary
+
+
+def _market_classification_summary(
+    watchset: Iterable[WatchSetSnapshot],
+    decisions: Iterable[LabGateDecision],
+) -> dict[str, int | float]:
+    watch_items = list(watchset)
+    decision_items = list(decisions)
+    total = len(watch_items)
+    unknown = sum(1 for item in watch_items if normalize_market_side(item.candidate_market) == MarketSide.UNKNOWN)
+    unknown_wait = sum(
+        1
+        for item in decision_items
+        if normalize_market_side(item.candidate_market) == MarketSide.UNKNOWN and item.status == LabGateStatus.WAIT
+    )
+    ready_possible = sum(
+        1
+        for item in decision_items
+        if normalize_market_side(item.candidate_market) == MarketSide.UNKNOWN
+        and item.status in {LabGateStatus.READY, LabGateStatus.READY_SMALL, LabGateStatus.OBSERVE}
+    )
+    return {
+        "market_classification_total_count": total,
+        "market_classification_unknown_count": unknown,
+        "market_classification_unknown_ratio": round(unknown / total, 4) if total else 0.0,
+        "unknown_market_wait_count": unknown_wait,
+        "unknown_market_ready_possible_count": ready_possible,
+    }

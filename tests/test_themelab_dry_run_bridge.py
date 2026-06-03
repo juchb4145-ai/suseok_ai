@@ -181,6 +181,10 @@ def test_candidate_market_weak_wait_is_recoverable_without_entry_plan_or_intent(
             reasons=("CANDIDATE_MARKET_WEAK", "KOSDAQ_MARKET_WEAK", "WAIT_MARKET_RECOVERY"),
             candidate_market=MarketSide.KOSDAQ.value,
             candidate_market_status=MarketStatus.WEAK.value,
+            market_side_reason_codes=("KOSDAQ_SIDE_BREADTH_WEAK", "SIDE_BREADTH_WEAK_INDEX_OK"),
+            candidate_breadth_pct=0.25,
+            candidate_breadth_ready=True,
+            candidate_breadth_sample_count=120,
         ),
         dry_run_orders=True,
     )
@@ -198,7 +202,11 @@ def test_candidate_market_weak_wait_is_recoverable_without_entry_plan_or_intent(
     assert details["order_eligibility"] == "NOT_ELIGIBLE_MARKET"
     assert details["candidate_market"] == MarketSide.KOSDAQ.value
     assert details["candidate_market_status"] == MarketStatus.WEAK.value
+    assert details["candidate_breadth_pct"] == 0.25
+    assert details["candidate_breadth_ready"] is True
+    assert details["candidate_breadth_sample_count"] == 120
     assert "KOSDAQ_MARKET_WEAK" in details["reason_codes"]
+    assert "KOSDAQ_SIDE_BREADTH_WEAK" in details["market_side_reason_codes"]
     assert db.list_entry_plans(candidate.id) == []
     assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 
@@ -669,6 +677,10 @@ def _flow_result(
     theme_name: str = "AI",
     candidate_market: str = MarketSide.KOSDAQ.value,
     candidate_market_status: str = MarketStatus.EXPANSION.value,
+    market_side_reason_codes: tuple[str, ...] | None = None,
+    candidate_breadth_pct: float | None = None,
+    candidate_breadth_ready: bool = False,
+    candidate_breadth_sample_count: int = 0,
 ) -> ThemeLabFlowResult:
     theme = ThemeConditionSnapshot(
         calculated_at=NOW.isoformat(),
@@ -713,7 +725,14 @@ def _flow_result(
         kosdaq_market_status=candidate_market_status if candidate_market == MarketSide.KOSDAQ.value else MarketStatus.SELECTIVE.value,
         kospi_return_pct=0.1,
         kosdaq_return_pct=-1.2 if candidate_market_status == MarketStatus.WEAK.value else 0.2,
-        market_side_reason_codes=reasons if any("MARKET" in reason for reason in reasons) else (),
+        candidate_breadth_pct=candidate_breadth_pct,
+        candidate_breadth_ready=candidate_breadth_ready,
+        candidate_breadth_sample_count=candidate_breadth_sample_count,
+        candidate_breadth_source="SIDE_BREADTH_SOURCE_REALTIME_UNIVERSE" if candidate_breadth_ready else "",
+        candidate_valid_quote_ratio=1.0 if candidate_breadth_ready else None,
+        market_side_reason_codes=market_side_reason_codes
+        if market_side_reason_codes is not None
+        else (reasons if any("MARKET" in reason for reason in reasons) else ()),
     )
     decision = LabGateDecision(
         symbol="000001",
@@ -737,7 +756,14 @@ def _flow_result(
         kosdaq_market_status=candidate_market_status if candidate_market == MarketSide.KOSDAQ.value else MarketStatus.SELECTIVE.value,
         kospi_return_pct=0.1,
         kosdaq_return_pct=-1.2 if candidate_market_status == MarketStatus.WEAK.value else 0.2,
-        market_side_reason_codes=reasons if any("MARKET" in reason for reason in reasons) else (),
+        candidate_breadth_pct=candidate_breadth_pct,
+        candidate_breadth_ready=candidate_breadth_ready,
+        candidate_breadth_sample_count=candidate_breadth_sample_count,
+        candidate_breadth_source="SIDE_BREADTH_SOURCE_REALTIME_UNIVERSE" if candidate_breadth_ready else "",
+        candidate_valid_quote_ratio=1.0 if candidate_breadth_ready else None,
+        market_side_reason_codes=market_side_reason_codes
+        if market_side_reason_codes is not None
+        else (reasons if any("MARKET" in reason for reason in reasons) else ()),
     )
     return ThemeLabFlowResult(
         market=MarketStrengthSnapshot(

@@ -6,6 +6,7 @@ from trading.theme_engine.lab import (
     LiquidityFilterConfig,
     MarketStatus,
     MarketSide,
+    MarketSideBreadthConfig,
     MarketStrengthSnapshot,
     MarketStrengthEngine,
     PositionAdjustmentConfig,
@@ -210,7 +211,127 @@ def test_market_strength_calculates_side_statuses_separately():
     assert market.market_status == MarketStatus.CHOPPY
     assert market.kospi_status == MarketStatus.CHOPPY
     assert market.kosdaq_status == MarketStatus.WEAK
-    assert market.side_statuses[MarketSide.KOSDAQ.value]["reason_codes"] == ["KOSDAQ_MARKET_WEAK"]
+    assert "KOSDAQ_MARKET_WEAK" in market.side_statuses[MarketSide.KOSDAQ.value]["reason_codes"]
+    assert "SIDE_BREADTH_FALLBACK_GLOBAL" in market.side_breadth_reason_codes
+
+
+def test_kosdaq_side_breadth_weak_blocks_kosdaq_candidate_even_when_index_is_flat():
+    engine = MarketStrengthEngine(
+        side_breadth_config=MarketSideBreadthConfig(
+            min_sample_count_kosdaq=4,
+            min_sample_count_kospi=2,
+            breadth_weak_pct=0.38,
+            breadth_risk_off_pct=0.20,
+        )
+    )
+    market = engine.calculate(
+        [
+            _snapshot("000001", 5.0, current_price=105, metadata={"market": "KOSDAQ"}),
+            _snapshot("000002", -1.0, current_price=99, metadata={"market": "KOSDAQ"}),
+            _snapshot("000003", -1.2, current_price=98.8, metadata={"market": "KOSDAQ"}),
+            _snapshot("000004", -0.7, current_price=99.3, metadata={"market": "KOSDAQ"}),
+            _snapshot("100001", 0.5, current_price=100.5, metadata={"market": "KOSPI"}),
+            _snapshot("100002", 0.2, current_price=100.2, metadata={"market": "KOSPI"}),
+        ],
+        kospi_return_pct=0.2,
+        kosdaq_return_pct=0.0,
+    )
+    decision = ThemeLabHybridGate().evaluate(
+        market=market,
+        theme=_leading_theme(),
+        watch=WatchSetSnapshot(
+            calculated_at="",
+            symbol="000001",
+            primary_theme="t",
+            return_pct=5.0,
+            condition_level=3,
+            stock_role=StockRole.LEADER,
+            candidate_market=MarketSide.KOSDAQ.value,
+        ),
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
+    )
+
+    assert market.kosdaq_breadth_ready is True
+    assert market.kosdaq_breadth_pct == 0.25
+    assert market.kosdaq_status == MarketStatus.WEAK
+    assert decision.status == LabGateStatus.WAIT
+    assert "KOSDAQ_SIDE_BREADTH_WEAK" in decision.reason_codes
+    assert decision.candidate_breadth_ready is True
+
+
+def test_kosdaq_side_breadth_weak_does_not_block_kospi_candidate():
+    market = MarketStrengthEngine(
+        side_breadth_config=MarketSideBreadthConfig(
+            min_sample_count_kosdaq=4,
+            min_sample_count_kospi=2,
+            breadth_risk_off_pct=0.20,
+        )
+    ).calculate(
+        [
+            _snapshot("000001", 5.0, current_price=105, metadata={"market": "KOSDAQ"}),
+            _snapshot("000002", -1.0, current_price=99, metadata={"market": "KOSDAQ"}),
+            _snapshot("000003", -1.2, current_price=98.8, metadata={"market": "KOSDAQ"}),
+            _snapshot("000004", -0.7, current_price=99.3, metadata={"market": "KOSDAQ"}),
+            _snapshot("100001", 1.0, current_price=101, metadata={"market": "KOSPI"}),
+            _snapshot("100002", 0.2, current_price=100.2, metadata={"market": "KOSPI"}),
+        ],
+        kospi_return_pct=0.2,
+        kosdaq_return_pct=0.0,
+    )
+    decision = ThemeLabHybridGate().evaluate(
+        market=market,
+        theme=_leading_theme(),
+        watch=WatchSetSnapshot(
+            calculated_at="",
+            symbol="100001",
+            primary_theme="t",
+            return_pct=5.0,
+            condition_level=3,
+            stock_role=StockRole.LEADER,
+            candidate_market=MarketSide.KOSPI.value,
+        ),
+        price_location=_price_location(PriceLocationStatus.GOOD_PULLBACK),
+    )
+
+    assert market.kosdaq_status == MarketStatus.WEAK
+    assert market.kospi_status in {MarketStatus.EXPANSION, MarketStatus.SELECTIVE}
+    assert decision.status == LabGateStatus.READY
+
+
+def test_side_breadth_sample_too_small_falls_back_to_index_return():
+    market = MarketStrengthEngine(
+        side_breadth_config=MarketSideBreadthConfig(min_sample_count_kosdaq=5)
+    ).calculate(
+        [
+            _snapshot("000001", -2.0, current_price=98, metadata={"market": "KOSDAQ"}),
+            _snapshot("000002", -1.5, current_price=98.5, metadata={"market": "KOSDAQ"}),
+        ],
+        kosdaq_return_pct=0.1,
+    )
+
+    assert market.kosdaq_breadth_ready is False
+    assert "SIDE_BREADTH_SAMPLE_TOO_SMALL" in market.side_breadth_data_quality_flags
+    assert "SIDE_BREADTH_FALLBACK_INDEX_RETURN" in market.side_breadth_reason_codes
+    assert market.kosdaq_status == MarketStatus.CHOPPY
+
+
+def test_side_breadth_valid_quote_ratio_low_falls_back_to_index_return():
+    market = MarketStrengthEngine(
+        side_breadth_config=MarketSideBreadthConfig(min_sample_count_kosdaq=2, valid_quote_ratio_min=0.75)
+    ).calculate(
+        [
+            _snapshot("000001", 2.0, current_price=102, metadata={"market": "KOSDAQ", "quote_age_sec": 10}),
+            _snapshot("000002", 1.5, current_price=101.5, metadata={"market": "KOSDAQ", "quote_age_sec": 10}),
+            _snapshot("000003", -2.0, current_price=98, metadata={"market": "KOSDAQ", "quote_age_sec": 120}),
+            _snapshot("000004", -2.5, current_price=97.5, metadata={"market": "KOSDAQ", "quote_age_sec": 120}),
+        ],
+        kosdaq_return_pct=0.2,
+    )
+
+    assert market.kosdaq_breadth_ready is False
+    assert market.kosdaq_valid_quote_ratio == 0.5
+    assert "SIDE_BREADTH_VALID_QUOTE_RATIO_LOW" in market.side_breadth_data_quality_flags
+    assert market.kosdaq_status == MarketStatus.CHOPPY
 
 
 def test_candidate_side_market_gate_blocks_only_matching_weak_side():
@@ -366,6 +487,29 @@ def test_watchset_infers_candidate_market_from_snapshot_metadata():
 
     assert watchset[0].candidate_market == MarketSide.KOSDAQ.value
     assert watchset[0].candidate_market_source == "snapshot.metadata.market"
+
+
+def test_unknown_market_passive_metrics_are_recorded_in_pipeline_data_quality():
+    config = ThemeLabConfig(
+        watchset_limits=WatchSetLimits(max_watchset_size=10, max_watch_per_theme=5, top_theme_count=3),
+        theme_status=ThemeStatusThresholds(min_strong_count_for_leading=1, min_leader_count_for_leading=1),
+    )
+    result = ThemeLabFlowEngine(config).run_pipeline(
+        theme_inputs=[
+            ("ai", "AI", [_member("ai", "000001"), _member("ai", "000002"), _member("ai", "000003")]),
+        ],
+        snapshots=[
+            _snapshot("000001", 6, turnover=5_000_000, current_price=106, metadata={"prev_close": 100}),
+            _snapshot("000002", 4, turnover=4_000_000, current_price=104, metadata={"prev_close": 100, "market": "KOSDAQ"}),
+            _snapshot("000003", 0, turnover=3_000_000, current_price=100, metadata={"prev_close": 100, "market": "KOSPI"}),
+        ],
+        kospi_return_pct=0.2,
+        kosdaq_return_pct=0.4,
+    )
+
+    assert result.data_quality["market_classification_total_count"] >= 2
+    assert result.data_quality["market_classification_unknown_count"] >= 1
+    assert result.data_quality["market_classification_unknown_ratio"] > 0
 
 
 def test_pipeline_outputs_market_theme_watchset_gate_and_quality_summary():
