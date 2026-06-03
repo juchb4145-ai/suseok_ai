@@ -211,6 +211,45 @@ def test_candidate_market_weak_wait_is_recoverable_without_entry_plan_or_intent(
     assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 
 
+def test_restored_market_weak_state_does_not_create_dry_run_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.WAIT,
+            PriceLocationStatus.GOOD_PULLBACK,
+            reasons=("CANDIDATE_MARKET_WEAK", "KOSDAQ_MARKET_WEAK", "MARKET_WEAK_CONFIRMED", "WAIT_CANDIDATE_MARKET_WEAK"),
+            candidate_market=MarketSide.KOSDAQ.value,
+            candidate_market_status=MarketStatus.WEAK.value,
+            candidate_market_raw_status=MarketStatus.WEAK.value,
+            candidate_market_confirmed_status=MarketStatus.WEAK.value,
+            market_side_reason_codes=("MARKET_CONFIRMATION_STATE_RESTORED", "MARKET_WEAK_CONFIRMED"),
+            market_confirmation_state_restored=True,
+            market_confirmation_state_persisted=True,
+            market_confirmation_state_restore_reason="MARKET_CONFIRMATION_STATE_RESTORED",
+            market_confirmation_state_source="restored_db",
+            market_confirmation_state_version=1,
+            market_confirmation_state_last_updated_at=NOW.isoformat(),
+            market_confirmation_transition_type="WEAK_CONFIRMED",
+        ),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+    assert candidate.state == CandidateState.BLOCKED
+    assert candidate.block_type == BlockType.TEMPORARY
+    assert details["sub_status"] == "WAIT_CANDIDATE_MARKET_WEAK"
+    assert details["market_confirmation_state_restored"] is True
+    assert details["market_confirmation_state_source"] == "restored_db"
+    assert "MARKET_CONFIRMATION_STATE_RESTORED" in details["market_side_reason_codes"]
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_virtual_orders(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
 def test_market_confirmation_pending_wait_is_recoverable_without_entry_plan_or_intent(tmp_path):
     runtime, db, _gateway_state = _runtime(
         tmp_path,
@@ -759,6 +798,15 @@ def _flow_result(
     market_side_never_recovered: bool = False,
     market_side_blocked_buy_intent_count: int = 0,
     market_side_recheck_after_sec: int = 0,
+    market_confirmation_state_persisted: bool = False,
+    market_confirmation_state_restored: bool = False,
+    market_confirmation_state_restore_reason: str = "",
+    market_confirmation_state_last_updated_at: str = "",
+    market_confirmation_state_age_sec: float | None = None,
+    market_confirmation_state_version: int = 0,
+    market_confirmation_state_source: str = "memory",
+    market_confirmation_state_reset_reason: str = "",
+    market_confirmation_transition_type: str = "",
 ) -> ThemeLabFlowResult:
     theme = ThemeConditionSnapshot(
         calculated_at=NOW.isoformat(),
@@ -828,6 +876,15 @@ def _flow_result(
         market_side_never_recovered=market_side_never_recovered,
         market_side_blocked_buy_intent_count=market_side_blocked_buy_intent_count,
         market_side_recheck_after_sec=market_side_recheck_after_sec,
+        market_confirmation_state_persisted=market_confirmation_state_persisted,
+        market_confirmation_state_restored=market_confirmation_state_restored,
+        market_confirmation_state_restore_reason=market_confirmation_state_restore_reason,
+        market_confirmation_state_last_updated_at=market_confirmation_state_last_updated_at,
+        market_confirmation_state_age_sec=market_confirmation_state_age_sec,
+        market_confirmation_state_version=market_confirmation_state_version,
+        market_confirmation_state_source=market_confirmation_state_source,
+        market_confirmation_state_reset_reason=market_confirmation_state_reset_reason,
+        market_confirmation_transition_type=market_confirmation_transition_type,
         market_side_reason_codes=market_side_reason_codes
         if market_side_reason_codes is not None
         else (reasons if any("MARKET" in reason for reason in reasons) else ()),
@@ -879,6 +936,15 @@ def _flow_result(
         market_side_never_recovered=market_side_never_recovered,
         market_side_blocked_buy_intent_count=market_side_blocked_buy_intent_count,
         market_side_recheck_after_sec=market_side_recheck_after_sec,
+        market_confirmation_state_persisted=market_confirmation_state_persisted,
+        market_confirmation_state_restored=market_confirmation_state_restored,
+        market_confirmation_state_restore_reason=market_confirmation_state_restore_reason,
+        market_confirmation_state_last_updated_at=market_confirmation_state_last_updated_at,
+        market_confirmation_state_age_sec=market_confirmation_state_age_sec,
+        market_confirmation_state_version=market_confirmation_state_version,
+        market_confirmation_state_source=market_confirmation_state_source,
+        market_confirmation_state_reset_reason=market_confirmation_state_reset_reason,
+        market_confirmation_transition_type=market_confirmation_transition_type,
         market_side_reason_codes=market_side_reason_codes
         if market_side_reason_codes is not None
         else (reasons if any("MARKET" in reason for reason in reasons) else ()),

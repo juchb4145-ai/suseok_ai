@@ -256,6 +256,69 @@ class TradingDatabase:
                 data_quality_json TEXT NOT NULL DEFAULT '{}',
                 payload_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS market_side_confirmation_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                market_side TEXT NOT NULL,
+                raw_status TEXT NOT NULL DEFAULT '',
+                confirmed_status TEXT NOT NULL DEFAULT '',
+                previous_confirmed_status TEXT NOT NULL DEFAULT '',
+                confirmation_pending INTEGER NOT NULL DEFAULT 0,
+                recovery_pending INTEGER NOT NULL DEFAULT 0,
+                weak_consecutive_cycles INTEGER NOT NULL DEFAULT 0,
+                risk_off_consecutive_cycles INTEGER NOT NULL DEFAULT 0,
+                healthy_consecutive_cycles INTEGER NOT NULL DEFAULT 0,
+                last_breadth_pct REAL,
+                last_index_return_pct REAL,
+                last_turnover_weighted_return_pct REAL,
+                last_source TEXT NOT NULL DEFAULT '',
+                last_trust_level TEXT NOT NULL DEFAULT '',
+                last_data_quality_flags_json TEXT NOT NULL DEFAULT '[]',
+                last_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                source_conflict INTEGER NOT NULL DEFAULT 0,
+                source_conflict_count INTEGER NOT NULL DEFAULT 0,
+                last_source_conflict_at TEXT NOT NULL DEFAULT '',
+                last_status_changed_at TEXT NOT NULL DEFAULT '',
+                last_confirmed_at TEXT NOT NULL DEFAULT '',
+                last_recovered_at TEXT NOT NULL DEFAULT '',
+                wait_started_at TEXT NOT NULL DEFAULT '',
+                last_cycle_id TEXT NOT NULL DEFAULT '',
+                last_evaluated_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL DEFAULT '',
+                state_version INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(trade_date, session_id, market_side, state_version)
+            );
+            CREATE TABLE IF NOT EXISTS market_side_confirmation_transitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                market_side TEXT NOT NULL,
+                cycle_id TEXT NOT NULL DEFAULT '',
+                previous_raw_status TEXT NOT NULL DEFAULT '',
+                new_raw_status TEXT NOT NULL DEFAULT '',
+                previous_confirmed_status TEXT NOT NULL DEFAULT '',
+                new_confirmed_status TEXT NOT NULL DEFAULT '',
+                previous_confirmation_pending INTEGER NOT NULL DEFAULT 0,
+                new_confirmation_pending INTEGER NOT NULL DEFAULT 0,
+                previous_recovery_pending INTEGER NOT NULL DEFAULT 0,
+                new_recovery_pending INTEGER NOT NULL DEFAULT 0,
+                weak_consecutive_cycles INTEGER NOT NULL DEFAULT 0,
+                risk_off_consecutive_cycles INTEGER NOT NULL DEFAULT 0,
+                healthy_consecutive_cycles INTEGER NOT NULL DEFAULT 0,
+                breadth_pct REAL,
+                index_return_pct REAL,
+                turnover_weighted_return_pct REAL,
+                source TEXT NOT NULL DEFAULT '',
+                trust_level TEXT NOT NULL DEFAULT '',
+                source_conflict INTEGER NOT NULL DEFAULT 0,
+                transition_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                transition_type TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(trade_date, session_id, market_side, cycle_id, transition_type)
+            );
             CREATE TABLE IF NOT EXISTS candidates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trade_date TEXT NOT NULL,
@@ -735,6 +798,14 @@ class TradingDatabase:
                 ON dynamic_theme_clusters(status);
             CREATE INDEX IF NOT EXISTS idx_theme_source_sync_runs_source_started
                 ON theme_source_sync_runs(source, started_at);
+            CREATE INDEX IF NOT EXISTS idx_market_side_confirmation_state_lookup
+                ON market_side_confirmation_state(trade_date, session_id, market_side, state_version);
+            CREATE INDEX IF NOT EXISTS idx_market_side_confirmation_state_expires
+                ON market_side_confirmation_state(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_market_side_confirmation_transitions_lookup
+                ON market_side_confirmation_transitions(trade_date, session_id, market_side, created_at);
+            CREATE INDEX IF NOT EXISTS idx_market_side_confirmation_transitions_type
+                ON market_side_confirmation_transitions(transition_type, created_at);
             CREATE INDEX IF NOT EXISTS idx_hybrid_validation_trade_date
                 ON hybrid_gate_validation_events(trade_date);
             CREATE INDEX IF NOT EXISTS idx_hybrid_validation_stock_code
@@ -2145,6 +2216,168 @@ class TradingDatabase:
         payload["calculated_at"] = row["calculated_at"]
         return payload
 
+    def upsert_market_side_confirmation_state(self, payload: dict) -> dict:
+        normalized = _market_side_confirmation_state_params(payload)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO market_side_confirmation_state(
+                    trade_date, session_id, market_side, raw_status, confirmed_status,
+                    previous_confirmed_status, confirmation_pending, recovery_pending,
+                    weak_consecutive_cycles, risk_off_consecutive_cycles, healthy_consecutive_cycles,
+                    last_breadth_pct, last_index_return_pct, last_turnover_weighted_return_pct,
+                    last_source, last_trust_level, last_data_quality_flags_json, last_reason_codes_json,
+                    source_conflict, source_conflict_count, last_source_conflict_at,
+                    last_status_changed_at, last_confirmed_at, last_recovered_at, wait_started_at,
+                    last_cycle_id, last_evaluated_at, updated_at, created_at, expires_at, state_version
+                ) VALUES (
+                    :trade_date, :session_id, :market_side, :raw_status, :confirmed_status,
+                    :previous_confirmed_status, :confirmation_pending, :recovery_pending,
+                    :weak_consecutive_cycles, :risk_off_consecutive_cycles, :healthy_consecutive_cycles,
+                    :last_breadth_pct, :last_index_return_pct, :last_turnover_weighted_return_pct,
+                    :last_source, :last_trust_level, :last_data_quality_flags_json, :last_reason_codes_json,
+                    :source_conflict, :source_conflict_count, :last_source_conflict_at,
+                    :last_status_changed_at, :last_confirmed_at, :last_recovered_at, :wait_started_at,
+                    :last_cycle_id, :last_evaluated_at, :updated_at, :created_at, :expires_at, :state_version
+                )
+                ON CONFLICT(trade_date, session_id, market_side, state_version) DO UPDATE SET
+                    raw_status=excluded.raw_status,
+                    confirmed_status=excluded.confirmed_status,
+                    previous_confirmed_status=excluded.previous_confirmed_status,
+                    confirmation_pending=excluded.confirmation_pending,
+                    recovery_pending=excluded.recovery_pending,
+                    weak_consecutive_cycles=excluded.weak_consecutive_cycles,
+                    risk_off_consecutive_cycles=excluded.risk_off_consecutive_cycles,
+                    healthy_consecutive_cycles=excluded.healthy_consecutive_cycles,
+                    last_breadth_pct=excluded.last_breadth_pct,
+                    last_index_return_pct=excluded.last_index_return_pct,
+                    last_turnover_weighted_return_pct=excluded.last_turnover_weighted_return_pct,
+                    last_source=excluded.last_source,
+                    last_trust_level=excluded.last_trust_level,
+                    last_data_quality_flags_json=excluded.last_data_quality_flags_json,
+                    last_reason_codes_json=excluded.last_reason_codes_json,
+                    source_conflict=excluded.source_conflict,
+                    source_conflict_count=excluded.source_conflict_count,
+                    last_source_conflict_at=excluded.last_source_conflict_at,
+                    last_status_changed_at=excluded.last_status_changed_at,
+                    last_confirmed_at=excluded.last_confirmed_at,
+                    last_recovered_at=excluded.last_recovered_at,
+                    wait_started_at=excluded.wait_started_at,
+                    last_cycle_id=excluded.last_cycle_id,
+                    last_evaluated_at=excluded.last_evaluated_at,
+                    updated_at=excluded.updated_at,
+                    expires_at=excluded.expires_at
+                """,
+                normalized,
+            )
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM market_side_confirmation_state
+            WHERE trade_date = ? AND session_id = ? AND market_side = ? AND state_version = ?
+            """,
+            (
+                normalized["trade_date"],
+                normalized["session_id"],
+                normalized["market_side"],
+                normalized["state_version"],
+            ),
+        ).fetchone()
+        return _row_to_market_side_confirmation_state(row) if row else normalized
+
+    def load_market_side_confirmation_states(
+        self,
+        *,
+        trade_date: str,
+        session_id: str,
+        state_version: int,
+    ) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM market_side_confirmation_state
+            WHERE trade_date = ? AND session_id = ? AND state_version = ?
+            ORDER BY market_side
+            """,
+            (str(trade_date or ""), str(session_id or ""), int(state_version or 0)),
+        ).fetchall()
+        return [_row_to_market_side_confirmation_state(row) for row in rows]
+
+    def load_any_market_side_confirmation_states(self, *, trade_date: str, session_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM market_side_confirmation_state
+            WHERE trade_date = ? AND session_id = ?
+            ORDER BY market_side, state_version DESC
+            """,
+            (str(trade_date or ""), str(session_id or "")),
+        ).fetchall()
+        return [_row_to_market_side_confirmation_state(row) for row in rows]
+
+    def save_market_side_confirmation_transition(self, payload: dict) -> bool:
+        normalized = _market_side_confirmation_transition_params(payload)
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO market_side_confirmation_transitions(
+                    trade_date, session_id, market_side, cycle_id,
+                    previous_raw_status, new_raw_status,
+                    previous_confirmed_status, new_confirmed_status,
+                    previous_confirmation_pending, new_confirmation_pending,
+                    previous_recovery_pending, new_recovery_pending,
+                    weak_consecutive_cycles, risk_off_consecutive_cycles, healthy_consecutive_cycles,
+                    breadth_pct, index_return_pct, turnover_weighted_return_pct,
+                    source, trust_level, source_conflict, transition_reason_codes_json,
+                    transition_type, created_at
+                ) VALUES (
+                    :trade_date, :session_id, :market_side, :cycle_id,
+                    :previous_raw_status, :new_raw_status,
+                    :previous_confirmed_status, :new_confirmed_status,
+                    :previous_confirmation_pending, :new_confirmation_pending,
+                    :previous_recovery_pending, :new_recovery_pending,
+                    :weak_consecutive_cycles, :risk_off_consecutive_cycles, :healthy_consecutive_cycles,
+                    :breadth_pct, :index_return_pct, :turnover_weighted_return_pct,
+                    :source, :trust_level, :source_conflict, :transition_reason_codes_json,
+                    :transition_type, :created_at
+                )
+                """,
+                normalized,
+            )
+        return cursor.rowcount > 0
+
+    def list_market_side_confirmation_transitions(
+        self,
+        *,
+        trade_date: str = "",
+        session_id: str = "",
+        market_side: str = "",
+        limit: int = 100,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(trade_date)
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if market_side:
+            clauses.append("market_side = ?")
+            params.append(market_side)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM market_side_confirmation_transitions
+            {where}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            tuple(params + [max(1, int(limit or 100))]),
+        ).fetchall()
+        return [_row_to_market_side_confirmation_transition(row) for row in rows]
+
     def save_entry_plan(self, plan: EntryPlan) -> EntryPlan:
         with self.conn:
             if plan.id is None:
@@ -3546,6 +3779,107 @@ def _runtime_order_intent_params(payload: dict) -> dict:
         else:
             normalized[key] = json.dumps(value or {}, ensure_ascii=False, sort_keys=True, default=str)
     return normalized
+
+
+def _market_side_confirmation_state_params(payload: dict) -> dict:
+    now = str(payload.get("updated_at") or payload.get("created_at") or "")
+    created_at = str(payload.get("created_at") or now)
+    return {
+        "trade_date": str(payload.get("trade_date") or ""),
+        "session_id": str(payload.get("session_id") or ""),
+        "market_side": str(payload.get("market_side") or payload.get("side") or ""),
+        "raw_status": str(payload.get("raw_status") or payload.get("current_raw_status") or ""),
+        "confirmed_status": str(payload.get("confirmed_status") or ""),
+        "previous_confirmed_status": str(payload.get("previous_confirmed_status") or ""),
+        "confirmation_pending": int(bool(payload.get("confirmation_pending"))),
+        "recovery_pending": int(bool(payload.get("recovery_pending"))),
+        "weak_consecutive_cycles": int(payload.get("weak_consecutive_cycles") or 0),
+        "risk_off_consecutive_cycles": int(payload.get("risk_off_consecutive_cycles") or 0),
+        "healthy_consecutive_cycles": int(payload.get("healthy_consecutive_cycles") or 0),
+        "last_breadth_pct": _nullable_float(payload.get("last_breadth_pct")),
+        "last_index_return_pct": _nullable_float(payload.get("last_index_return_pct")),
+        "last_turnover_weighted_return_pct": _nullable_float(payload.get("last_turnover_weighted_return_pct")),
+        "last_source": str(payload.get("last_source") or ""),
+        "last_trust_level": str(payload.get("last_trust_level") or ""),
+        "last_data_quality_flags_json": json.dumps(payload.get("last_data_quality_flags") or [], ensure_ascii=False, sort_keys=True, default=str),
+        "last_reason_codes_json": json.dumps(payload.get("last_reason_codes") or payload.get("reason_codes") or [], ensure_ascii=False, sort_keys=True, default=str),
+        "source_conflict": int(bool(payload.get("source_conflict"))),
+        "source_conflict_count": int(payload.get("source_conflict_count") or 0),
+        "last_source_conflict_at": str(payload.get("last_source_conflict_at") or ""),
+        "last_status_changed_at": str(payload.get("last_status_changed_at") or ""),
+        "last_confirmed_at": str(payload.get("last_confirmed_at") or ""),
+        "last_recovered_at": str(payload.get("last_recovered_at") or ""),
+        "wait_started_at": str(payload.get("wait_started_at") or payload.get("market_wait_started_at") or ""),
+        "last_cycle_id": str(payload.get("last_cycle_id") or payload.get("cycle_id") or ""),
+        "last_evaluated_at": str(payload.get("last_evaluated_at") or ""),
+        "updated_at": now,
+        "created_at": created_at,
+        "expires_at": str(payload.get("expires_at") or ""),
+        "state_version": int(payload.get("state_version") or 0),
+    }
+
+
+def _market_side_confirmation_transition_params(payload: dict) -> dict:
+    return {
+        "trade_date": str(payload.get("trade_date") or ""),
+        "session_id": str(payload.get("session_id") or ""),
+        "market_side": str(payload.get("market_side") or payload.get("side") or ""),
+        "cycle_id": str(payload.get("cycle_id") or ""),
+        "previous_raw_status": str(payload.get("previous_raw_status") or ""),
+        "new_raw_status": str(payload.get("new_raw_status") or payload.get("current_raw_status") or ""),
+        "previous_confirmed_status": str(payload.get("previous_confirmed_status") or ""),
+        "new_confirmed_status": str(payload.get("new_confirmed_status") or payload.get("confirmed_status") or ""),
+        "previous_confirmation_pending": int(bool(payload.get("previous_confirmation_pending"))),
+        "new_confirmation_pending": int(bool(payload.get("new_confirmation_pending") or payload.get("confirmation_pending"))),
+        "previous_recovery_pending": int(bool(payload.get("previous_recovery_pending"))),
+        "new_recovery_pending": int(bool(payload.get("new_recovery_pending") or payload.get("recovery_pending"))),
+        "weak_consecutive_cycles": int(payload.get("weak_consecutive_cycles") or 0),
+        "risk_off_consecutive_cycles": int(payload.get("risk_off_consecutive_cycles") or 0),
+        "healthy_consecutive_cycles": int(payload.get("healthy_consecutive_cycles") or 0),
+        "breadth_pct": _nullable_float(payload.get("breadth_pct") if "breadth_pct" in payload else payload.get("last_breadth_pct")),
+        "index_return_pct": _nullable_float(payload.get("index_return_pct") if "index_return_pct" in payload else payload.get("last_index_return_pct")),
+        "turnover_weighted_return_pct": _nullable_float(
+            payload.get("turnover_weighted_return_pct")
+            if "turnover_weighted_return_pct" in payload
+            else payload.get("last_turnover_weighted_return_pct")
+        ),
+        "source": str(payload.get("source") or payload.get("last_source") or ""),
+        "trust_level": str(payload.get("trust_level") or payload.get("last_trust_level") or ""),
+        "source_conflict": int(bool(payload.get("source_conflict"))),
+        "transition_reason_codes_json": json.dumps(payload.get("transition_reason_codes") or payload.get("reason_codes") or [], ensure_ascii=False, sort_keys=True, default=str),
+        "transition_type": str(payload.get("transition_type") or ""),
+        "created_at": str(payload.get("created_at") or ""),
+    }
+
+
+def _row_to_market_side_confirmation_state(row: sqlite3.Row) -> dict:
+    data = {key: row[key] for key in row.keys()}
+    data["confirmation_pending"] = bool(data.get("confirmation_pending"))
+    data["recovery_pending"] = bool(data.get("recovery_pending"))
+    data["source_conflict"] = bool(data.get("source_conflict"))
+    data["last_data_quality_flags"] = _safe_json_loads(data.get("last_data_quality_flags_json"), [])
+    data["last_reason_codes"] = _safe_json_loads(data.get("last_reason_codes_json"), [])
+    return data
+
+
+def _row_to_market_side_confirmation_transition(row: sqlite3.Row) -> dict:
+    data = {key: row[key] for key in row.keys()}
+    data["previous_confirmation_pending"] = bool(data.get("previous_confirmation_pending"))
+    data["new_confirmation_pending"] = bool(data.get("new_confirmation_pending"))
+    data["previous_recovery_pending"] = bool(data.get("previous_recovery_pending"))
+    data["new_recovery_pending"] = bool(data.get("new_recovery_pending"))
+    data["source_conflict"] = bool(data.get("source_conflict"))
+    data["transition_reason_codes"] = _safe_json_loads(data.get("transition_reason_codes_json"), [])
+    return data
+
+
+def _nullable_float(value) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _row_to_runtime_order_intent(row: sqlite3.Row) -> dict:

@@ -429,6 +429,15 @@ class WatchSetSnapshot:
     market_side_never_recovered: bool = False
     market_side_blocked_buy_intent_count: int = 0
     market_side_recheck_after_sec: int = 0
+    market_confirmation_state_persisted: bool = False
+    market_confirmation_state_restored: bool = False
+    market_confirmation_state_restore_reason: str = ""
+    market_confirmation_state_last_updated_at: str = ""
+    market_confirmation_state_age_sec: float | None = None
+    market_confirmation_state_version: int = 0
+    market_confirmation_state_source: str = "memory"
+    market_confirmation_state_reset_reason: str = ""
+    market_confirmation_transition_type: str = ""
     kospi_breadth_pct: float | None = None
     kosdaq_breadth_pct: float | None = None
     kospi_breadth_ready: bool = False
@@ -512,6 +521,15 @@ class LabGateDecision:
     market_side_never_recovered: bool = False
     market_side_blocked_buy_intent_count: int = 0
     market_side_recheck_after_sec: int = 0
+    market_confirmation_state_persisted: bool = False
+    market_confirmation_state_restored: bool = False
+    market_confirmation_state_restore_reason: str = ""
+    market_confirmation_state_last_updated_at: str = ""
+    market_confirmation_state_age_sec: float | None = None
+    market_confirmation_state_version: int = 0
+    market_confirmation_state_source: str = "memory"
+    market_confirmation_state_reset_reason: str = ""
+    market_confirmation_transition_type: str = ""
     kospi_breadth_pct: float | None = None
     kosdaq_breadth_pct: float | None = None
     kospi_breadth_ready: bool = False
@@ -1345,12 +1363,24 @@ class _MarketSideConfirmationState:
     recovery_pending: bool = False
     last_breadth_pct: float | None = None
     last_index_return_pct: float | None = None
+    last_turnover_weighted_return_pct: float | None = None
     last_source: str = ""
     last_trust_level: str = ""
     last_data_quality_flags: tuple[str, ...] = ()
     source_conflict: bool = False
+    source_conflict_count: int = 0
+    last_source_conflict_at: str = ""
     reason_codes: tuple[str, ...] = ()
     blocked_buy_intent_count: int = 0
+    transition_type: str = ""
+    state_source: str = "memory"
+    restored: bool = False
+    persisted: bool = False
+    restore_reason: str = ""
+    last_updated_at: str = ""
+    state_age_sec: float | None = None
+    state_version: int = 0
+    reset_reason: str = ""
 
     def to_dict(self, *, recheck_after_sec: int) -> dict[str, Any]:
         cycles_to_recover = 0
@@ -1373,11 +1403,15 @@ class _MarketSideConfirmationState:
             "recovery_pending": self.recovery_pending,
             "last_breadth_pct": self.last_breadth_pct,
             "last_index_return_pct": self.last_index_return_pct,
+            "last_turnover_weighted_return_pct": self.last_turnover_weighted_return_pct,
             "last_source": self.last_source,
             "last_trust_level": self.last_trust_level,
             "last_data_quality_flags": list(self.last_data_quality_flags),
             "source_conflict": self.source_conflict,
+            "source_conflict_count": self.source_conflict_count,
+            "last_source_conflict_at": self.last_source_conflict_at,
             "reason_codes": list(self.reason_codes),
+            "transition_type": self.transition_type,
             "recheck_after_sec": int(recheck_after_sec or 0),
             "market_wait_started_at": self.wait_started_at,
             "market_wait_recovered_at": self.last_recovered_at,
@@ -1385,6 +1419,15 @@ class _MarketSideConfirmationState:
             "recovered_to_ready": bool(self.last_recovered_at and not self.confirmation_pending and not self.recovery_pending),
             "never_recovered": bool(self.wait_started_at and not self.last_recovered_at),
             "blocked_buy_intent_count": self.blocked_buy_intent_count,
+            "market_confirmation_state_persisted": self.persisted,
+            "market_confirmation_state_restored": self.restored,
+            "market_confirmation_state_restore_reason": self.restore_reason,
+            "market_confirmation_state_last_updated_at": self.last_updated_at,
+            "market_confirmation_state_age_sec": self.state_age_sec,
+            "market_confirmation_state_version": self.state_version,
+            "market_confirmation_state_source": self.state_source,
+            "market_confirmation_state_reset_reason": self.reset_reason,
+            "market_confirmation_transition_type": self.transition_type,
         }
 
 
@@ -1392,6 +1435,12 @@ class MarketSideConfirmationTracker:
     def __init__(self, config: MarketSideGateConfirmationConfig | None = None) -> None:
         self.config = config or MarketSideGateConfirmationConfig()
         self._states: dict[MarketSide, _MarketSideConfirmationState] = {}
+        self._cycle_reason_codes: tuple[str, ...] = ()
+        self._cycle_state_source: str = "memory"
+        self._cycle_restored: bool = False
+        self._cycle_restore_reason: str = ""
+        self._cycle_reset_reason: str = ""
+        self._conservative_fallback_once: bool = False
 
     def apply(self, market: MarketStrengthSnapshot, *, calculated_at: str = "") -> MarketStrengthSnapshot:
         if not self.config.enabled:
@@ -1401,6 +1450,34 @@ class MarketSideConfirmationTracker:
         updates: dict[str, Any] = {}
         for side in (MarketSide.KOSPI, MarketSide.KOSDAQ):
             state = self._update_side(side, market, side_statuses.get(side.value) or {}, calculated_at)
+            if state.restored and state.restore_reason:
+                state = replace(state, reason_codes=_dedupe_tuple(state.reason_codes + (state.restore_reason,)))
+            if self._cycle_reason_codes:
+                state = replace(state, reason_codes=_dedupe_tuple(state.reason_codes + self._cycle_reason_codes))
+            if self._conservative_fallback_once and state.confirmed_status not in {MarketStatus.WEAK, MarketStatus.RISK_OFF} and not state.recovery_pending:
+                state = replace(
+                    state,
+                    confirmation_pending=True,
+                    wait_started_at=state.wait_started_at or calculated_at,
+                    reason_codes=_dedupe_tuple(
+                        state.reason_codes
+                        + (
+                            "MARKET_CONFIRMATION_STATE_CONSERVATIVE_FALLBACK",
+                            "WAIT_MARKET_CONFIRMATION_PENDING",
+                        )
+                    ),
+                    transition_type=state.transition_type or "STATE_RESET",
+                    state_source="db_failed_memory_fallback",
+                    reset_reason="restore_failure_conservative_fallback",
+                )
+            if self._cycle_state_source:
+                state = replace(
+                    state,
+                    state_source=self._cycle_state_source if state.state_source == "memory" else state.state_source,
+                    restored=state.restored or self._cycle_restored,
+                    restore_reason=state.restore_reason or self._cycle_restore_reason,
+                    reset_reason=state.reset_reason or self._cycle_reset_reason,
+                )
             self._states[side] = state
             side_dict = state.to_dict(recheck_after_sec=self.config.recheck_after_sec)
             side_confirmation_states[side.value] = side_dict
@@ -1425,6 +1502,15 @@ class MarketSideConfirmationTracker:
                     "never_recovered": side_dict.get("never_recovered", False),
                     "blocked_buy_intent_count": state.blocked_buy_intent_count,
                     "recheck_after_sec": self.config.recheck_after_sec,
+                    "market_confirmation_state_persisted": state.persisted,
+                    "market_confirmation_state_restored": state.restored,
+                    "market_confirmation_state_restore_reason": state.restore_reason,
+                    "market_confirmation_state_last_updated_at": state.last_updated_at,
+                    "market_confirmation_state_age_sec": state.state_age_sec,
+                    "market_confirmation_state_version": state.state_version,
+                    "market_confirmation_state_source": state.state_source,
+                    "market_confirmation_state_reset_reason": state.reset_reason,
+                    "market_confirmation_transition_type": state.transition_type,
                     "reason_codes": list(
                         _dedupe_tuple(tuple(current_detail.get("reason_codes") or ()) + state.reason_codes)
                     ),
@@ -1445,6 +1531,12 @@ class MarketSideConfirmationTracker:
         for state in self._states.values():
             reason_codes.extend(state.reason_codes)
             data_flags.extend(state.last_data_quality_flags)
+        self._cycle_reason_codes = ()
+        self._cycle_state_source = "memory"
+        self._cycle_restored = False
+        self._cycle_restore_reason = ""
+        self._cycle_reset_reason = ""
+        self._conservative_fallback_once = False
         return MarketStrengthSnapshot(
             **{
                 **market.__dict__,
@@ -1457,6 +1549,92 @@ class MarketSideConfirmationTracker:
             }
         )
 
+    def restore_states(
+        self,
+        records: Iterable[dict[str, Any]],
+        *,
+        restored_at: str = "",
+        state_version: int = 0,
+        state_age_by_side: dict[str, float | None] | None = None,
+    ) -> None:
+        restored: dict[MarketSide, _MarketSideConfirmationState] = {}
+        age_by_side = dict(state_age_by_side or {})
+        for record in records:
+            side = normalize_market_side(record.get("market_side") or record.get("side"))
+            if side not in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
+                continue
+            restored[side] = _MarketSideConfirmationState(
+                side=side,
+                current_raw_status=_market_status_from_value(record.get("raw_status") or record.get("current_raw_status")),
+                confirmed_status=_market_status_from_value(record.get("confirmed_status")),
+                previous_confirmed_status=_market_status_from_value(record.get("previous_confirmed_status")),
+                weak_consecutive_cycles=int(record.get("weak_consecutive_cycles") or 0),
+                risk_off_consecutive_cycles=int(record.get("risk_off_consecutive_cycles") or 0),
+                healthy_consecutive_cycles=int(record.get("healthy_consecutive_cycles") or 0),
+                last_status_changed_at=str(record.get("last_status_changed_at") or ""),
+                last_confirmed_at=str(record.get("last_confirmed_at") or ""),
+                last_recovered_at=str(record.get("last_recovered_at") or ""),
+                wait_started_at=str(record.get("wait_started_at") or record.get("market_wait_started_at") or ""),
+                cycle_id=str(record.get("last_cycle_id") or record.get("cycle_id") or ""),
+                confirmation_pending=bool(record.get("confirmation_pending")),
+                recovery_pending=bool(record.get("recovery_pending")),
+                last_breadth_pct=_float_or_none(record.get("last_breadth_pct")),
+                last_index_return_pct=_float_or_none(record.get("last_index_return_pct")),
+                last_turnover_weighted_return_pct=_float_or_none(record.get("last_turnover_weighted_return_pct")),
+                last_source=str(record.get("last_source") or ""),
+                last_trust_level=str(record.get("last_trust_level") or ""),
+                last_data_quality_flags=tuple(record.get("last_data_quality_flags") or []),
+                source_conflict=bool(record.get("source_conflict")),
+                source_conflict_count=int(record.get("source_conflict_count") or 0),
+                last_source_conflict_at=str(record.get("last_source_conflict_at") or ""),
+                reason_codes=_dedupe_tuple(tuple(record.get("last_reason_codes") or ()) + ("MARKET_CONFIRMATION_STATE_RESTORED",)),
+                transition_type="INIT",
+                state_source="restored_db",
+                restored=True,
+                persisted=True,
+                restore_reason="MARKET_CONFIRMATION_STATE_RESTORED",
+                last_updated_at=str(record.get("updated_at") or restored_at or ""),
+                state_age_sec=age_by_side.get(side.value),
+                state_version=int(record.get("state_version") or state_version or 0),
+            )
+        self._states.update(restored)
+
+    def mark_restore_failure(self, *, reason: str, conservative: bool = False) -> None:
+        codes = ("MARKET_CONFIRMATION_STATE_RESTORE_FAILED", "MARKET_CONFIRMATION_STATE_MEMORY_FALLBACK")
+        if reason:
+            codes = codes + (reason,)
+        if conservative:
+            codes = codes + ("MARKET_CONFIRMATION_STATE_CONSERVATIVE_FALLBACK",)
+        self._cycle_reason_codes = _dedupe_tuple(self._cycle_reason_codes + codes)
+        self._cycle_state_source = "db_failed_memory_fallback"
+        self._cycle_restore_reason = reason or "MARKET_CONFIRMATION_STATE_RESTORE_FAILED"
+        self._conservative_fallback_once = conservative
+
+    def mark_state_reset(self, reason: str) -> None:
+        if reason:
+            self._cycle_reason_codes = _dedupe_tuple(self._cycle_reason_codes + ("MARKET_CONFIRMATION_STATE_RESET", reason))
+            self._cycle_reset_reason = reason
+
+    def states_for_persistence(self, *, recheck_after_sec: int | None = None) -> list[dict[str, Any]]:
+        recheck = self.config.recheck_after_sec if recheck_after_sec is None else int(recheck_after_sec or 0)
+        return [state.to_dict(recheck_after_sec=recheck) for side, state in sorted(self._states.items(), key=lambda item: item[0].value)]
+
+    def mark_persist_result(self, side: MarketSide | str, *, persisted: bool, reason: str = "", updated_at: str = "") -> None:
+        normalized = normalize_market_side(side)
+        state = self._states.get(normalized)
+        if state is None:
+            return
+        codes = ("MARKET_CONFIRMATION_STATE_PERSISTED",) if persisted else ("MARKET_CONFIRMATION_STATE_PERSIST_FAILED",)
+        if reason:
+            codes = codes + (reason,)
+        self._states[normalized] = replace(
+            state,
+            persisted=persisted,
+            state_source=state.state_source if persisted else "db_failed_memory_fallback",
+            last_updated_at=updated_at or state.last_updated_at,
+            reason_codes=_dedupe_tuple(state.reason_codes + codes),
+        )
+
     def _update_side(
         self,
         side: MarketSide,
@@ -1467,9 +1645,21 @@ class MarketSideConfirmationTracker:
         now_text = str(calculated_at or "")
         previous = self._previous_state(side, market)
         raw_status = self._raw_status_for_side(side, market, side_detail)
+        if previous.cycle_id and now_text and previous.cycle_id == now_text:
+            return replace(
+                previous,
+                current_raw_status=raw_status,
+                reason_codes=_dedupe_tuple(previous.reason_codes + ("MARKET_CONFIRMATION_STATE_PERSISTED",)),
+                transition_type="NO_CHANGE",
+            )
         if self._outside_confirmation_window(previous, now_text):
             base_status = raw_status if raw_status not in {MarketStatus.WEAK, MarketStatus.RISK_OFF} else MarketStatus.CHOPPY
-            previous = _MarketSideConfirmationState(side=side, confirmed_status=base_status, previous_confirmed_status=base_status)
+            previous = _MarketSideConfirmationState(
+                side=side,
+                confirmed_status=base_status,
+                previous_confirmed_status=base_status,
+                reset_reason="MARKET_CONFIRMATION_STATE_STALE",
+            )
         if raw_status != previous.current_raw_status:
             previous.weak_consecutive_cycles = 0
             previous.risk_off_consecutive_cycles = 0
@@ -1479,10 +1669,13 @@ class MarketSideConfirmationTracker:
         source_conflict = "SIDE_BREADTH_SOURCE_CONFLICT" in set(side_detail.get("reason_codes") or ()) | set(side_detail.get("data_quality_flags") or ())
         data_flags = _dedupe_tuple(tuple(side_detail.get("data_quality_flags") or ()))
         reason_codes: list[str] = []
+        transition_type = "NO_CHANGE"
         confirmed_status = previous.confirmed_status
         wait_started_at = previous.wait_started_at
         last_confirmed_at = previous.last_confirmed_at
         last_recovered_at = previous.last_recovered_at
+        source_conflict_count = previous.source_conflict_count
+        last_source_conflict_at = previous.last_source_conflict_at
         confirmation_pending = False
         recovery_pending = False
         blocked_buy_intent_count = previous.blocked_buy_intent_count
@@ -1492,6 +1685,9 @@ class MarketSideConfirmationTracker:
 
         if source_conflict and self.config.source_conflict_blocks_entry:
             confirmation_pending = True
+            source_conflict_count += 1
+            last_source_conflict_at = now_text
+            transition_type = "SOURCE_CONFLICT"
             reason_codes.extend(("SIDE_BREADTH_SOURCE_CONFLICT", "WAIT_MARKET_CONFIRMATION_PENDING"))
             wait_started_at = wait_started_at or now_text
         elif raw_status == MarketStatus.WEAK:
@@ -1503,10 +1699,12 @@ class MarketSideConfirmationTracker:
                 confirmed_status = MarketStatus.WEAK
                 last_confirmed_at = last_confirmed_at or now_text
                 wait_started_at = wait_started_at or now_text
+                transition_type = "WEAK_CONFIRMED"
                 reason_codes.extend(("MARKET_WEAK_CONFIRMED", "WAIT_CANDIDATE_MARKET_WEAK"))
             else:
                 confirmation_pending = bool(self.config.confirmation_pending_blocks_entry)
                 wait_started_at = wait_started_at or now_text
+                transition_type = "WEAK_PENDING"
                 reason_codes.extend(
                     (
                         "MARKET_WEAK_CONFIRMATION_PENDING",
@@ -1524,10 +1722,12 @@ class MarketSideConfirmationTracker:
                 confirmed_status = MarketStatus.RISK_OFF
                 last_confirmed_at = last_confirmed_at or now_text
                 wait_started_at = wait_started_at or now_text
+                transition_type = "RISK_OFF_CONFIRMED"
                 reason_codes.extend(("MARKET_RISK_OFF_CONFIRMED", "WAIT_CANDIDATE_MARKET_RISK_OFF"))
             else:
                 confirmation_pending = bool(self.config.confirmation_pending_blocks_entry)
                 wait_started_at = wait_started_at or now_text
+                transition_type = "RISK_OFF_PENDING"
                 reason_codes.extend(
                     (
                         "MARKET_RISK_OFF_CONFIRMATION_PENDING",
@@ -1546,11 +1746,13 @@ class MarketSideConfirmationTracker:
                     wait_started_at = ""
                     last_recovered_at = now_text
                     last_confirmed_at = now_text
+                    transition_type = "RECOVERY_CONFIRMED"
                     reason_codes.extend(("MARKET_WAIT_RECOVERED", "MARKET_RECOVERY_CONFIRMED"))
                 else:
                     confirmed_status = previous.confirmed_status
                     recovery_pending = True
                     wait_started_at = wait_started_at or previous.wait_started_at or now_text
+                    transition_type = "RECOVERY_PENDING"
                     reason_codes.extend(
                         (
                             "MARKET_RECOVERY_CONFIRMATION_PENDING",
@@ -1563,6 +1765,7 @@ class MarketSideConfirmationTracker:
                 confirmed_status = raw_status
                 wait_started_at = ""
                 if previous.confirmation_pending or previous.recovery_pending:
+                    transition_type = "STATE_RESET"
                     reason_codes.append("MARKET_WAIT_STATE_RESET")
 
         blocks_entry = confirmation_pending or recovery_pending or confirmed_status in {MarketStatus.WEAK, MarketStatus.RISK_OFF}
@@ -1586,12 +1789,24 @@ class MarketSideConfirmationTracker:
             recovery_pending=recovery_pending,
             last_breadth_pct=_float_or_none(side_detail.get("breadth_pct")),
             last_index_return_pct=_float_or_none(side_detail.get("index_return_pct")),
+            last_turnover_weighted_return_pct=_float_or_none(side_detail.get("turnover_weighted_return_pct")),
             last_source=str(side_detail.get("breadth_source") or ""),
             last_trust_level=str(side_detail.get("breadth_trust_level") or ""),
             last_data_quality_flags=data_flags,
             source_conflict=source_conflict,
+            source_conflict_count=source_conflict_count,
+            last_source_conflict_at=last_source_conflict_at,
             reason_codes=_dedupe_tuple(reason_codes),
             blocked_buy_intent_count=blocked_buy_intent_count,
+            transition_type=transition_type,
+            state_source=previous.state_source or "memory",
+            restored=previous.restored,
+            persisted=False,
+            restore_reason=previous.restore_reason,
+            last_updated_at=previous.last_updated_at,
+            state_age_sec=previous.state_age_sec,
+            state_version=previous.state_version,
+            reset_reason=previous.reset_reason,
         )
 
     def _previous_state(self, side: MarketSide, market: MarketStrengthSnapshot) -> _MarketSideConfirmationState:
@@ -2473,6 +2688,23 @@ class ThemeLabFlowEngine:
                     "market_side_blocked_buy_intent_count": decision.market_side_blocked_buy_intent_count
                     or enriched.market_side_blocked_buy_intent_count,
                     "market_side_recheck_after_sec": decision.market_side_recheck_after_sec or enriched.market_side_recheck_after_sec,
+                    "market_confirmation_state_persisted": decision.market_confirmation_state_persisted,
+                    "market_confirmation_state_restored": decision.market_confirmation_state_restored,
+                    "market_confirmation_state_restore_reason": decision.market_confirmation_state_restore_reason
+                    or enriched.market_confirmation_state_restore_reason,
+                    "market_confirmation_state_last_updated_at": decision.market_confirmation_state_last_updated_at
+                    or enriched.market_confirmation_state_last_updated_at,
+                    "market_confirmation_state_age_sec": decision.market_confirmation_state_age_sec
+                    if decision.market_confirmation_state_age_sec is not None
+                    else enriched.market_confirmation_state_age_sec,
+                    "market_confirmation_state_version": decision.market_confirmation_state_version
+                    or enriched.market_confirmation_state_version,
+                    "market_confirmation_state_source": decision.market_confirmation_state_source
+                    or enriched.market_confirmation_state_source,
+                    "market_confirmation_state_reset_reason": decision.market_confirmation_state_reset_reason
+                    or enriched.market_confirmation_state_reset_reason,
+                    "market_confirmation_transition_type": decision.market_confirmation_transition_type
+                    or enriched.market_confirmation_transition_type,
                     "market_side_reason_codes": decision.market_side_reason_codes or enriched.market_side_reason_codes,
                     "market_side_data_quality_flags": decision.market_side_data_quality_flags or enriched.market_side_data_quality_flags,
                 }
@@ -2790,6 +3022,15 @@ def _market_side_context(market: MarketStrengthSnapshot, watch: WatchSetSnapshot
         "market_side_never_recovered": bool(side_state.get("never_recovered")),
         "market_side_blocked_buy_intent_count": int(side_state.get("blocked_buy_intent_count") or 0),
         "market_side_recheck_after_sec": int(side_state.get("recheck_after_sec") or 0),
+        "market_confirmation_state_persisted": bool(side_state.get("market_confirmation_state_persisted")),
+        "market_confirmation_state_restored": bool(side_state.get("market_confirmation_state_restored")),
+        "market_confirmation_state_restore_reason": str(side_state.get("market_confirmation_state_restore_reason") or ""),
+        "market_confirmation_state_last_updated_at": str(side_state.get("market_confirmation_state_last_updated_at") or ""),
+        "market_confirmation_state_age_sec": side_state.get("market_confirmation_state_age_sec"),
+        "market_confirmation_state_version": int(side_state.get("market_confirmation_state_version") or 0),
+        "market_confirmation_state_source": str(side_state.get("market_confirmation_state_source") or "memory"),
+        "market_confirmation_state_reset_reason": str(side_state.get("market_confirmation_state_reset_reason") or ""),
+        "market_confirmation_transition_type": str(side_state.get("market_confirmation_transition_type") or ""),
         "kospi_breadth_pct": market.kospi_breadth_pct,
         "kosdaq_breadth_pct": market.kosdaq_breadth_pct,
         "kospi_breadth_ready": market.kospi_breadth_ready,

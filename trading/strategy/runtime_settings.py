@@ -212,6 +212,23 @@ LEGACY_DEFAULT_SETTINGS: dict[str, Any] = {
         "extreme_breadth_risk_off_pct": 0.20,
         "extreme_turnover_weighted_return_pct": -1.5,
     },
+    "market_side_confirmation_persistence": {
+        "enabled": True,
+        "storage": "db",
+        "state_version": 1,
+        "session_scope": "trade_date",
+        "ttl_sec": 21600,
+        "reset_on_trade_date_change": True,
+        "reset_before_market_open": True,
+        "reset_after_market_close": False,
+        "max_state_age_sec": 300,
+        "fallback_to_memory_on_db_error": True,
+        "conservative_on_restore_failure": True,
+        "transition_log_enabled": True,
+        "transition_log_every_cycle": False,
+        "persist_unknown_market_state": False,
+        "force_reset_market_confirmation_state": False,
+    },
     "entry_plan_thresholds": {
         "max_chase_pct": {
             "kosdaq": 0.7,
