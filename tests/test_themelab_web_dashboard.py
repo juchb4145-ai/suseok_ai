@@ -23,16 +23,28 @@ def test_themelab_page_is_standalone_dark_terminal():
     soup = BeautifulSoup(html, "html.parser")
 
     assert soup.select_one(".terminal-shell") is not None
+    assert soup.select_one("#operating-cockpit") is not None
+    assert soup.select_one("#operation-status") is not None
+    assert soup.select_one("#cockpit-market-sides") is not None
+    assert soup.select_one("#cockpit-live-readiness") is not None
     assert soup.select_one("#theme-rank-list") is not None
     assert soup.select_one("#chart-stage") is not None
     assert soup.select_one("#gate-status") is not None
+    assert soup.select_one("#gate-display-status") is not None
+    assert soup.select_one("#gate-detail-sections") is not None
     assert soup.select_one("#watchset-body") is not None
     assert soup.select_one("#order-candidates") is not None
+    assert soup.select_one('[data-filter-value="LIVE_GUARD_BLOCKED"]') is not None
+    assert soup.select_one('[data-filter-value="MISSING_VWAP"]') is not None
+    assert soup.select_one('[data-filter-value="ORDER_INTENT_CREATED"]') is not None
     assert "/static/themelab.css" in html
     assert "/static/themelab.js" in html
     assert "--app-bg: #0b0f14" in css
+    assert "cockpit-grid" in css
     assert "/ws/dashboard" in js
     assert "/api/themelab/snapshot" in js
+    assert "matchesFilters" in js
+    assert "renderCockpit" in js
 
 
 def test_theme_lab_snapshot_sorts_watchset_and_filters_entry_candidates(tmp_path):
@@ -61,10 +73,124 @@ def test_theme_lab_snapshot_sorts_watchset_and_filters_entry_candidates(tmp_path
     assert payload["available"] is True
     assert [item["gate_status"] for item in payload["watchset"]] == ["READY", "READY_SMALL", "OBSERVE", "BLOCKED"]
     assert [item["symbol"] for item in payload["entry_candidates"]] == ["000001", "000002"]
+    assert payload["summary"]["ready_count"] == 1
+    assert payload["summary"]["ready_small_count"] == 1
+    assert payload["summary"]["observe_count"] == 1
+    assert payload["summary"]["blocked_count"] == 1
+    assert payload["summary"]["live_guard_blocked_count"] == 2
     universe = {item["symbol"]: item for item in payload["chart_universe"]}
     assert {"KOSPI", "KOSDAQ", "000001", "000002"}.issubset(universe)
     assert "000004" not in universe
     assert payload["data_quality"]["vi_status_supported"] is False
+
+
+def test_theme_lab_snapshot_summary_counts_operating_cockpit_fields(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        ready = _watch("000101", "READY", role="LEADER")
+        ready.update(
+            {
+                "candidate_market": "KOSDAQ",
+                "live_order_enabled": True,
+                "live_order_guard_passed": True,
+                "runtime_order_intent_created": True,
+                "virtual_order_created": True,
+                "submittable": True,
+            }
+        )
+        ready_small = _watch("000102", "READY_SMALL", role="CO_LEADER", multiplier=0.5)
+        ready_small.update({"candidate_market": "KOSPI", "live_order_enabled": True, "live_order_guard_passed": False})
+        late_chase = _watch("000103", "WAIT", role="FOLLOWER")
+        late_chase.update({"late_chase_level": "soft_block", "late_chase_recheck_after_sec": 45})
+        chase_block = _watch("000104", "BLOCKED", role="LATE_LAGGARD")
+        chase_block.update({"chase_risk": True, "risk_reason_codes": ["CHASE_RISK"]})
+        market_pending = _watch("000105", "WAIT")
+        market_pending.update({"candidate_market": "KOSDAQ", "candidate_market_confirmation_pending": True})
+        data_pending = _watch("000106", "WAIT")
+        data_pending.update({"support_ready_reason": "WAIT_DATA_SUPPORT_NOT_READY", "diagnostic_only": True})
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:07:00",
+            {
+                "market_status": {
+                    "market_status": "SELECTIVE",
+                    "kospi_return_pct": 0.2,
+                    "kosdaq_return_pct": 0.7,
+                    "side_statuses": {
+                        "KOSPI": {"status": "CHOPPY", "index_return_pct": 0.2, "breadth_pct": 0.52, "breadth_source": "REALTIME", "breadth_trust_level": "HIGH"},
+                        "KOSDAQ": {"status": "SELECTIVE", "index_return_pct": 0.7, "breadth_pct": 0.61, "breadth_source": "REALTIME", "breadth_trust_level": "MEDIUM"},
+                    },
+                },
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [data_pending, chase_block, market_pending, ready_small, late_chase, ready],
+                "gate_decisions": [],
+                "data_quality": {"status": "OK", "candle_missing_count": 0},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    summary = payload["summary"]
+    assert summary["ready_count"] == 1
+    assert summary["ready_small_count"] == 1
+    assert summary["wait_count"] == 3
+    assert summary["blocked_count"] == 1
+    assert summary["late_chase_wait_count"] == 1
+    assert summary["chase_risk_blocked_count"] == 1
+    assert summary["market_pending_count"] == 1
+    assert summary["data_not_ready_count"] == 1
+    assert summary["diagnostic_only_count"] == 1
+    assert summary["runtime_order_intent_created_count"] == 1
+    assert summary["virtual_order_created_count"] == 1
+    assert summary["live_guard_passed_count"] == 1
+    assert summary["live_guard_blocked_count"] == 1
+    assert summary["leader_count"] == 1
+    assert summary["co_leader_count"] == 1
+    assert summary["late_laggard_count"] == 1
+    assert summary["top_theme_name"] == "전력기기"
+    assert summary["operation_status"] == "READY_TO_TRADE"
+    assert summary["operation_message_ko"] == "READY 후보가 있고 데이터 품질이 정상입니다."
+    assert payload["market"]["sides"][0]["side"] == "KOSPI"
+    assert payload["market"]["sides"][1]["breadth_trust_level"] == "MEDIUM"
+
+
+def test_theme_lab_snapshot_operation_status_for_ready_live_blocked_and_data_quality(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        blocked_ready = _watch("000201", "READY")
+        blocked_ready.update({"live_order_enabled": True, "live_order_guard_passed": False})
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:08:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [blocked_ready],
+                "gate_decisions": [],
+                "data_quality": {"status": "OK", "candle_missing_count": 0},
+            },
+        )
+        payload = build_theme_lab_dashboard_snapshot(db)
+        assert payload["summary"]["operation_status"] == "READY_BUT_LIVE_BLOCKED"
+        assert payload["summary"]["operation_message_ko"] == "READY 후보는 있으나 LIVE Guard 통과 후보가 없습니다."
+
+        data_wait = _watch("000202", "WAIT")
+        data_wait.update({"support_ready_reason": "WAIT_DATA_SUPPORT_NOT_READY", "diagnostic_only": True})
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:09:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [data_wait],
+                "gate_decisions": [],
+                "data_quality": {"status": "DEGRADED", "candle_missing_count": 1},
+            },
+        )
+        payload = build_theme_lab_dashboard_snapshot(db)
+        assert payload["summary"]["operation_status"] == "WAIT_DATA_QUALITY"
+        assert payload["summary"]["operation_message_ko"] == "VWAP/지지선/틱 데이터 부족으로 진단 전용 후보가 많습니다."
+    finally:
+        db.close()
 
 
 def test_theme_lab_snapshot_demotes_themes_without_live_price_signal(tmp_path):

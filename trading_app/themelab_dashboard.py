@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any
 
@@ -10,6 +10,16 @@ from trading.theme_engine.repository import ThemeEngineRepository
 
 GATE_ORDER = {"READY": 0, "READY_SMALL": 1, "WAIT": 2, "OBSERVE": 3, "BLOCKED": 4}
 ROLE_ORDER = {"LEADER": 0, "CO_LEADER": 1, "FOLLOWER": 2, "LATE_LAGGARD": 3, "WEAK_MEMBER": 4, "OVERHEATED": 5}
+DISPLAY_WAIT_ORDER = {
+    "LATE_CHASE_TEMP_WAIT": 0,
+    "WAIT_MARKET_CONFIRMATION_PENDING": 1,
+    "WAIT_MARKET_RECOVERY_PENDING": 1,
+    "WAIT_MARKET_STATE_CONSERVATIVE_FALLBACK": 1,
+    "WAIT_CANDIDATE_MARKET_RISK_OFF": 1,
+    "WAIT_CANDIDATE_MARKET_WEAK": 1,
+    "WAIT_DATA_SUPPORT_NOT_READY": 2,
+    "WAIT_DATA_LATEST_TICK_STALE": 2,
+}
 
 
 def build_theme_lab_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
@@ -27,6 +37,7 @@ def build_theme_lab_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     selected_watch = next((item for item in watchset if item.get("symbol") == selected.get("symbol")), {})
 
     ranked_themes = _ranked_theme_rows(themes, condition_counts)
+    summary = _summary(ranked_themes, watchset, entry_candidates, data_quality)
 
     return {
         "available": True,
@@ -43,14 +54,7 @@ def build_theme_lab_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "chart_universe": chart_universe,
         "selected_chart": selected,
         "gate_detail": _gate_detail(selected_watch),
-        "summary": {
-            "theme_count": len(themes),
-            "watchset_size": len(watchset),
-            "ready_count": sum(1 for item in watchset if item.get("gate_status") == "READY"),
-            "ready_small_count": sum(1 for item in watchset if item.get("gate_status") == "READY_SMALL"),
-            "blocked_count": sum(1 for item in watchset if item.get("gate_status") == "BLOCKED"),
-            "order_candidate_count": len(entry_candidates),
-        },
+        "summary": summary,
     }
 
 
@@ -67,6 +71,10 @@ def _empty_snapshot() -> dict[str, Any]:
             "kosdaq_return_pct": None,
             "market_strong_count": 0,
             "market_leader_count": 0,
+            "sides": [
+                _empty_market_side("KOSPI"),
+                _empty_market_side("KOSDAQ"),
+            ],
         },
         "condition_statuses": [],
         "data_quality": {
@@ -81,14 +89,7 @@ def _empty_snapshot() -> dict[str, Any]:
         "chart_universe": _index_chart_items(),
         "selected_chart": {"symbol": "KOSDAQ", "name": "KOSDAQ", "type": "index", "chart_data_status": "NO_CANDLE_DATA"},
         "gate_detail": {"gate_status": "OBSERVE", "summary_message": "선택된 WatchSet 종목이 없습니다."},
-        "summary": {
-            "theme_count": 0,
-            "watchset_size": 0,
-            "ready_count": 0,
-            "ready_small_count": 0,
-            "blocked_count": 0,
-            "order_candidate_count": 0,
-        },
+        "summary": _empty_summary(),
     }
 
 
@@ -102,7 +103,250 @@ def _market(raw: dict[str, Any]) -> dict[str, Any]:
         "advancers": int(raw.get("advancers") or 0),
         "decliners": int(raw.get("decliners") or 0),
         "data_quality_flags": list(raw.get("data_quality_flags") or []),
+        "sides": [_market_side(raw, "KOSPI"), _market_side(raw, "KOSDAQ")],
     }
+
+
+def _market_side(raw: dict[str, Any], side: str) -> dict[str, Any]:
+    key = side.lower()
+    side_statuses = raw.get("side_statuses") if isinstance(raw.get("side_statuses"), dict) else {}
+    side_data = dict(side_statuses.get(side) or side_statuses.get(side.upper()) or side_statuses.get(key) or {})
+    return {
+        "side": side,
+        "status": _value(
+            side_data.get("status")
+            or raw.get(f"{key}_confirmed_status")
+            or raw.get(f"{key}_status")
+            or raw.get("market_status")
+            or raw.get("status")
+            or "UNKNOWN"
+        ),
+        "index_return_pct": _first_not_none(
+            side_data.get("index_return_pct"),
+            raw.get(f"{key}_index_return_pct"),
+            raw.get(f"{key}_return_pct"),
+        ),
+        "breadth_pct": _first_not_none(side_data.get("breadth_pct"), raw.get(f"{key}_breadth_pct")),
+        "breadth_ready": bool(_first_not_none(side_data.get("breadth_ready"), raw.get(f"{key}_breadth_ready"), False)),
+        "breadth_sample_count": int(_first_not_none(side_data.get("breadth_sample_count"), raw.get(f"{key}_breadth_sample_count"), 0) or 0),
+        "breadth_source": _value(side_data.get("breadth_source") or raw.get(f"{key}_breadth_source") or ""),
+        "breadth_trust_level": _value(side_data.get("breadth_trust_level") or raw.get(f"{key}_breadth_trust_level") or "UNKNOWN"),
+        "breadth_gate_usable": bool(_first_not_none(side_data.get("breadth_gate_usable"), raw.get(f"{key}_breadth_gate_usable"), False)),
+        "breadth_diagnostic_only": bool(_first_not_none(side_data.get("breadth_diagnostic_only"), raw.get(f"{key}_breadth_diagnostic_only"), False)),
+        "valid_quote_ratio": _first_not_none(side_data.get("valid_quote_ratio"), raw.get(f"{key}_valid_quote_ratio")),
+        "turnover_weighted_return_pct": _first_not_none(
+            side_data.get("turnover_weighted_return_pct"),
+            raw.get(f"{key}_turnover_weighted_return_pct"),
+        ),
+        "reason_codes": list(side_data.get("reason_codes") or []),
+        "data_quality_flags": list(side_data.get("data_quality_flags") or []),
+    }
+
+
+def _empty_market_side(side: str) -> dict[str, Any]:
+    return {
+        "side": side,
+        "status": "WAITING",
+        "index_return_pct": None,
+        "breadth_pct": None,
+        "breadth_ready": False,
+        "breadth_sample_count": 0,
+        "breadth_source": "",
+        "breadth_trust_level": "UNKNOWN",
+        "breadth_gate_usable": False,
+        "breadth_diagnostic_only": False,
+        "valid_quote_ratio": None,
+        "turnover_weighted_return_pct": None,
+        "reason_codes": [],
+        "data_quality_flags": [],
+    }
+
+
+def _summary(
+    ranked_themes: list[dict[str, Any]],
+    watchset: list[dict[str, Any]],
+    entry_candidates: list[dict[str, Any]],
+    data_quality: dict[str, Any],
+) -> dict[str, Any]:
+    gates = Counter(str(item.get("gate_status") or "UNKNOWN") for item in watchset)
+    displays = Counter(str(item.get("display_status") or item.get("gate_status") or "UNKNOWN") for item in watchset)
+    theme_statuses = Counter(_theme_status_bucket(item.get("theme_status")) for item in ranked_themes)
+    leader_count = sum(1 for item in watchset if item.get("stock_role") == "LEADER")
+    co_leader_count = sum(1 for item in watchset if item.get("stock_role") == "CO_LEADER")
+    late_laggard_count = sum(1 for item in watchset if item.get("stock_role") == "LATE_LAGGARD")
+    live_guard_passed = sum(1 for item in watchset if item.get("live_order_guard_passed"))
+    ready_like = [item for item in watchset if item.get("gate_status") in {"READY", "READY_SMALL"}]
+    live_guard_blocked = sum(1 for item in ready_like if not item.get("live_order_guard_passed"))
+    market_pending_count = sum(1 for item in watchset if _is_market_pending(item))
+    data_not_ready_count = sum(1 for item in watchset if _is_data_not_ready(item))
+    top_theme = ranked_themes[0] if ranked_themes else {}
+    status, message = _operation_status_message(
+        ready_count=gates.get("READY", 0),
+        ready_small_count=gates.get("READY_SMALL", 0),
+        market_pending_count=market_pending_count,
+        data_not_ready_count=data_not_ready_count,
+        late_chase_wait_count=displays.get("LATE_CHASE_TEMP_WAIT", 0),
+        chase_risk_blocked_count=displays.get("CHASE_RISK_BLOCKED", 0),
+        live_guard_passed_count=live_guard_passed,
+        live_guard_blocked_count=live_guard_blocked,
+        order_candidate_count=len(entry_candidates),
+        data_quality_status=str(data_quality.get("status") or "UNKNOWN"),
+        watchset_size=len(watchset),
+    )
+    return {
+        "theme_count": len(ranked_themes),
+        "watchset_size": len(watchset),
+        "ready_count": gates.get("READY", 0),
+        "ready_small_count": gates.get("READY_SMALL", 0),
+        "wait_count": gates.get("WAIT", 0),
+        "observe_count": gates.get("OBSERVE", 0),
+        "blocked_count": gates.get("BLOCKED", 0),
+        "late_chase_wait_count": displays.get("LATE_CHASE_TEMP_WAIT", 0),
+        "chase_risk_blocked_count": displays.get("CHASE_RISK_BLOCKED", 0),
+        "market_pending_count": market_pending_count,
+        "data_not_ready_count": data_not_ready_count,
+        "diagnostic_only_count": sum(1 for item in watchset if item.get("diagnostic_only")),
+        "submittable_count": sum(1 for item in watchset if item.get("submittable")),
+        "runtime_order_intent_created_count": sum(1 for item in watchset if item.get("runtime_order_intent_created")),
+        "virtual_order_created_count": sum(1 for item in watchset if item.get("virtual_order_created")),
+        "live_order_enabled": any(item.get("live_order_enabled") for item in watchset),
+        "live_guard_passed_count": live_guard_passed,
+        "live_guard_blocked_count": live_guard_blocked,
+        "leader_count": leader_count,
+        "co_leader_count": co_leader_count,
+        "late_laggard_count": late_laggard_count,
+        "order_candidate_count": len(entry_candidates),
+        "theme_status_counts": dict(theme_statuses),
+        "display_status_counts": dict(displays),
+        "top_theme_name": top_theme.get("theme_name", ""),
+        "top_theme_status": top_theme.get("theme_status", ""),
+        "top_theme_score": top_theme.get("condition_score", 0),
+        "top_leader_name": top_theme.get("top_leader_name", ""),
+        "top_leader_symbol": top_theme.get("top_leader_symbol", ""),
+        "top_leader_turnover_krw": top_theme.get("top_leader_turnover_krw", 0),
+        "operation_status": status,
+        "operation_message_ko": message,
+    }
+
+
+def _empty_summary() -> dict[str, Any]:
+    status, message = _operation_status_message(
+        ready_count=0,
+        ready_small_count=0,
+        market_pending_count=0,
+        data_not_ready_count=0,
+        late_chase_wait_count=0,
+        chase_risk_blocked_count=0,
+        live_guard_passed_count=0,
+        live_guard_blocked_count=0,
+        order_candidate_count=0,
+        data_quality_status="BROKEN",
+        watchset_size=0,
+    )
+    return {
+        "theme_count": 0,
+        "watchset_size": 0,
+        "ready_count": 0,
+        "ready_small_count": 0,
+        "wait_count": 0,
+        "observe_count": 0,
+        "blocked_count": 0,
+        "late_chase_wait_count": 0,
+        "chase_risk_blocked_count": 0,
+        "market_pending_count": 0,
+        "data_not_ready_count": 0,
+        "diagnostic_only_count": 0,
+        "submittable_count": 0,
+        "runtime_order_intent_created_count": 0,
+        "virtual_order_created_count": 0,
+        "live_order_enabled": False,
+        "live_guard_passed_count": 0,
+        "live_guard_blocked_count": 0,
+        "leader_count": 0,
+        "co_leader_count": 0,
+        "late_laggard_count": 0,
+        "order_candidate_count": 0,
+        "theme_status_counts": {},
+        "display_status_counts": {},
+        "top_theme_name": "",
+        "top_theme_status": "",
+        "top_theme_score": 0,
+        "top_leader_name": "",
+        "top_leader_symbol": "",
+        "top_leader_turnover_krw": 0,
+        "operation_status": status,
+        "operation_message_ko": message,
+    }
+
+
+def _theme_status_bucket(value: Any) -> str:
+    text = _value(value).upper()
+    if "LEADING" in text:
+        return "LEADING"
+    if "ACTIVE" in text:
+        return "ACTIVE"
+    if "WATCH" in text:
+        return "WATCH"
+    if "WEAK" in text:
+        return "WEAK"
+    return text or "UNKNOWN"
+
+
+def _is_market_pending(item: dict[str, Any]) -> bool:
+    display = str(item.get("display_status") or "")
+    return (
+        display.startswith("WAIT_MARKET")
+        or display.startswith("WAIT_CANDIDATE_MARKET")
+        or bool(item.get("market_confirmation_pending"))
+        or bool(item.get("market_recovery_pending"))
+    )
+
+
+def _is_data_not_ready(item: dict[str, Any]) -> bool:
+    display = str(item.get("display_status") or "")
+    flags = set(item.get("data_quality_flags") or []) | set(item.get("price_location_data_quality_flags") or [])
+    return (
+        display.startswith("WAIT_DATA")
+        or bool(item.get("diagnostic_only"))
+        or item.get("latest_tick_ready") is False
+        or bool(item.get("support_ready_reason"))
+        or any(str(flag).startswith("MISSING") or str(flag).startswith("STALE") for flag in flags)
+    )
+
+
+def _operation_status_message(
+    *,
+    ready_count: int,
+    ready_small_count: int,
+    market_pending_count: int,
+    data_not_ready_count: int,
+    late_chase_wait_count: int,
+    chase_risk_blocked_count: int,
+    live_guard_passed_count: int,
+    live_guard_blocked_count: int,
+    order_candidate_count: int,
+    data_quality_status: str,
+    watchset_size: int,
+) -> tuple[str, str]:
+    data_status = data_quality_status.upper()
+    ready_like = ready_count + ready_small_count
+    if watchset_size == 0:
+        return "SNAPSHOT_UNAVAILABLE", "ThemeLabFlow 결과 대기 중입니다."
+    if ready_count > 0 and live_guard_passed_count > 0 and data_status not in {"DEGRADED", "BROKEN"}:
+        return "READY_TO_TRADE", "READY 후보가 있고 데이터 품질이 정상입니다."
+    if ready_like > 0 and live_guard_passed_count == 0 and live_guard_blocked_count > 0:
+        return "READY_BUT_LIVE_BLOCKED", "READY 후보는 있으나 LIVE Guard 통과 후보가 없습니다."
+    if data_status in {"DEGRADED", "BROKEN"} or data_not_ready_count >= max(1, ready_like + market_pending_count):
+        return "WAIT_DATA_QUALITY", "VWAP/지지선/틱 데이터 부족으로 진단 전용 후보가 많습니다."
+    if market_pending_count > 0:
+        return "WAIT_MARKET_CONFIRMATION", "시장 확인 대기 후보가 많아 관찰 우선입니다."
+    if chase_risk_blocked_count > 0 or late_chase_wait_count >= max(1, ready_like):
+        return "RISK_BLOCKED", "추격매수 차단 후보가 많아 신규 진입 대기입니다."
+    if order_candidate_count == 0:
+        if ready_like == 0 and watchset_size > 0:
+            return "OBSERVE_ONLY", "현재 READY 후보가 없어 관찰 우선입니다."
+        return "NO_SIGNAL", "현재 주문 후보가 없습니다."
+    return "OBSERVE_ONLY", "장중 매수 가능 후보를 관찰 중입니다."
 
 
 def _condition_statuses(db: TradingDatabase) -> list[dict[str, Any]]:
@@ -138,11 +382,11 @@ def _condition_statuses(db: TradingDatabase) -> list[dict[str, Any]]:
 def _data_quality(raw: dict[str, Any], watchset: list[dict[str, Any]]) -> dict[str, Any]:
     data = dict(raw.get("data_quality") or {})
     price_flags = [flag for item in watchset for flag in item.get("data_quality_flags", []) + item.get("price_location_data_quality_flags", [])]
-    missing_vwap = int(data.get("vwap_missing_count") or price_flags.count("MISSING_VWAP"))
-    missing_session_high = int(data.get("session_high_missing_count") or price_flags.count("MISSING_SESSION_HIGH"))
-    missing_prev_close = int(data.get("prev_close_missing_count") or price_flags.count("MISSING_PREV_CLOSE"))
-    candle_missing = int(data.get("candle_missing_count") or len(watchset))
-    quote_stale = int(data.get("quote_stale_count") or 0)
+    missing_vwap = int(_first_not_none(data.get("vwap_missing_count"), price_flags.count("MISSING_VWAP")) or 0)
+    missing_session_high = int(_first_not_none(data.get("session_high_missing_count"), price_flags.count("MISSING_SESSION_HIGH")) or 0)
+    missing_prev_close = int(_first_not_none(data.get("prev_close_missing_count"), price_flags.count("MISSING_PREV_CLOSE")) or 0)
+    candle_missing = int(_first_not_none(data.get("candle_missing_count"), len(watchset)) or 0)
+    quote_stale = int(_first_not_none(data.get("quote_stale_count"), 0) or 0)
     status = str(data.get("status") or "OK")
     if candle_missing or quote_stale >= 5:
         status = "DEGRADED"
@@ -426,18 +670,19 @@ def _display_status(item: dict[str, Any], gate: str) -> str:
 def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
     gate = _value(item.get("final_gate_status") or item.get("gate_status") or "OBSERVE")
     display_status = _display_status(item, gate)
-    candidate_market = item.get("candidate_market") or ""
+    candidate_market = item.get("candidate_market") or "UNKNOWN"
     return {
         "gate_status": gate,
         "final_status": gate,
         "display_status": display_status,
         "normalized_status": display_status,
         "symbol": item.get("symbol") or "",
-        "code": item.get("symbol") or "",
+        "code": item.get("code") or item.get("symbol") or "",
         "stock_name": item.get("name") or item.get("stock_name") or "",
         "name": item.get("name") or item.get("stock_name") or "",
         "candidate_instance_id": item.get("candidate_instance_id", ""),
         "candidate_market": candidate_market,
+        "candidate_market_source": item.get("candidate_market_source", ""),
         "primary_theme": item.get("primary_theme") or "",
         "theme_name": item.get("theme_name") or item.get("primary_theme") or "",
         "theme_score": item.get("theme_score", item.get("condition_score")),
@@ -474,6 +719,8 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
         "recent_support_ready": bool(item.get("recent_support_ready", False)),
         "market_raw_status": item.get("candidate_market_raw_status") or item.get("market_raw_status", ""),
         "market_confirmed_status": item.get("candidate_market_confirmed_status") or item.get("candidate_market_status") or item.get("market_confirmed_status", ""),
+        "kospi_market_status": item.get("kospi_market_status", ""),
+        "kosdaq_market_status": item.get("kosdaq_market_status", ""),
         "market_previous_confirmed_status": item.get("market_previous_confirmed_status", ""),
         "market_confirmation_pending": bool(item.get("candidate_market_confirmation_pending", item.get("market_confirmation_pending", False))),
         "market_recovery_pending": bool(item.get("candidate_market_recovery_pending", item.get("market_recovery_pending", False))),
@@ -521,7 +768,7 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
         "live_order_guard_passed": bool(item.get("live_order_guard_passed")),
         "position_size_multiplier": float(item.get("position_size_multiplier") or 1.0),
         "recheck_after_sec": int(item.get("recheck_after_sec") or 0),
-        "summary_reason": _summary_message(item, gate),
+        "summary_reason": _summary_message(item, gate, display_status),
         "risk_reason_codes": list(item.get("risk_reason_codes") or []),
         "price_location_reason_codes": list(item.get("price_location_reason_codes") or []),
         "data_quality_flags": list(item.get("data_quality_flags") or []),
@@ -543,13 +790,22 @@ def _entry_row(item: dict[str, Any], priority: int) -> dict[str, Any]:
     return {
         "priority": priority,
         "symbol": item.get("symbol") or "",
+        "code": item.get("code") or item.get("symbol") or "",
         "stock_name": item.get("stock_name") or item.get("name") or "",
         "theme_name": item.get("primary_theme") or "",
         "stock_role": item.get("stock_role") or "",
         "gate_status": item.get("gate_status") or "",
+        "display_status": item.get("display_status") or item.get("gate_status") or "",
         "position_size_multiplier": item.get("position_size_multiplier") or 1.0,
         "entry_reference": _metric_ref(item, "breakout_level_gap_pct", "돌파 기준"),
         "stop_reference": _metric_ref(item, "support_gap_pct", "지지선"),
+        "live_order_enabled": bool(item.get("live_order_enabled")),
+        "live_order_guard_passed": bool(item.get("live_order_guard_passed")),
+        "runtime_order_intent_created": bool(item.get("runtime_order_intent_created")),
+        "virtual_order_created": bool(item.get("virtual_order_created")),
+        "candidate_instance_id": item.get("candidate_instance_id", ""),
+        "diagnostic_only": bool(item.get("diagnostic_only")),
+        "submittable": bool(item.get("submittable")),
         "reason": item.get("summary_reason") or "",
     }
 
@@ -623,28 +879,77 @@ def _select_chart(chart_universe: list[dict[str, Any]], watchset: list[dict[str,
 
 
 def _sorted_watchset(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    def sort_key(item: dict[str, Any]):
-        gate = _value(item.get("final_gate_status") or item.get("gate_status") or "OBSERVE")
-        role = _value(item.get("stock_role") or "UNKNOWN")
+    rows = [_watch_row(item) for item in items]
+
+    def sort_key(row: dict[str, Any]):
         return (
-            GATE_ORDER.get(gate, 9),
-            ROLE_ORDER.get(role, 9),
-            -float(item.get("turnover_krw") or 0),
-            -float(item.get("price_location_score") or 0),
+            _operating_priority(row),
+            _recheck_seconds(row),
+            ROLE_ORDER.get(str(row.get("stock_role") or "UNKNOWN"), 9),
+            -float(row.get("turnover_krw") or 0),
+            -float(row.get("theme_score") or 0),
+            -int(row.get("condition_level") or 0),
+            -float(row.get("price_location_score") or 0),
+            str(row.get("symbol") or ""),
         )
 
-    return sorted((_watch_row(item) for item in items), key=sort_key)
+    return sorted(rows, key=sort_key)
 
 
-def _summary_message(item: dict[str, Any], gate: str) -> str:
+def _operating_priority(row: dict[str, Any]) -> int:
+    gate = str(row.get("gate_status") or "OBSERVE")
+    display = str(row.get("display_status") or gate)
+    if gate == "READY":
+        return 0
+    if gate == "READY_SMALL":
+        return 1
+    if gate == "WAIT":
+        return 20 + DISPLAY_WAIT_ORDER.get(display, 0)
+    if _is_market_pending(row):
+        return 31
+    if _is_data_not_ready(row):
+        return 32
+    if gate == "OBSERVE":
+        return 40
+    if gate == "BLOCKED":
+        return 50
+    return 60 + GATE_ORDER.get(gate, 9)
+
+
+def _recheck_seconds(row: dict[str, Any]) -> int:
+    candidates = [
+        int(row.get("recheck_after_sec") or 0),
+        int(row.get("late_chase_recheck_after_sec") or 0),
+        int(row.get("market_wait_recheck_after_sec") or 0),
+    ]
+    positives = [value for value in candidates if value > 0]
+    return min(positives) if positives else 999999
+
+
+def _summary_message(item: dict[str, Any], gate: str, display_status: str = "") -> str:
     role = _value(item.get("stock_role") or "UNKNOWN")
     location = _value(item.get("price_location_status") or "UNKNOWN")
     multiplier = float(item.get("position_size_multiplier") or 1.0)
     reasons = list(item.get("risk_reason_codes") or item.get("price_location_reason_codes") or [])
+    display_status = str(display_status or item.get("display_status") or "")
+    if display_status == "LATE_CHASE_TEMP_WAIT":
+        seconds = int(item.get("late_chase_recheck_after_sec") or item.get("recheck_after_sec") or 0)
+        return f"추격매수 대기: {seconds}초 후 재확인" if seconds else "추격매수 대기"
+    if display_status == "CHASE_RISK_BLOCKED":
+        return "추격매수 리스크로 신규 진입 차단"
+    if display_status.startswith("WAIT_MARKET") or display_status.startswith("WAIT_CANDIDATE_MARKET"):
+        seconds = int(item.get("market_wait_recheck_after_sec") or item.get("recheck_after_sec") or 0)
+        suffix = f", {seconds}초 후 재확인" if seconds else ""
+        return f"시장 확인 대기{suffix}"
+    if display_status.startswith("WAIT_DATA"):
+        reason = item.get("support_ready_reason") or item.get("blocked_reason") or "보조 데이터 준비 필요"
+        return f"데이터 보강 대기: {reason}"
     if gate == "READY":
-        return f"{role} / {location} 조건으로 진입 가능, {multiplier:.2g}배 비중"
+        live_note = "" if item.get("live_order_guard_passed") else " / LIVE Guard 미통과"
+        return f"{role} / {location} 조건으로 진입 가능, {multiplier:.2g}배 비중{live_note}"
     if gate == "READY_SMALL":
-        return f"{role} 흐름은 유효하지만 {location} 기준으로 소액 진입, {multiplier:.2g}배 비중"
+        live_note = "" if item.get("live_order_guard_passed") else " / LIVE Guard 미통과"
+        return f"{role} 흐름은 유효하지만 {location} 기준으로 소액 관찰 진입, {multiplier:.2g}배 비중{live_note}"
     if gate == "WAIT":
         return f"{location} 또는 리스크 확인 필요로 WAIT"
     if gate == "BLOCKED":
@@ -685,8 +990,15 @@ def _as_list(value: Any) -> list[dict[str, Any]]:
     return [dict(item) for item in value if isinstance(item, dict)]
 
 
+def _first_not_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 def _value(value: Any) -> str:
-    return str(value or "")
+    return str(getattr(value, "value", value) or "")
 
 
 def _now_time() -> str:

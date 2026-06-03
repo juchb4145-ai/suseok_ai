@@ -717,6 +717,30 @@ function renderOpsAlerts(payload) {
     .join("");
 }
 
+function renderThemeLabSummary(themeLab) {
+  const payload = themeLab || {};
+  const summary = payload.summary || {};
+  const dataQuality = payload.data_quality || {};
+  const status = summary.operation_status || "SNAPSHOT_UNAVAILABLE";
+  const tone = /READY_TO_TRADE/i.test(status)
+    ? "ok"
+    : /BLOCKED|BROKEN|RISK/i.test(status)
+      ? "bad"
+      : /WAIT|LIVE_BLOCKED|QUALITY/i.test(status)
+        ? "warn"
+        : "muted";
+
+  text("themelab-operation-status", status);
+  cls("themelab-operation-status", `counter ${tone}`);
+  text("themelab-operation-message", summary.operation_message_ko || "ThemeLabFlow 결과 대기 중");
+  text("themelab-ready", `${summary.ready_count || 0} / ${summary.ready_small_count || 0}`);
+  text("themelab-wait-blocked", `${summary.wait_count || 0} / ${summary.blocked_count || 0}`);
+  text("themelab-top-theme", summary.top_theme_name || "-");
+  text("themelab-data-quality", dataQuality.status || "UNKNOWN");
+  text("themelab-live-readiness", `${summary.live_guard_passed_count || 0} 통과 / ${summary.live_guard_blocked_count || 0} 차단`);
+  text("themelab-order-candidates", summary.order_candidate_count || 0);
+}
+
 function render(snapshot) {
   state.latestSnapshot = snapshot;
   const core = snapshot.core || {};
@@ -734,6 +758,7 @@ function render(snapshot) {
   const reviews = snapshot.reviews || { summary: {}, items: [] };
   const logs = snapshot.logs || { core: [], gateway: [], warnings: [] };
   const opsAlerts = snapshot.ops_alerts || { summary: {}, alerts: [] };
+  const themeLab = snapshot.theme_lab || {};
 
   text("snapshot-time", snapshot.timestamp || "대기 중");
   text("core-mode", core.mode || "OBSERVE");
@@ -748,6 +773,7 @@ function render(snapshot) {
   cls("gateway-state", `pill ${gateway.heartbeat_ok ? "ok" : gateway.connected ? "warn" : "bad"}`);
   cls("orderable-state", `pill ${gateway.orderable ? "ok" : "muted"}`);
   renderOpsAlerts(opsAlerts);
+  renderThemeLabSummary(themeLab);
 
   text("transport-mode", transport.mode || "rest_long_poll");
   text("transport-event-p95", formatMs(transport.event_latency_p95_ms));

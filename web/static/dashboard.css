@@ -118,7 +118,27 @@ button {
   padding: 5px 10px;
 }
 
+.link-button {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--blue);
+  font-weight: 800;
+  padding: 5px 10px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
 button:hover {
+  border-color: #96a7bb;
+  background: var(--blue-bg);
+}
+
+.link-button:hover {
   border-color: #96a7bb;
   background: var(--blue-bg);
 }
@@ -247,6 +267,10 @@ button:disabled {
 }
 
 .ops-grid {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.themelab-summary-grid {
   grid-template-columns: repeat(6, minmax(0, 1fr));
 }
 
@@ -615,6 +639,7 @@ td {
   .status-grid,
   .mini-grid,
   .ops-grid,
+  .themelab-summary-grid,
   .runtime-grid,
   .command-grid,
   .filter-grid {
@@ -654,6 +679,7 @@ td {
   .status-grid,
   .mini-grid,
   .ops-grid,
+  .themelab-summary-grid,
   .runtime-grid,
   .command-grid,
   .filter-grid,

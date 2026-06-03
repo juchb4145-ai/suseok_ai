@@ -91,6 +91,74 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   gap: 8px;
 }
 
+.cockpit-panel {
+  padding: 14px;
+}
+
+.cockpit-head {
+  align-items: center;
+}
+
+.cockpit-actions,
+.gate-status-strip {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.cockpit-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.cockpit-card {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  padding: 10px;
+}
+
+.cockpit-card > span,
+.filter-row > span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.cockpit-lines {
+  display: grid;
+  gap: 7px;
+  margin-top: 8px;
+}
+
+.cockpit-line {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--sub);
+  font-variant-numeric: tabular-nums;
+}
+
+.cockpit-line strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.cockpit-line span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .flow-grid {
   display: grid;
   grid-template-columns: minmax(270px, 0.85fr) minmax(480px, 1.45fr) minmax(300px, 0.9fr);
@@ -269,15 +337,54 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   font-variant-numeric: tabular-nums;
 }
 
+.gate-detail-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.gate-section {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+}
+
+.gate-section summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 900;
+  padding: 9px 10px;
+}
+
+.gate-section .metric-list {
+  margin: 0;
+  padding: 0 10px 10px;
+}
+
+.metric-list .attention {
+  border-color: rgba(250, 204, 21, 0.45);
+}
+
 .filter-row {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  justify-content: flex-end;
+  align-items: center;
+}
+
+.filter-stack {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.filter-row > span {
+  min-width: 70px;
 }
 
 .table-wrap {
-  max-height: 235px;
+  max-height: 360px;
   overflow: auto;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -285,6 +392,7 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
 
 table {
   width: 100%;
+  min-width: 1480px;
   border-collapse: collapse;
   font-variant-numeric: tabular-nums;
 }
@@ -318,6 +426,16 @@ tbody tr:hover {
   background: var(--panel-hover);
 }
 
+tbody tr.selected {
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.reason-cell {
+  min-width: 260px;
+  max-width: 360px;
+  white-space: normal;
+}
+
 .muted {
   color: var(--muted);
 }
@@ -327,6 +445,7 @@ tbody tr:hover {
 
 @media (max-width: 900px) {
   body { min-width: 0; }
+  .cockpit-grid,
   .flow-grid,
   .bottom-grid,
   .quality-grid {
