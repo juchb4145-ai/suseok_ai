@@ -2315,6 +2315,30 @@ class TradingDatabase:
         ).fetchall()
         return [_row_to_market_side_confirmation_state(row) for row in rows]
 
+    def load_market_side_confirmation_states_for_trade_date(self, *, trade_date: str) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM market_side_confirmation_state
+            WHERE trade_date = ?
+            ORDER BY session_id DESC, market_side, state_version DESC
+            """,
+            (str(trade_date or ""),),
+        ).fetchall()
+        return [_row_to_market_side_confirmation_state(row) for row in rows]
+
+    def load_recent_market_side_confirmation_states(self, *, limit: int = 20) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM market_side_confirmation_state
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit or 20)),),
+        ).fetchall()
+        return [_row_to_market_side_confirmation_state(row) for row in rows]
+
     def save_market_side_confirmation_transition(self, payload: dict) -> bool:
         normalized = _market_side_confirmation_transition_params(payload)
         with self.conn:

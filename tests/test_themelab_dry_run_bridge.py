@@ -308,6 +308,106 @@ def test_market_confirmation_pending_wait_is_recoverable_without_entry_plan_or_i
     assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 
 
+def test_session_boundary_wait_does_not_create_dry_run_or_virtual_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.WAIT,
+            PriceLocationStatus.GOOD_PULLBACK,
+            reasons=(
+                "WAIT_MARKET_CONFIRMATION_PENDING",
+                "MARKET_CONFIRMATION_STATE_RESTORE_SKIPPED",
+                "MARKET_SESSION_POST_CLOSE",
+            ),
+            candidate_market=MarketSide.KOSDAQ.value,
+            candidate_market_status=MarketStatus.EXPANSION.value,
+            candidate_market_raw_status=MarketStatus.EXPANSION.value,
+            candidate_market_confirmed_status=MarketStatus.EXPANSION.value,
+            candidate_market_confirmation_pending=True,
+            market_side_reason_codes=(
+                "MARKET_SESSION_BOUNDARY_DETECTED",
+                "MARKET_SESSION_POST_CLOSE",
+                "MARKET_CONFIRMATION_STATE_RESTORE_SKIPPED",
+                "MARKET_CONFIRMATION_STATE_RESET_ON_MARKET_CLOSE",
+                "WAIT_MARKET_CONFIRMATION_PENDING",
+            ),
+            market_confirmation_state_restore_skipped=True,
+            market_confirmation_state_restore_reason="MARKET_CONFIRMATION_STATE_RESET_ON_MARKET_CLOSE",
+            market_confirmation_state_source="session_boundary_memory_fallback",
+            market_confirmation_state_reset_reason="MARKET_CONFIRMATION_STATE_RESET_ON_MARKET_CLOSE",
+            market_confirmation_state_reset_count=1,
+            market_confirmation_state_max_restore_age_sec=0,
+            market_session_id="2026-06-01:post_close",
+            market_session_type="post_close",
+            market_trade_date="2026-06-01",
+            market_timezone="Asia/Seoul",
+            market_schedule_source="runtime_settings",
+            market_schedule_known=True,
+            market_is_regular_session=False,
+            market_restore_allowed=False,
+            market_reset_required=True,
+            market_reset_reason="MARKET_CONFIRMATION_STATE_RESET_ON_MARKET_CLOSE",
+            market_session_reason_codes=("MARKET_SESSION_BOUNDARY_DETECTED", "MARKET_SESSION_POST_CLOSE"),
+        ),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+    assert candidate.state == CandidateState.BLOCKED
+    assert candidate.block_type == BlockType.TEMPORARY
+    assert details["sub_status"] == "WAIT_MARKET_CONFIRMATION_PENDING"
+    assert details["market_session_type"] == "post_close"
+    assert details["market_restore_allowed"] is False
+    assert details["market_confirmation_state_restore_skipped"] is True
+    assert "MARKET_SESSION_POST_CLOSE" in details["market_side_reason_codes"]
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_virtual_orders(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
+def test_session_boundary_wait_with_noop_sink_never_queues_gateway_command(tmp_path):
+    runtime, db, gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.WAIT,
+            PriceLocationStatus.GOOD_PULLBACK,
+            reasons=("WAIT_MARKET_CONFIRMATION_PENDING", "MARKET_CONFIRMATION_STATE_RESTORE_SKIPPED"),
+            candidate_market_confirmation_pending=True,
+            market_side_reason_codes=(
+                "MARKET_SESSION_BOUNDARY_DETECTED",
+                "MARKET_CONFIRMATION_STATE_RESTORE_SKIPPED",
+                "WAIT_MARKET_CONFIRMATION_PENDING",
+                "LIVE_PATH_UNCHANGED",
+                "LIVE_ORDER_GUARD_NOT_BYPASSED",
+            ),
+            market_confirmation_state_restore_skipped=True,
+            market_confirmation_state_source="session_boundary_memory_fallback",
+            market_session_id="2026-06-01:post_close",
+            market_session_type="post_close",
+            market_restore_allowed=False,
+            market_reset_required=True,
+            market_session_reason_codes=("MARKET_SESSION_BOUNDARY_DETECTED", "MARKET_SESSION_POST_CLOSE"),
+        ),
+        dry_run_orders=False,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+    assert candidate.state == CandidateState.BLOCKED
+    assert details["market_session_type"] == "post_close"
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_virtual_orders(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+    assert gateway_state.command_snapshot()["queued_count"] == 0
+
+
 @pytest.mark.parametrize(
     ("status", "price_location", "expected_final"),
     [
@@ -806,7 +906,23 @@ def _flow_result(
     market_confirmation_state_version: int = 0,
     market_confirmation_state_source: str = "memory",
     market_confirmation_state_reset_reason: str = "",
+    market_confirmation_state_restore_skipped: bool = False,
+    market_confirmation_state_max_restore_age_sec: int = 0,
+    market_confirmation_state_expires_at: str = "",
+    market_confirmation_state_reset_count: int = 0,
     market_confirmation_transition_type: str = "",
+    market_session_id: str = "",
+    market_session_type: str = "",
+    market_trade_date: str = "",
+    market_timezone: str = "",
+    market_schedule_source: str = "",
+    market_schedule_known: bool = True,
+    market_is_regular_session: bool = True,
+    market_restore_allowed: bool = True,
+    market_reset_required: bool = False,
+    market_reset_reason: str = "",
+    market_session_reason_codes: tuple[str, ...] = (),
+    market_confirmation_metrics: dict | None = None,
 ) -> ThemeLabFlowResult:
     theme = ThemeConditionSnapshot(
         calculated_at=NOW.isoformat(),
@@ -884,7 +1000,23 @@ def _flow_result(
         market_confirmation_state_version=market_confirmation_state_version,
         market_confirmation_state_source=market_confirmation_state_source,
         market_confirmation_state_reset_reason=market_confirmation_state_reset_reason,
+        market_confirmation_state_restore_skipped=market_confirmation_state_restore_skipped,
+        market_confirmation_state_max_restore_age_sec=market_confirmation_state_max_restore_age_sec,
+        market_confirmation_state_expires_at=market_confirmation_state_expires_at,
+        market_confirmation_state_reset_count=market_confirmation_state_reset_count,
         market_confirmation_transition_type=market_confirmation_transition_type,
+        market_session_id=market_session_id,
+        market_session_type=market_session_type,
+        market_trade_date=market_trade_date,
+        market_timezone=market_timezone,
+        market_schedule_source=market_schedule_source,
+        market_schedule_known=market_schedule_known,
+        market_is_regular_session=market_is_regular_session,
+        market_restore_allowed=market_restore_allowed,
+        market_reset_required=market_reset_required,
+        market_reset_reason=market_reset_reason,
+        market_session_reason_codes=market_session_reason_codes,
+        market_confirmation_metrics=dict(market_confirmation_metrics or {}),
         market_side_reason_codes=market_side_reason_codes
         if market_side_reason_codes is not None
         else (reasons if any("MARKET" in reason for reason in reasons) else ()),
@@ -944,7 +1076,23 @@ def _flow_result(
         market_confirmation_state_version=market_confirmation_state_version,
         market_confirmation_state_source=market_confirmation_state_source,
         market_confirmation_state_reset_reason=market_confirmation_state_reset_reason,
+        market_confirmation_state_restore_skipped=market_confirmation_state_restore_skipped,
+        market_confirmation_state_max_restore_age_sec=market_confirmation_state_max_restore_age_sec,
+        market_confirmation_state_expires_at=market_confirmation_state_expires_at,
+        market_confirmation_state_reset_count=market_confirmation_state_reset_count,
         market_confirmation_transition_type=market_confirmation_transition_type,
+        market_session_id=market_session_id,
+        market_session_type=market_session_type,
+        market_trade_date=market_trade_date,
+        market_timezone=market_timezone,
+        market_schedule_source=market_schedule_source,
+        market_schedule_known=market_schedule_known,
+        market_is_regular_session=market_is_regular_session,
+        market_restore_allowed=market_restore_allowed,
+        market_reset_required=market_reset_required,
+        market_reset_reason=market_reset_reason,
+        market_session_reason_codes=market_session_reason_codes,
+        market_confirmation_metrics=dict(market_confirmation_metrics or {}),
         market_side_reason_codes=market_side_reason_codes
         if market_side_reason_codes is not None
         else (reasons if any("MARKET" in reason for reason in reasons) else ()),

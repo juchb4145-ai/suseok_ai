@@ -15,7 +15,9 @@ from trading.theme_engine.lab import (
 )
 from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeStatus
 from trading.theme_engine.repository import ThemeEngineRepository
-from trading.theme_engine.runtime_pipeline import MarketSideConfirmationPersistenceConfig, ThemeLabRuntimePipeline
+from trading.theme_engine.runtime_pipeline import MarketSessionConfig, MarketSideConfirmationPersistenceConfig, ThemeLabRuntimePipeline
+
+REGULAR_SESSION_ID = "2026-06-01:regular"
 
 
 def test_runtime_restart_restores_weak_confirmation_cycles(tmp_path):
@@ -37,7 +39,7 @@ def test_runtime_restart_restores_weak_confirmation_cycles(tmp_path):
 
     first_state = db.load_market_side_confirmation_states(
         trade_date="2026-06-01",
-        session_id="2026-06-01",
+        session_id=REGULAR_SESSION_ID,
         state_version=1,
     )
     kosdaq_first = next(item for item in first_state if item["market_side"] == MarketSide.KOSDAQ.value)
@@ -60,14 +62,14 @@ def test_runtime_restart_restores_weak_confirmation_cycles(tmp_path):
         item
         for item in db.load_market_side_confirmation_states(
             trade_date="2026-06-01",
-            session_id="2026-06-01",
+            session_id=REGULAR_SESSION_ID,
             state_version=1,
         )
         if item["market_side"] == MarketSide.KOSDAQ.value
     )
     transitions = db.list_market_side_confirmation_transitions(
         trade_date="2026-06-01",
-        session_id="2026-06-01",
+        session_id=REGULAR_SESSION_ID,
         market_side=MarketSide.KOSDAQ.value,
     )
 
@@ -100,7 +102,7 @@ def test_candidate_universe_state_persistence_is_side_isolated(tmp_path):
     pipeline.run(now)
     rows = db.load_market_side_confirmation_states(
         trade_date="2026-06-01",
-        session_id="2026-06-01",
+        session_id=REGULAR_SESSION_ID,
         state_version=1,
     )
     by_side = {item["market_side"]: item for item in rows}
@@ -128,9 +130,9 @@ def test_stale_market_confirmation_state_is_rejected_and_reset_logged(tmp_path):
     kosdaq_state = next(
         item
         for item in db.load_market_side_confirmation_states(
-            trade_date="2026-06-01",
-            session_id="2026-06-01",
-            state_version=1,
+                trade_date="2026-06-01",
+                session_id=REGULAR_SESSION_ID,
+                state_version=1,
         )
         if item["market_side"] == MarketSide.KOSDAQ.value
     )
@@ -158,7 +160,7 @@ def test_stale_market_confirmation_state_is_rejected_and_reset_logged(tmp_path):
     decision = next(item for item in result.gate_decisions if item.symbol == "000001")
     transitions = db.list_market_side_confirmation_transitions(
         trade_date="2026-06-01",
-        session_id="2026-06-01",
+        session_id=REGULAR_SESSION_ID,
         market_side=MarketSide.KOSDAQ.value,
     )
 
@@ -167,7 +169,7 @@ def test_stale_market_confirmation_state_is_rejected_and_reset_logged(tmp_path):
     assert decision.market_confirmation_state_restored is False
     assert decision.market_confirmation_state_reset_reason == "MARKET_CONFIRMATION_STATE_EXPIRED"
     assert "MARKET_CONFIRMATION_STATE_EXPIRED" in decision.market_side_reason_codes
-    assert any(item["transition_type"] == "STATE_EXPIRED" for item in transitions)
+    assert any(item["transition_type"] == "RESET_EXPIRED" for item in transitions)
 
 
 def test_version_mismatched_market_confirmation_state_is_rejected(tmp_path):
@@ -256,7 +258,7 @@ def test_same_cycle_persistence_is_idempotent(tmp_path):
     pipeline.run(now)
     first_transitions = db.list_market_side_confirmation_transitions(
         trade_date="2026-06-01",
-        session_id="2026-06-01",
+        session_id=REGULAR_SESSION_ID,
         market_side=MarketSide.KOSDAQ.value,
     )
     pipeline.run(now)
@@ -264,19 +266,197 @@ def test_same_cycle_persistence_is_idempotent(tmp_path):
         item
         for item in db.load_market_side_confirmation_states(
             trade_date="2026-06-01",
-            session_id="2026-06-01",
+            session_id=REGULAR_SESSION_ID,
             state_version=1,
         )
         if item["market_side"] == MarketSide.KOSDAQ.value
     )
     second_transitions = db.list_market_side_confirmation_transitions(
         trade_date="2026-06-01",
-        session_id="2026-06-01",
+        session_id=REGULAR_SESSION_ID,
         market_side=MarketSide.KOSDAQ.value,
     )
 
     assert second_state["weak_consecutive_cycles"] == 1
     assert len(second_transitions) == len(first_transitions)
+
+
+def test_pre_open_restore_is_skipped_and_blocks_first_cycle(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    _seed_theme(db)
+    market_data = MarketDataStore()
+    market_index = MarketIndexStore()
+    regular_at = datetime(2026, 6, 1, 9, 5, 0)
+    _set_index(market_index, regular_at)
+    _set_weak_kosdaq_ticks(market_data, regular_at)
+    ThemeLabRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=market_index,
+        engine=_engine(),
+    ).run(regular_at)
+
+    pre_open_at = datetime(2026, 6, 1, 8, 45, 0)
+    _set_index(market_index, pre_open_at)
+    _set_healthy_ticks(market_data, pre_open_at)
+    result = ThemeLabRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=market_index,
+        engine=_engine(),
+    ).run(pre_open_at)
+    decision = next(item for item in result.gate_decisions if item.symbol == "000001")
+    metrics = result.data_quality["market_confirmation_session"]
+
+    assert decision.status == "WAIT"
+    assert decision.market_session_id == "2026-06-01:pre_open"
+    assert decision.market_session_type == "pre_open"
+    assert decision.market_restore_allowed is False
+    assert decision.market_confirmation_state_restore_skipped is True
+    assert decision.market_confirmation_state_source == "session_boundary_memory_fallback"
+    assert "MARKET_SESSION_PRE_OPEN" in decision.market_side_reason_codes
+    assert "MARKET_CONFIRMATION_STATE_RESTORE_NOT_ALLOWED" in decision.market_side_reason_codes
+    assert "WAIT_MARKET_CONFIRMATION_PENDING" in decision.reason_codes
+    assert metrics["market_confirmation_restore_skipped_count"] == 1
+    assert metrics["market_confirmation_conservative_fallback_count"] == 1
+
+
+def test_post_close_restore_is_skipped_and_reset_on_close_logged(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    _seed_theme(db)
+    market_data = MarketDataStore()
+    market_index = MarketIndexStore()
+    regular_at = datetime(2026, 6, 1, 9, 5, 0)
+    _set_index(market_index, regular_at)
+    _set_healthy_ticks(market_data, regular_at)
+    ThemeLabRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=market_index,
+        engine=_engine(),
+    ).run(regular_at)
+
+    post_close_at = datetime(2026, 6, 1, 15, 45, 0)
+    _set_index(market_index, post_close_at)
+    _set_healthy_ticks(market_data, post_close_at)
+    result = ThemeLabRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=market_index,
+        engine=_engine(),
+    ).run(post_close_at)
+    decision = next(item for item in result.gate_decisions if item.symbol == "000001")
+    transitions = db.list_market_side_confirmation_transitions(
+        trade_date="2026-06-01",
+        session_id="2026-06-01:post_close",
+        market_side=MarketSide.KOSDAQ.value,
+    )
+
+    assert decision.status == "WAIT"
+    assert decision.market_session_type == "post_close"
+    assert decision.market_reset_reason == "MARKET_CONFIRMATION_STATE_RESET_ON_MARKET_CLOSE"
+    assert "MARKET_SESSION_POST_CLOSE" in decision.market_side_reason_codes
+    assert db.load_market_side_confirmation_states(
+        trade_date="2026-06-01",
+        session_id="2026-06-01:post_close",
+        state_version=1,
+    )
+    assert any(item["transition_type"] == "SESSION_CLOSE" for item in transitions)
+
+
+def test_same_trade_date_session_mismatch_is_rejected(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    _seed_theme(db)
+    market_data = MarketDataStore()
+    market_index = MarketIndexStore()
+    pre_open_at = datetime(2026, 6, 1, 8, 45, 0)
+    _set_index(market_index, pre_open_at)
+    _set_weak_kosdaq_ticks(market_data, pre_open_at)
+    ThemeLabRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=market_index,
+        engine=_engine(),
+        session_config=MarketSessionConfig(allow_restore_during_pre_open=True),
+        persistence_config=MarketSideConfirmationPersistenceConfig(max_restore_age_sec_pre_open=900),
+    ).run(pre_open_at)
+
+    regular_at = datetime(2026, 6, 1, 9, 5, 0)
+    _set_index(market_index, regular_at)
+    _set_weak_kosdaq_ticks(market_data, regular_at)
+    result = ThemeLabRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=market_index,
+        engine=_engine(),
+    ).run(regular_at)
+    decision = next(item for item in result.gate_decisions if item.symbol == "000001")
+    metrics = result.data_quality["market_confirmation_session"]
+
+    assert decision.market_session_id == REGULAR_SESSION_ID
+    assert decision.market_confirmation_state_restored is False
+    assert decision.market_confirmation_state_reset_reason == "MARKET_CONFIRMATION_STATE_SESSION_MISMATCH"
+    assert "MARKET_CONFIRMATION_STATE_SESSION_MISMATCH" in decision.market_side_reason_codes
+    assert metrics["market_confirmation_reset_by_reason"]["MARKET_CONFIRMATION_STATE_SESSION_MISMATCH"] == 1
+
+
+def test_previous_trade_date_state_is_not_restored(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    _seed_theme(db)
+    market_data = MarketDataStore()
+    market_index = MarketIndexStore()
+    first_at = datetime(2026, 6, 1, 9, 5, 0)
+    _set_index(market_index, first_at)
+    _set_weak_kosdaq_ticks(market_data, first_at)
+    ThemeLabRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=market_index,
+        engine=_engine(),
+    ).run(first_at)
+
+    next_trade_at = datetime(2026, 6, 2, 9, 5, 0)
+    _set_index(market_index, next_trade_at)
+    _set_weak_kosdaq_ticks(market_data, next_trade_at)
+    result = ThemeLabRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=market_index,
+        engine=_engine(),
+    ).run(next_trade_at)
+    decision = next(item for item in result.gate_decisions if item.symbol == "000001")
+
+    assert decision.market_trade_date == "2026-06-02"
+    assert decision.market_confirmation_state_restored is False
+    assert decision.market_confirmation_state_reset_reason == "MARKET_CONFIRMATION_STATE_DATE_MISMATCH"
+    assert "MARKET_CONFIRMATION_STATE_DATE_MISMATCH" in decision.market_side_reason_codes
+
+
+def test_schedule_unknown_fails_closed_with_conservative_fallback(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    _seed_theme(db)
+    market_data = MarketDataStore()
+    market_index = MarketIndexStore()
+    now = datetime(2026, 6, 1, 9, 5, 0)
+    _set_index(market_index, now)
+    _set_healthy_ticks(market_data, now)
+
+    result = ThemeLabRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=market_index,
+        engine=_engine(),
+        session_config=MarketSessionConfig(regular_open="bad"),
+    ).run(now)
+    decision = next(item for item in result.gate_decisions if item.symbol == "000001")
+    metrics = result.data_quality["market_confirmation_session"]
+
+    assert decision.status == "WAIT"
+    assert decision.market_schedule_known is False
+    assert decision.market_session_type == "closed"
+    assert decision.market_confirmation_state_restore_reason == "MARKET_CONFIRMATION_STATE_SCHEDULE_UNKNOWN"
+    assert "MARKET_CONFIRMATION_STATE_SCHEDULE_UNKNOWN" in decision.market_side_reason_codes
+    assert metrics["market_confirmation_schedule_unknown_count"] == 1
 
 
 def _engine() -> ThemeLabFlowEngine:

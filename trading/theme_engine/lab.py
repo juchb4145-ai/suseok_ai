@@ -364,6 +364,23 @@ class MarketStrengthSnapshot:
     kosdaq_confirmation_pending: bool = False
     kospi_recovery_pending: bool = False
     kosdaq_recovery_pending: bool = False
+    market_session_id: str = ""
+    market_session_type: str = ""
+    market_trade_date: str = ""
+    market_timezone: str = ""
+    market_schedule_source: str = ""
+    market_schedule_known: bool = True
+    market_is_regular_session: bool = True
+    market_restore_allowed: bool = True
+    market_reset_required: bool = False
+    market_reset_reason: str = ""
+    market_confirmation_state_restore_skipped: bool = False
+    market_confirmation_state_restore_reason: str = ""
+    market_confirmation_state_reset_count: int = 0
+    market_confirmation_state_max_restore_age_sec: int = 0
+    market_confirmation_state_expires_at: str = ""
+    market_confirmation_metrics: dict[str, Any] = field(default_factory=dict)
+    market_session_reason_codes: tuple[str, ...] = ()
 
     def status_for_side(self, side: MarketSide | str) -> MarketStatus | None:
         normalized = normalize_market_side(side)
@@ -437,7 +454,23 @@ class WatchSetSnapshot:
     market_confirmation_state_version: int = 0
     market_confirmation_state_source: str = "memory"
     market_confirmation_state_reset_reason: str = ""
+    market_confirmation_state_restore_skipped: bool = False
+    market_confirmation_state_max_restore_age_sec: int = 0
+    market_confirmation_state_expires_at: str = ""
+    market_confirmation_state_reset_count: int = 0
     market_confirmation_transition_type: str = ""
+    market_session_id: str = ""
+    market_session_type: str = ""
+    market_trade_date: str = ""
+    market_timezone: str = ""
+    market_schedule_source: str = ""
+    market_schedule_known: bool = True
+    market_is_regular_session: bool = True
+    market_restore_allowed: bool = True
+    market_reset_required: bool = False
+    market_reset_reason: str = ""
+    market_session_reason_codes: tuple[str, ...] = ()
+    market_confirmation_metrics: dict[str, Any] = field(default_factory=dict)
     kospi_breadth_pct: float | None = None
     kosdaq_breadth_pct: float | None = None
     kospi_breadth_ready: bool = False
@@ -529,7 +562,23 @@ class LabGateDecision:
     market_confirmation_state_version: int = 0
     market_confirmation_state_source: str = "memory"
     market_confirmation_state_reset_reason: str = ""
+    market_confirmation_state_restore_skipped: bool = False
+    market_confirmation_state_max_restore_age_sec: int = 0
+    market_confirmation_state_expires_at: str = ""
+    market_confirmation_state_reset_count: int = 0
     market_confirmation_transition_type: str = ""
+    market_session_id: str = ""
+    market_session_type: str = ""
+    market_trade_date: str = ""
+    market_timezone: str = ""
+    market_schedule_source: str = ""
+    market_schedule_known: bool = True
+    market_is_regular_session: bool = True
+    market_restore_allowed: bool = True
+    market_reset_required: bool = False
+    market_reset_reason: str = ""
+    market_session_reason_codes: tuple[str, ...] = ()
+    market_confirmation_metrics: dict[str, Any] = field(default_factory=dict)
     kospi_breadth_pct: float | None = None
     kosdaq_breadth_pct: float | None = None
     kospi_breadth_ready: bool = False
@@ -1381,6 +1430,7 @@ class _MarketSideConfirmationState:
     state_age_sec: float | None = None
     state_version: int = 0
     reset_reason: str = ""
+    expires_at: str = ""
 
     def to_dict(self, *, recheck_after_sec: int) -> dict[str, Any]:
         cycles_to_recover = 0
@@ -1427,6 +1477,7 @@ class _MarketSideConfirmationState:
             "market_confirmation_state_version": self.state_version,
             "market_confirmation_state_source": self.state_source,
             "market_confirmation_state_reset_reason": self.reset_reason,
+            "market_confirmation_state_expires_at": self.expires_at,
             "market_confirmation_transition_type": self.transition_type,
         }
 
@@ -1467,7 +1518,7 @@ class MarketSideConfirmationTracker:
                         )
                     ),
                     transition_type=state.transition_type or "STATE_RESET",
-                    state_source="db_failed_memory_fallback",
+                    state_source=self._cycle_state_source or "db_failed_memory_fallback",
                     reset_reason="restore_failure_conservative_fallback",
                 )
             if self._cycle_state_source:
@@ -1510,6 +1561,7 @@ class MarketSideConfirmationTracker:
                     "market_confirmation_state_version": state.state_version,
                     "market_confirmation_state_source": state.state_source,
                     "market_confirmation_state_reset_reason": state.reset_reason,
+                    "market_confirmation_state_expires_at": state.expires_at,
                     "market_confirmation_transition_type": state.transition_type,
                     "reason_codes": list(
                         _dedupe_tuple(tuple(current_detail.get("reason_codes") or ()) + state.reason_codes)
@@ -1596,6 +1648,7 @@ class MarketSideConfirmationTracker:
                 last_updated_at=str(record.get("updated_at") or restored_at or ""),
                 state_age_sec=age_by_side.get(side.value),
                 state_version=int(record.get("state_version") or state_version or 0),
+                expires_at=str(record.get("expires_at") or ""),
             )
         self._states.update(restored)
 
@@ -1610,7 +1663,19 @@ class MarketSideConfirmationTracker:
         self._cycle_restore_reason = reason or "MARKET_CONFIRMATION_STATE_RESTORE_FAILED"
         self._conservative_fallback_once = conservative
 
+    def mark_restore_skipped(self, *, reason: str, conservative: bool = False) -> None:
+        codes = ("MARKET_CONFIRMATION_STATE_RESTORE_SKIPPED",)
+        if reason:
+            codes = codes + (reason,)
+        if conservative:
+            codes = codes + ("MARKET_CONFIRMATION_STATE_CONSERVATIVE_FALLBACK",)
+        self._cycle_reason_codes = _dedupe_tuple(self._cycle_reason_codes + codes)
+        self._cycle_state_source = "session_boundary_memory_fallback"
+        self._cycle_restore_reason = reason or "MARKET_CONFIRMATION_STATE_RESTORE_SKIPPED"
+        self._conservative_fallback_once = conservative
+
     def mark_state_reset(self, reason: str) -> None:
+        self._states = {}
         if reason:
             self._cycle_reason_codes = _dedupe_tuple(self._cycle_reason_codes + ("MARKET_CONFIRMATION_STATE_RESET", reason))
             self._cycle_reset_reason = reason
@@ -1807,6 +1872,7 @@ class MarketSideConfirmationTracker:
             state_age_sec=previous.state_age_sec,
             state_version=previous.state_version,
             reset_reason=previous.reset_reason,
+            expires_at=previous.expires_at,
         )
 
     def _previous_state(self, side: MarketSide, market: MarketStrengthSnapshot) -> _MarketSideConfirmationState:
@@ -2974,6 +3040,7 @@ def _market_side_context(market: MarketStrengthSnapshot, watch: WatchSetSnapshot
         reason_codes
         + tuple(side_detail.get("reason_codes") or ())
         + tuple(side_state.get("reason_codes") or ())
+        + tuple(market.market_session_reason_codes or ())
     )
     if side == MarketSide.UNKNOWN and "MARKET_CLASSIFICATION_MISSING" not in reason_codes:
         reason_codes = reason_codes + ("MARKET_CLASSIFICATION_MISSING",)
@@ -3030,7 +3097,23 @@ def _market_side_context(market: MarketStrengthSnapshot, watch: WatchSetSnapshot
         "market_confirmation_state_version": int(side_state.get("market_confirmation_state_version") or 0),
         "market_confirmation_state_source": str(side_state.get("market_confirmation_state_source") or "memory"),
         "market_confirmation_state_reset_reason": str(side_state.get("market_confirmation_state_reset_reason") or ""),
+        "market_confirmation_state_restore_skipped": bool(market.market_confirmation_state_restore_skipped),
+        "market_confirmation_state_max_restore_age_sec": int(market.market_confirmation_state_max_restore_age_sec or 0),
+        "market_confirmation_state_expires_at": str(side_state.get("market_confirmation_state_expires_at") or market.market_confirmation_state_expires_at or ""),
+        "market_confirmation_state_reset_count": int(market.market_confirmation_state_reset_count or 0),
         "market_confirmation_transition_type": str(side_state.get("market_confirmation_transition_type") or ""),
+        "market_session_id": market.market_session_id,
+        "market_session_type": market.market_session_type,
+        "market_trade_date": market.market_trade_date,
+        "market_timezone": market.market_timezone,
+        "market_schedule_source": market.market_schedule_source,
+        "market_schedule_known": market.market_schedule_known,
+        "market_is_regular_session": market.market_is_regular_session,
+        "market_restore_allowed": market.market_restore_allowed,
+        "market_reset_required": market.market_reset_required,
+        "market_reset_reason": market.market_reset_reason,
+        "market_session_reason_codes": market.market_session_reason_codes,
+        "market_confirmation_metrics": dict(market.market_confirmation_metrics or {}),
         "kospi_breadth_pct": market.kospi_breadth_pct,
         "kosdaq_breadth_pct": market.kosdaq_breadth_pct,
         "kospi_breadth_ready": market.kospi_breadth_ready,

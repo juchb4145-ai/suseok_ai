@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime, time, timedelta
+from typing import Any, Optional
 
 from trading.strategy.candidates import normalize_code
 from trading.strategy.market_data import MarketDataStore, StrategyTick
@@ -33,8 +33,14 @@ class MarketSideConfirmationPersistenceConfig:
     reset_before_market_open: bool = True
     reset_after_market_close: bool = False
     max_state_age_sec: int = 300
+    max_restore_age_sec_regular: int = 900
+    max_restore_age_sec_pre_open: int = 0
+    max_restore_age_sec_after_close: int = 0
+    expire_on_regular_close: bool = True
+    reset_on_session_id_change: bool = True
     fallback_to_memory_on_db_error: bool = True
     conservative_on_restore_failure: bool = True
+    conservative_on_schedule_unknown: bool = True
     transition_log_enabled: bool = True
     transition_log_every_cycle: bool = False
     persist_unknown_market_state: bool = False
@@ -43,6 +49,7 @@ class MarketSideConfirmationPersistenceConfig:
     @classmethod
     def from_settings(cls, settings: dict | None) -> "MarketSideConfirmationPersistenceConfig":
         payload = dict(settings or {})
+        max_age = int(payload.get("max_state_age_sec") or payload.get("max_restore_age_sec_regular") or 300)
         return cls(
             enabled=_bool(payload.get("enabled"), True),
             storage=str(payload.get("storage") or "db"),
@@ -52,14 +59,84 @@ class MarketSideConfirmationPersistenceConfig:
             reset_on_trade_date_change=_bool(payload.get("reset_on_trade_date_change"), True),
             reset_before_market_open=_bool(payload.get("reset_before_market_open"), True),
             reset_after_market_close=_bool(payload.get("reset_after_market_close"), False),
-            max_state_age_sec=int(payload.get("max_state_age_sec") or 300),
+            max_state_age_sec=max_age,
+            max_restore_age_sec_regular=int(payload.get("max_restore_age_sec_regular") or max_age or 900),
+            max_restore_age_sec_pre_open=int(payload.get("max_restore_age_sec_pre_open") or 0),
+            max_restore_age_sec_after_close=int(payload.get("max_restore_age_sec_after_close") or 0),
+            expire_on_regular_close=_bool(payload.get("expire_on_regular_close"), True),
+            reset_on_session_id_change=_bool(payload.get("reset_on_session_id_change"), True),
             fallback_to_memory_on_db_error=_bool(payload.get("fallback_to_memory_on_db_error"), True),
             conservative_on_restore_failure=_bool(payload.get("conservative_on_restore_failure"), True),
+            conservative_on_schedule_unknown=_bool(payload.get("conservative_on_schedule_unknown"), True),
             transition_log_enabled=_bool(payload.get("transition_log_enabled"), True),
             transition_log_every_cycle=_bool(payload.get("transition_log_every_cycle"), False),
             persist_unknown_market_state=_bool(payload.get("persist_unknown_market_state"), False),
             force_reset_market_confirmation_state=_bool(payload.get("force_reset_market_confirmation_state"), False),
         )
+
+
+@dataclass(frozen=True)
+class MarketSessionConfig:
+    enabled: bool = True
+    timezone: str = "Asia/Seoul"
+    exchange: str = "KRX"
+    regular_open: str = "09:00"
+    regular_close: str = "15:30"
+    pre_open_start: str = "08:30"
+    post_close_end: str = "16:00"
+    session_id_format: str = "{trade_date}:{session_type}"
+    reset_on_trade_date_change: bool = True
+    reset_before_regular_open: bool = True
+    allow_restore_during_regular_session: bool = True
+    allow_restore_during_pre_open: bool = False
+    allow_restore_after_close: bool = False
+    allow_restore_on_holiday: bool = False
+    holiday_calendar_source: str = "config_or_existing"
+    holidays: tuple[str, ...] = ()
+    schedule_source: str = "runtime_settings"
+    fail_closed_on_schedule_error: bool = True
+
+    @classmethod
+    def from_settings(cls, settings: dict | None) -> "MarketSessionConfig":
+        payload = dict(settings or {})
+        holidays = payload.get("holidays") or payload.get("holiday_dates") or ()
+        return cls(
+            enabled=_bool(payload.get("enabled"), True),
+            timezone=str(payload.get("timezone") or "Asia/Seoul"),
+            exchange=str(payload.get("exchange") or "KRX"),
+            regular_open=str(payload.get("regular_open") or "09:00"),
+            regular_close=str(payload.get("regular_close") or "15:30"),
+            pre_open_start=str(payload.get("pre_open_start") or "08:30"),
+            post_close_end=str(payload.get("post_close_end") or "16:00"),
+            session_id_format=str(payload.get("session_id_format") or "{trade_date}:{session_type}"),
+            reset_on_trade_date_change=_bool(payload.get("reset_on_trade_date_change"), True),
+            reset_before_regular_open=_bool(payload.get("reset_before_regular_open"), True),
+            allow_restore_during_regular_session=_bool(payload.get("allow_restore_during_regular_session"), True),
+            allow_restore_during_pre_open=_bool(payload.get("allow_restore_during_pre_open"), False),
+            allow_restore_after_close=_bool(payload.get("allow_restore_after_close"), False),
+            allow_restore_on_holiday=_bool(payload.get("allow_restore_on_holiday"), False),
+            holiday_calendar_source=str(payload.get("holiday_calendar_source") or "config_or_existing"),
+            holidays=tuple(str(item) for item in holidays),
+            schedule_source=str(payload.get("schedule_source") or "runtime_settings"),
+            fail_closed_on_schedule_error=_bool(payload.get("fail_closed_on_schedule_error"), True),
+        )
+
+
+@dataclass(frozen=True)
+class MarketSessionContext:
+    trade_date: str
+    session_id: str
+    session_type: str
+    timezone: str
+    schedule_source: str
+    schedule_known: bool
+    is_regular_session: bool
+    restore_allowed: bool
+    reset_required: bool
+    reset_reason: str = ""
+    reason_codes: tuple[str, ...] = ()
+    transition_type: str = ""
+    max_restore_age_sec: int = 0
 
 
 class ThemeLabRuntimePipeline:
@@ -72,6 +149,7 @@ class ThemeLabRuntimePipeline:
         interval_sec: int = 3,
         engine: Optional[ThemeLabFlowEngine] = None,
         persistence_config: MarketSideConfirmationPersistenceConfig | None = None,
+        session_config: MarketSessionConfig | None = None,
     ) -> None:
         self.db = db
         self.market_data = market_data
@@ -81,10 +159,15 @@ class ThemeLabRuntimePipeline:
         self.persistence_config = persistence_config or MarketSideConfirmationPersistenceConfig.from_settings(
             legacy_strategy_runtime_settings().value("market_side_confirmation_persistence", {})
         )
+        self.session_config = session_config or MarketSessionConfig.from_settings(
+            legacy_strategy_runtime_settings().value("market_session", {})
+        )
         self.last_run_at: Optional[datetime] = None
         self.last_result: Optional[ThemeLabFlowResult] = None
         self._warnings: list[str] = []
         self._restored_session_key: tuple[str, str, int] | None = None
+        self._last_session_context: MarketSessionContext | None = None
+        self._market_confirmation_metrics: dict[str, Any] = _empty_market_confirmation_metrics()
 
     def run_if_due(self, now: datetime) -> Optional[ThemeLabFlowResult]:
         current = now.replace(microsecond=0)
@@ -105,9 +188,9 @@ class ThemeLabRuntimePipeline:
         missing_prev_close = [code for code, snapshot in snapshots.items() if not _prev_close(snapshot)]
         if missing_prev_close:
             self._warnings.append("THEME_LAB_PREV_CLOSE_MISSING")
-        trade_date = now.date().isoformat()
-        session_id = self._session_id(now)
-        self._restore_confirmation_state_once(now, trade_date=trade_date, session_id=session_id)
+        session = self._market_session_context(now)
+        self._market_confirmation_metrics = _empty_market_confirmation_metrics()
+        self._restore_confirmation_state_once(now, session=session)
         result = self.engine.run_pipeline(
             theme_inputs=theme_inputs,
             snapshots=snapshots,
@@ -115,19 +198,142 @@ class ThemeLabRuntimePipeline:
             kosdaq_return_pct=self.market_index_store.state("KOSDAQ").change_rate,
             calculated_at=now.isoformat(),
         )
-        result = self._persist_confirmation_state(result, now, trade_date=trade_date, session_id=session_id)
+        result = self._persist_confirmation_state(result, now, session=session)
+        result = _annotate_market_session(result, session, self._market_confirmation_metrics)
         self.last_result = result
         self._save_result(result, now)
         return result
 
     def _session_id(self, now: datetime) -> str:
-        cfg = self.persistence_config
-        if str(cfg.session_scope or "").lower() == "trade_date":
-            return now.date().isoformat()
-        return f"{now.date().isoformat()}:{str(cfg.session_scope or 'session')}"
+        return self._market_session_context(now).session_id
 
-    def _restore_confirmation_state_once(self, now: datetime, *, trade_date: str, session_id: str) -> None:
+    def _market_session_context(self, now: datetime) -> MarketSessionContext:
+        cfg = self.session_config
+        trade_date = now.date().isoformat()
+        if not cfg.enabled:
+            return MarketSessionContext(
+                trade_date=trade_date,
+                session_id=trade_date,
+                session_type="regular",
+                timezone=cfg.timezone,
+                schedule_source=cfg.schedule_source,
+                schedule_known=True,
+                is_regular_session=True,
+                restore_allowed=True,
+                reset_required=False,
+                reason_codes=("MARKET_SESSION_REGULAR_OPEN",),
+                transition_type="SESSION_OPEN",
+                max_restore_age_sec=self.persistence_config.max_restore_age_sec_regular,
+            )
+        parsed = _parse_market_session_times(cfg)
+        if parsed is None:
+            reason = "MARKET_CONFIRMATION_STATE_SCHEDULE_UNKNOWN"
+            return self._session_context(
+                now,
+                session_type="closed",
+                schedule_known=False,
+                restore_allowed=not cfg.fail_closed_on_schedule_error,
+                reset_required=cfg.fail_closed_on_schedule_error,
+                reset_reason=reason if cfg.fail_closed_on_schedule_error else "",
+                reason_codes=("MARKET_SESSION_CLOSED", reason, "MARKET_CONFIRMATION_STATE_RESTORE_NOT_ALLOWED"),
+                transition_type="SCHEDULE_UNKNOWN_CONSERVATIVE",
+            )
+        pre_open, regular_open, regular_close, post_close = parsed
+        is_holiday = trade_date in set(cfg.holidays) or now.weekday() >= 5
+        if is_holiday:
+            return self._session_context(
+                now,
+                session_type="holiday",
+                schedule_known=True,
+                restore_allowed=cfg.allow_restore_on_holiday,
+                reset_required=not cfg.allow_restore_on_holiday,
+                reset_reason="" if cfg.allow_restore_on_holiday else "MARKET_CONFIRMATION_STATE_HOLIDAY",
+                reason_codes=("MARKET_CONFIRMATION_STATE_HOLIDAY", "MARKET_CONFIRMATION_STATE_RESTORE_NOT_ALLOWED"),
+                transition_type="RESTORE_SKIPPED",
+            )
+        current = now.time().replace(microsecond=0)
+        if pre_open <= current < regular_open:
+            return self._session_context(
+                now,
+                session_type="pre_open",
+                schedule_known=True,
+                restore_allowed=cfg.allow_restore_during_pre_open,
+                reset_required=not cfg.allow_restore_during_pre_open,
+                reset_reason="" if cfg.allow_restore_during_pre_open else "MARKET_CONFIRMATION_STATE_RESTORE_NOT_ALLOWED",
+                reason_codes=("MARKET_SESSION_PRE_OPEN", "MARKET_CONFIRMATION_STATE_RESTORE_NOT_ALLOWED"),
+                transition_type="RESTORE_SKIPPED",
+            )
+        if regular_open <= current < regular_close:
+            return self._session_context(
+                now,
+                session_type="regular",
+                schedule_known=True,
+                restore_allowed=cfg.allow_restore_during_regular_session,
+                reset_required=False,
+                reason_codes=("MARKET_SESSION_REGULAR_OPEN",),
+                transition_type="SESSION_OPEN",
+            )
+        if regular_close <= current <= post_close:
+            reason = "MARKET_CONFIRMATION_STATE_RESET_ON_MARKET_CLOSE" if self.persistence_config.expire_on_regular_close else "MARKET_CONFIRMATION_STATE_SESSION_CLOSED"
+            return self._session_context(
+                now,
+                session_type="post_close",
+                schedule_known=True,
+                restore_allowed=cfg.allow_restore_after_close,
+                reset_required=not cfg.allow_restore_after_close,
+                reset_reason="" if cfg.allow_restore_after_close else reason,
+                reason_codes=("MARKET_SESSION_POST_CLOSE", "MARKET_CONFIRMATION_STATE_RESTORE_NOT_ALLOWED", reason),
+                transition_type="SESSION_CLOSE",
+            )
+        reason = "MARKET_CONFIRMATION_STATE_SESSION_CLOSED"
+        return self._session_context(
+            now,
+            session_type="closed",
+            schedule_known=True,
+            restore_allowed=False,
+            reset_required=True,
+            reset_reason=reason,
+            reason_codes=("MARKET_SESSION_CLOSED", "MARKET_CONFIRMATION_STATE_RESTORE_NOT_ALLOWED", reason),
+            transition_type="RESTORE_SKIPPED",
+        )
+
+    def _session_context(
+        self,
+        now: datetime,
+        *,
+        session_type: str,
+        schedule_known: bool,
+        restore_allowed: bool,
+        reset_required: bool,
+        reset_reason: str = "",
+        reason_codes: tuple[str, ...] = (),
+        transition_type: str = "",
+    ) -> MarketSessionContext:
+        trade_date = now.date().isoformat()
+        cfg = self.session_config
+        max_restore_age = _max_restore_age_for_session(self.persistence_config, session_type)
+        session_id = _format_session_id(cfg.session_id_format, trade_date=trade_date, session_type=session_type)
+        boundary_reasons = ("MARKET_SESSION_BOUNDARY_DETECTED",) if session_type != "regular" else ()
+        return MarketSessionContext(
+            trade_date=trade_date,
+            session_id=session_id,
+            session_type=session_type,
+            timezone=cfg.timezone,
+            schedule_source=cfg.schedule_source,
+            schedule_known=schedule_known,
+            is_regular_session=session_type == "regular",
+            restore_allowed=bool(restore_allowed and schedule_known),
+            reset_required=bool(reset_required),
+            reset_reason=reset_reason,
+            reason_codes=_dedupe_tuple(boundary_reasons + reason_codes),
+            transition_type=transition_type,
+            max_restore_age_sec=max_restore_age,
+        )
+
+    def _restore_confirmation_state_once(self, now: datetime, *, session: MarketSessionContext) -> None:
         cfg = self.persistence_config
+        trade_date = session.trade_date
+        session_id = session.session_id
         key = (trade_date, session_id, int(cfg.state_version))
         if self._restored_session_key == key:
             return
@@ -135,15 +341,47 @@ class ThemeLabRuntimePipeline:
         tracker = getattr(self.engine, "market_side_confirmation", None)
         if tracker is None or not cfg.enabled or str(cfg.storage).lower() != "db":
             return
+        self._record_restore_metric("attempt")
+        session_change_reason = self._session_change_reset_reason(session)
+        if session_change_reason:
+            tracker.mark_state_reset(session_change_reason)
+            self._record_reset_metric(session_change_reason)
+            self._log_restore_reset(now, session, session_change_reason, transition_type=_transition_type_for_reset_reason(session_change_reason))
+        self._last_session_context = session
         if cfg.force_reset_market_confirmation_state:
-            tracker.mark_state_reset("MARKET_CONFIRMATION_STATE_RESET")
+            reason = "MARKET_CONFIRMATION_STATE_FORCE_RESET"
+            tracker.mark_state_reset(reason)
+            tracker.mark_restore_skipped(reason=reason, conservative=True)
+            self._record_restore_metric("skipped")
+            self._record_reset_metric(reason)
+            self._log_restore_reset(now, session, reason, transition_type="RESET_FORCE")
+            return
+        if not session.schedule_known:
+            reason = "MARKET_CONFIRMATION_STATE_SCHEDULE_UNKNOWN"
+            tracker.mark_state_reset(reason)
+            tracker.mark_restore_skipped(reason=reason, conservative=cfg.conservative_on_schedule_unknown)
+            self._record_restore_metric("skipped")
+            self._record_reset_metric(reason)
+            self._market_confirmation_metrics["market_confirmation_schedule_unknown_count"] += 1
+            if cfg.conservative_on_schedule_unknown:
+                self._market_confirmation_metrics["market_confirmation_conservative_fallback_count"] += 1
+            self._log_restore_reset(now, session, reason, transition_type="SCHEDULE_UNKNOWN_CONSERVATIVE")
+            return
+        if not session.restore_allowed:
+            reason = session.reset_reason or "MARKET_CONFIRMATION_STATE_RESTORE_NOT_ALLOWED"
+            tracker.mark_state_reset(reason)
+            tracker.mark_restore_skipped(reason=reason, conservative=True)
+            self._record_restore_metric("skipped")
+            self._record_reset_metric(reason)
+            self._market_confirmation_metrics["market_confirmation_conservative_fallback_count"] += 1
+            self._log_restore_reset(now, session, reason, transition_type=session.transition_type or _transition_type_for_reset_reason(reason))
             return
         load = getattr(self.db, "load_market_side_confirmation_states", None)
         if not callable(load):
             return
         try:
             rows = load(trade_date=trade_date, session_id=session_id, state_version=cfg.state_version)
-            valid_rows, age_by_side, reset_reason = self._valid_restore_rows(rows, now, trade_date=trade_date, session_id=session_id)
+            valid_rows, age_by_side, reset_reason = self._valid_restore_rows(rows, now, session=session)
             if not rows:
                 load_any = getattr(self.db, "load_any_market_side_confirmation_states", None)
                 if callable(load_any):
@@ -151,15 +389,29 @@ class ThemeLabRuntimePipeline:
                     _, _, any_reset_reason = self._valid_restore_rows(
                         any_rows,
                         now,
-                        trade_date=trade_date,
-                        session_id=session_id,
+                        session=session,
                     )
                     reset_reason = reset_reason or any_reset_reason
+                load_trade_date = getattr(self.db, "load_market_side_confirmation_states_for_trade_date", None)
+                if not reset_reason and callable(load_trade_date):
+                    trade_date_rows = load_trade_date(trade_date=trade_date)
+                    _, _, trade_date_reset_reason = self._valid_restore_rows(trade_date_rows, now, session=session)
+                    reset_reason = reset_reason or trade_date_reset_reason
+                load_recent = getattr(self.db, "load_recent_market_side_confirmation_states", None)
+                if not reset_reason and callable(load_recent):
+                    recent_rows = load_recent(limit=8)
+                    _, _, recent_reset_reason = self._valid_restore_rows(recent_rows, now, session=session)
+                    reset_reason = recent_reset_reason if recent_reset_reason == "MARKET_CONFIRMATION_STATE_DATE_MISMATCH" else ""
             if reset_reason:
                 tracker.mark_state_reset(reset_reason)
-                self._log_restore_reset(now, trade_date, session_id, reset_reason)
+                tracker.mark_restore_skipped(reason=reset_reason, conservative=False)
+                self._record_restore_metric("skipped")
+                self._record_reset_metric(reset_reason)
+                self._log_restore_reset(now, session, reset_reason, transition_type=_transition_type_for_reset_reason(reset_reason))
             if valid_rows:
                 tracker.restore_states(valid_rows, restored_at=now.isoformat(), state_version=cfg.state_version, state_age_by_side=age_by_side)
+                self._record_restore_metric("success", rows=valid_rows, age_by_side=age_by_side)
+                self._log_session_transition(now, session, "RESTORE_ALLOWED", ("MARKET_CONFIRMATION_STATE_RESTORED",))
                 self._warnings.append("MARKET_CONFIRMATION_STATE_RESTORED")
         except Exception as exc:
             self._warnings.append(f"MARKET_CONFIRMATION_STATE_DB_ERROR:{exc}")
@@ -173,14 +425,17 @@ class ThemeLabRuntimePipeline:
                 reason="MARKET_CONFIRMATION_STATE_DB_ERROR",
                 conservative=cfg.conservative_on_restore_failure,
             )
+            self._record_restore_metric("failed")
+            self._market_confirmation_metrics["market_confirmation_memory_fallback_count"] += 1
+            if cfg.conservative_on_restore_failure:
+                self._market_confirmation_metrics["market_confirmation_conservative_fallback_count"] += 1
 
     def _valid_restore_rows(
         self,
         rows: list[dict],
         now: datetime,
         *,
-        trade_date: str,
-        session_id: str,
+        session: MarketSessionContext,
     ) -> tuple[list[dict], dict[str, float | None], str]:
         cfg = self.persistence_config
         valid: list[dict] = []
@@ -190,11 +445,14 @@ class ThemeLabRuntimePipeline:
             side = str(row.get("market_side") or "")
             if side not in {MarketSide.KOSPI.value, MarketSide.KOSDAQ.value} and not cfg.persist_unknown_market_state:
                 continue
-            if str(row.get("trade_date") or "") != trade_date:
+            if not str(row.get("confirmed_status") or ""):
+                reset_reason = "MARKET_CONFIRMATION_STATE_ROW_INVALID"
+                continue
+            if str(row.get("trade_date") or "") != session.trade_date:
                 reset_reason = "MARKET_CONFIRMATION_STATE_DATE_MISMATCH"
                 continue
-            if str(row.get("session_id") or "") != session_id:
-                reset_reason = "MARKET_CONFIRMATION_STATE_RESET"
+            if str(row.get("session_id") or "") != session.session_id:
+                reset_reason = "MARKET_CONFIRMATION_STATE_SESSION_MISMATCH"
                 continue
             if int(row.get("state_version") or 0) != int(cfg.state_version):
                 reset_reason = "MARKET_CONFIRMATION_STATE_VERSION_MISMATCH"
@@ -207,8 +465,8 @@ class ThemeLabRuntimePipeline:
             age_sec = None
             if updated_at is not None:
                 age_sec = max(0.0, (now.replace(tzinfo=None) - updated_at).total_seconds())
-                if cfg.max_state_age_sec > 0 and age_sec > cfg.max_state_age_sec:
-                    reset_reason = "MARKET_CONFIRMATION_STATE_STALE"
+                if session.max_restore_age_sec > 0 and age_sec > session.max_restore_age_sec:
+                    reset_reason = "MARKET_CONFIRMATION_STATE_RESTORE_AGE_EXCEEDED"
                     continue
             age_by_side[side] = age_sec
             valid.append(row)
@@ -219,8 +477,7 @@ class ThemeLabRuntimePipeline:
         result: ThemeLabFlowResult,
         now: datetime,
         *,
-        trade_date: str,
-        session_id: str,
+        session: MarketSessionContext,
     ) -> ThemeLabFlowResult:
         cfg = self.persistence_config
         tracker = getattr(self.engine, "market_side_confirmation", None)
@@ -243,8 +500,8 @@ class ThemeLabRuntimePipeline:
                 "last_reason_codes": state.get("reason_codes") or [],
                 "last_cycle_id": state.get("cycle_id") or now_text,
                 "last_evaluated_at": now_text,
-                "trade_date": trade_date,
-                "session_id": session_id,
+                "trade_date": session.trade_date,
+                "session_id": session.session_id,
                 "state_version": cfg.state_version,
                 "updated_at": now_text,
                 "created_at": now_text,
@@ -261,9 +518,10 @@ class ThemeLabRuntimePipeline:
                     "market_confirmation_state_last_updated_at": saved.get("updated_at") or now_text,
                     "market_confirmation_state_version": cfg.state_version,
                     "market_confirmation_state_source": state_source,
+                    "market_confirmation_state_expires_at": saved.get("expires_at") or expires_at,
                     "market_confirmation_transition_type": state.get("transition_type") or "",
                 }
-                self._persist_transition_log(state, now, trade_date=trade_date, session_id=session_id)
+                self._persist_transition_log(state, now, session=session)
             except Exception as exc:
                 tracker.mark_persist_result(side, persisted=False, reason="MARKET_CONFIRMATION_STATE_DB_ERROR", updated_at=now_text)
                 persisted_by_side[side] = {
@@ -277,11 +535,11 @@ class ThemeLabRuntimePipeline:
                     "market_confirmation_state_persist",
                     "error",
                     "MARKET_CONFIRMATION_STATE_PERSIST_FAILED",
-                    {"error": str(exc), "side": side, "trade_date": trade_date, "session_id": session_id},
+                    {"error": str(exc), "side": side, "trade_date": session.trade_date, "session_id": session.session_id},
                 )
         return _annotate_market_confirmation_persistence(result, persisted_by_side)
 
-    def _persist_transition_log(self, state: dict, now: datetime, *, trade_date: str, session_id: str) -> None:
+    def _persist_transition_log(self, state: dict, now: datetime, *, session: MarketSessionContext) -> None:
         cfg = self.persistence_config
         transition_type = str(state.get("transition_type") or "")
         if not cfg.transition_log_enabled:
@@ -292,8 +550,8 @@ class ThemeLabRuntimePipeline:
             inserted = self.db.save_market_side_confirmation_transition(
                 {
                     **state,
-                    "trade_date": trade_date,
-                    "session_id": session_id,
+                    "trade_date": session.trade_date,
+                    "session_id": session.session_id,
                     "market_side": state.get("side") or "",
                     "cycle_id": state.get("cycle_id") or now.isoformat(),
                     "previous_raw_status": "",
@@ -317,7 +575,7 @@ class ThemeLabRuntimePipeline:
                 {"error": str(exc), "side": state.get("side") or "", "transition_type": transition_type},
             )
 
-    def _log_restore_reset(self, now: datetime, trade_date: str, session_id: str, reset_reason: str) -> None:
+    def _log_restore_reset(self, now: datetime, session: MarketSessionContext, reset_reason: str, *, transition_type: str = "") -> None:
         if not self.persistence_config.transition_log_enabled:
             return
         save = getattr(self.db, "save_market_side_confirmation_transition", None)
@@ -327,17 +585,95 @@ class ThemeLabRuntimePipeline:
             try:
                 save(
                     {
-                        "trade_date": trade_date,
-                        "session_id": session_id,
+                        "trade_date": session.trade_date,
+                        "session_id": session.session_id,
                         "market_side": side,
                         "cycle_id": now.isoformat(),
-                        "transition_type": "STATE_EXPIRED" if reset_reason == "MARKET_CONFIRMATION_STATE_EXPIRED" else "STATE_RESET",
+                        "transition_type": transition_type or _transition_type_for_reset_reason(reset_reason),
                         "transition_reason_codes": ["MARKET_CONFIRMATION_STATE_RESET", reset_reason],
                         "created_at": now.isoformat(),
                     }
                 )
             except Exception:
                 return
+
+    def _log_session_transition(
+        self,
+        now: datetime,
+        session: MarketSessionContext,
+        transition_type: str,
+        reason_codes: tuple[str, ...],
+    ) -> None:
+        if not self.persistence_config.transition_log_enabled:
+            return
+        save = getattr(self.db, "save_market_side_confirmation_transition", None)
+        if not callable(save):
+            return
+        for side in (MarketSide.KOSPI.value, MarketSide.KOSDAQ.value):
+            try:
+                save(
+                    {
+                        "trade_date": session.trade_date,
+                        "session_id": session.session_id,
+                        "market_side": side,
+                        "cycle_id": now.isoformat(),
+                        "transition_type": transition_type,
+                        "transition_reason_codes": list(reason_codes),
+                        "created_at": now.isoformat(),
+                    }
+                )
+            except Exception:
+                return
+
+    def _session_change_reset_reason(self, session: MarketSessionContext) -> str:
+        previous = self._last_session_context
+        if previous is None:
+            return ""
+        if previous.trade_date != session.trade_date and self.persistence_config.reset_on_trade_date_change:
+            return "MARKET_CONFIRMATION_STATE_RESET_ON_TRADE_DATE_CHANGE"
+        if previous.session_id != session.session_id and self.persistence_config.reset_on_session_id_change:
+            return "MARKET_CONFIRMATION_STATE_RESET_ON_SESSION_CHANGE"
+        return ""
+
+    def _record_restore_metric(
+        self,
+        status: str,
+        *,
+        rows: list[dict] | None = None,
+        age_by_side: dict[str, float | None] | None = None,
+    ) -> None:
+        metrics = self._market_confirmation_metrics
+        if status == "attempt":
+            metrics["market_confirmation_restore_attempt_count"] += 1
+        elif status == "success":
+            metrics["market_confirmation_restore_success_count"] += 1
+            by_side = {str(row.get("market_side") or "") for row in rows or []}
+            if MarketSide.KOSPI.value in by_side:
+                metrics["kospi_confirmation_restore_success_count"] += 1
+            if MarketSide.KOSDAQ.value in by_side:
+                metrics["kosdaq_confirmation_restore_success_count"] += 1
+            ages = [float(age) for age in (age_by_side or {}).values() if age is not None]
+            if ages:
+                metrics["market_confirmation_avg_state_age_sec"] = sum(ages) / len(ages)
+                metrics["market_confirmation_max_state_age_sec"] = max(ages)
+        elif status == "skipped":
+            metrics["market_confirmation_restore_skipped_count"] += 1
+        elif status == "failed":
+            metrics["market_confirmation_restore_failed_count"] += 1
+
+    def _record_reset_metric(self, reason: str) -> None:
+        metrics = self._market_confirmation_metrics
+        metrics["market_confirmation_reset_count"] += 1
+        by_reason = dict(metrics.get("market_confirmation_reset_by_reason") or {})
+        by_reason[reason] = int(by_reason.get(reason) or 0) + 1
+        metrics["market_confirmation_reset_by_reason"] = by_reason
+        if reason in {"MARKET_CONFIRMATION_STATE_STALE", "MARKET_CONFIRMATION_STATE_RESTORE_AGE_EXCEEDED"}:
+            metrics["market_confirmation_state_stale_count"] += 1
+        if reason == "MARKET_CONFIRMATION_STATE_EXPIRED":
+            metrics["market_confirmation_state_expired_count"] += 1
+        if reason in {"MARKET_CONFIRMATION_STATE_SESSION_MISMATCH", "MARKET_CONFIRMATION_STATE_RESET_ON_SESSION_CHANGE"}:
+            metrics["kospi_confirmation_reset_count"] += 1
+            metrics["kosdaq_confirmation_reset_count"] += 1
 
     def _save_runtime_event_safe(self, event_type: str, status: str, message: str, payload: dict) -> None:
         save_event = getattr(self.db, "save_runtime_event", None)
@@ -430,6 +766,67 @@ def _annotate_market_confirmation_persistence(
     )
 
 
+def _annotate_market_session(
+    result: ThemeLabFlowResult,
+    session: MarketSessionContext,
+    metrics: dict[str, Any],
+) -> ThemeLabFlowResult:
+    session_fields = _market_session_fields(session, metrics)
+    watchset = tuple(
+        replace(
+            watch,
+            **{
+                **session_fields,
+                "market_side_reason_codes": _dedupe_tuple(tuple(watch.market_side_reason_codes or ()) + session.reason_codes),
+            },
+        )
+        for watch in result.watchset
+    )
+    decisions = tuple(
+        replace(
+            decision,
+            **{
+                **session_fields,
+                "market_side_reason_codes": _dedupe_tuple(tuple(decision.market_side_reason_codes or ()) + session.reason_codes),
+            },
+        )
+        for decision in result.gate_decisions
+    )
+    data_quality = dict(result.data_quality or {})
+    data_quality["market_confirmation_session"] = dict(metrics)
+    return replace(
+        result,
+        market=replace(result.market, **session_fields),
+        watchset=watchset,
+        gate_decisions=decisions,
+        data_quality=data_quality,
+    )
+
+
+def _market_session_fields(session: MarketSessionContext, metrics: dict[str, Any]) -> dict[str, Any]:
+    reset_count = int(metrics.get("market_confirmation_reset_count") or 0)
+    fields = {
+        "market_session_id": session.session_id,
+        "market_session_type": session.session_type,
+        "market_trade_date": session.trade_date,
+        "market_timezone": session.timezone,
+        "market_schedule_source": session.schedule_source,
+        "market_schedule_known": session.schedule_known,
+        "market_is_regular_session": session.is_regular_session,
+        "market_restore_allowed": session.restore_allowed,
+        "market_reset_required": session.reset_required,
+        "market_reset_reason": session.reset_reason,
+        "market_confirmation_state_restore_skipped": int(metrics.get("market_confirmation_restore_skipped_count") or 0) > 0,
+        "market_confirmation_state_reset_count": reset_count,
+        "market_confirmation_state_max_restore_age_sec": session.max_restore_age_sec,
+        "market_confirmation_metrics": dict(metrics),
+        "market_session_reason_codes": session.reason_codes,
+    }
+    if session.reset_reason:
+        fields["market_confirmation_state_restore_reason"] = session.reset_reason
+    return fields
+
+
 def _stock_snapshot_from_tick(tick: StrategyTick) -> StockSnapshot:
     metadata = dict(tick.metadata or {})
     return StockSnapshot(
@@ -471,6 +868,93 @@ def _parse_datetime(value) -> datetime | None:
         return datetime.fromisoformat(text).replace(tzinfo=None)
     except ValueError:
         return None
+
+
+def _parse_market_session_times(cfg: MarketSessionConfig) -> tuple[time, time, time, time] | None:
+    pre_open = _parse_time(cfg.pre_open_start)
+    regular_open = _parse_time(cfg.regular_open)
+    regular_close = _parse_time(cfg.regular_close)
+    post_close = _parse_time(cfg.post_close_end)
+    if None in {pre_open, regular_open, regular_close, post_close}:
+        return None
+    if not (pre_open <= regular_open < regular_close <= post_close):
+        return None
+    return pre_open, regular_open, regular_close, post_close
+
+
+def _parse_time(value: str) -> time | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        hour, minute = text.split(":", 1)
+        return time(int(hour), int(minute))
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_session_id(format_text: str, *, trade_date: str, session_type: str) -> str:
+    template = str(format_text or "{trade_date}:{session_type}")
+    try:
+        return template.format(trade_date=trade_date, session_type=session_type)
+    except (KeyError, ValueError):
+        return f"{trade_date}:{session_type}"
+
+
+def _max_restore_age_for_session(cfg: MarketSideConfirmationPersistenceConfig, session_type: str) -> int:
+    if session_type == "regular":
+        return int(cfg.max_restore_age_sec_regular or cfg.max_state_age_sec or 0)
+    if session_type == "pre_open":
+        return int(cfg.max_restore_age_sec_pre_open or 0)
+    return int(cfg.max_restore_age_sec_after_close or 0)
+
+
+def _transition_type_for_reset_reason(reason: str) -> str:
+    mapping = {
+        "MARKET_CONFIRMATION_STATE_FORCE_RESET": "RESET_FORCE",
+        "MARKET_CONFIRMATION_STATE_RESET_ON_TRADE_DATE_CHANGE": "RESET_ON_TRADE_DATE_CHANGE",
+        "MARKET_CONFIRMATION_STATE_DATE_MISMATCH": "RESET_ON_TRADE_DATE_CHANGE",
+        "MARKET_CONFIRMATION_STATE_RESET_ON_SESSION_CHANGE": "RESET_ON_SESSION_BOUNDARY",
+        "MARKET_CONFIRMATION_STATE_SESSION_MISMATCH": "RESET_ON_SESSION_BOUNDARY",
+        "MARKET_CONFIRMATION_STATE_RESET_ON_MARKET_CLOSE": "RESET_ON_MARKET_CLOSE",
+        "MARKET_CONFIRMATION_STATE_RESTORE_AGE_EXCEEDED": "RESET_STALE",
+        "MARKET_CONFIRMATION_STATE_STALE": "RESET_STALE",
+        "MARKET_CONFIRMATION_STATE_EXPIRED": "RESET_EXPIRED",
+        "MARKET_CONFIRMATION_STATE_SCHEDULE_UNKNOWN": "SCHEDULE_UNKNOWN_CONSERVATIVE",
+        "MARKET_CONFIRMATION_STATE_RESTORE_NOT_ALLOWED": "RESTORE_SKIPPED",
+    }
+    return mapping.get(str(reason or ""), "STATE_RESET")
+
+
+def _empty_market_confirmation_metrics() -> dict[str, Any]:
+    return {
+        "market_confirmation_restore_attempt_count": 0,
+        "market_confirmation_restore_success_count": 0,
+        "market_confirmation_restore_skipped_count": 0,
+        "market_confirmation_restore_failed_count": 0,
+        "market_confirmation_reset_count": 0,
+        "market_confirmation_reset_by_reason": {},
+        "market_confirmation_state_stale_count": 0,
+        "market_confirmation_state_expired_count": 0,
+        "market_confirmation_schedule_unknown_count": 0,
+        "market_confirmation_memory_fallback_count": 0,
+        "market_confirmation_conservative_fallback_count": 0,
+        "market_confirmation_avg_state_age_sec": None,
+        "market_confirmation_max_state_age_sec": None,
+        "kospi_confirmation_restore_success_count": 0,
+        "kosdaq_confirmation_restore_success_count": 0,
+        "kospi_confirmation_reset_count": 0,
+        "kosdaq_confirmation_reset_count": 0,
+    }
+
+
+def _dedupe_tuple(values: tuple[str, ...]) -> tuple[str, ...]:
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return tuple(result)
 
 
 def _bool(value, default: bool) -> bool:
