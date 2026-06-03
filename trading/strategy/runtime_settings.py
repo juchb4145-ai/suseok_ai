@@ -706,6 +706,8 @@ def _merge_value(default: Any, raw: Any, path: str, missing: list[str], invalid:
         if not isinstance(raw, list):
             invalid.append(path)
             return deepcopy(default)
+        if not default:
+            return deepcopy(raw)
         if len(raw) != len(default):
             invalid.append(path)
             return deepcopy(default)
