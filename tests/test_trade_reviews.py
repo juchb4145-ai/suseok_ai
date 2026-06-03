@@ -565,6 +565,20 @@ def test_review_summary_aggregates_reason_session_matrix_and_p1_diagnostics(tmp_
             final_status=ReviewFinalStatus.BLOCKED_FINAL.value,
             details={},
         ),
+        TradeReview(
+            candidate_id=4,
+            trade_date="2026-05-29",
+            code="444444",
+            theme_id="auto",
+            review_key="late-chase-warning",
+            final_status=ReviewFinalStatus.VIRTUAL_FILLED.value,
+            max_return_20m=1.2,
+            max_drawdown_20m=-2.2,
+            details={
+                "comparison_reason_codes": ["LATE_CHASE_WARNING"],
+                "late_chase_diagnostics": {"late_chase_level": "warning"},
+            },
+        ),
     ]
 
     exporter = ReviewExporter()
@@ -582,6 +596,8 @@ def test_review_summary_aggregates_reason_session_matrix_and_p1_diagnostics(tmp_
     assert session_rows["OPEN_10_90"]["false_negative_count"] == 1
     assert summary["late_chase_diagnostics"]["late_chase_count"] == 1
     assert summary["late_chase_diagnostics"]["soft_block_max_return_20m_avg"] == 5.5
+    assert summary["late_chase_diagnostics"]["warning_count"] == 1
+    assert summary["late_chase_diagnostics"]["warning_max_drawdown_20m_avg"] == -2.2
     assert summary["fill_diagnostics"]["legacy_fill_true_v2_false_count"] == 1
     assert summary["fill_diagnostics"]["confidence_level_performance"][0]["key"] == "low"
 

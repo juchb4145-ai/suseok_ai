@@ -46,7 +46,9 @@ LATE_CHASE_WARNING_SCORE = 25.0
 LATE_CHASE_SOFT_BLOCK_SCORE = 80.0
 LATE_CHASE_TEMP_WAIT = "LATE_CHASE_TEMP_WAIT"
 LATE_CHASE_WARNING = "LATE_CHASE_WARNING"
+LATE_CHASE_RECOVERY_PENDING = "LATE_CHASE_RECOVERY_PENDING"
 LATE_CHASE_RECOVERY_CONDITIONS = [
+    "late_chase_score_below_warning",
     "support_distance_no_longer_excessive",
     "volume_reacceleration_confirmed",
     "not_after_large_candle_or_new_pullback_confirmed",
@@ -649,6 +651,28 @@ class StockPullbackEntryGate:
                 ),
                 snapshot,
             )
+        recovery_status = _late_chase_recovery_status(candidate, details, self.settings)
+        details["late_chase_recovery_status"] = recovery_status
+        if recovery_status["pending"] and not recovery_status["recovered"]:
+            details["sub_status"] = LATE_CHASE_TEMP_WAIT
+            details["late_chase_recoverable"] = True
+            details["late_chase_block_type"] = "temporary_wait"
+            details["late_chase_recheck_after_sec"] = self.settings.integer("late_chase_policy.recheck_after_sec", 60)
+            reason_codes = _late_chase_recovery_pending_reason_codes(details)
+            return (
+                _decision(
+                    "StockPullbackEntryGate",
+                    False,
+                    self.settings.number("pullback_thresholds.stock_pullback_wait_score", 55.0),
+                    BlockType.TEMPORARY,
+                    reason_codes,
+                    details,
+                    can_recover=True,
+                    recheck_after_sec=int(details.get("late_chase_recheck_after_sec") or 60),
+                    settings=self.settings,
+                ),
+                snapshot,
+            )
 
         if profile == StrategyProfile.KOSPI_LEADER_PROFILE:
             return self._evaluate_kospi(candidate, snapshot, details)
@@ -910,6 +934,64 @@ def _late_chase_temp_wait_reason_codes(details: dict) -> list[str]:
         list(details.get("comparison_reason_codes") or [])
         + [ReasonCode.LATE_CHASE.value, ReasonCode.SOFT_BLOCK_ONLY.value, LATE_CHASE_TEMP_WAIT]
     )
+
+
+def _late_chase_recovery_pending_reason_codes(details: dict) -> list[str]:
+    return normalize_reason_codes(
+        list(details.get("comparison_reason_codes") or [])
+        + [
+            ReasonCode.LATE_CHASE.value,
+            ReasonCode.LATE_CHASE_TEMP_WAIT.value,
+            ReasonCode.LATE_CHASE_RECOVERY_PENDING.value,
+        ]
+    )
+
+
+def _late_chase_recovery_status(candidate: Candidate, details: dict, settings: StrategyRuntimeSettings) -> dict:
+    pending = _candidate_has_late_chase_temp_wait(candidate)
+    diagnostics = dict(details.get("late_chase_diagnostics") or {})
+    warning_score = settings.number("late_chase_thresholds.warning_score", LATE_CHASE_WARNING_SCORE)
+    score = _float_or_none(diagnostics.get("late_chase_score"))
+    after_large = bool(diagnostics.get("after_large_3m_candle")) or bool(diagnostics.get("after_large_5m_candle"))
+    checks = {
+        "late_chase_score_below_warning": score is not None and score < warning_score,
+        "support_distance_no_longer_excessive": not bool(diagnostics.get("support_distance_excessive")),
+        "volume_reacceleration_confirmed": bool(diagnostics.get("volume_reacceleration_confirmed")) or bool(details.get("volume_reaccel")),
+        "not_after_large_candle_or_new_pullback_confirmed": (not after_large) or bool(details.get("failed_low_break_rebound")),
+        "selected_support_ready": bool(details.get("selected_support_ready", details.get("support_ready", False))),
+        "latest_tick_ready": bool(details.get("latest_tick_ready", True)),
+    }
+    missing = [name for name, passed in checks.items() if not passed]
+    return {
+        "pending": pending,
+        "recovered": pending and not missing,
+        "checks": checks,
+        "missing_conditions": missing,
+        "late_chase_score": score,
+        "warning_score": warning_score,
+    }
+
+
+def _candidate_has_late_chase_temp_wait(candidate: Candidate) -> bool:
+    metadata = dict(candidate.metadata or {})
+    if str(metadata.get("sub_status") or "") == LATE_CHASE_TEMP_WAIT:
+        return True
+    values = []
+    for key in ("last_block_result",):
+        item = metadata.get(key)
+        if isinstance(item, dict):
+            values.append(str(item.get("sub_status") or ""))
+            values.extend(str(code) for code in item.get("reason_codes") or [])
+    for records_key in ("gate_results_by_theme", "block_reasons_by_theme"):
+        records = metadata.get(records_key)
+        if not isinstance(records, dict):
+            continue
+        for item in records.values():
+            if not isinstance(item, dict):
+                continue
+            values.append(str(item.get("sub_status") or ""))
+            values.extend(str(code) for code in item.get("reason_codes") or [])
+    return LATE_CHASE_TEMP_WAIT in values
 
 
 def _late_chase_diagnostics(

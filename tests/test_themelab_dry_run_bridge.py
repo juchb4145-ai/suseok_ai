@@ -143,6 +143,34 @@ def test_themelab_good_pullback_soft_block_waits_without_entry_plan_or_intent(tm
     assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 
 
+def test_themelab_generic_soft_block_does_not_pollute_late_chase_bucket(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.READY,
+            PriceLocationStatus.GOOD_PULLBACK,
+            risk=TradeabilityRiskLevel.SOFT_BLOCK,
+            reasons=("HIGH_RETURN_FOLLOWER",),
+        ),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+    assert candidate.state == CandidateState.BLOCKED
+    assert candidate.block_type == BlockType.TEMPORARY
+    assert details["sub_status"] == "RISK_SOFT_BLOCK_TEMP_WAIT"
+    assert details["risk_soft_block"] is True
+    assert details["late_chase_level"] == ""
+    assert "RISK_SOFT_BLOCK_TEMP_WAIT" in details["reason_codes"]
+    assert "LATE_CHASE_TEMP_WAIT" not in details["reason_codes"]
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
 @pytest.mark.parametrize(
     ("status", "price_location", "expected_final"),
     [

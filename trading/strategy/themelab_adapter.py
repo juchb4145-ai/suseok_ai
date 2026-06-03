@@ -53,6 +53,9 @@ from trading.theme_engine.lab import (
 
 SOURCE = "themelab_flow"
 ORDER_PHASE_ENTRY = "entry"
+LATE_CHASE_TEMP_WAIT = "LATE_CHASE_TEMP_WAIT"
+RISK_SOFT_BLOCK_TEMP_WAIT = "RISK_SOFT_BLOCK_TEMP_WAIT"
+LATE_CHASE_SOFT_BLOCK_CODES = {"HIGH_CHASE_RISK", "LATE_CHASE", "CHASE_RISK"}
 
 READY_PULLBACK_LOCATIONS = {
     PriceLocationStatus.GOOD_PULLBACK,
@@ -617,8 +620,12 @@ def _map_decision(
         wait_reasons = ["WAIT"] + reason_codes
         final_status = "WAIT"
         if decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK:
-            final_status = "LATE_CHASE_TEMP_WAIT"
-            wait_reasons.extend(["LATE_CHASE", "SOFT_BLOCK_ONLY", "LATE_CHASE_TEMP_WAIT"])
+            if _is_late_chase_soft_block(reason_codes):
+                final_status = LATE_CHASE_TEMP_WAIT
+                wait_reasons.extend(["LATE_CHASE", "SOFT_BLOCK_ONLY", LATE_CHASE_TEMP_WAIT])
+            else:
+                final_status = RISK_SOFT_BLOCK_TEMP_WAIT
+                wait_reasons.extend(["SOFT_BLOCK_ONLY", RISK_SOFT_BLOCK_TEMP_WAIT])
         return ThemeLabBridgeMapping(
             final_status,
             "NOT_ELIGIBLE_WAIT",
@@ -692,6 +699,10 @@ def _wait_data_for_support(
     )
 
 
+def _is_late_chase_soft_block(reason_codes: Iterable[str]) -> bool:
+    return bool({str(code).upper() for code in reason_codes} & LATE_CHASE_SOFT_BLOCK_CODES)
+
+
 def _selected_support_profile(
     price_location: PriceLocationStatus,
     support_candidates: dict[str, float],
@@ -744,6 +755,8 @@ def _stock_pullback_details(
 ) -> dict[str, Any]:
     support_candidates = _support_candidates(tick_metadata)
     coverage = support_coverage(tick_metadata, support_candidates)
+    is_late_chase_wait = mapping.final_gate_status == LATE_CHASE_TEMP_WAIT
+    is_risk_soft_block_wait = mapping.final_gate_status == RISK_SOFT_BLOCK_TEMP_WAIT
     if mapping.selected_support_source:
         nearest_support = mapping.selected_support_source
         nearest_support_price = mapping.selected_support_price
@@ -806,18 +819,20 @@ def _stock_pullback_details(
             "price_location_status": decision.price_location_status.value,
             "risk_level": decision.risk_level.value,
         },
-        "late_chase_level": "soft_block" if decision.price_location_status in OBSERVE_ONLY_LOCATIONS or decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK else "",
-        "late_chase_score": 100.0 if decision.price_location_status in OBSERVE_ONLY_LOCATIONS or decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK else 0.0,
-        "late_chase_block_type": "temporary_wait" if decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK else ("observe_only" if decision.price_location_status in OBSERVE_ONLY_LOCATIONS else ""),
-        "late_chase_recoverable": decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK,
-        "late_chase_recheck_after_sec": int(decision.recheck_after_sec or 60) if decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK else 0,
+        "late_chase_level": "soft_block" if is_late_chase_wait or decision.price_location_status in OBSERVE_ONLY_LOCATIONS else "",
+        "late_chase_score": 100.0 if is_late_chase_wait or decision.price_location_status in OBSERVE_ONLY_LOCATIONS else 0.0,
+        "late_chase_block_type": "temporary_wait" if is_late_chase_wait else ("observe_only" if decision.price_location_status in OBSERVE_ONLY_LOCATIONS else ""),
+        "late_chase_recoverable": is_late_chase_wait,
+        "late_chase_recheck_after_sec": int(decision.recheck_after_sec or 60) if is_late_chase_wait else 0,
         "late_chase_recovery_conditions": [
             "support_distance_no_longer_excessive",
             "volume_reacceleration_confirmed",
             "not_after_large_candle_or_new_pullback_confirmed",
             "selected_support_ready",
             "latest_tick_ready",
-        ] if decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK else [],
+        ] if is_late_chase_wait else [],
+        "risk_soft_block": is_risk_soft_block_wait,
+        "risk_soft_block_reason_codes": list(mapping.reason_codes) if is_risk_soft_block_wait else [],
         "comparison_reason_codes": list(mapping.reason_codes),
     }
 
@@ -903,6 +918,8 @@ def _base_details(
         "late_chase_recoverable": bool(stock_details.get("late_chase_recoverable")),
         "late_chase_recheck_after_sec": stock_details.get("late_chase_recheck_after_sec", 0),
         "late_chase_recovery_conditions": list(stock_details.get("late_chase_recovery_conditions") or []),
+        "risk_soft_block": bool(stock_details.get("risk_soft_block")),
+        "risk_soft_block_reason_codes": list(stock_details.get("risk_soft_block_reason_codes") or []),
         "stock_role": watch.stock_role.value,
         "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
         "theme_lab_bridge": {
@@ -945,6 +962,8 @@ def _base_details(
             "late_chase_block_type": stock_details.get("late_chase_block_type", ""),
             "late_chase_recoverable": bool(stock_details.get("late_chase_recoverable")),
             "late_chase_recheck_after_sec": stock_details.get("late_chase_recheck_after_sec", 0),
+            "risk_soft_block": bool(stock_details.get("risk_soft_block")),
+            "risk_soft_block_reason_codes": list(stock_details.get("risk_soft_block_reason_codes") or []),
             "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
         },
     }

@@ -73,13 +73,32 @@ def test_ready_early_small_soft_block_does_not_create_first_leg(monkeypatch):
     assert EntryPlanBuilder().build(result) is None
 
 
-def test_late_chase_recovery_reevaluation_can_pass_when_level_drops(monkeypatch):
+def test_late_chase_recovery_reevaluation_waits_until_recovery_conditions_clear(monkeypatch):
     first_decision, _first_snapshot = _evaluate_stock_gate(monkeypatch, late_chase_level="soft_block")
-    second_decision, _second_snapshot = _evaluate_stock_gate(monkeypatch, late_chase_level="warning")
+    second_decision, _second_snapshot = _evaluate_stock_gate(
+        monkeypatch,
+        late_chase_level="warning",
+        previous_late_chase=True,
+    )
 
     assert first_decision.details["sub_status"] == "LATE_CHASE_TEMP_WAIT"
-    assert second_decision.passed is True
-    assert second_decision.details["sub_status"] == "PASS"
+    assert second_decision.passed is False
+    assert second_decision.details["sub_status"] == "LATE_CHASE_TEMP_WAIT"
+    assert second_decision.details["late_chase_recovery_status"]["pending"] is True
+    assert "late_chase_score_below_warning" in second_decision.details["late_chase_recovery_status"]["missing_conditions"]
+    assert "LATE_CHASE_RECOVERY_PENDING" in second_decision.reason_codes
+
+
+def test_late_chase_recovery_reevaluation_can_pass_when_all_conditions_clear(monkeypatch):
+    decision, _snapshot = _evaluate_stock_gate(
+        monkeypatch,
+        late_chase_level="none",
+        previous_late_chase=True,
+    )
+
+    assert decision.passed is True
+    assert decision.details["sub_status"] == "PASS"
+    assert decision.details["late_chase_recovery_status"]["recovered"] is True
 
 
 def test_late_chase_recheck_setting_is_configurable(monkeypatch):
@@ -93,7 +112,14 @@ def test_late_chase_recheck_setting_is_configurable(monkeypatch):
     assert decision.details["late_chase_recheck_after_sec"] == 45
 
 
-def _evaluate_stock_gate(monkeypatch, *, late_chase_level: str, chase_risk: bool = False, settings: StrategyRuntimeSettings | None = None):
+def _evaluate_stock_gate(
+    monkeypatch,
+    *,
+    late_chase_level: str,
+    chase_risk: bool = False,
+    settings: StrategyRuntimeSettings | None = None,
+    previous_late_chase: bool = False,
+):
     active_settings = settings or legacy_strategy_runtime_settings()
     snapshot = IndicatorSnapshot(
         candidate_id=1,
@@ -126,16 +152,21 @@ def _evaluate_stock_gate(monkeypatch, *, late_chase_level: str, chase_risk: bool
 
     monkeypatch.setattr(gates, "_snapshot_for", lambda *args, **kwargs: snapshot)
     monkeypatch.setattr(gates, "support_status_for_snapshot", lambda *args, **kwargs: dict(support_status))
+    diagnostics = {
+        "feature_version": "late_chase_diagnostics_v1",
+        "late_chase_level": late_chase_level,
+        "late_chase_score": 100.0 if late_chase_level == "soft_block" else (30.0 if late_chase_level == "warning" else 0.0),
+        "reason_codes": ["LATE_CHASE", "SOFT_BLOCK_ONLY"] if late_chase_level == "soft_block" else [],
+        "input_missing_fields": [],
+        "support_distance_excessive": late_chase_level == "soft_block",
+        "volume_reacceleration_confirmed": True,
+        "after_large_3m_candle": late_chase_level == "soft_block",
+        "after_large_5m_candle": False,
+    }
     monkeypatch.setattr(
         gates,
         "_late_chase_diagnostics",
-        lambda *args, **kwargs: {
-            "feature_version": "late_chase_diagnostics_v1",
-            "late_chase_level": late_chase_level,
-            "late_chase_score": 100.0 if late_chase_level == "soft_block" else (30.0 if late_chase_level == "warning" else 0.0),
-            "reason_codes": ["LATE_CHASE", "SOFT_BLOCK_ONLY"] if late_chase_level == "soft_block" else [],
-            "input_missing_fields": [],
-        },
+        lambda *args, **kwargs: dict(diagnostics),
     )
     gate = gates.StockPullbackEntryGate(
         indicator_calculator=object(),
@@ -144,7 +175,20 @@ def _evaluate_stock_gate(monkeypatch, *, late_chase_level: str, chase_risk: bool
         market_data=object(),
         settings=active_settings,
     )
-    return gate.evaluate(Candidate(id=1, code="000001", strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE), _theme(), _leadership())
+    metadata = {}
+    if previous_late_chase:
+        metadata = {
+            "sub_status": "LATE_CHASE_TEMP_WAIT",
+            "last_block_result": {
+                "sub_status": "LATE_CHASE_TEMP_WAIT",
+                "reason_codes": ["LATE_CHASE", "SOFT_BLOCK_ONLY", "LATE_CHASE_TEMP_WAIT"],
+            },
+        }
+    return gate.evaluate(
+        Candidate(id=1, code="000001", strategy_profile=StrategyProfile.KOSDAQ_THEME_PROFILE, metadata=metadata),
+        _theme(),
+        _leadership(),
+    )
 
 
 def _pipeline_result(stock_decision: GateDecision, snapshot: IndicatorSnapshot) -> GatePipelineResult:

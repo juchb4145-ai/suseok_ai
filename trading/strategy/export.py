@@ -179,6 +179,8 @@ class ReviewExporter:
                 "",
                 f"- LATE_CHASE count: {summary['late_chase_diagnostics']['late_chase_count']}",
                 f"- LATE_CHASE soft_block avg max_return_20m: {_cell(summary['late_chase_diagnostics']['soft_block_max_return_20m_avg'])}",
+                f"- LATE_CHASE warning count: {summary['late_chase_diagnostics'].get('warning_count', 0)}",
+                f"- LATE_CHASE warning avg max_drawdown_20m: {_cell(summary['late_chase_diagnostics'].get('warning_max_drawdown_20m_avg'))}",
             ]
         )
         lines.extend(["", "## Fill Diagnostics", ""])
@@ -384,6 +386,7 @@ def _theme_leadership_diagnostics(reviews: list[TradeReview]) -> dict:
 def _late_chase_diagnostics(reviews: list[TradeReview]) -> dict:
     late_chase_items = [review for review in reviews if "LATE_CHASE" in _all_reason_codes(review)]
     soft_block_items = [review for review in reviews if _late_chase_level(review) == "soft_block"]
+    warning_items = [review for review in reviews if _late_chase_level(review) == "warning" or "LATE_CHASE_WARNING" in _all_reason_codes(review)]
     breakout_items = [
         review
         for review in reviews
@@ -394,10 +397,14 @@ def _late_chase_diagnostics(reviews: list[TradeReview]) -> dict:
     return {
         "late_chase_count": len(late_chase_items),
         "soft_block_max_return_20m_avg": _avg(_metric_values(soft_block_items, "max_return_20m")),
+        "warning_count": len(warning_items),
+        "warning_max_return_20m_avg": _avg(_metric_values(warning_items, "max_return_20m")),
+        "warning_max_drawdown_20m_avg": _avg(_metric_values(warning_items, "max_drawdown_20m")),
         "level_performance": _performance_by_key(reviews, lambda review: [_late_chase_level(review)] if _late_chase_level(review) else []),
         "breakout_vs_late_chase": [
             _performance_row("breakout_guardrail_passed", breakout_items),
             _performance_row("late_chase_soft_block", soft_block_items),
+            _performance_row("late_chase_warning_tag_only", warning_items),
         ],
     }
 
