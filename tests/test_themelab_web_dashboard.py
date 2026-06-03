@@ -223,6 +223,63 @@ def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, 
     assert snapshot["theme_lab"]["summary"]["ready_count"] == 1
 
 
+def test_theme_lab_snapshot_exposes_defensive_gate_observability_columns(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        late_chase = _watch("000011", "WAIT")
+        late_chase.update(
+            {
+                "late_chase_level": "soft_block",
+                "late_chase_block_type": "temporary",
+                "late_chase_recoverable": True,
+                "late_chase_recheck_after_sec": 60,
+                "risk_reason_codes": ["LATE_CHASE_TEMP_WAIT"],
+            }
+        )
+        market_pending = _watch("000012", "WAIT")
+        market_pending.update(
+            {
+                "candidate_market": "KOSPI",
+                "candidate_market_confirmation_pending": True,
+                "market_side_weak_consecutive_cycles": 1,
+                "market_side_recheck_after_sec": 60,
+            }
+        )
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:05:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [late_chase, market_pending],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    rows = {row["symbol"]: row for row in payload["watchset"]}
+    assert rows["000011"]["gate_status"] == "WAIT"
+    assert rows["000011"]["display_status"] == "LATE_CHASE_TEMP_WAIT"
+    assert rows["000011"]["strategy_eligible"] is False
+    assert rows["000011"]["late_chase_temp_wait"] is True
+    assert rows["000012"]["display_status"] == "WAIT_MARKET_CONFIRMATION_PENDING"
+    assert rows["000012"]["candidate_market"] == "KOSPI"
+    assert rows["000012"]["market_confirmation_pending"] is True
+    for key in (
+        "chase_risk",
+        "market_wait_reason",
+        "market_confirmation_state_restored",
+        "market_session_type",
+        "runtime_order_intent_created",
+        "virtual_order_created",
+        "live_order_guard_passed",
+    ):
+        assert key in rows["000011"]
+
+
 def _theme():
     return {
         "theme_id": "power",

@@ -49,6 +49,7 @@ from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThe
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
 from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, config_from_settings
 from trading_app.dry_run_threshold_ab import DryRunThresholdABAnalyzer, config_from_settings as threshold_ab_config_from_settings
+from trading_app.market_gate_review import MarketGateReviewAnalyzer
 from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.runtime_supervisor import RuntimeSupervisor
@@ -140,6 +141,10 @@ def _order_service() -> OrderEnqueueService:
 
 def _performance_analyzer(db: TradingDatabase) -> DryRunPerformanceAnalyzer:
     return DryRunPerformanceAnalyzer(db, config=config_from_settings(get_settings()))
+
+
+def _market_gate_review_analyzer(db: TradingDatabase) -> MarketGateReviewAnalyzer:
+    return MarketGateReviewAnalyzer(db)
 
 
 def _transport_config_from_settings() -> TransportLatencyConfig:
@@ -895,6 +900,37 @@ def export_runtime_dry_run_performance(
             "report_id": report["report_id"],
             "persisted": persisted is not None,
             "exports": analyzer.export_report(report, fmt=format),
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/market-gate/review")
+def runtime_market_gate_review(
+    trade_date: Optional[str] = None,
+    limit: int = Query(1000, ge=1, le=10000),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return _market_gate_review_analyzer(db).build_report(trade_date=trade_date, limit=limit)
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/market-gate/review/export")
+def export_runtime_market_gate_review(
+    trade_date: Optional[str] = None,
+    format: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        analyzer = _market_gate_review_analyzer(db)
+        report = analyzer.build_report(trade_date=trade_date, limit=10000)
+        return {
+            "report_id": report["report_id"],
+            "exports": analyzer.export_report(report, fmt=format),
+            "notes": report.get("notes", []),
         }
     finally:
         close_database(db)

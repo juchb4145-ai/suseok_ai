@@ -944,6 +944,9 @@ def _stock_pullback_details(
         "recent_support_price_present": coverage["recent_support_price_present"],
         "vwap_present": coverage["vwap_present"],
         "vwap_ready": coverage["vwap_ready"],
+        "base_line_120_ready": bool(tick_metadata.get("base_line_120_ready")),
+        "base_line_120_candle_count": int(tick_metadata.get("base_line_120_candle_count") or 0),
+        "recent_support_ready": bool(tick_metadata.get("recent_support_ready")),
         "minute_bar_present": coverage["minute_bar_present"],
         "minute_bar_count": coverage["minute_bar_count"],
         "ready_type": mapping.ready_type,
@@ -1006,6 +1009,7 @@ def _base_details(
     generation_reason = str(metadata.get("generation_reason") or metadata.get("candidate_generation_reason") or "")
     decision_cycle_id = str(decision_cycle_id or metadata.get("decision_cycle_id") or "")
     market_fields = _market_side_fields(decision, watch)
+    observability = _observability_status_fields(mapping, stock_details, market_fields)
     details = {
         "source": SOURCE,
         "candidate_instance_id": candidate_instance_id,
@@ -1023,6 +1027,7 @@ def _base_details(
         "theme_score": theme_score,
         "dynamic_theme_score": theme_score,
         "final_gate_status": mapping.final_gate_status,
+        **observability,
         "order_eligibility": mapping.order_eligibility,
         "ready_type": mapping.ready_type,
         "lab_gate_status": decision.status.value,
@@ -1060,6 +1065,9 @@ def _base_details(
         "recent_support_price_present": bool(stock_details.get("recent_support_price_present")),
         "vwap_present": bool(stock_details.get("vwap_present")),
         "vwap_ready": bool(stock_details.get("vwap_ready")),
+        "base_line_120_ready": bool(stock_details.get("base_line_120_ready")),
+        "base_line_120_candle_count": stock_details.get("base_line_120_candle_count", 0),
+        "recent_support_ready": bool(stock_details.get("recent_support_ready")),
         "minute_bar_present": bool(stock_details.get("minute_bar_present")),
         "minute_bar_count": stock_details.get("minute_bar_count", 0),
         "late_chase_diagnostics": dict(stock_details.get("late_chase_diagnostics") or {}),
@@ -1091,6 +1099,7 @@ def _base_details(
             "theme_name": theme_name,
             "lab_gate_status": decision.status.value,
             "final_gate_status": mapping.final_gate_status,
+            **observability,
             "order_eligibility": mapping.order_eligibility,
             "ready_type": mapping.ready_type,
             "price_location_status": decision.price_location_status.value,
@@ -1108,6 +1117,9 @@ def _base_details(
             "recent_support_price_present": bool(stock_details.get("recent_support_price_present")),
             "vwap_present": bool(stock_details.get("vwap_present")),
             "vwap_ready": bool(stock_details.get("vwap_ready")),
+            "base_line_120_ready": bool(stock_details.get("base_line_120_ready")),
+            "base_line_120_candle_count": stock_details.get("base_line_120_candle_count", 0),
+            "recent_support_ready": bool(stock_details.get("recent_support_ready")),
             "minute_bar_present": bool(stock_details.get("minute_bar_present")),
             "minute_bar_count": stock_details.get("minute_bar_count", 0),
             "late_chase_level": stock_details.get("late_chase_level", ""),
@@ -1130,6 +1142,66 @@ def _base_details(
         legacy_score=0.0,
         new_score=mapping.final_score,
     )
+
+
+def _observability_status_fields(
+    mapping: ThemeLabBridgeMapping,
+    stock_details: dict[str, Any],
+    market_fields: dict[str, Any],
+) -> dict[str, Any]:
+    reason_codes = set(str(reason) for reason in mapping.reason_codes)
+    support_reason = str(stock_details.get("support_ready_reason") or stock_details.get("support_missing_reason") or "")
+    price_location = str(stock_details.get("price_location_status") or "")
+    late_chase_level = str(stock_details.get("late_chase_level") or "")
+    late_chase_block_type = str(stock_details.get("late_chase_block_type") or "")
+    market_pending = bool(market_fields.get("candidate_market_confirmation_pending"))
+    market_recovery = bool(market_fields.get("candidate_market_recovery_pending"))
+    market_status = str(market_fields.get("candidate_market_confirmed_status") or market_fields.get("candidate_market_status") or "")
+    restore_reason = str(market_fields.get("market_confirmation_state_restore_reason") or "")
+    reset_reason = str(market_fields.get("market_confirmation_state_reset_reason") or "")
+    session_type = str(market_fields.get("market_session_type") or "")
+
+    normalized = str(mapping.final_gate_status or mapping.final_grade or "")
+    display = normalized
+    if stock_details.get("chase_risk") or "CHASE_RISK" in reason_codes:
+        normalized = "CHASE_RISK_BLOCKED"
+        display = "CHASE_RISK_BLOCKED"
+    elif late_chase_level == "soft_block" or mapping.final_gate_status == LATE_CHASE_TEMP_WAIT:
+        normalized = "LATE_CHASE_TEMP_WAIT"
+        display = "LATE_CHASE_TEMP_WAIT"
+    elif restore_reason == "MARKET_CONFIRMATION_STATE_DB_ERROR" or "MARKET_CONFIRMATION_STATE_CONSERVATIVE_FALLBACK" in reason_codes:
+        normalized = "WAIT_MARKET_STATE_CONSERVATIVE_FALLBACK"
+        display = "WAIT_MARKET_STATE_CONSERVATIVE_FALLBACK"
+    elif market_recovery:
+        normalized = "WAIT_MARKET_RECOVERY_PENDING"
+        display = "WAIT_MARKET_RECOVERY_PENDING"
+    elif market_pending:
+        normalized = "WAIT_MARKET_CONFIRMATION_PENDING"
+        display = "WAIT_MARKET_CONFIRMATION_PENDING"
+    elif market_status == "RISK_OFF":
+        normalized = "WAIT_CANDIDATE_MARKET_RISK_OFF"
+        display = "WAIT_CANDIDATE_MARKET_RISK_OFF"
+    elif market_status == "WEAK":
+        normalized = "WAIT_CANDIDATE_MARKET_WEAK"
+        display = "WAIT_CANDIDATE_MARKET_WEAK"
+    elif not bool(stock_details.get("support_ready", True)) or support_reason:
+        normalized = "WAIT_DATA_SUPPORT_NOT_READY"
+        display = "WAIT_DATA_SUPPORT_NOT_READY"
+    elif not bool(stock_details.get("latest_tick_ready", True)):
+        normalized = "WAIT_DATA_LATEST_TICK_STALE"
+        display = "WAIT_DATA_LATEST_TICK_STALE"
+
+    return {
+        "normalized_status": normalized,
+        "display_status": display,
+        "display_status_source": "themelab_observability",
+        "display_status_reason": support_reason or restore_reason or reset_reason or late_chase_block_type or price_location,
+        "late_chase_temp_wait": normalized == "LATE_CHASE_TEMP_WAIT",
+        "chase_risk_reason": "CHASE_RISK" if normalized == "CHASE_RISK_BLOCKED" else "",
+        "price_location_block_reason": price_location if normalized in {"CHASE_RISK_BLOCKED", "LATE_CHASE_TEMP_WAIT"} else "",
+        "market_wait_reason": normalized if normalized.startswith("WAIT_MARKET") or normalized.startswith("WAIT_CANDIDATE_MARKET") else "",
+        "session_boundary_status": session_type,
+    }
 
 
 def themelab_entry_idempotency_key(

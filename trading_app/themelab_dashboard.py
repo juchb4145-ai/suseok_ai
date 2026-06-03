@@ -393,20 +393,132 @@ def _state_value(value: Any) -> str:
     return str(getattr(value, "value", value) or "")
 
 
+def _display_status(item: dict[str, Any], gate: str) -> str:
+    existing = str(item.get("display_status") or item.get("normalized_status") or "").strip()
+    if existing:
+        return existing
+    reasons = {str(reason or "") for reason in item.get("reason_codes") or item.get("risk_reason_codes") or []}
+    market_reasons = {str(reason or "") for reason in item.get("market_side_reason_codes") or []}
+    all_reasons = reasons | market_reasons
+    market_status = str(item.get("candidate_market_confirmed_status") or item.get("candidate_market_status") or "")
+    if bool(item.get("chase_risk")) or "CHASE_RISK" in all_reasons:
+        return "CHASE_RISK_BLOCKED"
+    if str(item.get("late_chase_level") or "") == "soft_block" or "LATE_CHASE_TEMP_WAIT" in all_reasons:
+        return "LATE_CHASE_TEMP_WAIT"
+    if "MARKET_CONFIRMATION_STATE_CONSERVATIVE_FALLBACK" in all_reasons:
+        return "WAIT_MARKET_STATE_CONSERVATIVE_FALLBACK"
+    if bool(item.get("candidate_market_recovery_pending")):
+        return "WAIT_MARKET_RECOVERY_PENDING"
+    if bool(item.get("candidate_market_confirmation_pending")):
+        return "WAIT_MARKET_CONFIRMATION_PENDING"
+    if market_status == "RISK_OFF":
+        return "WAIT_CANDIDATE_MARKET_RISK_OFF"
+    if market_status == "WEAK":
+        return "WAIT_CANDIDATE_MARKET_WEAK"
+    support_reason = str(item.get("support_ready_reason") or item.get("selected_support_ready_reason") or "")
+    if support_reason:
+        return "WAIT_DATA_SUPPORT_NOT_READY"
+    if item.get("latest_tick_ready") is False:
+        return "WAIT_DATA_LATEST_TICK_STALE"
+    return gate
+
+
 def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
     gate = _value(item.get("final_gate_status") or item.get("gate_status") or "OBSERVE")
+    display_status = _display_status(item, gate)
+    candidate_market = item.get("candidate_market") or ""
     return {
         "gate_status": gate,
+        "final_status": gate,
+        "display_status": display_status,
+        "normalized_status": display_status,
         "symbol": item.get("symbol") or "",
+        "code": item.get("symbol") or "",
         "stock_name": item.get("name") or item.get("stock_name") or "",
+        "name": item.get("name") or item.get("stock_name") or "",
+        "candidate_instance_id": item.get("candidate_instance_id", ""),
+        "candidate_market": candidate_market,
         "primary_theme": item.get("primary_theme") or "",
+        "theme_name": item.get("theme_name") or item.get("primary_theme") or "",
+        "theme_score": item.get("theme_score", item.get("condition_score")),
         "stock_role": _value(item.get("stock_role") or "UNKNOWN"),
+        "strategy_eligible": gate in {"READY", "READY_SMALL"},
+        "order_eligibility": item.get("order_eligibility", ""),
+        "entry_profile": item.get("profile", ""),
+        "ready_type": item.get("ready_type", ""),
         "return_pct": item.get("return_pct"),
         "turnover_krw": item.get("turnover_krw"),
         "condition_level": int(item.get("condition_level") or 0),
-        "price_location_status": _value(item.get("price_location_status") or "UNKNOWN"),
+        "price_location_status": _value(item.get("price_location_status") or item.get("price_location") or "UNKNOWN"),
+        "price_location": _value(item.get("price_location_status") or item.get("price_location") or "UNKNOWN"),
         "price_location_score": float(item.get("price_location_score") or 0),
+        "price_location_block_reason": item.get("price_location_block_reason", ""),
         "risk_level": _value(item.get("risk_level") or "UNKNOWN"),
+        "chase_risk": bool(item.get("chase_risk")),
+        "chase_risk_reason": item.get("chase_risk_reason", ""),
+        "late_chase_level": item.get("late_chase_level", ""),
+        "late_chase_score": item.get("late_chase_score"),
+        "late_chase_block_type": item.get("late_chase_block_type", ""),
+        "late_chase_temp_wait": bool(item.get("late_chase_temp_wait") or display_status == "LATE_CHASE_TEMP_WAIT"),
+        "late_chase_recoverable": bool(item.get("late_chase_recoverable")),
+        "late_chase_recheck_after_sec": int(item.get("late_chase_recheck_after_sec") or 0),
+        "support_source": item.get("selected_support_source") or item.get("nearest_support") or item.get("support_source") or "",
+        "support_price": item.get("selected_support_price") or item.get("nearest_support_price") or item.get("support_price"),
+        "support_ready": bool(item.get("support_ready", item.get("selected_support_ready", False))),
+        "support_ready_reason": item.get("support_ready_reason") or item.get("selected_support_ready_reason") or "",
+        "latest_tick_ready": bool(item.get("latest_tick_ready", True)),
+        "latest_tick_age_sec": item.get("latest_tick_age_sec"),
+        "base_line_120_ready": bool(item.get("base_line_120_ready", False)),
+        "base_line_120_candle_count": int(item.get("base_line_120_candle_count") or 0),
+        "vwap_ready": bool(item.get("vwap_ready", False)),
+        "recent_support_ready": bool(item.get("recent_support_ready", False)),
+        "market_raw_status": item.get("candidate_market_raw_status") or item.get("market_raw_status", ""),
+        "market_confirmed_status": item.get("candidate_market_confirmed_status") or item.get("candidate_market_status") or item.get("market_confirmed_status", ""),
+        "market_previous_confirmed_status": item.get("market_previous_confirmed_status", ""),
+        "market_confirmation_pending": bool(item.get("candidate_market_confirmation_pending", item.get("market_confirmation_pending", False))),
+        "market_recovery_pending": bool(item.get("candidate_market_recovery_pending", item.get("market_recovery_pending", False))),
+        "market_weak_consecutive_cycles": int(item.get("market_side_weak_consecutive_cycles", item.get("market_weak_consecutive_cycles", 0)) or 0),
+        "market_risk_off_consecutive_cycles": int(item.get("market_side_risk_off_consecutive_cycles", item.get("market_risk_off_consecutive_cycles", 0)) or 0),
+        "market_healthy_consecutive_cycles": int(item.get("market_side_healthy_consecutive_cycles", item.get("market_healthy_consecutive_cycles", 0)) or 0),
+        "market_wait_reason": item.get("market_wait_reason")
+        or (display_status if display_status.startswith("WAIT_MARKET") or display_status.startswith("WAIT_CANDIDATE_MARKET") else ""),
+        "market_wait_started_at": item.get("market_side_wait_started_at") or item.get("market_wait_started_at", ""),
+        "market_wait_cycle_id": item.get("market_side_cycle_id") or item.get("market_wait_cycle_id", ""),
+        "market_wait_recheck_after_sec": int(item.get("market_side_recheck_after_sec", item.get("market_wait_recheck_after_sec", 0)) or 0),
+        "market_wait_recovered_at": item.get("market_side_recovered_at") or item.get("market_wait_recovered_at", ""),
+        "market_wait_cycles_to_recover": int(item.get("market_side_cycles_to_recover", item.get("market_wait_cycles_to_recover", 0)) or 0),
+        "market_confirmation_state_source": item.get("market_confirmation_state_source", ""),
+        "market_confirmation_state_restored": bool(item.get("market_confirmation_state_restored")),
+        "market_confirmation_state_persisted": bool(item.get("market_confirmation_state_persisted")),
+        "market_confirmation_state_age_sec": item.get("market_confirmation_state_age_sec"),
+        "market_confirmation_state_max_restore_age_sec": item.get("market_confirmation_state_max_restore_age_sec"),
+        "market_confirmation_state_restore_reason": item.get("market_confirmation_state_restore_reason", ""),
+        "market_confirmation_state_reset_reason": item.get("market_confirmation_state_reset_reason", ""),
+        "market_session_id": item.get("market_session_id", ""),
+        "market_session_type": item.get("market_session_type", ""),
+        "market_trade_date": item.get("market_trade_date", ""),
+        "market_restore_allowed": bool(item.get("market_restore_allowed", True)),
+        "market_reset_required": bool(item.get("market_reset_required", False)),
+        "market_side_breadth_pct": item.get("candidate_breadth_pct", item.get("market_side_breadth_pct")),
+        "market_side_index_return_pct": item.get("candidate_index_return_pct", item.get("market_side_index_return_pct")),
+        "market_side_turnover_weighted_return_pct": item.get("market_side_turnover_weighted_return_pct"),
+        "market_side_breadth_source": item.get("candidate_breadth_source") or item.get("market_side_breadth_source", ""),
+        "market_side_breadth_trust_level": item.get("candidate_breadth_trust_level") or item.get("market_side_breadth_trust_level", ""),
+        "market_side_breadth_gate_usable": bool(item.get("candidate_breadth_gate_usable", item.get("market_side_breadth_gate_usable", False))),
+        "market_side_source_conflict": bool(item.get("market_side_source_conflict"))
+        or "SIDE_BREADTH_SOURCE_CONFLICT" in set(item.get("market_side_reason_codes") or item.get("blocked_reason_codes") or []),
+        "market_side_source_conflict_delta": item.get("market_side_source_conflict_delta"),
+        "market_side_valid_quote_ratio": item.get("candidate_valid_quote_ratio", item.get("market_side_valid_quote_ratio")),
+        "market_side_sample_count": int(item.get("candidate_breadth_sample_count", item.get("market_side_sample_count", 0)) or 0),
+        "entry_plan_created": bool(item.get("entry_plan_created")),
+        "diagnostic_only": bool(item.get("diagnostic_only")),
+        "submittable": bool(item.get("submittable", gate in {"READY", "READY_SMALL"})),
+        "blocked_reason": item.get("blocked_reason", ""),
+        "blocked_reason_codes": list(item.get("reason_codes") or item.get("blocked_reason_codes") or item.get("risk_reason_codes") or []),
+        "runtime_order_intent_created": bool(item.get("runtime_order_intent_created")),
+        "virtual_order_created": bool(item.get("virtual_order_created")),
+        "live_order_enabled": bool(item.get("live_order_enabled")),
+        "live_order_guard_passed": bool(item.get("live_order_guard_passed")),
         "position_size_multiplier": float(item.get("position_size_multiplier") or 1.0),
         "recheck_after_sec": int(item.get("recheck_after_sec") or 0),
         "summary_reason": _summary_message(item, gate),
