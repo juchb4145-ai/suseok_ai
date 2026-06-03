@@ -37,7 +37,7 @@ from trading_app.runtime_adapters import (
     GatewayEventMarketDataBridge,
 )
 from trading_app.order_enqueue_service import OrderEnqueueService
-from trading_app.runtime_order_sink import DryRunRuntimeOrderSink, NoopRuntimeOrderSink
+from trading_app.runtime_order_sink import DryRunRuntimeOrderSink, LiveSimRuntimeOrderSink, NoopRuntimeOrderSink
 
 
 @dataclass
@@ -106,7 +106,7 @@ def build_core_strategy_runtime(
     realtime_client = GatewayCommandRealtimeClient(gateway_state, warning_sink=warning_sink)
     theme_runtime = RealTimeThemeRuntime(theme_repository)
     theme_runtime_bridge = GatewayEventThemeRuntimeBridge(theme_runtime, warning_sink=warning_sink)
-    order_sink = _build_order_sink(settings, gateway_state, warning_sink)
+    order_sink = _build_order_sink(settings, gateway_state, warning_sink, runtime_settings=runtime_settings)
     theme_lab_pipeline = None
     if config.theme_engine_mode == "themelab_flow":
         theme_lab_pipeline = ThemeLabRuntimePipeline(
@@ -161,9 +161,27 @@ def _build_order_sink(
     settings: CoreSettings,
     gateway_state: GatewayStateStore,
     warning_sink: Callable[[str], None] | None,
+    runtime_settings: Any | None = None,
 ):
     if settings.runtime_allow_live_orders and warning_sink is not None:
         warning_sink("RUNTIME_LIVE_ORDERS_DISABLED_IN_PR5")
+    execution = dict(runtime_settings.value("order_execution", {}) or {}) if runtime_settings is not None else {}
+    execution_mode = str(execution.get("mode") or "DRY_RUN").upper()
+    if execution_mode == "LIVE_REAL" or bool(execution.get("live_real_enabled")):
+        if warning_sink is not None:
+            warning_sink("LIVE_REAL_ORDER_BLOCKED")
+        return NoopRuntimeOrderSink(reason="LIVE_REAL_ORDER_BLOCKED")
+    if execution_mode == "LIVE_SIM" and bool(execution.get("live_sim_enabled")):
+        if settings.runtime_mode == "DRY_RUN" and settings.runtime_allow_dry_run_orders:
+            service = OrderEnqueueService(
+                settings=settings,
+                gateway_state=gateway_state,
+                db_path=settings.db_path,
+            )
+            return LiveSimRuntimeOrderSink(settings=settings, service=service, warning_sink=warning_sink, runtime_settings=runtime_settings)
+        if warning_sink is not None:
+            warning_sink("LIVE_SIM_REQUIRES_DRY_RUN_RUNTIME")
+        return NoopRuntimeOrderSink(reason="LIVE_SIM_REQUIRES_DRY_RUN_RUNTIME")
     if settings.runtime_mode == "DRY_RUN" and settings.runtime_allow_dry_run_orders:
         service = OrderEnqueueService(
             settings=settings,

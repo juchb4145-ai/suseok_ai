@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional, Union
 
@@ -686,6 +687,106 @@ class TradingDatabase:
                 payload_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS live_sim_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_intent_id TEXT UNIQUE NOT NULL,
+                command_id TEXT NOT NULL DEFAULT '',
+                entry_plan_id INTEGER,
+                candidate_id INTEGER,
+                virtual_order_id INTEGER,
+                virtual_position_id INTEGER,
+                exit_decision_id INTEGER,
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                account_id_masked TEXT NOT NULL DEFAULT '',
+                order_mode TEXT NOT NULL DEFAULT 'LIVE_SIM',
+                broker TEXT NOT NULL DEFAULT 'KIWOOM',
+                broker_env TEXT NOT NULL DEFAULT 'SIMULATION',
+                order_leg INTEGER NOT NULL DEFAULT 1,
+                side TEXT NOT NULL DEFAULT '',
+                order_type TEXT NOT NULL DEFAULT '',
+                requested_qty INTEGER NOT NULL DEFAULT 0,
+                requested_price INTEGER NOT NULL DEFAULT 0,
+                submitted_qty INTEGER NOT NULL DEFAULT 0,
+                submitted_price INTEGER NOT NULL DEFAULT 0,
+                broker_order_id TEXT NOT NULL DEFAULT '',
+                broker_original_order_id TEXT NOT NULL DEFAULT '',
+                broker_response_code TEXT NOT NULL DEFAULT '',
+                broker_response_message TEXT NOT NULL DEFAULT '',
+                order_status TEXT NOT NULL DEFAULT 'CREATED',
+                submitted_at TEXT NOT NULL DEFAULT '',
+                accepted_at TEXT NOT NULL DEFAULT '',
+                rejected_at TEXT NOT NULL DEFAULT '',
+                first_fill_at TEXT NOT NULL DEFAULT '',
+                last_fill_at TEXT NOT NULL DEFAULT '',
+                cancelled_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
+                idempotency_key TEXT NOT NULL DEFAULT '',
+                dedupe_key TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS live_sim_order_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_intent_id TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL DEFAULT '',
+                status_from TEXT NOT NULL DEFAULT '',
+                status_to TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS live_sim_fill_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_intent_id TEXT NOT NULL DEFAULT '',
+                broker_order_id TEXT NOT NULL DEFAULT '',
+                fill_id TEXT NOT NULL DEFAULT '',
+                event_id TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                account_id_masked TEXT NOT NULL DEFAULT '',
+                fill_qty INTEGER NOT NULL DEFAULT 0,
+                fill_price INTEGER NOT NULL DEFAULT 0,
+                cumulative_fill_qty INTEGER NOT NULL DEFAULT 0,
+                remaining_qty INTEGER NOT NULL DEFAULT 0,
+                fill_amount INTEGER NOT NULL DEFAULT 0,
+                commission REAL NOT NULL DEFAULT 0,
+                tax REAL NOT NULL DEFAULT 0,
+                event_time TEXT NOT NULL DEFAULT '',
+                received_at TEXT NOT NULL DEFAULT '',
+                raw_event_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(broker_order_id, fill_id)
+            );
+            CREATE TABLE IF NOT EXISTS live_sim_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id TEXT UNIQUE NOT NULL,
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                account_id_masked TEXT NOT NULL DEFAULT '',
+                order_mode TEXT NOT NULL DEFAULT 'LIVE_SIM',
+                opened_at TEXT NOT NULL DEFAULT '',
+                closed_at TEXT NOT NULL DEFAULT '',
+                entry_qty INTEGER NOT NULL DEFAULT 0,
+                entry_avg_price INTEGER NOT NULL DEFAULT 0,
+                current_qty INTEGER NOT NULL DEFAULT 0,
+                realized_qty INTEGER NOT NULL DEFAULT 0,
+                realized_pnl REAL NOT NULL DEFAULT 0,
+                realized_pnl_pct REAL NOT NULL DEFAULT 0,
+                unrealized_pnl REAL NOT NULL DEFAULT 0,
+                unrealized_pnl_pct REAL NOT NULL DEFAULT 0,
+                max_favorable_excursion_pct REAL NOT NULL DEFAULT 0,
+                max_adverse_excursion_pct REAL NOT NULL DEFAULT 0,
+                stop_loss_price INTEGER NOT NULL DEFAULT 0,
+                take_profit_price INTEGER NOT NULL DEFAULT 0,
+                max_hold_exit_at TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
             CREATE TABLE IF NOT EXISTS dry_run_performance_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 report_id TEXT UNIQUE NOT NULL,
@@ -880,6 +981,24 @@ class TradingDatabase:
                 ON runtime_order_intent_events(intent_id, id);
             CREATE INDEX IF NOT EXISTS idx_runtime_order_intent_events_type_created_at
                 ON runtime_order_intent_events(event_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_orders_trade_date
+                ON live_sim_orders(trade_date, created_at);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_orders_code_status
+                ON live_sim_orders(code, order_status);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_orders_idempotency_key
+                ON live_sim_orders(idempotency_key);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_orders_dedupe_key
+                ON live_sim_orders(dedupe_key);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_orders_command_id
+                ON live_sim_orders(command_id);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_orders_broker_order_id
+                ON live_sim_orders(broker_order_id);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_order_events_order
+                ON live_sim_order_events(order_intent_id, id);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_fill_events_order
+                ON live_sim_fill_events(order_intent_id, id);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_positions_code_status
+                ON live_sim_positions(code, status);
             CREATE INDEX IF NOT EXISTS idx_dry_run_performance_reports_trade_date
                 ON dry_run_performance_reports(trade_date, generated_at);
             CREATE INDEX IF NOT EXISTS idx_dry_run_performance_items_report_id
@@ -993,36 +1112,158 @@ class TradingDatabase:
         self.conn.commit()
 
     def save_order_result(self, result: BrokerOrderResult) -> None:
-        self.conn.execute(
-            "INSERT INTO order_results(ok, result_code, message, request_json) VALUES (?, ?, ?, ?)",
-            (
-                int(result.ok),
-                result.code,
-                result.message,
-                json.dumps(result.request.to_dict(), ensure_ascii=False),
-            ),
-        )
-        self.conn.commit()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO order_results(ok, result_code, message, request_json) VALUES (?, ?, ?, ?)",
+                (
+                    int(result.ok),
+                    result.code,
+                    result.message,
+                    json.dumps(result.request.to_dict(), ensure_ascii=False),
+                ),
+            )
+        self._sync_live_sim_order_result(result)
 
     def save_execution(self, event: BrokerExecutionEvent) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO executions(
-                code, order_no, side, quantity, price, filled_quantity, remaining_quantity, tag
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event.code,
-                event.order_no,
-                event.side,
-                event.quantity,
-                event.price,
-                event.filled_quantity,
-                event.remaining_quantity,
-                event.tag,
-            ),
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO executions(
+                    code, order_no, side, quantity, price, filled_quantity, remaining_quantity, tag
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.code,
+                    event.order_no,
+                    event.side,
+                    event.quantity,
+                    event.price,
+                    event.filled_quantity,
+                    event.remaining_quantity,
+                    event.tag,
+                ),
+            )
+        self._sync_live_sim_execution(event)
+
+    def _sync_live_sim_order_result(self, result: BrokerOrderResult) -> None:
+        lookup = result.idempotency_key or result.request.idempotency_key
+        order = self.find_live_sim_order_by_idempotency(lookup) if lookup else None
+        if order is None and result.command_id:
+            order = self.find_live_sim_order_by_command_id(result.command_id)
+        if order is None:
+            return
+        now = str(result.raw.get("timestamp") or result.raw.get("received_at") or "")
+        if not now:
+            from trading.broker.models import utc_timestamp
+
+            now = utc_timestamp()
+        status_from = str(order.get("order_status") or "")
+        if result.ok:
+            status_to = "ACCEPTED"
+            reason_codes = _merge_reason_codes(order, ["ORDER_RECONCILED_FROM_KIWOOM"])
+            updates = {
+                "command_id": result.command_id or order.get("command_id"),
+                "broker_order_id": result.order_no or order.get("broker_order_id"),
+                "broker_response_code": str(result.code),
+                "broker_response_message": result.message,
+                "order_status": status_to,
+                "accepted_at": now,
+                "updated_at": now,
+                "reason_codes": reason_codes,
+                "details": {
+                    **dict(order.get("details") or {}),
+                    "order_result": result.to_dict(),
+                    "order_result_ok": True,
+                },
+            }
+        else:
+            status_to = "REJECTED"
+            reason_codes = _merge_reason_codes(order, ["LIVE_SIM_ORDER_REJECTED"])
+            updates = {
+                "command_id": result.command_id or order.get("command_id"),
+                "broker_response_code": str(result.code),
+                "broker_response_message": result.message,
+                "order_status": status_to,
+                "rejected_at": now,
+                "updated_at": now,
+                "reason_codes": reason_codes,
+                "details": {
+                    **dict(order.get("details") or {}),
+                    "order_result": result.to_dict(),
+                    "order_result_ok": False,
+                },
+            }
+        saved = self.update_live_sim_order(str(order.get("order_intent_id") or ""), updates)
+        self.append_live_sim_order_event(
+            str(order.get("order_intent_id") or ""),
+            "order_result",
+            status_from=status_from,
+            status_to=str((saved or updates).get("order_status") or status_to),
+            message=result.message or status_to,
+            payload=result.to_dict(),
+            created_at=now,
         )
-        self.conn.commit()
+
+    def _sync_live_sim_execution(self, event: BrokerExecutionEvent) -> None:
+        order = self.find_live_sim_order_by_broker_order_id(event.order_no)
+        if order is None and event.command_id:
+            order = self.find_live_sim_order_by_command_id(event.command_id)
+        if order is None and event.idempotency_key:
+            order = self.find_live_sim_order_by_idempotency(event.idempotency_key)
+        if order is None:
+            return
+        now = str(event.timestamp or "")
+        fill_id = event.execution_id or f"{event.order_no}:{event.filled_quantity}:{event.remaining_quantity}:{event.price}:{now}"
+        fill_payload = {
+            "order_intent_id": order.get("order_intent_id"),
+            "broker_order_id": event.order_no or order.get("broker_order_id"),
+            "fill_id": fill_id,
+            "event_id": event.execution_id,
+            "code": event.code or order.get("code"),
+            "side": event.side or order.get("side"),
+            "account_id_masked": order.get("account_id_masked"),
+            "fill_qty": event.filled_quantity,
+            "fill_price": event.price,
+            "cumulative_fill_qty": max(0, int(event.quantity or 0) - max(0, int(event.remaining_quantity or 0))),
+            "remaining_qty": event.remaining_quantity,
+            "fill_amount": max(0, int(event.filled_quantity or 0)) * max(0, int(event.price or 0)),
+            "commission": event.raw.get("commission", 0),
+            "tax": event.raw.get("tax", 0),
+            "event_time": now,
+            "received_at": now,
+            "raw_event": event.to_dict(),
+        }
+        inserted, fill = self.save_live_sim_fill_event(fill_payload)
+        if not inserted:
+            return
+        status_from = str(order.get("order_status") or "")
+        status_to = "PARTIAL_FILLED" if int(event.remaining_quantity or 0) > 0 else "FILLED"
+        reason = "LIVE_SIM_PARTIAL_FILL_TRACKED" if status_to == "PARTIAL_FILLED" else "ORDER_RECONCILED_FROM_KIWOOM"
+        details = dict(order.get("details") or {})
+        position = self.upsert_live_sim_position_from_fill(order, fill, exit_guard=dict(details.get("exit_guard") or {}))
+        updates = {
+            "broker_order_id": event.order_no or order.get("broker_order_id"),
+            "order_status": status_to,
+            "first_fill_at": order.get("first_fill_at") or now,
+            "last_fill_at": now,
+            "updated_at": now,
+            "reason_codes": _merge_reason_codes(order, [reason]),
+            "details": {
+                **details,
+                "last_fill": fill,
+                "position": position,
+            },
+        }
+        saved = self.update_live_sim_order(str(order.get("order_intent_id") or ""), updates)
+        self.append_live_sim_order_event(
+            str(order.get("order_intent_id") or ""),
+            "execution",
+            status_from=status_from,
+            status_to=str((saved or updates).get("order_status") or status_to),
+            message=reason,
+            payload={"execution": event.to_dict(), "fill": fill, "position": position},
+            created_at=now,
+        )
 
     def save_log(self, message: str) -> None:
         self.conn.execute("INSERT INTO logs(message) VALUES (?)", (message,))
@@ -1238,6 +1479,336 @@ class TradingDatabase:
             ),
         )
         self.conn.commit()
+
+    def save_live_sim_order(self, record: dict) -> dict:
+        payload = _live_sim_order_params(record)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO live_sim_orders(
+                    order_intent_id, command_id, entry_plan_id, candidate_id,
+                    virtual_order_id, virtual_position_id, exit_decision_id,
+                    candidate_instance_id, trade_date, code, name, account_id_masked,
+                    order_mode, broker, broker_env, order_leg, side, order_type,
+                    requested_qty, requested_price, submitted_qty, submitted_price,
+                    broker_order_id, broker_original_order_id, broker_response_code,
+                    broker_response_message, order_status, submitted_at, accepted_at,
+                    rejected_at, first_fill_at, last_fill_at, cancelled_at, updated_at,
+                    idempotency_key, dedupe_key, reason_codes_json, details_json
+                ) VALUES (
+                    :order_intent_id, :command_id, :entry_plan_id, :candidate_id,
+                    :virtual_order_id, :virtual_position_id, :exit_decision_id,
+                    :candidate_instance_id, :trade_date, :code, :name, :account_id_masked,
+                    :order_mode, :broker, :broker_env, :order_leg, :side, :order_type,
+                    :requested_qty, :requested_price, :submitted_qty, :submitted_price,
+                    :broker_order_id, :broker_original_order_id, :broker_response_code,
+                    :broker_response_message, :order_status, :submitted_at, :accepted_at,
+                    :rejected_at, :first_fill_at, :last_fill_at, :cancelled_at, :updated_at,
+                    :idempotency_key, :dedupe_key, :reason_codes_json, :details_json
+                )
+                ON CONFLICT(order_intent_id) DO UPDATE SET
+                    command_id=excluded.command_id,
+                    broker_order_id=excluded.broker_order_id,
+                    broker_response_code=excluded.broker_response_code,
+                    broker_response_message=excluded.broker_response_message,
+                    order_status=excluded.order_status,
+                    submitted_at=excluded.submitted_at,
+                    accepted_at=excluded.accepted_at,
+                    rejected_at=excluded.rejected_at,
+                    first_fill_at=excluded.first_fill_at,
+                    last_fill_at=excluded.last_fill_at,
+                    cancelled_at=excluded.cancelled_at,
+                    updated_at=excluded.updated_at,
+                    reason_codes_json=excluded.reason_codes_json,
+                    details_json=excluded.details_json
+                """,
+                payload,
+            )
+        return self.get_live_sim_order(str(payload.get("order_intent_id") or "")) or dict(record or {})
+
+    def update_live_sim_order(self, order_intent_id: str, updates: dict) -> Optional[dict]:
+        current = self.get_live_sim_order(order_intent_id)
+        if current is None:
+            return None
+        payload = {**current, **dict(updates or {})}
+        return self.save_live_sim_order(payload)
+
+    def get_live_sim_order(self, order_intent_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM live_sim_orders WHERE order_intent_id = ?",
+            (order_intent_id,),
+        ).fetchone()
+        return _row_to_live_sim_order(row) if row else None
+
+    def find_live_sim_order_by_idempotency(self, idempotency_key: str) -> Optional[dict]:
+        if not idempotency_key:
+            return None
+        row = self.conn.execute(
+            """
+            SELECT * FROM live_sim_orders
+            WHERE idempotency_key = ?
+              AND order_status IN ('CREATED', 'SUBMITTING', 'SUBMITTED', 'ACCEPTED', 'PARTIAL_FILLED', 'UNKNOWN_SUBMIT', 'CANCEL_REQUESTED')
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (idempotency_key,),
+        ).fetchone()
+        return _row_to_live_sim_order(row) if row else None
+
+    def find_live_sim_order_by_command_id(self, command_id: str) -> Optional[dict]:
+        if not command_id:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM live_sim_orders WHERE command_id = ? ORDER BY id DESC LIMIT 1",
+            (command_id,),
+        ).fetchone()
+        return _row_to_live_sim_order(row) if row else None
+
+    def find_live_sim_order_by_broker_order_id(self, broker_order_id: str) -> Optional[dict]:
+        if not broker_order_id:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM live_sim_orders WHERE broker_order_id = ? ORDER BY id DESC LIMIT 1",
+            (broker_order_id,),
+        ).fetchone()
+        return _row_to_live_sim_order(row) if row else None
+
+    def list_live_sim_orders(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        status: Optional[str] = None,
+        code: Optional[str] = None,
+        side: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(trade_date)
+        if status:
+            clauses.append("order_status = ?")
+            params.append(status)
+        if code:
+            clauses.append("code = ?")
+            params.append(code)
+        if side:
+            clauses.append("side = ?")
+            params.append(side)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM live_sim_orders
+            {where}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_live_sim_order(row) for row in rows]
+
+    def append_live_sim_order_event(
+        self,
+        order_intent_id: str,
+        event_type: str,
+        *,
+        status_from: str = "",
+        status_to: str = "",
+        message: str = "",
+        payload: Optional[dict] = None,
+        created_at: str = "",
+    ) -> None:
+        if not created_at:
+            from trading.broker.models import utc_timestamp
+
+            created_at = utc_timestamp()
+        self.conn.execute(
+            """
+            INSERT INTO live_sim_order_events(
+                order_intent_id, event_type, status_from, status_to, message, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                order_intent_id,
+                event_type,
+                status_from,
+                status_to,
+                message,
+                json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str),
+                created_at,
+            ),
+        )
+        self.conn.commit()
+
+    def save_live_sim_fill_event(self, payload: dict) -> tuple[bool, dict]:
+        params = _live_sim_fill_params(payload)
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO live_sim_fill_events(
+                    order_intent_id, broker_order_id, fill_id, event_id, code, side,
+                    account_id_masked, fill_qty, fill_price, cumulative_fill_qty,
+                    remaining_qty, fill_amount, commission, tax, event_time,
+                    received_at, raw_event_json
+                ) VALUES (
+                    :order_intent_id, :broker_order_id, :fill_id, :event_id, :code, :side,
+                    :account_id_masked, :fill_qty, :fill_price, :cumulative_fill_qty,
+                    :remaining_qty, :fill_amount, :commission, :tax, :event_time,
+                    :received_at, :raw_event_json
+                )
+                """,
+                params,
+            )
+        inserted = cursor.rowcount > 0
+        row = self.conn.execute(
+            "SELECT * FROM live_sim_fill_events WHERE broker_order_id = ? AND fill_id = ?",
+            (params["broker_order_id"], params["fill_id"]),
+        ).fetchone()
+        return inserted, (_row_to_live_sim_fill(row) if row else dict(payload or {}))
+
+    def upsert_live_sim_position_from_fill(self, order: dict, fill: dict, *, exit_guard: Optional[dict] = None) -> dict:
+        side = str(fill.get("side") or order.get("side") or "").lower()
+        code = str(order.get("code") or fill.get("code") or "")
+        account_id_masked = str(order.get("account_id_masked") or fill.get("account_id_masked") or "")
+        candidate_instance_id = str(order.get("candidate_instance_id") or "")
+        position_id = f"LIVE_SIM:{account_id_masked}:{code}:{candidate_instance_id or 'no_ci'}"
+        existing = self.conn.execute(
+            "SELECT * FROM live_sim_positions WHERE position_id = ?",
+            (position_id,),
+        ).fetchone()
+        current = _row_to_live_sim_position(existing) if existing else None
+        fill_qty = max(0, int(fill.get("fill_qty") or 0))
+        fill_price = max(0, int(fill.get("fill_price") or 0))
+        now = str(fill.get("event_time") or fill.get("received_at") or "")
+        exit_cfg = dict(exit_guard or {})
+        if current is None:
+            current = {
+                "position_id": position_id,
+                "candidate_instance_id": candidate_instance_id,
+                "code": code,
+                "name": order.get("name", ""),
+                "account_id_masked": account_id_masked,
+                "order_mode": "LIVE_SIM",
+                "opened_at": now,
+                "closed_at": "",
+                "entry_qty": 0,
+                "entry_avg_price": 0,
+                "current_qty": 0,
+                "realized_qty": 0,
+                "realized_pnl": 0.0,
+                "realized_pnl_pct": 0.0,
+                "unrealized_pnl": 0.0,
+                "unrealized_pnl_pct": 0.0,
+                "max_favorable_excursion_pct": 0.0,
+                "max_adverse_excursion_pct": 0.0,
+                "stop_loss_price": 0,
+                "take_profit_price": 0,
+                "max_hold_exit_at": "",
+                "status": "OPEN",
+                "details": {},
+                "updated_at": now,
+            }
+        if side == "buy":
+            old_qty = int(current.get("current_qty") or 0)
+            old_avg = int(current.get("entry_avg_price") or 0)
+            new_qty = old_qty + fill_qty
+            if new_qty > 0:
+                current["entry_avg_price"] = int(round(((old_avg * old_qty) + (fill_price * fill_qty)) / new_qty)) if old_qty else fill_price
+            current["entry_qty"] = int(current.get("entry_qty") or 0) + fill_qty
+            current["current_qty"] = new_qty
+            current["status"] = "OPEN"
+            current["stop_loss_price"] = _price_from_pct(int(current["entry_avg_price"]), float(exit_cfg.get("stop_loss_pct") or -2.0))
+            current["take_profit_price"] = _price_from_pct(int(current["entry_avg_price"]), float(exit_cfg.get("take_profit_pct") or 5.0))
+            if not current.get("max_hold_exit_at"):
+                current["max_hold_exit_at"] = _add_minutes(now, int(exit_cfg.get("max_hold_minutes") or 60))
+        elif side == "sell":
+            entry_avg = int(current.get("entry_avg_price") or fill_price)
+            sell_qty = min(fill_qty, int(current.get("current_qty") or 0))
+            current["current_qty"] = max(0, int(current.get("current_qty") or 0) - sell_qty)
+            current["realized_qty"] = int(current.get("realized_qty") or 0) + sell_qty
+            current["realized_pnl"] = float(current.get("realized_pnl") or 0.0) + float((fill_price - entry_avg) * sell_qty)
+            basis = max(1.0, float(entry_avg * max(1, int(current.get("realized_qty") or sell_qty or 1))))
+            current["realized_pnl_pct"] = round(float(current["realized_pnl"]) / basis * 100.0, 6)
+            if int(current.get("current_qty") or 0) <= 0:
+                current["status"] = "CLOSED"
+                current["closed_at"] = now
+        current["updated_at"] = now
+        params = _live_sim_position_params(current)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO live_sim_positions(
+                    position_id, candidate_instance_id, code, name, account_id_masked,
+                    order_mode, opened_at, closed_at, entry_qty, entry_avg_price,
+                    current_qty, realized_qty, realized_pnl, realized_pnl_pct,
+                    unrealized_pnl, unrealized_pnl_pct, max_favorable_excursion_pct,
+                    max_adverse_excursion_pct, stop_loss_price, take_profit_price,
+                    max_hold_exit_at, status, details_json, updated_at
+                ) VALUES (
+                    :position_id, :candidate_instance_id, :code, :name, :account_id_masked,
+                    :order_mode, :opened_at, :closed_at, :entry_qty, :entry_avg_price,
+                    :current_qty, :realized_qty, :realized_pnl, :realized_pnl_pct,
+                    :unrealized_pnl, :unrealized_pnl_pct, :max_favorable_excursion_pct,
+                    :max_adverse_excursion_pct, :stop_loss_price, :take_profit_price,
+                    :max_hold_exit_at, :status, :details_json, :updated_at
+                )
+                ON CONFLICT(position_id) DO UPDATE SET
+                    closed_at=excluded.closed_at,
+                    entry_qty=excluded.entry_qty,
+                    entry_avg_price=excluded.entry_avg_price,
+                    current_qty=excluded.current_qty,
+                    realized_qty=excluded.realized_qty,
+                    realized_pnl=excluded.realized_pnl,
+                    realized_pnl_pct=excluded.realized_pnl_pct,
+                    unrealized_pnl=excluded.unrealized_pnl,
+                    unrealized_pnl_pct=excluded.unrealized_pnl_pct,
+                    max_favorable_excursion_pct=excluded.max_favorable_excursion_pct,
+                    max_adverse_excursion_pct=excluded.max_adverse_excursion_pct,
+                    stop_loss_price=excluded.stop_loss_price,
+                    take_profit_price=excluded.take_profit_price,
+                    max_hold_exit_at=excluded.max_hold_exit_at,
+                    status=excluded.status,
+                    details_json=excluded.details_json,
+                    updated_at=excluded.updated_at
+                """,
+                params,
+            )
+        row = self.conn.execute("SELECT * FROM live_sim_positions WHERE position_id = ?", (position_id,)).fetchone()
+        return _row_to_live_sim_position(row) if row else current
+
+    def live_sim_summary(self, *, trade_date: Optional[str] = None) -> dict:
+        params: list[object] = []
+        where = ""
+        if trade_date:
+            where = "WHERE trade_date = ?"
+            params.append(trade_date)
+        rows = self.conn.execute(
+            f"SELECT order_status, COUNT(*) AS count FROM live_sim_orders {where} GROUP BY order_status",
+            tuple(params),
+        ).fetchall()
+        counts = {str(row["order_status"]): int(row["count"] or 0) for row in rows}
+        positions = self.conn.execute("SELECT status, realized_pnl, realized_pnl_pct FROM live_sim_positions").fetchall()
+        realized = [float(row["realized_pnl"] or 0.0) for row in positions]
+        realized_pct = [float(row["realized_pnl_pct"] or 0.0) for row in positions if float(row["realized_pnl_pct"] or 0.0) != 0.0]
+        return {
+            "submitted_order_count": counts.get("SUBMITTED", 0) + counts.get("ACCEPTED", 0),
+            "accepted_order_count": counts.get("ACCEPTED", 0),
+            "rejected_order_count": counts.get("REJECTED", 0) + counts.get("FAILED", 0),
+            "filled_order_count": counts.get("FILLED", 0),
+            "partial_fill_count": counts.get("PARTIAL_FILLED", 0),
+            "cancelled_order_count": counts.get("CANCELLED", 0),
+            "duplicate_order_blocked_count": counts.get("DUPLICATE", 0),
+            "unknown_submit_count": counts.get("UNKNOWN_SUBMIT", 0),
+            "opened_position_count": sum(1 for row in positions if str(row["status"]) in {"OPEN", "PARTIAL"}),
+            "closed_position_count": sum(1 for row in positions if str(row["status"]) in {"CLOSED", "FORCE_CLOSED"}),
+            "win_count": sum(1 for value in realized if value > 0),
+            "loss_count": sum(1 for value in realized if value < 0),
+            "realized_pnl_total": round(sum(realized), 4),
+            "realized_pnl_pct_avg": round(sum(realized_pct) / len(realized_pct), 6) if realized_pct else 0.0,
+        }
 
     def list_runtime_order_intents(
         self,
@@ -3916,6 +4487,171 @@ def _row_to_runtime_order_intent(row: sqlite3.Row) -> dict:
     data["live_would_pass"] = bool(data.get("live_safety", {}).get("ok"))
     data["live_reject_reason"] = "" if data["live_would_pass"] else str(data.get("live_safety", {}).get("reason") or "")
     return data
+
+
+def _live_sim_order_params(payload: dict) -> dict:
+    details = payload.get("details") if "details" in payload else payload.get("details_json", {})
+    reason_codes = payload.get("reason_codes") if "reason_codes" in payload else payload.get("reason_codes_json", [])
+    now = str(payload.get("updated_at") or payload.get("created_at") or "")
+    account = str(payload.get("account_id_masked") or payload.get("account") or "")
+    return {
+        "order_intent_id": str(payload.get("order_intent_id") or payload.get("intent_id") or ""),
+        "command_id": str(payload.get("command_id") or ""),
+        "entry_plan_id": payload.get("entry_plan_id"),
+        "candidate_id": payload.get("candidate_id"),
+        "virtual_order_id": payload.get("virtual_order_id"),
+        "virtual_position_id": payload.get("virtual_position_id"),
+        "exit_decision_id": payload.get("exit_decision_id"),
+        "candidate_instance_id": str(payload.get("candidate_instance_id") or ""),
+        "trade_date": str(payload.get("trade_date") or ""),
+        "code": str(payload.get("code") or ""),
+        "name": str(payload.get("name") or ""),
+        "account_id_masked": _mask_account(account),
+        "order_mode": str(payload.get("order_mode") or "LIVE_SIM"),
+        "broker": str(payload.get("broker") or "KIWOOM"),
+        "broker_env": str(payload.get("broker_env") or "SIMULATION"),
+        "order_leg": int(payload.get("order_leg") or payload.get("leg_index") or 1),
+        "side": str(payload.get("side") or ""),
+        "order_type": str(payload.get("order_type") or ""),
+        "requested_qty": int(payload.get("requested_qty") or payload.get("quantity") or 0),
+        "requested_price": int(payload.get("requested_price") or payload.get("price") or 0),
+        "submitted_qty": int(payload.get("submitted_qty") or payload.get("quantity") or 0),
+        "submitted_price": int(payload.get("submitted_price") or payload.get("price") or 0),
+        "broker_order_id": str(payload.get("broker_order_id") or payload.get("order_no") or ""),
+        "broker_original_order_id": str(payload.get("broker_original_order_id") or ""),
+        "broker_response_code": str(payload.get("broker_response_code") or ""),
+        "broker_response_message": str(payload.get("broker_response_message") or ""),
+        "order_status": str(payload.get("order_status") or payload.get("status") or "CREATED"),
+        "submitted_at": str(payload.get("submitted_at") or ""),
+        "accepted_at": str(payload.get("accepted_at") or ""),
+        "rejected_at": str(payload.get("rejected_at") or ""),
+        "first_fill_at": str(payload.get("first_fill_at") or ""),
+        "last_fill_at": str(payload.get("last_fill_at") or ""),
+        "cancelled_at": str(payload.get("cancelled_at") or ""),
+        "updated_at": now,
+        "idempotency_key": str(payload.get("idempotency_key") or ""),
+        "dedupe_key": str(payload.get("dedupe_key") or ""),
+        "reason_codes_json": reason_codes
+        if isinstance(reason_codes, str)
+        else json.dumps(list(reason_codes or []), ensure_ascii=False, sort_keys=True, default=str),
+        "details_json": details
+        if isinstance(details, str)
+        else json.dumps(dict(details or {}), ensure_ascii=False, sort_keys=True, default=str),
+    }
+
+
+def _row_to_live_sim_order(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["reason_codes"] = _safe_json_loads(data.get("reason_codes_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    return data
+
+
+def _live_sim_fill_params(payload: dict) -> dict:
+    raw_event = payload.get("raw_event_json", payload.get("raw_event", {}))
+    fill_qty = int(payload.get("fill_qty") or payload.get("filled_quantity") or 0)
+    fill_price = int(payload.get("fill_price") or payload.get("price") or 0)
+    return {
+        "order_intent_id": str(payload.get("order_intent_id") or ""),
+        "broker_order_id": str(payload.get("broker_order_id") or payload.get("order_no") or ""),
+        "fill_id": str(payload.get("fill_id") or payload.get("execution_id") or ""),
+        "event_id": str(payload.get("event_id") or ""),
+        "code": str(payload.get("code") or ""),
+        "side": str(payload.get("side") or ""),
+        "account_id_masked": _mask_account(str(payload.get("account_id_masked") or payload.get("account") or "")),
+        "fill_qty": fill_qty,
+        "fill_price": fill_price,
+        "cumulative_fill_qty": int(payload.get("cumulative_fill_qty") or 0),
+        "remaining_qty": int(payload.get("remaining_qty") or payload.get("remaining_quantity") or 0),
+        "fill_amount": int(payload.get("fill_amount") or (fill_qty * max(0, fill_price))),
+        "commission": float(payload.get("commission") or 0.0),
+        "tax": float(payload.get("tax") or 0.0),
+        "event_time": str(payload.get("event_time") or payload.get("timestamp") or ""),
+        "received_at": str(payload.get("received_at") or payload.get("event_time") or payload.get("timestamp") or ""),
+        "raw_event_json": raw_event
+        if isinstance(raw_event, str)
+        else json.dumps(dict(raw_event or {}), ensure_ascii=False, sort_keys=True, default=str),
+    }
+
+
+def _row_to_live_sim_fill(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["raw_event"] = _safe_json_loads(data.get("raw_event_json"), {})
+    return data
+
+
+def _live_sim_position_params(payload: dict) -> dict:
+    details = payload.get("details_json", payload.get("details", {}))
+    return {
+        "position_id": str(payload.get("position_id") or ""),
+        "candidate_instance_id": str(payload.get("candidate_instance_id") or ""),
+        "code": str(payload.get("code") or ""),
+        "name": str(payload.get("name") or ""),
+        "account_id_masked": _mask_account(str(payload.get("account_id_masked") or payload.get("account") or "")),
+        "order_mode": str(payload.get("order_mode") or "LIVE_SIM"),
+        "opened_at": str(payload.get("opened_at") or ""),
+        "closed_at": str(payload.get("closed_at") or ""),
+        "entry_qty": int(payload.get("entry_qty") or 0),
+        "entry_avg_price": int(payload.get("entry_avg_price") or 0),
+        "current_qty": int(payload.get("current_qty") or 0),
+        "realized_qty": int(payload.get("realized_qty") or 0),
+        "realized_pnl": float(payload.get("realized_pnl") or 0.0),
+        "realized_pnl_pct": float(payload.get("realized_pnl_pct") or 0.0),
+        "unrealized_pnl": float(payload.get("unrealized_pnl") or 0.0),
+        "unrealized_pnl_pct": float(payload.get("unrealized_pnl_pct") or 0.0),
+        "max_favorable_excursion_pct": float(payload.get("max_favorable_excursion_pct") or 0.0),
+        "max_adverse_excursion_pct": float(payload.get("max_adverse_excursion_pct") or 0.0),
+        "stop_loss_price": int(payload.get("stop_loss_price") or 0),
+        "take_profit_price": int(payload.get("take_profit_price") or 0),
+        "max_hold_exit_at": str(payload.get("max_hold_exit_at") or ""),
+        "status": str(payload.get("status") or "OPEN"),
+        "details_json": details
+        if isinstance(details, str)
+        else json.dumps(dict(details or {}), ensure_ascii=False, sort_keys=True, default=str),
+        "updated_at": str(payload.get("updated_at") or ""),
+    }
+
+
+def _row_to_live_sim_position(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    return data
+
+
+def _merge_reason_codes(order: dict, additions: Iterable[str]) -> list[str]:
+    merged: list[str] = []
+    for code in list(order.get("reason_codes") or []) + [str(item) for item in additions if item]:
+        if code and code not in merged:
+            merged.append(code)
+    return merged
+
+
+def _mask_account(account: str) -> str:
+    text = str(account or "")
+    if not text:
+        return ""
+    if "*" in text:
+        return text
+    if len(text) <= 4:
+        return "*" * len(text)
+    return f"{text[:2]}{'*' * max(2, len(text) - 4)}{text[-2:]}"
+
+
+def _price_from_pct(base_price: int, pct: float) -> int:
+    if base_price <= 0:
+        return 0
+    return int(round(float(base_price) * (1.0 + float(pct or 0.0) / 100.0)))
+
+
+def _add_minutes(timestamp: str, minutes: int) -> str:
+    text = str(timestamp or "")
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return (parsed + timedelta(minutes=max(0, int(minutes or 0)))).isoformat(timespec="seconds")
 
 
 def _row_to_dry_run_performance_report(

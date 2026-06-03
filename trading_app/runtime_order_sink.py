@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Callable
 
 from trading.strategy.exit import FINAL_EXIT_TYPES
@@ -408,6 +408,142 @@ class DryRunRuntimeOrderSink(RuntimeOrderSink):
             self.last_exit_intent_at = timestamp
 
 
+@dataclass
+class LiveSimRuntimeOrderSink(DryRunRuntimeOrderSink):
+    runtime_settings: Any = None
+    live_sim_total_count: int = 0
+    live_sim_accepted_count: int = 0
+    live_sim_blocked_count: int = 0
+    live_sim_duplicate_count: int = 0
+    live_sim_exit_accepted_count: int = 0
+    live_sim_exit_blocked_count: int = 0
+    last_live_sim_order_intent_at: str = ""
+    last_live_sim_reject_reason: str = ""
+
+    def on_entry_order_decision(
+        self,
+        *,
+        candidate: Candidate,
+        gate_result: GatePipelineResult,
+        entry_plan: EntryPlan,
+        virtual_order: VirtualOrder,
+        runtime_cycle_at: str,
+    ) -> dict[str, Any]:
+        dry_payload = super().on_entry_order_decision(
+            candidate=candidate,
+            gate_result=gate_result,
+            entry_plan=entry_plan,
+            virtual_order=virtual_order,
+            runtime_cycle_at=runtime_cycle_at,
+        )
+        live_payload = self._submit_live_sim_from_dry_payload(dry_payload, phase="entry")
+        return {**dry_payload, "live_sim": live_payload}
+
+    def on_exit_order_decision(
+        self,
+        *,
+        candidate: Candidate,
+        virtual_position: VirtualPosition,
+        exit_decision: ExitDecision,
+        runtime_cycle_at: str,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        dry_payload = super().on_exit_order_decision(
+            candidate=candidate,
+            virtual_position=virtual_position,
+            exit_decision=exit_decision,
+            runtime_cycle_at=runtime_cycle_at,
+            context=context,
+        )
+        live_payload = self._submit_live_sim_from_dry_payload(dry_payload, phase="exit")
+        return {**dry_payload, "live_sim": live_payload}
+
+    def snapshot(self) -> dict[str, Any]:
+        payload = super().snapshot()
+        summary = self.service.live_sim_summary()
+        payload.update(
+            {
+                "live_sim_order_sink_enabled": True,
+                "live_sim_order_policy": "LIVE_SIM_FIRST_LEG_GUARDED",
+                "live_sim_order_intent_count": int(summary.get("submitted_order_count") or self.live_sim_total_count),
+                "live_sim_order_accepted_count": int(summary.get("accepted_order_count") or self.live_sim_accepted_count),
+                "live_sim_order_blocked_count": self.live_sim_blocked_count,
+                "live_sim_order_duplicate_count": int(summary.get("duplicate_order_blocked_count") or self.live_sim_duplicate_count),
+                "live_sim_exit_accepted_count": self.live_sim_exit_accepted_count,
+                "live_sim_exit_blocked_count": self.live_sim_exit_blocked_count,
+                "last_live_sim_order_intent_at": self.last_live_sim_order_intent_at,
+                "last_live_sim_reject_reason": self.last_live_sim_reject_reason,
+                "live_sim_summary": summary,
+            }
+        )
+        return payload
+
+    def _submit_live_sim_from_dry_payload(self, dry_payload: dict[str, Any], *, phase: str) -> dict[str, Any]:
+        if not dry_payload.get("accepted"):
+            return {
+                "accepted": False,
+                "mode": "LIVE_SIM",
+                "status": "SKIPPED",
+                "reason": "DRY_RUN_INTENT_NOT_ACCEPTED",
+                "dry_run_status": dry_payload.get("status"),
+                "dry_run_reason": dry_payload.get("reason"),
+            }
+        try:
+            dry_request = _runtime_request_from_dry_payload(dry_payload)
+            request = _replace_runtime_request(
+                dry_request,
+                dry_run=False,
+                idempotency_key=None,
+                metadata={
+                    **dict(dry_request.metadata or {}),
+                    "dry_run_intent_id": dry_payload.get("intent_id"),
+                    "dry_run_status": dry_payload.get("status"),
+                    "dry_run_reason": dry_payload.get("reason"),
+                },
+            )
+            result = self.service.enqueue_live_sim_order(
+                request,
+                execution_config=self._execution_config(),
+                exit_guard_config=self._exit_guard_config(),
+            )
+        except Exception as exc:
+            message = f"RUNTIME_LIVE_SIM_ORDER_SINK_FAILED:{dry_payload.get('request', {}).get('code', '')}:{exc}"
+            self.errors.append(message)
+            if self.warning_sink is not None:
+                self.warning_sink(message)
+            return {"accepted": False, "mode": "LIVE_SIM", "status": "ERROR", "reason": str(exc)}
+        self._record_live_sim_result(result, phase=phase)
+        return result.to_dict()
+
+    def _execution_config(self) -> dict[str, Any]:
+        if self.runtime_settings is None:
+            return {"mode": "DRY_RUN", "live_sim_enabled": False, "live_real_enabled": False}
+        return dict(self.runtime_settings.value("order_execution", {}) or {})
+
+    def _exit_guard_config(self) -> dict[str, Any]:
+        if self.runtime_settings is None:
+            return {"enabled": False}
+        return dict(self.runtime_settings.value("live_sim_exit_guard", {}) or {})
+
+    def _record_live_sim_result(self, result, *, phase: str) -> None:
+        self.live_sim_total_count += 1
+        if result.status == "DUPLICATE":
+            self.live_sim_duplicate_count += 1
+        elif result.accepted:
+            self.live_sim_accepted_count += 1
+            if phase == "exit":
+                self.live_sim_exit_accepted_count += 1
+        else:
+            self.live_sim_blocked_count += 1
+            self.last_live_sim_reject_reason = result.reason
+            if phase == "exit":
+                self.live_sim_exit_blocked_count += 1
+        timestamp = str((result.response or {}).get("created_at") or "")
+        if not timestamp and result.record:
+            timestamp = str(result.record.get("updated_at") or result.record.get("created_at") or "")
+        self.last_live_sim_order_intent_at = timestamp
+
+
 def _optional_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
@@ -451,6 +587,17 @@ def _theme_lab_bridge_metadata(
         "support_missing_reason": cancel.get("support_missing_reason") or bridge.get("support_missing_reason") or details.get("support_missing_reason") or "",
         "support_taxonomy": cancel.get("support_taxonomy") or bridge.get("support_taxonomy") or details.get("support_taxonomy") or "",
         "support_coverage": dict(cancel.get("support_coverage") or bridge.get("support_coverage") or details.get("support_coverage") or {}),
+        "support_ready": bool(
+            cancel.get("support_ready")
+            or bridge.get("support_ready")
+            or details.get("support_ready")
+            or cancel.get("support_price")
+            or bridge.get("support_price")
+            or details.get("support_price")
+            or cancel.get("vwap_ready")
+            or bridge.get("vwap_ready")
+            or details.get("vwap_ready")
+        ),
         "support_reclaimed": bool(cancel.get("support_reclaimed") or bridge.get("support_reclaimed") or details.get("support_reclaimed")),
         "recent_support_price_present": bool(cancel.get("recent_support_price_present") or bridge.get("recent_support_price_present") or details.get("recent_support_price_present")),
         "vwap_present": bool(cancel.get("vwap_present") or bridge.get("vwap_present") or details.get("vwap_present")),
@@ -462,6 +609,14 @@ def _theme_lab_bridge_metadata(
         "max_chase_pct": cancel.get("max_chase_pct"),
         "split_leg": virtual_order.leg_index,
         "weight_pct": virtual_order.weight_pct,
+        "late_chase_level": details.get("late_chase_level") or bridge.get("late_chase_level") or cancel.get("late_chase_level") or "",
+        "sub_status": details.get("sub_status") or bridge.get("sub_status") or "",
+        "chase_risk": bool(details.get("chase_risk") or bridge.get("chase_risk") or "CHASE_RISK" in list(details.get("risk_reason_codes") or [])),
+        "latest_tick_ready": not bool(details.get("latest_tick_stale") or bridge.get("latest_tick_stale")),
+        "latest_tick_stale": bool(details.get("latest_tick_stale") or bridge.get("latest_tick_stale")),
+        "candidate_market_status": details.get("candidate_market_status") or bridge.get("candidate_market_status") or "",
+        "market_status": details.get("market_status") or bridge.get("market_status") or "",
+        "market_reason_codes": list(details.get("market_reason_codes") or bridge.get("market_reason_codes") or []),
     }
     if leg:
         metadata["split_leg_plan"] = dict(leg)
@@ -485,3 +640,19 @@ def _first_text(*values: Any) -> Any:
         if value not in (None, ""):
             return value
     return ""
+
+
+def _runtime_request_from_dry_payload(payload: dict[str, Any]) -> RuntimeOrderIntentRequest:
+    raw_request = dict(payload.get("request") or {})
+    field_names = {item.name for item in fields(RuntimeOrderIntentRequest)}
+    values = {name: raw_request.get(name) for name in field_names if name in raw_request}
+    values.setdefault("metadata", dict(raw_request.get("metadata") or {}))
+    values.setdefault("source", str(raw_request.get("source") or "strategy_runtime"))
+    values.setdefault("dry_run", False)
+    return RuntimeOrderIntentRequest(**values)
+
+
+def _replace_runtime_request(request: RuntimeOrderIntentRequest, **updates: Any) -> RuntimeOrderIntentRequest:
+    payload = request.to_dict()
+    payload.update(updates)
+    return RuntimeOrderIntentRequest(**payload)

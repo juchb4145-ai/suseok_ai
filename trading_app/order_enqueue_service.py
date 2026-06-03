@@ -383,10 +383,295 @@ class OrderEnqueueService:
         finally:
             db.close()
 
+    def enqueue_live_sim_order(
+        self,
+        request: RuntimeOrderIntentRequest,
+        *,
+        execution_config: dict[str, Any] | None = None,
+        exit_guard_config: dict[str, Any] | None = None,
+    ) -> OrderEnqueueResult:
+        execution = dict(execution_config or {})
+        exit_guard = dict(exit_guard_config or {})
+        now = str(self.clock())
+        trade_date = self._trade_date(request, now)
+        gateway_status = self.gateway_state.snapshot().to_dict()
+        broker_request = self._broker_request_from_runtime_live_sim(request, gateway_status=gateway_status)
+        idempotency_key = broker_request.idempotency_key or self._live_sim_idempotency_key(request, broker_request, trade_date)
+        broker_request = BrokerOrderRequest(**{**broker_request.to_dict(), "idempotency_key": idempotency_key})
+        dedupe_key = dedupe_key_for_order_request(broker_request)
+        order_intent_id = new_message_id("live_sim_intent")
+        account_guard = _live_sim_account_guard(
+            broker_request,
+            gateway_status,
+            execution,
+        )
+        base_record = self._live_sim_order_record(
+            request,
+            broker_request,
+            order_intent_id=order_intent_id,
+            trade_date=trade_date,
+            now=now,
+            status="CREATED",
+            dedupe_key=dedupe_key,
+            reason_codes=[],
+            details={
+                "account_guard": account_guard,
+                "execution_config": _public_execution_config(execution),
+                "exit_guard": exit_guard,
+                "request": request.to_dict(),
+            },
+        )
+
+        block_reason, block_codes, block_details = self._live_sim_pre_submit_block_reason(
+            request,
+            broker_request,
+            gateway_status=gateway_status,
+            execution=execution,
+            exit_guard=exit_guard,
+            account_guard=account_guard,
+        )
+        db = TradingDatabase(str(self.db_path))
+        try:
+            duplicate = db.find_live_sim_order_by_idempotency(idempotency_key)
+            if duplicate is not None:
+                codes = _unique_reason_codes(
+                    [
+                        "ORDER_DUPLICATE_BLOCKED",
+                        "DUPLICATE_FIRST_LEG_ORDER_BLOCKED" if broker_request.side == "buy" else "",
+                    ]
+                )
+                record = {
+                    **base_record,
+                    "order_status": "DUPLICATE",
+                    "reason_codes": codes,
+                    "details": {
+                        **dict(base_record.get("details") or {}),
+                        "duplicate_of": duplicate.get("order_intent_id"),
+                        "duplicate_status": duplicate.get("order_status"),
+                    },
+                }
+                saved = db.save_live_sim_order(record)
+                db.append_live_sim_order_event(
+                    order_intent_id,
+                    "duplicate_blocked",
+                    status_to="DUPLICATE",
+                    message="ORDER_DUPLICATE_BLOCKED",
+                    payload={"duplicate_of": duplicate, "idempotency_key": idempotency_key, "dedupe_key": dedupe_key},
+                    created_at=now,
+                )
+                return OrderEnqueueResult(
+                    accepted=False,
+                    mode="LIVE_SIM",
+                    dry_run=False,
+                    intent_id=order_intent_id,
+                    idempotency_key=idempotency_key,
+                    dedupe_key=dedupe_key,
+                    duplicate_of=str(duplicate.get("order_intent_id") or ""),
+                    status="DUPLICATE",
+                    reason="ORDER_DUPLICATE_BLOCKED",
+                    safety={"ok": False, "reason": "ORDER_DUPLICATE_BLOCKED", "details": record["details"]},
+                    request=broker_request.to_dict(),
+                    record=saved,
+                )
+
+            if block_reason:
+                record = {
+                    **base_record,
+                    "order_status": "BLOCKED",
+                    "reason_codes": block_codes,
+                    "details": {**dict(base_record.get("details") or {}), **block_details},
+                }
+                saved = db.save_live_sim_order(record)
+                db.append_live_sim_order_event(
+                    order_intent_id,
+                    "blocked",
+                    status_to="BLOCKED",
+                    message=block_reason,
+                    payload={"reason_codes": block_codes, "details": record["details"]},
+                    created_at=now,
+                )
+                return OrderEnqueueResult(
+                    accepted=False,
+                    mode="LIVE_SIM",
+                    dry_run=False,
+                    intent_id=order_intent_id,
+                    idempotency_key=idempotency_key,
+                    dedupe_key=dedupe_key,
+                    status="BLOCKED",
+                    reason=block_reason,
+                    safety={"ok": False, "reason": block_reason, "details": record["details"]},
+                    request=broker_request.to_dict(),
+                    record=saved,
+                )
+
+            duplicate_command = self.gateway_state.has_duplicate(dedupe_key)
+            live_safety = self._live_sim_guard(execution).validate(
+                broker_request,
+                gateway_status=gateway_status,
+                existing_order_command_count=self._order_command_count(
+                    broker_request.code,
+                    broker_request.side,
+                    broker_request.tag,
+                    order_type=broker_request.order_type,
+                ),
+                duplicate=duplicate_command,
+            )
+            if not live_safety.ok:
+                codes = _unique_reason_codes(["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD", live_safety.reason])
+                record = {
+                    **base_record,
+                    "order_status": "BLOCKED",
+                    "reason_codes": codes,
+                    "details": {
+                        **dict(base_record.get("details") or {}),
+                        "live_safety": live_safety.to_dict(),
+                    },
+                }
+                saved = db.save_live_sim_order(record)
+                db.append_live_sim_order_event(
+                    order_intent_id,
+                    "blocked_live_safety",
+                    status_to="BLOCKED",
+                    message=live_safety.reason,
+                    payload=live_safety.to_dict(),
+                    created_at=now,
+                )
+                return OrderEnqueueResult(
+                    accepted=False,
+                    mode="LIVE_SIM",
+                    dry_run=False,
+                    intent_id=order_intent_id,
+                    idempotency_key=idempotency_key,
+                    dedupe_key=dedupe_key,
+                    status="BLOCKED",
+                    reason=live_safety.reason,
+                    safety=live_safety.to_dict(),
+                    request=broker_request.to_dict(),
+                    record=saved,
+                )
+
+            command = GatewayCommand(
+                type="send_order",
+                command_id=new_message_id("cmd_order"),
+                idempotency_key=idempotency_key,
+                payload={
+                    **broker_request.to_dict(),
+                    **dict(broker_request.metadata or {}),
+                    "order_mode": "LIVE_SIM",
+                    "broker_env": "SIMULATION",
+                    "account_id_masked": _mask_account(broker_request.account),
+                    "live_sim_order_intent_id": order_intent_id,
+                },
+            )
+            enqueue_result = self.gateway_state.enqueue_command(
+                command,
+                priority=CommandPriority.HIGH,
+                ttl_sec=int(execution.get("command_ttl_sec") or self.settings.command_ttl_sec),
+                max_attempts=int(execution.get("command_max_attempts") or self.settings.command_max_attempts),
+                metadata={"runtime": "LIVE_SIM", "dedupe_key": dedupe_key, "order_intent_id": order_intent_id},
+            )
+            if not enqueue_result.accepted:
+                status = "UNKNOWN_SUBMIT" if str(enqueue_result.reason or "") in {"TIMEOUT", "UNKNOWN"} else "BLOCKED"
+                reason = "ORDER_UNKNOWN_SUBMIT_REQUIRES_RECONCILE" if status == "UNKNOWN_SUBMIT" else (enqueue_result.reason or "ORDER_DUPLICATE_BLOCKED")
+                codes = _unique_reason_codes([reason])
+                record = {
+                    **base_record,
+                    "command_id": command.command_id,
+                    "order_status": status,
+                    "submitted_at": now if status == "UNKNOWN_SUBMIT" else "",
+                    "reason_codes": codes,
+                    "details": {
+                        **dict(base_record.get("details") or {}),
+                        "enqueue_result": enqueue_result.to_dict(),
+                    },
+                }
+                saved = db.save_live_sim_order(record)
+                db.append_live_sim_order_event(
+                    order_intent_id,
+                    "enqueue_rejected",
+                    status_to=status,
+                    message=reason,
+                    payload=enqueue_result.to_dict(),
+                    created_at=now,
+                )
+                return OrderEnqueueResult(
+                    accepted=False,
+                    mode="LIVE_SIM",
+                    dry_run=False,
+                    intent_id=order_intent_id,
+                    command_id=command.command_id,
+                    idempotency_key=idempotency_key,
+                    dedupe_key=dedupe_key,
+                    duplicate_of=enqueue_result.duplicate_of,
+                    status=status,
+                    reason=reason,
+                    safety=live_safety.to_dict(),
+                    request=broker_request.to_dict(),
+                    command=command.to_dict(),
+                    record=saved,
+                )
+
+            allowed_codes = _unique_reason_codes(
+                [
+                    "LIVE_SIM_ORDER_ALLOWED",
+                    "ACCOUNT_GUARD_PASSED_SIMULATION",
+                    "LIVE_SIM_FIRST_LEG_ONLY" if broker_request.side == "buy" else "LIVE_SIM_EXIT_ORDER_SUBMITTED",
+                    "ORDER_IDEMPOTENCY_KEY_CREATED",
+                ]
+            )
+            record = {
+                **base_record,
+                "command_id": command.command_id,
+                "order_status": "SUBMITTED",
+                "submitted_at": now,
+                "reason_codes": allowed_codes,
+                "details": {
+                    **dict(base_record.get("details") or {}),
+                    "live_safety": live_safety.to_dict(),
+                    "command": command.to_dict(),
+                    "enqueue_result": enqueue_result.to_dict(),
+                },
+            }
+            saved = db.save_live_sim_order(record)
+            db.append_live_sim_order_event(
+                order_intent_id,
+                "submitted",
+                status_to="SUBMITTED",
+                message="LIVE_SIM_ORDER_ALLOWED",
+                payload={"command": command.to_dict(), "enqueue_result": enqueue_result.to_dict()},
+                created_at=now,
+            )
+            return OrderEnqueueResult(
+                accepted=True,
+                mode="LIVE_SIM",
+                dry_run=False,
+                intent_id=order_intent_id,
+                command_id=command.command_id,
+                idempotency_key=idempotency_key,
+                dedupe_key=dedupe_key,
+                status="SUBMITTED",
+                reason="LIVE_SIM_ORDER_ALLOWED",
+                safety=live_safety.to_dict(),
+                live_safety=live_safety.to_dict(),
+                live_would_pass=True,
+                request=broker_request.to_dict(),
+                command=command.to_dict(),
+                record=saved,
+            )
+        finally:
+            db.close()
+
     def dry_run_summary(self, *, trade_date: str | None = None) -> dict:
         db = TradingDatabase(str(self.db_path))
         try:
             return db.runtime_order_intent_summary(trade_date=trade_date)
+        finally:
+            db.close()
+
+    def live_sim_summary(self, *, trade_date: str | None = None) -> dict:
+        db = TradingDatabase(str(self.db_path))
+        try:
+            return db.live_sim_summary(trade_date=trade_date)
         finally:
             db.close()
 
@@ -513,6 +798,45 @@ class OrderEnqueueService:
             },
         )
 
+    def _broker_request_from_runtime_live_sim(
+        self,
+        request: RuntimeOrderIntentRequest,
+        *,
+        gateway_status: dict[str, Any],
+    ) -> BrokerOrderRequest:
+        account = request.account or str(gateway_status.get("account") or "") or self.settings.runtime_dry_run_account
+        metadata = {
+            **dict(request.metadata or {}),
+            "strategy_name": request.strategy_name,
+            "candidate_id": request.candidate_id,
+            "entry_plan_id": request.entry_plan_id,
+            "virtual_order_id": request.virtual_order_id,
+            "virtual_position_id": request.virtual_position_id,
+            "exit_decision_id": request.exit_decision_id,
+            "exit_decision_type": request.exit_decision_type,
+            "exit_percent": request.exit_percent,
+            "exit_quantity": request.exit_quantity,
+            "position_quantity": request.position_quantity,
+            "virtual_exit_price": request.virtual_exit_price,
+            "order_phase": request.order_phase or ("exit" if request.side == "sell" else "entry"),
+            "leg_index": request.leg_index,
+            "reason": request.reason,
+            "strategy_order_id": self._strategy_order_id(request),
+            "order_mode": "LIVE_SIM",
+        }
+        return BrokerOrderRequest(
+            account=account,
+            code=request.code,
+            quantity=int(request.quantity or 0),
+            price=int(request.price or 0),
+            side=str(request.side or "").lower(),
+            tag=request.tag,
+            order_type=int(request.order_type or 0),
+            hoga=request.hoga,
+            idempotency_key=str(request.idempotency_key or ""),
+            metadata=metadata,
+        )
+
     def _runtime_idempotency_key(self, request: RuntimeOrderIntentRequest, broker_request: BrokerOrderRequest) -> str:
         trade_date = self._trade_date(request, str(self.clock()))
         if request.side == "sell":
@@ -532,6 +856,22 @@ class OrderEnqueueService:
             f"runtime:dryrun:entry:{trade_date}:{request.candidate_id or ''}:"
             f"{request.entry_plan_id or ''}:{request.virtual_order_id or ''}:"
             f"{request.leg_index or ''}:{broker_request.code}:{broker_request.side}:{broker_request.price}"
+        )
+
+    def _live_sim_idempotency_key(self, request: RuntimeOrderIntentRequest, broker_request: BrokerOrderRequest, trade_date: str) -> str:
+        phase = request.order_phase or ("exit" if broker_request.side == "sell" else "entry")
+        candidate_instance_id = str((request.metadata or {}).get("candidate_instance_id") or "")
+        account_id_masked = _mask_account(broker_request.account)
+        if broker_request.side == "sell":
+            return (
+                f"runtime:livesim:exit:{trade_date}:{account_id_masked}:{broker_request.code}:"
+                f"{request.virtual_position_id or ''}:{request.exit_decision_id or ''}:{request.exit_decision_type}:"
+                f"{broker_request.price}:{broker_request.quantity}"
+            )
+        return (
+            f"runtime:livesim:{phase}:{trade_date}:{account_id_masked}:{candidate_instance_id}:"
+            f"{request.candidate_id or ''}:{request.entry_plan_id or ''}:{request.virtual_order_id or ''}:"
+            f"{request.leg_index or ''}:{broker_request.code}:{broker_request.price}:{broker_request.quantity}"
         )
 
     @staticmethod
@@ -565,6 +905,126 @@ class OrderEnqueueService:
                 allow_zero_price=False,
             )
         )
+
+    def _live_sim_guard(self, execution: dict[str, Any]) -> OrderCommandSafetyGuard:
+        return OrderCommandSafetyGuard(
+            OrderSafetyConfig(
+                mode="LIVE",
+                live_order_enabled=True,
+                max_order_amount=int(execution.get("max_order_amount_krw") or self.settings.max_order_amount),
+                max_daily_orders_per_code=int(execution.get("max_orders_per_day") or self.settings.max_daily_orders_per_code),
+                allow_zero_price=False,
+            )
+        )
+
+    def _live_sim_pre_submit_block_reason(
+        self,
+        request: RuntimeOrderIntentRequest,
+        broker_request: BrokerOrderRequest,
+        *,
+        gateway_status: dict[str, Any],
+        execution: dict[str, Any],
+        exit_guard: dict[str, Any],
+        account_guard: dict[str, Any],
+    ) -> tuple[str, list[str], dict[str, Any]]:
+        codes: list[str] = []
+        details: dict[str, Any] = {}
+        mode = str(execution.get("mode") or "DRY_RUN").upper()
+        if mode == "LIVE_REAL" or bool(execution.get("live_real_enabled")):
+            return "LIVE_REAL_ORDER_BLOCKED", ["LIVE_REAL_ORDER_BLOCKED"], {"execution_mode": mode}
+        if mode != "LIVE_SIM" or not bool(execution.get("live_sim_enabled")):
+            return "LIVE_SIM_DISABLED", ["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD"], {"execution_mode": mode}
+        if bool(execution.get("kill_switch_active")) or (bool(execution.get("kill_switch_enabled", True)) and str(execution.get("kill_switch_state") or "").upper() == "ACTIVE"):
+            return "LIVE_SIM_KILL_SWITCH_ACTIVE", ["LIVE_SIM_KILL_SWITCH_ACTIVE"], {"kill_switch_active": True}
+        if not account_guard.get("ok"):
+            reason = str(account_guard.get("reason") or "LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD")
+            return reason, _unique_reason_codes(["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD", reason]), {"account_guard": account_guard}
+        if broker_request.side == "buy" and not bool(exit_guard.get("enabled")):
+            return "EXIT_GUARD_NOT_READY_BUY_BLOCKED", ["EXIT_GUARD_REQUIRED", "EXIT_GUARD_NOT_READY_BUY_BLOCKED"], {"exit_guard": exit_guard}
+        if broker_request.side == "buy" and bool(execution.get("submit_first_leg_only", True)):
+            try:
+                leg_index = int(request.leg_index or broker_request.metadata.get("leg_index") or 1)
+            except (TypeError, ValueError):
+                leg_index = 1
+            if leg_index != 1:
+                return (
+                    "SECOND_THIRD_LEG_BLOCKED_BEFORE_FIRST_FILL",
+                    ["SECOND_THIRD_LEG_BLOCKED_BEFORE_FIRST_FILL"],
+                    {"leg_index": leg_index, "submit_first_leg_only": True},
+                )
+        if not _order_price_type_allowed(broker_request, execution):
+            return "PRICE_INVALID_OR_MARKET_ORDER_UNSUPPORTED", ["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD"], {"hoga": broker_request.hoga, "price": broker_request.price}
+        amount = int(broker_request.quantity or 0) * max(0, int(broker_request.price or 0))
+        min_amount = int(execution.get("min_order_amount_krw") or 0)
+        max_amount = int(execution.get("max_order_amount_krw") or self.settings.max_order_amount)
+        if broker_request.side == "buy" and min_amount > 0 and amount < min_amount:
+            return "ORDER_AMOUNT_BELOW_MIN", ["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD"], {"amount": amount, "min_order_amount_krw": min_amount}
+        if amount > max_amount:
+            return "ORDER_AMOUNT_LIMIT", ["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD"], {"amount": amount, "max_order_amount_krw": max_amount}
+        gate_reason = _runtime_gate_block_reason(request)
+        if gate_reason:
+            return gate_reason, [gate_reason], {"metadata": dict(request.metadata or {}), "gate_status": request.gate_status}
+        if not bool(gateway_status.get("connected")) or not bool(gateway_status.get("heartbeat_ok")):
+            return "LIVE_SIM_BROKER_DISCONNECTED", ["LIVE_SIM_BROKER_DISCONNECTED"], {"gateway_status": _public_gateway_status(gateway_status)}
+        summary = self._live_sim_summary_for_guard()
+        max_orders = int(execution.get("max_orders_per_day") or 0)
+        if max_orders > 0 and int(summary.get("submitted_order_count") or 0) >= max_orders:
+            return "LIVE_SIM_MAX_ORDERS_HIT", ["LIVE_SIM_MAX_ORDERS_HIT"], {"summary": summary, "max_orders_per_day": max_orders}
+        max_rejects = int(execution.get("max_rejected_orders_per_day") or 0)
+        if max_rejects > 0 and int(summary.get("rejected_order_count") or 0) >= max_rejects:
+            return "LIVE_SIM_MAX_REJECTS_HIT", ["LIVE_SIM_MAX_REJECTS_HIT"], {"summary": summary, "max_rejected_orders_per_day": max_rejects}
+        return "", [], details
+
+    def _live_sim_summary_for_guard(self) -> dict[str, Any]:
+        db = TradingDatabase(str(self.db_path))
+        try:
+            return db.live_sim_summary(trade_date=_kst_trade_date(str(self.clock())))
+        finally:
+            db.close()
+
+    def _live_sim_order_record(
+        self,
+        request: RuntimeOrderIntentRequest,
+        broker_request: BrokerOrderRequest,
+        *,
+        order_intent_id: str,
+        trade_date: str,
+        now: str,
+        status: str,
+        dedupe_key: str,
+        reason_codes: list[str],
+        details: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "order_intent_id": order_intent_id,
+            "command_id": "",
+            "entry_plan_id": request.entry_plan_id,
+            "candidate_id": request.candidate_id,
+            "virtual_order_id": request.virtual_order_id,
+            "virtual_position_id": request.virtual_position_id,
+            "exit_decision_id": request.exit_decision_id,
+            "candidate_instance_id": str((request.metadata or {}).get("candidate_instance_id") or ""),
+            "trade_date": trade_date,
+            "code": broker_request.code,
+            "name": str((request.metadata or {}).get("name") or ""),
+            "account_id_masked": _mask_account(broker_request.account),
+            "order_mode": "LIVE_SIM",
+            "broker": "KIWOOM",
+            "broker_env": "SIMULATION",
+            "order_leg": int(request.leg_index or 1),
+            "side": broker_request.side,
+            "order_type": str(broker_request.order_type),
+            "requested_qty": broker_request.quantity,
+            "requested_price": broker_request.price,
+            "submitted_qty": broker_request.quantity,
+            "submitted_price": broker_request.price,
+            "order_status": status,
+            "updated_at": now,
+            "idempotency_key": broker_request.idempotency_key,
+            "dedupe_key": dedupe_key,
+            "reason_codes": _unique_reason_codes(reason_codes),
+            "details": details,
+        }
 
     @staticmethod
     def _synthetic_gateway_status(request: BrokerOrderRequest) -> dict[str, Any]:
@@ -624,6 +1084,214 @@ def _dry_run_reject_reason(request: RuntimeOrderIntentRequest, fallback: str) ->
     if fallback == "QUANTITY_INVALID" and quantity_reason in {"QUANTITY_ZERO", "QUANTITY_BELOW_MIN"}:
         return quantity_reason
     return fallback
+
+
+def _live_sim_account_guard(
+    request: BrokerOrderRequest,
+    gateway_status: dict[str, Any],
+    execution: dict[str, Any],
+) -> dict[str, Any]:
+    heartbeat = dict(gateway_status.get("last_heartbeat_payload") or {})
+    account = str(request.account or "")
+    gateway_account = str(gateway_status.get("account") or heartbeat.get("account") or "")
+    if not account:
+        return {"ok": False, "reason": "ACCOUNT_GUARD_FAILED_UNKNOWN_ACCOUNT_MODE", "account_id_masked": ""}
+    allowed_accounts = {str(item) for item in list(execution.get("allowed_account_numbers") or []) if str(item)}
+    if allowed_accounts and account not in allowed_accounts:
+        return {
+            "ok": False,
+            "reason": "ACCOUNT_GUARD_FAILED_ACCOUNT_NOT_ALLOWLISTED",
+            "account_id_masked": _mask_account(account),
+            "allowlist_size": len(allowed_accounts),
+        }
+    if gateway_account and gateway_account != account:
+        return {
+            "ok": False,
+            "reason": "ACCOUNT_GUARD_FAILED_ACCOUNT_NOT_ALLOWLISTED",
+            "account_id_masked": _mask_account(account),
+            "gateway_account_id_masked": _mask_account(gateway_account),
+        }
+    raw_modes = _gateway_mode_candidates(gateway_status)
+    normalized_modes = [_normalize_broker_env(value) for value in raw_modes if str(value or "")]
+    normalized_modes = [value for value in normalized_modes if value]
+    if any(value == "REAL" for value in normalized_modes):
+        return {
+            "ok": False,
+            "reason": "ACCOUNT_GUARD_FAILED_REAL_ACCOUNT",
+            "account_id_masked": _mask_account(account),
+            "raw_modes": raw_modes,
+        }
+    if any(value == "SIMULATION" for value in normalized_modes):
+        return {
+            "ok": True,
+            "reason": "ACCOUNT_GUARD_PASSED_SIMULATION",
+            "account_id_masked": _mask_account(account),
+            "broker_env": "SIMULATION",
+            "raw_modes": raw_modes,
+        }
+    if not raw_modes:
+        return {
+            "ok": False,
+            "reason": "ACCOUNT_GUARD_FAILED_SERVER_MODE_UNKNOWN",
+            "account_id_masked": _mask_account(account),
+            "raw_modes": [],
+        }
+    if bool(execution.get("fail_closed_on_account_unknown", True)):
+        return {
+            "ok": False,
+            "reason": "ACCOUNT_GUARD_FAILED_UNKNOWN_ACCOUNT_MODE",
+            "account_id_masked": _mask_account(account),
+            "raw_modes": raw_modes,
+        }
+    return {
+        "ok": True,
+        "reason": "ACCOUNT_GUARD_UNKNOWN_ALLOWED_BY_CONFIG",
+        "account_id_masked": _mask_account(account),
+        "raw_modes": raw_modes,
+    }
+
+
+def _gateway_mode_candidates(gateway_status: dict[str, Any]) -> list[str]:
+    heartbeat = dict(gateway_status.get("last_heartbeat_payload") or {})
+    keys = [
+        "account_mode",
+        "account_type",
+        "broker_env",
+        "environment",
+        "server_mode",
+        "server_type",
+        "server",
+        "kiwoom_server",
+        "mode",
+    ]
+    values: list[str] = []
+    for source in (heartbeat, gateway_status):
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                text = str(value).strip()
+                if text and text not in values:
+                    values.append(text)
+    return values
+
+
+def _normalize_broker_env(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    if text in {"SIM", "SIMULATION", "MOCK", "PAPER", "PAPER_TRADING", "LIVE_SIM", "DEMO", "TEST", "1"}:
+        return "SIMULATION"
+    if text in {"REAL", "LIVE", "PROD", "PRODUCTION", "LIVE_REAL", "0"}:
+        return "REAL"
+    if "모의" in str(value):
+        return "SIMULATION"
+    if "실전" in str(value) or "실계좌" in str(value):
+        return "REAL"
+    return "UNKNOWN"
+
+
+def _runtime_gate_block_reason(request: RuntimeOrderIntentRequest) -> str:
+    metadata = dict(request.metadata or {})
+    reason_codes = {
+        str(item)
+        for item in list(metadata.get("reason_codes") or [])
+        + list(metadata.get("risk_reason_codes") or [])
+        + list(metadata.get("market_reason_codes") or [])
+        if str(item)
+    }
+    if str(request.gate_status or "").upper() in {"BLOCKED", "WAIT", "TEMP_WAIT"}:
+        return str(request.gate_reason or "RUNTIME_GATE_NOT_READY")
+    if metadata.get("support_ready") is False or metadata.get("support_missing_reason"):
+        return "DATA_INSUFFICIENT"
+    if metadata.get("latest_tick_ready") is False or metadata.get("tick_stale") or metadata.get("latest_tick_stale"):
+        return "DATA_INSUFFICIENT"
+    if metadata.get("chase_risk") or "CHASE_RISK" in reason_codes:
+        return "CHASE_RISK"
+    if (
+        metadata.get("late_chase_temp_wait")
+        or str(metadata.get("late_chase_level") or "").lower() == "soft_block"
+        or str(metadata.get("sub_status") or "").upper() == "LATE_CHASE_TEMP_WAIT"
+        or "LATE_CHASE_TEMP_WAIT" in reason_codes
+    ):
+        return "LATE_CHASE_TEMP_WAIT"
+    market_block_codes = {
+        "WAIT_MARKET_CONFIRMATION_PENDING",
+        "WAIT_CANDIDATE_MARKET_WEAK",
+        "WAIT_CANDIDATE_MARKET_RISK_OFF",
+        "WAIT_MARKET_RECOVERY_PENDING",
+        "MARKET_WAIT_HYSTERESIS_HOLD",
+        "MARKET_WEAK_CONFIRMED",
+        "MARKET_RISK_OFF_CONFIRMED",
+        "CANDIDATE_MARKET_WEAK",
+        "CANDIDATE_MARKET_RISK_OFF",
+        "KOSPI_MARKET_WEAK",
+        "KOSDAQ_MARKET_WEAK",
+        "KOSPI_MARKET_RISK_OFF",
+        "KOSDAQ_MARKET_RISK_OFF",
+        "GLOBAL_MARKET_RISK_OFF",
+    }
+    for code in market_block_codes:
+        if code in reason_codes:
+            return code
+    market_status = str(metadata.get("candidate_market_status") or metadata.get("market_status") or "").upper()
+    if market_status in {"WEAK", "RISK_OFF", "WAIT", "TEMP_WAIT", "RECOVERY_PENDING", "CONFIRMATION_PENDING"}:
+        return "WAIT_CANDIDATE_MARKET_WEAK" if market_status == "WEAK" else "WAIT_MARKET_CONFIRMATION_PENDING"
+    if str(metadata.get("order_eligibility") or "").upper() in {"WAIT_DATA", "BLOCKED", "WAIT"}:
+        return "DATA_INSUFFICIENT"
+    return ""
+
+
+def _order_price_type_allowed(request: BrokerOrderRequest, execution: dict[str, Any]) -> bool:
+    if int(request.quantity or 0) <= 0:
+        return False
+    if int(request.price or 0) <= 0:
+        return False
+    if bool(execution.get("allow_market_order")):
+        return True
+    hoga = str(request.hoga or "")
+    return hoga in {"00", "0", ""}
+
+
+def _public_execution_config(execution: dict[str, Any]) -> dict[str, Any]:
+    hidden = {"allowed_account_numbers"}
+    return {
+        key: (_mask_account(str(value)) if key == "account" else value)
+        for key, value in dict(execution or {}).items()
+        if key not in hidden
+    }
+
+
+def _public_gateway_status(gateway_status: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(gateway_status or {})
+    if payload.get("account"):
+        payload["account_id_masked"] = _mask_account(str(payload.get("account") or ""))
+        payload.pop("account", None)
+    heartbeat = dict(payload.get("last_heartbeat_payload") or {})
+    if heartbeat.get("account"):
+        heartbeat["account_id_masked"] = _mask_account(str(heartbeat.get("account") or ""))
+        heartbeat.pop("account", None)
+    payload["last_heartbeat_payload"] = heartbeat
+    return payload
+
+
+def _unique_reason_codes(codes: list[str]) -> list[str]:
+    result: list[str] = []
+    for code in codes:
+        text = str(code or "")
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _mask_account(account: str) -> str:
+    text = str(account or "")
+    if not text:
+        return ""
+    if "*" in text:
+        return text
+    if len(text) <= 4:
+        return "*" * len(text)
+    return f"{text[:2]}{'*' * max(2, len(text) - 4)}{text[-2:]}"
 
 
 def _kst_trade_date(timestamp: str) -> str:
