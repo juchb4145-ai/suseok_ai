@@ -109,9 +109,14 @@ class StrategyMarketDataBridge:
             best_ask=best_ask,
             best_bid=best_bid,
         )
+        clean_price = _safe_int(price)
+        previous_tick = self.market_data.latest_tick(code)
+        if clean_price <= 0 and previous_tick is not None and previous_tick.price > 0:
+            clean_price = previous_tick.price
+            tick_metadata["merged_from_previous_price_tick"] = True
         feature_result = self.realtime_features.enrich(
             code=code,
-            price=_safe_int(price),
+            price=clean_price,
             cum_volume=_safe_int(cum_volume),
             trade_value=_safe_float(trade_value),
             timestamp=timestamp,
@@ -121,7 +126,7 @@ class StrategyMarketDataBridge:
         )
         tick = StrategyTick.from_realtime(
             code=code,
-            price=price,
+            price=clean_price,
             change_rate=change_rate,
             cum_volume=cum_volume,
             best_ask=best_ask,

@@ -149,8 +149,9 @@ class RealtimeFeatureCalculator:
                 display_payloads[-1] = active_payload
         if display_payloads:
             metadata["recent_candles_1m"] = display_payloads[-self.recent_candle_window :]
-        if logical_completed_1m:
-            support_candles = logical_completed_1m[-self.support_window :]
+        valid_support_candles = [candle for candle in logical_completed_1m if candle.low > 0]
+        if valid_support_candles:
+            support_candles = valid_support_candles[-self.support_window :]
             metadata["recent_support_price"] = min(float(candle.low) for candle in support_candles)
             metadata["recent_support_candle_count"] = len(support_candles)
             metadata["recent_support_ready"] = len(support_candles) >= self.support_window

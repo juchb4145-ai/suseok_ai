@@ -128,6 +128,26 @@ def test_bridge_preserves_rich_tick_metadata_and_realtime_features():
     assert quality["field_coverage"]["momentum"] == 1.0
 
 
+def test_bridge_uses_previous_valid_price_for_zero_price_candles():
+    clock = MutableClock(datetime(2026, 5, 29, 9, 0, 1))
+    stock_store = MarketDataStore()
+    builder = CandleBuilder()
+    bridge = StrategyMarketDataBridge(stock_store, builder, clock=clock)
+
+    assert bridge.on_realtime_tick("005930", price=1000, cum_volume=100, trade_value=100000) is True
+    clock.set(datetime(2026, 5, 29, 9, 0, 20))
+    assert bridge.on_realtime_tick("005930", price=0, cum_volume=120, trade_value=120000) is True
+
+    active = builder.active_candle("005930")
+    latest = stock_store.latest_tick("005930")
+    assert active is not None
+    assert active.low == 1000
+    assert active.close == 1000
+    assert latest is not None
+    assert latest.price == 1000
+    assert latest.metadata["merged_from_previous_price_tick"] is True
+
+
 def test_bridge_can_infer_index_type_from_mapper_without_polluting_stock_candles():
     client = MockKiwoomClient()
     clock = MutableClock(datetime(2026, 5, 29, 9, 0, 1))
