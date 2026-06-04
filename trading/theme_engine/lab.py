@@ -2359,7 +2359,7 @@ class ThemeLabHybridGate:
         snapshot: StockSnapshot | None = None,
         data_quality_flags: Iterable[str] = (),
     ) -> LabGateDecision:
-        flags = set(data_quality_flags) | set(theme.data_quality_flags) | set(price_location.data_quality_flags)
+        flags = _dedupe_tuple(tuple(data_quality_flags) + tuple(price_location.data_quality_flags))
         role = watch.stock_role
         risk = self.risk_filter.evaluate(_risk_input(market, theme, watch, snapshot, flags))
         risk = _risk_adjusted_for_price_location(risk, role, price_location, self.position_config)
@@ -2678,15 +2678,19 @@ class ThemeLabFlowEngine:
                     **_market_side_context(market, enriched),
                 }
             )
-            price_location = self.price_location_evaluator.evaluate(_price_location_input(market, theme, enriched, snapshot))
+            watch_data_quality_flags = _watch_member_data_quality_flags(theme, enriched)
+            price_location = self.price_location_evaluator.evaluate(
+                _price_location_input(market, theme, enriched, snapshot, watch_data_quality_flags)
+            )
             decision = self.gate.evaluate(
                 market=market,
                 theme=theme,
                 watch=enriched,
                 price_location=price_location,
                 snapshot=snapshot,
+                data_quality_flags=watch_data_quality_flags,
             )
-            risk_input = _risk_input(market, theme, enriched, snapshot, theme.data_quality_flags)
+            risk_input = _risk_input(market, theme, enriched, snapshot, watch_data_quality_flags)
             enriched = WatchSetSnapshot(
                 **{
                     **enriched.__dict__,
@@ -3207,11 +3211,20 @@ def _risk_input(
     )
 
 
+def _watch_member_data_quality_flags(theme: ThemeConditionSnapshot, watch: WatchSetSnapshot) -> tuple[str, ...]:
+    symbol = normalize_stock_code(watch.symbol)
+    for hit in theme.member_hits:
+        if normalize_stock_code(hit.symbol) == symbol:
+            return tuple(hit.data_quality_flags)
+    return ()
+
+
 def _price_location_input(
     market: MarketStrengthSnapshot,
     theme: ThemeConditionSnapshot,
     watch: WatchSetSnapshot,
     snapshot: StockSnapshot | None,
+    data_quality_flags: Iterable[str] = (),
 ) -> PriceLocationInput:
     metadata = dict(snapshot.metadata if snapshot else {})
     return PriceLocationInput(
@@ -3236,7 +3249,7 @@ def _price_location_input(
         stock_role=watch.stock_role,
         theme_status=theme.theme_status,
         market_status=market.market_status,
-        data_quality_flags=theme.data_quality_flags,
+        data_quality_flags=tuple(data_quality_flags),
     )
 
 
