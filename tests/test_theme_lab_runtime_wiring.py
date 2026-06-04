@@ -16,6 +16,7 @@ from trading.theme_engine.lab import (
     ConditionHitSnapshot,
     MarketStatus,
     MarketStrengthSnapshot,
+    PriceLocationStatus,
     ThemeConditionSnapshot,
     ThemeLabFlowResult,
     ThemeLabThemeStatus,
@@ -105,6 +106,55 @@ def test_theme_lab_runtime_uses_legacy_market_metadata_when_tick_has_no_market(t
     assert watch_by_symbol["000001"].candidate_market_source == "metadata_by_symbol.raw.market"
     assert watch_by_symbol["000002"].candidate_market == "KOSDAQ"
     assert result.data_quality["market_classification_unknown_count"] == 0
+    db.close()
+
+
+def test_theme_lab_runtime_uses_realtime_price_context_for_price_location(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    _seed_theme(db)
+    _seed_legacy_market(db, {"000001": "KOSDAQ", "000002": "KOSDAQ"})
+    market_data = MarketDataStore()
+    now = datetime(2026, 6, 1, 9, 2, 0)
+    market_data.update_tick(
+        StrategyTick.from_realtime(
+            "000001",
+            price=106,
+            change_rate=6.0,
+            cum_volume=10_000,
+            trade_value=1_060_000,
+            execution_strength=120,
+            timestamp=now,
+            metadata={
+                "prev_close": 100,
+                "name": "stock-000001",
+                "session_high": 108,
+                "day_high": 108,
+                "vwap": 104,
+                "vwap_ready": True,
+                "recent_support_price": 103,
+                "recent_support_ready": True,
+                "recent_candles_1m": [{"high": 108, "low": 105, "close": 106}],
+                "momentum_1m": 0.5,
+                "momentum_3m": 0.3,
+            },
+        )
+    )
+    market_data.update_tick(_tick("000002", 104, 4.0, now))
+    market_data.update_tick(_tick("000003", 100, 0.0, now))
+
+    result = ThemeLabRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=MarketIndexStore(),
+    ).run(now)
+
+    watch = next(item for item in result.watchset if item.symbol == "000001")
+
+    assert watch.price_location_status == PriceLocationStatus.PULLBACK_RECLAIM
+    assert watch.gate_status.value == "READY"
+    assert "MISSING_VWAP" not in watch.price_location_data_quality_flags
+    assert "MISSING_RECENT_SUPPORT_PRICE" not in watch.price_location_data_quality_flags
+    assert "MISSING_RECENT_CANDLES" not in watch.price_location_data_quality_flags
     db.close()
 
 

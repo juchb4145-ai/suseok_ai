@@ -883,6 +883,10 @@ def _stock_snapshot_from_tick(tick: StrategyTick) -> StockSnapshot:
         best_ask=float(tick.best_ask or 0),
         session_high=float(metadata.get("session_high") or metadata.get("day_high") or 0),
         session_low=float(metadata.get("session_low") or metadata.get("day_low") or 0),
+        momentum_1m=_float(metadata.get("momentum_1m")),
+        momentum_3m=_float(metadata.get("momentum_3m")),
+        momentum_5m=_float(metadata.get("momentum_5m")),
+        turnover_strength=max(0.0, _float(metadata.get("turnover_strength")) or 1.0),
         ts=tick.timestamp.isoformat() if tick.timestamp else "",
         updated_at=tick.timestamp.isoformat() if tick.timestamp else "",
         metadata=metadata,
@@ -956,6 +960,18 @@ def _row_mapping(row: Any, columns: list[str]) -> dict[str, Any]:
     if hasattr(row, "keys"):
         return dict(row)
     return {column: row[index] for index, column in enumerate(columns)}
+
+
+def _float(value: Any) -> float:
+    if value is None:
+        return 0.0
+    text = str(value).strip().replace(",", "").replace("+", "").replace("%", "")
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _prev_close(snapshot: StockSnapshot) -> float:

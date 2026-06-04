@@ -22,8 +22,10 @@ class _MinuteTurnover:
 
 
 class RealtimeFeatureCalculator:
-    def __init__(self, *, turnover_average_window: int = 5) -> None:
+    def __init__(self, *, turnover_average_window: int = 5, recent_candle_window: int = 5, support_window: int = 3) -> None:
         self.turnover_average_window = max(1, int(turnover_average_window))
+        self.recent_candle_window = max(1, int(recent_candle_window))
+        self.support_window = max(1, int(support_window))
         self._last_trade_value: dict[str, float] = {}
         self._minute_turnover: dict[str, _MinuteTurnover] = {}
         self._recent_minute_turnovers: dict[str, Deque[float]] = defaultdict(
@@ -45,15 +47,23 @@ class RealtimeFeatureCalculator:
         enriched = dict(metadata or {})
         reason_codes = set(str(value) for value in enriched.get("reason_codes") or [] if str(value or "").strip())
 
-        effective_trade_value = max(0.0, _float(trade_value))
+        raw_trade_value = max(0.0, _float(trade_value))
+        effective_trade_value = raw_trade_value
         if effective_trade_value <= 0 and price > 0 and cum_volume > 0:
             effective_trade_value = float(price * cum_volume)
             reason_codes.add("TURNOVER_ESTIMATED")
+
+        vwap = self._vwap(raw_trade_value, cum_volume)
+        if vwap is not None:
+            enriched["vwap"] = vwap
+            enriched["vwap_ready"] = True
 
         momentums, warmup = self._momentums(clean_code, candle_builder)
         enriched.update(momentums)
         if warmup:
             reason_codes.add("MOMENTUM_WARMUP")
+
+        enriched.update(self._recent_price_context(clean_code, candle_builder))
 
         enriched["turnover_strength"] = self._turnover_strength(
             clean_code,
@@ -82,6 +92,29 @@ class RealtimeFeatureCalculator:
             return 0.0
         return ((candle.close - candle.open) / candle.open) * 100.0
 
+    @staticmethod
+    def _vwap(trade_value: float, cum_volume: int) -> float | None:
+        volume = max(0, int(cum_volume or 0))
+        if trade_value <= 0 or volume <= 0:
+            return None
+        return round(float(trade_value) / volume, 4)
+
+    def _recent_price_context(self, code: str, candle_builder: CandleBuilder) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        candles_1m = candle_builder.completed_candles(code, 1)[-self.recent_candle_window :]
+        candles_3m = candle_builder.completed_candles(code, 3)[-self.recent_candle_window :]
+        if candles_1m:
+            metadata["recent_candles_1m"] = [_candle_payload(candle) for candle in candles_1m]
+            support_candles = candles_1m[-self.support_window :]
+            metadata["recent_support_price"] = min(float(candle.low) for candle in support_candles)
+            metadata["recent_support_candle_count"] = len(support_candles)
+            metadata["recent_support_ready"] = len(support_candles) >= self.support_window
+        if candles_3m:
+            metadata["recent_candles_3m"] = [_candle_payload(candle) for candle in candles_3m]
+            metadata["recent_3m_bar_count"] = len(candles_3m)
+        metadata["completed_minute_bar_count"] = len(candle_builder.completed_candles(code, 1))
+        return metadata
+
     def _turnover_strength(self, code: str, trade_value: float, timestamp: datetime) -> float:
         if trade_value <= 0:
             return 1.0
@@ -109,6 +142,17 @@ class RealtimeFeatureCalculator:
         if average <= 0:
             return 1.0
         return round(max(0.0, state.delta / average), 4)
+
+
+def _candle_payload(candle) -> dict[str, Any]:
+    return {
+        "start_at": candle.start_at.isoformat(),
+        "open": candle.open,
+        "high": candle.high,
+        "low": candle.low,
+        "close": candle.close,
+        "volume": candle.volume,
+    }
 
 
 def _float(value: Any) -> float:
