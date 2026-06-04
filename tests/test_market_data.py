@@ -50,3 +50,39 @@ def test_market_data_store_ignores_out_of_order_tick():
     assert store.latest_tick("005930") == current
     assert store.day_high_low("005930") == (80_000, 80_000)
     assert store.tick_count("005930") == 1
+
+
+def test_market_data_store_preserves_trade_fields_when_quote_only_tick_arrives_later():
+    store = MarketDataStore()
+    trade = StrategyTick.from_realtime(
+        "005930",
+        80_000,
+        change_rate=1.25,
+        cum_volume=1_200,
+        trade_value=96_000_000,
+        execution_strength=123.4,
+        timestamp=datetime(2026, 5, 29, 9, 1),
+        metadata={"real_type": "trade", "session_high": 80_500, "session_low": 79_500},
+    )
+    quote_only = StrategyTick.from_realtime(
+        "005930",
+        0,
+        best_ask=80_100,
+        best_bid=80_000,
+        spread_ticks=1,
+        timestamp=datetime(2026, 5, 29, 9, 1, 1),
+        metadata={"real_type": "quote", "reason_codes": ["TRADE_VALUE_MISSING"]},
+    )
+
+    assert store.update_tick(trade)
+    assert store.update_tick(quote_only)
+
+    latest = store.latest_tick("005930")
+    assert latest is not None
+    assert latest.price == 80_000
+    assert latest.change_rate == 1.25
+    assert latest.trade_value == 96_000_000
+    assert latest.execution_strength == 123.4
+    assert latest.best_ask == 80_100
+    assert latest.best_bid == 80_000
+    assert latest.metadata["merged_from_previous_price_tick"] is True

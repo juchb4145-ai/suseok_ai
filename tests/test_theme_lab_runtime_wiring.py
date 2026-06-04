@@ -8,10 +8,22 @@ from main import build_observe_runtime
 from storage.db import TradingDatabase
 from trading.strategy.config import StrategyRuntimeConfigRepository
 from trading.strategy.market_data import StrategyTick
-from trading.strategy.models import OrderMode
+from trading.strategy.market_data import MarketDataStore
+from trading.strategy.market_index import MarketIndexStore
+from trading.strategy.models import Candidate, CandidateState, OrderMode
 from trading.strategy.runtime import StrategyRuntimeConfig
+from trading.theme_engine.lab import (
+    ConditionHitSnapshot,
+    MarketStatus,
+    MarketStrengthSnapshot,
+    PriceLocationStatus,
+    ThemeConditionSnapshot,
+    ThemeLabFlowResult,
+    ThemeLabThemeStatus,
+)
 from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeStatus
 from trading.theme_engine.repository import ThemeEngineRepository
+from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline
 
 
 def test_themelab_flow_is_default_and_runtime_contains_pipeline(tmp_path):
@@ -72,6 +84,163 @@ def test_theme_lab_runtime_tick_runs_pipeline_saves_result_and_syncs_watchset(tm
     db.close()
 
 
+def test_theme_lab_runtime_uses_legacy_market_metadata_when_tick_has_no_market(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    _seed_theme(db)
+    _seed_legacy_market(db, {"000001": "KOSDAQ", "000002": "KOSDAQ"})
+    market_data = MarketDataStore()
+    now = datetime(2026, 6, 1, 9, 1, 0)
+    market_data.update_tick(_tick("000001", 106, 6.0, now))
+    market_data.update_tick(_tick("000002", 104, 4.0, now))
+    market_data.update_tick(_tick("000003", 100, 0.0, now))
+
+    result = ThemeLabRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=MarketIndexStore(),
+    ).run(now)
+
+    watch_by_symbol = {item.symbol: item for item in result.watchset}
+
+    assert watch_by_symbol["000001"].candidate_market == "KOSDAQ"
+    assert watch_by_symbol["000001"].candidate_market_source == "metadata_by_symbol.raw.market"
+    assert watch_by_symbol["000002"].candidate_market == "KOSDAQ"
+    assert result.data_quality["market_classification_unknown_count"] == 0
+    db.close()
+
+
+def test_theme_lab_runtime_uses_realtime_price_context_for_price_location(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    _seed_theme(db)
+    _seed_legacy_market(db, {"000001": "KOSDAQ", "000002": "KOSDAQ"})
+    market_data = MarketDataStore()
+    now = datetime(2026, 6, 1, 9, 2, 0)
+    market_data.update_tick(
+        StrategyTick.from_realtime(
+            "000001",
+            price=106,
+            change_rate=6.0,
+            cum_volume=10_000,
+            trade_value=1_060_000,
+            execution_strength=120,
+            timestamp=now,
+            metadata={
+                "prev_close": 100,
+                "name": "stock-000001",
+                "session_high": 108,
+                "day_high": 108,
+                "vwap": 104,
+                "vwap_ready": True,
+                "recent_support_price": 103,
+                "recent_support_ready": True,
+                "recent_candles_1m": [{"high": 108, "low": 105, "close": 106}],
+                "momentum_1m": 0.5,
+                "momentum_3m": 0.3,
+            },
+        )
+    )
+    market_data.update_tick(_tick("000002", 104, 4.0, now))
+    market_data.update_tick(_tick("000003", 100, 0.0, now))
+
+    result = ThemeLabRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=MarketIndexStore(),
+    ).run(now)
+
+    watch = next(item for item in result.watchset if item.symbol == "000001")
+
+    assert watch.price_location_status == PriceLocationStatus.PULLBACK_RECLAIM
+    assert watch.gate_status.value == "READY"
+    assert "MISSING_VWAP" not in watch.price_location_data_quality_flags
+    assert "MISSING_RECENT_SUPPORT_PRICE" not in watch.price_location_data_quality_flags
+    assert "MISSING_RECENT_CANDLES" not in watch.price_location_data_quality_flags
+    db.close()
+
+
+def test_theme_lab_pipeline_watchset_codes_bootstraps_from_condition_hits(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    pipeline = ThemeLabRuntimePipeline(
+        db=db,
+        market_data=MarketDataStore(),
+        market_index_store=MarketIndexStore(),
+    )
+    pipeline.last_result = ThemeLabFlowResult(
+        market=MarketStrengthSnapshot(MarketStatus.CHOPPY),
+        themes=(
+            ThemeConditionSnapshot(
+                calculated_at="2026-06-04T09:01:00",
+                theme_id="ai",
+                theme_name="AI",
+                theme_status=ThemeLabThemeStatus.WEAK_THEME,
+                member_hits=(
+                    ConditionHitSnapshot(
+                        calculated_at="2026-06-04T09:01:00",
+                        symbol="000001",
+                        name="alive-only",
+                        alive_hit=True,
+                    ),
+                    ConditionHitSnapshot(
+                        calculated_at="2026-06-04T09:01:00",
+                        symbol="000002",
+                        name="strong",
+                        alive_hit=True,
+                        strong_hit=True,
+                        return_pct=3.1,
+                    ),
+                    ConditionHitSnapshot(
+                        calculated_at="2026-06-04T09:01:00",
+                        symbol="000003",
+                        name="leader",
+                        alive_hit=True,
+                        strong_hit=True,
+                        leader_hit=True,
+                        return_pct=5.2,
+                    ),
+                ),
+            ),
+        ),
+        watchset=(),
+        gate_decisions=(),
+        data_quality={},
+    )
+
+    assert pipeline.watchset_codes() == ["000003", "000002"]
+    db.close()
+
+
+def test_theme_lab_empty_watchset_bootstraps_candidate_realtime_subscriptions(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    client = MockKiwoomClient()
+    runtime = build_observe_runtime(client, db)
+    _seed_theme(db)
+    now = datetime(2026, 6, 1, 9, 1, 0)
+    for code in ("000001", "000002", "000003"):
+        db.save_candidate(
+            Candidate(
+                trade_date="2026-06-01",
+                code=code,
+                state=CandidateState.DETECTED,
+                detected_at=now.isoformat(),
+                last_seen_at=now.isoformat(),
+                expires_at=(now + timedelta(minutes=30)).isoformat(),
+                condition_names=["테마랩_생존_-1"],
+                metadata={"sub_status": "DATA_INSUFFICIENT", "insufficient_reason": ["NO_GATE_RESULT"]},
+            )
+        )
+
+    snapshot = runtime.start(now)
+
+    assert {"000001", "000002", "000003"} <= set(client.registered_codes)
+    assert snapshot.candidate_subscription_selected_count == 3
+    assert "THEME_LAB_BOOTSTRAP_SUBSCRIPTIONS=3" in snapshot.warnings
+    for code in ("000001", "000002", "000003"):
+        record = runtime.subscription_manager.records[code]
+        assert "theme_lab_bootstrap" in record.sources
+        assert "candidate_watch" not in record.sources
+    db.close()
+
+
 def test_theme_lab_condition_adapter_registers_only_three_lab_conditions(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     client = MockKiwoomClient()
@@ -111,6 +280,33 @@ def _seed_theme(db: TradingDatabase) -> None:
                 trade_eligible=True,
             )
         )
+
+
+def _seed_legacy_market(db: TradingDatabase, markets: dict[str, str]) -> None:
+    db.conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS legacy_theme_mappings_archive (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            market TEXT NOT NULL DEFAULT '',
+            theme_id TEXT NOT NULL DEFAULT '',
+            theme_name TEXT NOT NULL DEFAULT '',
+            strategy_profile TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    with db.conn:
+        for code, market in markets.items():
+            db.conn.execute(
+                """
+                INSERT INTO legacy_theme_mappings_archive(
+                    code, name, market, theme_id, theme_name, strategy_profile, enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                """,
+                (code, f"stock-{code}", market, "ai", "AI", f"{market}_THEME_PROFILE"),
+            )
 
 
 def _tick(code: str, price: int, change_rate: float, now: datetime) -> StrategyTick:

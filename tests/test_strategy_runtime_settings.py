@@ -111,6 +111,27 @@ def test_invalid_gate_weight_sum_warns_and_uses_legacy_weights():
     assert settings.number("gate_weights.market", 0) == 0.15
 
 
+def test_empty_default_lists_allow_variable_length_values(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    payload = legacy_profile_payload()
+    raw = json.loads(json.dumps(LEGACY_DEFAULT_SETTINGS))
+    raw["order_execution"]["mode"] = "LIVE_SIM"
+    raw["order_execution"]["live_sim_enabled"] = True
+    raw["order_execution"]["allowed_account_numbers"] = ["1234567890"]
+    raw["market_session"]["holidays"] = ["2026-01-01"]
+    payload["settings_json"] = json.dumps(raw)
+    payload["config_json"] = payload["settings_json"]
+    db.save_strategy_runtime_settings_profile(payload)
+
+    settings = StrategyRuntimeSettingsRepository(db).load()
+
+    assert settings.value("order_execution.allowed_account_numbers") == ["1234567890"]
+    assert settings.value("market_session.holidays") == ["2026-01-01"]
+    assert "order_execution.allowed_account_numbers" not in settings.invalid_keys
+    assert "market_session.holidays" not in settings.invalid_keys
+    db.close()
+
+
 def test_runtime_settings_module_does_not_reference_real_order_path():
     source = open("trading/strategy/runtime_settings.py", encoding="utf-8").read()
 

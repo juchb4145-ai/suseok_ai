@@ -8,7 +8,7 @@ from typing import Any, Optional
 from storage.db import TradingDatabase
 from trading.broker.command_queue import CommandPriority
 from trading.broker.gateway_state import GatewayStateStore
-from trading.broker.models import BrokerOrderRequest, GatewayCommand, new_message_id, utc_timestamp
+from trading.broker.models import BrokerExecutionEvent, BrokerOrderRequest, GatewayCommand, new_message_id, utc_timestamp
 from trading.risk.safety_guard import OrderCommandSafetyGuard, OrderSafetyConfig, dedupe_key_for_order_request
 from trading_app.dependencies import CoreSettings
 from trading_app.schemas import OrderEnqueueRequest
@@ -389,9 +389,13 @@ class OrderEnqueueService:
         *,
         execution_config: dict[str, Any] | None = None,
         exit_guard_config: dict[str, Any] | None = None,
+        lifecycle_config: dict[str, Any] | None = None,
+        reconcile_config: dict[str, Any] | None = None,
     ) -> OrderEnqueueResult:
         execution = dict(execution_config or {})
         exit_guard = dict(exit_guard_config or {})
+        lifecycle = dict(lifecycle_config or {})
+        reconcile = dict(reconcile_config or {})
         now = str(self.clock())
         trade_date = self._trade_date(request, now)
         gateway_status = self.gateway_state.snapshot().to_dict()
@@ -418,6 +422,8 @@ class OrderEnqueueService:
                 "account_guard": account_guard,
                 "execution_config": _public_execution_config(execution),
                 "exit_guard": exit_guard,
+                "lifecycle": lifecycle,
+                "reconcile": reconcile,
                 "request": request.to_dict(),
             },
         )
@@ -428,6 +434,8 @@ class OrderEnqueueService:
             gateway_status=gateway_status,
             execution=execution,
             exit_guard=exit_guard,
+            lifecycle=lifecycle,
+            reconcile=reconcile,
             account_guard=account_guard,
         )
         db = TradingDatabase(str(self.db_path))
@@ -615,6 +623,7 @@ class OrderEnqueueService:
                 [
                     "LIVE_SIM_ORDER_ALLOWED",
                     "ACCOUNT_GUARD_PASSED_SIMULATION",
+                    *list(account_guard.get("reason_codes") or []),
                     "LIVE_SIM_FIRST_LEG_ONLY" if broker_request.side == "buy" else "LIVE_SIM_EXIT_ORDER_SUBMITTED",
                     "ORDER_IDEMPOTENCY_KEY_CREATED",
                 ]
@@ -658,6 +667,464 @@ class OrderEnqueueService:
                 command=command.to_dict(),
                 record=saved,
             )
+        finally:
+            db.close()
+
+    def run_live_sim_order_lifecycle(
+        self,
+        *,
+        execution_config: dict[str, Any] | None = None,
+        lifecycle_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        execution = dict(execution_config or {})
+        lifecycle = dict(lifecycle_config or {})
+        now = str(self.clock())
+        if not bool(lifecycle.get("enabled", True)):
+            return {"status": "SKIPPED", "reason": "LIVE_SIM_ORDER_LIFECYCLE_DISABLED", "cancelled": []}
+        db = TradingDatabase(str(self.db_path))
+        cancelled: list[dict[str, Any]] = []
+        blocked: list[dict[str, Any]] = []
+        try:
+            for status in ["SUBMITTED", "ACCEPTED", "PARTIAL_FILLED"]:
+                for order in db.list_live_sim_orders(status=status, limit=500):
+                    due_reason = _cancel_due_reason(order, lifecycle, now)
+                    if not due_reason:
+                        continue
+                    cancel_qty = _remaining_cancel_qty(order)
+                    result = self.enqueue_live_sim_cancel_order(
+                        order,
+                        cancel_qty=cancel_qty,
+                        cancel_reason=due_reason,
+                        execution_config=execution,
+                        lifecycle_config=lifecycle,
+                    )
+                    payload = result.to_dict()
+                    if result.accepted:
+                        cancelled.append(payload)
+                    else:
+                        blocked.append(payload)
+            db.save_live_sim_runtime_health(
+                "cancel_scheduler",
+                status="HEALTHY",
+                reason="OK",
+                details={"cancelled": len(cancelled), "blocked": len(blocked)},
+                updated_at=now,
+            )
+            return {"status": "HEALTHY", "cancelled": cancelled, "blocked": blocked}
+        except Exception as exc:
+            db.save_live_sim_runtime_health(
+                "cancel_scheduler",
+                status="UNHEALTHY",
+                reason=str(exc),
+                consecutive_failures=1,
+                details={"error": str(exc)},
+                updated_at=now,
+            )
+            return {"status": "UNHEALTHY", "reason": str(exc), "cancelled": cancelled, "blocked": blocked}
+        finally:
+            db.close()
+
+    def enqueue_live_sim_cancel_order(
+        self,
+        order: dict[str, Any],
+        *,
+        cancel_qty: int,
+        cancel_reason: str,
+        execution_config: dict[str, Any] | None = None,
+        lifecycle_config: dict[str, Any] | None = None,
+    ) -> OrderEnqueueResult:
+        execution = dict(execution_config or {})
+        lifecycle = dict(lifecycle_config or {})
+        now = str(self.clock())
+        gateway_status = self.gateway_state.snapshot().to_dict()
+        account = str(gateway_status.get("account") or (gateway_status.get("last_heartbeat_payload") or {}).get("account") or "")
+        broker_order_id = str(order.get("broker_order_id") or "")
+        original_order_id = str(order.get("order_intent_id") or "")
+        trade_date = str(order.get("trade_date") or _kst_trade_date(now))
+        account_id_masked = _mask_account(account or str(order.get("account_id_masked") or ""))
+        cancel_qty = max(0, int(cancel_qty or 0))
+        idempotency_key = _live_sim_cancel_idempotency_key(
+            trade_date=trade_date,
+            broker_order_id=broker_order_id,
+            original_order_id=original_order_id,
+            code=str(order.get("code") or ""),
+            cancel_qty=cancel_qty,
+            cancel_reason=cancel_reason,
+            account_id_masked=account_id_masked,
+        )
+        cancel_intent_id = new_message_id("live_sim_cancel")
+        base_record = {
+            "cancel_intent_id": cancel_intent_id,
+            "original_order_id": original_order_id,
+            "broker_order_id": broker_order_id,
+            "trade_date": trade_date,
+            "code": order.get("code"),
+            "side": order.get("side"),
+            "cancel_qty": cancel_qty,
+            "cancel_reason": cancel_reason,
+            "order_mode": "LIVE_SIM",
+            "account_id_masked": account_id_masked,
+            "candidate_instance_id": order.get("candidate_instance_id"),
+            "entry_plan_id": order.get("entry_plan_id"),
+            "idempotency_key": idempotency_key,
+            "status": "CREATED",
+            "attempts": int(order.get("details", {}).get("cancel_attempts") or 0) + 1,
+            "created_at": now,
+            "updated_at": now,
+            "reason_codes": _cancel_reason_codes(cancel_reason),
+            "details": {"original_order": order},
+        }
+        db = TradingDatabase(str(self.db_path))
+        try:
+            if str(order.get("order_status") or "") in {"FILLED", "CANCELLED", "REJECTED", "FAILED", "EXPIRED"}:
+                saved = db.save_live_sim_cancel_order(
+                    {**base_record, "status": "REJECTED", "reason_codes": ["LIVE_SIM_CANCEL_ORDER_REJECTED"], "details": {**base_record["details"], "reason": "ORDER_TERMINAL"}}
+                )
+                return OrderEnqueueResult(False, "LIVE_SIM", False, intent_id=cancel_intent_id, idempotency_key=idempotency_key, status="REJECTED", reason="ORDER_TERMINAL", record=saved)
+            if not broker_order_id or str(order.get("order_status") or "") == "UNKNOWN_SUBMIT":
+                updated = db.update_live_sim_order(
+                    original_order_id,
+                    {
+                        "order_status": "RECONCILE_REQUIRED",
+                        "updated_at": now,
+                        "reason_codes": _merge_reason_codes(order, ["LIVE_SIM_CANCEL_RECONCILE_REQUIRED"]),
+                        "details": {**dict(order.get("details") or {}), "cancel_blocked_reason": "BROKER_ORDER_ID_MISSING"},
+                    },
+                )
+                saved = db.save_live_sim_cancel_order(
+                    {**base_record, "status": "RECONCILE_REQUIRED", "reason_codes": ["LIVE_SIM_CANCEL_RECONCILE_REQUIRED"], "details": {**base_record["details"], "order": updated}}
+                )
+                return OrderEnqueueResult(False, "LIVE_SIM", False, intent_id=cancel_intent_id, idempotency_key=idempotency_key, status="RECONCILE_REQUIRED", reason="LIVE_SIM_CANCEL_RECONCILE_REQUIRED", record=saved)
+            duplicate = db.find_pending_live_sim_cancel(broker_order_id=broker_order_id)
+            if duplicate is not None:
+                saved = db.save_live_sim_cancel_order(
+                    {**base_record, "status": "DUPLICATE", "reason_codes": ["LIVE_SIM_CANCEL_DUPLICATE_BLOCKED"], "details": {**base_record["details"], "duplicate_of": duplicate}}
+                )
+                return OrderEnqueueResult(False, "LIVE_SIM", False, intent_id=cancel_intent_id, idempotency_key=idempotency_key, duplicate_of=str(duplicate.get("cancel_intent_id") or ""), status="DUPLICATE", reason="LIVE_SIM_CANCEL_DUPLICATE_BLOCKED", record=saved)
+            max_attempts = int(lifecycle.get("max_cancel_attempts") or 2)
+            attempts = int(base_record["attempts"])
+            if attempts > max_attempts:
+                updated = db.update_live_sim_order(
+                    original_order_id,
+                    {
+                        "order_status": "RECONCILE_REQUIRED",
+                        "updated_at": now,
+                        "reason_codes": _merge_reason_codes(order, ["LIVE_SIM_CANCEL_MAX_ATTEMPTS_EXCEEDED", "LIVE_SIM_CANCEL_RECONCILE_REQUIRED"]),
+                        "details": {**dict(order.get("details") or {}), "cancel_attempts": attempts},
+                    },
+                )
+                saved = db.save_live_sim_cancel_order(
+                    {**base_record, "status": "RECONCILE_REQUIRED", "reason_codes": ["LIVE_SIM_CANCEL_MAX_ATTEMPTS_EXCEEDED", "LIVE_SIM_CANCEL_RECONCILE_REQUIRED"], "details": {**base_record["details"], "order": updated}}
+                )
+                return OrderEnqueueResult(False, "LIVE_SIM", False, intent_id=cancel_intent_id, idempotency_key=idempotency_key, status="RECONCILE_REQUIRED", reason="LIVE_SIM_CANCEL_MAX_ATTEMPTS_EXCEEDED", record=saved)
+            guard_request = BrokerOrderRequest(
+                account=account,
+                code=str(order.get("code") or ""),
+                quantity=cancel_qty,
+                price=0,
+                side=str(order.get("side") or "buy"),
+            )
+            account_guard = _live_sim_account_guard(guard_request, gateway_status, execution)
+            if not account_guard.get("ok") or not bool(gateway_status.get("connected")) or not bool(gateway_status.get("heartbeat_ok")):
+                reason = str(account_guard.get("reason") or "LIVE_SIM_BROKER_DISCONNECTED")
+                saved = db.save_live_sim_cancel_order(
+                    {**base_record, "status": "REJECTED", "reason_codes": ["LIVE_SIM_CANCEL_ORDER_REJECTED", reason], "details": {**base_record["details"], "account_guard": account_guard}}
+                )
+                return OrderEnqueueResult(False, "LIVE_SIM", False, intent_id=cancel_intent_id, idempotency_key=idempotency_key, status="REJECTED", reason=reason, record=saved)
+            command = GatewayCommand(
+                type="cancel_order",
+                command_id=new_message_id("cmd_cancel"),
+                idempotency_key=idempotency_key,
+                payload={
+                    "account": account,
+                    "code": str(order.get("code") or ""),
+                    "quantity": cancel_qty,
+                    "original_order_no": broker_order_id,
+                    "order_mode": "LIVE_SIM",
+                    "account_id_masked": account_id_masked,
+                    "cancel_intent_id": cancel_intent_id,
+                    "original_order_id": original_order_id,
+                    "cancel_reason": cancel_reason,
+                },
+            )
+            enqueue_result = self.gateway_state.enqueue_command(
+                command,
+                priority=CommandPriority.HIGH,
+                ttl_sec=int(lifecycle.get("cancel_command_ttl_sec") or self.settings.command_ttl_sec),
+                max_attempts=1,
+                metadata={"runtime": "LIVE_SIM", "cancel_intent_id": cancel_intent_id, "original_order_id": original_order_id},
+            )
+            if not enqueue_result.accepted:
+                saved = db.save_live_sim_cancel_order(
+                    {**base_record, "command_id": command.command_id, "status": "REJECTED", "reason_codes": ["LIVE_SIM_CANCEL_ORDER_REJECTED"], "details": {**base_record["details"], "enqueue_result": enqueue_result.to_dict()}}
+                )
+                return OrderEnqueueResult(False, "LIVE_SIM", False, intent_id=cancel_intent_id, command_id=command.command_id, idempotency_key=idempotency_key, status="REJECTED", reason=enqueue_result.reason or "LIVE_SIM_CANCEL_ORDER_REJECTED", command=command.to_dict(), record=saved)
+            codes = _unique_reason_codes([*base_record["reason_codes"], "LIVE_SIM_CANCEL_ORDER_QUEUED", "LIVE_SIM_CANCEL_ORDER_SUBMITTED"])
+            saved = db.save_live_sim_cancel_order(
+                {**base_record, "command_id": command.command_id, "status": "SUBMITTED", "submitted_at": now, "reason_codes": codes, "details": {**base_record["details"], "command": command.to_dict(), "enqueue_result": enqueue_result.to_dict()}}
+            )
+            db.update_live_sim_order(
+                original_order_id,
+                {
+                    "order_status": "CANCEL_REQUESTED",
+                    "updated_at": now,
+                    "reason_codes": _merge_reason_codes(order, codes),
+                    "details": {**dict(order.get("details") or {}), "cancel_attempts": attempts, "cancel_intent": saved},
+                },
+            )
+            db.append_live_sim_order_event(
+                original_order_id,
+                "cancel_requested",
+                status_from=str(order.get("order_status") or ""),
+                status_to="CANCEL_REQUESTED",
+                message=cancel_reason,
+                payload=saved,
+                created_at=now,
+            )
+            return OrderEnqueueResult(True, "LIVE_SIM", False, intent_id=cancel_intent_id, command_id=command.command_id, idempotency_key=idempotency_key, status="SUBMITTED", reason="LIVE_SIM_CANCEL_ORDER_QUEUED", command=command.to_dict(), record=saved)
+        finally:
+            db.close()
+
+    def run_live_sim_exit_monitor(
+        self,
+        *,
+        execution_config: dict[str, Any] | None = None,
+        exit_guard_config: dict[str, Any] | None = None,
+        lifecycle_config: dict[str, Any] | None = None,
+        reconcile_config: dict[str, Any] | None = None,
+        latest_ticks: dict[str, Any] | None = None,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        execution = dict(execution_config or {})
+        exit_guard = dict(exit_guard_config or {})
+        lifecycle = dict(lifecycle_config or {})
+        reconcile = dict(reconcile_config or {})
+        now = str(now or self.clock())
+        if not bool(exit_guard.get("enabled", True)):
+            self._save_live_sim_health("exit_monitor", "UNHEALTHY", "LIVE_SIM_EXIT_MONITOR_UNHEALTHY", now=now)
+            return {"status": "UNHEALTHY", "reason": "LIVE_SIM_EXIT_MONITOR_UNHEALTHY", "orders": []}
+        ticks = dict(latest_ticks or {})
+        db = TradingDatabase(str(self.db_path))
+        orders: list[dict[str, Any]] = []
+        try:
+            stale_codes: list[str] = []
+            for position in db.list_live_sim_positions(limit=500):
+                if str(position.get("status") or "") not in {"OPEN", "PARTIAL"}:
+                    continue
+                tick = _normalize_tick(ticks.get(str(position.get("code") or "")), now)
+                if _tick_is_stale(tick, now, int(exit_guard.get("max_exit_tick_age_sec") or 10)):
+                    stale_codes.append(str(position.get("code") or ""))
+                    continue
+                trigger = _exit_trigger(position, tick, exit_guard, now)
+                if not trigger:
+                    continue
+                if _has_active_exit_order(db, str(position.get("position_id") or ""), str(position.get("code") or "")):
+                    orders.append({"accepted": False, "status": "DUPLICATE", "reason": "LIVE_SIM_EXIT_DUPLICATE_BLOCKED", "position_id": position.get("position_id")})
+                    continue
+                request = RuntimeOrderIntentRequest(
+                    source="live_sim_exit_monitor",
+                    dry_run=False,
+                    account="",
+                    code=str(position.get("code") or ""),
+                    side="sell",
+                    quantity=int(position.get("current_qty") or 0),
+                    price=int(tick.get("price") or 0),
+                    order_type=int(self.settings.runtime_dry_run_order_type_sell),
+                    hoga=self.settings.runtime_dry_run_hoga,
+                    tag=f"runtime:exit:{trigger['reason']}",
+                    order_phase="exit",
+                    reason=str(trigger["reason"]),
+                    exit_decision_type=str(trigger["reason"]),
+                    runtime_cycle_at=now,
+                    metadata={
+                        "position_id": position.get("position_id"),
+                        "candidate_instance_id": position.get("candidate_instance_id"),
+                        "reason_codes": [trigger["reason_code"], "LIVE_SIM_EXIT_ORDER_QUEUED"],
+                    },
+                )
+                result = self.enqueue_live_sim_order(
+                    request,
+                    execution_config=execution,
+                    exit_guard_config=exit_guard,
+                    lifecycle_config=lifecycle,
+                    reconcile_config=reconcile,
+                )
+                orders.append(result.to_dict())
+                if result.accepted:
+                    db.save_live_sim_position(
+                        {
+                            **position,
+                            "status": "EXIT_ORDERED",
+                            "updated_at": now,
+                            "details": {**dict(position.get("details") or {}), "exit_order": result.to_dict(), "exit_reason": trigger["reason"]},
+                        }
+                    )
+            if stale_codes and bool(exit_guard.get("require_latest_tick_ready_for_exit", True)):
+                self._save_live_sim_health(
+                    "exit_monitor",
+                    "UNHEALTHY",
+                    "LIVE_SIM_EXIT_LATEST_TICK_STALE",
+                    now=now,
+                    details={"stale_codes": stale_codes},
+                )
+                return {"status": "UNHEALTHY", "reason": "LIVE_SIM_EXIT_LATEST_TICK_STALE", "orders": orders, "stale_codes": stale_codes}
+            self._save_live_sim_health("exit_monitor", "HEALTHY", "OK", now=now, details={"orders": len(orders)})
+            return {"status": "HEALTHY", "orders": orders}
+        except Exception as exc:
+            self._save_live_sim_health("exit_monitor", "UNHEALTHY", str(exc), now=now, details={"error": str(exc)})
+            return {"status": "UNHEALTHY", "reason": str(exc), "orders": orders}
+        finally:
+            db.close()
+
+    def run_live_sim_reconcile(
+        self,
+        *,
+        reconcile_config: dict[str, Any] | None = None,
+        broker_snapshot: dict[str, Any] | None = None,
+        trigger: str = "manual",
+    ) -> dict[str, Any]:
+        reconcile = dict(reconcile_config or {})
+        now = str(self.clock())
+        if not bool(reconcile.get("enabled", True)):
+            return {"status": "SKIPPED", "reason": "LIVE_SIM_RECONCILE_DISABLED"}
+        event_id = new_message_id("live_sim_reconcile")
+        snapshot = dict(broker_snapshot or {})
+        reason_codes = _unique_reason_codes(["LIVE_SIM_RECONCILE_STARTED", _reconcile_trigger_code(trigger)])
+        db = TradingDatabase(str(self.db_path))
+        try:
+            orders_reconciled = 0
+            positions_reconciled = 0
+            external_positions = 0
+            for fill in list(snapshot.get("fills") or []):
+                broker_order_id = str(fill.get("broker_order_id") or fill.get("order_no") or "")
+                order = db.find_live_sim_order_by_broker_order_id(broker_order_id)
+                if order is None:
+                    continue
+                event = BrokerExecutionEvent(
+                    code=str(fill.get("code") or order.get("code") or ""),
+                    order_no=broker_order_id,
+                    side=str(fill.get("side") or order.get("side") or ""),
+                    quantity=int(fill.get("quantity") or fill.get("filled_quantity") or order.get("requested_qty") or 0),
+                    price=int(fill.get("price") or fill.get("fill_price") or order.get("requested_price") or 0),
+                    filled_quantity=int(fill.get("filled_quantity") or fill.get("fill_qty") or fill.get("quantity") or 0),
+                    remaining_quantity=int(fill.get("remaining_quantity") or fill.get("remaining_qty") or 0),
+                    execution_id=str(fill.get("execution_id") or fill.get("fill_id") or f"reconcile:{broker_order_id}"),
+                    command_id=str(order.get("command_id") or ""),
+                    idempotency_key=str(order.get("idempotency_key") or ""),
+                    timestamp=now,
+                    raw={"source": "live_sim_reconcile", **dict(fill or {})},
+                )
+                db.save_execution(event)
+                orders_reconciled += 1
+                reason_codes.append("LIVE_SIM_RECONCILE_ORDER_FILLED_FROM_BROKER")
+            for broker_order in list(snapshot.get("open_orders") or []):
+                broker_order_id = str(broker_order.get("broker_order_id") or broker_order.get("order_no") or "")
+                order = db.find_live_sim_order_by_broker_order_id(broker_order_id)
+                if order:
+                    db.append_live_sim_order_event(
+                        str(order.get("order_intent_id") or ""),
+                        "reconcile_open_order",
+                        status_from=str(order.get("order_status") or ""),
+                        status_to=str(order.get("order_status") or ""),
+                        message="LIVE_SIM_RECONCILE_ON_STARTUP",
+                        payload=broker_order,
+                        created_at=now,
+                    )
+                    orders_reconciled += 1
+            if bool(snapshot.get("cancelled_orders")):
+                for broker_order in list(snapshot.get("cancelled_orders") or []):
+                    broker_order_id = str(broker_order.get("broker_order_id") or broker_order.get("order_no") or "")
+                    order = db.find_live_sim_order_by_broker_order_id(broker_order_id)
+                    if order:
+                        db.update_live_sim_order(
+                            str(order.get("order_intent_id") or ""),
+                            {
+                                "order_status": "CANCELLED",
+                                "cancelled_at": now,
+                                "updated_at": now,
+                                "reason_codes": _merge_reason_codes(order, ["LIVE_SIM_RECONCILE_ORDER_CANCELLED_FROM_BROKER"]),
+                            },
+                        )
+                        orders_reconciled += 1
+                        reason_codes.append("LIVE_SIM_RECONCILE_ORDER_CANCELLED_FROM_BROKER")
+            open_positions = db.list_live_sim_positions(limit=1000)
+            open_keys = {
+                (str(item.get("code") or ""), str(item.get("account_id_masked") or ""))
+                for item in open_positions
+                if str(item.get("status") or "") in {"OPEN", "PARTIAL", "EXIT_ORDERED", "EXIT_SUBMITTING"}
+            }
+            for broker_position in list(snapshot.get("positions") or []):
+                code = str(broker_position.get("code") or "")
+                qty = int(broker_position.get("quantity") or broker_position.get("current_qty") or 0)
+                account_id_masked = _mask_account(str(broker_position.get("account") or broker_position.get("account_id_masked") or ""))
+                if qty <= 0 or not code:
+                    continue
+                if (code, account_id_masked) in open_keys:
+                    positions_reconciled += 1
+                    reason_codes.append("LIVE_SIM_RECONCILE_POSITION_SYNCED")
+                    continue
+                external_positions += 1
+                db.save_live_sim_position(
+                    {
+                        "position_id": f"EXTERNAL:{account_id_masked}:{code}",
+                        "candidate_instance_id": "EXTERNAL_POSITION_DETECTED",
+                        "code": code,
+                        "name": broker_position.get("name", ""),
+                        "account_id_masked": account_id_masked,
+                        "opened_at": now,
+                        "entry_qty": qty,
+                        "entry_avg_price": int(broker_position.get("avg_price") or broker_position.get("entry_avg_price") or 0),
+                        "current_qty": qty,
+                        "status": "RECONCILE_REQUIRED",
+                        "details": {"external_position_detected": True, "broker_position": broker_position},
+                        "updated_at": now,
+                    }
+                )
+                reason_codes.append("LIVE_SIM_RECONCILE_EXTERNAL_POSITION_DETECTED")
+            status = "COMPLETED"
+            if external_positions:
+                db.save_live_sim_runtime_health(
+                    "reconcile",
+                    status="RECONCILE_REQUIRED",
+                    reason="LIVE_SIM_RECONCILE_EXTERNAL_POSITION_DETECTED",
+                    details={"external_positions": external_positions},
+                    updated_at=now,
+                )
+            else:
+                db.save_live_sim_runtime_health("reconcile", status="HEALTHY", reason="OK", details={}, updated_at=now)
+            reason_codes.append("LIVE_SIM_RECONCILE_COMPLETED")
+            event = db.save_live_sim_reconcile_event(
+                {
+                    "event_id": event_id,
+                    "trigger": trigger,
+                    "status": status,
+                    "reason": "OK",
+                    "started_at": now,
+                    "completed_at": now,
+                    "payload": {
+                        "orders_reconciled": orders_reconciled,
+                        "positions_reconciled": positions_reconciled,
+                        "external_positions": external_positions,
+                    },
+                    "reason_codes": _unique_reason_codes(reason_codes),
+                }
+            )
+            return {"status": status, "event": event}
+        except Exception as exc:
+            db.save_live_sim_runtime_health("reconcile", status="UNHEALTHY", reason=str(exc), consecutive_failures=1, details={"error": str(exc)}, updated_at=now)
+            event = db.save_live_sim_reconcile_event(
+                {
+                    "event_id": event_id,
+                    "trigger": trigger,
+                    "status": "FAILED",
+                    "reason": str(exc),
+                    "started_at": now,
+                    "completed_at": now,
+                    "payload": {"error": str(exc)},
+                    "reason_codes": _unique_reason_codes([*reason_codes, "LIVE_SIM_RECONCILE_FAILED"]),
+                }
+            )
+            return {"status": "FAILED", "reason": str(exc), "event": event}
         finally:
             db.close()
 
@@ -863,10 +1330,11 @@ class OrderEnqueueService:
         candidate_instance_id = str((request.metadata or {}).get("candidate_instance_id") or "")
         account_id_masked = _mask_account(broker_request.account)
         if broker_request.side == "sell":
+            position_id = str((request.metadata or {}).get("position_id") or request.virtual_position_id or "")
+            exit_reason = str(request.exit_decision_type or request.exit_reason or request.reason or "")
             return (
                 f"runtime:livesim:exit:{trade_date}:{account_id_masked}:{broker_request.code}:"
-                f"{request.virtual_position_id or ''}:{request.exit_decision_id or ''}:{request.exit_decision_type}:"
-                f"{broker_request.price}:{broker_request.quantity}"
+                f"{position_id}:{exit_reason}"
             )
         return (
             f"runtime:livesim:{phase}:{trade_date}:{account_id_masked}:{candidate_instance_id}:"
@@ -925,6 +1393,8 @@ class OrderEnqueueService:
         gateway_status: dict[str, Any],
         execution: dict[str, Any],
         exit_guard: dict[str, Any],
+        lifecycle: dict[str, Any] | None = None,
+        reconcile: dict[str, Any] | None = None,
         account_guard: dict[str, Any],
     ) -> tuple[str, list[str], dict[str, Any]]:
         codes: list[str] = []
@@ -938,7 +1408,7 @@ class OrderEnqueueService:
             return "LIVE_SIM_KILL_SWITCH_ACTIVE", ["LIVE_SIM_KILL_SWITCH_ACTIVE"], {"kill_switch_active": True}
         if not account_guard.get("ok"):
             reason = str(account_guard.get("reason") or "LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD")
-            return reason, _unique_reason_codes(["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD", reason]), {"account_guard": account_guard}
+            return reason, _unique_reason_codes(["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD", reason, *list(account_guard.get("reason_codes") or [])]), {"account_guard": account_guard}
         if broker_request.side == "buy" and not bool(exit_guard.get("enabled")):
             return "EXIT_GUARD_NOT_READY_BUY_BLOCKED", ["EXIT_GUARD_REQUIRED", "EXIT_GUARD_NOT_READY_BUY_BLOCKED"], {"exit_guard": exit_guard}
         if broker_request.side == "buy" and bool(execution.get("submit_first_leg_only", True)):
@@ -964,6 +1434,16 @@ class OrderEnqueueService:
         gate_reason = _runtime_gate_block_reason(request)
         if gate_reason:
             return gate_reason, [gate_reason], {"metadata": dict(request.metadata or {}), "gate_status": request.gate_status}
+        if broker_request.side == "buy":
+            lifecycle_reason, lifecycle_codes, lifecycle_details = self._live_sim_buy_lifecycle_block(
+                request,
+                broker_request,
+                lifecycle=dict(lifecycle or {}),
+                reconcile=dict(reconcile or {}),
+                exit_guard=exit_guard,
+            )
+            if lifecycle_reason:
+                return lifecycle_reason, lifecycle_codes, lifecycle_details
         if not bool(gateway_status.get("connected")) or not bool(gateway_status.get("heartbeat_ok")):
             return "LIVE_SIM_BROKER_DISCONNECTED", ["LIVE_SIM_BROKER_DISCONNECTED"], {"gateway_status": _public_gateway_status(gateway_status)}
         summary = self._live_sim_summary_for_guard()
@@ -1025,6 +1505,98 @@ class OrderEnqueueService:
             "reason_codes": _unique_reason_codes(reason_codes),
             "details": details,
         }
+
+    def _live_sim_buy_lifecycle_block(
+        self,
+        request: RuntimeOrderIntentRequest,
+        broker_request: BrokerOrderRequest,
+        *,
+        lifecycle: dict[str, Any],
+        reconcile: dict[str, Any],
+        exit_guard: dict[str, Any],
+    ) -> tuple[str, list[str], dict[str, Any]]:
+        db = TradingDatabase(str(self.db_path))
+        try:
+            account_id_masked = _mask_account(broker_request.account)
+            code = str(broker_request.code or "")
+            candidate_instance_id = str((request.metadata or {}).get("candidate_instance_id") or "")
+            if bool(exit_guard.get("block_new_buy_if_exit_loop_unhealthy", True)):
+                health = db.get_live_sim_runtime_health("exit_monitor")
+                if health and str(health.get("status") or "") == "UNHEALTHY":
+                    return (
+                        "LIVE_SIM_BUY_BLOCKED_EXIT_MONITOR_UNHEALTHY",
+                        ["LIVE_SIM_BUY_BLOCKED_EXIT_MONITOR_UNHEALTHY", "LIVE_SIM_BUY_BLOCKED_LIFECYCLE_GUARD"],
+                        {"health": health},
+                    )
+            if bool(lifecycle.get("block_new_buy_if_cancel_scheduler_unhealthy", True)):
+                health = db.get_live_sim_runtime_health("cancel_scheduler")
+                if health and str(health.get("status") or "") == "UNHEALTHY":
+                    return (
+                        "LIVE_SIM_BUY_BLOCKED_LIFECYCLE_GUARD",
+                        ["LIVE_SIM_BUY_BLOCKED_LIFECYCLE_GUARD"],
+                        {"health": health},
+                    )
+            if bool(reconcile.get("block_new_buy_on_reconcile_failure", True)):
+                health = db.get_live_sim_runtime_health("reconcile")
+                if health and str(health.get("status") or "") in {"UNHEALTHY", "RECONCILE_REQUIRED"}:
+                    reason = (
+                        "LIVE_SIM_BUY_BLOCKED_RECONCILE_FAILURE_LIMIT"
+                        if str(health.get("status") or "") == "UNHEALTHY"
+                        else "LIVE_SIM_BUY_BLOCKED_RECONCILE_REQUIRED"
+                    )
+                    return reason, [reason], {"health": health}
+            pending_cancel = db.find_pending_live_sim_cancel(code=code, account_id_masked=account_id_masked)
+            if pending_cancel is not None and bool(lifecycle.get("block_new_order_when_cancel_pending", True)):
+                return (
+                    "LIVE_SIM_BUY_BLOCKED_PENDING_CANCEL",
+                    ["LIVE_SIM_BUY_BLOCKED_PENDING_CANCEL", "LIVE_SIM_NEW_BUY_BLOCKED_CANCEL_PENDING"],
+                    {"pending_cancel": pending_cancel},
+                )
+            for status in ["SUBMITTED", "ACCEPTED", "PARTIAL_FILLED"]:
+                for order in db.list_live_sim_orders(status=status, code=code, side="buy", limit=50):
+                    if str(order.get("account_id_masked") or "") != account_id_masked:
+                        continue
+                    if candidate_instance_id and str(order.get("candidate_instance_id") or "") not in {"", candidate_instance_id}:
+                        continue
+                    return "LIVE_SIM_BUY_BLOCKED_PENDING_ORDER", ["LIVE_SIM_BUY_BLOCKED_PENDING_ORDER"], {"pending_order": order}
+            for order in db.list_live_sim_orders(status="UNKNOWN_SUBMIT", code=code, limit=50):
+                if str(order.get("account_id_masked") or "") == account_id_masked:
+                    return "LIVE_SIM_BUY_BLOCKED_UNKNOWN_SUBMIT", ["LIVE_SIM_BUY_BLOCKED_UNKNOWN_SUBMIT"], {"unknown_submit": order}
+            for status in ["RECONCILE_REQUIRED", "CANCEL_REJECTED"]:
+                for order in db.list_live_sim_orders(status=status, code=code, limit=50):
+                    if str(order.get("account_id_masked") or "") == account_id_masked:
+                        return "LIVE_SIM_BUY_BLOCKED_RECONCILE_REQUIRED", ["LIVE_SIM_BUY_BLOCKED_RECONCILE_REQUIRED"], {"order": order}
+            for position in db.list_live_sim_positions(code=code, account_id_masked=account_id_masked, limit=50):
+                if str(position.get("status") or "") == "RECONCILE_REQUIRED":
+                    details = dict(position.get("details") or {})
+                    if details.get("external_position_detected"):
+                        return "LIVE_SIM_BUY_BLOCKED_EXTERNAL_POSITION", ["LIVE_SIM_BUY_BLOCKED_EXTERNAL_POSITION"], {"position": position}
+                    return "LIVE_SIM_BUY_BLOCKED_RECONCILE_REQUIRED", ["LIVE_SIM_BUY_BLOCKED_RECONCILE_REQUIRED"], {"position": position}
+            return "", [], {}
+        finally:
+            db.close()
+
+    def _save_live_sim_health(
+        self,
+        component: str,
+        status: str,
+        reason: str,
+        *,
+        now: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        db = TradingDatabase(str(self.db_path))
+        try:
+            db.save_live_sim_runtime_health(
+                component,
+                status=status,
+                reason=reason,
+                consecutive_failures=1 if status == "UNHEALTHY" else 0,
+                details=details or {},
+                updated_at=now,
+            )
+        finally:
+            db.close()
 
     @staticmethod
     def _synthetic_gateway_status(request: BrokerOrderRequest) -> dict[str, Any]:
@@ -1128,20 +1700,23 @@ def _live_sim_account_guard(
             "account_id_masked": _mask_account(account),
             "broker_env": "SIMULATION",
             "raw_modes": raw_modes,
+            "reason_codes": ["BROKER_ENV_NORMALIZED", "ACCOUNT_GUARD_PASSED_SIMULATION"],
         }
     if not raw_modes:
         return {
             "ok": False,
-            "reason": "ACCOUNT_GUARD_FAILED_SERVER_MODE_UNKNOWN",
+            "reason": "BROKER_SERVER_MODE_UNKNOWN",
             "account_id_masked": _mask_account(account),
             "raw_modes": [],
+            "reason_codes": ["BROKER_SERVER_MODE_UNKNOWN"],
         }
     if bool(execution.get("fail_closed_on_account_unknown", True)):
         return {
             "ok": False,
-            "reason": "ACCOUNT_GUARD_FAILED_UNKNOWN_ACCOUNT_MODE",
+            "reason": "BROKER_ENV_UNKNOWN",
             "account_id_masked": _mask_account(account),
             "raw_modes": raw_modes,
+            "reason_codes": ["BROKER_ENV_UNKNOWN"],
         }
     return {
         "ok": True,
@@ -1283,6 +1858,10 @@ def _unique_reason_codes(codes: list[str]) -> list[str]:
     return result
 
 
+def _merge_reason_codes(order: dict[str, Any], additions: list[str]) -> list[str]:
+    return _unique_reason_codes(list(order.get("reason_codes") or []) + list(additions or []))
+
+
 def _mask_account(account: str) -> str:
     text = str(account or "")
     if not text:
@@ -1292,6 +1871,161 @@ def _mask_account(account: str) -> str:
     if len(text) <= 4:
         return "*" * len(text)
     return f"{text[:2]}{'*' * max(2, len(text) - 4)}{text[-2:]}"
+
+
+def _cancel_due_reason(order: dict[str, Any], lifecycle: dict[str, Any], now: str) -> str:
+    status = str(order.get("order_status") or "")
+    side = str(order.get("side") or "").lower()
+    started_at = str(order.get("accepted_at") or order.get("submitted_at") or order.get("updated_at") or order.get("created_at") or "")
+    if not _age_exceeded(started_at, now, int(lifecycle.get("cancel_unfilled_buy_after_sec") or 60)) and side == "buy" and status in {"SUBMITTED", "ACCEPTED"}:
+        return ""
+    if side == "buy" and status in {"SUBMITTED", "ACCEPTED"}:
+        return "unfilled_buy"
+    if side == "sell" and status in {"SUBMITTED", "ACCEPTED"}:
+        if _age_exceeded(started_at, now, int(lifecycle.get("cancel_unfilled_sell_after_sec") or 60)):
+            return "unfilled_sell"
+        return ""
+    if status == "PARTIAL_FILLED":
+        partial_started_at = str(order.get("last_fill_at") or started_at)
+        if _age_exceeded(partial_started_at, now, int(lifecycle.get("cancel_partial_remainder_after_sec") or 90)):
+            return "partial_remainder"
+    return ""
+
+
+def _remaining_cancel_qty(order: dict[str, Any]) -> int:
+    details = dict(order.get("details") or {})
+    last_fill = dict(details.get("last_fill") or {})
+    if last_fill.get("remaining_qty") is not None:
+        return max(0, int(last_fill.get("remaining_qty") or 0))
+    return max(0, int(order.get("submitted_qty") or order.get("requested_qty") or 0))
+
+
+def _cancel_reason_codes(cancel_reason: str) -> list[str]:
+    mapping = {
+        "unfilled_buy": "LIVE_SIM_UNFILLED_BUY_CANCEL_DUE",
+        "unfilled_sell": "LIVE_SIM_UNFILLED_SELL_CANCEL_DUE",
+        "partial_remainder": "LIVE_SIM_PARTIAL_REMAINDER_CANCEL_DUE",
+    }
+    return _unique_reason_codes([mapping.get(str(cancel_reason or ""), "LIVE_SIM_ORDER_UNFILLED_TIMEOUT")])
+
+
+def _live_sim_cancel_idempotency_key(
+    *,
+    trade_date: str,
+    broker_order_id: str,
+    original_order_id: str,
+    code: str,
+    cancel_qty: int,
+    cancel_reason: str,
+    account_id_masked: str,
+) -> str:
+    return (
+        f"runtime:livesim:cancel:{trade_date}:{account_id_masked}:{code}:"
+        f"{broker_order_id}:{original_order_id}:{cancel_qty}:{cancel_reason}"
+    )
+
+
+def _normalize_tick(raw: Any, now: str) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return {
+            "price": int(raw.get("price") or raw.get("current_price") or 0),
+            "timestamp": str(raw.get("timestamp") or raw.get("trade_time") or raw.get("created_at") or now),
+        }
+    try:
+        price = int(raw or 0)
+    except (TypeError, ValueError):
+        price = 0
+    return {"price": price, "timestamp": now if price > 0 else ""}
+
+
+def _tick_is_stale(tick: dict[str, Any], now: str, max_age_sec: int) -> bool:
+    if int(tick.get("price") or 0) <= 0:
+        return True
+    timestamp = str(tick.get("timestamp") or "")
+    if not timestamp:
+        return True
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        current = datetime.fromisoformat(str(now).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return (current.astimezone(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() > max_age_sec
+
+
+def _exit_trigger(position: dict[str, Any], tick: dict[str, Any], exit_guard: dict[str, Any], now: str) -> dict[str, str] | None:
+    price = int(tick.get("price") or 0)
+    entry = int(position.get("entry_avg_price") or 0)
+    if price <= 0 or entry <= 0:
+        return None
+    stop_price = int(position.get("stop_loss_price") or round(entry * (1.0 + float(exit_guard.get("stop_loss_pct") or -2.0) / 100.0)))
+    take_price = int(position.get("take_profit_price") or round(entry * (1.0 + float(exit_guard.get("take_profit_pct") or 5.0) / 100.0)))
+    if stop_price > 0 and price <= stop_price:
+        return {"reason": "stop_loss", "reason_code": "LIVE_SIM_STOP_LOSS_TRIGGERED"}
+    if take_price > 0 and price >= take_price:
+        return {"reason": "take_profit", "reason_code": "LIVE_SIM_TAKE_PROFIT_TRIGGERED"}
+    max_hold_at = str(position.get("max_hold_exit_at") or "")
+    if max_hold_at and _time_reached(max_hold_at, now):
+        return {"reason": "max_hold", "reason_code": "LIVE_SIM_MAX_HOLD_EXIT_TRIGGERED"}
+    if bool(exit_guard.get("market_close_liquidation_enabled", True)) and _market_close_reached(str(exit_guard.get("market_close_liquidation_time") or "15:15"), now):
+        return {"reason": "market_close_liquidation", "reason_code": "LIVE_SIM_MARKET_CLOSE_LIQUIDATION_TRIGGERED"}
+    return None
+
+
+def _has_active_exit_order(db: TradingDatabase, position_id: str, code: str) -> bool:
+    for status in ["SUBMITTED", "ACCEPTED", "PARTIAL_FILLED", "UNKNOWN_SUBMIT"]:
+        for order in db.list_live_sim_orders(status=status, code=code, side="sell", limit=100):
+            details = dict(order.get("details") or {})
+            request = dict(details.get("request") or {})
+            metadata = dict(request.get("metadata") or {})
+            if str(metadata.get("position_id") or "") == position_id:
+                return True
+    return False
+
+
+def _reconcile_trigger_code(trigger: str) -> str:
+    if str(trigger or "") == "startup":
+        return "LIVE_SIM_RECONCILE_ON_STARTUP"
+    if str(trigger or "") == "reconnect":
+        return "LIVE_SIM_RECONCILE_ON_RECONNECT"
+    return "LIVE_SIM_RECONCILE_STARTED"
+
+
+def _age_exceeded(started_at: str, now: str, threshold_sec: int) -> bool:
+    try:
+        started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+        current = datetime.fromisoformat(str(now).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return (current.astimezone(timezone.utc) - started.astimezone(timezone.utc)).total_seconds() >= max(0, int(threshold_sec or 0))
+
+
+def _time_reached(target: str, now: str) -> bool:
+    try:
+        target_dt = datetime.fromisoformat(str(target).replace("Z", "+00:00"))
+        now_dt = datetime.fromisoformat(str(now).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if target_dt.tzinfo is None:
+        target_dt = target_dt.replace(tzinfo=timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    return now_dt.astimezone(timezone.utc) >= target_dt.astimezone(timezone.utc)
+
+
+def _market_close_reached(close_time: str, now: str) -> bool:
+    text = str(now or "")
+    if "T" not in text:
+        return False
+    current_hhmm = text.split("T", 1)[1][:5]
+    return current_hhmm >= str(close_time or "15:15")
 
 
 def _kst_trade_date(timestamp: str) -> str:

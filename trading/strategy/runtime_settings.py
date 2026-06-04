@@ -286,11 +286,41 @@ LEGACY_DEFAULT_SETTINGS: dict[str, Any] = {
         "stop_loss_pct": -2.0,
         "take_profit_pct": 5.0,
         "max_hold_minutes": 60,
+        "exit_check_interval_sec": 3,
+        "require_latest_tick_ready_for_exit": True,
+        "max_exit_tick_age_sec": 10,
         "cancel_unfilled_sell_after_sec": 60,
         "market_close_liquidation_enabled": True,
         "market_close_liquidation_time": "15:15",
         "allow_manual_sell_override": True,
         "emergency_liquidation_enabled": True,
+        "block_new_buy_if_exit_loop_unhealthy": True,
+        "max_exit_order_attempts": 2,
+        "exit_order_price_type": "LIMIT",
+        "emergency_exit_price_type": "MARKET_DISABLED_BY_DEFAULT",
+    },
+    "live_sim_order_lifecycle": {
+        "enabled": True,
+        "cancel_unfilled_buy_after_sec": 60,
+        "cancel_unfilled_sell_after_sec": 60,
+        "cancel_partial_remainder_after_sec": 90,
+        "cancel_check_interval_sec": 5,
+        "max_cancel_attempts": 2,
+        "cancel_retry_interval_sec": 10,
+        "block_new_order_when_cancel_pending": True,
+        "require_reconcile_after_cancel_failure": True,
+        "block_new_buy_if_cancel_scheduler_unhealthy": True,
+    },
+    "live_sim_reconcile": {
+        "enabled": True,
+        "reconcile_on_startup": True,
+        "reconcile_on_reconnect": True,
+        "reconcile_interval_sec": 30,
+        "max_reconcile_failures": 3,
+        "block_new_buy_on_reconcile_failure": True,
+        "query_open_orders": True,
+        "query_fills": True,
+        "query_positions": True,
     },
     "entry_plan_thresholds": {
         "max_chase_pct": {
@@ -676,6 +706,8 @@ def _merge_value(default: Any, raw: Any, path: str, missing: list[str], invalid:
         if not isinstance(raw, list):
             invalid.append(path)
             return deepcopy(default)
+        if not default:
+            return deepcopy(raw)
         if len(raw) != len(default):
             invalid.append(path)
             return deepcopy(default)

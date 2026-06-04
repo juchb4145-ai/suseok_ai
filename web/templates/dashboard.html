@@ -56,6 +56,27 @@
           <div id="ops-alert-lines" class="alert-list"></div>
         </section>
 
+        <section class="band">
+          <div class="section-head">
+            <div>
+              <h2>ThemeLab 운용 요약</h2>
+              <p id="themelab-operation-message" class="help-text">ThemeLabFlow 결과 대기 중</p>
+            </div>
+            <div class="action-strip">
+              <span id="themelab-operation-status" class="counter muted">SNAPSHOT_UNAVAILABLE</span>
+              <a class="link-button" href="/themelab">ThemeLab 열기</a>
+            </div>
+          </div>
+          <div class="mini-grid themelab-summary-grid">
+            <div><span>READY / SMALL</span><strong id="themelab-ready">0 / 0</strong></div>
+            <div><span>WAIT / BLOCKED</span><strong id="themelab-wait-blocked">0 / 0</strong></div>
+            <div><span>TOP 테마</span><strong id="themelab-top-theme">-</strong></div>
+            <div><span>데이터 품질</span><strong id="themelab-data-quality">UNKNOWN</strong></div>
+            <div><span>LIVE Guard</span><strong id="themelab-live-readiness">0 통과 / 0 차단</strong></div>
+            <div><span>주문 후보</span><strong id="themelab-order-candidates">0</strong></div>
+          </div>
+        </section>
+
         <section class="band two-col">
           <div class="unframed-panel">
             <div class="section-head">

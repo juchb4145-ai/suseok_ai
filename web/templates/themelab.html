@@ -16,6 +16,45 @@
         <div id="market-strip" class="market-strip"></div>
       </header>
 
+      <section id="operating-cockpit" class="panel cockpit-panel" aria-label="운용 Cockpit">
+        <div class="panel-head cockpit-head">
+          <div>
+            <h2>운용 Cockpit</h2>
+            <p id="operation-message">ThemeLabFlow 결과 대기 중</p>
+          </div>
+          <div class="cockpit-actions">
+            <span id="operation-status" class="badge observe">SNAPSHOT_UNAVAILABLE</span>
+            <span id="cockpit-snapshot-state" class="counter">대기</span>
+          </div>
+        </div>
+        <div class="cockpit-grid">
+          <article class="cockpit-card">
+            <span>시장 상태</span>
+            <div id="cockpit-market-sides" class="cockpit-lines"></div>
+          </article>
+          <article class="cockpit-card">
+            <span>테마 상태</span>
+            <div id="cockpit-theme-status" class="cockpit-lines"></div>
+          </article>
+          <article class="cockpit-card">
+            <span>후보 상태</span>
+            <div id="cockpit-candidate-status" class="cockpit-lines"></div>
+          </article>
+          <article class="cockpit-card">
+            <span>주문 후보</span>
+            <div id="cockpit-order-status" class="cockpit-lines"></div>
+          </article>
+          <article class="cockpit-card">
+            <span>데이터 품질</span>
+            <div id="cockpit-data-quality" class="cockpit-lines"></div>
+          </article>
+          <article class="cockpit-card">
+            <span>LIVE 준비상태</span>
+            <div id="cockpit-live-readiness" class="cockpit-lines"></div>
+          </article>
+        </div>
+      </section>
+
       <section class="flow-grid">
         <aside class="panel theme-panel">
           <div class="panel-head">
@@ -48,14 +87,13 @@
         <aside class="panel gate-panel">
           <div class="panel-head">
             <h2>Gate Detail</h2>
-            <span id="gate-status" class="badge observe">OBSERVE</span>
+            <div class="gate-status-strip">
+              <span id="gate-status" class="badge observe">OBSERVE</span>
+              <span id="gate-display-status" class="badge observe">OBSERVE</span>
+            </div>
           </div>
           <p id="gate-summary" class="gate-summary">선택된 WatchSet 종목이 없습니다.</p>
-          <dl id="gate-metrics" class="metric-list"></dl>
-          <div>
-            <h3>막힌 이유 / 누락 데이터</h3>
-            <div id="gate-reasons" class="reason-list"></div>
-          </div>
+          <div id="gate-detail-sections" class="gate-detail-sections"></div>
         </aside>
       </section>
 
@@ -63,20 +101,60 @@
         <section class="panel watch-panel">
           <div class="panel-head">
             <h2>WatchSet</h2>
-            <div id="watch-filters" class="filter-row">
-              <button class="active" data-status="ALL" type="button">전체</button>
-              <button data-status="READY" type="button">READY</button>
-              <button data-status="READY_SMALL" type="button">READY_SMALL</button>
-              <button data-status="WAIT" type="button">WAIT</button>
-              <button data-status="BLOCKED" type="button">BLOCKED</button>
-              <button data-status="OBSERVE" type="button">OBSERVE</button>
+            <span id="watch-count" class="counter">0</span>
+          </div>
+          <div id="watch-filters" class="filter-stack" aria-label="WatchSet 필터">
+            <div class="filter-row" data-filter-group="status">
+              <span>상태</span>
+              <button class="active" data-filter-kind="status" data-filter-value="ALL" type="button">전체</button>
+              <button data-filter-kind="status" data-filter-value="READY" type="button">READY</button>
+              <button data-filter-kind="status" data-filter-value="READY_SMALL" type="button">READY_SMALL</button>
+              <button data-filter-kind="status" data-filter-value="WAIT" type="button">WAIT</button>
+              <button data-filter-kind="status" data-filter-value="OBSERVE" type="button">OBSERVE</button>
+              <button data-filter-kind="status" data-filter-value="BLOCKED" type="button">BLOCKED</button>
+              <button data-filter-kind="status" data-filter-value="LATE_CHASE_TEMP_WAIT" type="button">추격대기</button>
+              <button data-filter-kind="status" data-filter-value="MARKET_PENDING" type="button">시장대기</button>
+              <button data-filter-kind="status" data-filter-value="DATA_NOT_READY" type="button">데이터대기</button>
+              <button data-filter-kind="status" data-filter-value="LIVE_GUARD_BLOCKED" type="button">LIVE차단</button>
+            </div>
+            <div class="filter-row" data-filter-group="role">
+              <span>역할</span>
+              <button class="active" data-filter-kind="role" data-filter-value="ALL" type="button">전체</button>
+              <button data-filter-kind="role" data-filter-value="LEADER" type="button">LEADER</button>
+              <button data-filter-kind="role" data-filter-value="CO_LEADER" type="button">CO_LEADER</button>
+              <button data-filter-kind="role" data-filter-value="FOLLOWER" type="button">FOLLOWER</button>
+              <button data-filter-kind="role" data-filter-value="LATE_LAGGARD" type="button">LATE_LAGGARD</button>
+            </div>
+            <div class="filter-row" data-filter-group="market">
+              <span>시장</span>
+              <button class="active" data-filter-kind="market" data-filter-value="ALL" type="button">전체</button>
+              <button data-filter-kind="market" data-filter-value="KOSPI" type="button">KOSPI</button>
+              <button data-filter-kind="market" data-filter-value="KOSDAQ" type="button">KOSDAQ</button>
+              <button data-filter-kind="market" data-filter-value="UNKNOWN" type="button">UNKNOWN</button>
+            </div>
+            <div class="filter-row" data-filter-group="data">
+              <span>데이터</span>
+              <button class="active" data-filter-kind="data" data-filter-value="ALL" type="button">전체</button>
+              <button data-filter-kind="data" data-filter-value="READY_DATA" type="button">준비됨</button>
+              <button data-filter-kind="data" data-filter-value="MISSING_SUPPORT" type="button">지지선부족</button>
+              <button data-filter-kind="data" data-filter-value="MISSING_VWAP" type="button">VWAP부족</button>
+              <button data-filter-kind="data" data-filter-value="STALE_TICK" type="button">틱지연</button>
+              <button data-filter-kind="data" data-filter-value="DIAGNOSTIC_ONLY" type="button">진단전용</button>
+            </div>
+            <div class="filter-row" data-filter-group="order">
+              <span>주문 연결</span>
+              <button class="active" data-filter-kind="order" data-filter-value="ALL" type="button">전체</button>
+              <button data-filter-kind="order" data-filter-value="ORDER_INTENT_CREATED" type="button">의도생성</button>
+              <button data-filter-kind="order" data-filter-value="VIRTUAL_ORDER_CREATED" type="button">가상주문</button>
+              <button data-filter-kind="order" data-filter-value="LIVE_GUARD_PASSED" type="button">LIVE통과</button>
+              <button data-filter-kind="order" data-filter-value="LIVE_GUARD_REJECTED" type="button">LIVE거부</button>
             </div>
           </div>
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>상태</th><th>종목</th><th>테마</th><th>역할</th><th>등락</th><th>대금</th><th>가격 위치</th><th>리스크</th><th>비중</th><th>사유</th>
+                  <th>상태</th><th>종목</th><th>테마</th><th>역할</th><th>시장</th><th>등락</th><th>대금</th><th>테마/조건</th><th>가격 위치</th><th>지지/VWAP</th><th>추격 리스크</th><th>시장 확인</th><th>주문 연결</th><th>사유</th>
                 </tr>
               </thead>
               <tbody id="watchset-body"></tbody>

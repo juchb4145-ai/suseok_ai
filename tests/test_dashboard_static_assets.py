@@ -33,11 +33,15 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
     assert soup.select_one("#detail-json") is not None
     assert soup.select_one("#ops-alert-lines") is not None
     assert soup.select_one("#ops-alert-severity") is not None
+    assert soup.select_one("#themelab-operation-status") is not None
+    assert soup.select_one("#themelab-ready") is not None
+    assert soup.select_one('a[href="/themelab"]') is not None
     assert "DRY_RUN 기준 제안" in html
     assert "게이트/리스크 A/B 후보" in html
     assert "Gateway/Transport" in html
     assert "Runtime/DRY_RUN" in html
     assert "LIVE 자동주문" in html
+    assert "ThemeLab 운용 요약" in html
 
 
 def test_dashboard_html_keeps_safety_boundary_buttons_read_only():
@@ -66,7 +70,9 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "TOKEN_STORAGE_KEY" in js
     assert "invalid local gateway token" in js
     assert "function renderOpsAlerts" in js
+    assert "function renderThemeLabSummary" in js
     assert "ops_alerts" in js
+    assert "theme_lab" in js
     assert "thresholdAB" in js
     assert "gradeLabelsKo" in js
     assert "/api/runtime/threshold-ab/dry-run" in js

@@ -504,6 +504,20 @@ class WatchSetSnapshot:
     pullback_reclaim: bool | None = None
     breakout_continuation: bool | None = None
     price_location_data_quality_flags: tuple[str, ...] = ()
+    current_price: float | None = None
+    vwap: float | None = None
+    recent_support_price: float | None = None
+    upper_limit_price: float | None = None
+    breakout_level: float | None = None
+    recent_candles_1m: tuple[Any, ...] = ()
+    recent_candles_3m: tuple[Any, ...] = ()
+    completed_minute_bar_count: int = 0
+    recent_3m_bar_count: int = 0
+    minute_bar_present: bool = False
+    recent_support_source: str = ""
+    recent_support_ready: bool = False
+    recent_support_candle_count: int = 0
+    prev_close_inferred_from_change_rate: bool = False
 
 
 @dataclass(frozen=True)
@@ -2196,6 +2210,8 @@ class PriceLocationEvaluator:
         close = _float_or_none(latest.get("close"))
         low = _float_or_none(latest.get("low"))
         if high is None or close is None or low is None or high <= low:
+            if high is not None and close is not None and low is not None and high == low and close == high:
+                return False
             _add_flag(flags, "INVALID_RECENT_CANDLE")
             return None
         ratio = (high - close) / (high - low)
@@ -2359,7 +2375,7 @@ class ThemeLabHybridGate:
         snapshot: StockSnapshot | None = None,
         data_quality_flags: Iterable[str] = (),
     ) -> LabGateDecision:
-        flags = set(data_quality_flags) | set(theme.data_quality_flags) | set(price_location.data_quality_flags)
+        flags = _dedupe_tuple(tuple(data_quality_flags) + tuple(price_location.data_quality_flags))
         role = watch.stock_role
         risk = self.risk_filter.evaluate(_risk_input(market, theme, watch, snapshot, flags))
         risk = _risk_adjusted_for_price_location(risk, role, price_location, self.position_config)
@@ -2676,17 +2692,22 @@ class ThemeLabFlowEngine:
                 **{
                     **enriched.__dict__,
                     **_market_side_context(market, enriched),
+                    **_watch_price_context(snapshot),
                 }
             )
-            price_location = self.price_location_evaluator.evaluate(_price_location_input(market, theme, enriched, snapshot))
+            watch_data_quality_flags = _watch_member_data_quality_flags(theme, enriched)
+            price_location = self.price_location_evaluator.evaluate(
+                _price_location_input(market, theme, enriched, snapshot, watch_data_quality_flags)
+            )
             decision = self.gate.evaluate(
                 market=market,
                 theme=theme,
                 watch=enriched,
                 price_location=price_location,
                 snapshot=snapshot,
+                data_quality_flags=watch_data_quality_flags,
             )
-            risk_input = _risk_input(market, theme, enriched, snapshot, theme.data_quality_flags)
+            risk_input = _risk_input(market, theme, enriched, snapshot, watch_data_quality_flags)
             enriched = WatchSetSnapshot(
                 **{
                     **enriched.__dict__,
@@ -3207,11 +3228,20 @@ def _risk_input(
     )
 
 
+def _watch_member_data_quality_flags(theme: ThemeConditionSnapshot, watch: WatchSetSnapshot) -> tuple[str, ...]:
+    symbol = normalize_stock_code(watch.symbol)
+    for hit in theme.member_hits:
+        if normalize_stock_code(hit.symbol) == symbol:
+            return tuple(hit.data_quality_flags)
+    return ()
+
+
 def _price_location_input(
     market: MarketStrengthSnapshot,
     theme: ThemeConditionSnapshot,
     watch: WatchSetSnapshot,
     snapshot: StockSnapshot | None,
+    data_quality_flags: Iterable[str] = (),
 ) -> PriceLocationInput:
     metadata = dict(snapshot.metadata if snapshot else {})
     return PriceLocationInput(
@@ -3236,8 +3266,30 @@ def _price_location_input(
         stock_role=watch.stock_role,
         theme_status=theme.theme_status,
         market_status=market.market_status,
-        data_quality_flags=theme.data_quality_flags,
+        data_quality_flags=tuple(data_quality_flags),
     )
+
+
+def _watch_price_context(snapshot: StockSnapshot | None) -> dict[str, Any]:
+    if snapshot is None:
+        return {}
+    metadata = dict(snapshot.metadata or {})
+    return {
+        "current_price": _positive_float_or_none(snapshot.current_price),
+        "vwap": _metadata_float_or_none(metadata, "vwap"),
+        "recent_support_price": _metadata_float_or_none(metadata, "recent_support_price"),
+        "upper_limit_price": _metadata_float_or_none(metadata, "upper_limit_price"),
+        "breakout_level": _metadata_float_or_none(metadata, "breakout_level"),
+        "recent_candles_1m": tuple(metadata.get("recent_candles_1m") or ()),
+        "recent_candles_3m": tuple(metadata.get("recent_candles_3m") or ()),
+        "completed_minute_bar_count": _metadata_int(metadata, "completed_minute_bar_count"),
+        "recent_3m_bar_count": _metadata_int(metadata, "recent_3m_bar_count"),
+        "minute_bar_present": _metadata_bool(metadata, "minute_bar_present"),
+        "recent_support_source": str(metadata.get("recent_support_source") or ""),
+        "recent_support_ready": _metadata_bool(metadata, "recent_support_ready"),
+        "recent_support_candle_count": _metadata_int(metadata, "recent_support_candle_count"),
+        "prev_close_inferred_from_change_rate": _metadata_bool(metadata, "prev_close_inferred_from_change_rate"),
+    }
 
 
 def _has_hard_data_quality(flags: Iterable[str]) -> bool:

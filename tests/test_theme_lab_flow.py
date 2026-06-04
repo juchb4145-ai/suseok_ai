@@ -6,6 +6,7 @@ from trading.theme_engine.lab import (
     LiquidityFilterConfig,
     MarketStatus,
     MarketSide,
+    MarketSideGateConfig,
     MarketSideBreadthConfig,
     MarketSideGateConfirmationConfig,
     MarketStrengthSnapshot,
@@ -768,6 +769,54 @@ def test_missing_prev_close_without_change_rate_records_quality_and_blocks_ready
     assert "DATA_QUALITY_BLOCK" in decision.reason_codes
 
 
+def test_pipeline_does_not_hard_block_watch_member_for_theme_wide_missing_price_flags():
+    config = ThemeLabConfig(
+        watchset_limits=WatchSetLimits(max_watchset_size=5, max_watch_per_theme=5, top_theme_count=1),
+        theme_status=ThemeStatusThresholds(
+            min_eligible_members=1,
+            min_strong_count_for_leading=1,
+            min_leader_count_for_leading=1,
+        ),
+        market_side_gate=MarketSideGateConfig(enabled=False),
+        market_side_gate_confirmation=MarketSideGateConfirmationConfig(enabled=False),
+    )
+    leader = _snapshot(
+        "000001",
+        6.0,
+        turnover=5_000_000_000,
+        current_price=106,
+        session_high=108,
+        metadata={
+            "market": "KOSDAQ",
+            "prev_close": 100,
+            "vwap": 104,
+            "upper_limit_price": 130,
+            "breakout_level": 105,
+            "recent_support_price": 103,
+            "recent_candles_1m": [{"high": 108, "low": 105, "close": 106}],
+        },
+    )
+    leader.momentum_1m = 0.5
+    leader.momentum_3m = 0.3
+    leader.execution_strength = 120
+
+    result = ThemeLabFlowEngine(config).run_pipeline(
+        theme_inputs=[("t", "T", [_member("t", "000001"), _member("t", "000002")])],
+        snapshots=[leader],
+        kospi_return_pct=0.2,
+        kosdaq_return_pct=0.4,
+    )
+
+    watch = result.watchset[0]
+
+    assert "MISSING_CURRENT_PRICE" in result.themes[0].data_quality_flags
+    assert watch.symbol == "000001"
+    assert watch.gate_status == LabGateStatus.READY
+    assert watch.risk_level != TradeabilityRiskLevel.HARD_BLOCK
+    assert "DATA_QUALITY_BLOCK" not in watch.risk_reason_codes
+    assert "MISSING_CURRENT_PRICE" not in watch.price_location_data_quality_flags
+
+
 def test_theme_breadth_uses_tick_change_rate_when_prev_close_missing():
     theme = ThemeBreadthEngine().calculate(
         [("t", "테마", [_member("t", "000001")])],
@@ -1065,6 +1114,31 @@ def test_price_location_failed_breakout_with_negative_momentum_waits_or_blocks()
 
     assert price.status == PriceLocationStatus.FAILED_BREAKOUT
     assert decision.status in {LabGateStatus.WAIT, LabGateStatus.BLOCKED}
+
+
+def test_price_location_flat_recent_candle_is_neutral_not_invalid():
+    price = PriceLocationEvaluator().evaluate(
+        PriceLocationInput(
+            symbol="000001",
+            current_price=100,
+            return_pct=3,
+            turnover_krw=1_000_000_000,
+            session_high=102,
+            vwap=99,
+            upper_limit_price=130,
+            breakout_level=101,
+            recent_support_price=99,
+            recent_candles_1m=({"high": 100, "low": 100, "close": 100},),
+            momentum_1m=0.2,
+            momentum_3m=0.1,
+            stock_role=StockRole.LEADER,
+            theme_status=ThemeLabThemeStatus.LEADING_THEME,
+            market_status=MarketStatus.SELECTIVE,
+        )
+    )
+
+    assert price.upper_wick_risk is False
+    assert "INVALID_RECENT_CANDLE" not in price.data_quality_flags
 
 
 def test_price_location_deep_pullback_below_vwap_with_weak_momentum_is_not_ready():

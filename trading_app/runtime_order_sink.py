@@ -505,6 +505,8 @@ class LiveSimRuntimeOrderSink(DryRunRuntimeOrderSink):
                 request,
                 execution_config=self._execution_config(),
                 exit_guard_config=self._exit_guard_config(),
+                lifecycle_config=self._lifecycle_config(),
+                reconcile_config=self._reconcile_config(),
             )
         except Exception as exc:
             message = f"RUNTIME_LIVE_SIM_ORDER_SINK_FAILED:{dry_payload.get('request', {}).get('code', '')}:{exc}"
@@ -524,6 +526,16 @@ class LiveSimRuntimeOrderSink(DryRunRuntimeOrderSink):
         if self.runtime_settings is None:
             return {"enabled": False}
         return dict(self.runtime_settings.value("live_sim_exit_guard", {}) or {})
+
+    def _lifecycle_config(self) -> dict[str, Any]:
+        if self.runtime_settings is None:
+            return {"enabled": False}
+        return dict(self.runtime_settings.value("live_sim_order_lifecycle", {}) or {})
+
+    def _reconcile_config(self) -> dict[str, Any]:
+        if self.runtime_settings is None:
+            return {"enabled": False}
+        return dict(self.runtime_settings.value("live_sim_reconcile", {}) or {})
 
     def _record_live_sim_result(self, result, *, phase: str) -> None:
         self.live_sim_total_count += 1

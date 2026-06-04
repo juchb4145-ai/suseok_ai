@@ -16,6 +16,7 @@ SOURCE_PRIORITIES = {
     "holding": 80,
     "candidate_watch": 50,
     "theme_lab_watchset": 55,
+    "theme_lab_bootstrap": 54,
     "theme_universe": 45,
 }
 PROTECTED_SOURCES = {
@@ -35,6 +36,7 @@ FALLBACK_SOURCE_ORDER = {
     "virtual_order": 4,
     "candidate_watch": 5,
     "theme_lab_watchset": 5,
+    "theme_lab_bootstrap": 5,
 }
 
 
@@ -145,6 +147,15 @@ class RealTimeSubscriptionManager:
             record.active = record.code in self.code_to_screen
             record.screen_no = self.code_to_screen.get(record.code, "")
         return set(self.code_to_screen)
+
+    def mark_all_stale(self, reason: str = "") -> None:
+        self.code_to_screen.clear()
+        self.screen_to_codes.clear()
+        for record in self.records.values():
+            record.active = False
+            record.screen_no = ""
+        suffix = f":{reason}" if reason else ""
+        self.warnings.append(f"REALTIME_SUBSCRIPTIONS_MARKED_STALE{suffix}")
 
     def remove_realtime(self, codes: Iterable[str]) -> None:
         self.warnings = []
