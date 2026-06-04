@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
@@ -16,11 +16,21 @@ TR_OPT10081 = "opt10081"
 OPT10001_FIELDS = ["종목명", "현재가", "등락율", "거래량", "거래대금", "시가", "고가", "저가", "기준가"]
 OPT10081_FIELDS = ["일자", "현재가", "시가", "고가", "저가", "거래량"]
 ACTIVE_STATUSES = {CommandStatus.QUEUED.value, CommandStatus.DISPATCHED.value}
+PAUSE_DISABLED = "DISABLED"
+PAUSE_NOT_OBSERVE_MODE = "NOT_OBSERVE_MODE"
+PAUSE_READY_EXISTS = "READY_EXISTS"
+PAUSE_ORDER_PENDING = "ORDER_PENDING"
+PAUSE_NON_BACKFILL_PENDING = "NON_BACKFILL_PENDING"
+PAUSE_GATEWAY_UNHEALTHY = "GATEWAY_UNHEALTHY"
+PAUSE_PENDING_LIMIT = "PENDING_LIMIT"
+PAUSE_OPT10081_DISABLED = "OPT10081_DISABLED"
 
 
 @dataclass(frozen=True)
 class ThemeBackfillConfig:
     enabled: bool = False
+    trading_mode: str = "OBSERVE"
+    observe_only: bool = True
     max_per_cycle: int = 3
     max_pending: int = 5
     ttl_sec: int = 90
@@ -30,9 +40,11 @@ class ThemeBackfillConfig:
     allow_regular_session: bool = True
 
     @classmethod
-    def from_env(cls) -> "ThemeBackfillConfig":
+    def from_env(cls, *, trading_mode: str | None = None) -> "ThemeBackfillConfig":
         return cls(
             enabled=_bool_env("TRADING_THEME_BACKFILL_ENABLED", False),
+            trading_mode=str(trading_mode or os.environ.get("TRADING_MODE", "OBSERVE") or "OBSERVE").strip().upper() or "OBSERVE",
+            observe_only=_bool_env("TRADING_THEME_BACKFILL_OBSERVE_ONLY", True),
             max_per_cycle=_int_env("TRADING_THEME_BACKFILL_MAX_PER_CYCLE", 3),
             max_pending=_int_env("TRADING_THEME_BACKFILL_MAX_PENDING", 5),
             ttl_sec=_int_env("TRADING_THEME_BACKFILL_TTL_SEC", 90),
@@ -68,9 +80,18 @@ class ThemeBackfillService:
     def plan_and_enqueue(self, result: Any, now: datetime) -> dict[str, Any]:
         cfg = self.config
         summary = _empty_summary(cfg)
-        summary["candidate_count"] = len(build_backfill_candidates(result, cfg=cfg, now=now))
+        summary.update(_result_quality_metrics(result, prefix="before"))
+        candidates = build_backfill_candidates(result, cfg=cfg, now=now)
+        summary["candidate_count"] = len(candidates)
+        summary["theme_backfill_candidate_count"] = len(candidates)
+        if not cfg.allow_opt10081:
+            summary["opt10081_disabled_count"] = _missing_prev_close_hit_count(result)
         if not cfg.enabled:
-            summary["paused_reason"] = "DISABLED"
+            summary["paused_reason"] = PAUSE_DISABLED
+            self.last_summary = summary
+            return summary
+        if cfg.observe_only and str(cfg.trading_mode or "").upper() != "OBSERVE":
+            summary["paused_reason"] = PAUSE_NOT_OBSERVE_MODE
             self.last_summary = summary
             return summary
         pause_reason = enqueue_pause_reason(self.gateway_state, result)
@@ -80,14 +101,15 @@ class ThemeBackfillService:
             self.last_summary = summary
             return summary
         pending = active_theme_backfill_records(self.gateway_state)
+        summary["gateway_command_queue_depth"] = len(_active_records(self.gateway_state))
         summary["queued_count"] = len([item for item in pending if item.get("status") == CommandStatus.QUEUED.value])
         summary["dispatched_count"] = len([item for item in pending if item.get("status") == CommandStatus.DISPATCHED.value])
         if len(pending) >= cfg.max_pending:
-            summary["paused_reason"] = "MAX_PENDING"
+            summary["paused_reason"] = PAUSE_PENDING_LIMIT
             self.last_summary = summary
             return summary
         enqueued = 0
-        for candidate in build_backfill_candidates(result, cfg=cfg, now=now):
+        for candidate in candidates:
             if enqueued >= cfg.max_per_cycle or len(pending) + enqueued >= cfg.max_pending:
                 break
             command = command_for_candidate(candidate, cfg=cfg, now=now)
@@ -105,6 +127,7 @@ class ThemeBackfillService:
             if enqueue.accepted:
                 enqueued += 1
                 summary["enqueued_count"] += 1
+                summary["theme_backfill_enqueued_count"] += 1
             elif enqueue.reason == "DUPLICATE_COMMAND":
                 summary["duplicated_bucket_count"] += 1
         summary["queued_count"] += enqueued
@@ -195,19 +218,24 @@ def command_for_candidate(candidate: BackfillCandidate, *, cfg: ThemeBackfillCon
 
 def enqueue_pause_reason(gateway_state: GatewayStateStore, result: Any) -> str:
     if _has_ready_like(result):
-        return CommandStatus.SKIPPED_READY.value
+        return PAUSE_READY_EXISTS
     active = _active_records(gateway_state)
     if any(_command_type(record) in ORDER_COMMAND_TYPES for record in active):
-        return CommandStatus.SKIPPED_ORDER_PENDING.value
+        return PAUSE_ORDER_PENDING
     if any(not is_theme_backfill_record(record) for record in active):
-        return CommandStatus.SKIPPED_NON_BACKFILL_PENDING.value
+        return PAUSE_NON_BACKFILL_PENDING
     snapshot = gateway_state.snapshot().to_dict()
     if not snapshot.get("connected") or not snapshot.get("heartbeat_ok") or not snapshot.get("kiwoom_logged_in"):
-        return CommandStatus.SKIPPED_GATEWAY_UNHEALTHY.value
+        return PAUSE_GATEWAY_UNHEALTHY
     return ""
 
 
-def apply_dispatch_guard(gateway_state: GatewayStateStore, raw_theme_lab: dict[str, Any] | None = None) -> dict[str, Any]:
+def apply_dispatch_guard(
+    gateway_state: GatewayStateStore,
+    raw_theme_lab: dict[str, Any] | None = None,
+    *,
+    config: ThemeBackfillConfig | None = None,
+) -> dict[str, Any]:
     skipped: dict[str, int] = {}
     active = _active_records(gateway_state)
     backfill = [record for record in active if is_theme_backfill_record(record)]
@@ -228,7 +256,7 @@ def apply_dispatch_guard(gateway_state: GatewayStateStore, raw_theme_lab: dict[s
     backfill = [record for record in active if is_theme_backfill_record(record)]
     if not backfill:
         return {"skipped": skipped}
-    reason = dispatch_pause_reason(gateway_state, raw_theme_lab or {}, active)
+    reason = dispatch_pause_reason(gateway_state, raw_theme_lab or {}, active, config=config)
     if not reason:
         return {"skipped": skipped}
     for record in backfill:
@@ -247,7 +275,16 @@ def apply_dispatch_guard(gateway_state: GatewayStateStore, raw_theme_lab: dict[s
     return {"skipped": skipped}
 
 
-def dispatch_pause_reason(gateway_state: GatewayStateStore, raw_theme_lab: dict[str, Any], active_records: list[dict[str, Any]] | None = None) -> str:
+def dispatch_pause_reason(
+    gateway_state: GatewayStateStore,
+    raw_theme_lab: dict[str, Any],
+    active_records: list[dict[str, Any]] | None = None,
+    *,
+    config: ThemeBackfillConfig | None = None,
+) -> str:
+    cfg = config or ThemeBackfillConfig.from_env()
+    if cfg.observe_only and str(cfg.trading_mode or "").upper() != "OBSERVE":
+        return CommandStatus.SKIPPED_NOT_OBSERVE_MODE.value
     if _raw_has_ready_like(raw_theme_lab):
         return CommandStatus.SKIPPED_READY.value
     active = active_records if active_records is not None else _active_records(gateway_state)
@@ -274,49 +311,68 @@ def is_theme_backfill_command(command: GatewayCommand) -> bool:
     return str((command.payload or {}).get("purpose") or "") == THEME_BACKFILL_PURPOSE
 
 
-def parse_theme_backfill(tr_code: str, rows: list[dict[str, str]], *, code: str, trade_date: str = "") -> dict[str, Any]:
+def parse_theme_backfill(
+    tr_code: str,
+    rows: list[dict[str, str]],
+    *,
+    code: str,
+    trade_date: str = "",
+    master_prev_close: Any = None,
+) -> dict[str, Any]:
     if str(tr_code).lower() == TR_OPT10081:
         return parse_opt10081_backfill(rows, code=code, trade_date=trade_date)
-    return parse_opt10001_backfill(rows, code=code)
+    return parse_opt10001_backfill(rows, code=code, master_prev_close=master_prev_close)
 
 
-def parse_opt10001_backfill(rows: list[dict[str, str]], *, code: str) -> dict[str, Any]:
+
+def parse_opt10001_backfill(rows: list[dict[str, str]], *, code: str, master_prev_close: Any = None) -> dict[str, Any]:
     row = dict(rows[0] if rows else {})
     if not row:
-        return {}
-    base_price = _parse_price(row.get("기준가"))
-    return {
+        return {
+            "code": _normalize_code(code),
+            "parser_status": "EMPTY",
+            "parser_missing_fields": ["row"],
+            "parsed_fields_count": 0,
+        }
+    base_price = _parse_price(_field_value(row, ("\uae30\uc900\uac00", "湲곗?媛")))
+    master_price = _parse_price(master_prev_close)
+    prev_close = base_price or master_price
+    prev_source = TR_OPT10001 if base_price > 0 else ("GetMasterLastPrice" if master_price > 0 else "")
+    parsed = {
         "code": _normalize_code(code),
-        "stock_name": str(row.get("종목명") or "").strip(),
-        "current_price": _parse_price(row.get("현재가")),
-        "change_rate": _parse_float(row.get("등락율")),
-        "volume": int(_parse_price(row.get("거래량")) or 0),
-        "turnover": _parse_price(row.get("거래대금")),
-        "open_price": _parse_price(row.get("시가")),
-        "session_high": _parse_price(row.get("고가")),
-        "session_low": _parse_price(row.get("저가")),
-        "prev_close": base_price,
-        "previous_close": base_price,
-        "prev_close_source": TR_OPT10001 if base_price > 0 else "",
+        "stock_name": str(_field_value(row, ("\uc885\ubaa9\uba85", "醫낅ぉ紐?")) or "").strip(),
+        "current_price": _parse_price(_field_value(row, ("\ud604\uc7ac\uac00", "?꾩옱媛"))),
+        "change_rate": _parse_float(_field_value(row, ("\ub4f1\ub77d\uc728", "\ub4f1\ub77d\ub960", "?깅씫??", "?깅씫瑜?"))),
+        "volume": int(_parse_price(_field_value(row, ("\uac70\ub798\ub7c9", "嫄곕옒??"))) or 0),
+        "turnover": _parse_price(_field_value(row, ("\uac70\ub798\ub300\uae08", "嫄곕옒?湲?"))),
+        "open_price": _parse_price(_field_value(row, ("\uc2dc\uac00", "?쒓?"))),
+        "session_high": _parse_price(_field_value(row, ("\uace0\uac00", "怨좉?"))),
+        "session_low": _parse_price(_field_value(row, ("\uc800\uac00", "?媛"))),
+        "prev_close": prev_close,
+        "previous_close": prev_close,
+        "prev_close_source": prev_source,
+        "master_prev_close_used": bool(master_price > 0 and base_price <= 0),
     }
+    return _with_parser_status(parsed, ("current_price", "prev_close", "stock_name"))
 
 
 def parse_opt10081_backfill(rows: list[dict[str, str]], *, code: str, trade_date: str) -> dict[str, Any]:
     clean_trade_date = str(trade_date or "").replace("-", "")
     prev_close = 0.0
     for row in rows:
-        row_date = str(row.get("일자") or "").strip()
+        row_date = str(_field_value(row, ("\uc77c\uc790", "?쇱옄")) or "").strip()
         if clean_trade_date and row_date >= clean_trade_date:
             continue
-        prev_close = _parse_price(row.get("현재가"))
+        prev_close = _parse_price(_field_value(row, ("\ud604\uc7ac\uac00", "?꾩옱媛")))
         if prev_close > 0:
             break
-    return {
+    parsed = {
         "code": _normalize_code(code),
         "prev_close": prev_close,
         "previous_close": prev_close,
         "prev_close_source": TR_OPT10081 if prev_close > 0 else "",
     }
+    return _with_parser_status(parsed, ("prev_close",))
 
 
 def bucket_for(tr_code: str, now: datetime, cfg: ThemeBackfillConfig) -> int:
@@ -421,11 +477,49 @@ def _is_expired_record(record: dict[str, Any]) -> bool:
     return _as_utc(datetime.now(timezone.utc)) >= _as_utc(expires_at)
 
 
+def _result_quality_metrics(result: Any, *, prefix: str) -> dict[str, Any]:
+    total = 0
+    missing_price = 0
+    missing_prev = 0
+    for theme in getattr(result, "themes", ()) or ():
+        for hit in getattr(theme, "member_hits", ()) or ():
+            if bool(getattr(hit, "excluded", False)):
+                continue
+            total += 1
+            flags = set(getattr(hit, "data_quality_flags", ()) or ())
+            if "MISSING_CURRENT_PRICE" in flags:
+                missing_price += 1
+            if "MISSING_PREV_CLOSE" in flags:
+                missing_prev += 1
+    coverage = None if total <= 0 else round((total - missing_price) / total, 4)
+    return {
+        f"missing_price_count_{prefix}": missing_price,
+        f"missing_prev_close_count_{prefix}": missing_prev,
+        f"theme_coverage_{prefix}": coverage,
+    }
+
+
+def _missing_prev_close_hit_count(result: Any) -> int:
+    count = 0
+    for theme in getattr(result, "themes", ()) or ():
+        for hit in getattr(theme, "member_hits", ()) or ():
+            if bool(getattr(hit, "excluded", False)):
+                continue
+            if "MISSING_PREV_CLOSE" in set(getattr(hit, "data_quality_flags", ()) or ()):
+                count += 1
+    return count
+
+
 def _empty_summary(cfg: ThemeBackfillConfig) -> dict[str, Any]:
     return {
         "enabled": cfg.enabled,
+        "observe_only": cfg.observe_only,
+        "trading_mode": cfg.trading_mode,
+        "observe_pilot_active": bool(cfg.enabled and (not cfg.observe_only or str(cfg.trading_mode or "").upper() == "OBSERVE")),
+        "history_window": "recent_500_commands",
         "paused_reason": "",
         "candidate_count": 0,
+        "theme_backfill_candidate_count": 0,
         "queued_count": 0,
         "dispatched_count": 0,
         "success_count": 0,
@@ -433,7 +527,25 @@ def _empty_summary(cfg: ThemeBackfillConfig) -> dict[str, Any]:
         "skipped_count": 0,
         "expired_count": 0,
         "enqueued_count": 0,
+        "theme_backfill_enqueued_count": 0,
+        "theme_backfill_dispatched_count": 0,
+        "theme_backfill_success_count": 0,
+        "theme_backfill_failure_count": 0,
+        "theme_backfill_skip_count": 0,
         "duplicated_bucket_count": 0,
+        "opt10081_disabled_count": 0,
+        "parser_miss_count": 0,
+        "parser_miss_ratio": None,
+        "missing_price_count_before": 0,
+        "missing_price_count_after": 0,
+        "missing_prev_close_count_before": 0,
+        "missing_prev_close_count_after": 0,
+        "theme_coverage_before": None,
+        "theme_coverage_after": None,
+        "tr_backfill_snapshot_count": 0,
+        "rt_tick_snapshot_count": 0,
+        "backfill_expired_before_dispatch_count": 0,
+        "gateway_command_queue_depth": 0,
         "last_success_at": "",
         "last_failure_at": "",
         "last_failure_reason": "",
@@ -445,11 +557,11 @@ def _empty_summary(cfg: ThemeBackfillConfig) -> dict[str, Any]:
 
 
 def _increment_pause(summary: dict[str, Any], reason: str) -> None:
-    if reason == CommandStatus.SKIPPED_READY.value:
+    if reason in {PAUSE_READY_EXISTS, CommandStatus.SKIPPED_READY.value}:
         summary["backfill_paused_by_ready_count"] += 1
-    elif reason == CommandStatus.SKIPPED_ORDER_PENDING.value:
+    elif reason in {PAUSE_ORDER_PENDING, CommandStatus.SKIPPED_ORDER_PENDING.value}:
         summary["backfill_paused_by_order_count"] += 1
-    elif reason == CommandStatus.SKIPPED_GATEWAY_UNHEALTHY.value:
+    elif reason in {PAUSE_GATEWAY_UNHEALTHY, CommandStatus.SKIPPED_GATEWAY_UNHEALTHY.value}:
         summary["backfill_paused_by_gateway_unhealthy_count"] += 1
 
 
@@ -468,18 +580,48 @@ def _normalize_code(value: Any) -> str:
     return text.zfill(6) if text.isdigit() and len(text) < 6 else text
 
 
+def _field_value(row: dict[str, Any], aliases: Iterable[str]) -> Any:
+    normalized = {_normalize_field_name(key): value for key, value in row.items()}
+    for alias in aliases:
+        key = _normalize_field_name(alias)
+        if key in normalized:
+            return normalized[key]
+    return None
+
+
+def _normalize_field_name(value: Any) -> str:
+    return "".join(str(value or "").split()).lower()
+
+
+def _with_parser_status(parsed: dict[str, Any], required_fields: Iterable[str]) -> dict[str, Any]:
+    missing = [
+        field
+        for field in required_fields
+        if parsed.get(field) in {None, "", 0, 0.0}
+    ]
+    parsed["parser_missing_fields"] = missing
+    parsed["parsed_fields_count"] = sum(
+        1
+        for key, value in parsed.items()
+        if key not in {"parser_missing_fields", "parsed_fields_count", "parser_status"} and value not in {None, "", 0, 0.0, False}
+    )
+    parsed["parser_status"] = "PARTIAL" if missing else "OK"
+    return parsed
+
+
 def _parse_price(value: Any) -> float:
-    text = str(value or "").strip().replace(",", "").replace("+", "")
+    text = "".join(str(value or "").split()).replace(",", "").replace("+", "")
     if not text:
         return 0.0
     try:
-        return abs(float(text))
+        number = abs(float(text))
+        return number if number > 0 else 0.0
     except (TypeError, ValueError):
         return 0.0
 
 
 def _parse_float(value: Any) -> float:
-    text = str(value or "").strip().replace(",", "").replace("+", "").replace("%", "")
+    text = "".join(str(value or "").split()).replace(",", "").replace("+", "").replace("%", "")
     if not text:
         return 0.0
     try:

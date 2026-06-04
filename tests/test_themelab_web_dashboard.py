@@ -525,7 +525,50 @@ def test_theme_lab_snapshot_adds_theme_backfill_command_status(tmp_path):
     assert row["theme_backfill_status"] == "대기"
     assert row["theme_backfill_raw_status"] == "QUEUED"
     assert payload["theme_backfill_runtime"]["queued_count"] == 1
+    assert payload["theme_backfill_runtime"]["history_window"] == "recent_500_commands"
+    assert payload["theme_backfill_runtime"]["parser_miss_ratio"] is None
     assert payload["theme_backfill_runtime"]["tr_backfill_caused_ready_count"] == 0
+
+
+def test_theme_lab_snapshot_counts_backfill_parser_miss_ratio(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    state = GatewayStateStore()
+    try:
+        db.save_theme_lab_flow_result(
+            "09:05:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [],
+                "gate_decisions": [],
+                "data_quality": {},
+                "theme_backfill_runtime": {"enabled": True},
+            },
+        )
+        for index, (command_id, parser_status) in enumerate((("cmd-ok", "OK"), ("cmd-partial", "PARTIAL")), start=1):
+            state.enqueue_command(
+                GatewayCommand(
+                    type="tr_request",
+                    command_id=command_id,
+                    idempotency_key=f"theme-backfill-test-{index}",
+                    payload={"purpose": THEME_BACKFILL_PURPOSE, "primary_theme_id": "power", "code": f"00000{index}"},
+                ),
+                priority=CommandPriority.LOW,
+            )
+            state.ack_command(
+                command_id,
+                status="ACKED",
+                result_payload={"purpose": THEME_BACKFILL_PURPOSE, "parser_status": parser_status},
+            )
+
+        payload = build_theme_lab_dashboard_snapshot(db, gateway_state=state)
+    finally:
+        db.close()
+
+    runtime = payload["theme_backfill_runtime"]
+    assert runtime["success_count"] == 2
+    assert runtime["parser_miss_count"] == 1
+    assert runtime["parser_miss_ratio"] == 0.5
 
 
 def test_theme_lab_snapshot_overlays_condition_event_breadth(tmp_path):

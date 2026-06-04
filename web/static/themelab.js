@@ -1,4 +1,4 @@
-const state = {
+﻿const state = {
   snapshot: null,
   filters: {
     status: "ALL",
@@ -104,6 +104,13 @@ function pct(value) {
   return `${number > 0 ? "+" : ""}${number.toFixed(2)}%`;
 }
 
+function ratio(value) {
+  if (value == null || value === "") return "-";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return `${(number * 100).toFixed(1)}%`;
+}
+
 function money(value) {
   const number = Number(value || 0);
   if (!Number.isFinite(number) || number <= 0) return "-";
@@ -151,6 +158,7 @@ function renderHeader(snapshot) {
   const market = snapshot.market || {};
   const summary = snapshot.summary || {};
   const dataQuality = snapshot.data_quality || {};
+  const backfill = snapshot.theme_backfill_runtime || {};
   const snapshotAge = summary.snapshot_age_label ? ` / age ${summary.snapshot_age_label}` : "";
   text("flow-updated", snapshot.available ? `계산 ${snapshot.calculated_at || "-"} / 갱신 ${snapshot.last_updated_at || "-"}${snapshotAge}` : "ThemeLabFlow 결과 대기 중");
   document.getElementById("market-strip").innerHTML = [
@@ -168,6 +176,7 @@ function renderCockpit(snapshot) {
   const summary = snapshot.summary || {};
   const market = snapshot.market || {};
   const dataQuality = snapshot.data_quality || {};
+  const backfill = snapshot.theme_backfill_runtime || {};
   setBadge("operation-status", summary.operation_status || "SNAPSHOT_UNAVAILABLE");
   text("operation-message", summary.operation_message_ko || "ThemeLabFlow 결과 대기 중");
   const snapshotState = summary.snapshot_stale ? "STALE" : "FRESH";
@@ -222,6 +231,7 @@ function renderCockpit(snapshot) {
   document.getElementById("cockpit-live-readiness").innerHTML = [
     `<div class="cockpit-line"><strong>Runtime</strong>${badge(summary.runtime_status || "UNKNOWN")}<span>${summary.runtime_running ? "running" : "inactive"} ${escapeHtml(summary.runtime_mode || "")}</span></div>`,
     `<div class="cockpit-line"><strong>Snapshot</strong>${badge(summary.snapshot_stale ? "SNAPSHOT_STALE" : "OK")}<span>${escapeHtml(summary.snapshot_age_label || "-")}</span></div>`,
+    `<div class="cockpit-line"><strong>TR_BACKFILL</strong>${boolBadge(backfill.enabled, "ON", "OFF")}<span>${escapeHtml(backfill.paused_reason || (backfill.observe_pilot_active ? "OBSERVE_PILOT" : "IDLE"))} · parser miss ${ratio(backfill.parser_miss_ratio)} · ${escapeHtml(backfill.history_window || "recent_500_commands")}</span></div>`,
     `<div class="cockpit-line"><strong>LIVE</strong>${boolBadge(summary.live_order_enabled, "활성", "비활성")}</div>`,
     countLine("Guard 통과", summary.live_guard_passed_count),
     countLine("Guard 차단", summary.live_guard_blocked_count),

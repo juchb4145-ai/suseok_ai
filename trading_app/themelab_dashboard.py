@@ -96,6 +96,12 @@ def _empty_snapshot(*, runtime_status: dict[str, Any] | None = None) -> dict[str
             "failure_count": 0,
             "skipped_count": 0,
             "expired_count": 0,
+            "observe_pilot_active": False,
+            "history_window": "recent_500_commands",
+            "parser_miss_count": 0,
+            "parser_miss_ratio": None,
+            "backfill_expired_before_dispatch_count": 0,
+            "gateway_command_queue_depth": 0,
             "tr_backfill_caused_ready_count": 0,
         },
         **_freshness_quality_fields(freshness),
@@ -746,33 +752,85 @@ def _theme_backfill_runtime(raw: dict[str, Any], gateway_state: Any | None) -> d
     base.setdefault("failure_count", 0)
     base.setdefault("skipped_count", 0)
     base.setdefault("expired_count", 0)
+    base.setdefault("observe_pilot_active", bool(base.get("enabled") and str(base.get("trading_mode") or "OBSERVE") == "OBSERVE"))
+    base.setdefault("history_window", "recent_500_commands")
+    base.setdefault("parser_miss_count", 0)
+    base.setdefault("parser_miss_ratio", None)
+    base.setdefault("backfill_expired_before_dispatch_count", 0)
+    base.setdefault("theme_backfill_dispatched_count", 0)
+    base.setdefault("theme_backfill_success_count", 0)
+    base.setdefault("theme_backfill_failure_count", 0)
+    base.setdefault("theme_backfill_skip_count", 0)
+    base.setdefault("gateway_command_queue_depth", 0)
+    base.setdefault("backfill_paused_by_ready_count", 0)
+    base.setdefault("backfill_paused_by_order_count", 0)
+    base.setdefault("backfill_paused_by_gateway_unhealthy_count", 0)
     base.setdefault("last_success_at", "")
     base.setdefault("last_failure_at", "")
     base.setdefault("last_failure_reason", "")
     base.setdefault("tr_backfill_caused_ready_count", 0)
     if gateway_state is None:
         return base
-    for key in ("queued_count", "dispatched_count", "success_count", "failure_count", "skipped_count", "expired_count"):
+    for key in (
+        "queued_count",
+        "dispatched_count",
+        "success_count",
+        "failure_count",
+        "skipped_count",
+        "expired_count",
+        "parser_miss_count",
+        "backfill_expired_before_dispatch_count",
+        "theme_backfill_dispatched_count",
+        "theme_backfill_success_count",
+        "theme_backfill_failure_count",
+        "theme_backfill_skip_count",
+        "backfill_paused_by_ready_count",
+        "backfill_paused_by_order_count",
+        "backfill_paused_by_gateway_unhealthy_count",
+    ):
         base[key] = 0
-    for record in _theme_backfill_records(gateway_state):
+    records = _theme_backfill_records(gateway_state)
+    base["history_window"] = "recent_500_commands"
+    base["gateway_command_queue_depth"] = len([record for record in records if str(record.get("status") or "") in {"QUEUED", "DISPATCHED"}])
+    parsed_records = 0
+    for record in records:
         status = str(record.get("status") or "")
         if status == "QUEUED":
             base["queued_count"] = int(base.get("queued_count") or 0) + 1
         elif status == "DISPATCHED":
             base["dispatched_count"] = int(base.get("dispatched_count") or 0) + 1
+            base["theme_backfill_dispatched_count"] = int(base.get("theme_backfill_dispatched_count") or 0) + 1
         elif status == "ACKED":
             base["success_count"] = int(base.get("success_count") or 0) + 1
+            base["theme_backfill_success_count"] = int(base.get("theme_backfill_success_count") or 0) + 1
             base["last_success_at"] = max(str(base.get("last_success_at") or ""), str(record.get("finished_at") or record.get("acked_at") or ""))
         elif status == "FAILED":
             base["failure_count"] = int(base.get("failure_count") or 0) + 1
+            base["theme_backfill_failure_count"] = int(base.get("theme_backfill_failure_count") or 0) + 1
             failed_at = str(record.get("finished_at") or "")
             if failed_at >= str(base.get("last_failure_at") or ""):
                 base["last_failure_at"] = failed_at
                 base["last_failure_reason"] = str(record.get("last_error") or "")
         elif status.startswith("SKIPPED"):
             base["skipped_count"] = int(base.get("skipped_count") or 0) + 1
+            base["theme_backfill_skip_count"] = int(base.get("theme_backfill_skip_count") or 0) + 1
+            if status == "SKIPPED_READY":
+                base["backfill_paused_by_ready_count"] = int(base.get("backfill_paused_by_ready_count") or 0) + 1
+            elif status == "SKIPPED_ORDER_PENDING":
+                base["backfill_paused_by_order_count"] = int(base.get("backfill_paused_by_order_count") or 0) + 1
+            elif status == "SKIPPED_GATEWAY_UNHEALTHY":
+                base["backfill_paused_by_gateway_unhealthy_count"] = int(base.get("backfill_paused_by_gateway_unhealthy_count") or 0) + 1
         elif status.startswith("EXPIRED"):
             base["expired_count"] = int(base.get("expired_count") or 0) + 1
+            if status == "EXPIRED_BEFORE_DISPATCH":
+                base["backfill_expired_before_dispatch_count"] = int(base.get("backfill_expired_before_dispatch_count") or 0) + 1
+        result_payload = _record_result_payload(record)
+        parser_status = str(result_payload.get("parser_status") or dict(result_payload.get("raw") or {}).get("parser_status") or "")
+        if parser_status:
+            parsed_records += 1
+            if parser_status != "OK":
+                base["parser_miss_count"] = int(base.get("parser_miss_count") or 0) + 1
+    base["parser_miss_ratio"] = None if parsed_records <= 0 else round(int(base.get("parser_miss_count") or 0) / parsed_records, 4)
     return base
 
 
@@ -788,6 +846,7 @@ def _theme_backfill_status_by_theme(gateway_state: Any | None) -> dict[str, dict
         "SKIPPED_ORDER_PENDING": 3,
         "SKIPPED_GATEWAY_UNHEALTHY": 3,
         "SKIPPED_NON_BACKFILL_PENDING": 3,
+        "SKIPPED_NOT_OBSERVE_MODE": 3,
         "EXPIRED_BEFORE_DISPATCH": 4,
         "EXPIRED": 4,
         "ACKED": 5,
@@ -823,6 +882,11 @@ def _record_payload(record: dict[str, Any]) -> dict[str, Any]:
     if isinstance(payload, dict):
         return payload
     payload = record.get("payload")
+    return dict(payload or {}) if isinstance(payload, dict) else {}
+
+
+def _record_result_payload(record: dict[str, Any]) -> dict[str, Any]:
+    payload = record.get("result_payload")
     return dict(payload or {}) if isinstance(payload, dict) else {}
 
 

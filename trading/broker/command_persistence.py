@@ -374,6 +374,7 @@ class SQLiteCommandStore:
                         CommandStatus.SKIPPED_ORDER_PENDING,
                         CommandStatus.SKIPPED_GATEWAY_UNHEALTHY,
                         CommandStatus.SKIPPED_NON_BACKFILL_PENDING,
+                        CommandStatus.SKIPPED_NOT_OBSERVE_MODE,
                     }
                 ),
                 "expired_before_dispatch_count": counts.get(CommandStatus.EXPIRED_BEFORE_DISPATCH.value, 0),

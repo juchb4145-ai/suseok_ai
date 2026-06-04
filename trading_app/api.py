@@ -43,7 +43,7 @@ from trading.broker.ws_messages import GatewayWsMessage
 from trading.strategy.candidates import CandidateCollector
 from trading.strategy.models import BlockType, CandidateState
 from trading.strategy.reason_taxonomy import normalize_reason_status, reason_status_family, reason_summary
-from trading.theme_engine.backfill import apply_dispatch_guard
+from trading.theme_engine.backfill import ThemeBackfillConfig, apply_dispatch_guard
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSourceSyncService
 from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThemeUniverseSource
@@ -1388,7 +1388,11 @@ async def gateway_commands(
 def _apply_theme_backfill_dispatch_guard() -> None:
     db = open_database()
     try:
-        apply_dispatch_guard(gateway_state, db.latest_theme_lab_flow_result())
+        apply_dispatch_guard(
+            gateway_state,
+            db.latest_theme_lab_flow_result(),
+            config=ThemeBackfillConfig.from_env(trading_mode=get_settings().mode),
+        )
     finally:
         close_database(db)
 

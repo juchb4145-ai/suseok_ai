@@ -52,14 +52,14 @@ def test_theme_backfill_planner_respects_ready_order_low_and_duplicate_bucket():
     state = _healthy_state()
     ready = _result([_theme("high", 1, [_hit("000001", ("MISSING_CURRENT_PRICE",))])], ready=True)
     service = ThemeBackfillService(state, config=ThemeBackfillConfig(enabled=True))
-    assert service.plan_and_enqueue(ready, NOW)["paused_reason"] == CommandStatus.SKIPPED_READY.value
+    assert service.plan_and_enqueue(ready, NOW)["paused_reason"] == "READY_EXISTS"
 
     state = _healthy_state()
     state.enqueue_command(GatewayCommand(type="send_order", command_id="cmd-order"), priority=CommandPriority.HIGH)
     service = ThemeBackfillService(state, config=ThemeBackfillConfig(enabled=True))
     assert service.plan_and_enqueue(_result([_theme("high", 1, [_hit("000001", ("MISSING_CURRENT_PRICE",))])]), NOW)[
         "paused_reason"
-    ] == CommandStatus.SKIPPED_ORDER_PENDING.value
+    ] == "ORDER_PENDING"
 
     state = _healthy_state()
     service = ThemeBackfillService(state, config=ThemeBackfillConfig(enabled=True))
@@ -69,6 +69,15 @@ def test_theme_backfill_planner_respects_ready_order_low_and_duplicate_bucket():
     high = _result([_theme("high", 1, [_hit("000001", ("MISSING_CURRENT_PRICE",))])])
     assert service.plan_and_enqueue(high, NOW)["enqueued_count"] == 1
     assert service.plan_and_enqueue(high, NOW)["duplicated_bucket_count"] == 1
+
+
+def test_theme_backfill_observe_pilot_blocks_non_observe_mode():
+    state = _healthy_state()
+    service = ThemeBackfillService(state, config=ThemeBackfillConfig(enabled=True, trading_mode="LIVE", observe_only=True))
+    summary = service.plan_and_enqueue(_result([_theme("high", 1, [_hit("000001", ("MISSING_CURRENT_PRICE",))])]), NOW)
+    assert summary["paused_reason"] == "NOT_OBSERVE_MODE"
+    assert summary["observe_pilot_active"] is False
+    assert state.list_commands(limit=10, include_finished=True) == []
 
 
 def test_theme_backfill_dispatch_guard_skips_queued_backfill_after_ready_or_non_backfill():
@@ -92,6 +101,17 @@ def test_theme_backfill_dispatch_guard_marks_expired_before_dispatch():
     assert state.get_command(command.command_id).status == CommandStatus.EXPIRED_BEFORE_DISPATCH
 
 
+def test_theme_backfill_dispatch_guard_skips_non_observe_mode():
+    state = _healthy_state()
+    _enqueue_backfill(state, "000001")
+    apply_dispatch_guard(
+        state,
+        {"watchset_snapshots": []},
+        config=ThemeBackfillConfig(enabled=True, trading_mode="LIVE", observe_only=True),
+    )
+    assert state.list_commands(include_finished=True)[0]["status"] == CommandStatus.SKIPPED_NOT_OBSERVE_MODE.value
+
+
 def test_theme_backfill_parsers_normalize_prices_and_prev_close():
     parsed = parse_opt10001_backfill(
         [{"종목명": "파두", "현재가": "-12,340", "등락율": "+5.70", "거래량": "1,000", "거래대금": "123,000", "기준가": "11,000"}],
@@ -107,6 +127,26 @@ def test_theme_backfill_parsers_normalize_prices_and_prev_close():
         trade_date="20260605",
     )
     assert daily["prev_close"] == 11500
+
+
+def test_theme_backfill_parser_aliases_master_prev_close_and_missing_fields():
+    parsed = parse_opt10001_backfill(
+        [{" 종목명 ": "테스트", " 현재가 ": " -12,340 ", "등락률": "+5.70%", "거래량": "1,000"}],
+        code="440110",
+        master_prev_close=" 11,000 ",
+    )
+    assert parsed["stock_name"] == "테스트"
+    assert parsed["current_price"] == 12340
+    assert parsed["change_rate"] == 5.7
+    assert parsed["prev_close"] == 11000
+    assert parsed["prev_close_source"] == "GetMasterLastPrice"
+    assert parsed["master_prev_close_used"] is True
+    assert parsed["parser_status"] == "OK"
+
+    partial = parse_opt10001_backfill([{"종목명": "테스트"}], code="440110")
+    assert partial["parser_status"] == "PARTIAL"
+    assert "current_price" in partial["parser_missing_fields"]
+    assert "prev_close" in partial["parser_missing_fields"]
 
 
 def test_theme_backfill_merge_does_not_overwrite_recent_realtime_price_and_marks_tr_only_gate_unusable():
@@ -194,6 +234,8 @@ class _Runner:
 class _Client:
     def __init__(self):
         self.comm_called = False
+        self.master_last_price = ""
+        self.master_last_price_called = False
 
     def set_input_value(self, key, value):
         return None
@@ -201,6 +243,10 @@ class _Client:
     def comm_rq_data(self, rq_name, tr_code, prev_next, screen_no):
         self.comm_called = True
         return 0
+
+    def get_master_last_price(self, code):
+        self.master_last_price_called = True
+        return self.master_last_price
 
 
 def test_gateway_capture_tr_uses_runner_and_regular_tr_keeps_comm_rq_data_path():
@@ -230,6 +276,37 @@ def test_gateway_capture_tr_uses_runner_and_regular_tr_keeps_comm_rq_data_path()
     result = _execute_command(client, regular, tr_runner=runner)
     assert client.comm_called is True
     assert result["status"] == "ACKED"
+
+
+def test_gateway_capture_uses_master_last_price_only_when_opt10001_base_missing():
+    from apps.kiwoom_gateway import _execute_command
+
+    client = _Client()
+    runner = _Runner(rows=[{"현재가": "12340", "기준가": "11000"}])
+    capture = GatewayCommand(
+        type="tr_request",
+        payload={
+            "purpose": THEME_BACKFILL_PURPOSE,
+            "response_mode": "capture",
+            "code": "440110",
+            "tr_code": "opt10001",
+            "rq_name": "ThemeBackfill_opt10001",
+            "fields": ["현재가", "기준가"],
+            "inputs": {"종목코드": "440110"},
+        },
+    )
+    result = _execute_command(client, capture, tr_runner=runner)
+    assert result["parsed_backfill"]["prev_close"] == 11000
+    assert client.master_last_price_called is False
+
+    client = _Client()
+    client.master_last_price = " 10,500 "
+    runner = _Runner(rows=[{"현재가": "12340"}])
+    result = _execute_command(client, capture, tr_runner=runner)
+    assert result["parsed_backfill"]["prev_close"] == 10500
+    assert result["parsed_backfill"]["prev_close_source"] == "GetMasterLastPrice"
+    assert result["parsed_backfill"]["master_prev_close_used"] is True
+    assert client.master_last_price_called is True
 
 
 def _healthy_state() -> GatewayStateStore:

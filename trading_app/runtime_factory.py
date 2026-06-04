@@ -112,7 +112,7 @@ def build_core_strategy_runtime(
     if config.theme_engine_mode == "themelab_flow":
         theme_backfill_service = ThemeBackfillService(
             gateway_state,
-            config=ThemeBackfillConfig.from_env(),
+            config=ThemeBackfillConfig.from_env(trading_mode=settings.mode),
         )
         theme_lab_pipeline = ThemeLabRuntimePipeline(
             db=db,

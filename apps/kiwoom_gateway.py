@@ -786,6 +786,7 @@ def _execute_command(client, command: GatewayCommand, *, tr_runner=None) -> dict
         return _result_payload(result_code=0, message="condition stopped")
     elif command.type == "tr_request":
         if str(payload.get("response_mode") or "") == "capture":
+            capture_started = time.perf_counter()
             runner = tr_runner or KiwoomTrRunner(client)
             tr_code = str(payload.get("tr_code") or "")
             rq_name = str(payload.get("rq_name") or tr_code or "TR_CAPTURE")
@@ -819,12 +820,23 @@ def _execute_command(client, command: GatewayCommand, *, tr_runner=None) -> dict
                         code=str(payload.get("code") or ""),
                         trade_date=str(payload.get("trade_date") or ""),
                     )
+                    if str(tr_code).lower() == "opt10001" and float(parsed.get("prev_close") or 0.0) <= 0:
+                        master_prev_close = _safe_master_last_price(client, str(payload.get("code") or ""))
+                        if master_prev_close:
+                            parsed = parse_theme_backfill(
+                                tr_code,
+                                rows,
+                                code=str(payload.get("code") or ""),
+                                trade_date=str(payload.get("trade_date") or ""),
+                                master_prev_close=master_prev_close,
+                            )
                 except Exception as exc:
                     return _result_payload(
                         result_code=-1,
                         message=f"PARSE_ERROR:{exc}",
                         raw={"tr_rows": rows, "warnings": result.warnings, "errors": [f"PARSE_ERROR:{exc}"]},
                     )
+            latency_ms = round((time.perf_counter() - capture_started) * 1000.0, 3)
             ack = _result_payload(
                 result_code=0,
                 message="tr captured",
@@ -836,6 +848,10 @@ def _execute_command(client, command: GatewayCommand, *, tr_runner=None) -> dict
                     "source_tr_code": tr_code,
                     "code": str(payload.get("code") or parsed.get("code") or ""),
                     "purpose": str(payload.get("purpose") or ""),
+                    "parser_status": str(parsed.get("parser_status") or ""),
+                    "parser_missing_fields": list(parsed.get("parser_missing_fields") or []),
+                    "parsed_fields_count": int(parsed.get("parsed_fields_count") or 0),
+                    "latency_ms": latency_ms,
                 },
             )
             ack.update(
@@ -844,6 +860,10 @@ def _execute_command(client, command: GatewayCommand, *, tr_runner=None) -> dict
                     "source_tr_code": tr_code,
                     "code": str(payload.get("code") or parsed.get("code") or ""),
                     "purpose": str(payload.get("purpose") or ""),
+                    "parser_status": str(parsed.get("parser_status") or ""),
+                    "parser_missing_fields": list(parsed.get("parser_missing_fields") or []),
+                    "parsed_fields_count": int(parsed.get("parsed_fields_count") or 0),
+                    "latency_ms": latency_ms,
                 }
             )
             return ack
@@ -885,6 +905,32 @@ def _execute_command(client, command: GatewayCommand, *, tr_runner=None) -> dict
         "result_code": -1,
         "raw": {},
     }
+
+
+def _safe_master_last_price(client, code: str) -> float | None:
+    clean_code = str(code or "").strip()
+    if not clean_code:
+        return None
+    try:
+        getter = getattr(client, "get_master_last_price", None)
+        if callable(getter):
+            raw = getter(clean_code)
+        else:
+            ocx = getattr(client, "ocx", None)
+            dynamic_call = getattr(ocx, "dynamicCall", None)
+            if not callable(dynamic_call):
+                return None
+            raw = dynamic_call("GetMasterLastPrice(QString)", clean_code)
+    except Exception:
+        return None
+    text = "".join(str(raw or "").split()).replace(",", "").replace("+", "")
+    if not text:
+        return None
+    try:
+        value = abs(float(text))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _websocket_pilot_command_rejection(runtime: GatewayRuntime, command: GatewayCommand) -> str:

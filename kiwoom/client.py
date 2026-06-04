@@ -128,6 +128,12 @@ class KiwoomClient:
     def get_code_name(self, code: str) -> str:
         return str(self.ocx.dynamicCall("GetMasterCodeName(QString)", code) or "")
 
+    def get_master_last_price(self, code: str) -> str:
+        try:
+            return str(self.ocx.dynamicCall("GetMasterLastPrice(QString)", str(code)) or "").strip()
+        except Exception:
+            return ""
+
     def register_realtime(self, codes: Iterable[str], screen_no: Optional[str] = None) -> None:
         code_list = [code for code in codes if code]
         fids = realtime_stock_fid_string()
@@ -543,6 +549,7 @@ class MockKiwoomClient:
         self._tr_inputs: dict[str, str] = {}
         self._tr_pages: dict[tuple[str, str], list[dict]] = {}
         self._current_tr_page: dict = {}
+        self._last_prices: dict[str, str] = {}
         self._names: dict[str, str] = {
             "005930": "삼성전자",
             "000660": "SK하이닉스",
@@ -561,6 +568,9 @@ class MockKiwoomClient:
 
     def get_code_name(self, code: str) -> str:
         return self._names.get(code, f"MOCK-{code}")
+
+    def get_master_last_price(self, code: str) -> str:
+        return str(self._last_prices.get(str(code), "") or "")
 
     def register_realtime(self, codes: Iterable[str], screen_no: Optional[str] = None) -> None:
         code_list = [code for code in codes if code]

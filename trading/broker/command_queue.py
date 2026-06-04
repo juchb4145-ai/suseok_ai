@@ -23,6 +23,7 @@ class CommandStatus(str, Enum):
     SKIPPED_ORDER_PENDING = "SKIPPED_ORDER_PENDING"
     SKIPPED_GATEWAY_UNHEALTHY = "SKIPPED_GATEWAY_UNHEALTHY"
     SKIPPED_NON_BACKFILL_PENDING = "SKIPPED_NON_BACKFILL_PENDING"
+    SKIPPED_NOT_OBSERVE_MODE = "SKIPPED_NOT_OBSERVE_MODE"
     EXPIRED_BEFORE_DISPATCH = "EXPIRED_BEFORE_DISPATCH"
     DUPLICATED_BUCKET = "DUPLICATED_BUCKET"
 
@@ -43,6 +44,7 @@ FINISHED_STATUSES = {
     CommandStatus.SKIPPED_ORDER_PENDING,
     CommandStatus.SKIPPED_GATEWAY_UNHEALTHY,
     CommandStatus.SKIPPED_NON_BACKFILL_PENDING,
+    CommandStatus.SKIPPED_NOT_OBSERVE_MODE,
     CommandStatus.EXPIRED_BEFORE_DISPATCH,
     CommandStatus.DUPLICATED_BUCKET,
 }
@@ -411,9 +413,10 @@ class CommandQueue:
                 for status in {
                     CommandStatus.SKIPPED_READY,
                     CommandStatus.SKIPPED_ORDER_PENDING,
-                    CommandStatus.SKIPPED_GATEWAY_UNHEALTHY,
-                    CommandStatus.SKIPPED_NON_BACKFILL_PENDING,
-                }
+                        CommandStatus.SKIPPED_GATEWAY_UNHEALTHY,
+                        CommandStatus.SKIPPED_NON_BACKFILL_PENDING,
+                        CommandStatus.SKIPPED_NOT_OBSERVE_MODE,
+                    }
             ),
             "expired_before_dispatch_count": counts.get(CommandStatus.EXPIRED_BEFORE_DISPATCH, 0),
             "duplicate_rejected_count": self.duplicate_rejected_count,
