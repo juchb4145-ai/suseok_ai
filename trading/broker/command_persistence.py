@@ -8,7 +8,6 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Protocol
 
-from storage.db import TradingDatabase
 from trading.broker.command_queue import (
     FINISHED_STATUSES,
     ORDER_COMMAND_TYPES,
@@ -112,6 +111,8 @@ class SQLiteCommandStore:
         self.path = Path(db_path).expanduser()
         if self.path.parent:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+        from storage.db import TradingDatabase
+
         bootstrap = TradingDatabase(str(self.path))
         bootstrap.close()
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
@@ -366,6 +367,16 @@ class SQLiteCommandStore:
                 "expired_count": counts.get(CommandStatus.EXPIRED.value, 0),
                 "rejected_count": counts.get(CommandStatus.REJECTED.value, 0),
                 "cancelled_count": counts.get(CommandStatus.CANCELLED.value, 0),
+                "skipped_count": sum(
+                    counts.get(status.value, 0)
+                    for status in {
+                        CommandStatus.SKIPPED_READY,
+                        CommandStatus.SKIPPED_ORDER_PENDING,
+                        CommandStatus.SKIPPED_GATEWAY_UNHEALTHY,
+                        CommandStatus.SKIPPED_NON_BACKFILL_PENDING,
+                    }
+                ),
+                "expired_before_dispatch_count": counts.get(CommandStatus.EXPIRED_BEFORE_DISPATCH.value, 0),
                 "duplicate_rejected_count": int(duplicate_count or 0),
                 "last_command_at": str(last_command_at or ""),
                 "last_order_command_at": str(last_order_command_at or ""),

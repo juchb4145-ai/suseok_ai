@@ -9,6 +9,7 @@ from trading.strategy.candidates import normalize_code
 from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.strategy.market_index import MarketIndexStore
 from trading.strategy.runtime_settings import legacy_strategy_runtime_settings
+from trading.theme_engine.backfill import ThemeBackfillService
 from trading.theme_engine.lab import (
     InstrumentMetadata,
     LabGateDecision,
@@ -151,6 +152,7 @@ class ThemeLabRuntimePipeline:
         engine: Optional[ThemeLabFlowEngine] = None,
         persistence_config: MarketSideConfirmationPersistenceConfig | None = None,
         session_config: MarketSessionConfig | None = None,
+        backfill_service: ThemeBackfillService | None = None,
     ) -> None:
         self.db = db
         self.market_data = market_data
@@ -169,6 +171,8 @@ class ThemeLabRuntimePipeline:
         self._restored_session_key: tuple[str, str, int] | None = None
         self._last_session_context: MarketSessionContext | None = None
         self._market_confirmation_metrics: dict[str, Any] = _empty_market_confirmation_metrics()
+        self.backfill_service = backfill_service
+        self.last_backfill_runtime: dict[str, Any] = {}
 
     def run_if_due(self, now: datetime) -> Optional[ThemeLabFlowResult]:
         current = now.replace(microsecond=0)
@@ -204,6 +208,7 @@ class ThemeLabRuntimePipeline:
         result = self._persist_confirmation_state(result, now, session=session)
         result = _annotate_market_session(result, session, self._market_confirmation_metrics)
         self.last_result = result
+        self.last_backfill_runtime = self._run_backfill(result, now)
         self._save_result(result, now)
         return result
 
@@ -770,9 +775,20 @@ class ThemeLabRuntimePipeline:
 
     def _save_result(self, result: ThemeLabFlowResult, now: datetime) -> None:
         payload = _result_payload(result)
+        if self.last_backfill_runtime:
+            payload["theme_backfill_runtime"] = dict(self.last_backfill_runtime)
         save = getattr(self.db, "save_theme_lab_flow_result", None)
         if callable(save):
             save(now.isoformat(), payload)
+
+    def _run_backfill(self, result: ThemeLabFlowResult, now: datetime) -> dict[str, Any]:
+        if self.backfill_service is None:
+            return {}
+        try:
+            return self.backfill_service.plan_and_enqueue(result, now)
+        except Exception as exc:
+            self._warnings.append(f"THEME_BACKFILL_FAILED:{exc}")
+            return {"enabled": True, "paused_reason": f"ERROR:{exc}"}
 
 
 def _annotate_market_confirmation_persistence(

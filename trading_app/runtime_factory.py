@@ -25,6 +25,7 @@ from trading.strategy.review import TradeReviewService
 from trading.strategy.runtime import StrategyRuntime
 from trading.strategy.runtime_settings import StrategyRuntimeSettingsRepository
 from trading.strategy.virtual_orders import VirtualOrderService
+from trading.theme_engine.backfill import ThemeBackfillConfig, ThemeBackfillService
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime import RealTimeThemeRuntime
@@ -109,11 +110,16 @@ def build_core_strategy_runtime(
     order_sink = _build_order_sink(settings, gateway_state, warning_sink, runtime_settings=runtime_settings)
     theme_lab_pipeline = None
     if config.theme_engine_mode == "themelab_flow":
+        theme_backfill_service = ThemeBackfillService(
+            gateway_state,
+            config=ThemeBackfillConfig.from_env(),
+        )
         theme_lab_pipeline = ThemeLabRuntimePipeline(
             db=db,
             market_data=market_data,
             market_index_store=market_index_store,
             interval_sec=config.theme_lab_pipeline_interval_sec,
+            backfill_service=theme_backfill_service,
         )
     runtime = StrategyRuntime(
         db=db,

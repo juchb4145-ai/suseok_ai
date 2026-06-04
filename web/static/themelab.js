@@ -36,6 +36,8 @@ const statusClass = {
   RISK_BLOCKED: "blocked",
   NO_SIGNAL: "observe",
   SNAPSHOT_UNAVAILABLE: "observe",
+  RUNTIME_INACTIVE: "warning",
+  SNAPSHOT_STALE: "warning",
   EXPANSION: "ready",
   SELECTIVE: "ready-small",
   CHOPPY: "wait",
@@ -149,7 +151,8 @@ function renderHeader(snapshot) {
   const market = snapshot.market || {};
   const summary = snapshot.summary || {};
   const dataQuality = snapshot.data_quality || {};
-  text("flow-updated", snapshot.available ? `계산 ${snapshot.calculated_at || "-"} / 갱신 ${snapshot.last_updated_at || "-"}` : "ThemeLabFlow 결과 대기 중");
+  const snapshotAge = summary.snapshot_age_label ? ` / age ${summary.snapshot_age_label}` : "";
+  text("flow-updated", snapshot.available ? `계산 ${snapshot.calculated_at || "-"} / 갱신 ${snapshot.last_updated_at || "-"}${snapshotAge}` : "ThemeLabFlow 결과 대기 중");
   document.getElementById("market-strip").innerHTML = [
     badge(market.market_status || "WAITING"),
     `<span class="counter">KOSPI ${pct(market.kospi_return_pct)}</span>`,
@@ -167,7 +170,9 @@ function renderCockpit(snapshot) {
   const dataQuality = snapshot.data_quality || {};
   setBadge("operation-status", summary.operation_status || "SNAPSHOT_UNAVAILABLE");
   text("operation-message", summary.operation_message_ko || "ThemeLabFlow 결과 대기 중");
-  text("cockpit-snapshot-state", snapshot.available ? `갱신 ${snapshot.last_updated_at || "-"}` : "대기");
+  const snapshotState = summary.snapshot_stale ? "STALE" : "FRESH";
+  const snapshotAge = summary.snapshot_age_label ? `age ${summary.snapshot_age_label}` : `갱신 ${snapshot.last_updated_at || "-"}`;
+  text("cockpit-snapshot-state", snapshot.available ? `${snapshotState} / ${snapshotAge}` : "대기");
 
   const sides = market.sides || [];
   document.getElementById("cockpit-market-sides").innerHTML = sides.length
@@ -215,6 +220,8 @@ function renderCockpit(snapshot) {
   ].join("");
 
   document.getElementById("cockpit-live-readiness").innerHTML = [
+    `<div class="cockpit-line"><strong>Runtime</strong>${badge(summary.runtime_status || "UNKNOWN")}<span>${summary.runtime_running ? "running" : "inactive"} ${escapeHtml(summary.runtime_mode || "")}</span></div>`,
+    `<div class="cockpit-line"><strong>Snapshot</strong>${badge(summary.snapshot_stale ? "SNAPSHOT_STALE" : "OK")}<span>${escapeHtml(summary.snapshot_age_label || "-")}</span></div>`,
     `<div class="cockpit-line"><strong>LIVE</strong>${boolBadge(summary.live_order_enabled, "활성", "비활성")}</div>`,
     countLine("Guard 통과", summary.live_guard_passed_count),
     countLine("Guard 차단", summary.live_guard_blocked_count),
@@ -281,7 +288,9 @@ function themeQualityDetail(item) {
   if (priority !== "NONE") {
     const trs = (item.theme_backfill_trs || []).slice(0, 2).join(", ");
     const symbols = (item.theme_backfill_symbols || []).slice(0, 5).join(", ");
-    parts.push(`TR 보강 ${priority}${trs ? `: ${trs}` : ""}${symbols ? ` · 후보 ${symbols}` : ""}`);
+    const status = item.theme_backfill_status ? ` · 상태 ${item.theme_backfill_status}` : "";
+    const failure = item.theme_backfill_failure_reason ? `(${item.theme_backfill_failure_reason})` : "";
+    parts.push(`TR 보강 ${priority}${status}${failure}${trs ? `: ${trs}` : ""}${symbols ? ` · 후보 ${symbols}` : ""}`);
   }
   return parts.join(" · ");
 }

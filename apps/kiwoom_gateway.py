@@ -36,6 +36,8 @@ from trading.broker.transport_metrics import (
     trace_from_payload,
     utc_now_ms,
 )
+from kiwoom.tr import KiwoomTrRunner
+from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE, parse_theme_backfill
 
 
 @dataclass
@@ -189,6 +191,7 @@ class GatewayRuntime:
         self.drained_event_count = 0
         self.coalesced_tick_count = 0
         self.data_quality = RealtimeDataQualityTracker()
+        self.tr_runner = None
 
     def emit(self, event_type: str, payload: dict[str, Any] | None = None, **kwargs) -> None:
         raw_payload = dict(payload or {})
@@ -701,7 +704,9 @@ def _drain_real_commands(client, runtime: GatewayRuntime) -> None:
             )
             execute_start = monotonic_ms()
             execute_started_at = utc_now_ms()
-            result_payload = _execute_command(client, command)
+            if getattr(runtime, "tr_runner", None) is None:
+                runtime.tr_runner = KiwoomTrRunner(client)
+            result_payload = _execute_command(client, command, tr_runner=runtime.tr_runner)
             execute_finished_at = utc_now_ms()
             execute_ms = monotonic_delta_ms(execute_start, monotonic_ms())
             runtime.rate_limiter.record(command.type)
@@ -741,7 +746,7 @@ def _drain_real_commands(client, runtime: GatewayRuntime) -> None:
             )
 
 
-def _execute_command(client, command: GatewayCommand) -> dict[str, Any]:
+def _execute_command(client, command: GatewayCommand, *, tr_runner=None) -> dict[str, Any]:
     payload = dict(command.payload or {})
     if command.type == "login":
         result_code = int(client.login() or 0)
@@ -780,6 +785,68 @@ def _execute_command(client, command: GatewayCommand) -> dict[str, Any]:
         )
         return _result_payload(result_code=0, message="condition stopped")
     elif command.type == "tr_request":
+        if str(payload.get("response_mode") or "") == "capture":
+            runner = tr_runner or KiwoomTrRunner(client)
+            tr_code = str(payload.get("tr_code") or "")
+            rq_name = str(payload.get("rq_name") or tr_code or "TR_CAPTURE")
+            fields = [str(field) for field in list(payload.get("fields") or [])]
+            result = runner.request_pages(
+                tr_code=tr_code,
+                rq_name=rq_name,
+                inputs=dict(payload.get("inputs") or {}),
+                fields=fields,
+                screen_no=str(payload.get("screen_no") or "8700"),
+            )
+            rows = [dict(row) for row in result.rows]
+            if result.errors:
+                return _result_payload(
+                    result_code=-1,
+                    message=";".join(result.errors),
+                    raw={"tr_rows": rows, "warnings": result.warnings, "errors": result.errors},
+                )
+            if not rows:
+                return _result_payload(
+                    result_code=-1,
+                    message="TR_EMPTY",
+                    raw={"tr_rows": rows, "warnings": result.warnings, "errors": ["TR_EMPTY"]},
+                )
+            parsed = {}
+            if str(payload.get("purpose") or "") == THEME_BACKFILL_PURPOSE:
+                try:
+                    parsed = parse_theme_backfill(
+                        tr_code,
+                        rows,
+                        code=str(payload.get("code") or ""),
+                        trade_date=str(payload.get("trade_date") or ""),
+                    )
+                except Exception as exc:
+                    return _result_payload(
+                        result_code=-1,
+                        message=f"PARSE_ERROR:{exc}",
+                        raw={"tr_rows": rows, "warnings": result.warnings, "errors": [f"PARSE_ERROR:{exc}"]},
+                    )
+            ack = _result_payload(
+                result_code=0,
+                message="tr captured",
+                raw={
+                    "tr_rows": rows,
+                    "warnings": result.warnings,
+                    "errors": result.errors,
+                    "parsed_backfill": parsed,
+                    "source_tr_code": tr_code,
+                    "code": str(payload.get("code") or parsed.get("code") or ""),
+                    "purpose": str(payload.get("purpose") or ""),
+                },
+            )
+            ack.update(
+                {
+                    "parsed_backfill": parsed,
+                    "source_tr_code": tr_code,
+                    "code": str(payload.get("code") or parsed.get("code") or ""),
+                    "purpose": str(payload.get("purpose") or ""),
+                }
+            )
+            return ack
         for key, value in dict(payload.get("inputs") or {}).items():
             client.set_input_value(str(key), str(value))
         result_code = int(client.comm_rq_data(

@@ -276,6 +276,10 @@ class RuntimeSupervisor:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
             return
+        if event.type == "command_ack" and str((event.payload or {}).get("purpose") or "") == "theme_data_backfill":
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
+            return
         if event.type != "price_tick":
             return
         self._queue_price_tick(event)

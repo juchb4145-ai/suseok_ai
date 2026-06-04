@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from trading.strategy.candidates import normalize_code
@@ -78,6 +78,56 @@ class MarketDataStore:
     def latest_tick(self, code: str) -> Optional[StrategyTick]:
         return self._latest_ticks.get(normalize_code(code))
 
+    def apply_theme_backfill(
+        self,
+        code: str,
+        payload: dict[str, Any],
+        *,
+        now: Optional[datetime] = None,
+        recent_price_guard_sec: int = 30,
+    ) -> bool:
+        clean_code = normalize_code(code)
+        if not clean_code:
+            return False
+        current = (now or datetime.now()).replace(microsecond=0)
+        existing = self.latest_tick(clean_code)
+        metadata_updates = _backfill_metadata(payload)
+        if existing is not None:
+            metadata = dict(existing.metadata or {})
+            for key, value in metadata_updates.items():
+                if value in {None, "", 0, 0.0}:
+                    continue
+                if key not in metadata or metadata.get(key) in {None, "", 0, 0.0}:
+                    metadata[key] = value
+            trade_value = existing.trade_value
+            turnover = _clean_float(payload.get("turnover"))
+            if trade_value <= 0 and turnover > 0:
+                trade_value = turnover
+            guarded_recent_price = existing.price > 0 and current - existing.timestamp <= timedelta(seconds=max(0, recent_price_guard_sec))
+            price = existing.price if guarded_recent_price or existing.price > 0 else _clean_abs_int(payload.get("current_price"))
+            merged = replace(existing, price=price, trade_value=trade_value, metadata=metadata)
+            self._latest_ticks[clean_code] = merged
+            return True
+        price = _clean_abs_int(payload.get("current_price"))
+        if price <= 0:
+            return False
+        metadata = dict(metadata_updates)
+        metadata["price_source"] = "TR_BACKFILL"
+        metadata["gate_usable"] = False
+        tick = StrategyTick.from_realtime(
+            clean_code,
+            price=price,
+            change_rate=payload.get("change_rate", 0.0),
+            cum_volume=payload.get("volume", 0),
+            trade_value=payload.get("turnover", 0.0),
+            timestamp=current,
+            metadata=metadata,
+        )
+        self._latest_ticks[clean_code] = tick
+        self._last_timestamps[clean_code] = tick.timestamp
+        self._tick_counts[clean_code] = self._tick_counts.get(clean_code, 0) + 1
+        return True
+
     def has_recent_tick(self, code: str, now: datetime, max_age_sec: int) -> bool:
         tick = self.latest_tick(code)
         if tick is None:
@@ -108,6 +158,28 @@ def _merge_missing_price_tick(previous: StrategyTick, tick: StrategyTick) -> Str
         spread_ticks=tick.spread_ticks if tick.spread_ticks else previous.spread_ticks,
         metadata=metadata,
     )
+
+
+def _backfill_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "backfill_source": "theme_data_backfill",
+        "tr_backfill_applied": True,
+    }
+    for source_key, metadata_key in {
+        "stock_name": "stock_name",
+        "prev_close": "prev_close",
+        "previous_close": "previous_close",
+        "prev_close_source": "prev_close_source",
+        "session_high": "session_high",
+        "session_low": "session_low",
+        "open_price": "open_price",
+    }.items():
+        value = payload.get(source_key)
+        if value not in {None, "", 0, 0.0}:
+            metadata[metadata_key] = value
+    if payload.get("prev_close") not in {None, "", 0, 0.0}:
+        metadata.setdefault("prev_close_source", "TR_BACKFILL")
+    return metadata
 
 
 def _clean_abs_int(value) -> int:

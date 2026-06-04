@@ -826,6 +826,21 @@ class ThemeBreadthEngine:
             exclusion = self.exclusion_filter.evaluate(metadata, snapshot)
             if exclusion.fallback_used:
                 _add_flag(flags, "EXCLUSION_METADATA_FALLBACK")
+            gate_usable_snapshot = _snapshot_gate_usable(snapshot)
+            if snapshot is not None and not gate_usable_snapshot:
+                hit = ConditionHitSnapshot(
+                    calculated_at=calculated_at,
+                    symbol=symbol,
+                    name=(snapshot.stock_name or member.stock_name),
+                    current_price=float(snapshot.current_price or 0),
+                    return_pct=0.0,
+                    turnover_krw=float(snapshot.turnover or 0),
+                    excluded=exclusion.excluded,
+                    excluded_reason=exclusion.reason,
+                    data_quality_flags=(),
+                )
+                hits.append(hit)
+                continue
             current_price = snapshot.current_price if snapshot else None
             prev_close = _prev_close(snapshot)
             change_rate = snapshot.change_rate if snapshot else None
@@ -3510,8 +3525,12 @@ def _return_pct(
 def _prev_close(snapshot: StockSnapshot | None) -> float | None:
     if snapshot is None:
         return None
+    metadata = snapshot.metadata or {}
+    source = str(metadata.get("prev_close_source") or "").strip().upper()
+    if source in {"TR_BACKFILL", "THEME_DATA_BACKFILL", "OPT10001", "OPT10081"}:
+        return None
     for key in ("prev_close", "previous_close", "yesterday_close"):
-        value = (snapshot.metadata or {}).get(key)
+        value = metadata.get(key)
         try:
             number = float(value)
         except (TypeError, ValueError):
@@ -3519,6 +3538,20 @@ def _prev_close(snapshot: StockSnapshot | None) -> float | None:
         if number > 0:
             return number
     return None
+
+
+def _snapshot_gate_usable(snapshot: StockSnapshot | None) -> bool:
+    if snapshot is None:
+        return True
+    metadata = dict(snapshot.metadata or {})
+    if str(metadata.get("price_source") or "").upper() == "TR_BACKFILL":
+        return False
+    gate_usable = metadata.get("gate_usable")
+    if isinstance(gate_usable, str):
+        return gate_usable.strip().lower() not in {"0", "false", "no", "n", "off"}
+    if gate_usable is False:
+        return False
+    return True
 
 
 def _snapshot_map(snapshots: dict[str, StockSnapshot] | list[StockSnapshot]) -> dict[str, StockSnapshot]:

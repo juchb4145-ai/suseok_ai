@@ -19,6 +19,12 @@ class CommandStatus(str, Enum):
     FAILED = "FAILED"
     EXPIRED = "EXPIRED"
     CANCELLED = "CANCELLED"
+    SKIPPED_READY = "SKIPPED_READY"
+    SKIPPED_ORDER_PENDING = "SKIPPED_ORDER_PENDING"
+    SKIPPED_GATEWAY_UNHEALTHY = "SKIPPED_GATEWAY_UNHEALTHY"
+    SKIPPED_NON_BACKFILL_PENDING = "SKIPPED_NON_BACKFILL_PENDING"
+    EXPIRED_BEFORE_DISPATCH = "EXPIRED_BEFORE_DISPATCH"
+    DUPLICATED_BUCKET = "DUPLICATED_BUCKET"
 
 
 class CommandPriority(str, Enum):
@@ -33,6 +39,12 @@ FINISHED_STATUSES = {
     CommandStatus.FAILED,
     CommandStatus.EXPIRED,
     CommandStatus.CANCELLED,
+    CommandStatus.SKIPPED_READY,
+    CommandStatus.SKIPPED_ORDER_PENDING,
+    CommandStatus.SKIPPED_GATEWAY_UNHEALTHY,
+    CommandStatus.SKIPPED_NON_BACKFILL_PENDING,
+    CommandStatus.EXPIRED_BEFORE_DISPATCH,
+    CommandStatus.DUPLICATED_BUCKET,
 }
 ACTIVE_DEDUPE_STATUSES = {
     CommandStatus.QUEUED,
@@ -394,6 +406,16 @@ class CommandQueue:
             "expired_count": counts.get(CommandStatus.EXPIRED, 0),
             "rejected_count": counts.get(CommandStatus.REJECTED, 0),
             "cancelled_count": counts.get(CommandStatus.CANCELLED, 0),
+            "skipped_count": sum(
+                counts.get(status, 0)
+                for status in {
+                    CommandStatus.SKIPPED_READY,
+                    CommandStatus.SKIPPED_ORDER_PENDING,
+                    CommandStatus.SKIPPED_GATEWAY_UNHEALTHY,
+                    CommandStatus.SKIPPED_NON_BACKFILL_PENDING,
+                }
+            ),
+            "expired_before_dispatch_count": counts.get(CommandStatus.EXPIRED_BEFORE_DISPATCH, 0),
             "duplicate_rejected_count": self.duplicate_rejected_count,
             "last_command_at": self.last_command_at,
             "last_order_command_at": self.last_order_command_at,

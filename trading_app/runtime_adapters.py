@@ -39,8 +39,23 @@ class GatewayEventMarketDataBridge:
 
     def handle_event(self, event: GatewayEvent) -> bool:
         if event.type != "price_tick":
+            if event.type == "command_ack":
+                return self.handle_theme_backfill_ack(dict(event.payload or {}))
             return False
         return self.handle_price_tick(dict(event.payload or {}))
+
+    def handle_theme_backfill_ack(self, payload: dict[str, Any]) -> bool:
+        if str(payload.get("purpose") or "") != "theme_data_backfill":
+            return False
+        parsed = dict(payload.get("parsed_backfill") or dict(payload.get("raw") or {}).get("parsed_backfill") or {})
+        code = str(payload.get("code") or parsed.get("code") or "").strip()
+        if not code or not parsed:
+            return False
+        try:
+            return bool(self._bridge.market_data.apply_theme_backfill(code, parsed))
+        except Exception as exc:
+            self._warn(f"THEME_BACKFILL_MERGE_FAILED:{code}:{exc}")
+            return False
 
     def handle_price_tick(self, payload: dict[str, Any]) -> bool:
         code = str(payload.get("code") or "").strip()

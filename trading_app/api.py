@@ -43,6 +43,7 @@ from trading.broker.ws_messages import GatewayWsMessage
 from trading.strategy.candidates import CandidateCollector
 from trading.strategy.models import BlockType, CandidateState
 from trading.strategy.reason_taxonomy import normalize_reason_status, reason_status_family, reason_summary
+from trading.theme_engine.backfill import apply_dispatch_guard
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSourceSyncService
 from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThemeUniverseSource
@@ -1209,7 +1210,7 @@ def snapshot() -> dict[str, Any]:
 def theme_lab_snapshot() -> dict[str, Any]:
     db = open_database()
     try:
-        return build_theme_lab_dashboard_snapshot(db)
+        return build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_supervisor.status(), gateway_state=gateway_state)
     finally:
         close_database(db)
 
@@ -1339,9 +1340,11 @@ async def gateway_commands(
     poll_received_at = utc_now_ms()
     poll_started = time.perf_counter()
     deadline = asyncio.get_event_loop().time() + wait_sec
+    _apply_theme_backfill_dispatch_guard()
     commands = gateway_state.dispatch_commands(limit)
     while not commands and wait_sec > 0 and asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.25)
+        _apply_theme_backfill_dispatch_guard()
         commands = gateway_state.dispatch_commands(limit)
     response_at = utc_now_ms()
     long_poll_wait_ms = (time.perf_counter() - poll_started) * 1000.0
@@ -1380,6 +1383,14 @@ async def gateway_commands(
     finally:
         close_database(db)
     return GatewayCommandBatch(commands=payloads, count=len(payloads), timestamp=utc_timestamp())
+
+
+def _apply_theme_backfill_dispatch_guard() -> None:
+    db = open_database()
+    try:
+        apply_dispatch_guard(gateway_state, db.latest_theme_lab_flow_result())
+    finally:
+        close_database(db)
 
 
 @app.get("/api/gateway/commands/status")
@@ -1765,7 +1776,8 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     logs_payload = build_logs_snapshot(db)
     transport_payload = dict(status_payload.get("transport") or _transport_dashboard_payload(_transport_status_payload(db)))
     transport_experiment_payload = _transport_experiment_dashboard_payload(db)
-    runtime_payload = _runtime_dashboard_payload(runtime_supervisor.status())
+    runtime_status = runtime_supervisor.status()
+    runtime_payload = _runtime_dashboard_payload(runtime_status)
     dry_run_orders_payload = {
         "summary": db.runtime_order_intent_summary(),
         "items": db.list_runtime_order_intents(limit=20),
@@ -1842,7 +1854,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "orders": orders_payload,
         "reviews": reviews_payload,
         "logs": logs_payload,
-        "theme_lab": build_theme_lab_dashboard_snapshot(db),
+        "theme_lab": build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_status, gateway_state=gateway_state),
         "market_data": {
             "latest_ticks": gateway_state.latest_ticks(limit=30),
             "raw_tick_rendering": "disabled",

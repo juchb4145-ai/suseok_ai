@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import importlib
+from datetime import datetime
 from pathlib import Path
 
 from bs4 import BeautifulSoup
 from fastapi.testclient import TestClient
 
 from storage.db import TradingDatabase
+from trading.broker.command_queue import CommandPriority
+from trading.broker.gateway_state import GatewayStateStore
+from trading.broker.models import GatewayCommand
 from trading.strategy.models import Candidate, CandidateState
+from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE
 from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeStatus
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading_app.themelab_dashboard import build_theme_lab_dashboard_snapshot
@@ -49,6 +54,8 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "matchesFilters" in js
     assert "renderCockpit" in js
     assert "minuteChartSvg" in js
+    assert "RUNTIME_INACTIVE" in js
+    assert "snapshot_age_label" in js
     assert ".chart-ref.vwap" in css
 
 
@@ -297,6 +304,46 @@ def test_theme_lab_snapshot_operation_status_for_ready_live_blocked_and_data_qua
         db.close()
 
 
+def test_theme_lab_snapshot_marks_runtime_inactive_and_stale_age(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        ready = _watch("000211", "READY")
+        ready.update({"live_order_enabled": True, "live_order_guard_passed": True})
+        db.save_theme_lab_flow_result(
+            "2026-06-04T09:00:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [ready],
+                "gate_decisions": [],
+                "data_quality": {"status": "OK", "candle_missing_count": 0},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(
+            db,
+            runtime_status={"enabled": False, "auto_start": False, "running": False, "mode": "OBSERVE", "cycle_count": 0},
+            now=datetime.fromisoformat("2026-06-04T09:05:00"),
+        )
+        assert payload["runtime"]["status"] == "RUNTIME_INACTIVE"
+        assert payload["summary"]["operation_status"] == "RUNTIME_INACTIVE"
+        assert payload["summary"]["runtime_running"] is False
+        assert payload["summary"]["snapshot_age_sec"] == 300
+        assert payload["summary"]["snapshot_age_label"] == "5m 0s"
+        assert payload["summary"]["snapshot_stale"] is True
+        assert payload["data_quality"]["snapshot_age_sec"] == 300
+
+        stale_payload = build_theme_lab_dashboard_snapshot(
+            db,
+            runtime_status={"enabled": True, "auto_start": True, "running": True, "mode": "OBSERVE", "cycle_count": 3},
+            now=datetime.fromisoformat("2026-06-04T09:05:00"),
+        )
+        assert stale_payload["summary"]["operation_status"] == "SNAPSHOT_STALE"
+        assert stale_payload["summary"]["runtime_running"] is True
+    finally:
+        db.close()
+
+
 def test_theme_lab_data_quality_uses_actual_watchset_candles(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     try:
@@ -436,6 +483,49 @@ def test_theme_lab_snapshot_demotes_themes_without_live_price_signal(tmp_path):
     assert ranked[1]["theme_backfill_priority"] == "HIGH"
     assert "테마 폭 산출 불가" in ranked[1]["quality_label"]
     assert "실시간 현재가 보강 필요" in ranked[1]["quality_label"]
+
+
+def test_theme_lab_snapshot_adds_theme_backfill_command_status(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    state = GatewayStateStore()
+    try:
+        db.save_theme_lab_flow_result(
+            "09:04:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [],
+                "gate_decisions": [],
+                "data_quality": {},
+                "theme_backfill_runtime": {"enabled": True, "tr_backfill_caused_ready_count": 0},
+            },
+        )
+        state.enqueue_command(
+            GatewayCommand(
+                type="tr_request",
+                command_id="cmd-backfill-power",
+                payload={
+                    "purpose": THEME_BACKFILL_PURPOSE,
+                    "primary_theme_id": "power",
+                    "related_theme_ids": ["power"],
+                    "code": "000001",
+                    "tr_code": "opt10001",
+                },
+            ),
+            priority=CommandPriority.LOW,
+            ttl_sec=90,
+            max_attempts=1,
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db, gateway_state=state)
+    finally:
+        db.close()
+
+    row = payload["ranked_themes"][0]
+    assert row["theme_backfill_status"] == "대기"
+    assert row["theme_backfill_raw_status"] == "QUEUED"
+    assert payload["theme_backfill_runtime"]["queued_count"] == 1
+    assert payload["theme_backfill_runtime"]["tr_backfill_caused_ready_count"] == 0
 
 
 def test_theme_lab_snapshot_overlays_condition_event_breadth(tmp_path):

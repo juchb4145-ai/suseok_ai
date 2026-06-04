@@ -5,11 +5,13 @@ from datetime import datetime
 from typing import Any
 
 from storage.db import TradingDatabase
+from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE
 from trading.theme_engine.repository import ThemeEngineRepository
 
 
 GATE_ORDER = {"READY": 0, "READY_SMALL": 1, "WAIT": 2, "OBSERVE": 3, "BLOCKED": 4}
 ROLE_ORDER = {"LEADER": 0, "CO_LEADER": 1, "FOLLOWER": 2, "LATE_LAGGARD": 3, "WEAK_MEMBER": 4, "OVERHEATED": 5}
+SNAPSHOT_STALE_THRESHOLD_SEC = 60
 DISPLAY_WAIT_ORDER = {
     "LATE_CHASE_TEMP_WAIT": 0,
     "WAIT_MARKET_CONFIRMATION_PENDING": 1,
@@ -25,22 +27,33 @@ DISPLAY_WAIT_ORDER = {
 }
 
 
-def build_theme_lab_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
+def build_theme_lab_dashboard_snapshot(
+    db: TradingDatabase,
+    *,
+    runtime_status: dict[str, Any] | None = None,
+    gateway_state: Any | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     raw = db.latest_theme_lab_flow_result()
     if not raw:
-        return _empty_snapshot()
+        return _empty_snapshot(runtime_status=runtime_status)
 
     themes = _as_list(raw.get("theme_rankings") or raw.get("theme_condition_snapshots"))
     watchset = _sorted_watchset(_as_list(raw.get("watchset_snapshots")))
     condition_counts = _condition_theme_counts(db, raw)
     data_quality = _data_quality(raw, watchset)
+    runtime = _runtime_context(runtime_status)
+    freshness = _snapshot_freshness(raw, now=now)
+    data_quality = {**data_quality, **_freshness_quality_fields(freshness)}
     entry_candidates = [item for item in watchset if item.get("gate_status") in {"READY", "READY_SMALL"}]
     chart_universe = _chart_universe(themes, watchset, entry_candidates)
     selected = _select_chart(chart_universe, watchset)
     selected_watch = next((item for item in watchset if item.get("symbol") == selected.get("symbol")), {})
 
-    ranked_themes = _ranked_theme_rows(themes, condition_counts)
-    summary = _summary(ranked_themes, watchset, entry_candidates, data_quality)
+    backfill_runtime = _theme_backfill_runtime(raw, gateway_state)
+    backfill_status_by_theme = _theme_backfill_status_by_theme(gateway_state)
+    ranked_themes = _ranked_theme_rows(themes, condition_counts, backfill_status_by_theme=backfill_status_by_theme)
+    summary = _summary(ranked_themes, watchset, entry_candidates, data_quality, runtime=runtime, freshness=freshness)
 
     return {
         "available": True,
@@ -48,6 +61,9 @@ def build_theme_lab_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "created_at": raw.get("created_at", ""),
         "calculated_at": raw.get("calculated_at", ""),
         "last_updated_at": _now_time(),
+        "runtime": runtime,
+        "theme_backfill_runtime": backfill_runtime,
+        **_freshness_quality_fields(freshness),
         "market": _market(raw.get("market_status") or {}),
         "condition_statuses": _condition_statuses(db),
         "data_quality": data_quality,
@@ -61,13 +77,28 @@ def build_theme_lab_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     }
 
 
-def _empty_snapshot() -> dict[str, Any]:
+def _empty_snapshot(*, runtime_status: dict[str, Any] | None = None) -> dict[str, Any]:
+    runtime = _runtime_context(runtime_status)
+    freshness = _empty_freshness()
     return {
         "available": False,
         "source": "theme_lab_flow_snapshots",
         "created_at": "",
         "calculated_at": "",
         "last_updated_at": _now_time(),
+        "runtime": runtime,
+        "theme_backfill_runtime": {
+            "enabled": False,
+            "paused_reason": "SNAPSHOT_UNAVAILABLE",
+            "queued_count": 0,
+            "dispatched_count": 0,
+            "success_count": 0,
+            "failure_count": 0,
+            "skipped_count": 0,
+            "expired_count": 0,
+            "tr_backfill_caused_ready_count": 0,
+        },
+        **_freshness_quality_fields(freshness),
         "market": {
             "market_status": "WAITING",
             "kospi_return_pct": None,
@@ -92,7 +123,7 @@ def _empty_snapshot() -> dict[str, Any]:
         "chart_universe": _index_chart_items(),
         "selected_chart": {"symbol": "KOSDAQ", "name": "KOSDAQ", "type": "index", "chart_data_status": "NO_CANDLE_DATA"},
         "gate_detail": {"gate_status": "OBSERVE", "summary_message": "선택된 WatchSet 종목이 없습니다."},
-        "summary": _empty_summary(),
+        "summary": _empty_summary(runtime=runtime, freshness=freshness),
     }
 
 
@@ -170,7 +201,12 @@ def _summary(
     watchset: list[dict[str, Any]],
     entry_candidates: list[dict[str, Any]],
     data_quality: dict[str, Any],
+    *,
+    runtime: dict[str, Any] | None = None,
+    freshness: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    runtime = runtime or _runtime_context(None)
+    freshness = freshness or _empty_freshness()
     gates = Counter(str(item.get("gate_status") or "UNKNOWN") for item in watchset)
     displays = Counter(str(item.get("display_status") or item.get("gate_status") or "UNKNOWN") for item in watchset)
     theme_statuses = Counter(_theme_status_bucket(item.get("theme_status")) for item in ranked_themes)
@@ -198,6 +234,8 @@ def _summary(
         order_candidate_count=len(entry_candidates),
         data_quality_status=str(data_quality.get("status") or "UNKNOWN"),
         watchset_size=len(watchset),
+        runtime=runtime,
+        freshness=freshness,
     )
     return {
         "theme_count": len(ranked_themes),
@@ -230,12 +268,19 @@ def _summary(
         "top_leader_name": top_theme.get("top_leader_name", ""),
         "top_leader_symbol": top_theme.get("top_leader_symbol", ""),
         "top_leader_turnover_krw": top_theme.get("top_leader_turnover_krw", 0),
+        **_summary_runtime_fields(runtime, freshness),
         "operation_status": status,
         "operation_message_ko": message,
     }
 
 
-def _empty_summary() -> dict[str, Any]:
+def _empty_summary(
+    *,
+    runtime: dict[str, Any] | None = None,
+    freshness: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    runtime = runtime or _runtime_context(None)
+    freshness = freshness or _empty_freshness()
     status, message = _operation_status_message(
         theme_count=0,
         ready_count=0,
@@ -250,6 +295,8 @@ def _empty_summary() -> dict[str, Any]:
         order_candidate_count=0,
         data_quality_status="BROKEN",
         watchset_size=0,
+        runtime=runtime,
+        freshness=freshness,
     )
     return {
         "theme_count": 0,
@@ -282,9 +329,115 @@ def _empty_summary() -> dict[str, Any]:
         "top_leader_name": "",
         "top_leader_symbol": "",
         "top_leader_turnover_krw": 0,
+        **_summary_runtime_fields(runtime, freshness),
         "operation_status": status,
         "operation_message_ko": message,
     }
+
+
+def _runtime_context(runtime_status: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(runtime_status, dict):
+        return {
+            "known": False,
+            "enabled": None,
+            "auto_start": None,
+            "running": None,
+            "mode": "",
+            "last_cycle_at": "",
+            "cycle_count": 0,
+            "worker_stage": "",
+            "status": "UNKNOWN",
+        }
+    running = bool(runtime_status.get("running"))
+    return {
+        "known": True,
+        "enabled": bool(runtime_status.get("enabled")),
+        "auto_start": bool(runtime_status.get("auto_start")),
+        "running": running,
+        "mode": str(runtime_status.get("mode") or ""),
+        "last_cycle_at": str(runtime_status.get("last_cycle_at") or ""),
+        "cycle_count": int(runtime_status.get("cycle_count") or 0),
+        "worker_stage": str(runtime_status.get("worker_stage") or ""),
+        "status": "ACTIVE" if running else "RUNTIME_INACTIVE",
+    }
+
+
+def _snapshot_freshness(raw: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    parsed = _parse_snapshot_time(str(raw.get("calculated_at") or "")) or _parse_snapshot_time(str(raw.get("created_at") or ""))
+    if parsed is None:
+        return _empty_freshness()
+    if now is None:
+        current = datetime.now(tz=parsed.tzinfo) if parsed.tzinfo else datetime.now()
+    else:
+        current = now
+    if parsed.tzinfo is not None and current.tzinfo is None:
+        current = current.replace(tzinfo=parsed.tzinfo)
+    elif parsed.tzinfo is None and current.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=current.tzinfo)
+    age_sec = max(0, int((current - parsed).total_seconds()))
+    return {
+        "snapshot_age_sec": age_sec,
+        "snapshot_age_label": _age_label(age_sec),
+        "snapshot_stale": age_sec > SNAPSHOT_STALE_THRESHOLD_SEC,
+        "snapshot_stale_threshold_sec": SNAPSHOT_STALE_THRESHOLD_SEC,
+    }
+
+
+def _empty_freshness() -> dict[str, Any]:
+    return {
+        "snapshot_age_sec": None,
+        "snapshot_age_label": "",
+        "snapshot_stale": False,
+        "snapshot_stale_threshold_sec": SNAPSHOT_STALE_THRESHOLD_SEC,
+    }
+
+
+def _freshness_quality_fields(freshness: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "snapshot_age_sec": freshness.get("snapshot_age_sec"),
+        "snapshot_age_label": freshness.get("snapshot_age_label", ""),
+        "snapshot_stale": bool(freshness.get("snapshot_stale")),
+        "snapshot_stale_threshold_sec": freshness.get("snapshot_stale_threshold_sec", SNAPSHOT_STALE_THRESHOLD_SEC),
+    }
+
+
+def _summary_runtime_fields(runtime: dict[str, Any], freshness: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "runtime_known": bool(runtime.get("known")),
+        "runtime_status": runtime.get("status", "UNKNOWN"),
+        "runtime_enabled": runtime.get("enabled"),
+        "runtime_auto_start": runtime.get("auto_start"),
+        "runtime_running": runtime.get("running"),
+        "runtime_mode": runtime.get("mode", ""),
+        "runtime_last_cycle_at": runtime.get("last_cycle_at", ""),
+        "runtime_cycle_count": runtime.get("cycle_count", 0),
+        **_freshness_quality_fields(freshness),
+    }
+
+
+def _parse_snapshot_time(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _age_label(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
 
 
 def _theme_status_bucket(value: Any) -> str:
@@ -342,9 +495,18 @@ def _operation_status_message(
     order_candidate_count: int,
     data_quality_status: str,
     watchset_size: int,
+    runtime: dict[str, Any] | None = None,
+    freshness: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
+    runtime = runtime or _runtime_context(None)
+    freshness = freshness or _empty_freshness()
     data_status = data_quality_status.upper()
     ready_like = ready_count + ready_small_count
+    if runtime.get("known") and not runtime.get("running"):
+        return "RUNTIME_INACTIVE", "전략 Runtime loop가 꺼져 있어 마지막 ThemeLab 스냅샷만 표시 중입니다."
+    if runtime.get("known") and freshness.get("snapshot_stale"):
+        age_label = str(freshness.get("snapshot_age_label") or "오래")
+        return "SNAPSHOT_STALE", f"ThemeLab 스냅샷이 {age_label} 전 계산되어 최신 운용 상태가 아닙니다."
     if watchset_size == 0:
         if theme_count <= 0 or data_status == "BROKEN":
             return "SNAPSHOT_UNAVAILABLE", "ThemeLabFlow 결과 대기 중입니다."
@@ -478,7 +640,12 @@ def _data_quality_reasons(
     return reasons
 
 
-def _theme_row(item: dict[str, Any], rank: int, condition_counts: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+def _theme_row(
+    item: dict[str, Any],
+    rank: int,
+    condition_counts: dict[str, dict[str, Any]] | None = None,
+    backfill_status_by_theme: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     overlay = dict((condition_counts or {}).get(str(item.get("theme_id") or ""), {}) or {})
     eligible_total = int(item.get("eligible_total_members") or 0)
     price_alive_count = int(item.get("alive_count") or 0)
@@ -537,11 +704,20 @@ def _theme_row(item: dict[str, Any], rank: int, condition_counts: dict[str, dict
     }
     row["has_live_price_signal"] = _theme_has_live_price_signal(row)
     row.update(_theme_quality_profile(row))
+    row.update((backfill_status_by_theme or {}).get(str(row["theme_id"]), {}))
     return row
 
 
-def _ranked_theme_rows(themes: list[dict[str, Any]], condition_counts: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    rows = [_theme_row(item, index, condition_counts) for index, item in enumerate(themes, start=1)]
+def _ranked_theme_rows(
+    themes: list[dict[str, Any]],
+    condition_counts: dict[str, dict[str, Any]] | None = None,
+    *,
+    backfill_status_by_theme: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    rows = [
+        _theme_row(item, index, condition_counts, backfill_status_by_theme)
+        for index, item in enumerate(themes, start=1)
+    ]
     rows.sort(key=_theme_sort_key)
     for index, row in enumerate(rows, start=1):
         row["rank"] = index
@@ -558,6 +734,112 @@ def _theme_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
         -float(row.get("theme_turnover_krw") or 0),
         str(row.get("theme_name") or ""),
     )
+
+
+def _theme_backfill_runtime(raw: dict[str, Any], gateway_state: Any | None) -> dict[str, Any]:
+    base = dict(raw.get("theme_backfill_runtime") or {})
+    base.setdefault("enabled", False)
+    base.setdefault("paused_reason", "")
+    base.setdefault("queued_count", 0)
+    base.setdefault("dispatched_count", 0)
+    base.setdefault("success_count", 0)
+    base.setdefault("failure_count", 0)
+    base.setdefault("skipped_count", 0)
+    base.setdefault("expired_count", 0)
+    base.setdefault("last_success_at", "")
+    base.setdefault("last_failure_at", "")
+    base.setdefault("last_failure_reason", "")
+    base.setdefault("tr_backfill_caused_ready_count", 0)
+    if gateway_state is None:
+        return base
+    for key in ("queued_count", "dispatched_count", "success_count", "failure_count", "skipped_count", "expired_count"):
+        base[key] = 0
+    for record in _theme_backfill_records(gateway_state):
+        status = str(record.get("status") or "")
+        if status == "QUEUED":
+            base["queued_count"] = int(base.get("queued_count") or 0) + 1
+        elif status == "DISPATCHED":
+            base["dispatched_count"] = int(base.get("dispatched_count") or 0) + 1
+        elif status == "ACKED":
+            base["success_count"] = int(base.get("success_count") or 0) + 1
+            base["last_success_at"] = max(str(base.get("last_success_at") or ""), str(record.get("finished_at") or record.get("acked_at") or ""))
+        elif status == "FAILED":
+            base["failure_count"] = int(base.get("failure_count") or 0) + 1
+            failed_at = str(record.get("finished_at") or "")
+            if failed_at >= str(base.get("last_failure_at") or ""):
+                base["last_failure_at"] = failed_at
+                base["last_failure_reason"] = str(record.get("last_error") or "")
+        elif status.startswith("SKIPPED"):
+            base["skipped_count"] = int(base.get("skipped_count") or 0) + 1
+        elif status.startswith("EXPIRED"):
+            base["expired_count"] = int(base.get("expired_count") or 0) + 1
+    return base
+
+
+def _theme_backfill_status_by_theme(gateway_state: Any | None) -> dict[str, dict[str, Any]]:
+    if gateway_state is None:
+        return {}
+    status_by_theme: dict[str, dict[str, Any]] = {}
+    priority = {
+        "DISPATCHED": 0,
+        "QUEUED": 1,
+        "FAILED": 2,
+        "SKIPPED_READY": 3,
+        "SKIPPED_ORDER_PENDING": 3,
+        "SKIPPED_GATEWAY_UNHEALTHY": 3,
+        "SKIPPED_NON_BACKFILL_PENDING": 3,
+        "EXPIRED_BEFORE_DISPATCH": 4,
+        "EXPIRED": 4,
+        "ACKED": 5,
+    }
+    for record in _theme_backfill_records(gateway_state):
+        payload = _record_payload(record)
+        themes = [str(payload.get("primary_theme_id") or "")]
+        themes.extend(str(item) for item in payload.get("related_theme_ids") or [])
+        status = str(record.get("status") or "")
+        item = {
+            "theme_backfill_status": _display_backfill_status(status),
+            "theme_backfill_raw_status": status,
+            "theme_backfill_failure_reason": str(record.get("last_error") or ""),
+        }
+        for theme_id in {theme for theme in themes if theme}:
+            current = status_by_theme.get(theme_id)
+            if current is None or priority.get(status, 99) < priority.get(str(current.get("theme_backfill_raw_status") or ""), 99):
+                status_by_theme[theme_id] = item
+    return status_by_theme
+
+
+def _theme_backfill_records(gateway_state: Any) -> list[dict[str, Any]]:
+    try:
+        records = gateway_state.list_commands(limit=500, include_finished=True, command_type="tr_request")
+    except Exception:
+        return []
+    return [record for record in records if _record_payload(record).get("purpose") == THEME_BACKFILL_PURPOSE]
+
+
+def _record_payload(record: dict[str, Any]) -> dict[str, Any]:
+    command = dict(record.get("command") or {})
+    payload = command.get("payload")
+    if isinstance(payload, dict):
+        return payload
+    payload = record.get("payload")
+    return dict(payload or {}) if isinstance(payload, dict) else {}
+
+
+def _display_backfill_status(status: str) -> str:
+    if status == "QUEUED":
+        return "대기"
+    if status == "DISPATCHED":
+        return "진행"
+    if status == "ACKED":
+        return "완료"
+    if status == "FAILED":
+        return "실패"
+    if status.startswith("SKIPPED"):
+        return "스킵"
+    if status.startswith("EXPIRED"):
+        return "만료"
+    return ""
 
 
 def _theme_has_live_price_signal(row: dict[str, Any]) -> bool:
