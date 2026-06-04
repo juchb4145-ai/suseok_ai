@@ -59,7 +59,12 @@ class RealtimeFeatureCalculator:
         if vwap is not None:
             enriched["vwap"] = vwap
             enriched["vwap_ready"] = True
-        price_context = self._recent_price_context(clean_code, candle_builder)
+        price_context = self._recent_price_context(
+            clean_code,
+            candle_builder,
+            current_price=price,
+            timestamp=timestamp,
+        )
         enriched.update(price_context)
         prev_close = self._prev_close(enriched, price=price, change_rate=change_rate)
         if prev_close is not None:
@@ -111,36 +116,55 @@ class RealtimeFeatureCalculator:
             return None
         return round(float(trade_value) / volume, 4)
 
-    def _recent_price_context(self, code: str, candle_builder: CandleBuilder) -> dict[str, Any]:
+    def _recent_price_context(
+        self,
+        code: str,
+        candle_builder: CandleBuilder,
+        *,
+        current_price: int,
+        timestamp: datetime,
+    ) -> dict[str, Any]:
         metadata: dict[str, Any] = {}
         completed_1m = candle_builder.completed_candles(code, 1)
         candles_1m = completed_1m[-self.recent_candle_window :]
         candles_3m = candle_builder.completed_candles(code, 3)[-self.recent_candle_window :]
         active_1m = candle_builder.active_candle(code, 1)
-        display_candles = list(candles_1m)
-        if active_1m is not None and (not display_candles or display_candles[-1].start_at != active_1m.start_at):
-            display_candles.append(active_1m)
-        if display_candles:
-            metadata["recent_candles_1m"] = [
-                _candle_payload(candle, completed=active_1m is None or candle.start_at != active_1m.start_at)
-                for candle in display_candles[-self.recent_candle_window :]
-            ]
-        if candles_1m:
-            support_candles = candles_1m[-self.support_window :]
+        current_start = minute_start(timestamp)
+        logical_completed_1m = list(candles_1m)
+        display_payloads = [_candle_payload(candle, completed=True) for candle in candles_1m]
+        active_payload: dict[str, Any] | None = None
+        if active_1m is not None and active_1m.start_at < current_start:
+            if not logical_completed_1m or logical_completed_1m[-1].start_at != active_1m.start_at:
+                logical_completed_1m.append(active_1m)
+                display_payloads.append(_candle_payload(active_1m, completed=True))
+            active_payload = _tick_candle_payload(current_start, current_price)
+        elif active_1m is not None:
+            active_payload = _active_candle_payload(active_1m, current_price=current_price)
+        elif current_price > 0:
+            active_payload = _tick_candle_payload(current_start, current_price)
+        if active_payload:
+            if not display_payloads or display_payloads[-1].get("start_at") != active_payload.get("start_at"):
+                display_payloads.append(active_payload)
+            else:
+                display_payloads[-1] = active_payload
+        if display_payloads:
+            metadata["recent_candles_1m"] = display_payloads[-self.recent_candle_window :]
+        if logical_completed_1m:
+            support_candles = logical_completed_1m[-self.support_window :]
             metadata["recent_support_price"] = min(float(candle.low) for candle in support_candles)
             metadata["recent_support_candle_count"] = len(support_candles)
             metadata["recent_support_ready"] = len(support_candles) >= self.support_window
             metadata["recent_support_source"] = "completed_1m_low"
-        elif active_1m is not None:
-            metadata["recent_support_price"] = float(active_1m.low)
+        elif active_payload:
+            metadata["recent_support_price"] = float(active_payload["low"])
             metadata["recent_support_candle_count"] = 0
             metadata["recent_support_ready"] = False
             metadata["recent_support_source"] = "active_1m_low_provisional"
         if candles_3m:
             metadata["recent_candles_3m"] = [_candle_payload(candle, completed=True) for candle in candles_3m]
             metadata["recent_3m_bar_count"] = len(candles_3m)
-        metadata["completed_minute_bar_count"] = len(completed_1m)
-        metadata["minute_bar_present"] = bool(display_candles)
+        metadata["completed_minute_bar_count"] = len(logical_completed_1m)
+        metadata["minute_bar_present"] = bool(display_payloads)
         return metadata
 
     @staticmethod
@@ -216,6 +240,33 @@ def _candle_payload(candle, *, completed: bool) -> dict[str, Any]:
         "close": candle.close,
         "volume": candle.volume,
         "completed": completed,
+    }
+
+
+def _active_candle_payload(candle, *, current_price: int) -> dict[str, Any]:
+    price = current_price if current_price > 0 else candle.close
+    return {
+        "start_at": candle.start_at.isoformat(),
+        "open": candle.open,
+        "high": max(candle.high, price),
+        "low": min(candle.low, price),
+        "close": price,
+        "volume": candle.volume,
+        "completed": False,
+    }
+
+
+def _tick_candle_payload(start_at: datetime, current_price: int) -> dict[str, Any] | None:
+    if current_price <= 0:
+        return None
+    return {
+        "start_at": start_at.isoformat(),
+        "open": current_price,
+        "high": current_price,
+        "low": current_price,
+        "close": current_price,
+        "volume": 0,
+        "completed": False,
     }
 
 

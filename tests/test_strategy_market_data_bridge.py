@@ -116,6 +116,9 @@ def test_bridge_preserves_rich_tick_metadata_and_realtime_features():
     assert latest.metadata["raw_fids_present"] == [10, 14, 228]
     assert latest.metadata["momentum_1m"] == 0.0
     assert latest.metadata["turnover_strength"] == 1.0
+    assert latest.metadata["minute_bar_present"] is True
+    assert latest.metadata["recent_candles_1m"][0]["completed"] is False
+    assert latest.metadata["recent_support_source"] == "active_1m_low_provisional"
     assert "MOMENTUM_WARMUP" in latest.metadata["reason_codes"]
     assert "SPREAD_APPROXIMATED" in latest.metadata["reason_codes"]
 
