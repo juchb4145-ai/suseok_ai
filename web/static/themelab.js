@@ -23,6 +23,9 @@ const statusClass = {
   WAIT_MARKET_STATE_CONSERVATIVE_FALLBACK: "wait",
   WAIT_CANDIDATE_MARKET_RISK_OFF: "blocked",
   WAIT_CANDIDATE_MARKET_WEAK: "wait",
+  WAIT_FAILED_BREAKOUT: "wait",
+  WAIT_DEEP_PULLBACK: "wait",
+  WAIT_PRICE_LOCATION_UNKNOWN: "wait",
   WAIT_DATA_SUPPORT_NOT_READY: "warning",
   WAIT_DATA_LATEST_TICK_STALE: "warning",
   READY_TO_TRADE: "ready",
@@ -54,6 +57,9 @@ const displayStatusDescriptions = {
   CHASE_RISK_BLOCKED: "추격매수 차단",
   WAIT_MARKET_CONFIRMATION_PENDING: "시장 확인 대기",
   WAIT_MARKET_RECOVERY_PENDING: "시장 회복 대기",
+  WAIT_FAILED_BREAKOUT: "돌파 실패 대기",
+  WAIT_DEEP_PULLBACK: "과도한 눌림 대기",
+  WAIT_PRICE_LOCATION_UNKNOWN: "가격 위치 확인 대기",
   WAIT_DATA_SUPPORT_NOT_READY: "지지선 데이터 대기",
   WAIT_DATA_LATEST_TICK_STALE: "틱 데이터 갱신 대기",
 };
@@ -198,8 +204,12 @@ function renderCockpit(snapshot) {
     countLine("가상 주문", summary.virtual_order_created_count),
   ].join("");
 
+  const dataQualityReasons = (dataQuality.reasons || [])
+    .slice(0, 3)
+    .map((reason) => `<div class="cockpit-line"><strong>원인</strong><span>${escapeHtml(reason)}</span></div>`);
   document.getElementById("cockpit-data-quality").innerHTML = [
     `<div class="cockpit-line"><strong>상태</strong>${badge(dataQuality.status || "UNKNOWN")}<span>${escapeHtml(dataQuality.message || "-")}</span></div>`,
+    ...dataQualityReasons,
     countLine("데이터 대기", summary.data_not_ready_count),
     countLine("진단 전용", summary.diagnostic_only_count),
   ].join("");
@@ -252,11 +262,28 @@ function leaderLine(item) {
 
 function themeQualityLine(item) {
   const flags = item.data_quality_flags || [];
-  if (item.quality_label) {
-    return `<div class="row-meta warning">데이터 품질: ${escapeHtml(item.quality_label)}</div>`;
+  const status = item.theme_quality_status || (item.quality_label || flags.length ? "WARNING" : "OK");
+  const tone = item.theme_quality_tone || statusClass[status] || (status === "OK" ? "ready" : "warning");
+  const label = item.quality_label || (!flags.length ? "정상" : flags.slice(0, 3).join(", "));
+  const detail = themeQualityDetail(item);
+  return [
+    `<div class="row-meta ${tone}">데이터 품질: ${badge(status, tone)} ${escapeHtml(label)}</div>`,
+    detail ? `<div class="row-meta muted">원인/조치: ${escapeHtml(detail)}</div>` : "",
+  ].filter(Boolean).join("");
+}
+
+function themeQualityDetail(item) {
+  const reasons = (item.theme_quality_reasons || []).slice(0, 2);
+  const parts = [];
+  if (reasons.length) parts.push(reasons.join(" · "));
+  if (item.theme_quality_action && item.theme_quality_status !== "OK") parts.push(item.theme_quality_action);
+  const priority = item.theme_backfill_priority || "NONE";
+  if (priority !== "NONE") {
+    const trs = (item.theme_backfill_trs || []).slice(0, 2).join(", ");
+    const symbols = (item.theme_backfill_symbols || []).slice(0, 5).join(", ");
+    parts.push(`TR 보강 ${priority}${trs ? `: ${trs}` : ""}${symbols ? ` · 후보 ${symbols}` : ""}`);
   }
-  if (!flags.length) return `<div class="row-meta muted">데이터 품질: 정상</div>`;
-  return `<div class="row-meta warning">데이터 품질: ${escapeHtml(flags.slice(0, 3).join(", "))}</div>`;
+  return parts.join(" · ");
 }
 
 function renderChart(chart) {
@@ -435,6 +462,10 @@ function gateSections(detail) {
         ["metrics.vwap_gap_pct", "VWAP 이격"],
         ["metrics.pullback_from_high_pct", "고점 눌림"],
         ["metrics.distance_to_session_high_pct", "당일고점 이격"],
+        ["momentum_1m", "1분 모멘텀"],
+        ["momentum_1m_missing_reason", "1분 모멘텀 사유"],
+        ["momentum_3m", "3분 모멘텀"],
+        ["momentum_3m_missing_reason", "3분 모멘텀 사유"],
       ],
     },
     {
@@ -622,6 +653,9 @@ function matchesStatus(item, value) {
   if (["READY", "READY_SMALL", "OBSERVE", "BLOCKED"].includes(value)) return gate === value;
   if (value === "WAIT") return gate === "WAIT" || display.startsWith("WAIT") || display === "LATE_CHASE_TEMP_WAIT";
   if (value === "LATE_CHASE_TEMP_WAIT") return display === "LATE_CHASE_TEMP_WAIT";
+  if (value === "WAIT_FAILED_BREAKOUT") return display === "WAIT_FAILED_BREAKOUT";
+  if (value === "WAIT_DEEP_PULLBACK") return display === "WAIT_DEEP_PULLBACK";
+  if (value === "WAIT_PRICE_LOCATION_UNKNOWN") return display === "WAIT_PRICE_LOCATION_UNKNOWN";
   if (value === "MARKET_PENDING") return isMarketPending(item);
   if (value === "DATA_NOT_READY") return isDataNotReady(item);
   if (value === "LIVE_GUARD_BLOCKED") return gateIsReadyLike(item) && !item.live_order_guard_passed;

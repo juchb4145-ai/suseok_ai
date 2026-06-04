@@ -17,6 +17,9 @@ DISPLAY_WAIT_ORDER = {
     "WAIT_MARKET_STATE_CONSERVATIVE_FALLBACK": 1,
     "WAIT_CANDIDATE_MARKET_RISK_OFF": 1,
     "WAIT_CANDIDATE_MARKET_WEAK": 1,
+    "WAIT_FAILED_BREAKOUT": 2,
+    "WAIT_DEEP_PULLBACK": 2,
+    "WAIT_PRICE_LOCATION_UNKNOWN": 2,
     "WAIT_DATA_SUPPORT_NOT_READY": 2,
     "WAIT_DATA_LATEST_TICK_STALE": 2,
 }
@@ -398,19 +401,31 @@ def _condition_statuses(db: TradingDatabase) -> list[dict[str, Any]]:
 def _data_quality(raw: dict[str, Any], watchset: list[dict[str, Any]]) -> dict[str, Any]:
     data = dict(raw.get("data_quality") or {})
     price_flags = [flag for item in watchset for flag in item.get("data_quality_flags", []) + item.get("price_location_data_quality_flags", [])]
+    missing_current_price = int(_first_not_none(data.get("current_price_missing_count"), data.get("missing_current_price_count"), price_flags.count("MISSING_CURRENT_PRICE")) or 0)
     missing_vwap = int(_first_not_none(data.get("vwap_missing_count"), price_flags.count("MISSING_VWAP")) or 0)
     missing_session_high = int(_first_not_none(data.get("session_high_missing_count"), price_flags.count("MISSING_SESSION_HIGH")) or 0)
-    missing_prev_close = int(_first_not_none(data.get("prev_close_missing_count"), price_flags.count("MISSING_PREV_CLOSE")) or 0)
-    candle_missing = int(_first_not_none(data.get("candle_missing_count"), len(watchset)) or 0)
+    missing_prev_close = int(_first_not_none(data.get("prev_close_missing_count"), data.get("missing_prev_close_count"), price_flags.count("MISSING_PREV_CLOSE")) or 0)
+    candle_missing = int(_first_not_none(data.get("candle_missing_count"), _watchset_candle_missing_count(watchset)) or 0)
     quote_stale = int(_first_not_none(data.get("quote_stale_count"), 0) or 0)
     status = str(data.get("status") or "OK")
-    if candle_missing or quote_stale >= 5:
+    if status == "BROKEN":
+        pass
+    elif candle_missing or quote_stale >= 5:
         status = "DEGRADED"
-    elif any([missing_vwap, missing_session_high, missing_prev_close, quote_stale]):
+    elif any([missing_current_price, missing_vwap, missing_session_high, missing_prev_close, quote_stale]):
         status = "WARNING"
+    reasons = _data_quality_reasons(
+        candle_missing=candle_missing,
+        quote_stale=quote_stale,
+        missing_current_price=missing_current_price,
+        missing_prev_close=missing_prev_close,
+        missing_vwap=missing_vwap,
+        missing_session_high=missing_session_high,
+    )
     return {
         "status": status,
         "quote_stale_count": quote_stale,
+        "current_price_missing_count": missing_current_price,
         "prev_close_missing_count": missing_prev_close,
         "candle_missing_count": candle_missing,
         "vwap_missing_count": missing_vwap,
@@ -420,8 +435,47 @@ def _data_quality(raw: dict[str, Any], watchset: list[dict[str, Any]]) -> dict[s
         "watchset_size": len(watchset),
         "realtime_subscription_count": int(data.get("realtime_subscription_count") or 0),
         "realtime_subscription_limit": int(data.get("realtime_subscription_limit") or 0),
-        "message": _data_quality_message(status, candle_missing, missing_vwap),
+        "reasons": reasons,
+        "message": _data_quality_message(status, reasons),
     }
+
+
+def _watchset_candle_missing_count(watchset: list[dict[str, Any]]) -> int:
+    missing = 0
+    for item in watchset:
+        if int(item.get("completed_minute_bar_count") or 0) > 0:
+            continue
+        if _as_list(item.get("recent_candles_1m")):
+            continue
+        if bool(item.get("minute_bar_present")):
+            continue
+        missing += 1
+    return missing
+
+
+def _data_quality_reasons(
+    *,
+    candle_missing: int,
+    quote_stale: int,
+    missing_current_price: int,
+    missing_prev_close: int,
+    missing_vwap: int,
+    missing_session_high: int,
+) -> list[str]:
+    reasons = []
+    if candle_missing:
+        reasons.append(f"WatchSet 분봉 {candle_missing}종목 누락")
+    if quote_stale:
+        reasons.append(f"stale quote {quote_stale}종목")
+    if missing_vwap:
+        reasons.append(f"VWAP {missing_vwap}종목 누락")
+    if missing_session_high:
+        reasons.append(f"당일 고점 {missing_session_high}종목 누락")
+    if missing_current_price:
+        reasons.append(f"테마 universe 현재가 {missing_current_price}종목 누락")
+    if missing_prev_close:
+        reasons.append(f"테마 universe 전일종가 {missing_prev_close}종목 누락")
+    return reasons
 
 
 def _theme_row(item: dict[str, Any], rank: int, condition_counts: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -466,6 +520,13 @@ def _theme_row(item: dict[str, Any], rank: int, condition_counts: dict[str, dict
         "turnover_label": "수신대금",
         "priced_member_count": quality["priced_member_count"],
         "turnover_member_count": quality["turnover_member_count"],
+        "prev_close_member_count": quality["prev_close_member_count"],
+        "member_price_coverage_ratio": quality["price_coverage_ratio"],
+        "member_turnover_coverage_ratio": quality["turnover_coverage_ratio"],
+        "missing_current_price_member_count": quality["missing_current_price_member_count"],
+        "missing_prev_close_member_count": quality["missing_prev_close_member_count"],
+        "missing_current_price_members": quality["missing_current_price_members"],
+        "missing_prev_close_members": quality["missing_prev_close_members"],
         "member_data_coverage_label": quality["coverage_label"],
         "top_leader_symbol": leader["symbol"] or item.get("top_leader_symbol") or "",
         "top_leader_name": leader["name"] or item.get("top_leader_name") or "",
@@ -475,7 +536,7 @@ def _theme_row(item: dict[str, Any], rank: int, condition_counts: dict[str, dict
         "data_quality_flags": list(item.get("data_quality_flags") or []),
     }
     row["has_live_price_signal"] = _theme_has_live_price_signal(row)
-    row["quality_label"] = _theme_quality_label(row)
+    row.update(_theme_quality_profile(row))
     return row
 
 
@@ -510,36 +571,181 @@ def _theme_has_live_price_signal(row: dict[str, Any]) -> bool:
     )
 
 
-def _theme_quality_label(row: dict[str, Any]) -> str:
+def _theme_quality_profile(row: dict[str, Any]) -> dict[str, Any]:
     flags = set(row.get("data_quality_flags") or [])
-    labels = []
-    if "MISSING_CURRENT_PRICE" in flags:
-        labels.append("일부 구성종목 데이터 대기" if row.get("has_live_price_signal") else "현재가 미수신")
-    if "MISSING_PREV_CLOSE" in flags:
-        labels.append("전일종가 일부 누락")
+    total = int(row.get("eligible_total_members") or 0)
+    priced = int(row.get("priced_member_count") or 0)
+    turnover = int(row.get("turnover_member_count") or 0)
+    price_ratio = float(row.get("member_price_coverage_ratio") or _ratio(priced, total))
+    turnover_ratio = float(row.get("member_turnover_coverage_ratio") or _ratio(turnover, total))
+    missing_current = int(row.get("missing_current_price_member_count") or 0)
+    missing_prev = int(row.get("missing_prev_close_member_count") or 0)
+    if "MISSING_CURRENT_PRICE" in flags and missing_current <= 0:
+        missing_current = max(0, total - priced)
+    if "MISSING_PREV_CLOSE" in flags and missing_prev <= 0:
+        missing_prev = max(0, total - priced)
+
+    has_live_signal = bool(row.get("has_live_price_signal"))
+    price_text = f"가격 {priced}/{total}({_pct_label(price_ratio)})" if total else "가격 universe 없음"
+    turnover_text = f"대금 {turnover}/{total}({_pct_label(turnover_ratio)})" if total else "대금 universe 없음"
+    reasons: list[str] = []
+    if total:
+        reasons.append(f"가격 커버리지 {priced}/{total}({_pct_label(price_ratio)})")
+    if missing_current:
+        reasons.append(f"현재가 누락 {missing_current}종목")
+    if missing_prev:
+        reasons.append(f"전일종가 누락 {missing_prev}종목")
     if "EXCLUSION_METADATA_FALLBACK" in flags:
-        if not row.get("has_live_price_signal"):
-            labels.append("제외 메타 보조값 사용")
-    return ", ".join(labels)
+        reasons.append("제외/거래가능 메타데이터 fallback")
+    if turnover_ratio < 0.3 and total:
+        reasons.append(f"대금 커버리지 {turnover}/{total}({_pct_label(turnover_ratio)})")
+
+    status = "OK"
+    tone = "ready"
+    label = ""
+    action = "정상: 테마 폭과 WatchSet/Gate 판단을 함께 사용"
+    backfill_priority = "NONE"
+    backfill_trs: list[str] = []
+
+    if not total:
+        status = "WARNING"
+        tone = "warning"
+        label = "테마 universe 비어 있음: 구성종목 매핑 확인 필요"
+        action = "테마 순위는 참고용; canonical membership 적재 확인"
+    elif not has_live_signal and ("MISSING_CURRENT_PRICE" in flags or price_ratio == 0):
+        status = "BROKEN"
+        tone = "blocked"
+        label = f"테마 폭 산출 불가: {price_text}, 실시간 현재가 보강 필요"
+        action = "매매 판단 제외; Kiwoom 현재가/TR 보강 후 재평가"
+        backfill_priority = "HIGH"
+    elif price_ratio < 0.3 or ("MISSING_CURRENT_PRICE" in flags and missing_current >= max(2, total * 0.7)):
+        status = "DEGRADED"
+        tone = "blocked"
+        label = f"테마 폭 신뢰 낮음: {price_text}, 대장/조건식만 보수 해석"
+        action = "실매수 판단은 WatchSet/Gate 품질 통과 종목만 사용"
+        backfill_priority = "HIGH"
+    elif flags or price_ratio < 0.6 or missing_current or missing_prev:
+        status = "WARNING"
+        tone = "warning"
+        details = [price_text]
+        if missing_current:
+            details.append(f"현재가 {missing_current}종목 대기")
+        if missing_prev:
+            details.append(f"전일종가 {missing_prev}종목 보강 필요")
+        if "EXCLUSION_METADATA_FALLBACK" in flags:
+            details.append("메타 fallback")
+        if has_live_signal:
+            details.append("대장/조건식 확인")
+        label = f"테마 폭 신뢰 보통: {', '.join(details)}"
+        action = "테마 폭은 보수 해석; 대장 후보와 WatchSet 품질 우선"
+        backfill_priority = "MEDIUM" if missing_current or missing_prev else "LOW"
+    else:
+        label = ""
+
+    if backfill_priority != "NONE":
+        if missing_current or "MISSING_CURRENT_PRICE" in flags:
+            backfill_trs.append("opt10001 주식기본정보요청: 현재가/기준가 보강")
+        if missing_prev or "MISSING_PREV_CLOSE" in flags:
+            backfill_trs.append("opt10081 주식일봉차트조회요청: 전일종가 검증")
+
+    backfill_symbols = _theme_backfill_symbols(row)
+    if backfill_priority == "NONE" and backfill_symbols:
+        backfill_priority = "LOW"
+    return {
+        "quality_label": label,
+        "theme_quality_status": status,
+        "theme_quality_tone": tone,
+        "theme_quality_reasons": reasons[:5],
+        "theme_quality_action": action,
+        "theme_backfill_priority": backfill_priority,
+        "theme_backfill_trs": backfill_trs,
+        "theme_backfill_symbols": backfill_symbols,
+        "theme_quality_coverage_summary": f"{price_text} · {turnover_text}",
+    }
 
 
 def _theme_member_quality(member_hits: list[dict[str, Any]], eligible_total: int) -> dict[str, Any]:
     priced = 0
     turnover = 0
+    prev_close = 0
+    missing_current = 0
+    missing_prev = 0
+    missing_current_members: list[str] = []
+    missing_prev_members: list[str] = []
+    active_total = 0
     for hit in member_hits:
         if hit.get("excluded"):
             continue
-        flags = set(hit.get("data_quality_flags") or [])
-        if "MISSING_CURRENT_PRICE" not in flags and hit.get("return_pct") is not None:
+        active_total += 1
+        flags = {str(flag) for flag in hit.get("data_quality_flags") or []}
+        member_label = _member_label(hit)
+        has_price_signal = any(
+            [
+                hit.get("return_pct") is not None,
+                hit.get("current_price") is not None,
+                hit.get("last_price") is not None,
+                hit.get("price") is not None,
+                float(hit.get("turnover_krw") or hit.get("turnover") or 0) > 0,
+                bool(hit.get("alive_hit") or hit.get("strong_hit") or hit.get("leader_hit")),
+            ]
+        )
+        if "MISSING_CURRENT_PRICE" in flags:
+            missing_current += 1
+            if member_label:
+                missing_current_members.append(member_label)
+        elif has_price_signal:
             priced += 1
+        has_prev_close_signal = any(
+            [
+                hit.get("return_pct") is not None,
+                hit.get("prev_close") is not None,
+                hit.get("previous_close") is not None,
+                hit.get("base_price") is not None,
+            ]
+        )
+        if "MISSING_PREV_CLOSE" in flags:
+            missing_prev += 1
+            if member_label:
+                missing_prev_members.append(member_label)
+        elif has_prev_close_signal:
+            prev_close += 1
         if float(hit.get("turnover_krw") or hit.get("turnover") or 0) > 0:
             turnover += 1
-    total = eligible_total or len([hit for hit in member_hits if not hit.get("excluded")])
+    total = eligible_total or active_total
     return {
         "priced_member_count": priced,
         "turnover_member_count": turnover,
+        "prev_close_member_count": prev_close,
+        "price_coverage_ratio": _ratio(priced, total),
+        "turnover_coverage_ratio": _ratio(turnover, total),
+        "missing_current_price_member_count": missing_current,
+        "missing_prev_close_member_count": missing_prev,
+        "missing_current_price_members": missing_current_members[:8],
+        "missing_prev_close_members": missing_prev_members[:8],
         "coverage_label": f"{priced}/{total} 종목 수신" if total else "0/0 종목 수신",
     }
+
+
+def _theme_backfill_symbols(row: dict[str, Any]) -> list[str]:
+    symbols: list[str] = []
+    for key in ("missing_current_price_members", "missing_prev_close_members"):
+        for label in row.get(key) or []:
+            text = str(label or "").strip()
+            if text and text not in symbols:
+                symbols.append(text)
+    return symbols[:5]
+
+
+def _member_label(hit: dict[str, Any]) -> str:
+    symbol = str(hit.get("symbol") or hit.get("code") or "").strip()
+    name = str(hit.get("name") or hit.get("stock_name") or "").strip()
+    if symbol and name:
+        return f"{name}[{symbol}]"
+    return name or symbol
+
+
+def _pct_label(value: float) -> str:
+    return f"{round(float(value or 0) * 100):.0f}%"
 
 
 def _leader_candidate(member_hits: list[dict[str, Any]], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -657,7 +863,10 @@ def _display_status(item: dict[str, Any], gate: str) -> str:
     existing = str(item.get("display_status") or item.get("normalized_status") or "").strip()
     if existing:
         return existing
-    reasons = {str(reason or "") for reason in item.get("reason_codes") or item.get("risk_reason_codes") or []}
+    reason_values: list[Any] = []
+    for key in ("reason_codes", "risk_reason_codes", "price_location_reason_codes"):
+        reason_values.extend(item.get(key) or [])
+    reasons = {str(reason or "") for reason in reason_values}
     market_reasons = {str(reason or "") for reason in item.get("market_side_reason_codes") or []}
     all_reasons = reasons | market_reasons
     market_status = str(item.get("candidate_market_confirmed_status") or item.get("candidate_market_status") or "")
@@ -680,6 +889,31 @@ def _display_status(item: dict[str, Any], gate: str) -> str:
         return "WAIT_DATA_SUPPORT_NOT_READY"
     if item.get("latest_tick_ready") is False:
         return "WAIT_DATA_LATEST_TICK_STALE"
+    if (
+        gate == "WAIT"
+        and (
+            str(item.get("price_location_status") or "") == "FAILED_BREAKOUT"
+            or "FAILED_BREAKOUT" in all_reasons
+        )
+    ):
+        return "WAIT_FAILED_BREAKOUT"
+    if (
+        gate == "WAIT"
+        and (
+            str(item.get("price_location_status") or "") == "DEEP_PULLBACK"
+            or "DEEP_PULLBACK" in all_reasons
+        )
+    ):
+        return "WAIT_DEEP_PULLBACK"
+    if (
+        gate == "WAIT"
+        and (
+            str(item.get("price_location_status") or "") == "UNKNOWN"
+            or "PRICE_LOCATION_UNKNOWN" in all_reasons
+            or "PRICE_LOCATION_DATA_MISSING" in all_reasons
+        )
+    ):
+        return "WAIT_PRICE_LOCATION_UNKNOWN"
     return gate
 
 
@@ -687,6 +921,21 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
     gate = _value(item.get("final_gate_status") or item.get("gate_status") or "OBSERVE")
     display_status = _display_status(item, gate)
     candidate_market = item.get("candidate_market") or "UNKNOWN"
+    recent_candles_1m = _as_list(item.get("recent_candles_1m"))
+    recent_candles_3m = _as_list(item.get("recent_candles_3m"))
+    momentum_1m = _first_not_none(item.get("momentum_1m"), _latest_candle_momentum(recent_candles_1m))
+    momentum_3m = _first_not_none(item.get("momentum_3m"), _latest_candle_momentum(recent_candles_3m))
+    momentum_5m = item.get("momentum_5m")
+    momentum_1m_missing_reason = "" if momentum_1m is not None else _momentum_missing_reason(recent_candles_1m, "1분")
+    momentum_3m_missing_reason = "" if momentum_3m is not None else _momentum_missing_reason(recent_candles_3m, "3분")
+    summary_item = {
+        **item,
+        "momentum_1m": momentum_1m,
+        "momentum_3m": momentum_3m,
+        "momentum_5m": momentum_5m,
+        "momentum_1m_missing_reason": momentum_1m_missing_reason,
+        "momentum_3m_missing_reason": momentum_3m_missing_reason,
+    }
     return {
         "gate_status": gate,
         "final_status": gate,
@@ -738,8 +987,15 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
         "recent_support_price": item.get("recent_support_price"),
         "upper_limit_price": item.get("upper_limit_price"),
         "breakout_level": item.get("breakout_level"),
-        "recent_candles_1m": _as_list(item.get("recent_candles_1m")),
-        "recent_candles_3m": _as_list(item.get("recent_candles_3m")),
+        "momentum_1m": momentum_1m,
+        "momentum_3m": momentum_3m,
+        "momentum_5m": momentum_5m,
+        "momentum_1m_missing_reason": momentum_1m_missing_reason,
+        "momentum_3m_missing_reason": momentum_3m_missing_reason,
+        "upper_wick_risk": item.get("upper_wick_risk"),
+        "failed_breakout": item.get("failed_breakout"),
+        "recent_candles_1m": recent_candles_1m,
+        "recent_candles_3m": recent_candles_3m,
         "completed_minute_bar_count": int(item.get("completed_minute_bar_count") or 0),
         "recent_3m_bar_count": int(item.get("recent_3m_bar_count") or 0),
         "minute_bar_present": bool(item.get("minute_bar_present")),
@@ -797,7 +1053,7 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
         "live_order_guard_passed": bool(item.get("live_order_guard_passed")),
         "position_size_multiplier": float(item.get("position_size_multiplier") or 1.0),
         "recheck_after_sec": int(item.get("recheck_after_sec") or 0),
-        "summary_reason": _summary_message(item, gate, display_status),
+        "summary_reason": _summary_message(summary_item, gate, display_status),
         "risk_reason_codes": list(item.get("risk_reason_codes") or []),
         "price_location_reason_codes": list(item.get("price_location_reason_codes") or []),
         "data_quality_flags": list(item.get("data_quality_flags") or []),
@@ -809,6 +1065,8 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
             "upper_limit_gap_pct": item.get("upper_limit_gap_pct"),
             "breakout_level_gap_pct": item.get("breakout_level_gap_pct"),
             "support_gap_pct": item.get("support_gap_pct"),
+            "momentum_1m": momentum_1m,
+            "momentum_3m": momentum_3m,
             "vi_active": item.get("vi_active"),
             "seconds_since_vi_release": item.get("seconds_since_vi_release"),
         },
@@ -996,6 +1254,165 @@ def _recheck_seconds(row: dict[str, Any]) -> int:
     return min(positives) if positives else 999999
 
 
+PRICE_LOCATION_MISSING_LABELS = {
+    "MISSING_CURRENT_PRICE": "현재가",
+    "MISSING_SESSION_HIGH": "당일 고점",
+    "MISSING_VWAP": "VWAP",
+    "MISSING_BREAKOUT_LEVEL": "돌파 기준",
+    "MISSING_RECENT_SUPPORT_PRICE": "최근 지지선",
+    "MISSING_RETURN_PCT": "등락률",
+    "MISSING_STOCK_ROLE": "종목 역할",
+    "MISSING_THEME_STATUS": "테마 상태",
+    "MISSING_MARKET_STATUS": "시장 상태",
+    "INVALID_RECENT_CANDLE": "최근 캔들",
+}
+
+
+def _price_location_wait_summary(item: dict[str, Any]) -> str:
+    reasons = [str(reason) for reason in item.get("price_location_reason_codes") or [] if reason]
+    flags = {
+        str(flag)
+        for flag in list(item.get("data_quality_flags") or []) + list(item.get("price_location_data_quality_flags") or [])
+        if flag
+    }
+    missing = [label for code, label in PRICE_LOCATION_MISSING_LABELS.items() if code in flags]
+    if "PRICE_LOCATION_DATA_MISSING" in reasons or missing:
+        detail = ", ".join(missing[:4]) + " 부족" if missing else "핵심 가격 데이터 부족"
+        return f"가격 위치 데이터 대기: {detail}{_wait_recheck_suffix(item)}"
+
+    metrics = _price_location_metric_summary(item)
+    if metrics:
+        return f"가격 위치 미확정: 분류 기준 밖({metrics}){_wait_recheck_suffix(item)}"
+
+    reason_text = ", ".join(reasons[:3]) if reasons else "세부 가격 지표 확인 필요"
+    return f"가격 위치 미확정: {reason_text}{_wait_recheck_suffix(item)}"
+
+
+def _deep_pullback_wait_summary(item: dict[str, Any]) -> str:
+    parts = []
+    pullback = _metric_number(item, "pullback_from_high_pct")
+    vwap_gap = _metric_number(item, "vwap_gap_pct")
+    support_gap = _metric_number(item, "support_gap_pct")
+    if pullback is not None:
+        parts.append(f"고점대비 {pullback:.2f}% 눌림")
+    if vwap_gap is not None:
+        parts.append(f"VWAP {vwap_gap:+.2f}%")
+    else:
+        parts.append("VWAP 미확인")
+    parts.append(_momentum_summary_text(item, "momentum_3m", "3분"))
+    if support_gap is not None:
+        parts.append(f"지지선 {support_gap:+.2f}%")
+    detail = ", ".join(parts) if parts else "고점대비 눌림 과다 또는 VWAP/모멘텀 회복 미확인"
+    return f"과도한 눌림 대기: {detail}{_wait_recheck_suffix(item)}"
+
+
+def _failed_breakout_wait_summary(item: dict[str, Any]) -> str:
+    parts = []
+    breakout_gap = _metric_number(item, "breakout_level_gap_pct")
+    vwap_gap = _metric_number(item, "vwap_gap_pct")
+    upper_wick = item.get("upper_wick_risk")
+    if breakout_gap is not None:
+        parts.append(f"돌파선 {breakout_gap:+.2f}% 이탈")
+    else:
+        parts.append("돌파선 이탈폭 미확인")
+    if upper_wick is not None:
+        parts.append(f"윗꼬리 리스크 {_risk_flag_label(upper_wick)}")
+    else:
+        parts.append("윗꼬리 리스크 미확인")
+    parts.append(_momentum_summary_text(item, "momentum_1m", "1분"))
+    if vwap_gap is not None:
+        parts.append(f"VWAP {vwap_gap:+.2f}%")
+    detail = ", ".join(parts)
+    return f"돌파 실패 대기: {detail}{_wait_recheck_suffix(item)}"
+
+
+def _price_location_metric_summary(item: dict[str, Any]) -> str:
+    fields = [
+        ("pullback_from_high_pct", "고점대비", False),
+        ("vwap_gap_pct", "VWAP", True),
+        ("breakout_level_gap_pct", "돌파선", True),
+        ("support_gap_pct", "지지선", True),
+    ]
+    parts = []
+    for key, label, signed in fields:
+        value = _metric_number(item, key)
+        if value is None:
+            continue
+        formatted = f"{value:+.2f}%" if signed else f"{value:.2f}%"
+        parts.append(f"{label} {formatted}")
+    return ", ".join(parts)
+
+
+def _metric_number(item: dict[str, Any], key: str) -> float | None:
+    value = item.get(key)
+    if value is None and isinstance(item.get("metrics"), dict):
+        value = item["metrics"].get(key)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _momentum_summary_text(item: dict[str, Any], key: str, label: str) -> str:
+    value = _metric_number(item, key)
+    if value is not None:
+        return f"{label} 모멘텀 {value:+.2f}%"
+    reason = str(item.get(f"{key}_missing_reason") or "").strip()
+    suffix = f"({reason})" if reason else ""
+    return f"{label} 모멘텀 미확인{suffix}"
+
+
+def _latest_candle_momentum(candles: list[dict[str, Any]]) -> float | None:
+    if not candles:
+        return None
+    candle = candles[-1]
+    open_price = _metric_number(candle, "open")
+    close_price = _metric_number(candle, "close")
+    if open_price is None or close_price is None or open_price <= 0:
+        return None
+    return round(((close_price - open_price) / open_price) * 100.0, 4)
+
+
+def _momentum_missing_reason(candles: list[dict[str, Any]], label: str) -> str:
+    if not candles:
+        return f"완성 {label}봉 없음"
+    candle = candles[-1]
+    open_price = _metric_number(candle, "open")
+    close_price = _metric_number(candle, "close")
+    if open_price is None or close_price is None:
+        return f"최근 {label}봉 open/close 누락"
+    if open_price <= 0:
+        return f"최근 {label}봉 시가 0"
+    return "계산값 미저장"
+
+
+def _risk_flag_label(value: Any) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return "있음"
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return "없음"
+    return "있음" if bool(value) else "없음"
+
+
+def _wait_recheck_suffix(item: dict[str, Any]) -> str:
+    candidates = [
+        _int_or_zero(item.get("recheck_after_sec")),
+        _int_or_zero(item.get("late_chase_recheck_after_sec")),
+        _int_or_zero(item.get("market_wait_recheck_after_sec")),
+    ]
+    positives = [value for value in candidates if value > 0]
+    return f", {min(positives)}초 후 재확인" if positives else ""
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _summary_message(item: dict[str, Any], gate: str, display_status: str = "") -> str:
     role = _value(item.get("stock_role") or "UNKNOWN")
     location = _value(item.get("price_location_status") or "UNKNOWN")
@@ -1014,6 +1431,12 @@ def _summary_message(item: dict[str, Any], gate: str, display_status: str = "") 
     if display_status.startswith("WAIT_DATA"):
         reason = item.get("support_ready_reason") or item.get("blocked_reason") or "보조 데이터 준비 필요"
         return f"데이터 보강 대기: {reason}"
+    if display_status == "WAIT_FAILED_BREAKOUT":
+        return _failed_breakout_wait_summary(item)
+    if display_status == "WAIT_DEEP_PULLBACK":
+        return _deep_pullback_wait_summary(item)
+    if display_status == "WAIT_PRICE_LOCATION_UNKNOWN":
+        return _price_location_wait_summary(item)
     if gate == "READY":
         live_note = "" if item.get("live_order_guard_passed") else " / LIVE Guard 미통과"
         return f"{role} / {location} 조건으로 진입 가능, {multiplier:.2g}배 비중{live_note}"
@@ -1021,6 +1444,12 @@ def _summary_message(item: dict[str, Any], gate: str, display_status: str = "") 
         live_note = "" if item.get("live_order_guard_passed") else " / LIVE Guard 미통과"
         return f"{role} 흐름은 유효하지만 {location} 기준으로 소액 관찰 진입, {multiplier:.2g}배 비중{live_note}"
     if gate == "WAIT":
+        if location == "FAILED_BREAKOUT" or "FAILED_BREAKOUT" in reasons:
+            return _failed_breakout_wait_summary(item)
+        if location == "DEEP_PULLBACK" or "DEEP_PULLBACK" in reasons:
+            return _deep_pullback_wait_summary(item)
+        if location == "UNKNOWN" or "PRICE_LOCATION_UNKNOWN" in reasons or "PRICE_LOCATION_DATA_MISSING" in reasons:
+            return _price_location_wait_summary(item)
         return f"{location} 또는 리스크 확인 필요로 WAIT"
     if gate == "BLOCKED":
         return "진입 차단: " + (", ".join(str(reason) for reason in reasons[:3]) if reasons else "리스크 필터 차단")
@@ -1046,12 +1475,12 @@ def _metric_ref(item: dict[str, Any], key: str, label: str) -> str:
     return f"{label} {float(value):+.2f}%"
 
 
-def _data_quality_message(status: str, candle_missing: int, missing_vwap: int) -> str:
+def _data_quality_message(status: str, reasons: list[str]) -> str:
     if status == "DEGRADED":
-        return f"분봉 {candle_missing}종목 누락, VWAP {missing_vwap}종목 누락"
+        return ", ".join(reasons[:2]) if reasons else "핵심 실시간 데이터 부족"
     if status == "WARNING":
-        return "일부 보조 데이터가 누락되어 보수적으로 표시합니다."
-    return "Data OK"
+        return ", ".join(reasons[:2]) if reasons else "일부 보조 데이터가 누락되어 보수적으로 표시합니다."
+    return "WatchSet 분봉/VWAP OK"
 
 
 def _as_list(value: Any) -> list[dict[str, Any]]:

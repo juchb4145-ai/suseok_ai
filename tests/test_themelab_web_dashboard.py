@@ -37,6 +37,9 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one('[data-filter-value="LIVE_GUARD_BLOCKED"]') is not None
     assert soup.select_one('[data-filter-value="MISSING_VWAP"]') is not None
     assert soup.select_one('[data-filter-value="ORDER_INTENT_CREATED"]') is not None
+    assert soup.select_one('[data-filter-value="WAIT_FAILED_BREAKOUT"]') is not None
+    assert soup.select_one('[data-filter-value="WAIT_DEEP_PULLBACK"]') is not None
+    assert soup.select_one('[data-filter-value="WAIT_PRICE_LOCATION_UNKNOWN"]') is not None
     assert "/static/themelab.css" in html
     assert "/static/themelab.js" in html
     assert "--app-bg: #0b0f14" in css
@@ -294,6 +297,52 @@ def test_theme_lab_snapshot_operation_status_for_ready_live_blocked_and_data_qua
         db.close()
 
 
+def test_theme_lab_data_quality_uses_actual_watchset_candles(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        watch = _watch("000203", "WAIT")
+        watch.update(
+            {
+                "recent_candles_1m": [
+                    {
+                        "start_at": "2026-06-04T09:01:00",
+                        "open": 1000,
+                        "high": 1010,
+                        "low": 995,
+                        "close": 1005,
+                    }
+                ],
+                "completed_minute_bar_count": 1,
+                "minute_bar_present": True,
+            }
+        )
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:09:30",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [watch],
+                "gate_decisions": [],
+                "data_quality": {
+                    "missing_current_price_count": 43,
+                    "missing_prev_close_count": 43,
+                },
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    quality = payload["data_quality"]
+    assert quality["status"] == "WARNING"
+    assert quality["candle_missing_count"] == 0
+    assert quality["current_price_missing_count"] == 43
+    assert quality["prev_close_missing_count"] == 43
+    assert "테마 universe 현재가 43종목 누락" in quality["reasons"]
+    assert "WatchSet 분봉 1종목 누락" not in quality["reasons"]
+
+
 def test_theme_lab_snapshot_operation_status_for_empty_watchset_with_theme_data_wait(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     try:
@@ -377,9 +426,16 @@ def test_theme_lab_snapshot_demotes_themes_without_live_price_signal(tmp_path):
     ranked = payload["ranked_themes"]
     assert ranked[0]["theme_id"] == "live"
     assert ranked[0]["has_live_price_signal"] is True
-    assert ranked[0]["quality_label"] == "일부 구성종목 데이터 대기, 전일종가 일부 누락"
+    assert ranked[0]["theme_quality_status"] == "WARNING"
+    assert ranked[0]["theme_backfill_priority"] == "MEDIUM"
+    assert "테마 폭 신뢰 보통" in ranked[0]["quality_label"]
+    assert "현재가 3종목 대기" in ranked[0]["quality_label"]
+    assert "전일종가 3종목 보강 필요" in ranked[0]["quality_label"]
     assert ranked[1]["theme_id"] == "missing"
-    assert ranked[1]["quality_label"] == "현재가 미수신, 전일종가 일부 누락"
+    assert ranked[1]["theme_quality_status"] == "BROKEN"
+    assert ranked[1]["theme_backfill_priority"] == "HIGH"
+    assert "테마 폭 산출 불가" in ranked[1]["quality_label"]
+    assert "실시간 현재가 보강 필요" in ranked[1]["quality_label"]
 
 
 def test_theme_lab_snapshot_overlays_condition_event_breadth(tmp_path):
@@ -542,6 +598,175 @@ def test_theme_lab_snapshot_exposes_defensive_gate_observability_columns(tmp_pat
         "live_order_guard_passed",
     ):
         assert key in rows["000011"]
+
+
+def test_theme_lab_snapshot_explains_unknown_price_location_wait(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        wait = _watch("000013", "WAIT")
+        wait.update(
+            {
+                "price_location_status": "UNKNOWN",
+                "price_location_score": 40,
+                "price_location_reason_codes": ["PRICE_LOCATION_UNKNOWN"],
+                "pullback_from_high_pct": 4.2961,
+                "vwap_gap_pct": -0.1354,
+                "breakout_level_gap_pct": 0.0,
+                "support_gap_pct": 0.3465,
+                "recheck_after_sec": 30,
+            }
+        )
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:05:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [wait],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    row = payload["watchset"][0]
+    assert row["display_status"] == "WAIT_PRICE_LOCATION_UNKNOWN"
+    assert row["summary_reason"].startswith("가격 위치 미확정")
+    assert "고점대비 4.30%" in row["summary_reason"]
+    assert "VWAP -0.14%" in row["summary_reason"]
+    assert "돌파선 +0.00%" in row["summary_reason"]
+    assert "지지선 +0.35%" in row["summary_reason"]
+    assert "30초 후 재확인" in row["summary_reason"]
+
+
+def test_theme_lab_snapshot_explains_deep_pullback_wait(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        wait = _watch("000014", "WAIT")
+        wait.update(
+            {
+                "price_location_status": "DEEP_PULLBACK",
+                "price_location_score": 35,
+                "price_location_reason_codes": ["DEEP_PULLBACK"],
+                "pullback_from_high_pct": 8.7132,
+                "vwap_gap_pct": -3.231,
+                "support_gap_pct": 0.213,
+                "momentum_3m": -0.42,
+                "recheck_after_sec": 60,
+            }
+        )
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:05:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [wait],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    row = payload["watchset"][0]
+    assert row["display_status"] == "WAIT_DEEP_PULLBACK"
+    assert row["summary_reason"].startswith("과도한 눌림 대기")
+    assert "고점대비 8.71% 눌림" in row["summary_reason"]
+    assert "VWAP -3.23%" in row["summary_reason"]
+    assert "3분 모멘텀 -0.42%" in row["summary_reason"]
+    assert "지지선 +0.21%" in row["summary_reason"]
+    assert "60초 후 재확인" in row["summary_reason"]
+
+
+def test_theme_lab_snapshot_explains_failed_breakout_wait(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        wait = _watch("000015", "WAIT")
+        wait.update(
+            {
+                "price_location_status": "FAILED_BREAKOUT",
+                "price_location_score": 25,
+                "price_location_reason_codes": ["FAILED_BREAKOUT"],
+                "breakout_level_gap_pct": -0.6485,
+                "vwap_gap_pct": -2.4986,
+                "recent_candles_1m": [
+                    {
+                        "start_at": "2026-06-04T09:01:00",
+                        "open": 1000,
+                        "high": 1002,
+                        "low": 996,
+                        "close": 996.9,
+                    }
+                ],
+                "upper_wick_risk": True,
+                "failed_breakout": True,
+                "recheck_after_sec": 60,
+            }
+        )
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:05:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [wait],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    row = payload["watchset"][0]
+    assert row["display_status"] == "WAIT_FAILED_BREAKOUT"
+    assert row["summary_reason"].startswith("돌파 실패 대기")
+    assert "돌파선 -0.65% 이탈" in row["summary_reason"]
+    assert "윗꼬리 리스크 있음" in row["summary_reason"]
+    assert "1분 모멘텀 -0.31%" in row["summary_reason"]
+    assert "VWAP -2.50%" in row["summary_reason"]
+    assert "60초 후 재확인" in row["summary_reason"]
+
+
+def test_theme_lab_snapshot_explains_missing_momentum_reason(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        wait = _watch("000016", "WAIT")
+        wait.update(
+            {
+                "price_location_status": "FAILED_BREAKOUT",
+                "price_location_score": 25,
+                "price_location_reason_codes": ["FAILED_BREAKOUT"],
+                "breakout_level_gap_pct": -0.5,
+                "upper_wick_risk": True,
+                "failed_breakout": True,
+                "recheck_after_sec": 60,
+            }
+        )
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:05:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [wait],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    row = payload["watchset"][0]
+    assert row["display_status"] == "WAIT_FAILED_BREAKOUT"
+    assert row["momentum_1m"] is None
+    assert row["momentum_1m_missing_reason"] == "완성 1분봉 없음"
+    assert "1분 모멘텀 미확인(완성 1분봉 없음)" in row["summary_reason"]
 
 
 def _theme():

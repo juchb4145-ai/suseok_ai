@@ -242,6 +242,13 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   font-variant-numeric: tabular-nums;
 }
 
+.row-meta .badge {
+  min-height: 20px;
+  padding: 1px 6px;
+  font-size: 11px;
+  vertical-align: middle;
+}
+
 .chart-panel {
   display: flex;
   flex-direction: column;
