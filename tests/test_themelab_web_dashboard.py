@@ -140,6 +140,51 @@ def test_theme_lab_snapshot_carries_minute_chart_context(tmp_path):
     assert chart["prev_close_inferred_from_change_rate"] is True
 
 
+def test_theme_lab_snapshot_prefers_watchset_chart_data_over_empty_theme_leader(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        watch = _watch("000778", "WAIT", role="FOLLOWER")
+        watch.update(
+            {
+                "current_price": 1000,
+                "vwap": 998,
+                "recent_support_price": 995,
+                "recent_candles_1m": [
+                    {
+                        "start_at": "2026-06-04T09:02:00",
+                        "open": 995,
+                        "high": 1001,
+                        "low": 995,
+                        "close": 1000,
+                        "volume": 50,
+                        "completed": False,
+                    }
+                ],
+                "minute_bar_present": True,
+                "recent_support_source": "active_1m_low_provisional",
+            }
+        )
+        theme = _theme()
+        theme.update({"top_leader_symbol": "999999", "top_leader_name": "empty leader"})
+        db.save_theme_lab_flow_result(
+            "2026-06-04T09:13:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [theme],
+                "watchset_snapshots": [watch],
+                "gate_decisions": [],
+                "data_quality": {"status": "OK", "candle_missing_count": 0},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    assert payload["selected_chart"]["symbol"] == "000778"
+    assert payload["selected_chart"]["chart_data_status"] == "READY"
+
+
 def test_theme_lab_snapshot_summary_counts_operating_cockpit_fields(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     try:

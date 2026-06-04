@@ -933,11 +933,15 @@ def _index_chart_items() -> list[dict[str, Any]]:
 def _select_chart(chart_universe: list[dict[str, Any]], watchset: list[dict[str, Any]]) -> dict[str, Any]:
     for status in ("READY", "READY_SMALL", "THEME_LEADER"):
         for item in chart_universe:
-            if item.get("reason") == status:
+            if item.get("reason") == status and item.get("has_candle_data"):
                 return item
     for item in chart_universe:
         if item.get("has_candle_data"):
             return item
+    for status in ("READY", "READY_SMALL", "THEME_LEADER"):
+        for item in chart_universe:
+            if item.get("reason") == status:
+                return item
     for item in chart_universe:
         if item.get("symbol") == "KOSDAQ":
             return item
