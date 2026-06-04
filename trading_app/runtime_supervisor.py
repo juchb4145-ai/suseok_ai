@@ -60,6 +60,8 @@ class RuntimeSupervisor:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strategy-runtime")
         self._bundle: CoreRuntimeBundle | None = None
         self._shutdown = False
+        self._last_gateway_logged_in: bool | None = None
+        self._last_gateway_reconnect_count: int | None = None
         if self.mode != "OBSERVE":
             self._warn(f"RUNTIME_ORDER_MODE_FORCED_OBSERVE:{self.mode}")
         if self.settings.runtime_allow_live_orders:
@@ -264,6 +266,12 @@ class RuntimeSupervisor:
     async def handle_gateway_event(self, event: GatewayEvent) -> None:
         if not self.enabled or self._bundle is None:
             return
+        session_reset_reason = self._gateway_session_reset_reason(event)
+        if session_reset_reason:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._executor, self._mark_realtime_subscriptions_stale_in_worker, session_reset_reason)
+            if event.type != "price_tick":
+                return
         if event.type in {"condition_load_result", "condition_loaded"}:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
@@ -382,6 +390,48 @@ class RuntimeSupervisor:
     def _pending_price_tick_count(self) -> int:
         with self._event_lock:
             return len(self._pending_price_ticks)
+
+    def _gateway_session_reset_reason(self, event: GatewayEvent) -> str:
+        payload = dict(event.payload or {})
+        if event.type == "login_status":
+            logged_in = bool(payload.get("logged_in"))
+            previous = self._last_gateway_logged_in
+            self._last_gateway_logged_in = logged_in
+            if logged_in and previous is not True:
+                return "LOGIN_STATUS_TRUE"
+            return ""
+        if event.type != "heartbeat":
+            return ""
+        logged_in = bool(payload.get("kiwoom_logged_in", False))
+        reasons: list[str] = []
+        if logged_in and self._last_gateway_logged_in is not True:
+            reasons.append("LOGIN_HEARTBEAT_TRUE")
+        self._last_gateway_logged_in = logged_in
+        reconnect_count = payload.get("reconnect_count")
+        if reconnect_count is not None:
+            try:
+                current_reconnect_count = int(reconnect_count or 0)
+            except (TypeError, ValueError):
+                current_reconnect_count = None
+            if current_reconnect_count is not None:
+                previous_reconnect_count = self._last_gateway_reconnect_count
+                self._last_gateway_reconnect_count = current_reconnect_count
+                if previous_reconnect_count is not None and current_reconnect_count != previous_reconnect_count:
+                    reasons.append(f"RECONNECT_COUNT_CHANGED:{previous_reconnect_count}->{current_reconnect_count}")
+        if logged_in and reasons:
+            return ",".join(reasons)
+        return ""
+
+    def _mark_realtime_subscriptions_stale_in_worker(self, reason: str) -> None:
+        if self._bundle is None:
+            return
+        manager = getattr(getattr(self._bundle, "runtime", None), "subscription_manager", None)
+        marker = getattr(manager, "mark_all_stale", None)
+        if not callable(marker):
+            self._warn("REALTIME_SUBSCRIPTION_STALE_MARK_UNSUPPORTED")
+            return
+        marker(reason)
+        self._warn(f"REALTIME_SUBSCRIPTIONS_STALE:{reason}")
 
     def _set_worker_stage(self, stage: str) -> None:
         with self._state_lock:

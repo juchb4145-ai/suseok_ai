@@ -146,6 +146,15 @@ class RealTimeSubscriptionManager:
             record.screen_no = self.code_to_screen.get(record.code, "")
         return set(self.code_to_screen)
 
+    def mark_all_stale(self, reason: str = "") -> None:
+        self.code_to_screen.clear()
+        self.screen_to_codes.clear()
+        for record in self.records.values():
+            record.active = False
+            record.screen_no = ""
+        suffix = f":{reason}" if reason else ""
+        self.warnings.append(f"REALTIME_SUBSCRIPTIONS_MARKED_STALE{suffix}")
+
     def remove_realtime(self, codes: Iterable[str]) -> None:
         self.warnings = []
         self._remove_codes([normalize_code(code) for code in codes])

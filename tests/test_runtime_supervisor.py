@@ -17,6 +17,7 @@ class _FakeRuntime:
         self.start_calls = 0
         self.stop_calls = 0
         self.cycle_calls = 0
+        self.subscription_manager = _FakeSubscriptionManager()
 
     def start(self):
         self.started = True
@@ -44,6 +45,14 @@ class _FakeBridge:
     def handle_event(self, event):
         self.events.append(event)
         return True
+
+
+class _FakeSubscriptionManager:
+    def __init__(self):
+        self.stale_reasons = []
+
+    def mark_all_stale(self, reason=""):
+        self.stale_reasons.append(reason)
 
 
 class _FakeDb:
@@ -175,6 +184,23 @@ def test_gateway_event_is_forwarded_to_runtime_bridge(tmp_path):
 
     assert queued["pending_price_tick_count"] == 1
     assert bridge.events[0].type == "price_tick"
+
+
+def test_gateway_login_marks_realtime_subscriptions_stale(tmp_path):
+    runtime = _FakeRuntime()
+    supervisor, _ = _supervisor(tmp_path, runtime)
+
+    async def scenario():
+        await supervisor.start()
+        await supervisor.handle_gateway_event(GatewayEvent(type="login_status", payload={"logged_in": True}))
+        status = supervisor.status()
+        await supervisor.shutdown()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert runtime.subscription_manager.stale_reasons == ["LOGIN_STATUS_TRUE"]
+    assert "REALTIME_SUBSCRIPTIONS_STALE:LOGIN_STATUS_TRUE" in status["warnings"]
 
 
 def test_gateway_price_ticks_are_coalesced_until_cycle(tmp_path):

@@ -150,6 +150,20 @@ def test_remove_all_fallback_reregisters_protected_records_when_screen_mapping_m
     assert "005930" in client.registered_codes
 
 
+def test_mark_all_stale_forces_next_sync_to_reregister_active_records():
+    client = MockKiwoomClient()
+    manager = RealTimeSubscriptionManager(client, max_codes=10)
+    manager.ensure_subscription("001", "index")
+    manager.ensure_subscription("101", "index")
+    manager.sync()
+
+    manager.mark_all_stale("LOGIN_STATUS_TRUE")
+    manager.sync()
+
+    assert client.registered_code_order == ["001", "101", "001", "101"]
+    assert manager.code_to_screen == {"001": "7000", "101": "7000"}
+
+
 def test_realtime_manager_does_not_call_send_order(monkeypatch):
     client = MockKiwoomClient()
     manager = RealTimeSubscriptionManager(client, max_codes=10)

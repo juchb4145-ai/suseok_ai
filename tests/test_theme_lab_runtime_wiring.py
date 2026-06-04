@@ -8,10 +8,21 @@ from main import build_observe_runtime
 from storage.db import TradingDatabase
 from trading.strategy.config import StrategyRuntimeConfigRepository
 from trading.strategy.market_data import StrategyTick
+from trading.strategy.market_data import MarketDataStore
+from trading.strategy.market_index import MarketIndexStore
 from trading.strategy.models import OrderMode
 from trading.strategy.runtime import StrategyRuntimeConfig
+from trading.theme_engine.lab import (
+    ConditionHitSnapshot,
+    MarketStatus,
+    MarketStrengthSnapshot,
+    ThemeConditionSnapshot,
+    ThemeLabFlowResult,
+    ThemeLabThemeStatus,
+)
 from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeStatus
 from trading.theme_engine.repository import ThemeEngineRepository
+from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline
 
 
 def test_themelab_flow_is_default_and_runtime_contains_pipeline(tmp_path):
@@ -69,6 +80,57 @@ def test_theme_lab_runtime_tick_runs_pipeline_saves_result_and_syncs_watchset(tm
     assert {"000001", "000002"} <= set(client.registered_codes)
     assert "000003" not in set(client.registered_codes)
     assert snapshot.gate_result_count == len(payload["gate_decisions"])
+    db.close()
+
+
+def test_theme_lab_pipeline_watchset_codes_bootstraps_from_condition_hits(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    pipeline = ThemeLabRuntimePipeline(
+        db=db,
+        market_data=MarketDataStore(),
+        market_index_store=MarketIndexStore(),
+    )
+    pipeline.last_result = ThemeLabFlowResult(
+        market=MarketStrengthSnapshot(MarketStatus.CHOPPY),
+        themes=(
+            ThemeConditionSnapshot(
+                calculated_at="2026-06-04T09:01:00",
+                theme_id="ai",
+                theme_name="AI",
+                theme_status=ThemeLabThemeStatus.WEAK_THEME,
+                member_hits=(
+                    ConditionHitSnapshot(
+                        calculated_at="2026-06-04T09:01:00",
+                        symbol="000001",
+                        name="alive-only",
+                        alive_hit=True,
+                    ),
+                    ConditionHitSnapshot(
+                        calculated_at="2026-06-04T09:01:00",
+                        symbol="000002",
+                        name="strong",
+                        alive_hit=True,
+                        strong_hit=True,
+                        return_pct=3.1,
+                    ),
+                    ConditionHitSnapshot(
+                        calculated_at="2026-06-04T09:01:00",
+                        symbol="000003",
+                        name="leader",
+                        alive_hit=True,
+                        strong_hit=True,
+                        leader_hit=True,
+                        return_pct=5.2,
+                    ),
+                ),
+            ),
+        ),
+        watchset=(),
+        gate_decisions=(),
+        data_quality={},
+    )
+
+    assert pipeline.watchset_codes() == ["000003", "000002"]
     db.close()
 
 

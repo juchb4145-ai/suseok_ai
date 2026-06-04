@@ -179,12 +179,15 @@ def _summary(
     live_guard_blocked = sum(1 for item in ready_like if not item.get("live_order_guard_passed"))
     market_pending_count = sum(1 for item in watchset if _is_market_pending(item))
     data_not_ready_count = sum(1 for item in watchset if _is_data_not_ready(item))
+    theme_data_not_ready_count = sum(1 for item in ranked_themes if _is_theme_data_not_ready(item))
     top_theme = ranked_themes[0] if ranked_themes else {}
     status, message = _operation_status_message(
+        theme_count=len(ranked_themes),
         ready_count=gates.get("READY", 0),
         ready_small_count=gates.get("READY_SMALL", 0),
         market_pending_count=market_pending_count,
         data_not_ready_count=data_not_ready_count,
+        theme_data_not_ready_count=theme_data_not_ready_count,
         late_chase_wait_count=displays.get("LATE_CHASE_TEMP_WAIT", 0),
         chase_risk_blocked_count=displays.get("CHASE_RISK_BLOCKED", 0),
         live_guard_passed_count=live_guard_passed,
@@ -231,10 +234,12 @@ def _summary(
 
 def _empty_summary() -> dict[str, Any]:
     status, message = _operation_status_message(
+        theme_count=0,
         ready_count=0,
         ready_small_count=0,
         market_pending_count=0,
         data_not_ready_count=0,
+        theme_data_not_ready_count=0,
         late_chase_wait_count=0,
         chase_risk_blocked_count=0,
         live_guard_passed_count=0,
@@ -314,12 +319,19 @@ def _is_data_not_ready(item: dict[str, Any]) -> bool:
     )
 
 
+def _is_theme_data_not_ready(item: dict[str, Any]) -> bool:
+    flags = set(item.get("data_quality_flags") or [])
+    return any(str(flag).startswith("MISSING") or str(flag).startswith("STALE") for flag in flags)
+
+
 def _operation_status_message(
     *,
+    theme_count: int,
     ready_count: int,
     ready_small_count: int,
     market_pending_count: int,
     data_not_ready_count: int,
+    theme_data_not_ready_count: int,
     late_chase_wait_count: int,
     chase_risk_blocked_count: int,
     live_guard_passed_count: int,
@@ -331,7 +343,11 @@ def _operation_status_message(
     data_status = data_quality_status.upper()
     ready_like = ready_count + ready_small_count
     if watchset_size == 0:
-        return "SNAPSHOT_UNAVAILABLE", "ThemeLabFlow 결과 대기 중입니다."
+        if theme_count <= 0 or data_status == "BROKEN":
+            return "SNAPSHOT_UNAVAILABLE", "ThemeLabFlow 결과 대기 중입니다."
+        if data_status == "DEGRADED" or theme_data_not_ready_count > 0:
+            return "WAIT_DATA_QUALITY", "테마 결과는 있으나 지수/현재가 데이터 워밍업 중입니다."
+        return "OBSERVE_ONLY", "ThemeLabFlow 결과는 있으나 WatchSet 조건을 통과한 종목이 없습니다."
     if ready_count > 0 and live_guard_passed_count > 0 and data_status not in {"DEGRADED", "BROKEN"}:
         return "READY_TO_TRADE", "READY 후보가 있고 데이터 품질이 정상입니다."
     if ready_like > 0 and live_guard_passed_count == 0 and live_guard_blocked_count > 0:

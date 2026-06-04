@@ -687,11 +687,41 @@ class ThemeLabRuntimePipeline:
     def watchset_codes(self) -> list[str]:
         if self.last_result is None:
             return []
-        return [
-            normalize_code(item.symbol)
-            for item in self.last_result.watchset
-            if normalize_code(item.symbol) and int(item.condition_level or 0) >= 2
-        ]
+        watchset_limits = getattr(getattr(self.engine, "config", None), "watchset_limits", None)
+        limit = max(1, int(getattr(watchset_limits, "max_watchset_size", 100) or 100))
+        codes: list[str] = []
+
+        def add_code(raw_code: str) -> None:
+            code = normalize_code(raw_code)
+            if code and code not in codes and len(codes) < limit:
+                codes.append(code)
+
+        for item in self.last_result.watchset:
+            if int(item.condition_level or 0) >= 2:
+                add_code(item.symbol)
+        if len(codes) >= limit:
+            return codes
+
+        for theme in self.last_result.themes:
+            hits = [
+                hit
+                for hit in theme.member_hits
+                if not hit.excluded and (hit.leader_hit or hit.strong_hit)
+            ]
+            for hit in sorted(
+                hits,
+                key=lambda item: (
+                    1 if item.leader_hit else 0,
+                    1 if item.strong_hit else 0,
+                    float(item.turnover_krw or 0),
+                    float(item.return_pct or 0),
+                ),
+                reverse=True,
+            ):
+                add_code(hit.symbol)
+                if len(codes) >= limit:
+                    return codes
+        return codes
 
     def drain_warnings(self) -> list[str]:
         warnings = list(self._warnings)

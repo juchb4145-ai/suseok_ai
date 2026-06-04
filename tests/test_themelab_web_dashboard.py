@@ -193,6 +193,43 @@ def test_theme_lab_snapshot_operation_status_for_ready_live_blocked_and_data_qua
         db.close()
 
 
+def test_theme_lab_snapshot_operation_status_for_empty_watchset_with_theme_data_wait(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        theme = _theme()
+        theme.update({"data_quality_flags": ["MISSING_CURRENT_PRICE", "MISSING_PREV_CLOSE"]})
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:10:00",
+            {
+                "market_status": {"market_status": "CHOPPY"},
+                "theme_rankings": [theme],
+                "watchset_snapshots": [],
+                "gate_decisions": [],
+                "data_quality": {"status": "OK", "candle_missing_count": 0},
+            },
+        )
+        payload = build_theme_lab_dashboard_snapshot(db)
+        assert payload["summary"]["operation_status"] == "WAIT_DATA_QUALITY"
+        assert payload["summary"]["operation_message_ko"] == "테마 결과는 있으나 지수/현재가 데이터 워밍업 중입니다."
+
+        clean_theme = _theme()
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:11:00",
+            {
+                "market_status": {"market_status": "CHOPPY"},
+                "theme_rankings": [clean_theme],
+                "watchset_snapshots": [],
+                "gate_decisions": [],
+                "data_quality": {"status": "OK", "candle_missing_count": 0},
+            },
+        )
+        payload = build_theme_lab_dashboard_snapshot(db)
+        assert payload["summary"]["operation_status"] == "OBSERVE_ONLY"
+        assert payload["summary"]["operation_message_ko"] == "ThemeLabFlow 결과는 있으나 WatchSet 조건을 통과한 종목이 없습니다."
+    finally:
+        db.close()
+
+
 def test_theme_lab_snapshot_demotes_themes_without_live_price_signal(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     try:
