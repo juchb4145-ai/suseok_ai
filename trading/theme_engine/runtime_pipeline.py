@@ -10,6 +10,7 @@ from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.strategy.market_index import MarketIndexStore
 from trading.strategy.runtime_settings import legacy_strategy_runtime_settings
 from trading.theme_engine.lab import (
+    InstrumentMetadata,
     LabGateDecision,
     MarketSide,
     ThemeLabConfig,
@@ -188,12 +189,14 @@ class ThemeLabRuntimePipeline:
         missing_prev_close = [code for code, snapshot in snapshots.items() if not _prev_close(snapshot)]
         if missing_prev_close:
             self._warnings.append("THEME_LAB_PREV_CLOSE_MISSING")
+        metadata_by_symbol = self._metadata_by_symbol(theme_inputs)
         session = self._market_session_context(now)
         self._market_confirmation_metrics = _empty_market_confirmation_metrics()
         self._restore_confirmation_state_once(now, session=session)
         result = self.engine.run_pipeline(
             theme_inputs=theme_inputs,
             snapshots=snapshots,
+            metadata_by_symbol=metadata_by_symbol,
             kospi_return_pct=self.market_index_store.state("KOSPI").change_rate,
             kosdaq_return_pct=self.market_index_store.state("KOSDAQ").change_rate,
             calculated_at=now.isoformat(),
@@ -756,6 +759,15 @@ class ThemeLabRuntimePipeline:
             snapshots[code] = _stock_snapshot_from_tick(tick)
         return snapshots
 
+    def _metadata_by_symbol(self, theme_inputs: list[tuple[str, str, list[ThemeMembership]]]) -> dict[str, InstrumentMetadata]:
+        codes = {
+            normalize_code(member.stock_code)
+            for _, _, members in theme_inputs
+            for member in members
+            if normalize_code(member.stock_code)
+        }
+        return _legacy_market_metadata(getattr(self.db, "conn", None), codes)
+
     def _save_result(self, result: ThemeLabFlowResult, now: datetime) -> None:
         payload = _result_payload(result)
         save = getattr(self.db, "save_theme_lab_flow_result", None)
@@ -875,6 +887,75 @@ def _stock_snapshot_from_tick(tick: StrategyTick) -> StockSnapshot:
         updated_at=tick.timestamp.isoformat() if tick.timestamp else "",
         metadata=metadata,
     )
+
+
+def _legacy_market_metadata(conn: Any, codes: set[str]) -> dict[str, InstrumentMetadata]:
+    if conn is None or not codes or not _table_exists(conn, "legacy_theme_mappings_archive"):
+        return {}
+    columns = _table_columns(conn, "legacy_theme_mappings_archive")
+    required = {"code", "market"}
+    if not required <= columns:
+        return {}
+    select_columns = ["code", "market"]
+    for optional in ("name", "strategy_profile", "theme_id", "theme_name", "enabled"):
+        if optional in columns:
+            select_columns.append(optional)
+    placeholders = ",".join("?" for _ in codes)
+    order = " ORDER BY code"
+    if "enabled" in columns:
+        order = " ORDER BY code, enabled DESC"
+    rows = conn.execute(
+        f"""
+        SELECT {", ".join(select_columns)}
+        FROM legacy_theme_mappings_archive
+        WHERE code IN ({placeholders})
+        {order}
+        """,
+        tuple(sorted(codes)),
+    ).fetchall()
+    result: dict[str, InstrumentMetadata] = {}
+    for row in rows:
+        payload = _row_mapping(row, select_columns)
+        code = normalize_code(payload.get("code"))
+        if not code or code in result:
+            continue
+        market = str(payload.get("market") or "").strip()
+        if normalize_market_side(market) == MarketSide.UNKNOWN:
+            continue
+        raw = {
+            "market": market,
+            "market_source": "legacy_theme_mappings_archive",
+            "strategy_profile": str(payload.get("strategy_profile") or ""),
+            "theme_id": str(payload.get("theme_id") or ""),
+            "theme_name": str(payload.get("theme_name") or ""),
+        }
+        result[code] = InstrumentMetadata(
+            symbol=code,
+            name=str(payload.get("name") or ""),
+            raw=raw,
+        )
+    return result
+
+
+def _table_exists(conn: Any, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _table_columns(conn: Any, table_name: str) -> set[str]:
+    columns: set[str] = set()
+    for row in conn.execute(f"PRAGMA table_info({table_name})"):
+        columns.add(str(row["name"] if hasattr(row, "keys") else row[1]))
+    return columns
+
+
+def _row_mapping(row: Any, columns: list[str]) -> dict[str, Any]:
+    if hasattr(row, "keys"):
+        return dict(row)
+    return {column: row[index] for index, column in enumerate(columns)}
 
 
 def _prev_close(snapshot: StockSnapshot) -> float:

@@ -83,6 +83,31 @@ def test_theme_lab_runtime_tick_runs_pipeline_saves_result_and_syncs_watchset(tm
     db.close()
 
 
+def test_theme_lab_runtime_uses_legacy_market_metadata_when_tick_has_no_market(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    _seed_theme(db)
+    _seed_legacy_market(db, {"000001": "KOSDAQ", "000002": "KOSDAQ"})
+    market_data = MarketDataStore()
+    now = datetime(2026, 6, 1, 9, 1, 0)
+    market_data.update_tick(_tick("000001", 106, 6.0, now))
+    market_data.update_tick(_tick("000002", 104, 4.0, now))
+    market_data.update_tick(_tick("000003", 100, 0.0, now))
+
+    result = ThemeLabRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=MarketIndexStore(),
+    ).run(now)
+
+    watch_by_symbol = {item.symbol: item for item in result.watchset}
+
+    assert watch_by_symbol["000001"].candidate_market == "KOSDAQ"
+    assert watch_by_symbol["000001"].candidate_market_source == "metadata_by_symbol.raw.market"
+    assert watch_by_symbol["000002"].candidate_market == "KOSDAQ"
+    assert result.data_quality["market_classification_unknown_count"] == 0
+    db.close()
+
+
 def test_theme_lab_pipeline_watchset_codes_bootstraps_from_condition_hits(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     pipeline = ThemeLabRuntimePipeline(
@@ -205,6 +230,33 @@ def _seed_theme(db: TradingDatabase) -> None:
                 trade_eligible=True,
             )
         )
+
+
+def _seed_legacy_market(db: TradingDatabase, markets: dict[str, str]) -> None:
+    db.conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS legacy_theme_mappings_archive (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            market TEXT NOT NULL DEFAULT '',
+            theme_id TEXT NOT NULL DEFAULT '',
+            theme_name TEXT NOT NULL DEFAULT '',
+            strategy_profile TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    with db.conn:
+        for code, market in markets.items():
+            db.conn.execute(
+                """
+                INSERT INTO legacy_theme_mappings_archive(
+                    code, name, market, theme_id, theme_name, strategy_profile, enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                """,
+                (code, f"stock-{code}", market, "ai", "AI", f"{market}_THEME_PROFILE"),
+            )
 
 
 def _tick(code: str, price: int, change_rate: float, now: datetime) -> StrategyTick:
