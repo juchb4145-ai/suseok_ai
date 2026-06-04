@@ -350,6 +350,9 @@ class RuntimeSupervisor:
         if not key:
             return
         with self._event_lock:
+            existing = self._pending_price_ticks.get(key)
+            if existing is not None and not _should_replace_pending_price_tick(existing, event):
+                return
             if key not in self._pending_price_ticks and len(self._pending_price_ticks) >= MAX_PENDING_PRICE_TICKS:
                 oldest_key = next(iter(self._pending_price_ticks), "")
                 if oldest_key:
@@ -557,6 +560,18 @@ def _price_tick_key(event: GatewayEvent) -> str:
     if key:
         return key
     return str(event.event_id or event.command_id or "").strip()
+
+
+def _should_replace_pending_price_tick(existing: GatewayEvent, incoming: GatewayEvent) -> bool:
+    return not (_price_tick_has_current_price(existing) and not _price_tick_has_current_price(incoming))
+
+
+def _price_tick_has_current_price(event: GatewayEvent) -> bool:
+    payload = dict(event.payload or {})
+    try:
+        return abs(float(str(payload.get("price") or payload.get("current_price") or 0).replace(",", ""))) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _call_with_optional_timing(callback: Callable[..., Any], timing_callback: Callable[[str, float], None]) -> Any:

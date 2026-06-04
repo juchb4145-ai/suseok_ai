@@ -222,3 +222,35 @@ def test_gateway_price_ticks_are_coalesced_until_cycle(tmp_path):
     assert cycled["latest_snapshot"]["runtime_forwarded_price_tick_count"] == 1
     assert len(bridge.events) == 1
     assert bridge.events[0].payload["price"] == 70100
+
+
+def test_gateway_price_tick_coalescing_keeps_trade_tick_over_later_quote_only_tick(tmp_path):
+    runtime = _FakeRuntime()
+    supervisor, bridge = _supervisor(tmp_path, runtime)
+
+    async def scenario():
+        await supervisor.start()
+        await supervisor.handle_gateway_event(
+            GatewayEvent(
+                type="price_tick",
+                payload={"code": "005930", "price": 70000, "change_rate": 1.2, "metadata": {"real_type": "trade"}},
+            )
+        )
+        await supervisor.handle_gateway_event(
+            GatewayEvent(
+                type="price_tick",
+                payload={"code": "005930", "price": 0, "best_ask": 70100, "best_bid": 70000, "metadata": {"real_type": "quote"}},
+            )
+        )
+        queued = supervisor.status()
+        cycled = await supervisor.run_once()
+        await supervisor.shutdown()
+        return queued, cycled
+
+    queued, cycled = asyncio.run(scenario())
+
+    assert queued["pending_price_tick_count"] == 1
+    assert cycled["latest_snapshot"]["runtime_forwarded_price_tick_count"] == 1
+    assert len(bridge.events) == 1
+    assert bridge.events[0].payload["price"] == 70000
+    assert bridge.events[0].payload["metadata"]["real_type"] == "trade"

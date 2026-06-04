@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Optional
 
@@ -63,6 +63,9 @@ class MarketDataStore:
         last_timestamp = self._last_timestamps.get(tick.code)
         if last_timestamp is not None and tick.timestamp < last_timestamp:
             return False
+        previous = self._latest_ticks.get(tick.code)
+        if previous is not None and tick.price <= 0 < previous.price:
+            tick = _merge_missing_price_tick(previous, tick)
         self._latest_ticks[tick.code] = tick
         self._last_timestamps[tick.code] = tick.timestamp
         self._tick_counts[tick.code] = self._tick_counts.get(tick.code, 0) + 1
@@ -87,6 +90,24 @@ class MarketDataStore:
 
     def tick_count(self, code: str) -> int:
         return self._tick_counts.get(normalize_code(code), 0)
+
+
+def _merge_missing_price_tick(previous: StrategyTick, tick: StrategyTick) -> StrategyTick:
+    metadata = dict(previous.metadata or {})
+    metadata.update(dict(tick.metadata or {}))
+    metadata["merged_from_previous_price_tick"] = True
+    return replace(
+        tick,
+        price=previous.price,
+        change_rate=tick.change_rate if tick.change_rate else previous.change_rate,
+        cum_volume=tick.cum_volume if tick.cum_volume else previous.cum_volume,
+        best_ask=tick.best_ask if tick.best_ask else previous.best_ask,
+        best_bid=tick.best_bid if tick.best_bid else previous.best_bid,
+        trade_value=tick.trade_value if tick.trade_value else previous.trade_value,
+        execution_strength=tick.execution_strength if tick.execution_strength else previous.execution_strength,
+        spread_ticks=tick.spread_ticks if tick.spread_ticks else previous.spread_ticks,
+        metadata=metadata,
+    )
 
 
 def _clean_abs_int(value) -> int:
