@@ -45,6 +45,8 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "/api/themelab/snapshot" in js
     assert "matchesFilters" in js
     assert "renderCockpit" in js
+    assert "minuteChartSvg" in js
+    assert ".chart-ref.vwap" in css
 
 
 def test_theme_lab_snapshot_sorts_watchset_and_filters_entry_candidates(tmp_path):
@@ -82,6 +84,60 @@ def test_theme_lab_snapshot_sorts_watchset_and_filters_entry_candidates(tmp_path
     assert {"KOSPI", "KOSDAQ", "000001", "000002"}.issubset(universe)
     assert "000004" not in universe
     assert payload["data_quality"]["vi_status_supported"] is False
+
+
+def test_theme_lab_snapshot_carries_minute_chart_context(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        ready = _watch("000777", "READY", role="LEADER")
+        ready.update(
+            {
+                "current_price": 1060,
+                "vwap": 1055.5,
+                "recent_support_price": 1000,
+                "upper_limit_price": 1300,
+                "breakout_level": 1050,
+                "recent_candles_1m": [
+                    {
+                        "start_at": "2026-06-04T09:01:00",
+                        "open": 1000,
+                        "high": 1060,
+                        "low": 995,
+                        "close": 1060,
+                        "volume": 120,
+                        "completed": True,
+                    }
+                ],
+                "completed_minute_bar_count": 1,
+                "minute_bar_present": True,
+                "recent_support_source": "completed_1m_low",
+                "recent_support_ready": True,
+                "prev_close_inferred_from_change_rate": True,
+            }
+        )
+        db.save_theme_lab_flow_result(
+            "2026-06-04T09:12:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [ready],
+                "gate_decisions": [],
+                "data_quality": {"status": "OK", "candle_missing_count": 0},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    chart = payload["selected_chart"]
+    assert chart["symbol"] == "000777"
+    assert chart["chart_data_status"] == "READY"
+    assert chart["has_candle_data"] is True
+    assert chart["candles"][0]["close"] == 1060
+    assert chart["vwap"] == 1055.5
+    assert chart["recent_support_source"] == "completed_1m_low"
+    assert chart["prev_close_inferred_from_change_rate"] is True
 
 
 def test_theme_lab_snapshot_summary_counts_operating_cockpit_fields(tmp_path):

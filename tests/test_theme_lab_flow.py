@@ -1116,6 +1116,31 @@ def test_price_location_failed_breakout_with_negative_momentum_waits_or_blocks()
     assert decision.status in {LabGateStatus.WAIT, LabGateStatus.BLOCKED}
 
 
+def test_price_location_flat_recent_candle_is_neutral_not_invalid():
+    price = PriceLocationEvaluator().evaluate(
+        PriceLocationInput(
+            symbol="000001",
+            current_price=100,
+            return_pct=3,
+            turnover_krw=1_000_000_000,
+            session_high=102,
+            vwap=99,
+            upper_limit_price=130,
+            breakout_level=101,
+            recent_support_price=99,
+            recent_candles_1m=({"high": 100, "low": 100, "close": 100},),
+            momentum_1m=0.2,
+            momentum_3m=0.1,
+            stock_role=StockRole.LEADER,
+            theme_status=ThemeLabThemeStatus.LEADING_THEME,
+            market_status=MarketStatus.SELECTIVE,
+        )
+    )
+
+    assert price.upper_wick_risk is False
+    assert "INVALID_RECENT_CANDLE" not in price.data_quality_flags
+
+
 def test_price_location_deep_pullback_below_vwap_with_weak_momentum_is_not_ready():
     price = PriceLocationEvaluator().evaluate(
         PriceLocationInput(

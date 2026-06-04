@@ -117,6 +117,7 @@ class StrategyMarketDataBridge:
             timestamp=timestamp,
             candle_builder=self.candle_builder,
             metadata=tick_metadata,
+            change_rate=_safe_float(change_rate),
         )
         tick = StrategyTick.from_realtime(
             code=code,

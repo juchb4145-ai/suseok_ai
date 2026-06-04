@@ -7,6 +7,7 @@ from typing import Any, Deque
 
 from trading.strategy.candidates import normalize_code
 from trading.strategy.candles import CandleBuilder, minute_start
+from trading.rules import tick_size
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class RealtimeFeatureCalculator:
         timestamp: datetime,
         candle_builder: CandleBuilder,
         metadata: dict[str, Any] | None = None,
+        change_rate: float = 0.0,
     ) -> RealtimeFeatureResult:
         clean_code = normalize_code(code)
         enriched = dict(metadata or {})
@@ -57,13 +59,23 @@ class RealtimeFeatureCalculator:
         if vwap is not None:
             enriched["vwap"] = vwap
             enriched["vwap_ready"] = True
+        price_context = self._recent_price_context(clean_code, candle_builder)
+        enriched.update(price_context)
+        prev_close = self._prev_close(enriched, price=price, change_rate=change_rate)
+        if prev_close is not None:
+            enriched.setdefault("prev_close", prev_close)
+            upper_limit = self._upper_limit_price(prev_close)
+            if upper_limit is not None:
+                enriched["upper_limit_price"] = upper_limit
+                enriched["upper_limit_gap_pct"] = round(((upper_limit - price) / max(1.0, float(price))) * 100.0, 4)
+        breakout_level = self._breakout_level(price_context)
+        if breakout_level is not None:
+            enriched["breakout_level"] = breakout_level
 
         momentums, warmup = self._momentums(clean_code, candle_builder)
         enriched.update(momentums)
         if warmup:
             reason_codes.add("MOMENTUM_WARMUP")
-
-        enriched.update(self._recent_price_context(clean_code, candle_builder))
 
         enriched["turnover_strength"] = self._turnover_strength(
             clean_code,
@@ -101,19 +113,70 @@ class RealtimeFeatureCalculator:
 
     def _recent_price_context(self, code: str, candle_builder: CandleBuilder) -> dict[str, Any]:
         metadata: dict[str, Any] = {}
-        candles_1m = candle_builder.completed_candles(code, 1)[-self.recent_candle_window :]
+        completed_1m = candle_builder.completed_candles(code, 1)
+        candles_1m = completed_1m[-self.recent_candle_window :]
         candles_3m = candle_builder.completed_candles(code, 3)[-self.recent_candle_window :]
+        active_1m = candle_builder.active_candle(code, 1)
+        display_candles = list(candles_1m)
+        if active_1m is not None and (not display_candles or display_candles[-1].start_at != active_1m.start_at):
+            display_candles.append(active_1m)
+        if display_candles:
+            metadata["recent_candles_1m"] = [
+                _candle_payload(candle, completed=active_1m is None or candle.start_at != active_1m.start_at)
+                for candle in display_candles[-self.recent_candle_window :]
+            ]
         if candles_1m:
-            metadata["recent_candles_1m"] = [_candle_payload(candle) for candle in candles_1m]
             support_candles = candles_1m[-self.support_window :]
             metadata["recent_support_price"] = min(float(candle.low) for candle in support_candles)
             metadata["recent_support_candle_count"] = len(support_candles)
             metadata["recent_support_ready"] = len(support_candles) >= self.support_window
+            metadata["recent_support_source"] = "completed_1m_low"
+        elif active_1m is not None:
+            metadata["recent_support_price"] = float(active_1m.low)
+            metadata["recent_support_candle_count"] = 0
+            metadata["recent_support_ready"] = False
+            metadata["recent_support_source"] = "active_1m_low_provisional"
         if candles_3m:
-            metadata["recent_candles_3m"] = [_candle_payload(candle) for candle in candles_3m]
+            metadata["recent_candles_3m"] = [_candle_payload(candle, completed=True) for candle in candles_3m]
             metadata["recent_3m_bar_count"] = len(candles_3m)
-        metadata["completed_minute_bar_count"] = len(candle_builder.completed_candles(code, 1))
+        metadata["completed_minute_bar_count"] = len(completed_1m)
+        metadata["minute_bar_present"] = bool(display_candles)
         return metadata
+
+    @staticmethod
+    def _prev_close(metadata: dict[str, Any], *, price: int, change_rate: float) -> float | None:
+        for key in ("prev_close", "previous_close", "yesterday_close"):
+            value = _float(metadata.get(key))
+            if value > 0:
+                return value
+        rate = _float(change_rate)
+        if price > 0 and rate != -100.0:
+            inferred = float(price) / (1.0 + (rate / 100.0))
+            if inferred > 0:
+                metadata["prev_close_inferred_from_change_rate"] = True
+                return round(inferred, 4)
+        return None
+
+    @staticmethod
+    def _upper_limit_price(prev_close: float) -> int | None:
+        if prev_close <= 0:
+            return None
+        raw = int(prev_close * 1.3)
+        unit = max(1, tick_size(raw))
+        return (raw // unit) * unit
+
+    @staticmethod
+    def _breakout_level(metadata: dict[str, Any]) -> float | None:
+        completed = [
+            candle
+            for candle in metadata.get("recent_candles_1m") or []
+            if candle.get("completed", True)
+        ]
+        if not completed:
+            return None
+        highs = [_float(candle.get("high")) for candle in completed]
+        highs = [value for value in highs if value > 0]
+        return max(highs) if highs else None
 
     def _turnover_strength(self, code: str, trade_value: float, timestamp: datetime) -> float:
         if trade_value <= 0:
@@ -144,7 +207,7 @@ class RealtimeFeatureCalculator:
         return round(max(0.0, state.delta / average), 4)
 
 
-def _candle_payload(candle) -> dict[str, Any]:
+def _candle_payload(candle, *, completed: bool) -> dict[str, Any]:
     return {
         "start_at": candle.start_at.isoformat(),
         "open": candle.open,
@@ -152,6 +215,7 @@ def _candle_payload(candle) -> dict[str, Any]:
         "low": candle.low,
         "close": candle.close,
         "volume": candle.volume,
+        "completed": completed,
     }
 
 

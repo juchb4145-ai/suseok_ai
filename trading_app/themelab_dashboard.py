@@ -733,6 +733,19 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
         "base_line_120_candle_count": int(item.get("base_line_120_candle_count") or 0),
         "vwap_ready": bool(item.get("vwap_ready", False)),
         "recent_support_ready": bool(item.get("recent_support_ready", False)),
+        "current_price": item.get("current_price"),
+        "vwap": item.get("vwap"),
+        "recent_support_price": item.get("recent_support_price"),
+        "upper_limit_price": item.get("upper_limit_price"),
+        "breakout_level": item.get("breakout_level"),
+        "recent_candles_1m": _as_list(item.get("recent_candles_1m")),
+        "recent_candles_3m": _as_list(item.get("recent_candles_3m")),
+        "completed_minute_bar_count": int(item.get("completed_minute_bar_count") or 0),
+        "recent_3m_bar_count": int(item.get("recent_3m_bar_count") or 0),
+        "minute_bar_present": bool(item.get("minute_bar_present")),
+        "recent_support_source": item.get("recent_support_source", ""),
+        "recent_support_candle_count": int(item.get("recent_support_candle_count") or 0),
+        "prev_close_inferred_from_change_rate": bool(item.get("prev_close_inferred_from_change_rate")),
         "market_raw_status": item.get("candidate_market_raw_status") or item.get("market_raw_status", ""),
         "market_confirmed_status": item.get("candidate_market_confirmed_status") or item.get("candidate_market_status") or item.get("market_confirmed_status", ""),
         "kospi_market_status": item.get("kospi_market_status", ""),
@@ -839,11 +852,15 @@ def _gate_detail(item: dict[str, Any]) -> dict[str, Any]:
 
 def _chart_universe(themes: list[dict[str, Any]], watchset: list[dict[str, Any]], entry_candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     items = {item["symbol"]: item for item in _index_chart_items()}
+    watch_by_symbol = {str(item.get("symbol") or ""): item for item in watchset}
 
     def add(symbol: str, name: str, item_type: str, reason: str, priority: int, status: str = "NO_CANDLE_DATA") -> None:
         if not symbol or len(items) >= 50:
             return
         current = items.get(symbol)
+        watch = watch_by_symbol.get(symbol, {})
+        chart_context = _chart_context(watch)
+        resolved_status = chart_context.pop("chart_data_status")
         if current is None or priority < current["priority"]:
             items[symbol] = {
                 "symbol": symbol,
@@ -851,9 +868,9 @@ def _chart_universe(themes: list[dict[str, Any]], watchset: list[dict[str, Any]]
                 "type": item_type,
                 "reason": reason,
                 "priority": priority,
-                "has_candle_data": status == "READY",
-                "chart_data_status": status,
-                "last_candle_at": "",
+                "has_candle_data": resolved_status == "READY",
+                "chart_data_status": resolved_status if resolved_status != "NO_DATA" else status,
+                **chart_context,
             }
 
     for item in entry_candidates:
@@ -876,6 +893,36 @@ def _chart_universe(themes: list[dict[str, Any]], watchset: list[dict[str, Any]]
     return sorted(items.values(), key=lambda item: (item["priority"], item["symbol"]))
 
 
+def _chart_context(item: dict[str, Any]) -> dict[str, Any]:
+    candles_1m = _as_list(item.get("recent_candles_1m"))
+    candles_3m = _as_list(item.get("recent_candles_3m"))
+    candles = candles_1m or candles_3m
+    quote_values = {
+        "current_price": _number_or_none(item.get("current_price")),
+        "vwap": _number_or_none(item.get("vwap")),
+        "recent_support_price": _number_or_none(item.get("recent_support_price")),
+        "upper_limit_price": _number_or_none(item.get("upper_limit_price")),
+        "breakout_level": _number_or_none(item.get("breakout_level")),
+    }
+    status = "READY" if candles else "QUOTE_ONLY" if any(value is not None for value in quote_values.values()) else "NO_CANDLE_DATA"
+    last = candles[-1] if candles else {}
+    return {
+        "chart_data_status": status,
+        "candles": candles,
+        "recent_candles_1m": candles_1m,
+        "recent_candles_3m": candles_3m,
+        "last_candle_at": str(last.get("start_at") or ""),
+        "completed_minute_bar_count": int(item.get("completed_minute_bar_count") or 0),
+        "recent_3m_bar_count": int(item.get("recent_3m_bar_count") or 0),
+        "minute_bar_present": bool(item.get("minute_bar_present") or candles),
+        "recent_support_source": item.get("recent_support_source", ""),
+        "recent_support_ready": bool(item.get("recent_support_ready")),
+        "recent_support_candle_count": int(item.get("recent_support_candle_count") or 0),
+        "prev_close_inferred_from_change_rate": bool(item.get("prev_close_inferred_from_change_rate")),
+        **quote_values,
+    }
+
+
 def _index_chart_items() -> list[dict[str, Any]]:
     return [
         {"symbol": "KOSPI", "name": "KOSPI", "type": "index", "reason": "INDEX", "priority": 10, "has_candle_data": False, "chart_data_status": "NO_CANDLE_DATA", "last_candle_at": ""},
@@ -888,6 +935,9 @@ def _select_chart(chart_universe: list[dict[str, Any]], watchset: list[dict[str,
         for item in chart_universe:
             if item.get("reason") == status:
                 return item
+    for item in chart_universe:
+        if item.get("has_candle_data"):
+            return item
     for item in chart_universe:
         if item.get("symbol") == "KOSDAQ":
             return item
@@ -1001,7 +1051,7 @@ def _data_quality_message(status: str, candle_missing: int, missing_vwap: int) -
 
 
 def _as_list(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
+    if not isinstance(value, (list, tuple)):
         return []
     return [dict(item) for item in value if isinstance(item, dict)]
 
@@ -1015,6 +1065,14 @@ def _first_not_none(*values: Any) -> Any:
 
 def _value(value: Any) -> str:
     return str(getattr(value, "value", value) or "")
+
+
+def _number_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def _now_time() -> str:

@@ -261,15 +261,123 @@ function themeQualityLine(item) {
 
 function renderChart(chart) {
   text("chart-title", `${chart.name || "KOSDAQ"} ${chart.symbol ? `[${chart.symbol}]` : ""}`);
-  text("chart-subtitle", `${chart.reason || "INDEX"} / ${chart.chart_data_status || "NO_CANDLE_DATA"}`);
+  text("chart-subtitle", `${chart.reason || "INDEX"} / ${chart.chart_data_status || "NO_CANDLE_DATA"} / bars ${chart.completed_minute_bar_count || 0}`);
   const stage = document.getElementById("chart-stage");
   const status = chart.chart_data_status || "NO_CANDLE_DATA";
+  const candles = normalizeCandles(chart.candles || chart.recent_candles_1m || chart.recent_candles_3m);
+  if (candles.length) {
+    stage.innerHTML = minuteChartSvg(chart, candles);
+    return;
+  }
   stage.innerHTML = `
     <div class="empty-chart">
       <strong>${status === "QUOTE_ONLY" ? "실시간 현재가만 수신 중" : "분봉 데이터 없음"}</strong>
       <span>${escapeHtml(chart.symbol || "KOSDAQ")} · ChartUniverse 대상 · VWAP/마커는 데이터가 있을 때만 표시</span>
     </div>
   `;
+}
+
+function normalizeCandles(values) {
+  if (!Array.isArray(values)) return [];
+  return values.map((item) => ({
+    start_at: item.start_at || "",
+    open: numberOrNull(item.open),
+    high: numberOrNull(item.high),
+    low: numberOrNull(item.low),
+    close: numberOrNull(item.close),
+    volume: numberOrNull(item.volume) || 0,
+    completed: item.completed !== false,
+  })).filter((item) => item.open !== null && item.high !== null && item.low !== null && item.close !== null);
+}
+
+function minuteChartSvg(chart, candles) {
+  const width = 900;
+  const height = 420;
+  const margin = { top: 20, right: 82, bottom: 34, left: 48 };
+  const innerWidth = width - margin.left - margin.right;
+  const innerHeight = height - margin.top - margin.bottom;
+  const refs = chartReferenceLines(chart);
+  const priceValues = candles.flatMap((item) => [item.open, item.high, item.low, item.close])
+    .concat(refs.map((item) => item.value))
+    .filter((value) => value !== null && Number.isFinite(value));
+  let minPrice = Math.min(...priceValues);
+  let maxPrice = Math.max(...priceValues);
+  if (minPrice === maxPrice) {
+    minPrice -= Math.max(1, minPrice * 0.01);
+    maxPrice += Math.max(1, maxPrice * 0.01);
+  }
+  const pad = Math.max(1, (maxPrice - minPrice) * 0.08);
+  minPrice -= pad;
+  maxPrice += pad;
+  const y = (price) => margin.top + ((maxPrice - price) / (maxPrice - minPrice)) * innerHeight;
+  const xStep = innerWidth / Math.max(1, candles.length);
+  const candleWidth = Math.max(5, Math.min(18, xStep * 0.55));
+  const grid = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+    const yy = margin.top + innerHeight * ratio;
+    const price = maxPrice - (maxPrice - minPrice) * ratio;
+    return `
+      <line class="chart-grid-line" x1="${margin.left}" y1="${yy.toFixed(2)}" x2="${width - margin.right}" y2="${yy.toFixed(2)}"></line>
+      <text class="chart-axis-label" x="${width - margin.right + 8}" y="${(yy + 4).toFixed(2)}">${escapeHtml(formatPrice(price))}</text>
+    `;
+  }).join("");
+  const bodies = candles.map((item, index) => {
+    const x = margin.left + xStep * (index + 0.5);
+    const openY = y(item.open);
+    const closeY = y(item.close);
+    const highY = y(item.high);
+    const lowY = y(item.low);
+    const bodyY = Math.min(openY, closeY);
+    const bodyHeight = Math.max(2, Math.abs(closeY - openY));
+    const tone = item.close >= item.open ? "up" : "down";
+    const completeClass = item.completed ? "" : " provisional";
+    return `
+      <line class="chart-wick ${tone}${completeClass}" x1="${x.toFixed(2)}" y1="${highY.toFixed(2)}" x2="${x.toFixed(2)}" y2="${lowY.toFixed(2)}"></line>
+      <rect class="chart-candle ${tone}${completeClass}" x="${(x - candleWidth / 2).toFixed(2)}" y="${bodyY.toFixed(2)}" width="${candleWidth.toFixed(2)}" height="${bodyHeight.toFixed(2)}"></rect>
+    `;
+  }).join("");
+  const overlays = refs.map((item) => {
+    const yy = y(item.value);
+    return `
+      <line class="chart-ref ${item.kind}" x1="${margin.left}" y1="${yy.toFixed(2)}" x2="${width - margin.right}" y2="${yy.toFixed(2)}"></line>
+      <text class="chart-ref-label ${item.kind}" x="${margin.left + 8}" y="${(yy - 5).toFixed(2)}">${escapeHtml(item.label)} ${escapeHtml(formatPrice(item.value))}</text>
+    `;
+  }).join("");
+  const footer = [
+    candles[candles.length - 1]?.start_at || "",
+    chart.recent_support_source || "",
+    chart.prev_close_inferred_from_change_rate ? "prev_close inferred" : "",
+  ].filter(Boolean).join(" / ");
+  return `
+    <svg class="minute-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="minute candlestick chart">
+      <rect class="chart-bg" x="0" y="0" width="${width}" height="${height}"></rect>
+      ${grid}
+      ${overlays}
+      ${bodies}
+      <text class="chart-footer" x="${margin.left}" y="${height - 10}">${escapeHtml(footer)}</text>
+    </svg>
+  `;
+}
+
+function chartReferenceLines(chart) {
+  return [
+    { key: "vwap", label: "VWAP", kind: "vwap" },
+    { key: "recent_support_price", label: "SUPPORT", kind: "support" },
+    { key: "breakout_level", label: "BREAKOUT", kind: "breakout" },
+    { key: "upper_limit_price", label: "UPPER", kind: "upper" },
+    { key: "current_price", label: "LAST", kind: "last" },
+  ].map((item) => ({ ...item, value: numberOrNull(chart[item.key]) }))
+    .filter((item) => item.value !== null && Number.isFinite(item.value));
+}
+
+function numberOrNull(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function formatPrice(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return number.toLocaleString("ko-KR", { maximumFractionDigits: number >= 100 ? 0 : 2 });
 }
 
 function renderGate(detail) {
