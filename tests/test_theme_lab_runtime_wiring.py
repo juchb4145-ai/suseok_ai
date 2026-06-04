@@ -10,7 +10,7 @@ from trading.strategy.config import StrategyRuntimeConfigRepository
 from trading.strategy.market_data import StrategyTick
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import MarketIndexStore
-from trading.strategy.models import OrderMode
+from trading.strategy.models import Candidate, CandidateState, OrderMode
 from trading.strategy.runtime import StrategyRuntimeConfig
 from trading.theme_engine.lab import (
     ConditionHitSnapshot,
@@ -131,6 +131,38 @@ def test_theme_lab_pipeline_watchset_codes_bootstraps_from_condition_hits(tmp_pa
     )
 
     assert pipeline.watchset_codes() == ["000003", "000002"]
+    db.close()
+
+
+def test_theme_lab_empty_watchset_bootstraps_candidate_realtime_subscriptions(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    client = MockKiwoomClient()
+    runtime = build_observe_runtime(client, db)
+    _seed_theme(db)
+    now = datetime(2026, 6, 1, 9, 1, 0)
+    for code in ("000001", "000002", "000003"):
+        db.save_candidate(
+            Candidate(
+                trade_date="2026-06-01",
+                code=code,
+                state=CandidateState.DETECTED,
+                detected_at=now.isoformat(),
+                last_seen_at=now.isoformat(),
+                expires_at=(now + timedelta(minutes=30)).isoformat(),
+                condition_names=["테마랩_생존_-1"],
+                metadata={"sub_status": "DATA_INSUFFICIENT", "insufficient_reason": ["NO_GATE_RESULT"]},
+            )
+        )
+
+    snapshot = runtime.start(now)
+
+    assert {"000001", "000002", "000003"} <= set(client.registered_codes)
+    assert snapshot.candidate_subscription_selected_count == 3
+    assert "THEME_LAB_BOOTSTRAP_SUBSCRIPTIONS=3" in snapshot.warnings
+    for code in ("000001", "000002", "000003"):
+        record = runtime.subscription_manager.records[code]
+        assert "theme_lab_bootstrap" in record.sources
+        assert "candidate_watch" not in record.sources
     db.close()
 
 

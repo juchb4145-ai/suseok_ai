@@ -47,7 +47,7 @@ from trading.strategy.models import (
 )
 from trading.strategy.pipeline import GatePipeline, GatePipelineResult
 from trading.strategy.readiness import ReadinessReport, _active_theme_presence_by_code, build_readiness_report, dedupe_warnings
-from trading.strategy.realtime import RealTimeSubscriptionManager
+from trading.strategy.realtime import RealTimeSubscriptionManager, _candidate_watchable
 from trading.strategy.reason_taxonomy import normalize_reason_status, reason_status_family, reason_summary
 from trading.strategy.review import TradeReviewService
 from trading.strategy.themelab_adapter import ThemeLabDryRunLifecycleBridge
@@ -1206,8 +1206,9 @@ class StrategyRuntime:
     def _reconcile_subscriptions(self, candidates: list[Candidate], snapshot: StrategyRuntimeSnapshot) -> None:
         try:
             self._sync_virtual_activity_subscriptions()
+            theme_lab_selected_count = 0
             if self._theme_lab_flow_active():
-                self._sync_theme_lab_watchset_subscriptions(snapshot)
+                theme_lab_selected_count = self._sync_theme_lab_watchset_subscriptions(snapshot, candidates)
             else:
                 self._sync_theme_universe_subscriptions(snapshot)
             for raw_index_code in self.config.index_watch_codes.values():
@@ -1223,7 +1224,9 @@ class StrategyRuntime:
             desired_candidates = candidates[: self.config.max_candidates_to_watch]
             if self._theme_lab_flow_active():
                 desired_candidates = []
-            snapshot.candidate_subscription_selected_count = len(desired_candidates)
+                snapshot.candidate_subscription_selected_count = theme_lab_selected_count
+            else:
+                snapshot.candidate_subscription_selected_count = len(desired_candidates)
             watched = self.subscription_manager.watch_candidates(desired_candidates)
             for candidate in desired_candidates:
                 if candidate.state == CandidateState.DETECTED and normalize_code(candidate.code) in watched:
@@ -1238,7 +1241,8 @@ class StrategyRuntime:
             elif self.subscription_manager.max_codes - protected_count <= 5:
                 snapshot.warnings.append(f"PROTECTED_SUBSCRIPTION_NEAR_LIMIT:{protected_count}/{self.subscription_manager.max_codes}")
             snapshot.warnings.extend(self.subscription_manager.warnings)
-            snapshot.warnings.append(f"RECONCILED_SUBSCRIPTIONS={len(watched)}")
+            reconciled_count = len(self.subscription_manager.code_to_screen) if self._theme_lab_flow_active() else len(watched)
+            snapshot.warnings.append(f"RECONCILED_SUBSCRIPTIONS={reconciled_count}")
         except Exception as exc:
             snapshot.warnings.append(f"SUBSCRIPTION_RECONCILE_FAILED:{exc}")
 
@@ -1307,18 +1311,60 @@ class StrategyRuntime:
             return last_result
         return None
 
-    def _sync_theme_lab_watchset_subscriptions(self, snapshot: StrategyRuntimeSnapshot) -> None:
+    def _sync_theme_lab_watchset_subscriptions(self, snapshot: StrategyRuntimeSnapshot, candidates: list[Candidate] | None = None) -> int:
         if self.theme_lab_pipeline is None:
             snapshot.warnings.append("THEME_LAB_FLOW_NOT_WIRED")
-            return
+            return 0
         target_codes = set(self.theme_lab_pipeline.watchset_codes())
+        bootstrap_codes: set[str] = set()
+        if not target_codes:
+            bootstrap_codes = set(self._theme_lab_bootstrap_codes(candidates or [], snapshot))
         for code, record in list(self.subscription_manager.records.items()):
             if "theme_lab_watchset" in record.sources and code not in target_codes:
                 self.subscription_manager.remove_subscription(code, "theme_lab_watchset")
+            if "theme_lab_bootstrap" in record.sources and code not in bootstrap_codes:
+                self.subscription_manager.remove_subscription(code, "theme_lab_bootstrap")
         for code in sorted(target_codes):
             self.subscription_manager.ensure_subscription(code, "theme_lab_watchset", protected=False)
+        for code in sorted(bootstrap_codes):
+            self.subscription_manager.ensure_subscription(code, "theme_lab_bootstrap", protected=False)
         if target_codes:
             snapshot.warnings.append(f"THEME_LAB_WATCHSET_SUBSCRIPTIONS={len(target_codes)}")
+            return len(target_codes)
+        if bootstrap_codes:
+            snapshot.warnings.append(f"THEME_LAB_BOOTSTRAP_SUBSCRIPTIONS={len(bootstrap_codes)}")
+        return len(bootstrap_codes)
+
+    def _theme_lab_bootstrap_codes(self, candidates: list[Candidate], snapshot: StrategyRuntimeSnapshot) -> list[str]:
+        limit = self._theme_lab_bootstrap_subscription_limit(snapshot)
+        if limit <= 0:
+            return []
+        codes: list[str] = []
+        for candidate in candidates:
+            if len(codes) >= limit:
+                break
+            if not _candidate_watchable(candidate):
+                continue
+            code = normalize_code(candidate.code)
+            if code and code not in codes:
+                codes.append(code)
+        return codes
+
+    def _theme_lab_bootstrap_subscription_limit(self, snapshot: StrategyRuntimeSnapshot) -> int:
+        protected_codes = {
+            normalize_code(code)
+            for code in (
+                list(self.config.index_watch_codes.values())
+                + list(self.config.leader_watch_codes)
+                + list(self.config.semiconductor_signal_codes)
+                + list(self.config.holding_watch_codes)
+                + list(self._holding_codes(snapshot))
+            )
+            if normalize_code(code)
+        }
+        protected_codes.update(record.code for record in self.subscription_manager.records.values() if record.protected)
+        available = max(0, int(self.config.realtime_subscription_limit or 0) - len(protected_codes))
+        return max(0, min(int(self.config.max_candidates_to_watch or 0), available))
 
     def _theme_lab_flow_active(self) -> bool:
         return self.config.theme_engine_mode == "themelab_flow" and self.theme_lab_pipeline is not None
