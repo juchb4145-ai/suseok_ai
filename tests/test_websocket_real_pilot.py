@@ -4,10 +4,10 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from apps.kiwoom_gateway import RestCoreClient, _build_core_client, _websocket_pilot_command_rejection
+from apps.kiwoom_gateway import RestCoreClient, _build_core_client, _prioritize_gateway_events, _websocket_pilot_command_rejection
 from storage.db import TradingDatabase
-from trading.broker.gateway_transport import WebSocketRealCoreClient
-from trading.broker.models import GatewayCommand
+from trading.broker.gateway_transport import WebSocketPilotPolicy, WebSocketRealCoreClient
+from trading.broker.models import GatewayCommand, GatewayEvent
 from trading.broker.transport_metrics import TRANSPORT_MODE_WEBSOCKET_REAL_PILOT
 from trading.broker.ws_messages import GatewayWsMessage
 
@@ -142,6 +142,110 @@ def test_websocket_real_client_receives_command_batch_without_ack(monkeypatch):
     assert client.snapshot()["ws_command_queue_size"] == 0
 
 
+def test_websocket_real_client_routes_only_control_events_to_ws(monkeypatch):
+    class Fallback:
+        transport_mode = "rest_long_poll"
+
+        def __init__(self):
+            self.events = []
+            self.last_poll_error = ""
+
+        def post_event(self, event):
+            self.events.append(event)
+            return {"accepted": True, "transport_mode": self.transport_mode}
+
+        def poll_commands(self, *, limit=20, wait_sec=1.0):
+            return []
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def snapshot(self):
+            return {"transport_mode": self.transport_mode}
+
+    fallback = Fallback()
+    client = WebSocketRealCoreClient(
+        core_url="http://127.0.0.1:8000",
+        ws_url="ws://127.0.0.1:8000/ws/gateway/transport",
+        token="test-token",
+        fallback_client=fallback,
+        policy=WebSocketPilotPolicy(enabled=True, allow_real=True),
+    )
+    monkeypatch.setattr(client, "start", lambda: None)
+
+    client.post_event(GatewayEvent(type="price_tick", payload={"code": "005930"}))
+    client.post_event(GatewayEvent(type="command_ack", command_id="cmd-1", payload={"status": "ACKED"}))
+    client.stop()
+
+    assert [event.type for event in fallback.events] == ["price_tick"]
+    assert client._outbound.qsize() == 1
+    assert client._outbound.get_nowait().type == "command_ack"
+    snapshot = client.snapshot()
+    assert snapshot["ws_price_tick_sampled_count"] == 0
+    assert snapshot["ws_price_tick_fallback_count"] == 1
+
+
+def test_websocket_real_client_can_sample_price_ticks_to_ws(monkeypatch):
+    class Fallback:
+        transport_mode = "rest_long_poll"
+        last_poll_error = ""
+
+        def __init__(self):
+            self.events = []
+
+        def post_event(self, event):
+            self.events.append(event)
+            return {"accepted": True, "transport_mode": self.transport_mode}
+
+        def poll_commands(self, *, limit=20, wait_sec=1.0):
+            return []
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def snapshot(self):
+            return {"transport_mode": self.transport_mode}
+
+    fallback = Fallback()
+    client = WebSocketRealCoreClient(
+        core_url="http://127.0.0.1:8000",
+        ws_url="ws://127.0.0.1:8000/ws/gateway/transport",
+        token="test-token",
+        fallback_client=fallback,
+        policy=WebSocketPilotPolicy(enabled=True, allow_real=True, price_tick_sample_rate=1.0),
+    )
+    monkeypatch.setattr(client, "start", lambda: None)
+
+    client.post_event(GatewayEvent(type="price_tick", payload={"code": "005930"}))
+    client.stop()
+
+    assert fallback.events == []
+    assert client._outbound.get_nowait().type == "gateway_event"
+    snapshot = client.snapshot()
+    assert snapshot["ws_price_tick_sample_rate"] == 1.0
+    assert snapshot["ws_price_tick_sampled_count"] == 1
+    assert snapshot["ws_price_tick_fallback_count"] == 0
+
+
+def test_gateway_network_prioritizes_control_events_before_price_ticks():
+    events = [
+        GatewayEvent(type="price_tick", payload={"code": "005930"}),
+        GatewayEvent(type="heartbeat", payload={"kiwoom_logged_in": True}),
+        GatewayEvent(type="price_tick", payload={"code": "000660"}),
+        GatewayEvent(type="command_ack", command_id="cmd-1", payload={"status": "ACKED"}),
+    ]
+
+    prioritized = _prioritize_gateway_events(events)
+
+    assert [event.type for event in prioritized] == ["heartbeat", "command_ack", "price_tick", "price_tick"]
+
+
 def test_websocket_pilot_blocks_order_commands_by_default(monkeypatch):
     monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_REAL_PILOT", "1")
     monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL", "1")
@@ -203,6 +307,12 @@ def test_core_ws_endpoint_accepts_real_pilot_mode_and_status(tmp_path, monkeypat
                     "ws_last_error_at": "2026-06-01T00:00:01.000+00:00",
                     "ws_last_close_code": "1006",
                     "pilot_blocked_order_command_count": 1,
+                    "ws_price_tick_sample_rate": 0.01,
+                    "ws_price_tick_sampled_count": 7,
+                    "ws_price_tick_fallback_count": 701,
+                    "ws_event_fallback_count": 2,
+                    "last_ws_event_at": "2026-06-01T00:00:02.000+00:00",
+                    "last_ws_ack_at": "2026-06-01T00:00:03.000+00:00",
                     "kiwoom_logged_in": True,
                     "orderable": False,
                     "mode": "OBSERVE",
@@ -221,6 +331,12 @@ def test_core_ws_endpoint_accepts_real_pilot_mode_and_status(tmp_path, monkeypat
     assert status["last_error_stage"] == "recv"
     assert status["last_close_code"] == "1006"
     assert status["blocked_order_command_count"] == 1
+    assert status["price_tick_sample_rate"] == 0.01
+    assert status["price_tick_sampled_count"] == 7
+    assert status["price_tick_fallback_count"] == 701
+    assert status["event_fallback_count"] == 2
+    assert status["last_ws_event_at"] == "2026-06-01T00:00:02.000+00:00"
+    assert status["last_ws_ack_at"] == "2026-06-01T00:00:03.000+00:00"
     db = TradingDatabase(str(db_path))
     try:
         logs = "\n".join(db.recent_logs(limit=20))

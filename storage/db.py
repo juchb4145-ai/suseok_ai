@@ -161,6 +161,15 @@ class TradingDatabase:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(theme_id, stock_code)
             );
+            CREATE TABLE IF NOT EXISTS kiwoom_symbol_master (
+                code TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                market TEXT NOT NULL,
+                market_code TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'kiwoom_code_list',
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS theme_activity_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -3895,6 +3904,80 @@ class TradingDatabase:
     def close(self) -> None:
         self.conn.close()
 
+    def upsert_kiwoom_symbol_master(self, rows: Iterable[dict]) -> int:
+        cleaned: list[dict] = []
+        for item in rows:
+            code = _clean_stock_code(item.get("code"))
+            market = str(item.get("market") or "").strip().upper()
+            if not code or market not in {"KOSPI", "KOSDAQ"}:
+                continue
+            cleaned.append(
+                {
+                    "code": code,
+                    "name": str(item.get("name") or ""),
+                    "market": market,
+                    "market_code": str(item.get("market_code") or ""),
+                    "source": str(item.get("source") or "kiwoom_code_list"),
+                    "raw": dict(item.get("raw") or {}),
+                }
+            )
+        if not cleaned:
+            return 0
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT INTO kiwoom_symbol_master(
+                    code, name, market, market_code, source, raw_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(code) DO UPDATE SET
+                    name=COALESCE(NULLIF(excluded.name, ''), kiwoom_symbol_master.name),
+                    market=excluded.market,
+                    market_code=excluded.market_code,
+                    source=excluded.source,
+                    raw_json=excluded.raw_json,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                [
+                    (
+                        item["code"],
+                        item["name"],
+                        item["market"],
+                        item["market_code"],
+                        item["source"],
+                        json.dumps(item["raw"], ensure_ascii=False, sort_keys=True),
+                    )
+                    for item in cleaned
+                ],
+            )
+        return len(cleaned)
+
+    def list_kiwoom_symbol_master(self, codes: Iterable[str]) -> list[dict]:
+        clean_codes = sorted({_clean_stock_code(code) for code in codes if _clean_stock_code(code)})
+        if not clean_codes:
+            return []
+        placeholders = ",".join("?" for _ in clean_codes)
+        rows = self.conn.execute(
+            f"""
+            SELECT code, name, market, market_code, source, raw_json, updated_at
+            FROM kiwoom_symbol_master
+            WHERE code IN ({placeholders})
+            ORDER BY code
+            """,
+            tuple(clean_codes),
+        ).fetchall()
+        return [
+            {
+                "code": row["code"],
+                "name": row["name"],
+                "market": row["market"],
+                "market_code": row["market_code"],
+                "source": row["source"],
+                "raw": _safe_json_loads(row["raw_json"], {}),
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
     def _archive_legacy_theme_mappings(self) -> None:
         row = self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'theme_mappings'"
@@ -5227,3 +5310,11 @@ def _safe_json_loads(value: object, default):
         return json.loads(str(value or ""))
     except Exception:
         return default
+
+
+def _clean_stock_code(value: object) -> str:
+    text = str(value or "").strip().upper()
+    if text.startswith("A") and len(text) == 7:
+        text = text[1:]
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits.zfill(6) if digits else ""

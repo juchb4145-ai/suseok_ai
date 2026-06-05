@@ -55,6 +55,7 @@ class CoreSettings:
     dry_run_pending_grace_minutes: int = 30
     transport_metrics_enabled: bool = True
     transport_metrics_sample_price_tick_rate: float = 0.01
+    transport_metrics_persist_ws_price_ticks: bool = False
     transport_metrics_sample_heartbeat_rate: float = 0.1
     transport_metrics_retention_sec: int = 604800
     transport_latency_p95_warn_ms: int = 1000
@@ -132,6 +133,7 @@ def get_settings() -> CoreSettings:
         dry_run_pending_grace_minutes=_int_env("TRADING_DRY_RUN_PENDING_GRACE_MINUTES", 30),
         transport_metrics_enabled=_bool_env("TRADING_TRANSPORT_METRICS_ENABLED", True),
         transport_metrics_sample_price_tick_rate=_float_env("TRADING_TRANSPORT_METRICS_SAMPLE_PRICE_TICK_RATE", 0.01),
+        transport_metrics_persist_ws_price_ticks=_bool_env("TRADING_TRANSPORT_METRICS_PERSIST_WS_PRICE_TICKS", False),
         transport_metrics_sample_heartbeat_rate=_float_env("TRADING_TRANSPORT_METRICS_SAMPLE_HEARTBEAT_RATE", 0.1),
         transport_metrics_retention_sec=_int_env("TRADING_TRANSPORT_METRICS_RETENTION_SEC", 604800),
         transport_latency_p95_warn_ms=_int_env("TRADING_TRANSPORT_LATENCY_P95_WARN_MS", 1000),

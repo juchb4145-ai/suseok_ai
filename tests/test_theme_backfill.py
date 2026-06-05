@@ -101,6 +101,25 @@ def test_theme_backfill_dispatch_guard_marks_expired_before_dispatch():
     assert state.get_command(command.command_id).status == CommandStatus.EXPIRED_BEFORE_DISPATCH
 
 
+def test_theme_backfill_dispatch_guard_expires_stale_dispatched_backfill():
+    state = _healthy_state()
+    command = _enqueue_backfill(state, "000001", ttl_sec=60, now=datetime.now(timezone.utc))
+    state.dispatch_commands(limit=1)
+    record = state.get_command(command.command_id)
+    record.dispatched_at = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(timespec="seconds")
+
+    summary = apply_dispatch_guard(
+        state,
+        {"watchset_snapshots": []},
+        config=ThemeBackfillConfig(enabled=True, ttl_sec=1),
+    )
+
+    record = state.get_command(command.command_id)
+    assert record.status == CommandStatus.EXPIRED
+    assert record.last_error == "STALE_DISPATCHED_BACKFILL_CLEANUP"
+    assert summary["skipped"][CommandStatus.EXPIRED.value] == 1
+
+
 def test_theme_backfill_dispatch_guard_skips_non_observe_mode():
     state = _healthy_state()
     _enqueue_backfill(state, "000001")

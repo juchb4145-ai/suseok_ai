@@ -124,6 +124,71 @@ def test_gateway_transport_ws_hello_gateway_event_and_command_ack_flow(tmp_path,
     assert any(sample["experiment_id"] == "exp-ws" for sample in samples)
 
 
+def test_gateway_transport_ws_real_pilot_price_tick_skips_latency_persistence_by_default(tmp_path, monkeypatch):
+    client, db_path = _client(tmp_path, monkeypatch)
+
+    with client.websocket_connect("/ws/gateway/transport?token=test-token") as ws:
+        ws.receive_json()
+        ws.send_json(
+            GatewayWsMessage(
+                type="gateway_event",
+                source="kiwoom_gateway",
+                payload={
+                    "type": "price_tick",
+                    "event_id": "evt-ws-price-no-db",
+                    "payload": {
+                        "code": "005930",
+                        "price": 70000,
+                    },
+                },
+                metadata={"transport_mode": "websocket_real_pilot"},
+                sequence=1,
+            ).to_dict()
+        )
+        assert _recv_until(ws, "event_ack")["payload"]["accepted"] is True
+
+    db = TradingDatabase(str(db_path))
+    try:
+        samples = db.list_gateway_transport_latency_samples(event_id="evt-ws-price-no-db")
+    finally:
+        db.close()
+    assert samples == []
+
+
+def test_gateway_transport_ws_real_pilot_price_tick_can_persist_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_TRANSPORT_METRICS_PERSIST_WS_PRICE_TICKS", "1")
+    client, db_path = _client(tmp_path, monkeypatch)
+
+    with client.websocket_connect("/ws/gateway/transport?token=test-token") as ws:
+        ws.receive_json()
+        ws.send_json(
+            GatewayWsMessage(
+                type="gateway_event",
+                source="kiwoom_gateway",
+                payload={
+                    "type": "price_tick",
+                    "event_id": "evt-ws-price-db",
+                    "payload": {
+                        "code": "005930",
+                        "price": 70000,
+                    },
+                },
+                metadata={"transport_mode": "websocket_real_pilot"},
+                sequence=1,
+            ).to_dict()
+        )
+        assert _recv_until(ws, "event_ack")["payload"]["accepted"] is True
+
+    db = TradingDatabase(str(db_path))
+    try:
+        samples = db.list_gateway_transport_latency_samples(event_id="evt-ws-price-db")
+    finally:
+        db.close()
+    assert len(samples) == 1
+    assert samples[0]["message_type"] == "price_tick"
+    assert samples[0]["transport_mode"] == "websocket_real_pilot"
+
+
 def test_gateway_transport_ws_command_failed_marks_failed(tmp_path, monkeypatch):
     client, _ = _client(tmp_path, monkeypatch)
     headers = {"X-Local-Token": "test-token"}

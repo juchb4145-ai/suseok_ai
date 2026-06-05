@@ -54,6 +54,21 @@ from trading.broker.transport_metrics import (
 from kiwoom.tr import KiwoomTrRunner
 from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE, parse_theme_backfill
 
+CONTROL_EVENT_TYPES = {
+    "heartbeat",
+    "login_status",
+    "orderability",
+    "condition_load_result",
+    "condition_loaded",
+    "condition_event",
+    "command_started",
+    "command_ack",
+    "command_failed",
+    "rate_limited",
+    "gateway_error",
+    "error",
+}
+
 
 @dataclass
 class RestCoreClient:
@@ -263,6 +278,7 @@ class GatewayRuntime:
         while not self._stop.is_set():
             try:
                 drained = self.events.drain(limit=self.event_drain_limit)
+                drained = _prioritize_gateway_events(drained)
                 self.drained_event_count += len(drained)
                 for event in drained:
                     self.core_client.post_event(event)
@@ -339,6 +355,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-sample-price-tick-rate", type=float, default=float(os.environ.get("TRADING_TRANSPORT_METRICS_SAMPLE_PRICE_TICK_RATE", "0.01")))
     parser.add_argument("--metrics-sample-heartbeat-rate", type=float, default=float(os.environ.get("TRADING_TRANSPORT_METRICS_SAMPLE_HEARTBEAT_RATE", "0.1")))
     return parser.parse_args()
+
+
+def _prioritize_gateway_events(events: list[GatewayEvent]) -> list[GatewayEvent]:
+    if len(events) < 2:
+        return events
+    return sorted(events, key=lambda event: 0 if event.type in CONTROL_EVENT_TYPES else 1)
 
 
 def _build_core_client(args: argparse.Namespace) -> RestCoreClient:
@@ -553,10 +575,7 @@ def _kiwoom_heartbeat_payload(client, runtime: GatewayRuntime) -> dict[str, Any]
 
 def _wire_kiwoom_signals(client, runtime: GatewayRuntime) -> None:
     client.connected.connect(
-        lambda ok, code, message: runtime.emit(
-            "login_status",
-            {"logged_in": bool(ok), "code": int(code), "message": str(message or "")},
-        )
+        lambda ok, code, message: _emit_login_status(client, runtime, bool(ok), int(code), str(message or ""))
     )
     rich_signal = getattr(client, "price_tick_received", None)
     if rich_signal is not None and callable(getattr(rich_signal, "connect", None)):
@@ -630,6 +649,29 @@ def _wire_kiwoom_signals(client, runtime: GatewayRuntime) -> None:
             if code.strip()
         ]
     )
+
+
+def _emit_login_status(client, runtime: GatewayRuntime, ok: bool, code: int, message: str) -> None:
+    runtime.emit(
+        "login_status",
+        {"logged_in": bool(ok), "code": int(code), "message": str(message or "")},
+    )
+    if ok:
+        _emit_market_symbols(client, runtime)
+
+
+def _emit_market_symbols(client, runtime: GatewayRuntime) -> None:
+    markets = []
+    for market_code, market_name in (("0", "KOSPI"), ("10", "KOSDAQ")):
+        try:
+            codes = _clean_codes(getattr(client, "get_code_list_by_market")(market_code))
+        except Exception as exc:
+            runtime.emit("gateway_error", {"message": f"MARKET_SYMBOLS_LOAD_FAILED:{market_name}:{exc}"})
+            continue
+        if codes:
+            markets.append({"market_code": market_code, "market": market_name, "symbols": codes})
+    if markets:
+        runtime.emit("market_symbols", {"source": "kiwoom_code_list", "markets": markets})
 
 
 def _price_tick_payload(tick: BrokerPriceTick | dict[str, Any]) -> dict[str, Any]:
@@ -947,6 +989,20 @@ def _safe_master_last_price(client, code: str) -> float | None:
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
+
+
+def _clean_codes(codes) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in list(codes or []):
+        text = str(raw or "").strip().upper()
+        if text.startswith("A") and len(text) == 7:
+            text = text[1:]
+        code = "".join(ch for ch in text if ch.isdigit())
+        if code and code not in seen:
+            seen.add(code)
+            result.append(code.zfill(6))
+    return result
 
 
 def _websocket_pilot_command_rejection(runtime: GatewayRuntime, command: GatewayCommand) -> str:

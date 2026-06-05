@@ -38,6 +38,20 @@ DEFAULT_PILOT_ALLOWED_COMMANDS = {
     "stop_condition",
     "tr_request",
 }
+DEFAULT_PILOT_CONTROL_EVENT_TYPES = {
+    "heartbeat",
+    "login_status",
+    "orderability",
+    "condition_load_result",
+    "condition_loaded",
+    "condition_event",
+    "command_started",
+    "command_ack",
+    "command_failed",
+    "rate_limited",
+    "gateway_error",
+    "error",
+}
 
 
 class CoreTransportClient(Protocol):
@@ -71,6 +85,8 @@ class WebSocketPilotPolicy:
     block_order_commands: bool = True
     allow_order_commands: bool = False
     allowed_commands: set[str] = field(default_factory=lambda: set(DEFAULT_PILOT_ALLOWED_COMMANDS))
+    allowed_event_types: set[str] = field(default_factory=lambda: set(DEFAULT_PILOT_CONTROL_EVENT_TYPES))
+    price_tick_sample_rate: float = 0.0
     max_queue_size: int = 2000
     outbound_send_burst_size: int = 100
     heartbeat_interval_sec: float = 5.0
@@ -85,6 +101,12 @@ class WebSocketPilotPolicy:
             if allowed_raw
             else set(DEFAULT_PILOT_ALLOWED_COMMANDS)
         )
+        allowed_events_raw = os.environ.get("TRADING_GATEWAY_WEBSOCKET_PILOT_EVENT_TYPES", "")
+        allowed_events = (
+            {item.strip() for item in allowed_events_raw.split(",") if item.strip()}
+            if allowed_events_raw
+            else set(DEFAULT_PILOT_CONTROL_EVENT_TYPES)
+        )
         return cls(
             enabled=_bool_env("TRADING_GATEWAY_WEBSOCKET_REAL_PILOT", False),
             allow_real=_bool_env("TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL", False),
@@ -96,6 +118,8 @@ class WebSocketPilotPolicy:
             block_order_commands=_bool_env("TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS", True),
             allow_order_commands=_bool_env("TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS", False),
             allowed_commands=allowed,
+            allowed_event_types=allowed_events,
+            price_tick_sample_rate=_float_env("TRADING_GATEWAY_WEBSOCKET_PRICE_TICK_SAMPLE_RATE", 0.0),
             outbound_send_burst_size=_int_env("TRADING_GATEWAY_WEBSOCKET_OUTBOUND_SEND_BURST_SIZE", 100),
         )
 
@@ -104,6 +128,12 @@ class WebSocketPilotPolicy:
         if normalized in ORDER_COMMAND_TYPES:
             return bool(self.allow_order_commands and not self.block_order_commands)
         return normalized in self.allowed_commands
+
+    def event_allowed(self, event_type: str) -> bool:
+        normalized = str(event_type or "")
+        if normalized == "price_tick":
+            return random.random() < min(1.0, max(0.0, float(self.price_tick_sample_rate or 0.0)))
+        return normalized in self.allowed_event_types
 
 
 class WebSocketRealCoreClient:
@@ -159,6 +189,9 @@ class WebSocketRealCoreClient:
         self.duplicate_ack_count = 0
         self.unknown_ack_count = 0
         self.blocked_order_command_count = 0
+        self.ws_price_tick_sampled_count = 0
+        self.ws_price_tick_fallback_count = 0
+        self.ws_event_fallback_count = 0
         self.last_ws_event_at = ""
         self.last_ws_ack_at = ""
         self._sequence = 0
@@ -198,6 +231,14 @@ class WebSocketRealCoreClient:
     def post_event(self, event: GatewayEvent) -> dict[str, Any]:
         if self.fallback_active:
             return self.fallback_client.post_event(event)  # type: ignore[union-attr]
+        if not self.policy.event_allowed(event.type):
+            if self.fallback_client is not None:
+                if event.type == "price_tick":
+                    self.ws_price_tick_fallback_count += 1
+                else:
+                    self.ws_event_fallback_count += 1
+                return self.fallback_client.post_event(event)
+            return {"accepted": False, "queued": False, "transport_mode": self.transport_mode, "reason": "EVENT_TYPE_NOT_ALLOWED"}
         self.start()
         post_start = monotonic_ms()
         try:
@@ -205,6 +246,8 @@ class WebSocketRealCoreClient:
             self._outbound.put(message, timeout=0.1)
             self.last_event_post_ms = monotonic_delta_ms(post_start, monotonic_ms()) or 0.0
             self.post_count += 1
+            if event.type == "price_tick":
+                self.ws_price_tick_sampled_count += 1
             return {"accepted": True, "queued": True, "transport_mode": self.transport_mode}
         except Exception as exc:
             self.last_event_post_ms = monotonic_delta_ms(post_start, monotonic_ms()) or 0.0
@@ -276,6 +319,10 @@ class WebSocketRealCoreClient:
             "ws_duplicate_ack_count": self.duplicate_ack_count,
             "ws_unknown_ack_count": self.unknown_ack_count,
             "pilot_blocked_order_command_count": self.blocked_order_command_count,
+            "ws_price_tick_sample_rate": min(1.0, max(0.0, float(self.policy.price_tick_sample_rate or 0.0))),
+            "ws_price_tick_sampled_count": self.ws_price_tick_sampled_count,
+            "ws_price_tick_fallback_count": self.ws_price_tick_fallback_count,
+            "ws_event_fallback_count": self.ws_event_fallback_count,
             "last_ws_event_at": self.last_ws_event_at,
             "last_ws_ack_at": self.last_ws_ack_at,
             "fallback": fallback_snapshot,
@@ -599,5 +646,12 @@ def _bool_env(name: str, default: bool) -> bool:
 def _int_env(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
     except ValueError:
         return default

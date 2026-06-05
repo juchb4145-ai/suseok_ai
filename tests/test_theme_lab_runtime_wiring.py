@@ -9,7 +9,7 @@ from storage.db import TradingDatabase
 from trading.strategy.config import StrategyRuntimeConfigRepository
 from trading.strategy.market_data import StrategyTick
 from trading.strategy.market_data import MarketDataStore
-from trading.strategy.market_index import MarketIndexStore
+from trading.strategy.market_index import IndexTick, MarketIndexStore
 from trading.strategy.models import Candidate, CandidateState, OrderMode
 from trading.strategy.runtime import StrategyRuntimeConfig
 from trading.theme_engine.lab import (
@@ -57,6 +57,35 @@ def test_theme_lab_unresolved_conditions_emit_specific_readiness_warnings(tmp_pa
     assert "THEME_LAB_CONDITION_STRONG_UNRESOLVED" in runtime.readiness_report.warnings
     assert "THEME_LAB_CONDITION_LEADER_UNRESOLVED" in runtime.readiness_report.warnings
     db.close()
+
+
+def test_theme_lab_uses_kiwoom_symbol_master_when_legacy_market_mapping_missing(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        _seed_theme(db)
+        db.upsert_kiwoom_symbol_master(
+            [
+                {"code": "000001", "name": "stock-000001", "market": "KOSPI", "market_code": "0"},
+                {"code": "000002", "name": "stock-000002", "market": "KOSDAQ", "market_code": "10"},
+            ]
+        )
+        now = datetime(2026, 6, 5, 10, 0, 0)
+        market_data = MarketDataStore()
+        market_data.update_tick(_tick("000001", 105, 5.0, now))
+        market_data.update_tick(_tick("000002", 104, 4.0, now))
+        market_index_store = MarketIndexStore()
+        market_index_store.update_index_tick(IndexTick.from_realtime("KOSPI", "KOSPI", 3000, change_rate=0.2, timestamp=now))
+        market_index_store.update_index_tick(IndexTick.from_realtime("KOSDAQ", "KOSDAQ", 900, change_rate=-1.2, timestamp=now))
+        pipeline = ThemeLabRuntimePipeline(db=db, market_data=market_data, market_index_store=market_index_store)
+
+        result = pipeline.run(now)
+
+        watch_by_symbol = {item.symbol: item for item in result.watchset}
+        assert watch_by_symbol["000001"].candidate_market == "KOSPI"
+        assert watch_by_symbol["000001"].candidate_market_source == "metadata_by_symbol.raw.market"
+        assert watch_by_symbol["000002"].candidate_market == "KOSDAQ"
+    finally:
+        db.close()
 
 
 def test_theme_lab_runtime_tick_runs_pipeline_saves_result_and_syncs_watchset(tmp_path):

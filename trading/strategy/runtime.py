@@ -522,6 +522,12 @@ class StrategyRuntime:
     def _retry_condition_adapter_start(self, snapshot: StrategyRuntimeSnapshot, now: datetime) -> None:
         if self.condition_adapter is None:
             return
+        recover = getattr(self.condition_adapter, "recover_unacked_conditions", None)
+        if callable(recover):
+            try:
+                snapshot.warnings.extend(recover(now))
+            except Exception as exc:
+                snapshot.warnings.append(f"CONDITION_ADAPTER_RECOVERY_FAILED:{exc}")
         registered = getattr(self.condition_adapter, "registered_conditions", None)
         if not isinstance(registered, dict) or registered:
             return
@@ -1205,6 +1211,14 @@ class StrategyRuntime:
 
     def _reconcile_subscriptions(self, candidates: list[Candidate], snapshot: StrategyRuntimeSnapshot) -> None:
         try:
+            expire_stale = getattr(getattr(self.subscription_manager, "client", None), "expire_stale_register_commands", None)
+            if callable(expire_stale):
+                expired_count = int(expire_stale() or 0)
+                if expired_count:
+                    marker = getattr(self.subscription_manager, "mark_all_stale", None)
+                    if callable(marker):
+                        marker("STALE_REGISTER_REALTIME_DISPATCHED")
+                    snapshot.warnings.append(f"REALTIME_REGISTER_STALE_EXPIRED={expired_count}")
             self._sync_virtual_activity_subscriptions()
             theme_lab_selected_count = 0
             if self._theme_lab_flow_active():

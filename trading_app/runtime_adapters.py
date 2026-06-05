@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 
-from trading.broker.command_queue import CommandPriority
+from trading.broker.command_queue import CommandPriority, CommandStatus, EnqueueResult
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import ConditionInfo, GatewayCommand, GatewayEvent, Signal, new_message_id
 from trading.strategy.bridge import StrategyMarketDataBridge
@@ -171,9 +171,16 @@ class GatewayEventThemeRuntimeBridge:
 
 
 class GatewayCommandRealtimeClient:
-    def __init__(self, gateway_state: GatewayStateStore, *, warning_sink: WarningSink | None = None) -> None:
+    def __init__(
+        self,
+        gateway_state: GatewayStateStore,
+        *,
+        warning_sink: WarningSink | None = None,
+        stale_dispatch_timeout_sec: int = 30,
+    ) -> None:
         self.gateway_state = gateway_state
         self.warning_sink = warning_sink
+        self.stale_dispatch_timeout_sec = max(5, int(stale_dispatch_timeout_sec))
 
     def register_realtime(self, codes: Iterable[str], screen_no: str = "") -> None:
         clean_codes = _clean_codes(codes)
@@ -201,6 +208,30 @@ class GatewayCommandRealtimeClient:
             payload={"scope": "runtime"},
             key=f"runtime:remove_all_realtime:{new_message_id('scope')}",
         )
+
+    def expire_stale_register_commands(self, now: datetime | None = None) -> int:
+        current = _as_utc(now or datetime.now(timezone.utc))
+        expired = 0
+        for record in self.gateway_state.list_commands(limit=1000, include_finished=False, command_type="register_realtime"):
+            if str(record.get("status") or "").upper() != CommandStatus.DISPATCHED.value:
+                continue
+            if not _stale_dispatched(record, current, self.stale_dispatch_timeout_sec):
+                continue
+            command_id = str(record.get("command_id") or "")
+            if not command_id:
+                continue
+            if self.gateway_state.ack_command(
+                command_id,
+                status=CommandStatus.EXPIRED.value,
+                result_payload={
+                    "recovery_reason": "STALE_REGISTER_REALTIME_DISPATCHED",
+                    "requeue": "subscription_manager_sync",
+                },
+                error="STALE_REGISTER_REALTIME_DISPATCHED",
+            ):
+                expired += 1
+                self._warn(f"REALTIME_REGISTER_STALE_EXPIRED:{command_id}")
+        return expired
 
     def _enqueue(self, command_type: str, *, payload: dict[str, Any], key: str) -> None:
         command = GatewayCommand(
@@ -235,6 +266,8 @@ class GatewayCommandConditionAdapter:
         max_realtime_conditions: int = 10,
         condition_screen_base: int = 7600,
         purpose_filter: set[str] | None = None,
+        send_condition_recovery_cooldown_sec: int = 60,
+        send_condition_stale_dispatch_timeout_sec: int = 30,
     ) -> None:
         self.gateway_state = gateway_state
         self.repository = repository
@@ -244,12 +277,15 @@ class GatewayCommandConditionAdapter:
         self.max_realtime_conditions = max(0, int(max_realtime_conditions))
         self.condition_screen_base = int(condition_screen_base)
         self.purpose_filter = set(purpose_filter or set())
+        self.send_condition_recovery_cooldown_sec = max(5, int(send_condition_recovery_cooldown_sec))
+        self.send_condition_stale_dispatch_timeout_sec = max(5, int(send_condition_stale_dispatch_timeout_sec))
         self.condition_candidate_included = Signal()
         self.condition_candidate_removed = Signal()
         self.registered_conditions: dict[tuple[str, int], RegisteredCondition] = {}
         self.condition_event_counts: dict[str, dict[str, int | str]] = {}
         self.warnings: list[str] = []
         self._load_succeeded = False
+        self._send_condition_recovery_at: dict[tuple[str, int, str], datetime] = {}
 
     def start(self, now: datetime | None = None) -> list[str]:
         self.warnings = []
@@ -286,6 +322,84 @@ class GatewayCommandConditionAdapter:
         self.registered_conditions.clear()
         return list(self.warnings)
 
+    def recover_unacked_conditions(self, now: datetime | None = None) -> list[str]:
+        """Re-enqueue condition registration when the gateway never ACKed it.
+
+        Kiwoom condition registration is stateful in the 32-bit gateway. If a
+        send_condition command expires in the command queue, the strategy must
+        not assume that the condition is live just because the profile index was
+        resolved earlier.
+        """
+        self.warnings = []
+        if not self._gateway_ready():
+            return list(self.warnings)
+        current = now or datetime.now()
+        latest = self._latest_send_condition_commands()
+        for screen_index, profile in enumerate(self._selected_profiles()):
+            if profile.last_resolved_index is None:
+                continue
+            condition_index = int(profile.last_resolved_index)
+            screen_no = f"{self.condition_screen_base + screen_index:04d}"
+            key = (profile.condition_name, condition_index, screen_no)
+            record = latest.get(key)
+            if record is None:
+                continue
+            status = str(record.get("status") or "").upper()
+            if status == CommandStatus.DISPATCHED.value and _stale_dispatched(
+                record,
+                _as_utc(current),
+                self.send_condition_stale_dispatch_timeout_sec,
+            ):
+                command_id = str(record.get("command_id") or "")
+                if command_id and self.gateway_state.ack_command(
+                    command_id,
+                    status=CommandStatus.EXPIRED.value,
+                    result_payload={
+                        "recovery_reason": "STALE_SEND_CONDITION_DISPATCHED",
+                        "condition_name": profile.condition_name,
+                        "condition_index": condition_index,
+                        "screen_no": screen_no,
+                    },
+                    error="STALE_SEND_CONDITION_DISPATCHED",
+                ):
+                    status = CommandStatus.EXPIRED.value
+                    record["status"] = status
+                    record["last_error"] = "STALE_SEND_CONDITION_DISPATCHED"
+                    self._warn(f"CONDITION_SEND_STALE_EXPIRED:{profile.condition_name}:{command_id}")
+            if status == "ACKED":
+                self._remember_registered_condition(profile, condition_index, screen_no, current)
+                continue
+            if status in {"QUEUED", "DISPATCHED"}:
+                continue
+            if not self._condition_recovery_due(key, current):
+                continue
+            recovery_key = (
+                f"runtime:send_condition_recover:{profile.condition_name}:"
+                f"{condition_index}:{screen_no}:{current.strftime('%Y%m%d%H%M%S')}"
+            )
+            result = self._enqueue(
+                "send_condition",
+                payload={
+                    "screen_no": screen_no,
+                    "condition_name": profile.condition_name,
+                    "condition_index": condition_index,
+                    "realtime": True,
+                    "search_type": 1,
+                },
+                key=recovery_key,
+                metadata={
+                    "runtime": "strategy",
+                    "adapter": "condition",
+                    "condition_recovery": True,
+                    "recovered_from_command_id": str(record.get("command_id") or ""),
+                    "recovered_from_status": status,
+                },
+            )
+            if result.accepted:
+                self._send_condition_recovery_at[key] = current
+                self._warn(f"CONDITION_SEND_RECOVERY_ENQUEUED:{profile.condition_name}:{status}")
+        return list(self.warnings)
+
     def get_code_name(self, code: str) -> str:
         return ""
 
@@ -317,9 +431,7 @@ class GatewayCommandConditionAdapter:
         for condition in conditions:
             by_name.setdefault(condition.name, []).append(condition)
 
-        profiles = sorted(self.repository.enabled_profiles(), key=lambda profile: profile.priority, reverse=True)
-        if self.purpose_filter:
-            profiles = [profile for profile in profiles if profile.purpose in self.purpose_filter]
+        profiles = self._filtered_profiles()
         selected = profiles[: self.max_realtime_conditions]
         for skipped in profiles[self.max_realtime_conditions :]:
             self._warn(f"CONDITION_PROFILE_SKIPPED_LIMIT:{skipped.condition_name}")
@@ -337,7 +449,7 @@ class GatewayCommandConditionAdapter:
             condition_index = unique_indices[0]
             self.repository.update_last_resolved_index(profile.condition_name, condition_index)
             screen_no = f"{self.condition_screen_base + index:04d}"
-            self._enqueue(
+            result = self._enqueue(
                 "send_condition",
                 payload={
                     "screen_no": screen_no,
@@ -348,14 +460,8 @@ class GatewayCommandConditionAdapter:
                 },
                 key=f"runtime:send_condition:{profile.condition_name}:{condition_index}:{screen_no}",
             )
-            self.registered_conditions[(profile.condition_name, condition_index)] = RegisteredCondition(
-                condition_name=profile.condition_name,
-                condition_index=condition_index,
-                screen_no=screen_no,
-                strategy_profile=profile.strategy_profile,
-                purpose=profile.purpose,
-                registered_at=current.replace(microsecond=0).isoformat(),
-            )
+            if result.accepted:
+                self._remember_registered_condition(profile, condition_index, screen_no, current)
 
     def _gateway_ready(self) -> bool:
         snapshot = self.gateway_state.snapshot()
@@ -367,7 +473,55 @@ class GatewayCommandConditionAdapter:
             return False
         return True
 
-    def _enqueue(self, command_type: str, *, payload: dict[str, Any], key: str) -> None:
+    def _filtered_profiles(self) -> list:
+        profiles = sorted(self.repository.enabled_profiles(), key=lambda profile: profile.priority, reverse=True)
+        if self.purpose_filter:
+            profiles = [profile for profile in profiles if profile.purpose in self.purpose_filter]
+        return profiles
+
+    def _selected_profiles(self) -> list:
+        return self._filtered_profiles()[: self.max_realtime_conditions]
+
+    def _latest_send_condition_commands(self) -> dict[tuple[str, int, str], dict[str, Any]]:
+        latest: dict[tuple[str, int, str], dict[str, Any]] = {}
+        for record in self.gateway_state.list_commands(limit=1000, include_finished=True, command_type="send_condition"):
+            command = dict(record.get("command") or {})
+            payload = dict(command.get("payload") or {})
+            name = str(payload.get("condition_name") or "").strip()
+            screen_no = str(payload.get("screen_no") or "").strip()
+            try:
+                condition_index = int(payload.get("condition_index"))
+            except (TypeError, ValueError):
+                continue
+            if not name or not screen_no:
+                continue
+            latest.setdefault((name, condition_index, screen_no), record)
+        return latest
+
+    def _condition_recovery_due(self, key: tuple[str, int, str], current: datetime) -> bool:
+        previous = self._send_condition_recovery_at.get(key)
+        if previous is None:
+            return True
+        return (current - previous).total_seconds() >= self.send_condition_recovery_cooldown_sec
+
+    def _remember_registered_condition(self, profile, condition_index: int, screen_no: str, current: datetime) -> None:
+        self.registered_conditions[(profile.condition_name, int(condition_index))] = RegisteredCondition(
+            condition_name=profile.condition_name,
+            condition_index=int(condition_index),
+            screen_no=screen_no,
+            strategy_profile=profile.strategy_profile,
+            purpose=profile.purpose,
+            registered_at=current.replace(microsecond=0).isoformat(),
+        )
+
+    def _enqueue(
+        self,
+        command_type: str,
+        *,
+        payload: dict[str, Any],
+        key: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> EnqueueResult:
         command = GatewayCommand(
             type=command_type,
             command_id=new_message_id("cmd_cond"),
@@ -378,10 +532,11 @@ class GatewayCommandConditionAdapter:
         result = self.gateway_state.enqueue_command(
             command,
             priority=CommandPriority.NORMAL,
-            metadata={"runtime": "strategy", "adapter": "condition"},
+            metadata=metadata or {"runtime": "strategy", "adapter": "condition"},
         )
         if not result.accepted:
             self._warn(f"CONDITION_COMMAND_REJECTED:{command_type}:{result.reason}:{result.duplicate_of}")
+        return result
 
     def _warn(self, warning: str) -> None:
         self.warnings.append(warning)
@@ -396,6 +551,29 @@ def _clean_codes(codes: Iterable[str]) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def _stale_dispatched(record: dict[str, Any], current: datetime, timeout_sec: int) -> bool:
+    dispatched_at = _parse_record_time(record.get("dispatched_at")) or _parse_record_time(record.get("created_at"))
+    if dispatched_at is None:
+        return False
+    return _as_utc(current) >= _as_utc(dispatched_at) + timedelta(seconds=max(1, int(timeout_sec)))
+
+
+def _parse_record_time(value: Any) -> datetime | None:
+    text = str(value or "")
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _condition_infos(raw_conditions: Iterable[Any]) -> list[ConditionInfo]:

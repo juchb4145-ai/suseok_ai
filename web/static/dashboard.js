@@ -795,6 +795,12 @@ function render(snapshot) {
   text("transport-real-pilot-duplicate-ack", realPilot.duplicate_ack_count || 0);
   text("transport-real-pilot-unknown-ack", realPilot.unknown_ack_count || 0);
   text("transport-real-pilot-fallback", realPilot.fallback_reason || realPilot.fallback_state || "-");
+  text("transport-real-pilot-price-sample-rate", formatRate(realPilot.price_tick_sample_rate || 0));
+  text("transport-real-pilot-price-sampled", realPilot.price_tick_sampled_count || 0);
+  text("transport-real-pilot-price-fallback", realPilot.price_tick_fallback_count || 0);
+  text("transport-real-pilot-event-fallback", realPilot.event_fallback_count || 0);
+  text("transport-real-pilot-last-event", formatDateTime(realPilot.last_ws_event_at || ""));
+  text("transport-real-pilot-last-ack", formatDateTime(realPilot.last_ws_ack_at || ""));
   const transportWarnings = [transport.websocket_recommendation_reason || "", ...((transport.warning_flags || []).map((flag) => `경고: ${flag}`))].filter(Boolean);
   const transportNode = document.getElementById("transport-warning-lines");
   if (transportNode) transportNode.innerHTML = transportWarnings.length ? transportWarnings.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">전송 상태가 안정적입니다</span>';

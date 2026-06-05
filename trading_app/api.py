@@ -2422,6 +2422,14 @@ def _save_gateway_event_transport_sample(
     settings = get_settings()
     if not settings.transport_metrics_enabled:
         return
+    trace = trace_from_payload(event.payload)
+    transport_mode = str(event.payload.get("transport_mode") or trace.get("transport_mode") or "rest_long_poll")
+    if (
+        str(event.type or "") == "price_tick"
+        and transport_mode == TRANSPORT_MODE_WEBSOCKET_REAL_PILOT
+        and not settings.transport_metrics_persist_ws_price_ticks
+    ):
+        return
     sample_key = event.event_id or event.command_id or event.request_id
     if not should_sample_transport_message(
         message_type=event.type,
@@ -2430,7 +2438,6 @@ def _save_gateway_event_transport_sample(
         heartbeat_rate=settings.transport_metrics_sample_heartbeat_rate,
     ):
         return
-    trace = trace_from_payload(event.payload)
     sample = TransportLatencySample.from_gateway_event_trace(
         event_type=event.type,
         event_id=event.event_id,
@@ -2446,7 +2453,7 @@ def _save_gateway_event_transport_sample(
         metadata={
             "status": event.payload.get("status"),
             "result_code": event.payload.get("result_code"),
-            "transport_mode": event.payload.get("transport_mode") or trace.get("transport_mode") or "rest_long_poll",
+            "transport_mode": transport_mode,
         },
     )
     db.save_gateway_transport_latency_sample(sample.to_dict())
@@ -2553,6 +2560,10 @@ def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
             db.save_log(f"[gateway][command_started] {event.payload.get('command_type', '')} {command_id}")
     elif event.type == "command_ack":
         _handle_command_ack(db, event)
+    elif event.type == "market_symbols":
+        saved = _handle_market_symbols_event(db, dict(event.payload or {}))
+        if saved:
+            db.save_log(f"[gateway][market_symbols] saved={saved}")
     elif event.type == "command_failed":
         command_id = str(event.payload.get("command_id") or event.command_id or "")
         command_type = str(event.payload.get("command_type") or "")
@@ -2581,6 +2592,35 @@ def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
                 payload=dict(event.payload or {}),
             )
         db.save_log(f"[gateway][WARN] {message}")
+
+
+def _handle_market_symbols_event(db: TradingDatabase, payload: dict[str, Any]) -> int:
+    rows: list[dict[str, Any]] = []
+    market_payloads = list(payload.get("markets") or [])
+    if not market_payloads and payload.get("symbols"):
+        market_payloads = [payload]
+    for market_payload in market_payloads:
+        market = str(market_payload.get("market") or "").strip().upper()
+        market_code = str(market_payload.get("market_code") or "").strip()
+        symbols = list(market_payload.get("symbols") or [])
+        for symbol in symbols:
+            if isinstance(symbol, dict):
+                code = symbol.get("code") or symbol.get("symbol")
+                name = symbol.get("name") or ""
+            else:
+                code = symbol
+                name = ""
+            rows.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "market": market,
+                    "market_code": market_code,
+                    "source": "kiwoom_code_list",
+                    "raw": {"gateway_event": "market_symbols"},
+                }
+            )
+    return db.upsert_kiwoom_symbol_master(rows)
 
 
 def _handle_command_ack(db: TradingDatabase, event: GatewayEvent) -> None:
@@ -2715,6 +2755,12 @@ def _transport_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
         "real_pilot_session_loss_count": real_pilot.get("session_loss_count", 0),
         "real_pilot_duplicate_ack_count": real_pilot.get("duplicate_ack_count", 0),
         "real_pilot_unknown_ack_count": real_pilot.get("unknown_ack_count", 0),
+        "real_pilot_price_tick_sample_rate": real_pilot.get("price_tick_sample_rate", 0),
+        "real_pilot_price_tick_sampled_count": real_pilot.get("price_tick_sampled_count", 0),
+        "real_pilot_price_tick_fallback_count": real_pilot.get("price_tick_fallback_count", 0),
+        "real_pilot_event_fallback_count": real_pilot.get("event_fallback_count", 0),
+        "real_pilot_last_ws_event_at": real_pilot.get("last_ws_event_at", ""),
+        "real_pilot_last_ws_ack_at": real_pilot.get("last_ws_ack_at", ""),
     }
 
 
@@ -2963,6 +3009,14 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         "session_loss_count": int(heartbeat.get("ws_session_loss_count") or state.get("session_loss_count") or 0),
         "duplicate_ack_count": int(heartbeat.get("ws_duplicate_ack_count") or state.get("duplicate_ack_count") or 0),
         "unknown_ack_count": int(heartbeat.get("ws_unknown_ack_count") or state.get("unknown_ack_count") or 0),
+        "price_tick_sample_rate": float(heartbeat.get("ws_price_tick_sample_rate") or state.get("price_tick_sample_rate") or 0),
+        "price_tick_sampled_count": int(
+            heartbeat.get("ws_price_tick_sampled_count") or state.get("price_tick_sampled_count") or 0
+        ),
+        "price_tick_fallback_count": int(
+            heartbeat.get("ws_price_tick_fallback_count") or state.get("price_tick_fallback_count") or 0
+        ),
+        "event_fallback_count": int(heartbeat.get("ws_event_fallback_count") or state.get("event_fallback_count") or 0),
         "last_ws_event_at": heartbeat.get("last_ws_event_at") or state.get("last_ws_event_at") or "",
         "last_ws_ack_at": heartbeat.get("last_ws_ack_at") or state.get("last_ws_ack_at") or "",
     }

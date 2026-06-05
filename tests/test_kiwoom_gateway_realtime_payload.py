@@ -30,6 +30,10 @@ class SignalClient:
         self.condition_loaded = Signal()
         self.condition_real_received = Signal()
         self.condition_tr_received = Signal()
+        self.market_codes = {"0": ["A005930", "084670"], "10": ["035720"]}
+
+    def get_code_list_by_market(self, market_code: str) -> list[str]:
+        return list(self.market_codes.get(str(market_code), []))
 
 
 def test_gateway_runtime_uses_rich_price_tick_signal_payload():
@@ -86,6 +90,21 @@ def test_gateway_runtime_keeps_old_price_received_fallback_path():
     assert payload["best_ask"] == 70100
     assert payload["best_bid"] == 70000
     assert payload["trade_value"] == 0.0
+
+
+def test_gateway_runtime_emits_market_symbols_after_login_success():
+    runtime = GatewayRuntime(FakeCoreClient())
+    client = SignalClient(rich=True)
+    _wire_kiwoom_signals(client, runtime)
+
+    client.connected.emit(True, 0, "ok")
+
+    events = runtime.events.drain()
+    assert [event.type for event in events] == ["login_status", "market_symbols"]
+    assert events[1].payload["markets"] == [
+        {"market_code": "0", "market": "KOSPI", "symbols": ["005930", "084670"]},
+        {"market_code": "10", "market": "KOSDAQ", "symbols": ["035720"]},
+    ]
 
 
 def test_gateway_runtime_emits_condition_load_events():

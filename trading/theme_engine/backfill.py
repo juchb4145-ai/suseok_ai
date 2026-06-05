@@ -236,27 +236,42 @@ def apply_dispatch_guard(
     *,
     config: ThemeBackfillConfig | None = None,
 ) -> dict[str, Any]:
+    cfg = config or ThemeBackfillConfig.from_env()
     skipped: dict[str, int] = {}
     active = _active_records(gateway_state)
     backfill = [record for record in active if is_theme_backfill_record(record)]
     if not backfill:
         return {"skipped": skipped}
     for record in backfill:
-        if _status(record) == CommandStatus.QUEUED.value and _is_expired_record(record):
-            command_id = str(record.get("command_id") or "")
-            if command_id:
-                gateway_state.ack_command(
-                    command_id,
-                    status=CommandStatus.EXPIRED_BEFORE_DISPATCH.value,
-                    result_payload={"purpose": THEME_BACKFILL_PURPOSE, "skipped_reason": CommandStatus.EXPIRED_BEFORE_DISPATCH.value},
-                    error=CommandStatus.EXPIRED_BEFORE_DISPATCH.value,
-                )
-                skipped[CommandStatus.EXPIRED_BEFORE_DISPATCH.value] = skipped.get(CommandStatus.EXPIRED_BEFORE_DISPATCH.value, 0) + 1
+        status = _status(record)
+        command_id = str(record.get("command_id") or "")
+        if not command_id:
+            continue
+        if status == CommandStatus.QUEUED.value and _is_expired_record(record):
+            gateway_state.ack_command(
+                command_id,
+                status=CommandStatus.EXPIRED_BEFORE_DISPATCH.value,
+                result_payload={"purpose": THEME_BACKFILL_PURPOSE, "skipped_reason": CommandStatus.EXPIRED_BEFORE_DISPATCH.value},
+                error=CommandStatus.EXPIRED_BEFORE_DISPATCH.value,
+            )
+            skipped[CommandStatus.EXPIRED_BEFORE_DISPATCH.value] = skipped.get(CommandStatus.EXPIRED_BEFORE_DISPATCH.value, 0) + 1
+        elif status == CommandStatus.DISPATCHED.value and _is_stale_dispatched_backfill(record, cfg):
+            gateway_state.ack_command(
+                command_id,
+                status=CommandStatus.EXPIRED.value,
+                result_payload={
+                    "purpose": THEME_BACKFILL_PURPOSE,
+                    "skipped_reason": "STALE_DISPATCHED_BACKFILL_CLEANUP",
+                    "cleanup_reason": "DISPATCHED_WITHOUT_ACK_AFTER_TTL",
+                },
+                error="STALE_DISPATCHED_BACKFILL_CLEANUP",
+            )
+            skipped[CommandStatus.EXPIRED.value] = skipped.get(CommandStatus.EXPIRED.value, 0) + 1
     active = _active_records(gateway_state)
     backfill = [record for record in active if is_theme_backfill_record(record)]
     if not backfill:
         return {"skipped": skipped}
-    reason = dispatch_pause_reason(gateway_state, raw_theme_lab or {}, active, config=config)
+    reason = dispatch_pause_reason(gateway_state, raw_theme_lab or {}, active, config=cfg)
     if not reason:
         return {"skipped": skipped}
     for record in backfill:
@@ -475,6 +490,26 @@ def _is_expired_record(record: dict[str, Any]) -> bool:
     except ValueError:
         return False
     return _as_utc(datetime.now(timezone.utc)) >= _as_utc(expires_at)
+
+
+def _is_stale_dispatched_backfill(record: dict[str, Any], cfg: ThemeBackfillConfig) -> bool:
+    if _status(record) != CommandStatus.DISPATCHED.value:
+        return False
+    base = _record_time(record, "dispatched_at") or _record_time(record, "created_at")
+    if base is None:
+        return _is_expired_record(record)
+    grace_sec = max(1, int(cfg.ttl_sec or 90))
+    return _as_utc(datetime.now(timezone.utc)) >= _as_utc(base) + timedelta(seconds=grace_sec)
+
+
+def _record_time(record: dict[str, Any], key: str) -> datetime | None:
+    text = str(record.get(key) or "")
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def _result_quality_metrics(result: Any, *, prefix: str) -> dict[str, Any]:

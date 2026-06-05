@@ -910,7 +910,17 @@ def _stock_snapshot_from_tick(tick: StrategyTick) -> StockSnapshot:
 
 
 def _legacy_market_metadata(conn: Any, codes: set[str]) -> dict[str, InstrumentMetadata]:
-    if conn is None or not codes or not _table_exists(conn, "legacy_theme_mappings_archive"):
+    if conn is None or not codes:
+        return {}
+    result = _legacy_theme_mapping_metadata(conn, codes)
+    missing_codes = {code for code in codes if code not in result}
+    if missing_codes:
+        result.update(_kiwoom_symbol_master_metadata(conn, missing_codes))
+    return result
+
+
+def _legacy_theme_mapping_metadata(conn: Any, codes: set[str]) -> dict[str, InstrumentMetadata]:
+    if not _table_exists(conn, "legacy_theme_mappings_archive"):
         return {}
     columns = _table_columns(conn, "legacy_theme_mappings_archive")
     required = {"code", "market"}
@@ -948,6 +958,50 @@ def _legacy_market_metadata(conn: Any, codes: set[str]) -> dict[str, InstrumentM
             "strategy_profile": str(payload.get("strategy_profile") or ""),
             "theme_id": str(payload.get("theme_id") or ""),
             "theme_name": str(payload.get("theme_name") or ""),
+        }
+        result[code] = InstrumentMetadata(
+            symbol=code,
+            name=str(payload.get("name") or ""),
+            raw=raw,
+        )
+    return result
+
+
+def _kiwoom_symbol_master_metadata(conn: Any, codes: set[str]) -> dict[str, InstrumentMetadata]:
+    if not _table_exists(conn, "kiwoom_symbol_master"):
+        return {}
+    columns = _table_columns(conn, "kiwoom_symbol_master")
+    required = {"code", "market"}
+    if not required <= columns:
+        return {}
+    select_columns = ["code", "market"]
+    for optional in ("name", "market_code", "source", "updated_at"):
+        if optional in columns:
+            select_columns.append(optional)
+    placeholders = ",".join("?" for _ in codes)
+    rows = conn.execute(
+        f"""
+        SELECT {", ".join(select_columns)}
+        FROM kiwoom_symbol_master
+        WHERE code IN ({placeholders})
+        ORDER BY code
+        """,
+        tuple(sorted(codes)),
+    ).fetchall()
+    result: dict[str, InstrumentMetadata] = {}
+    for row in rows:
+        payload = _row_mapping(row, select_columns)
+        code = normalize_code(payload.get("code"))
+        if not code or code in result:
+            continue
+        market = str(payload.get("market") or "").strip()
+        if normalize_market_side(market) == MarketSide.UNKNOWN:
+            continue
+        raw = {
+            "market": market,
+            "market_source": str(payload.get("source") or "kiwoom_symbol_master"),
+            "market_code": str(payload.get("market_code") or ""),
+            "updated_at": str(payload.get("updated_at") or ""),
         }
         result[code] = InstrumentMetadata(
             symbol=code,

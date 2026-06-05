@@ -35,6 +35,12 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
     assert soup.select_one("#ops-alert-severity") is not None
     assert soup.select_one("#themelab-operation-status") is not None
     assert soup.select_one("#themelab-ready") is not None
+    assert soup.select_one("#transport-real-pilot-price-sample-rate") is not None
+    assert soup.select_one("#transport-real-pilot-price-sampled") is not None
+    assert soup.select_one("#transport-real-pilot-price-fallback") is not None
+    assert soup.select_one("#transport-real-pilot-event-fallback") is not None
+    assert soup.select_one("#transport-real-pilot-last-event") is not None
+    assert soup.select_one("#transport-real-pilot-last-ack") is not None
     assert soup.select_one('a[href="/themelab"]') is not None
     assert "DRY_RUN 기준 제안" in html
     assert "게이트/리스크 A/B 후보" in html
@@ -73,6 +79,12 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "function renderThemeLabSummary" in js
     assert "ops_alerts" in js
     assert "theme_lab" in js
+    assert "price_tick_sample_rate" in js
+    assert "price_tick_sampled_count" in js
+    assert "price_tick_fallback_count" in js
+    assert "event_fallback_count" in js
+    assert "last_ws_event_at" in js
+    assert "last_ws_ack_at" in js
     assert "thresholdAB" in js
     assert "gradeLabelsKo" in js
     assert "/api/runtime/threshold-ab/dry-run" in js

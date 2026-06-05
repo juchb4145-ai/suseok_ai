@@ -1,7 +1,9 @@
+from datetime import datetime, timedelta, timezone
+
 from storage.db import TradingDatabase
 from tests.theme_naver_helpers import repo_with_naver_fixture
 from trading.broker.gateway_state import GatewayStateStore
-from trading.broker.models import BrokerPriceTick, GatewayEvent, utc_timestamp
+from trading.broker.models import BrokerPriceTick, GatewayCommand, GatewayEvent, utc_timestamp
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.conditions import ConditionProfile, ConditionProfileRepository
 from trading.strategy.market_data import MarketDataStore
@@ -137,6 +139,24 @@ def test_realtime_adapter_enqueues_gateway_commands():
     assert [item["command_type"] for item in history] == ["remove_realtime", "register_realtime"]
 
 
+def test_realtime_adapter_expires_stale_dispatched_register_command():
+    state = GatewayStateStore()
+    state.status.connected = True
+    state.status.kiwoom_logged_in = True
+    state.status.last_heartbeat_at = utc_timestamp()
+    client = GatewayCommandRealtimeClient(state, stale_dispatch_timeout_sec=5)
+    created_at = datetime.now(timezone.utc)
+
+    client.register_realtime(["005930"], screen_no="7000")
+    command = state.dispatch_commands(now=created_at, limit=1)[0]
+    expired = client.expire_stale_register_commands(now=created_at + timedelta(seconds=10))
+
+    assert expired == 1
+    record = state.get_command(command.command_id)
+    assert record.status.value == "EXPIRED"
+    assert record.last_error == "STALE_REGISTER_REALTIME_DISPATCHED"
+
+
 def test_condition_adapter_warns_when_index_is_not_ready(tmp_path):
     db = TradingDatabase(str(tmp_path / "runtime.sqlite3"))
     try:
@@ -233,5 +253,169 @@ def test_condition_adapter_resolves_indexes_from_gateway_condition_loaded(tmp_pa
             and item["command"]["payload"]["condition_index"] == 83
             for item in commands
         )
+    finally:
+        db.close()
+
+
+def test_condition_adapter_recovers_expired_send_condition(tmp_path):
+    db = TradingDatabase(str(tmp_path / "runtime.sqlite3"))
+    try:
+        repository = ConditionProfileRepository(db)
+        repository.upsert_profile(
+            ConditionProfile(
+                condition_name="theme_lab_strong",
+                strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+                enabled=True,
+                priority=200,
+                purpose="theme_lab_strong",
+                last_resolved_index=84,
+            )
+        )
+        state = GatewayStateStore()
+        state.status.connected = True
+        state.status.kiwoom_logged_in = True
+        state.status.last_heartbeat_at = utc_timestamp()
+        created_at = datetime.now()
+        state.enqueue_command(
+            GatewayCommand(
+                type="send_condition",
+                command_id="cmd-expired-strong",
+                idempotency_key="runtime:send_condition:theme_lab_strong:84:7600",
+                source="strategy_runtime",
+                payload={
+                    "screen_no": "7600",
+                    "condition_name": "theme_lab_strong",
+                    "condition_index": 84,
+                    "realtime": True,
+                    "search_type": 1,
+                },
+            ),
+            now=created_at,
+            ttl_sec=1,
+        )
+        state.dispatch_commands(now=created_at)
+        state.expire_old_commands(now=created_at + timedelta(seconds=2))
+        adapter = GatewayCommandConditionAdapter(
+            state,
+            repository,
+            purpose_filter={"theme_lab_strong"},
+            send_condition_recovery_cooldown_sec=30,
+        )
+
+        warnings = adapter.recover_unacked_conditions(now=created_at + timedelta(seconds=3))
+
+        assert "CONDITION_SEND_RECOVERY_ENQUEUED:theme_lab_strong:EXPIRED" in warnings
+        commands = state.list_commands(limit=10, include_finished=True, command_type="send_condition")
+        newest = commands[0]
+        assert newest["status"] == "QUEUED"
+        assert newest["idempotency_key"].startswith("runtime:send_condition_recover:theme_lab_strong:84:7600:")
+        assert newest["command"]["payload"]["condition_name"] == "theme_lab_strong"
+        assert newest["metadata"]["condition_recovery"] is True
+        assert newest["metadata"]["recovered_from_command_id"] == "cmd-expired-strong"
+    finally:
+        db.close()
+
+
+def test_condition_adapter_expires_and_recovers_stale_dispatched_send_condition(tmp_path):
+    db = TradingDatabase(str(tmp_path / "runtime.sqlite3"))
+    try:
+        repository = ConditionProfileRepository(db)
+        repository.upsert_profile(
+            ConditionProfile(
+                condition_name="theme_lab_strong",
+                strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+                enabled=True,
+                priority=200,
+                purpose="theme_lab_strong",
+                last_resolved_index=84,
+            )
+        )
+        state = GatewayStateStore()
+        state.status.connected = True
+        state.status.kiwoom_logged_in = True
+        state.status.last_heartbeat_at = utc_timestamp()
+        created_at = datetime.now()
+        state.enqueue_command(
+            GatewayCommand(
+                type="send_condition",
+                command_id="cmd-stale-strong",
+                idempotency_key="runtime:send_condition:theme_lab_strong:84:7600",
+                source="strategy_runtime",
+                payload={
+                    "screen_no": "7600",
+                    "condition_name": "theme_lab_strong",
+                    "condition_index": 84,
+                    "realtime": True,
+                    "search_type": 1,
+                },
+            ),
+            now=created_at,
+            ttl_sec=60,
+        )
+        state.dispatch_commands(now=created_at)
+        adapter = GatewayCommandConditionAdapter(
+            state,
+            repository,
+            purpose_filter={"theme_lab_strong"},
+            send_condition_recovery_cooldown_sec=30,
+            send_condition_stale_dispatch_timeout_sec=5,
+        )
+
+        warnings = adapter.recover_unacked_conditions(now=created_at + timedelta(seconds=10))
+
+        assert "CONDITION_SEND_STALE_EXPIRED:theme_lab_strong:cmd-stale-strong" in warnings
+        assert "CONDITION_SEND_RECOVERY_ENQUEUED:theme_lab_strong:EXPIRED" in warnings
+        old = next(item for item in state.list_commands(limit=10, include_finished=True) if item["command_id"] == "cmd-stale-strong")
+        assert old["status"] == "EXPIRED"
+        assert old["last_error"] == "STALE_SEND_CONDITION_DISPATCHED"
+        newest = state.list_commands(limit=10, include_finished=True, command_type="send_condition")[0]
+        assert newest["status"] == "QUEUED"
+        assert newest["metadata"]["recovered_from_command_id"] == "cmd-stale-strong"
+    finally:
+        db.close()
+
+
+def test_condition_adapter_does_not_recover_acked_send_condition(tmp_path):
+    db = TradingDatabase(str(tmp_path / "runtime.sqlite3"))
+    try:
+        repository = ConditionProfileRepository(db)
+        repository.upsert_profile(
+            ConditionProfile(
+                condition_name="theme_lab_strong",
+                strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+                enabled=True,
+                priority=200,
+                purpose="theme_lab_strong",
+                last_resolved_index=84,
+            )
+        )
+        state = GatewayStateStore()
+        state.status.connected = True
+        state.status.kiwoom_logged_in = True
+        state.status.last_heartbeat_at = utc_timestamp()
+        state.enqueue_command(
+            GatewayCommand(
+                type="send_condition",
+                command_id="cmd-acked-strong",
+                idempotency_key="runtime:send_condition:theme_lab_strong:84:7600",
+                source="strategy_runtime",
+                payload={
+                    "screen_no": "7600",
+                    "condition_name": "theme_lab_strong",
+                    "condition_index": 84,
+                    "realtime": True,
+                    "search_type": 1,
+                },
+            )
+        )
+        state.ack_command("cmd-acked-strong", status="ACKED", result_payload={"message": "condition sent"})
+        adapter = GatewayCommandConditionAdapter(state, repository, purpose_filter={"theme_lab_strong"})
+
+        warnings = adapter.recover_unacked_conditions()
+
+        commands = state.list_commands(limit=10, include_finished=True, command_type="send_condition")
+        assert warnings == []
+        assert len(commands) == 1
+        assert ("theme_lab_strong", 84) in adapter.registered_conditions
     finally:
         db.close()
