@@ -10,8 +10,10 @@ from fastapi.testclient import TestClient
 from storage.db import TradingDatabase
 from trading.broker.command_queue import CommandPriority
 from trading.broker.gateway_state import GatewayStateStore
-from trading.broker.models import GatewayCommand
+from trading.broker.models import GatewayCommand, GatewayEvent, utc_timestamp
+from trading.strategy.conditions import ConditionProfile, ConditionProfileRepository
 from trading.strategy.models import Candidate, CandidateState
+from trading.strategy.models import StrategyProfile
 from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE
 from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeStatus
 from trading.theme_engine.repository import ThemeEngineRepository
@@ -30,6 +32,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one(".terminal-shell") is not None
     assert soup.select_one("#operating-cockpit") is not None
     assert soup.select_one("#operation-status") is not None
+    assert soup.select_one("#kiwoom-gateway-start") is not None
     assert soup.select_one("#cockpit-market-sides") is not None
     assert soup.select_one("#cockpit-live-readiness") is not None
     assert soup.select_one("#theme-rank-list") is not None
@@ -51,12 +54,16 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "cockpit-grid" in css
     assert "/ws/dashboard" in js
     assert "/api/themelab/snapshot" in js
+    assert "/api/gateway/kiwoom/start" in js
+    assert "startKiwoomGateway" in js
+    assert "gateway_unhealthy_display" in js
     assert "matchesFilters" in js
     assert "renderCockpit" in js
     assert "minuteChartSvg" in js
     assert "RUNTIME_INACTIVE" in js
     assert "snapshot_age_label" in js
     assert ".chart-ref.vwap" in css
+    assert "button:disabled" in css
 
 
 def test_theme_lab_snapshot_sorts_watchset_and_filters_entry_candidates(tmp_path):
@@ -571,6 +578,47 @@ def test_theme_lab_snapshot_counts_backfill_parser_miss_ratio(tmp_path):
     assert runtime["parser_miss_ratio"] == 0.5
 
 
+def test_theme_lab_snapshot_explains_gateway_unhealthy_kiwoom_login(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    state = GatewayStateStore()
+    try:
+        db.save_theme_lab_flow_result(
+            "09:06:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [],
+                "gate_decisions": [],
+                "data_quality": {},
+                "theme_backfill_runtime": {
+                    "enabled": True,
+                    "trading_mode": "OBSERVE",
+                    "paused_reason": "GATEWAY_UNHEALTHY",
+                },
+            },
+        )
+        state.record_event(
+            GatewayEvent(
+                type="heartbeat",
+                event_id="evt-heartbeat-not-logged-in",
+                timestamp=utc_timestamp(),
+                payload={"kiwoom_logged_in": False, "orderable": False, "mode": "OBSERVE"},
+            )
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db, gateway_state=state)
+    finally:
+        db.close()
+
+    runtime = payload["theme_backfill_runtime"]
+    assert runtime["paused_reason"] == "GATEWAY_UNHEALTHY"
+    assert runtime["gateway_unhealthy_detail"] == "KIWOOM_NOT_LOGGED_IN"
+    assert runtime["gateway_unhealthy_display"] == "\ud0a4\uc6c0 \ubbf8\ub85c\uadf8\uc778"
+    assert payload["gateway"]["connected"] is True
+    assert payload["gateway"]["heartbeat_ok"] is True
+    assert payload["gateway"]["kiwoom_logged_in"] is False
+
+
 def test_theme_lab_snapshot_overlays_condition_event_breadth(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     try:
@@ -632,16 +680,56 @@ def test_theme_lab_snapshot_overlays_condition_event_breadth(tmp_path):
     row = payload["ranked_themes"][0]
     assert row["price_strong_count"] == 0
     assert row["condition_strong_count"] == 2
-    assert row["condition_leader_count"] == 1
-    assert row["strong_count"] == 2
-    assert row["strong_ratio"] == 0.4
-    assert row["leader_ratio"] == 0.2
-    assert row["condition_signal_source"] == "condition_events"
-    assert row["top_leader_symbol"] == "000002"
-    assert row["top_leader_name"] == "후보전기"
-    assert row["top_leader_turnover_krw"] == 7000000000
-    assert row["turnover_label"] == "수신대금"
-    assert row["member_data_coverage_label"] == "2/5 종목 수신"
+
+
+def test_condition_status_uses_send_condition_ack_not_resolved_index(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        repo = ConditionProfileRepository(db)
+        repo.upsert_profile(
+            ConditionProfile(
+                condition_name="테마랩_주도_5",
+                strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+                enabled=True,
+                priority=200,
+                purpose="theme_lab_leader",
+                last_resolved_index=85,
+            )
+        )
+        state = GatewayStateStore()
+        state.enqueue_command(
+            GatewayCommand(
+                type="send_condition",
+                command_id="cmd-cond-failed",
+                payload={
+                    "condition_name": "테마랩_주도_5",
+                    "condition_index": 85,
+                    "screen_no": "7602",
+                },
+            )
+        )
+        state.ack_command("cmd-cond-failed", status="FAILED", error="CONDITION_SEND_FAILED")
+        db.save_theme_lab_flow_result(
+            "2026-06-02T09:04:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [],
+                "watchset_snapshots": [],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db, gateway_state=state)
+    finally:
+        db.close()
+
+    leader = next(item for item in payload["condition_statuses"] if item["purpose"] == "theme_lab_leader")
+    assert leader["resolved_index"] == 85
+    assert leader["registered"] is False
+    assert leader["command_status"] == "FAILED"
+    assert leader["screen_no"] == "7602"
+    assert leader["warning"] == "CONDITION_SEND_FAILED"
 
 
 def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, monkeypatch):

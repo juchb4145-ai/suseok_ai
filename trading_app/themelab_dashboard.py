@@ -51,6 +51,7 @@ def build_theme_lab_dashboard_snapshot(
     selected_watch = next((item for item in watchset if item.get("symbol") == selected.get("symbol")), {})
 
     backfill_runtime = _theme_backfill_runtime(raw, gateway_state)
+    gateway = _gateway_context(gateway_state)
     backfill_status_by_theme = _theme_backfill_status_by_theme(gateway_state)
     ranked_themes = _ranked_theme_rows(themes, condition_counts, backfill_status_by_theme=backfill_status_by_theme)
     summary = _summary(ranked_themes, watchset, entry_candidates, data_quality, runtime=runtime, freshness=freshness)
@@ -62,10 +63,11 @@ def build_theme_lab_dashboard_snapshot(
         "calculated_at": raw.get("calculated_at", ""),
         "last_updated_at": _now_time(),
         "runtime": runtime,
+        "gateway": gateway,
         "theme_backfill_runtime": backfill_runtime,
         **_freshness_quality_fields(freshness),
         "market": _market(raw.get("market_status") or {}),
-        "condition_statuses": _condition_statuses(db),
+        "condition_statuses": _condition_statuses(db, gateway_state),
         "data_quality": data_quality,
         "ranked_themes": ranked_themes[:30],
         "watchset": [_watch_row(item) for item in watchset],
@@ -87,6 +89,7 @@ def _empty_snapshot(*, runtime_status: dict[str, Any] | None = None) -> dict[str
         "calculated_at": "",
         "last_updated_at": _now_time(),
         "runtime": runtime,
+        "gateway": _gateway_context(None),
         "theme_backfill_runtime": {
             "enabled": False,
             "paused_reason": "SNAPSHOT_UNAVAILABLE",
@@ -130,6 +133,34 @@ def _empty_snapshot(*, runtime_status: dict[str, Any] | None = None) -> dict[str
         "selected_chart": {"symbol": "KOSDAQ", "name": "KOSDAQ", "type": "index", "chart_data_status": "NO_CANDLE_DATA"},
         "gate_detail": {"gate_status": "OBSERVE", "summary_message": "선택된 WatchSet 종목이 없습니다."},
         "summary": _empty_summary(runtime=runtime, freshness=freshness),
+    }
+
+
+def _gateway_context(gateway_state: Any | None) -> dict[str, Any]:
+    if gateway_state is None:
+        return {
+            "connected": False,
+            "heartbeat_ok": False,
+            "kiwoom_logged_in": False,
+            "orderable": False,
+            "connection_state": "UNKNOWN",
+        }
+    try:
+        snapshot = gateway_state.snapshot().to_dict()
+    except Exception:
+        return {
+            "connected": False,
+            "heartbeat_ok": False,
+            "kiwoom_logged_in": False,
+            "orderable": False,
+            "connection_state": "UNKNOWN",
+        }
+    return {
+        "connected": bool(snapshot.get("connected")),
+        "heartbeat_ok": bool(snapshot.get("heartbeat_ok")),
+        "kiwoom_logged_in": bool(snapshot.get("kiwoom_logged_in")),
+        "orderable": bool(snapshot.get("orderable")),
+        "connection_state": str(snapshot.get("connection_state") or "UNKNOWN"),
     }
 
 
@@ -536,7 +567,7 @@ def _operation_status_message(
     return "OBSERVE_ONLY", "장중 매수 가능 후보를 관찰 중입니다."
 
 
-def _condition_statuses(db: TradingDatabase) -> list[dict[str, Any]]:
+def _condition_statuses(db: TradingDatabase, gateway_state: Any | None = None) -> list[dict[str, Any]]:
     defaults = {
         "theme_lab_alive": "테마랩_생존_-1",
         "theme_lab_strong": "테마랩_강세_3",
@@ -548,22 +579,72 @@ def _condition_statuses(db: TradingDatabase) -> list[dict[str, Any]]:
     except Exception:
         profiles = []
     by_purpose = {profile.purpose: profile for profile in profiles}
+    latest_commands = _latest_condition_commands(gateway_state)
     for purpose, default_name in defaults.items():
         profile = by_purpose.get(purpose)
+        command = latest_commands.get(profile.condition_name if profile else default_name, {})
+        command_status = str(command.get("status") or "")
+        command_error = str(command.get("last_error") or "")
+        command_payload = dict(command.get("payload") or {})
+        registered = command_status == "ACKED"
+        warning = ""
+        if not profile:
+            warning = "CONDITION_PROFILE_UNRESOLVED"
+        elif command_status in {"FAILED", "EXPIRED", "EXPIRED_BEFORE_DISPATCH"}:
+            warning = _condition_command_warning(command_status, command_error)
+        elif command_status and command_status != "ACKED":
+            warning = f"CONDITION_SEND_{command_status}"
+        elif profile.last_resolved_index is not None and not command_status:
+            warning = "CONDITION_SEND_NOT_CONFIRMED"
         rows.append(
             {
                 "condition_name": profile.condition_name if profile else default_name,
                 "purpose": purpose,
                 "resolved_index": profile.last_resolved_index if profile and profile.last_resolved_index is not None else "UNKNOWN",
-                "registered": bool(profile and profile.last_resolved_index is not None),
-                "screen_no": "",
+                "registered": registered,
+                "command_status": command_status or "UNKNOWN",
+                "screen_no": str(command_payload.get("screen_no") or ""),
                 "include_count": 0,
                 "remove_count": 0,
                 "last_event_at": "",
-                "warning": "" if profile else "CONDITION_PROFILE_UNRESOLVED",
+                "warning": warning,
             }
         )
     return rows
+
+
+def _latest_condition_commands(gateway_state: Any | None) -> dict[str, dict[str, Any]]:
+    if gateway_state is None:
+        return {}
+    try:
+        records = gateway_state.list_commands(limit=500, include_finished=True, command_type="send_condition")
+    except Exception:
+        return {}
+    latest: dict[str, dict[str, Any]] = {}
+    for record in records:
+        payload = _record_payload(record)
+        name = str(payload.get("condition_name") or "")
+        if not name:
+            continue
+        current = latest.get(name)
+        if current is not None and str(current.get("created_at") or "") >= str(record.get("created_at") or ""):
+            continue
+        latest[name] = {
+            "status": str(record.get("status") or ""),
+            "last_error": str(record.get("last_error") or ""),
+            "created_at": str(record.get("created_at") or ""),
+            "payload": payload,
+        }
+    return latest
+
+
+def _condition_command_warning(status: str, error: str) -> str:
+    clean_error = str(error or "").strip()
+    if status == "FAILED" and clean_error in {"", "condition sent"}:
+        return "CONDITION_SEND_FAILED"
+    if status in {"EXPIRED", "EXPIRED_BEFORE_DISPATCH"} and clean_error in {"", status}:
+        return "COMMAND_TTL_EXPIRED"
+    return clean_error or status
 
 
 def _data_quality(raw: dict[str, Any], watchset: list[dict[str, Any]]) -> dict[str, Any]:
@@ -769,7 +850,10 @@ def _theme_backfill_runtime(raw: dict[str, Any], gateway_state: Any | None) -> d
     base.setdefault("last_failure_at", "")
     base.setdefault("last_failure_reason", "")
     base.setdefault("tr_backfill_caused_ready_count", 0)
+    base.setdefault("gateway_unhealthy_detail", "")
+    base.setdefault("gateway_unhealthy_display", "")
     if gateway_state is None:
+        _annotate_backfill_gateway_detail(base, None)
         return base
     for key in (
         "queued_count",
@@ -790,6 +874,7 @@ def _theme_backfill_runtime(raw: dict[str, Any], gateway_state: Any | None) -> d
     ):
         base[key] = 0
     records = _theme_backfill_records(gateway_state)
+    _annotate_backfill_gateway_detail(base, gateway_state)
     base["history_window"] = "recent_500_commands"
     base["gateway_command_queue_depth"] = len([record for record in records if str(record.get("status") or "") in {"QUEUED", "DISPATCHED"}])
     parsed_records = 0
@@ -832,6 +917,34 @@ def _theme_backfill_runtime(raw: dict[str, Any], gateway_state: Any | None) -> d
                 base["parser_miss_count"] = int(base.get("parser_miss_count") or 0) + 1
     base["parser_miss_ratio"] = None if parsed_records <= 0 else round(int(base.get("parser_miss_count") or 0) / parsed_records, 4)
     return base
+
+
+def _annotate_backfill_gateway_detail(base: dict[str, Any], gateway_state: Any | None) -> None:
+    paused_reason = str(base.get("paused_reason") or "")
+    if paused_reason not in {"GATEWAY_UNHEALTHY", "SKIPPED_GATEWAY_UNHEALTHY"}:
+        base["gateway_unhealthy_detail"] = ""
+        base["gateway_unhealthy_display"] = ""
+        return
+    if gateway_state is None:
+        base["gateway_unhealthy_detail"] = "GATEWAY_STATE_UNAVAILABLE"
+        base["gateway_unhealthy_display"] = "\uac8c\uc774\ud2b8\uc6e8\uc774 \uc0c1\ud0dc \ud655\uc778 \ubd88\uac00"
+        return
+    try:
+        snapshot = gateway_state.snapshot().to_dict()
+    except Exception:
+        snapshot = {}
+    if not bool(snapshot.get("connected")):
+        base["gateway_unhealthy_detail"] = "GATEWAY_DISCONNECTED"
+        base["gateway_unhealthy_display"] = "\uac8c\uc774\ud2b8\uc6e8\uc774 \ubbf8\uc5f0\uacb0"
+    elif not bool(snapshot.get("heartbeat_ok")):
+        base["gateway_unhealthy_detail"] = "HEARTBEAT_STALE"
+        base["gateway_unhealthy_display"] = "\uac8c\uc774\ud2b8\uc6e8\uc774 heartbeat \uc9c0\uc5f0"
+    elif not bool(snapshot.get("kiwoom_logged_in")):
+        base["gateway_unhealthy_detail"] = "KIWOOM_NOT_LOGGED_IN"
+        base["gateway_unhealthy_display"] = "\ud0a4\uc6c0 \ubbf8\ub85c\uadf8\uc778"
+    else:
+        base["gateway_unhealthy_detail"] = "UNKNOWN_GATEWAY_UNHEALTHY"
+        base["gateway_unhealthy_display"] = "\uac8c\uc774\ud2b8\uc6e8\uc774 \uc0c1\ud0dc \ud655\uc778 \ud544\uc694"
 
 
 def _theme_backfill_status_by_theme(gateway_state: Any | None) -> dict[str, dict[str, Any]]:

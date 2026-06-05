@@ -264,34 +264,11 @@ class GatewayCommandConditionAdapter:
         profiles = sorted(self.repository.enabled_profiles(), key=lambda profile: profile.priority, reverse=True)
         if self.purpose_filter:
             profiles = [profile for profile in profiles if profile.purpose in self.purpose_filter]
-        selected = profiles[: self.max_realtime_conditions]
         for skipped in profiles[self.max_realtime_conditions :]:
             self._warn(f"CONDITION_PROFILE_SKIPPED_LIMIT:{skipped.condition_name}")
-        for index, profile in enumerate(selected):
+        for profile in profiles[: self.max_realtime_conditions]:
             if profile.last_resolved_index is None:
                 self._warn(f"CONDITION_INDEX_NOT_READY:{profile.condition_name}")
-                continue
-            condition_index = int(profile.last_resolved_index)
-            screen_no = f"{self.condition_screen_base + index:04d}"
-            self._enqueue(
-                "send_condition",
-                payload={
-                    "screen_no": screen_no,
-                    "condition_name": profile.condition_name,
-                    "condition_index": condition_index,
-                    "realtime": True,
-                    "search_type": 1,
-                },
-                key=f"runtime:send_condition:{profile.condition_name}:{condition_index}:{screen_no}",
-            )
-            self.registered_conditions[(profile.condition_name, condition_index)] = RegisteredCondition(
-                condition_name=profile.condition_name,
-                condition_index=condition_index,
-                screen_no=screen_no,
-                strategy_profile=profile.strategy_profile,
-                purpose=profile.purpose,
-                registered_at=(now or datetime.now()).replace(microsecond=0).isoformat(),
-            )
         return list(self.warnings)
 
     def stop(self) -> list[str]:

@@ -29,6 +29,50 @@ def test_runtime_disabled_status_and_start(tmp_path, monkeypatch):
     assert started["running"] is False
 
 
+def test_start_kiwoom_gateway_skips_when_gateway_connected(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch, enabled="0") as client:
+        client.post(
+            "/api/gateway/events",
+            json={"type": "heartbeat", "event_id": "evt-gateway-online", "payload": {"kiwoom_logged_in": True}},
+            headers={"X-Local-Token": "test-token"},
+        )
+        response = client.post("/api/gateway/kiwoom/start", headers={"X-Local-Token": "test-token"}).json()
+
+    assert response["started"] is False
+    assert response["reason"] == "ALREADY_CONNECTED"
+    assert response["gateway"]["connected"] is True
+
+
+def test_start_kiwoom_gateway_launches_process_when_disconnected(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch, enabled="0") as client:
+        import trading_app.api as api
+
+        monkeypatch.setattr(api, "_find_kiwoom_gateway_processes", lambda: [])
+        monkeypatch.setattr(
+            api,
+            "_start_kiwoom_gateway_process",
+            lambda: {"pid": 1234, "name": "python.exe", "command_line": "python apps/kiwoom_gateway.py"},
+        )
+        response = client.post("/api/gateway/kiwoom/start", headers={"X-Local-Token": "test-token"}).json()
+
+    assert response["started"] is True
+    assert response["reason"] == "STARTED"
+    assert response["processes"][0]["pid"] == 1234
+
+
+def test_kiwoom_gateway_defaults_to_single_base_python(monkeypatch):
+    import trading_app.api as api
+
+    monkeypatch.delenv("TRADING_KIWOOM_GATEWAY_PYTHON", raising=False)
+    assert str(api._kiwoom_gateway_python_exe()).replace("\\", "/").endswith("Python39-32/python.exe")
+
+    env = {}
+    api._apply_kiwoom_gateway_runtime_env(env)
+    assert "venv_32" in env.get("PYTHONPATH", "")
+    assert "site-packages" in env.get("PYTHONPATH", "")
+    assert "QT_QPA_PLATFORM_PLUGIN_PATH" in env
+
+
 def test_runtime_start_cycle_stop_api(tmp_path, monkeypatch):
     db_path = tmp_path / "trader.sqlite3"
     with _client(tmp_path, monkeypatch, enabled="1") as client:

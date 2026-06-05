@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -400,6 +402,157 @@ def gateway_status() -> dict[str, Any]:
     payload = gateway_state.snapshot().to_dict()
     payload["commands"] = gateway_state.command_snapshot()
     return payload
+
+
+@app.post("/api/gateway/kiwoom/start")
+def start_kiwoom_gateway(_: None = Depends(verify_gateway_token)) -> dict[str, Any]:
+    snapshot = gateway_state.snapshot().to_dict()
+    if snapshot.get("connected") and snapshot.get("heartbeat_ok"):
+        return {
+            "started": False,
+            "reason": "ALREADY_CONNECTED",
+            "gateway": _gateway_start_status(snapshot),
+            "processes": [],
+        }
+    processes = _find_kiwoom_gateway_processes()
+    if processes:
+        return {
+            "started": False,
+            "reason": "ALREADY_RUNNING",
+            "gateway": _gateway_start_status(snapshot),
+            "processes": processes,
+        }
+    started = _start_kiwoom_gateway_process()
+    return {
+        "started": True,
+        "reason": "STARTED",
+        "gateway": _gateway_start_status(snapshot),
+        "processes": [started],
+        "logs": {
+            "stdout": str(PROJECT_ROOT / "logs" / "kiwoom_gateway_dashboard.out.log"),
+            "stderr": str(PROJECT_ROOT / "logs" / "kiwoom_gateway_dashboard.err.log"),
+        },
+    }
+
+
+def _gateway_start_status(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "connected": bool(snapshot.get("connected")),
+        "heartbeat_ok": bool(snapshot.get("heartbeat_ok")),
+        "kiwoom_logged_in": bool(snapshot.get("kiwoom_logged_in")),
+        "orderable": bool(snapshot.get("orderable")),
+        "connection_state": str(snapshot.get("connection_state") or "UNKNOWN"),
+    }
+
+
+def _find_kiwoom_gateway_processes() -> list[dict[str, Any]]:
+    if os.name != "nt":
+        return []
+    script = (
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { ($_.Name -match 'python|pythonw') -and ($_.CommandLine -match 'apps[\\\\/]kiwoom_gateway.py|kiwoom_gateway.py') } | "
+        "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Depth 4"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return []
+    text = str(result.stdout or "").strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    rows = payload if isinstance(payload, list) else [payload]
+    return [
+        {
+            "pid": int(row.get("ProcessId") or 0),
+            "name": str(row.get("Name") or ""),
+            "command_line": str(row.get("CommandLine") or ""),
+        }
+        for row in rows
+        if isinstance(row, dict) and int(row.get("ProcessId") or 0) > 0
+    ]
+
+
+def _start_kiwoom_gateway_process() -> dict[str, Any]:
+    logs_dir = PROJECT_ROOT / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    out_path = logs_dir / "kiwoom_gateway_dashboard.out.log"
+    err_path = logs_dir / "kiwoom_gateway_dashboard.err.log"
+    env = os.environ.copy()
+    _apply_kiwoom_gateway_runtime_env(env)
+    settings = get_settings()
+    python_exe = _kiwoom_gateway_python_exe()
+    gateway_script = PROJECT_ROOT / "apps" / "kiwoom_gateway.py"
+    if python_exe.exists():
+        command = [str(python_exe), str(gateway_script)]
+    else:
+        command = ["py", "-3.9-32", str(gateway_script)]
+    command.extend(
+        [
+            "--core-url",
+            str(os.environ.get("TRADING_KIWOOM_GATEWAY_CORE_URL") or "http://127.0.0.1:8000"),
+            "--token",
+            settings.local_token,
+            "--transport",
+            str(os.environ.get("TRADING_GATEWAY_TRANSPORT") or "rest"),
+            "--poll-wait-sec",
+            str(os.environ.get("TRADING_GATEWAY_POLL_WAIT_SEC") or "1.0"),
+            "--network-interval-sec",
+            str(os.environ.get("TRADING_GATEWAY_NETWORK_INTERVAL_SEC") or "0.5"),
+        ]
+    )
+    out_handle = out_path.open("ab")
+    err_handle = err_path.open("ab")
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(PROJECT_ROOT),
+            env=env,
+            stdout=out_handle,
+            stderr=err_handle,
+            close_fds=True,
+        )
+    finally:
+        out_handle.close()
+        err_handle.close()
+    return {"pid": process.pid, "name": Path(command[0]).name, "command_line": " ".join(command)}
+
+
+def _kiwoom_gateway_python_exe() -> Path:
+    python_env = str(os.environ.get("TRADING_KIWOOM_GATEWAY_PYTHON") or "").strip()
+    if python_env:
+        return Path(python_env).expanduser()
+    base_32 = Path("C:/Python39-32/python.exe")
+    if base_32.exists():
+        return base_32
+    return PROJECT_ROOT / "venv_32" / "Scripts" / "python.exe"
+
+
+def _apply_kiwoom_gateway_runtime_env(env: dict[str, str]) -> None:
+    site_packages = PROJECT_ROOT / "venv_32" / "Lib" / "site-packages"
+    if site_packages.exists():
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            str(site_packages)
+            if not existing_pythonpath
+            else f"{site_packages}{os.pathsep}{existing_pythonpath}"
+        )
+    qt_root = site_packages / "PyQt5" / "Qt5"
+    platforms_dir = qt_root / "plugins" / "platforms"
+    qt_bin = qt_root / "bin"
+    if platforms_dir.exists():
+        env.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(platforms_dir))
+    if qt_bin.exists():
+        env["PATH"] = f"{qt_bin}{os.pathsep}{env.get('PATH', '')}"
 
 
 @app.get("/api/gateway/transport/status")

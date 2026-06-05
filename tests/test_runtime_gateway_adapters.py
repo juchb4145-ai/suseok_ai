@@ -162,6 +162,35 @@ def test_condition_adapter_warns_when_index_is_not_ready(tmp_path):
         assert any(warning.startswith("CONDITION_INDEX_NOT_READY") for warning in warnings)
         commands = state.list_commands(limit=10, include_finished=True)
         assert any(item["command_type"] == "load_conditions" for item in commands)
+        assert not any(item["command_type"] == "send_condition" for item in commands)
+    finally:
+        db.close()
+
+
+def test_condition_adapter_does_not_send_from_stale_resolved_index_before_load_event(tmp_path):
+    db = TradingDatabase(str(tmp_path / "runtime.sqlite3"))
+    try:
+        repository = ConditionProfileRepository(db)
+        repository.upsert_profile(
+            ConditionProfile(
+                condition_name="leader",
+                strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+                enabled=True,
+                priority=200,
+                purpose="theme_lab_leader",
+                last_resolved_index=85,
+            )
+        )
+        state = GatewayStateStore()
+        state.status.connected = True
+        state.status.kiwoom_logged_in = True
+        state.status.last_heartbeat_at = utc_timestamp()
+        adapter = GatewayCommandConditionAdapter(state, repository)
+
+        adapter.start()
+
+        commands = state.list_commands(limit=10, include_finished=True)
+        assert [item["command_type"] for item in commands] == ["load_conditions"]
     finally:
         db.close()
 

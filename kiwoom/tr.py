@@ -130,7 +130,7 @@ class KiwoomTrRunner:
         return page
 
     def _extract_rows(self, result: TrRequestResult, meta: TrResponseMeta, fields: list[str]) -> list[dict[str, str]]:
-        record_name, repeat_count = self._repeat_count(result, meta)
+        record_name, repeat_count, record_candidates = self._repeat_count(result, meta)
         rows: list[dict[str, str]] = []
         for index in range(max(0, repeat_count)):
             row: dict[str, str] = {}
@@ -148,13 +148,44 @@ class KiwoomTrRunner:
                 row[field_name] = str(value or "").strip()
             rows.append(row)
         if not rows:
+            single_row = self._extract_single_row(result, meta, fields, record_candidates)
+            if single_row:
+                result.warnings.append(
+                    f"TR_SINGLE_ROW_FALLBACK:{result.tr_code}:{result.rq_name}:"
+                    f"record={single_row.get('_record_name') or '-'}"
+                )
+                single_row.pop("_record_name", None)
+                return [single_row]
+        if not rows:
             result.warnings.append(
                 f"TR_PAGE_EMPTY:{result.tr_code}:{result.rq_name}:record={record_name or '-'}:"
                 f"event_record={meta.record_name or '-'}"
             )
         return rows
 
-    def _repeat_count(self, result: TrRequestResult, meta: TrResponseMeta) -> tuple[str, int]:
+    def _extract_single_row(
+        self,
+        result: TrRequestResult,
+        meta: TrResponseMeta,
+        fields: list[str],
+        record_candidates: list[str],
+    ) -> dict[str, str]:
+        tr_code = meta.tr_code or result.tr_code
+        for record_name in record_candidates:
+            row: dict[str, str] = {}
+            for field_name in fields:
+                try:
+                    value = self.client.get_comm_data(tr_code, record_name, 0, field_name)
+                except Exception as exc:
+                    result.warnings.append(f"TR_SINGLE_FIELD_READ_FAILED:{result.tr_code}:{record_name}:{field_name}:{exc}")
+                    value = ""
+                row[field_name] = str(value or "").strip()
+            if any(value for value in row.values()):
+                row["_record_name"] = record_name
+                return row
+        return {}
+
+    def _repeat_count(self, result: TrRequestResult, meta: TrResponseMeta) -> tuple[str, int, list[str]]:
         tr_code = meta.tr_code or result.tr_code
         candidates = _dedupe(
             [
@@ -174,10 +205,10 @@ class KiwoomTrRunner:
                 failures.append(f"{record_name}:{exc}")
                 continue
             if repeat_count > 0:
-                return record_name, repeat_count
+                return record_name, repeat_count, candidates
         if failures:
             result.errors.append(f"TR_REPEAT_COUNT_FAILED:{result.tr_code}:{result.rq_name}:{';'.join(failures)}")
-        return candidates[0] if candidates else result.rq_name, 0
+        return candidates[0] if candidates else result.rq_name, 0, candidates
 
     def _handle_tr_data(self, *args) -> None:
         values = list(args) + [""] * 9

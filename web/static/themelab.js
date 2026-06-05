@@ -111,6 +111,66 @@ function ratio(value) {
   return `${(number * 100).toFixed(1)}%`;
 }
 
+function getStoredToken() {
+  try {
+    return window.localStorage.getItem("tradingCoreToken") || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function rememberToken(token) {
+  try {
+    if (token) window.localStorage.setItem("tradingCoreToken", token);
+  } catch (_) {}
+}
+
+function forgetStoredToken() {
+  try {
+    window.localStorage.removeItem("tradingCoreToken");
+  } catch (_) {}
+}
+
+function promptForToken(message = "TRADING_CORE_TOKEN") {
+  const token = window.prompt(message) || "";
+  rememberToken(token);
+  return token;
+}
+
+function isInvalidTokenResponse(response, payload) {
+  const detail = String((payload || {}).detail || (payload || {}).error || "");
+  return response.status === 401 || response.status === 403 || /invalid local gateway token/i.test(detail);
+}
+
+async function parseResponsePayload(response) {
+  try {
+    return await response.json();
+  } catch (_) {
+    try {
+      return { detail: await response.text() };
+    } catch (__) {
+      return {};
+    }
+  }
+}
+
+async function runWithLocalTokenRetry(requestFn) {
+  let token = getStoredToken() || promptForToken();
+  if (!token) return null;
+  let result = await requestFn(token);
+  if (!result.response.ok && isInvalidTokenResponse(result.response, result.payload)) {
+    forgetStoredToken();
+    token = promptForToken("TRADING_CORE_TOKEN");
+    if (!token) return null;
+    result = await requestFn(token);
+  }
+  if (!result.response.ok) {
+    if (isInvalidTokenResponse(result.response, result.payload)) forgetStoredToken();
+    throw new Error(result.payload.detail || result.payload.error || `${result.response.status} ${result.response.statusText}`);
+  }
+  return result.payload;
+}
+
 function money(value) {
   const number = Number(value || 0);
   if (!Number.isFinite(number) || number <= 0) return "-";
@@ -152,6 +212,7 @@ function render(snapshot) {
   renderGate(selected);
   renderConditions(snapshot.condition_statuses || []);
   renderDataQuality(snapshot.data_quality || {});
+  updateKiwoomGatewayButton(snapshot);
 }
 
 function renderHeader(snapshot) {
@@ -177,6 +238,7 @@ function renderCockpit(snapshot) {
   const market = snapshot.market || {};
   const dataQuality = snapshot.data_quality || {};
   const backfill = snapshot.theme_backfill_runtime || {};
+  const gateway = snapshot.gateway || {};
   setBadge("operation-status", summary.operation_status || "SNAPSHOT_UNAVAILABLE");
   text("operation-message", summary.operation_message_ko || "ThemeLabFlow 결과 대기 중");
   const snapshotState = summary.snapshot_stale ? "STALE" : "FRESH";
@@ -230,14 +292,66 @@ function renderCockpit(snapshot) {
 
   document.getElementById("cockpit-live-readiness").innerHTML = [
     `<div class="cockpit-line"><strong>Runtime</strong>${badge(summary.runtime_status || "UNKNOWN")}<span>${summary.runtime_running ? "running" : "inactive"} ${escapeHtml(summary.runtime_mode || "")}</span></div>`,
+    `<div class="cockpit-line"><strong>Kiwoom</strong>${boolBadge(gateway.kiwoom_logged_in, "\ub85c\uadf8\uc778", "\ubbf8\ub85c\uadf8\uc778")}<span>${gateway.heartbeat_ok ? "heartbeat OK" : "heartbeat wait"} · ${gateway.connected ? "connected" : "disconnected"}</span></div>`,
     `<div class="cockpit-line"><strong>Snapshot</strong>${badge(summary.snapshot_stale ? "SNAPSHOT_STALE" : "OK")}<span>${escapeHtml(summary.snapshot_age_label || "-")}</span></div>`,
-    `<div class="cockpit-line"><strong>TR_BACKFILL</strong>${boolBadge(backfill.enabled, "ON", "OFF")}<span>${escapeHtml(backfill.paused_reason || (backfill.observe_pilot_active ? "OBSERVE_PILOT" : "IDLE"))} · parser miss ${ratio(backfill.parser_miss_ratio)} · ${escapeHtml(backfill.history_window || "recent_500_commands")}</span></div>`,
+    `<div class="cockpit-line"><strong>TR_BACKFILL</strong>${boolBadge(backfill.enabled, "ON", "OFF")}<span>${escapeHtml(backfillStatusText(backfill))} · parser miss ${ratio(backfill.parser_miss_ratio)} · ${escapeHtml(backfill.history_window || "recent_500_commands")}</span></div>`,
     `<div class="cockpit-line"><strong>LIVE</strong>${boolBadge(summary.live_order_enabled, "활성", "비활성")}</div>`,
     countLine("Guard 통과", summary.live_guard_passed_count),
     countLine("Guard 차단", summary.live_guard_blocked_count),
     countLine("추격 대기", summary.late_chase_wait_count),
     countLine("추격 차단", summary.chase_risk_blocked_count),
   ].join("");
+}
+
+function backfillStatusText(backfill) {
+  if (backfill.gateway_unhealthy_display) {
+    return `${backfill.paused_reason || "GATEWAY_UNHEALTHY"}: ${backfill.gateway_unhealthy_display}`;
+  }
+  return backfill.paused_reason || (backfill.observe_pilot_active ? "OBSERVE_PILOT" : "IDLE");
+}
+
+function updateKiwoomGatewayButton(snapshot) {
+  const button = document.getElementById("kiwoom-gateway-start");
+  if (!button) return;
+  const gateway = (snapshot || {}).gateway || {};
+  const loggedIn = Boolean(gateway.kiwoom_logged_in);
+  const connected = Boolean(gateway.connected && gateway.heartbeat_ok);
+  button.disabled = connected || button.dataset.busy === "1";
+  if (button.dataset.busy === "1") {
+    button.textContent = "Gateway \uc2e4\ud589 \uc911";
+  } else if (loggedIn) {
+    button.textContent = "Gateway \ub85c\uadf8\uc778\ub428";
+  } else if (connected) {
+    button.textContent = "\uc790\ub3d9\ub85c\uadf8\uc778 \ub300\uae30";
+  } else {
+    button.textContent = "32bit Gateway \uc2e4\ud589";
+  }
+}
+
+async function startKiwoomGateway(button) {
+  if (!button || button.disabled) return;
+  button.dataset.busy = "1";
+  updateKiwoomGatewayButton(state.snapshot || {});
+  try {
+    const payload = await runWithLocalTokenRetry(async (token) => {
+      const response = await fetch("/api/gateway/kiwoom/start", {
+        method: "POST",
+        headers: { "X-Local-Token": token },
+      });
+      return { response, payload: await parseResponsePayload(response) };
+    });
+    if (payload) {
+      button.title = payload.started
+        ? "32bit Gateway \uc2e4\ud589 \uc694\uccad \uc644\ub8cc"
+        : `Gateway \ubbf8\uc2e4\ud589: ${payload.reason || "UNKNOWN"}`;
+    }
+    await fetchSnapshot();
+  } catch (error) {
+    button.title = error.message || String(error);
+  } finally {
+    button.dataset.busy = "0";
+    updateKiwoomGatewayButton(state.snapshot || {});
+  }
 }
 
 function countLine(label, value) {
@@ -810,6 +924,9 @@ function initFilters() {
     state.selectedSymbol = item.symbol;
     renderGate(item);
     renderWatchset(state.snapshot.watchset || []);
+  });
+  document.getElementById("kiwoom-gateway-start")?.addEventListener("click", (event) => {
+    startKiwoomGateway(event.currentTarget).catch(() => {});
   });
 }
 

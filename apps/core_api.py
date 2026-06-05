@@ -11,6 +11,20 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+def load_project_env(path: Path = PROJECT_ROOT / ".env") -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        os.environ[key] = value.strip().strip("\"'")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="64bit Trading Core/API server")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host. Keep 127.0.0.1 for local trading.")
@@ -23,6 +37,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    load_project_env()
     args = parse_args()
     if args.db:
         os.environ["TRADING_DB_PATH"] = args.db

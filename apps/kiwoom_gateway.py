@@ -15,6 +15,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+
+def configure_qt_paths() -> None:
+    try:
+        import PyQt5
+    except ImportError:
+        return
+    pyqt_dir = Path(PyQt5.__file__).resolve().parent
+    qt_root = pyqt_dir / "Qt5"
+    platforms_dir = qt_root / "plugins" / "platforms"
+    qt_bin = qt_root / "bin"
+    if platforms_dir.exists():
+        os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(platforms_dir))
+    if qt_bin.exists():
+        os.environ["PATH"] = f"{qt_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+
 from trading.broker.gateway_client import GatewayEventQueue
 from trading.broker.gateway_transport import WebSocketRealCoreClient, WebSocketPilotPolicy
 from trading.broker.data_quality import RealtimeDataQualityTracker
@@ -457,6 +472,7 @@ def run_mock_gateway(args: argparse.Namespace) -> int:
 
 
 def run_real_gateway(args: argparse.Namespace) -> int:
+    configure_qt_paths()
     from PyQt5.QtCore import QTimer
     from PyQt5.QtWidgets import QApplication
 
