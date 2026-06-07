@@ -222,7 +222,7 @@ def test_themelab_good_pullback_soft_block_waits_without_entry_plan_or_intent(tm
     assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 
 
-def test_themelab_generic_soft_block_does_not_pollute_late_chase_bucket(tmp_path):
+def test_themelab_high_return_follower_maps_to_entry_risk_final_block(tmp_path):
     runtime, db, _gateway_state = _runtime(
         tmp_path,
         _flow_result(
@@ -240,12 +240,64 @@ def test_themelab_generic_soft_block_does_not_pollute_late_chase_bucket(tmp_path
     candidate = db.load_candidate("2026-06-01", "000001")
     details = candidate.metadata["gate_results_by_theme"]["ai"]
     assert candidate.state == CandidateState.BLOCKED
-    assert candidate.block_type == BlockType.TEMPORARY
-    assert details["sub_status"] == "RISK_SOFT_BLOCK_TEMP_WAIT"
-    assert details["risk_soft_block"] is True
+    assert candidate.block_type == BlockType.FINAL
+    assert details["sub_status"] == "ENTRY_RISK_FINAL_BLOCK"
+    assert details["entry_risk_action"] == "final_block"
+    assert details["entry_risk_level"] == "final"
+    assert "HIGH_RETURN_FOLLOWER" in details["entry_risk_reason_codes"]
+    assert "ENTRY_RISK_FINAL_BLOCK" in details["reason_codes"]
+    assert details["risk_soft_block"] is False
     assert details["late_chase_level"] == ""
-    assert "RISK_SOFT_BLOCK_TEMP_WAIT" in details["reason_codes"]
+    assert "RISK_SOFT_BLOCK_TEMP_WAIT" not in details["reason_codes"]
     assert "LATE_CHASE_TEMP_WAIT" not in details["reason_codes"]
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
+def test_themelab_vi_cooldown_maps_to_entry_risk_temp_wait(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.READY,
+            PriceLocationStatus.GOOD_PULLBACK,
+            risk=TradeabilityRiskLevel.SOFT_BLOCK,
+            reasons=("VI_COOLDOWN",),
+        ),
+        dry_run_orders=True,
+        tick_metadata={
+            "prev_close": 10000,
+            "recent_support_price": 9950,
+            "recent_support_ready": True,
+            "recent_support_candle_count": 3,
+            "vwap": 9950,
+            "vwap_ready": True,
+            "base_line_120": 9800,
+            "base_line_120_ready": True,
+            "base_line_120_candle_count": 120,
+            "vi_status": "COOLDOWN",
+            "vi_signal_source": "inferred",
+            "seconds_since_vi_release": 90,
+            "upper_limit_price": 13000,
+            "upper_limit_gap_pct": 30.0,
+            "change_rate": 5.0,
+            "pullback_from_high_pct": 2.0,
+        },
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+    assert candidate.state == CandidateState.BLOCKED
+    assert candidate.block_type == BlockType.TEMPORARY
+    assert candidate.can_recover is True
+    assert details["sub_status"] == "ENTRY_RISK_TEMP_WAIT"
+    assert details["entry_risk_action"] == "temporary_wait"
+    assert details["vi_status"] == "COOLDOWN"
+    assert details["vi_signal_source"] == "inferred"
+    assert details["seconds_since_vi_release"] == 90
+    assert "VI_COOLDOWN" in details["entry_risk_reason_codes"]
     assert db.list_entry_plans(candidate.id) == []
     assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 

@@ -7,6 +7,9 @@ from trading.strategy.candidates import candidate_is_discovery_only
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.gates import (
     ACTIVE_STATES,
+    ENTRY_RISK_BLOCK_SUB_STATUSES,
+    ENTRY_RISK_FINAL_BLOCK,
+    ENTRY_RISK_TEMP_WAIT,
     MarketIndexGate,
     StockLeadershipGate,
     StockPullbackEntryGate,
@@ -243,6 +246,23 @@ class GatePipeline:
             "late_chase_recoverable": bool(stock_pullback_decision.details.get("late_chase_recoverable")),
             "late_chase_recheck_after_sec": stock_pullback_decision.details.get("late_chase_recheck_after_sec", 0),
             "late_chase_recovery_conditions": list(stock_pullback_decision.details.get("late_chase_recovery_conditions") or []),
+            "entry_risk_diagnostics": dict(stock_pullback_decision.details.get("entry_risk_diagnostics") or {}),
+            "entry_risk_feature_version": stock_pullback_decision.details.get("entry_risk_feature_version", ""),
+            "entry_risk_level": stock_pullback_decision.details.get("entry_risk_level", ""),
+            "entry_risk_score": stock_pullback_decision.details.get("entry_risk_score"),
+            "entry_risk_action": stock_pullback_decision.details.get("entry_risk_action", ""),
+            "entry_risk_reason_codes": list(stock_pullback_decision.details.get("entry_risk_reason_codes") or []),
+            "entry_risk_recovery_checks": dict(stock_pullback_decision.details.get("entry_risk_recovery_checks") or {}),
+            "vi_status": stock_pullback_decision.details.get("vi_status", "UNKNOWN"),
+            "vi_signal_source": stock_pullback_decision.details.get("vi_signal_source", "unknown"),
+            "seconds_since_vi_release": stock_pullback_decision.details.get("seconds_since_vi_release"),
+            "upper_limit_price": stock_pullback_decision.details.get("upper_limit_price"),
+            "upper_limit_gap_pct": stock_pullback_decision.details.get("upper_limit_gap_pct"),
+            "change_rate": stock_pullback_decision.details.get("change_rate"),
+            "pullback_from_high_pct": stock_pullback_decision.details.get("pullback_from_high_pct"),
+            "leadership_role": stock_pullback_decision.details.get("leadership_role", leadership_result.leadership_role),
+            "stock_role": stock_pullback_decision.details.get("stock_role", ""),
+            "position_size_multiplier": stock_pullback_decision.details.get("position_size_multiplier", 1.0),
             "comparison_reason_codes": comparison_reason_codes,
             "secondary_reason_codes": comparison_reason_codes,
             "hybrid_result": hybrid_payload,
@@ -427,6 +447,24 @@ def _final_grade(
     market = decision_by_name["MarketIndexGate"]
     theme_pullback = decision_by_name["ThemePullbackGate"]
 
+    if stock_pullback.details.get("sub_status") in ENTRY_RISK_BLOCK_SUB_STATUSES:
+        entry_codes = normalize_reason_codes(
+            list(stock_pullback.reason_codes)
+            + list(stock_pullback.details.get("entry_risk_reason_codes") or [])
+        )
+        cap_rules.extend(entry_codes)
+        if stock_pullback.details.get("sub_status") == ENTRY_RISK_FINAL_BLOCK:
+            if ENTRY_RISK_FINAL_BLOCK not in cap_rules:
+                cap_rules.append(ENTRY_RISK_FINAL_BLOCK)
+            return "C", False, BlockType.FINAL, False, 0, cap_rules, ENTRY_RISK_FINAL_BLOCK
+        if ENTRY_RISK_TEMP_WAIT not in cap_rules:
+            cap_rules.append(ENTRY_RISK_TEMP_WAIT)
+        recheck_after_sec = int(
+            stock_pullback.recheck_after_sec
+            or stock_pullback.details.get("entry_risk_diagnostics", {}).get("recheck_after_sec")
+            or active_settings.integer("entry_risk_gate.risk_recheck_after_sec", 30)
+        )
+        return "B", False, BlockType.TEMPORARY, bool(stock_pullback.can_recover), recheck_after_sec, cap_rules, ENTRY_RISK_TEMP_WAIT
     if stock_pullback.details.get("chase_risk"):
         cap_rules.append("CHASE_RISK_CAP")
         return "C", False, BlockType.FINAL, False, 0, cap_rules, "CHASE_RISK"

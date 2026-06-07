@@ -58,6 +58,34 @@ def test_strategy_ineligible_result_does_not_create_entry_plan():
     assert EntryPlanBuilder().build(gate_result(strategy_eligible=False)) is None
 
 
+def test_entry_risk_temp_or_final_result_does_not_create_entry_plan():
+    temp = gate_result(strategy_eligible=False)
+    temp.details["sub_status"] = "ENTRY_RISK_TEMP_WAIT"
+    temp.details["entry_risk_reason_codes"] = ["VI_COOLDOWN", "ENTRY_RISK_TEMP_WAIT"]
+    final = gate_result(strategy_eligible=False)
+    final.details["sub_status"] = "ENTRY_RISK_FINAL_BLOCK"
+    final.details["entry_risk_reason_codes"] = ["VI_ACTIVE", "ENTRY_RISK_FINAL_BLOCK"]
+
+    assert EntryPlanBuilder().build(temp) is None
+    assert EntryPlanBuilder().build(final) is None
+
+
+def test_entry_risk_recovered_scales_split_weight_only_after_recovery():
+    result = gate_result()
+    result.details["entry_risk_action"] = "recovered"
+    result.details["entry_risk_reason_codes"] = ["ENTRY_RISK_RECOVERED", "RISK_ADJUST_POSITION_SIZE"]
+    result.details["position_size_multiplier"] = 0.25
+    result.decisions[0].details["entry_risk_action"] = "recovered"
+    result.decisions[0].details["entry_risk_reason_codes"] = ["ENTRY_RISK_RECOVERED", "RISK_ADJUST_POSITION_SIZE"]
+
+    plan = EntryPlanBuilder().build(result)
+
+    assert plan is not None
+    assert [leg["weight_pct"] for leg in plan.split_plan] == [10.0, 7.5, 7.5]
+    assert plan.cancel_condition["entry_risk_action"] == "recovered"
+    assert plan.cancel_condition["split_policy"]["position_size_multiplier"] == 0.25
+
+
 def test_support_missing_plan_is_diagnostic_only_and_not_submittable():
     result = gate_result(support_price=None)
 

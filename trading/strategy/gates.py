@@ -47,6 +47,12 @@ LATE_CHASE_SOFT_BLOCK_SCORE = 80.0
 LATE_CHASE_TEMP_WAIT = "LATE_CHASE_TEMP_WAIT"
 LATE_CHASE_WARNING = "LATE_CHASE_WARNING"
 LATE_CHASE_RECOVERY_PENDING = "LATE_CHASE_RECOVERY_PENDING"
+ENTRY_RISK_TEMP_WAIT = "ENTRY_RISK_TEMP_WAIT"
+ENTRY_RISK_FINAL_BLOCK = "ENTRY_RISK_FINAL_BLOCK"
+ENTRY_RISK_RECOVERY_PENDING = "ENTRY_RISK_RECOVERY_PENDING"
+ENTRY_RISK_RECOVERED = "ENTRY_RISK_RECOVERED"
+RISK_ADJUST_POSITION_SIZE = "RISK_ADJUST_POSITION_SIZE"
+ENTRY_RISK_BLOCK_SUB_STATUSES = {ENTRY_RISK_TEMP_WAIT, ENTRY_RISK_FINAL_BLOCK}
 LATE_CHASE_RECOVERY_CONDITIONS = [
     "late_chase_score_below_warning",
     "support_distance_no_longer_excessive",
@@ -607,6 +613,20 @@ class StockPullbackEntryGate:
         support_status = support_status_for_snapshot(snapshot, self.candle_builder, support_threshold, self.settings)
         details.update(support_status)
         _attach_late_chase_details(details, snapshot, support_status, support_threshold, self.settings)
+        _attach_entry_risk_details(
+            details,
+            _entry_risk_diagnostics(
+                snapshot,
+                candidate,
+                theme_result,
+                leadership_result,
+                support_status,
+                self.settings,
+            ),
+        )
+        entry_risk_decision = _entry_risk_decision_if_blocked(details, self.settings)
+        if entry_risk_decision is not None:
+            return entry_risk_decision, snapshot
         if snapshot.chase_risk:
             details["sub_status"] = "CHASE_RISK"
             return (
@@ -853,6 +873,422 @@ def support_status_for_snapshot(
         "support_readiness_by_source": readiness_by_source,
         **selected_metadata,
     }
+
+
+def _entry_risk_diagnostics(
+    snapshot: IndicatorSnapshot,
+    candidate: Candidate,
+    theme_result: ThemeStrengthResult,
+    leadership_result: StockLeadershipResult,
+    support_status: dict,
+    settings: Optional[StrategyRuntimeSettings] = None,
+) -> dict:
+    active_settings = settings or legacy_strategy_runtime_settings()
+    feature_version = str(active_settings.value("entry_risk_gate.feature_version", "entry_risk_diagnostics_v1"))
+    metadata = dict(snapshot.metadata or {})
+    candidate_metadata = dict(candidate.metadata or {})
+    if not _setting_bool(active_settings.value("entry_risk_gate.enabled", True), True):
+        return {
+            "feature_version": feature_version,
+            "entry_risk_action": "none",
+            "entry_risk_level": "disabled",
+            "entry_risk_score": 0.0,
+            "entry_risk_reason_codes": [],
+            "entry_risk_recovery_checks": {},
+            "vi_status": str(metadata.get("vi_status") or "UNKNOWN").upper(),
+            "vi_signal_source": str(metadata.get("vi_signal_source") or "unknown").lower(),
+            "seconds_since_vi_release": _round_optional(_float_or_none(metadata.get("seconds_since_vi_release"))),
+            "upper_limit_price": _round_optional(_float_or_none(metadata.get("upper_limit_price"))),
+            "upper_limit_gap_pct": _round_optional(_float_or_none(metadata.get("upper_limit_gap_pct"))),
+            "change_rate": _round_optional(_float_or_none(metadata.get("change_rate"))),
+            "pullback_from_high_pct": _round_optional(_float_or_none(metadata.get("pullback_from_high_pct"))),
+            "leadership_role_normalized": _leadership_role_for_entry_risk(leadership_result, candidate_metadata),
+            "stock_role": str(candidate_metadata.get("stock_role") or candidate_metadata.get("theme_lab_stock_role") or ""),
+        }
+    role = _leadership_role_for_entry_risk(leadership_result, candidate_metadata)
+    change_rate = _entry_risk_change_rate(metadata, leadership_result, candidate_metadata)
+    upper_limit_gap = _float_or_none(metadata.get("upper_limit_gap_pct"))
+    hard_gap = active_settings.number("entry_risk_gate.upper_limit_gap_hard_block_pct", 1.0)
+    block_gap = active_settings.number("entry_risk_gate.upper_limit_gap_block_pct", 3.0)
+    vi_status = _entry_vi_status(metadata, active_settings)
+    vi_signal_source = str(metadata.get("vi_signal_source") or "unknown").lower()
+    seconds_since_vi_release = _float_or_none(metadata.get("seconds_since_vi_release"))
+    pullback_from_high = _float_or_none(metadata.get("pullback_from_high_pct"))
+    near_high_threshold = active_settings.number("late_chase_thresholds.near_session_high_pct", LATE_CHASE_NEAR_HIGH_PCT)
+    near_session_high = pullback_from_high is not None and pullback_from_high <= near_high_threshold
+    threshold = _high_return_threshold_for_role(role, active_settings)
+    hard_extra = _high_return_hard_extra_for_role(role, active_settings)
+    high_return = change_rate is not None and change_rate >= threshold
+    upper_hard_near = upper_limit_gap is not None and upper_limit_gap <= hard_gap
+    upper_near = upper_limit_gap is not None and upper_limit_gap < block_gap
+    turnover_maintained = _entry_turnover_maintained(snapshot, metadata, leadership_result)
+
+    reason_codes: list[str] = []
+    signals: list[str] = []
+    action = "none"
+    level = "none"
+    can_recover = False
+    recheck_after_sec = active_settings.integer("entry_risk_gate.risk_recheck_after_sec", 30)
+
+    if vi_status == "ACTIVE":
+        action = "final_block"
+        level = "final"
+        signals.append("vi_active")
+        reason_codes.append(ReasonCode.VI_ACTIVE.value)
+    elif vi_status == "COOLDOWN":
+        action = "temporary_wait"
+        level = "temporary"
+        can_recover = True
+        recheck_after_sec = active_settings.integer("entry_risk_gate.vi_cooldown_recheck_sec", 30)
+        signals.append("vi_cooldown")
+        reason_codes.append(ReasonCode.VI_COOLDOWN.value)
+
+    if upper_hard_near:
+        action = "final_block"
+        level = "final"
+        can_recover = False
+        signals.append("upper_limit_hard_near")
+        reason_codes.append(ReasonCode.UPPER_LIMIT_HARD_NEAR.value)
+    elif upper_near:
+        signals.append("upper_limit_near")
+        reason_codes.append(ReasonCode.UPPER_LIMIT_NEAR.value)
+        upper_action = _upper_limit_near_action(role, turnover_maintained, vi_status)
+        action, level, can_recover = _combine_entry_risk_action(action, upper_action, can_recover)
+
+    if high_return:
+        reason_codes.append(_high_return_reason_code(role))
+        signals.append("high_return")
+        high_action = "final_block"
+        if role in {"leader", "co_leader"} and change_rate is not None and change_rate < threshold + hard_extra:
+            high_action = "temporary_wait"
+        action, level, can_recover = _combine_entry_risk_action(action, high_action, can_recover)
+
+    vi_unknown_limit_risk = (
+        vi_status == "UNKNOWN"
+        and _setting_bool(active_settings.value("entry_risk_gate.vi_unknown_uses_inferred_limit_risk", True), True)
+        and (upper_near or high_return or near_session_high)
+    )
+    if vi_unknown_limit_risk:
+        reason_codes.append(ReasonCode.VI_UNKNOWN_LIMIT_RISK.value)
+        signals.append("vi_unknown_limit_risk")
+        if action == "none":
+            fallback_action = "temporary_wait" if role in {"leader", "co_leader"} else "final_block"
+            action, level, can_recover = _combine_entry_risk_action(action, fallback_action, can_recover)
+
+    recovery_checks = _risk_recovery_checks(
+        {
+            "latest_tick_ready": metadata.get("latest_tick_ready", True),
+            "support_status": support_status,
+            "snapshot": snapshot,
+            "upper_limit_gap_pct": upper_limit_gap,
+            "pullback_from_high_pct": pullback_from_high,
+            "turnover_maintained": turnover_maintained,
+        },
+        active_settings,
+    )
+    recovered = False
+    if action == "none" and _candidate_has_entry_risk_temp_wait(candidate):
+        missing = [name for name, passed in recovery_checks["checks"].items() if not passed]
+        if missing:
+            action = "temporary_wait"
+            level = "temporary"
+            can_recover = True
+            reason_codes.append(ReasonCode.ENTRY_RISK_RECOVERY_PENDING.value)
+            signals.append("entry_risk_recovery_pending")
+        else:
+            action = "recovered"
+            level = "recovered"
+            recovered = True
+            reason_codes.extend([ReasonCode.ENTRY_RISK_RECOVERED.value, ReasonCode.RISK_ADJUST_POSITION_SIZE.value])
+            signals.append("entry_risk_recovered")
+
+    if action == "temporary_wait":
+        reason_codes.append(ReasonCode.ENTRY_RISK_TEMP_WAIT.value)
+        can_recover = True
+    elif action == "final_block":
+        reason_codes.append(ReasonCode.ENTRY_RISK_FINAL_BLOCK.value)
+        can_recover = False
+
+    score = 0.0
+    if vi_status == "ACTIVE":
+        score += 100.0
+    elif vi_status == "COOLDOWN":
+        score += 60.0
+    if upper_hard_near:
+        score += 80.0
+    elif upper_near:
+        score += 50.0
+    if high_return:
+        score += min(40.0, max(0.0, float(change_rate or 0.0) - threshold) * 4.0 + 20.0)
+    if vi_unknown_limit_risk:
+        score += 10.0
+
+    return {
+        "feature_version": feature_version,
+        "theme_id": theme_result.theme_id,
+        "theme_grade": theme_result.grade,
+        "leadership_role": leadership_result.leadership_role,
+        "leadership_role_normalized": role,
+        "stock_role": str(candidate_metadata.get("stock_role") or candidate_metadata.get("theme_lab_stock_role") or role),
+        "change_rate": _round_optional(change_rate),
+        "high_return_threshold_pct": threshold,
+        "high_return_hard_threshold_pct": threshold + hard_extra,
+        "upper_limit_gap_pct": _round_optional(upper_limit_gap),
+        "upper_limit_price": _round_optional(_float_or_none(metadata.get("upper_limit_price"))),
+        "pullback_from_high_pct": _round_optional(pullback_from_high),
+        "session_high": _round_optional(_float_or_none(metadata.get("session_high") or metadata.get("day_high"))),
+        "vi_status": vi_status,
+        "vi_signal_source": vi_signal_source,
+        "vi_active": vi_status == "ACTIVE",
+        "seconds_since_vi_release": _round_optional(seconds_since_vi_release),
+        "near_session_high": bool(near_session_high),
+        "upper_limit_near": bool(upper_near),
+        "upper_limit_hard_near": bool(upper_hard_near),
+        "high_return": bool(high_return),
+        "turnover_maintained": bool(turnover_maintained),
+        "entry_risk_action": action,
+        "entry_risk_level": level,
+        "entry_risk_score": round(score, 4),
+        "entry_risk_reason_codes": normalize_reason_codes(reason_codes),
+        "entry_risk_recovery_checks": recovery_checks,
+        "entry_risk_recovered": recovered,
+        "position_size_multiplier": active_settings.number("entry_risk_gate.risk_adjust_position_size_multiplier", 0.25)
+        if recovered
+        else None,
+        "can_recover": bool(can_recover),
+        "recheck_after_sec": int(recheck_after_sec),
+        "signals": normalize_reason_codes(signals),
+        "input_ready": bool(metadata.get("entry_risk_input_ready", True)),
+        "input_missing_fields": normalize_reason_codes(metadata.get("entry_risk_input_missing_fields") or []),
+    }
+
+
+def _attach_entry_risk_details(details: dict, diagnostics: dict) -> None:
+    reason_codes = normalize_reason_codes(diagnostics.get("entry_risk_reason_codes") or [])
+    details["entry_risk_diagnostics"] = dict(diagnostics)
+    details["entry_risk_feature_version"] = diagnostics.get("feature_version", "")
+    details["entry_risk_action"] = diagnostics.get("entry_risk_action", "none")
+    details["entry_risk_level"] = diagnostics.get("entry_risk_level", "none")
+    details["entry_risk_score"] = diagnostics.get("entry_risk_score", 0.0)
+    details["entry_risk_reason_codes"] = reason_codes
+    details["entry_risk_recovery_checks"] = dict(diagnostics.get("entry_risk_recovery_checks") or {})
+    details["vi_status"] = diagnostics.get("vi_status", "UNKNOWN")
+    details["vi_signal_source"] = diagnostics.get("vi_signal_source", "unknown")
+    details["seconds_since_vi_release"] = diagnostics.get("seconds_since_vi_release")
+    details["upper_limit_price"] = diagnostics.get("upper_limit_price")
+    details["upper_limit_gap_pct"] = diagnostics.get("upper_limit_gap_pct")
+    details["change_rate"] = diagnostics.get("change_rate")
+    details["pullback_from_high_pct"] = diagnostics.get("pullback_from_high_pct")
+    details["leadership_role"] = diagnostics.get("leadership_role_normalized") or details.get("leadership_role")
+    details["stock_role"] = diagnostics.get("stock_role", "")
+    if diagnostics.get("position_size_multiplier") is not None:
+        details["position_size_multiplier"] = diagnostics["position_size_multiplier"]
+    details["comparison_reason_codes"] = normalize_reason_codes(
+        list(details.get("comparison_reason_codes") or []) + reason_codes
+    )
+    details["secondary_reason_codes"] = normalize_reason_codes(
+        list(details.get("secondary_reason_codes") or []) + reason_codes
+    )
+
+
+def _entry_risk_decision_if_blocked(details: dict, settings: Optional[StrategyRuntimeSettings]) -> Optional[GateDecision]:
+    active_settings = settings or legacy_strategy_runtime_settings()
+    action = str(details.get("entry_risk_action") or "none")
+    reason_codes = normalize_reason_codes(details.get("entry_risk_reason_codes") or [])
+    if action == "final_block":
+        details["sub_status"] = ENTRY_RISK_FINAL_BLOCK
+        return _decision(
+            "StockPullbackEntryGate",
+            False,
+            0.0,
+            BlockType.FINAL,
+            reason_codes,
+            details,
+            can_recover=False,
+            settings=active_settings,
+        )
+    if action == "temporary_wait":
+        details["sub_status"] = ENTRY_RISK_TEMP_WAIT
+        return _decision(
+            "StockPullbackEntryGate",
+            False,
+            active_settings.number("pullback_thresholds.stock_pullback_wait_score", 55.0),
+            BlockType.TEMPORARY,
+            reason_codes,
+            details,
+            can_recover=True,
+            recheck_after_sec=int(
+                details.get("entry_risk_diagnostics", {}).get("recheck_after_sec")
+                or active_settings.integer("entry_risk_gate.risk_recheck_after_sec", 30)
+            ),
+            settings=active_settings,
+        )
+    return None
+
+
+def _leadership_role_for_entry_risk(leadership_result: StockLeadershipResult, candidate_metadata: dict) -> str:
+    raw = str(
+        leadership_result.leadership_role
+        or candidate_metadata.get("stock_role")
+        or candidate_metadata.get("theme_lab_stock_role")
+        or ""
+    ).strip().lower()
+    normalized = raw.replace("-", "_").replace(" ", "_")
+    if normalized in {"leader", "signal_leader"}:
+        return "leader"
+    if normalized in {"co_leader", "second_leader", "signal_second_leader"}:
+        return "co_leader"
+    if normalized == "follower":
+        return "follower"
+    if normalized == "late_laggard":
+        return "late_laggard"
+    return "unknown"
+
+
+def _high_return_threshold_for_role(role: str, settings: StrategyRuntimeSettings) -> float:
+    return settings.number(
+        f"entry_risk_gate.high_return_thresholds.{role}",
+        settings.number("entry_risk_gate.high_return_thresholds.unknown", 8.0),
+    )
+
+
+def _high_return_hard_extra_for_role(role: str, settings: StrategyRuntimeSettings) -> float:
+    return settings.number(
+        f"entry_risk_gate.high_return_hard_block_extra_pct.{role}",
+        settings.number("entry_risk_gate.high_return_hard_block_extra_pct.unknown", 2.0),
+    )
+
+
+def _high_return_reason_code(role: str) -> str:
+    if role == "leader":
+        return ReasonCode.HIGH_RETURN_LEADER.value
+    if role == "co_leader":
+        return ReasonCode.HIGH_RETURN_CO_LEADER.value
+    if role == "follower":
+        return ReasonCode.HIGH_RETURN_FOLLOWER.value
+    if role == "late_laggard":
+        return ReasonCode.HIGH_RETURN_LATE_LAGGARD.value
+    return ReasonCode.HIGH_RETURN_UNKNOWN_ROLE.value
+
+
+def _upper_limit_near_action(role: str, turnover_maintained: bool, vi_status: str) -> str:
+    if role in {"leader", "co_leader"} and turnover_maintained and vi_status != "COOLDOWN":
+        return "temporary_wait"
+    return "final_block"
+
+
+def _combine_entry_risk_action(current: str, incoming: str, can_recover: bool) -> tuple[str, str, bool]:
+    if incoming == "final_block" or current == "final_block":
+        return "final_block", "final", False
+    if incoming == "temporary_wait" or current == "temporary_wait":
+        return "temporary_wait", "temporary", True
+    return current, "none" if current == "none" else current, can_recover
+
+
+def _risk_recovery_checks(details: dict, settings: Optional[StrategyRuntimeSettings] = None) -> dict:
+    active_settings = settings or legacy_strategy_runtime_settings()
+    support_status = dict(details.get("support_status") or {})
+    snapshot = details.get("snapshot")
+    upper_gap = details.get("upper_limit_gap_pct")
+    pullback_from_high = details.get("pullback_from_high_pct")
+    block_gap = active_settings.number("entry_risk_gate.upper_limit_gap_block_pct", 3.0)
+    near_high_threshold = active_settings.number("late_chase_thresholds.near_session_high_pct", LATE_CHASE_NEAR_HIGH_PCT)
+    nearest = str(support_status.get("nearest_support") or "")
+    support_reclaimed = bool(support_status.get("support_reclaimed"))
+    vwap_or_recent = nearest in {"vwap", "recent_support_price", "support_price"} and support_reclaimed
+    checks = {
+        "latest_tick_ready": bool(details.get("latest_tick_ready", True)),
+        "support_ready": bool(support_status.get("selected_support_ready", support_status.get("support_ready", False))),
+        "support_reclaimed": support_reclaimed,
+        "vwap_or_recent_support_reclaimed": vwap_or_recent,
+        "not_near_upper_limit": upper_gap is not None and float(upper_gap) >= block_gap,
+        "not_near_session_high": pullback_from_high is not None and float(pullback_from_high) > near_high_threshold,
+        "volume_reaccel_or_turnover_strength": bool(getattr(snapshot, "volume_reaccel", False)) or bool(details.get("turnover_maintained")),
+    }
+    return {
+        "checks": checks,
+        "missing_conditions": [name for name, passed in checks.items() if not passed],
+        "required_conditions": active_settings.list_value(
+            "entry_risk_gate.leader_recovery_requires",
+            [
+                "latest_tick_ready",
+                "support_ready",
+                "support_reclaimed",
+                "vwap_or_recent_support_reclaimed",
+                "not_near_upper_limit",
+                "not_near_session_high",
+                "volume_reaccel_or_turnover_strength",
+            ],
+        ),
+    }
+
+
+def _entry_risk_change_rate(
+    metadata: dict,
+    leadership_result: StockLeadershipResult,
+    candidate_metadata: dict,
+) -> Optional[float]:
+    for value in (
+        metadata.get("change_rate"),
+        leadership_result.details.get("change_rate") if isinstance(leadership_result.details, dict) else None,
+        candidate_metadata.get("return_pct"),
+        candidate_metadata.get("watch_return_pct"),
+    ):
+        number = _float_or_none(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _entry_turnover_maintained(
+    snapshot: IndicatorSnapshot,
+    metadata: dict,
+    leadership_result: StockLeadershipResult,
+) -> bool:
+    turnover_strength = _float_or_none(metadata.get("turnover_strength"))
+    leadership_turnover = _float_or_none(leadership_result.details.get("turnover") if isinstance(leadership_result.details, dict) else None)
+    return bool(
+        snapshot.volume_reaccel
+        or bool(metadata.get("volume_reaccel"))
+        or (turnover_strength is not None and turnover_strength >= 1.0)
+        or (leadership_turnover is not None and leadership_turnover > 0)
+    )
+
+
+def _entry_vi_status(metadata: dict, settings: StrategyRuntimeSettings) -> str:
+    status = str(metadata.get("vi_status") or "").strip().upper()
+    if status not in {"ACTIVE", "COOLDOWN", "INACTIVE", "UNKNOWN"}:
+        status = "UNKNOWN"
+    seconds_since_release = _float_or_none(metadata.get("seconds_since_vi_release"))
+    if status == "UNKNOWN" and seconds_since_release is not None:
+        cooldown_sec = settings.integer("entry_risk_gate.vi_cooldown_sec", 180)
+        if 0 <= seconds_since_release <= cooldown_sec:
+            return "COOLDOWN"
+    return status
+
+
+def _candidate_has_entry_risk_temp_wait(candidate: Candidate) -> bool:
+    metadata = dict(candidate.metadata or {})
+    if str(metadata.get("sub_status") or "") == ENTRY_RISK_TEMP_WAIT:
+        return True
+    values = []
+    for key in ("last_block_result",):
+        item = metadata.get(key)
+        if isinstance(item, dict):
+            values.append(str(item.get("sub_status") or ""))
+            values.extend(str(code) for code in item.get("reason_codes") or [])
+            values.extend(str(code) for code in item.get("entry_risk_reason_codes") or [])
+    for records_key in ("gate_results_by_theme", "block_reasons_by_theme"):
+        records = metadata.get(records_key)
+        if not isinstance(records, dict):
+            continue
+        for item in records.values():
+            if not isinstance(item, dict):
+                continue
+            values.append(str(item.get("sub_status") or ""))
+            values.extend(str(code) for code in item.get("reason_codes") or [])
+            values.extend(str(code) for code in item.get("entry_risk_reason_codes") or [])
+    return ENTRY_RISK_TEMP_WAIT in values
 
 
 def _attach_late_chase_details(
