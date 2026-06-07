@@ -265,6 +265,69 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   text-align: center;
 }
 
+.session-review-panel,
+.event-journal-panel {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.session-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.session-review-card {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  padding: 10px;
+  box-shadow: inset 3px 0 0 var(--border-active);
+}
+
+.session-review-card span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.session-review-card strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+.session-review-card.critical { box-shadow: inset 3px 0 0 var(--blocked); }
+.session-review-card.warning { box-shadow: inset 3px 0 0 var(--warning); }
+.session-review-card.opportunity,
+.session-review-card.ready { box-shadow: inset 3px 0 0 var(--ready); }
+.session-review-card.ready-small,
+.session-review-card.info { box-shadow: inset 3px 0 0 var(--ready-small); }
+.session-review-card.wait { box-shadow: inset 3px 0 0 var(--wait); }
+.session-review-card.blocked { box-shadow: inset 3px 0 0 var(--blocked); }
+
+.operator-event-journal-list {
+  display: grid;
+  gap: 7px;
+  max-height: 290px;
+  overflow: auto;
+}
+
+.operator-event-row.pending-sync {
+  border-style: dashed;
+}
+
+.operator-event-row.event-journal-row {
+  min-height: 48px;
+}
+
 .flow-grid {
   display: grid;
   grid-template-columns: minmax(270px, 0.85fr) minmax(480px, 1.45fr) minmax(300px, 0.9fr);
@@ -818,6 +881,7 @@ tbody tr.selected {
   body { min-width: 0; }
   .cockpit-grid,
   .operator-alert-grid,
+  .session-summary-grid,
   .flow-grid,
   .bottom-grid,
   .quality-grid {

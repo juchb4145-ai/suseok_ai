@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional, Union
@@ -266,6 +267,43 @@ class TradingDatabase:
                 data_quality_json TEXT NOT NULL DEFAULT '{}',
                 payload_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS dashboard_operator_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                trade_date TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'themelab_dashboard',
+                event_type TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                category TEXT NOT NULL,
+                symbol TEXT,
+                stock_name TEXT,
+                primary_theme TEXT,
+                stock_role TEXT,
+                candidate_instance_id TEXT,
+                from_status TEXT,
+                to_status TEXT,
+                gate_status TEXT,
+                display_status TEXT,
+                message_ko TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                acknowledged_at TEXT,
+                acknowledged_by TEXT,
+                hidden INTEGER NOT NULL DEFAULT 0,
+                snoozed_until TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_events_trade_date_occurred
+                ON dashboard_operator_events(trade_date, occurred_at);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_events_trade_date_severity
+                ON dashboard_operator_events(trade_date, severity);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_events_trade_date_category
+                ON dashboard_operator_events(trade_date, category);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_events_symbol_trade_date
+                ON dashboard_operator_events(symbol, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_events_candidate_instance
+                ON dashboard_operator_events(candidate_instance_id);
             CREATE TABLE IF NOT EXISTS market_side_confirmation_state (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trade_date TEXT NOT NULL,
@@ -3170,6 +3208,153 @@ class TradingDatabase:
         payload["calculated_at"] = row["calculated_at"]
         return payload
 
+    def save_operator_event(self, event: dict) -> bool:
+        normalized = _normalize_operator_event(event)
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO dashboard_operator_events(
+                    event_id, trade_date, occurred_at, received_at, source,
+                    event_type, severity, category, symbol, stock_name,
+                    primary_theme, stock_role, candidate_instance_id,
+                    from_status, to_status, gate_status, display_status,
+                    message_ko, payload_json, acknowledged_at, acknowledged_by,
+                    hidden, snoozed_until
+                ) VALUES (
+                    :event_id, :trade_date, :occurred_at, :received_at, :source,
+                    :event_type, :severity, :category, :symbol, :stock_name,
+                    :primary_theme, :stock_role, :candidate_instance_id,
+                    :from_status, :to_status, :gate_status, :display_status,
+                    :message_ko, :payload_json, :acknowledged_at, :acknowledged_by,
+                    :hidden, :snoozed_until
+                )
+                """,
+                normalized,
+            )
+        return cursor.rowcount == 1
+
+    def save_operator_events(self, events: list[dict]) -> dict:
+        inserted = 0
+        duplicate = 0
+        rejected = 0
+        for event in events or []:
+            try:
+                if self.save_operator_event(event):
+                    inserted += 1
+                else:
+                    duplicate += 1
+            except (TypeError, ValueError, sqlite3.Error):
+                rejected += 1
+        return {"inserted_count": inserted, "duplicate_count": duplicate, "rejected_count": rejected}
+
+    def list_operator_events(
+        self,
+        trade_date: str,
+        *,
+        severity: str | None = None,
+        category: str | None = None,
+        symbol: str | None = None,
+        include_acknowledged: bool = True,
+        include_hidden: bool = False,
+        limit: int = 200,
+    ) -> list[dict]:
+        where = ["trade_date = ?"]
+        params: list[object] = [str(trade_date or "")]
+        if severity:
+            where.append("severity = ?")
+            params.append(str(severity).upper())
+        if category:
+            where.append("category = ?")
+            params.append(str(category).lower())
+        if symbol:
+            where.append("symbol = ?")
+            params.append(str(symbol))
+        if not include_acknowledged:
+            where.append("acknowledged_at IS NULL")
+        if not include_hidden:
+            where.append("hidden = 0")
+        normalized_limit = max(1, min(1000, int(limit or 200)))
+        params.append(normalized_limit)
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM dashboard_operator_events
+            WHERE {" AND ".join(where)}
+            ORDER BY occurred_at DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [_operator_event_row_to_dict(row) for row in rows]
+
+    def acknowledge_operator_event(self, event_id: str, acknowledged_by: str | None = None) -> int:
+        return self.acknowledge_operator_events([event_id], acknowledged_by=acknowledged_by)
+
+    def acknowledge_operator_events(self, event_ids: list[str], acknowledged_by: str | None = None) -> int:
+        ids = [str(event_id or "") for event_id in event_ids or [] if str(event_id or "")]
+        if not ids:
+            return 0
+        acknowledged_at = datetime.now().isoformat(timespec="seconds")
+        updated = 0
+        with self.conn:
+            for event_id in ids:
+                cursor = self.conn.execute(
+                    """
+                    UPDATE dashboard_operator_events
+                    SET acknowledged_at = COALESCE(acknowledged_at, ?),
+                        acknowledged_by = COALESCE(NULLIF(?, ''), acknowledged_by)
+                    WHERE event_id = ?
+                    """,
+                    (acknowledged_at, str(acknowledged_by or ""), event_id),
+                )
+                updated += cursor.rowcount
+        return updated
+
+    def hide_operator_event(self, event_id: str) -> int:
+        return self.hide_operator_events([event_id])
+
+    def hide_operator_events(self, event_ids: list[str]) -> int:
+        ids = [str(event_id or "") for event_id in event_ids or [] if str(event_id or "")]
+        if not ids:
+            return 0
+        updated = 0
+        with self.conn:
+            for event_id in ids:
+                cursor = self.conn.execute(
+                    "UPDATE dashboard_operator_events SET hidden = 1 WHERE event_id = ?",
+                    (event_id,),
+                )
+                updated += cursor.rowcount
+        return updated
+
+    def summarize_operator_events(self, trade_date: str) -> dict:
+        events = self.list_operator_events(trade_date, include_acknowledged=True, include_hidden=False, limit=1000)
+        severity_counts = Counter(str(event.get("severity") or "").upper() for event in events)
+        type_counts = Counter(str(event.get("event_type") or "") for event in events)
+        symbol_counts = Counter(str(event.get("symbol") or "") for event in events if event.get("symbol"))
+        theme_counts = Counter(str(event.get("primary_theme") or "") for event in events if event.get("primary_theme"))
+        return {
+            "trade_date": str(trade_date or ""),
+            "total_count": len(events),
+            "critical_count": severity_counts.get("CRITICAL", 0),
+            "warning_count": severity_counts.get("WARNING", 0),
+            "opportunity_count": severity_counts.get("OPPORTUNITY", 0),
+            "info_count": severity_counts.get("INFO", 0),
+            "ready_event_count": type_counts.get("BUY_READY_NEW", 0),
+            "ready_small_event_count": type_counts.get("BUY_READY_SMALL_NEW", 0),
+            "live_guard_blocked_count": type_counts.get("READY_BUT_LIVE_BLOCKED", 0),
+            "order_intent_created_count": type_counts.get("ORDER_INTENT_CREATED", 0),
+            "virtual_order_created_count": type_counts.get("VIRTUAL_ORDER_CREATED", 0),
+            "market_wait_started_count": type_counts.get("MARKET_WAIT_STARTED", 0),
+            "data_quality_degraded_count": type_counts.get("DATA_QUALITY_DEGRADED", 0),
+            "chase_risk_blocked_count": type_counts.get("CHASE_RISK_BLOCKED", 0),
+            "gateway_disconnected_count": type_counts.get("GATEWAY_DISCONNECTED", 0),
+            "snapshot_stale_count": type_counts.get("SNAPSHOT_STALE", 0),
+            "by_event_type": dict(type_counts),
+            "by_symbol": [{"symbol": symbol, "count": count} for symbol, count in symbol_counts.most_common(20)],
+            "by_theme": [{"primary_theme": theme, "count": count} for theme, count in theme_counts.most_common(20)],
+        }
+
     def upsert_market_side_confirmation_state(self, payload: dict) -> dict:
         normalized = _market_side_confirmation_state_params(payload)
         with self.conn:
@@ -5301,6 +5486,64 @@ def _row_to_gateway_transport_latency_report(row: sqlite3.Row) -> dict:
         "generated_at": row["generated_at"],
         "created_at": row["created_at"],
     }
+
+
+def _normalize_operator_event(event: dict) -> dict:
+    if not isinstance(event, dict):
+        raise ValueError("operator event must be a dict")
+    event_id = str(event.get("event_id") or event.get("id") or "").strip()
+    event_type = str(event.get("event_type") or event.get("type") or "").strip()
+    severity = str(event.get("severity") or "").strip().upper()
+    category = str(event.get("category") or "").strip().lower()
+    message = str(event.get("message_ko") or event.get("message") or "").strip()
+    occurred_at = str(event.get("occurred_at") or event.get("created_at") or datetime.now().isoformat(timespec="seconds")).strip()
+    if not event_id or not event_type or not severity or not category or not message:
+        raise ValueError("operator event missing required fields")
+    trade_date = str(event.get("trade_date") or _trade_date_from_timestamp(occurred_at) or datetime.now().date().isoformat()).strip()
+    payload = dict(event.get("payload") or event)
+    return {
+        "event_id": event_id,
+        "trade_date": trade_date,
+        "occurred_at": occurred_at,
+        "received_at": str(event.get("received_at") or datetime.now().isoformat(timespec="seconds")),
+        "source": str(event.get("source") or "themelab_dashboard"),
+        "event_type": event_type,
+        "severity": severity,
+        "category": category,
+        "symbol": str(event.get("symbol") or "") or None,
+        "stock_name": str(event.get("stock_name") or "") or None,
+        "primary_theme": str(event.get("primary_theme") or "") or None,
+        "stock_role": str(event.get("stock_role") or "") or None,
+        "candidate_instance_id": str(event.get("candidate_instance_id") or "") or None,
+        "from_status": str(event.get("from_status") or "") or None,
+        "to_status": str(event.get("to_status") or "") or None,
+        "gate_status": str(event.get("gate_status") or "") or None,
+        "display_status": str(event.get("display_status") or "") or None,
+        "message_ko": message,
+        "payload_json": json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+        "acknowledged_at": str(event.get("acknowledged_at") or "") or None,
+        "acknowledged_by": str(event.get("acknowledged_by") or "") or None,
+        "hidden": 1 if bool(event.get("hidden")) else 0,
+        "snoozed_until": str(event.get("snoozed_until") or "") or None,
+    }
+
+
+def _operator_event_row_to_dict(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    data["payload"] = payload if isinstance(payload, dict) else {}
+    data["hidden"] = bool(data.get("hidden"))
+    data["acknowledged"] = bool(data.get("acknowledged_at"))
+    data["message"] = data.get("message_ko", "")
+    data["type"] = data.get("event_type", "")
+    return data
+
+
+def _trade_date_from_timestamp(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    return ""
 
 
 def _safe_json_loads(value: object, default):

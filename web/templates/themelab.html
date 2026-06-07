@@ -96,6 +96,39 @@
         </div>
       </section>
 
+      <section id="operator-session-review" class="panel session-review-panel" aria-label="Operator Session Review">
+        <div class="panel-head operator-alert-head">
+          <div>
+            <h2>Session Review</h2>
+            <p>당일 운영 이벤트 집계와 복기 로그</p>
+          </div>
+          <span id="operator-event-sync-status" class="counter event-sync-status">저장 대기</span>
+        </div>
+        <div id="operator-session-summary-cards" class="session-summary-grid"></div>
+      </section>
+
+      <section id="operator-event-journal" class="panel event-journal-panel" aria-label="Operator Event Journal">
+        <div class="panel-head operator-alert-head">
+          <div>
+            <h2>Event Journal</h2>
+            <p>당일 전체 운영 이벤트 로그</p>
+          </div>
+          <span id="operator-event-journal-count" class="counter">0</span>
+        </div>
+        <div id="operator-event-journal-filters" class="filter-row operator-alert-filters" data-filter-group="operator-event-journal">
+          <span>Journal</span>
+          <button class="active" data-journal-filter="ALL" type="button">전체</button>
+          <button data-journal-filter="OPPORTUNITY" type="button">기회</button>
+          <button data-journal-filter="WARNING" type="button">경고</button>
+          <button data-journal-filter="CRITICAL" type="button">위험</button>
+          <button data-journal-filter="ORDER" type="button">주문</button>
+          <button data-journal-filter="DATA" type="button">데이터</button>
+          <button data-journal-filter="MARKET" type="button">시장</button>
+          <button data-journal-filter="SYMBOL" type="button">종목</button>
+        </div>
+        <div id="operator-event-journal-list" class="operator-event-journal-list"></div>
+      </section>
+
       <section class="flow-grid">
         <aside class="panel theme-panel">
           <div class="panel-head">

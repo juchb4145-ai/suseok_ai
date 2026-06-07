@@ -12,10 +12,16 @@
   chartInterval: "1m",
   operatorEvents: [],
   acknowledgedEventIds: new Set(),
+  persistedEventIds: new Set(),
+  operatorEventSyncPending: [],
+  operatorEventLastSyncAt: "",
+  operatorEventServerBacked: false,
+  operatorSessionSummary: {},
   alertFilters: {
     category: "ALL",
     hideAcknowledged: false,
   },
+  journalFilter: "ALL",
   maxOperatorEvents: 200,
 };
 
@@ -288,6 +294,53 @@ function saveOperatorAlertFilter() {
   } catch (_) {}
 }
 
+function normalizeEventCategory(value) {
+  const category = String(value || "").trim().toLowerCase();
+  return category || "info";
+}
+
+function normalizeOperatorEvent(event, options = {}) {
+  const type = String(event.event_type || event.type || "").trim();
+  const eventId = String(event.event_id || event.id || makeEventId({ ...event, type })).trim();
+  const occurredAt = String(event.occurred_at || event.created_at || new Date().toISOString());
+  const severity = String(event.severity || eventSeverity({ ...event, type })).toUpperCase();
+  const category = normalizeEventCategory(event.category || eventCategory({ ...event, type, severity }));
+  const acknowledged = Boolean(event.acknowledged || event.acknowledged_at);
+  const normalized = {
+    ...event,
+    id: eventId,
+    event_id: eventId,
+    type,
+    event_type: type,
+    created_at: occurredAt,
+    occurred_at: occurredAt,
+    severity,
+    category,
+    message: event.message_ko || event.message || type,
+    message_ko: event.message_ko || event.message || type,
+    acknowledged,
+    hidden: Boolean(event.hidden),
+    persisted: Boolean(options.persisted || event.persisted || event.received_at),
+    pending_sync: Boolean(event.pending_sync),
+  };
+  if (acknowledged) state.acknowledgedEventIds.add(eventId);
+  if (normalized.persisted) state.persistedEventIds.add(eventId);
+  return normalized;
+}
+
+function mergeOperatorEvents(events, options = {}) {
+  const existing = new Map(state.operatorEvents.map((event) => [event.id, event]));
+  (events || []).forEach((event) => {
+    const normalized = normalizeOperatorEvent(event, options);
+    if (!normalized.id || !normalized.type) return;
+    const previous = existing.get(normalized.id) || {};
+    existing.set(normalized.id, { ...previous, ...normalized });
+  });
+  state.operatorEvents = [...existing.values()]
+    .sort((left, right) => new Date(right.created_at || 0) - new Date(left.created_at || 0))
+    .slice(0, state.maxOperatorEvents);
+}
+
 function watchsetBySymbol(snapshot) {
   return new Map(((snapshot || {}).watchset || []).map((item) => [String(item.symbol || ""), item]));
 }
@@ -308,6 +361,7 @@ function selectSymbol(symbol, options = {}) {
   renderWatchset(snapshot.watchset || []);
   renderOperatorAlerts();
   renderDecisionTimeline();
+  renderOperatorEventJournal();
 }
 
 function deriveOperatorEvents(previousSnapshot, currentSnapshot) {
@@ -325,20 +379,23 @@ function deriveOperatorEvents(previousSnapshot, currentSnapshot) {
 }
 
 function appendOperatorEvents(events) {
-  if (!events.length) return;
+  if (!events.length) return [];
   const existingIds = new Set(state.operatorEvents.map((event) => event.id));
   const additions = [];
   events.forEach((event) => {
     const id = makeEventId(event);
     if (existingIds.has(id)) return;
     existingIds.add(id);
-    additions.push({ ...event, id, severity: eventSeverity(event), category: eventCategory(event) });
+    additions.push(normalizeOperatorEvent({ ...event, id, event_id: id, pending_sync: true }));
   });
-  if (!additions.length) return;
+  if (!additions.length) return [];
   state.operatorEvents = [...additions, ...state.operatorEvents].slice(0, state.maxOperatorEvents);
+  return additions;
 }
 
 function makeEventId(event) {
+  if (event.event_id) return String(event.event_id);
+  if (event.id) return String(event.id);
   if (["ORDER_INTENT_CREATED", "VIRTUAL_ORDER_CREATED"].includes(event.type) && event.candidate_instance_id) {
     return [event.type, event.candidate_instance_id].join(":");
   }
@@ -530,14 +587,18 @@ function eventSeverity(event) {
 }
 
 function eventCategory(event) {
-  if (["ORDER_INTENT_CREATED", "VIRTUAL_ORDER_CREATED"].includes(event.type)) return "ORDER";
-  if (["DATA_QUALITY_DEGRADED", "DATA_QUALITY_RECOVERED", "SNAPSHOT_STALE", "SNAPSHOT_RECOVERED"].includes(event.type)) return "DATA";
-  if (["MARKET_WAIT_STARTED", "MARKET_RECOVERED", "TOP_THEME_CHANGED", "TOP_LEADER_CHANGED"].includes(event.type)) return "MARKET";
+  if (["ORDER_INTENT_CREATED", "VIRTUAL_ORDER_CREATED"].includes(event.type)) return "order";
+  if (["DATA_QUALITY_DEGRADED", "DATA_QUALITY_RECOVERED"].includes(event.type)) return "data";
+  if (["SNAPSHOT_STALE", "SNAPSHOT_RECOVERED"].includes(event.type)) return "snapshot";
+  if (["GATEWAY_DISCONNECTED", "GATEWAY_RECOVERED"].includes(event.type)) return "gateway";
+  if (["MARKET_WAIT_STARTED", "MARKET_RECOVERED"].includes(event.type)) return "market";
+  if (["TOP_THEME_CHANGED", "TOP_LEADER_CHANGED"].includes(event.type)) return "theme";
+  if (["CHASE_RISK_BLOCKED", "LATE_CHASE_TEMP_WAIT", "READY_BUT_LIVE_BLOCKED"].includes(event.type)) return "risk";
   const severity = event.severity || eventSeverity(event);
-  if (severity === "OPPORTUNITY") return "OPPORTUNITY";
-  if (severity === "CRITICAL") return "CRITICAL";
-  if (severity === "WARNING") return "WARNING";
-  return "INFO";
+  if (severity === "OPPORTUNITY") return "opportunity";
+  if (severity === "CRITICAL") return "critical";
+  if (severity === "WARNING") return "warning";
+  return "info";
 }
 
 function renderOperatorAlerts() {
@@ -547,7 +608,7 @@ function renderOperatorAlerts() {
   if (!list || !count) return;
   updateOperatorFilterButtons();
   const filtered = filteredOperatorEvents();
-  const unackCount = state.operatorEvents.filter((event) => !state.acknowledgedEventIds.has(event.id)).length;
+  const unackCount = state.operatorEvents.filter((event) => !event.hidden && !state.acknowledgedEventIds.has(event.id)).length;
   text("operator-alert-count", unackCount);
   if (hideButton) {
     hideButton.classList.toggle("active", state.alertFilters.hideAcknowledged);
@@ -565,27 +626,36 @@ function updateOperatorFilterButtons() {
 function renderDecisionTimeline() {
   const list = document.getElementById("operator-timeline-list");
   if (!list) return;
-  list.innerHTML = state.operatorEvents.length
-    ? state.operatorEvents.slice(0, 20).map((event) => operatorEventRow(event, true)).join("")
+  const visible = state.operatorEvents.filter((event) => !event.hidden);
+  list.innerHTML = visible.length
+    ? visible.slice(0, 20).map((event) => operatorEventRow(event, true)).join("")
     : `<div class="operator-alert-empty">상태 변화가 감지되면 여기에 누적됩니다.</div>`;
 }
 
 function filteredOperatorEvents() {
   const filter = state.alertFilters.category || "ALL";
   return state.operatorEvents.filter((event) => {
+    if (event.hidden) return false;
     const acknowledged = state.acknowledgedEventIds.has(event.id);
     if (state.alertFilters.hideAcknowledged && acknowledged) return false;
-    if (filter === "ALL") return true;
-    return event.category === filter || event.severity === filter;
+    return matchesOperatorFilter(event, filter);
   });
+}
+
+function matchesOperatorFilter(event, filter) {
+  const normalizedFilter = String(filter || "ALL").toUpperCase();
+  if (normalizedFilter === "ALL") return true;
+  return String(event.severity || "").toUpperCase() === normalizedFilter
+    || String(event.category || "").toUpperCase() === normalizedFilter;
 }
 
 function operatorEventRow(event, compact = false) {
   const severity = event.severity || eventSeverity(event);
   const acknowledged = state.acknowledgedEventIds.has(event.id);
   const symbol = event.symbol || "";
+  const syncState = event.persisted ? "persisted" : event.pending_sync ? "pending-sync" : "";
   return `
-    <button class="operator-event-row ${severity.toLowerCase()} ${acknowledged ? "acknowledged" : ""} ${compact ? "compact" : ""}" data-event-id="${escapeHtml(event.id)}" data-symbol="${escapeHtml(symbol)}" type="button">
+    <button class="operator-event-row ${severity.toLowerCase()} ${acknowledged ? "acknowledged" : ""} ${compact ? "compact" : ""} ${syncState}" data-event-id="${escapeHtml(event.id)}" data-symbol="${escapeHtml(symbol)}" type="button">
       <span class="operator-event-main">
         ${badge(severity, severity.toLowerCase())}
         <strong>${escapeHtml(event.message || event.type)}</strong>
@@ -593,6 +663,220 @@ function operatorEventRow(event, compact = false) {
       <span class="operator-event-meta">${escapeHtml(formatEventTime(event.created_at))} · ${escapeHtml(event.type)}${symbol ? ` · ${escapeHtml(symbol)}` : ""}</span>
     </button>
   `;
+}
+
+function renderOperatorSessionReview(summary = state.operatorSessionSummary) {
+  const node = document.getElementById("operator-session-summary-cards");
+  if (!node) return;
+  const cards = [
+    ["총 이벤트", summary.total_count, "info"],
+    ["CRITICAL", summary.critical_count, "critical"],
+    ["WARNING", summary.warning_count, "warning"],
+    ["OPPORTUNITY", summary.opportunity_count, "opportunity"],
+    ["READY", summary.ready_event_count, "ready"],
+    ["LIVE 차단", summary.live_guard_blocked_count, "warning"],
+    ["주문 의도", summary.order_intent_created_count, "ready-small"],
+    ["데이터 저하", summary.data_quality_degraded_count, "warning"],
+    ["시장 대기", summary.market_wait_started_count, "wait"],
+    ["추격 차단", summary.chase_risk_blocked_count, "blocked"],
+    ["Gateway", summary.gateway_disconnected_count, "critical"],
+    ["Snapshot", summary.snapshot_stale_count, "warning"],
+  ];
+  node.innerHTML = cards.map(([label, value, tone]) => `
+    <article class="session-review-card ${tone}">
+      <span>${escapeHtml(label)}</span>
+      <strong>${Number(value || 0).toLocaleString("ko-KR")}</strong>
+    </article>
+  `).join("");
+}
+
+function renderOperatorEventJournal() {
+  const list = document.getElementById("operator-event-journal-list");
+  if (!list) return;
+  document.querySelectorAll("[data-journal-filter]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.journalFilter === state.journalFilter);
+  });
+  const visible = state.operatorEvents.filter((event) => !event.hidden);
+  const filtered = visible.filter((event) => {
+    if (state.journalFilter === "SYMBOL") return Boolean(state.selectedSymbol && event.symbol === state.selectedSymbol);
+    return matchesOperatorFilter(event, state.journalFilter);
+  });
+  text("operator-event-journal-count", `${filtered.length}/${visible.length}`);
+  list.innerHTML = filtered.length
+    ? filtered.slice(0, 120).map(eventJournalRow).join("")
+    : `<div class="operator-alert-empty">저장된 운영 이벤트가 없습니다.</div>`;
+}
+
+function eventJournalRow(event) {
+  const severity = event.severity || eventSeverity(event);
+  const acknowledged = state.acknowledgedEventIds.has(event.id);
+  const symbol = event.symbol || "";
+  const category = String(event.category || "info").toUpperCase();
+  const persisted = event.persisted ? "DB" : "PENDING";
+  return `
+    <button class="operator-event-row event-journal-row ${severity.toLowerCase()} ${acknowledged ? "acknowledged" : ""}" data-event-id="${escapeHtml(event.id)}" data-symbol="${escapeHtml(symbol)}" type="button">
+      <span class="operator-event-main">
+        ${badge(severity, severity.toLowerCase())}
+        <strong>${escapeHtml(event.message || event.type)}</strong>
+      </span>
+      <span class="operator-event-meta">${escapeHtml(formatEventTime(event.created_at))} · ${escapeHtml(event.type)} · ${escapeHtml(category)}${symbol ? ` · ${escapeHtml(symbol)}` : ""} · ${escapeHtml(persisted)}</span>
+    </button>
+  `;
+}
+
+function updateOperatorSyncStatus(message = "") {
+  const node = document.getElementById("operator-event-sync-status");
+  if (!node) return;
+  if (message) {
+    node.textContent = message;
+    return;
+  }
+  if (state.operatorEventSyncPending.length) {
+    node.textContent = `저장 지연 ${state.operatorEventSyncPending.length}건`;
+    return;
+  }
+  node.textContent = state.operatorEventServerBacked
+    ? `DB 동기화 ${formatEventTime(state.operatorEventLastSyncAt)}`
+    : "DB 연결 대기";
+}
+
+function operatorEventPayload(event) {
+  return {
+    event_id: event.id,
+    event_type: event.type,
+    severity: event.severity,
+    category: normalizeEventCategory(event.category),
+    occurred_at: event.created_at,
+    source: "themelab_dashboard",
+    symbol: event.symbol || "",
+    stock_name: event.stock_name || "",
+    primary_theme: event.primary_theme || "",
+    stock_role: event.stock_role || "",
+    candidate_instance_id: event.candidate_instance_id || "",
+    from_status: event.from_status || "",
+    to_status: event.to_status || "",
+    gate_status: event.gate_status || "",
+    display_status: event.display_status || "",
+    message_ko: event.message || event.type,
+    payload: { ...event },
+  };
+}
+
+async function persistOperatorEvents(events) {
+  const pending = (events || [])
+    .map((event) => normalizeOperatorEvent(event))
+    .filter((event) => event.id && !state.persistedEventIds.has(event.id));
+  if (!pending.length) return;
+  state.operatorEventSyncPending = pending.map((event) => event.id);
+  updateOperatorSyncStatus();
+  const response = await fetch("/api/themelab/operator-events", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ events: pending.map(operatorEventPayload) }),
+  });
+  const payload = await parseResponsePayload(response);
+  if (!response.ok) throw new Error(payload.detail || payload.error || `operator-events ${response.status}`);
+  pending.forEach((event) => {
+    state.persistedEventIds.add(event.id);
+    const current = state.operatorEvents.find((item) => item.id === event.id);
+    if (current) {
+      current.persisted = true;
+      current.pending_sync = false;
+    }
+  });
+  state.operatorEventSyncPending = state.operatorEventSyncPending.filter((eventId) => !state.persistedEventIds.has(eventId));
+  state.operatorEventServerBacked = true;
+  state.operatorEventLastSyncAt = new Date().toISOString();
+  updateOperatorSyncStatus();
+  renderOperatorEventJournal();
+  await fetchOperatorSessionReview();
+}
+
+async function fetchOperatorEvents() {
+  const response = await fetch("/api/themelab/operator-events?include_hidden=false&limit=200", { cache: "no-store" });
+  const payload = await parseResponsePayload(response);
+  if (!response.ok) throw new Error(payload.detail || payload.error || `operator-events ${response.status}`);
+  mergeOperatorEvents(payload.events || [], { persisted: true });
+  state.operatorEventServerBacked = true;
+  state.operatorEventLastSyncAt = new Date().toISOString();
+  saveAcknowledgedEventIds();
+  updateOperatorSyncStatus();
+  renderOperatorAlerts();
+  renderDecisionTimeline();
+  renderOperatorEventJournal();
+}
+
+async function fetchOperatorSessionReview() {
+  const response = await fetch("/api/themelab/operator-events/summary", { cache: "no-store" });
+  const payload = await parseResponsePayload(response);
+  if (!response.ok) throw new Error(payload.detail || payload.error || `operator-events summary ${response.status}`);
+  state.operatorSessionSummary = payload || {};
+  renderOperatorSessionReview(state.operatorSessionSummary);
+}
+
+async function acknowledgeOperatorEvents(eventIds) {
+  const ids = (eventIds || []).filter(Boolean);
+  if (!ids.length) return 0;
+  const response = await fetch("/api/themelab/operator-events/ack", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event_ids: ids, acknowledged_by: "operator" }),
+  });
+  const payload = await parseResponsePayload(response);
+  if (!response.ok) throw new Error(payload.detail || payload.error || `operator-events ack ${response.status}`);
+  if (Number(payload.updated_count || 0) < ids.length) throw new Error("ACK 대상이 DB에 아직 저장되지 않았습니다.");
+  const acknowledgedAt = new Date().toISOString();
+  ids.forEach((eventId) => {
+    state.acknowledgedEventIds.add(eventId);
+    const item = state.operatorEvents.find((event) => event.id === eventId);
+    if (item) {
+      item.acknowledged = true;
+      item.acknowledged_at = item.acknowledged_at || acknowledgedAt;
+    }
+  });
+  state.operatorEventServerBacked = true;
+  state.operatorEventLastSyncAt = acknowledgedAt;
+  saveAcknowledgedEventIds();
+  updateOperatorSyncStatus();
+  renderOperatorAlerts();
+  renderDecisionTimeline();
+  renderOperatorEventJournal();
+  return Number(payload.updated_count || 0);
+}
+
+async function hideOperatorEvents(eventIds) {
+  const ids = (eventIds || []).filter(Boolean);
+  if (!ids.length) return 0;
+  const response = await fetch("/api/themelab/operator-events/hide", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event_ids: ids }),
+  });
+  const payload = await parseResponsePayload(response);
+  if (!response.ok) throw new Error(payload.detail || payload.error || `operator-events hide ${response.status}`);
+  if (Number(payload.updated_count || 0) < ids.length) throw new Error("숨김 대상이 DB에 아직 저장되지 않았습니다.");
+  ids.forEach((eventId) => {
+    const item = state.operatorEvents.find((event) => event.id === eventId);
+    if (item) item.hidden = true;
+  });
+  state.operatorEventServerBacked = true;
+  state.operatorEventLastSyncAt = new Date().toISOString();
+  updateOperatorSyncStatus();
+  renderOperatorAlerts();
+  renderDecisionTimeline();
+  renderOperatorEventJournal();
+  await fetchOperatorSessionReview();
+  return Number(payload.updated_count || 0);
+}
+
+async function initOperatorEventJournal() {
+  try {
+    await Promise.all([fetchOperatorEvents(), fetchOperatorSessionReview()]);
+  } catch (error) {
+    updateOperatorSyncStatus(`DB 복원 실패: ${error.message || error}`);
+    renderOperatorSessionReview();
+    renderOperatorEventJournal();
+  }
 }
 
 function formatEventTime(value) {
@@ -604,7 +888,12 @@ function formatEventTime(value) {
 function render(snapshot) {
   const currentSnapshot = snapshot || {};
   const previousSnapshot = state.previousSnapshot;
-  if (previousSnapshot) appendOperatorEvents(deriveOperatorEvents(previousSnapshot, currentSnapshot));
+  const additions = previousSnapshot ? appendOperatorEvents(deriveOperatorEvents(previousSnapshot, currentSnapshot)) : [];
+  if (additions.length) {
+    persistOperatorEvents(additions).catch((error) => {
+      updateOperatorSyncStatus(`저장 실패: ${error.message || error}`);
+    });
+  }
   state.snapshot = currentSnapshot;
   const selected = selectedWatchItem(state.snapshot);
   state.selectedSymbol = selected.symbol || state.selectedSymbol || "";
@@ -621,6 +910,8 @@ function render(snapshot) {
   renderDataQuality(currentSnapshot.data_quality || {});
   renderOperatorAlerts();
   renderDecisionTimeline();
+  renderOperatorSessionReview();
+  renderOperatorEventJournal();
   updateKiwoomGatewayButton(currentSnapshot);
   state.previousSnapshot = currentSnapshot;
 }
@@ -1651,30 +1942,48 @@ function initFilters() {
     renderOperatorAlerts();
   });
   document.getElementById("operator-alert-ack-all")?.addEventListener("click", () => {
-    state.operatorEvents.forEach((event) => state.acknowledgedEventIds.add(event.id));
-    saveAcknowledgedEventIds();
-    renderOperatorAlerts();
-    renderDecisionTimeline();
+    const ids = state.operatorEvents
+      .filter((event) => !event.hidden && state.persistedEventIds.has(event.id) && !state.acknowledgedEventIds.has(event.id))
+      .map((event) => event.id);
+    acknowledgeOperatorEvents(ids).catch((error) => {
+      updateOperatorSyncStatus(`ACK 실패: ${error.message || error}`);
+    });
   });
   document.getElementById("operator-alert-hide-acknowledged")?.addEventListener("click", () => {
     state.alertFilters.hideAcknowledged = !state.alertFilters.hideAcknowledged;
     saveOperatorAlertFilter();
     renderOperatorAlerts();
+    if (state.alertFilters.hideAcknowledged) {
+      const ids = state.operatorEvents
+        .filter((event) => !event.hidden && state.persistedEventIds.has(event.id) && state.acknowledgedEventIds.has(event.id))
+        .map((event) => event.id);
+      hideOperatorEvents(ids).catch((error) => {
+        updateOperatorSyncStatus(`숨김 실패: ${error.message || error}`);
+      });
+    }
   });
-  ["operator-alert-list", "operator-timeline-list"].forEach((id) => {
+  document.getElementById("operator-event-journal-filters")?.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-journal-filter]");
+    if (!button) return;
+    state.journalFilter = button.dataset.journalFilter || "ALL";
+    renderOperatorEventJournal();
+  });
+  ["operator-alert-list", "operator-timeline-list", "operator-event-journal-list"].forEach((id) => {
     document.getElementById(id)?.addEventListener("click", (event) => {
       const row = event.target.closest("[data-event-id]");
       if (!row) return;
       const eventItem = state.operatorEvents.find((item) => item.id === row.dataset.eventId);
       if (!eventItem) return;
-      state.acknowledgedEventIds.add(eventItem.id);
-      saveAcknowledgedEventIds();
       if (eventItem.symbol) {
-        selectSymbol(eventItem.symbol, { source: "alert", acknowledgeEventId: eventItem.id });
-      } else {
-        renderOperatorAlerts();
-        renderDecisionTimeline();
+        selectSymbol(eventItem.symbol, { source: "alert" });
       }
+      acknowledgeOperatorEvents([eventItem.id])
+        .then(() => {
+          if (eventItem.symbol) selectSymbol(eventItem.symbol, { source: "alert", acknowledgeEventId: eventItem.id });
+        })
+        .catch((error) => {
+          updateOperatorSyncStatus(`ACK 실패: ${error.message || error}`);
+        });
     });
   });
   document.getElementById("chart-timeframe")?.addEventListener("click", (event) => {
@@ -1710,6 +2019,7 @@ function connectWs() {
 
 loadOperatorPreferences();
 initFilters();
+initOperatorEventJournal();
 fetchSnapshot().catch(() => {});
 connectWs();
 setInterval(() => fetchSnapshot().catch(() => {}), 5000);

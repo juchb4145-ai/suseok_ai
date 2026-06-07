@@ -82,6 +82,40 @@ KST = timezone(timedelta(hours=9), "KST")
 TRANSPORT_LIVE_WINDOW_SEC = 15 * 60
 LOG_LIVE_WINDOW_SEC = 5 * 60
 DASHBOARD_EVENT_PUSH_MIN_INTERVAL_SEC = 1.0
+THEMELAB_OPERATOR_EVENT_TYPES = {
+    "BUY_READY_NEW",
+    "BUY_READY_SMALL_NEW",
+    "READY_TO_WAIT",
+    "READY_BUT_LIVE_BLOCKED",
+    "ORDER_INTENT_CREATED",
+    "VIRTUAL_ORDER_CREATED",
+    "MARKET_WAIT_STARTED",
+    "MARKET_RECOVERED",
+    "DATA_QUALITY_DEGRADED",
+    "DATA_QUALITY_RECOVERED",
+    "CHASE_RISK_BLOCKED",
+    "LATE_CHASE_TEMP_WAIT",
+    "GATEWAY_DISCONNECTED",
+    "GATEWAY_RECOVERED",
+    "SNAPSHOT_STALE",
+    "SNAPSHOT_RECOVERED",
+    "TOP_THEME_CHANGED",
+    "TOP_LEADER_CHANGED",
+}
+THEMELAB_OPERATOR_EVENT_SEVERITIES = {"CRITICAL", "WARNING", "OPPORTUNITY", "INFO"}
+THEMELAB_OPERATOR_EVENT_CATEGORIES = {
+    "opportunity",
+    "warning",
+    "critical",
+    "order",
+    "data",
+    "market",
+    "gateway",
+    "snapshot",
+    "theme",
+    "risk",
+    "info",
+}
 
 
 def _build_gateway_state() -> GatewayStateStore:
@@ -1366,6 +1400,157 @@ def theme_lab_snapshot() -> dict[str, Any]:
         return build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_supervisor.status(), gateway_state=gateway_state)
     finally:
         close_database(db)
+
+
+@app.post("/api/themelab/operator-events")
+def ingest_theme_lab_operator_events(body: dict[str, Any]) -> dict[str, Any]:
+    events = body.get("events") if isinstance(body, dict) else []
+    if not isinstance(events, list):
+        raise HTTPException(status_code=400, detail="events must be a list")
+    normalized: list[dict[str, Any]] = []
+    rejected_count = 0
+    for event in events:
+        try:
+            normalized.append(_validate_theme_lab_operator_event(event))
+        except ValueError:
+            rejected_count += 1
+    db = open_database()
+    try:
+        result = db.save_operator_events(normalized)
+    finally:
+        close_database(db)
+    return {
+        "inserted_count": int(result.get("inserted_count") or 0),
+        "duplicate_count": int(result.get("duplicate_count") or 0),
+        "rejected_count": int(result.get("rejected_count") or 0) + rejected_count,
+    }
+
+
+@app.get("/api/themelab/operator-events")
+def list_theme_lab_operator_events(
+    trade_date: str | None = Query(None),
+    severity: str | None = Query(None),
+    category: str | None = Query(None),
+    symbol: str | None = Query(None),
+    include_acknowledged: bool = Query(True),
+    include_hidden: bool = Query(False),
+    limit: int = Query(200, ge=1, le=1000),
+) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    normalized_severity = str(severity or "").upper() or None
+    normalized_category = str(category or "").lower() or None
+    if normalized_severity and normalized_severity not in THEMELAB_OPERATOR_EVENT_SEVERITIES:
+        raise HTTPException(status_code=400, detail="invalid severity")
+    if normalized_category and normalized_category not in THEMELAB_OPERATOR_EVENT_CATEGORIES:
+        raise HTTPException(status_code=400, detail="invalid category")
+    db = open_database()
+    try:
+        events = db.list_operator_events(
+            resolved_trade_date,
+            severity=normalized_severity,
+            category=normalized_category,
+            symbol=symbol,
+            include_acknowledged=include_acknowledged,
+            include_hidden=include_hidden,
+            limit=limit,
+        )
+    finally:
+        close_database(db)
+    return {"trade_date": resolved_trade_date, "events": events}
+
+
+@app.post("/api/themelab/operator-events/ack")
+def acknowledge_theme_lab_operator_events(body: dict[str, Any]) -> dict[str, Any]:
+    event_ids = body.get("event_ids") if isinstance(body, dict) else []
+    if not isinstance(event_ids, list):
+        raise HTTPException(status_code=400, detail="event_ids must be a list")
+    db = open_database()
+    try:
+        updated_count = db.acknowledge_operator_events(
+            [str(event_id) for event_id in event_ids],
+            acknowledged_by=str(body.get("acknowledged_by") or "") if isinstance(body, dict) else "",
+        )
+    finally:
+        close_database(db)
+    return {"updated_count": updated_count}
+
+
+@app.post("/api/themelab/operator-events/hide")
+def hide_theme_lab_operator_events(body: dict[str, Any]) -> dict[str, Any]:
+    event_ids = body.get("event_ids") if isinstance(body, dict) else []
+    if not isinstance(event_ids, list):
+        raise HTTPException(status_code=400, detail="event_ids must be a list")
+    db = open_database()
+    try:
+        updated_count = db.hide_operator_events([str(event_id) for event_id in event_ids])
+    finally:
+        close_database(db)
+    return {"updated_count": updated_count}
+
+
+@app.get("/api/themelab/operator-events/summary")
+def theme_lab_operator_event_summary(trade_date: str | None = Query(None)) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    db = open_database()
+    try:
+        return db.summarize_operator_events(resolved_trade_date)
+    finally:
+        close_database(db)
+
+
+def _validate_theme_lab_operator_event(event: Any) -> dict[str, Any]:
+    if not isinstance(event, dict):
+        raise ValueError("event must be an object")
+    event_type = str(event.get("event_type") or event.get("type") or "").strip()
+    severity = str(event.get("severity") or "").strip().upper()
+    category = str(event.get("category") or "").strip().lower()
+    event_id = str(event.get("event_id") or event.get("id") or "").strip()
+    occurred_at = str(event.get("occurred_at") or event.get("created_at") or datetime.now(KST).isoformat(timespec="seconds")).strip()
+    message = str(event.get("message_ko") or event.get("message") or "").strip()
+    if event_type not in THEMELAB_OPERATOR_EVENT_TYPES:
+        raise ValueError("invalid event_type")
+    if severity not in THEMELAB_OPERATOR_EVENT_SEVERITIES:
+        raise ValueError("invalid severity")
+    if category not in THEMELAB_OPERATOR_EVENT_CATEGORIES:
+        raise ValueError("invalid category")
+    if not event_id or not message:
+        raise ValueError("missing required fields")
+    payload = dict(event.get("payload") or event)
+    return {
+        "event_id": event_id,
+        "trade_date": str(event.get("trade_date") or _theme_lab_trade_date(None, occurred_at=occurred_at)),
+        "occurred_at": occurred_at,
+        "received_at": datetime.now(KST).isoformat(timespec="seconds"),
+        "source": str(event.get("source") or "themelab_dashboard"),
+        "event_type": event_type,
+        "severity": severity,
+        "category": category,
+        "symbol": str(event.get("symbol") or ""),
+        "stock_name": str(event.get("stock_name") or ""),
+        "primary_theme": str(event.get("primary_theme") or ""),
+        "stock_role": str(event.get("stock_role") or ""),
+        "candidate_instance_id": str(event.get("candidate_instance_id") or ""),
+        "from_status": str(event.get("from_status") or ""),
+        "to_status": str(event.get("to_status") or ""),
+        "gate_status": str(event.get("gate_status") or ""),
+        "display_status": str(event.get("display_status") or ""),
+        "message_ko": message,
+        "payload": payload,
+        "acknowledged_at": str(event.get("acknowledged_at") or ""),
+        "acknowledged_by": str(event.get("acknowledged_by") or ""),
+        "hidden": bool(event.get("hidden")),
+        "snoozed_until": str(event.get("snoozed_until") or ""),
+    }
+
+
+def _theme_lab_trade_date(trade_date: str | None, *, occurred_at: str | None = None) -> str:
+    explicit = str(trade_date or "").strip()
+    if explicit:
+        return explicit[:10]
+    timestamp = str(occurred_at or "").strip()
+    if len(timestamp) >= 10 and timestamp[4] == "-" and timestamp[7] == "-":
+        return timestamp[:10]
+    return datetime.now(KST).date().isoformat()
 
 
 @app.post("/api/gateway/events")

@@ -40,8 +40,15 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#operator-timeline-list") is not None
     assert soup.select_one("#operator-alert-ack-all") is not None
     assert soup.select_one("#operator-alert-hide-acknowledged") is not None
+    assert soup.select_one("#operator-session-review") is not None
+    assert soup.select_one("#operator-event-sync-status") is not None
+    assert soup.select_one("#operator-session-summary-cards") is not None
+    assert soup.select_one("#operator-event-journal") is not None
+    assert soup.select_one("#operator-event-journal-filters") is not None
+    assert soup.select_one("#operator-event-journal-list") is not None
     assert soup.select_one('[data-alert-filter="OPPORTUNITY"]') is not None
     assert soup.select_one('[data-alert-filter="CRITICAL"]') is not None
+    assert soup.select_one('[data-journal-filter="SYMBOL"]') is not None
     assert soup.select_one("#cockpit-market-sides") is not None
     assert soup.select_one("#cockpit-live-readiness") is not None
     assert soup.select_one("#theme-rank-list") is not None
@@ -79,13 +86,26 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "previousSnapshot" in js
     assert "operatorEvents" in js
     assert "acknowledgedEventIds" in js
+    assert "persistedEventIds" in js
+    assert "operatorSessionSummary" in js
+    assert "journalFilter" in js
     assert "alertFilters" in js
     assert "maxOperatorEvents: 200" in js
     assert "deriveOperatorEvents" in js
     assert "appendOperatorEvents" in js
     assert "makeEventId" in js
+    assert "persistOperatorEvents" in js
+    assert "fetchOperatorEvents" in js
+    assert "fetchOperatorSessionReview" in js
     assert "renderOperatorAlerts" in js
     assert "renderDecisionTimeline" in js
+    assert "renderOperatorSessionReview" in js
+    assert "renderOperatorEventJournal" in js
+    assert "acknowledgeOperatorEvents" in js
+    assert "hideOperatorEvents" in js
+    assert "/api/themelab/operator-events" in js
+    assert "/api/themelab/operator-events/summary" in js
+    assert "/api/themelab/operator-events/ack" in js
     assert "eventSeverity" in js
     assert "eventCategory" in js
     assert "selectSymbol" in js
@@ -120,6 +140,8 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "snapshot_age_label" in js
     assert ".chart-ref.vwap" in css
     assert "operator-alert-panel" in css
+    assert "session-review-card" in css
+    assert "operator-event-journal-list" in css
     assert ".critical" in css
     assert ".warning" in css
     assert ".opportunity" in css
