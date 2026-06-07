@@ -65,17 +65,39 @@
           <div id="theme-rank-list" class="rank-list"></div>
         </aside>
 
-        <section class="panel chart-panel">
+        <section id="candidate-focus-panel" class="panel chart-panel candidate-focus-panel">
           <div class="panel-head chart-head">
             <div>
-              <h2 id="chart-title">Chart Focus</h2>
+              <h2>Candidate Focus</h2>
+              <p id="chart-title">선택 후보 대기</p>
               <p id="chart-subtitle">분봉 데이터 수신 전입니다.</p>
             </div>
-            <div class="segmented">
-              <button class="active" type="button">1m</button>
-              <button type="button">3m</button>
-              <button type="button">5m</button>
+            <div id="chart-timeframe" class="segmented" aria-label="분봉 주기">
+              <button class="active" data-chart-interval="1m" type="button" aria-pressed="true">1m</button>
+              <button data-chart-interval="3m" type="button" aria-pressed="false">3m</button>
+              <button data-chart-interval="5m" type="button" disabled title="5m 분봉 데이터 미지원" aria-pressed="false">5m 미지원</button>
             </div>
+          </div>
+          <div id="candidate-focus" class="candidate-focus">
+            <div id="focus-summary" class="focus-summary-grid"></div>
+            <section class="focus-section" aria-label="Decision Checklist">
+              <div class="focus-section-head">
+                <h3>Decision Checklist</h3>
+                <span id="focus-next-check" class="counter">대기</span>
+              </div>
+              <div id="decision-checklist" class="decision-checklist"></div>
+            </section>
+            <section class="focus-section" aria-label="Price Position Map">
+              <div class="focus-section-head">
+                <h3>Price Position Map</h3>
+                <span id="focus-price-state" class="counter">데이터 대기</span>
+              </div>
+              <div id="price-map" class="price-map"></div>
+            </section>
+          </div>
+          <div class="focus-chart-head">
+            <h3>Minute Chart</h3>
+            <span id="chart-interval-state" class="counter">1m</span>
           </div>
           <div id="chart-stage" class="chart-stage">
             <div class="empty-chart">

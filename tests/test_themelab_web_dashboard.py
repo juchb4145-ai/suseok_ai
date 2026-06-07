@@ -36,6 +36,14 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#cockpit-market-sides") is not None
     assert soup.select_one("#cockpit-live-readiness") is not None
     assert soup.select_one("#theme-rank-list") is not None
+    assert soup.select_one("#candidate-focus-panel") is not None
+    assert soup.select_one("#focus-summary") is not None
+    assert soup.select_one("#decision-checklist") is not None
+    assert soup.select_one("#price-map") is not None
+    assert soup.select_one("#chart-timeframe") is not None
+    assert soup.select_one('[data-chart-interval="1m"]') is not None
+    assert soup.select_one('[data-chart-interval="3m"]') is not None
+    assert soup.select_one('[data-chart-interval="5m"][disabled]') is not None
     assert soup.select_one("#chart-stage") is not None
     assert soup.select_one("#gate-status") is not None
     assert soup.select_one("#gate-display-status") is not None
@@ -59,10 +67,21 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "gateway_unhealthy_display" in js
     assert "matchesFilters" in js
     assert "renderCockpit" in js
+    assert 'chartInterval: "1m"' in js
+    assert "renderFocusPanel" in js
+    assert "selectedChartForSymbol" in js
+    assert "chartFromWatchItem" in js
+    assert "renderDecisionChecklist" in js
+    assert "renderPriceMap" in js
+    assert "renderFocusPanel(item, selectedChart)" in js
+    assert "renderChart(selectedChart)" in js
     assert "minuteChartSvg" in js
     assert "RUNTIME_INACTIVE" in js
     assert "snapshot_age_label" in js
     assert ".chart-ref.vwap" in css
+    assert "candidate-focus-panel" in css
+    assert "decision-checklist" in css
+    assert "price-track" in css
     assert "button:disabled" in css
 
 
@@ -101,6 +120,58 @@ def test_theme_lab_snapshot_sorts_watchset_and_filters_entry_candidates(tmp_path
     assert {"KOSPI", "KOSDAQ", "000001", "000002"}.issubset(universe)
     assert "000004" not in universe
     assert payload["data_quality"]["vi_status_supported"] is False
+
+
+def test_theme_lab_snapshot_adds_candidate_focus_operating_fields(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        ready = _watch("000101", "READY", role="LEADER")
+        ready.update(
+            {
+                "current_price": 1060,
+                "vwap": 1055,
+                "recent_support_price": 1030,
+                "support_price": 1020,
+                "breakout_level": 1050,
+                "upper_limit_price": 1300,
+                "live_order_enabled": True,
+                "live_order_guard_passed": True,
+                "submittable": True,
+                "recheck_after_sec": 45,
+            }
+        )
+        data_wait = _watch("000102", "WAIT")
+        data_wait.update({"support_ready_reason": "WAIT_DATA_SUPPORT_NOT_READY", "diagnostic_only": True})
+        market_wait = _watch("000103", "WAIT")
+        market_wait.update({"candidate_market": "KOSDAQ", "candidate_market_confirmation_pending": True, "market_side_recheck_after_sec": 30})
+        chase_blocked = _watch("000104", "BLOCKED")
+        chase_blocked.update({"chase_risk": True, "risk_reason_codes": ["CHASE_RISK"]})
+        db.save_theme_lab_flow_result(
+            "09:01:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [data_wait, market_wait, chase_blocked, ready],
+                "gate_decisions": [],
+                "data_quality": {"status": "OK"},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    rows = {item["symbol"]: item for item in payload["watchset"]}
+    assert rows["000101"]["operator_action"] == "BUY_READY"
+    assert rows["000101"]["next_recheck_after_sec"] == 45
+    assert rows["000101"]["decision_checklist"]["order_link"] == "READY"
+    assert rows["000101"]["price_map"]["current_price"] == 1060
+    assert rows["000102"]["operator_action"] == "DATA_WAIT"
+    assert rows["000102"]["decision_checklist"]["data"] == "DEGRADED"
+    assert rows["000103"]["operator_action"] == "MARKET_WAIT"
+    assert rows["000103"]["decision_checklist"]["market"] == "WAIT"
+    assert rows["000104"]["operator_action"] == "CHASE_BLOCKED"
+    assert rows["000104"]["decision_checklist"]["chase_risk"] == "BLOCK"
 
 
 def test_theme_lab_snapshot_merges_risk_off_details_from_gate_decisions(tmp_path):

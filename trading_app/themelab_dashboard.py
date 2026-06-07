@@ -1537,7 +1537,7 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
         "momentum_1m_missing_reason": momentum_1m_missing_reason,
         "momentum_3m_missing_reason": momentum_3m_missing_reason,
     }
-    return {
+    row = {
         "gate_status": gate,
         "final_status": gate,
         "display_status": display_status,
@@ -1693,6 +1693,12 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
             "seconds_since_vi_release": item.get("seconds_since_vi_release"),
         },
     }
+    next_recheck_after_sec = _recheck_seconds(row)
+    row["operator_action"] = _operator_action(row)
+    row["next_recheck_after_sec"] = next_recheck_after_sec if next_recheck_after_sec != 999999 else None
+    row["decision_checklist"] = _decision_checklist(row)
+    row["price_map"] = _price_map(row)
+    return row
 
 
 def _entry_row(item: dict[str, Any], priority: int) -> dict[str, Any]:
@@ -1874,6 +1880,112 @@ def _recheck_seconds(row: dict[str, Any]) -> int:
     ]
     positives = [value for value in candidates if value > 0]
     return min(positives) if positives else 999999
+
+
+def _operator_action(row: dict[str, Any]) -> str:
+    gate = str(row.get("gate_status") or "")
+    display = str(row.get("display_status") or gate)
+    ready_like = gate in {"READY", "READY_SMALL"}
+    if ready_like and row.get("submittable") and row.get("live_order_guard_passed"):
+        return "BUY_READY"
+    if ready_like and not row.get("live_order_guard_passed"):
+        return "LIVE_GUARD_BLOCKED"
+    if row.get("diagnostic_only") or display.startswith("WAIT_DATA"):
+        return "DATA_WAIT"
+    if _is_market_pending(row) or display.startswith("WAIT_CANDIDATE_MARKET") or str(row.get("market_confirmed_status") or "") == "RISK_OFF":
+        return "MARKET_WAIT"
+    if row.get("chase_risk") or display == "CHASE_RISK_BLOCKED":
+        return "CHASE_BLOCKED"
+    return "OBSERVE"
+
+
+def _decision_checklist(row: dict[str, Any]) -> dict[str, str]:
+    return {
+        "market": _market_decision(row),
+        "theme": _theme_decision(row),
+        "role": _role_decision(row),
+        "price_location": _price_location_decision(row),
+        "data": _data_decision(row),
+        "chase_risk": _chase_decision(row),
+        "order_link": _order_decision(row),
+    }
+
+
+def _market_decision(row: dict[str, Any]) -> str:
+    display = str(row.get("display_status") or "")
+    status = str(row.get("market_confirmed_status") or row.get("candidate_market_status") or "")
+    if status == "RISK_OFF" or "RISK_OFF" in display:
+        return "BLOCK"
+    if _is_market_pending(row) or status in {"WEAK", "CHOPPY"}:
+        return "WAIT"
+    return "PASS"
+
+
+def _theme_decision(row: dict[str, Any]) -> str:
+    status = str(row.get("theme_status") or "").upper()
+    try:
+        theme_score = float(row.get("theme_score") or 0)
+    except (TypeError, ValueError):
+        theme_score = 0.0
+    if "WEAK" in status or theme_score < 40:
+        return "WEAK"
+    if "WATCH" in status or theme_score < 65:
+        return "WATCH"
+    return "PASS"
+
+
+def _role_decision(row: dict[str, Any]) -> str:
+    role = str(row.get("stock_role") or "WEAK_MEMBER")
+    return role if role in {"LEADER", "CO_LEADER", "FOLLOWER", "LATE_LAGGARD", "WEAK_MEMBER"} else "WEAK_MEMBER"
+
+
+def _price_location_decision(row: dict[str, Any]) -> str:
+    display = str(row.get("display_status") or "")
+    status = str(row.get("price_location_status") or "")
+    if display.startswith("WAIT_DATA") or status == "UNKNOWN":
+        return "DATA_WAIT"
+    if status in {"FAILED_BREAKOUT", "DEEP_PULLBACK"}:
+        return "WAIT"
+    if row.get("chase_risk") or display == "CHASE_RISK_BLOCKED":
+        return "BLOCK"
+    return "PASS"
+
+
+def _data_decision(row: dict[str, Any]) -> str:
+    flags = set(row.get("data_quality_flags") or []) | set(row.get("price_location_data_quality_flags") or [])
+    if _is_data_not_ready(row):
+        return "DEGRADED"
+    return "WARNING" if flags else "OK"
+
+
+def _chase_decision(row: dict[str, Any]) -> str:
+    display = str(row.get("display_status") or "")
+    if row.get("chase_risk") or display == "CHASE_RISK_BLOCKED":
+        return "BLOCK"
+    if display == "LATE_CHASE_TEMP_WAIT" or row.get("late_chase_level"):
+        return "WAIT"
+    return "PASS"
+
+
+def _order_decision(row: dict[str, Any]) -> str:
+    if row.get("runtime_order_intent_created"):
+        return "INTENT_CREATED"
+    if str(row.get("gate_status") or "") in {"READY", "READY_SMALL"} and not row.get("live_order_guard_passed"):
+        return "LIVE_BLOCKED"
+    if row.get("submittable") and row.get("live_order_guard_passed"):
+        return "READY"
+    return "OBSERVE"
+
+
+def _price_map(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "current_price": row.get("current_price"),
+        "vwap": row.get("vwap"),
+        "recent_support_price": row.get("recent_support_price"),
+        "support_price": row.get("support_price"),
+        "breakout_level": row.get("breakout_level"),
+        "upper_limit_price": row.get("upper_limit_price"),
+    }
 
 
 PRICE_LOCATION_MISSING_LABELS = {

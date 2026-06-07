@@ -263,6 +263,10 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   flex-direction: column;
 }
 
+.candidate-focus-panel {
+  gap: 10px;
+}
+
 .chart-head {
   align-items: center;
 }
@@ -270,6 +274,169 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
 .segmented {
   display: flex;
   gap: 6px;
+}
+
+.candidate-focus {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.focus-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.focus-card,
+.focus-section {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+}
+
+.focus-card {
+  padding: 10px;
+}
+
+.focus-card > span,
+.focus-section-head h3,
+.price-metric span,
+.check-pill em {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.focus-card strong {
+  display: block;
+  min-height: 26px;
+  margin-top: 5px;
+  color: var(--text);
+  line-height: 1.45;
+}
+
+.focus-card p {
+  margin-top: 6px;
+  color: var(--sub);
+  line-height: 1.45;
+}
+
+.empty-focus {
+  grid-column: 1 / -1;
+}
+
+.focus-section {
+  padding: 10px;
+}
+
+.focus-section-head,
+.focus-chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.focus-chart-head {
+  margin: 2px 0 8px;
+}
+
+.decision-checklist {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.check-pill {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  border: 1px solid var(--border-active);
+  border-radius: 5px;
+  background: #0b1220;
+  padding: 7px 8px;
+  font-weight: 900;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.price-map {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.price-track {
+  position: relative;
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: linear-gradient(90deg, rgba(16, 185, 129, 0.16), rgba(250, 204, 21, 0.16), rgba(239, 68, 68, 0.14));
+}
+
+.price-marker {
+  position: absolute;
+  top: 3px;
+  transform: translateX(-50%);
+  display: grid;
+  justify-items: center;
+  gap: 2px;
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.price-marker i {
+  display: block;
+  width: 2px;
+  height: 18px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+.price-marker.current_price { color: var(--text); }
+.price-marker.vwap { color: var(--ready-small); }
+.price-marker.support_price,
+.price-marker.recent_support_price { color: var(--ready); }
+.price-marker.breakout_level { color: var(--wait); }
+.price-marker.upper_limit_price { color: var(--warning); }
+
+.price-metrics {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.price-metric {
+  min-width: 0;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 5px;
+}
+
+.price-metric strong {
+  display: block;
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.price-map-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 58px;
+  border: 1px dashed var(--border-active);
+  border-radius: 6px;
+  color: var(--muted);
+  font-weight: 900;
 }
 
 .chart-stage {
@@ -286,6 +453,11 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   align-items: stretch;
   justify-content: stretch;
   position: relative;
+}
+
+.candidate-focus-panel .chart-stage {
+  flex: 0 0 auto;
+  min-height: 220px;
 }
 
 .empty-chart {
@@ -307,6 +479,10 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   display: block;
   width: 100%;
   min-height: 320px;
+}
+
+.candidate-focus-panel .minute-chart {
+  min-height: 220px;
 }
 
 .chart-bg {
@@ -544,5 +720,10 @@ tbody tr.selected {
   .market-header {
     align-items: flex-start;
     flex-direction: column;
+  }
+  .focus-summary-grid,
+  .decision-checklist,
+  .price-metrics {
+    grid-template-columns: 1fr;
   }
 }
