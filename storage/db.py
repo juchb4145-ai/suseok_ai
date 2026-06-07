@@ -339,6 +339,53 @@ class TradingDatabase:
                 ON dashboard_operator_actions(symbol, trade_date);
             CREATE INDEX IF NOT EXISTS idx_dashboard_operator_actions_candidate_instance
                 ON dashboard_operator_actions(candidate_instance_id);
+            CREATE TABLE IF NOT EXISTS dashboard_postmarket_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                review_id TEXT NOT NULL UNIQUE,
+                trade_date TEXT NOT NULL,
+                generated_at TEXT NOT NULL,
+                review_scope TEXT NOT NULL,
+                symbol TEXT,
+                stock_name TEXT,
+                primary_theme TEXT,
+                stock_role TEXT,
+                candidate_instance_id TEXT,
+                event_id TEXT,
+                event_type TEXT,
+                source_status TEXT,
+                block_reason TEXT,
+                block_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                base_time TEXT,
+                base_price REAL,
+                price_1m REAL,
+                price_3m REAL,
+                price_5m REAL,
+                price_10m REAL,
+                price_close_or_last REAL,
+                return_1m_pct REAL,
+                return_3m_pct REAL,
+                return_5m_pct REAL,
+                return_10m_pct REAL,
+                return_close_or_last_pct REAL,
+                outcome_label TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                confidence_reason TEXT,
+                recommendation_ko TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_dashboard_postmarket_reviews_trade_date_generated
+                ON dashboard_postmarket_reviews(trade_date, generated_at);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_postmarket_reviews_trade_date_outcome
+                ON dashboard_postmarket_reviews(trade_date, outcome_label);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_postmarket_reviews_trade_date_event_type
+                ON dashboard_postmarket_reviews(trade_date, event_type);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_postmarket_reviews_symbol_trade_date
+                ON dashboard_postmarket_reviews(symbol, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_postmarket_reviews_candidate_instance
+                ON dashboard_postmarket_reviews(candidate_instance_id);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_postmarket_reviews_event
+                ON dashboard_postmarket_reviews(event_id);
             CREATE TABLE IF NOT EXISTS market_side_confirmation_state (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trade_date TEXT NOT NULL,
@@ -3528,6 +3575,175 @@ class TradingDatabase:
             "by_action_type": dict(type_counts),
         }
 
+    def save_postmarket_review_item(self, item: dict) -> bool:
+        normalized = _normalize_postmarket_review_item(item)
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO dashboard_postmarket_reviews(
+                    review_id, trade_date, generated_at, review_scope,
+                    symbol, stock_name, primary_theme, stock_role,
+                    candidate_instance_id, event_id, event_type, source_status,
+                    block_reason, block_reason_codes_json, base_time, base_price,
+                    price_1m, price_3m, price_5m, price_10m,
+                    price_close_or_last, return_1m_pct, return_3m_pct,
+                    return_5m_pct, return_10m_pct, return_close_or_last_pct,
+                    outcome_label, confidence, confidence_reason,
+                    recommendation_ko, payload_json
+                ) VALUES (
+                    :review_id, :trade_date, :generated_at, :review_scope,
+                    :symbol, :stock_name, :primary_theme, :stock_role,
+                    :candidate_instance_id, :event_id, :event_type, :source_status,
+                    :block_reason, :block_reason_codes_json, :base_time, :base_price,
+                    :price_1m, :price_3m, :price_5m, :price_10m,
+                    :price_close_or_last, :return_1m_pct, :return_3m_pct,
+                    :return_5m_pct, :return_10m_pct, :return_close_or_last_pct,
+                    :outcome_label, :confidence, :confidence_reason,
+                    :recommendation_ko, :payload_json
+                )
+                """,
+                normalized,
+            )
+        return cursor.rowcount == 1
+
+    def save_postmarket_review_items(self, items: list[dict]) -> dict:
+        inserted = 0
+        duplicate = 0
+        rejected = 0
+        for item in items or []:
+            try:
+                if self.save_postmarket_review_item(item):
+                    inserted += 1
+                else:
+                    duplicate += 1
+            except (TypeError, ValueError, sqlite3.Error):
+                rejected += 1
+        return {"inserted_count": inserted, "duplicate_count": duplicate, "rejected_count": rejected}
+
+    def list_postmarket_review_items(
+        self,
+        trade_date: str,
+        *,
+        review_scope: str | None = None,
+        outcome_label: str | None = None,
+        event_type: str | None = None,
+        symbol: str | None = None,
+        primary_theme: str | None = None,
+        min_return_5m_pct: float | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[dict]:
+        where = ["trade_date = ?"]
+        params: list[object] = [str(trade_date or "")]
+        if review_scope:
+            where.append("review_scope = ?")
+            params.append(str(review_scope).lower())
+        if outcome_label:
+            where.append("outcome_label = ?")
+            params.append(str(outcome_label).upper())
+        if event_type:
+            where.append("event_type = ?")
+            params.append(str(event_type).upper())
+        if symbol:
+            where.append("symbol = ?")
+            params.append(str(symbol))
+        if primary_theme:
+            where.append("primary_theme = ?")
+            params.append(str(primary_theme))
+        if min_return_5m_pct is not None:
+            where.append("return_5m_pct >= ?")
+            params.append(float(min_return_5m_pct))
+        normalized_limit = max(1, min(1000, int(limit or 200)))
+        normalized_offset = max(0, int(offset or 0))
+        params.extend([normalized_limit, normalized_offset])
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM dashboard_postmarket_reviews
+            WHERE {" AND ".join(where)}
+            ORDER BY generated_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            params,
+        ).fetchall()
+        return [_postmarket_review_row_to_dict(row) for row in rows]
+
+    def summarize_postmarket_reviews(self, trade_date: str) -> dict:
+        items = self.list_postmarket_review_items(trade_date, limit=1000)
+        outcome_counts = Counter(str(item.get("outcome_label") or "").upper() for item in items)
+        type_counts = Counter(str(item.get("event_type") or "") for item in items if item.get("event_type"))
+        reason_counts = Counter(str(item.get("block_reason") or "") for item in items if item.get("block_reason"))
+        symbol_counts = Counter(str(item.get("symbol") or "") for item in items if item.get("symbol"))
+        theme_counts = Counter(str(item.get("primary_theme") or "") for item in items if item.get("primary_theme"))
+        return {
+            "trade_date": str(trade_date or ""),
+            "total_count": len(items),
+            "ready_count": type_counts.get("BUY_READY_NEW", 0),
+            "ready_small_count": type_counts.get("BUY_READY_SMALL_NEW", 0),
+            "ready_without_order_count": sum(
+                1
+                for item in items
+                if str(item.get("event_type") or "").upper() in {"BUY_READY_NEW", "BUY_READY_SMALL_NEW", "READY_BUT_LIVE_BLOCKED"}
+                and not bool((item.get("payload") or {}).get("has_order"))
+            ),
+            "ready_but_live_blocked_count": type_counts.get("READY_BUT_LIVE_BLOCKED", 0),
+            "order_intent_created_count": type_counts.get("ORDER_INTENT_CREATED", 0),
+            "virtual_order_created_count": type_counts.get("VIRTUAL_ORDER_CREATED", 0),
+            "data_wait_count": type_counts.get("DATA_QUALITY_DEGRADED", 0) + type_counts.get("SNAPSHOT_STALE", 0),
+            "market_wait_count": type_counts.get("MARKET_WAIT_STARTED", 0),
+            "chase_blocked_count": type_counts.get("CHASE_RISK_BLOCKED", 0),
+            "late_chase_temp_wait_count": type_counts.get("LATE_CHASE_TEMP_WAIT", 0),
+            "observe_count": type_counts.get("READY_TO_WAIT", 0),
+            "blocked_count": sum(
+                type_counts.get(event_type, 0)
+                for event_type in {
+                    "READY_TO_WAIT",
+                    "MARKET_WAIT_STARTED",
+                    "DATA_QUALITY_DEGRADED",
+                    "SNAPSHOT_STALE",
+                    "GATEWAY_DISCONNECTED",
+                    "CHASE_RISK_BLOCKED",
+                    "LATE_CHASE_TEMP_WAIT",
+                }
+            ),
+            "missed_opportunity_count": outcome_counts.get("MISSED_OPPORTUNITY", 0),
+            "good_block_count": outcome_counts.get("GOOD_BLOCK", 0),
+            "review_needed_count": outcome_counts.get("REVIEW_NEEDED", 0),
+            "protected_from_chase_count": outcome_counts.get("PROTECTED_FROM_CHASE", 0),
+            "protected_from_loss_count": outcome_counts.get("PROTECTED_FROM_CHASE", 0) + outcome_counts.get("GOOD_BLOCK", 0),
+            "data_insufficient_count": outcome_counts.get("DATA_INSUFFICIENT", 0),
+            "uncertain_block_count": outcome_counts.get("REVIEW_NEEDED", 0) + outcome_counts.get("DATA_INSUFFICIENT", 0),
+            "neutral_count": outcome_counts.get("NEUTRAL", 0),
+            "by_outcome_label": dict(outcome_counts),
+            "by_event_type": dict(type_counts),
+            "by_block_reason": [{"block_reason": reason, "count": count} for reason, count in reason_counts.most_common(20)],
+            "by_symbol": [{"symbol": symbol, "count": count} for symbol, count in symbol_counts.most_common(20)],
+            "by_theme": [{"primary_theme": theme, "count": count} for theme, count in theme_counts.most_common(20)],
+            "top_missed_opportunities": _top_postmarket_items(items, "MISSED_OPPORTUNITY"),
+            "top_good_blocks": _top_postmarket_items(items, "GOOD_BLOCK"),
+            "top_review_needed": _top_postmarket_items(items, "REVIEW_NEEDED"),
+        }
+
+    def delete_postmarket_reviews_for_date(self, trade_date: str, review_scope: str | None = None) -> int:
+        where = ["trade_date = ?"]
+        params: list[object] = [str(trade_date or "")]
+        if review_scope:
+            where.append("review_scope = ?")
+            params.append(str(review_scope).lower())
+        with self.conn:
+            cursor = self.conn.execute(
+                f"DELETE FROM dashboard_postmarket_reviews WHERE {' AND '.join(where)}",
+                params,
+            )
+        return cursor.rowcount
+
+    def rebuild_postmarket_reviews(self, trade_date: str, review_scope: str = "postmarket") -> dict:
+        from trading_app.dashboard_postmarket_review import build_postmarket_review
+
+        report = build_postmarket_review(self, trade_date=trade_date, review_scope=review_scope)
+        result = self.save_postmarket_review_items(list(report.get("items") or []))
+        return {**report, **result}
+
     def upsert_market_side_confirmation_state(self, payload: dict) -> dict:
         normalized = _market_side_confirmation_state_params(payload)
         with self.conn:
@@ -5768,6 +5984,92 @@ def _operator_action_row_to_dict(row: sqlite3.Row) -> dict:
     return data
 
 
+def _normalize_postmarket_review_item(item: dict) -> dict:
+    if not isinstance(item, dict):
+        raise ValueError("postmarket review item must be a dict")
+    generated_at = str(item.get("generated_at") or datetime.now().isoformat(timespec="seconds"))
+    event_id = str(item.get("event_id") or "")
+    candidate_instance_id = str(item.get("candidate_instance_id") or "")
+    event_type = str(item.get("event_type") or "").upper()
+    symbol = str(item.get("symbol") or "")
+    review_id = str(item.get("review_id") or "").strip()
+    if not review_id:
+        review_id = ":".join(
+            [
+                "postmarket",
+                str(item.get("trade_date") or _trade_date_from_timestamp(generated_at) or datetime.now().date().isoformat()),
+                str(item.get("review_scope") or "postmarket"),
+                event_id or candidate_instance_id or symbol or f"item_{uuid4().hex}",
+                event_type or "UNKNOWN",
+            ]
+        )
+    outcome_label = str(item.get("outcome_label") or "").strip().upper()
+    confidence = str(item.get("confidence") or "LOW").strip().upper()
+    if not outcome_label:
+        raise ValueError("postmarket review item missing outcome_label")
+    block_reason_codes = item.get("block_reason_codes")
+    if block_reason_codes is None:
+        block_reason_codes = item.get("block_reason_codes_json")
+    return {
+        "review_id": review_id,
+        "trade_date": str(item.get("trade_date") or _trade_date_from_timestamp(generated_at) or datetime.now().date().isoformat()),
+        "generated_at": generated_at,
+        "review_scope": str(item.get("review_scope") or "postmarket").lower(),
+        "symbol": symbol or None,
+        "stock_name": str(item.get("stock_name") or "") or None,
+        "primary_theme": str(item.get("primary_theme") or "") or None,
+        "stock_role": str(item.get("stock_role") or "") or None,
+        "candidate_instance_id": candidate_instance_id or None,
+        "event_id": event_id or None,
+        "event_type": event_type or None,
+        "source_status": str(item.get("source_status") or "") or None,
+        "block_reason": str(item.get("block_reason") or "") or None,
+        "block_reason_codes_json": _json_list(block_reason_codes),
+        "base_time": str(item.get("base_time") or "") or None,
+        "base_price": _float_or_none(item.get("base_price")),
+        "price_1m": _float_or_none(item.get("price_1m")),
+        "price_3m": _float_or_none(item.get("price_3m")),
+        "price_5m": _float_or_none(item.get("price_5m")),
+        "price_10m": _float_or_none(item.get("price_10m")),
+        "price_close_or_last": _float_or_none(item.get("price_close_or_last")),
+        "return_1m_pct": _float_or_none(item.get("return_1m_pct")),
+        "return_3m_pct": _float_or_none(item.get("return_3m_pct")),
+        "return_5m_pct": _float_or_none(item.get("return_5m_pct")),
+        "return_10m_pct": _float_or_none(item.get("return_10m_pct")),
+        "return_close_or_last_pct": _float_or_none(item.get("return_close_or_last_pct")),
+        "outcome_label": outcome_label,
+        "confidence": confidence,
+        "confidence_reason": str(item.get("confidence_reason") or "") or None,
+        "recommendation_ko": str(item.get("recommendation_ko") or "") or None,
+        "payload_json": _json_payload(item.get("payload") or item),
+    }
+
+
+def _postmarket_review_row_to_dict(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["block_reason_codes"] = _safe_json_loads(data.pop("block_reason_codes_json", "[]"), [])
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    data["payload"] = payload if isinstance(payload, dict) else {}
+    return data
+
+
+def _top_postmarket_items(items: list[dict], outcome_label: str) -> list[dict]:
+    filtered = [item for item in items if str(item.get("outcome_label") or "") == outcome_label]
+    filtered.sort(key=lambda item: abs(float(item.get("return_5m_pct") or item.get("return_3m_pct") or 0)), reverse=True)
+    return [
+        {
+            "review_id": item.get("review_id"),
+            "symbol": item.get("symbol"),
+            "stock_name": item.get("stock_name"),
+            "event_type": item.get("event_type"),
+            "return_3m_pct": item.get("return_3m_pct"),
+            "return_5m_pct": item.get("return_5m_pct"),
+            "recommendation_ko": item.get("recommendation_ko"),
+        }
+        for item in filtered[:10]
+    ]
+
+
 def _json_payload(value: object) -> str:
     if isinstance(value, str):
         parsed = _safe_json_loads(value, {})
@@ -5775,6 +6077,26 @@ def _json_payload(value: object) -> str:
     if value is None:
         value = {}
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _json_list(value: object) -> str:
+    if isinstance(value, str):
+        parsed = _safe_json_loads(value, [])
+        value = parsed if isinstance(parsed, list) else [value] if value else []
+    if value is None:
+        value = []
+    if not isinstance(value, list):
+        value = list(value) if isinstance(value, tuple) else [value]
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _float_or_none(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _safe_json_loads(value: object, default):

@@ -169,6 +169,61 @@
         <div id="operator-runbook-body" class="runbook-body"></div>
       </section>
 
+      <section id="postmarket-review-panel" class="panel postmarket-review-panel" aria-label="Post-market Review">
+        <div class="panel-head operator-alert-head">
+          <div>
+            <h2>Post-market Review</h2>
+            <p>READY missed opportunity / block reason analytics</p>
+          </div>
+          <div class="operator-alert-actions postmarket-review-toolbar">
+            <span id="postmarket-review-status" class="counter">not loaded</span>
+            <button id="postmarket-review-refresh" type="button">새로고침</button>
+            <button id="postmarket-review-rebuild" type="button">리뷰 재생성</button>
+            <a id="postmarket-review-export" class="button-link" href="/api/themelab/postmarket-review/export?format=csv">CSV</a>
+          </div>
+        </div>
+        <div id="postmarket-review-summary" class="postmarket-summary-grid"></div>
+        <div id="postmarket-review-tabs" class="filter-row operator-alert-filters" data-filter-group="postmarket-review">
+          <span>Outcome</span>
+          <button class="active" data-postmarket-outcome="ALL" type="button">ALL</button>
+          <button data-postmarket-outcome="MISSED_OPPORTUNITY" type="button">Missed</button>
+          <button data-postmarket-outcome="GOOD_BLOCK" type="button">Good Block</button>
+          <button data-postmarket-outcome="REVIEW_NEEDED" type="button">Review</button>
+          <button data-postmarket-outcome="PROTECTED_FROM_CHASE" type="button">Protected</button>
+          <button data-postmarket-outcome="DATA_INSUFFICIENT" type="button">Data</button>
+        </div>
+        <div class="postmarket-review-grid">
+          <div class="postmarket-review-lists">
+            <section class="postmarket-review-list-section outcome-missed" aria-label="Missed Opportunity">
+              <div class="operator-alert-subhead"><h3>Missed Opportunity</h3><span class="counter">READY no order</span></div>
+              <div id="missed-opportunity-list" class="review-table"></div>
+            </section>
+            <section class="postmarket-review-list-section outcome-good-block" aria-label="Good Block">
+              <div class="operator-alert-subhead"><h3>Good Block</h3><span class="counter">valid blocks</span></div>
+              <div id="good-block-list" class="review-table"></div>
+            </section>
+            <section class="postmarket-review-list-section outcome-review-needed" aria-label="Review Needed">
+              <div class="operator-alert-subhead"><h3>Review Needed</h3><span class="counter">human review</span></div>
+              <div id="review-needed-list" class="review-table"></div>
+            </section>
+            <section class="postmarket-review-list-section outcome-protected" aria-label="Protected from Chase">
+              <div class="operator-alert-subhead"><h3>Protected from Chase</h3><span class="counter">chase blocks</span></div>
+              <div id="protected-from-chase-list" class="review-table"></div>
+            </section>
+            <section class="postmarket-review-list-section outcome-data-insufficient" aria-label="Data Insufficient">
+              <div class="operator-alert-subhead"><h3>Data Insufficient</h3><span class="counter">price missing</span></div>
+              <div id="data-insufficient-list" class="review-table"></div>
+            </section>
+          </div>
+          <aside class="review-detail-panel">
+            <div class="operator-alert-subhead"><h3>Block Reasons</h3><span class="counter">top 20</span></div>
+            <div id="block-reason-summary" class="block-reason-summary"></div>
+            <div class="operator-alert-subhead"><h3>Detail</h3><span class="counter">selected</span></div>
+            <div id="postmarket-review-detail" class="postmarket-review-detail"></div>
+          </aside>
+        </div>
+      </section>
+
       <section class="flow-grid">
         <aside class="panel theme-panel">
           <div class="panel-head">

@@ -27,6 +27,14 @@
   pendingAction: null,
   actionSummary: {},
   runbook: null,
+  postmarketReviewSummary: {},
+  postmarketReviewItems: [],
+  postmarketReviewFilters: {
+    outcome_label: "ALL",
+  },
+  postmarketReviewSelectedItem: null,
+  postmarketReviewLoading: false,
+  postmarketReviewLastGeneratedAt: "",
   alertFilters: {
     category: "ALL",
     hideAcknowledged: false,
@@ -108,6 +116,7 @@ const safeOperatorActionTypes = [
   "START_KIWOOM_GATEWAY",
   "OPEN_DRY_RUN_ORDER_DETAIL",
   "REBUILD_DRY_RUN_PERFORMANCE",
+  "REBUILD_POSTMARKET_REVIEW",
   "REBUILD_TRANSPORT_LATENCY_REPORT",
   "EXPORT_TRANSPORT_LATENCY_REPORT",
   "ACK_EVENT",
@@ -1100,6 +1109,9 @@ async function executeOperatorAction(actionType, context = state.selectedActionC
   await Promise.all([fetchActionHistory(), fetchActionSummary(), fetchOperatorEvents().catch(() => {})]);
   if (actionType === "REFRESH_SNAPSHOT") await fetchSnapshot().catch(() => {});
   if (actionType === "OPEN_RUNBOOK") renderRunbook((result.result || {}).runbook || runbookForStatus((context || {}).event_type));
+  if (actionType === "REBUILD_POSTMARKET_REVIEW") {
+    await Promise.all([fetchPostmarketReviewSummary(), fetchPostmarketReviewItems()]);
+  }
   return result;
 }
 
@@ -1133,6 +1145,235 @@ function actionRequiresToken(actionType) {
 
 function actionRiskLevel(actionType) {
   return String((state.actionCatalog[actionType] || {}).risk_level || "LOW");
+}
+
+async function fetchPostmarketReviewSummary() {
+  const response = await fetch("/api/themelab/postmarket-review/summary", { cache: "no-store" });
+  const payload = await parseResponsePayload(response);
+  if (!response.ok) throw new Error(payload.detail || payload.error || `postmarket-review summary ${response.status}`);
+  state.postmarketReviewSummary = payload || {};
+  state.postmarketReviewLastGeneratedAt = latestGeneratedAt(state.postmarketReviewItems);
+  renderPostmarketReviewPanel();
+  return state.postmarketReviewSummary;
+}
+
+async function fetchPostmarketReviewItems(filters = state.postmarketReviewFilters) {
+  const params = new URLSearchParams();
+  params.set("limit", "1000");
+  if (filters.symbol) params.set("symbol", filters.symbol);
+  if (filters.primary_theme) params.set("primary_theme", filters.primary_theme);
+  if (filters.event_type) params.set("event_type", filters.event_type);
+  if (filters.min_return_5m_pct != null && filters.min_return_5m_pct !== "") {
+    params.set("min_return_5m_pct", filters.min_return_5m_pct);
+  }
+  const response = await fetch(`/api/themelab/postmarket-review?${params.toString()}`, { cache: "no-store" });
+  const payload = await parseResponsePayload(response);
+  if (!response.ok) throw new Error(payload.detail || payload.error || `postmarket-review ${response.status}`);
+  state.postmarketReviewItems = payload.items || [];
+  state.postmarketReviewLastGeneratedAt = latestGeneratedAt(state.postmarketReviewItems);
+  const exportLink = document.getElementById("postmarket-review-export");
+  if (exportLink) exportLink.href = `/api/themelab/postmarket-review/export?trade_date=${encodeURIComponent(payload.trade_date || "")}&format=csv`;
+  renderPostmarketReviewPanel();
+  return state.postmarketReviewItems;
+}
+
+async function rebuildPostmarketReview(options = {}) {
+  if (!state.actionCatalog.REBUILD_POSTMARKET_REVIEW) {
+    state.actionCatalog.REBUILD_POSTMARKET_REVIEW = {
+      action_type: "REBUILD_POSTMARKET_REVIEW",
+      label_ko: "Post-market 리뷰 재생성",
+      risk_level: "MEDIUM",
+      requires_token: true,
+      confirmation_required: true,
+      endpoint: "/api/themelab/postmarket-review/rebuild",
+    };
+  }
+  const context = {
+    trade_date: options.trade_date || state.postmarketReviewSummary.trade_date || "",
+    review_scope: options.review_scope || "postmarket",
+    force: options.force !== false,
+  };
+  return executeOperatorAction("REBUILD_POSTMARKET_REVIEW", context, options);
+}
+
+function renderPostmarketReviewPanel() {
+  renderPostmarketReviewSummary(state.postmarketReviewSummary || {});
+  renderMissedOpportunityList(state.postmarketReviewItems || []);
+  renderGoodBlockList(state.postmarketReviewItems || []);
+  renderReviewNeededList(state.postmarketReviewItems || []);
+  renderProtectedFromChaseList(state.postmarketReviewItems || []);
+  renderDataInsufficientList(state.postmarketReviewItems || []);
+  renderBlockReasonSummary(state.postmarketReviewSummary || {});
+  renderPostmarketReviewDetail(state.postmarketReviewSelectedItem);
+  const loading = state.postmarketReviewLoading ? "loading" : "";
+  const generatedAt = state.postmarketReviewLastGeneratedAt || latestGeneratedAt(state.postmarketReviewItems);
+  text("postmarket-review-status", loading || (generatedAt ? `generated ${formatEventTime(generatedAt)}` : "no review data"));
+}
+
+function renderPostmarketReviewSummary(summary = {}) {
+  const node = document.getElementById("postmarket-review-summary");
+  if (!node) return;
+  const cards = [
+    ["Missed Opportunity", summary.missed_opportunity_count || 0, "outcome-missed"],
+    ["Good Block", summary.good_block_count || 0, "outcome-good-block"],
+    ["Review Needed", summary.review_needed_count || 0, "outcome-review-needed"],
+    ["Protected", summary.protected_from_chase_count || 0, "outcome-protected"],
+    ["Data Insufficient", summary.data_insufficient_count || 0, "outcome-data-insufficient"],
+    ["READY no order", summary.ready_without_order_count || 0, ""],
+  ];
+  node.innerHTML = cards.map(([label, value, tone]) => `
+    <div class="postmarket-summary-card ${tone}">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+    </div>
+  `).join("");
+}
+
+function renderMissedOpportunityList(items) {
+  renderReviewTable("missed-opportunity-list", items, "MISSED_OPPORTUNITY");
+}
+
+function renderGoodBlockList(items) {
+  renderReviewTable("good-block-list", items, "GOOD_BLOCK");
+}
+
+function renderReviewNeededList(items) {
+  renderReviewTable("review-needed-list", items, "REVIEW_NEEDED");
+}
+
+function renderProtectedFromChaseList(items) {
+  renderReviewTable("protected-from-chase-list", items, "PROTECTED_FROM_CHASE");
+}
+
+function renderDataInsufficientList(items) {
+  renderReviewTable("data-insufficient-list", items, "DATA_INSUFFICIENT");
+}
+
+function renderReviewTable(id, items, outcomeLabel) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const visible = reviewOutcomeVisible(outcomeLabel);
+  node.closest(".postmarket-review-list-section")?.classList.toggle("hidden", !visible);
+  if (!visible) return;
+  const rows = (items || []).filter((item) => item.outcome_label === outcomeLabel).slice(0, 12);
+  node.innerHTML = rows.length ? rows.map((item) => reviewRow(item)).join("") : `<div class="operator-alert-empty">해당 분류가 없습니다.</div>`;
+}
+
+function reviewRow(item) {
+  const selected = state.postmarketReviewSelectedItem && state.postmarketReviewSelectedItem.review_id === item.review_id;
+  return `
+    <button type="button" class="review-row ${selected ? "selected" : ""}" data-review-id="${escapeHtml(item.review_id || "")}">
+      <span>${escapeHtml(formatEventTime(item.base_time || item.generated_at))}</span>
+      <strong>${escapeHtml(item.stock_name || item.symbol || "-")}</strong>
+      <span>${escapeHtml(item.primary_theme || "-")} · ${escapeHtml(item.event_type || "-")}</span>
+      <span class="${returnClass(item.return_3m_pct)}">${formatReturnPct(item.return_3m_pct)}</span>
+      <span class="${returnClass(item.return_5m_pct)}">${formatReturnPct(item.return_5m_pct)}</span>
+      ${confidenceBadge(item.confidence)}
+    </button>
+  `;
+}
+
+function renderBlockReasonSummary(summary = {}) {
+  const node = document.getElementById("block-reason-summary");
+  if (!node) return;
+  const rows = summary.by_block_reason || [];
+  node.innerHTML = rows.length ? rows.slice(0, 12).map((item) => `
+    <div class="block-reason-row">
+      <span>${escapeHtml(item.block_reason || "UNKNOWN")}</span>
+      <strong>${escapeHtml(item.count || 0)}</strong>
+    </div>
+  `).join("") : `<div class="operator-alert-empty">차단 사유 집계가 없습니다.</div>`;
+}
+
+function renderPostmarketReviewDetail(item) {
+  const node = document.getElementById("postmarket-review-detail");
+  if (!node) return;
+  if (!item) {
+    node.innerHTML = `<div class="operator-alert-empty">리뷰 항목을 선택하세요.</div>`;
+    return;
+  }
+  node.innerHTML = [
+    actionLine("Outcome", `${outcomeLabelKo(item.outcome_label)} / ${item.confidence || "LOW"}`),
+    actionLine("종목", `${item.stock_name || "-"} ${item.symbol ? `[${item.symbol}]` : ""}`),
+    actionLine("이벤트", `${item.event_type || "-"} · ${formatEventTime(item.base_time || item.generated_at)}`),
+    actionLine("사유", item.block_reason || "-"),
+    actionLine("기준가", item.base_price ?? "-"),
+    actionLine("+1m / +3m", `${formatReturnPct(item.return_1m_pct)} / ${formatReturnPct(item.return_3m_pct)}`),
+    actionLine("+5m / +10m", `${formatReturnPct(item.return_5m_pct)} / ${formatReturnPct(item.return_10m_pct)}`),
+    actionLine("close/last", formatReturnPct(item.return_close_or_last_pct)),
+    actionLine("추천", item.recommendation_ko || "-"),
+    `<pre>${escapeHtml(JSON.stringify((item.payload || {}).event || item.payload || {}, null, 2)).slice(0, 2400)}</pre>`,
+  ].join("");
+}
+
+function formatReturnPct(value) {
+  if (value == null || value === "") return "-";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return `${number > 0 ? "+" : ""}${number.toFixed(2)}%`;
+}
+
+function outcomeLabelKo(label) {
+  return {
+    MISSED_OPPORTUNITY: "Missed Opportunity",
+    GOOD_BLOCK: "Good Block",
+    REVIEW_NEEDED: "Review Needed",
+    DATA_INSUFFICIENT: "Data Insufficient",
+    PROTECTED_FROM_CHASE: "Protected from Chase",
+    NEUTRAL: "Neutral",
+  }[String(label || "").toUpperCase()] || label || "-";
+}
+
+function confidenceBadge(confidence) {
+  const label = String(confidence || "LOW").toUpperCase();
+  const tone = label === "HIGH" ? "confidence-high" : label === "MEDIUM" ? "confidence-medium" : "confidence-low";
+  return `<span class="confidence-badge ${tone}">${escapeHtml(label)}</span>`;
+}
+
+function selectReviewItem(item) {
+  state.postmarketReviewSelectedItem = item || null;
+  if (item) {
+    state.selectedEventId = item.event_id || state.selectedEventId;
+    state.selectedActionContext = {
+      event_id: item.event_id || "",
+      event_type: item.event_type || "",
+      symbol: item.symbol || "",
+      stock_name: item.stock_name || "",
+      candidate_instance_id: item.candidate_instance_id || "",
+    };
+    if (item.symbol && state.snapshot) selectSymbol(item.symbol, { source: "postmarket-review" });
+    fetchActionRecommendations(state.selectedActionContext).catch(() => {});
+  }
+  renderPostmarketReviewPanel();
+}
+
+function reviewOutcomeVisible(outcomeLabel) {
+  const selected = state.postmarketReviewFilters.outcome_label || "ALL";
+  return selected === "ALL" || selected === outcomeLabel;
+}
+
+function returnClass(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || Math.abs(number) < 0.05) return "return-neutral";
+  return number > 0 ? "return-positive" : "return-negative";
+}
+
+function latestGeneratedAt(items = []) {
+  return (items || []).map((item) => item.generated_at).filter(Boolean).sort().at(-1) || "";
+}
+
+async function initPostmarketReviewPanel() {
+  state.postmarketReviewLoading = true;
+  renderPostmarketReviewPanel();
+  try {
+    await Promise.all([fetchPostmarketReviewSummary(), fetchPostmarketReviewItems()]);
+  } catch (error) {
+    text("postmarket-review-status", `review load failed: ${error.message || error}`);
+    renderPostmarketReviewPanel();
+  } finally {
+    state.postmarketReviewLoading = false;
+    renderPostmarketReviewPanel();
+  }
 }
 
 function renderRunbook(context) {
@@ -2333,6 +2574,37 @@ function initFilters() {
       text("operator-action-context", `액션 실패: ${error.message || error}`);
     });
   });
+  document.getElementById("postmarket-review-refresh")?.addEventListener("click", () => {
+    initPostmarketReviewPanel().catch((error) => {
+      text("postmarket-review-status", `refresh failed: ${error.message || error}`);
+    });
+  });
+  document.getElementById("postmarket-review-rebuild")?.addEventListener("click", () => {
+    rebuildPostmarketReview({ force: true }).catch((error) => {
+      text("postmarket-review-status", `rebuild failed: ${error.message || error}`);
+    });
+  });
+  document.getElementById("postmarket-review-tabs")?.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-postmarket-outcome]");
+    if (!button) return;
+    state.postmarketReviewFilters.outcome_label = button.dataset.postmarketOutcome || "ALL";
+    button.closest("[data-filter-group]")?.querySelectorAll("button").forEach((node) => node.classList.toggle("active", node === button));
+    renderPostmarketReviewPanel();
+  });
+  [
+    "missed-opportunity-list",
+    "good-block-list",
+    "review-needed-list",
+    "protected-from-chase-list",
+    "data-insufficient-list",
+  ].forEach((id) => {
+    document.getElementById(id)?.addEventListener("click", (event) => {
+      const row = event.target.closest("[data-review-id]");
+      if (!row) return;
+      const item = state.postmarketReviewItems.find((review) => review.review_id === row.dataset.reviewId);
+      selectReviewItem(item);
+    });
+  });
   ["operator-alert-list", "operator-timeline-list", "operator-event-journal-list"].forEach((id) => {
     document.getElementById(id)?.addEventListener("click", (event) => {
       const row = event.target.closest("[data-event-id]");
@@ -2393,6 +2665,7 @@ loadOperatorPreferences();
 initFilters();
 initOperatorEventJournal();
 initOperatorActionCenter();
+initPostmarketReviewPanel();
 fetchSnapshot().catch(() => {});
 connectWs();
 setInterval(() => fetchSnapshot().catch(() => {}), 5000);

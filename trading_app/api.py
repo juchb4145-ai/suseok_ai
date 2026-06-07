@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import os
 import subprocess
@@ -13,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -226,6 +228,13 @@ OPERATOR_ACTION_CATALOG = {
         "requires_token": True,
         "confirmation_required": True,
         "endpoint": "/api/runtime/performance/dry-run/rebuild",
+    },
+    "REBUILD_POSTMARKET_REVIEW": {
+        "label_ko": "Post-market 리뷰 재생성",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/themelab/postmarket-review/rebuild",
     },
     "REBUILD_TRANSPORT_LATENCY_REPORT": {
         "label_ko": "전송 지연 리포트 재계산",
@@ -1831,6 +1840,187 @@ def theme_lab_operator_action_summary(trade_date: str | None = Query(None)) -> d
         close_database(db)
 
 
+@app.post("/api/themelab/postmarket-review/rebuild")
+def rebuild_theme_lab_postmarket_review(body: dict[str, Any], request: Request) -> dict[str, Any]:
+    _verify_operator_action_token(request)
+    payload = body if isinstance(body, dict) else {}
+    action_id = str(payload.get("action_id") or new_message_id("act"))
+    requested_at = datetime.now(KST).isoformat(timespec="seconds")
+    db = open_database()
+    try:
+        meta = _operator_action_catalog_item("REBUILD_POSTMARKET_REVIEW", OPERATOR_ACTION_CATALOG["REBUILD_POSTMARKET_REVIEW"])
+        action = db.save_operator_action(
+            _operator_action_record(
+                action_id=action_id,
+                action_type="REBUILD_POSTMARKET_REVIEW",
+                status="RUNNING",
+                requested_at=requested_at,
+                payload={**payload, "confirm": True},
+                event=None,
+                meta=meta,
+            )
+        )
+        try:
+            response_payload = _rebuild_postmarket_review_payload(db, payload)
+        except Exception as exc:
+            failed = db.update_operator_action_status(action_id, "FAILED", error_message=str(exc)) or action
+            _save_operator_action_result_event(db, failed, "FAILED", {"error": str(exc)})
+            raise
+        saved = db.update_operator_action_status(action_id, "SUCCESS", response=response_payload) or action
+        _save_operator_action_result_event(db, saved, "SUCCESS", response_payload)
+        return response_payload
+    finally:
+        close_database(db)
+
+
+@app.get("/api/themelab/postmarket-review")
+def list_theme_lab_postmarket_review(
+    trade_date: str | None = Query(None),
+    review_scope: str | None = Query(None),
+    outcome_label: str | None = Query(None),
+    event_type: str | None = Query(None),
+    symbol: str | None = Query(None),
+    primary_theme: str | None = Query(None),
+    min_return_5m_pct: float | None = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    db = open_database()
+    try:
+        items = db.list_postmarket_review_items(
+            resolved_trade_date,
+            review_scope=review_scope,
+            outcome_label=outcome_label,
+            event_type=event_type,
+            symbol=symbol,
+            primary_theme=primary_theme,
+            min_return_5m_pct=min_return_5m_pct,
+            limit=limit + 1,
+            offset=offset,
+        )
+        page, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {
+            "trade_date": resolved_trade_date,
+            "items": page,
+            "pagination": pagination,
+            "filters": {
+                "trade_date": resolved_trade_date,
+                "review_scope": review_scope or "",
+                "outcome_label": str(outcome_label or "").upper(),
+                "event_type": str(event_type or "").upper(),
+                "symbol": symbol or "",
+                "primary_theme": primary_theme or "",
+                "min_return_5m_pct": min_return_5m_pct,
+                "limit": limit,
+                "offset": offset,
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/themelab/postmarket-review/summary")
+def theme_lab_postmarket_review_summary(trade_date: str | None = Query(None)) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    db = open_database()
+    try:
+        return db.summarize_postmarket_reviews(resolved_trade_date)
+    finally:
+        close_database(db)
+
+
+@app.get("/api/themelab/postmarket-review/export", response_model=None)
+def export_theme_lab_postmarket_review(
+    trade_date: str | None = Query(None),
+    format: str = Query("csv"),
+) -> dict[str, Any] | PlainTextResponse:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    export_format = str(format or "csv").lower()
+    db = open_database()
+    try:
+        items = db.list_postmarket_review_items(resolved_trade_date, limit=1000)
+        summary = db.summarize_postmarket_reviews(resolved_trade_date)
+    finally:
+        close_database(db)
+    if export_format == "json":
+        return {"trade_date": resolved_trade_date, "summary": summary, "items": items}
+    if export_format != "csv":
+        raise HTTPException(status_code=400, detail="format must be csv or json")
+    csv_body = _postmarket_review_csv(items)
+    return PlainTextResponse(
+        csv_body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="postmarket-review-{resolved_trade_date}.csv"'},
+    )
+
+
+def _rebuild_postmarket_review_payload(db: TradingDatabase, payload: dict[str, Any]) -> dict[str, Any]:
+    trade_date = _theme_lab_trade_date(str(payload.get("trade_date") or "") or None)
+    review_scope = str(payload.get("review_scope") or "postmarket").lower()
+    if review_scope not in {"postmarket", "intraday"}:
+        raise HTTPException(status_code=400, detail="review_scope must be postmarket or intraday")
+    deleted_count = 0
+    if bool(payload.get("force")):
+        deleted_count = db.delete_postmarket_reviews_for_date(trade_date, review_scope=review_scope)
+    report = db.rebuild_postmarket_reviews(trade_date, review_scope=review_scope)
+    persisted_summary = db.summarize_postmarket_reviews(trade_date)
+    analysis_summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    summary = {**analysis_summary, **persisted_summary}
+    return {
+        "trade_date": trade_date,
+        "review_scope": review_scope,
+        "generated_at": report.get("generated_at") or "",
+        "generated_count": int(report.get("generated_count") or len(report.get("items") or [])),
+        "inserted_count": int(report.get("inserted_count") or 0),
+        "duplicate_count": int(report.get("duplicate_count") or 0),
+        "rejected_count": int(report.get("rejected_count") or 0),
+        "deleted_count": deleted_count,
+        "data_insufficient_count": int(summary.get("data_insufficient_count") or 0),
+        "summary": summary,
+    }
+
+
+def _postmarket_review_csv(items: list[dict[str, Any]]) -> str:
+    fields = [
+        "review_id",
+        "trade_date",
+        "generated_at",
+        "review_scope",
+        "symbol",
+        "stock_name",
+        "primary_theme",
+        "stock_role",
+        "candidate_instance_id",
+        "event_id",
+        "event_type",
+        "source_status",
+        "block_reason",
+        "base_time",
+        "base_price",
+        "price_1m",
+        "price_3m",
+        "price_5m",
+        "price_10m",
+        "price_close_or_last",
+        "return_1m_pct",
+        "return_3m_pct",
+        "return_5m_pct",
+        "return_10m_pct",
+        "return_close_or_last_pct",
+        "outcome_label",
+        "confidence",
+        "confidence_reason",
+        "recommendation_ko",
+    ]
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for item in items:
+        writer.writerow({field: item.get(field) if item.get(field) is not None else "" for field in fields})
+    return output.getvalue()
+
+
 def _operator_action_catalog_item(action_type: str, meta: dict[str, Any]) -> dict[str, Any]:
     return {
         "action_type": action_type,
@@ -2042,6 +2232,8 @@ async def _execute_operator_action(
         report = _performance_analyzer(db).build_report(trade_date=trade_date, limit=10000)
         persisted = _performance_analyzer(db).persist_report(report)
         return {"report_id": report.get("report_id"), "persisted": persisted is not None, "summary": report.get("summary", {})}
+    if action_type == "REBUILD_POSTMARKET_REVIEW":
+        return _rebuild_postmarket_review_payload(db, payload)
     if action_type == "REBUILD_TRANSPORT_LATENCY_REPORT":
         trade_date = str(payload.get("trade_date") or "") or None
         report = _transport_analyzer(db).build_report(trade_date=trade_date, limit=10000)

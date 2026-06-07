@@ -443,6 +443,200 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   font-weight: 900;
 }
 
+.postmarket-review-panel {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.postmarket-review-toolbar {
+  flex-wrap: wrap;
+}
+
+.button-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  border: 1px solid var(--border-active);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  color: var(--text);
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 900;
+  text-decoration: none;
+}
+
+.postmarket-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.postmarket-summary-card {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  padding: 10px;
+}
+
+.postmarket-summary-card span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.postmarket-summary-card strong {
+  display: block;
+  margin-top: 5px;
+  color: var(--text);
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.outcome-missed { box-shadow: inset 3px 0 0 var(--warning); }
+.outcome-good-block { box-shadow: inset 3px 0 0 var(--ready); }
+.outcome-review-needed { box-shadow: inset 3px 0 0 var(--wait); }
+.outcome-data-insufficient { box-shadow: inset 3px 0 0 var(--muted); }
+.outcome-protected { box-shadow: inset 3px 0 0 var(--ready-small); }
+
+.postmarket-review-grid {
+  display: grid;
+  grid-template-columns: minmax(520px, 1fr) minmax(320px, 0.42fr);
+  gap: 10px;
+}
+
+.postmarket-review-lists {
+  display: grid;
+  gap: 8px;
+}
+
+.postmarket-review-list-section {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.55);
+  padding: 10px;
+}
+
+.postmarket-review-list-section.hidden {
+  display: none;
+}
+
+.review-table {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.review-row {
+  display: grid;
+  grid-template-columns: 88px minmax(96px, 1fr) minmax(140px, 1.4fr) 70px 70px 64px;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-alt);
+  color: var(--sub);
+  padding: 8px;
+  text-align: left;
+}
+
+.review-row strong {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-row.selected,
+.review-row:hover {
+  background: var(--panel-hover);
+}
+
+.review-detail-panel {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.55);
+  padding: 10px;
+}
+
+.block-reason-summary,
+.postmarket-review-detail {
+  display: grid;
+  gap: 6px;
+}
+
+.block-reason-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px solid var(--border);
+  padding: 5px 0;
+  color: var(--sub);
+}
+
+.block-reason-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.confidence-badge {
+  border-radius: 999px;
+  padding: 3px 7px;
+  font-size: 10px;
+  font-weight: 900;
+  text-align: center;
+}
+
+.confidence-high {
+  background: rgba(34, 197, 94, 0.16);
+  color: var(--ready);
+}
+
+.confidence-medium {
+  background: rgba(250, 204, 21, 0.16);
+  color: var(--wait);
+}
+
+.confidence-low {
+  background: rgba(148, 163, 184, 0.14);
+  color: var(--muted);
+}
+
+.return-positive { color: var(--positive); }
+.return-negative { color: var(--negative); }
+.return-neutral { color: var(--muted); }
+
+.postmarket-review-detail pre {
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #070b10;
+  color: var(--sub);
+  padding: 8px;
+  white-space: pre-wrap;
+}
+
 .action-confirm-modal {
   position: fixed;
   inset: 0;
@@ -1049,6 +1243,8 @@ tbody tr.selected {
   .operator-alert-grid,
   .session-summary-grid,
   .action-center-grid,
+  .postmarket-summary-grid,
+  .postmarket-review-grid,
   .flow-grid,
   .bottom-grid,
   .quality-grid {
@@ -1060,7 +1256,8 @@ tbody tr.selected {
   }
   .focus-summary-grid,
   .decision-checklist,
-  .price-metrics {
+  .price-metrics,
+  .review-row {
     grid-template-columns: 1fr;
   }
 }

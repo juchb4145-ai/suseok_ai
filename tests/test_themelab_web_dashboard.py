@@ -55,6 +55,17 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#operator-runbook-panel") is not None
     assert soup.select_one("#operator-runbook-title") is not None
     assert soup.select_one("#operator-runbook-body") is not None
+    assert soup.select_one("#postmarket-review-panel") is not None
+    assert soup.select_one(".postmarket-review-toolbar") is not None
+    assert soup.select_one("#postmarket-review-summary") is not None
+    assert soup.select_one("#postmarket-review-tabs") is not None
+    assert soup.select_one("#missed-opportunity-list") is not None
+    assert soup.select_one("#good-block-list") is not None
+    assert soup.select_one("#review-needed-list") is not None
+    assert soup.select_one("#protected-from-chase-list") is not None
+    assert soup.select_one("#data-insufficient-list") is not None
+    assert soup.select_one("#block-reason-summary") is not None
+    assert soup.select_one("#postmarket-review-detail") is not None
     assert soup.select_one('[data-alert-filter="OPPORTUNITY"]') is not None
     assert soup.select_one('[data-alert-filter="CRITICAL"]') is not None
     assert soup.select_one('[data-journal-filter="SYMBOL"]') is not None
@@ -104,6 +115,12 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "selectedActionContext" in js
     assert "pendingAction" in js
     assert "actionSummary" in js
+    assert "postmarketReviewSummary" in js
+    assert "postmarketReviewItems" in js
+    assert "postmarketReviewFilters" in js
+    assert "postmarketReviewSelectedItem" in js
+    assert "postmarketReviewLoading" in js
+    assert "postmarketReviewLastGeneratedAt" in js
     assert "alertFilters" in js
     assert "maxOperatorEvents: 200" in js
     assert "deriveOperatorEvents" in js
@@ -127,6 +144,22 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "renderActionHistory" in js
     assert "renderActionSummary" in js
     assert "renderRunbook" in js
+    assert "fetchPostmarketReviewSummary" in js
+    assert "fetchPostmarketReviewItems" in js
+    assert "rebuildPostmarketReview" in js
+    assert "renderPostmarketReviewPanel" in js
+    assert "renderPostmarketReviewSummary" in js
+    assert "renderMissedOpportunityList" in js
+    assert "renderGoodBlockList" in js
+    assert "renderReviewNeededList" in js
+    assert "renderProtectedFromChaseList" in js
+    assert "renderDataInsufficientList" in js
+    assert "renderBlockReasonSummary" in js
+    assert "renderPostmarketReviewDetail" in js
+    assert "formatReturnPct" in js
+    assert "outcomeLabelKo" in js
+    assert "confidenceBadge" in js
+    assert "selectReviewItem" in js
     assert "runbookForEvent" in js
     assert "runbookForStatus" in js
     assert "appendActionResultToEvents" in js
@@ -136,6 +169,9 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "/api/themelab/operator-actions/catalog" in js
     assert "/api/themelab/operator-actions/recommendations" in js
     assert "/api/themelab/operator-actions/execute" in js
+    assert "/api/themelab/postmarket-review" in js
+    assert "/api/themelab/postmarket-review/summary" in js
+    assert "REBUILD_POSTMARKET_REVIEW" in js
     assert "LIVE_BUY" in js
     assert "LIVE_SELL" in js
     assert "CANCEL_LIVE_ORDER" in js
@@ -145,6 +181,11 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "START_KIWOOM_GATEWAY" in js
     assert "ADD_OPERATOR_NOTE" in js
     assert "OPEN_RUNBOOK" in js
+    assert "MISSED_OPPORTUNITY" in js
+    assert "GOOD_BLOCK" in js
+    assert "REVIEW_NEEDED" in js
+    assert "DATA_INSUFFICIENT" in js
+    assert "PROTECTED_FROM_CHASE" in js
     assert "eventSeverity" in js
     assert "eventCategory" in js
     assert "selectSymbol" in js
@@ -191,6 +232,23 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "action-status-failed" in css
     assert "action-status-blocked" in css
     assert "action-status-running" in css
+    assert "postmarket-review-panel" in css
+    assert "postmarket-review-toolbar" in css
+    assert "postmarket-summary-grid" in css
+    assert "postmarket-summary-card" in css
+    assert "outcome-missed" in css
+    assert "outcome-good-block" in css
+    assert "outcome-review-needed" in css
+    assert "outcome-data-insufficient" in css
+    assert "outcome-protected" in css
+    assert "confidence-high" in css
+    assert "confidence-medium" in css
+    assert "confidence-low" in css
+    assert "review-table" in css
+    assert "review-detail-panel" in css
+    assert "return-positive" in css
+    assert "return-negative" in css
+    assert "return-neutral" in css
     assert ".critical" in css
     assert ".warning" in css
     assert ".opportunity" in css
