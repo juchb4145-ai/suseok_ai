@@ -56,6 +56,46 @@
         </div>
       </section>
 
+      <section id="operator-alert-panel" class="panel operator-alert-panel" aria-label="Operator Alert Inbox">
+        <div class="panel-head operator-alert-head">
+          <div>
+            <h2>Operator Alert Inbox</h2>
+            <p>최근 상태 변화와 운용 판단 이벤트</p>
+          </div>
+          <div class="operator-alert-actions">
+            <span id="operator-alert-count" class="counter">0</span>
+            <button id="operator-alert-ack-all" type="button">전체 확인</button>
+            <button id="operator-alert-hide-acknowledged" type="button" aria-pressed="false">확인된 알림 숨김</button>
+          </div>
+        </div>
+        <div id="operator-alert-filters" class="filter-row operator-alert-filters" data-filter-group="operator-alert">
+          <span>알림</span>
+          <button class="active" data-alert-filter="ALL" type="button">전체</button>
+          <button data-alert-filter="OPPORTUNITY" type="button">기회</button>
+          <button data-alert-filter="WARNING" type="button">경고</button>
+          <button data-alert-filter="CRITICAL" type="button">위험</button>
+          <button data-alert-filter="ORDER" type="button">주문</button>
+          <button data-alert-filter="DATA" type="button">데이터</button>
+          <button data-alert-filter="MARKET" type="button">시장</button>
+        </div>
+        <div class="operator-alert-grid">
+          <div>
+            <div class="operator-alert-subhead">
+              <h3>Inbox</h3>
+              <span class="counter">click to focus</span>
+            </div>
+            <div id="operator-alert-list" class="operator-alert-list"></div>
+          </div>
+          <div>
+            <div class="operator-alert-subhead">
+              <h3>Decision Timeline</h3>
+              <span class="counter">latest 20</span>
+            </div>
+            <div id="operator-timeline-list" class="operator-timeline-list"></div>
+          </div>
+        </div>
+      </section>
+
       <section class="flow-grid">
         <aside class="panel theme-panel">
           <div class="panel-head">

@@ -1,5 +1,6 @@
 ﻿const state = {
   snapshot: null,
+  previousSnapshot: null,
   filters: {
     status: "ALL",
     role: "ALL",
@@ -9,6 +10,13 @@
   },
   selectedSymbol: "",
   chartInterval: "1m",
+  operatorEvents: [],
+  acknowledgedEventIds: new Set(),
+  alertFilters: {
+    category: "ALL",
+    hideAcknowledged: false,
+  },
+  maxOperatorEvents: 200,
 };
 
 const statusClass = {
@@ -65,6 +73,12 @@ const displayStatusDescriptions = {
   WAIT_PRICE_LOCATION_UNKNOWN: "가격 위치 확인 대기",
   WAIT_DATA_SUPPORT_NOT_READY: "지지선 데이터 대기",
   WAIT_DATA_LATEST_TICK_STALE: "틱 데이터 갱신 대기",
+};
+
+const operatorStorageKeys = {
+  acknowledged: "themeLabOperatorAcknowledgedEventIds",
+  alertFilter: "themeLabOperatorAlertFilter",
+  hideAcknowledged: "themeLabOperatorHideAcknowledged",
 };
 
 function escapeHtml(value) {
@@ -246,22 +260,369 @@ function chartFromWatchItem(item) {
   };
 }
 
+function loadOperatorPreferences() {
+  try {
+    const raw = window.localStorage.getItem(operatorStorageKeys.acknowledged);
+    const values = JSON.parse(raw || "[]");
+    state.acknowledgedEventIds = new Set(Array.isArray(values) ? values : []);
+  } catch (_) {
+    state.acknowledgedEventIds = new Set();
+  }
+  try {
+    state.alertFilters.category = window.localStorage.getItem(operatorStorageKeys.alertFilter) || "ALL";
+    state.alertFilters.hideAcknowledged = window.localStorage.getItem(operatorStorageKeys.hideAcknowledged) === "1";
+  } catch (_) {}
+}
+
+function saveAcknowledgedEventIds() {
+  try {
+    const ids = [...state.acknowledgedEventIds].slice(-500);
+    window.localStorage.setItem(operatorStorageKeys.acknowledged, JSON.stringify(ids));
+  } catch (_) {}
+}
+
+function saveOperatorAlertFilter() {
+  try {
+    window.localStorage.setItem(operatorStorageKeys.alertFilter, state.alertFilters.category || "ALL");
+    window.localStorage.setItem(operatorStorageKeys.hideAcknowledged, state.alertFilters.hideAcknowledged ? "1" : "0");
+  } catch (_) {}
+}
+
+function watchsetBySymbol(snapshot) {
+  return new Map(((snapshot || {}).watchset || []).map((item) => [String(item.symbol || ""), item]));
+}
+
+function selectSymbol(symbol, options = {}) {
+  const snapshot = state.snapshot || {};
+  const targetSymbol = String(symbol || "");
+  const item = (snapshot.watchset || []).find((candidate) => candidate.symbol === targetSymbol) || selectedWatchItem(snapshot);
+  if (targetSymbol) state.selectedSymbol = targetSymbol;
+  if (options.acknowledgeEventId) {
+    state.acknowledgedEventIds.add(options.acknowledgeEventId);
+    saveAcknowledgedEventIds();
+  }
+  const selectedChart = selectedChartForSymbol(snapshot, item.symbol || state.selectedSymbol);
+  renderFocusPanel(item, selectedChart);
+  renderChart(selectedChart);
+  renderGate(item);
+  renderWatchset(snapshot.watchset || []);
+  renderOperatorAlerts();
+  renderDecisionTimeline();
+}
+
+function deriveOperatorEvents(previousSnapshot, currentSnapshot) {
+  if (!previousSnapshot || !currentSnapshot) return [];
+  return [
+    ...summaryDiffEvents(previousSnapshot.summary || {}, currentSnapshot.summary || {}),
+    ...watchsetDiffEvents(previousSnapshot.watchset || [], currentSnapshot.watchset || []),
+    ...gatewayDiffEvents(previousSnapshot.gateway || {}, currentSnapshot.gateway || {}),
+    ...dataQualityDiffEvents(previousSnapshot.data_quality || {}, currentSnapshot.data_quality || {}),
+    ...themeDiffEvents(previousSnapshot.ranked_themes || [], currentSnapshot.ranked_themes || []),
+  ].map((event) => ({
+    created_at: new Date().toISOString(),
+    ...event,
+  }));
+}
+
+function appendOperatorEvents(events) {
+  if (!events.length) return;
+  const existingIds = new Set(state.operatorEvents.map((event) => event.id));
+  const additions = [];
+  events.forEach((event) => {
+    const id = makeEventId(event);
+    if (existingIds.has(id)) return;
+    existingIds.add(id);
+    additions.push({ ...event, id, severity: eventSeverity(event), category: eventCategory(event) });
+  });
+  if (!additions.length) return;
+  state.operatorEvents = [...additions, ...state.operatorEvents].slice(0, state.maxOperatorEvents);
+}
+
+function makeEventId(event) {
+  if (["ORDER_INTENT_CREATED", "VIRTUAL_ORDER_CREATED"].includes(event.type) && event.candidate_instance_id) {
+    return [event.type, event.candidate_instance_id].join(":");
+  }
+  const bucket = String(event.created_at || new Date().toISOString()).slice(0, 16);
+  return [
+    event.type,
+    event.symbol || "GLOBAL",
+    event.from_status || "",
+    event.to_status || "",
+    event.candidate_instance_id || "",
+    bucket,
+  ].join(":");
+}
+
+function summaryDiffEvents(previousSummary, currentSummary) {
+  const events = [];
+  if (!previousSummary.snapshot_stale && currentSummary.snapshot_stale) {
+    events.push({
+      type: "SNAPSHOT_STALE",
+      from_status: "FRESH",
+      to_status: "STALE",
+      message: `스냅샷 지연: ${currentSummary.snapshot_age_label || "-"} 전 계산된 결과`,
+    });
+  }
+  if (previousSummary.snapshot_stale && !currentSummary.snapshot_stale) {
+    events.push({
+      type: "SNAPSHOT_RECOVERED",
+      from_status: "STALE",
+      to_status: "FRESH",
+      message: "스냅샷 지연 회복: 최신 ThemeLab 결과 수신",
+    });
+  }
+  if (previousSummary.operation_status !== "READY_BUT_LIVE_BLOCKED" && currentSummary.operation_status === "READY_BUT_LIVE_BLOCKED") {
+    events.push({
+      type: "READY_BUT_LIVE_BLOCKED",
+      from_status: previousSummary.operation_status || "",
+      to_status: "READY_BUT_LIVE_BLOCKED",
+      message: currentSummary.operation_message_ko || "READY지만 LIVE Guard 통과 후보가 없습니다.",
+    });
+  }
+  return events;
+}
+
+function watchsetDiffEvents(previousWatchset, currentWatchset) {
+  const previousBySymbol = new Map(previousWatchset.map((item) => [String(item.symbol || ""), item]));
+  return currentWatchset.flatMap((item) => {
+    const previous = previousBySymbol.get(String(item.symbol || "")) || {};
+    const events = [];
+    const gate = item.gate_status || "";
+    const previousGate = previous.gate_status || "";
+    const display = item.display_status || gate;
+    const previousDisplay = previous.display_status || previousGate;
+    if (gate === "READY" && previousGate !== "READY") events.push(stockEvent("BUY_READY_NEW", item, previousGate, gate, readyMessage(item)));
+    if (gate === "READY_SMALL" && previousGate !== "READY_SMALL") events.push(stockEvent("BUY_READY_SMALL_NEW", item, previousGate, gate, readyMessage(item)));
+    if (previousGate === "READY" && gate === "WAIT") events.push(stockEvent("READY_TO_WAIT", item, previousGate, gate, `READY 이탈: ${stockLabel(item)} / ${display}`));
+    if (gateIsReadyLike(item) && !item.live_order_guard_passed && (!gateIsReadyLike(previous) || previous.live_order_guard_passed)) {
+      events.push(stockEvent("READY_BUT_LIVE_BLOCKED", item, previousDisplay, display, `READY지만 LIVE 차단: ${stockLabel(item)} / ${blockReason(item)}`));
+    }
+    if (item.runtime_order_intent_created && !previous.runtime_order_intent_created) {
+      events.push(stockEvent("ORDER_INTENT_CREATED", item, previousDisplay, display, `주문 의도 생성: ${stockLabel(item)} / ${item.candidate_instance_id || "-"}`));
+    }
+    if (item.virtual_order_created && !previous.virtual_order_created) {
+      events.push(stockEvent("VIRTUAL_ORDER_CREATED", item, previousDisplay, display, `가상 주문 생성: ${stockLabel(item)} / ${item.candidate_instance_id || "-"}`));
+    }
+    if (isMarketPending(item) && !isMarketPending(previous)) {
+      events.push(stockEvent("MARKET_WAIT_STARTED", item, previousDisplay, display, `시장 대기 전환: ${stockLabel(item)} / ${display} / ${item.market_wait_reason || "-"}`));
+    }
+    if (!isMarketPending(item) && isMarketPending(previous)) {
+      events.push(stockEvent("MARKET_RECOVERED", item, previousDisplay, display, `시장 대기 해소: ${stockLabel(item)} / ${display || gate}`));
+    }
+    if ((item.chase_risk || display === "CHASE_RISK_BLOCKED") && !(previous.chase_risk || previousDisplay === "CHASE_RISK_BLOCKED")) {
+      events.push(stockEvent("CHASE_RISK_BLOCKED", item, previousDisplay, display, chaseRiskMessage(item)));
+    }
+    if (display === "LATE_CHASE_TEMP_WAIT" && previousDisplay !== "LATE_CHASE_TEMP_WAIT") {
+      events.push(stockEvent("LATE_CHASE_TEMP_WAIT", item, previousDisplay, display, chaseRiskMessage(item)));
+    }
+    return events;
+  });
+}
+
+function gatewayDiffEvents(previousGateway, currentGateway) {
+  const wasHealthy = Boolean(previousGateway.connected && previousGateway.heartbeat_ok);
+  const healthy = Boolean(currentGateway.connected && currentGateway.heartbeat_ok);
+  if (wasHealthy && !healthy) {
+    return [{
+      type: "GATEWAY_DISCONNECTED",
+      from_status: "CONNECTED",
+      to_status: currentGateway.connection_state || "DISCONNECTED",
+      message: "Gateway 연결 끊김: heartbeat 또는 connected 상태 확인 필요",
+    }];
+  }
+  if (!wasHealthy && healthy) {
+    return [{
+      type: "GATEWAY_RECOVERED",
+      from_status: previousGateway.connection_state || "DISCONNECTED",
+      to_status: "CONNECTED",
+      message: "Gateway 연결 회복: heartbeat 정상 수신",
+    }];
+  }
+  return [];
+}
+
+function dataQualityDiffEvents(previousDataQuality, currentDataQuality) {
+  const previousStatus = previousDataQuality.status || "UNKNOWN";
+  const currentStatus = currentDataQuality.status || "UNKNOWN";
+  const previousBad = ["DEGRADED", "BROKEN"].includes(previousStatus);
+  const currentBad = ["DEGRADED", "BROKEN"].includes(currentStatus);
+  if (!previousBad && currentBad) {
+    return [{
+      type: "DATA_QUALITY_DEGRADED",
+      from_status: previousStatus,
+      to_status: currentStatus,
+      data_status: currentStatus,
+      message: `데이터 품질 저하: ${currentDataQuality.message || currentStatus}`,
+    }];
+  }
+  if (previousBad && !currentBad && currentStatus === "OK") {
+    return [{
+      type: "DATA_QUALITY_RECOVERED",
+      from_status: previousStatus,
+      to_status: currentStatus,
+      message: "데이터 품질 회복: WatchSet 보조 데이터 정상화",
+    }];
+  }
+  return [];
+}
+
+function themeDiffEvents(previousThemes, currentThemes) {
+  const previousTop = previousThemes[0] || {};
+  const currentTop = currentThemes[0] || {};
+  const events = [];
+  if (previousTop.theme_name && currentTop.theme_name && previousTop.theme_name !== currentTop.theme_name) {
+    events.push({
+      type: "TOP_THEME_CHANGED",
+      from_status: previousTop.theme_name,
+      to_status: currentTop.theme_name,
+      symbol: currentTop.top_leader_symbol || "",
+      message: `Top 테마 변경: ${previousTop.theme_name} → ${currentTop.theme_name}`,
+    });
+  }
+  if (previousTop.top_leader_symbol && currentTop.top_leader_symbol && previousTop.top_leader_symbol !== currentTop.top_leader_symbol) {
+    events.push({
+      type: "TOP_LEADER_CHANGED",
+      from_status: previousTop.top_leader_symbol,
+      to_status: currentTop.top_leader_symbol,
+      symbol: currentTop.top_leader_symbol || "",
+      message: `Top 리더 변경: ${previousTop.top_leader_name || previousTop.top_leader_symbol} → ${currentTop.top_leader_name || currentTop.top_leader_symbol}`,
+    });
+  }
+  return events;
+}
+
+function stockEvent(type, item, fromStatus, toStatus, message) {
+  return {
+    type,
+    symbol: item.symbol || "",
+    stock_name: item.stock_name || item.name || "",
+    primary_theme: item.primary_theme || item.theme_name || "",
+    stock_role: item.stock_role || "",
+    candidate_instance_id: item.candidate_instance_id || "",
+    from_status: fromStatus || "",
+    to_status: toStatus || "",
+    message,
+  };
+}
+
+function readyMessage(item) {
+  return `READY 발생: ${stockLabel(item)} / ${item.primary_theme || "-"} / ${item.stock_role || "-"} / LIVE Guard ${item.live_order_guard_passed ? "통과" : "미통과"}`;
+}
+
+function chaseRiskMessage(item) {
+  return `추격매수 차단: ${stockLabel(item)} / ${item.late_chase_level || "-"} / ${Number(item.late_chase_recheck_after_sec || 0)}초 후 재확인`;
+}
+
+function stockLabel(item) {
+  return `${item.stock_name || item.name || item.symbol || "-"}[${item.symbol || "-"}]`;
+}
+
+function blockReason(item) {
+  return item.blocked_reason || (item.blocked_reason_codes || item.risk_reason_codes || []).join(", ") || "-";
+}
+
+function eventSeverity(event) {
+  if (event.type === "DATA_QUALITY_DEGRADED" && event.data_status === "BROKEN") return "CRITICAL";
+  if (["GATEWAY_DISCONNECTED", "SNAPSHOT_STALE", "READY_BUT_LIVE_BLOCKED"].includes(event.type)) return "CRITICAL";
+  if (["MARKET_WAIT_STARTED", "DATA_QUALITY_DEGRADED", "CHASE_RISK_BLOCKED", "LATE_CHASE_TEMP_WAIT", "READY_TO_WAIT"].includes(event.type)) return "WARNING";
+  if (["BUY_READY_NEW", "BUY_READY_SMALL_NEW", "MARKET_RECOVERED", "TOP_THEME_CHANGED", "TOP_LEADER_CHANGED"].includes(event.type)) return "OPPORTUNITY";
+  return "INFO";
+}
+
+function eventCategory(event) {
+  if (["ORDER_INTENT_CREATED", "VIRTUAL_ORDER_CREATED"].includes(event.type)) return "ORDER";
+  if (["DATA_QUALITY_DEGRADED", "DATA_QUALITY_RECOVERED", "SNAPSHOT_STALE", "SNAPSHOT_RECOVERED"].includes(event.type)) return "DATA";
+  if (["MARKET_WAIT_STARTED", "MARKET_RECOVERED", "TOP_THEME_CHANGED", "TOP_LEADER_CHANGED"].includes(event.type)) return "MARKET";
+  const severity = event.severity || eventSeverity(event);
+  if (severity === "OPPORTUNITY") return "OPPORTUNITY";
+  if (severity === "CRITICAL") return "CRITICAL";
+  if (severity === "WARNING") return "WARNING";
+  return "INFO";
+}
+
+function renderOperatorAlerts() {
+  const list = document.getElementById("operator-alert-list");
+  const count = document.getElementById("operator-alert-count");
+  const hideButton = document.getElementById("operator-alert-hide-acknowledged");
+  if (!list || !count) return;
+  updateOperatorFilterButtons();
+  const filtered = filteredOperatorEvents();
+  const unackCount = state.operatorEvents.filter((event) => !state.acknowledgedEventIds.has(event.id)).length;
+  text("operator-alert-count", unackCount);
+  if (hideButton) {
+    hideButton.classList.toggle("active", state.alertFilters.hideAcknowledged);
+    hideButton.setAttribute("aria-pressed", state.alertFilters.hideAcknowledged ? "true" : "false");
+  }
+  list.innerHTML = filtered.length ? filtered.slice(0, 40).map(operatorEventRow).join("") : `<div class="operator-alert-empty">표시할 신규 알림이 없습니다.</div>`;
+}
+
+function updateOperatorFilterButtons() {
+  document.querySelectorAll("[data-alert-filter]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.alertFilter === state.alertFilters.category);
+  });
+}
+
+function renderDecisionTimeline() {
+  const list = document.getElementById("operator-timeline-list");
+  if (!list) return;
+  list.innerHTML = state.operatorEvents.length
+    ? state.operatorEvents.slice(0, 20).map((event) => operatorEventRow(event, true)).join("")
+    : `<div class="operator-alert-empty">상태 변화가 감지되면 여기에 누적됩니다.</div>`;
+}
+
+function filteredOperatorEvents() {
+  const filter = state.alertFilters.category || "ALL";
+  return state.operatorEvents.filter((event) => {
+    const acknowledged = state.acknowledgedEventIds.has(event.id);
+    if (state.alertFilters.hideAcknowledged && acknowledged) return false;
+    if (filter === "ALL") return true;
+    return event.category === filter || event.severity === filter;
+  });
+}
+
+function operatorEventRow(event, compact = false) {
+  const severity = event.severity || eventSeverity(event);
+  const acknowledged = state.acknowledgedEventIds.has(event.id);
+  const symbol = event.symbol || "";
+  return `
+    <button class="operator-event-row ${severity.toLowerCase()} ${acknowledged ? "acknowledged" : ""} ${compact ? "compact" : ""}" data-event-id="${escapeHtml(event.id)}" data-symbol="${escapeHtml(symbol)}" type="button">
+      <span class="operator-event-main">
+        ${badge(severity, severity.toLowerCase())}
+        <strong>${escapeHtml(event.message || event.type)}</strong>
+      </span>
+      <span class="operator-event-meta">${escapeHtml(formatEventTime(event.created_at))} · ${escapeHtml(event.type)}${symbol ? ` · ${escapeHtml(symbol)}` : ""}</span>
+    </button>
+  `;
+}
+
+function formatEventTime(value) {
+  const date = new Date(value || Date.now());
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
 function render(snapshot) {
-  state.snapshot = snapshot || {};
+  const currentSnapshot = snapshot || {};
+  const previousSnapshot = state.previousSnapshot;
+  if (previousSnapshot) appendOperatorEvents(deriveOperatorEvents(previousSnapshot, currentSnapshot));
+  state.snapshot = currentSnapshot;
   const selected = selectedWatchItem(state.snapshot);
   state.selectedSymbol = selected.symbol || state.selectedSymbol || "";
   const selectedChart = selectedChartForSymbol(state.snapshot, state.selectedSymbol);
-  renderHeader(snapshot);
-  renderCockpit(snapshot);
-  renderThemes(snapshot.ranked_themes || []);
-  renderWatchset(snapshot.watchset || []);
-  renderOrders(snapshot.entry_candidates || []);
+  renderHeader(currentSnapshot);
+  renderCockpit(currentSnapshot);
+  renderThemes(currentSnapshot.ranked_themes || []);
+  renderWatchset(currentSnapshot.watchset || []);
+  renderOrders(currentSnapshot.entry_candidates || []);
   renderFocusPanel(selected, selectedChart);
   renderChart(selectedChart);
   renderGate(selected);
-  renderConditions(snapshot.condition_statuses || []);
-  renderDataQuality(snapshot.data_quality || {});
-  updateKiwoomGatewayButton(snapshot);
+  renderConditions(currentSnapshot.condition_statuses || []);
+  renderDataQuality(currentSnapshot.data_quality || {});
+  renderOperatorAlerts();
+  renderDecisionTimeline();
+  updateKiwoomGatewayButton(currentSnapshot);
+  state.previousSnapshot = currentSnapshot;
 }
 
 function renderHeader(snapshot) {
@@ -1204,7 +1565,7 @@ function renderOrders(items) {
     const liveBlocked = item.gate_status === "READY" && !item.live_order_guard_passed;
     const small = item.gate_status === "READY_SMALL";
     return `
-      <div class="order-row">
+      <div class="order-row" data-symbol="${escapeHtml(item.symbol)}">
         <div class="row-top"><span class="row-title">${item.priority}. ${escapeHtml(item.stock_name || item.symbol)} ${item.code ? `[${escapeHtml(item.code)}]` : ""}</span>${badge(item.display_status || item.gate_status)}</div>
         <div class="row-meta">${escapeHtml(item.theme_name || "-")} · ${escapeHtml(item.stock_role || "-")} · ${item.position_size_multiplier}배</div>
         <div class="row-meta">진입 ${escapeHtml(item.entry_reference || "-")} · 손절 ${escapeHtml(item.stop_reference || "-")}</div>
@@ -1275,14 +1636,46 @@ function initFilters() {
   document.getElementById("watchset-body").addEventListener("click", (event) => {
     const row = event.target.closest("tr[data-symbol]");
     if (!row || !state.snapshot) return;
-    const item = (state.snapshot.watchset || []).find((candidate) => candidate.symbol === row.dataset.symbol);
-    if (!item) return;
-    state.selectedSymbol = item.symbol;
-    const selectedChart = selectedChartForSymbol(state.snapshot, item.symbol);
-    renderFocusPanel(item, selectedChart);
-    renderChart(selectedChart);
-    renderGate(item);
-    renderWatchset(state.snapshot.watchset || []);
+    selectSymbol(row.dataset.symbol, { source: "watchset" });
+  });
+  document.getElementById("order-candidates")?.addEventListener("click", (event) => {
+    const row = event.target.closest("[data-symbol]");
+    if (!row || !state.snapshot) return;
+    selectSymbol(row.dataset.symbol, { source: "order" });
+  });
+  document.getElementById("operator-alert-filters")?.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-alert-filter]");
+    if (!button) return;
+    state.alertFilters.category = button.dataset.alertFilter || "ALL";
+    saveOperatorAlertFilter();
+    renderOperatorAlerts();
+  });
+  document.getElementById("operator-alert-ack-all")?.addEventListener("click", () => {
+    state.operatorEvents.forEach((event) => state.acknowledgedEventIds.add(event.id));
+    saveAcknowledgedEventIds();
+    renderOperatorAlerts();
+    renderDecisionTimeline();
+  });
+  document.getElementById("operator-alert-hide-acknowledged")?.addEventListener("click", () => {
+    state.alertFilters.hideAcknowledged = !state.alertFilters.hideAcknowledged;
+    saveOperatorAlertFilter();
+    renderOperatorAlerts();
+  });
+  ["operator-alert-list", "operator-timeline-list"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("click", (event) => {
+      const row = event.target.closest("[data-event-id]");
+      if (!row) return;
+      const eventItem = state.operatorEvents.find((item) => item.id === row.dataset.eventId);
+      if (!eventItem) return;
+      state.acknowledgedEventIds.add(eventItem.id);
+      saveAcknowledgedEventIds();
+      if (eventItem.symbol) {
+        selectSymbol(eventItem.symbol, { source: "alert", acknowledgeEventId: eventItem.id });
+      } else {
+        renderOperatorAlerts();
+        renderDecisionTimeline();
+      }
+    });
   });
   document.getElementById("chart-timeframe")?.addEventListener("click", (event) => {
     const button = event.target.closest("button[data-chart-interval]");
@@ -1315,6 +1708,7 @@ function connectWs() {
   ws.onclose = () => setTimeout(connectWs, 1500);
 }
 
+loadOperatorPreferences();
 initFilters();
 fetchSnapshot().catch(() => {});
 connectWs();

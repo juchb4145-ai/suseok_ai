@@ -33,6 +33,15 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#operating-cockpit") is not None
     assert soup.select_one("#operation-status") is not None
     assert soup.select_one("#kiwoom-gateway-start") is not None
+    assert soup.select_one("#operator-alert-panel") is not None
+    assert soup.select_one("#operator-alert-count") is not None
+    assert soup.select_one("#operator-alert-filters") is not None
+    assert soup.select_one("#operator-alert-list") is not None
+    assert soup.select_one("#operator-timeline-list") is not None
+    assert soup.select_one("#operator-alert-ack-all") is not None
+    assert soup.select_one("#operator-alert-hide-acknowledged") is not None
+    assert soup.select_one('[data-alert-filter="OPPORTUNITY"]') is not None
+    assert soup.select_one('[data-alert-filter="CRITICAL"]') is not None
     assert soup.select_one("#cockpit-market-sides") is not None
     assert soup.select_one("#cockpit-live-readiness") is not None
     assert soup.select_one("#theme-rank-list") is not None
@@ -67,6 +76,37 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "gateway_unhealthy_display" in js
     assert "matchesFilters" in js
     assert "renderCockpit" in js
+    assert "previousSnapshot" in js
+    assert "operatorEvents" in js
+    assert "acknowledgedEventIds" in js
+    assert "alertFilters" in js
+    assert "maxOperatorEvents: 200" in js
+    assert "deriveOperatorEvents" in js
+    assert "appendOperatorEvents" in js
+    assert "makeEventId" in js
+    assert "renderOperatorAlerts" in js
+    assert "renderDecisionTimeline" in js
+    assert "eventSeverity" in js
+    assert "eventCategory" in js
+    assert "selectSymbol" in js
+    assert "watchsetBySymbol" in js
+    assert "summaryDiffEvents" in js
+    assert "watchsetDiffEvents" in js
+    assert "gatewayDiffEvents" in js
+    assert "dataQualityDiffEvents" in js
+    assert "themeDiffEvents" in js
+    assert 'selectSymbol(row.dataset.symbol, { source: "watchset" })' in js
+    assert 'selectSymbol(eventItem.symbol, { source: "alert", acknowledgeEventId: eventItem.id })' in js
+    for event_type in (
+        "BUY_READY_NEW",
+        "READY_BUT_LIVE_BLOCKED",
+        "DATA_QUALITY_DEGRADED",
+        "MARKET_WAIT_STARTED",
+        "ORDER_INTENT_CREATED",
+        "GATEWAY_DISCONNECTED",
+        "SNAPSHOT_STALE",
+    ):
+        assert event_type in js
     assert 'chartInterval: "1m"' in js
     assert "renderFocusPanel" in js
     assert "selectedChartForSymbol" in js
@@ -79,6 +119,11 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "RUNTIME_INACTIVE" in js
     assert "snapshot_age_label" in js
     assert ".chart-ref.vwap" in css
+    assert "operator-alert-panel" in css
+    assert ".critical" in css
+    assert ".warning" in css
+    assert ".opportunity" in css
+    assert ".info" in css
     assert "candidate-focus-panel" in css
     assert "decision-checklist" in css
     assert "price-track" in css
