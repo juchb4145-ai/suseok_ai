@@ -103,6 +103,62 @@ def test_theme_lab_snapshot_sorts_watchset_and_filters_entry_candidates(tmp_path
     assert payload["data_quality"]["vi_status_supported"] is False
 
 
+def test_theme_lab_snapshot_merges_risk_off_details_from_gate_decisions(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        watch = _watch("000001", "WAIT", role="LEADER")
+        db.save_theme_lab_flow_result(
+            "09:01:00",
+            {
+                "market_status": {"market_status": "RISK_OFF"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [watch],
+                "gate_decisions": [
+                    {
+                        "symbol": "000001",
+                        "status": "WAIT",
+                        "reason_codes": ["GLOBAL_MARKET_RISK_OFF", "WAIT_MARKET_RECOVERY"],
+                        "candidate_market": "KOSDAQ",
+                        "candidate_market_status": "RISK_OFF",
+                        "candidate_market_raw_status": "RISK_OFF",
+                        "candidate_market_confirmed_status": "RISK_OFF",
+                        "candidate_market_confirmation_pending": False,
+                        "candidate_market_recovery_pending": False,
+                        "market_side_reason_codes": ["MARKET_RISK_OFF_CONFIRMED", "WAIT_CANDIDATE_MARKET_RISK_OFF"],
+                        "risk_off_entry_details": {
+                            "risk_off_entry_enabled": True,
+                            "risk_off_entry_observe_only": True,
+                            "risk_off_entry_allowed": False,
+                            "risk_off_entry_rejected_reason": "STALE_QUOTE",
+                            "risk_off_relative_strength_pct": 7.5,
+                            "risk_off_candidate_breadth_pct": 0.67,
+                            "risk_off_candidate_index_return_pct": -3.7,
+                            "risk_off_max_position_size_multiplier": 0.25,
+                            "risk_off_exit_hint": {"max_hold_minutes": 20},
+                        },
+                    }
+                ],
+                "data_quality": {"vi_status_supported": 0},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    row = payload["watchset"][0]
+    assert row["display_status"] == "WAIT_CANDIDATE_MARKET_RISK_OFF"
+    assert row["candidate_market_confirmation_pending"] is False
+    assert row["risk_off_entry_enabled"] is True
+    assert row["risk_off_entry_allowed"] is False
+    assert row["risk_off_entry_rejected_reason"] == "STALE_QUOTE"
+    assert payload["summary"]["risk_off_small_entry_candidate_count"] == 1
+    assert payload["summary"]["risk_off_small_entry_rejected_count"] == 1
+    assert payload["summary"]["risk_off_small_entry_reject_reason_counts"] == {"STALE_QUOTE": 1}
+    assert payload["summary"]["market_confirmation_pending_count"] == 0
+    assert payload["summary"]["market_risk_off_wait_count"] == 1
+
+
 def test_theme_lab_snapshot_carries_minute_chart_context(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     try:

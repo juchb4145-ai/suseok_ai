@@ -79,6 +79,25 @@ MARKET_RECOVERY_PENDING_CODES = {
     "MARKET_WAIT_HYSTERESIS_HOLD",
 }
 MARKET_CLASSIFICATION_WAIT_CODES = {"MARKET_CLASSIFICATION_MISSING", "MARKET_CLASSIFICATION_FALLBACK_STRICT"}
+RISK_OFF_SMALL_ENTRY_CODES = {"RISK_OFF_SMALL_ENTRY", "READY_RISK_OFF_SMALL", "OBSERVE_RISK_OFF_SMALL_ENTRY"}
+RISK_OFF_SMALL_ENTRY_BLOCKING_CODES = {
+    "EXTREME_RISK_OFF",
+    "WAIT_MARKET_CONFIRMATION_PENDING",
+    "MARKET_RISK_OFF_CONFIRMATION_PENDING",
+    "CANDIDATE_MARKET_RISK_OFF_UNCONFIRMED",
+    "WAIT_MARKET_RECOVERY_PENDING",
+    "MARKET_RECOVERY_CONFIRMATION_PENDING",
+    "MARKET_WAIT_HYSTERESIS_HOLD",
+    "SIDE_BREADTH_SOURCE_CONFLICT",
+    "DATA_INSUFFICIENT",
+    "INDICATOR_DATA_INSUFFICIENT",
+    "STALE_QUOTE",
+    "MISSING_CURRENT_PRICE",
+    "SUPPORT_NOT_READY",
+    "WAIT_DATA_SUPPORT_NOT_READY",
+    "MARKET_CONFIRMATION_PENDING",
+    "MARKET_RECOVERY_PENDING",
+}
 
 READY_PULLBACK_LOCATIONS = {
     PriceLocationStatus.GOOD_PULLBACK,
@@ -588,6 +607,42 @@ def _map_decision(
             latest_tick_age_sec=latest.age_sec,
         )
     support = _selected_support_profile(price_location, _support_candidates(metadata), metadata)
+    risk_off_small_entry = _is_risk_off_small_entry(reason_codes)
+    risk_off_details = dict(getattr(decision, "risk_off_entry_details", {}) or {})
+    risk_off_observe_only = bool(risk_off_details.get("risk_off_entry_observe_only")) or "OBSERVE_RISK_OFF_SMALL_ENTRY" in {
+        str(code).upper() for code in reason_codes
+    }
+    if risk_off_small_entry and decision.status in {LabGateStatus.READY_SMALL, LabGateStatus.OBSERVE}:
+        if not support["ready"]:
+            return _wait_data_for_support(
+                decision,
+                recheck_after_sec,
+                reason_codes,
+                support,
+                latest,
+            )
+        support_reason_codes = [SUPPORT_SOURCE_FALLBACK_USED] if support["fallback_used"] else []
+        final_status = "OBSERVE_RISK_OFF_SMALL_ENTRY" if risk_off_observe_only or decision.status == LabGateStatus.OBSERVE else "READY_RISK_OFF_SMALL"
+        strategy_eligible = final_status == "READY_RISK_OFF_SMALL"
+        ready_type = "READY_RISK_OFF_SMALL" if strategy_eligible else "OBSERVE_RISK_OFF_SMALL_ENTRY"
+        return ThemeLabBridgeMapping(
+            final_status,
+            "BUY_ELIGIBLE_RISK_OFF_SMALL" if strategy_eligible else "NOT_ELIGIBLE_OBSERVE",
+            strategy_eligible,
+            BlockType.NONE,
+            False,
+            0 if strategy_eligible else recheck_after_sec,
+            "B_RISK_OFF",
+            min(75.0, max(65.0, float(decision.price_location_score or 65.0))),
+            _dedupe([final_status, ready_type] + support_reason_codes + reason_codes),
+            ready_type=ready_type,
+            selected_support_source=support["source"],
+            selected_support_price=int(support["price"]),
+            selected_support_ready=True,
+            support_source_fallback_used=bool(support["fallback_used"]),
+            latest_tick_ready=True,
+            latest_tick_age_sec=latest.age_sec,
+        )
     if (
         decision.status == LabGateStatus.READY
         and price_location in READY_PULLBACK_LOCATIONS
@@ -748,6 +803,10 @@ def _is_late_chase_soft_block(reason_codes: Iterable[str]) -> bool:
     return bool({str(code).upper() for code in reason_codes} & LATE_CHASE_SOFT_BLOCK_CODES)
 
 
+def _is_risk_off_small_entry(reason_codes: Iterable[str]) -> bool:
+    return bool({str(code).upper() for code in reason_codes} & RISK_OFF_SMALL_ENTRY_CODES)
+
+
 def _market_wait_status(reason_codes: Iterable[str]) -> str:
     upper_codes = {str(code).upper() for code in reason_codes}
     if upper_codes & MARKET_CLASSIFICATION_WAIT_CODES and "MARKET_CLASSIFICATION_FALLBACK_STRICT" in upper_codes:
@@ -756,6 +815,8 @@ def _market_wait_status(reason_codes: Iterable[str]) -> str:
         return "WAIT_MARKET_RECOVERY_PENDING"
     if upper_codes & MARKET_CONFIRMATION_PENDING_CODES:
         return "WAIT_MARKET_CONFIRMATION_PENDING"
+    if upper_codes & RISK_OFF_SMALL_ENTRY_CODES and not (upper_codes & RISK_OFF_SMALL_ENTRY_BLOCKING_CODES):
+        return ""
     if upper_codes & MARKET_RISK_OFF_WAIT_CODES:
         return "WAIT_CANDIDATE_MARKET_RISK_OFF"
     if upper_codes & MARKET_WEAK_WAIT_CODES:
@@ -933,6 +994,7 @@ def _stock_pullback_details(
     position_size_multiplier = max(0.0, float(decision.position_size_multiplier or 0.0))
     if position_size_multiplier <= 0:
         position_size_multiplier = 1.0
+    risk_off_details = dict(getattr(decision, "risk_off_entry_details", {}) or {})
     return {
         "source": SOURCE,
         "profile": candidate.strategy_profile.value if candidate.strategy_profile else StrategyProfile.KOSDAQ_THEME_PROFILE.value,
@@ -965,6 +1027,16 @@ def _stock_pullback_details(
         "stock_role": watch.stock_role.value,
         **market_fields,
         "position_size_multiplier": position_size_multiplier,
+        "risk_off_entry": risk_off_details,
+        "risk_off_entry_enabled": bool(risk_off_details.get("risk_off_entry_enabled")),
+        "risk_off_entry_observe_only": bool(risk_off_details.get("risk_off_entry_observe_only")),
+        "risk_off_entry_allowed": bool(risk_off_details.get("risk_off_entry_allowed")),
+        "risk_off_entry_rejected_reason": str(risk_off_details.get("risk_off_entry_rejected_reason") or ""),
+        "risk_off_relative_strength_pct": risk_off_details.get("risk_off_relative_strength_pct"),
+        "risk_off_candidate_breadth_pct": risk_off_details.get("risk_off_candidate_breadth_pct"),
+        "risk_off_candidate_index_return_pct": risk_off_details.get("risk_off_candidate_index_return_pct"),
+        "risk_off_max_position_size_multiplier": risk_off_details.get("risk_off_max_position_size_multiplier"),
+        "risk_off_exit_hint": dict(risk_off_details.get("risk_off_exit_hint") or {}),
         "dynamic_pullback_policy": {"source": SOURCE},
         "late_chase_diagnostics": {
             "source": SOURCE,
@@ -1081,6 +1153,16 @@ def _base_details(
         "risk_soft_block_reason_codes": list(stock_details.get("risk_soft_block_reason_codes") or []),
         "stock_role": watch.stock_role.value,
         "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
+        "risk_off_entry": dict(stock_details.get("risk_off_entry") or {}),
+        "risk_off_entry_enabled": bool(stock_details.get("risk_off_entry_enabled")),
+        "risk_off_entry_observe_only": bool(stock_details.get("risk_off_entry_observe_only")),
+        "risk_off_entry_allowed": bool(stock_details.get("risk_off_entry_allowed")),
+        "risk_off_entry_rejected_reason": stock_details.get("risk_off_entry_rejected_reason", ""),
+        "risk_off_relative_strength_pct": stock_details.get("risk_off_relative_strength_pct"),
+        "risk_off_candidate_breadth_pct": stock_details.get("risk_off_candidate_breadth_pct"),
+        "risk_off_candidate_index_return_pct": stock_details.get("risk_off_candidate_index_return_pct"),
+        "risk_off_max_position_size_multiplier": stock_details.get("risk_off_max_position_size_multiplier"),
+        "risk_off_exit_hint": dict(stock_details.get("risk_off_exit_hint") or {}),
         "theme_lab_bridge": {
             "source": SOURCE,
             "code": candidate.code,
@@ -1129,6 +1211,16 @@ def _base_details(
             "risk_soft_block": bool(stock_details.get("risk_soft_block")),
             "risk_soft_block_reason_codes": list(stock_details.get("risk_soft_block_reason_codes") or []),
             "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
+            "risk_off_entry": dict(stock_details.get("risk_off_entry") or {}),
+            "risk_off_entry_enabled": bool(stock_details.get("risk_off_entry_enabled")),
+            "risk_off_entry_observe_only": bool(stock_details.get("risk_off_entry_observe_only")),
+            "risk_off_entry_allowed": bool(stock_details.get("risk_off_entry_allowed")),
+            "risk_off_entry_rejected_reason": stock_details.get("risk_off_entry_rejected_reason", ""),
+            "risk_off_relative_strength_pct": stock_details.get("risk_off_relative_strength_pct"),
+            "risk_off_candidate_breadth_pct": stock_details.get("risk_off_candidate_breadth_pct"),
+            "risk_off_candidate_index_return_pct": stock_details.get("risk_off_candidate_index_return_pct"),
+            "risk_off_max_position_size_multiplier": stock_details.get("risk_off_max_position_size_multiplier"),
+            "risk_off_exit_hint": dict(stock_details.get("risk_off_exit_hint") or {}),
         },
     }
     return standardize_details(
@@ -1163,6 +1255,7 @@ def _observability_status_fields(
 
     normalized = str(mapping.final_gate_status or mapping.final_grade or "")
     display = normalized
+    risk_off_small_entry_status = normalized in {"READY_RISK_OFF_SMALL", "OBSERVE_RISK_OFF_SMALL_ENTRY"}
     if stock_details.get("chase_risk") or "CHASE_RISK" in reason_codes:
         normalized = "CHASE_RISK_BLOCKED"
         display = "CHASE_RISK_BLOCKED"
@@ -1178,6 +1271,9 @@ def _observability_status_fields(
     elif market_pending:
         normalized = "WAIT_MARKET_CONFIRMATION_PENDING"
         display = "WAIT_MARKET_CONFIRMATION_PENDING"
+    elif risk_off_small_entry_status:
+        normalized = str(mapping.final_gate_status)
+        display = str(mapping.final_gate_status)
     elif market_status == "RISK_OFF":
         normalized = "WAIT_CANDIDATE_MARKET_RISK_OFF"
         display = "WAIT_CANDIDATE_MARKET_RISK_OFF"

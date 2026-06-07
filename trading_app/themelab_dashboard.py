@@ -39,7 +39,8 @@ def build_theme_lab_dashboard_snapshot(
         return _empty_snapshot(runtime_status=runtime_status)
 
     themes = _as_list(raw.get("theme_rankings") or raw.get("theme_condition_snapshots"))
-    watchset = _sorted_watchset(_as_list(raw.get("watchset_snapshots")))
+    gate_decisions = _as_list(raw.get("gate_decisions"))
+    watchset = _sorted_watchset(_merge_watchset_gate_decisions(_as_list(raw.get("watchset_snapshots")), gate_decisions))
     condition_counts = _condition_theme_counts(db, raw)
     data_quality = _data_quality(raw, watchset)
     runtime = _runtime_context(runtime_status)
@@ -134,6 +135,74 @@ def _empty_snapshot(*, runtime_status: dict[str, Any] | None = None) -> dict[str
         "gate_detail": {"gate_status": "OBSERVE", "summary_message": "선택된 WatchSet 종목이 없습니다."},
         "summary": _empty_summary(runtime=runtime, freshness=freshness),
     }
+
+
+def _merge_watchset_gate_decisions(watchset: list[dict[str, Any]], decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    decisions_by_symbol = {str(item.get("symbol") or ""): item for item in decisions if item.get("symbol")}
+    decision_fields = (
+        "status",
+        "reason_codes",
+        "blocked_reason",
+        "risk_level",
+        "risk_reason_codes",
+        "position_size_multiplier",
+        "recheck_after_sec",
+        "price_location_status",
+        "price_location_score",
+        "price_location_reason_codes",
+        "candidate_market",
+        "candidate_market_source",
+        "candidate_market_status",
+        "candidate_market_action",
+        "candidate_index_return_pct",
+        "global_market_status",
+        "kospi_market_status",
+        "kosdaq_market_status",
+        "kospi_return_pct",
+        "kosdaq_return_pct",
+        "candidate_breadth_pct",
+        "candidate_breadth_ready",
+        "candidate_breadth_sample_count",
+        "candidate_breadth_source",
+        "candidate_valid_quote_ratio",
+        "candidate_breadth_trust_level",
+        "candidate_breadth_gate_usable",
+        "candidate_breadth_diagnostic_only",
+        "candidate_market_raw_status",
+        "candidate_market_confirmed_status",
+        "candidate_market_confirmation_pending",
+        "candidate_market_recovery_pending",
+        "market_side_reason_codes",
+        "market_side_data_quality_flags",
+    )
+    merged: list[dict[str, Any]] = []
+    for item in watchset:
+        row = dict(item)
+        decision = decisions_by_symbol.get(str(row.get("symbol") or ""))
+        if decision:
+            if decision.get("status") and row.get("gate_status") in (None, ""):
+                row["gate_status"] = decision.get("status")
+            for field in decision_fields:
+                value = decision.get(field)
+                if value not in (None, "", [], {}):
+                    row[field] = value
+            risk_off = dict(decision.get("risk_off_entry_details") or {})
+            if risk_off:
+                row["risk_off_entry"] = risk_off
+                for key in (
+                    "risk_off_entry_enabled",
+                    "risk_off_entry_observe_only",
+                    "risk_off_entry_allowed",
+                    "risk_off_entry_rejected_reason",
+                    "risk_off_relative_strength_pct",
+                    "risk_off_candidate_breadth_pct",
+                    "risk_off_candidate_index_return_pct",
+                    "risk_off_max_position_size_multiplier",
+                    "risk_off_exit_hint",
+                ):
+                    row[key] = risk_off.get(key)
+        merged.append(row)
+    return merged
 
 
 def _gateway_context(gateway_state: Any | None) -> dict[str, Any]:
@@ -253,7 +322,29 @@ def _summary(
     live_guard_passed = sum(1 for item in watchset if item.get("live_order_guard_passed"))
     ready_like = [item for item in watchset if item.get("gate_status") in {"READY", "READY_SMALL"}]
     live_guard_blocked = sum(1 for item in ready_like if not item.get("live_order_guard_passed"))
+    risk_off_small_entries = [item for item in watchset if _is_risk_off_small_entry(item)]
+    risk_off_reject_reasons = Counter(
+        str(item.get("risk_off_entry_rejected_reason") or "UNKNOWN")
+        for item in watchset
+        if item.get("risk_off_entry_enabled") and not item.get("risk_off_entry_allowed")
+    )
     market_pending_count = sum(1 for item in watchset if _is_market_pending(item))
+    market_confirmation_pending_count = sum(
+        1
+        for item in watchset
+        if item.get("candidate_market_confirmation_pending") or item.get("market_confirmation_pending")
+    )
+    market_recovery_pending_count = sum(
+        1
+        for item in watchset
+        if item.get("candidate_market_recovery_pending") or item.get("market_recovery_pending")
+    )
+    market_risk_off_wait_count = sum(
+        1
+        for item in watchset
+        if str(item.get("display_status") or "") == "WAIT_CANDIDATE_MARKET_RISK_OFF"
+        or str(item.get("candidate_market_confirmed_status") or item.get("market_confirmed_status") or "") == "RISK_OFF"
+    )
     data_not_ready_count = sum(1 for item in watchset if _is_data_not_ready(item))
     theme_data_not_ready_count = sum(1 for item in ranked_themes if _is_theme_data_not_ready(item))
     top_theme = ranked_themes[0] if ranked_themes else {}
@@ -262,6 +353,9 @@ def _summary(
         ready_count=gates.get("READY", 0),
         ready_small_count=gates.get("READY_SMALL", 0),
         market_pending_count=market_pending_count,
+        market_confirmation_pending_count=market_confirmation_pending_count,
+        market_recovery_pending_count=market_recovery_pending_count,
+        market_risk_off_wait_count=market_risk_off_wait_count,
         data_not_ready_count=data_not_ready_count,
         theme_data_not_ready_count=theme_data_not_ready_count,
         late_chase_wait_count=displays.get("LATE_CHASE_TEMP_WAIT", 0),
@@ -285,11 +379,23 @@ def _summary(
         "late_chase_wait_count": displays.get("LATE_CHASE_TEMP_WAIT", 0),
         "chase_risk_blocked_count": displays.get("CHASE_RISK_BLOCKED", 0),
         "market_pending_count": market_pending_count,
+        "market_confirmation_pending_count": market_confirmation_pending_count,
+        "market_recovery_pending_count": market_recovery_pending_count,
+        "market_risk_off_wait_count": market_risk_off_wait_count,
         "data_not_ready_count": data_not_ready_count,
         "diagnostic_only_count": sum(1 for item in watchset if item.get("diagnostic_only")),
         "submittable_count": sum(1 for item in watchset if item.get("submittable")),
         "runtime_order_intent_created_count": sum(1 for item in watchset if item.get("runtime_order_intent_created")),
         "virtual_order_created_count": sum(1 for item in watchset if item.get("virtual_order_created")),
+        "risk_off_small_entry_candidate_count": sum(1 for item in watchset if item.get("risk_off_entry_enabled")),
+        "risk_off_small_entry_allowed_count": sum(1 for item in risk_off_small_entries if item.get("risk_off_entry_allowed")),
+        "risk_off_small_entry_observe_only_count": sum(
+            1 for item in risk_off_small_entries if item.get("risk_off_entry_observe_only")
+        ),
+        "risk_off_small_entry_rejected_count": sum(
+            1 for item in watchset if item.get("risk_off_entry_enabled") and not item.get("risk_off_entry_allowed")
+        ),
+        "risk_off_small_entry_reject_reason_counts": dict(risk_off_reject_reasons),
         "live_order_enabled": any(item.get("live_order_enabled") for item in watchset),
         "live_guard_passed_count": live_guard_passed,
         "live_guard_blocked_count": live_guard_blocked,
@@ -323,6 +429,9 @@ def _empty_summary(
         ready_count=0,
         ready_small_count=0,
         market_pending_count=0,
+        market_confirmation_pending_count=0,
+        market_recovery_pending_count=0,
+        market_risk_off_wait_count=0,
         data_not_ready_count=0,
         theme_data_not_ready_count=0,
         late_chase_wait_count=0,
@@ -346,11 +455,19 @@ def _empty_summary(
         "late_chase_wait_count": 0,
         "chase_risk_blocked_count": 0,
         "market_pending_count": 0,
+        "market_confirmation_pending_count": 0,
+        "market_recovery_pending_count": 0,
+        "market_risk_off_wait_count": 0,
         "data_not_ready_count": 0,
         "diagnostic_only_count": 0,
         "submittable_count": 0,
         "runtime_order_intent_created_count": 0,
         "virtual_order_created_count": 0,
+        "risk_off_small_entry_candidate_count": 0,
+        "risk_off_small_entry_allowed_count": 0,
+        "risk_off_small_entry_observe_only_count": 0,
+        "risk_off_small_entry_rejected_count": 0,
+        "risk_off_small_entry_reject_reason_counts": {},
         "live_order_enabled": False,
         "live_guard_passed_count": 0,
         "live_guard_blocked_count": 0,
@@ -523,6 +640,9 @@ def _operation_status_message(
     ready_count: int,
     ready_small_count: int,
     market_pending_count: int,
+    market_confirmation_pending_count: int,
+    market_recovery_pending_count: int,
+    market_risk_off_wait_count: int,
     data_not_ready_count: int,
     theme_data_not_ready_count: int,
     late_chase_wait_count: int,
@@ -556,8 +676,12 @@ def _operation_status_message(
         return "READY_BUT_LIVE_BLOCKED", "READY 후보는 있으나 LIVE Guard 통과 후보가 없습니다."
     if data_status in {"DEGRADED", "BROKEN"} or data_not_ready_count >= max(1, ready_like + market_pending_count):
         return "WAIT_DATA_QUALITY", "VWAP/지지선/틱 데이터 부족으로 진단 전용 후보가 많습니다."
-    if market_pending_count > 0:
+    if market_confirmation_pending_count > 0:
         return "WAIT_MARKET_CONFIRMATION", "시장 확인 대기 후보가 많아 관찰 우선입니다."
+    if market_recovery_pending_count > 0 or market_risk_off_wait_count > 0:
+        return "WAIT_MARKET_RISK_OFF", "시장 RISK_OFF가 확인되어 회복 또는 RISK_OFF 소액진입 조건 충족을 대기 중입니다."
+    if market_pending_count > 0:
+        return "WAIT_MARKET_CONDITION", "시장 조건 대기 후보가 많아 관찰 우선입니다."
     if chase_risk_blocked_count > 0 or late_chase_wait_count >= max(1, ready_like):
         return "RISK_BLOCKED", "추격매수 차단 후보가 많아 신규 진입 대기입니다."
     if order_candidate_count == 0:
@@ -1322,6 +1446,11 @@ def _display_status(item: dict[str, Any], gate: str) -> str:
     existing = str(item.get("display_status") or item.get("normalized_status") or "").strip()
     if existing:
         return existing
+    if _is_risk_off_small_entry(item):
+        ready_type = str(item.get("ready_type") or "")
+        if ready_type == "READY_RISK_OFF_SMALL" or str(item.get("order_eligibility") or "") == "BUY_ELIGIBLE_RISK_OFF_SMALL":
+            return "READY_RISK_OFF_SMALL"
+        return "OBSERVE_RISK_OFF_SMALL_ENTRY"
     reason_values: list[Any] = []
     for key in ("reason_codes", "risk_reason_codes", "price_location_reason_codes"):
         reason_values.extend(item.get(key) or [])
@@ -1376,6 +1505,19 @@ def _display_status(item: dict[str, Any], gate: str) -> str:
     return gate
 
 
+def _is_risk_off_small_entry(item: dict[str, Any]) -> bool:
+    reason_values: list[Any] = []
+    for key in ("reason_codes", "risk_reason_codes", "price_location_reason_codes"):
+        reason_values.extend(item.get(key) or [])
+    reasons = {str(reason).upper() for reason in reason_values}
+    return bool(
+        item.get("risk_off_entry_allowed")
+        or str(item.get("ready_type") or "") == "READY_RISK_OFF_SMALL"
+        or str(item.get("final_gate_status") or "") in {"READY_RISK_OFF_SMALL", "OBSERVE_RISK_OFF_SMALL_ENTRY"}
+        or bool(reasons & {"RISK_OFF_SMALL_ENTRY", "READY_RISK_OFF_SMALL", "OBSERVE_RISK_OFF_SMALL_ENTRY"})
+    )
+
+
 def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
     gate = _value(item.get("final_gate_status") or item.get("gate_status") or "OBSERVE")
     display_status = _display_status(item, gate)
@@ -1407,6 +1549,17 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
         "candidate_instance_id": item.get("candidate_instance_id", ""),
         "candidate_market": candidate_market,
         "candidate_market_source": item.get("candidate_market_source", ""),
+        "candidate_market_status": item.get("candidate_market_status", ""),
+        "candidate_market_raw_status": item.get("candidate_market_raw_status") or item.get("market_raw_status", ""),
+        "candidate_market_confirmed_status": item.get("candidate_market_confirmed_status")
+        or item.get("candidate_market_status")
+        or item.get("market_confirmed_status", ""),
+        "candidate_market_confirmation_pending": bool(
+            item.get("candidate_market_confirmation_pending", item.get("market_confirmation_pending", False))
+        ),
+        "candidate_market_recovery_pending": bool(
+            item.get("candidate_market_recovery_pending", item.get("market_recovery_pending", False))
+        ),
         "primary_theme": item.get("primary_theme") or "",
         "theme_name": item.get("theme_name") or item.get("primary_theme") or "",
         "theme_score": item.get("theme_score", item.get("condition_score")),
@@ -1508,6 +1661,16 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
         "blocked_reason_codes": list(item.get("reason_codes") or item.get("blocked_reason_codes") or item.get("risk_reason_codes") or []),
         "runtime_order_intent_created": bool(item.get("runtime_order_intent_created")),
         "virtual_order_created": bool(item.get("virtual_order_created")),
+        "risk_off_entry": dict(item.get("risk_off_entry") or {}),
+        "risk_off_entry_enabled": bool(item.get("risk_off_entry_enabled")),
+        "risk_off_entry_observe_only": bool(item.get("risk_off_entry_observe_only")),
+        "risk_off_entry_allowed": bool(item.get("risk_off_entry_allowed")),
+        "risk_off_entry_rejected_reason": item.get("risk_off_entry_rejected_reason", ""),
+        "risk_off_relative_strength_pct": item.get("risk_off_relative_strength_pct"),
+        "risk_off_candidate_breadth_pct": item.get("risk_off_candidate_breadth_pct"),
+        "risk_off_candidate_index_return_pct": item.get("risk_off_candidate_index_return_pct"),
+        "risk_off_max_position_size_multiplier": item.get("risk_off_max_position_size_multiplier"),
+        "risk_off_exit_hint": dict(item.get("risk_off_exit_hint") or {}),
         "live_order_enabled": bool(item.get("live_order_enabled")),
         "live_order_guard_passed": bool(item.get("live_order_guard_passed")),
         "position_size_multiplier": float(item.get("position_size_multiplier") or 1.0),

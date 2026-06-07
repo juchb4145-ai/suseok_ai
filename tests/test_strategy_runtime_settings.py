@@ -62,6 +62,15 @@ def test_legacy_profile_keeps_gate_final_score_equal_to_hardcoded_weights(tmp_pa
     db.close()
 
 
+def test_risk_off_entry_default_is_disabled_observe_only():
+    settings = StrategyRuntimeSettings.legacy_default()
+
+    assert settings.value("risk_off_entry.enabled") is False
+    assert settings.value("risk_off_entry.observe_only") is True
+    assert settings.number("risk_off_entry.min_relative_strength_vs_index_pct", 0) == 4.0
+    assert settings.number("risk_off_entry.max_position_size_multiplier", 0) == 0.25
+
+
 def test_partial_settings_fallback_records_missing_keys_in_entry_plan_details(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     payload = legacy_profile_payload()

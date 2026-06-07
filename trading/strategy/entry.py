@@ -21,6 +21,8 @@ from trading.strategy.support_readiness import (
     support_source_readiness,
 )
 
+READY_RISK_OFF_SMALL = "READY_RISK_OFF_SMALL"
+
 
 class TickSizeProvider:
     def tick_size(self, price: int) -> int:
@@ -130,7 +132,19 @@ class EntryPlanBuilder:
                 "one_new_leg_per_cycle": True,
                 "later_legs_require_previous_fill": True,
                 "early_small_first_leg_only": ready_type == READY_EARLY_SMALL,
+                "risk_off_small_first_leg_only": ready_type == READY_RISK_OFF_SMALL,
             },
+            "risk_off_entry": dict(stock_details.get("risk_off_entry") or {}),
+            "risk_off_entry_enabled": bool(stock_details.get("risk_off_entry_enabled")),
+            "risk_off_entry_observe_only": bool(stock_details.get("risk_off_entry_observe_only")),
+            "risk_off_entry_allowed": bool(stock_details.get("risk_off_entry_allowed")),
+            "risk_off_entry_rejected_reason": stock_details.get("risk_off_entry_rejected_reason", ""),
+            "risk_off_relative_strength_pct": stock_details.get("risk_off_relative_strength_pct"),
+            "risk_off_candidate_breadth_pct": stock_details.get("risk_off_candidate_breadth_pct"),
+            "risk_off_candidate_index_return_pct": stock_details.get("risk_off_candidate_index_return_pct"),
+            "risk_off_max_position_size_multiplier": stock_details.get("risk_off_max_position_size_multiplier"),
+            "risk_off_exit_hint": dict(stock_details.get("risk_off_exit_hint") or {}),
+            "risk_off_unfilled_cancel_after_sec": 45 if ready_type == READY_RISK_OFF_SMALL else 0,
             "dynamic_pullback_policy": dict(stock_details.get("dynamic_pullback_policy") or {}),
             "late_chase_diagnostics": dict(stock_details.get("late_chase_diagnostics") or {}),
             "late_chase_level": stock_details.get("late_chase_level", ""),
@@ -190,9 +204,9 @@ class EntryPlanBuilder:
             if index == 1 and submittable and not first_support_readiness["ready"]:
                 submittable = False
                 reason = str(first_support_readiness["reason"] or WAIT_DATA_SUPPORT_NOT_READY)
-            if index > 1 and ready_type == READY_EARLY_SMALL:
+            if index > 1 and ready_type in {READY_EARLY_SMALL, READY_RISK_OFF_SMALL}:
                 submittable = False
-                reason = "early_small_later_leg_pending"
+                reason = "risk_off_small_later_leg_pending" if ready_type == READY_RISK_OFF_SMALL else "early_small_later_leg_pending"
             tick_offset = self.settings.integer("entry_plan_thresholds.tick_offset", 1) if submittable else 0
             limit_price = self.tick_provider.add_ticks(int(support_price), tick_offset) if submittable else 0
             plan.append(
@@ -206,7 +220,7 @@ class EntryPlanBuilder:
                     "submittable": submittable,
                     "requires_previous_leg": index > 1,
                     "confirmation_required": index > 1 and not submittable,
-                    "pending_after_first_fill": index > 1 and ready_type == READY_EARLY_SMALL,
+                    "pending_after_first_fill": index > 1 and ready_type in {READY_EARLY_SMALL, READY_RISK_OFF_SMALL},
                     "current_price_at_plan": current_price,
                     "reason": reason,
                 }

@@ -14,6 +14,7 @@ from trading.theme_engine.lab import (
     InstrumentMetadata,
     LabGateDecision,
     MarketSide,
+    RiskOffEntryConfig,
     ThemeLabConfig,
     ThemeLabFlowEngine,
     ThemeLabFlowResult,
@@ -141,6 +142,75 @@ class MarketSessionContext:
     max_restore_age_sec: int = 0
 
 
+def theme_lab_config_from_settings(settings: Any | None = None) -> ThemeLabConfig:
+    active = settings or legacy_strategy_runtime_settings()
+    payload = dict(active.value("risk_off_entry", {}) or {}) if hasattr(active, "value") else {}
+    return ThemeLabConfig(risk_off_entry=_risk_off_entry_config_from_settings(payload))
+
+
+def _risk_off_entry_config_from_settings(payload: dict[str, Any]) -> RiskOffEntryConfig:
+    defaults = RiskOffEntryConfig()
+
+    def _bool(name: str, default: bool) -> bool:
+        value = payload.get(name, default)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
+
+    def _float(name: str, default: float) -> float:
+        try:
+            return float(payload.get(name, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _int(name: str, default: int) -> int:
+        try:
+            return int(payload.get(name, default))
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+        value = payload.get(name, default)
+        if isinstance(value, (list, tuple)):
+            return tuple(str(item).upper() for item in value)
+        return tuple(str(item).upper() for item in default)
+
+    return RiskOffEntryConfig(
+        enabled=_bool("enabled", defaults.enabled),
+        observe_only=_bool("observe_only", defaults.observe_only),
+        block_extreme_risk_off=_bool("block_extreme_risk_off", defaults.block_extreme_risk_off),
+        allowed_theme_statuses=_tuple("allowed_theme_statuses", defaults.allowed_theme_statuses),
+        allowed_roles=_tuple("allowed_roles", defaults.allowed_roles),
+        allowed_price_locations=_tuple("allowed_price_locations", defaults.allowed_price_locations),
+        min_theme_score=_float("min_theme_score", defaults.min_theme_score),
+        min_theme_alive_ratio=_float("min_theme_alive_ratio", defaults.min_theme_alive_ratio),
+        min_theme_strong_ratio=_float("min_theme_strong_ratio", defaults.min_theme_strong_ratio),
+        min_theme_leader_count=_int("min_theme_leader_count", defaults.min_theme_leader_count),
+        min_candidate_breadth_pct=_float("min_candidate_breadth_pct", defaults.min_candidate_breadth_pct),
+        min_candidate_breadth_sample_count_kospi=_int(
+            "min_candidate_breadth_sample_count_kospi", defaults.min_candidate_breadth_sample_count_kospi
+        ),
+        min_candidate_breadth_sample_count_kosdaq=_int(
+            "min_candidate_breadth_sample_count_kosdaq", defaults.min_candidate_breadth_sample_count_kosdaq
+        ),
+        min_relative_strength_vs_index_pct=_float("min_relative_strength_vs_index_pct", defaults.min_relative_strength_vs_index_pct),
+        require_candidate_breadth_ready=_bool("require_candidate_breadth_ready", defaults.require_candidate_breadth_ready),
+        require_candidate_breadth_gate_usable=_bool("require_candidate_breadth_gate_usable", defaults.require_candidate_breadth_gate_usable),
+        require_latest_tick_ready=_bool("require_latest_tick_ready", defaults.require_latest_tick_ready),
+        require_support_ready=_bool("require_support_ready", defaults.require_support_ready),
+        require_vwap_or_recent_support_ready=_bool(
+            "require_vwap_or_recent_support_ready", defaults.require_vwap_or_recent_support_ready
+        ),
+        max_position_size_multiplier=_float("max_position_size_multiplier", defaults.max_position_size_multiplier),
+        max_ready_per_cycle=_int("max_ready_per_cycle", defaults.max_ready_per_cycle),
+        recheck_after_sec=_int("recheck_after_sec", defaults.recheck_after_sec),
+        reason_code=str(payload.get("reason_code") or defaults.reason_code),
+        exit_stop_loss_pct=_float("exit_stop_loss_pct", defaults.exit_stop_loss_pct),
+        exit_take_profit_pct=_float("exit_take_profit_pct", defaults.exit_take_profit_pct),
+        exit_max_hold_minutes=_int("exit_max_hold_minutes", defaults.exit_max_hold_minutes),
+    )
+
+
 class ThemeLabRuntimePipeline:
     def __init__(
         self,
@@ -158,7 +228,7 @@ class ThemeLabRuntimePipeline:
         self.market_data = market_data
         self.market_index_store = market_index_store
         self.interval_sec = max(1, int(interval_sec))
-        self.engine = engine or ThemeLabFlowEngine(ThemeLabConfig())
+        self.engine = engine or ThemeLabFlowEngine(theme_lab_config_from_settings())
         self.persistence_config = persistence_config or MarketSideConfirmationPersistenceConfig.from_settings(
             legacy_strategy_runtime_settings().value("market_side_confirmation_persistence", {})
         )

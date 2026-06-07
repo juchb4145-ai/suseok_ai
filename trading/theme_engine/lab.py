@@ -178,6 +178,36 @@ class MarketSideGateConfirmationConfig:
 
 
 @dataclass(frozen=True)
+class RiskOffEntryConfig:
+    enabled: bool = False
+    observe_only: bool = True
+    block_extreme_risk_off: bool = True
+    allowed_theme_statuses: tuple[str, ...] = ("LEADING_THEME", "SPREADING_THEME")
+    allowed_roles: tuple[str, ...] = ("LEADER", "CO_LEADER")
+    allowed_price_locations: tuple[str, ...] = ("VWAP_RECLAIM", "PULLBACK_RECLAIM", "GOOD_PULLBACK")
+    min_theme_score: float = 75.0
+    min_theme_alive_ratio: float = 0.65
+    min_theme_strong_ratio: float = 0.30
+    min_theme_leader_count: int = 2
+    min_candidate_breadth_pct: float = 0.38
+    min_candidate_breadth_sample_count_kospi: int = 80
+    min_candidate_breadth_sample_count_kosdaq: int = 120
+    min_relative_strength_vs_index_pct: float = 4.0
+    require_candidate_breadth_ready: bool = True
+    require_candidate_breadth_gate_usable: bool = True
+    require_latest_tick_ready: bool = True
+    require_support_ready: bool = True
+    require_vwap_or_recent_support_ready: bool = True
+    max_position_size_multiplier: float = 0.25
+    max_ready_per_cycle: int = 1
+    recheck_after_sec: int = 30
+    reason_code: str = "RISK_OFF_SMALL_ENTRY"
+    exit_stop_loss_pct: float = -1.2
+    exit_take_profit_pct: float = 1.8
+    exit_max_hold_minutes: int = 20
+
+
+@dataclass(frozen=True)
 class TradeabilityRiskConfig:
     vi_cooldown_sec: int = 180
     leader_max_buy_return_pct: float = 15.0
@@ -234,6 +264,7 @@ class ThemeLabConfig:
     market_side_gate: MarketSideGateConfig = field(default_factory=MarketSideGateConfig)
     market_side_breadth: MarketSideBreadthConfig = field(default_factory=MarketSideBreadthConfig)
     market_side_gate_confirmation: MarketSideGateConfirmationConfig = field(default_factory=MarketSideGateConfirmationConfig)
+    risk_off_entry: RiskOffEntryConfig = field(default_factory=RiskOffEntryConfig)
 
 
 @dataclass(frozen=True)
@@ -603,6 +634,7 @@ class LabGateDecision:
     kosdaq_valid_quote_ratio: float | None = None
     market_side_reason_codes: tuple[str, ...] = ()
     market_side_data_quality_flags: tuple[str, ...] = ()
+    risk_off_entry_details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -2375,10 +2407,14 @@ class ThemeLabHybridGate:
         risk_filter: TradeabilityRiskFilter | None = None,
         position_config: PositionAdjustmentConfig | None = None,
         market_side_config: MarketSideGateConfig | None = None,
+        risk_off_entry_config: RiskOffEntryConfig | None = None,
+        market_side_confirmation_config: MarketSideGateConfirmationConfig | None = None,
     ) -> None:
         self.risk_filter = risk_filter or TradeabilityRiskFilter()
         self.position_config = position_config or PositionAdjustmentConfig()
         self.market_side_config = market_side_config or MarketSideGateConfig()
+        self.risk_off_entry_config = risk_off_entry_config or RiskOffEntryConfig()
+        self.market_side_confirmation_config = market_side_confirmation_config or MarketSideGateConfirmationConfig()
 
     def evaluate(
         self,
@@ -2406,6 +2442,18 @@ class ThemeLabHybridGate:
                 )
             return LabGateDecision(**{**decision.__dict__, **context})
 
+        risk_off_candidate = _risk_off_small_entry_candidate(
+            market=market,
+            theme=theme,
+            watch=watch,
+            price_location=price_location,
+            risk=risk,
+            market_context=market_context,
+            snapshot=snapshot,
+            data_quality_flags=flags,
+            config=self.risk_off_entry_config,
+            confirmation_config=self.market_side_confirmation_config,
+        )
         if risk.risk_level == TradeabilityRiskLevel.HARD_BLOCK:
             return finalize(
                 LabGateDecision(
@@ -2420,6 +2468,7 @@ class ThemeLabHybridGate:
                     price_location.status,
                     price_location.score,
                     price_location.reason_codes,
+                    risk_off_entry_details=risk_off_candidate,
                 )
             )
         if risk.risk_level == TradeabilityRiskLevel.SOFT_BLOCK:
@@ -2436,8 +2485,35 @@ class ThemeLabHybridGate:
                     price_location.status,
                     price_location.score,
                     price_location.reason_codes,
+                    risk_off_entry_details=risk_off_candidate,
                 ),
                 action="TEMPORARY_WAIT",
+            )
+        if risk_off_candidate.get("risk_off_entry_allowed"):
+            status = LabGateStatus.OBSERVE if self.risk_off_entry_config.observe_only else LabGateStatus.READY_SMALL
+            primary_code = "OBSERVE_RISK_OFF_SMALL_ENTRY" if self.risk_off_entry_config.observe_only else "READY_RISK_OFF_SMALL"
+            return finalize(
+                LabGateDecision(
+                    watch.symbol,
+                    status,
+                    (
+                        primary_code,
+                        str(self.risk_off_entry_config.reason_code or "RISK_OFF_SMALL_ENTRY"),
+                        "RISK_OFF_RELATIVE_STRENGTH",
+                        "RISK_OFF_BREADTH_FILTER_PASS",
+                    ),
+                    "",
+                    risk.risk_level,
+                    risk.reason_codes,
+                    min(float(risk.position_size_multiplier or 1.0), float(self.risk_off_entry_config.max_position_size_multiplier or 1.0)),
+                    self.risk_off_entry_config.recheck_after_sec,
+                    price_location.status,
+                    price_location.score,
+                    price_location.reason_codes,
+                    risk_off_entry_details=risk_off_candidate,
+                ),
+                action="RISK_OFF_SMALL_ENTRY_OBSERVE" if self.risk_off_entry_config.observe_only else "RISK_OFF_SMALL_ENTRY_ALLOW",
+                reason_codes=("RISK_OFF_CONTEXT_OBSERVED",),
             )
         if market.market_status == MarketStatus.RISK_OFF:
             reasons = ("GLOBAL_MARKET_RISK_OFF", "WAIT_MARKET_RECOVERY")
@@ -2455,6 +2531,7 @@ class ThemeLabHybridGate:
                         price_location.status,
                         price_location.score,
                         price_location.reason_codes,
+                        risk_off_entry_details=risk_off_candidate,
                     ),
                     action="FINAL_BLOCK",
                     reason_codes=reasons,
@@ -2472,6 +2549,7 @@ class ThemeLabHybridGate:
                     price_location.status,
                     price_location.score,
                     price_location.reason_codes,
+                    risk_off_entry_details=risk_off_candidate,
                 ),
                 action="TEMPORARY_WAIT",
                 reason_codes=reasons,
@@ -2491,6 +2569,7 @@ class ThemeLabHybridGate:
                     price_location.status,
                     price_location.score,
                     price_location.reason_codes,
+                    risk_off_entry_details=risk_off_candidate,
                 ),
                 action="TEMPORARY_WAIT",
                 reason_codes=market_wait_reasons,
@@ -2660,6 +2739,8 @@ class ThemeLabFlowEngine:
             TradeabilityRiskFilter(self.config.tradeability_risk),
             self.config.position_adjustment,
             self.config.market_side_gate,
+            self.config.risk_off_entry,
+            self.config.market_side_gate_confirmation,
         )
 
     def run_pipeline(
@@ -2696,6 +2777,7 @@ class ThemeLabFlowEngine:
         theme_by_id = {theme.theme_id: theme for theme in ranked_themes}
         enriched_watchset: list[WatchSetSnapshot] = []
         decisions: list[LabGateDecision] = []
+        risk_off_small_ready_count = 0
         for watch in watchset:
             theme = theme_by_id.get(watch.primary_theme)
             if theme is None:
@@ -2722,6 +2804,23 @@ class ThemeLabFlowEngine:
                 snapshot=snapshot,
                 data_quality_flags=watch_data_quality_flags,
             )
+            if _is_risk_off_small_entry_decision(decision):
+                if risk_off_small_ready_count >= int(self.config.risk_off_entry.max_ready_per_cycle or 0):
+                    details = {
+                        **dict(decision.risk_off_entry_details or {}),
+                        "risk_off_entry_allowed": False,
+                        "risk_off_entry_rejected_reason": "RISK_OFF_SMALL_ENTRY_CYCLE_LIMIT",
+                    }
+                    decision = replace(
+                        decision,
+                        status=LabGateStatus.WAIT,
+                        reason_codes=("RISK_OFF_SMALL_ENTRY_CYCLE_LIMIT", "WAIT_CANDIDATE_MARKET_RISK_OFF"),
+                        position_size_multiplier=0.0,
+                        recheck_after_sec=self.config.risk_off_entry.recheck_after_sec,
+                        risk_off_entry_details=details,
+                    )
+                else:
+                    risk_off_small_ready_count += 1
             risk_input = _risk_input(market, theme, enriched, snapshot, watch_data_quality_flags)
             enriched = WatchSetSnapshot(
                 **{
@@ -3361,6 +3460,221 @@ def _risk_adjusted_for_price_location(
             PriceLocationConfig().chase_high_recheck_sec,
         )
     return risk
+
+
+RISK_OFF_ENTRY_BLOCKING_DATA_FLAGS = {
+    "DATA_INSUFFICIENT",
+    "INDICATOR_DATA_INSUFFICIENT",
+    "MISSING_CURRENT_PRICE",
+    "MISSING_PREV_CLOSE",
+    "MISSING_RETURN_PCT",
+    "MISSING_MARKET_STATUS",
+    "MISSING_THEME_STATUS",
+    "MISSING_STOCK_ROLE",
+    "PRICE_LOCATION_DATA_MISSING",
+    "STALE_QUOTE",
+    "MISSING_RECENT_CANDLES",
+    "STALE_MINUTE_BARS",
+}
+
+RISK_OFF_ENTRY_BLOCKING_PRICE_LOCATIONS = {
+    PriceLocationStatus.CHASE_HIGH,
+    PriceLocationStatus.BREAKOUT_CONTINUATION,
+    PriceLocationStatus.VWAP_OVEREXTENDED,
+    PriceLocationStatus.FAILED_BREAKOUT,
+    PriceLocationStatus.DEEP_PULLBACK,
+    PriceLocationStatus.UNKNOWN,
+}
+
+
+def _risk_off_small_entry_candidate(
+    *,
+    market: MarketStrengthSnapshot,
+    theme: ThemeConditionSnapshot,
+    watch: WatchSetSnapshot,
+    price_location: PriceLocationResult,
+    risk: TradeabilityRiskResult,
+    market_context: dict[str, Any],
+    snapshot: StockSnapshot | None,
+    data_quality_flags: Iterable[str],
+    config: RiskOffEntryConfig,
+    confirmation_config: MarketSideGateConfirmationConfig,
+) -> dict[str, Any]:
+    side = normalize_market_side(market_context.get("candidate_market") or watch.candidate_market)
+    side_detail = dict(market.side_statuses.get(side.value) or {}) if side != MarketSide.UNKNOWN else {}
+    context_reason_codes = _dedupe_tuple(
+        tuple(market_context.get("market_side_reason_codes") or ())
+        + tuple(side_detail.get("reason_codes") or ())
+        + tuple(market.side_breadth_reason_codes or ())
+    )
+    context_data_flags = _dedupe_tuple(
+        tuple(data_quality_flags)
+        + tuple(price_location.data_quality_flags)
+        + tuple(market_context.get("market_side_data_quality_flags") or ())
+        + tuple(side_detail.get("data_quality_flags") or ())
+        + tuple(market.market_side_data_quality_flags or ())
+    )
+    candidate_status = _market_status_from_value(
+        market_context.get("candidate_market_confirmed_status")
+        or market_context.get("candidate_market_status")
+        or market.status_for_side(side)
+    )
+    index_return = _float_or_none(market_context.get("candidate_index_return_pct"))
+    if index_return is None:
+        index_return = market.index_return_for_side(side)
+    relative_strength = round(float(watch.return_pct or 0.0) - float(index_return or 0.0), 4) if index_return is not None else None
+    breadth_pct = _float_or_none(market_context.get("candidate_breadth_pct"))
+    sample_count = int(market_context.get("candidate_breadth_sample_count") or 0)
+    required_sample_count = _risk_off_min_breadth_sample_count(config, side)
+    extreme = _risk_off_entry_extreme(side_detail, market_context, confirmation_config)
+    metadata = dict(snapshot.metadata or {}) if snapshot is not None else {}
+    details: dict[str, Any] = {
+        "risk_off_entry_enabled": bool(config.enabled),
+        "risk_off_entry_observe_only": bool(config.observe_only),
+        "risk_off_entry_allowed": False,
+        "risk_off_entry_rejected_reason": "",
+        "risk_off_relative_strength_pct": relative_strength,
+        "risk_off_candidate_breadth_pct": breadth_pct,
+        "risk_off_candidate_index_return_pct": index_return,
+        "risk_off_max_position_size_multiplier": float(config.max_position_size_multiplier),
+        "risk_off_candidate_market": side.value,
+        "risk_off_candidate_market_status": candidate_status.value,
+        "risk_off_candidate_breadth_sample_count": sample_count,
+        "risk_off_required_breadth_sample_count": required_sample_count,
+        "risk_off_extreme": bool(extreme),
+        "risk_off_entry_reason_code": str(config.reason_code or "RISK_OFF_SMALL_ENTRY"),
+        "risk_off_exit_hint": {
+            "stop_loss_pct": float(config.exit_stop_loss_pct),
+            "take_profit_pct": float(config.exit_take_profit_pct),
+            "max_hold_minutes": int(config.exit_max_hold_minutes),
+        },
+    }
+
+    def reject(reason: str) -> dict[str, Any]:
+        details["risk_off_entry_rejected_reason"] = reason
+        return details
+
+    if not config.enabled:
+        return reject("RISK_OFF_ENTRY_DISABLED")
+    if market.market_status != MarketStatus.RISK_OFF and candidate_status != MarketStatus.RISK_OFF:
+        return reject("NOT_RISK_OFF")
+    if bool(market_context.get("candidate_market_confirmation_pending")) or bool(
+        set(context_reason_codes)
+        & {
+            "MARKET_CONFIRMATION_PENDING",
+            "WAIT_MARKET_CONFIRMATION_PENDING",
+            "MARKET_RISK_OFF_CONFIRMATION_PENDING",
+            "CANDIDATE_MARKET_RISK_OFF_UNCONFIRMED",
+        }
+    ):
+        return reject("MARKET_CONFIRMATION_PENDING")
+    if bool(market_context.get("candidate_market_recovery_pending")) or bool(
+        set(context_reason_codes)
+        & {
+            "MARKET_RECOVERY_PENDING",
+            "WAIT_MARKET_RECOVERY_PENDING",
+            "MARKET_RECOVERY_CONFIRMATION_PENDING",
+            "MARKET_WAIT_HYSTERESIS_HOLD",
+        }
+    ):
+        return reject("MARKET_RECOVERY_PENDING")
+    if "SIDE_BREADTH_SOURCE_CONFLICT" in set(context_reason_codes) | set(context_data_flags):
+        return reject("SIDE_BREADTH_SOURCE_CONFLICT")
+    if bool(config.block_extreme_risk_off) and extreme:
+        return reject("EXTREME_RISK_OFF")
+    blocking_data_flags = set(context_data_flags) & RISK_OFF_ENTRY_BLOCKING_DATA_FLAGS
+    if "STALE_QUOTE" in blocking_data_flags:
+        return reject("STALE_QUOTE")
+    if blocking_data_flags:
+        return reject("DATA_INSUFFICIENT")
+    if config.require_latest_tick_ready:
+        if snapshot is None:
+            return reject("LATEST_TICK_MISSING")
+        quote_ready, quote_reason = _quote_valid_for_breadth(snapshot, watch.calculated_at or theme.calculated_at, 60)
+        if not quote_ready:
+            return reject(quote_reason or "LATEST_TICK_NOT_READY")
+    if theme.theme_status.value not in {str(value).upper() for value in config.allowed_theme_statuses}:
+        return reject("THEME_STATUS_NOT_ALLOWED")
+    if float(theme.condition_score or 0.0) < float(config.min_theme_score):
+        return reject("THEME_SCORE_TOO_LOW")
+    if float(theme.alive_ratio or 0.0) < float(config.min_theme_alive_ratio):
+        return reject("THEME_ALIVE_RATIO_TOO_LOW")
+    if float(theme.strong_ratio or 0.0) < float(config.min_theme_strong_ratio):
+        return reject("THEME_STRONG_RATIO_TOO_LOW")
+    if int(theme.leader_count or 0) < int(config.min_theme_leader_count):
+        return reject("THEME_LEADER_COUNT_TOO_LOW")
+    if watch.stock_role.value not in {str(value).upper() for value in config.allowed_roles}:
+        return reject("ROLE_NOT_ALLOWED")
+    if price_location.status.value not in {str(value).upper() for value in config.allowed_price_locations}:
+        return reject("PRICE_LOCATION_NOT_ALLOWED")
+    if price_location.status in RISK_OFF_ENTRY_BLOCKING_PRICE_LOCATIONS:
+        return reject("PRICE_LOCATION_BLOCKED")
+    if risk.risk_level not in {TradeabilityRiskLevel.PASS, TradeabilityRiskLevel.RISK_ADJUST}:
+        return reject("RISK_LEVEL_NOT_ALLOWED")
+    if config.require_candidate_breadth_ready and not bool(market_context.get("candidate_breadth_ready")):
+        return reject("CANDIDATE_BREADTH_NOT_READY")
+    if config.require_candidate_breadth_gate_usable and not bool(market_context.get("candidate_breadth_gate_usable")):
+        return reject("CANDIDATE_BREADTH_NOT_GATE_USABLE")
+    if sample_count < required_sample_count:
+        return reject("CANDIDATE_BREADTH_SAMPLE_TOO_SMALL")
+    if breadth_pct is None or breadth_pct < float(config.min_candidate_breadth_pct):
+        return reject("CANDIDATE_BREADTH_TOO_WEAK")
+    if relative_strength is None:
+        return reject("RELATIVE_STRENGTH_MISSING")
+    if relative_strength < float(config.min_relative_strength_vs_index_pct):
+        return reject("RELATIVE_STRENGTH_TOO_LOW")
+    if (config.require_support_ready or config.require_vwap_or_recent_support_ready) and not _risk_off_support_ready(
+        price_location.status,
+        watch,
+        metadata,
+    ):
+        return reject("SUPPORT_NOT_READY")
+
+    details["risk_off_entry_allowed"] = True
+    details["risk_off_entry_rejected_reason"] = ""
+    return details
+
+
+def _risk_off_min_breadth_sample_count(config: RiskOffEntryConfig, side: MarketSide) -> int:
+    if side == MarketSide.KOSPI:
+        return int(config.min_candidate_breadth_sample_count_kospi or 0)
+    return int(config.min_candidate_breadth_sample_count_kosdaq or 0)
+
+
+def _risk_off_entry_extreme(
+    side_detail: dict[str, Any],
+    market_context: dict[str, Any],
+    confirmation_config: MarketSideGateConfirmationConfig,
+) -> bool:
+    breadth = _float_or_none(side_detail.get("breadth_pct"))
+    if breadth is None:
+        breadth = _float_or_none(market_context.get("candidate_breadth_pct"))
+    weighted = _float_or_none(side_detail.get("turnover_weighted_return_pct"))
+    if breadth is not None and breadth <= float(confirmation_config.extreme_breadth_risk_off_pct):
+        return True
+    if weighted is not None and weighted <= float(confirmation_config.extreme_turnover_weighted_return_pct):
+        return True
+    return False
+
+
+def _risk_off_support_ready(
+    price_location: PriceLocationStatus,
+    watch: WatchSetSnapshot,
+    metadata: dict[str, Any],
+) -> bool:
+    vwap_ready = _metadata_bool(metadata, "vwap_ready") or _positive_float_or_none(watch.vwap) is not None
+    recent_support_ready = _metadata_bool(metadata, "recent_support_ready") or bool(watch.recent_support_ready)
+    recent_support_present = _positive_float_or_none(watch.recent_support_price) is not None or _positive_float_or_none(
+        metadata.get("recent_support_price")
+    ) is not None
+    if price_location == PriceLocationStatus.VWAP_RECLAIM:
+        return vwap_ready
+    return recent_support_ready and recent_support_present
+
+
+def _is_risk_off_small_entry_decision(decision: LabGateDecision) -> bool:
+    codes = {str(code).upper() for code in decision.reason_codes}
+    return "RISK_OFF_SMALL_ENTRY" in codes or "READY_RISK_OFF_SMALL" in codes or "OBSERVE_RISK_OFF_SMALL_ENTRY" in codes
 
 
 def _theme_market_role_ready(market: MarketStrengthSnapshot, theme: ThemeConditionSnapshot, role: StockRole) -> bool:

@@ -114,6 +114,84 @@ def test_ready_small_leader_good_pullback_creates_scaled_small_intent(tmp_path):
     assert intent["metadata"]["weight_pct"] == 25.0
 
 
+def test_risk_off_small_entry_creates_one_scaled_dry_run_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.READY_SMALL,
+            PriceLocationStatus.VWAP_RECLAIM,
+            role=StockRole.LEADER,
+            reasons=("READY_RISK_OFF_SMALL", "RISK_OFF_SMALL_ENTRY", "RISK_OFF_RELATIVE_STRENGTH", "RISK_OFF_BREADTH_FILTER_PASS"),
+            candidate_market=MarketSide.KOSDAQ.value,
+            candidate_market_status=MarketStatus.RISK_OFF.value,
+            candidate_market_raw_status=MarketStatus.RISK_OFF.value,
+            candidate_market_confirmed_status=MarketStatus.RISK_OFF.value,
+            candidate_breadth_pct=0.50,
+            candidate_breadth_ready=True,
+            candidate_breadth_sample_count=140,
+            candidate_breadth_gate_usable=True,
+            multiplier=0.25,
+            risk_off_entry_details=_risk_off_entry_details(observe_only=False),
+        ),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+    plan = db.list_entry_plans(candidate.id)[0]
+    intent = db.list_runtime_order_intents(candidate_id=candidate.id)[0]
+
+    assert details["sub_status"] == "READY_RISK_OFF_SMALL"
+    assert details["order_eligibility"] == "BUY_ELIGIBLE_RISK_OFF_SMALL"
+    assert details["risk_off_entry_allowed"] is True
+    assert plan.cancel_condition["ready_type"] == "READY_RISK_OFF_SMALL"
+    assert plan.cancel_condition["risk_off_entry_allowed"] is True
+    assert plan.split_plan[0]["submittable"] is True
+    assert plan.split_plan[0]["weight_pct"] <= 25.0
+    assert plan.split_plan[1]["submittable"] is False
+    assert plan.split_plan[1]["reason"] == "risk_off_small_later_leg_pending"
+    assert intent["metadata"]["order_eligibility"] == "BUY_ELIGIBLE_RISK_OFF_SMALL"
+    assert intent["metadata"]["weight_pct"] <= 25.0
+    assert intent["metadata"]["risk_off_exit_hint"]["max_hold_minutes"] == 20
+
+
+def test_risk_off_small_entry_observe_only_does_not_create_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.OBSERVE,
+            PriceLocationStatus.VWAP_RECLAIM,
+            role=StockRole.LEADER,
+            reasons=("OBSERVE_RISK_OFF_SMALL_ENTRY", "RISK_OFF_SMALL_ENTRY", "RISK_OFF_RELATIVE_STRENGTH", "RISK_OFF_BREADTH_FILTER_PASS"),
+            candidate_market=MarketSide.KOSDAQ.value,
+            candidate_market_status=MarketStatus.RISK_OFF.value,
+            candidate_market_raw_status=MarketStatus.RISK_OFF.value,
+            candidate_market_confirmed_status=MarketStatus.RISK_OFF.value,
+            candidate_breadth_pct=0.50,
+            candidate_breadth_ready=True,
+            candidate_breadth_sample_count=140,
+            candidate_breadth_gate_usable=True,
+            multiplier=0.25,
+            risk_off_entry_details=_risk_off_entry_details(observe_only=True),
+        ),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+    assert details["sub_status"] == "OBSERVE_RISK_OFF_SMALL_ENTRY"
+    assert details["risk_off_entry_allowed"] is True
+    assert details["risk_off_entry_observe_only"] is True
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
 def test_themelab_good_pullback_soft_block_waits_without_entry_plan_or_intent(tmp_path):
     runtime, db, _gateway_state = _runtime(
         tmp_path,
@@ -923,6 +1001,7 @@ def _flow_result(
     market_reset_reason: str = "",
     market_session_reason_codes: tuple[str, ...] = (),
     market_confirmation_metrics: dict | None = None,
+    risk_off_entry_details: dict | None = None,
 ) -> ThemeLabFlowResult:
     theme = ThemeConditionSnapshot(
         calculated_at=NOW.isoformat(),
@@ -1096,6 +1175,7 @@ def _flow_result(
         market_side_reason_codes=market_side_reason_codes
         if market_side_reason_codes is not None
         else (reasons if any("MARKET" in reason for reason in reasons) else ()),
+        risk_off_entry_details=dict(risk_off_entry_details or {}),
     )
     return ThemeLabFlowResult(
         market=MarketStrengthSnapshot(
@@ -1112,6 +1192,24 @@ def _flow_result(
         gate_decisions=(decision,),
         data_quality={},
     )
+
+
+def _risk_off_entry_details(*, observe_only: bool) -> dict:
+    return {
+        "risk_off_entry_enabled": True,
+        "risk_off_entry_observe_only": observe_only,
+        "risk_off_entry_allowed": True,
+        "risk_off_entry_rejected_reason": "",
+        "risk_off_relative_strength_pct": 8.2,
+        "risk_off_candidate_breadth_pct": 0.50,
+        "risk_off_candidate_index_return_pct": -3.2,
+        "risk_off_max_position_size_multiplier": 0.25,
+        "risk_off_exit_hint": {
+            "stop_loss_pct": -1.2,
+            "take_profit_pct": 1.8,
+            "max_hold_minutes": 20,
+        },
+    }
 
 
 def _seed_theme(db: TradingDatabase) -> None:

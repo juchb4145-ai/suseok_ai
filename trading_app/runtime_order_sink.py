@@ -621,6 +621,41 @@ def _theme_lab_bridge_metadata(
         "max_chase_pct": cancel.get("max_chase_pct"),
         "split_leg": virtual_order.leg_index,
         "weight_pct": virtual_order.weight_pct,
+        "risk_off_entry": dict(details.get("risk_off_entry") or bridge.get("risk_off_entry") or cancel.get("risk_off_entry") or {}),
+        "risk_off_entry_enabled": bool(details.get("risk_off_entry_enabled") or bridge.get("risk_off_entry_enabled") or cancel.get("risk_off_entry_enabled")),
+        "risk_off_entry_observe_only": bool(
+            details.get("risk_off_entry_observe_only") or bridge.get("risk_off_entry_observe_only") or cancel.get("risk_off_entry_observe_only")
+        ),
+        "risk_off_entry_allowed": bool(details.get("risk_off_entry_allowed") or bridge.get("risk_off_entry_allowed") or cancel.get("risk_off_entry_allowed")),
+        "risk_off_entry_rejected_reason": details.get("risk_off_entry_rejected_reason")
+        or bridge.get("risk_off_entry_rejected_reason")
+        or cancel.get("risk_off_entry_rejected_reason")
+        or "",
+        "risk_off_relative_strength_pct": _first_text(
+            details.get("risk_off_relative_strength_pct"),
+            bridge.get("risk_off_relative_strength_pct"),
+            cancel.get("risk_off_relative_strength_pct"),
+            None,
+        ),
+        "risk_off_candidate_breadth_pct": _first_text(
+            details.get("risk_off_candidate_breadth_pct"),
+            bridge.get("risk_off_candidate_breadth_pct"),
+            cancel.get("risk_off_candidate_breadth_pct"),
+            None,
+        ),
+        "risk_off_candidate_index_return_pct": _first_text(
+            details.get("risk_off_candidate_index_return_pct"),
+            bridge.get("risk_off_candidate_index_return_pct"),
+            cancel.get("risk_off_candidate_index_return_pct"),
+            None,
+        ),
+        "risk_off_max_position_size_multiplier": _first_text(
+            details.get("risk_off_max_position_size_multiplier"),
+            bridge.get("risk_off_max_position_size_multiplier"),
+            cancel.get("risk_off_max_position_size_multiplier"),
+            None,
+        ),
+        "risk_off_exit_hint": dict(details.get("risk_off_exit_hint") or bridge.get("risk_off_exit_hint") or cancel.get("risk_off_exit_hint") or {}),
         "late_chase_level": details.get("late_chase_level") or bridge.get("late_chase_level") or cancel.get("late_chase_level") or "",
         "sub_status": details.get("sub_status") or bridge.get("sub_status") or "",
         "chase_risk": bool(details.get("chase_risk") or bridge.get("chase_risk") or "CHASE_RISK" in list(details.get("risk_reason_codes") or [])),

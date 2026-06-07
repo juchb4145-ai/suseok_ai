@@ -67,7 +67,8 @@ def build_observe_runtime(client, db: TradingDatabase):
     from trading.strategy.runtime import StrategyRuntime
     from trading.strategy.virtual_orders import VirtualOrderService
     from trading.strategy.hybrid_validation import HybridValidationRepository
-    from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline
+    from trading.theme_engine.lab import ThemeLabFlowEngine
+    from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline, theme_lab_config_from_settings
     from trading.theme_engine.context_provider import DynamicThemeContextProvider
     from trading.theme_engine.repository import ThemeEngineRepository
 
@@ -118,6 +119,7 @@ def build_observe_runtime(client, db: TradingDatabase):
             market_data=market_data,
             market_index_store=market_index_store,
             interval_sec=config.theme_lab_pipeline_interval_sec,
+            engine=ThemeLabFlowEngine(theme_lab_config_from_settings(settings)),
         )
     runtime = StrategyRuntime(
         db=db,

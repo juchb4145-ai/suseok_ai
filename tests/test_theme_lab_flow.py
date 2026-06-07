@@ -17,8 +17,10 @@ from trading.theme_engine.lab import (
     PriceLocationInput,
     PriceLocationResult,
     PriceLocationStatus,
+    RiskOffEntryConfig,
     StockRole,
     ThemeBreadthEngine,
+    ThemeConditionSnapshot,
     ThemeLabConditionClassifier,
     ThemeLabConfig,
     ThemeLabFlowEngine,
@@ -587,6 +589,97 @@ def test_market_side_index_hard_risk_off_confirms_immediately():
     assert decision.candidate_market_confirmation_pending is False
     assert "WAIT_CANDIDATE_MARKET_RISK_OFF" in decision.reason_codes
     assert "MARKET_RISK_OFF_CONFIRMED" in decision.reason_codes
+
+
+def test_risk_off_small_entry_allows_only_strong_leader_when_enabled():
+    gate = ThemeLabHybridGate(
+        risk_off_entry_config=RiskOffEntryConfig(enabled=True, observe_only=False),
+        market_side_confirmation_config=MarketSideGateConfirmationConfig(),
+    )
+
+    decision = gate.evaluate(
+        market=_risk_off_market(),
+        theme=_risk_off_leading_theme(),
+        watch=_risk_off_watch(),
+        price_location=_price_location(PriceLocationStatus.VWAP_RECLAIM),
+        snapshot=_risk_off_snapshot(),
+    )
+
+    assert decision.status == LabGateStatus.READY_SMALL
+    assert "RISK_OFF_SMALL_ENTRY" in decision.reason_codes
+    assert "RISK_OFF_RELATIVE_STRENGTH" in decision.reason_codes
+    assert "RISK_OFF_BREADTH_FILTER_PASS" in decision.reason_codes
+    assert "GLOBAL_MARKET_RISK_OFF" not in decision.reason_codes
+    assert decision.position_size_multiplier == 0.25
+    assert decision.risk_off_entry_details["risk_off_entry_allowed"] is True
+    assert decision.risk_off_entry_details["risk_off_relative_strength_pct"] >= 4.0
+
+
+def test_risk_off_small_entry_blocks_extreme_breadth():
+    gate = ThemeLabHybridGate(
+        risk_off_entry_config=RiskOffEntryConfig(enabled=True, observe_only=False),
+        market_side_confirmation_config=MarketSideGateConfirmationConfig(),
+    )
+
+    decision = gate.evaluate(
+        market=_risk_off_market(breadth_pct=0.10),
+        theme=_risk_off_leading_theme(),
+        watch=_risk_off_watch(),
+        price_location=_price_location(PriceLocationStatus.VWAP_RECLAIM),
+        snapshot=_risk_off_snapshot(),
+    )
+
+    assert decision.status == LabGateStatus.WAIT
+    assert "GLOBAL_MARKET_RISK_OFF" in decision.reason_codes
+    assert decision.risk_off_entry_details["risk_off_entry_rejected_reason"] == "EXTREME_RISK_OFF"
+
+
+def test_risk_off_small_entry_blocks_chase_locations():
+    gate = ThemeLabHybridGate(
+        risk_off_entry_config=RiskOffEntryConfig(enabled=True, observe_only=False),
+        market_side_confirmation_config=MarketSideGateConfirmationConfig(),
+    )
+
+    decision = gate.evaluate(
+        market=_risk_off_market(),
+        theme=_risk_off_leading_theme(),
+        watch=_risk_off_watch(),
+        price_location=_price_location(PriceLocationStatus.CHASE_HIGH),
+        snapshot=_risk_off_snapshot(),
+    )
+
+    assert decision.status == LabGateStatus.WAIT
+    assert "RISK_OFF_SMALL_ENTRY" not in decision.reason_codes
+    assert decision.risk_off_entry_details["risk_off_entry_rejected_reason"] == "PRICE_LOCATION_NOT_ALLOWED"
+
+
+def test_risk_off_small_entry_blocks_stale_quote_data():
+    gate = ThemeLabHybridGate(
+        risk_off_entry_config=RiskOffEntryConfig(enabled=True, observe_only=False),
+        market_side_confirmation_config=MarketSideGateConfirmationConfig(),
+    )
+
+    decision = gate.evaluate(
+        market=_risk_off_market(),
+        theme=_risk_off_leading_theme(),
+        watch=_risk_off_watch(),
+        price_location=_price_location(PriceLocationStatus.VWAP_RECLAIM),
+        snapshot=_snapshot(
+            "000001",
+            6.0,
+            turnover=5_000_000_000,
+            current_price=10000,
+            metadata={
+                "prev_close": 9434,
+                "vwap": 9950,
+                "vwap_ready": True,
+                "latest_tick_stale": True,
+            },
+        ),
+    )
+
+    assert decision.status == LabGateStatus.WAIT
+    assert decision.risk_off_entry_details["risk_off_entry_rejected_reason"] == "STALE_QUOTE"
 
 
 def test_market_side_recovery_requires_confirmed_healthy_cycles():
@@ -1313,6 +1406,100 @@ def _watch(*, role: StockRole, return_pct: float, symbol: str = "000001") -> Wat
         turnover_krw=5_000_000_000,
         condition_level=3 if return_pct >= 5 else 2,
         stock_role=role,
+    )
+
+
+def _risk_off_market(*, breadth_pct: float = 0.50, turnover_weighted_return_pct: float = 0.5) -> MarketStrengthSnapshot:
+    side_detail = {
+        "status": MarketStatus.RISK_OFF.value,
+        "raw_status": MarketStatus.RISK_OFF.value,
+        "confirmed_status": MarketStatus.RISK_OFF.value,
+        "index_return_pct": -3.2,
+        "breadth_pct": breadth_pct,
+        "breadth_ready": True,
+        "breadth_sample_count": 140,
+        "breadth_gate_usable": True,
+        "turnover_weighted_return_pct": turnover_weighted_return_pct,
+        "reason_codes": ["KOSDAQ_MARKET_RISK_OFF", "MARKET_RISK_OFF_CONFIRMED"],
+        "data_quality_flags": [],
+    }
+    return MarketStrengthSnapshot(
+        MarketStatus.RISK_OFF,
+        kospi_return_pct=0.1,
+        kosdaq_return_pct=-3.2,
+        kosdaq_status=MarketStatus.RISK_OFF,
+        kosdaq_confirmed_status=MarketStatus.RISK_OFF,
+        kosdaq_index_return_pct=-3.2,
+        side_statuses={MarketSide.KOSDAQ.value: side_detail},
+        side_confirmation_states={
+            MarketSide.KOSDAQ.value: {
+                "confirmed_status": MarketStatus.RISK_OFF.value,
+                "current_raw_status": MarketStatus.RISK_OFF.value,
+                "confirmation_pending": False,
+                "recovery_pending": False,
+                "reason_codes": ["MARKET_RISK_OFF_CONFIRMED"],
+            }
+        },
+    )
+
+
+def _risk_off_watch() -> WatchSetSnapshot:
+    return WatchSetSnapshot(
+        calculated_at="2026-06-01T09:05:00",
+        symbol="000001",
+        primary_theme="t",
+        return_pct=6.0,
+        turnover_krw=5_000_000_000,
+        condition_level=3,
+        stock_role=StockRole.LEADER,
+        candidate_market=MarketSide.KOSDAQ.value,
+        candidate_market_status=MarketStatus.RISK_OFF.value,
+        candidate_market_confirmed_status=MarketStatus.RISK_OFF.value,
+        candidate_index_return_pct=-3.2,
+        candidate_breadth_pct=0.50,
+        candidate_breadth_ready=True,
+        candidate_breadth_sample_count=140,
+        candidate_breadth_gate_usable=True,
+        vwap=9950,
+        recent_support_price=9900,
+        recent_support_ready=True,
+    )
+
+
+def _risk_off_leading_theme() -> ThemeConditionSnapshot:
+    return ThemeConditionSnapshot(
+        calculated_at="2026-06-01T09:05:00",
+        theme_id="t",
+        theme_name="AI",
+        raw_total_members=5,
+        eligible_total_members=5,
+        alive_count=5,
+        strong_count=3,
+        leader_count=2,
+        alive_ratio=1.0,
+        strong_ratio=0.60,
+        leader_ratio=0.40,
+        condition_score=85.0,
+        theme_status=ThemeLabThemeStatus.LEADING_THEME,
+    )
+
+
+def _risk_off_snapshot() -> StockSnapshot:
+    return _snapshot(
+        "000001",
+        6.0,
+        turnover=5_000_000_000,
+        current_price=10000,
+        session_high=10300,
+        metadata={
+            "prev_close": 9434,
+            "vwap": 9950,
+            "vwap_ready": True,
+            "recent_support_price": 9900,
+            "recent_support_ready": True,
+            "recent_support_candle_count": 4,
+            "quote_ts": "2026-06-01T09:05:00",
+        },
     )
 
 

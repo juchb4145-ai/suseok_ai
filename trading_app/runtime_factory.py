@@ -29,7 +29,8 @@ from trading.theme_engine.backfill import ThemeBackfillConfig, ThemeBackfillServ
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime import RealTimeThemeRuntime
-from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline
+from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline, theme_lab_config_from_settings
+from trading.theme_engine.lab import ThemeLabFlowEngine
 from trading_app.dependencies import CoreSettings
 from trading_app.runtime_adapters import (
     GatewayCommandConditionAdapter,
@@ -119,6 +120,7 @@ def build_core_strategy_runtime(
             market_data=market_data,
             market_index_store=market_index_store,
             interval_sec=config.theme_lab_pipeline_interval_sec,
+            engine=ThemeLabFlowEngine(theme_lab_config_from_settings(runtime_settings)),
             backfill_service=theme_backfill_service,
         )
     runtime = StrategyRuntime(

@@ -12,6 +12,7 @@ from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import IndexTick, MarketIndexStore
 from trading.strategy.models import Candidate, CandidateState, OrderMode
 from trading.strategy.runtime import StrategyRuntimeConfig
+from trading.strategy.runtime_settings import LEGACY_DEFAULT_SETTINGS, legacy_profile_payload
 from trading.theme_engine.lab import (
     ConditionHitSnapshot,
     MarketStatus,
@@ -33,6 +34,31 @@ def test_themelab_flow_is_default_and_runtime_contains_pipeline(tmp_path):
 
     assert runtime.config.theme_engine_mode == "themelab_flow"
     assert runtime.theme_lab_pipeline is not None
+    db.close()
+
+
+def test_themelab_runtime_uses_saved_risk_off_entry_settings(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    payload = legacy_profile_payload()
+    settings_json = json.loads(json.dumps(LEGACY_DEFAULT_SETTINGS))
+    settings_json["risk_off_entry"] = {
+        **settings_json["risk_off_entry"],
+        "enabled": True,
+        "observe_only": True,
+        "min_relative_strength_vs_index_pct": 5.5,
+        "max_position_size_multiplier": 0.15,
+    }
+    payload["settings_json"] = json.dumps(settings_json)
+    payload["config_json"] = payload["settings_json"]
+    db.save_strategy_runtime_settings_profile(payload)
+
+    runtime = build_observe_runtime(MockKiwoomClient(), db)
+
+    config = runtime.theme_lab_pipeline.engine.config.risk_off_entry
+    assert config.enabled is True
+    assert config.observe_only is True
+    assert config.min_relative_strength_vs_index_pct == 5.5
+    assert config.max_position_size_multiplier == 0.15
     db.close()
 
 
