@@ -46,6 +46,15 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#operator-event-journal") is not None
     assert soup.select_one("#operator-event-journal-filters") is not None
     assert soup.select_one("#operator-event-journal-list") is not None
+    assert soup.select_one("#operator-action-center") is not None
+    assert soup.select_one("#operator-action-context") is not None
+    assert soup.select_one("#operator-action-recommendations") is not None
+    assert soup.select_one("#operator-action-history") is not None
+    assert soup.select_one("#operator-action-summary") is not None
+    assert soup.select_one("#operator-action-confirm-modal") is not None
+    assert soup.select_one("#operator-runbook-panel") is not None
+    assert soup.select_one("#operator-runbook-title") is not None
+    assert soup.select_one("#operator-runbook-body") is not None
     assert soup.select_one('[data-alert-filter="OPPORTUNITY"]') is not None
     assert soup.select_one('[data-alert-filter="CRITICAL"]') is not None
     assert soup.select_one('[data-journal-filter="SYMBOL"]') is not None
@@ -89,6 +98,12 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "persistedEventIds" in js
     assert "operatorSessionSummary" in js
     assert "journalFilter" in js
+    assert "actionCatalog" in js
+    assert "actionRecommendations" in js
+    assert "selectedEventId" in js
+    assert "selectedActionContext" in js
+    assert "pendingAction" in js
+    assert "actionSummary" in js
     assert "alertFilters" in js
     assert "maxOperatorEvents: 200" in js
     assert "deriveOperatorEvents" in js
@@ -103,9 +118,33 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "renderOperatorEventJournal" in js
     assert "acknowledgeOperatorEvents" in js
     assert "hideOperatorEvents" in js
+    assert "fetchActionCatalog" in js
+    assert "fetchActionRecommendations" in js
+    assert "executeOperatorAction" in js
+    assert "confirmOperatorAction" in js
+    assert "renderOperatorActionCenter" in js
+    assert "renderActionRecommendations" in js
+    assert "renderActionHistory" in js
+    assert "renderActionSummary" in js
+    assert "renderRunbook" in js
+    assert "runbookForEvent" in js
+    assert "runbookForStatus" in js
+    assert "appendActionResultToEvents" in js
     assert "/api/themelab/operator-events" in js
     assert "/api/themelab/operator-events/summary" in js
     assert "/api/themelab/operator-events/ack" in js
+    assert "/api/themelab/operator-actions/catalog" in js
+    assert "/api/themelab/operator-actions/recommendations" in js
+    assert "/api/themelab/operator-actions/execute" in js
+    assert "LIVE_BUY" in js
+    assert "LIVE_SELL" in js
+    assert "CANCEL_LIVE_ORDER" in js
+    assert "OVERRIDE_LIVE_GUARD" in js
+    assert "RUNTIME_CYCLE_ONCE" in js
+    assert "CHECK_GATEWAY_STATUS" in js
+    assert "START_KIWOOM_GATEWAY" in js
+    assert "ADD_OPERATOR_NOTE" in js
+    assert "OPEN_RUNBOOK" in js
     assert "eventSeverity" in js
     assert "eventCategory" in js
     assert "selectSymbol" in js
@@ -142,6 +181,16 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "operator-alert-panel" in css
     assert "session-review-card" in css
     assert "operator-event-journal-list" in css
+    assert "action-center-panel" in css
+    assert "action-card" in css
+    assert "action-history-row" in css
+    assert "action-confirm-modal" in css
+    assert "runbook-panel" in css
+    assert "runbook-step" in css
+    assert "action-status-success" in css
+    assert "action-status-failed" in css
+    assert "action-status-blocked" in css
+    assert "action-status-running" in css
     assert ".critical" in css
     assert ".warning" in css
     assert ".opportunity" in css

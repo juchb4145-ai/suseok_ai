@@ -17,6 +17,16 @@
   operatorEventLastSyncAt: "",
   operatorEventServerBacked: false,
   operatorSessionSummary: {},
+  actionCatalog: {},
+  disabledActionCatalog: {},
+  actionRecommendations: [],
+  disabledActionRecommendations: [],
+  actionHistory: [],
+  selectedEventId: "",
+  selectedActionContext: {},
+  pendingAction: null,
+  actionSummary: {},
+  runbook: null,
   alertFilters: {
     category: "ALL",
     hideAcknowledged: false,
@@ -86,6 +96,37 @@ const operatorStorageKeys = {
   alertFilter: "themeLabOperatorAlertFilter",
   hideAcknowledged: "themeLabOperatorHideAcknowledged",
 };
+
+const safeOperatorActionTypes = [
+  "REFRESH_SNAPSHOT",
+  "RUNTIME_CYCLE_ONCE",
+  "RUNTIME_START",
+  "RUNTIME_STOP",
+  "RUNTIME_RESTART",
+  "CHECK_RUNTIME_READINESS",
+  "CHECK_GATEWAY_STATUS",
+  "START_KIWOOM_GATEWAY",
+  "OPEN_DRY_RUN_ORDER_DETAIL",
+  "REBUILD_DRY_RUN_PERFORMANCE",
+  "REBUILD_TRANSPORT_LATENCY_REPORT",
+  "EXPORT_TRANSPORT_LATENCY_REPORT",
+  "ACK_EVENT",
+  "HIDE_EVENT",
+  "SNOOZE_EVENT",
+  "ADD_OPERATOR_NOTE",
+  "OPEN_RUNBOOK",
+];
+
+const blockedOperatorActionTypes = [
+  "LIVE_BUY",
+  "LIVE_SELL",
+  "CANCEL_LIVE_ORDER",
+  "OVERRIDE_LIVE_GUARD",
+  "FORCE_READY",
+  "CHANGE_RISK_THRESHOLD",
+  "CHANGE_STRATEGY_PARAMETER",
+  "DISABLE_RISK_GATE",
+];
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -362,6 +403,13 @@ function selectSymbol(symbol, options = {}) {
   renderOperatorAlerts();
   renderDecisionTimeline();
   renderOperatorEventJournal();
+  if (options.source) {
+    const context = actionContextFromCandidate(item);
+    state.selectedActionContext = context;
+    fetchActionRecommendations(context).catch((error) => {
+      text("operator-action-context", `추천 액션 실패: ${error.message || error}`);
+    });
+  }
 }
 
 function deriveOperatorEvents(previousSnapshot, currentSnapshot) {
@@ -877,6 +925,288 @@ async function initOperatorEventJournal() {
     renderOperatorSessionReview();
     renderOperatorEventJournal();
   }
+}
+
+async function fetchActionCatalog() {
+  const response = await fetch("/api/themelab/operator-actions/catalog", { cache: "no-store" });
+  const payload = await parseResponsePayload(response);
+  if (!response.ok) throw new Error(payload.detail || payload.error || `operator-actions catalog ${response.status}`);
+  state.actionCatalog = Object.fromEntries((payload.actions || []).map((item) => [item.action_type, item]));
+  state.disabledActionCatalog = Object.fromEntries((payload.disabled_actions || []).map((item) => [item.action_type, item]));
+  renderOperatorActionCenter();
+}
+
+async function fetchActionRecommendations(context = state.selectedActionContext) {
+  const params = new URLSearchParams();
+  const nextContext = { ...(context || {}) };
+  if (nextContext.event_id) params.set("event_id", nextContext.event_id);
+  if (nextContext.symbol) params.set("symbol", nextContext.symbol);
+  if (nextContext.candidate_instance_id) params.set("candidate_instance_id", nextContext.candidate_instance_id);
+  const response = await fetch(`/api/themelab/operator-actions/recommendations?${params.toString()}`, { cache: "no-store" });
+  const payload = await parseResponsePayload(response);
+  if (!response.ok) throw new Error(payload.detail || payload.error || `operator-actions recommendations ${response.status}`);
+  state.selectedActionContext = { ...nextContext, ...(payload.context || {}) };
+  state.selectedEventId = state.selectedActionContext.event_id || "";
+  state.actionRecommendations = payload.recommendations || [];
+  state.disabledActionRecommendations = payload.disabled_actions || [];
+  state.runbook = payload.runbook || state.runbook;
+  renderOperatorActionCenter();
+  renderRunbook(state.runbook);
+}
+
+async function fetchActionHistory() {
+  const response = await fetch("/api/themelab/operator-actions?limit=20", { cache: "no-store" });
+  const payload = await parseResponsePayload(response);
+  if (!response.ok) throw new Error(payload.detail || payload.error || `operator-actions ${response.status}`);
+  state.actionHistory = payload.actions || payload.items || [];
+  renderActionHistory(state.actionHistory);
+}
+
+async function fetchActionSummary() {
+  const response = await fetch("/api/themelab/operator-actions/summary", { cache: "no-store" });
+  const payload = await parseResponsePayload(response);
+  if (!response.ok) throw new Error(payload.detail || payload.error || `operator-actions summary ${response.status}`);
+  state.actionSummary = payload || {};
+  renderActionSummary(state.actionSummary);
+}
+
+async function initOperatorActionCenter() {
+  try {
+    await fetchActionCatalog();
+    await Promise.all([fetchActionHistory(), fetchActionSummary(), fetchActionRecommendations(state.selectedActionContext || {})]);
+  } catch (error) {
+    text("operator-action-context", `Action Center 복원 실패: ${error.message || error}`);
+    renderOperatorActionCenter();
+    renderRunbook(runbookForStatus("GENERAL"));
+  }
+}
+
+function renderOperatorActionCenter() {
+  renderActionContext();
+  renderActionRecommendations(state.actionRecommendations);
+  renderActionHistory(state.actionHistory);
+  renderActionSummary(state.actionSummary);
+}
+
+function renderActionContext() {
+  const context = state.selectedActionContext || {};
+  const parts = [
+    context.event_type ? `event ${context.event_type}` : "",
+    context.symbol ? `symbol ${context.symbol}` : "",
+    context.candidate_instance_id ? `candidate ${context.candidate_instance_id}` : "",
+  ].filter(Boolean);
+  text("operator-action-context", parts.length ? parts.join(" / ") : "선택 이벤트 또는 후보 기준 추천 액션");
+}
+
+function renderActionRecommendations(recommendations = []) {
+  const node = document.getElementById("operator-action-recommendations");
+  if (!node) return;
+  const disabled = state.disabledActionRecommendations || [];
+  const cards = [
+    ...recommendations.map((item) => actionCard(item)),
+    ...disabled.map((item) => actionCard(item, true)),
+  ];
+  node.innerHTML = cards.length ? cards.join("") : `<div class="operator-alert-empty">추천 액션이 없습니다.</div>`;
+}
+
+function actionCard(action, disabled = false) {
+  const actionType = action.action_type || "";
+  const risk = String(action.risk_level || (disabled ? "BLOCKED" : "LOW")).toLowerCase();
+  const reason = action.reason_ko || action.reason || action.reason_ko || "";
+  const token = action.requires_token ? "token 필요" : "token 불필요";
+  const confirm = action.confirmation_required ? "확인 필요" : "즉시 기록";
+  const title = disabled ? (action.reason_ko || "이번 PR 범위에서 금지된 액션입니다.") : "";
+  return `
+    <article class="action-card ${disabled ? "disabled" : risk}">
+      <div class="action-card-head">
+        <div class="action-card-title">
+          <strong>${escapeHtml(action.label_ko || actionType)}</strong>
+          <span>${escapeHtml(actionType)} · ${escapeHtml(token)} · ${escapeHtml(confirm)}</span>
+        </div>
+        ${badge(disabled ? "BLOCKED" : String(action.risk_level || "LOW"), disabled ? "blocked" : actionRiskLevel(actionType).toLowerCase())}
+      </div>
+      <p>${escapeHtml(reason || "현재 컨텍스트에서 실행 가능한 안전 액션입니다.")}</p>
+      <button type="button" data-action-type="${escapeHtml(actionType)}" ${disabled ? "disabled" : ""} title="${escapeHtml(title)}">${disabled ? "금지됨" : "실행"}</button>
+    </article>
+  `;
+}
+
+function renderActionHistory(items = []) {
+  const node = document.getElementById("operator-action-history");
+  if (!node) return;
+  node.innerHTML = items.length
+    ? items.slice(0, 20).map((item) => `
+      <div class="action-history-row">
+        <div class="action-card-title">
+          <strong>${escapeHtml(item.action_type || "-")}</strong>
+          <span>${escapeHtml(formatEventTime(item.requested_at))}${item.symbol ? ` · ${escapeHtml(item.symbol)}` : ""}</span>
+        </div>
+        <span class="action-status-${escapeHtml(String(item.status || "").toLowerCase())}">${escapeHtml(item.status || "-")}</span>
+      </div>
+    `).join("")
+    : `<div class="operator-alert-empty">아직 실행 기록이 없습니다.</div>`;
+}
+
+function renderActionSummary(summary = {}) {
+  const total = Number(summary.total_count || 0);
+  const success = Number(summary.success_count || 0);
+  const failed = Number(summary.failed_count || 0);
+  const blocked = Number(summary.blocked_count || 0);
+  text("operator-action-summary", `${total} actions / success ${success} / failed ${failed} / blocked ${blocked}`);
+}
+
+async function executeOperatorAction(actionType, context = state.selectedActionContext, options = {}) {
+  const action = state.actionCatalog[actionType] || state.disabledActionCatalog[actionType] || { action_type: actionType };
+  const needsModal = !options.confirm && (action.confirmation_required || actionType === "ADD_OPERATOR_NOTE");
+  if (needsModal) {
+    confirmOperatorAction({ ...action, action_type: actionType, context });
+    return null;
+  }
+  const body = {
+    ...(context || {}),
+    action_type: actionType,
+    confirm: Boolean(options.confirm || !action.confirmation_required),
+    note: options.note || "",
+  };
+  const runRequest = async (token = "") => {
+    const headers = { "Content-Type": "application/json" };
+    if (token) headers["X-Local-Token"] = token;
+    const response = await fetch("/api/themelab/operator-actions/execute", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    return { response, payload: await parseResponsePayload(response) };
+  };
+  let result;
+  try {
+    if (actionRequiresToken(actionType)) {
+      result = await runWithLocalTokenRetry((token) => runRequest(token));
+      if (!result) return null;
+    } else {
+      const { response, payload } = await runRequest();
+      if (!response.ok) throw new Error(payload.detail || payload.error || `${response.status} ${response.statusText}`);
+      result = payload;
+    }
+  } catch (error) {
+    text("operator-action-context", `액션 실패: ${error.message || error}`);
+    return null;
+  }
+  if (result.confirmation_required) {
+    confirmOperatorAction({ ...action, action_type: actionType, context });
+    return result;
+  }
+  appendActionResultToEvents(result);
+  await Promise.all([fetchActionHistory(), fetchActionSummary(), fetchOperatorEvents().catch(() => {})]);
+  if (actionType === "REFRESH_SNAPSHOT") await fetchSnapshot().catch(() => {});
+  if (actionType === "OPEN_RUNBOOK") renderRunbook((result.result || {}).runbook || runbookForStatus((context || {}).event_type));
+  return result;
+}
+
+function confirmOperatorAction(action) {
+  state.pendingAction = action;
+  const modal = document.getElementById("operator-action-confirm-modal");
+  const body = document.getElementById("operator-action-confirm-body");
+  const note = document.getElementById("operator-action-note");
+  if (!modal || !body) return;
+  const context = action.context || state.selectedActionContext || {};
+  body.innerHTML = [
+    actionLine("액션", `${action.label_ko || action.action_type} (${action.action_type})`),
+    actionLine("대상 종목", context.symbol || "-"),
+    actionLine("연결 이벤트", context.event_id || "-"),
+    actionLine("예상 API", action.endpoint || "-"),
+    actionLine("위험도", action.risk_level || actionRiskLevel(action.action_type)),
+    actionLine("토큰", actionRequiresToken(action.action_type) ? "필요" : "불필요"),
+    `<div class="operator-alert-empty">이 액션은 주문을 실행하지 않습니다. LIVE Guard 우회는 지원하지 않습니다.</div>`,
+  ].join("");
+  if (note) note.value = "";
+  modal.hidden = false;
+}
+
+function actionLine(label, value) {
+  return `<div class="cockpit-line"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(value)}</span></div>`;
+}
+
+function actionRequiresToken(actionType) {
+  return Boolean((state.actionCatalog[actionType] || {}).requires_token);
+}
+
+function actionRiskLevel(actionType) {
+  return String((state.actionCatalog[actionType] || {}).risk_level || "LOW");
+}
+
+function renderRunbook(context) {
+  const runbook = context && context.steps_ko ? context : runbookForStatus(String((context || {}).event_type || context || "GENERAL"));
+  state.runbook = runbook;
+  text("operator-runbook-title", runbook.title_ko || "Runbook");
+  const node = document.getElementById("operator-runbook-body");
+  if (!node) return;
+  node.innerHTML = (runbook.steps_ko || []).map((step) => `
+    <div class="runbook-step"><span>${escapeHtml(step)}</span></div>
+  `).join("") || `<div class="operator-alert-empty">Runbook 단계가 없습니다.</div>`;
+}
+
+function runbookForEvent(event) {
+  return runbookForStatus((event || {}).event_type || (event || {}).type || (event || {}).display_status || "GENERAL");
+}
+
+function runbookForStatus(status) {
+  const key = String(status || "GENERAL").toUpperCase();
+  const map = {
+    GATEWAY_DISCONNECTED: ["Gateway 연결 복구", ["Gateway 상태를 확인합니다.", "heartbeat, 로그인, orderable 상태를 봅니다.", "Gateway 실행 후 30초 내 회복 여부를 확인합니다."]],
+    SNAPSHOT_STALE: ["스냅샷 지연 복구", ["Runtime 준비 상태를 확인합니다.", "Runtime 1회 평가를 실행합니다.", "snapshot_age가 줄어드는지 확인합니다."]],
+    READY_BUT_LIVE_BLOCKED: ["LIVE Guard 차단 점검", ["차단 사유를 확인합니다.", "주문 실행이나 Guard 우회는 하지 않습니다.", "운영 메모로 판단 근거를 남깁니다."]],
+    DATA_QUALITY_DEGRADED: ["데이터 품질 저하 점검", ["tick, VWAP, support 상태를 확인합니다.", "스냅샷 새로고침 또는 Runtime 1회 평가를 실행합니다.", "회복 후 READY 전환을 확인합니다."]],
+    CHASE_RISK_BLOCKED: ["추격 리스크 차단 점검", ["late_chase_level을 확인합니다.", "강제 매수하지 않습니다.", "재확인 시점까지 보류할 수 있습니다."]],
+    LATE_CHASE_TEMP_WAIT: ["추격 대기 점검", ["재확인 시간을 확인합니다.", "즉시 주문하지 않습니다.", "필요하면 운영 메모를 남깁니다."]],
+    MARKET_WAIT_STARTED: ["시장 대기 점검", ["시장 breadth와 후보 시장을 확인합니다.", "시장 회복 조건을 기다립니다.", "재확인 시점까지 보류할 수 있습니다."]],
+  };
+  const [title, steps] = map[key] || ["일반 운영 점검", ["스냅샷과 Runtime 준비 상태를 확인합니다.", "필요하면 이벤트를 ACK 처리하고 메모를 남깁니다.", "LIVE 주문/취소/Guard 우회는 지원하지 않습니다."]];
+  return { key, title_ko: title, steps_ko: steps };
+}
+
+function appendActionResultToEvents(result) {
+  const action = (result || {}).action || {};
+  const status = String((result || {}).status || action.status || "INFO").toUpperCase();
+  const eventType = status === "SUCCESS" ? "ACTION_EXECUTED" : status === "BLOCKED" ? "ACTION_BLOCKED" : "ACTION_FAILED";
+  const event = normalizeOperatorEvent({
+    id: `operator-action:${action.action_id || Date.now()}:${status}`,
+    event_id: `operator-action:${action.action_id || Date.now()}:${status}`,
+    event_type: eventType,
+    type: eventType,
+    severity: status === "SUCCESS" ? "INFO" : "WARNING",
+    category: "action",
+    symbol: action.symbol || "",
+    candidate_instance_id: action.candidate_instance_id || "",
+    message: `운영 액션 ${status}: ${action.action_type || ""}`,
+    created_at: new Date().toISOString(),
+    persisted: true,
+  }, { persisted: true });
+  mergeOperatorEvents([event], { persisted: true });
+  renderOperatorAlerts();
+  renderDecisionTimeline();
+  renderOperatorEventJournal();
+}
+
+function actionContextFromEvent(event) {
+  return {
+    event_id: event.id || event.event_id || "",
+    event_type: event.type || event.event_type || "",
+    symbol: event.symbol || "",
+    stock_name: event.stock_name || "",
+    candidate_instance_id: event.candidate_instance_id || "",
+  };
+}
+
+function actionContextFromCandidate(item = {}) {
+  return {
+    event_id: state.selectedEventId || "",
+    symbol: item.symbol || state.selectedSymbol || "",
+    stock_name: item.stock_name || item.name || "",
+    candidate_instance_id: item.candidate_instance_id || "",
+    gate_status: item.gate_status || "",
+    display_status: item.display_status || item.gate_status || "",
+  };
 }
 
 function formatEventTime(value) {
@@ -1968,12 +2298,54 @@ function initFilters() {
     state.journalFilter = button.dataset.journalFilter || "ALL";
     renderOperatorEventJournal();
   });
+  document.getElementById("operator-action-refresh")?.addEventListener("click", () => {
+    Promise.all([
+      fetchActionRecommendations(state.selectedActionContext || {}),
+      fetchActionHistory(),
+      fetchActionSummary(),
+    ]).catch((error) => {
+      text("operator-action-context", `Action Center 갱신 실패: ${error.message || error}`);
+    });
+  });
+  document.getElementById("operator-action-recommendations")?.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-action-type]");
+    if (!button || button.disabled) return;
+    executeOperatorAction(button.dataset.actionType, state.selectedActionContext || {}).catch((error) => {
+      text("operator-action-context", `액션 실패: ${error.message || error}`);
+    });
+  });
+  document.getElementById("operator-action-confirm-cancel")?.addEventListener("click", () => {
+    state.pendingAction = null;
+    const modal = document.getElementById("operator-action-confirm-modal");
+    if (modal) modal.hidden = true;
+  });
+  document.getElementById("operator-action-confirm-submit")?.addEventListener("click", () => {
+    const pending = state.pendingAction;
+    const modal = document.getElementById("operator-action-confirm-modal");
+    const note = document.getElementById("operator-action-note");
+    if (!pending) return;
+    if (modal) modal.hidden = true;
+    state.pendingAction = null;
+    executeOperatorAction(pending.action_type, pending.context || state.selectedActionContext || {}, {
+      confirm: true,
+      note: note ? note.value : "",
+    }).catch((error) => {
+      text("operator-action-context", `액션 실패: ${error.message || error}`);
+    });
+  });
   ["operator-alert-list", "operator-timeline-list", "operator-event-journal-list"].forEach((id) => {
     document.getElementById(id)?.addEventListener("click", (event) => {
       const row = event.target.closest("[data-event-id]");
       if (!row) return;
       const eventItem = state.operatorEvents.find((item) => item.id === row.dataset.eventId);
       if (!eventItem) return;
+      const actionContext = actionContextFromEvent(eventItem);
+      state.selectedEventId = eventItem.id;
+      state.selectedActionContext = actionContext;
+      fetchActionRecommendations(actionContext).catch((error) => {
+        text("operator-action-context", `추천 액션 실패: ${error.message || error}`);
+      });
+      renderRunbook(runbookForEvent(eventItem));
       if (eventItem.symbol) {
         selectSymbol(eventItem.symbol, { source: "alert" });
       }
@@ -2020,6 +2392,7 @@ function connectWs() {
 loadOperatorPreferences();
 initFilters();
 initOperatorEventJournal();
+initOperatorActionCenter();
 fetchSnapshot().catch(() => {});
 connectWs();
 setInterval(() => fetchSnapshot().catch(() => {}), 5000);

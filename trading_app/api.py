@@ -27,6 +27,7 @@ from trading.broker.models import (
     BrokerOrderResult,
     GatewayCommand,
     GatewayEvent,
+    new_message_id,
     utc_timestamp,
 )
 from trading.broker.transport_metrics import (
@@ -101,6 +102,9 @@ THEMELAB_OPERATOR_EVENT_TYPES = {
     "SNAPSHOT_RECOVERED",
     "TOP_THEME_CHANGED",
     "TOP_LEADER_CHANGED",
+    "ACTION_EXECUTED",
+    "ACTION_FAILED",
+    "ACTION_BLOCKED",
 }
 THEMELAB_OPERATOR_EVENT_SEVERITIES = {"CRITICAL", "WARNING", "OPPORTUNITY", "INFO"}
 THEMELAB_OPERATOR_EVENT_CATEGORIES = {
@@ -114,7 +118,164 @@ THEMELAB_OPERATOR_EVENT_CATEGORIES = {
     "snapshot",
     "theme",
     "risk",
+    "action",
     "info",
+}
+THEMELAB_OPERATOR_ACTION_STATUSES = {"PENDING", "RUNNING", "SUCCESS", "FAILED", "BLOCKED", "SKIPPED"}
+FORBIDDEN_OPERATOR_ACTIONS = {
+    "LIVE_BUY": {
+        "label_ko": "LIVE 매수",
+        "reason_ko": "이번 PR 범위 제외: LIVE 주문 금지",
+    },
+    "LIVE_SELL": {
+        "label_ko": "LIVE 매도",
+        "reason_ko": "이번 PR 범위 제외: LIVE 주문 금지",
+    },
+    "CANCEL_LIVE_ORDER": {
+        "label_ko": "LIVE 주문 취소",
+        "reason_ko": "이번 PR 범위 제외: LIVE 주문 취소 금지",
+    },
+    "OVERRIDE_LIVE_GUARD": {
+        "label_ko": "LIVE Guard 우회",
+        "reason_ko": "LIVE Guard 우회는 지원하지 않습니다.",
+    },
+    "FORCE_READY": {
+        "label_ko": "강제 READY",
+        "reason_ko": "운영자가 상태를 강제로 바꾸는 액션은 금지됩니다.",
+    },
+    "CHANGE_RISK_THRESHOLD": {
+        "label_ko": "리스크 임계값 변경",
+        "reason_ko": "전략/리스크 파라미터 변경은 이번 PR 범위가 아닙니다.",
+    },
+    "CHANGE_STRATEGY_PARAMETER": {
+        "label_ko": "전략 파라미터 변경",
+        "reason_ko": "전략 파라미터 변경은 이번 PR 범위가 아닙니다.",
+    },
+    "DISABLE_RISK_GATE": {
+        "label_ko": "Risk Gate 비활성화",
+        "reason_ko": "리스크 게이트 비활성화는 지원하지 않습니다.",
+    },
+}
+OPERATOR_ACTION_CATALOG = {
+    "REFRESH_SNAPSHOT": {
+        "label_ko": "스냅샷 새로고침",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "/api/themelab/snapshot",
+    },
+    "RUNTIME_CYCLE_ONCE": {
+        "label_ko": "Runtime 1회 평가",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/runtime/cycle",
+    },
+    "RUNTIME_START": {
+        "label_ko": "Runtime 시작",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/runtime/start",
+    },
+    "RUNTIME_STOP": {
+        "label_ko": "Runtime 중지",
+        "risk_level": "HIGH",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/runtime/stop",
+    },
+    "RUNTIME_RESTART": {
+        "label_ko": "Runtime 재시작",
+        "risk_level": "HIGH",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/runtime/restart",
+    },
+    "CHECK_RUNTIME_READINESS": {
+        "label_ko": "Runtime 준비 상태 확인",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "/api/runtime/readiness",
+    },
+    "CHECK_GATEWAY_STATUS": {
+        "label_ko": "Gateway 상태 확인",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "/api/gateway/status",
+    },
+    "START_KIWOOM_GATEWAY": {
+        "label_ko": "32bit Gateway 실행",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/gateway/kiwoom/start",
+    },
+    "OPEN_DRY_RUN_ORDER_DETAIL": {
+        "label_ko": "DRY_RUN 주문 상세",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "/api/runtime/orders/dry-run/{intent_id}",
+    },
+    "REBUILD_DRY_RUN_PERFORMANCE": {
+        "label_ko": "DRY_RUN 성과 재계산",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/runtime/performance/dry-run/rebuild",
+    },
+    "REBUILD_TRANSPORT_LATENCY_REPORT": {
+        "label_ko": "전송 지연 리포트 재계산",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/gateway/transport/latency/rebuild",
+    },
+    "EXPORT_TRANSPORT_LATENCY_REPORT": {
+        "label_ko": "전송 지연 리포트 내보내기",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/gateway/transport/latency/export",
+    },
+    "ACK_EVENT": {
+        "label_ko": "이벤트 확인",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "/api/themelab/operator-events/ack",
+    },
+    "HIDE_EVENT": {
+        "label_ko": "이벤트 숨김",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": True,
+        "endpoint": "/api/themelab/operator-events/hide",
+    },
+    "SNOOZE_EVENT": {
+        "label_ko": "이벤트 잠시 보류",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": True,
+        "endpoint": "/api/themelab/operator-events/snooze",
+    },
+    "ADD_OPERATOR_NOTE": {
+        "label_ko": "운영 메모 추가",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "/api/themelab/operator-actions/execute",
+    },
+    "OPEN_RUNBOOK": {
+        "label_ko": "Runbook 열기",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "client:runbook",
+    },
 }
 
 
@@ -440,6 +601,10 @@ def gateway_status() -> dict[str, Any]:
 
 @app.post("/api/gateway/kiwoom/start")
 def start_kiwoom_gateway(_: None = Depends(verify_gateway_token)) -> dict[str, Any]:
+    return _start_kiwoom_gateway_response()
+
+
+def _start_kiwoom_gateway_response() -> dict[str, Any]:
     snapshot = gateway_state.snapshot().to_dict()
     if snapshot.get("connected") and snapshot.get("heartbeat_ok"):
         return {
@@ -1496,6 +1661,533 @@ def theme_lab_operator_event_summary(trade_date: str | None = Query(None)) -> di
         return db.summarize_operator_events(resolved_trade_date)
     finally:
         close_database(db)
+
+
+@app.get("/api/themelab/operator-actions/catalog")
+def theme_lab_operator_action_catalog() -> dict[str, Any]:
+    return {
+        "actions": [_operator_action_catalog_item(action_type, meta) for action_type, meta in OPERATOR_ACTION_CATALOG.items()],
+        "disabled_actions": [_disabled_operator_action_item(action_type, meta) for action_type, meta in FORBIDDEN_OPERATOR_ACTIONS.items()],
+    }
+
+
+@app.get("/api/themelab/operator-actions/recommendations")
+def theme_lab_operator_action_recommendations(
+    event_id: str | None = Query(None),
+    symbol: str | None = Query(None),
+    candidate_instance_id: str | None = Query(None),
+    trade_date: str | None = Query(None),
+) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    db = open_database()
+    try:
+        return _build_operator_action_recommendations(
+            db,
+            trade_date=resolved_trade_date,
+            event_id=str(event_id or ""),
+            symbol=str(symbol or ""),
+            candidate_instance_id=str(candidate_instance_id or ""),
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/themelab/operator-actions/execute")
+async def execute_theme_lab_operator_action(body: dict[str, Any], request: Request) -> dict[str, Any]:
+    payload = body if isinstance(body, dict) else {}
+    action_type = str(payload.get("action_type") or "").strip().upper()
+    if not action_type:
+        raise HTTPException(status_code=400, detail="action_type is required")
+    if action_type not in OPERATOR_ACTION_CATALOG and action_type not in FORBIDDEN_OPERATOR_ACTIONS:
+        raise HTTPException(status_code=400, detail="unknown operator action")
+
+    action_id = str(payload.get("action_id") or new_message_id("act"))
+    requested_at = datetime.now(KST).isoformat(timespec="seconds")
+    db = open_database()
+    try:
+        existing = db.get_operator_action(action_id)
+        if existing and existing.get("status") in {"SUCCESS", "FAILED", "BLOCKED", "SKIPPED"}:
+            return {"status": existing.get("status"), "duplicate": True, "action": existing}
+
+        event = db.get_operator_event(str(payload.get("event_id") or "")) if payload.get("event_id") else None
+        if action_type in FORBIDDEN_OPERATOR_ACTIONS:
+            action = db.save_operator_action(
+                _operator_action_record(
+                    action_id=action_id,
+                    action_type=action_type,
+                    status="BLOCKED",
+                    requested_at=requested_at,
+                    payload=payload,
+                    event=event,
+                    meta=_disabled_operator_action_item(action_type, FORBIDDEN_OPERATOR_ACTIONS[action_type]),
+                    error_message=FORBIDDEN_OPERATOR_ACTIONS[action_type]["reason_ko"],
+                )
+            )
+            _save_operator_action_result_event(db, action, "BLOCKED", {"blocked_reason": action.get("error_message")})
+            return {
+                "status": "BLOCKED",
+                "blocked": True,
+                "reason_ko": FORBIDDEN_OPERATOR_ACTIONS[action_type]["reason_ko"],
+                "action": action,
+            }
+
+        meta = _operator_action_catalog_item(action_type, OPERATOR_ACTION_CATALOG[action_type])
+        if meta["confirmation_required"] and not bool(payload.get("confirm")):
+            action = db.save_operator_action(
+                _operator_action_record(
+                    action_id=action_id,
+                    action_type=action_type,
+                    status="PENDING",
+                    requested_at=requested_at,
+                    payload=payload,
+                    event=event,
+                    meta=meta,
+                )
+            )
+            return {"status": "PENDING", "confirmation_required": True, "action": action, "catalog_item": meta}
+
+        action = db.save_operator_action(
+            _operator_action_record(
+                action_id=action_id,
+                action_type=action_type,
+                status="RUNNING",
+                requested_at=requested_at,
+                payload=payload,
+                event=event,
+                meta=meta,
+            )
+        )
+        if meta["requires_token"]:
+            try:
+                _verify_operator_action_token(request)
+            except HTTPException as exc:
+                failed = db.update_operator_action_status(action_id, "FAILED", error_message=str(exc.detail)) or action
+                _save_operator_action_result_event(db, failed, "FAILED", {"error": str(exc.detail)})
+                raise
+
+        try:
+            response_payload = await _execute_operator_action(action_type, payload, db=db, event=event)
+        except Exception as exc:
+            failed = db.update_operator_action_status(action_id, "FAILED", error_message=str(exc)) or action
+            _save_operator_action_result_event(db, failed, "FAILED", {"error": str(exc)})
+            return {"status": "FAILED", "action": failed, "error": str(exc)}
+
+        saved = db.update_operator_action_status(action_id, "SUCCESS", response=response_payload) or action
+        _save_operator_action_result_event(db, saved, "SUCCESS", response_payload)
+        return {"status": "SUCCESS", "action": saved, "result": response_payload}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/themelab/operator-actions")
+def list_theme_lab_operator_actions(
+    trade_date: str | None = Query(None),
+    action_type: str | None = Query(None),
+    status: str | None = Query(None),
+    symbol: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    normalized_status = str(status or "").upper() or None
+    if normalized_status and normalized_status not in THEMELAB_OPERATOR_ACTION_STATUSES:
+        raise HTTPException(status_code=400, detail="invalid status")
+    db = open_database()
+    try:
+        items = db.list_operator_actions(
+            resolved_trade_date,
+            action_type=action_type,
+            status=normalized_status,
+            symbol=symbol,
+            limit=limit + 1,
+            offset=offset,
+        )
+        page, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {
+            "trade_date": resolved_trade_date,
+            "actions": page,
+            "items": page,
+            "pagination": pagination,
+            "filters": {
+                "trade_date": resolved_trade_date,
+                "action_type": action_type or "",
+                "status": normalized_status or "",
+                "symbol": symbol or "",
+                "limit": limit,
+                "offset": offset,
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/themelab/operator-actions/summary")
+def theme_lab_operator_action_summary(trade_date: str | None = Query(None)) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    db = open_database()
+    try:
+        return db.summarize_operator_actions(resolved_trade_date)
+    finally:
+        close_database(db)
+
+
+def _operator_action_catalog_item(action_type: str, meta: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "action_type": action_type,
+        "label_ko": str(meta.get("label_ko") or action_type),
+        "risk_level": str(meta.get("risk_level") or "LOW"),
+        "requires_token": bool(meta.get("requires_token")),
+        "confirmation_required": bool(meta.get("confirmation_required")),
+        "enabled": True,
+        "endpoint": str(meta.get("endpoint") or ""),
+    }
+
+
+def _disabled_operator_action_item(action_type: str, meta: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "action_type": action_type,
+        "label_ko": str(meta.get("label_ko") or action_type),
+        "risk_level": "BLOCKED",
+        "requires_token": False,
+        "confirmation_required": False,
+        "enabled": False,
+        "reason_ko": str(meta.get("reason_ko") or "이번 PR 범위에서 금지된 액션입니다."),
+    }
+
+
+def _build_operator_action_recommendations(
+    db: TradingDatabase,
+    *,
+    trade_date: str,
+    event_id: str = "",
+    symbol: str = "",
+    candidate_instance_id: str = "",
+) -> dict[str, Any]:
+    event = db.get_operator_event(event_id) if event_id else None
+    context = _operator_action_context(event=event, symbol=symbol, candidate_instance_id=candidate_instance_id)
+    event_type = str((event or {}).get("event_type") or "")
+    recommendations: list[dict[str, Any]] = []
+    disabled: list[dict[str, Any]] = []
+
+    def add(action_type: str, reason_ko: str) -> None:
+        recommendations.append(_operator_action_recommendation(action_type, reason_ko))
+
+    def block(action_type: str) -> None:
+        if action_type in FORBIDDEN_OPERATOR_ACTIONS:
+            disabled.append(_disabled_operator_action_item(action_type, FORBIDDEN_OPERATOR_ACTIONS[action_type]))
+
+    if event_type == "GATEWAY_DISCONNECTED":
+        add("CHECK_GATEWAY_STATUS", "Gateway 연결 끊김 이벤트가 발생했습니다.")
+        add("START_KIWOOM_GATEWAY", "Gateway 프로세스 또는 heartbeat 회복이 필요할 수 있습니다.")
+        add("OPEN_RUNBOOK", "Gateway 복구 순서를 확인합니다.")
+    elif event_type == "SNAPSHOT_STALE":
+        add("REFRESH_SNAPSHOT", "스냅샷 지연 상태를 다시 확인합니다.")
+        add("RUNTIME_CYCLE_ONCE", "Runtime 평가를 1회 트리거해 최신 결과 생성을 시도합니다.")
+        add("CHECK_RUNTIME_READINESS", "Runtime 준비 상태와 차단 요인을 확인합니다.")
+    elif event_type == "DATA_QUALITY_DEGRADED":
+        add("REFRESH_SNAPSHOT", "데이터 품질 상태를 다시 조회합니다.")
+        add("RUNTIME_CYCLE_ONCE", "Runtime 재평가로 보조 데이터 회복 여부를 확인합니다.")
+        add("OPEN_RUNBOOK", "데이터 품질 저하 대응 절차를 확인합니다.")
+    elif event_type == "READY_BUT_LIVE_BLOCKED":
+        add("OPEN_RUNBOOK", "LIVE Guard 차단 사유 확인 절차를 봅니다.")
+        add("ADD_OPERATOR_NOTE", "차단 사유와 수동 판단을 감사 로그에 남깁니다.")
+        add("ACK_EVENT", "확인한 이벤트를 ACK 처리합니다.")
+        block("OVERRIDE_LIVE_GUARD")
+        block("LIVE_BUY")
+    elif event_type == "ORDER_INTENT_CREATED":
+        add("OPEN_DRY_RUN_ORDER_DETAIL", "생성된 DRY_RUN 주문 의도 상세를 확인합니다.")
+        add("ADD_OPERATOR_NOTE", "주문 의도 검토 내용을 남깁니다.")
+    elif event_type == "MARKET_WAIT_STARTED":
+        add("OPEN_RUNBOOK", "시장 대기 상태 대응 절차를 확인합니다.")
+        add("SNOOZE_EVENT", "재확인 전까지 이벤트를 잠시 보류합니다.")
+        add("ADD_OPERATOR_NOTE", "시장 대기 판단 근거를 남깁니다.")
+    elif event_type in {"CHASE_RISK_BLOCKED", "LATE_CHASE_TEMP_WAIT"}:
+        add("SNOOZE_EVENT", "late chase 재확인 시점까지 알림을 보류합니다.")
+        add("ADD_OPERATOR_NOTE", "추격 차단 판단 근거를 남깁니다.")
+        add("OPEN_RUNBOOK", "추격 리스크 대응 절차를 확인합니다.")
+
+    candidate = _find_operator_action_candidate(db, context)
+    if candidate:
+        context.update(
+            {
+                "symbol": candidate.get("symbol") or context.get("symbol") or "",
+                "candidate_instance_id": candidate.get("candidate_instance_id") or context.get("candidate_instance_id") or "",
+                "gate_status": candidate.get("gate_status") or "",
+                "display_status": candidate.get("display_status") or "",
+                "stock_name": candidate.get("stock_name") or candidate.get("name") or context.get("stock_name") or "",
+            }
+        )
+        if str(candidate.get("gate_status") or "") in {"READY", "READY_SMALL"}:
+            add("RUNTIME_CYCLE_ONCE", "선택 후보가 READY 계열이므로 최신 평가를 1회 확인합니다.")
+            add("ADD_OPERATOR_NOTE", "READY 판단을 운영 메모로 남깁니다.")
+            add("OPEN_RUNBOOK", "READY 후보 점검 절차를 확인합니다.")
+            block("LIVE_BUY")
+
+    if not recommendations:
+        add("REFRESH_SNAPSHOT", "현재 컨텍스트의 최신 상태를 확인합니다.")
+        add("OPEN_RUNBOOK", "일반 운영 점검 절차를 확인합니다.")
+
+    deduped = list({item["action_type"]: item for item in recommendations}.values())
+    disabled_deduped = list({item["action_type"]: item for item in disabled}.values())
+    return {
+        "trade_date": trade_date,
+        "context": context,
+        "recommendations": deduped,
+        "disabled_actions": disabled_deduped,
+        "runbook": _runbook_payload(event_type or str(context.get("display_status") or context.get("gate_status") or "")),
+    }
+
+
+def _operator_action_recommendation(action_type: str, reason_ko: str) -> dict[str, Any]:
+    meta = _operator_action_catalog_item(action_type, OPERATOR_ACTION_CATALOG[action_type])
+    return {**meta, "reason_ko": reason_ko}
+
+
+def _operator_action_context(*, event: Optional[dict], symbol: str, candidate_instance_id: str) -> dict[str, Any]:
+    event = event or {}
+    payload = dict(event.get("payload") or {})
+    return {
+        "event_id": event.get("event_id") or "",
+        "event_type": event.get("event_type") or "",
+        "symbol": symbol or event.get("symbol") or payload.get("symbol") or "",
+        "stock_name": event.get("stock_name") or payload.get("stock_name") or "",
+        "candidate_instance_id": candidate_instance_id or event.get("candidate_instance_id") or payload.get("candidate_instance_id") or "",
+    }
+
+
+def _find_operator_action_candidate(db: TradingDatabase, context: dict[str, Any]) -> Optional[dict[str, Any]]:
+    symbol = str(context.get("symbol") or "")
+    candidate_instance_id = str(context.get("candidate_instance_id") or "")
+    if not symbol and not candidate_instance_id:
+        return None
+    snapshot = build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_supervisor.status(), gateway_state=gateway_state)
+    for item in snapshot.get("watchset") or []:
+        if symbol and str(item.get("symbol") or "") == symbol:
+            return item
+        if candidate_instance_id and str(item.get("candidate_instance_id") or "") == candidate_instance_id:
+            return item
+    return None
+
+
+def _operator_action_record(
+    *,
+    action_id: str,
+    action_type: str,
+    status: str,
+    requested_at: str,
+    payload: dict[str, Any],
+    event: Optional[dict],
+    meta: dict[str, Any],
+    error_message: str = "",
+) -> dict[str, Any]:
+    event = event or {}
+    request_payload = dict(payload or {})
+    return {
+        "action_id": action_id,
+        "trade_date": str(payload.get("trade_date") or _theme_lab_trade_date(None, occurred_at=requested_at)),
+        "requested_at": requested_at,
+        "action_type": action_type,
+        "status": status,
+        "requested_by": str(payload.get("requested_by") or "operator"),
+        "event_id": str(payload.get("event_id") or event.get("event_id") or ""),
+        "symbol": str(payload.get("symbol") or event.get("symbol") or ""),
+        "stock_name": str(payload.get("stock_name") or event.get("stock_name") or ""),
+        "candidate_instance_id": str(payload.get("candidate_instance_id") or event.get("candidate_instance_id") or ""),
+        "requires_token": bool(meta.get("requires_token")),
+        "confirmation_required": bool(meta.get("confirmation_required")),
+        "endpoint": str(meta.get("endpoint") or ""),
+        "request_payload": request_payload,
+        "response_payload": {},
+        "error_message": error_message,
+    }
+
+
+def _verify_operator_action_token(request: Request) -> None:
+    verify_gateway_token(
+        request,
+        authorization=request.headers.get("authorization"),
+        x_local_token=request.headers.get("x-local-token"),
+    )
+
+
+async def _execute_operator_action(
+    action_type: str,
+    payload: dict[str, Any],
+    *,
+    db: TradingDatabase,
+    event: Optional[dict],
+) -> dict[str, Any]:
+    if action_type == "REFRESH_SNAPSHOT":
+        snapshot = build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_supervisor.status(), gateway_state=gateway_state)
+        return {"refreshed": True, "summary": snapshot.get("summary", {})}
+    if action_type == "CHECK_GATEWAY_STATUS":
+        return gateway_status()
+    if action_type == "START_KIWOOM_GATEWAY":
+        return _start_kiwoom_gateway_response()
+    if action_type == "CHECK_RUNTIME_READINESS":
+        return await runtime_supervisor.readiness()
+    if action_type == "RUNTIME_CYCLE_ONCE":
+        return await runtime_supervisor.run_once(reason="operator_action_center")
+    if action_type == "RUNTIME_START":
+        return await runtime_supervisor.start()
+    if action_type == "RUNTIME_STOP":
+        return await runtime_supervisor.stop()
+    if action_type == "RUNTIME_RESTART":
+        return await runtime_supervisor.restart()
+    if action_type == "OPEN_DRY_RUN_ORDER_DETAIL":
+        intent_id = _operator_action_intent_id(payload, event)
+        return _order_service().get_dry_run_order(intent_id) if intent_id else {"found": False, "reason": "INTENT_ID_MISSING"}
+    if action_type == "REBUILD_DRY_RUN_PERFORMANCE":
+        trade_date = str(payload.get("trade_date") or "") or None
+        report = _performance_analyzer(db).build_report(trade_date=trade_date, limit=10000)
+        persisted = _performance_analyzer(db).persist_report(report)
+        return {"report_id": report.get("report_id"), "persisted": persisted is not None, "summary": report.get("summary", {})}
+    if action_type == "REBUILD_TRANSPORT_LATENCY_REPORT":
+        trade_date = str(payload.get("trade_date") or "") or None
+        report = _transport_analyzer(db).build_report(trade_date=trade_date, limit=10000)
+        saved = db.save_gateway_transport_latency_report(report)
+        return {"report_id": report.get("report_id"), "saved": saved, "summary": report.get("summary", {})}
+    if action_type == "EXPORT_TRANSPORT_LATENCY_REPORT":
+        trade_date = str(payload.get("trade_date") or "") or None
+        report = _transport_analyzer(db).build_report(trade_date=trade_date, limit=10000)
+        return {"report_id": report.get("report_id"), "export_paths": _transport_analyzer(db).export_report(report)}
+    if action_type == "ACK_EVENT":
+        event_id = str(payload.get("event_id") or (event or {}).get("event_id") or "")
+        return {"updated_count": db.acknowledge_operator_event(event_id, acknowledged_by=str(payload.get("requested_by") or "operator"))}
+    if action_type == "HIDE_EVENT":
+        event_id = str(payload.get("event_id") or (event or {}).get("event_id") or "")
+        return {"updated_count": db.hide_operator_event(event_id)}
+    if action_type == "SNOOZE_EVENT":
+        event_id = str(payload.get("event_id") or (event or {}).get("event_id") or "")
+        minutes = max(1, min(240, int(payload.get("snooze_minutes") or 15)))
+        snoozed_until = (datetime.now(KST) + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        return {"updated_count": db.snooze_operator_event(event_id, snoozed_until), "snoozed_until": snoozed_until}
+    if action_type == "ADD_OPERATOR_NOTE":
+        return {"noted": True, "note": str(payload.get("note") or ""), "event_id": str(payload.get("event_id") or "")}
+    if action_type == "OPEN_RUNBOOK":
+        key = str((event or {}).get("event_type") or payload.get("status") or payload.get("display_status") or "")
+        return {"opened": True, "runbook": _runbook_payload(key)}
+    raise ValueError(f"unsupported action: {action_type}")
+
+
+def _operator_action_intent_id(payload: dict[str, Any], event: Optional[dict]) -> str:
+    event = event or {}
+    event_payload = dict(event.get("payload") or {})
+    for source in (payload, event_payload, event):
+        for key in ("intent_id", "order_intent_id", "runtime_order_intent_id", "candidate_instance_id"):
+            value = str(source.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _save_operator_action_result_event(db: TradingDatabase, action: dict[str, Any], status: str, response_payload: Optional[dict] = None) -> None:
+    action_id = str(action.get("action_id") or "")
+    if not action_id:
+        return
+    event_type = "ACTION_EXECUTED" if status == "SUCCESS" else "ACTION_BLOCKED" if status == "BLOCKED" else "ACTION_FAILED"
+    severity = "INFO" if status == "SUCCESS" else "WARNING"
+    message = {
+        "SUCCESS": "운영 액션 실행 완료",
+        "BLOCKED": "운영 액션 차단",
+        "FAILED": "운영 액션 실패",
+    }.get(status, "운영 액션 상태 변경")
+    try:
+        db.save_operator_event(
+            {
+                "event_id": f"operator-action:{action_id}:{status}",
+                "trade_date": action.get("trade_date") or _theme_lab_trade_date(None),
+                "occurred_at": datetime.now(KST).isoformat(timespec="seconds"),
+                "source": "themelab_dashboard",
+                "event_type": event_type,
+                "severity": severity,
+                "category": "action",
+                "symbol": action.get("symbol") or "",
+                "stock_name": action.get("stock_name") or "",
+                "candidate_instance_id": action.get("candidate_instance_id") or "",
+                "message_ko": f"{message}: {action.get('action_type')}",
+                "payload": {"action": action, "response": response_payload or {}},
+            }
+        )
+    except Exception:
+        return
+
+
+def _runbook_payload(key: str) -> dict[str, Any]:
+    normalized = str(key or "").upper()
+    runbooks = {
+        "GATEWAY_DISCONNECTED": (
+            "Gateway 연결 복구",
+            [
+                "Gateway 상태에서 connected, heartbeat_ok, kiwoom_logged_in, orderable을 확인합니다.",
+                "이미 실행 중인 32bit Gateway 프로세스가 있는지 확인합니다.",
+                "START_KIWOOM_GATEWAY 실행 후 30초 내 heartbeat 회복 여부를 봅니다.",
+                "회복되지 않으면 HTS 로그인 상태와 Gateway 로그를 수동 확인합니다.",
+            ],
+        ),
+        "SNAPSHOT_STALE": (
+            "스냅샷 지연 복구",
+            [
+                "Runtime 준비 상태를 확인합니다.",
+                "Runtime 1회 평가를 실행합니다.",
+                "snapshot_age가 줄어드는지 확인합니다.",
+                "반복 stale이면 Runtime restart 필요 여부를 판단합니다.",
+            ],
+        ),
+        "READY_BUT_LIVE_BLOCKED": (
+            "LIVE Guard 차단 점검",
+            [
+                "LIVE Guard 차단 사유와 candidate_instance_id를 확인합니다.",
+                "주문 실행이나 Guard 우회는 하지 않습니다.",
+                "차단 사유를 운영 메모로 남깁니다.",
+                "장 마감 후 guard 정책 개선 대상으로 검토합니다.",
+            ],
+        ),
+        "DATA_QUALITY_DEGRADED": (
+            "데이터 품질 저하 점검",
+            [
+                "latest tick, VWAP, support 데이터 준비 상태를 확인합니다.",
+                "Runtime 1회 평가 또는 스냅샷 새로고침으로 회복 여부를 확인합니다.",
+                "회복 후 READY 전환이 정상인지 확인합니다.",
+            ],
+        ),
+        "CHASE_RISK_BLOCKED": (
+            "추격 리스크 차단 점검",
+            [
+                "late_chase_level과 점수, 재확인 시간을 확인합니다.",
+                "강제 매수하지 않습니다.",
+                "재확인 시점까지 알림을 보류하고, 장 마감 후 late chase 차단 효율을 리뷰합니다.",
+            ],
+        ),
+        "LATE_CHASE_TEMP_WAIT": (
+            "추격 대기 점검",
+            [
+                "재확인까지 남은 시간을 확인합니다.",
+                "즉시 주문하지 않고 다음 Runtime 평가를 기다립니다.",
+                "필요하면 운영 메모를 남깁니다.",
+            ],
+        ),
+        "MARKET_WAIT_STARTED": (
+            "시장 대기 점검",
+            [
+                "후보의 candidate_market과 시장 breadth를 확인합니다.",
+                "시장 확인 또는 회복 조건을 기다립니다.",
+                "재확인 시점까지 알림을 보류할 수 있습니다.",
+            ],
+        ),
+    }
+    title, steps = runbooks.get(
+        normalized,
+        (
+            "일반 운영 점검",
+            [
+                "스냅샷과 Runtime 준비 상태를 확인합니다.",
+                "필요하면 이벤트를 ACK 처리하고 운영 메모를 남깁니다.",
+                "LIVE 주문, 취소, Guard 우회는 이번 Action Center에서 수행하지 않습니다.",
+            ],
+        ),
+    )
+    return {"key": normalized or "GENERAL", "title_ko": title, "steps_ko": steps}
 
 
 def _validate_theme_lab_operator_event(event: Any) -> dict[str, Any]:

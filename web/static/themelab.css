@@ -328,6 +328,169 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   min-height: 48px;
 }
 
+.action-center-panel,
+.runbook-panel {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.action-center-grid {
+  display: grid;
+  grid-template-columns: minmax(420px, 1fr) minmax(320px, 0.72fr);
+  gap: 10px;
+}
+
+.action-recommendations,
+.action-history,
+.runbook-body {
+  display: grid;
+  gap: 7px;
+}
+
+.action-history {
+  max-height: 250px;
+  overflow: auto;
+}
+
+.action-card,
+.action-history-row,
+.runbook-step {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  padding: 10px;
+}
+
+.action-card {
+  display: grid;
+  gap: 8px;
+}
+
+.action-card-head,
+.action-history-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.action-card-title {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.action-card-title strong,
+.runbook-step strong {
+  color: var(--text);
+}
+
+.action-card-title span,
+.action-card p,
+.action-history-row span,
+.runbook-step span {
+  color: var(--sub);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.action-card.low { box-shadow: inset 3px 0 0 var(--ready-small); }
+.action-card.medium { box-shadow: inset 3px 0 0 var(--wait); }
+.action-card.high { box-shadow: inset 3px 0 0 var(--warning); }
+.action-card.disabled {
+  opacity: 0.58;
+  box-shadow: inset 3px 0 0 var(--blocked);
+}
+
+.action-card.disabled button {
+  cursor: not-allowed;
+}
+
+.action-status-success { color: var(--ready); }
+.action-status-failed,
+.action-status-blocked { color: var(--blocked); }
+.action-status-running { color: var(--wait); }
+.action-status-pending,
+.action-status-skipped { color: var(--muted); }
+
+.runbook-panel {
+  border-color: rgba(56, 189, 248, 0.25);
+}
+
+.runbook-body {
+  counter-reset: runbook-step;
+}
+
+.runbook-step {
+  display: grid;
+  grid-template-columns: 34px 1fr;
+  align-items: center;
+}
+
+.runbook-step::before {
+  counter-increment: runbook-step;
+  content: counter(runbook-step);
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-active);
+  border-radius: 5px;
+  color: var(--ready-small);
+  font-weight: 900;
+}
+
+.action-confirm-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(11, 15, 20, 0.72);
+  padding: 18px;
+}
+
+.action-confirm-modal[hidden] {
+  display: none;
+}
+
+.action-confirm-dialog {
+  width: min(520px, 100%);
+  border: 1px solid var(--border-active);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 14px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+}
+
+.action-confirm-body {
+  display: grid;
+  gap: 7px;
+  margin: 12px 0;
+}
+
+.action-note-field {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-weight: 900;
+}
+
+.action-note-field textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  color: var(--text);
+  font: inherit;
+  padding: 8px;
+}
+
 .flow-grid {
   display: grid;
   grid-template-columns: minmax(270px, 0.85fr) minmax(480px, 1.45fr) minmax(300px, 0.9fr);
@@ -733,6 +896,9 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
 .critical { color: var(--blocked); border-color: rgba(239, 68, 68, 0.62); }
 .opportunity { color: var(--ready); border-color: rgba(16, 185, 129, 0.55); }
 .info { color: var(--ready-small); border-color: rgba(56, 189, 248, 0.45); }
+.low { color: var(--ready-small); border-color: rgba(56, 189, 248, 0.45); }
+.medium { color: var(--wait); border-color: rgba(250, 204, 21, 0.45); }
+.high { color: var(--warning); border-color: rgba(245, 158, 11, 0.55); }
 
 .operator-event-row.critical { box-shadow: inset 3px 0 0 var(--blocked); }
 .operator-event-row.warning { box-shadow: inset 3px 0 0 var(--warning); }
@@ -882,6 +1048,7 @@ tbody tr.selected {
   .cockpit-grid,
   .operator-alert-grid,
   .session-summary-grid,
+  .action-center-grid,
   .flow-grid,
   .bottom-grid,
   .quality-grid {

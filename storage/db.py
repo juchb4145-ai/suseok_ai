@@ -6,6 +6,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional, Union
+from uuid import uuid4
 
 from trading.broker.models import BrokerExecutionEvent, BrokerOrderResult
 from trading.models import BuyLeg, LegStatus, WatchItem
@@ -304,6 +305,40 @@ class TradingDatabase:
                 ON dashboard_operator_events(symbol, trade_date);
             CREATE INDEX IF NOT EXISTS idx_dashboard_operator_events_candidate_instance
                 ON dashboard_operator_events(candidate_instance_id);
+            CREATE TABLE IF NOT EXISTS dashboard_operator_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_id TEXT NOT NULL UNIQUE,
+                trade_date TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                completed_at TEXT,
+                action_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'themelab_dashboard',
+                requested_by TEXT,
+                event_id TEXT,
+                symbol TEXT,
+                stock_name TEXT,
+                candidate_instance_id TEXT,
+                requires_token INTEGER NOT NULL DEFAULT 0,
+                confirmation_required INTEGER NOT NULL DEFAULT 1,
+                endpoint TEXT,
+                request_payload_json TEXT NOT NULL DEFAULT '{}',
+                response_payload_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_actions_trade_date_requested
+                ON dashboard_operator_actions(trade_date, requested_at);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_actions_type_trade_date
+                ON dashboard_operator_actions(action_type, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_actions_status_trade_date
+                ON dashboard_operator_actions(status, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_actions_event
+                ON dashboard_operator_actions(event_id);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_actions_symbol_trade_date
+                ON dashboard_operator_actions(symbol, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_actions_candidate_instance
+                ON dashboard_operator_actions(candidate_instance_id);
             CREATE TABLE IF NOT EXISTS market_side_confirmation_state (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trade_date TEXT NOT NULL,
@@ -3355,6 +3390,144 @@ class TradingDatabase:
             "by_theme": [{"primary_theme": theme, "count": count} for theme, count in theme_counts.most_common(20)],
         }
 
+    def get_operator_event(self, event_id: str) -> Optional[dict]:
+        if not event_id:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM dashboard_operator_events WHERE event_id = ?",
+            (str(event_id),),
+        ).fetchone()
+        return _operator_event_row_to_dict(row) if row else None
+
+    def snooze_operator_event(self, event_id: str, snoozed_until: str) -> int:
+        if not event_id:
+            return 0
+        with self.conn:
+            cursor = self.conn.execute(
+                "UPDATE dashboard_operator_events SET snoozed_until = ? WHERE event_id = ?",
+                (str(snoozed_until or ""), str(event_id)),
+            )
+        return cursor.rowcount
+
+    def save_operator_action(self, action: dict) -> dict:
+        normalized = _normalize_operator_action(action)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO dashboard_operator_actions(
+                    action_id, trade_date, requested_at, completed_at,
+                    action_type, status, source, requested_by, event_id,
+                    symbol, stock_name, candidate_instance_id, requires_token,
+                    confirmation_required, endpoint, request_payload_json,
+                    response_payload_json, error_message
+                ) VALUES (
+                    :action_id, :trade_date, :requested_at, :completed_at,
+                    :action_type, :status, :source, :requested_by, :event_id,
+                    :symbol, :stock_name, :candidate_instance_id, :requires_token,
+                    :confirmation_required, :endpoint, :request_payload_json,
+                    :response_payload_json, :error_message
+                )
+                """,
+                normalized,
+            )
+        return self.get_operator_action(normalized["action_id"]) or dict(normalized)
+
+    def get_operator_action(self, action_id: str) -> Optional[dict]:
+        if not action_id:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM dashboard_operator_actions WHERE action_id = ?",
+            (str(action_id),),
+        ).fetchone()
+        return _operator_action_row_to_dict(row) if row else None
+
+    def update_operator_action_status(
+        self,
+        action_id: str,
+        status: str,
+        response: Optional[dict] = None,
+        error_message: Optional[str] = None,
+    ) -> Optional[dict]:
+        if not action_id:
+            return None
+        completed_at = datetime.now().isoformat(timespec="seconds")
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE dashboard_operator_actions
+                SET status = ?,
+                    completed_at = ?,
+                    response_payload_json = ?,
+                    error_message = ?
+                WHERE action_id = ?
+                """,
+                (
+                    str(status or "").upper(),
+                    completed_at,
+                    json.dumps(response or {}, ensure_ascii=False, sort_keys=True, default=str),
+                    str(error_message or "") or None,
+                    str(action_id),
+                ),
+            )
+        return self.get_operator_action(action_id)
+
+    def list_operator_actions(
+        self,
+        trade_date: str,
+        *,
+        action_type: str | None = None,
+        status: str | None = None,
+        symbol: str | None = None,
+        event_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        where = ["trade_date = ?"]
+        params: list[object] = [str(trade_date or "")]
+        if action_type:
+            where.append("action_type = ?")
+            params.append(str(action_type).upper())
+        if status:
+            where.append("status = ?")
+            params.append(str(status).upper())
+        if symbol:
+            where.append("symbol = ?")
+            params.append(str(symbol))
+        if event_id:
+            where.append("event_id = ?")
+            params.append(str(event_id))
+        normalized_limit = max(1, min(1000, int(limit or 100)))
+        normalized_offset = max(0, int(offset or 0))
+        params.extend([normalized_limit, normalized_offset])
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM dashboard_operator_actions
+            WHERE {" AND ".join(where)}
+            ORDER BY requested_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            params,
+        ).fetchall()
+        return [_operator_action_row_to_dict(row) for row in rows]
+
+    def summarize_operator_actions(self, trade_date: str) -> dict:
+        actions = self.list_operator_actions(trade_date, limit=1000)
+        status_counts = Counter(str(action.get("status") or "").upper() for action in actions)
+        type_counts = Counter(str(action.get("action_type") or "") for action in actions)
+        return {
+            "trade_date": str(trade_date or ""),
+            "total_count": len(actions),
+            "pending_count": status_counts.get("PENDING", 0),
+            "running_count": status_counts.get("RUNNING", 0),
+            "success_count": status_counts.get("SUCCESS", 0),
+            "failed_count": status_counts.get("FAILED", 0),
+            "blocked_count": status_counts.get("BLOCKED", 0),
+            "skipped_count": status_counts.get("SKIPPED", 0),
+            "by_status": dict(status_counts),
+            "by_action_type": dict(type_counts),
+        }
+
     def upsert_market_side_confirmation_state(self, payload: dict) -> dict:
         normalized = _market_side_confirmation_state_params(payload)
         with self.conn:
@@ -5544,6 +5717,64 @@ def _trade_date_from_timestamp(value: str) -> str:
     if len(text) >= 10 and text[4] == "-" and text[7] == "-":
         return text[:10]
     return ""
+
+
+def _normalize_operator_action(action: dict) -> dict:
+    if not isinstance(action, dict):
+        raise ValueError("operator action must be a dict")
+    action_id = str(action.get("action_id") or action.get("id") or f"act_{uuid4().hex}").strip()
+    action_type = str(action.get("action_type") or "").strip().upper()
+    status = str(action.get("status") or "PENDING").strip().upper()
+    requested_at = str(action.get("requested_at") or datetime.now().isoformat(timespec="seconds")).strip()
+    trade_date = str(action.get("trade_date") or _trade_date_from_timestamp(requested_at) or datetime.now().date().isoformat()).strip()
+    if not action_id or not action_type or not status:
+        raise ValueError("operator action missing required fields")
+    request_payload = action.get("request_payload")
+    if request_payload is None:
+        request_payload = action.get("request_payload_json")
+    response_payload = action.get("response_payload")
+    if response_payload is None:
+        response_payload = action.get("response_payload_json")
+    return {
+        "action_id": action_id,
+        "trade_date": trade_date,
+        "requested_at": requested_at,
+        "completed_at": str(action.get("completed_at") or "") or None,
+        "action_type": action_type,
+        "status": status,
+        "source": str(action.get("source") or "themelab_dashboard"),
+        "requested_by": str(action.get("requested_by") or "") or None,
+        "event_id": str(action.get("event_id") or "") or None,
+        "symbol": str(action.get("symbol") or "") or None,
+        "stock_name": str(action.get("stock_name") or "") or None,
+        "candidate_instance_id": str(action.get("candidate_instance_id") or "") or None,
+        "requires_token": 1 if bool(action.get("requires_token")) else 0,
+        "confirmation_required": 1 if bool(action.get("confirmation_required", True)) else 0,
+        "endpoint": str(action.get("endpoint") or "") or None,
+        "request_payload_json": _json_payload(request_payload),
+        "response_payload_json": _json_payload(response_payload),
+        "error_message": str(action.get("error_message") or "") or None,
+    }
+
+
+def _operator_action_row_to_dict(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    request_payload = _safe_json_loads(data.pop("request_payload_json", "{}"), {})
+    response_payload = _safe_json_loads(data.pop("response_payload_json", "{}"), {})
+    data["request_payload"] = request_payload if isinstance(request_payload, dict) else {}
+    data["response_payload"] = response_payload if isinstance(response_payload, dict) else {}
+    data["requires_token"] = bool(data.get("requires_token"))
+    data["confirmation_required"] = bool(data.get("confirmation_required"))
+    return data
+
+
+def _json_payload(value: object) -> str:
+    if isinstance(value, str):
+        parsed = _safe_json_loads(value, {})
+        value = parsed if isinstance(parsed, (dict, list)) else {}
+    if value is None:
+        value = {}
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
 def _safe_json_loads(value: object, default):

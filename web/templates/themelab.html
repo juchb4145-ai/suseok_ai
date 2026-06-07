@@ -129,6 +129,46 @@
         <div id="operator-event-journal-list" class="operator-event-journal-list"></div>
       </section>
 
+      <section id="operator-action-center" class="panel action-center-panel" aria-label="Operator Action Center">
+        <div class="panel-head operator-alert-head">
+          <div>
+            <h2>Operator Action Center</h2>
+            <p id="operator-action-context">선택 이벤트 또는 후보 기준 추천 액션</p>
+          </div>
+          <div class="operator-alert-actions">
+            <span id="operator-action-summary" class="counter">0 actions</span>
+            <button id="operator-action-refresh" type="button">액션 새로고침</button>
+          </div>
+        </div>
+        <div class="action-center-grid">
+          <div>
+            <div class="operator-alert-subhead">
+              <h3>Recommendations</h3>
+              <span class="counter">safe only</span>
+            </div>
+            <div id="operator-action-recommendations" class="action-recommendations"></div>
+          </div>
+          <div>
+            <div class="operator-alert-subhead">
+              <h3>History</h3>
+              <span class="counter">latest 20</span>
+            </div>
+            <div id="operator-action-history" class="action-history"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="operator-runbook-panel" class="panel runbook-panel" aria-label="Operator Runbook">
+        <div class="panel-head operator-alert-head">
+          <div>
+            <h2 id="operator-runbook-title">Runbook</h2>
+            <p>이 Action Center는 주문을 실행하지 않습니다.</p>
+          </div>
+          <span class="counter">safe runbook</span>
+        </div>
+        <div id="operator-runbook-body" class="runbook-body"></div>
+      </section>
+
       <section class="flow-grid">
         <aside class="panel theme-panel">
           <div class="panel-head">
@@ -286,6 +326,20 @@
           <div id="data-quality-list" class="quality-list"></div>
         </section>
       </section>
+      <div id="operator-action-confirm-modal" class="action-confirm-modal" hidden>
+        <div class="action-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="operator-action-confirm-title">
+          <h2 id="operator-action-confirm-title">액션 실행 확인</h2>
+          <div id="operator-action-confirm-body" class="action-confirm-body"></div>
+          <label class="action-note-field">
+            <span>운영 메모</span>
+            <textarea id="operator-action-note" rows="3" placeholder="필요한 경우 판단 근거를 남깁니다."></textarea>
+          </label>
+          <div class="operator-alert-actions">
+            <button id="operator-action-confirm-cancel" type="button">취소</button>
+            <button id="operator-action-confirm-submit" type="button">실행</button>
+          </div>
+        </div>
+      </div>
     </main>
     <script src="/static/themelab.js?v=theme-backfill-gateway-start"></script>
   </body>
