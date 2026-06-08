@@ -419,3 +419,128 @@ def test_condition_adapter_does_not_recover_acked_send_condition(tmp_path):
         assert ("theme_lab_strong", 84) in adapter.registered_conditions
     finally:
         db.close()
+
+
+def test_condition_adapter_prefers_current_session_ack_over_later_failed_duplicate(tmp_path):
+    db = TradingDatabase(str(tmp_path / "runtime.sqlite3"))
+    try:
+        repository = ConditionProfileRepository(db)
+        repository.upsert_profile(
+            ConditionProfile(
+                condition_name="theme_lab_strong",
+                strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+                enabled=True,
+                priority=200,
+                purpose="theme_lab_strong",
+                last_resolved_index=84,
+            )
+        )
+        state = GatewayStateStore()
+        state.status.connected = True
+        state.status.kiwoom_logged_in = True
+        state.status.last_heartbeat_at = utc_timestamp()
+        state.status.last_heartbeat_payload = {"ws_session_id": "current-session"}
+        state.enqueue_command(
+            GatewayCommand(
+                type="send_condition",
+                command_id="cmd-acked-current",
+                idempotency_key="runtime:send_condition:theme_lab_strong:84:7600",
+                source="strategy_runtime",
+                payload={
+                    "screen_no": "7600",
+                    "condition_name": "theme_lab_strong",
+                    "condition_index": 84,
+                    "realtime": True,
+                    "search_type": 1,
+                },
+            )
+        )
+        state.ack_command(
+            "cmd-acked-current",
+            status="ACKED",
+            result_payload={"message": "condition sent", "transport_trace": {"ws_session_id": "current-session"}},
+        )
+        state.enqueue_command(
+            GatewayCommand(
+                type="send_condition",
+                command_id="cmd-failed-duplicate",
+                idempotency_key="runtime:send_condition_recover:theme_lab_strong:84:7600:20260608094500",
+                source="strategy_runtime",
+                payload={
+                    "screen_no": "7600",
+                    "condition_name": "theme_lab_strong",
+                    "condition_index": 84,
+                    "realtime": True,
+                    "search_type": 1,
+                },
+            )
+        )
+        state.ack_command("cmd-failed-duplicate", status="FAILED", error="condition sent")
+        adapter = GatewayCommandConditionAdapter(state, repository, purpose_filter={"theme_lab_strong"})
+
+        warnings = adapter.recover_unacked_conditions()
+
+        commands = state.list_commands(limit=10, include_finished=True, command_type="send_condition")
+        assert warnings == []
+        assert len(commands) == 2
+        assert ("theme_lab_strong", 84) in adapter.registered_conditions
+    finally:
+        db.close()
+
+
+def test_condition_adapter_recovers_ack_from_previous_gateway_session(tmp_path):
+    db = TradingDatabase(str(tmp_path / "runtime.sqlite3"))
+    try:
+        repository = ConditionProfileRepository(db)
+        repository.upsert_profile(
+            ConditionProfile(
+                condition_name="theme_lab_strong",
+                strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+                enabled=True,
+                priority=200,
+                purpose="theme_lab_strong",
+                last_resolved_index=84,
+            )
+        )
+        state = GatewayStateStore()
+        state.status.connected = True
+        state.status.kiwoom_logged_in = True
+        state.status.last_heartbeat_at = utc_timestamp()
+        state.status.last_heartbeat_payload = {"ws_session_id": "current-session"}
+        state.enqueue_command(
+            GatewayCommand(
+                type="send_condition",
+                command_id="cmd-acked-old-session",
+                idempotency_key="runtime:send_condition:theme_lab_strong:84:7600",
+                source="strategy_runtime",
+                payload={
+                    "screen_no": "7600",
+                    "condition_name": "theme_lab_strong",
+                    "condition_index": 84,
+                    "realtime": True,
+                    "search_type": 1,
+                },
+            )
+        )
+        state.ack_command(
+            "cmd-acked-old-session",
+            status="ACKED",
+            result_payload={"message": "condition sent", "transport_trace": {"ws_session_id": "old-session"}},
+        )
+        adapter = GatewayCommandConditionAdapter(
+            state,
+            repository,
+            purpose_filter={"theme_lab_strong"},
+            send_condition_recovery_cooldown_sec=30,
+        )
+
+        warnings = adapter.recover_unacked_conditions()
+
+        assert "CONDITION_SEND_ACK_STALE_SESSION:theme_lab_strong:cmd-acked-old-session" in warnings
+        assert "CONDITION_SEND_RECOVERY_ENQUEUED:theme_lab_strong:EXPIRED" in warnings
+        newest = state.list_commands(limit=10, include_finished=True, command_type="send_condition")[0]
+        assert newest["status"] == "QUEUED"
+        assert newest["metadata"]["recovered_from_command_id"] == "cmd-acked-old-session"
+        assert ("theme_lab_strong", 84) not in adapter.registered_conditions
+    finally:
+        db.close()

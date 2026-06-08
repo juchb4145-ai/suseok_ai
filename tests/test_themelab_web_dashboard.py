@@ -1033,6 +1033,75 @@ def test_condition_status_uses_send_condition_ack_not_resolved_index(tmp_path):
     assert leader["warning"] == "CONDITION_SEND_FAILED"
 
 
+def test_condition_status_prefers_current_session_ack_over_later_failed_duplicate(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        repo = ConditionProfileRepository(db)
+        repo.upsert_profile(
+            ConditionProfile(
+                condition_name="theme-lab-leader",
+                strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+                enabled=True,
+                priority=200,
+                purpose="theme_lab_leader",
+                last_resolved_index=85,
+            )
+        )
+        state = GatewayStateStore()
+        state.status.connected = True
+        state.status.last_heartbeat_at = utc_timestamp()
+        state.status.last_heartbeat_payload = {"ws_session_id": "current-session"}
+        state.enqueue_command(
+            GatewayCommand(
+                type="send_condition",
+                command_id="cmd-cond-acked",
+                payload={
+                    "condition_name": "theme-lab-leader",
+                    "condition_index": 85,
+                    "screen_no": "7602",
+                },
+            )
+        )
+        state.ack_command(
+            "cmd-cond-acked",
+            status="ACKED",
+            result_payload={"message": "condition sent", "transport_trace": {"ws_session_id": "current-session"}},
+        )
+        state.enqueue_command(
+            GatewayCommand(
+                type="send_condition",
+                command_id="cmd-cond-failed-later",
+                idempotency_key="runtime:send_condition_recover:theme-lab-leader:85:7602:20260608094500",
+                payload={
+                    "condition_name": "theme-lab-leader",
+                    "condition_index": 85,
+                    "screen_no": "7602",
+                },
+            )
+        )
+        state.ack_command("cmd-cond-failed-later", status="FAILED", error="condition sent")
+        db.save_theme_lab_flow_result(
+            "2026-06-02T09:04:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [],
+                "watchset_snapshots": [],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db, gateway_state=state)
+    finally:
+        db.close()
+
+    leader = next(item for item in payload["condition_statuses"] if item["purpose"] == "theme_lab_leader")
+    assert leader["registered"] is True
+    assert leader["command_status"] == "ACKED"
+    assert leader["screen_no"] == "7602"
+    assert leader["warning"] == ""
+
+
 def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, monkeypatch):
     db_path = tmp_path / "trader.sqlite3"
     monkeypatch.setenv("TRADING_DB_PATH", str(db_path))

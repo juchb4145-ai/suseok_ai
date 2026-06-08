@@ -334,6 +334,7 @@ class GatewayCommandConditionAdapter:
         if not self._gateway_ready():
             return list(self.warnings)
         current = now or datetime.now()
+        current_session = _gateway_session_tokens(self.gateway_state.snapshot().last_heartbeat_payload)
         latest = self._latest_send_condition_commands()
         for screen_index, profile in enumerate(self._selected_profiles()):
             if profile.last_resolved_index is None:
@@ -367,8 +368,13 @@ class GatewayCommandConditionAdapter:
                     record["last_error"] = "STALE_SEND_CONDITION_DISPATCHED"
                     self._warn(f"CONDITION_SEND_STALE_EXPIRED:{profile.condition_name}:{command_id}")
             if status == "ACKED":
-                self._remember_registered_condition(profile, condition_index, screen_no, current)
-                continue
+                if _record_matches_session(record, current_session):
+                    self._remember_registered_condition(profile, condition_index, screen_no, current)
+                    continue
+                status = CommandStatus.EXPIRED.value
+                record["status"] = status
+                record["last_error"] = "STALE_SEND_CONDITION_ACK_SESSION"
+                self._warn(f"CONDITION_SEND_ACK_STALE_SESSION:{profile.condition_name}:{record.get('command_id') or ''}")
             if status in {"QUEUED", "DISPATCHED"}:
                 continue
             if not self._condition_recovery_due(key, current):
@@ -484,6 +490,7 @@ class GatewayCommandConditionAdapter:
 
     def _latest_send_condition_commands(self) -> dict[tuple[str, int, str], dict[str, Any]]:
         latest: dict[tuple[str, int, str], dict[str, Any]] = {}
+        current_session = _gateway_session_tokens(self.gateway_state.snapshot().last_heartbeat_payload)
         for record in self.gateway_state.list_commands(limit=1000, include_finished=True, command_type="send_condition"):
             command = dict(record.get("command") or {})
             payload = dict(command.get("payload") or {})
@@ -495,7 +502,13 @@ class GatewayCommandConditionAdapter:
                 continue
             if not name or not screen_no:
                 continue
-            latest.setdefault((name, condition_index, screen_no), record)
+            key = (name, condition_index, screen_no)
+            current = latest.get(key)
+            if current is None:
+                latest[key] = record
+                continue
+            if _prefer_condition_command_record(record, current, current_session):
+                latest[key] = record
         return latest
 
     def _condition_recovery_due(self, key: tuple[str, int, str], current: datetime) -> bool:
@@ -551,6 +564,48 @@ def _clean_codes(codes: Iterable[str]) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def _prefer_condition_command_record(
+    candidate: dict[str, Any],
+    current: dict[str, Any],
+    current_session: set[str],
+) -> bool:
+    """Prefer a current-session ACK over newer duplicate recovery failures."""
+    candidate_status = str(candidate.get("status") or "").upper()
+    current_status = str(current.get("status") or "").upper()
+    candidate_current_ack = candidate_status == CommandStatus.ACKED.value and _record_matches_session(candidate, current_session)
+    current_current_ack = current_status == CommandStatus.ACKED.value and _record_matches_session(current, current_session)
+    if candidate_current_ack != current_current_ack:
+        return candidate_current_ack
+    candidate_created = str(candidate.get("created_at") or "")
+    current_created = str(current.get("created_at") or "")
+    if candidate_created != current_created:
+        return candidate_created > current_created
+    return str(candidate.get("updated_at") or "") > str(current.get("updated_at") or "")
+
+
+def _record_matches_session(record: dict[str, Any], current_session: set[str]) -> bool:
+    if not current_session:
+        return True
+    record_session = _gateway_session_tokens(record.get("result_payload") or {})
+    if not record_session:
+        return True
+    return not record_session.isdisjoint(current_session)
+
+
+def _gateway_session_tokens(payload: Any) -> set[str]:
+    if not isinstance(payload, dict):
+        return set()
+    tokens: set[str] = set()
+    for key in ("ws_session_id", "websocket_session_id", "ws_connection_id", "connection_id"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            tokens.add(value)
+    trace = payload.get("transport_trace")
+    if isinstance(trace, dict):
+        tokens.update(_gateway_session_tokens(trace))
+    return tokens
 
 
 def _stale_dispatched(record: dict[str, Any], current: datetime, timeout_sec: int) -> bool:

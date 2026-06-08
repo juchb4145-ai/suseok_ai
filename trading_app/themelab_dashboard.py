@@ -741,6 +741,7 @@ def _latest_condition_commands(gateway_state: Any | None) -> dict[str, dict[str,
     if gateway_state is None:
         return {}
     try:
+        current_session = _gateway_session_tokens(gateway_state.snapshot().to_dict().get("last_heartbeat_payload") or {})
         records = gateway_state.list_commands(limit=500, include_finished=True, command_type="send_condition")
     except Exception:
         return {}
@@ -751,15 +752,63 @@ def _latest_condition_commands(gateway_state: Any | None) -> dict[str, dict[str,
         if not name:
             continue
         current = latest.get(name)
-        if current is not None and str(current.get("created_at") or "") >= str(record.get("created_at") or ""):
-            continue
-        latest[name] = {
+        candidate = {
             "status": str(record.get("status") or ""),
             "last_error": str(record.get("last_error") or ""),
             "created_at": str(record.get("created_at") or ""),
+            "updated_at": str(record.get("updated_at") or ""),
             "payload": payload,
+            "result_payload": dict(record.get("result_payload") or {}),
         }
+        if current is not None and not _prefer_condition_command_record(candidate, current, current_session):
+            continue
+        latest[name] = candidate
     return latest
+
+
+def _prefer_condition_command_record(
+    candidate: dict[str, Any],
+    current: dict[str, Any],
+    current_session: set[str],
+) -> bool:
+    candidate_current_ack = str(candidate.get("status") or "").upper() == "ACKED" and _record_matches_session(
+        candidate,
+        current_session,
+    )
+    current_current_ack = str(current.get("status") or "").upper() == "ACKED" and _record_matches_session(
+        current,
+        current_session,
+    )
+    if candidate_current_ack != current_current_ack:
+        return candidate_current_ack
+    candidate_created = str(candidate.get("created_at") or "")
+    current_created = str(current.get("created_at") or "")
+    if candidate_created != current_created:
+        return candidate_created > current_created
+    return str(candidate.get("updated_at") or "") > str(current.get("updated_at") or "")
+
+
+def _record_matches_session(record: dict[str, Any], current_session: set[str]) -> bool:
+    if not current_session:
+        return True
+    record_session = _gateway_session_tokens(record.get("result_payload") or {})
+    if not record_session:
+        return True
+    return not record_session.isdisjoint(current_session)
+
+
+def _gateway_session_tokens(payload: Any) -> set[str]:
+    if not isinstance(payload, dict):
+        return set()
+    tokens: set[str] = set()
+    for key in ("ws_session_id", "websocket_session_id", "ws_connection_id", "connection_id"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            tokens.add(value)
+    trace = payload.get("transport_trace")
+    if isinstance(trace, dict):
+        tokens.update(_gateway_session_tokens(trace))
+    return tokens
 
 
 def _condition_command_warning(status: str, error: str) -> str:
