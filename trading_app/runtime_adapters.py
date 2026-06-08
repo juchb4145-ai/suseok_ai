@@ -192,6 +192,32 @@ class GatewayCommandRealtimeClient:
             key=f"runtime:register_realtime:{screen_no}:{','.join(clean_codes)}",
         )
 
+    def register_realtime_records(self, records: Iterable[Any], screen_no: str = "") -> None:
+        record_list = list(records or [])
+        clean_codes = _clean_codes(getattr(record, "code", "") for record in record_list)
+        if not clean_codes:
+            return
+        code_sources: dict[str, list[str]] = {}
+        code_protected: dict[str, bool] = {}
+        for record in record_list:
+            codes = _clean_codes([getattr(record, "code", "")])
+            if not codes:
+                continue
+            code = codes[0]
+            sources = sorted(str(source) for source in getattr(record, "sources", set()) or [])
+            code_sources[code] = sources
+            code_protected[code] = bool(getattr(record, "protected", False))
+        self._enqueue(
+            "register_realtime",
+            payload={
+                "codes": clean_codes,
+                "screen_no": str(screen_no or ""),
+                "code_sources": code_sources,
+                "code_protected": code_protected,
+            },
+            key=f"runtime:register_realtime:{screen_no}:{','.join(clean_codes)}",
+        )
+
     def remove_realtime(self, codes: Iterable[str], screen_no: str = "") -> None:
         clean_codes = _clean_codes(codes)
         if not clean_codes:

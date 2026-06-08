@@ -52,6 +52,10 @@ DEFAULT_PILOT_CONTROL_EVENT_TYPES = {
     "gateway_error",
     "error",
 }
+DEFAULT_PRIORITY_PRICE_TICK_SOURCES = {
+    "holding",
+    "theme_lab_watchset",
+}
 
 
 class CoreTransportClient(Protocol):
@@ -87,6 +91,8 @@ class WebSocketPilotPolicy:
     allowed_commands: set[str] = field(default_factory=lambda: set(DEFAULT_PILOT_ALLOWED_COMMANDS))
     allowed_event_types: set[str] = field(default_factory=lambda: set(DEFAULT_PILOT_CONTROL_EVENT_TYPES))
     price_tick_sample_rate: float = 0.0
+    priority_price_tick_codes: set[str] = field(default_factory=set)
+    priority_price_tick_sources: set[str] = field(default_factory=lambda: set(DEFAULT_PRIORITY_PRICE_TICK_SOURCES))
     max_queue_size: int = 2000
     outbound_send_burst_size: int = 100
     heartbeat_interval_sec: float = 5.0
@@ -107,6 +113,13 @@ class WebSocketPilotPolicy:
             if allowed_events_raw
             else set(DEFAULT_PILOT_CONTROL_EVENT_TYPES)
         )
+        priority_codes = _clean_code_set(os.environ.get("TRADING_GATEWAY_WEBSOCKET_PRIORITY_TICK_CODES", ""))
+        priority_sources_raw = os.environ.get("TRADING_GATEWAY_WEBSOCKET_PRIORITY_TICK_SOURCES", "")
+        priority_sources = (
+            {item.strip() for item in priority_sources_raw.split(",") if item.strip()}
+            if priority_sources_raw
+            else set(DEFAULT_PRIORITY_PRICE_TICK_SOURCES)
+        )
         return cls(
             enabled=_bool_env("TRADING_GATEWAY_WEBSOCKET_REAL_PILOT", False),
             allow_real=_bool_env("TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL", False),
@@ -120,6 +133,8 @@ class WebSocketPilotPolicy:
             allowed_commands=allowed,
             allowed_event_types=allowed_events,
             price_tick_sample_rate=_float_env("TRADING_GATEWAY_WEBSOCKET_PRICE_TICK_SAMPLE_RATE", 0.0),
+            priority_price_tick_codes=priority_codes,
+            priority_price_tick_sources=priority_sources,
             outbound_send_burst_size=_int_env("TRADING_GATEWAY_WEBSOCKET_OUTBOUND_SEND_BURST_SIZE", 100),
         )
 
@@ -192,6 +207,8 @@ class WebSocketRealCoreClient:
         self.ws_price_tick_sampled_count = 0
         self.ws_price_tick_fallback_count = 0
         self.ws_event_fallback_count = 0
+        self.ws_priority_price_tick_sampled_count = 0
+        self.ws_priority_price_tick_codes: dict[str, set[str]] = {}
         self.last_ws_event_at = ""
         self.last_ws_ack_at = ""
         self._sequence = 0
@@ -231,7 +248,8 @@ class WebSocketRealCoreClient:
     def post_event(self, event: GatewayEvent) -> dict[str, Any]:
         if self.fallback_active:
             return self.fallback_client.post_event(event)  # type: ignore[union-attr]
-        if not self.policy.event_allowed(event.type):
+        allowed, priority_tick = self._event_allowed(event)
+        if not allowed:
             if self.fallback_client is not None:
                 if event.type == "price_tick":
                     self.ws_price_tick_fallback_count += 1
@@ -248,6 +266,8 @@ class WebSocketRealCoreClient:
             self.post_count += 1
             if event.type == "price_tick":
                 self.ws_price_tick_sampled_count += 1
+                if priority_tick:
+                    self.ws_priority_price_tick_sampled_count += 1
             return {"accepted": True, "queued": True, "transport_mode": self.transport_mode}
         except Exception as exc:
             self.last_event_post_ms = monotonic_delta_ms(post_start, monotonic_ms()) or 0.0
@@ -322,11 +342,65 @@ class WebSocketRealCoreClient:
             "ws_price_tick_sample_rate": min(1.0, max(0.0, float(self.policy.price_tick_sample_rate or 0.0))),
             "ws_price_tick_sampled_count": self.ws_price_tick_sampled_count,
             "ws_price_tick_fallback_count": self.ws_price_tick_fallback_count,
+            "ws_priority_price_tick_code_count": len(self._priority_price_tick_code_set()),
+            "ws_priority_price_tick_codes": sorted(self._priority_price_tick_code_set())[:200],
+            "ws_priority_price_tick_sources": sorted(self.policy.priority_price_tick_sources),
+            "ws_priority_price_tick_sampled_count": self.ws_priority_price_tick_sampled_count,
             "ws_event_fallback_count": self.ws_event_fallback_count,
             "last_ws_event_at": self.last_ws_event_at,
             "last_ws_ack_at": self.last_ws_ack_at,
             "fallback": fallback_snapshot,
         }
+
+    def apply_realtime_subscription_update(self, command_type: str, payload: dict[str, Any]) -> None:
+        normalized_type = str(command_type or "")
+        payload = dict(payload or {})
+        if normalized_type == "remove_all_realtime":
+            self.ws_priority_price_tick_codes.clear()
+            return
+        codes = _clean_code_set(payload.get("codes") or [])
+        if not codes:
+            return
+        if normalized_type == "remove_realtime":
+            self._remove_dynamic_priority_price_tick_codes(codes)
+            return
+        if normalized_type != "register_realtime":
+            return
+        code_sources = _normalized_code_sources(payload.get("code_sources"))
+        priority_sources = {str(source) for source in self.policy.priority_price_tick_sources}
+        for code in sorted(codes):
+            matched_sources = set(code_sources.get(code) or []) & priority_sources
+            if matched_sources:
+                self.ws_priority_price_tick_codes.setdefault(code, set()).update(matched_sources)
+
+    def _event_allowed(self, event: GatewayEvent) -> tuple[bool, bool]:
+        if event.type != "price_tick":
+            return self.policy.event_allowed(event.type), False
+        if self._priority_price_tick_event(event):
+            return True, True
+        return self.policy.event_allowed(event.type), False
+
+    def _priority_price_tick_event(self, event: GatewayEvent) -> bool:
+        code = _event_stock_code(event)
+        payload = dict(event.payload or {})
+        metadata = dict(payload.get("metadata") or {})
+        if _truthy(metadata.get("ws_priority_tick") or metadata.get("ws_tick_priority")):
+            return True
+        sources = _string_set(
+            metadata.get("subscription_sources")
+            or metadata.get("realtime_sources")
+            or metadata.get("realtime_source")
+        )
+        if sources & {str(source) for source in self.policy.priority_price_tick_sources}:
+            return True
+        return bool(code and code in self._priority_price_tick_code_set())
+
+    def _priority_price_tick_code_set(self) -> set[str]:
+        return set(self.policy.priority_price_tick_codes) | set(self.ws_priority_price_tick_codes)
+
+    def _remove_dynamic_priority_price_tick_codes(self, codes: set[str]) -> None:
+        for code in codes:
+            self.ws_priority_price_tick_codes.pop(code, None)
 
     def _thread_main(self) -> None:
         try:
@@ -634,6 +708,63 @@ def _ws_url_from_core_url(core_url: str) -> str:
     elif base.startswith("http://"):
         base = "ws://" + base[len("http://") :]
     return f"{base}/ws/gateway/transport"
+
+
+def _event_stock_code(event: GatewayEvent) -> str:
+    payload = dict(event.payload or {})
+    return next(iter(_clean_code_set([payload.get("code") or payload.get("stock_code") or ""])), "")
+
+
+def _normalized_code_sources(value: Any) -> dict[str, set[str]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, set[str]] = {}
+    for raw_code, raw_sources in value.items():
+        codes = _clean_code_set([raw_code])
+        if not codes:
+            continue
+        result[next(iter(codes))] = _string_set(raw_sources)
+    return result
+
+
+def _clean_code_set(values: Any) -> set[str]:
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        raw_values = values.split(",")
+    else:
+        try:
+            raw_values = list(values)
+        except TypeError:
+            raw_values = [values]
+    result: set[str] = set()
+    for raw in raw_values:
+        text = str(raw or "").strip().upper()
+        if text.startswith("A") and len(text) == 7:
+            text = text[1:]
+        code = "".join(ch for ch in text if ch.isdigit())
+        if code:
+            result.add(code.zfill(6))
+    return result
+
+
+def _string_set(values: Any) -> set[str]:
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        raw_values = values.split(",")
+    else:
+        try:
+            raw_values = list(values)
+        except TypeError:
+            raw_values = [values]
+    return {str(value).strip() for value in raw_values if str(value).strip()}
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 def _bool_env(name: str, default: bool) -> bool:

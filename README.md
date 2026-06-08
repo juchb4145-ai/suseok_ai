@@ -323,6 +323,9 @@ Pilot safety flags:
 
 - `TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOWED_COMMANDS`: default allows login/condition/realtime/TR commands.
 - `TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS=1`: default blocks `send_order`, `cancel_order`, `modify_order`.
+- `TRADING_GATEWAY_WEBSOCKET_PRICE_TICK_SAMPLE_RATE`: broad real-time tick WebSocket sample rate; default `0`.
+- `TRADING_GATEWAY_WEBSOCKET_PRIORITY_TICK_SOURCES`: sources that bypass broad tick sampling; default `holding,theme_lab_watchset`.
+- `TRADING_GATEWAY_WEBSOCKET_PRIORITY_TICK_CODES`: optional comma-separated codes that always use the WebSocket pilot tick path.
 - `TRADING_GATEWAY_WEBSOCKET_FALLBACK_AFTER_ERRORS=3`
 - `TRADING_GATEWAY_WEBSOCKET_FALLBACK_AFTER_RECONNECTS=5`
 

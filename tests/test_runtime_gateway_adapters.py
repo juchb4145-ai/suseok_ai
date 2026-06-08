@@ -9,6 +9,7 @@ from trading.strategy.conditions import ConditionProfile, ConditionProfileReposi
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import MarketIndexStore
 from trading.strategy.models import StrategyProfile
+from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.theme_engine.runtime import RealTimeThemeRuntime
 from trading_app.runtime_adapters import (
     GatewayCommandConditionAdapter,
@@ -137,6 +138,25 @@ def test_realtime_adapter_enqueues_gateway_commands():
 
     history = state.list_commands(limit=10, include_finished=True)
     assert [item["command_type"] for item in history] == ["remove_realtime", "register_realtime"]
+
+
+def test_realtime_adapter_register_command_carries_subscription_sources():
+    state = GatewayStateStore()
+    client = GatewayCommandRealtimeClient(state)
+    manager = RealTimeSubscriptionManager(client, max_codes=10)
+
+    manager.ensure_subscription("000001", "theme_lab_watchset")
+    manager.ensure_subscription("000270", "holding", protected=True)
+    manager.ensure_subscription("005930", "candidate_watch")
+    manager.sync()
+
+    command = state.list_commands(limit=10, include_finished=True, command_type="register_realtime")[0]
+    payload = command["command"]["payload"]
+
+    assert payload["code_sources"]["000001"] == ["theme_lab_watchset"]
+    assert payload["code_sources"]["000270"] == ["holding"]
+    assert payload["code_sources"]["005930"] == ["candidate_watch"]
+    assert payload["code_protected"]["000270"] is True
 
 
 def test_realtime_adapter_expires_stale_dispatched_register_command():

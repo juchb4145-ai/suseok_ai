@@ -768,6 +768,8 @@ def _drain_real_commands(client, runtime: GatewayRuntime) -> None:
             execute_finished_at = utc_now_ms()
             execute_ms = monotonic_delta_ms(execute_start, monotonic_ms())
             runtime.rate_limiter.record(command.type)
+            if str(result_payload.get("status") or "").upper() == "ACKED":
+                _apply_realtime_subscription_transport_update(runtime.core_client, command)
             runtime.emit(
                 "command_ack",
                 {
@@ -1133,6 +1135,14 @@ def _command_with_gateway_trace(command: GatewayCommand, trace_updates: dict[str
     data = command.to_dict()
     data["payload"] = payload
     return GatewayCommand.from_dict(data)
+
+
+def _apply_realtime_subscription_transport_update(core_client, command: GatewayCommand) -> None:
+    if command.type not in {"register_realtime", "remove_realtime", "remove_all_realtime"}:
+        return
+    updater = getattr(core_client, "apply_realtime_subscription_update", None)
+    if callable(updater):
+        updater(command.type, dict(command.payload or {}))
 
 
 def _command_event_payload(command: GatewayCommand, trace_updates: dict[str, Any] | None = None) -> dict[str, Any]:

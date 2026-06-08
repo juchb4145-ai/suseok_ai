@@ -233,6 +233,110 @@ def test_websocket_real_client_can_sample_price_ticks_to_ws(monkeypatch):
     assert snapshot["ws_price_tick_fallback_count"] == 0
 
 
+def test_websocket_real_client_prioritizes_watchset_and_holding_ticks_to_ws(monkeypatch):
+    class Fallback:
+        transport_mode = "rest_long_poll"
+        last_poll_error = ""
+
+        def __init__(self):
+            self.events = []
+
+        def post_event(self, event):
+            self.events.append(event)
+            return {"accepted": True, "transport_mode": self.transport_mode}
+
+        def poll_commands(self, *, limit=20, wait_sec=1.0):
+            return []
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def snapshot(self):
+            return {"transport_mode": self.transport_mode}
+
+    fallback = Fallback()
+    client = WebSocketRealCoreClient(
+        core_url="http://127.0.0.1:8000",
+        ws_url="ws://127.0.0.1:8000/ws/gateway/transport",
+        token="test-token",
+        fallback_client=fallback,
+        policy=WebSocketPilotPolicy(enabled=True, allow_real=True, price_tick_sample_rate=0.0),
+    )
+    monkeypatch.setattr(client, "start", lambda: None)
+
+    client.apply_realtime_subscription_update(
+        "register_realtime",
+        {
+            "codes": ["000001", "000270", "005930"],
+            "code_sources": {
+                "000001": ["theme_lab_watchset"],
+                "000270": ["holding"],
+                "005930": ["candidate_watch"],
+            },
+        },
+    )
+    client.post_event(GatewayEvent(type="price_tick", payload={"code": "000001"}))
+    client.post_event(GatewayEvent(type="price_tick", payload={"code": "000270"}))
+    client.post_event(GatewayEvent(type="price_tick", payload={"code": "005930"}))
+    client.stop()
+
+    assert [event.payload["code"] for event in fallback.events] == ["005930"]
+    assert [client._outbound.get_nowait().payload["type"] for _ in range(client._outbound.qsize())] == [
+        "price_tick",
+        "price_tick",
+    ]
+    snapshot = client.snapshot()
+    assert snapshot["ws_priority_price_tick_code_count"] == 2
+    assert snapshot["ws_priority_price_tick_sampled_count"] == 2
+    assert snapshot["ws_price_tick_fallback_count"] == 1
+
+
+def test_websocket_real_client_removes_priority_tick_code_after_realtime_remove(monkeypatch):
+    class Fallback:
+        transport_mode = "rest_long_poll"
+        last_poll_error = ""
+
+        def __init__(self):
+            self.events = []
+
+        def post_event(self, event):
+            self.events.append(event)
+            return {"accepted": True, "transport_mode": self.transport_mode}
+
+        def poll_commands(self, *, limit=20, wait_sec=1.0):
+            return []
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def snapshot(self):
+            return {"transport_mode": self.transport_mode}
+
+    fallback = Fallback()
+    client = WebSocketRealCoreClient(
+        core_url="http://127.0.0.1:8000",
+        ws_url="ws://127.0.0.1:8000/ws/gateway/transport",
+        token="test-token",
+        fallback_client=fallback,
+        policy=WebSocketPilotPolicy(enabled=True, allow_real=True, price_tick_sample_rate=0.0),
+    )
+    monkeypatch.setattr(client, "start", lambda: None)
+
+    client.apply_realtime_subscription_update("register_realtime", {"codes": ["000001"], "code_sources": {"000001": ["theme_lab_watchset"]}})
+    client.apply_realtime_subscription_update("remove_realtime", {"codes": ["000001"]})
+    client.post_event(GatewayEvent(type="price_tick", payload={"code": "000001"}))
+    client.stop()
+
+    assert [event.payload["code"] for event in fallback.events] == ["000001"]
+    assert client.snapshot()["ws_priority_price_tick_code_count"] == 0
+
+
 def test_gateway_network_prioritizes_control_events_before_price_ticks():
     events = [
         GatewayEvent(type="price_tick", payload={"code": "005930"}),

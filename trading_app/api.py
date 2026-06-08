@@ -4077,9 +4077,13 @@ def _record_ws_message_side_effects(event: GatewayEvent, metadata: dict[str, Any
         ("ws_session_loss_count", "session_loss_count"),
         ("ws_duplicate_ack_count", "duplicate_ack_count"),
         ("ws_unknown_ack_count", "unknown_ack_count"),
+        ("ws_priority_price_tick_code_count", "priority_price_tick_code_count"),
+        ("ws_priority_price_tick_sampled_count", "priority_price_tick_sampled_count"),
     ):
         if source_key in payload:
             patch[target_key] = payload.get(source_key)
+    if "ws_priority_price_tick_sources" in payload:
+        patch["priority_price_tick_sources"] = list(payload.get("ws_priority_price_tick_sources") or [])
     _update_gateway_ws_transport_state(patch)
     if db is not None:
         _record_ws_pilot_diagnostic_log(db, payload)
@@ -4197,6 +4201,15 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         ),
         "price_tick_fallback_count": int(
             heartbeat.get("ws_price_tick_fallback_count") or state.get("price_tick_fallback_count") or 0
+        ),
+        "priority_price_tick_code_count": int(
+            heartbeat.get("ws_priority_price_tick_code_count") or state.get("priority_price_tick_code_count") or 0
+        ),
+        "priority_price_tick_sampled_count": int(
+            heartbeat.get("ws_priority_price_tick_sampled_count") or state.get("priority_price_tick_sampled_count") or 0
+        ),
+        "priority_price_tick_sources": list(
+            heartbeat.get("ws_priority_price_tick_sources") or state.get("priority_price_tick_sources") or []
         ),
         "event_fallback_count": int(heartbeat.get("ws_event_fallback_count") or state.get("event_fallback_count") or 0),
         "last_ws_event_at": heartbeat.get("last_ws_event_at") or state.get("last_ws_event_at") or "",
