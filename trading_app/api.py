@@ -7,9 +7,10 @@ import json
 import os
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from contextlib import asynccontextmanager
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -37,6 +38,7 @@ from trading.broker.transport_metrics import (
     TRANSPORT_MODE_WEBSOCKET_REAL_PILOT,
     TransportLatencySample,
     ensure_transport_trace,
+    monotonic_delta_ms,
     monotonic_ms,
     payload_size_bytes,
     should_sample_transport_message,
@@ -71,10 +73,12 @@ WEB_ROOT = PROJECT_ROOT / "web"
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    await _start_gateway_condition_event_worker()
     await runtime_supervisor.startup()
     try:
         yield
     finally:
+        await _stop_gateway_condition_event_worker()
         await runtime_supervisor.shutdown()
 
 
@@ -327,9 +331,69 @@ gateway_ws_transport_state: dict[str, Any] = {
     "session_loss_count": 0,
     "duplicate_ack_count": 0,
     "unknown_ack_count": 0,
+    "last_send_ms": 0.0,
+    "last_receive_ms": 0.0,
+    "outbound_queue_size": 0,
+    "control_outbound_queue_size": 0,
+    "data_outbound_queue_size": 0,
+    "core_ws_outbound_writer_active": False,
+    "core_ws_outbound_queue_size": 0,
+    "core_ws_outbound_queue_max_size": 0,
+    "core_ws_outbound_queued_count": 0,
+    "core_ws_outbound_sent_count": 0,
+    "core_ws_outbound_dropped_count": 0,
+    "core_ws_last_send_json_ms": 0.0,
+    "core_ws_last_send_queue_wait_ms": 0.0,
+    "core_ws_last_send_json_type": "",
+    "core_ws_last_send_json_at": "",
+    "core_ws_slow_send_count": 0,
+    "core_ws_last_slow_send_json_ms": 0.0,
+    "core_ws_last_slow_send_at": "",
+    "core_ws_last_receive_text_ms": 0.0,
+    "core_ws_receive_loop_gap_ms": 0.0,
+    "condition_event_queue_size": 0,
+    "command_queue_size": 0,
     "last_ws_event_at": "",
     "last_ws_ack_at": "",
 }
+gateway_condition_event_worker_state: dict[str, Any] = {
+    "enabled": False,
+    "queue_size": 0,
+    "queue_batch_count": 0,
+    "queue_max_size": 0,
+    "active_count": 0,
+    "queued_count": 0,
+    "processed_count": 0,
+    "failed_count": 0,
+    "dropped_count": 0,
+    "last_batch_size": 0,
+    "last_batch_duration_ms": 0.0,
+    "last_queued_at": "",
+    "last_processed_at": "",
+    "last_error": "",
+}
+
+
+@dataclass
+class _ConditionEventBatchWorkItem:
+    events: list[GatewayEvent]
+    queued_at: str
+    queued_monotonic_ms: float
+
+
+@dataclass
+class _CoreWsOutboundMessage:
+    payload: dict[str, Any]
+    message_type: str
+    queued_at: str
+    queued_monotonic_ms: float
+    connection_id: str
+
+
+_gateway_condition_event_queue: asyncio.Queue[_ConditionEventBatchWorkItem] | None = None
+_gateway_condition_event_worker_task: asyncio.Task | None = None
+_gateway_condition_event_worker_loop: asyncio.AbstractEventLoop | None = None
+_gateway_condition_event_executor: ThreadPoolExecutor | None = None
 _dashboard_snapshot_task: asyncio.Task | None = None
 _dashboard_snapshot_last_sent_monotonic = 0.0
 
@@ -2513,6 +2577,398 @@ async def _process_gateway_event(event: GatewayEvent) -> dict[str, Any]:
     }
 
 
+async def _start_gateway_condition_event_worker() -> None:
+    if not _gateway_condition_event_async_enabled():
+        _update_gateway_condition_event_worker_state({"enabled": False})
+        return
+    _ensure_gateway_condition_event_worker()
+
+
+async def _stop_gateway_condition_event_worker() -> None:
+    global _gateway_condition_event_worker_task, _gateway_condition_event_executor
+    task = _gateway_condition_event_worker_task
+    if task is not None and not task.done():
+        try:
+            queue = _gateway_condition_event_queue
+            if queue is not None:
+                await asyncio.wait_for(queue.join(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _gateway_condition_event_worker_task = None
+    if _gateway_condition_event_executor is not None:
+        _gateway_condition_event_executor.shutdown(wait=False, cancel_futures=True)
+        _gateway_condition_event_executor = None
+    _update_gateway_condition_event_worker_state({"enabled": False, "queue_size": 0, "queue_batch_count": 0, "active_count": 0})
+
+
+def _gateway_condition_event_async_enabled() -> bool:
+    return os.environ.get("TRADING_CORE_WS_CONDITION_EVENT_ASYNC_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _gateway_condition_event_queue_max_size() -> int:
+    try:
+        value = int(os.environ.get("TRADING_CORE_WS_CONDITION_EVENT_QUEUE_SIZE", "5000"))
+    except ValueError:
+        value = 5000
+    return max(1, value)
+
+
+def _ensure_gateway_condition_event_worker() -> None:
+    global _gateway_condition_event_queue
+    global _gateway_condition_event_worker_task
+    global _gateway_condition_event_worker_loop
+    global _gateway_condition_event_executor
+    if not _gateway_condition_event_async_enabled():
+        _update_gateway_condition_event_worker_state({"enabled": False})
+        return
+    loop = asyncio.get_running_loop()
+    if _gateway_condition_event_worker_loop is not loop:
+        _gateway_condition_event_queue = asyncio.Queue(maxsize=_gateway_condition_event_queue_max_size())
+        _gateway_condition_event_worker_task = None
+        _gateway_condition_event_worker_loop = loop
+        _update_gateway_condition_event_worker_state({"queue_size": 0, "queue_batch_count": 0, "active_count": 0})
+    if _gateway_condition_event_executor is None:
+        _gateway_condition_event_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="core-condition-events")
+    if _gateway_condition_event_worker_task is None or _gateway_condition_event_worker_task.done():
+        _gateway_condition_event_worker_task = loop.create_task(_gateway_condition_event_worker_loop_main())
+    queue = _gateway_condition_event_queue
+    _update_gateway_condition_event_worker_state(
+        {
+            "enabled": True,
+            "queue_size": int(gateway_condition_event_worker_state.get("queue_size") or 0),
+            "queue_batch_count": queue.qsize() if queue is not None else 0,
+            "queue_max_size": queue.maxsize if queue is not None else _gateway_condition_event_queue_max_size(),
+        }
+    )
+
+
+def _enqueue_gateway_condition_events(events: list[GatewayEvent], metadata: dict[str, Any]) -> dict[str, Any]:
+    if not events:
+        return {"accepted": True, "queued": True, "count": 0, "queued_count": 0, "dropped_count": 0, "queue_size": 0}
+    _ensure_gateway_condition_event_worker()
+    queue = _gateway_condition_event_queue
+    if queue is None:
+        return {"accepted": False, "queued": False, "count": len(events), "queued_count": 0, "dropped_count": len(events), "queue_size": 0, "reason": "WORKER_DISABLED"}
+    queue_size = int(gateway_condition_event_worker_state.get("queue_size") or 0)
+    queue_max_size = _gateway_condition_event_queue_max_size()
+    if queue_size + len(events) > queue_max_size:
+        now = utc_now_ms()
+        _update_gateway_condition_event_worker_state(
+            {
+                "enabled": True,
+                "queue_size": queue_size,
+                "queue_batch_count": queue.qsize(),
+                "queue_max_size": queue_max_size,
+                "dropped_count": int(gateway_condition_event_worker_state.get("dropped_count") or 0) + len(events),
+                "last_error": "CONDITION_EVENT_QUEUE_FULL",
+                "last_queued_at": now,
+            }
+        )
+        return {
+            "accepted": False,
+            "queued": False,
+            "count": len(events),
+            "queued_count": 0,
+            "dropped_count": len(events),
+            "queue_size": queue_size,
+            "queue_batch_count": queue.qsize(),
+            "queue_max_size": queue_max_size,
+            "reason": "QUEUE_FULL",
+        }
+    queued_at = utc_now_ms()
+    queued_monotonic = monotonic_ms()
+    queued_events: list[GatewayEvent] = []
+    for index, event in enumerate(events):
+        _record_ws_message_side_effects(event, metadata)
+        queued_event = _event_with_trace(
+            event,
+            {
+                "core_condition_event_queued_at_utc": queued_at,
+                "core_condition_event_queued_monotonic_ms": queued_monotonic,
+                "core_condition_event_queue_size": queue_size + index + 1,
+                "core_condition_event_queue_batch_size": len(events),
+                "core_condition_event_queue_batch_index": index,
+            },
+        )
+        queued_events.append(queued_event)
+    try:
+        queue.put_nowait(
+            _ConditionEventBatchWorkItem(
+                events=queued_events,
+                queued_at=queued_at,
+                queued_monotonic_ms=queued_monotonic,
+            )
+        )
+    except asyncio.QueueFull:
+        _update_gateway_condition_event_worker_state(
+            {
+                "enabled": True,
+                "queue_size": queue_size,
+                "queue_batch_count": queue.qsize(),
+                "queue_max_size": queue_max_size,
+                "dropped_count": int(gateway_condition_event_worker_state.get("dropped_count") or 0) + len(events),
+                "last_error": "CONDITION_EVENT_BATCH_QUEUE_FULL",
+                "last_queued_at": queued_at,
+            }
+        )
+        return {
+            "accepted": False,
+            "queued": False,
+            "count": len(events),
+            "queued_count": 0,
+            "dropped_count": len(events),
+            "queue_size": queue_size,
+            "queue_batch_count": queue.qsize(),
+            "queue_max_size": queue_max_size,
+            "reason": "QUEUE_FULL",
+        }
+    next_queue_size = queue_size + len(queued_events)
+    _update_gateway_condition_event_worker_state(
+        {
+            "enabled": True,
+            "queue_size": next_queue_size,
+            "queue_batch_count": queue.qsize(),
+            "queue_max_size": queue_max_size,
+            "queued_count": int(gateway_condition_event_worker_state.get("queued_count") or 0) + len(events),
+            "last_queued_at": queued_at,
+            "last_error": "",
+        }
+    )
+    return {
+        "accepted": True,
+        "queued": True,
+        "count": len(events),
+        "queued_count": len(events),
+        "dropped_count": 0,
+        "queue_size": next_queue_size,
+        "queue_batch_count": queue.qsize(),
+        "queue_max_size": queue_max_size,
+    }
+
+
+async def _gateway_condition_event_worker_loop_main() -> None:
+    while True:
+        queue = _gateway_condition_event_queue
+        if queue is None:
+            await asyncio.sleep(0.1)
+            continue
+        item = await queue.get()
+        events = item.events
+        batch_size = len(events)
+        queue_size = max(0, int(gateway_condition_event_worker_state.get("queue_size") or 0) - batch_size)
+        _update_gateway_condition_event_worker_state(
+            {
+                "queue_size": queue_size,
+                "queue_batch_count": queue.qsize(),
+                "active_count": batch_size,
+                "last_batch_size": batch_size,
+            }
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            if _gateway_condition_event_executor is None:
+                raise RuntimeError("condition event worker executor is not initialized")
+            batch_started = time.perf_counter()
+            result = await loop.run_in_executor(
+                _gateway_condition_event_executor,
+                _process_condition_event_batch_in_worker,
+                events,
+            )
+            batch_duration_ms = (time.perf_counter() - batch_started) * 1000.0
+            processed_count = int(result.get("processed_count") or 0)
+            failed_count = int(result.get("failed_count") or 0)
+            _update_gateway_condition_event_worker_state(
+                {
+                    "queue_size": int(gateway_condition_event_worker_state.get("queue_size") or 0),
+                    "queue_batch_count": queue.qsize(),
+                    "active_count": 0,
+                    "processed_count": int(gateway_condition_event_worker_state.get("processed_count") or 0) + processed_count,
+                    "failed_count": int(gateway_condition_event_worker_state.get("failed_count") or 0) + failed_count,
+                    "last_batch_duration_ms": round(batch_duration_ms, 3),
+                    "last_processed_at": utc_now_ms(),
+                    "last_error": "" if failed_count == 0 else str(result.get("last_error") or ""),
+                }
+            )
+            if int(result.get("accepted_count") or 0) > 0:
+                await _schedule_dashboard_snapshot_broadcast()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _update_gateway_condition_event_worker_state(
+                {
+                    "queue_size": int(gateway_condition_event_worker_state.get("queue_size") or 0),
+                    "queue_batch_count": queue.qsize(),
+                    "active_count": 0,
+                    "failed_count": int(gateway_condition_event_worker_state.get("failed_count") or 0) + batch_size,
+                    "last_error": str(exc) or repr(exc),
+                }
+            )
+        finally:
+            queue.task_done()
+            _update_gateway_condition_event_worker_state({"queue_batch_count": queue.qsize()})
+
+
+def _process_condition_event_in_worker(event: GatewayEvent) -> dict[str, Any]:
+    result = _process_condition_event_batch_in_worker([event])
+    results = list(result.get("results") or [])
+    if not results:
+        return {"accepted": False, "event_id": event.event_id, "type": event.type, "failed": True, "error": "EMPTY_BATCH_RESULT"}
+    return results[0]
+
+
+def _process_condition_event_batch_in_worker(events: list[GatewayEvent]) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    accepted_count = 0
+    failed_count = 0
+    last_error = ""
+    if not events:
+        return {"processed_count": 0, "accepted_count": 0, "failed_count": 0, "results": []}
+    db = open_database()
+    try:
+        collector = CandidateCollector(db)
+        for event in events:
+            try:
+                result = _process_condition_event_with_db(db, collector, event)
+            except Exception as exc:
+                result = _record_condition_event_worker_failure(db, event, exc)
+            results.append(result)
+            if result.get("accepted"):
+                accepted_count += 1
+            if result.get("failed"):
+                failed_count += 1
+                last_error = str(result.get("error") or last_error)
+    finally:
+        close_database(db)
+    return {
+        "processed_count": len(results),
+        "accepted_count": accepted_count,
+        "failed_count": failed_count,
+        "last_error": last_error,
+        "results": results,
+    }
+
+
+def _process_condition_event_with_db(db: TradingDatabase, collector: CandidateCollector, event: GatewayEvent) -> dict[str, Any]:
+    if event.type != "condition_event":
+        raise ValueError(f"unsupported async condition event type: {event.type}")
+    core_received_at = utc_now_ms()
+    core_received_monotonic = monotonic_ms()
+    trace = trace_from_payload(event.payload)
+    event = _event_with_trace(
+        event,
+        {
+            "core_condition_event_worker_started_at_utc": core_received_at,
+            "core_condition_event_worker_started_monotonic_ms": core_received_monotonic,
+            "core_condition_event_queue_wait_ms": monotonic_delta_ms(
+                trace.get("core_condition_event_queued_monotonic_ms"),
+                core_received_monotonic,
+            ),
+            "core_event_received_at_utc": core_received_at,
+            "core_event_received_monotonic_ms": core_received_monotonic,
+        },
+    )
+    accepted = gateway_state.record_event(event)
+    persist_ms = 0.0
+    if accepted:
+        persist_started = time.perf_counter()
+        _persist_condition_event_with_collector(db, collector, event)
+        persist_ms = (time.perf_counter() - persist_started) * 1000.0
+        event = _event_with_trace(
+            event,
+            {
+                "core_event_persisted_at_utc": utc_now_ms(),
+                "core_event_persisted_monotonic_ms": monotonic_ms(),
+            },
+        )
+        _save_gateway_event_transport_sample(
+            db,
+            event,
+            accepted=True,
+            core_receive_ms=wall_ms(trace_from_payload(event.payload).get("gateway_event_post_end_at_utc"), core_received_at),
+            core_persist_ms=persist_ms,
+        )
+    else:
+        _save_gateway_event_transport_sample(
+            db,
+            event,
+            accepted=False,
+            core_receive_ms=wall_ms(trace_from_payload(event.payload).get("gateway_event_post_end_at_utc"), core_received_at),
+            core_persist_ms=persist_ms,
+            error="DUPLICATE_OR_REJECTED_EVENT",
+        )
+    return {
+        "accepted": accepted,
+        "event_id": event.event_id,
+        "type": event.type,
+        "transport": {
+            "core_receive_ms": wall_ms(trace_from_payload(event.payload).get("gateway_event_post_end_at_utc"), core_received_at),
+            "core_persist_ms": persist_ms,
+        },
+    }
+
+
+def _record_condition_event_worker_failure(db: TradingDatabase, event: GatewayEvent, exc: Exception) -> dict[str, Any]:
+    core_received_at = utc_now_ms()
+    core_received_monotonic = monotonic_ms()
+    trace = trace_from_payload(event.payload)
+    event = _event_with_trace(
+        event,
+        {
+            "core_condition_event_worker_started_at_utc": core_received_at,
+            "core_condition_event_worker_started_monotonic_ms": core_received_monotonic,
+            "core_condition_event_queue_wait_ms": monotonic_delta_ms(
+                trace.get("core_condition_event_queued_monotonic_ms"),
+                core_received_monotonic,
+            ),
+            "core_event_received_at_utc": core_received_at,
+            "core_event_received_monotonic_ms": core_received_monotonic,
+        },
+    )
+    error = str(exc) or repr(exc)
+    try:
+        _save_gateway_event_transport_sample(
+            db,
+            event,
+            accepted=False,
+            core_receive_ms=wall_ms(trace.get("gateway_event_post_end_at_utc"), core_received_at),
+            core_persist_ms=0.0,
+            error=error,
+        )
+    except Exception:
+        pass
+    return {
+        "accepted": False,
+        "event_id": event.event_id,
+        "type": event.type,
+        "failed": True,
+        "error": error,
+        "transport": {
+            "core_receive_ms": wall_ms(trace.get("gateway_event_post_end_at_utc"), core_received_at),
+            "core_persist_ms": 0.0,
+        },
+    }
+
+
+def _persist_condition_event_with_collector(db: TradingDatabase, collector: CandidateCollector, event: GatewayEvent) -> None:
+    if event.type != "condition_event":
+        _persist_gateway_event(db, event)
+        return
+    condition_event = BrokerConditionEvent.from_dict(event.payload)
+    if condition_event.event_type == "remove":
+        collector.handle_condition_remove(condition_event)
+    else:
+        collector.handle_condition_include(condition_event)
+
+
+def _update_gateway_condition_event_worker_state(patch: dict[str, Any]) -> None:
+    gateway_condition_event_worker_state.update({key: value for key, value in patch.items() if value is not None})
+
+
 async def _schedule_dashboard_snapshot_broadcast() -> None:
     global _dashboard_snapshot_task
     if dashboard_connections.client_count <= 0:
@@ -2805,6 +3261,146 @@ async def dashboard_ws(websocket: WebSocket) -> None:
         dashboard_connections.disconnect(websocket)
 
 
+def _core_ws_outbound_queue_max_size() -> int:
+    try:
+        value = int(os.environ.get("TRADING_CORE_WS_OUTBOUND_QUEUE_SIZE", "1000"))
+    except ValueError:
+        value = 1000
+    return max(1, value)
+
+
+def _core_ws_send_slow_ms() -> float:
+    try:
+        value = float(os.environ.get("TRADING_CORE_WS_SEND_SLOW_MS", "1000"))
+    except ValueError:
+        value = 1000.0
+    return max(1.0, value)
+
+
+def _core_ws_outbound_metadata(queue: asyncio.Queue[_CoreWsOutboundMessage]) -> dict[str, Any]:
+    return {
+        "core_ws_outbound_queue_size": queue.qsize(),
+        "core_ws_outbound_queue_max_size": queue.maxsize,
+        "core_ws_last_send_json_ms": float(gateway_ws_transport_state.get("core_ws_last_send_json_ms") or 0.0),
+        "core_ws_last_send_queue_wait_ms": float(
+            gateway_ws_transport_state.get("core_ws_last_send_queue_wait_ms") or 0.0
+        ),
+    }
+
+
+def _queue_core_ws_outbound(
+    queue: asyncio.Queue[_CoreWsOutboundMessage],
+    payload: dict[str, Any],
+    *,
+    connection_id: str,
+) -> None:
+    queued_at = utc_now_ms()
+    item = _CoreWsOutboundMessage(
+        payload=payload,
+        message_type=str(payload.get("type") or ""),
+        queued_at=queued_at,
+        queued_monotonic_ms=monotonic_ms(),
+        connection_id=connection_id,
+    )
+    try:
+        queue.put_nowait(item)
+    except asyncio.QueueFull as exc:
+        dropped_count = int(gateway_ws_transport_state.get("core_ws_outbound_dropped_count") or 0) + 1
+        _update_gateway_ws_transport_state(
+            {
+                "core_ws_outbound_writer_active": True,
+                "core_ws_outbound_queue_size": queue.qsize(),
+                "core_ws_outbound_queue_max_size": queue.maxsize,
+                "core_ws_outbound_dropped_count": dropped_count,
+                "last_error": "CORE_WS_OUTBOUND_QUEUE_FULL",
+                "last_error_type": type(exc).__name__,
+                "last_error_stage": "core_ws_outbound_enqueue",
+                "last_error_at": queued_at,
+            }
+        )
+        raise RuntimeError("CORE_WS_OUTBOUND_QUEUE_FULL") from exc
+    _update_gateway_ws_transport_state(
+        {
+            "core_ws_outbound_writer_active": True,
+            "core_ws_outbound_queue_size": queue.qsize(),
+            "core_ws_outbound_queue_max_size": queue.maxsize,
+            "core_ws_outbound_queued_count": int(gateway_ws_transport_state.get("core_ws_outbound_queued_count") or 0) + 1,
+        }
+    )
+
+
+async def _core_ws_outbound_writer_loop(
+    websocket: WebSocket,
+    queue: asyncio.Queue[_CoreWsOutboundMessage],
+) -> None:
+    while True:
+        item = await queue.get()
+        try:
+            queue_wait_ms = monotonic_delta_ms(item.queued_monotonic_ms, monotonic_ms()) or 0.0
+            send_started = time.perf_counter()
+            await websocket.send_json(item.payload)
+            send_ms = (time.perf_counter() - send_started) * 1000.0
+            sent_at = utc_now_ms()
+            patch: dict[str, Any] = {
+                "core_ws_outbound_writer_active": True,
+                "core_ws_outbound_queue_size": queue.qsize(),
+                "core_ws_outbound_queue_max_size": queue.maxsize,
+                "core_ws_outbound_sent_count": int(gateway_ws_transport_state.get("core_ws_outbound_sent_count") or 0) + 1,
+                "core_ws_last_send_json_ms": send_ms,
+                "core_ws_last_send_queue_wait_ms": queue_wait_ms,
+                "core_ws_last_send_json_type": item.message_type,
+                "core_ws_last_send_json_at": sent_at,
+            }
+            if send_ms >= _core_ws_send_slow_ms():
+                patch.update(
+                    {
+                        "core_ws_slow_send_count": int(gateway_ws_transport_state.get("core_ws_slow_send_count") or 0) + 1,
+                        "core_ws_last_slow_send_json_ms": send_ms,
+                        "core_ws_last_slow_send_at": sent_at,
+                    }
+                )
+            _update_gateway_ws_transport_state(patch)
+        except Exception as exc:
+            _update_gateway_ws_transport_state(
+                {
+                    "core_ws_outbound_writer_active": False,
+                    "core_ws_outbound_queue_size": queue.qsize(),
+                    "last_error": _truncate_log_detail(str(exc) or repr(exc)),
+                    "last_error_type": type(exc).__name__,
+                    "last_error_stage": "core_ws_send_json",
+                    "last_error_at": utc_now_ms(),
+                }
+            )
+            raise
+        finally:
+            queue.task_done()
+
+
+async def _stop_core_ws_outbound_writer(
+    task: asyncio.Task,
+    queue: asyncio.Queue[_CoreWsOutboundMessage],
+) -> None:
+    if not task.done():
+        try:
+            await asyncio.wait_for(queue.join(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+    _update_gateway_ws_transport_state(
+        {
+            "core_ws_outbound_writer_active": False,
+            "core_ws_outbound_queue_size": 0,
+            "core_ws_outbound_queue_max_size": queue.maxsize,
+        }
+    )
+
+
 @app.websocket("/ws/gateway/transport")
 async def gateway_transport_ws(websocket: WebSocket) -> None:
     if not _valid_gateway_ws_token(websocket):
@@ -2815,6 +3411,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
     connection_id = f"ws_conn_{id(websocket)}"
     sequence = 0
     connection_transport_mode = TRANSPORT_MODE_WEBSOCKET_MOCK
+    outbound_queue: asyncio.Queue[_CoreWsOutboundMessage] = asyncio.Queue(maxsize=_core_ws_outbound_queue_max_size())
+    outbound_writer_task = asyncio.create_task(_core_ws_outbound_writer_loop(websocket, outbound_queue))
     _update_gateway_ws_transport_state(
         {
             "connected": True,
@@ -2822,9 +3420,13 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
             "transport_mode": connection_transport_mode,
             "ws_session_id": session_id,
             "ws_connection_id": connection_id,
+            "core_ws_outbound_writer_active": True,
+            "core_ws_outbound_queue_size": 0,
+            "core_ws_outbound_queue_max_size": outbound_queue.maxsize,
         }
     )
-    await websocket.send_json(
+    _queue_core_ws_outbound(
+        outbound_queue,
         GatewayWsMessage(
             type="hello_ack",
             source="core",
@@ -2834,13 +3436,28 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                 "real_gateway_switch_ready": False,
             },
             metadata={"connection_id": connection_id, "websocket_session_id": session_id},
-        ).to_dict()
+        ).to_dict(),
+        connection_id=connection_id,
     )
+    last_receive_done_monotonic = monotonic_ms()
     try:
         while True:
+            if outbound_writer_task.done():
+                await outbound_writer_task
+            receive_ready_monotonic = monotonic_ms()
+            receive_loop_gap_ms = monotonic_delta_ms(last_receive_done_monotonic, receive_ready_monotonic) or 0.0
             receive_started = time.perf_counter()
             raw_text = await websocket.receive_text()
             receive_ms = (time.perf_counter() - receive_started) * 1000.0
+            last_receive_done_monotonic = monotonic_ms()
+            _update_gateway_ws_transport_state(
+                {
+                    "core_ws_last_receive_text_ms": receive_ms,
+                    "core_ws_receive_loop_gap_ms": receive_loop_gap_ms,
+                    "core_ws_outbound_queue_size": outbound_queue.qsize(),
+                    "core_ws_outbound_queue_max_size": outbound_queue.maxsize,
+                }
+            )
             try:
                 raw = json.loads(raw_text)
                 if not isinstance(raw, dict):
@@ -2855,6 +3472,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                     "transport_mode": connection_transport_mode,
                     "ws_receive_ms": receive_ms,
                     "ws_message_sequence": sequence,
+                    "core_ws_receive_loop_gap_ms": receive_loop_gap_ms,
+                    **_core_ws_outbound_metadata(outbound_queue),
                 }
                 _record_gateway_ws_protocol_error(
                     exc,
@@ -2869,6 +3488,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                     message="invalid websocket message",
                     metadata=metadata,
                     sequence=sequence,
+                    outbound_queue=outbound_queue,
+                    connection_id=connection_id,
                 )
                 continue
             if gateway_ws_transport_state.get("state") == "PROTOCOL_ERROR":
@@ -2894,6 +3515,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                 "transport_mode": message_transport_mode,
                 "ws_receive_ms": receive_ms,
                 "ws_message_sequence": sequence,
+                "core_ws_receive_loop_gap_ms": receive_loop_gap_ms,
+                **_core_ws_outbound_metadata(outbound_queue),
             }
             if message.type == "hello":
                 _update_gateway_ws_transport_state(
@@ -2907,7 +3530,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                         "reconnect_count": int(message.payload.get("reconnect_count") or message.metadata.get("ws_reconnect_count") or 0),
                     }
                 )
-                await websocket.send_json(
+                _queue_core_ws_outbound(
+                    outbound_queue,
                     GatewayWsMessage(
                         type="hello_ack",
                         trace_id=message.trace_id,
@@ -2919,10 +3543,12 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                         },
                         metadata=metadata,
                         sequence=sequence,
-                    ).to_dict()
+                    ).to_dict(),
+                    connection_id=connection_id,
                 )
             elif message.type == "ping":
-                await websocket.send_json(
+                _queue_core_ws_outbound(
+                    outbound_queue,
                     GatewayWsMessage(
                         type="pong",
                         trace_id=message.trace_id,
@@ -2930,7 +3556,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                         payload={"received_at": utc_now_ms()},
                         metadata=metadata,
                         sequence=sequence,
-                    ).to_dict()
+                    ).to_dict(),
+                    connection_id=connection_id,
                 )
             elif message.type == "ready_for_commands":
                 limit = int(message.payload.get("limit") or 20)
@@ -2962,7 +3589,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                             )
                     finally:
                         close_database(db)
-                await websocket.send_json(
+                _queue_core_ws_outbound(
+                    outbound_queue,
                     GatewayWsMessage(
                         type="core_command_batch",
                         trace_id=message.trace_id,
@@ -2970,13 +3598,15 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                         payload={"commands": payloads, "count": len(payloads), "timestamp": sent_at},
                         metadata=metadata,
                         sequence=sequence,
-                    ).to_dict()
+                    ).to_dict(),
+                    connection_id=connection_id,
                 )
             elif message.type == "transport_heartbeat":
                 event = _gateway_event_from_ws_message(message, metadata=metadata)
                 _record_ws_message_side_effects(event, metadata)
                 _maybe_record_ws_pilot_diagnostic_log(dict(event.payload or {}))
-                await websocket.send_json(
+                _queue_core_ws_outbound(
+                    outbound_queue,
                     GatewayWsMessage(
                         type="event_ack",
                         trace_id=message.trace_id,
@@ -2991,13 +3621,66 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                         },
                         metadata=metadata,
                         sequence=sequence,
-                    ).to_dict()
+                    ).to_dict(),
+                    connection_id=connection_id,
+                )
+            elif message.type == "condition_event_batch":
+                events = _gateway_events_from_ws_batch_message(message, metadata=metadata)
+                if _gateway_condition_event_async_enabled():
+                    queue_result = _enqueue_gateway_condition_events(events, metadata)
+                    accepted_count = int(queue_result.get("queued_count") or 0)
+                    ack_payload = {
+                        "accepted": bool(queue_result.get("accepted")),
+                        "queued": bool(queue_result.get("queued")),
+                        "type": "condition_event_batch",
+                        "batch_id": message.payload.get("batch_id") or message.event_id,
+                        "count": len(events),
+                        "accepted_count": accepted_count,
+                        "queued_count": accepted_count,
+                        "dropped_count": int(queue_result.get("dropped_count") or 0),
+                        "queue_size": int(queue_result.get("queue_size") or 0),
+                        "queue_batch_count": int(queue_result.get("queue_batch_count") or 0),
+                        "queue_max_size": int(queue_result.get("queue_max_size") or 0),
+                        "reason": str(queue_result.get("reason") or ""),
+                        "event_ids": [event.event_id for event in events],
+                    }
+                else:
+                    results = []
+                    for event in events:
+                        _record_ws_message_side_effects(event, metadata)
+                        results.append(await _process_gateway_event(event))
+                    accepted_count = sum(1 for result in results if result.get("accepted"))
+                    ack_payload = {
+                        "accepted": accepted_count == len(events),
+                        "queued": False,
+                        "type": "condition_event_batch",
+                        "batch_id": message.payload.get("batch_id") or message.event_id,
+                        "count": len(events),
+                        "accepted_count": accepted_count,
+                        "queued_count": 0,
+                        "dropped_count": 0,
+                        "event_ids": [str(result.get("event_id") or "") for result in results],
+                    }
+                _queue_core_ws_outbound(
+                    outbound_queue,
+                    GatewayWsMessage(
+                        type="event_ack",
+                        trace_id=message.trace_id,
+                        source="core",
+                        event_id=message.event_id,
+                        command_id=message.command_id,
+                        payload=ack_payload,
+                        metadata={**metadata, "condition_event_batch_count": len(events)},
+                        sequence=sequence,
+                    ).to_dict(),
+                    connection_id=connection_id,
                 )
             elif message.type in {"gateway_event", "heartbeat", "command_started", "command_ack", "command_failed", "rate_limited"}:
                 event = _gateway_event_from_ws_message(message, metadata=metadata)
                 _record_ws_message_side_effects(event, metadata)
                 result = await _process_gateway_event(event)
-                await websocket.send_json(
+                _queue_core_ws_outbound(
+                    outbound_queue,
                     GatewayWsMessage(
                         type="event_ack",
                         trace_id=message.trace_id,
@@ -3007,7 +3690,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                         payload=result,
                         metadata=metadata,
                         sequence=sequence,
-                    ).to_dict()
+                    ).to_dict(),
+                    connection_id=connection_id,
                 )
             else:
                 event = GatewayEvent(
@@ -3023,6 +3707,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                     metadata=metadata,
                     trace_id=message.trace_id,
                     sequence=sequence,
+                    outbound_queue=outbound_queue,
+                    connection_id=connection_id,
                 )
     except WebSocketDisconnect:
         _update_gateway_ws_transport_state(
@@ -3053,6 +3739,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
             }
         )
         return
+    finally:
+        await _stop_core_ws_outbound_writer(outbound_writer_task, outbound_queue)
 
 
 
@@ -3987,21 +4675,25 @@ async def _send_gateway_ws_error(
     metadata: dict[str, Any],
     trace_id: str = "",
     sequence: int = 0,
+    outbound_queue: asyncio.Queue[_CoreWsOutboundMessage] | None = None,
+    connection_id: str = "",
 ) -> None:
-    await websocket.send_json(
-        GatewayWsMessage(
-            type="error",
-            trace_id=trace_id or f"trace_ws_error_{int(time.time() * 1000)}",
-            source="core",
-            payload={
-                "accepted": False,
-                "code": code,
-                "message": message,
-            },
-            metadata=metadata,
-            sequence=sequence,
-        ).to_dict()
-    )
+    payload = GatewayWsMessage(
+        type="error",
+        trace_id=trace_id or f"trace_ws_error_{int(time.time() * 1000)}",
+        source="core",
+        payload={
+            "accepted": False,
+            "code": code,
+            "message": message,
+        },
+        metadata=metadata,
+        sequence=sequence,
+    ).to_dict()
+    if outbound_queue is not None:
+        _queue_core_ws_outbound(outbound_queue, payload, connection_id=connection_id)
+        return
+    await websocket.send_json(payload)
 
 
 def _record_gateway_ws_protocol_error(
@@ -4079,11 +4771,29 @@ def _record_ws_message_side_effects(event: GatewayEvent, metadata: dict[str, Any
         ("ws_unknown_ack_count", "unknown_ack_count"),
         ("ws_priority_price_tick_code_count", "priority_price_tick_code_count"),
         ("ws_priority_price_tick_sampled_count", "priority_price_tick_sampled_count"),
+        ("ws_condition_event_batch_queued_count", "condition_event_batch_queued_count"),
+        ("ws_condition_event_batch_sent_count", "condition_event_batch_sent_count"),
+        ("ws_condition_event_batched_count", "condition_event_batched_count"),
+        ("ws_condition_event_batch_coalesced_count", "condition_event_batch_coalesced_count"),
+        ("ws_last_send_ms", "last_send_ms"),
+        ("ws_last_receive_ms", "last_receive_ms"),
+        ("ws_outbound_queue_size", "outbound_queue_size"),
+        ("ws_control_outbound_queue_size", "control_outbound_queue_size"),
+        ("ws_data_outbound_queue_size", "data_outbound_queue_size"),
+        ("ws_condition_event_queue_size", "condition_event_queue_size"),
+        ("ws_command_queue_size", "command_queue_size"),
     ):
         if source_key in payload:
             patch[target_key] = payload.get(source_key)
     if "ws_priority_price_tick_sources" in payload:
         patch["priority_price_tick_sources"] = list(payload.get("ws_priority_price_tick_sources") or [])
+    for source_key, target_key in (
+        ("ws_condition_event_batch_enabled", "condition_event_batch_enabled"),
+        ("ws_condition_event_batch_max_size", "condition_event_batch_max_size"),
+        ("ws_condition_event_batch_max_wait_ms", "condition_event_batch_max_wait_ms"),
+    ):
+        if source_key in payload:
+            patch[target_key] = payload.get(source_key)
     _update_gateway_ws_transport_state(patch)
     if db is not None:
         _record_ws_pilot_diagnostic_log(db, payload)
@@ -4159,6 +4869,7 @@ def _ws_pilot_diagnostic_fields(payload: dict[str, Any]) -> dict[str, str]:
 def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | None = None) -> dict[str, Any]:
     heartbeat = dict(heartbeat_payload or {})
     state = dict(gateway_ws_transport_state)
+    condition_worker = dict(gateway_condition_event_worker_state)
     enabled = bool(
         state.get("enabled")
         or heartbeat.get("ws_pilot_enabled")
@@ -4195,6 +4906,34 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         "session_loss_count": int(heartbeat.get("ws_session_loss_count") or state.get("session_loss_count") or 0),
         "duplicate_ack_count": int(heartbeat.get("ws_duplicate_ack_count") or state.get("duplicate_ack_count") or 0),
         "unknown_ack_count": int(heartbeat.get("ws_unknown_ack_count") or state.get("unknown_ack_count") or 0),
+        "last_send_ms": float(heartbeat.get("ws_last_send_ms") or state.get("last_send_ms") or 0.0),
+        "last_receive_ms": float(heartbeat.get("ws_last_receive_ms") or state.get("last_receive_ms") or 0.0),
+        "outbound_queue_size": int(heartbeat.get("ws_outbound_queue_size") or state.get("outbound_queue_size") or 0),
+        "control_outbound_queue_size": int(
+            heartbeat.get("ws_control_outbound_queue_size") or state.get("control_outbound_queue_size") or 0
+        ),
+        "data_outbound_queue_size": int(
+            heartbeat.get("ws_data_outbound_queue_size") or state.get("data_outbound_queue_size") or 0
+        ),
+        "condition_event_queue_size": int(
+            heartbeat.get("ws_condition_event_queue_size") or state.get("condition_event_queue_size") or 0
+        ),
+        "command_queue_size": int(heartbeat.get("ws_command_queue_size") or state.get("command_queue_size") or 0),
+        "core_ws_outbound_writer_active": bool(state.get("core_ws_outbound_writer_active")),
+        "core_ws_outbound_queue_size": int(state.get("core_ws_outbound_queue_size") or 0),
+        "core_ws_outbound_queue_max_size": int(state.get("core_ws_outbound_queue_max_size") or 0),
+        "core_ws_outbound_queued_count": int(state.get("core_ws_outbound_queued_count") or 0),
+        "core_ws_outbound_sent_count": int(state.get("core_ws_outbound_sent_count") or 0),
+        "core_ws_outbound_dropped_count": int(state.get("core_ws_outbound_dropped_count") or 0),
+        "core_ws_last_send_json_ms": float(state.get("core_ws_last_send_json_ms") or 0.0),
+        "core_ws_last_send_queue_wait_ms": float(state.get("core_ws_last_send_queue_wait_ms") or 0.0),
+        "core_ws_last_send_json_type": state.get("core_ws_last_send_json_type") or "",
+        "core_ws_last_send_json_at": state.get("core_ws_last_send_json_at") or "",
+        "core_ws_slow_send_count": int(state.get("core_ws_slow_send_count") or 0),
+        "core_ws_last_slow_send_json_ms": float(state.get("core_ws_last_slow_send_json_ms") or 0.0),
+        "core_ws_last_slow_send_at": state.get("core_ws_last_slow_send_at") or "",
+        "core_ws_last_receive_text_ms": float(state.get("core_ws_last_receive_text_ms") or 0.0),
+        "core_ws_receive_loop_gap_ms": float(state.get("core_ws_receive_loop_gap_ms") or 0.0),
         "price_tick_sample_rate": float(heartbeat.get("ws_price_tick_sample_rate") or state.get("price_tick_sample_rate") or 0),
         "price_tick_sampled_count": int(
             heartbeat.get("ws_price_tick_sampled_count") or state.get("price_tick_sampled_count") or 0
@@ -4212,6 +4951,41 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
             heartbeat.get("ws_priority_price_tick_sources") or state.get("priority_price_tick_sources") or []
         ),
         "event_fallback_count": int(heartbeat.get("ws_event_fallback_count") or state.get("event_fallback_count") or 0),
+        "condition_event_batch_enabled": bool(
+            heartbeat.get("ws_condition_event_batch_enabled") or state.get("condition_event_batch_enabled") or False
+        ),
+        "condition_event_batch_max_size": int(
+            heartbeat.get("ws_condition_event_batch_max_size") or state.get("condition_event_batch_max_size") or 0
+        ),
+        "condition_event_batch_max_wait_ms": float(
+            heartbeat.get("ws_condition_event_batch_max_wait_ms") or state.get("condition_event_batch_max_wait_ms") or 0
+        ),
+        "condition_event_batch_queued_count": int(
+            heartbeat.get("ws_condition_event_batch_queued_count") or state.get("condition_event_batch_queued_count") or 0
+        ),
+        "condition_event_batch_sent_count": int(
+            heartbeat.get("ws_condition_event_batch_sent_count") or state.get("condition_event_batch_sent_count") or 0
+        ),
+        "condition_event_batched_count": int(
+            heartbeat.get("ws_condition_event_batched_count") or state.get("condition_event_batched_count") or 0
+        ),
+        "condition_event_batch_coalesced_count": int(
+            heartbeat.get("ws_condition_event_batch_coalesced_count") or state.get("condition_event_batch_coalesced_count") or 0
+        ),
+        "core_condition_event_async_enabled": bool(condition_worker.get("enabled")),
+        "core_condition_event_queue_size": int(condition_worker.get("queue_size") or 0),
+        "core_condition_event_queue_batch_count": int(condition_worker.get("queue_batch_count") or 0),
+        "core_condition_event_queue_max_size": int(condition_worker.get("queue_max_size") or 0),
+        "core_condition_event_active_count": int(condition_worker.get("active_count") or 0),
+        "core_condition_event_queued_count": int(condition_worker.get("queued_count") or 0),
+        "core_condition_event_processed_count": int(condition_worker.get("processed_count") or 0),
+        "core_condition_event_failed_count": int(condition_worker.get("failed_count") or 0),
+        "core_condition_event_dropped_count": int(condition_worker.get("dropped_count") or 0),
+        "core_condition_event_last_batch_size": int(condition_worker.get("last_batch_size") or 0),
+        "core_condition_event_last_batch_duration_ms": float(condition_worker.get("last_batch_duration_ms") or 0.0),
+        "core_condition_event_last_queued_at": condition_worker.get("last_queued_at") or "",
+        "core_condition_event_last_processed_at": condition_worker.get("last_processed_at") or "",
+        "core_condition_event_last_error": condition_worker.get("last_error") or "",
         "last_ws_event_at": heartbeat.get("last_ws_event_at") or state.get("last_ws_event_at") or "",
         "last_ws_ack_at": heartbeat.get("last_ws_ack_at") or state.get("last_ws_ack_at") or "",
     }
@@ -4262,6 +5036,46 @@ def _gateway_event_from_ws_message(message: GatewayWsMessage, *, metadata: dict[
     data["source"] = event.source or message.source
     data["command_id"] = event.command_id or message.command_id
     return GatewayEvent.from_dict(data)
+
+
+def _gateway_events_from_ws_batch_message(message: GatewayWsMessage, *, metadata: dict[str, Any]) -> list[GatewayEvent]:
+    payload = dict(message.payload or {})
+    raw_events = list(payload.get("events") or [])
+    batch_id = str(payload.get("batch_id") or message.event_id or message.message_id)
+    batch_size = len(raw_events)
+    received_at = utc_now_ms()
+    events: list[GatewayEvent] = []
+    for index, raw_event in enumerate(raw_events):
+        if not isinstance(raw_event, dict):
+            continue
+        event = GatewayEvent.from_dict(raw_event)
+        if event.type != "condition_event":
+            continue
+        trace = trace_from_payload(event.payload)
+        trace_payload = ensure_transport_trace(
+            event.payload,
+            trace_id=trace.get("trace_id") or f"trace:{event.event_id or batch_id}:{index}",
+            process="gateway",
+            extra={
+                **metadata,
+                "transport_mode": metadata.get("transport_mode") or TRANSPORT_MODE_WEBSOCKET_MOCK,
+                "gateway_ws_message_id": message.message_id,
+                "gateway_ws_message_type": message.type,
+                "gateway_ws_message_timestamp": message.timestamp,
+                "gateway_ws_message_sequence": message.sequence,
+                "gateway_ws_message_trace_id": message.trace_id,
+                "gateway_ws_condition_batch_id": batch_id,
+                "gateway_ws_condition_batch_size": batch_size,
+                "gateway_ws_condition_batch_index": index,
+                "core_ws_received_at_utc": received_at,
+            },
+        )
+        data = event.to_dict()
+        data["payload"] = trace_payload
+        data["event_id"] = event.event_id or f"evt_ws_{batch_id}_{index}"
+        data["source"] = event.source or message.source
+        events.append(GatewayEvent.from_dict(data))
+    return events
 
 
 def _ws_command_dict_with_trace(command: GatewayCommand, trace_updates: dict[str, Any], *, transport_mode: str = TRANSPORT_MODE_WEBSOCKET_MOCK) -> dict[str, Any]:

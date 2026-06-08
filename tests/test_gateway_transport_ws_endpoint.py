@@ -1,4 +1,5 @@
 import importlib
+import time
 from pathlib import Path
 
 import pytest
@@ -6,6 +7,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from storage.db import TradingDatabase
+from trading.broker.models import GatewayEvent
 from trading.broker.ws_messages import GatewayWsMessage
 
 
@@ -27,6 +29,20 @@ def _recv_until(ws, message_type: str, limit: int = 8):
         if message.get("type") == message_type:
             return message
     raise AssertionError(f"message {message_type} not received")
+
+
+def _wait_for_latency_samples(db_path: Path, event_id: str, *, timeout_sec: float = 2.0):
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        db = TradingDatabase(str(db_path))
+        try:
+            samples = db.list_gateway_transport_latency_samples(event_id=event_id)
+        finally:
+            db.close()
+        if samples:
+            return samples
+        time.sleep(0.05)
+    return []
 
 
 def test_gateway_transport_ws_rejects_missing_token(tmp_path, monkeypatch):
@@ -187,6 +203,111 @@ def test_gateway_transport_ws_real_pilot_price_tick_can_persist_when_enabled(tmp
     assert len(samples) == 1
     assert samples[0]["message_type"] == "price_tick"
     assert samples[0]["transport_mode"] == "websocket_real_pilot"
+
+
+def test_gateway_transport_ws_condition_event_batch_persists_individual_samples(tmp_path, monkeypatch):
+    client, db_path = _client(tmp_path, monkeypatch)
+    events = [
+        GatewayEvent(
+            type="condition_event",
+            event_id="evt-cond-batch-1",
+            payload={
+                "condition_name": "mock",
+                "condition_index": 1,
+                "code": "005930",
+                "event_type": "include",
+                "transport_trace": {"gateway_event_created_at_utc": "2026-06-08T00:00:00.000+00:00"},
+            },
+        ),
+        GatewayEvent(
+            type="condition_event",
+            event_id="evt-cond-batch-2",
+            payload={
+                "condition_name": "mock",
+                "condition_index": 1,
+                "code": "000660",
+                "event_type": "include",
+                "transport_trace": {"gateway_event_created_at_utc": "2026-06-08T00:00:00.010+00:00"},
+            },
+        ),
+    ]
+
+    with client.websocket_connect("/ws/gateway/transport?token=test-token") as ws:
+        ws.receive_json()
+        ws.send_json(
+            GatewayWsMessage(
+                type="condition_event_batch",
+                source="kiwoom_gateway",
+                payload={
+                    "batch_id": "batch-cond-1",
+                    "events": [event.to_dict() for event in events],
+                    "count": len(events),
+                },
+                metadata={"transport_mode": "websocket_real_pilot"},
+                sequence=1,
+            ).to_dict()
+        )
+        ack = _recv_until(ws, "event_ack")
+        sample_1 = _wait_for_latency_samples(db_path, "evt-cond-batch-1")
+        sample_2 = _wait_for_latency_samples(db_path, "evt-cond-batch-2")
+
+    assert ack["payload"]["type"] == "condition_event_batch"
+    assert ack["payload"]["count"] == 2
+    assert ack["payload"]["accepted_count"] == 2
+    assert ack["payload"]["queued"] is True
+    assert ack["payload"]["queued_count"] == 2
+    assert "queue_batch_count" in ack["payload"]
+    assert sample_1 and sample_1[0]["message_type"] == "condition_event"
+    assert sample_2 and sample_2[0]["message_type"] == "condition_event"
+    assert sample_1[0]["transport_mode"] == "websocket_real_pilot"
+    status = client.get("/api/gateway/transport/status").json()["real_gateway_websocket_pilot"]
+    assert status["core_condition_event_async_enabled"] is True
+    assert status["core_condition_event_queued_count"] >= 2
+    assert status["core_condition_event_processed_count"] >= 2
+    assert status["core_condition_event_failed_count"] == 0
+    assert status["core_condition_event_queue_size"] == 0
+    assert status["core_condition_event_queue_batch_count"] == 0
+    assert status["core_condition_event_last_batch_size"] >= 2
+
+
+def test_gateway_transport_ws_condition_event_worker_survives_ws_disconnect_with_lifespan(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "trader.sqlite3"
+    monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    monkeypatch.setenv("TRADING_TRANSPORT_METRICS_SAMPLE_PRICE_TICK_RATE", "1")
+    monkeypatch.setenv("TRADING_TRANSPORT_METRICS_SAMPLE_HEARTBEAT_RATE", "1")
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    with TestClient(api.app) as client:
+        event = GatewayEvent(
+            type="condition_event",
+            event_id="evt-cond-lifespan",
+            payload={
+                "condition_name": "mock",
+                "condition_index": 1,
+                "code": "005930",
+                "event_type": "include",
+                "transport_trace": {"gateway_event_created_at_utc": "2026-06-08T00:00:00.000+00:00"},
+            },
+        )
+        with client.websocket_connect("/ws/gateway/transport?token=test-token") as ws:
+            ws.receive_json()
+            ws.send_json(
+                GatewayWsMessage(
+                    type="condition_event_batch",
+                    source="kiwoom_gateway",
+                    payload={"batch_id": "batch-cond-lifespan", "events": [event.to_dict()], "count": 1},
+                    metadata={"transport_mode": "websocket_real_pilot"},
+                    sequence=1,
+                ).to_dict()
+            )
+            ack = _recv_until(ws, "event_ack")
+        assert ack["payload"]["queued"] is True
+        samples = _wait_for_latency_samples(db_path, "evt-cond-lifespan")
+        assert samples and samples[0]["message_type"] == "condition_event"
+        status = client.get("/api/gateway/transport/status").json()["real_gateway_websocket_pilot"]
+        assert status["core_condition_event_processed_count"] >= 1
 
 
 def test_gateway_transport_ws_command_failed_marks_failed(tmp_path, monkeypatch):

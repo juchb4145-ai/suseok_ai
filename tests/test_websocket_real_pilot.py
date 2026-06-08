@@ -1,4 +1,6 @@
 import importlib
+import asyncio
+import json
 from argparse import Namespace
 from pathlib import Path
 
@@ -8,7 +10,7 @@ from apps.kiwoom_gateway import RestCoreClient, _build_core_client, _prioritize_
 from storage.db import TradingDatabase
 from trading.broker.gateway_transport import WebSocketPilotPolicy, WebSocketRealCoreClient
 from trading.broker.models import GatewayCommand, GatewayEvent
-from trading.broker.transport_metrics import TRANSPORT_MODE_WEBSOCKET_REAL_PILOT
+from trading.broker.transport_metrics import TRANSPORT_MODE_WEBSOCKET_REAL_PILOT, trace_from_payload
 from trading.broker.ws_messages import GatewayWsMessage
 
 
@@ -68,6 +70,98 @@ def test_websocket_transport_keepalive_is_not_kiwoom_status(monkeypatch):
     assert "kiwoom_logged_in" not in message.payload
     assert "orderable" not in message.payload
     assert "account" not in message.payload
+
+
+def test_websocket_send_injects_send_started_trace(monkeypatch):
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, payload):
+            self.sent.append(payload)
+
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_REAL_PILOT", "1")
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL", "1")
+    client = _build_core_client(_args(transport="websocket-pilot"))
+    fake_ws = FakeWebSocket()
+    message = client._message_from_event(
+        GatewayEvent(
+            type="heartbeat",
+            event_id="evt-heartbeat-send-trace",
+            payload={"transport_trace": {"gateway_ws_send_queued_at_utc": "2026-06-08T00:00:00.000+00:00"}},
+        )
+    )
+
+    asyncio.run(client._send_ws(fake_ws, message))
+    client.stop()
+
+    sent = GatewayWsMessage.from_dict(json.loads(fake_ws.sent[0]))
+    trace = trace_from_payload(sent.payload)
+    assert trace["gateway_ws_send_queued_at_utc"]
+    assert trace["gateway_ws_send_started_at_utc"]
+    assert trace["gateway_ws_send_started_monotonic_ms"] > 0
+    assert sent.metadata["gateway_ws_send_started_at_utc"] == trace["gateway_ws_send_started_at_utc"]
+    assert client.snapshot()["ws_last_send_ms"] >= 0
+
+
+def test_websocket_connection_loop_drains_incoming_while_send_is_blocked():
+    class SlowSendWebSocket:
+        def __init__(self):
+            self.send_started = asyncio.Event()
+            self.release_send = asyncio.Event()
+            self.recv_count = 0
+            self.sent = []
+
+        async def send(self, payload):
+            self.sent.append(payload)
+            self.send_started.set()
+            await self.release_send.wait()
+
+        async def recv(self):
+            if self.recv_count == 0:
+                self.recv_count += 1
+                return json.dumps(
+                    GatewayWsMessage(
+                        type="core_command_batch",
+                        payload={
+                            "commands": [
+                                {
+                                    "type": "login",
+                                    "command_id": "cmd-drain-while-send",
+                                    "payload": {"transport_trace": {"trace_id": "trace-drain-while-send"}},
+                                }
+                            ],
+                            "count": 1,
+                        },
+                        sequence=42,
+                    ).to_dict()
+                )
+            await asyncio.Event().wait()
+
+    async def scenario():
+        client = WebSocketRealCoreClient(
+            core_url="http://127.0.0.1:8000",
+            ws_url="ws://127.0.0.1:8000/ws/gateway/transport",
+            token="test-token",
+            policy=WebSocketPilotPolicy(enabled=True, allow_real=True, heartbeat_interval_sec=60.0),
+        )
+        fake_ws = SlowSendWebSocket()
+        client._outbound.put(
+            client._message_from_event(GatewayEvent(type="price_tick", event_id="evt-blocked-send", payload={"code": "005930"}))
+        )
+        task = asyncio.create_task(client._connection_loop(fake_ws))
+        await asyncio.wait_for(fake_ws.send_started.wait(), timeout=1.0)
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while client._commands.empty() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert not client._commands.empty()
+        assert client._commands.get_nowait().command_id == "cmd-drain-while-send"
+        client._stop.set()
+        fake_ws.release_send.set()
+        await asyncio.wait_for(task, timeout=1.0)
+        client.stop()
+
+    asyncio.run(scenario())
 
 
 def test_websocket_real_client_snapshots_error_diagnostics(monkeypatch):
@@ -181,11 +275,127 @@ def test_websocket_real_client_routes_only_control_events_to_ws(monkeypatch):
     client.stop()
 
     assert [event.type for event in fallback.events] == ["price_tick"]
-    assert client._outbound.qsize() == 1
-    assert client._outbound.get_nowait().type == "command_ack"
+    assert client._control_outbound.qsize() == 1
+    assert client._control_outbound.get_nowait().type == "command_ack"
     snapshot = client.snapshot()
     assert snapshot["ws_price_tick_sampled_count"] == 0
     assert snapshot["ws_price_tick_fallback_count"] == 1
+
+
+def test_websocket_real_client_batches_condition_events_and_keeps_control_priority(monkeypatch):
+    class Fallback:
+        transport_mode = "rest_long_poll"
+        last_poll_error = ""
+
+        def post_event(self, event):
+            return {"accepted": True, "transport_mode": self.transport_mode}
+
+        def poll_commands(self, *, limit=20, wait_sec=1.0):
+            return []
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def snapshot(self):
+            return {"transport_mode": self.transport_mode}
+
+    client = WebSocketRealCoreClient(
+        core_url="http://127.0.0.1:8000",
+        ws_url="ws://127.0.0.1:8000/ws/gateway/transport",
+        token="test-token",
+        fallback_client=Fallback(),
+        policy=WebSocketPilotPolicy(
+            enabled=True,
+            allow_real=True,
+            condition_event_batch_enabled=True,
+            condition_event_batch_max_size=10,
+            condition_event_batch_max_wait_ms=0,
+        ),
+    )
+    monkeypatch.setattr(client, "start", lambda: None)
+
+    client.post_event(
+        GatewayEvent(
+            type="condition_event",
+            event_id="evt-cond-1",
+            payload={"condition_name": "entry", "condition_index": 7, "code": "005930", "event_type": "include"},
+        )
+    )
+    client.post_event(
+        GatewayEvent(
+            type="condition_event",
+            event_id="evt-cond-2",
+            payload={"condition_name": "entry", "condition_index": 7, "code": "000660", "event_type": "include"},
+        )
+    )
+    client.post_event(GatewayEvent(type="command_ack", command_id="cmd-1", payload={"status": "ACKED"}))
+
+    pending = []
+    started = client._drain_condition_events(pending, batch_started=0.0)
+    batch = client._condition_batch_message(pending)
+    control = client._next_control_message()
+    snapshot = client.snapshot()
+    client.stop()
+
+    assert started > 0
+    assert control is not None
+    assert control.type == "command_ack"
+    assert batch.type == "condition_event_batch"
+    assert batch.payload["count"] == 2
+    assert [item["event_id"] for item in batch.payload["events"]] == ["evt-cond-1", "evt-cond-2"]
+    assert snapshot["ws_condition_event_batch_queued_count"] == 2
+    assert snapshot["ws_condition_event_batch_sent_count"] == 1
+    assert snapshot["ws_condition_event_batched_count"] == 2
+
+
+def test_websocket_real_client_coalesces_duplicate_condition_events_inside_batch(monkeypatch):
+    client = WebSocketRealCoreClient(
+        core_url="http://127.0.0.1:8000",
+        ws_url="ws://127.0.0.1:8000/ws/gateway/transport",
+        token="test-token",
+        policy=WebSocketPilotPolicy(enabled=True, allow_real=True, condition_event_batch_max_wait_ms=0),
+    )
+    monkeypatch.setattr(client, "start", lambda: None)
+
+    client.post_event(
+        GatewayEvent(
+            type="condition_event",
+            event_id="evt-old",
+            payload={
+                "condition_name": "entry",
+                "condition_index": 7,
+                "code": "A005930",
+                "event_type": "include",
+                "sequence": 1,
+            },
+        )
+    )
+    client.post_event(
+        GatewayEvent(
+            type="condition_event",
+            event_id="evt-new",
+            payload={
+                "condition_name": "entry",
+                "condition_index": 7,
+                "code": "005930",
+                "event_type": "include",
+                "sequence": 2,
+            },
+        )
+    )
+
+    pending = []
+    client._drain_condition_events(pending, batch_started=0.0)
+    batch = client._condition_batch_message(pending)
+    client.stop()
+
+    assert batch.payload["count"] == 1
+    assert batch.payload["events"][0]["event_id"] == "evt-new"
+    assert batch.payload["events"][0]["payload"]["sequence"] == 2
+    assert client.snapshot()["ws_condition_event_batch_coalesced_count"] == 1
 
 
 def test_websocket_real_client_can_sample_price_ticks_to_ws(monkeypatch):
@@ -439,6 +649,15 @@ def test_core_ws_endpoint_accepts_real_pilot_mode_and_status(tmp_path, monkeypat
     assert status["price_tick_sampled_count"] == 7
     assert status["price_tick_fallback_count"] == 701
     assert status["event_fallback_count"] == 2
+    assert status["core_ws_outbound_queue_size"] == 0
+    assert status["core_ws_outbound_queue_max_size"] >= 1
+    assert status["core_ws_outbound_queued_count"] >= 3
+    assert status["core_ws_outbound_sent_count"] >= 3
+    assert status["core_ws_outbound_dropped_count"] == 0
+    assert status["core_ws_last_send_json_ms"] >= 0.0
+    assert status["core_ws_last_send_queue_wait_ms"] >= 0.0
+    assert status["core_ws_last_send_json_type"] in {"hello_ack", "event_ack"}
+    assert status["core_ws_receive_loop_gap_ms"] >= 0.0
     assert status["last_ws_event_at"] == "2026-06-01T00:00:02.000+00:00"
     assert status["last_ws_ack_at"] == "2026-06-01T00:00:03.000+00:00"
     db = TradingDatabase(str(db_path))

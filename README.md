@@ -326,6 +326,14 @@ Pilot safety flags:
 - `TRADING_GATEWAY_WEBSOCKET_PRICE_TICK_SAMPLE_RATE`: broad real-time tick WebSocket sample rate; default `0`.
 - `TRADING_GATEWAY_WEBSOCKET_PRIORITY_TICK_SOURCES`: sources that bypass broad tick sampling; default `holding,theme_lab_watchset`.
 - `TRADING_GATEWAY_WEBSOCKET_PRIORITY_TICK_CODES`: optional comma-separated codes that always use the WebSocket pilot tick path.
+- `TRADING_GATEWAY_WEBSOCKET_CONDITION_EVENT_BATCH_ENABLED`: coalesce condition-event bursts into WebSocket batches; default `1`.
+- `TRADING_GATEWAY_WEBSOCKET_CONDITION_EVENT_BATCH_MAX_SIZE`: max `condition_event` items per batch; default `100`.
+- `TRADING_GATEWAY_WEBSOCKET_CONDITION_EVENT_BATCH_MAX_WAIT_MS`: max micro-batch wait before flush; default `200`.
+- `TRADING_CORE_WS_CONDITION_EVENT_ASYNC_ENABLED`: process WS condition-event batches on a Core worker instead of the receive loop; default `1`.
+- `TRADING_CORE_WS_CONDITION_EVENT_QUEUE_SIZE`: Core bounded queued event count for async condition-event processing; default `5000`. Status exposes pending events as `core_condition_event_queue_size`, pending batches as `core_condition_event_queue_batch_count`, and in-flight work as `core_condition_event_active_count`.
+- WebSocket send diagnostics split Gateway-to-Core latency into `gateway_ws_queue_to_send_start_ms`, `gateway_ws_send_start_to_core_receive_ms`, and the legacy combined `gateway_ws_to_core_receive_ms`.
+- Gateway WebSocket pilot drains Core responses on a dedicated receiver task so event acks cannot build up behind outbound bursts.
+- Core WebSocket replies use a bounded outbound writer queue (`TRADING_CORE_WS_OUTBOUND_QUEUE_SIZE`, default `1000`) so the receive loop can return to `receive_text()` quickly. Status exposes `core_ws_outbound_queue_size`, `core_ws_last_send_json_ms`, and `core_ws_receive_loop_gap_ms`.
 - `TRADING_GATEWAY_WEBSOCKET_FALLBACK_AFTER_ERRORS=3`
 - `TRADING_GATEWAY_WEBSOCKET_FALLBACK_AFTER_RECONNECTS=5`
 

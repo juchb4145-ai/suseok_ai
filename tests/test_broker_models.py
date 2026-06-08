@@ -51,6 +51,60 @@ def test_gateway_event_queue_coalesces_price_ticks_on_put():
     assert queue.drain()[0].payload["price"] == 70100
 
 
+def test_gateway_event_queue_coalesces_duplicate_condition_events_on_put():
+    queue = GatewayEventQueue()
+    base_payload = {
+        "code": "A005930",
+        "condition_name": "entry",
+        "condition_index": 7,
+        "event_type": "include",
+        "source": "condition",
+    }
+    queue.put(GatewayEvent(type="condition_event", payload={**base_payload, "sequence": 1}))
+    queue.put(GatewayEvent(type="condition_event", payload={**base_payload, "code": "005930", "sequence": 2}))
+
+    events = queue.drain()
+
+    assert len(events) == 1
+    assert events[0].payload["sequence"] == 2
+
+
+def test_gateway_event_queue_keeps_distinct_condition_event_actions():
+    queue = GatewayEventQueue()
+    base_payload = {
+        "code": "005930",
+        "condition_name": "entry",
+        "condition_index": 7,
+        "source": "condition",
+    }
+    queue.put(GatewayEvent(type="condition_event", payload={**base_payload, "event_type": "include"}))
+    queue.put(GatewayEvent(type="condition_event", payload={**base_payload, "event_type": "remove"}))
+
+    events = queue.drain()
+
+    assert [event.payload["event_type"] for event in events] == ["include", "remove"]
+
+
+def test_gateway_event_queue_keeps_distinct_condition_names():
+    queue = GatewayEventQueue()
+    queue.put(
+        GatewayEvent(
+            type="condition_event",
+            payload={"code": "005930", "condition_name": "entry", "condition_index": 7, "event_type": "include"},
+        )
+    )
+    queue.put(
+        GatewayEvent(
+            type="condition_event",
+            payload={"code": "005930", "condition_name": "theme", "condition_index": 8, "event_type": "include"},
+        )
+    )
+
+    events = queue.drain()
+
+    assert [event.payload["condition_name"] for event in events] == ["entry", "theme"]
+
+
 def test_gateway_event_queue_preserves_non_price_events_when_full():
     queue = GatewayEventQueue(max_size=2)
     queue.put(GatewayEvent(type="heartbeat", payload={"kiwoom_logged_in": True}))

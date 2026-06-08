@@ -334,6 +334,8 @@ class TransportLatencySample:
         total = wall_ms(created_at, completed_at)
         if total is None and core_receive_ms is not None:
             total = core_receive_ms
+        ws_send_reference_at = trace_data.get("gateway_ws_condition_batch_sent_at_utc") or trace_data.get("gateway_ws_send_queued_at_utc")
+        ws_send_started_at = trace_data.get("gateway_ws_send_started_at_utc")
         stage = {
             "gateway_queue_wait_ms": monotonic_delta_ms(
                 trace_data.get("gateway_event_created_monotonic_ms"),
@@ -345,6 +347,14 @@ class TransportLatencySample:
             ),
             "core_receive_ms": core_receive_ms,
             "core_persist_ms": core_persist_ms,
+            "core_condition_event_queue_wait_ms": monotonic_delta_ms(
+                trace_data.get("core_condition_event_queued_monotonic_ms"),
+                trace_data.get("core_condition_event_worker_started_monotonic_ms"),
+            ),
+            "core_ws_receive_loop_gap_ms": _optional_float(trace_data.get("core_ws_receive_loop_gap_ms")),
+            "gateway_ws_queue_to_send_start_ms": wall_ms(ws_send_reference_at, ws_send_started_at),
+            "gateway_ws_send_start_to_core_receive_ms": wall_ms(ws_send_started_at, trace_data.get("core_ws_received_at_utc")),
+            "gateway_ws_to_core_receive_ms": wall_ms(ws_send_reference_at, trace_data.get("core_ws_received_at_utc")),
         }
         command_ack_types = {"command_ack", "command_failed", "command_started", "rate_limited"}
         direction = "gateway_ack_to_core" if event_type in command_ack_types or command_id else "gateway_to_core"
