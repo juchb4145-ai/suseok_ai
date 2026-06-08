@@ -192,6 +192,48 @@ def test_risk_off_small_entry_observe_only_does_not_create_intent(tmp_path):
     assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 
 
+def test_risk_off_rejected_shadow_entry_metadata_persists_without_intent(tmp_path):
+    risk_off_details = _risk_off_blocked_entry_details()
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.WAIT,
+            PriceLocationStatus.UNKNOWN,
+            role=StockRole.LEADER,
+            reasons=("GLOBAL_MARKET_RISK_OFF", "WAIT_MARKET_RECOVERY", "RISK_OFF_SMALL_ENTRY_REJECTED"),
+            candidate_market=MarketSide.KOSDAQ.value,
+            candidate_market_status=MarketStatus.RISK_OFF.value,
+            candidate_market_raw_status=MarketStatus.RISK_OFF.value,
+            candidate_market_confirmed_status=MarketStatus.RISK_OFF.value,
+            candidate_breadth_pct=0.10,
+            candidate_breadth_ready=False,
+            candidate_breadth_sample_count=3,
+            candidate_breadth_gate_usable=False,
+            risk_off_entry_details=risk_off_details,
+        ),
+        dry_run_orders=True,
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+    shadow = details["risk_off_shadow_entry"]
+
+    assert details["risk_off_entry_allowed"] is False
+    assert details["risk_off_entry_rejected_reason"] == "EXTREME_RISK_OFF"
+    assert details["risk_off_entry_failed_checks"] == risk_off_details["risk_off_entry_failed_checks"]
+    assert details["risk_off_entry_blocking_data_flags"] == ["STALE_QUOTE"]
+    assert shadow["record_only"] is True
+    assert shadow["status"] == "BLOCKED"
+    assert shadow["primary_reject_reason"] == "EXTREME_RISK_OFF"
+    assert shadow["hypothetical_entry_price"] == 10000
+    assert shadow["failed_checks"] == risk_off_details["risk_off_entry_failed_checks"]
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
 def test_themelab_good_pullback_soft_block_waits_without_entry_plan_or_intent(tmp_path):
     runtime, db, _gateway_state = _runtime(
         tmp_path,
@@ -1260,6 +1302,55 @@ def _risk_off_entry_details(*, observe_only: bool) -> dict:
             "stop_loss_pct": -1.2,
             "take_profit_pct": 1.8,
             "max_hold_minutes": 20,
+        },
+    }
+
+
+def _risk_off_blocked_entry_details() -> dict:
+    failed_checks = [
+        "EXTREME_RISK_OFF",
+        "STALE_QUOTE",
+        "PRICE_LOCATION_NOT_ALLOWED",
+        "PRICE_LOCATION_BLOCKED",
+    ]
+    passed_checks = [
+        "MARKET_CONFIRMED",
+        "NO_MARKET_RECOVERY_HOLD",
+        "THEME_STATUS_ALLOWED",
+        "THEME_SCORE_OK",
+    ]
+    return {
+        "risk_off_entry_enabled": True,
+        "risk_off_entry_observe_only": True,
+        "risk_off_entry_allowed": False,
+        "risk_off_entry_rejected_reason": "EXTREME_RISK_OFF",
+        "risk_off_entry_failed_checks": failed_checks,
+        "risk_off_entry_passed_checks": passed_checks,
+        "risk_off_entry_blocking_data_flags": ["STALE_QUOTE"],
+        "risk_off_relative_strength_pct": 7.5,
+        "risk_off_candidate_breadth_pct": 0.10,
+        "risk_off_candidate_index_return_pct": -6.8,
+        "risk_off_max_position_size_multiplier": 0.25,
+        "risk_off_exit_hint": {
+            "stop_loss_pct": -1.2,
+            "take_profit_pct": 1.8,
+            "max_hold_minutes": 20,
+        },
+        "risk_off_shadow_entry": {
+            "feature_version": "risk_off_shadow_entry_v1",
+            "record_only": True,
+            "status": "BLOCKED",
+            "hypothetical_entry_price": 10000,
+            "hypothetical_support_price": 9950,
+            "hypothetical_stop_price": 9880,
+            "hypothetical_take_profit_price": 10180,
+            "max_hold_minutes": 20,
+            "max_position_size_multiplier": 0.25,
+            "risk_position_size_multiplier": 0.25,
+            "price_location_status": PriceLocationStatus.UNKNOWN.value,
+            "primary_reject_reason": "EXTREME_RISK_OFF",
+            "failed_checks": failed_checks,
+            "passed_checks": passed_checks,
         },
     }
 

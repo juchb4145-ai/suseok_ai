@@ -1095,6 +1095,7 @@ def _stock_pullback_details(
     if position_size_multiplier <= 0:
         position_size_multiplier = 1.0
     risk_off_details = dict(getattr(decision, "risk_off_entry_details", {}) or {})
+    risk_off_shadow_entry = dict(risk_off_details.get("risk_off_shadow_entry") or {})
     return {
         "source": SOURCE,
         "profile": candidate.strategy_profile.value if candidate.strategy_profile else StrategyProfile.KOSDAQ_THEME_PROFILE.value,
@@ -1132,6 +1133,10 @@ def _stock_pullback_details(
         "risk_off_entry_observe_only": bool(risk_off_details.get("risk_off_entry_observe_only")),
         "risk_off_entry_allowed": bool(risk_off_details.get("risk_off_entry_allowed")),
         "risk_off_entry_rejected_reason": str(risk_off_details.get("risk_off_entry_rejected_reason") or ""),
+        "risk_off_entry_failed_checks": list(risk_off_details.get("risk_off_entry_failed_checks") or []),
+        "risk_off_entry_passed_checks": list(risk_off_details.get("risk_off_entry_passed_checks") or []),
+        "risk_off_entry_blocking_data_flags": list(risk_off_details.get("risk_off_entry_blocking_data_flags") or []),
+        "risk_off_shadow_entry": risk_off_shadow_entry,
         "risk_off_relative_strength_pct": risk_off_details.get("risk_off_relative_strength_pct"),
         "risk_off_candidate_breadth_pct": risk_off_details.get("risk_off_candidate_breadth_pct"),
         "risk_off_candidate_index_return_pct": risk_off_details.get("risk_off_candidate_index_return_pct"),
@@ -1327,6 +1332,10 @@ def _base_details(
         "risk_off_entry_observe_only": bool(stock_details.get("risk_off_entry_observe_only")),
         "risk_off_entry_allowed": bool(stock_details.get("risk_off_entry_allowed")),
         "risk_off_entry_rejected_reason": stock_details.get("risk_off_entry_rejected_reason", ""),
+        "risk_off_entry_failed_checks": list(stock_details.get("risk_off_entry_failed_checks") or []),
+        "risk_off_entry_passed_checks": list(stock_details.get("risk_off_entry_passed_checks") or []),
+        "risk_off_entry_blocking_data_flags": list(stock_details.get("risk_off_entry_blocking_data_flags") or []),
+        "risk_off_shadow_entry": dict(stock_details.get("risk_off_shadow_entry") or {}),
         "risk_off_relative_strength_pct": stock_details.get("risk_off_relative_strength_pct"),
         "risk_off_candidate_breadth_pct": stock_details.get("risk_off_candidate_breadth_pct"),
         "risk_off_candidate_index_return_pct": stock_details.get("risk_off_candidate_index_return_pct"),
@@ -1401,6 +1410,10 @@ def _base_details(
             "risk_off_entry_observe_only": bool(stock_details.get("risk_off_entry_observe_only")),
             "risk_off_entry_allowed": bool(stock_details.get("risk_off_entry_allowed")),
             "risk_off_entry_rejected_reason": stock_details.get("risk_off_entry_rejected_reason", ""),
+            "risk_off_entry_failed_checks": list(stock_details.get("risk_off_entry_failed_checks") or []),
+            "risk_off_entry_passed_checks": list(stock_details.get("risk_off_entry_passed_checks") or []),
+            "risk_off_entry_blocking_data_flags": list(stock_details.get("risk_off_entry_blocking_data_flags") or []),
+            "risk_off_shadow_entry": dict(stock_details.get("risk_off_shadow_entry") or {}),
             "risk_off_relative_strength_pct": stock_details.get("risk_off_relative_strength_pct"),
             "risk_off_candidate_breadth_pct": stock_details.get("risk_off_candidate_breadth_pct"),
             "risk_off_candidate_index_return_pct": stock_details.get("risk_off_candidate_index_return_pct"),
