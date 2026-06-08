@@ -258,6 +258,31 @@ def test_gateway_transport_ws_unknown_ack_does_not_crash(tmp_path, monkeypatch):
         assert _recv_until(ws, "event_ack")["payload"]["accepted"] is True
 
 
+def test_gateway_transport_ws_bad_json_returns_error_and_keeps_connection(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+
+    with client.websocket_connect("/ws/gateway/transport?token=test-token") as ws:
+        ws.receive_json()
+        ws.send_text("{bad json")
+        error = _recv_until(ws, "error")
+        assert error["payload"]["accepted"] is False
+        assert error["payload"]["code"] == "BAD_MESSAGE"
+
+        ws.send_json(GatewayWsMessage(type="ping", sequence=2).to_dict())
+        assert _recv_until(ws, "pong")["type"] == "pong"
+
+
+def test_gateway_transport_ws_unsupported_type_returns_error(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+
+    with client.websocket_connect("/ws/gateway/transport?token=test-token") as ws:
+        ws.receive_json()
+        ws.send_json(GatewayWsMessage(type="unknown_type", sequence=1).to_dict())
+        error = _recv_until(ws, "error")
+        assert error["payload"]["accepted"] is False
+        assert error["payload"]["code"] == "UNSUPPORTED_MESSAGE_TYPE"
+
+
 def test_transport_heartbeat_does_not_override_kiwoom_login(tmp_path, monkeypatch):
     client, _ = _client(tmp_path, monkeypatch)
 

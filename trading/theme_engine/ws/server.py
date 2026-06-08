@@ -81,11 +81,21 @@ def create_app(db, runtime=None, broadcaster=None) -> Any:
             await websocket.send_json(build_heartbeat_payload())
             while True:
                 raw = await websocket.receive_text()
-                request = parse_subscribe_request(json.loads(raw))
-                if request["action"] != "subscribe":
-                    await websocket.send_json(build_error_payload("unsupported action", code="BAD_REQUEST"))
+                try:
+                    request = parse_subscribe_request(json.loads(raw))
+                except json.JSONDecodeError:
+                    await _send_theme_ws_error(websocket, "invalid websocket JSON message", code="BAD_MESSAGE")
                     continue
-                await _send_subscription_snapshot(websocket, request, repository, provider, runtime)
+                except Exception:
+                    await _send_theme_ws_error(websocket, "invalid subscribe request", code="BAD_REQUEST")
+                    continue
+                if request["action"] != "subscribe":
+                    await _send_theme_ws_error(websocket, "unsupported action", code="BAD_REQUEST")
+                    continue
+                try:
+                    await _send_subscription_snapshot(websocket, request, repository, provider, runtime)
+                except Exception:
+                    await _send_theme_ws_error(websocket, "subscription snapshot failed", code="SNAPSHOT_FAILED")
                 await asyncio.sleep(0)
         except WebSocketDisconnect:
             pass
@@ -94,6 +104,10 @@ def create_app(db, runtime=None, broadcaster=None) -> Any:
                 await broadcaster.unregister(websocket)
 
     return app
+
+
+async def _send_theme_ws_error(websocket, message: str, *, code: str) -> None:
+    await websocket.send_json(build_error_payload(message, code=code))
 
 
 async def _send_subscription_snapshot(websocket, request, repository, provider, runtime=None) -> None:

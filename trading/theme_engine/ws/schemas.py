@@ -5,15 +5,18 @@ from typing import Any
 
 
 def parse_subscribe_request(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("subscribe payload must be a JSON object")
     channels = payload.get("channels") or []
     if isinstance(channels, str):
         channels = [channels]
+    top_n = _bounded_int(payload.get("top_n"), default=20, minimum=1, maximum=100)
     return {
         "action": str(payload.get("action") or ""),
         "channels": [str(item) for item in channels],
-        "top_n": int(payload.get("top_n") or 20),
-        "theme_ids": [str(item) for item in list(payload.get("theme_ids") or [])],
-        "stock_codes": [str(item) for item in list(payload.get("stock_codes") or [])],
+        "top_n": top_n,
+        "theme_ids": _string_list(payload.get("theme_ids")),
+        "stock_codes": _string_list(payload.get("stock_codes")),
     }
 
 
@@ -117,6 +120,24 @@ def _obj_dict(obj) -> dict[str, Any]:
 
 def _value(value) -> str:
     return value.value if hasattr(value, "value") else str(value or "")
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(value if value not in (None, "") else default)
+    except (TypeError, ValueError):
+        number = default
+    return max(minimum, min(maximum, number))
 
 
 def _now_ts() -> str:

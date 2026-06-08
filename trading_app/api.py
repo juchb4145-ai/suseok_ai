@@ -2839,9 +2839,48 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
     try:
         while True:
             receive_started = time.perf_counter()
-            raw = await websocket.receive_json()
+            raw_text = await websocket.receive_text()
             receive_ms = (time.perf_counter() - receive_started) * 1000.0
-            message = GatewayWsMessage.from_dict(raw)
+            try:
+                raw = json.loads(raw_text)
+                if not isinstance(raw, dict):
+                    raise ValueError("websocket message must be a JSON object")
+                message = GatewayWsMessage.from_dict(raw)
+            except Exception as exc:
+                metadata = {
+                    "connection_id": connection_id,
+                    "websocket_session_id": session_id,
+                    "ws_connection_id": connection_id,
+                    "ws_session_id": session_id,
+                    "transport_mode": connection_transport_mode,
+                    "ws_receive_ms": receive_ms,
+                    "ws_message_sequence": sequence,
+                }
+                _record_gateway_ws_protocol_error(
+                    exc,
+                    stage="receive_decode",
+                    connection_transport_mode=connection_transport_mode,
+                    session_id=session_id,
+                    connection_id=connection_id,
+                )
+                await _send_gateway_ws_error(
+                    websocket,
+                    code="BAD_MESSAGE",
+                    message="invalid websocket message",
+                    metadata=metadata,
+                    sequence=sequence,
+                )
+                continue
+            if gateway_ws_transport_state.get("state") == "PROTOCOL_ERROR":
+                _update_gateway_ws_transport_state(
+                    {
+                        "connected": True,
+                        "state": "CONNECTED",
+                        "transport_mode": connection_transport_mode,
+                        "ws_session_id": session_id,
+                        "ws_connection_id": connection_id,
+                    }
+                )
             sequence = message.sequence or sequence + 1
             if message.type == "hello":
                 connection_transport_mode = _ws_message_transport_mode(message, default=connection_transport_mode)
@@ -2977,11 +3016,37 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                     payload={"message": f"unsupported websocket message type: {message.type}", "metadata": metadata},
                 )
                 await _process_gateway_event(event)
+                await _send_gateway_ws_error(
+                    websocket,
+                    code="UNSUPPORTED_MESSAGE_TYPE",
+                    message=f"unsupported websocket message type: {message.type}",
+                    metadata=metadata,
+                    trace_id=message.trace_id,
+                    sequence=sequence,
+                )
     except WebSocketDisconnect:
         _update_gateway_ws_transport_state(
             {
                 "connected": False,
                 "state": "DISCONNECTED",
+                "transport_mode": connection_transport_mode,
+                "ws_session_id": session_id,
+                "ws_connection_id": connection_id,
+            }
+        )
+        return
+    except Exception as exc:
+        _record_gateway_ws_protocol_error(
+            exc,
+            stage="connection_loop",
+            connection_transport_mode=connection_transport_mode,
+            session_id=session_id,
+            connection_id=connection_id,
+        )
+        _update_gateway_ws_transport_state(
+            {
+                "connected": False,
+                "state": "ERROR",
                 "transport_mode": connection_transport_mode,
                 "ws_session_id": session_id,
                 "ws_connection_id": connection_id,
@@ -3912,6 +3977,54 @@ def _valid_gateway_ws_token(websocket: WebSocket) -> bool:
     if authorization.lower().startswith("bearer "):
         provided = authorization.split(" ", 1)[1].strip()
     return bool(expected and provided == expected)
+
+
+async def _send_gateway_ws_error(
+    websocket: WebSocket,
+    *,
+    code: str,
+    message: str,
+    metadata: dict[str, Any],
+    trace_id: str = "",
+    sequence: int = 0,
+) -> None:
+    await websocket.send_json(
+        GatewayWsMessage(
+            type="error",
+            trace_id=trace_id or f"trace_ws_error_{int(time.time() * 1000)}",
+            source="core",
+            payload={
+                "accepted": False,
+                "code": code,
+                "message": message,
+            },
+            metadata=metadata,
+            sequence=sequence,
+        ).to_dict()
+    )
+
+
+def _record_gateway_ws_protocol_error(
+    exc: Exception,
+    *,
+    stage: str,
+    connection_transport_mode: str,
+    session_id: str,
+    connection_id: str,
+) -> None:
+    _update_gateway_ws_transport_state(
+        {
+            "connected": True,
+            "state": "PROTOCOL_ERROR",
+            "transport_mode": connection_transport_mode,
+            "ws_session_id": session_id,
+            "ws_connection_id": connection_id,
+            "last_error": _truncate_log_detail(str(exc) or repr(exc)),
+            "last_error_type": type(exc).__name__,
+            "last_error_stage": stage,
+            "last_error_at": utc_now_ms(),
+        }
+    )
 
 
 def _ws_message_transport_mode(message: GatewayWsMessage, *, default: str = TRANSPORT_MODE_WEBSOCKET_MOCK) -> str:
