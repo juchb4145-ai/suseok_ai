@@ -78,6 +78,25 @@ const tableConfigs = {
       (item) => textCell([item.virtual_order_id, item.virtual_position_id, item.exit_decision_id].filter(Boolean).join(" / ") || "-"),
     ],
   },
+  intradayDecisions: {
+    endpoint: "/api/runtime/decisions/intraday",
+    bodyId: "intradayDecisions-body",
+    statusId: "intradayDecisions-status",
+    paginationId: "intradayDecisions-pagination",
+    defaultLimit: 50,
+    detailTitle: (item) => `Intraday Decision ${item.decision_id || ""}`,
+    columns: [
+      (item) => textCell(formatDateTime(item.decision_at || item.created_at)),
+      (item) => textCell(`${item.code || "-"} ${item.name || ""}`.trim()),
+      (item) => textCell(item.theme_name || "-"),
+      (item) => badge(item.gate_status || "-"),
+      (item) => textCell(item.action_type || "-"),
+      (item) => badge(item.action_result || "-"),
+      (item) => textCell((item.reason_codes || []).slice(0, 3).join(", ") || item.gate_reason || "-"),
+      (item) => textCell([item.gate_score, item.hybrid_score, item.theme_score].map((value) => value == null ? "-" : fmtNumber(value, 1)).join(" / ")),
+      (item) => compactId(item.order_intent_id || item.virtual_order_id || item.virtual_position_id || item.exit_decision_id || item.candidate_instance_id || "-"),
+    ],
+  },
   dryRunPerformance: {
     endpoint: "/api/runtime/performance/dry-run",
     bodyId: "dryRunPerformance-body",
@@ -622,7 +641,7 @@ function closeDetailPanel() {
 
 function detailSummaryHtml(payload) {
   const record = payload.record || payload.item || payload.report || payload.candidate || payload;
-  const keys = ["command_id", "intent_id", "candidate_id", "report_id", "sample_id", "experiment_id", "lifecycle_id", "status", "command_type", "code", "reason", "error"];
+  const keys = ["decision_id", "command_id", "intent_id", "candidate_id", "report_id", "sample_id", "experiment_id", "lifecycle_id", "status", "action_type", "action_result", "command_type", "code", "reason", "error"];
   return keys
     .filter((key) => record && record[key] != null && record[key] !== "")
     .map((key) => `<div><span>${escapeHtml(key)}</span><strong>${escapeHtml(summaryValue(record[key]))}</strong></div>`)
@@ -750,6 +769,7 @@ function render(snapshot) {
   const transportExperiment = snapshot.transport_experiment || {};
   const runtime = snapshot.runtime || {};
   const dryRunOrders = snapshot.dry_run_orders || runtime.dry_run_orders || { summary: {} };
+  const intradayDecisions = snapshot.intraday_decisions || runtime.intraday_decisions || { funnel: {} };
   const dryRunPerformance = snapshot.dry_run_performance || runtime.dry_run_performance || {};
   const thresholdAB = snapshot.threshold_ab || runtime.threshold_ab || { summary: {}, recommendations: [] };
   const candidates = snapshot.candidates || { summary: {}, items: [] };
@@ -836,6 +856,26 @@ function render(snapshot) {
   const runtimeWarnings = [runtime.last_error ? `오류: ${runtime.last_error}` : "", ...(runtime.warnings || [])].filter(Boolean);
   const runtimeNode = document.getElementById("runtime-warning-lines");
   if (runtimeNode) runtimeNode.innerHTML = runtimeWarnings.length ? runtimeWarnings.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">Runtime 경고가 없습니다</span>';
+
+  const decisionFunnel = intradayDecisions.funnel || {};
+  text("decision-ledger-event-count", `${intradayDecisions.event_count || 0} events`);
+  text("decision-funnel-detected", decisionFunnel.detected || 0);
+  text("decision-funnel-evaluated", decisionFunnel.evaluated || 0);
+  text("decision-funnel-ready", decisionFunnel.ready || 0);
+  text("decision-funnel-wait", decisionFunnel.wait || 0);
+  text("decision-funnel-blocked", decisionFunnel.blocked || 0);
+  text("decision-funnel-entry-plan", decisionFunnel.entry_plan || 0);
+  text("decision-funnel-order-intent", decisionFunnel.order_intent || 0);
+  text("decision-funnel-open-position", decisionFunnel.open_position || 0);
+  text("decision-funnel-exit-decision", decisionFunnel.exit_decision || 0);
+  text("decision-ready-without-order", intradayDecisions.ready_without_order_count || 0);
+  text("decision-order-rejected", intradayDecisions.order_rejected_count || 0);
+  renderInlineCounts("decision-block-reason-lines", intradayDecisions.top_block_reasons || [], "reason", "BLOCK reason이 없습니다");
+  renderInlineCounts("decision-wait-reason-lines", intradayDecisions.top_wait_reasons || [], "reason", "WAIT reason이 없습니다");
+  renderInlineCounts("decision-data-quality-lines", [
+    ...((intradayDecisions.major_reason_distribution || []).map((item) => ({ ...item, reason: `major:${item.reason}` }))),
+    ...((intradayDecisions.top_data_quality_issues || []).map((item) => ({ ...item, reason: `data:${item.reason}` }))),
+  ], "reason", "데이터 품질 이슈가 없습니다");
 
   const drySummary = dryRunOrders.summary || {};
   text("dryrun-order-policy", runtime.dry_run_order_sink_enabled ? runtime.dry_run_order_policy || "enabled" : runtime.dry_run_order_policy || "disabled");

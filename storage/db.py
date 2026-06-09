@@ -816,6 +816,50 @@ class TradingDatabase:
                 payload_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS strategy_decision_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_id TEXT UNIQUE NOT NULL,
+                runtime_cycle_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                decision_at TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                candidate_generation_seq INTEGER NOT NULL DEFAULT 0,
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                strategy_name TEXT NOT NULL DEFAULT '',
+                strategy_version TEXT NOT NULL DEFAULT '',
+                config_hash TEXT NOT NULL DEFAULT '',
+                gate_status TEXT NOT NULL DEFAULT '',
+                gate_reason TEXT NOT NULL DEFAULT '',
+                reason_status TEXT NOT NULL DEFAULT '',
+                reason_family TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                block_type TEXT NOT NULL DEFAULT '',
+                action_type TEXT NOT NULL DEFAULT '',
+                action_result TEXT NOT NULL DEFAULT '',
+                price REAL,
+                change_rate REAL,
+                trade_value REAL,
+                execution_strength REAL,
+                vwap REAL,
+                momentum_1m REAL,
+                momentum_3m REAL,
+                momentum_5m REAL,
+                gate_score REAL,
+                hybrid_score REAL,
+                theme_score REAL,
+                data_status TEXT NOT NULL DEFAULT '',
+                data_quality_issues_json TEXT NOT NULL DEFAULT '[]',
+                order_intent_id TEXT NOT NULL DEFAULT '',
+                entry_plan_id INTEGER,
+                virtual_order_id INTEGER,
+                virtual_position_id INTEGER,
+                exit_decision_id INTEGER,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
             CREATE TABLE IF NOT EXISTS live_sim_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 order_intent_id TEXT UNIQUE NOT NULL,
@@ -1156,6 +1200,22 @@ class TradingDatabase:
                 ON runtime_order_intent_events(intent_id, id);
             CREATE INDEX IF NOT EXISTS idx_runtime_order_intent_events_type_created_at
                 ON runtime_order_intent_events(event_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_trade_date_at
+                ON strategy_decision_events(trade_date, decision_at, id);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_code_at
+                ON strategy_decision_events(code, decision_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_candidate
+                ON strategy_decision_events(candidate_id, decision_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_candidate_instance
+                ON strategy_decision_events(candidate_instance_id, decision_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_gate_status
+                ON strategy_decision_events(gate_status, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_action
+                ON strategy_decision_events(action_type, action_result, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_reason
+                ON strategy_decision_events(reason_status, reason_family, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_order_intent
+                ON strategy_decision_events(order_intent_id);
             CREATE INDEX IF NOT EXISTS idx_live_sim_orders_trade_date
                 ON live_sim_orders(trade_date, created_at);
             CREATE INDEX IF NOT EXISTS idx_live_sim_orders_code_status
@@ -1861,6 +1921,139 @@ class TradingDatabase:
             ),
         )
         self.conn.commit()
+
+    def save_strategy_decision_events(self, events: Iterable[dict]) -> int:
+        rows = [_strategy_decision_event_params(event) for event in events if isinstance(event, dict)]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT OR IGNORE INTO strategy_decision_events(
+                    decision_id, runtime_cycle_id, trade_date, created_at, decision_at,
+                    candidate_id, candidate_instance_id, candidate_generation_seq,
+                    code, name, theme_name, strategy_name, strategy_version, config_hash,
+                    gate_status, gate_reason, reason_status, reason_family, reason_codes_json,
+                    block_type, action_type, action_result,
+                    price, change_rate, trade_value, execution_strength, vwap,
+                    momentum_1m, momentum_3m, momentum_5m,
+                    gate_score, hybrid_score, theme_score,
+                    data_status, data_quality_issues_json,
+                    order_intent_id, entry_plan_id, virtual_order_id, virtual_position_id,
+                    exit_decision_id, details_json
+                ) VALUES (
+                    :decision_id, :runtime_cycle_id, :trade_date, :created_at, :decision_at,
+                    :candidate_id, :candidate_instance_id, :candidate_generation_seq,
+                    :code, :name, :theme_name, :strategy_name, :strategy_version, :config_hash,
+                    :gate_status, :gate_reason, :reason_status, :reason_family, :reason_codes_json,
+                    :block_type, :action_type, :action_result,
+                    :price, :change_rate, :trade_value, :execution_strength, :vwap,
+                    :momentum_1m, :momentum_3m, :momentum_5m,
+                    :gate_score, :hybrid_score, :theme_score,
+                    :data_status, :data_quality_issues_json,
+                    :order_intent_id, :entry_plan_id, :virtual_order_id, :virtual_position_id,
+                    :exit_decision_id, :details_json
+                )
+                """,
+                rows,
+            )
+        return int(self.conn.total_changes - before)
+
+    def list_strategy_decision_events(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        theme_name: Optional[str] = None,
+        gate_status: Optional[str] = None,
+        action_type: Optional[str] = None,
+        action_result: Optional[str] = None,
+        reason_status: Optional[str] = None,
+        reason_family: Optional[str] = None,
+        window_sec: Optional[int] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses, params = _strategy_decision_event_filters(
+            trade_date=trade_date,
+            code=code,
+            theme_name=theme_name,
+            gate_status=gate_status,
+            action_type=action_type,
+            action_result=action_result,
+            reason_status=reason_status,
+            reason_family=reason_family,
+            window_sec=window_sec,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_decision_events
+            {where}
+            ORDER BY decision_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_strategy_decision_event(row) for row in rows]
+
+    def strategy_decision_event_count(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        theme_name: Optional[str] = None,
+        gate_status: Optional[str] = None,
+        action_type: Optional[str] = None,
+        action_result: Optional[str] = None,
+        reason_status: Optional[str] = None,
+        reason_family: Optional[str] = None,
+        window_sec: Optional[int] = None,
+    ) -> int:
+        clauses, params = _strategy_decision_event_filters(
+            trade_date=trade_date,
+            code=code,
+            theme_name=theme_name,
+            gate_status=gate_status,
+            action_type=action_type,
+            action_result=action_result,
+            reason_status=reason_status,
+            reason_family=reason_family,
+            window_sec=window_sec,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM strategy_decision_events {where}",
+            tuple(params),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+
+    def get_strategy_decision_event(self, decision_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_decision_events WHERE decision_id = ?",
+            (decision_id,),
+        ).fetchone()
+        return _row_to_strategy_decision_event(row) if row else None
+
+    def strategy_decision_summary(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        window_sec: Optional[int] = None,
+    ) -> dict:
+        clauses, params = _strategy_decision_event_filters(trade_date=trade_date, window_sec=window_sec)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_decision_events
+            {where}
+            ORDER BY decision_at ASC, id ASC
+            """,
+            tuple(params),
+        ).fetchall()
+        events = [_row_to_strategy_decision_event(row) for row in rows]
+        return _strategy_decision_summary(events, trade_date=trade_date or "", window_sec=window_sec)
 
     def save_live_sim_order(self, record: dict) -> dict:
         payload = _live_sim_order_params(record)
@@ -5651,6 +5844,237 @@ class TradingDatabase:
 def _default_review_key(review: TradeReview) -> str:
     status = review.final_status.value if isinstance(review.final_status, ReviewFinalStatus) else str(review.final_status)
     return f"{review.gate_result_key}:{status}:{review.virtual_order_id or ''}:{review.virtual_position_id or ''}"
+
+
+def _strategy_decision_event_params(payload: dict) -> dict:
+    now = str(payload.get("created_at") or payload.get("decision_at") or datetime.now().isoformat(timespec="seconds"))
+    decision_at = str(payload.get("decision_at") or now)
+    return {
+        "decision_id": str(payload.get("decision_id") or f"decision:{uuid4().hex}"),
+        "runtime_cycle_id": str(payload.get("runtime_cycle_id") or payload.get("cycle_id") or ""),
+        "trade_date": str(payload.get("trade_date") or _trade_date_from_timestamp(decision_at) or ""),
+        "created_at": now,
+        "decision_at": decision_at,
+        "candidate_id": _nullable_int(payload.get("candidate_id")),
+        "candidate_instance_id": str(payload.get("candidate_instance_id") or ""),
+        "candidate_generation_seq": int(payload.get("candidate_generation_seq") or 0),
+        "code": _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+        "name": str(payload.get("name") or ""),
+        "theme_name": str(payload.get("theme_name") or ""),
+        "strategy_name": str(payload.get("strategy_name") or ""),
+        "strategy_version": str(payload.get("strategy_version") or ""),
+        "config_hash": str(payload.get("config_hash") or ""),
+        "gate_status": str(payload.get("gate_status") or ""),
+        "gate_reason": str(payload.get("gate_reason") or ""),
+        "reason_status": str(payload.get("reason_status") or ""),
+        "reason_family": str(payload.get("reason_family") or ""),
+        "reason_codes_json": _json_list(payload.get("reason_codes_json", payload.get("reason_codes", []))),
+        "block_type": str(payload.get("block_type") or ""),
+        "action_type": str(payload.get("action_type") or ""),
+        "action_result": str(payload.get("action_result") or ""),
+        "price": _nullable_float(payload.get("price")),
+        "change_rate": _nullable_float(payload.get("change_rate")),
+        "trade_value": _nullable_float(payload.get("trade_value")),
+        "execution_strength": _nullable_float(payload.get("execution_strength")),
+        "vwap": _nullable_float(payload.get("vwap")),
+        "momentum_1m": _nullable_float(payload.get("momentum_1m")),
+        "momentum_3m": _nullable_float(payload.get("momentum_3m")),
+        "momentum_5m": _nullable_float(payload.get("momentum_5m")),
+        "gate_score": _nullable_float(payload.get("gate_score")),
+        "hybrid_score": _nullable_float(payload.get("hybrid_score")),
+        "theme_score": _nullable_float(payload.get("theme_score")),
+        "data_status": str(payload.get("data_status") or ""),
+        "data_quality_issues_json": _json_list(payload.get("data_quality_issues_json", payload.get("data_quality_issues", []))),
+        "order_intent_id": str(payload.get("order_intent_id") or payload.get("intent_id") or ""),
+        "entry_plan_id": _nullable_int(payload.get("entry_plan_id")),
+        "virtual_order_id": _nullable_int(payload.get("virtual_order_id")),
+        "virtual_position_id": _nullable_int(payload.get("virtual_position_id")),
+        "exit_decision_id": _nullable_int(payload.get("exit_decision_id")),
+        "details_json": _json_payload(_sanitize_decision_details(payload.get("details_json", payload.get("details", {})))),
+    }
+
+
+def _strategy_decision_event_filters(
+    *,
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    theme_name: Optional[str] = None,
+    gate_status: Optional[str] = None,
+    action_type: Optional[str] = None,
+    action_result: Optional[str] = None,
+    reason_status: Optional[str] = None,
+    reason_family: Optional[str] = None,
+    window_sec: Optional[int] = None,
+) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if trade_date:
+        clauses.append("trade_date = ?")
+        params.append(str(trade_date))
+    if code:
+        clauses.append("code = ?")
+        params.append(_clean_stock_code(code) or str(code))
+    if theme_name:
+        clauses.append("theme_name = ?")
+        params.append(str(theme_name))
+    if gate_status:
+        clauses.append("gate_status = ?")
+        params.append(str(gate_status))
+    if action_type:
+        clauses.append("action_type = ?")
+        params.append(str(action_type))
+    if action_result:
+        clauses.append("action_result = ?")
+        params.append(str(action_result))
+    if reason_status:
+        clauses.append("reason_status = ?")
+        params.append(str(reason_status))
+    if reason_family:
+        clauses.append("reason_family = ?")
+        params.append(str(reason_family))
+    if window_sec is not None:
+        clauses.append("julianday(replace(substr(decision_at, 1, 19), 'T', ' ')) >= julianday('now', ?)")
+        params.append(f"-{max(1, int(window_sec or 1))} seconds")
+    return clauses, params
+
+
+def _row_to_strategy_decision_event(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["reason_codes"] = _safe_json_loads(data.get("reason_codes_json"), [])
+    data["data_quality_issues"] = _safe_json_loads(data.get("data_quality_issues_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    return data
+
+
+def _strategy_decision_summary(events: list[dict], *, trade_date: str = "", window_sec: Optional[int] = None) -> dict:
+    def key(event: dict) -> str:
+        return str(
+            event.get("candidate_instance_id")
+            or event.get("candidate_id")
+            or event.get("code")
+            or event.get("decision_id")
+            or ""
+        )
+
+    by_action: dict[str, set[str]] = {
+        "detected": set(),
+        "evaluated": set(),
+        "ready": set(),
+        "wait": set(),
+        "blocked": set(),
+        "entry_plan": set(),
+        "order_intent": set(),
+        "open_position": set(),
+        "exit_decision": set(),
+    }
+    ready_keys: set[str] = set()
+    order_any_keys: set[str] = set()
+    block_reasons: Counter[str] = Counter()
+    wait_reasons: Counter[str] = Counter()
+    data_quality: Counter[str] = Counter()
+    major_reasons: Counter[str] = Counter()
+    order_rejected_count = 0
+    exit_decision_count = 0
+
+    for event in events:
+        event_key = key(event)
+        if event_key:
+            by_action["detected"].add(event_key)
+        action_type = str(event.get("action_type") or "")
+        action_result = str(event.get("action_result") or "")
+        gate_status = str(event.get("gate_status") or "")
+        if action_type == "EVALUATE":
+            by_action["evaluated"].add(event_key)
+        if action_type == "READY" or gate_status == "READY":
+            by_action["ready"].add(event_key)
+            ready_keys.add(event_key)
+        if action_type == "WAIT" or gate_status == "WAIT":
+            by_action["wait"].add(event_key)
+        if action_type == "BLOCK" or gate_status == "BLOCKED":
+            by_action["blocked"].add(event_key)
+        if action_type == "ENTRY_PLAN" and action_result == "ACCEPTED":
+            by_action["entry_plan"].add(event_key)
+        if action_type == "ENTRY_ORDER_INTENT":
+            order_any_keys.add(event_key)
+            if action_result in {"ACCEPTED", "DUPLICATE"}:
+                by_action["order_intent"].add(event_key)
+            if action_result == "REJECTED":
+                order_rejected_count += 1
+        if action_type == "HOLD" and event.get("virtual_position_id") is not None:
+            by_action["open_position"].add(event_key)
+        if action_type == "EXIT_DECISION":
+            by_action["exit_decision"].add(event_key)
+            exit_decision_count += 1
+
+        reason_codes = [str(reason) for reason in event.get("reason_codes") or [] if str(reason)]
+        major_reasons.update(_major_reason_keys(reason_codes))
+        if action_type == "BLOCK" or gate_status == "BLOCKED":
+            block_reasons.update(reason_codes or [str(event.get("gate_reason") or "UNKNOWN")])
+        if action_type == "WAIT" or gate_status == "WAIT":
+            wait_reasons.update(reason_codes or [str(event.get("gate_reason") or "UNKNOWN")])
+        data_quality.update(str(issue) for issue in event.get("data_quality_issues") or [] if str(issue))
+
+    return {
+        "trade_date": trade_date,
+        "window_sec": window_sec,
+        "event_count": len(events),
+        "funnel": {name: len(values) for name, values in by_action.items()},
+        "top_block_reasons": _counter_rows(block_reasons),
+        "top_wait_reasons": _counter_rows(wait_reasons),
+        "top_data_quality_issues": _counter_rows(data_quality),
+        "major_reason_distribution": _counter_rows(major_reasons, limit=20),
+        "ready_without_order_count": len(ready_keys - order_any_keys),
+        "order_rejected_count": order_rejected_count,
+        "exit_decision_count": exit_decision_count,
+    }
+
+
+def _major_reason_keys(reason_codes: list[str]) -> list[str]:
+    result: list[str] = []
+    for reason in reason_codes:
+        text = str(reason or "").upper()
+        if "DATA_INSUFFICIENT" in text:
+            result.append("DATA_INSUFFICIENT")
+        if text == "VI_UNKNOWN" or "VI_UNKNOWN" in text:
+            result.append("VI_UNKNOWN")
+        if "RISK_OFF" in text or text in {"MARKET_RISK_OFF", "RISK_OFF_ENTRY"}:
+            result.append("RISK_OFF")
+        if "LATE_CHASE" in text or "CHASE_RISK" in text:
+            result.append("LATE_CHASE")
+    return list(dict.fromkeys(result))
+
+
+def _counter_rows(counter: Counter[str], limit: int = 10) -> list[dict]:
+    return [{"reason": key, "count": int(count)} for key, count in counter.most_common(limit) if key]
+
+
+def _nullable_int(value) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sanitize_decision_details(value: object) -> object:
+    parsed = _safe_json_loads(value, {}) if isinstance(value, str) else value
+    sensitive_terms = ("token", "secret", "password", "authorization", "account")
+
+    def clean(item):
+        if isinstance(item, dict):
+            result = {}
+            for key, child in item.items():
+                key_text = str(key)
+                if any(term in key_text.lower() for term in sensitive_terms):
+                    continue
+                result[key_text] = clean(child)
+            return result
+        if isinstance(item, list):
+            return [clean(child) for child in item]
+        return item
+
+    return clean(parsed if parsed is not None else {})
 
 
 def _runtime_order_intent_params(payload: dict) -> dict:

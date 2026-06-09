@@ -309,6 +309,54 @@
 
         <section class="band">
           <div class="section-head">
+            <h2>전략 흐름 Funnel</h2>
+            <span id="decision-ledger-event-count" class="counter">0 events</span>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>후보</span><strong id="decision-funnel-detected">0</strong></div>
+            <div><span>평가</span><strong id="decision-funnel-evaluated">0</strong></div>
+            <div><span>READY</span><strong id="decision-funnel-ready">0</strong></div>
+            <div><span>WAIT</span><strong id="decision-funnel-wait">0</strong></div>
+            <div><span>BLOCKED</span><strong id="decision-funnel-blocked">0</strong></div>
+            <div><span>EntryPlan</span><strong id="decision-funnel-entry-plan">0</strong></div>
+            <div><span>주문의도</span><strong id="decision-funnel-order-intent">0</strong></div>
+            <div><span>포지션</span><strong id="decision-funnel-open-position">0</strong></div>
+            <div><span>청산판단</span><strong id="decision-funnel-exit-decision">0</strong></div>
+            <div><span>READY 주문 없음</span><strong id="decision-ready-without-order">0</strong></div>
+            <div><span>주문 거절</span><strong id="decision-order-rejected">0</strong></div>
+          </div>
+          <div id="decision-block-reason-lines" class="inline-log"></div>
+          <div id="decision-wait-reason-lines" class="inline-log"></div>
+          <div id="decision-data-quality-lines" class="inline-log"></div>
+        </section>
+
+        <section class="band table-panel" data-table-section="intradayDecisions">
+          <div class="section-head">
+            <h2>Why Not Bought</h2>
+            <span id="intradayDecisions-status" class="counter">대기</span>
+          </div>
+          <div class="filter-grid">
+            <label>거래일<input data-table="intradayDecisions" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>종목코드<input data-table="intradayDecisions" data-filter="code" /></label>
+            <label>테마<input data-table="intradayDecisions" data-filter="theme_name" /></label>
+            <label>Gate<select data-table="intradayDecisions" data-filter="gate_status"><option value="">전체</option><option>READY</option><option>WAIT</option><option>BLOCKED</option></select></label>
+            <label>Action<select data-table="intradayDecisions" data-filter="action_type"><option value="">전체</option><option>EVALUATE</option><option>WAIT</option><option>BLOCK</option><option>READY</option><option>ENTRY_PLAN</option><option>ENTRY_ORDER_INTENT</option><option>EXIT_DECISION</option><option>HOLD</option></select></label>
+            <label>Result<select data-table="intradayDecisions" data-filter="action_result"><option value="">전체</option><option>ACCEPTED</option><option>REJECTED</option><option>SKIPPED</option><option>DUPLICATE</option><option>NOT_APPLICABLE</option></select></label>
+            <label>Reason Status<input data-table="intradayDecisions" data-filter="reason_status" /></label>
+            <label>Reason Family<input data-table="intradayDecisions" data-filter="reason_family" /></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="intradayDecisions"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>시간</th><th>종목</th><th>테마</th><th>Gate</th><th>Action</th><th>Result</th><th>Reason</th><th>Score</th><th>연결</th></tr></thead>
+              <tbody id="intradayDecisions-body"></tbody>
+            </table>
+          </div>
+          <div id="intradayDecisions-pagination" class="pagination"></div>
+        </section>
+
+        <section class="band">
+          <div class="section-head">
             <h2>Runtime DRY_RUN 주문 의도</h2>
             <span id="dryrun-order-policy" class="counter">disabled</span>
           </div>
