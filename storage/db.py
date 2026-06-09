@@ -890,6 +890,42 @@ class TradingDatabase:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(decision_id, horizon_sec)
             );
+            CREATE TABLE IF NOT EXISTS shadow_strategy_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                evaluation_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                evaluated_at TEXT NOT NULL DEFAULT '',
+                runtime_cycle_id TEXT NOT NULL DEFAULT '',
+                decision_id TEXT NOT NULL DEFAULT '',
+                policy_id TEXT NOT NULL DEFAULT '',
+                policy_name TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                candidate_generation_seq INTEGER NOT NULL DEFAULT 0,
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                baseline_gate_status TEXT NOT NULL DEFAULT '',
+                baseline_action_type TEXT NOT NULL DEFAULT '',
+                baseline_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                shadow_gate_status TEXT NOT NULL DEFAULT '',
+                shadow_action_type TEXT NOT NULL DEFAULT '',
+                shadow_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                baseline_score REAL,
+                shadow_score REAL,
+                baseline_position_size_multiplier REAL,
+                shadow_position_size_multiplier REAL,
+                changed_decision INTEGER NOT NULL DEFAULT 0,
+                change_type TEXT NOT NULL DEFAULT '',
+                expected_effect TEXT NOT NULL DEFAULT '',
+                expected_risk TEXT NOT NULL DEFAULT '',
+                data_status TEXT NOT NULL DEFAULT '',
+                data_quality_issues_json TEXT NOT NULL DEFAULT '[]',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(decision_id, policy_id)
+            );
             CREATE TABLE IF NOT EXISTS live_sim_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 order_intent_id TEXT UNIQUE NOT NULL,
@@ -1258,6 +1294,18 @@ class TradingDatabase:
                 ON strategy_decision_outcomes(horizon_sec, trade_date);
             CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_candidate_instance
                 ON strategy_decision_outcomes(candidate_instance_id);
+            CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_trade_date
+                ON shadow_strategy_evaluations(trade_date, evaluated_at, id);
+            CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_policy
+                ON shadow_strategy_evaluations(policy_id, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_decision
+                ON shadow_strategy_evaluations(decision_id, policy_id);
+            CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_code
+                ON shadow_strategy_evaluations(code, evaluated_at);
+            CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_change
+                ON shadow_strategy_evaluations(change_type, changed_decision, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_shadow_gate
+                ON shadow_strategy_evaluations(shadow_gate_status, trade_date);
             CREATE INDEX IF NOT EXISTS idx_live_sim_orders_trade_date
                 ON live_sim_orders(trade_date, created_at);
             CREATE INDEX IF NOT EXISTS idx_live_sim_orders_code_status
@@ -2377,6 +2425,257 @@ class TradingDatabase:
             trade_date=trade_date or "",
             window_sec=window_sec,
             horizon_sec=horizon_sec,
+        )
+
+    def list_strategy_decision_events_due_for_shadow(
+        self,
+        *,
+        policy_ids: Iterable[str],
+        trade_date: Optional[str] = None,
+        limit: int = 500,
+        force: bool = False,
+    ) -> list[dict]:
+        normalized_policy_ids = [str(policy_id) for policy_id in policy_ids if str(policy_id or "")]
+        if not normalized_policy_ids:
+            return []
+        clauses = ["d.decision_id <> ''"]
+        params: list[object] = []
+        if trade_date:
+            clauses.append("d.trade_date = ?")
+            params.append(str(trade_date))
+        if not force:
+            placeholders = ",".join("?" for _ in normalized_policy_ids)
+            clauses.append(
+                f"""
+                (
+                    SELECT COUNT(DISTINCT e.policy_id)
+                    FROM shadow_strategy_evaluations e
+                    WHERE e.decision_id = d.decision_id
+                      AND e.policy_id IN ({placeholders})
+                ) < ?
+                """
+            )
+            params.extend(normalized_policy_ids)
+            params.append(len(normalized_policy_ids))
+        params.append(max(1, int(limit or 500)))
+        rows = self.conn.execute(
+            f"""
+            SELECT d.*
+            FROM strategy_decision_events d
+            WHERE {" AND ".join(clauses)}
+            ORDER BY d.decision_at DESC, d.id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        return [_row_to_strategy_decision_event(row) for row in rows]
+
+    def save_shadow_strategy_evaluations(self, evaluations: Iterable[dict], *, force: bool = False) -> int:
+        rows = [_shadow_strategy_evaluation_params(evaluation) for evaluation in evaluations if isinstance(evaluation, dict)]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        if force:
+            sql = """
+                INSERT INTO shadow_strategy_evaluations(
+                    evaluation_id, trade_date, evaluated_at, runtime_cycle_id, decision_id,
+                    policy_id, policy_name, candidate_id, candidate_instance_id,
+                    candidate_generation_seq, code, name, theme_name,
+                    baseline_gate_status, baseline_action_type, baseline_reason_codes_json,
+                    shadow_gate_status, shadow_action_type, shadow_reason_codes_json,
+                    baseline_score, shadow_score, baseline_position_size_multiplier,
+                    shadow_position_size_multiplier, changed_decision, change_type,
+                    expected_effect, expected_risk, data_status, data_quality_issues_json,
+                    details_json, created_at, updated_at
+                ) VALUES (
+                    :evaluation_id, :trade_date, :evaluated_at, :runtime_cycle_id, :decision_id,
+                    :policy_id, :policy_name, :candidate_id, :candidate_instance_id,
+                    :candidate_generation_seq, :code, :name, :theme_name,
+                    :baseline_gate_status, :baseline_action_type, :baseline_reason_codes_json,
+                    :shadow_gate_status, :shadow_action_type, :shadow_reason_codes_json,
+                    :baseline_score, :shadow_score, :baseline_position_size_multiplier,
+                    :shadow_position_size_multiplier, :changed_decision, :change_type,
+                    :expected_effect, :expected_risk, :data_status, :data_quality_issues_json,
+                    :details_json, :created_at, :updated_at
+                )
+                ON CONFLICT(decision_id, policy_id) DO UPDATE SET
+                    evaluation_id=excluded.evaluation_id,
+                    trade_date=excluded.trade_date,
+                    evaluated_at=excluded.evaluated_at,
+                    runtime_cycle_id=excluded.runtime_cycle_id,
+                    policy_name=excluded.policy_name,
+                    candidate_id=excluded.candidate_id,
+                    candidate_instance_id=excluded.candidate_instance_id,
+                    candidate_generation_seq=excluded.candidate_generation_seq,
+                    code=excluded.code,
+                    name=excluded.name,
+                    theme_name=excluded.theme_name,
+                    baseline_gate_status=excluded.baseline_gate_status,
+                    baseline_action_type=excluded.baseline_action_type,
+                    baseline_reason_codes_json=excluded.baseline_reason_codes_json,
+                    shadow_gate_status=excluded.shadow_gate_status,
+                    shadow_action_type=excluded.shadow_action_type,
+                    shadow_reason_codes_json=excluded.shadow_reason_codes_json,
+                    baseline_score=excluded.baseline_score,
+                    shadow_score=excluded.shadow_score,
+                    baseline_position_size_multiplier=excluded.baseline_position_size_multiplier,
+                    shadow_position_size_multiplier=excluded.shadow_position_size_multiplier,
+                    changed_decision=excluded.changed_decision,
+                    change_type=excluded.change_type,
+                    expected_effect=excluded.expected_effect,
+                    expected_risk=excluded.expected_risk,
+                    data_status=excluded.data_status,
+                    data_quality_issues_json=excluded.data_quality_issues_json,
+                    details_json=excluded.details_json,
+                    updated_at=excluded.updated_at
+                """
+        else:
+            sql = """
+                INSERT OR IGNORE INTO shadow_strategy_evaluations(
+                    evaluation_id, trade_date, evaluated_at, runtime_cycle_id, decision_id,
+                    policy_id, policy_name, candidate_id, candidate_instance_id,
+                    candidate_generation_seq, code, name, theme_name,
+                    baseline_gate_status, baseline_action_type, baseline_reason_codes_json,
+                    shadow_gate_status, shadow_action_type, shadow_reason_codes_json,
+                    baseline_score, shadow_score, baseline_position_size_multiplier,
+                    shadow_position_size_multiplier, changed_decision, change_type,
+                    expected_effect, expected_risk, data_status, data_quality_issues_json,
+                    details_json, created_at, updated_at
+                ) VALUES (
+                    :evaluation_id, :trade_date, :evaluated_at, :runtime_cycle_id, :decision_id,
+                    :policy_id, :policy_name, :candidate_id, :candidate_instance_id,
+                    :candidate_generation_seq, :code, :name, :theme_name,
+                    :baseline_gate_status, :baseline_action_type, :baseline_reason_codes_json,
+                    :shadow_gate_status, :shadow_action_type, :shadow_reason_codes_json,
+                    :baseline_score, :shadow_score, :baseline_position_size_multiplier,
+                    :shadow_position_size_multiplier, :changed_decision, :change_type,
+                    :expected_effect, :expected_risk, :data_status, :data_quality_issues_json,
+                    :details_json, :created_at, :updated_at
+                )
+                """
+        with self.conn:
+            self.conn.executemany(sql, rows)
+        return int(self.conn.total_changes - before)
+
+    def list_shadow_strategy_evaluations(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        policy_id: Optional[str] = None,
+        code: Optional[str] = None,
+        theme_name: Optional[str] = None,
+        baseline_gate_status: Optional[str] = None,
+        shadow_gate_status: Optional[str] = None,
+        change_type: Optional[str] = None,
+        changed_decision: Optional[bool] = None,
+        outcome_label: Optional[str] = None,
+        expected_risk: Optional[str] = None,
+        window_sec: Optional[int] = None,
+        horizon_sec: Optional[int] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses, params = _shadow_strategy_evaluation_filters(
+            trade_date=trade_date,
+            policy_id=policy_id,
+            code=code,
+            theme_name=theme_name,
+            baseline_gate_status=baseline_gate_status,
+            shadow_gate_status=shadow_gate_status,
+            change_type=change_type,
+            changed_decision=changed_decision,
+            outcome_label=outcome_label,
+            expected_risk=expected_risk,
+            window_sec=window_sec,
+        )
+        join_sql, join_params = _shadow_strategy_outcome_join(horizon_sec)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                e.*,
+                o.outcome_label AS outcome_label,
+                o.horizon_sec AS outcome_horizon_sec,
+                o.max_return_pct AS outcome_max_return_pct,
+                o.max_drawdown_pct AS outcome_max_drawdown_pct,
+                o.current_return_pct AS outcome_current_return_pct,
+                o.label_confidence AS outcome_label_confidence,
+                o.data_status AS outcome_data_status,
+                o.data_quality_issues_json AS outcome_data_quality_issues_json
+            FROM shadow_strategy_evaluations e
+            {join_sql}
+            {where}
+            ORDER BY e.evaluated_at DESC, e.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(join_params + params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_shadow_strategy_evaluation(row) for row in rows]
+
+    def shadow_strategy_evaluation_count(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        policy_id: Optional[str] = None,
+        code: Optional[str] = None,
+        theme_name: Optional[str] = None,
+        baseline_gate_status: Optional[str] = None,
+        shadow_gate_status: Optional[str] = None,
+        change_type: Optional[str] = None,
+        changed_decision: Optional[bool] = None,
+        outcome_label: Optional[str] = None,
+        expected_risk: Optional[str] = None,
+        window_sec: Optional[int] = None,
+        horizon_sec: Optional[int] = None,
+    ) -> int:
+        clauses, params = _shadow_strategy_evaluation_filters(
+            trade_date=trade_date,
+            policy_id=policy_id,
+            code=code,
+            theme_name=theme_name,
+            baseline_gate_status=baseline_gate_status,
+            shadow_gate_status=shadow_gate_status,
+            change_type=change_type,
+            changed_decision=changed_decision,
+            outcome_label=outcome_label,
+            expected_risk=expected_risk,
+            window_sec=window_sec,
+        )
+        join_sql, join_params = _shadow_strategy_outcome_join(horizon_sec)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM shadow_strategy_evaluations e
+            {join_sql}
+            {where}
+            """,
+            tuple(join_params + params),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+
+    def shadow_strategy_summary(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        window_sec: Optional[int] = None,
+        horizon_sec: Optional[int] = None,
+        policy_id: Optional[str] = None,
+    ) -> dict:
+        items = self.list_shadow_strategy_evaluations(
+            trade_date=trade_date,
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+            policy_id=policy_id,
+            limit=10000,
+            offset=0,
+        )
+        return _shadow_strategy_summary(
+            items,
+            trade_date=trade_date or "",
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+            policy_id=policy_id or "",
         )
 
     def save_live_sim_order(self, record: dict) -> dict:
@@ -6532,6 +6831,310 @@ def _strategy_decision_outcome_summary(
         "exit_too_early_count": by_label.get("EXIT_TOO_EARLY_CANDIDATE", 0),
         "data_quality_issues": _counter_rows(data_quality),
     }
+
+
+def _shadow_strategy_evaluation_params(evaluation: dict) -> dict:
+    now = datetime.now().isoformat(timespec="seconds")
+    decision_id = str(evaluation.get("decision_id") or "").strip()
+    policy_id = str(evaluation.get("policy_id") or "").strip()
+    evaluation_id = str(evaluation.get("evaluation_id") or f"shadow:{decision_id}:{policy_id}").strip()
+    details = _sanitize_decision_details(evaluation.get("details_json", evaluation.get("details", {})))
+    return {
+        "evaluation_id": evaluation_id,
+        "trade_date": str(evaluation.get("trade_date") or ""),
+        "evaluated_at": str(evaluation.get("evaluated_at") or now),
+        "runtime_cycle_id": str(evaluation.get("runtime_cycle_id") or evaluation.get("cycle_id") or ""),
+        "decision_id": decision_id,
+        "policy_id": policy_id,
+        "policy_name": str(evaluation.get("policy_name") or ""),
+        "candidate_id": _nullable_int(evaluation.get("candidate_id")),
+        "candidate_instance_id": str(evaluation.get("candidate_instance_id") or ""),
+        "candidate_generation_seq": int(evaluation.get("candidate_generation_seq") or 0),
+        "code": _clean_stock_code(evaluation.get("code")) or str(evaluation.get("code") or ""),
+        "name": str(evaluation.get("name") or ""),
+        "theme_name": str(evaluation.get("theme_name") or ""),
+        "baseline_gate_status": str(evaluation.get("baseline_gate_status") or ""),
+        "baseline_action_type": str(evaluation.get("baseline_action_type") or ""),
+        "baseline_reason_codes_json": _json_list(
+            evaluation.get("baseline_reason_codes_json", evaluation.get("baseline_reason_codes", []))
+        ),
+        "shadow_gate_status": str(evaluation.get("shadow_gate_status") or ""),
+        "shadow_action_type": str(evaluation.get("shadow_action_type") or ""),
+        "shadow_reason_codes_json": _json_list(
+            evaluation.get("shadow_reason_codes_json", evaluation.get("shadow_reason_codes", []))
+        ),
+        "baseline_score": _nullable_float(evaluation.get("baseline_score")),
+        "shadow_score": _nullable_float(evaluation.get("shadow_score")),
+        "baseline_position_size_multiplier": _nullable_float(evaluation.get("baseline_position_size_multiplier")),
+        "shadow_position_size_multiplier": _nullable_float(evaluation.get("shadow_position_size_multiplier")),
+        "changed_decision": 1 if bool(evaluation.get("changed_decision")) else 0,
+        "change_type": str(evaluation.get("change_type") or ""),
+        "expected_effect": str(evaluation.get("expected_effect") or ""),
+        "expected_risk": str(evaluation.get("expected_risk") or ""),
+        "data_status": str(evaluation.get("data_status") or ""),
+        "data_quality_issues_json": _json_list(
+            evaluation.get("data_quality_issues_json", evaluation.get("data_quality_issues", []))
+        ),
+        "details_json": _json_payload(details),
+        "created_at": str(evaluation.get("created_at") or now),
+        "updated_at": str(evaluation.get("updated_at") or now),
+    }
+
+
+def _shadow_strategy_evaluation_filters(
+    *,
+    trade_date: Optional[str] = None,
+    policy_id: Optional[str] = None,
+    code: Optional[str] = None,
+    theme_name: Optional[str] = None,
+    baseline_gate_status: Optional[str] = None,
+    shadow_gate_status: Optional[str] = None,
+    change_type: Optional[str] = None,
+    changed_decision: Optional[bool] = None,
+    outcome_label: Optional[str] = None,
+    expected_risk: Optional[str] = None,
+    window_sec: Optional[int] = None,
+) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if trade_date:
+        clauses.append("e.trade_date = ?")
+        params.append(str(trade_date))
+    if policy_id:
+        clauses.append("e.policy_id = ?")
+        params.append(str(policy_id))
+    if code:
+        clauses.append("e.code = ?")
+        params.append(_clean_stock_code(code) or str(code))
+    if theme_name:
+        clauses.append("e.theme_name = ?")
+        params.append(str(theme_name))
+    if baseline_gate_status:
+        clauses.append("e.baseline_gate_status = ?")
+        params.append(str(baseline_gate_status).upper())
+    if shadow_gate_status:
+        clauses.append("e.shadow_gate_status = ?")
+        params.append(str(shadow_gate_status).upper())
+    if change_type:
+        clauses.append("e.change_type = ?")
+        params.append(str(change_type).upper())
+    if changed_decision is not None:
+        clauses.append("e.changed_decision = ?")
+        params.append(1 if bool(changed_decision) else 0)
+    if outcome_label:
+        clauses.append("o.outcome_label = ?")
+        params.append(str(outcome_label).upper())
+    if expected_risk:
+        clauses.append("e.expected_risk = ?")
+        params.append(str(expected_risk))
+    if window_sec is not None:
+        clauses.append("julianday(replace(substr(e.evaluated_at, 1, 19), 'T', ' ')) >= julianday('now', ?)")
+        params.append(f"-{max(1, int(window_sec or 1))} seconds")
+    return clauses, params
+
+
+def _shadow_strategy_outcome_join(horizon_sec: Optional[int]) -> tuple[str, list[object]]:
+    params: list[object] = []
+    horizon_clause = ""
+    if horizon_sec is not None:
+        horizon_clause = "AND oo.horizon_sec = ?"
+        params.append(max(1, int(horizon_sec or 1)))
+    return (
+        f"""
+        LEFT JOIN strategy_decision_outcomes o ON o.id = (
+            SELECT oo.id
+            FROM strategy_decision_outcomes oo
+            WHERE oo.decision_id = e.decision_id
+              {horizon_clause}
+            ORDER BY oo.horizon_sec DESC, oo.id DESC
+            LIMIT 1
+        )
+        """,
+        params,
+    )
+
+
+def _row_to_shadow_strategy_evaluation(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["baseline_reason_codes"] = _safe_json_loads(data.get("baseline_reason_codes_json"), [])
+    data["shadow_reason_codes"] = _safe_json_loads(data.get("shadow_reason_codes_json"), [])
+    data["data_quality_issues"] = _safe_json_loads(data.get("data_quality_issues_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    data["changed_decision"] = bool(data.get("changed_decision"))
+    outcome_issues = _safe_json_loads(data.pop("outcome_data_quality_issues_json", "[]"), [])
+    data["outcome"] = {
+        "label": data.pop("outcome_label", "") or "",
+        "horizon_sec": data.pop("outcome_horizon_sec", None),
+        "max_return_pct": data.pop("outcome_max_return_pct", None),
+        "max_drawdown_pct": data.pop("outcome_max_drawdown_pct", None),
+        "current_return_pct": data.pop("outcome_current_return_pct", None),
+        "label_confidence": data.pop("outcome_label_confidence", None),
+        "data_status": data.pop("outcome_data_status", "") or "",
+        "data_quality_issues": outcome_issues,
+    }
+    data["outcome_label"] = data["outcome"]["label"]
+    data["outcome_horizon_sec"] = data["outcome"]["horizon_sec"]
+    data["max_return_pct"] = data["outcome"]["max_return_pct"]
+    data["max_drawdown_pct"] = data["outcome"]["max_drawdown_pct"]
+    return data
+
+
+def _shadow_strategy_summary(
+    items: list[dict],
+    *,
+    trade_date: str = "",
+    window_sec: Optional[int] = None,
+    horizon_sec: Optional[int] = None,
+    policy_id: str = "",
+) -> dict:
+    by_policy: dict[str, dict] = {}
+    by_change_type: Counter[str] = Counter()
+    by_shadow_gate: Counter[str] = Counter()
+    by_outcome: Counter[str] = Counter()
+    data_quality: Counter[str] = Counter()
+    baseline_ready_count = 0
+    shadow_ready_count = 0
+    changed_count = 0
+    for item in items:
+        policy_key = str(item.get("policy_id") or "")
+        policy = by_policy.setdefault(
+            policy_key,
+            {
+                "policy_id": policy_key,
+                "policy_name": item.get("policy_name") or policy_key,
+                "label_ko": "",
+                "total_count": 0,
+                "changed_decision_count": 0,
+                "baseline_ready_count": 0,
+                "shadow_ready_count": 0,
+                "opportunity_loss_reduced_count": 0,
+                "false_positive_increase_count": 0,
+                "risk_block_effective_count": 0,
+                "exit_too_late_reduced_count": 0,
+                "exit_too_early_risk_count": 0,
+                "insufficient_count": 0,
+            },
+        )
+        policy["total_count"] += 1
+        if _is_ready_like(item.get("baseline_gate_status")) or str(item.get("baseline_action_type") or "") == "ENTRY_ORDER_INTENT":
+            baseline_ready_count += 1
+            policy["baseline_ready_count"] += 1
+        if _is_ready_like(item.get("shadow_gate_status")) or str(item.get("shadow_action_type") or "") == "SHADOW_ENTRY_CANDIDATE":
+            shadow_ready_count += 1
+            policy["shadow_ready_count"] += 1
+        if bool(item.get("changed_decision")):
+            changed_count += 1
+            policy["changed_decision_count"] += 1
+        change_type = str(item.get("change_type") or "NO_CHANGE")
+        shadow_gate = str(item.get("shadow_gate_status") or "")
+        outcome_label = str(item.get("outcome_label") or "PENDING")
+        by_change_type[change_type] += 1
+        if shadow_gate:
+            by_shadow_gate[shadow_gate] += 1
+        by_outcome[outcome_label] += 1
+        data_quality.update(str(issue) for issue in item.get("data_quality_issues") or [] if str(issue))
+        data_quality.update(str(issue) for issue in (item.get("outcome") or {}).get("data_quality_issues") or [] if str(issue))
+        _apply_shadow_policy_counters(policy, item, outcome_label)
+
+    ranking = []
+    for policy in by_policy.values():
+        policy["ready_delta"] = int(policy["shadow_ready_count"] or 0) - int(policy["baseline_ready_count"] or 0)
+        policy["estimated_net_benefit_score"] = _shadow_policy_score(policy)
+        policy["confidence"] = _shadow_policy_confidence(policy)
+        policy["recommendation_grade"] = _shadow_policy_grade(policy)
+        ranking.append(policy)
+    ranking.sort(key=lambda row: (float(row.get("estimated_net_benefit_score") or 0.0), int(row.get("changed_decision_count") or 0)), reverse=True)
+    return {
+        "trade_date": trade_date,
+        "window_sec": window_sec,
+        "horizon_sec": horizon_sec,
+        "policy_id": policy_id,
+        "total_evaluations": len(items),
+        "changed_decision_count": changed_count,
+        "by_policy": {key: value["total_count"] for key, value in by_policy.items()},
+        "by_change_type": dict(by_change_type),
+        "by_shadow_gate_status": dict(by_shadow_gate),
+        "by_outcome_label": dict(by_outcome),
+        "policy_ranking": ranking,
+        "baseline_ready_count": baseline_ready_count,
+        "shadow_ready_count": shadow_ready_count,
+        "ready_delta": shadow_ready_count - baseline_ready_count,
+        "estimated_opportunity_loss_reduced_count": sum(int(row.get("opportunity_loss_reduced_count") or 0) for row in ranking),
+        "estimated_false_positive_increase_count": sum(int(row.get("false_positive_increase_count") or 0) for row in ranking),
+        "estimated_risk_block_effective_count": sum(int(row.get("risk_block_effective_count") or 0) for row in ranking),
+        "estimated_exit_too_late_reduced_count": sum(int(row.get("exit_too_late_reduced_count") or 0) for row in ranking),
+        "data_quality_issues": _counter_rows(data_quality),
+        "recommendation_cards": ranking[:5],
+        "disclaimer_ko": "Shadow 결과는 장중 진단용이며 실제 전략 설정에 자동 적용되지 않습니다.",
+    }
+
+
+def _apply_shadow_policy_counters(policy: dict, item: dict, outcome_label: str) -> None:
+    change_type = str(item.get("change_type") or "")
+    expected_effect = str(item.get("expected_effect") or "")
+    if outcome_label in {"INSUFFICIENT_OUTCOME_DATA", "PENDING", ""}:
+        policy["insufficient_count"] += 1
+    if change_type in {"WAIT_TO_READY", "BLOCK_TO_READY"}:
+        if "OPPORTUNITY_LOSS" in outcome_label or outcome_label == "EARLY_TRUE_POSITIVE":
+            policy["opportunity_loss_reduced_count"] += 1
+        if outcome_label in {"EARLY_FALSE_POSITIVE", "ENTRY_TOO_EARLY_CANDIDATE"}:
+            policy["false_positive_increase_count"] += 1
+    if change_type == "READY_TO_BLOCK":
+        if outcome_label in {"RISK_BLOCK_EFFECTIVE", "GOOD_BLOCK", "TRUE_NEGATIVE", "EARLY_FALSE_POSITIVE", "ENTRY_TOO_EARLY_CANDIDATE"}:
+            policy["risk_block_effective_count"] += 1
+        if "OPPORTUNITY_LOSS" in outcome_label or outcome_label == "EARLY_TRUE_POSITIVE":
+            policy["false_positive_increase_count"] += 1
+    if change_type == "HOLD_TO_EXIT":
+        if outcome_label == "EXIT_TOO_LATE_CANDIDATE" or expected_effect == "reduce_giveback":
+            policy["exit_too_late_reduced_count"] += 1
+        if outcome_label == "EXIT_TOO_EARLY_CANDIDATE":
+            policy["exit_too_early_risk_count"] += 1
+
+
+def _shadow_policy_score(policy: dict) -> float:
+    return round(
+        float(policy.get("opportunity_loss_reduced_count") or 0) * 2.0
+        + float(policy.get("risk_block_effective_count") or 0)
+        + float(policy.get("exit_too_late_reduced_count") or 0) * 1.5
+        - float(policy.get("false_positive_increase_count") or 0) * 3.0
+        - float(policy.get("exit_too_early_risk_count") or 0) * 2.0
+        - float(policy.get("insufficient_count") or 0) * 0.25,
+        3,
+    )
+
+
+def _shadow_policy_confidence(policy: dict) -> float:
+    total = max(1, int(policy.get("total_count") or 0))
+    labeled = max(0, total - int(policy.get("insufficient_count") or 0))
+    changed = int(policy.get("changed_decision_count") or 0)
+    return round(min(1.0, (labeled / total) * min(1.0, changed / 3.0 if changed else 0.25)), 3)
+
+
+def _shadow_policy_grade(policy: dict) -> str:
+    total = int(policy.get("total_count") or 0)
+    changed = int(policy.get("changed_decision_count") or 0)
+    insufficient = int(policy.get("insufficient_count") or 0)
+    fp_increase = int(policy.get("false_positive_increase_count") or 0)
+    score = float(policy.get("estimated_net_benefit_score") or 0.0)
+    confidence = float(policy.get("confidence") or 0.0)
+    policy_id = str(policy.get("policy_id") or "")
+    if total == 0 or changed == 0 or insufficient >= max(1, total):
+        return "DATA_INSUFFICIENT"
+    if fp_increase >= 2 or score < -1:
+        return "DO_NOT_APPLY"
+    if fp_increase >= 1 or score < 1:
+        return "RISKY_CANDIDATE"
+    if policy_id.startswith("relaxed_") and changed < 3:
+        return "WATCH_CANDIDATE"
+    if ("vi" in policy_id or "entry_risk" in policy_id) and score >= 3:
+        return "WATCH_CANDIDATE"
+    if score >= 3 and confidence >= 0.6:
+        return "STRONG_CANDIDATE"
+    return "WATCH_CANDIDATE"
+
+
+def _is_ready_like(value: object) -> bool:
+    return str(value or "").upper() in {"READY", "READY_SMALL", "OBSERVE_READY"}
 
 
 def _major_reason_keys(reason_codes: list[str]) -> list[str]:

@@ -87,6 +87,19 @@ class CoreSettings:
     intraday_outcome_fp_return_pct: float = -1.0
     intraday_outcome_exit_giveback_pct: float = -2.0
     intraday_outcome_max_batch_size: int = 500
+    shadow_strategy_enabled: bool = True
+    shadow_strategy_policies: str = (
+        "relaxed_risk_off_leader,strict_late_chase,strict_entry_risk,"
+        "relaxed_data_wait_for_leader,fast_theme_exit_shadow"
+    )
+    shadow_strategy_max_batch_size: int = 500
+    shadow_strategy_runtime_hook_enabled: bool = True
+    shadow_strategy_rebuild_limit: int = 10000
+    shadow_strategy_min_theme_score: float = 70.0
+    shadow_strategy_min_hybrid_score: float = 65.0
+    shadow_strategy_ready_small_multiplier: float = 0.3
+    shadow_strategy_observe_only: bool = True
+    shadow_strategy_allow_apply: bool = False
 
     @property
     def live_order_enabled(self) -> bool:
@@ -179,6 +192,19 @@ def get_settings() -> CoreSettings:
         intraday_outcome_fp_return_pct=_float_env("TRADING_INTRADAY_OUTCOME_FP_RETURN_PCT", -1.0),
         intraday_outcome_exit_giveback_pct=_float_env("TRADING_INTRADAY_OUTCOME_EXIT_GIVEBACK_PCT", -2.0),
         intraday_outcome_max_batch_size=_int_env("TRADING_INTRADAY_OUTCOME_MAX_BATCH_SIZE", 500),
+        shadow_strategy_enabled=_bool_env("TRADING_SHADOW_STRATEGY_ENABLED", True),
+        shadow_strategy_policies=os.environ.get(
+            "TRADING_SHADOW_STRATEGY_POLICIES",
+            "relaxed_risk_off_leader,strict_late_chase,strict_entry_risk,relaxed_data_wait_for_leader,fast_theme_exit_shadow",
+        ),
+        shadow_strategy_max_batch_size=_int_env("TRADING_SHADOW_STRATEGY_MAX_BATCH_SIZE", 500),
+        shadow_strategy_runtime_hook_enabled=_bool_env("TRADING_SHADOW_STRATEGY_RUNTIME_HOOK_ENABLED", True),
+        shadow_strategy_rebuild_limit=_int_env("TRADING_SHADOW_STRATEGY_REBUILD_LIMIT", 10000),
+        shadow_strategy_min_theme_score=_float_env("TRADING_SHADOW_STRATEGY_MIN_THEME_SCORE", 70.0),
+        shadow_strategy_min_hybrid_score=_float_env("TRADING_SHADOW_STRATEGY_MIN_HYBRID_SCORE", 65.0),
+        shadow_strategy_ready_small_multiplier=_float_env("TRADING_SHADOW_STRATEGY_READY_SMALL_MULTIPLIER", 0.3),
+        shadow_strategy_observe_only=_bool_env("TRADING_SHADOW_STRATEGY_OBSERVE_ONLY", True),
+        shadow_strategy_allow_apply=_bool_env("TRADING_SHADOW_STRATEGY_ALLOW_APPLY", False),
     )
 
 

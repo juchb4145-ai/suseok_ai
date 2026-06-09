@@ -16,6 +16,7 @@ from trading.strategy.runtime import StrategyRuntime
 from trading_app.dependencies import CoreSettings
 from trading_app.intraday_outcomes import IntradayOutcomeLabeler, config_from_settings as outcome_config_from_settings
 from trading_app.runtime_factory import CoreRuntimeBundle, build_core_strategy_runtime
+from trading_app.shadow_strategy import ShadowStrategyEvaluator, config_from_settings as shadow_config_from_settings
 
 
 RuntimeBuilder = Callable[..., CoreRuntimeBundle]
@@ -335,6 +336,8 @@ class RuntimeSupervisor:
             snapshot["runtime_forwarded_price_tick_count"] = forwarded_count
             self._set_worker_stage("intraday_outcome_labeler")
             snapshot["intraday_outcome_labeler"] = self._label_intraday_outcomes_in_worker()
+            self._set_worker_stage("shadow_strategy_evaluator")
+            snapshot["shadow_strategy_evaluator"] = self._evaluate_shadow_strategies_in_worker()
             return snapshot
         finally:
             self._set_worker_stage("idle")
@@ -410,6 +413,24 @@ class RuntimeSupervisor:
         except Exception as exc:
             self._warn(f"INTRADAY_OUTCOME_LABELER_FAILED:{exc}")
             return {"status": "FAILED", "error": str(exc), "persisted_count": 0, "outcome_count": 0}
+
+    def _evaluate_shadow_strategies_in_worker(self) -> dict[str, Any]:
+        if (
+            self._bundle is None
+            or not bool(getattr(self.settings, "shadow_strategy_enabled", True))
+            or not bool(getattr(self.settings, "shadow_strategy_runtime_hook_enabled", True))
+        ):
+            return {"status": "DISABLED", "persisted_count": 0, "evaluated_count": 0}
+        try:
+            evaluator = ShadowStrategyEvaluator(self._bundle.db, config=shadow_config_from_settings(self.settings))
+            return evaluator.rebuild(
+                trade_date=datetime.now().date().isoformat(),
+                limit=int(getattr(self.settings, "shadow_strategy_max_batch_size", 500)),
+                persist=True,
+            )
+        except Exception as exc:
+            self._warn(f"SHADOW_STRATEGY_EVALUATOR_FAILED:{exc}")
+            return {"status": "FAILED", "error": str(exc), "persisted_count": 0, "evaluated_count": 0}
 
     def _pending_price_tick_count(self) -> int:
         with self._event_lock:

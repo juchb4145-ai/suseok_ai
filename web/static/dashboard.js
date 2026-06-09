@@ -117,6 +117,46 @@ const tableConfigs = {
       (item) => textCell((item.reason_codes || []).slice(0, 3).join(", ") || item.outcome_reason || "-"),
     ],
   },
+  shadowEvaluations: {
+    endpoint: "/api/runtime/shadow-strategies/evaluations",
+    bodyId: "shadowEvaluations-body",
+    statusId: "shadowEvaluations-status",
+    paginationId: "shadowEvaluations-pagination",
+    defaultLimit: 50,
+    detailTitle: (item) => `Shadow Evaluation ${item.evaluation_id || ""}`,
+    columns: [
+      (item) => textCell(`${item.code || "-"} ${item.name || ""}`.trim()),
+      (item) => textCell(item.theme_name || "-"),
+      (item) => textCell(item.policy_name || item.policy_id || "-"),
+      (item) => badge(item.baseline_gate_status || "-"),
+      (item) => badge(item.shadow_gate_status || "-"),
+      (item) => badge(item.change_type || "-"),
+      (item) => textCell((item.baseline_reason_codes || []).slice(0, 3).join(", ") || "-"),
+      (item) => textCell((item.shadow_reason_codes || []).slice(0, 3).join(", ") || "-"),
+      (item) => badge(item.outcome_label || "PENDING"),
+      (item) => textCell(formatPercentValue(item.max_return_pct)),
+      (item) => textCell(formatPercentValue(item.max_drawdown_pct)),
+    ],
+  },
+  shadowRiskCandidates: {
+    endpoint: "/api/runtime/shadow-strategies/evaluations",
+    bodyId: "shadowRiskCandidates-body",
+    statusId: "shadowRiskCandidates-status",
+    paginationId: "shadowRiskCandidates-pagination",
+    defaultLimit: 50,
+    defaultFilters: { changed_decision: true },
+    detailTitle: (item) => `Shadow Risk ${item.evaluation_id || ""}`,
+    columns: [
+      (item) => textCell(item.policy_name || item.policy_id || "-"),
+      (item) => textCell(`${item.code || "-"} ${item.name || ""}`.trim()),
+      (item) => badge(item.change_type || "-"),
+      (item) => textCell(item.expected_risk || "-"),
+      (item) => textCell(item.expected_effect || "-"),
+      (item) => badge(item.outcome_label || "PENDING"),
+      (item) => textCell(formatPercentValue(item.max_return_pct)),
+      (item) => textCell(formatPercentValue(item.max_drawdown_pct)),
+    ],
+  },
   dryRunPerformance: {
     endpoint: "/api/runtime/performance/dry-run",
     bodyId: "dryRunPerformance-body",
@@ -529,7 +569,7 @@ async function fetchTable(tableKey) {
   updateTableState(tableKey, { requestSeq: seq, loading: true, error: "" });
   setTableStatus(tableKey, "불러오는 중", "warn");
   const filters = tableFilters(tableKey);
-  const params = { ...filters, limit: table.limit, offset: table.offset };
+  const params = { ...(config.defaultFilters || {}), ...filters, limit: table.limit, offset: table.offset };
   try {
     const payload = await apiGet(config.endpoint, params, tableKey);
     if (state.tables[tableKey].requestSeq !== seq) return;
@@ -714,6 +754,15 @@ function renderThresholdRecommendations(id, rows) {
   node.innerHTML = lines.length ? lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">아직 추천 후보가 없습니다. DRY_RUN 표본이 더 쌓이면 자동으로 표시됩니다.</span>';
 }
 
+function renderShadowPolicyRanking(id, rows) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const lines = firstItems(rows || [], 8).map((item) => (
+    `${item.policy_name || item.policy_id || "-"} - ${item.recommendation_grade || "-"} - score ${fmtNumber(item.estimated_net_benefit_score, 1)} / changed ${item.changed_decision_count || 0} / ready ${item.ready_delta || 0}`
+  ));
+  node.innerHTML = lines.length ? lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">Shadow policy ranking이 없습니다</span>';
+}
+
 function renderOpsAlerts(payload) {
   const ops = payload || { summary: {}, alerts: [] };
   const summary = ops.summary || {};
@@ -791,6 +840,7 @@ function render(snapshot) {
   const dryRunOrders = snapshot.dry_run_orders || runtime.dry_run_orders || { summary: {} };
   const intradayDecisions = snapshot.intraday_decisions || runtime.intraday_decisions || { funnel: {} };
   const intradayOutcomes = snapshot.intraday_outcomes || runtime.intraday_outcomes || {};
+  const shadowStrategies = snapshot.shadow_strategies || runtime.shadow_strategies || {};
   const dryRunPerformance = snapshot.dry_run_performance || runtime.dry_run_performance || {};
   const thresholdAB = snapshot.threshold_ab || runtime.threshold_ab || { summary: {}, recommendations: [] };
   const candidates = snapshot.candidates || { summary: {}, items: [] };
@@ -913,6 +963,23 @@ function render(snapshot) {
     "Outcome label이 없습니다"
   );
   renderInlineCounts("outcome-quality-lines", intradayOutcomes.data_quality_issues || [], "reason", "Outcome data quality 이슈가 없습니다");
+
+  text("shadow-evaluation-total", shadowStrategies.total_evaluations || 0);
+  text("shadow-changed-count", shadowStrategies.changed_decision_count || 0);
+  text("shadow-baseline-ready", shadowStrategies.baseline_ready_count || 0);
+  text("shadow-ready", shadowStrategies.shadow_ready_count || 0);
+  text("shadow-ready-delta", shadowStrategies.ready_delta || 0);
+  text("shadow-opportunity-reduced", shadowStrategies.estimated_opportunity_loss_reduced_count || 0);
+  text("shadow-fp-increase", shadowStrategies.estimated_false_positive_increase_count || 0);
+  text("shadow-risk-effective", shadowStrategies.estimated_risk_block_effective_count || 0);
+  text("shadow-exit-late-reduced", shadowStrategies.estimated_exit_too_late_reduced_count || 0);
+  renderInlineCounts(
+    "shadow-change-lines",
+    Object.entries(shadowStrategies.by_change_type || {}).map(([reason, count]) => ({ reason, count })),
+    "reason",
+    "Shadow change가 없습니다"
+  );
+  renderShadowPolicyRanking("shadow-policy-ranking-lines", shadowStrategies.policy_ranking || []);
 
   const drySummary = dryRunOrders.summary || {};
   text("dryrun-order-policy", runtime.dry_run_order_sink_enabled ? runtime.dry_run_order_policy || "enabled" : runtime.dry_run_order_policy || "disabled");

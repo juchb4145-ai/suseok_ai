@@ -401,6 +401,73 @@
 
         <section class="band">
           <div class="section-head">
+            <h2>Shadow Strategy Comparison</h2>
+            <span id="shadow-evaluation-total" class="counter">0</span>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>Changed</span><strong id="shadow-changed-count">0</strong></div>
+            <div><span>Baseline READY</span><strong id="shadow-baseline-ready">0</strong></div>
+            <div><span>Shadow READY</span><strong id="shadow-ready">0</strong></div>
+            <div><span>READY Delta</span><strong id="shadow-ready-delta">0</strong></div>
+            <div><span>Opportunity Reduced</span><strong id="shadow-opportunity-reduced">0</strong></div>
+            <div><span>FP Risk</span><strong id="shadow-fp-increase">0</strong></div>
+            <div><span>Risk Block Effective</span><strong id="shadow-risk-effective">0</strong></div>
+            <div><span>Exit Late Reduced</span><strong id="shadow-exit-late-reduced">0</strong></div>
+          </div>
+          <div id="shadow-policy-ranking-lines" class="inline-log"></div>
+          <div id="shadow-change-lines" class="inline-log"></div>
+        </section>
+
+        <section class="band table-panel" data-table-section="shadowEvaluations">
+          <div class="section-head">
+            <h2>Shadow Different Decisions</h2>
+            <span id="shadowEvaluations-status" class="counter">대기</span>
+          </div>
+          <div class="filter-grid">
+            <label>거래일<input data-table="shadowEvaluations" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>Policy<input data-table="shadowEvaluations" data-filter="policy_id" /></label>
+            <label>종목코드<input data-table="shadowEvaluations" data-filter="code" /></label>
+            <label>테마<input data-table="shadowEvaluations" data-filter="theme_name" /></label>
+            <label>Baseline Gate<input data-table="shadowEvaluations" data-filter="baseline_gate_status" /></label>
+            <label>Shadow Gate<input data-table="shadowEvaluations" data-filter="shadow_gate_status" /></label>
+            <label>Change<input data-table="shadowEvaluations" data-filter="change_type" /></label>
+            <label>Outcome<input data-table="shadowEvaluations" data-filter="outcome_label" /></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="shadowEvaluations"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>종목</th><th>테마</th><th>Policy</th><th>Baseline</th><th>Shadow</th><th>Change</th><th>Base Reason</th><th>Shadow Reason</th><th>Outcome</th><th>Max</th><th>MDD</th></tr></thead>
+              <tbody id="shadowEvaluations-body"></tbody>
+            </table>
+          </div>
+          <div id="shadowEvaluations-pagination" class="pagination"></div>
+        </section>
+
+        <section class="band table-panel" data-table-section="shadowRiskCandidates">
+          <div class="section-head">
+            <h2>Shadow Apply Risk Candidates</h2>
+            <span id="shadowRiskCandidates-status" class="counter">대기</span>
+          </div>
+          <div class="filter-grid">
+            <input type="hidden" data-table="shadowRiskCandidates" data-filter="changed_decision" value="true" />
+            <label>거래일<input data-table="shadowRiskCandidates" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>Policy<input data-table="shadowRiskCandidates" data-filter="policy_id" /></label>
+            <label>Risk<input data-table="shadowRiskCandidates" data-filter="expected_risk" /></label>
+            <label>Outcome<input data-table="shadowRiskCandidates" data-filter="outcome_label" /></label>
+            <label>Change<input data-table="shadowRiskCandidates" data-filter="change_type" /></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="shadowRiskCandidates"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Policy</th><th>종목</th><th>Change</th><th>Expected Risk</th><th>Expected Effect</th><th>Outcome</th><th>Max</th><th>MDD</th></tr></thead>
+              <tbody id="shadowRiskCandidates-body"></tbody>
+            </table>
+          </div>
+          <div id="shadowRiskCandidates-pagination" class="pagination"></div>
+        </section>
+
+        <section class="band">
+          <div class="section-head">
             <h2>Runtime DRY_RUN 주문 의도</h2>
             <span id="dryrun-order-policy" class="counter">disabled</span>
           </div>

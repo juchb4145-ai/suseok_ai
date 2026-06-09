@@ -19,6 +19,10 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
         "transportLatency",
         "transportExperiments",
         "dryRunOrders",
+        "intradayDecisions",
+        "intradayOutcomes",
+        "shadowEvaluations",
+        "shadowRiskCandidates",
         "dryRunPerformance",
         "falseSignals",
         "thresholdAB",
@@ -88,6 +92,9 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "thresholdAB" in js
     assert "gradeLabelsKo" in js
     assert "/api/runtime/threshold-ab/dry-run" in js
+    assert "/api/runtime/shadow-strategies/evaluations" in js
+    assert "shadowEvaluations" in js
+    assert "shadowRiskCandidates" in js
     assert ".slice(0, 10)" not in js
     assert ".slice(0, 20)" not in js
     assert "/api/gateway/transport/latency" in js

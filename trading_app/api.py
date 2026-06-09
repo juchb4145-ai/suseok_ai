@@ -66,6 +66,7 @@ from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
+from trading_app.shadow_strategy import ShadowStrategyEvaluator, config_from_settings as shadow_config_from_settings
 from trading_app.themelab_dashboard import build_theme_lab_dashboard_snapshot
 from trading_app.transport_latency import TransportLatencyAnalyzer, TransportLatencyConfig
 from trading_app.websocket import DashboardConnectionManager
@@ -519,6 +520,10 @@ def _performance_analyzer(db: TradingDatabase) -> DryRunPerformanceAnalyzer:
 
 def _intraday_outcome_labeler(db: TradingDatabase) -> IntradayOutcomeLabeler:
     return IntradayOutcomeLabeler(db, config=outcome_config_from_settings(get_settings()))
+
+
+def _shadow_strategy_evaluator(db: TradingDatabase) -> ShadowStrategyEvaluator:
+    return ShadowStrategyEvaluator(db, config=shadow_config_from_settings(get_settings()))
 
 
 def _market_gate_review_analyzer(db: TradingDatabase) -> MarketGateReviewAnalyzer:
@@ -1503,6 +1508,145 @@ def rebuild_runtime_intraday_outcomes(
             persist=persist,
         )
         result["summary"] = db.strategy_decision_outcome_summary(trade_date=trade_date, horizon_sec=horizon_sec) if persist else {}
+        return result
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/shadow-strategies/policies")
+def runtime_shadow_strategy_policies() -> dict[str, Any]:
+    db = open_database()
+    try:
+        evaluator = _shadow_strategy_evaluator(db)
+        policies = [policy.to_dict() for policy in evaluator.load_policies(include_baseline=True)]
+        return {
+            "policies": policies,
+            "items": policies,
+            "enabled": bool(evaluator.config.enabled),
+            "observe_only": bool(evaluator.config.observe_only),
+            "allow_apply": False,
+            "disclaimer_ko": "Shadow 결과는 장중 진단용이며 실제 전략 설정에 자동 적용되지 않습니다.",
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/shadow-strategies/evaluations")
+def runtime_shadow_strategy_evaluations(
+    trade_date: Optional[str] = None,
+    policy_id: Optional[str] = None,
+    code: Optional[str] = None,
+    theme_name: Optional[str] = None,
+    baseline_gate_status: Optional[str] = None,
+    shadow_gate_status: Optional[str] = None,
+    change_type: Optional[str] = None,
+    changed_decision: Optional[bool] = None,
+    outcome_label: Optional[str] = None,
+    expected_risk: Optional[str] = None,
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_shadow_strategy_evaluations(
+            trade_date=trade_date,
+            policy_id=policy_id,
+            code=code,
+            theme_name=theme_name,
+            baseline_gate_status=baseline_gate_status,
+            shadow_gate_status=shadow_gate_status,
+            change_type=change_type,
+            changed_decision=changed_decision,
+            outcome_label=outcome_label,
+            expected_risk=expected_risk,
+            horizon_sec=horizon_sec,
+            limit=limit,
+            offset=offset,
+        )
+        total = db.shadow_strategy_evaluation_count(
+            trade_date=trade_date,
+            policy_id=policy_id,
+            code=code,
+            theme_name=theme_name,
+            baseline_gate_status=baseline_gate_status,
+            shadow_gate_status=shadow_gate_status,
+            change_type=change_type,
+            changed_decision=changed_decision,
+            outcome_label=outcome_label,
+            expected_risk=expected_risk,
+            horizon_sec=horizon_sec,
+        )
+        filters = {
+            "trade_date": trade_date or "",
+            "policy_id": policy_id or "",
+            "code": code or "",
+            "theme_name": theme_name or "",
+            "baseline_gate_status": baseline_gate_status or "",
+            "shadow_gate_status": shadow_gate_status or "",
+            "change_type": change_type or "",
+            "changed_decision": changed_decision,
+            "outcome_label": outcome_label or "",
+            "expected_risk": expected_risk or "",
+            "horizon_sec": horizon_sec,
+            "limit": limit,
+            "offset": offset,
+        }
+        return {
+            "items": items,
+            "pagination": _pagination_payload(limit=limit, offset=offset, count=len(items), total=total),
+            "filters": filters,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/shadow-strategies/summary")
+def runtime_shadow_strategy_summary(
+    trade_date: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+    policy_id: Optional[str] = None,
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        summary = db.shadow_strategy_summary(
+            trade_date=trade_date,
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+            policy_id=policy_id,
+        )
+        return {
+            "summary": summary,
+            "filters": {
+                "trade_date": trade_date or "",
+                "window_sec": window_sec,
+                "horizon_sec": horizon_sec,
+                "policy_id": policy_id or "",
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/shadow-strategies/rebuild")
+def rebuild_runtime_shadow_strategies(
+    trade_date: Optional[str] = None,
+    policy_id: Optional[str] = None,
+    force: bool = False,
+    limit: int = Query(10000, ge=1, le=100000),
+    persist: bool = True,
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        result = _shadow_strategy_evaluator(db).rebuild(
+            trade_date=trade_date,
+            policy_id=policy_id,
+            force=force,
+            limit=limit,
+            persist=persist,
+        )
+        result["summary"] = db.shadow_strategy_summary(trade_date=trade_date, policy_id=policy_id) if persist else {}
         return result
     finally:
         close_database(db)
@@ -5318,6 +5462,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     }
     decision_summary_payload = db.strategy_decision_summary(trade_date=datetime.now().date().isoformat())
     outcome_summary_payload = db.strategy_decision_outcome_summary(trade_date=datetime.now().date().isoformat())
+    shadow_summary_payload = db.shadow_strategy_summary(trade_date=datetime.now().date().isoformat())
     dry_run_performance_report = _performance_analyzer(db).build_report(limit=10000)
     threshold_ab_report = _threshold_ab_analyzer().build_report(dry_run_performance_report, limit=10, offset=0)
     dry_run_performance_payload = {
@@ -5350,6 +5495,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
             if item.get("dry_run_false_positive_type") or item.get("opportunity_loss_type")
         ][:10],
         "intraday_outcomes": outcome_summary_payload,
+        "shadow_strategies": shadow_summary_payload,
     }
     threshold_ab_payload = {
         "generated_at": threshold_ab_report.get("generated_at", ""),
@@ -5363,6 +5509,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     runtime_payload["dry_run_orders"] = dry_run_orders_payload
     runtime_payload["intraday_decisions"] = decision_summary_payload
     runtime_payload["intraday_outcomes"] = outcome_summary_payload
+    runtime_payload["shadow_strategies"] = shadow_summary_payload
     runtime_payload["dry_run_performance"] = dry_run_performance_payload
     runtime_payload["threshold_ab"] = threshold_ab_payload
     ops_alerts_payload = build_ops_alerts(
@@ -5385,6 +5532,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "dry_run_orders": dry_run_orders_payload,
         "intraday_decisions": decision_summary_payload,
         "intraday_outcomes": outcome_summary_payload,
+        "shadow_strategies": shadow_summary_payload,
         "dry_run_performance": dry_run_performance_payload,
         "threshold_ab": threshold_ab_payload,
         "ops_alerts": ops_alerts_payload,
