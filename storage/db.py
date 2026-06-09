@@ -860,6 +860,36 @@ class TradingDatabase:
                 exit_decision_id INTEGER,
                 details_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS strategy_decision_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                outcome_id TEXT UNIQUE NOT NULL,
+                decision_id TEXT NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                candidate_generation_seq INTEGER NOT NULL DEFAULT 0,
+                decision_at TEXT NOT NULL DEFAULT '',
+                evaluated_at TEXT NOT NULL DEFAULT '',
+                horizon_sec INTEGER NOT NULL DEFAULT 0,
+                price_at_decision REAL,
+                price_at_horizon REAL,
+                max_price_after_decision REAL,
+                min_price_after_decision REAL,
+                max_return_pct REAL,
+                max_drawdown_pct REAL,
+                current_return_pct REAL,
+                outcome_label TEXT NOT NULL DEFAULT '',
+                outcome_reason TEXT NOT NULL DEFAULT '',
+                label_confidence REAL,
+                data_status TEXT NOT NULL DEFAULT '',
+                data_quality_issues_json TEXT NOT NULL DEFAULT '[]',
+                source TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(decision_id, horizon_sec)
+            );
             CREATE TABLE IF NOT EXISTS live_sim_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 order_intent_id TEXT UNIQUE NOT NULL,
@@ -1216,6 +1246,18 @@ class TradingDatabase:
                 ON strategy_decision_events(reason_status, reason_family, trade_date);
             CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_order_intent
                 ON strategy_decision_events(order_intent_id);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_trade_date_eval
+                ON strategy_decision_outcomes(trade_date, evaluated_at, id);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_decision
+                ON strategy_decision_outcomes(decision_id, horizon_sec);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_code_eval
+                ON strategy_decision_outcomes(code, evaluated_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_label
+                ON strategy_decision_outcomes(outcome_label, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_horizon
+                ON strategy_decision_outcomes(horizon_sec, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_candidate_instance
+                ON strategy_decision_outcomes(candidate_instance_id);
             CREATE INDEX IF NOT EXISTS idx_live_sim_orders_trade_date
                 ON live_sim_orders(trade_date, created_at);
             CREATE INDEX IF NOT EXISTS idx_live_sim_orders_code_status
@@ -2054,6 +2096,288 @@ class TradingDatabase:
         ).fetchall()
         events = [_row_to_strategy_decision_event(row) for row in rows]
         return _strategy_decision_summary(events, trade_date=trade_date or "", window_sec=window_sec)
+
+    def list_strategy_decision_events_due_for_outcomes(
+        self,
+        *,
+        evaluated_at: str,
+        horizons_sec: Iterable[int],
+        trade_date: Optional[str] = None,
+        limit: int = 500,
+        force: bool = False,
+    ) -> list[dict]:
+        normalized_horizons = [max(1, int(horizon or 0)) for horizon in horizons_sec if int(horizon or 0) > 0]
+        if not normalized_horizons or not evaluated_at:
+            return []
+        rows: list[dict] = []
+        seen: set[tuple[str, int]] = set()
+        normalized_limit = max(1, int(limit or 500))
+        for horizon_sec in normalized_horizons:
+            if len(rows) >= normalized_limit:
+                break
+            clauses = [
+                "d.decision_id <> ''",
+                "d.decision_at <> ''",
+                "julianday(replace(substr(d.decision_at, 1, 19), 'T', ' ')) <= julianday(replace(substr(?, 1, 19), 'T', ' '), ?)",
+            ]
+            params: list[object] = [str(evaluated_at), f"-{horizon_sec} seconds"]
+            if trade_date:
+                clauses.append("d.trade_date = ?")
+                params.append(str(trade_date))
+            if not force:
+                clauses.append(
+                    """
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM strategy_decision_outcomes o
+                        WHERE o.decision_id = d.decision_id AND o.horizon_sec = ?
+                    )
+                    """
+                )
+                params.append(horizon_sec)
+            query_limit = max(1, normalized_limit - len(rows))
+            params.append(query_limit)
+            result_rows = self.conn.execute(
+                f"""
+                SELECT d.*
+                FROM strategy_decision_events d
+                WHERE {" AND ".join(clauses)}
+                ORDER BY d.decision_at ASC, d.id ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+            for row in result_rows:
+                event = _row_to_strategy_decision_event(row)
+                key = (str(event.get("decision_id") or ""), horizon_sec)
+                if key in seen:
+                    continue
+                seen.add(key)
+                event["horizon_sec"] = horizon_sec
+                rows.append(event)
+                if len(rows) >= normalized_limit:
+                    break
+        return rows
+
+    def save_strategy_decision_outcomes(self, outcomes: Iterable[dict], *, force: bool = False) -> int:
+        rows = [_strategy_decision_outcome_params(outcome) for outcome in outcomes if isinstance(outcome, dict)]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        if force:
+            sql = """
+                INSERT INTO strategy_decision_outcomes(
+                    outcome_id, decision_id, trade_date, code, candidate_id,
+                    candidate_instance_id, candidate_generation_seq, decision_at,
+                    evaluated_at, horizon_sec, price_at_decision, price_at_horizon,
+                    max_price_after_decision, min_price_after_decision, max_return_pct,
+                    max_drawdown_pct, current_return_pct, outcome_label, outcome_reason,
+                    label_confidence, data_status, data_quality_issues_json, source,
+                    details_json, created_at, updated_at
+                ) VALUES (
+                    :outcome_id, :decision_id, :trade_date, :code, :candidate_id,
+                    :candidate_instance_id, :candidate_generation_seq, :decision_at,
+                    :evaluated_at, :horizon_sec, :price_at_decision, :price_at_horizon,
+                    :max_price_after_decision, :min_price_after_decision, :max_return_pct,
+                    :max_drawdown_pct, :current_return_pct, :outcome_label, :outcome_reason,
+                    :label_confidence, :data_status, :data_quality_issues_json, :source,
+                    :details_json, :created_at, :updated_at
+                )
+                ON CONFLICT(decision_id, horizon_sec) DO UPDATE SET
+                    outcome_id=excluded.outcome_id,
+                    trade_date=excluded.trade_date,
+                    code=excluded.code,
+                    candidate_id=excluded.candidate_id,
+                    candidate_instance_id=excluded.candidate_instance_id,
+                    candidate_generation_seq=excluded.candidate_generation_seq,
+                    decision_at=excluded.decision_at,
+                    evaluated_at=excluded.evaluated_at,
+                    price_at_decision=excluded.price_at_decision,
+                    price_at_horizon=excluded.price_at_horizon,
+                    max_price_after_decision=excluded.max_price_after_decision,
+                    min_price_after_decision=excluded.min_price_after_decision,
+                    max_return_pct=excluded.max_return_pct,
+                    max_drawdown_pct=excluded.max_drawdown_pct,
+                    current_return_pct=excluded.current_return_pct,
+                    outcome_label=excluded.outcome_label,
+                    outcome_reason=excluded.outcome_reason,
+                    label_confidence=excluded.label_confidence,
+                    data_status=excluded.data_status,
+                    data_quality_issues_json=excluded.data_quality_issues_json,
+                    source=excluded.source,
+                    details_json=excluded.details_json,
+                    updated_at=excluded.updated_at
+                """
+        else:
+            sql = """
+                INSERT OR IGNORE INTO strategy_decision_outcomes(
+                    outcome_id, decision_id, trade_date, code, candidate_id,
+                    candidate_instance_id, candidate_generation_seq, decision_at,
+                    evaluated_at, horizon_sec, price_at_decision, price_at_horizon,
+                    max_price_after_decision, min_price_after_decision, max_return_pct,
+                    max_drawdown_pct, current_return_pct, outcome_label, outcome_reason,
+                    label_confidence, data_status, data_quality_issues_json, source,
+                    details_json, created_at, updated_at
+                ) VALUES (
+                    :outcome_id, :decision_id, :trade_date, :code, :candidate_id,
+                    :candidate_instance_id, :candidate_generation_seq, :decision_at,
+                    :evaluated_at, :horizon_sec, :price_at_decision, :price_at_horizon,
+                    :max_price_after_decision, :min_price_after_decision, :max_return_pct,
+                    :max_drawdown_pct, :current_return_pct, :outcome_label, :outcome_reason,
+                    :label_confidence, :data_status, :data_quality_issues_json, :source,
+                    :details_json, :created_at, :updated_at
+                )
+                """
+        with self.conn:
+            self.conn.executemany(sql, rows)
+        return int(self.conn.total_changes - before)
+
+    def list_strategy_decision_outcomes(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        outcome_label: Optional[str] = None,
+        action_type: Optional[str] = None,
+        gate_status: Optional[str] = None,
+        reason_family: Optional[str] = None,
+        reason_code: Optional[str] = None,
+        horizon_sec: Optional[int] = None,
+        min_max_return_pct: Optional[float] = None,
+        max_drawdown_pct: Optional[float] = None,
+        window_sec: Optional[int] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses, params = _strategy_decision_outcome_filters(
+            trade_date=trade_date,
+            code=code,
+            outcome_label=outcome_label,
+            action_type=action_type,
+            gate_status=gate_status,
+            reason_family=reason_family,
+            reason_code=reason_code,
+            horizon_sec=horizon_sec,
+            min_max_return_pct=min_max_return_pct,
+            max_drawdown_pct=max_drawdown_pct,
+            window_sec=window_sec,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                o.*,
+                d.name AS decision_name,
+                d.theme_name AS decision_theme_name,
+                d.strategy_name AS decision_strategy_name,
+                d.gate_status AS decision_gate_status,
+                d.gate_reason AS decision_gate_reason,
+                d.reason_status AS decision_reason_status,
+                d.reason_family AS decision_reason_family,
+                d.reason_codes_json AS decision_reason_codes_json,
+                d.action_type AS decision_action_type,
+                d.action_result AS decision_action_result,
+                d.order_intent_id AS decision_order_intent_id,
+                d.virtual_order_id AS decision_virtual_order_id,
+                d.virtual_position_id AS decision_virtual_position_id,
+                d.exit_decision_id AS decision_exit_decision_id
+            FROM strategy_decision_outcomes o
+            LEFT JOIN strategy_decision_events d ON d.decision_id = o.decision_id
+            {where}
+            ORDER BY o.evaluated_at DESC, o.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_strategy_decision_outcome(row) for row in rows]
+
+    def strategy_decision_outcome_count(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        outcome_label: Optional[str] = None,
+        action_type: Optional[str] = None,
+        gate_status: Optional[str] = None,
+        reason_family: Optional[str] = None,
+        reason_code: Optional[str] = None,
+        horizon_sec: Optional[int] = None,
+        min_max_return_pct: Optional[float] = None,
+        max_drawdown_pct: Optional[float] = None,
+        window_sec: Optional[int] = None,
+    ) -> int:
+        clauses, params = _strategy_decision_outcome_filters(
+            trade_date=trade_date,
+            code=code,
+            outcome_label=outcome_label,
+            action_type=action_type,
+            gate_status=gate_status,
+            reason_family=reason_family,
+            reason_code=reason_code,
+            horizon_sec=horizon_sec,
+            min_max_return_pct=min_max_return_pct,
+            max_drawdown_pct=max_drawdown_pct,
+            window_sec=window_sec,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM strategy_decision_outcomes o
+            LEFT JOIN strategy_decision_events d ON d.decision_id = o.decision_id
+            {where}
+            """,
+            tuple(params),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+
+    def get_strategy_decision_outcome(self, decision_id: str, horizon_sec: int) -> Optional[dict]:
+        row = self.conn.execute(
+            """
+            SELECT
+                o.*,
+                d.name AS decision_name,
+                d.theme_name AS decision_theme_name,
+                d.strategy_name AS decision_strategy_name,
+                d.gate_status AS decision_gate_status,
+                d.gate_reason AS decision_gate_reason,
+                d.reason_status AS decision_reason_status,
+                d.reason_family AS decision_reason_family,
+                d.reason_codes_json AS decision_reason_codes_json,
+                d.action_type AS decision_action_type,
+                d.action_result AS decision_action_result,
+                d.order_intent_id AS decision_order_intent_id,
+                d.virtual_order_id AS decision_virtual_order_id,
+                d.virtual_position_id AS decision_virtual_position_id,
+                d.exit_decision_id AS decision_exit_decision_id
+            FROM strategy_decision_outcomes o
+            LEFT JOIN strategy_decision_events d ON d.decision_id = o.decision_id
+            WHERE o.decision_id = ? AND o.horizon_sec = ?
+            """,
+            (str(decision_id or ""), max(1, int(horizon_sec or 1))),
+        ).fetchone()
+        return _row_to_strategy_decision_outcome(row) if row else None
+
+    def strategy_decision_outcome_summary(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        window_sec: Optional[int] = None,
+        horizon_sec: Optional[int] = None,
+    ) -> dict:
+        items = self.list_strategy_decision_outcomes(
+            trade_date=trade_date,
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+            limit=10000,
+            offset=0,
+        )
+        return _strategy_decision_outcome_summary(
+            items,
+            trade_date=trade_date or "",
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+        )
 
     def save_live_sim_order(self, record: dict) -> dict:
         payload = _live_sim_order_params(record)
@@ -5946,6 +6270,118 @@ def _row_to_strategy_decision_event(row: sqlite3.Row) -> dict:
     return data
 
 
+def _strategy_decision_outcome_params(outcome: dict) -> dict:
+    now = datetime.now().isoformat(timespec="seconds")
+    decision_id = str(outcome.get("decision_id") or "").strip()
+    horizon_sec = max(0, int(outcome.get("horizon_sec") or 0))
+    outcome_id = str(outcome.get("outcome_id") or f"outcome:{decision_id}:{horizon_sec}").strip()
+    details = _sanitize_decision_details(outcome.get("details", outcome.get("details_json", {})))
+    return {
+        "outcome_id": outcome_id,
+        "decision_id": decision_id,
+        "trade_date": str(outcome.get("trade_date") or ""),
+        "code": _clean_stock_code(outcome.get("code")) or str(outcome.get("code") or ""),
+        "candidate_id": _nullable_int(outcome.get("candidate_id")),
+        "candidate_instance_id": str(outcome.get("candidate_instance_id") or ""),
+        "candidate_generation_seq": int(outcome.get("candidate_generation_seq") or 0),
+        "decision_at": str(outcome.get("decision_at") or ""),
+        "evaluated_at": str(outcome.get("evaluated_at") or now),
+        "horizon_sec": horizon_sec,
+        "price_at_decision": _nullable_float(outcome.get("price_at_decision")),
+        "price_at_horizon": _nullable_float(outcome.get("price_at_horizon")),
+        "max_price_after_decision": _nullable_float(outcome.get("max_price_after_decision")),
+        "min_price_after_decision": _nullable_float(outcome.get("min_price_after_decision")),
+        "max_return_pct": _nullable_float(outcome.get("max_return_pct")),
+        "max_drawdown_pct": _nullable_float(outcome.get("max_drawdown_pct")),
+        "current_return_pct": _nullable_float(outcome.get("current_return_pct")),
+        "outcome_label": str(outcome.get("outcome_label") or ""),
+        "outcome_reason": str(outcome.get("outcome_reason") or ""),
+        "label_confidence": _nullable_float(outcome.get("label_confidence")),
+        "data_status": str(outcome.get("data_status") or ""),
+        "data_quality_issues_json": _json_list(outcome.get("data_quality_issues", outcome.get("data_quality_issues_json", []))),
+        "source": str(outcome.get("source") or ""),
+        "details_json": _json_payload(details),
+        "created_at": str(outcome.get("created_at") or now),
+        "updated_at": str(outcome.get("updated_at") or now),
+    }
+
+
+def _strategy_decision_outcome_filters(
+    *,
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    outcome_label: Optional[str] = None,
+    action_type: Optional[str] = None,
+    gate_status: Optional[str] = None,
+    reason_family: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    horizon_sec: Optional[int] = None,
+    min_max_return_pct: Optional[float] = None,
+    max_drawdown_pct: Optional[float] = None,
+    window_sec: Optional[int] = None,
+) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if trade_date:
+        clauses.append("o.trade_date = ?")
+        params.append(str(trade_date))
+    if code:
+        clauses.append("o.code = ?")
+        params.append(_clean_stock_code(code) or str(code))
+    if outcome_label:
+        clauses.append("o.outcome_label = ?")
+        params.append(str(outcome_label).upper())
+    if action_type:
+        clauses.append("d.action_type = ?")
+        params.append(str(action_type).upper())
+    if gate_status:
+        clauses.append("d.gate_status = ?")
+        params.append(str(gate_status).upper())
+    if reason_family:
+        clauses.append("d.reason_family = ?")
+        params.append(str(reason_family))
+    if reason_code:
+        clauses.append("d.reason_codes_json LIKE ?")
+        params.append(f"%{str(reason_code)}%")
+    if horizon_sec is not None:
+        clauses.append("o.horizon_sec = ?")
+        params.append(max(1, int(horizon_sec or 1)))
+    if min_max_return_pct is not None:
+        clauses.append("o.max_return_pct >= ?")
+        params.append(float(min_max_return_pct))
+    if max_drawdown_pct is not None:
+        clauses.append("o.max_drawdown_pct <= ?")
+        params.append(float(max_drawdown_pct))
+    if window_sec is not None:
+        clauses.append("julianday(replace(substr(o.evaluated_at, 1, 19), 'T', ' ')) >= julianday('now', ?)")
+        params.append(f"-{max(1, int(window_sec or 1))} seconds")
+    return clauses, params
+
+
+def _row_to_strategy_decision_outcome(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["data_quality_issues"] = _safe_json_loads(data.get("data_quality_issues_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    data["name"] = data.pop("decision_name", "") if "decision_name" in data else ""
+    data["theme_name"] = data.pop("decision_theme_name", "") if "decision_theme_name" in data else ""
+    data["strategy_name"] = data.pop("decision_strategy_name", "") if "decision_strategy_name" in data else ""
+    data["gate_status"] = data.pop("decision_gate_status", "") if "decision_gate_status" in data else ""
+    data["gate_reason"] = data.pop("decision_gate_reason", "") if "decision_gate_reason" in data else ""
+    data["reason_status"] = data.pop("decision_reason_status", "") if "decision_reason_status" in data else ""
+    data["reason_family"] = data.pop("decision_reason_family", "") if "decision_reason_family" in data else ""
+    reason_codes_json = data.pop("decision_reason_codes_json", "[]") if "decision_reason_codes_json" in data else "[]"
+    data["reason_codes"] = _safe_json_loads(reason_codes_json, [])
+    data["action_type"] = data.pop("decision_action_type", "") if "decision_action_type" in data else ""
+    data["action_result"] = data.pop("decision_action_result", "") if "decision_action_result" in data else ""
+    data["order_intent_id"] = data.pop("decision_order_intent_id", "") if "decision_order_intent_id" in data else ""
+    data["virtual_order_id"] = data.pop("decision_virtual_order_id", None) if "decision_virtual_order_id" in data else None
+    data["virtual_position_id"] = (
+        data.pop("decision_virtual_position_id", None) if "decision_virtual_position_id" in data else None
+    )
+    data["exit_decision_id"] = data.pop("decision_exit_decision_id", None) if "decision_exit_decision_id" in data else None
+    return data
+
+
 def _strategy_decision_summary(events: list[dict], *, trade_date: str = "", window_sec: Optional[int] = None) -> dict:
     def key(event: dict) -> str:
         return str(
@@ -6026,6 +6462,75 @@ def _strategy_decision_summary(events: list[dict], *, trade_date: str = "", wind
         "ready_without_order_count": len(ready_keys - order_any_keys),
         "order_rejected_count": order_rejected_count,
         "exit_decision_count": exit_decision_count,
+    }
+
+
+def _strategy_decision_outcome_summary(
+    items: list[dict],
+    *,
+    trade_date: str = "",
+    window_sec: Optional[int] = None,
+    horizon_sec: Optional[int] = None,
+) -> dict:
+    by_label: Counter[str] = Counter()
+    by_action: Counter[str] = Counter()
+    by_gate: Counter[str] = Counter()
+    by_reason: Counter[str] = Counter()
+    data_quality: Counter[str] = Counter()
+    opportunity_loss_reasons: Counter[str] = Counter()
+    false_positive_reasons: Counter[str] = Counter()
+    effective_risk_reasons: Counter[str] = Counter()
+    decision_ids: set[str] = set()
+    ready_count = 0
+    insufficient_count = 0
+    for item in items:
+        decision_id = str(item.get("decision_id") or "")
+        if decision_id:
+            decision_ids.add(decision_id)
+        label = str(item.get("outcome_label") or "UNKNOWN")
+        by_label[label] += 1
+        action_type = str(item.get("action_type") or "")
+        gate_status = str(item.get("gate_status") or "")
+        if action_type:
+            by_action[action_type] += 1
+        if gate_status:
+            by_gate[gate_status] += 1
+        if gate_status == "READY" or action_type in {"READY", "ENTRY_ORDER_INTENT"}:
+            ready_count += 1
+        if label == "INSUFFICIENT_OUTCOME_DATA" or str(item.get("data_status") or "").upper() == "INSUFFICIENT":
+            insufficient_count += 1
+        reason_codes = [str(reason) for reason in item.get("reason_codes") or [] if str(reason)]
+        by_reason.update(reason_codes)
+        data_quality.update(str(issue) for issue in item.get("data_quality_issues") or [] if str(issue))
+        if "OPPORTUNITY_LOSS" in label:
+            opportunity_loss_reasons.update(reason_codes or [str(item.get("gate_reason") or "UNKNOWN")])
+        if label in {"EARLY_FALSE_POSITIVE", "ENTRY_TOO_EARLY_CANDIDATE"}:
+            false_positive_reasons.update(reason_codes or [str(item.get("gate_reason") or "UNKNOWN")])
+        if label == "RISK_BLOCK_EFFECTIVE":
+            effective_risk_reasons.update(reason_codes or [str(item.get("gate_reason") or "UNKNOWN")])
+    return {
+        "trade_date": trade_date,
+        "window_sec": window_sec,
+        "horizon_sec": horizon_sec,
+        "total_decisions": len(decision_ids),
+        "outcome_count": len(items),
+        "labeled_count": max(0, len(items) - insufficient_count),
+        "insufficient_count": insufficient_count,
+        "by_label": dict(by_label),
+        "by_action_type": dict(by_action),
+        "by_gate_status": dict(by_gate),
+        "by_reason_code": dict(by_reason),
+        "top_opportunity_loss_reasons": _counter_rows(opportunity_loss_reasons),
+        "top_false_positive_reasons": _counter_rows(false_positive_reasons),
+        "top_effective_risk_blocks": _counter_rows(effective_risk_reasons),
+        "ready_count": ready_count,
+        "early_true_positive_count": by_label.get("EARLY_TRUE_POSITIVE", 0),
+        "early_false_positive_count": by_label.get("EARLY_FALSE_POSITIVE", 0),
+        "wait_block_opportunity_loss_count": by_label.get("EARLY_OPPORTUNITY_LOSS", 0)
+        + by_label.get("RISK_BLOCK_OPPORTUNITY_LOSS", 0),
+        "exit_too_late_count": by_label.get("EXIT_TOO_LATE_CANDIDATE", 0),
+        "exit_too_early_count": by_label.get("EXIT_TOO_EARLY_CANDIDATE", 0),
+        "data_quality_issues": _counter_rows(data_quality),
     }
 
 

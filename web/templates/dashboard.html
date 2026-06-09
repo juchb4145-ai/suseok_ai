@@ -357,6 +357,50 @@
 
         <section class="band">
           <div class="section-head">
+            <h2>Intraday Outcome Label</h2>
+            <span id="outcome-label-status" class="counter">0</span>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>Labeled</span><strong id="outcome-labeled-count">0</strong></div>
+            <div><span>Insufficient</span><strong id="outcome-insufficient-count">0</strong></div>
+            <div><span>EARLY_TRUE_POSITIVE</span><strong id="outcome-early-tp-count">0</strong></div>
+            <div><span>EARLY_FALSE_POSITIVE</span><strong id="outcome-early-fp-count">0</strong></div>
+            <div><span>OPPORTUNITY_LOSS</span><strong id="outcome-opportunity-loss-count">0</strong></div>
+            <div><span>RISK_BLOCK_EFFECTIVE</span><strong id="outcome-risk-effective-count">0</strong></div>
+            <div><span>EXIT_TOO_LATE</span><strong id="outcome-exit-late-count">0</strong></div>
+            <div><span>EXIT_TOO_EARLY</span><strong id="outcome-exit-early-count">0</strong></div>
+          </div>
+          <div id="outcome-label-lines" class="inline-log"></div>
+          <div id="outcome-quality-lines" class="inline-log"></div>
+        </section>
+
+        <section class="band table-panel" data-table-section="intradayOutcomes">
+          <div class="section-head">
+            <h2>Outcome Label Timeline</h2>
+            <span id="intradayOutcomes-status" class="counter">대기</span>
+          </div>
+          <div class="filter-grid">
+            <label>거래일<input data-table="intradayOutcomes" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>종목코드<input data-table="intradayOutcomes" data-filter="code" /></label>
+            <label>Label<input data-table="intradayOutcomes" data-filter="outcome_label" /></label>
+            <label>Action<input data-table="intradayOutcomes" data-filter="action_type" /></label>
+            <label>Gate<input data-table="intradayOutcomes" data-filter="gate_status" /></label>
+            <label>Reason<input data-table="intradayOutcomes" data-filter="reason_code" /></label>
+            <label>Horizon<input data-table="intradayOutcomes" data-filter="horizon_sec" /></label>
+            <label>Min Max Return<input data-table="intradayOutcomes" data-filter="min_max_return_pct" /></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="intradayOutcomes"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>평가시각</th><th>종목</th><th>Gate</th><th>Action</th><th>Horizon</th><th>Max</th><th>MDD</th><th>Current</th><th>Label</th><th>Reason</th></tr></thead>
+              <tbody id="intradayOutcomes-body"></tbody>
+            </table>
+          </div>
+          <div id="intradayOutcomes-pagination" class="pagination"></div>
+        </section>
+
+        <section class="band">
+          <div class="section-head">
             <h2>Runtime DRY_RUN 주문 의도</h2>
             <span id="dryrun-order-policy" class="counter">disabled</span>
           </div>

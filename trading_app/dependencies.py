@@ -78,6 +78,15 @@ class CoreSettings:
     threshold_ab_confidence_min: float = 0.5
     threshold_ab_export_root: Path = PROJECT_ROOT / "reports" / "dry_run_threshold_ab"
     threshold_ab_enable_apply: bool = False
+    intraday_outcome_enabled: bool = True
+    intraday_outcome_horizons_sec: str = "60,180,300,600,1200"
+    intraday_outcome_min_price_samples: int = 2
+    intraday_outcome_tp_threshold_pct: float = 2.0
+    intraday_outcome_fn_threshold_pct: float = 2.5
+    intraday_outcome_fp_drawdown_pct: float = -1.5
+    intraday_outcome_fp_return_pct: float = -1.0
+    intraday_outcome_exit_giveback_pct: float = -2.0
+    intraday_outcome_max_batch_size: int = 500
 
     @property
     def live_order_enabled(self) -> bool:
@@ -161,6 +170,15 @@ def get_settings() -> CoreSettings:
             os.environ.get("TRADING_THRESHOLD_AB_EXPORT_ROOT", str(PROJECT_ROOT / "reports" / "dry_run_threshold_ab"))
         ).expanduser(),
         threshold_ab_enable_apply=_bool_env("TRADING_THRESHOLD_AB_ENABLE_APPLY", False),
+        intraday_outcome_enabled=_bool_env("TRADING_INTRADAY_OUTCOME_ENABLED", True),
+        intraday_outcome_horizons_sec=os.environ.get("TRADING_INTRADAY_OUTCOME_HORIZONS_SEC", "60,180,300,600,1200"),
+        intraday_outcome_min_price_samples=_int_env("TRADING_INTRADAY_OUTCOME_MIN_PRICE_SAMPLES", 2),
+        intraday_outcome_tp_threshold_pct=_float_env("TRADING_INTRADAY_OUTCOME_TP_THRESHOLD_PCT", 2.0),
+        intraday_outcome_fn_threshold_pct=_float_env("TRADING_INTRADAY_OUTCOME_FN_THRESHOLD_PCT", 2.5),
+        intraday_outcome_fp_drawdown_pct=_float_env("TRADING_INTRADAY_OUTCOME_FP_DRAWDOWN_PCT", -1.5),
+        intraday_outcome_fp_return_pct=_float_env("TRADING_INTRADAY_OUTCOME_FP_RETURN_PCT", -1.0),
+        intraday_outcome_exit_giveback_pct=_float_env("TRADING_INTRADAY_OUTCOME_EXIT_GIVEBACK_PCT", -2.0),
+        intraday_outcome_max_batch_size=_int_env("TRADING_INTRADAY_OUTCOME_MAX_BATCH_SIZE", 500),
     )
 
 

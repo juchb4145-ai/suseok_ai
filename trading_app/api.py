@@ -60,6 +60,7 @@ from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThe
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
 from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, config_from_settings
 from trading_app.dry_run_threshold_ab import DryRunThresholdABAnalyzer, config_from_settings as threshold_ab_config_from_settings
+from trading_app.intraday_outcomes import IntradayOutcomeLabeler, config_from_settings as outcome_config_from_settings
 from trading_app.market_gate_review import MarketGateReviewAnalyzer
 from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
@@ -514,6 +515,10 @@ def _order_service() -> OrderEnqueueService:
 
 def _performance_analyzer(db: TradingDatabase) -> DryRunPerformanceAnalyzer:
     return DryRunPerformanceAnalyzer(db, config=config_from_settings(get_settings()))
+
+
+def _intraday_outcome_labeler(db: TradingDatabase) -> IntradayOutcomeLabeler:
+    return IntradayOutcomeLabeler(db, config=outcome_config_from_settings(get_settings()))
 
 
 def _market_gate_review_analyzer(db: TradingDatabase) -> MarketGateReviewAnalyzer:
@@ -1389,6 +1394,116 @@ def runtime_intraday_decision_summary(
     try:
         summary = db.strategy_decision_summary(trade_date=trade_date, window_sec=window_sec)
         return {"summary": summary, "filters": {"trade_date": trade_date or "", "window_sec": window_sec}}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/outcomes/intraday")
+def runtime_intraday_outcomes(
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    outcome_label: Optional[str] = None,
+    action_type: Optional[str] = None,
+    gate_status: Optional[str] = None,
+    reason_family: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+    min_max_return_pct: Optional[float] = None,
+    max_drawdown_pct: Optional[float] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_strategy_decision_outcomes(
+            trade_date=trade_date,
+            code=code,
+            outcome_label=outcome_label,
+            action_type=action_type,
+            gate_status=gate_status,
+            reason_family=reason_family,
+            reason_code=reason_code,
+            horizon_sec=horizon_sec,
+            min_max_return_pct=min_max_return_pct,
+            max_drawdown_pct=max_drawdown_pct,
+            limit=limit,
+            offset=offset,
+        )
+        total = db.strategy_decision_outcome_count(
+            trade_date=trade_date,
+            code=code,
+            outcome_label=outcome_label,
+            action_type=action_type,
+            gate_status=gate_status,
+            reason_family=reason_family,
+            reason_code=reason_code,
+            horizon_sec=horizon_sec,
+            min_max_return_pct=min_max_return_pct,
+            max_drawdown_pct=max_drawdown_pct,
+        )
+        filters = {
+            "trade_date": trade_date or "",
+            "code": code or "",
+            "outcome_label": outcome_label or "",
+            "action_type": action_type or "",
+            "gate_status": gate_status or "",
+            "reason_family": reason_family or "",
+            "reason_code": reason_code or "",
+            "horizon_sec": horizon_sec,
+            "min_max_return_pct": min_max_return_pct,
+            "max_drawdown_pct": max_drawdown_pct,
+            "limit": limit,
+            "offset": offset,
+        }
+        return {
+            "items": items,
+            "pagination": _pagination_payload(limit=limit, offset=offset, count=len(items), total=total),
+            "filters": filters,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/outcomes/intraday/summary")
+def runtime_intraday_outcome_summary(
+    trade_date: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        summary = db.strategy_decision_outcome_summary(
+            trade_date=trade_date,
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+        )
+        return {
+            "summary": summary,
+            "filters": {"trade_date": trade_date or "", "window_sec": window_sec, "horizon_sec": horizon_sec},
+        }
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/outcomes/intraday/rebuild")
+def rebuild_runtime_intraday_outcomes(
+    trade_date: Optional[str] = None,
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+    force: bool = False,
+    limit: int = Query(10000, ge=1, le=100000),
+    persist: bool = True,
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        result = _intraday_outcome_labeler(db).rebuild(
+            trade_date=trade_date,
+            horizon_sec=horizon_sec,
+            force=force,
+            limit=limit,
+            persist=persist,
+        )
+        result["summary"] = db.strategy_decision_outcome_summary(trade_date=trade_date, horizon_sec=horizon_sec) if persist else {}
+        return result
     finally:
         close_database(db)
 
@@ -5202,6 +5317,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=20),
     }
     decision_summary_payload = db.strategy_decision_summary(trade_date=datetime.now().date().isoformat())
+    outcome_summary_payload = db.strategy_decision_outcome_summary(trade_date=datetime.now().date().isoformat())
     dry_run_performance_report = _performance_analyzer(db).build_report(limit=10000)
     threshold_ab_report = _threshold_ab_analyzer().build_report(dry_run_performance_report, limit=10, offset=0)
     dry_run_performance_payload = {
@@ -5233,6 +5349,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
             for item in dry_run_performance_report.get("items", [])
             if item.get("dry_run_false_positive_type") or item.get("opportunity_loss_type")
         ][:10],
+        "intraday_outcomes": outcome_summary_payload,
     }
     threshold_ab_payload = {
         "generated_at": threshold_ab_report.get("generated_at", ""),
@@ -5245,6 +5362,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     }
     runtime_payload["dry_run_orders"] = dry_run_orders_payload
     runtime_payload["intraday_decisions"] = decision_summary_payload
+    runtime_payload["intraday_outcomes"] = outcome_summary_payload
     runtime_payload["dry_run_performance"] = dry_run_performance_payload
     runtime_payload["threshold_ab"] = threshold_ab_payload
     ops_alerts_payload = build_ops_alerts(
@@ -5266,6 +5384,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "runtime": runtime_payload,
         "dry_run_orders": dry_run_orders_payload,
         "intraday_decisions": decision_summary_payload,
+        "intraday_outcomes": outcome_summary_payload,
         "dry_run_performance": dry_run_performance_payload,
         "threshold_ab": threshold_ab_payload,
         "ops_alerts": ops_alerts_payload,

@@ -97,6 +97,26 @@ const tableConfigs = {
       (item) => compactId(item.order_intent_id || item.virtual_order_id || item.virtual_position_id || item.exit_decision_id || item.candidate_instance_id || "-"),
     ],
   },
+  intradayOutcomes: {
+    endpoint: "/api/runtime/outcomes/intraday",
+    bodyId: "intradayOutcomes-body",
+    statusId: "intradayOutcomes-status",
+    paginationId: "intradayOutcomes-pagination",
+    defaultLimit: 50,
+    detailTitle: (item) => `Intraday Outcome ${item.outcome_id || ""}`,
+    columns: [
+      (item) => textCell(formatDateTime(item.evaluated_at || item.decision_at)),
+      (item) => textCell(`${item.code || "-"} ${item.name || ""}`.trim()),
+      (item) => badge(item.gate_status || "-"),
+      (item) => textCell(item.action_type || "-"),
+      (item) => textCell(`${item.horizon_sec || 0}s`),
+      (item) => textCell(formatPercentValue(item.max_return_pct)),
+      (item) => textCell(formatPercentValue(item.max_drawdown_pct)),
+      (item) => textCell(formatPercentValue(item.current_return_pct)),
+      (item) => badge(item.outcome_label || "-"),
+      (item) => textCell((item.reason_codes || []).slice(0, 3).join(", ") || item.outcome_reason || "-"),
+    ],
+  },
   dryRunPerformance: {
     endpoint: "/api/runtime/performance/dry-run",
     bodyId: "dryRunPerformance-body",
@@ -770,6 +790,7 @@ function render(snapshot) {
   const runtime = snapshot.runtime || {};
   const dryRunOrders = snapshot.dry_run_orders || runtime.dry_run_orders || { summary: {} };
   const intradayDecisions = snapshot.intraday_decisions || runtime.intraday_decisions || { funnel: {} };
+  const intradayOutcomes = snapshot.intraday_outcomes || runtime.intraday_outcomes || {};
   const dryRunPerformance = snapshot.dry_run_performance || runtime.dry_run_performance || {};
   const thresholdAB = snapshot.threshold_ab || runtime.threshold_ab || { summary: {}, recommendations: [] };
   const candidates = snapshot.candidates || { summary: {}, items: [] };
@@ -876,6 +897,22 @@ function render(snapshot) {
     ...((intradayDecisions.major_reason_distribution || []).map((item) => ({ ...item, reason: `major:${item.reason}` }))),
     ...((intradayDecisions.top_data_quality_issues || []).map((item) => ({ ...item, reason: `data:${item.reason}` }))),
   ], "reason", "데이터 품질 이슈가 없습니다");
+
+  text("outcome-labeled-count", intradayOutcomes.labeled_count || 0);
+  text("outcome-insufficient-count", intradayOutcomes.insufficient_count || 0);
+  text("outcome-early-tp-count", intradayOutcomes.early_true_positive_count || 0);
+  text("outcome-early-fp-count", intradayOutcomes.early_false_positive_count || 0);
+  text("outcome-opportunity-loss-count", intradayOutcomes.wait_block_opportunity_loss_count || 0);
+  text("outcome-risk-effective-count", (intradayOutcomes.by_label || {}).RISK_BLOCK_EFFECTIVE || 0);
+  text("outcome-exit-late-count", intradayOutcomes.exit_too_late_count || 0);
+  text("outcome-exit-early-count", intradayOutcomes.exit_too_early_count || 0);
+  renderInlineCounts(
+    "outcome-label-lines",
+    Object.entries(intradayOutcomes.by_label || {}).map(([label, count]) => ({ label, count })),
+    "label",
+    "Outcome label이 없습니다"
+  );
+  renderInlineCounts("outcome-quality-lines", intradayOutcomes.data_quality_issues || [], "reason", "Outcome data quality 이슈가 없습니다");
 
   const drySummary = dryRunOrders.summary || {};
   text("dryrun-order-policy", runtime.dry_run_order_sink_enabled ? runtime.dry_run_order_policy || "enabled" : runtime.dry_run_order_policy || "disabled");
