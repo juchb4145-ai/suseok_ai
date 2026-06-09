@@ -926,6 +926,42 @@ class TradingDatabase:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(decision_id, policy_id)
             );
+            CREATE TABLE IF NOT EXISTS strategy_replay_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                replay_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT '',
+                source_bundle_path TEXT NOT NULL DEFAULT '',
+                replay_db_path TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL DEFAULT '',
+                finished_at TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                runtime_config_hash TEXT NOT NULL DEFAULT '',
+                strategy_version TEXT NOT NULL DEFAULT '',
+                processed_tick_count INTEGER NOT NULL DEFAULT 0,
+                processed_candidate_event_count INTEGER NOT NULL DEFAULT 0,
+                processed_theme_snapshot_count INTEGER NOT NULL DEFAULT 0,
+                cycle_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS strategy_replay_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id TEXT UNIQUE NOT NULL,
+                replay_id TEXT NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT '',
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                funnel_json TEXT NOT NULL DEFAULT '{}',
+                outcome_summary_json TEXT NOT NULL DEFAULT '{}',
+                shadow_summary_json TEXT NOT NULL DEFAULT '{}',
+                diff_summary_json TEXT NOT NULL DEFAULT '{}',
+                recommendations_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS live_sim_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 order_intent_id TEXT UNIQUE NOT NULL,
@@ -1306,6 +1342,14 @@ class TradingDatabase:
                 ON shadow_strategy_evaluations(change_type, changed_decision, trade_date);
             CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_shadow_gate
                 ON shadow_strategy_evaluations(shadow_gate_status, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_replay_runs_trade_date
+                ON strategy_replay_runs(trade_date, started_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_replay_runs_status
+                ON strategy_replay_runs(status, mode);
+            CREATE INDEX IF NOT EXISTS idx_strategy_replay_reports_replay
+                ON strategy_replay_reports(replay_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_replay_reports_trade_date
+                ON strategy_replay_reports(trade_date, mode, created_at);
             CREATE INDEX IF NOT EXISTS idx_live_sim_orders_trade_date
                 ON live_sim_orders(trade_date, created_at);
             CREATE INDEX IF NOT EXISTS idx_live_sim_orders_code_status
@@ -2677,6 +2721,197 @@ class TradingDatabase:
             horizon_sec=horizon_sec,
             policy_id=policy_id or "",
         )
+
+    def save_strategy_replay_run(self, run: dict) -> dict:
+        replay_id = str(run.get("replay_id") or "").strip()
+        if not replay_id:
+            raise ValueError("replay_id is required")
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO strategy_replay_runs(
+                    replay_id, trade_date, mode, source_bundle_path, replay_db_path,
+                    started_at, finished_at, status, runtime_config_hash, strategy_version,
+                    processed_tick_count, processed_candidate_event_count,
+                    processed_theme_snapshot_count, cycle_count, error, warnings_json,
+                    metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(replay_id) DO UPDATE SET
+                    trade_date=excluded.trade_date,
+                    mode=excluded.mode,
+                    source_bundle_path=excluded.source_bundle_path,
+                    replay_db_path=excluded.replay_db_path,
+                    started_at=excluded.started_at,
+                    finished_at=excluded.finished_at,
+                    status=excluded.status,
+                    runtime_config_hash=excluded.runtime_config_hash,
+                    strategy_version=excluded.strategy_version,
+                    processed_tick_count=excluded.processed_tick_count,
+                    processed_candidate_event_count=excluded.processed_candidate_event_count,
+                    processed_theme_snapshot_count=excluded.processed_theme_snapshot_count,
+                    cycle_count=excluded.cycle_count,
+                    error=excluded.error,
+                    warnings_json=excluded.warnings_json,
+                    metadata_json=excluded.metadata_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    replay_id,
+                    str(run.get("trade_date") or ""),
+                    str(run.get("mode") or ""),
+                    str(run.get("source_bundle_path") or ""),
+                    str(run.get("replay_db_path") or ""),
+                    str(run.get("started_at") or now),
+                    str(run.get("finished_at") or ""),
+                    str(run.get("status") or ""),
+                    str(run.get("runtime_config_hash") or ""),
+                    str(run.get("strategy_version") or ""),
+                    int(run.get("processed_tick_count") or 0),
+                    int(run.get("processed_candidate_event_count") or 0),
+                    int(run.get("processed_theme_snapshot_count") or 0),
+                    int(run.get("cycle_count") or 0),
+                    str(run.get("error") or ""),
+                    _json_list(run.get("warnings_json", run.get("warnings", []))),
+                    _json_payload(run.get("metadata_json", run.get("metadata", {}))),
+                    str(run.get("created_at") or now),
+                    str(run.get("updated_at") or now),
+                ),
+            )
+        return self.get_strategy_replay_run(replay_id) or {"replay_id": replay_id}
+
+    def list_strategy_replay_runs(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        mode: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if mode:
+            clauses.append("mode = ?")
+            params.append(str(mode))
+        if status:
+            clauses.append("status = ?")
+            params.append(str(status))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_replay_runs
+            {where}
+            ORDER BY started_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 50)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_strategy_replay_run(row) for row in rows]
+
+    def get_strategy_replay_run(self, replay_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_replay_runs WHERE replay_id = ?",
+            (str(replay_id or ""),),
+        ).fetchone()
+        return _row_to_strategy_replay_run(row) if row else None
+
+    def save_strategy_replay_report(self, report: dict) -> dict:
+        report_id = str(report.get("report_id") or "").strip()
+        replay_id = str(report.get("replay_id") or "").strip()
+        if not report_id:
+            raise ValueError("report_id is required")
+        if not replay_id:
+            raise ValueError("replay_id is required")
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO strategy_replay_reports(
+                    report_id, replay_id, trade_date, mode, summary_json, funnel_json,
+                    outcome_summary_json, shadow_summary_json, diff_summary_json,
+                    recommendations_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_id) DO UPDATE SET
+                    replay_id=excluded.replay_id,
+                    trade_date=excluded.trade_date,
+                    mode=excluded.mode,
+                    summary_json=excluded.summary_json,
+                    funnel_json=excluded.funnel_json,
+                    outcome_summary_json=excluded.outcome_summary_json,
+                    shadow_summary_json=excluded.shadow_summary_json,
+                    diff_summary_json=excluded.diff_summary_json,
+                    recommendations_json=excluded.recommendations_json
+                """,
+                (
+                    report_id,
+                    replay_id,
+                    str(report.get("trade_date") or ""),
+                    str(report.get("mode") or ""),
+                    _json_payload(report.get("summary") or {}),
+                    _json_payload(report.get("funnel") or {}),
+                    _json_payload(report.get("outcome_summary") or {}),
+                    _json_payload(report.get("shadow_summary") or {}),
+                    _json_payload(report.get("diff_summary") or {}),
+                    _json_list(report.get("recommendations") or []),
+                    str(report.get("created_at") or now),
+                ),
+            )
+        return self.get_strategy_replay_report(report_id) or {"report_id": report_id}
+
+    def list_strategy_replay_reports(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        replay_id: Optional[str] = None,
+        mode: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if replay_id:
+            clauses.append("replay_id = ?")
+            params.append(str(replay_id))
+        if mode:
+            clauses.append("mode = ?")
+            params.append(str(mode))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_replay_reports
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 50)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_strategy_replay_report(row) for row in rows]
+
+    def get_strategy_replay_report(self, report_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_replay_reports WHERE report_id = ?",
+            (str(report_id or ""),),
+        ).fetchone()
+        return _row_to_strategy_replay_report(row) if row else None
+
+    def latest_strategy_replay_report(self, replay_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            """
+            SELECT * FROM strategy_replay_reports
+            WHERE replay_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (str(replay_id or ""),),
+        ).fetchone()
+        return _row_to_strategy_replay_report(row) if row else None
 
     def save_live_sim_order(self, record: dict) -> dict:
         payload = _live_sim_order_params(record)
@@ -6976,6 +7211,24 @@ def _row_to_shadow_strategy_evaluation(row: sqlite3.Row) -> dict:
     data["outcome_horizon_sec"] = data["outcome"]["horizon_sec"]
     data["max_return_pct"] = data["outcome"]["max_return_pct"]
     data["max_drawdown_pct"] = data["outcome"]["max_drawdown_pct"]
+    return data
+
+
+def _row_to_strategy_replay_run(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["warnings"] = _safe_json_loads(data.get("warnings_json"), [])
+    data["metadata"] = _safe_json_loads(data.get("metadata_json"), {})
+    return data
+
+
+def _row_to_strategy_replay_report(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["summary"] = _safe_json_loads(data.get("summary_json"), {})
+    data["funnel"] = _safe_json_loads(data.get("funnel_json"), {})
+    data["outcome_summary"] = _safe_json_loads(data.get("outcome_summary_json"), {})
+    data["shadow_summary"] = _safe_json_loads(data.get("shadow_summary_json"), {})
+    data["diff_summary"] = _safe_json_loads(data.get("diff_summary_json"), {})
+    data["recommendations"] = _safe_json_loads(data.get("recommendations_json"), [])
     return data
 
 

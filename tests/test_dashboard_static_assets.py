@@ -26,6 +26,7 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
         "dryRunPerformance",
         "falseSignals",
         "thresholdAB",
+        "strategyReplayRuns",
         "gatewayCommands",
     ]:
         assert soup.select_one(f'[data-table-section="{table_key}"]') is not None
@@ -90,6 +91,8 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "last_ws_event_at" in js
     assert "last_ws_ack_at" in js
     assert "thresholdAB" in js
+    assert "strategyReplayRuns" in js
+    assert "/api/runtime/replay/runs" in js
     assert "gradeLabelsKo" in js
     assert "/api/runtime/threshold-ab/dry-run" in js
     assert "/api/runtime/shadow-strategies/evaluations" in js

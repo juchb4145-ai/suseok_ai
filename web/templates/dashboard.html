@@ -517,6 +517,50 @@
       <section id="analysis" class="tab-panel" data-tab-panel="analysis">
         <section class="band">
           <div class="section-head">
+            <h2>Strategy Replay</h2>
+            <span id="strategy-replay-latest-id" class="counter">-</span>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>Status</span><strong id="strategy-replay-status">-</strong></div>
+            <div><span>Ticks</span><strong id="strategy-replay-ticks">0</strong></div>
+            <div><span>Candidates</span><strong id="strategy-replay-candidates">0</strong></div>
+            <div><span>READY</span><strong id="strategy-replay-ready">0</strong></div>
+            <div><span>Order Intents</span><strong id="strategy-replay-orders">0</strong></div>
+            <div><span>Outcome Labels</span><strong id="strategy-replay-outcomes">0</strong></div>
+            <div><span>Shadow Evals</span><strong id="strategy-replay-shadow">0</strong></div>
+            <div><span>Funnel</span><strong id="strategy-replay-funnel">0 -> 0 -> 0</strong></div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Policy</th><th>Ready Delta</th><th>Opp Reduced</th><th>FP Increase</th><th>Net Score</th><th>Grade</th></tr></thead>
+              <tbody id="strategy-replay-ranking-rows"></tbody>
+            </table>
+          </div>
+          <div id="strategy-replay-quality-lines" class="inline-log"></div>
+          <div id="strategy-replay-diff-lines" class="inline-log"></div>
+        </section>
+
+        <section class="band table-panel" data-table-section="strategyReplayRuns">
+          <div class="section-head">
+            <h2>Replay Runs</h2>
+            <span id="strategyReplayRuns-status" class="counter">waiting</span>
+          </div>
+          <div class="filter-grid">
+            <label>Trade date<input data-table="strategyReplayRuns" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>Mode<select data-table="strategyReplayRuns" data-filter="mode"><option value="">all</option><option>data_only</option><option>decision_led</option><option>full_runtime</option></select></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="strategyReplayRuns"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Replay ID</th><th>Date</th><th>Mode</th><th>Status</th><th>Ticks</th><th>Candidates</th><th>READY</th><th>Orders</th><th>Started</th></tr></thead>
+              <tbody id="strategyReplayRuns-body"></tbody>
+            </table>
+          </div>
+          <div id="strategyReplayRuns-pagination" class="pagination"></div>
+        </section>
+
+        <section class="band">
+          <div class="section-head">
             <h2>DRY_RUN 성과 분석</h2>
             <span id="dryrun-performance-generated" class="counter">-</span>
           </div>

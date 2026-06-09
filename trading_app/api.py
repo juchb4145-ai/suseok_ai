@@ -67,6 +67,17 @@ from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
 from trading_app.shadow_strategy import ShadowStrategyEvaluator, config_from_settings as shadow_config_from_settings
+from trading_app.strategy_replay import (
+    DEFAULT_BUNDLE_ROOT,
+    DEFAULT_REPLAY_DB_ROOT,
+    StrategyReplayBundleExporter,
+    StrategyRuntimeReplayRunner,
+    get_replay_report_detail,
+    get_replay_run_detail,
+    list_replay_bundles,
+    scan_replay_reports,
+    scan_replay_runs,
+)
 from trading_app.themelab_dashboard import build_theme_lab_dashboard_snapshot
 from trading_app.transport_latency import TransportLatencyAnalyzer, TransportLatencyConfig
 from trading_app.websocket import DashboardConnectionManager
@@ -1652,6 +1663,139 @@ def rebuild_runtime_shadow_strategies(
         close_database(db)
 
 
+@app.get("/api/runtime/replay/bundles")
+def runtime_replay_bundles(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    items = list_replay_bundles(DEFAULT_BUNDLE_ROOT, limit=limit + 1, offset=offset)
+    items, pagination = _trim_page(items, limit=limit, offset=offset)
+    return {"items": items, "pagination": pagination, "filters": {"limit": limit, "offset": offset}}
+
+
+@app.post("/api/runtime/replay/bundles/export")
+def export_runtime_replay_bundle(
+    trade_date: str,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    codes: Optional[str] = None,
+    theme_names: Optional[str] = None,
+    force: bool = False,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    settings = get_settings()
+    exporter = StrategyReplayBundleExporter(settings.db_path, output_root=DEFAULT_BUNDLE_ROOT)
+    bundle = exporter.export_bundle(
+        trade_date,
+        start_time=start_time,
+        end_time=end_time,
+        codes=_csv_values(codes),
+        theme_names=_csv_values(theme_names),
+        force=force,
+    )
+    return {
+        "replay_id": bundle.manifest.replay_id,
+        "bundle_path": str(bundle.path),
+        "manifest": bundle.manifest.to_dict(),
+        "summary": bundle.manifest.data_quality,
+        "warnings": bundle.manifest.warnings,
+    }
+
+
+@app.get("/api/runtime/replay/runs")
+def runtime_replay_runs(
+    trade_date: Optional[str] = None,
+    mode: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    items = scan_replay_runs(DEFAULT_REPLAY_DB_ROOT, trade_date=trade_date, mode=mode, limit=limit + 1, offset=offset)
+    items, pagination = _trim_page(items, limit=limit, offset=offset)
+    return {
+        "items": items,
+        "pagination": pagination,
+        "filters": {"trade_date": trade_date or "", "mode": mode or "", "limit": limit, "offset": offset},
+    }
+
+
+@app.post("/api/runtime/replay/run")
+def run_runtime_replay(
+    bundle_path: Optional[str] = None,
+    trade_date: Optional[str] = None,
+    mode: str = Query("decision_led", pattern="^(data_only|decision_led|full_runtime)$"),
+    cycle_interval_sec: Optional[float] = Query(None, ge=0.1, le=3600),
+    speed: float = Query(1.0, ge=0.0, le=1000),
+    replay_db: Optional[str] = None,
+    force: bool = False,
+    limit: Optional[int] = Query(None, ge=1, le=100000),
+    export_report: bool = True,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    settings = get_settings()
+    runner = StrategyRuntimeReplayRunner(
+        source_db_path=settings.db_path,
+        replay_db_root=DEFAULT_REPLAY_DB_ROOT,
+        bundle_root=DEFAULT_BUNDLE_ROOT,
+    )
+    result = runner.run(
+        bundle_path=bundle_path,
+        trade_date=trade_date,
+        mode=mode,
+        cycle_interval_sec=cycle_interval_sec,
+        speed=speed,
+        replay_db=replay_db,
+        force=force,
+        limit=limit,
+        export_report=export_report,
+    )
+    return {
+        "replay_id": result.replay_id,
+        "status": result.status,
+        "replay_db_path": result.replay_db_path,
+        "source_bundle_path": result.source_bundle_path,
+        "report_id": (result.report or {}).get("report_id", ""),
+        "summary": result.summary,
+        "warnings": result.warnings,
+        "error": result.error,
+    }
+
+
+@app.get("/api/runtime/replay/runs/{replay_id}")
+def runtime_replay_run_detail(replay_id: str) -> dict[str, Any]:
+    return get_replay_run_detail(replay_id, DEFAULT_REPLAY_DB_ROOT)
+
+
+@app.get("/api/runtime/replay/reports/{report_id}")
+def runtime_replay_report_detail(report_id: str) -> dict[str, Any]:
+    return get_replay_report_detail(report_id, DEFAULT_REPLAY_DB_ROOT)
+
+
+@app.get("/api/runtime/replay/summary")
+def runtime_replay_summary(
+    trade_date: Optional[str] = None,
+    replay_id: Optional[str] = None,
+    mode: Optional[str] = None,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    reports = scan_replay_reports(
+        DEFAULT_REPLAY_DB_ROOT,
+        trade_date=trade_date,
+        replay_id=replay_id,
+        mode=mode,
+        limit=limit + 1,
+        offset=offset,
+    )
+    items, pagination = _trim_page(reports, limit=limit, offset=offset)
+    latest = items[0] if items else None
+    return {
+        "latest": latest,
+        "items": items,
+        "pagination": pagination,
+        "filters": {"trade_date": trade_date or "", "replay_id": replay_id or "", "mode": mode or "", "limit": limit, "offset": offset},
+    }
+
+
 @app.get("/api/runtime/performance/dry-run")
 def runtime_dry_run_performance(
     trade_date: Optional[str] = None,
@@ -2935,6 +3079,10 @@ def _theme_lab_trade_date(trade_date: str | None, *, occurred_at: str | None = N
     if len(timestamp) >= 10 and timestamp[4] == "-" and timestamp[7] == "-":
         return timestamp[:10]
     return datetime.now(KST).date().isoformat()
+
+
+def _csv_values(value: Optional[str]) -> list[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
 
 @app.post("/api/gateway/events")
@@ -5463,6 +5611,17 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     decision_summary_payload = db.strategy_decision_summary(trade_date=datetime.now().date().isoformat())
     outcome_summary_payload = db.strategy_decision_outcome_summary(trade_date=datetime.now().date().isoformat())
     shadow_summary_payload = db.shadow_strategy_summary(trade_date=datetime.now().date().isoformat())
+    replay_reports = scan_replay_reports(DEFAULT_REPLAY_DB_ROOT, limit=1)
+    replay_runs = scan_replay_runs(DEFAULT_REPLAY_DB_ROOT, limit=5)
+    replay_payload = {
+        "latest": replay_reports[0] if replay_reports else {},
+        "recent_runs": replay_runs,
+        "summary": (replay_reports[0].get("summary") if replay_reports else {}) or {},
+        "funnel": (replay_reports[0].get("funnel") if replay_reports else {}) or {},
+        "shadow_ranking": (replay_reports[0].get("recommendations") if replay_reports else []) or [],
+        "data_quality": ((replay_reports[0].get("summary") or {}).get("warnings") if replay_reports else []) or [],
+        "diff_summary": (replay_reports[0].get("diff_summary") if replay_reports else {}) or {},
+    }
     dry_run_performance_report = _performance_analyzer(db).build_report(limit=10000)
     threshold_ab_report = _threshold_ab_analyzer().build_report(dry_run_performance_report, limit=10, offset=0)
     dry_run_performance_payload = {
@@ -5510,6 +5669,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     runtime_payload["intraday_decisions"] = decision_summary_payload
     runtime_payload["intraday_outcomes"] = outcome_summary_payload
     runtime_payload["shadow_strategies"] = shadow_summary_payload
+    runtime_payload["strategy_replay"] = replay_payload
     runtime_payload["dry_run_performance"] = dry_run_performance_payload
     runtime_payload["threshold_ab"] = threshold_ab_payload
     ops_alerts_payload = build_ops_alerts(
@@ -5533,6 +5693,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "intraday_decisions": decision_summary_payload,
         "intraday_outcomes": outcome_summary_payload,
         "shadow_strategies": shadow_summary_payload,
+        "strategy_replay": replay_payload,
         "dry_run_performance": dry_run_performance_payload,
         "threshold_ab": threshold_ab_payload,
         "ops_alerts": ops_alerts_payload,

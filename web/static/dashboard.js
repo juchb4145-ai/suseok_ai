@@ -234,6 +234,26 @@ const tableConfigs = {
       (item) => textCell(formatRate((((item.result || {}).recommendation || {}).confidence ?? item.confidence))),
     ],
   },
+  strategyReplayRuns: {
+    endpoint: "/api/runtime/replay/runs",
+    bodyId: "strategyReplayRuns-body",
+    statusId: "strategyReplayRuns-status",
+    paginationId: "strategyReplayRuns-pagination",
+    defaultLimit: 25,
+    detailTitle: (item) => `Strategy Replay ${item.replay_id || ""}`,
+    detailEndpoint: (item) => item.replay_id ? `/api/runtime/replay/runs/${encodeURIComponent(item.replay_id)}` : "",
+    columns: [
+      (item) => compactId(item.replay_id || "-"),
+      (item) => textCell(item.trade_date || "-"),
+      (item) => badge(item.mode || "-"),
+      (item) => badge(item.status || "-"),
+      (item) => textCell(item.processed_tick_count ?? 0),
+      (item) => textCell(((item.metadata || {}).summary || {}).candidate_count ?? item.processed_candidate_event_count ?? 0),
+      (item) => textCell(((item.metadata || {}).summary || {}).ready_count ?? "-"),
+      (item) => textCell(((item.metadata || {}).summary || {}).order_intent_count ?? "-"),
+      (item) => textCell(formatDateTime(item.started_at || item.created_at)),
+    ],
+  },
   gatewayCommands: {
     endpoint: "/api/gateway/commands/history",
     bodyId: "gatewayCommands-body",
@@ -843,6 +863,7 @@ function render(snapshot) {
   const shadowStrategies = snapshot.shadow_strategies || runtime.shadow_strategies || {};
   const dryRunPerformance = snapshot.dry_run_performance || runtime.dry_run_performance || {};
   const thresholdAB = snapshot.threshold_ab || runtime.threshold_ab || { summary: {}, recommendations: [] };
+  const strategyReplay = snapshot.strategy_replay || runtime.strategy_replay || { summary: {}, funnel: {}, shadow_ranking: [], data_quality: [], diff_summary: {} };
   const candidates = snapshot.candidates || { summary: {}, items: [] };
   const themes = snapshot.themes || { summary: {}, items: [] };
   const orders = snapshot.orders || { summary: {}, order_results: [], executions: [] };
@@ -1021,6 +1042,48 @@ function render(snapshot) {
   text("threshold-ab-fn-increase", thresholdSummary.total_new_false_negative_count || 0);
   text("threshold-ab-opp-delta", thresholdSummary.total_opportunity_loss_delta || 0);
   renderThresholdRecommendations("threshold-ab-recommendations", thresholdAB.recommendations || []);
+
+  const replaySummary = strategyReplay.summary || {};
+  const replayFunnel = strategyReplay.funnel || replaySummary.funnel || {};
+  const replayLatest = strategyReplay.latest || {};
+  text("strategy-replay-latest-id", replayLatest.replay_id || replaySummary.replay_id || "-");
+  text("strategy-replay-status", replaySummary.status || replayLatest.status || "-");
+  text("strategy-replay-ticks", replaySummary.processed_tick_count || 0);
+  text("strategy-replay-candidates", replaySummary.candidate_count || 0);
+  text("strategy-replay-ready", replaySummary.ready_count || 0);
+  text("strategy-replay-orders", replaySummary.order_intent_count || 0);
+  text("strategy-replay-outcomes", replaySummary.outcome_labeled_count || 0);
+  text("strategy-replay-shadow", replaySummary.shadow_evaluation_count || 0);
+  text("strategy-replay-funnel", [
+    replayFunnel.candidate_detected || 0,
+    replayFunnel.gate_evaluated || 0,
+    replayFunnel.ready || 0,
+    replayFunnel.order_intent_created || 0,
+    replayFunnel.position_opened || 0,
+    replayFunnel.position_closed || 0,
+    replayFunnel.outcome_labeled || 0,
+  ].join(" -> "));
+  renderRows("strategy-replay-ranking-rows", firstItems(strategyReplay.shadow_ranking || [], 8).map((item) => rowHtml([
+    item.policy_name || item.policy_id || "-",
+    item.ready_delta ?? 0,
+    item.estimated_opportunity_loss_reduced_count ?? 0,
+    item.estimated_false_positive_increase_count ?? 0,
+    item.net_benefit_score ?? 0,
+    item.recommendation_grade || "-",
+  ])), 6);
+  const replayWarnings = replaySummary.warnings || strategyReplay.data_quality || [];
+  const replayWarningNode = document.getElementById("strategy-replay-quality-lines");
+  if (replayWarningNode) replayWarningNode.innerHTML = replayWarnings.length ? replayWarnings.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">Replay data quality warnings are empty</span>';
+  const replayDiff = strategyReplay.diff_summary || {};
+  const replayDiffNode = document.getElementById("strategy-replay-diff-lines");
+  if (replayDiffNode) {
+    const lines = [
+      `status: ${replayDiff.status || "NO_REPORT"}`,
+      `diff_count: ${replayDiff.diff_count || 0}`,
+      ...(replayDiff.notes || []),
+    ];
+    replayDiffNode.innerHTML = lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("");
+  }
 
   text("command-queued", commands.queued_count || 0);
   text("command-dispatched", commands.dispatched_count || 0);
