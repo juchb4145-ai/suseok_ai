@@ -1388,53 +1388,94 @@ class TradingDatabase:
         )
 
     def _sync_live_sim_execution(self, event: BrokerExecutionEvent) -> None:
+        fill_link_method = ""
         order = self.find_live_sim_order_by_broker_order_id(event.order_no)
+        if order is not None:
+            fill_link_method = "broker_order_id"
         if order is None and event.command_id:
             order = self.find_live_sim_order_by_command_id(event.command_id)
+            if order is not None:
+                fill_link_method = "command_id"
         if order is None and event.idempotency_key:
             order = self.find_live_sim_order_by_idempotency(event.idempotency_key)
+            if order is not None:
+                fill_link_method = "idempotency_key"
         if order is None and event.order_no:
             order = self.find_live_sim_order_by_execution_fingerprint(event)
+            if order is not None:
+                fill_link_method = "execution_fingerprint"
         if order is None:
+            self._sync_manual_live_sim_execution(event)
             return
         now = str(event.timestamp or "")
+        order_intent_id = str(order.get("order_intent_id") or "")
+        broker_order_id = str(event.order_no or order.get("broker_order_id") or "")
+        cumulative_fill_qty = _execution_cumulative_fill_qty(event)
+        previous_cumulative_fill_qty = self._previous_live_sim_cumulative_fill_qty(
+            order_intent_id=order_intent_id,
+            broker_order_id=broker_order_id,
+        )
+        fill_qty = max(0, cumulative_fill_qty - previous_cumulative_fill_qty)
+        remaining_qty = max(0, int(event.remaining_quantity or 0))
+        fill_price = max(0, int(event.price or 0))
+        raw_event = {
+            **event.to_dict(),
+            "reported_filled_quantity": int(event.filled_quantity or 0),
+            "computed_fill_qty": fill_qty,
+            "computed_cumulative_fill_qty": cumulative_fill_qty,
+            "previous_cumulative_fill_qty": previous_cumulative_fill_qty,
+            "fill_link_method": fill_link_method,
+            "manual_intervention": False,
+        }
         fill_id = event.execution_id or f"{event.order_no}:{event.filled_quantity}:{event.remaining_quantity}:{event.price}:{now}"
         fill_payload = {
-            "order_intent_id": order.get("order_intent_id"),
-            "broker_order_id": event.order_no or order.get("broker_order_id"),
+            "order_intent_id": order_intent_id,
+            "broker_order_id": broker_order_id,
             "fill_id": fill_id,
             "event_id": event.execution_id,
             "code": event.code or order.get("code"),
             "side": event.side or order.get("side"),
             "account_id_masked": order.get("account_id_masked"),
-            "fill_qty": event.filled_quantity,
-            "fill_price": event.price,
-            "cumulative_fill_qty": max(0, int(event.quantity or 0) - max(0, int(event.remaining_quantity or 0))),
-            "remaining_qty": event.remaining_quantity,
-            "fill_amount": max(0, int(event.filled_quantity or 0)) * max(0, int(event.price or 0)),
+            "fill_qty": fill_qty,
+            "fill_price": fill_price,
+            "cumulative_fill_qty": cumulative_fill_qty,
+            "remaining_qty": remaining_qty,
+            "fill_amount": fill_qty * fill_price,
             "commission": event.raw.get("commission", 0),
             "tax": event.raw.get("tax", 0),
             "event_time": now,
             "received_at": now,
-            "raw_event": event.to_dict(),
+            "raw_event": raw_event,
         }
         inserted, fill = self.save_live_sim_fill_event(fill_payload)
         if not inserted:
             return
         status_from = str(order.get("order_status") or "")
-        status_to = "PARTIAL_FILLED" if int(event.remaining_quantity or 0) > 0 else "FILLED"
-        reason = "LIVE_SIM_PARTIAL_FILL_TRACKED" if status_to == "PARTIAL_FILLED" else "ORDER_RECONCILED_FROM_KIWOOM"
+        if fill_qty <= 0 and cumulative_fill_qty <= 0:
+            status_to = status_from or "ACCEPTED"
+            reason = "LIVE_SIM_EXECUTION_ACK_TRACKED"
+        else:
+            status_to = "PARTIAL_FILLED" if remaining_qty > 0 else "FILLED"
+            if status_from == "FILLED" and status_to == "PARTIAL_FILLED":
+                status_to = status_from
+            if fill_qty <= 0:
+                reason = "LIVE_SIM_EXECUTION_NO_DELTA_TRACKED"
+            else:
+                reason = "LIVE_SIM_PARTIAL_FILL_TRACKED" if status_to == "PARTIAL_FILLED" else "ORDER_RECONCILED_FROM_KIWOOM"
         details = dict(order.get("details") or {})
-        position = self.upsert_live_sim_position_from_fill(order, fill, exit_guard=dict(details.get("exit_guard") or {}))
+        position = dict(details.get("position") or {})
+        if fill_qty > 0:
+            position = self.upsert_live_sim_position_from_fill(order, fill, exit_guard=dict(details.get("exit_guard") or {}))
         updates = {
-            "broker_order_id": event.order_no or order.get("broker_order_id"),
+            "broker_order_id": broker_order_id,
             "order_status": status_to,
-            "first_fill_at": order.get("first_fill_at") or now,
+            "first_fill_at": order.get("first_fill_at") or (now if fill_qty > 0 else ""),
             "last_fill_at": now,
             "updated_at": now,
             "reason_codes": _merge_reason_codes(order, [reason]),
             "details": {
                 **details,
+                "fill_link_method": fill_link_method,
                 "last_fill": fill,
                 "position": position,
             },
@@ -1449,6 +1490,162 @@ class TradingDatabase:
             payload={"execution": event.to_dict(), "fill": fill, "position": position},
             created_at=now,
         )
+
+    def _sync_manual_live_sim_execution(self, event: BrokerExecutionEvent) -> None:
+        now = str(event.timestamp or "")
+        broker_order_id = str(event.order_no or "")
+        cumulative_fill_qty = _execution_cumulative_fill_qty(event)
+        previous_cumulative_fill_qty = self._previous_live_sim_cumulative_fill_qty(
+            order_intent_id="",
+            broker_order_id=broker_order_id,
+        )
+        fill_qty = max(0, cumulative_fill_qty - previous_cumulative_fill_qty)
+        if fill_qty <= 0 and cumulative_fill_qty <= 0:
+            return
+        account_id_masked = _mask_account(
+            str(
+                event.account
+                or event.raw.get("account_id_masked")
+                or event.raw.get("account")
+                or ""
+            )
+        )
+        position = self._find_live_sim_position_for_manual_execution(event, account_id_masked=account_id_masked)
+        if position and not account_id_masked:
+            account_id_masked = str(position.get("account_id_masked") or "")
+        raw_event = {
+            **event.to_dict(),
+            "reported_filled_quantity": int(event.filled_quantity or 0),
+            "computed_fill_qty": fill_qty,
+            "computed_cumulative_fill_qty": cumulative_fill_qty,
+            "previous_cumulative_fill_qty": previous_cumulative_fill_qty,
+            "fill_link_method": "manual_unmatched_execution",
+            "manual_intervention": True,
+        }
+        fill_id = event.execution_id or f"{event.order_no}:{event.filled_quantity}:{event.remaining_quantity}:{event.price}:{now}"
+        fill_payload = {
+            "order_intent_id": "",
+            "broker_order_id": broker_order_id,
+            "fill_id": fill_id,
+            "event_id": event.execution_id,
+            "code": event.code,
+            "side": event.side,
+            "account_id_masked": account_id_masked,
+            "fill_qty": fill_qty,
+            "fill_price": max(0, int(event.price or 0)),
+            "cumulative_fill_qty": cumulative_fill_qty,
+            "remaining_qty": max(0, int(event.remaining_quantity or 0)),
+            "fill_amount": fill_qty * max(0, int(event.price or 0)),
+            "commission": event.raw.get("commission", 0),
+            "tax": event.raw.get("tax", 0),
+            "event_time": now,
+            "received_at": now,
+            "raw_event": raw_event,
+        }
+        inserted, fill = self.save_live_sim_fill_event(fill_payload)
+        if not inserted:
+            return
+        updated_position: dict = {}
+        if fill_qty > 0 and position is not None:
+            order = {
+                "code": position.get("code") or event.code,
+                "name": position.get("name") or "",
+                "side": event.side,
+                "account_id_masked": account_id_masked,
+                "candidate_instance_id": position.get("candidate_instance_id") or "",
+            }
+            updated_position = self.upsert_live_sim_position_from_fill(order, fill)
+            updated_position = self.save_live_sim_position(
+                {
+                    **updated_position,
+                    "details": {
+                        **dict(updated_position.get("details") or {}),
+                        "manual_intervention": True,
+                        "last_manual_execution": fill,
+                    },
+                    "updated_at": now,
+                }
+            )
+        elif fill_qty > 0 and str(event.side or "").lower() == "buy":
+            order = {
+                "code": event.code,
+                "name": "",
+                "side": event.side,
+                "account_id_masked": account_id_masked,
+                "candidate_instance_id": "MANUAL_INTERVENTION",
+            }
+            updated_position = self.upsert_live_sim_position_from_fill(order, fill)
+            updated_position = self.save_live_sim_position(
+                {
+                    **updated_position,
+                    "status": "RECONCILE_REQUIRED",
+                    "details": {
+                        **dict(updated_position.get("details") or {}),
+                        "manual_intervention": True,
+                        "external_position_detected": True,
+                        "last_manual_execution": fill,
+                    },
+                    "updated_at": now,
+                }
+            )
+        self.save_live_sim_runtime_health(
+            "reconcile",
+            status="RECONCILE_REQUIRED",
+            reason="LIVE_SIM_MANUAL_EXECUTION_DETECTED",
+            details={
+                "code": event.code,
+                "side": event.side,
+                "broker_order_id": broker_order_id,
+                "account_id_masked": account_id_masked,
+                "position_id": updated_position.get("position_id") if updated_position else "",
+            },
+            updated_at=now,
+        )
+
+    def _find_live_sim_position_for_manual_execution(
+        self,
+        event: BrokerExecutionEvent,
+        *,
+        account_id_masked: str,
+    ) -> Optional[dict]:
+        code = str(event.code or "")
+        if not code:
+            return None
+        statuses = {"OPEN", "PARTIAL", "EXIT_ORDERED", "RECONCILE_REQUIRED"}
+        positions = [
+            position
+            for position in self.list_live_sim_positions(
+                code=code,
+                account_id_masked=account_id_masked or None,
+                limit=50,
+            )
+            if str(position.get("status") or "") in statuses
+            and int(position.get("current_qty") or 0) > 0
+        ]
+        if len(positions) == 1:
+            return positions[0]
+        return None
+
+    def _previous_live_sim_cumulative_fill_qty(self, *, order_intent_id: str, broker_order_id: str) -> int:
+        clauses: list[str] = []
+        params: list[object] = []
+        if order_intent_id:
+            clauses.append("order_intent_id = ?")
+            params.append(order_intent_id)
+        if broker_order_id:
+            clauses.append("broker_order_id = ?")
+            params.append(broker_order_id)
+        if not clauses:
+            return 0
+        row = self.conn.execute(
+            f"""
+            SELECT COALESCE(MAX(cumulative_fill_qty), 0) AS cumulative_fill_qty
+            FROM live_sim_fill_events
+            WHERE {' OR '.join(clauses)}
+            """,
+            tuple(params),
+        ).fetchone()
+        return max(0, int(row["cumulative_fill_qty"] or 0)) if row else 0
 
     def save_log(self, message: str) -> None:
         self.conn.execute("INSERT INTO logs(message) VALUES (?)", (message,))
@@ -2133,6 +2330,8 @@ class TradingDatabase:
                 )
                 ON CONFLICT(position_id) DO UPDATE SET
                     closed_at=excluded.closed_at,
+                    entry_qty=excluded.entry_qty,
+                    entry_avg_price=excluded.entry_avg_price,
                     current_qty=excluded.current_qty,
                     realized_qty=excluded.realized_qty,
                     realized_pnl=excluded.realized_pnl,
@@ -2294,17 +2493,36 @@ class TradingDatabase:
                 if text:
                     reason_counts[text] = reason_counts.get(text, 0) + 1
         positions = self.conn.execute("SELECT status, realized_pnl, realized_pnl_pct FROM live_sim_positions").fetchall()
+        position_status_counts: dict[str, int] = {}
+        for row in positions:
+            status = str(row["status"] or "")
+            position_status_counts[status] = position_status_counts.get(status, 0) + 1
+        manual_row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM live_sim_fill_events
+            WHERE raw_event_json LIKE '%"manual_intervention": true%'
+            """
+        ).fetchone()
+        manual_intervention_count = int(manual_row["count"] or 0) if manual_row else 0
+        reconcile_required_count = counts.get("RECONCILE_REQUIRED", 0) + position_status_counts.get("RECONCILE_REQUIRED", 0)
         realized = [float(row["realized_pnl"] or 0.0) for row in positions]
         realized_pct = [float(row["realized_pnl_pct"] or 0.0) for row in positions if float(row["realized_pnl_pct"] or 0.0) != 0.0]
         return {
+            "ledger_ok": reconcile_required_count == 0 and counts.get("UNKNOWN_SUBMIT", 0) == 0,
             "submitted_order_count": counts.get("SUBMITTED", 0) + counts.get("ACCEPTED", 0),
             "accepted_order_count": counts.get("ACCEPTED", 0),
             "rejected_order_count": counts.get("REJECTED", 0) + counts.get("FAILED", 0),
+            "reconcile_required_order_count": counts.get("RECONCILE_REQUIRED", 0),
+            "reconcile_required_position_count": position_status_counts.get("RECONCILE_REQUIRED", 0),
+            "reconcile_required_count": reconcile_required_count,
+            "manual_intervention_count": manual_intervention_count,
             "filled_order_count": counts.get("FILLED", 0),
             "partial_fill_count": counts.get("PARTIAL_FILLED", 0),
             "cancelled_order_count": counts.get("CANCELLED", 0),
             "duplicate_order_blocked_count": counts.get("DUPLICATE", 0),
             "unknown_submit_count": counts.get("UNKNOWN_SUBMIT", 0),
+            "open_position_count": sum(1 for row in positions if str(row["status"]) in {"OPEN", "PARTIAL"}),
             "opened_position_count": sum(1 for row in positions if str(row["status"]) in {"OPEN", "PARTIAL"}),
             "closed_position_count": sum(1 for row in positions if str(row["status"]) in {"CLOSED", "FORCE_CLOSED"}),
             "unfilled_buy_cancel_due_count": reason_counts.get("LIVE_SIM_UNFILLED_BUY_CANCEL_DUE", 0),
@@ -5712,6 +5930,18 @@ def _row_to_live_sim_cancel(row: sqlite3.Row) -> dict:
     return data
 
 
+def _execution_cumulative_fill_qty(event: BrokerExecutionEvent) -> int:
+    order_qty = max(0, int(event.quantity or 0))
+    remaining_qty = max(0, int(event.remaining_quantity or 0))
+    reported_fill_qty = max(0, int(event.filled_quantity or 0))
+    if order_qty > 0 and (
+        remaining_qty > 0
+        or reported_fill_qty > 0
+    ):
+        return max(0, min(order_qty, order_qty - remaining_qty))
+    return reported_fill_qty
+
+
 def _live_sim_fill_params(payload: dict) -> dict:
     raw_event = payload.get("raw_event_json", payload.get("raw_event", {}))
     fill_qty = int(payload.get("fill_qty") or payload.get("filled_quantity") or 0)
@@ -5746,7 +5976,7 @@ def _row_to_live_sim_fill(row: sqlite3.Row) -> dict:
 
 
 def _live_sim_position_params(payload: dict) -> dict:
-    details = payload.get("details_json", payload.get("details", {}))
+    details = payload.get("details") if "details" in payload else payload.get("details_json", {})
     return {
         "position_id": str(payload.get("position_id") or ""),
         "candidate_instance_id": str(payload.get("candidate_instance_id") or ""),

@@ -13,6 +13,7 @@ from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
+from itertools import count
 from pathlib import Path
 from threading import RLock
 from typing import Any, Optional
@@ -379,6 +380,7 @@ gateway_condition_event_worker_state: dict[str, Any] = {
     "queued_count": 0,
     "coalesced_count": 0,
     "stale_skipped_count": 0,
+    "stale_queue_wait_skipped_count": 0,
     "processed_count": 0,
     "failed_count": 0,
     "dropped_count": 0,
@@ -387,6 +389,10 @@ gateway_condition_event_worker_state: dict[str, Any] = {
     "last_queued_count": 0,
     "last_coalesced_count": 0,
     "last_stale_skipped_count": 0,
+    "last_stale_queue_wait_skipped_count": 0,
+    "last_stale_queue_wait_ms": 0.0,
+    "last_queue_wait_ms": 0.0,
+    "stale_include_skip_ms": 15000.0,
     "last_batch_duration_ms": 0.0,
     "last_worker_index": 0,
     "last_shard_key": "",
@@ -403,6 +409,19 @@ gateway_core_ws_event_worker_state: dict[str, Any] = {
     "processed_count": 0,
     "failed_count": 0,
     "dropped_count": 0,
+    "priority_enabled": True,
+    "split_enabled": True,
+    "control_worker_count": 1,
+    "control_queue_size": 0,
+    "control_queue_sizes": [],
+    "data_queue_size": 0,
+    "control_active_count": 0,
+    "data_active_count": 0,
+    "control_queued_count": 0,
+    "data_queued_count": 0,
+    "last_priority": 0,
+    "last_worker_kind": "",
+    "last_control_worker_index": 0,
     "price_tick_coalesce_enabled": True,
     "price_tick_pending_key_count": 0,
     "price_tick_received_count": 0,
@@ -439,6 +458,13 @@ class _CoreWsEventWorkItem:
     coalesce_key: str = ""
 
 
+@dataclass(order=True)
+class _CoreWsEventQueuedItem:
+    priority: int
+    sequence: int
+    work_item: _CoreWsEventWorkItem = field(compare=False)
+
+
 @dataclass
 class _CoreWsOutboundMessage:
     payload: dict[str, Any]
@@ -458,9 +484,16 @@ _gateway_condition_event_executor_worker_count = 0
 _gateway_condition_event_coalesce_lock = RLock()
 _gateway_condition_event_generation = 0
 _gateway_condition_event_latest_generation: dict[str, int] = {}
-_core_ws_event_queue: asyncio.Queue[_CoreWsEventWorkItem] | None = None
+_core_ws_event_queue: asyncio.PriorityQueue[_CoreWsEventQueuedItem] | None = None
+_core_ws_event_control_queue: asyncio.PriorityQueue[_CoreWsEventQueuedItem] | None = None
+_core_ws_event_data_queue: asyncio.PriorityQueue[_CoreWsEventQueuedItem] | None = None
+_core_ws_event_control_queues: list[asyncio.PriorityQueue[_CoreWsEventQueuedItem]] = []
 _core_ws_event_worker_task: asyncio.Task | None = None
+_core_ws_event_control_worker_task: asyncio.Task | None = None
+_core_ws_event_data_worker_task: asyncio.Task | None = None
+_core_ws_event_control_worker_tasks: list[asyncio.Task] = []
 _core_ws_event_worker_loop: asyncio.AbstractEventLoop | None = None
+_core_ws_event_queue_sequence = count()
 _core_ws_price_tick_coalesce_lock = RLock()
 _core_ws_price_tick_latest_by_key: dict[str, _CoreWsEventWorkItem] = {}
 _dashboard_snapshot_task: asyncio.Task | None = None
@@ -2709,21 +2742,70 @@ async def _start_core_ws_event_worker() -> None:
 
 async def _stop_core_ws_event_worker() -> None:
     global _core_ws_event_worker_task
-    task = _core_ws_event_worker_task
-    if task is not None and not task.done():
+    global _core_ws_event_control_worker_task
+    global _core_ws_event_data_worker_task
+    global _core_ws_event_control_worker_tasks
+    global _core_ws_event_queue
+    global _core_ws_event_control_queue
+    global _core_ws_event_data_queue
+    global _core_ws_event_control_queues
+    task_candidates = [
+        _core_ws_event_worker_task,
+        _core_ws_event_control_worker_task,
+        _core_ws_event_data_worker_task,
+        *_core_ws_event_control_worker_tasks,
+    ]
+    tasks = []
+    seen_task_ids: set[int] = set()
+    for task in task_candidates:
+        if task is not None and not task.done() and id(task) not in seen_task_ids:
+            tasks.append(task)
+            seen_task_ids.add(id(task))
+    queue_candidates = [
+        _core_ws_event_queue,
+        _core_ws_event_control_queue,
+        _core_ws_event_data_queue,
+        *_core_ws_event_control_queues,
+    ]
+    queues = []
+    seen_queue_ids: set[int] = set()
+    for queue in queue_candidates:
+        if queue is not None and id(queue) not in seen_queue_ids:
+            queues.append(queue)
+            seen_queue_ids.add(id(queue))
+    if tasks:
         try:
-            queue = _core_ws_event_queue
-            if queue is not None:
-                await asyncio.wait_for(queue.join(), timeout=_core_ws_event_drain_timeout_sec())
+            if queues:
+                await asyncio.wait_for(asyncio.gather(*(queue.join() for queue in queues)), timeout=_core_ws_event_drain_timeout_sec())
         except asyncio.TimeoutError:
             pass
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     _core_ws_event_worker_task = None
-    _update_gateway_core_ws_event_worker_state({"enabled": False, "queue_size": 0, "active_count": 0})
+    _core_ws_event_control_worker_task = None
+    _core_ws_event_data_worker_task = None
+    _core_ws_event_control_worker_tasks = []
+    _core_ws_event_queue = None
+    _core_ws_event_control_queue = None
+    _core_ws_event_data_queue = None
+    _core_ws_event_control_queues = []
+    with _core_ws_price_tick_coalesce_lock:
+        _core_ws_price_tick_latest_by_key.clear()
+    _update_gateway_core_ws_event_worker_state(
+        {
+            "enabled": False,
+            "queue_size": 0,
+            "control_worker_count": 0,
+            "control_queue_size": 0,
+            "control_queue_sizes": [],
+            "data_queue_size": 0,
+            "active_count": 0,
+            "control_active_count": 0,
+            "data_active_count": 0,
+            "price_tick_pending_key_count": 0,
+        }
+    )
 
 
 def _gateway_condition_event_async_enabled() -> bool:
@@ -2732,14 +2814,38 @@ def _gateway_condition_event_async_enabled() -> bool:
 
 def _gateway_condition_event_worker_count() -> int:
     try:
-        value = int(os.environ.get("TRADING_CORE_WS_CONDITION_EVENT_WORKERS", "2"))
+        value = int(os.environ.get("TRADING_CORE_WS_CONDITION_EVENT_WORKERS", "4"))
     except ValueError:
-        value = 2
+        value = 4
     return max(1, min(8, value))
+
+
+def _gateway_condition_event_stale_include_skip_ms() -> float:
+    try:
+        value = float(os.environ.get("TRADING_CORE_WS_CONDITION_EVENT_STALE_INCLUDE_SKIP_MS", "15000"))
+    except ValueError:
+        value = 15000.0
+    return max(0.0, value)
 
 
 def _core_ws_event_async_enabled() -> bool:
     return os.environ.get("TRADING_CORE_WS_EVENT_ASYNC_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _core_ws_event_priority_enabled() -> bool:
+    return os.environ.get("TRADING_CORE_WS_EVENT_PRIORITY_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _core_ws_event_worker_split_enabled() -> bool:
+    return os.environ.get("TRADING_CORE_WS_EVENT_WORKER_SPLIT_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _core_ws_event_control_worker_count() -> int:
+    try:
+        value = int(os.environ.get("TRADING_CORE_WS_EVENT_CONTROL_WORKERS", "2"))
+    except ValueError:
+        value = 2
+    return max(1, min(8, value))
 
 
 def _core_ws_price_tick_coalesce_enabled() -> bool:
@@ -2813,6 +2919,7 @@ def _ensure_gateway_condition_event_worker() -> None:
             "queue_batch_count": _gateway_condition_event_queue_batch_count(),
             "queue_max_size": queue_max_size,
             "worker_count": worker_count,
+            "stale_include_skip_ms": _gateway_condition_event_stale_include_skip_ms(),
         }
     )
 
@@ -2820,26 +2927,100 @@ def _ensure_gateway_condition_event_worker() -> None:
 def _ensure_core_ws_event_worker() -> None:
     global _core_ws_event_queue
     global _core_ws_event_worker_task
+    global _core_ws_event_control_queue
+    global _core_ws_event_data_queue
+    global _core_ws_event_control_queues
+    global _core_ws_event_control_worker_task
+    global _core_ws_event_data_worker_task
+    global _core_ws_event_control_worker_tasks
     global _core_ws_event_worker_loop
     if not _core_ws_event_async_enabled():
         _update_gateway_core_ws_event_worker_state({"enabled": False})
         return
     loop = asyncio.get_running_loop()
-    if _core_ws_event_worker_loop is not loop:
-        _core_ws_event_queue = asyncio.Queue(maxsize=_core_ws_event_queue_max_size())
+    split_enabled = _core_ws_event_worker_split_enabled()
+    control_worker_count = _core_ws_event_control_worker_count() if split_enabled else 0
+    queue_max_size = _core_ws_event_queue_max_size()
+    if (
+        _core_ws_event_worker_loop is not loop
+        or (split_enabled and len(_core_ws_event_control_queues) != control_worker_count)
+    ):
+        if split_enabled:
+            _core_ws_event_queue = None
+            _core_ws_event_control_queues = [
+                asyncio.PriorityQueue(maxsize=queue_max_size) for _ in range(control_worker_count)
+            ]
+            _core_ws_event_control_queue = _core_ws_event_control_queues[0] if _core_ws_event_control_queues else None
+            _core_ws_event_data_queue = asyncio.PriorityQueue(maxsize=queue_max_size)
+        else:
+            _core_ws_event_queue = asyncio.PriorityQueue(maxsize=queue_max_size)
+            _core_ws_event_control_queue = None
+            _core_ws_event_control_queues = []
+            _core_ws_event_data_queue = None
         _core_ws_event_worker_task = None
+        _core_ws_event_control_worker_task = None
+        _core_ws_event_data_worker_task = None
+        _core_ws_event_control_worker_tasks = []
         _core_ws_event_worker_loop = loop
         with _core_ws_price_tick_coalesce_lock:
             _core_ws_price_tick_latest_by_key.clear()
-        _update_gateway_core_ws_event_worker_state({"queue_size": 0, "active_count": 0, "price_tick_pending_key_count": 0})
-    if _core_ws_event_worker_task is None or _core_ws_event_worker_task.done():
-        _core_ws_event_worker_task = loop.create_task(_core_ws_event_worker_loop_main())
-    queue = _core_ws_event_queue
+        _update_gateway_core_ws_event_worker_state(
+            {
+                "queue_size": 0,
+                "control_worker_count": control_worker_count,
+                "control_queue_size": 0,
+                "control_queue_sizes": [0 for _ in range(control_worker_count)],
+                "data_queue_size": 0,
+                "active_count": 0,
+                "control_active_count": 0,
+                "data_active_count": 0,
+                "split_enabled": split_enabled,
+                "priority_enabled": _core_ws_event_priority_enabled(),
+                "price_tick_pending_key_count": 0,
+            }
+        )
+    if split_enabled:
+        if len(_core_ws_event_control_queues) != control_worker_count:
+            _core_ws_event_control_queues = [
+                asyncio.PriorityQueue(maxsize=queue_max_size) for _ in range(control_worker_count)
+            ]
+            _core_ws_event_control_worker_tasks = []
+        if _core_ws_event_control_queue is None:
+            _core_ws_event_control_queue = _core_ws_event_control_queues[0] if _core_ws_event_control_queues else None
+        if _core_ws_event_data_queue is None:
+            _core_ws_event_data_queue = asyncio.PriorityQueue(maxsize=queue_max_size)
+        active_control_tasks = [
+            task for task in _core_ws_event_control_worker_tasks if task is not None and not task.done()
+        ]
+        if len(active_control_tasks) != control_worker_count:
+            for task in active_control_tasks:
+                task.cancel()
+            _core_ws_event_control_worker_tasks = [
+                loop.create_task(_core_ws_event_worker_loop_main("control", worker_index))
+                for worker_index in range(control_worker_count)
+            ]
+            _core_ws_event_control_worker_task = (
+                _core_ws_event_control_worker_tasks[0] if _core_ws_event_control_worker_tasks else None
+            )
+        if _core_ws_event_data_worker_task is None or _core_ws_event_data_worker_task.done():
+            _core_ws_event_data_worker_task = loop.create_task(_core_ws_event_worker_loop_main("data"))
+        _core_ws_event_worker_task = _core_ws_event_control_worker_task
+    else:
+        if _core_ws_event_queue is None:
+            _core_ws_event_queue = asyncio.PriorityQueue(maxsize=queue_max_size)
+        if _core_ws_event_worker_task is None or _core_ws_event_worker_task.done():
+            _core_ws_event_worker_task = loop.create_task(_core_ws_event_worker_loop_main("single"))
     _update_gateway_core_ws_event_worker_state(
         {
             "enabled": True,
-            "queue_size": queue.qsize() if queue is not None else 0,
-            "queue_max_size": queue.maxsize if queue is not None else _core_ws_event_queue_max_size(),
+            "queue_size": _core_ws_event_total_queue_size(),
+            "queue_max_size": queue_max_size,
+            "control_worker_count": control_worker_count,
+            "control_queue_size": _core_ws_event_queue_size("control"),
+            "control_queue_sizes": _core_ws_event_control_queue_sizes(),
+            "data_queue_size": _core_ws_event_queue_size("data"),
+            "split_enabled": split_enabled,
+            "priority_enabled": _core_ws_event_priority_enabled(),
             "price_tick_coalesce_enabled": _core_ws_price_tick_coalesce_enabled(),
             "price_tick_pending_key_count": _core_ws_price_tick_pending_key_count(),
         }
@@ -2880,6 +3061,171 @@ def _gateway_condition_event_worker_index(event: GatewayEvent, worker_count: int
 def _core_ws_price_tick_pending_key_count() -> int:
     with _core_ws_price_tick_coalesce_lock:
         return len(_core_ws_price_tick_latest_by_key)
+
+
+_CORE_WS_CONTROL_MESSAGE_TYPES = {
+    "command_ack",
+    "command_started",
+    "command_failed",
+    "rate_limited",
+    "heartbeat",
+    "transport_heartbeat",
+    "login_status",
+    "order_result",
+    "execution_event",
+    "execution",
+}
+
+
+def _core_ws_event_priority(kind: str, event: GatewayEvent | None = None, message: GatewayWsMessage | None = None) -> int:
+    if not _core_ws_event_priority_enabled():
+        return 10
+    message_type = _core_ws_event_work_message_type(kind, event=event, message=message)
+    if message_type in _CORE_WS_CONTROL_MESSAGE_TYPES:
+        return 0
+    if message_type == "price_tick":
+        return 50
+    return 10
+
+
+def _core_ws_event_queue_item(item: _CoreWsEventWorkItem) -> _CoreWsEventQueuedItem:
+    return _CoreWsEventQueuedItem(
+        priority=_core_ws_event_priority(item.kind, event=item.event, message=item.message),
+        sequence=next(_core_ws_event_queue_sequence),
+        work_item=item,
+    )
+
+
+def _core_ws_event_queue_name_for_priority(priority: int) -> str:
+    if not _core_ws_event_worker_split_enabled():
+        return "single"
+    return "control" if int(priority) <= 0 else "data"
+
+
+def _core_ws_event_queue_for_name(queue_name: str) -> asyncio.PriorityQueue[_CoreWsEventQueuedItem] | None:
+    if queue_name.startswith("control:"):
+        try:
+            index = int(queue_name.split(":", 1)[1])
+        except (IndexError, ValueError):
+            index = 0
+        if 0 <= index < len(_core_ws_event_control_queues):
+            return _core_ws_event_control_queues[index]
+        return _core_ws_event_control_queue
+    if queue_name == "control":
+        if _core_ws_event_control_queues:
+            return _core_ws_event_control_queues[0]
+        return _core_ws_event_control_queue
+    if queue_name == "data":
+        return _core_ws_event_data_queue
+    return _core_ws_event_queue
+
+
+def _core_ws_event_queue_size(queue_name: str) -> int:
+    if queue_name == "control" and _core_ws_event_control_queues:
+        return sum(queue.qsize() for queue in _core_ws_event_control_queues)
+    queue = _core_ws_event_queue_for_name(queue_name)
+    return queue.qsize() if queue is not None else 0
+
+
+def _core_ws_event_control_queue_sizes() -> list[int]:
+    if _core_ws_event_control_queues:
+        return [queue.qsize() for queue in _core_ws_event_control_queues]
+    return [_core_ws_event_control_queue.qsize()] if _core_ws_event_control_queue is not None else []
+
+
+def _core_ws_event_total_queue_size() -> int:
+    if _core_ws_event_worker_split_enabled():
+        return _core_ws_event_queue_size("control") + _core_ws_event_queue_size("data")
+    return _core_ws_event_queue_size("single")
+
+
+def _core_ws_event_worker_state_patch(queue_name: str = "") -> dict[str, Any]:
+    return {
+        "queue_size": _core_ws_event_total_queue_size(),
+        "control_queue_size": _core_ws_event_queue_size("control"),
+        "control_queue_sizes": _core_ws_event_control_queue_sizes(),
+        "data_queue_size": _core_ws_event_queue_size("data"),
+        "queue_max_size": _core_ws_event_queue_max_size(),
+        "split_enabled": _core_ws_event_worker_split_enabled(),
+        "control_worker_count": len(_core_ws_event_control_queues)
+        or (1 if _core_ws_event_control_queue is not None and _core_ws_event_worker_split_enabled() else 0),
+        "priority_enabled": _core_ws_event_priority_enabled(),
+        "last_worker_kind": queue_name or gateway_core_ws_event_worker_state.get("last_worker_kind") or "",
+    }
+
+
+def _core_ws_event_active_state_patch(worker_kind: str, *, active: bool, worker_index: int = 0) -> dict[str, int]:
+    if worker_kind == "single":
+        return {"active_count": 1 if active else 0, "control_active_count": 0, "data_active_count": 0}
+    control_active = int(gateway_core_ws_event_worker_state.get("control_active_count") or 0)
+    data_active = int(gateway_core_ws_event_worker_state.get("data_active_count") or 0)
+    delta = 1 if active else -1
+    if worker_kind == "control":
+        control_active = max(0, control_active + delta)
+    elif worker_kind == "data":
+        data_active = max(0, data_active + delta)
+    return {
+        "active_count": control_active + data_active,
+        "control_active_count": control_active,
+        "data_active_count": data_active,
+        "last_control_worker_index": worker_index if worker_kind == "control" else int(
+            gateway_core_ws_event_worker_state.get("last_control_worker_index") or 0
+        ),
+    }
+
+
+def _core_ws_event_control_shard_key(
+    kind: str,
+    *,
+    event: GatewayEvent | None = None,
+    message: GatewayWsMessage | None = None,
+) -> str:
+    payload = dict(event.payload if event is not None else (message.payload if message is not None else {}) or {})
+    command_id = str(payload.get("command_id") or (event.command_id if event is not None else "") or (message.command_id if message is not None else "") or "").strip()
+    if command_id:
+        return f"command:{command_id}"
+    order_id = str(
+        payload.get("order_id")
+        or payload.get("order_no")
+        or payload.get("original_order_no")
+        or payload.get("order_number")
+        or ""
+    ).strip()
+    if order_id:
+        return f"order:{order_id}"
+    code = str(payload.get("code") or payload.get("stock_code") or payload.get("symbol") or "").strip()
+    message_type = _core_ws_event_work_message_type(kind, event=event, message=message)
+    if message_type in {"execution_event", "execution", "order_result"} and code:
+        return f"{message_type}:{code}"
+    event_id = str((event.event_id if event is not None else "") or (message.event_id if message is not None else "") or "").strip()
+    if event_id:
+        return f"event:{event_id}"
+    return f"type:{message_type}"
+
+
+def _core_ws_event_control_worker_index(
+    kind: str,
+    *,
+    event: GatewayEvent | None = None,
+    message: GatewayWsMessage | None = None,
+    worker_count: int | None = None,
+) -> int:
+    count = max(1, int(worker_count or len(_core_ws_event_control_queues) or _core_ws_event_control_worker_count()))
+    key = _core_ws_event_control_shard_key(kind, event=event, message=message)
+    return zlib.crc32(key.encode("utf-8", errors="ignore")) % count
+
+
+def _core_ws_event_target_queue_name(
+    kind: str,
+    *,
+    priority: int,
+    event: GatewayEvent | None = None,
+    message: GatewayWsMessage | None = None,
+) -> str:
+    queue_name = _core_ws_event_queue_name_for_priority(priority)
+    if queue_name == "control" and _core_ws_event_worker_split_enabled():
+        return f"control:{_core_ws_event_control_worker_index(kind, event=event, message=message)}"
+    return queue_name
 
 
 def _build_core_ws_event_work_item(
@@ -2930,7 +3276,10 @@ def _enqueue_core_ws_event_work(
             "queue_max_size": _core_ws_event_queue_max_size(),
         }
     _ensure_core_ws_event_worker()
-    queue = _core_ws_event_queue
+    priority = _core_ws_event_priority(kind, event=event, message=message)
+    queue_name = _core_ws_event_queue_name_for_priority(priority)
+    target_queue_name = _core_ws_event_target_queue_name(kind, priority=priority, event=event, message=message)
+    queue = _core_ws_event_queue_for_name(target_queue_name)
     if queue is None:
         return {
             "accepted": False,
@@ -2946,6 +3295,7 @@ def _enqueue_core_ws_event_work(
             return _enqueue_core_ws_price_tick_work(
                 queue,
                 queue_size=queue_size,
+                queue_name=target_queue_name,
                 kind=kind,
                 metadata=metadata,
                 event=event,
@@ -2962,16 +3312,18 @@ def _enqueue_core_ws_event_work(
         event=event,
         message=message,
     )
+    queued_item = _core_ws_event_queue_item(item)
+    message_type = _core_ws_event_work_message_type(kind, event=event, message=message)
     try:
-        queue.put_nowait(item)
+        queue.put_nowait(queued_item)
     except asyncio.QueueFull:
         _update_gateway_core_ws_event_worker_state(
             {
                 "enabled": True,
-                "queue_size": queue.qsize(),
-                "queue_max_size": queue.maxsize,
+                **_core_ws_event_worker_state_patch(target_queue_name),
+                "last_priority": queued_item.priority,
                 "dropped_count": int(gateway_core_ws_event_worker_state.get("dropped_count") or 0) + 1,
-                "last_message_type": _core_ws_event_work_message_type(kind, event=event, message=message),
+                "last_message_type": message_type,
                 "last_event_id": event.event_id if event is not None else (message.event_id if message is not None else ""),
                 "last_queued_at": queued_at,
                 "last_error": "CORE_WS_EVENT_QUEUE_FULL",
@@ -2981,17 +3333,20 @@ def _enqueue_core_ws_event_work(
             "accepted": False,
             "queued": False,
             "reason": "QUEUE_FULL",
-            "queue_size": queue.qsize(),
+            "queue_size": _core_ws_event_total_queue_size(),
             "queue_max_size": queue.maxsize,
         }
-    next_queue_size = queue.qsize()
     _update_gateway_core_ws_event_worker_state(
         {
             "enabled": True,
-            "queue_size": next_queue_size,
-            "queue_max_size": queue.maxsize,
+            **_core_ws_event_worker_state_patch(target_queue_name),
+            "control_queued_count": int(gateway_core_ws_event_worker_state.get("control_queued_count") or 0)
+            + (1 if queue_name == "control" else 0),
+            "data_queued_count": int(gateway_core_ws_event_worker_state.get("data_queued_count") or 0)
+            + (1 if queue_name == "data" else 0),
+            "last_priority": queued_item.priority,
             "queued_count": int(gateway_core_ws_event_worker_state.get("queued_count") or 0) + 1,
-            "last_message_type": _core_ws_event_work_message_type(kind, event=event, message=message),
+            "last_message_type": message_type,
             "last_event_id": event.event_id if event is not None else (message.event_id if message is not None else ""),
             "last_queued_at": queued_at,
             "last_error": "",
@@ -3001,15 +3356,16 @@ def _enqueue_core_ws_event_work(
         "accepted": True,
         "queued": True,
         "reason": "",
-        "queue_size": next_queue_size,
+        "queue_size": _core_ws_event_total_queue_size(),
         "queue_max_size": queue.maxsize,
     }
 
 
 def _enqueue_core_ws_price_tick_work(
-    queue: asyncio.Queue[_CoreWsEventWorkItem],
+    queue: asyncio.PriorityQueue[_CoreWsEventQueuedItem],
     *,
     queue_size: int,
+    queue_name: str,
     kind: str,
     metadata: dict[str, Any],
     event: GatewayEvent | None,
@@ -3032,11 +3388,12 @@ def _enqueue_core_ws_price_tick_work(
         with _core_ws_price_tick_coalesce_lock:
             _core_ws_price_tick_latest_by_key[coalesce_key] = item
             pending_key_count = len(_core_ws_price_tick_latest_by_key)
+        priority = _core_ws_event_priority(kind, event=event)
         _update_gateway_core_ws_event_worker_state(
             {
                 "enabled": True,
-                "queue_size": queue.qsize(),
-                "queue_max_size": queue.maxsize,
+                **_core_ws_event_worker_state_patch(queue_name),
+                "last_priority": priority,
                 "price_tick_coalesce_enabled": True,
                 "price_tick_pending_key_count": pending_key_count,
                 "price_tick_received_count": int(gateway_core_ws_event_worker_state.get("price_tick_received_count") or 0) + 1,
@@ -3053,17 +3410,18 @@ def _enqueue_core_ws_price_tick_work(
             "queued": True,
             "coalesced": True,
             "reason": "",
-            "queue_size": queue.qsize(),
+            "queue_size": _core_ws_event_total_queue_size(),
             "queue_max_size": queue.maxsize,
         }
+    queued_item = _core_ws_event_queue_item(item)
     try:
-        queue.put_nowait(item)
+        queue.put_nowait(queued_item)
     except asyncio.QueueFull:
         _update_gateway_core_ws_event_worker_state(
             {
                 "enabled": True,
-                "queue_size": queue.qsize(),
-                "queue_max_size": queue.maxsize,
+                **_core_ws_event_worker_state_patch(queue_name),
+                "last_priority": queued_item.priority,
                 "dropped_count": int(gateway_core_ws_event_worker_state.get("dropped_count") or 0) + 1,
                 "price_tick_coalesce_enabled": True,
                 "price_tick_pending_key_count": _core_ws_price_tick_pending_key_count(),
@@ -3081,18 +3439,18 @@ def _enqueue_core_ws_price_tick_work(
             "queued": False,
             "coalesced": False,
             "reason": "QUEUE_FULL",
-            "queue_size": queue.qsize(),
+            "queue_size": _core_ws_event_total_queue_size(),
             "queue_max_size": queue.maxsize,
         }
     with _core_ws_price_tick_coalesce_lock:
         _core_ws_price_tick_latest_by_key[coalesce_key] = item
         pending_key_count = len(_core_ws_price_tick_latest_by_key)
-    next_queue_size = queue.qsize()
     _update_gateway_core_ws_event_worker_state(
         {
             "enabled": True,
-            "queue_size": next_queue_size,
-            "queue_max_size": queue.maxsize,
+            **_core_ws_event_worker_state_patch(queue_name),
+            "data_queued_count": int(gateway_core_ws_event_worker_state.get("data_queued_count") or 0) + 1,
+            "last_priority": queued_item.priority,
             "queued_count": int(gateway_core_ws_event_worker_state.get("queued_count") or 0) + 1,
             "price_tick_coalesce_enabled": True,
             "price_tick_pending_key_count": pending_key_count,
@@ -3110,7 +3468,7 @@ def _enqueue_core_ws_price_tick_work(
         "queued": True,
         "coalesced": False,
         "reason": "",
-        "queue_size": next_queue_size,
+        "queue_size": _core_ws_event_total_queue_size(),
         "queue_max_size": queue.maxsize,
     }
 
@@ -3182,6 +3540,26 @@ def _condition_event_is_stale(event: GatewayEvent) -> bool:
     with _gateway_condition_event_coalesce_lock:
         latest_generation = _gateway_condition_event_latest_generation.get(key)
     return latest_generation is not None and latest_generation != generation
+
+
+def _condition_event_action(event: GatewayEvent) -> str:
+    payload = dict(event.payload or {})
+    return str(payload.get("event_type") or "include").strip().lower()
+
+
+def _condition_event_queue_wait_ms(event: GatewayEvent, worker_started_monotonic: float) -> float | None:
+    trace = trace_from_payload(event.payload)
+    return monotonic_delta_ms(trace.get("core_condition_event_queued_monotonic_ms"), worker_started_monotonic)
+
+
+def _condition_event_should_skip_stale_include(event: GatewayEvent, worker_started_monotonic: float) -> tuple[bool, float | None, float]:
+    threshold_ms = _gateway_condition_event_stale_include_skip_ms()
+    if threshold_ms <= 0.0 or event.type != "condition_event" or _condition_event_action(event) != "include":
+        return False, None, threshold_ms
+    queue_wait_ms = _condition_event_queue_wait_ms(event, worker_started_monotonic)
+    if queue_wait_ms is None:
+        return False, None, threshold_ms
+    return queue_wait_ms > threshold_ms, queue_wait_ms, threshold_ms
 
 
 def _clear_condition_event_generation_if_current(event: GatewayEvent) -> None:
@@ -3407,6 +3785,7 @@ async def _gateway_condition_event_worker_loop_main(worker_index: int = 0) -> No
         item = await queue.get()
         events = item.events
         batch_size = len(events)
+        batch_queue_wait_ms = monotonic_delta_ms(item.queued_monotonic_ms, monotonic_ms()) or 0.0
         queue_size = max(0, int(gateway_condition_event_worker_state.get("queue_size") or 0) - batch_size)
         _update_gateway_condition_event_worker_state(
             {
@@ -3415,6 +3794,7 @@ async def _gateway_condition_event_worker_loop_main(worker_index: int = 0) -> No
                 "active_worker_count": int(gateway_condition_event_worker_state.get("active_worker_count") or 0) + 1,
                 "active_count": int(gateway_condition_event_worker_state.get("active_count") or 0) + batch_size,
                 "last_batch_size": batch_size,
+                "last_queue_wait_ms": round(batch_queue_wait_ms, 3),
                 "last_worker_index": worker_index,
                 "last_shard_key": _condition_event_shard_key(events[-1]) if events else "",
             }
@@ -3433,6 +3813,7 @@ async def _gateway_condition_event_worker_loop_main(worker_index: int = 0) -> No
             processed_count = int(result.get("processed_count") or 0)
             failed_count = int(result.get("failed_count") or 0)
             stale_skipped_count = int(result.get("stale_skipped_count") or 0)
+            stale_queue_wait_skipped_count = int(result.get("stale_queue_wait_skipped_count") or 0)
             _update_gateway_condition_event_worker_state(
                 {
                     "queue_size": int(gateway_condition_event_worker_state.get("queue_size") or 0),
@@ -3442,7 +3823,12 @@ async def _gateway_condition_event_worker_loop_main(worker_index: int = 0) -> No
                     "processed_count": int(gateway_condition_event_worker_state.get("processed_count") or 0) + processed_count,
                     "failed_count": int(gateway_condition_event_worker_state.get("failed_count") or 0) + failed_count,
                     "stale_skipped_count": int(gateway_condition_event_worker_state.get("stale_skipped_count") or 0) + stale_skipped_count,
+                    "stale_queue_wait_skipped_count": int(gateway_condition_event_worker_state.get("stale_queue_wait_skipped_count") or 0)
+                    + stale_queue_wait_skipped_count,
                     "last_stale_skipped_count": stale_skipped_count,
+                    "last_stale_queue_wait_skipped_count": stale_queue_wait_skipped_count,
+                    "last_stale_queue_wait_ms": round(float(result.get("last_stale_queue_wait_ms") or 0.0), 3),
+                    "last_queue_wait_ms": round(float(result.get("last_queue_wait_ms") or batch_queue_wait_ms), 3),
                     "last_batch_duration_ms": round(batch_duration_ms, 3),
                     "last_worker_index": worker_index,
                     "last_processed_at": utc_now_ms(),
@@ -3470,22 +3856,32 @@ async def _gateway_condition_event_worker_loop_main(worker_index: int = 0) -> No
             _update_gateway_condition_event_worker_state({"queue_batch_count": _gateway_condition_event_queue_batch_count()})
 
 
-async def _core_ws_event_worker_loop_main() -> None:
+async def _core_ws_event_worker_loop_main(worker_kind: str = "single", worker_index: int = 0) -> None:
     while True:
-        queue = _core_ws_event_queue
+        worker_queue_name = f"control:{worker_index}" if worker_kind == "control" else worker_kind
+        queue = _core_ws_event_queue_for_name(worker_queue_name)
         if queue is None:
             await asyncio.sleep(0.1)
             continue
         queued_item = await queue.get()
-        item = _resolve_core_ws_event_work_item(queued_item)
+        item = _resolve_core_ws_event_work_item(queued_item.work_item)
+        item = replace(
+            item,
+            metadata={
+                **dict(item.metadata or {}),
+                "core_ws_event_worker_kind": worker_kind,
+                "core_ws_event_worker_index": worker_index,
+                "core_ws_event_worker_queue_name": worker_queue_name,
+            },
+        )
         message_type = _core_ws_event_work_message_type(item.kind, event=item.event, message=item.message)
         event_id = item.event.event_id if item.event is not None else (item.message.event_id if item.message is not None else "")
         queue_wait_ms = monotonic_delta_ms(item.queued_monotonic_ms, monotonic_ms()) or 0.0
         _update_gateway_core_ws_event_worker_state(
             {
-                "queue_size": queue.qsize(),
-                "queue_max_size": queue.maxsize,
-                "active_count": 1,
+                **_core_ws_event_worker_state_patch(worker_queue_name),
+                **_core_ws_event_active_state_patch(worker_kind, active=True, worker_index=worker_index),
+                "last_priority": queued_item.priority,
                 "price_tick_pending_key_count": _core_ws_price_tick_pending_key_count(),
                 "last_message_type": message_type,
                 "last_event_id": event_id,
@@ -3498,9 +3894,8 @@ async def _core_ws_event_worker_loop_main() -> None:
             duration_ms = (time.perf_counter() - started) * 1000.0
             _update_gateway_core_ws_event_worker_state(
                 {
-                    "queue_size": queue.qsize(),
-                    "queue_max_size": queue.maxsize,
-                    "active_count": 0,
+                    **_core_ws_event_worker_state_patch(worker_queue_name),
+                    **_core_ws_event_active_state_patch(worker_kind, active=False, worker_index=worker_index),
                     "processed_count": int(gateway_core_ws_event_worker_state.get("processed_count") or 0) + 1,
                     "price_tick_processed_count": int(gateway_core_ws_event_worker_state.get("price_tick_processed_count") or 0)
                     + (1 if message_type == "price_tick" else 0),
@@ -3515,9 +3910,8 @@ async def _core_ws_event_worker_loop_main() -> None:
         except Exception as exc:
             _update_gateway_core_ws_event_worker_state(
                 {
-                    "queue_size": queue.qsize(),
-                    "queue_max_size": queue.maxsize,
-                    "active_count": 0,
+                    **_core_ws_event_worker_state_patch(worker_queue_name),
+                    **_core_ws_event_active_state_patch(worker_kind, active=False, worker_index=worker_index),
                     "price_tick_pending_key_count": _core_ws_price_tick_pending_key_count(),
                     "failed_count": int(gateway_core_ws_event_worker_state.get("failed_count") or 0) + 1,
                     "last_error": _truncate_log_detail(str(exc) or repr(exc)),
@@ -3526,7 +3920,10 @@ async def _core_ws_event_worker_loop_main() -> None:
         finally:
             queue.task_done()
             _update_gateway_core_ws_event_worker_state(
-                {"queue_size": queue.qsize(), "price_tick_pending_key_count": _core_ws_price_tick_pending_key_count()}
+                {
+                    **_core_ws_event_worker_state_patch(worker_queue_name),
+                    "price_tick_pending_key_count": _core_ws_price_tick_pending_key_count(),
+                }
             )
 
 
@@ -3553,6 +3950,9 @@ async def _process_core_ws_event_work_item(item: _CoreWsEventWorkItem, *, queue_
             "core_ws_event_worker_started_at_utc": started_at,
             "core_ws_event_worker_started_monotonic_ms": started_monotonic,
             "core_ws_event_queue_wait_ms": queue_wait_ms,
+            "core_ws_event_worker_kind": item.metadata.get("core_ws_event_worker_kind"),
+            "core_ws_event_worker_index": item.metadata.get("core_ws_event_worker_index"),
+            "core_ws_event_worker_queue_name": item.metadata.get("core_ws_event_worker_queue_name"),
         },
     )
     if item.kind == "transport_heartbeat":
@@ -3596,9 +3996,19 @@ def _process_condition_event_batch_in_worker(events: list[GatewayEvent]) -> dict
     processed_count = 0
     failed_count = 0
     stale_skipped_count = 0
+    stale_queue_wait_skipped_count = 0
+    last_queue_wait_ms = 0.0
+    last_stale_queue_wait_ms = 0.0
     last_error = ""
     if not events:
-        return {"processed_count": 0, "accepted_count": 0, "failed_count": 0, "stale_skipped_count": 0, "results": []}
+        return {
+            "processed_count": 0,
+            "accepted_count": 0,
+            "failed_count": 0,
+            "stale_skipped_count": 0,
+            "stale_queue_wait_skipped_count": 0,
+            "results": [],
+        }
     db: TradingDatabase | None = None
     try:
         collector: CandidateCollector | None = None
@@ -3610,6 +4020,30 @@ def _process_condition_event_batch_in_worker(events: list[GatewayEvent]) -> dict
             if db is None:
                 db = open_database()
                 collector = CandidateCollector(db)
+            worker_started_monotonic = monotonic_ms()
+            skip_stale_include, queue_wait_ms, _threshold_ms = _condition_event_should_skip_stale_include(event, worker_started_monotonic)
+            if queue_wait_ms is not None:
+                last_queue_wait_ms = queue_wait_ms
+            if skip_stale_include:
+                stale_skipped_count += 1
+                stale_queue_wait_skipped_count += 1
+                last_stale_queue_wait_ms = float(queue_wait_ms or 0.0)
+                try:
+                    result = _record_condition_event_stale_include_skip(
+                        db,
+                        collector,
+                        event,
+                        worker_started_monotonic=worker_started_monotonic,
+                        queue_wait_ms=last_stale_queue_wait_ms,
+                    )
+                except Exception as exc:
+                    result = _record_condition_event_worker_failure(db, event, exc)
+                    failed_count += 1
+                    last_error = str(result.get("error") or last_error)
+                finally:
+                    _clear_condition_event_generation_if_current(event)
+                results.append(result)
+                continue
             try:
                 result = _process_condition_event_with_db(db, collector, event)
             except Exception as exc:
@@ -3631,6 +4065,9 @@ def _process_condition_event_batch_in_worker(events: list[GatewayEvent]) -> dict
         "accepted_count": accepted_count,
         "failed_count": failed_count,
         "stale_skipped_count": stale_skipped_count,
+        "stale_queue_wait_skipped_count": stale_queue_wait_skipped_count,
+        "last_queue_wait_ms": last_queue_wait_ms,
+        "last_stale_queue_wait_ms": last_stale_queue_wait_ms,
         "last_error": last_error,
         "results": results,
     }
@@ -3648,25 +4085,79 @@ def _condition_event_stale_skip_result(event: GatewayEvent) -> dict[str, Any]:
     }
 
 
+def _record_condition_event_stale_include_skip(
+    db: TradingDatabase,
+    collector: CandidateCollector,
+    event: GatewayEvent,
+    *,
+    worker_started_monotonic: float,
+    queue_wait_ms: float,
+) -> dict[str, Any]:
+    core_received_at = utc_now_ms()
+    trace = trace_from_payload(event.payload)
+    threshold_ms = _gateway_condition_event_stale_include_skip_ms()
+    event = _event_with_trace(
+        event,
+        {
+            "core_condition_event_worker_started_at_utc": core_received_at,
+            "core_condition_event_worker_started_monotonic_ms": worker_started_monotonic,
+            "core_condition_event_queue_wait_ms": queue_wait_ms,
+            "core_condition_event_stale_include_skipped": True,
+            "core_condition_event_stale_include_skip_ms": threshold_ms,
+            "core_condition_event_stale_reason": "STALE_CONDITION_INCLUDE_QUEUE_WAIT",
+            "core_event_received_at_utc": core_received_at,
+            "core_event_received_monotonic_ms": worker_started_monotonic,
+            "core_event_persisted_at_utc": utc_now_ms(),
+            "core_event_persisted_monotonic_ms": monotonic_ms(),
+        },
+    )
+    condition_event = BrokerConditionEvent.from_dict(event.payload)
+    collector.reject_condition_event(
+        condition_event,
+        "include",
+        warning=f"STALE_CONDITION_INCLUDE_QUEUE_WAIT:{condition_event.condition_name}:{condition_event.code}",
+        reason="stale condition include queue wait",
+    )
+    _save_gateway_event_transport_sample(
+        db,
+        event,
+        accepted=False,
+        core_receive_ms=wall_ms(trace.get("gateway_event_post_end_at_utc"), core_received_at),
+        core_persist_ms=0.0,
+        error="STALE_CONDITION_INCLUDE_QUEUE_WAIT",
+    )
+    return {
+        "accepted": False,
+        "event_id": event.event_id,
+        "type": event.type,
+        "skipped": True,
+        "skip_reason": "STALE_CONDITION_INCLUDE_QUEUE_WAIT",
+        "queue_wait_ms": queue_wait_ms,
+        "threshold_ms": threshold_ms,
+    }
+
+
 def _process_condition_event_with_db(db: TradingDatabase, collector: CandidateCollector, event: GatewayEvent) -> dict[str, Any]:
     if event.type != "condition_event":
         raise ValueError(f"unsupported async condition event type: {event.type}")
     core_received_at = utc_now_ms()
     core_received_monotonic = monotonic_ms()
     trace = trace_from_payload(event.payload)
+    condition_queue_wait_ms = monotonic_delta_ms(
+        trace.get("core_condition_event_queued_monotonic_ms"),
+        core_received_monotonic,
+    )
     event = _event_with_trace(
         event,
         {
             "core_condition_event_worker_started_at_utc": core_received_at,
             "core_condition_event_worker_started_monotonic_ms": core_received_monotonic,
-            "core_condition_event_queue_wait_ms": monotonic_delta_ms(
-                trace.get("core_condition_event_queued_monotonic_ms"),
-                core_received_monotonic,
-            ),
+            "core_condition_event_queue_wait_ms": condition_queue_wait_ms,
             "core_event_received_at_utc": core_received_at,
             "core_event_received_monotonic_ms": core_received_monotonic,
         },
     )
+    process_started = time.perf_counter()
     accepted = gateway_state.record_event(event)
     persist_ms = 0.0
     if accepted:
@@ -3676,6 +4167,7 @@ def _process_condition_event_with_db(db: TradingDatabase, collector: CandidateCo
         event = _event_with_trace(
             event,
             {
+                "core_condition_event_process_ms": (time.perf_counter() - process_started) * 1000.0,
                 "core_event_persisted_at_utc": utc_now_ms(),
                 "core_event_persisted_monotonic_ms": monotonic_ms(),
             },
@@ -3688,6 +4180,14 @@ def _process_condition_event_with_db(db: TradingDatabase, collector: CandidateCo
             core_persist_ms=persist_ms,
         )
     else:
+        event = _event_with_trace(
+            event,
+            {
+                "core_condition_event_process_ms": (time.perf_counter() - process_started) * 1000.0,
+                "core_event_persisted_at_utc": utc_now_ms(),
+                "core_event_persisted_monotonic_ms": monotonic_ms(),
+            },
+        )
         _save_gateway_event_transport_sample(
             db,
             event,
@@ -3711,17 +4211,21 @@ def _record_condition_event_worker_failure(db: TradingDatabase, event: GatewayEv
     core_received_at = utc_now_ms()
     core_received_monotonic = monotonic_ms()
     trace = trace_from_payload(event.payload)
+    condition_queue_wait_ms = monotonic_delta_ms(
+        trace.get("core_condition_event_queued_monotonic_ms"),
+        core_received_monotonic,
+    )
     event = _event_with_trace(
         event,
         {
             "core_condition_event_worker_started_at_utc": core_received_at,
             "core_condition_event_worker_started_monotonic_ms": core_received_monotonic,
-            "core_condition_event_queue_wait_ms": monotonic_delta_ms(
-                trace.get("core_condition_event_queued_monotonic_ms"),
-                core_received_monotonic,
-            ),
+            "core_condition_event_queue_wait_ms": condition_queue_wait_ms,
+            "core_condition_event_process_ms": 0.0,
             "core_event_received_at_utc": core_received_at,
             "core_event_received_monotonic_ms": core_received_monotonic,
+            "core_event_persisted_at_utc": utc_now_ms(),
+            "core_event_persisted_monotonic_ms": monotonic_ms(),
         },
     )
     error = str(exc) or repr(exc)
@@ -5918,10 +6422,23 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         "core_ws_event_queue_size": int(core_event_worker.get("queue_size") or 0),
         "core_ws_event_queue_max_size": int(core_event_worker.get("queue_max_size") or 0),
         "core_ws_event_active_count": int(core_event_worker.get("active_count") or 0),
+        "core_ws_event_split_enabled": bool(core_event_worker.get("split_enabled")),
+        "core_ws_event_control_worker_count": int(core_event_worker.get("control_worker_count") or 0),
+        "core_ws_event_control_queue_size": int(core_event_worker.get("control_queue_size") or 0),
+        "core_ws_event_control_queue_sizes": list(core_event_worker.get("control_queue_sizes") or []),
+        "core_ws_event_data_queue_size": int(core_event_worker.get("data_queue_size") or 0),
+        "core_ws_event_control_active_count": int(core_event_worker.get("control_active_count") or 0),
+        "core_ws_event_data_active_count": int(core_event_worker.get("data_active_count") or 0),
         "core_ws_event_queued_count": int(core_event_worker.get("queued_count") or 0),
         "core_ws_event_processed_count": int(core_event_worker.get("processed_count") or 0),
         "core_ws_event_failed_count": int(core_event_worker.get("failed_count") or 0),
         "core_ws_event_dropped_count": int(core_event_worker.get("dropped_count") or 0),
+        "core_ws_event_priority_enabled": bool(core_event_worker.get("priority_enabled")),
+        "core_ws_event_control_queued_count": int(core_event_worker.get("control_queued_count") or 0),
+        "core_ws_event_data_queued_count": int(core_event_worker.get("data_queued_count") or 0),
+        "core_ws_event_last_priority": int(core_event_worker.get("last_priority") or 0),
+        "core_ws_event_last_worker_kind": core_event_worker.get("last_worker_kind") or "",
+        "core_ws_event_last_control_worker_index": int(core_event_worker.get("last_control_worker_index") or 0),
         "core_ws_price_tick_coalesce_enabled": bool(core_event_worker.get("price_tick_coalesce_enabled")),
         "core_ws_price_tick_pending_key_count": int(core_event_worker.get("price_tick_pending_key_count") or 0),
         "core_ws_price_tick_received_count": int(core_event_worker.get("price_tick_received_count") or 0),
@@ -5986,6 +6503,7 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         "core_condition_event_queued_count": int(condition_worker.get("queued_count") or 0),
         "core_condition_event_coalesced_count": int(condition_worker.get("coalesced_count") or 0),
         "core_condition_event_stale_skipped_count": int(condition_worker.get("stale_skipped_count") or 0),
+        "core_condition_event_stale_queue_wait_skipped_count": int(condition_worker.get("stale_queue_wait_skipped_count") or 0),
         "core_condition_event_processed_count": int(condition_worker.get("processed_count") or 0),
         "core_condition_event_failed_count": int(condition_worker.get("failed_count") or 0),
         "core_condition_event_dropped_count": int(condition_worker.get("dropped_count") or 0),
@@ -5994,6 +6512,14 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         "core_condition_event_last_queued_count": int(condition_worker.get("last_queued_count") or 0),
         "core_condition_event_last_coalesced_count": int(condition_worker.get("last_coalesced_count") or 0),
         "core_condition_event_last_stale_skipped_count": int(condition_worker.get("last_stale_skipped_count") or 0),
+        "core_condition_event_last_stale_queue_wait_skipped_count": int(
+            condition_worker.get("last_stale_queue_wait_skipped_count") or 0
+        ),
+        "core_condition_event_last_stale_queue_wait_ms": float(condition_worker.get("last_stale_queue_wait_ms") or 0.0),
+        "core_condition_event_last_queue_wait_ms": float(condition_worker.get("last_queue_wait_ms") or 0.0),
+        "core_condition_event_stale_include_skip_ms": float(
+            condition_worker.get("stale_include_skip_ms") or _gateway_condition_event_stale_include_skip_ms()
+        ),
         "core_condition_event_last_batch_duration_ms": float(condition_worker.get("last_batch_duration_ms") or 0.0),
         "core_condition_event_last_worker_index": int(condition_worker.get("last_worker_index") or 0),
         "core_condition_event_last_shard_key": condition_worker.get("last_shard_key") or "",

@@ -352,6 +352,10 @@ class TransportLatencySample:
                 trace_data.get("core_condition_event_queued_monotonic_ms"),
                 trace_data.get("core_condition_event_worker_started_monotonic_ms"),
             ),
+            "core_condition_event_process_ms": _optional_float(trace_data.get("core_condition_event_process_ms")),
+            "core_condition_event_stale_include_skip_ms": _optional_float(
+                trace_data.get("core_condition_event_stale_include_skip_ms")
+            ),
             "core_ws_event_queue_wait_ms": monotonic_delta_ms(
                 trace_data.get("core_ws_event_queued_monotonic_ms"),
                 trace_data.get("core_ws_event_worker_started_monotonic_ms"),

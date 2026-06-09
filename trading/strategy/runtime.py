@@ -195,6 +195,7 @@ class StrategyRuntimeSnapshot:
     last_live_sim_order_intent_at: str = ""
     last_live_sim_reject_reason: str = ""
     live_sim_summary: dict = field(default_factory=dict)
+    live_sim_maintenance_summary: dict = field(default_factory=dict)
     subscription_active_count: int = 0
     virtual_order_status_change_count: int = 0
     condition_profiles_count: int = 0
@@ -389,6 +390,7 @@ class StrategyRuntime:
                 snapshot.warnings.append("RUNTIME_NOT_STARTED")
                 return snapshot
 
+            timed("order_sink_maintenance", lambda: self._run_order_sink_maintenance(snapshot, current))
             trade_date = timed("trade_date", self.candidate_collector._trade_date)
             timed("prune_position_context_history", lambda: self._prune_position_context_history(snapshot, current))
             timed("theme_lab_flow", lambda: self._run_theme_lab_flow(snapshot, current))
@@ -2029,6 +2031,21 @@ class StrategyRuntime:
         snapshot.last_live_sim_order_intent_at = str(payload.get("last_live_sim_order_intent_at") or "")
         snapshot.last_live_sim_reject_reason = str(payload.get("last_live_sim_reject_reason") or "")
         snapshot.live_sim_summary = dict(payload.get("live_sim_summary") or {})
+        snapshot.live_sim_maintenance_summary = dict(payload.get("live_sim_maintenance_summary") or {})
+
+    def _run_order_sink_maintenance(self, snapshot: StrategyRuntimeSnapshot, now: datetime) -> None:
+        if self.order_sink is None or not hasattr(self.order_sink, "run_maintenance"):
+            self._apply_order_sink_snapshot(snapshot)
+            return
+        try:
+            result = self.order_sink.run_maintenance(runtime_cycle_at=now.isoformat())
+            snapshot.live_sim_maintenance_summary = dict(result or {})
+            lifecycle = dict((result or {}).get("lifecycle") or {})
+            if str(lifecycle.get("status") or "") == "UNHEALTHY":
+                snapshot.warnings.append(f"LIVE_SIM_ORDER_LIFECYCLE_UNHEALTHY:{lifecycle.get('reason') or 'UNKNOWN'}")
+            self._apply_order_sink_snapshot(snapshot)
+        except Exception as exc:
+            snapshot.warnings.append(f"RUNTIME_ORDER_SINK_MAINTENANCE_FAILED:{exc}")
 
     def _apply_reason_summary(self, snapshot: StrategyRuntimeSnapshot) -> None:
         try:

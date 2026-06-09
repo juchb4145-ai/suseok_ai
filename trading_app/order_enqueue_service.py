@@ -1010,6 +1010,7 @@ class OrderEnqueueService:
             orders_reconciled = 0
             positions_reconciled = 0
             external_positions = 0
+            position_reconcile_required = False
             for fill in list(snapshot.get("fills") or []):
                 broker_order_id = str(fill.get("broker_order_id") or fill.get("order_no") or "")
                 order = db.find_live_sim_order_by_broker_order_id(broker_order_id)
@@ -1062,19 +1063,55 @@ class OrderEnqueueService:
                         )
                         orders_reconciled += 1
                         reason_codes.append("LIVE_SIM_RECONCILE_ORDER_CANCELLED_FROM_BROKER")
-            open_positions = db.list_live_sim_positions(limit=1000)
-            open_keys = {
-                (str(item.get("code") or ""), str(item.get("account_id_masked") or ""))
-                for item in open_positions
-                if str(item.get("status") or "") in {"OPEN", "PARTIAL", "EXIT_ORDERED", "EXIT_SUBMITTING"}
-            }
+            open_positions = [
+                item
+                for item in db.list_live_sim_positions(limit=1000)
+                if str(item.get("status") or "") in {"OPEN", "PARTIAL", "EXIT_ORDERED", "EXIT_SUBMITTING", "RECONCILE_REQUIRED"}
+            ]
+            open_by_key: dict[tuple[str, str], dict[str, Any] | None] = {}
+            for item in open_positions:
+                key = (str(item.get("code") or ""), str(item.get("account_id_masked") or ""))
+                open_by_key[key] = item if key not in open_by_key else None
             for broker_position in list(snapshot.get("positions") or []):
                 code = str(broker_position.get("code") or "")
                 qty = int(broker_position.get("quantity") or broker_position.get("current_qty") or 0)
                 account_id_masked = _mask_account(str(broker_position.get("account") or broker_position.get("account_id_masked") or ""))
                 if qty <= 0 or not code:
                     continue
-                if (code, account_id_masked) in open_keys:
+                key = (code, account_id_masked)
+                if key in open_by_key:
+                    position = open_by_key[key]
+                    if position is None:
+                        position_reconcile_required = True
+                        reason_codes.append("LIVE_SIM_RECONCILE_POSITION_AMBIGUOUS")
+                        db.save_live_sim_runtime_health(
+                            "reconcile",
+                            status="RECONCILE_REQUIRED",
+                            reason="LIVE_SIM_RECONCILE_POSITION_AMBIGUOUS",
+                            details={"code": code, "account_id_masked": account_id_masked},
+                            updated_at=now,
+                        )
+                        continue
+                    current_qty = int(position.get("current_qty") or 0)
+                    if current_qty != qty or str(position.get("status") or "") == "RECONCILE_REQUIRED":
+                        db.save_live_sim_position(
+                            {
+                                **position,
+                                "current_qty": qty,
+                                "entry_qty": max(int(position.get("entry_qty") or 0), qty),
+                                "status": "OPEN",
+                                "details": {
+                                    **dict(position.get("details") or {}),
+                                    "reconcile_position_sync": {
+                                        "previous_current_qty": current_qty,
+                                        "broker_current_qty": qty,
+                                        "broker_position": broker_position,
+                                        "synced_at": now,
+                                    },
+                                },
+                                "updated_at": now,
+                            }
+                        )
                     positions_reconciled += 1
                     reason_codes.append("LIVE_SIM_RECONCILE_POSITION_SYNCED")
                     continue
@@ -1097,12 +1134,19 @@ class OrderEnqueueService:
                 )
                 reason_codes.append("LIVE_SIM_RECONCILE_EXTERNAL_POSITION_DETECTED")
             status = "COMPLETED"
-            if external_positions:
+            if external_positions or position_reconcile_required:
                 db.save_live_sim_runtime_health(
                     "reconcile",
                     status="RECONCILE_REQUIRED",
-                    reason="LIVE_SIM_RECONCILE_EXTERNAL_POSITION_DETECTED",
-                    details={"external_positions": external_positions},
+                    reason=(
+                        "LIVE_SIM_RECONCILE_EXTERNAL_POSITION_DETECTED"
+                        if external_positions
+                        else "LIVE_SIM_RECONCILE_POSITION_AMBIGUOUS"
+                    ),
+                    details={
+                        "external_positions": external_positions,
+                        "position_reconcile_required": position_reconcile_required,
+                    },
                     updated_at=now,
                 )
             else:
@@ -1443,10 +1487,24 @@ class OrderEnqueueService:
         amount = int(broker_request.quantity or 0) * max(0, int(broker_request.price or 0))
         min_amount = int(execution.get("min_order_amount_krw") or 0)
         max_amount = int(execution.get("max_order_amount_krw") or self.settings.max_order_amount)
+        early_small_cap_applied = False
+        if broker_request.side == "buy" and _is_ready_early_small(request):
+            multiplier = float(execution.get("early_small_max_order_amount_multiplier") or 0.5)
+            multiplier = min(1.0, max(0.0, multiplier))
+            max_amount = max(1, int(max_amount * multiplier))
+            early_small_cap_applied = True
         if broker_request.side == "buy" and min_amount > 0 and amount < min_amount:
             return "ORDER_AMOUNT_BELOW_MIN", ["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD"], {"amount": amount, "min_order_amount_krw": min_amount}
         if broker_request.side == "buy" and amount > max_amount:
-            return "ORDER_AMOUNT_LIMIT", ["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD"], {"amount": amount, "max_order_amount_krw": max_amount}
+            return (
+                "ORDER_AMOUNT_LIMIT",
+                ["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD"],
+                {
+                    "amount": amount,
+                    "max_order_amount_krw": max_amount,
+                    "early_small_cap_applied": early_small_cap_applied,
+                },
+            )
         gate_reason = _runtime_gate_block_reason(request)
         if gate_reason:
             return gate_reason, [gate_reason], {"metadata": dict(request.metadata or {}), "gate_status": request.gate_status}
@@ -1696,6 +1754,13 @@ class OrderEnqueueService:
                         else "LIVE_SIM_BUY_BLOCKED_RECONCILE_REQUIRED"
                     )
                     return reason, [reason], {"health": health}
+                summary = db.live_sim_summary()
+                if int(summary.get("reconcile_required_count") or 0) > 0:
+                    return (
+                        "LIVE_SIM_BUY_BLOCKED_RECONCILE_REQUIRED",
+                        ["LIVE_SIM_BUY_BLOCKED_RECONCILE_REQUIRED"],
+                        {"summary": summary},
+                    )
             pending_cancel = db.find_pending_live_sim_cancel(code=code, account_id_masked=account_id_masked)
             if pending_cancel is not None and bool(lifecycle.get("block_new_order_when_cancel_pending", True)):
                 return (
@@ -1923,8 +1988,17 @@ def _runtime_gate_block_reason(request: RuntimeOrderIntentRequest) -> str:
         for item in list(metadata.get("reason_codes") or [])
         + list(metadata.get("risk_reason_codes") or [])
         + list(metadata.get("market_reason_codes") or [])
+        + list(metadata.get("market_side_reason_codes") or [])
+        + list(metadata.get("market_side_data_quality_flags") or [])
+        + list(metadata.get("data_quality_flags") or [])
+        + list(metadata.get("entry_risk_reason_codes") or [])
         if str(item)
     }
+    sub_status = str(metadata.get("sub_status") or metadata.get("final_gate_status") or "").upper()
+    if sub_status == "ENTRY_RISK_FINAL_BLOCK" or "ENTRY_RISK_FINAL_BLOCK" in reason_codes:
+        return "ENTRY_RISK_FINAL_BLOCK"
+    if sub_status == "DATA_INSUFFICIENT" and not _is_ready_early_small(request):
+        return "DATA_INSUFFICIENT"
     if str(request.gate_status or "").upper() in {"BLOCKED", "WAIT", "TEMP_WAIT"}:
         return str(request.gate_reason or "RUNTIME_GATE_NOT_READY")
     if metadata.get("support_ready") is False or metadata.get("support_missing_reason"):
@@ -1964,7 +2038,31 @@ def _runtime_gate_block_reason(request: RuntimeOrderIntentRequest) -> str:
         return "WAIT_CANDIDATE_MARKET_WEAK" if market_status == "WEAK" else "WAIT_MARKET_CONFIRMATION_PENDING"
     if str(metadata.get("order_eligibility") or "").upper() in {"WAIT_DATA", "BLOCKED", "WAIT"}:
         return "DATA_INSUFFICIENT"
+    bad_data_codes = {
+        "DATA_INSUFFICIENT",
+        "INDICATOR_DATA_INSUFFICIENT",
+        "INDEX_DATA_INSUFFICIENT",
+        "STALE_QUOTE",
+        "SIDE_BREADTH_SAMPLE_TOO_SMALL",
+        "SIDE_BREADTH_VALID_QUOTE_RATIO_LOW",
+    }
+    has_bad_data = bool(reason_codes & bad_data_codes)
+    breadth_known_bad = "candidate_breadth_ready" in metadata and metadata.get("candidate_breadth_ready") is False
+    if (has_bad_data or breadth_known_bad) and not _is_ready_early_small(request):
+        return "DATA_INSUFFICIENT"
     return ""
+
+
+def _is_ready_early_small(request: RuntimeOrderIntentRequest) -> bool:
+    metadata = dict(request.metadata or {})
+    values = {
+        str(request.gate_reason or "").upper(),
+        str(metadata.get("ready_type") or "").upper(),
+        str(metadata.get("final_status") or "").upper(),
+        str(metadata.get("final_gate_status") or "").upper(),
+    }
+    values.update(str(item or "").upper() for item in list(metadata.get("reason_codes") or []))
+    return "READY_EARLY_SMALL" in values
 
 
 def _order_price_type_allowed(request: BrokerOrderRequest, execution: dict[str, Any]) -> bool:
