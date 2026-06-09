@@ -5,6 +5,7 @@ from pathlib import Path
 from storage.db import TradingDatabase
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import BrokerExecutionEvent, BrokerOrderRequest, BrokerOrderResult, GatewayEvent, utc_timestamp
+from trading.strategy.runtime import StrategyRuntime, StrategyRuntimeSnapshot
 from trading.strategy.runtime_settings import StrategyRuntimeSettings
 from trading_app.dependencies import CoreSettings
 from trading_app.order_enqueue_service import OrderEnqueueService, RuntimeOrderIntentRequest
@@ -183,6 +184,24 @@ def test_factory_live_sim_requires_explicit_runtime_setting(tmp_path):
     sink = _build_order_sink(settings, _state(), None, runtime_settings=runtime_settings)
 
     assert isinstance(sink, LiveSimRuntimeOrderSink)
+
+
+def test_strategy_runtime_snapshot_includes_live_sim_order_sink_fields(tmp_path):
+    service, _, _ = _service(tmp_path)
+    runtime_settings = StrategyRuntimeSettings.from_settings_json(
+        {"order_execution": _live_sim_execution(), "live_sim_exit_guard": _exit_guard()}
+    )
+    sink = LiveSimRuntimeOrderSink(settings=_settings(tmp_path), service=service, runtime_settings=runtime_settings)
+    runtime = object.__new__(StrategyRuntime)
+    runtime.order_sink = sink
+    snapshot = StrategyRuntimeSnapshot()
+
+    StrategyRuntime._apply_order_sink_snapshot(runtime, snapshot)
+
+    assert snapshot.live_sim_order_sink_enabled is True
+    assert snapshot.live_sim_order_policy == "LIVE_SIM_FIRST_LEG_GUARDED"
+    assert snapshot.live_sim_order_intent_count == 0
+    assert snapshot.live_sim_summary["submitted_order_count"] == 0
 
 
 def test_factory_blocks_live_real_even_when_runtime_live_orders_requested(tmp_path):
@@ -378,6 +397,124 @@ def test_live_sim_order_result_and_fills_update_order_position_and_ignore_duplic
     assert filled["details"]["position"]["stop_loss_price"] == 68600
     assert filled["details"]["position"]["take_profit_price"] == 73500
     assert filled["details"]["position"]["max_hold_exit_at"]
+
+
+def test_live_sim_execution_links_pending_order_when_order_result_has_no_order_no(tmp_path):
+    service, settings, _ = _service(tmp_path)
+    submit = service.enqueue_live_sim_order(_request(), execution_config=_live_sim_execution(), exit_guard_config=_exit_guard())
+    request = BrokerOrderRequest.from_dict(dict(submit.command["payload"]))
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        db.save_order_result(
+            BrokerOrderResult(
+                ok=True,
+                code=0,
+                message="accepted",
+                request=request,
+                order_no="",
+                command_id=submit.command_id,
+                idempotency_key=submit.idempotency_key,
+            )
+        )
+        db.save_execution(
+            BrokerExecutionEvent(
+                code="005930",
+                order_no="A0001",
+                side="buy",
+                quantity=3,
+                price=70000,
+                filled_quantity=3,
+                remaining_quantity=0,
+                execution_id="fill-no-order-result-order-no",
+            )
+        )
+        filled = db.get_live_sim_order(submit.intent_id)
+        summary = db.live_sim_summary()
+    finally:
+        db.close()
+
+    assert filled["broker_order_id"] == "A0001"
+    assert filled["order_status"] == "FILLED"
+    assert summary["filled_order_count"] == 1
+
+
+def test_live_sim_exit_uses_open_position_quantity_instead_of_virtual_quantity(tmp_path):
+    service, settings, state = _service(tmp_path)
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        db.save_live_sim_position(
+            {
+                "position_id": "LIVE_SIM:12******90:005930:ci-1",
+                "candidate_instance_id": "ci-1",
+                "code": "005930",
+                "account_id_masked": "12******90",
+                "opened_at": "2026-05-30T09:00:00",
+                "entry_qty": 10,
+                "entry_avg_price": 70000,
+                "current_qty": 10,
+                "status": "OPEN",
+                "updated_at": "2026-05-30T09:00:00",
+            }
+        )
+    finally:
+        db.close()
+
+    result = service.enqueue_live_sim_order(
+        _request(
+            side="sell",
+            quantity=1,
+            price=69000,
+            order_type=2,
+            order_phase="exit",
+            exit_percent=100.0,
+            exit_quantity=1,
+            position_quantity=1,
+            remaining_quantity=0,
+            metadata={"candidate_instance_id": "ci-1", "full_exit": True, "position_closed": True},
+        ),
+        execution_config=_live_sim_execution(),
+        exit_guard_config=_exit_guard(),
+        lifecycle_config=_lifecycle(),
+        reconcile_config=_reconcile(),
+    )
+    commands = state.dispatch_commands(limit=10)
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        order = db.get_live_sim_order(result.intent_id)
+    finally:
+        db.close()
+
+    assert result.accepted is True
+    assert result.request["quantity"] == 10
+    assert order["requested_qty"] == 10
+    assert order["details"]["exit_quantity_resolution"]["current_qty"] == 10
+    assert commands[0].payload["quantity"] == 10
+    assert commands[0].payload["live_sim_exit_requested_qty"] == 1
+    assert commands[0].payload["live_sim_exit_resolved_qty"] == 10
+
+
+def test_live_sim_exit_blocks_when_open_position_quantity_is_unknown(tmp_path):
+    service, _, state = _service(tmp_path)
+
+    result = service.enqueue_live_sim_order(
+        _request(
+            side="sell",
+            quantity=1,
+            price=69000,
+            order_type=2,
+            order_phase="exit",
+            exit_percent=100.0,
+            metadata={"candidate_instance_id": "ci-missing", "full_exit": True},
+        ),
+        execution_config=_live_sim_execution(),
+        exit_guard_config=_exit_guard(),
+        lifecycle_config=_lifecycle(),
+        reconcile_config=_reconcile(),
+    )
+
+    assert result.accepted is False
+    assert result.reason == "LIVE_SIM_EXIT_POSITION_NOT_FOUND"
+    assert state.command_snapshot()["queued_count"] == 0
 
 
 def test_live_sim_unfilled_buy_auto_cancel_creates_cancel_order(tmp_path):

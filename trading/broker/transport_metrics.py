@@ -336,6 +336,7 @@ class TransportLatencySample:
             total = core_receive_ms
         ws_send_reference_at = trace_data.get("gateway_ws_condition_batch_sent_at_utc") or trace_data.get("gateway_ws_send_queued_at_utc")
         ws_send_started_at = trace_data.get("gateway_ws_send_started_at_utc")
+        ws_send_completed_at = trace_data.get("gateway_ws_send_completed_at_utc")
         stage = {
             "gateway_queue_wait_ms": monotonic_delta_ms(
                 trace_data.get("gateway_event_created_monotonic_ms"),
@@ -351,8 +352,17 @@ class TransportLatencySample:
                 trace_data.get("core_condition_event_queued_monotonic_ms"),
                 trace_data.get("core_condition_event_worker_started_monotonic_ms"),
             ),
+            "core_ws_event_queue_wait_ms": monotonic_delta_ms(
+                trace_data.get("core_ws_event_queued_monotonic_ms"),
+                trace_data.get("core_ws_event_worker_started_monotonic_ms"),
+            ),
             "core_ws_receive_loop_gap_ms": _optional_float(trace_data.get("core_ws_receive_loop_gap_ms")),
             "gateway_ws_queue_to_send_start_ms": wall_ms(ws_send_reference_at, ws_send_started_at),
+            "gateway_ws_send_start_to_send_complete_ms": (
+                _optional_float(trace_data.get("gateway_ws_send_duration_ms"))
+                or wall_ms(ws_send_started_at, ws_send_completed_at)
+            ),
+            "gateway_ws_send_complete_to_core_receive_ms": wall_ms(ws_send_completed_at, trace_data.get("core_ws_received_at_utc")),
             "gateway_ws_send_start_to_core_receive_ms": wall_ms(ws_send_started_at, trace_data.get("core_ws_received_at_utc")),
             "gateway_ws_to_core_receive_ms": wall_ms(ws_send_reference_at, trace_data.get("core_ws_received_at_utc")),
         }

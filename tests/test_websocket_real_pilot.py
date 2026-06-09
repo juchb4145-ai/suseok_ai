@@ -57,6 +57,20 @@ def test_websocket_pilot_feature_flags_select_real_client(monkeypatch):
     assert client.snapshot()["ws_pilot_live_order_blocked"] is True
 
 
+def test_websocket_pilot_snapshot_reflects_order_command_allow_policy(monkeypatch):
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_REAL_PILOT", "1")
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL", "1")
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS", "1")
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS", "0")
+    client = _build_core_client(_args(transport="websocket-pilot"))
+
+    snapshot = client.snapshot()
+    client.stop()
+
+    assert snapshot["ws_pilot_live_order_blocked"] is False
+    assert snapshot["ws_pilot_order_commands_allowed"] is True
+
+
 def test_websocket_transport_keepalive_is_not_kiwoom_status(monkeypatch):
     monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_REAL_PILOT", "1")
     monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL", "1")
@@ -67,9 +81,69 @@ def test_websocket_transport_keepalive_is_not_kiwoom_status(monkeypatch):
 
     assert message.type == "transport_heartbeat"
     assert message.payload["transport_keepalive"] is True
+    assert message.payload["ws_heartbeat_compact"] is True
     assert "kiwoom_logged_in" not in message.payload
     assert "orderable" not in message.payload
     assert "account" not in message.payload
+
+
+def test_websocket_real_client_compacts_status_heartbeat_payload(monkeypatch):
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_REAL_PILOT", "1")
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL", "1")
+    client = _build_core_client(_args(transport="websocket-pilot"))
+    client.ws_priority_price_tick_codes = {"005930": {"holding"}}
+
+    message = client._message_from_event(
+        GatewayEvent(
+            type="heartbeat",
+            event_id="evt-heartbeat-compact",
+            payload={
+                "kiwoom_logged_in": True,
+                "orderable": True,
+                "mode": "DRY_RUN",
+                "account": "1234567890",
+                "accounts": ["1234567890", "2222222222", "3333333333", "4444444444", "5555555555", "6666666666"],
+                "broker_name": "KIWOOM",
+                "broker_env": "SIMULATION",
+                "server_mode": "SIMULATION",
+                "account_mode": "SIMULATION",
+                "server_gubun": "1",
+                "rate_limit": {
+                    "commands": {
+                        "tr_request": {"allowed_count": 3, "limited_count": 1, "wait_time_sec": 0.8},
+                        "login": {"allowed_count": 1, "limited_count": 0, "wait_time_sec": 0.0},
+                    }
+                },
+                "fallback": {"transport_mode": "rest_long_poll", "gateway_last_poll_ms": 123},
+                "ws_priority_price_tick_codes": ["005930"] * 100,
+                "transport_trace": {"trace_id": "trace-heartbeat-compact"},
+            },
+        )
+    )
+    client.stop()
+
+    assert message.type == "heartbeat"
+    assert message.payload["kiwoom_logged_in"] is True
+    assert message.payload["orderable"] is True
+    assert message.payload["account"] == "1234567890"
+    assert message.payload["accounts"] == ["1234567890", "2222222222", "3333333333", "4444444444", "5555555555"]
+    assert message.payload["broker_env"] == "SIMULATION"
+    assert message.payload["server_mode"] == "SIMULATION"
+    assert message.payload["account_mode"] == "SIMULATION"
+    assert message.payload["server_gubun"] == "1"
+    assert message.payload["ws_heartbeat_compact"] is True
+    assert "rate_limit" not in message.payload
+    assert "fallback" not in message.payload
+    assert "ws_priority_price_tick_codes" not in message.payload
+    assert message.payload["rate_limit_summary"]["command_count"] == 2
+    assert message.payload["rate_limit_summary"]["limited_count"] == 1
+    assert message.payload["rate_limit_summary"]["max_wait_time_sec"] == 0.8
+    assert set(message.payload["ws_heartbeat_omitted_fields"]) == {
+        "rate_limit",
+        "fallback",
+        "ws_priority_price_tick_codes",
+    }
+    assert trace_from_payload(message.payload)["trace_id"] == "trace-heartbeat-compact"
 
 
 def test_websocket_send_injects_send_started_trace(monkeypatch):
@@ -101,7 +175,18 @@ def test_websocket_send_injects_send_started_trace(monkeypatch):
     assert trace["gateway_ws_send_started_at_utc"]
     assert trace["gateway_ws_send_started_monotonic_ms"] > 0
     assert sent.metadata["gateway_ws_send_started_at_utc"] == trace["gateway_ws_send_started_at_utc"]
-    assert client.snapshot()["ws_last_send_ms"] >= 0
+    diagnostic = GatewayWsMessage.from_dict(json.loads(fake_ws.sent[1]))
+    assert diagnostic.type == "transport_send_completed"
+    assert diagnostic.payload["original_message_id"] == sent.message_id
+    assert diagnostic.payload["original_type"] == "heartbeat"
+    assert diagnostic.payload["sample_message_type"] == "heartbeat"
+    assert diagnostic.payload["original_sequence"] == sent.sequence
+    assert diagnostic.payload["gateway_ws_send_completed_at_utc"]
+    assert diagnostic.payload["gateway_ws_send_duration_ms"] >= 0
+    snapshot = client.snapshot()
+    assert snapshot["ws_last_send_ms"] >= 0
+    assert snapshot["ws_last_send_completed_message_id"] == sent.message_id
+    assert snapshot["ws_last_send_completed_message_type"] == "heartbeat"
 
 
 def test_websocket_connection_loop_drains_incoming_while_send_is_blocked():
@@ -567,6 +652,7 @@ def test_websocket_pilot_blocks_order_commands_by_default(monkeypatch):
 
     class Runtime:
         core_client = client
+        last_heartbeat_payload = {"broker_env": "SIMULATION"}
 
     rejection = _websocket_pilot_command_rejection(
         Runtime(),
@@ -574,6 +660,33 @@ def test_websocket_pilot_blocks_order_commands_by_default(monkeypatch):
     )
 
     assert rejection == "WEBSOCKET_PILOT_ORDER_COMMAND_BLOCKED"
+
+
+def test_websocket_pilot_allows_order_commands_only_for_simulation(monkeypatch):
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_REAL_PILOT", "1")
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL", "1")
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS", "1")
+    monkeypatch.setenv("TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS", "0")
+    client = _build_core_client(_args(transport="websocket-pilot"))
+
+    class Runtime:
+        core_client = client
+
+        def __init__(self, broker_env):
+            self.last_heartbeat_payload = {"broker_env": broker_env}
+
+    command = GatewayCommand(type="send_order", command_id="cmd-order", payload={"code": "005930"})
+
+    assert _websocket_pilot_command_rejection(Runtime("SIMULATION"), command) == ""
+    assert (
+        _websocket_pilot_command_rejection(Runtime("REAL"), command)
+        == "WEBSOCKET_PILOT_ORDER_COMMAND_BLOCKED_REAL_ACCOUNT"
+    )
+    assert (
+        _websocket_pilot_command_rejection(Runtime(""), command)
+        == "WEBSOCKET_PILOT_ORDER_COMMAND_BLOCKED_ACCOUNT_UNKNOWN"
+    )
+    client.stop()
 
 
 def test_core_ws_endpoint_accepts_real_pilot_mode_and_status(tmp_path, monkeypatch):

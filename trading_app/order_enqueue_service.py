@@ -400,6 +400,13 @@ class OrderEnqueueService:
         trade_date = self._trade_date(request, now)
         gateway_status = self.gateway_state.snapshot().to_dict()
         broker_request = self._broker_request_from_runtime_live_sim(request, gateway_status=gateway_status)
+        (
+            request,
+            broker_request,
+            exit_quantity_block_reason,
+            exit_quantity_block_codes,
+            exit_quantity_details,
+        ) = self._apply_live_sim_exit_position_quantity(request, broker_request)
         idempotency_key = broker_request.idempotency_key or self._live_sim_idempotency_key(request, broker_request, trade_date)
         broker_request = BrokerOrderRequest(**{**broker_request.to_dict(), "idempotency_key": idempotency_key})
         dedupe_key = dedupe_key_for_order_request(broker_request)
@@ -425,19 +432,27 @@ class OrderEnqueueService:
                 "lifecycle": lifecycle,
                 "reconcile": reconcile,
                 "request": request.to_dict(),
+                **({"exit_quantity_resolution": exit_quantity_details} if exit_quantity_details else {}),
             },
         )
 
-        block_reason, block_codes, block_details = self._live_sim_pre_submit_block_reason(
-            request,
-            broker_request,
-            gateway_status=gateway_status,
-            execution=execution,
-            exit_guard=exit_guard,
-            lifecycle=lifecycle,
-            reconcile=reconcile,
-            account_guard=account_guard,
-        )
+        if exit_quantity_block_reason:
+            block_reason, block_codes, block_details = (
+                exit_quantity_block_reason,
+                exit_quantity_block_codes,
+                {"exit_quantity_resolution": exit_quantity_details},
+            )
+        else:
+            block_reason, block_codes, block_details = self._live_sim_pre_submit_block_reason(
+                request,
+                broker_request,
+                gateway_status=gateway_status,
+                execution=execution,
+                exit_guard=exit_guard,
+                lifecycle=lifecycle,
+                reconcile=reconcile,
+                account_guard=account_guard,
+            )
         db = TradingDatabase(str(self.db_path))
         try:
             duplicate = db.find_live_sim_order_by_idempotency(idempotency_key)
@@ -1382,6 +1397,7 @@ class OrderEnqueueService:
                 max_order_amount=int(execution.get("max_order_amount_krw") or self.settings.max_order_amount),
                 max_daily_orders_per_code=int(execution.get("max_orders_per_day") or self.settings.max_daily_orders_per_code),
                 allow_zero_price=False,
+                limit_sell_amount=False,
             )
         )
 
@@ -1429,7 +1445,7 @@ class OrderEnqueueService:
         max_amount = int(execution.get("max_order_amount_krw") or self.settings.max_order_amount)
         if broker_request.side == "buy" and min_amount > 0 and amount < min_amount:
             return "ORDER_AMOUNT_BELOW_MIN", ["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD"], {"amount": amount, "min_order_amount_krw": min_amount}
-        if amount > max_amount:
+        if broker_request.side == "buy" and amount > max_amount:
             return "ORDER_AMOUNT_LIMIT", ["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD"], {"amount": amount, "max_order_amount_krw": max_amount}
         gate_reason = _runtime_gate_block_reason(request)
         if gate_reason:
@@ -1461,6 +1477,141 @@ class OrderEnqueueService:
             return db.live_sim_summary(trade_date=_kst_trade_date(str(self.clock())))
         finally:
             db.close()
+
+    def _apply_live_sim_exit_position_quantity(
+        self,
+        request: RuntimeOrderIntentRequest,
+        broker_request: BrokerOrderRequest,
+    ) -> tuple[RuntimeOrderIntentRequest, BrokerOrderRequest, str, list[str], dict[str, Any]]:
+        if str(broker_request.side or "").lower() != "sell":
+            return request, broker_request, "", [], {}
+        if str(request.order_phase or "").lower() != "exit":
+            return request, broker_request, "", [], {}
+        account_id_masked = _mask_account(str(broker_request.account or ""))
+        candidate_instance_id = str((request.metadata or {}).get("candidate_instance_id") or "")
+        db = TradingDatabase(str(self.db_path))
+        try:
+            positions = [
+                position
+                for position in db.list_live_sim_positions(
+                    code=broker_request.code,
+                    account_id_masked=account_id_masked,
+                    limit=50,
+                )
+                if str(position.get("status") or "") in {"OPEN", "PARTIAL"}
+                and int(position.get("current_qty") or 0) > 0
+            ]
+        finally:
+            db.close()
+        exact = [
+            position
+            for position in positions
+            if candidate_instance_id and str(position.get("candidate_instance_id") or "") == candidate_instance_id
+        ]
+        if exact:
+            position = exact[0]
+        elif not candidate_instance_id and len(positions) == 1:
+            position = positions[0]
+        elif candidate_instance_id and len(positions) == 1:
+            position = positions[0]
+        else:
+            reason = "LIVE_SIM_EXIT_POSITION_NOT_FOUND" if not positions else "LIVE_SIM_EXIT_POSITION_AMBIGUOUS"
+            return (
+                request,
+                broker_request,
+                reason,
+                [reason],
+                {
+                    "code": broker_request.code,
+                    "account_id_masked": account_id_masked,
+                    "candidate_instance_id": candidate_instance_id,
+                    "open_position_count": len(positions),
+                    "requested_quantity": broker_request.quantity,
+                },
+            )
+        current_qty = max(0, int(position.get("current_qty") or 0))
+        requested_qty = max(0, int(broker_request.quantity or 0))
+        if current_qty <= 0:
+            return (
+                request,
+                broker_request,
+                "LIVE_SIM_EXIT_POSITION_QTY_ZERO",
+                ["LIVE_SIM_EXIT_POSITION_QTY_ZERO"],
+                {
+                    "position_id": position.get("position_id"),
+                    "requested_quantity": requested_qty,
+                    "current_qty": current_qty,
+                },
+            )
+        metadata = dict(request.metadata or {})
+        full_exit = (
+            bool(metadata.get("full_exit"))
+            or bool(metadata.get("position_closed"))
+            or float(request.exit_percent or 0.0) >= 100.0
+            or int(request.remaining_quantity or -1) == 0
+        )
+        if full_exit:
+            quantity = current_qty
+            reason = "LIVE_SIM_EXIT_FULL_POSITION_QTY"
+        elif request.exit_percent is not None:
+            quantity = max(1, int(current_qty * max(0.0, float(request.exit_percent or 0.0)) / 100.0))
+            quantity = min(current_qty, quantity)
+            reason = "LIVE_SIM_EXIT_PERCENT_POSITION_QTY"
+        else:
+            quantity = min(current_qty, requested_qty)
+            reason = "LIVE_SIM_EXIT_CAPPED_TO_POSITION_QTY" if requested_qty > current_qty else "LIVE_SIM_EXIT_REQUEST_QTY"
+        if quantity <= 0:
+            return (
+                request,
+                broker_request,
+                "LIVE_SIM_EXIT_QUANTITY_ZERO",
+                ["LIVE_SIM_EXIT_QUANTITY_ZERO"],
+                {
+                    "position_id": position.get("position_id"),
+                    "requested_quantity": requested_qty,
+                    "current_qty": current_qty,
+                },
+            )
+        adjustment = {
+            "position_id": position.get("position_id"),
+            "candidate_instance_id": position.get("candidate_instance_id"),
+            "current_qty": current_qty,
+            "requested_quantity": requested_qty,
+            "resolved_quantity": quantity,
+            "quantity_source": reason,
+        }
+        metadata.update(
+            {
+                "live_sim_position_id": position.get("position_id"),
+                "live_sim_position_current_qty": current_qty,
+                "live_sim_exit_requested_qty": requested_qty,
+                "live_sim_exit_resolved_qty": quantity,
+                "live_sim_exit_quantity_source": reason,
+            }
+        )
+        request_payload = {
+            **request.to_dict(),
+            "quantity": quantity,
+            "exit_quantity": quantity,
+            "position_quantity": current_qty,
+            "remaining_quantity": max(0, current_qty - quantity),
+            "metadata": metadata,
+        }
+        request = RuntimeOrderIntentRequest(**request_payload)
+        broker_metadata = {
+            **dict(broker_request.metadata or {}),
+            **metadata,
+            "exit_quantity": quantity,
+            "position_quantity": current_qty,
+        }
+        broker_request = BrokerOrderRequest(
+            **{
+                **broker_request.to_dict(),
+                "quantity": quantity,
+                "metadata": broker_metadata,
+            }
+        )
+        return request, broker_request, "", [], adjustment
 
     def _live_sim_order_record(
         self,

@@ -31,7 +31,7 @@ def configure_qt_paths() -> None:
         os.environ["PATH"] = f"{qt_bin}{os.pathsep}{os.environ.get('PATH', '')}"
 
 from trading.broker.gateway_client import GatewayEventQueue
-from trading.broker.gateway_transport import WebSocketRealCoreClient, WebSocketPilotPolicy
+from trading.broker.gateway_transport import ORDER_COMMAND_TYPES, WebSocketRealCoreClient, WebSocketPilotPolicy
 from trading.broker.data_quality import RealtimeDataQualityTracker
 from trading.broker.models import (
     BrokerExecutionEvent,
@@ -217,6 +217,7 @@ class GatewayRuntime:
         self._worker: threading.Thread | None = None
         self.last_error = ""
         self.reconnect_count = 0
+        self.last_heartbeat_payload: dict[str, Any] = {}
         self.network_interval_sec = 0.5
         self.drained_event_count = 0
         self.coalesced_tick_count = 0
@@ -227,6 +228,8 @@ class GatewayRuntime:
         raw_payload = dict(payload or {})
         if event_type == "price_tick":
             self.data_quality.observe_price_tick(raw_payload)
+        elif event_type == "heartbeat":
+            self.last_heartbeat_payload = dict(raw_payload)
         created_at = utc_now_ms()
         traced_payload = ensure_transport_trace(
             raw_payload,
@@ -417,6 +420,10 @@ def send_mock_events(core_url: str, token: str) -> list[dict[str, Any]]:
                 "orderable": False,
                 "mode": "OBSERVE",
                 "account": "MOCK-ACCOUNT",
+                "broker_name": "KIWOOM_MOCK",
+                "broker_env": "SIMULATION",
+                "server_mode": "MOCK",
+                "account_mode": "SIMULATION",
             },
         ),
         GatewayEvent(
@@ -476,6 +483,10 @@ def run_mock_gateway(args: argparse.Namespace) -> int:
                     "orderable": False,
                     "mode": "OBSERVE",
                     "account": "MOCK-ACCOUNT",
+                    "broker_name": "KIWOOM_MOCK",
+                    "broker_env": "SIMULATION",
+                    "server_mode": "MOCK",
+                    "account_mode": "SIMULATION",
                     "last_error": runtime.last_error,
                     "reconnect_count": runtime.reconnect_count,
                     "rate_limit": runtime.rate_limiter.snapshot(),
@@ -555,17 +566,74 @@ def _kiwoom_accounts(client) -> list[str]:
         return []
 
 
+def _kiwoom_server_gubun(client) -> str:
+    getter = getattr(client, "get_server_gubun", None)
+    if not callable(getter):
+        return ""
+    try:
+        return str(getter() or "").strip()
+    except Exception:
+        return ""
+
+
+def _normalize_broker_env(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if not text:
+        return "UNKNOWN"
+    if text in {"1", "SIM", "SIMULATION", "MOCK", "PAPER", "PAPER_TRADING", "LIVE_SIM", "DEMO", "TEST"}:
+        return "SIMULATION"
+    if text in {"0", "REAL", "LIVE", "PROD", "PRODUCTION", "LIVE_REAL"}:
+        return "REAL"
+    return "UNKNOWN"
+
+
+def _broker_env_from_payload(payload: dict[str, Any]) -> str:
+    modes = [
+        _normalize_broker_env(payload.get("broker_env")),
+        _normalize_broker_env(payload.get("account_mode")),
+        _normalize_broker_env(payload.get("server_mode")),
+        _normalize_broker_env(payload.get("server_gubun")),
+    ]
+    if "REAL" in modes:
+        return "REAL"
+    if "SIMULATION" in modes:
+        return "SIMULATION"
+    return "UNKNOWN"
+
+
+def _heartbeat_broker_mode_payload(client, *, logged_in: bool) -> dict[str, str]:
+    if not logged_in:
+        return {
+            "broker_name": "KIWOOM",
+            "broker_env": "UNKNOWN",
+            "server_mode": "UNKNOWN",
+            "account_mode": "UNKNOWN",
+            "server_gubun": "",
+        }
+    server_gubun = _kiwoom_server_gubun(client)
+    broker_env = _normalize_broker_env(server_gubun)
+    return {
+        "broker_name": "KIWOOM",
+        "broker_env": broker_env,
+        "server_mode": broker_env,
+        "account_mode": broker_env,
+        "server_gubun": server_gubun,
+    }
+
+
 def _kiwoom_heartbeat_payload(client, runtime: GatewayRuntime) -> dict[str, Any]:
     logged_in = _kiwoom_connect_state(client)
     accounts = _kiwoom_accounts(client) if logged_in else []
     configured_account = os.environ.get("TRADING_ACCOUNT", "").strip()
     account = configured_account or (accounts[0] if accounts else "")
+    broker_mode = _heartbeat_broker_mode_payload(client, logged_in=logged_in)
     return {
         "kiwoom_logged_in": logged_in,
         "orderable": bool(logged_in and account),
         "mode": os.environ.get("TRADING_MODE", "OBSERVE"),
         "account": account,
         "accounts": accounts,
+        **broker_mode,
         "last_error": runtime.last_error,
         "reconnect_count": runtime.reconnect_count,
         "rate_limit": runtime.rate_limiter.snapshot(),
@@ -717,7 +785,7 @@ def _drain_real_commands(client, runtime: GatewayRuntime) -> None:
             )
             runtime.commands.put(command)
             return
-        rejection = _websocket_pilot_command_rejection(runtime, command)
+        rejection = _websocket_pilot_command_rejection(runtime, command, client=client)
         if rejection:
             recorder = getattr(runtime.core_client, "record_blocked_order_command", None)
             if callable(recorder) and command.type in {"send_order", "cancel_order", "modify_order"}:
@@ -1007,7 +1075,24 @@ def _clean_codes(codes) -> list[str]:
     return result
 
 
-def _websocket_pilot_command_rejection(runtime: GatewayRuntime, command: GatewayCommand) -> str:
+def _websocket_pilot_broker_env(runtime: GatewayRuntime, client: Any | None = None) -> str:
+    heartbeat_payload = dict(getattr(runtime, "last_heartbeat_payload", {}) or {})
+    broker_env = _broker_env_from_payload(heartbeat_payload)
+    if broker_env != "UNKNOWN" or client is None:
+        return broker_env
+    try:
+        live_payload = _heartbeat_broker_mode_payload(client, logged_in=_kiwoom_connect_state(client))
+    except Exception:
+        return "UNKNOWN"
+    return _broker_env_from_payload(live_payload)
+
+
+def _websocket_pilot_command_rejection(
+    runtime: GatewayRuntime,
+    command: GatewayCommand,
+    *,
+    client: Any | None = None,
+) -> str:
     snapshot = {}
     snapshot_func = getattr(runtime.core_client, "snapshot", None)
     if callable(snapshot_func):
@@ -1016,11 +1101,16 @@ def _websocket_pilot_command_rejection(runtime: GatewayRuntime, command: Gateway
     if original_transport != TRANSPORT_MODE_WEBSOCKET_REAL_PILOT:
         return ""
     policy = getattr(runtime.core_client, "policy", None)
-    if command.type in {"send_order", "cancel_order", "modify_order"}:
+    if command.type in ORDER_COMMAND_TYPES:
         block_order = bool(getattr(policy, "block_order_commands", True))
         allow_order = bool(getattr(policy, "allow_order_commands", False))
         if block_order or not allow_order:
             return "WEBSOCKET_PILOT_ORDER_COMMAND_BLOCKED"
+        broker_env = _websocket_pilot_broker_env(runtime, client)
+        if broker_env == "REAL":
+            return "WEBSOCKET_PILOT_ORDER_COMMAND_BLOCKED_REAL_ACCOUNT"
+        if broker_env != "SIMULATION":
+            return "WEBSOCKET_PILOT_ORDER_COMMAND_BLOCKED_ACCOUNT_UNKNOWN"
     if policy is not None and hasattr(policy, "command_allowed") and not policy.command_allowed(command.type):
         return "WEBSOCKET_PILOT_COMMAND_NOT_ALLOWED"
     return ""

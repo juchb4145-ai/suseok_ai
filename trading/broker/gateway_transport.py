@@ -61,6 +61,13 @@ CONTROL_WS_MESSAGE_TYPES = {
     "command_failed",
     "rate_limited",
 }
+SEND_COMPLETED_DIAGNOSTIC_MESSAGE_TYPES = {
+    "heartbeat",
+    "command_started",
+    "command_ack",
+    "command_failed",
+    "rate_limited",
+}
 DEFAULT_PRIORITY_PRICE_TICK_SOURCES = {
     "holding",
     "theme_lab_watchset",
@@ -107,6 +114,7 @@ class WebSocketPilotPolicy:
     condition_event_batch_enabled: bool = True
     condition_event_batch_max_size: int = 100
     condition_event_batch_max_wait_ms: float = 200.0
+    send_completed_diagnostics_enabled: bool = True
     heartbeat_interval_sec: float = 5.0
     reconnect_base_sec: float = 0.5
     reconnect_max_sec: float = 10.0
@@ -151,6 +159,7 @@ class WebSocketPilotPolicy:
             condition_event_batch_enabled=_bool_env("TRADING_GATEWAY_WEBSOCKET_CONDITION_EVENT_BATCH_ENABLED", True),
             condition_event_batch_max_size=_int_env("TRADING_GATEWAY_WEBSOCKET_CONDITION_EVENT_BATCH_MAX_SIZE", 100),
             condition_event_batch_max_wait_ms=_float_env("TRADING_GATEWAY_WEBSOCKET_CONDITION_EVENT_BATCH_MAX_WAIT_MS", 200.0),
+            send_completed_diagnostics_enabled=_bool_env("TRADING_GATEWAY_WEBSOCKET_SEND_COMPLETED_DIAGNOSTICS", True),
         )
 
     def command_allowed(self, command_type: str) -> bool:
@@ -158,6 +167,9 @@ class WebSocketPilotPolicy:
         if normalized in ORDER_COMMAND_TYPES:
             return bool(self.allow_order_commands and not self.block_order_commands)
         return normalized in self.allowed_commands
+
+    def order_commands_allowed(self) -> bool:
+        return self.command_allowed("send_order")
 
     def event_allowed(self, event_type: str) -> bool:
         normalized = str(event_type or "")
@@ -204,6 +216,12 @@ class WebSocketRealCoreClient:
         self.last_close_reason = ""
         self._ws_stage = "idle"
         self.last_send_ms = 0.0
+        self.last_send_started_at = ""
+        self.last_send_completed_at = ""
+        self.last_send_completed_message_id = ""
+        self.last_send_completed_message_type = ""
+        self.last_send_completed_sequence = 0
+        self.last_send_completed_payload_size_bytes = 0
         self.last_receive_ms = 0.0
         self.last_event_post_ms = 0.0
         self.last_poll_ms = 0.0
@@ -339,12 +357,20 @@ class WebSocketRealCoreClient:
             "transport_mode": self.transport_mode if not self.fallback_active else "rest_long_poll_fallback",
             "original_transport": self.transport_mode,
             "ws_pilot_enabled": self.policy.enabled,
-            "ws_pilot_live_order_blocked": True,
+            "ws_pilot_live_order_blocked": not self.policy.order_commands_allowed(),
+            "ws_pilot_order_commands_allowed": self.policy.order_commands_allowed(),
             "ws_connection_state": self.connection_state,
             "ws_session_id": self.ws_session_id,
             "ws_connection_id": self.ws_connection_id,
             "ws_reconnect_count": self.reconnect_count,
             "ws_last_send_ms": round(self.last_send_ms, 3),
+            "ws_last_send_started_at": self.last_send_started_at,
+            "ws_last_send_completed_at": self.last_send_completed_at,
+            "ws_last_send_completed_message_id": self.last_send_completed_message_id,
+            "ws_last_send_completed_message_type": self.last_send_completed_message_type,
+            "ws_last_send_completed_sequence": self.last_send_completed_sequence,
+            "ws_last_send_completed_duration_ms": round(self.last_send_ms, 3),
+            "ws_last_send_completed_payload_size_bytes": self.last_send_completed_payload_size_bytes,
             "ws_last_receive_ms": round(self.last_receive_ms, 3),
             "ws_outbound_queue_size": self._control_outbound.qsize() + self._outbound.qsize() + self._condition_events.qsize(),
             "ws_control_outbound_queue_size": self._control_outbound.qsize(),
@@ -564,8 +590,79 @@ class WebSocketRealCoreClient:
                 "ws_message_sequence": message.sequence,
             },
         )
-        await ws.send(json.dumps(traced_message.to_dict(), ensure_ascii=False, default=str))
-        self.last_send_ms = monotonic_delta_ms(send_start, monotonic_ms()) or 0.0
+        serialized = json.dumps(traced_message.to_dict(), ensure_ascii=False, default=str)
+        await ws.send(serialized)
+        send_completed_at = utc_now_ms()
+        send_completed = monotonic_ms()
+        self.last_send_ms = monotonic_delta_ms(send_start, send_completed) or 0.0
+        self.last_send_started_at = send_started_at
+        self.last_send_completed_at = send_completed_at
+        self.last_send_completed_message_id = traced_message.message_id
+        self.last_send_completed_message_type = traced_message.type
+        self.last_send_completed_sequence = traced_message.sequence
+        self.last_send_completed_payload_size_bytes = len(serialized.encode("utf-8"))
+        if self._send_completed_diagnostic_enabled(traced_message):
+            diagnostic = self._send_completed_diagnostic_message(
+                traced_message,
+                send_started_at=send_started_at,
+                send_completed_at=send_completed_at,
+                send_started_monotonic_ms=send_start,
+                send_completed_monotonic_ms=send_completed,
+                send_duration_ms=self.last_send_ms,
+                payload_size_bytes=self.last_send_completed_payload_size_bytes,
+            )
+            await ws.send(json.dumps(diagnostic.to_dict(), ensure_ascii=False, default=str))
+
+    def _send_completed_diagnostic_enabled(self, message: GatewayWsMessage) -> bool:
+        return bool(
+            self.policy.send_completed_diagnostics_enabled
+            and message.type in SEND_COMPLETED_DIAGNOSTIC_MESSAGE_TYPES
+        )
+
+    def _send_completed_diagnostic_message(
+        self,
+        message: GatewayWsMessage,
+        *,
+        send_started_at: str,
+        send_completed_at: str,
+        send_started_monotonic_ms: float,
+        send_completed_monotonic_ms: float,
+        send_duration_ms: float,
+        payload_size_bytes: int,
+    ) -> GatewayWsMessage:
+        return GatewayWsMessage(
+            type="transport_send_completed",
+            trace_id=message.trace_id,
+            source=self.source,
+            payload={
+                "original_message_id": message.message_id,
+                "original_trace_id": message.trace_id,
+                "original_type": message.type,
+                "sample_message_type": _sample_message_type_for_ws_message(message),
+                "original_event_id": message.event_id,
+                "original_command_id": message.command_id,
+                "original_sequence": message.sequence,
+                "gateway_ws_send_started_at_utc": send_started_at,
+                "gateway_ws_send_completed_at_utc": send_completed_at,
+                "gateway_ws_send_started_monotonic_ms": send_started_monotonic_ms,
+                "gateway_ws_send_completed_monotonic_ms": send_completed_monotonic_ms,
+                "gateway_ws_send_duration_ms": send_duration_ms,
+                "gateway_ws_payload_size_bytes": payload_size_bytes,
+                "transport_mode": self.transport_mode,
+                "ws_session_id": self.ws_session_id,
+                "ws_connection_id": self.ws_connection_id,
+            },
+            event_id=message.event_id,
+            command_id=message.command_id,
+            sequence=self._next_sequence(),
+            metadata={
+                **self._message_metadata(),
+                "original_message_id": message.message_id,
+                "original_type": message.type,
+                "sample_message_type": _sample_message_type_for_ws_message(message),
+                "original_sequence": message.sequence,
+            },
+        )
 
     def _next_control_message(self) -> GatewayWsMessage | None:
         try:
@@ -702,6 +799,8 @@ class WebSocketRealCoreClient:
         event = self._event_for_ws_queue(event)
         if event.type in {"heartbeat", "command_started", "command_ack", "command_failed", "rate_limited"}:
             payload = dict(event.payload or {})
+            if event.type == "heartbeat":
+                payload = _compact_ws_heartbeat_payload(payload)
             message_type = event.type
         else:
             payload = {
@@ -768,7 +867,7 @@ class WebSocketRealCoreClient:
             payload={
                 "transport_mode": self.transport_mode,
                 "transport_keepalive": True,
-                **self.snapshot(),
+                **_compact_ws_heartbeat_payload(self.snapshot()),
             },
             sequence=self._next_sequence(),
             metadata=self._message_metadata(),
@@ -880,6 +979,160 @@ def _message_with_ws_send_started_trace(message: GatewayWsMessage, trace_updates
         )
     metadata = {**dict(message.metadata or {}), **trace_updates}
     return replace(message, payload=payload, metadata=metadata)
+
+
+def _sample_message_type_for_ws_message(message: GatewayWsMessage) -> str:
+    if message.type == "gateway_event":
+        payload = dict(message.payload or {})
+        if isinstance(payload.get("event"), dict):
+            return str(payload["event"].get("type") or message.type)
+        return str(payload.get("type") or message.type)
+    return message.type
+
+
+WS_HEARTBEAT_PAYLOAD_KEYS = {
+    "transport_mode",
+    "original_transport",
+    "transport_keepalive",
+    "kiwoom_logged_in",
+    "orderable",
+    "mode",
+    "account",
+    "accounts",
+    "broker_name",
+    "broker_env",
+    "server_mode",
+    "account_mode",
+    "server_gubun",
+    "last_error",
+    "reconnect_count",
+    "gateway_network_last_error",
+    "gateway_reconnect_count",
+    "gateway_poll_interval_sec",
+    "gateway_last_poll_ms",
+    "gateway_last_event_post_ms",
+    "gateway_event_queue_size",
+    "gateway_command_queue_size",
+    "gateway_poll_count",
+    "gateway_empty_poll_count",
+    "gateway_event_post_count",
+    "gateway_event_post_error_count",
+    "gateway_last_poll_command_count",
+    "gateway_event_drain_limit",
+    "gateway_transport_metrics",
+    "ws_pilot_enabled",
+    "ws_pilot_live_order_blocked",
+    "ws_pilot_order_commands_allowed",
+    "ws_connection_state",
+    "ws_session_id",
+    "ws_connection_id",
+    "ws_reconnect_count",
+    "ws_last_send_ms",
+    "ws_last_send_started_at",
+    "ws_last_send_completed_at",
+    "ws_last_send_completed_message_id",
+    "ws_last_send_completed_message_type",
+    "ws_last_send_completed_sequence",
+    "ws_last_send_completed_duration_ms",
+    "ws_last_send_completed_payload_size_bytes",
+    "ws_last_receive_ms",
+    "ws_outbound_queue_size",
+    "ws_control_outbound_queue_size",
+    "ws_data_outbound_queue_size",
+    "ws_condition_event_queue_size",
+    "ws_command_queue_size",
+    "ws_fallback_state",
+    "ws_fallback_reason",
+    "ws_fallback_detail",
+    "ws_fallback_at",
+    "ws_last_error",
+    "ws_last_error_type",
+    "ws_last_error_stage",
+    "ws_last_error_at",
+    "ws_last_error_reconnect_count",
+    "ws_last_close_code",
+    "ws_last_close_reason",
+    "ws_error_count",
+    "ws_session_loss_count",
+    "ws_duplicate_ack_count",
+    "ws_unknown_ack_count",
+    "pilot_blocked_order_command_count",
+    "ws_price_tick_sample_rate",
+    "ws_price_tick_sampled_count",
+    "ws_price_tick_fallback_count",
+    "ws_priority_price_tick_code_count",
+    "ws_priority_price_tick_sources",
+    "ws_priority_price_tick_sampled_count",
+    "ws_condition_event_batch_enabled",
+    "ws_condition_event_batch_max_size",
+    "ws_condition_event_batch_max_wait_ms",
+    "ws_condition_event_batch_queued_count",
+    "ws_condition_event_batch_sent_count",
+    "ws_condition_event_batched_count",
+    "ws_condition_event_batch_coalesced_count",
+    "ws_event_fallback_count",
+    "last_ws_event_at",
+    "last_ws_ack_at",
+    "transport_trace",
+}
+
+
+def _compact_ws_heartbeat_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    compact = {key: payload[key] for key in WS_HEARTBEAT_PAYLOAD_KEYS if key in payload}
+    if "rate_limit" in payload:
+        compact["rate_limit_summary"] = _rate_limit_summary(payload.get("rate_limit"))
+    if "gateway_transport_metrics" in compact and isinstance(compact["gateway_transport_metrics"], dict):
+        compact["gateway_transport_metrics"] = {
+            key: compact["gateway_transport_metrics"].get(key)
+            for key in ("last_poll_ms", "last_event_post_ms", "empty_poll_rate")
+            if key in compact["gateway_transport_metrics"]
+        }
+    if "accounts" in compact:
+        compact["accounts"] = list(compact.get("accounts") or [])[:5]
+    compact["ws_heartbeat_compact"] = True
+    compact["ws_heartbeat_omitted_fields"] = [
+        key
+        for key in ("rate_limit", "fallback", "ws_priority_price_tick_codes")
+        if key in payload
+    ]
+    return compact
+
+
+def _rate_limit_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    commands = value.get("commands")
+    if not isinstance(commands, dict):
+        return {}
+    allowed_count = 0
+    limited_count = 0
+    max_wait_time_sec = 0.0
+    limited_commands: list[str] = []
+    for command_type, raw_stats in commands.items():
+        if not isinstance(raw_stats, dict):
+            continue
+        allowed_count += int(raw_stats.get("allowed_count") or 0)
+        current_limited = int(raw_stats.get("limited_count") or 0)
+        limited_count += current_limited
+        wait_time = _safe_float(raw_stats.get("wait_time_sec"))
+        if wait_time > max_wait_time_sec:
+            max_wait_time_sec = wait_time
+        if current_limited:
+            limited_commands.append(str(command_type))
+    return {
+        "command_count": len(commands),
+        "allowed_count": allowed_count,
+        "limited_count": limited_count,
+        "max_wait_time_sec": round(max_wait_time_sec, 3),
+        "limited_commands": sorted(limited_commands)[:10],
+    }
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _gateway_event_payload_with_ws_send_trace(

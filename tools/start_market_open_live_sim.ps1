@@ -8,6 +8,9 @@ param(
     [int]$CoreStartupTimeoutSec = 45,
     [int]$GatewayStartupTimeoutSec = 90,
     [int]$RuntimeStartupTimeoutSec = 120,
+    [ValidateSet("rest", "websocket-pilot", "websocket-experimental")]
+    [string]$GatewayTransport = "websocket-pilot",
+    [string]$GatewayCoreUrl = "",
     [switch]$SkipGateway,
     [switch]$SkipRuntime,
     [switch]$NoStopExisting,
@@ -32,6 +35,11 @@ if (-not $Token) {
     $Token = if ($env:TRADING_CORE_TOKEN) { $env:TRADING_CORE_TOKEN } else { "local-dev-token" }
 }
 
+if (-not $GatewayCoreUrl) {
+    $gatewayHost = if ($BindHost -in @("0.0.0.0", "::", "[::]")) { "127.0.0.1" } else { $BindHost }
+    $GatewayCoreUrl = "http://${gatewayHost}:$Port"
+}
+
 $Python64 = Join-Path $ProjectRoot "venv_64\Scripts\python.exe"
 if (-not (Test-Path $Python64)) {
     throw "64-bit Python runtime not found: $Python64"
@@ -43,6 +51,16 @@ New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 $env:TRADING_MODE = "OBSERVE"
 $env:TRADING_RUNTIME_MODE = "DRY_RUN"
 $env:TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS = "1"
+$env:TRADING_RUNTIME_ALLOW_LIVE_ORDERS = "0"
+$env:TRADING_GATEWAY_TRANSPORT = $GatewayTransport
+$env:TRADING_KIWOOM_GATEWAY_CORE_URL = $GatewayCoreUrl
+if ($GatewayTransport -eq "websocket-pilot") {
+    $env:TRADING_GATEWAY_WEBSOCKET_REAL_PILOT = "1"
+    $env:TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL = "1"
+    $env:TRADING_GATEWAY_WEBSOCKET_FALLBACK_TO_REST = "1"
+    $env:TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS = "1"
+    $env:TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS = "0"
+}
 $env:TRADING_CORE_TOKEN = $Token
 $env:TRADING_DB_PATH = $DbPath
 $env:PYTHONIOENCODING = "utf-8"
@@ -97,6 +115,65 @@ function Wait-Until([scriptblock]$Condition, [int]$TimeoutSec, [string]$Label) {
         Start-Sleep -Seconds 1
     } while ((Get-Date) -lt $deadline)
     throw "Timed out waiting for $Label after ${TimeoutSec}s"
+}
+
+function Get-ObjectPropertyValue([object]$Object, [string]$Name) {
+    if ($null -eq $Object) {
+        return $null
+    }
+    if ($Object -is [System.Collections.IDictionary]) {
+        return $Object[$Name]
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($property) {
+        return $property.Value
+    }
+    return $null
+}
+
+function Normalize-BrokerMode([object]$Value) {
+    $text = ([string]$Value).Trim().ToUpperInvariant()
+    if (-not $text) {
+        return "UNKNOWN"
+    }
+    if (@("1", "SIM", "SIMULATION", "MOCK", "PAPER", "PAPER_TRADING", "LIVE_SIM", "DEMO", "TEST") -contains $text) {
+        return "SIMULATION"
+    }
+    if (@("0", "REAL", "LIVE", "PROD", "PRODUCTION", "LIVE_REAL") -contains $text) {
+        return "REAL"
+    }
+    return "UNKNOWN"
+}
+
+function Get-GatewayBrokerModeSummary([object]$Status) {
+    $payload = Get-ObjectPropertyValue $Status "last_heartbeat_payload"
+    $serverGubun = Get-ObjectPropertyValue $payload "server_gubun"
+    $serverGubunText = ""
+    if ($null -ne $serverGubun) {
+        $serverGubunText = [string]$serverGubun
+    }
+    [pscustomobject]@{
+        broker_env = Normalize-BrokerMode (Get-ObjectPropertyValue $payload "broker_env")
+        server_mode = Normalize-BrokerMode (Get-ObjectPropertyValue $payload "server_mode")
+        account_mode = Normalize-BrokerMode (Get-ObjectPropertyValue $payload "account_mode")
+        server_gubun = $serverGubunText
+    }
+}
+
+function Test-GatewaySimulationMode([object]$Status) {
+    $modes = Get-GatewayBrokerModeSummary $Status
+    return (
+        $modes.broker_env -eq "SIMULATION" -or
+        $modes.server_mode -eq "SIMULATION" -or
+        $modes.account_mode -eq "SIMULATION"
+    )
+}
+
+function Assert-GatewayNotRealMode([object]$Status) {
+    $modes = Get-GatewayBrokerModeSummary $Status
+    if ($modes.broker_env -eq "REAL" -or $modes.server_mode -eq "REAL" -or $modes.account_mode -eq "REAL") {
+        throw "Gateway reported REAL account/server mode; LIVE_SIM startup aborted."
+    }
 }
 
 function Get-DescendantProcessIds([int]$RootProcessId) {
@@ -178,13 +255,23 @@ try:
         "kill_switch_active": bool(execution.get("kill_switch_active")),
         "require_simulated_account": bool(execution.get("require_simulated_account")),
         "allowed_account_mode": str(execution.get("allowed_account_mode") or ""),
+        "block_real_account": bool(execution.get("block_real_account")),
+        "fail_closed_on_account_unknown": bool(execution.get("fail_closed_on_account_unknown")),
         "allowed_account_numbers_count": len(list(execution.get("allowed_account_numbers") or [])),
     }
 finally:
     db.close()
 
 print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-if result["mode"].upper() != "LIVE_SIM" or not result["live_sim_enabled"] or result["live_real_enabled"]:
+if (
+    result["mode"].upper() != "LIVE_SIM"
+    or not result["live_sim_enabled"]
+    or result["live_real_enabled"]
+    or not result["require_simulated_account"]
+    or result["allowed_account_mode"].upper() != "SIMULATION"
+    or not result["block_real_account"]
+    or not result["fail_closed_on_account_unknown"]
+):
     sys.exit(2)
 '@
     $output = ($script | & $Python64 - $DbPath) -join "`n"
@@ -193,7 +280,7 @@ if result["mode"].upper() != "LIVE_SIM" or not result["live_sim_enabled"] or res
         Write-Step "DB order execution: $output"
     }
     if ($exitCode -ne 0) {
-        throw "DB order_execution must be LIVE_SIM with live_sim_enabled=true and live_real_enabled=false."
+        throw "DB order_execution must be LIVE_SIM with simulation-account guards enabled and live_real_enabled=false."
     }
     return $output | ConvertFrom-Json
 }
@@ -204,6 +291,12 @@ try {
     Write-Step "Core TRADING_MODE=$env:TRADING_MODE"
     Write-Step "Runtime TRADING_RUNTIME_MODE=$env:TRADING_RUNTIME_MODE"
     Write-Step "Runtime TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS=$env:TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS"
+    Write-Step "Runtime TRADING_RUNTIME_ALLOW_LIVE_ORDERS=$env:TRADING_RUNTIME_ALLOW_LIVE_ORDERS"
+    Write-Step "Gateway transport=$env:TRADING_GATEWAY_TRANSPORT"
+    Write-Step "Gateway core URL=$env:TRADING_KIWOOM_GATEWAY_CORE_URL"
+    if ($GatewayTransport -eq "websocket-pilot") {
+        Write-Step "WebSocket pilot order commands allow=$env:TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS block=$env:TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS"
+    }
 
     $dbSettings = Assert-LiveSimDbSettings
 
@@ -218,6 +311,11 @@ try {
             trading_mode = $env:TRADING_MODE
             runtime_mode = $env:TRADING_RUNTIME_MODE
             runtime_allow_dry_run_orders = $env:TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS
+            runtime_allow_live_orders = $env:TRADING_RUNTIME_ALLOW_LIVE_ORDERS
+            gateway_transport = $env:TRADING_GATEWAY_TRANSPORT
+            gateway_core_url = $env:TRADING_KIWOOM_GATEWAY_CORE_URL
+            websocket_pilot_order_allow = $env:TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS
+            websocket_pilot_order_block = $env:TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS
             db_order_execution = $dbSettings
         } | ConvertTo-Json -Depth 6
         return
@@ -260,21 +358,27 @@ try {
     Write-Step "Core API healthy"
 
     $gatewayStatus = $null
+    $gatewayModes = $null
     if (-not $SkipGateway) {
         $gatewayStart = Invoke-CoreApi -Method POST -Path "/api/gateway/kiwoom/start" -TimeoutSec 20
         Write-Step "Gateway start reason=$($gatewayStart.reason)"
         $gatewayStatus = Wait-Until -TimeoutSec $GatewayStartupTimeoutSec -Label "Kiwoom gateway readiness" -Condition {
+            $status = $null
             try {
                 $status = Invoke-CoreApi -Method GET -Path "/api/gateway/status" -TimeoutSec 5
-                if ($status.connected -and $status.heartbeat_ok -and $status.kiwoom_logged_in -and $status.orderable) {
-                    return $status
-                }
             } catch {
                 return $null
             }
+            if ($status.connected -and $status.heartbeat_ok -and $status.kiwoom_logged_in -and $status.orderable) {
+                Assert-GatewayNotRealMode $status
+                if (Test-GatewaySimulationMode $status) {
+                    return $status
+                }
+            }
             return $null
         }
-        Write-Step "Gateway ready connected=$($gatewayStatus.connected) orderable=$($gatewayStatus.orderable)"
+        $gatewayModes = Get-GatewayBrokerModeSummary $gatewayStatus
+        Write-Step "Gateway ready connected=$($gatewayStatus.connected) orderable=$($gatewayStatus.orderable) broker_env=$($gatewayModes.broker_env) account_mode=$($gatewayModes.account_mode)"
     }
 
     $runtimeStatus = $null
@@ -325,6 +429,11 @@ try {
                 heartbeat_ok = [bool]$gatewayStatus.heartbeat_ok
                 kiwoom_logged_in = [bool]$gatewayStatus.kiwoom_logged_in
                 orderable = [bool]$gatewayStatus.orderable
+                transport = [string]$env:TRADING_GATEWAY_TRANSPORT
+                broker_env = [string]$gatewayModes.broker_env
+                server_mode = [string]$gatewayModes.server_mode
+                account_mode = [string]$gatewayModes.account_mode
+                server_gubun = [string]$gatewayModes.server_gubun
             }
         } else { $null }
         db_order_execution = $dbSettings

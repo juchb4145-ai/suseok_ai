@@ -184,6 +184,17 @@ class StrategyRuntimeSnapshot:
     last_dry_run_exit_order_reject_reason: str = ""
     dry_run_order_policy: str = ""
     dry_run_order_sink_enabled: bool = False
+    live_sim_order_sink_enabled: bool = False
+    live_sim_order_policy: str = ""
+    live_sim_order_intent_count: int = 0
+    live_sim_order_accepted_count: int = 0
+    live_sim_order_blocked_count: int = 0
+    live_sim_order_duplicate_count: int = 0
+    live_sim_exit_accepted_count: int = 0
+    live_sim_exit_blocked_count: int = 0
+    last_live_sim_order_intent_at: str = ""
+    last_live_sim_reject_reason: str = ""
+    live_sim_summary: dict = field(default_factory=dict)
     subscription_active_count: int = 0
     virtual_order_status_change_count: int = 0
     condition_profiles_count: int = 0
@@ -2007,6 +2018,17 @@ class StrategyRuntime:
         snapshot.last_dry_run_exit_order_reject_reason = str(payload.get("last_dry_run_exit_order_reject_reason") or "")
         snapshot.dry_run_order_policy = str(payload.get("dry_run_order_policy") or "")
         snapshot.dry_run_order_sink_enabled = bool(payload.get("dry_run_order_sink_enabled"))
+        snapshot.live_sim_order_sink_enabled = bool(payload.get("live_sim_order_sink_enabled"))
+        snapshot.live_sim_order_policy = str(payload.get("live_sim_order_policy") or "")
+        snapshot.live_sim_order_intent_count = int(payload.get("live_sim_order_intent_count") or 0)
+        snapshot.live_sim_order_accepted_count = int(payload.get("live_sim_order_accepted_count") or 0)
+        snapshot.live_sim_order_blocked_count = int(payload.get("live_sim_order_blocked_count") or 0)
+        snapshot.live_sim_order_duplicate_count = int(payload.get("live_sim_order_duplicate_count") or 0)
+        snapshot.live_sim_exit_accepted_count = int(payload.get("live_sim_exit_accepted_count") or 0)
+        snapshot.live_sim_exit_blocked_count = int(payload.get("live_sim_exit_blocked_count") or 0)
+        snapshot.last_live_sim_order_intent_at = str(payload.get("last_live_sim_order_intent_at") or "")
+        snapshot.last_live_sim_reject_reason = str(payload.get("last_live_sim_reject_reason") or "")
+        snapshot.live_sim_summary = dict(payload.get("live_sim_summary") or {})
 
     def _apply_reason_summary(self, snapshot: StrategyRuntimeSnapshot) -> None:
         try:

@@ -1393,6 +1393,8 @@ class TradingDatabase:
             order = self.find_live_sim_order_by_command_id(event.command_id)
         if order is None and event.idempotency_key:
             order = self.find_live_sim_order_by_idempotency(event.idempotency_key)
+        if order is None and event.order_no:
+            order = self.find_live_sim_order_by_execution_fingerprint(event)
         if order is None:
             return
         now = str(event.timestamp or "")
@@ -1753,6 +1755,36 @@ class TradingDatabase:
         row = self.conn.execute(
             "SELECT * FROM live_sim_orders WHERE broker_order_id = ? ORDER BY id DESC LIMIT 1",
             (broker_order_id,),
+        ).fetchone()
+        return _row_to_live_sim_order(row) if row else None
+
+    def find_live_sim_order_by_execution_fingerprint(self, event: BrokerExecutionEvent) -> Optional[dict]:
+        if not event.order_no:
+            return None
+        row = self.conn.execute(
+            """
+            SELECT * FROM live_sim_orders
+            WHERE broker_order_id = ''
+              AND code = ?
+              AND lower(side) = lower(?)
+              AND submitted_qty = ?
+              AND submitted_price = ?
+              AND order_status IN ('SUBMITTED', 'ACCEPTED', 'PARTIAL_FILLED')
+            ORDER BY
+              CASE
+                WHEN accepted_at != '' THEN accepted_at
+                WHEN submitted_at != '' THEN submitted_at
+                ELSE created_at
+              END DESC,
+              id DESC
+            LIMIT 1
+            """,
+            (
+                event.code,
+                event.side,
+                int(event.quantity or 0),
+                int(event.price or 0),
+            ),
         ).fetchone()
         return _row_to_live_sim_order(row) if row else None
 
@@ -2943,6 +2975,66 @@ class TradingDatabase:
             (sample_id,),
         ).fetchone()
         return _row_to_gateway_transport_latency_sample(row) if row else None
+
+    def find_gateway_transport_latency_sample_by_ws_message(
+        self,
+        *,
+        ws_session_id: str,
+        ws_message_sequence: int,
+        message_type: str,
+        event_id: str = "",
+        command_id: str = "",
+    ) -> Optional[dict]:
+        clauses = ["ws_session_id = ?", "ws_message_sequence = ?", "message_type = ?"]
+        params: list[object] = [ws_session_id, int(ws_message_sequence or 0), message_type]
+        if event_id:
+            clauses.append("event_id = ?")
+            params.append(event_id)
+        if command_id:
+            clauses.append("command_id = ?")
+            params.append(command_id)
+        row = self.conn.execute(
+            f"""
+            SELECT * FROM gateway_transport_latency_samples
+            WHERE {" AND ".join(clauses)}
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            tuple(params),
+        ).fetchone()
+        return _row_to_gateway_transport_latency_sample(row) if row else None
+
+    def update_gateway_transport_latency_sample_stage(
+        self,
+        sample_id: str,
+        *,
+        stage_updates: dict,
+        metadata_updates: Optional[dict] = None,
+    ) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT stage_ms_json, metadata_json FROM gateway_transport_latency_samples WHERE sample_id = ?",
+            (sample_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        stage = _safe_json_loads(row["stage_ms_json"], {})
+        metadata = _safe_json_loads(row["metadata_json"], {})
+        stage.update({key: value for key, value in dict(stage_updates or {}).items() if value is not None})
+        metadata.update({key: value for key, value in dict(metadata_updates or {}).items() if value is not None})
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE gateway_transport_latency_samples
+                SET stage_ms_json = ?, metadata_json = ?
+                WHERE sample_id = ?
+                """,
+                (
+                    json.dumps(stage, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True, default=str),
+                    sample_id,
+                ),
+            )
+        return self.get_gateway_transport_latency_sample(sample_id)
 
     def list_gateway_transport_latency_samples(
         self,

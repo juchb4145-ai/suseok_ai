@@ -125,6 +125,9 @@ class KiwoomClient:
     def get_user_id(self) -> str:
         return str(self.ocx.dynamicCall("GetLoginInfo(QString)", "USER_ID") or "")
 
+    def get_server_gubun(self) -> str:
+        return str(self.ocx.dynamicCall("GetLoginInfo(QString)", "GetServerGubun") or "").strip()
+
     def get_code_name(self, code: str) -> str:
         return str(self.ocx.dynamicCall("GetMasterCodeName(QString)", code) or "")
 
@@ -565,6 +568,9 @@ class MockKiwoomClient:
 
     def get_user_id(self) -> str:
         return "MOCK_USER"
+
+    def get_server_gubun(self) -> str:
+        return "MOCK"
 
     def get_code_name(self, code: str) -> str:
         return self._names.get(code, f"MOCK-{code}")
