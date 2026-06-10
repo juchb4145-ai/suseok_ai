@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable, Optional
@@ -332,59 +333,69 @@ class ThemeLabFlowPricePathProvider:
         self.db = db
         self.max_rows = max(1, int(max_rows or 300))
         self._row_sample_cache: dict[int, list[dict[str, Any]]] = {}
+        self._rows_by_trade_date_cache: dict[str, list[dict[str, Any]]] = {}
+        self._samples_by_code_cache: dict[str, dict[str, list[tuple[datetime, dict[str, Any]]]]] = {}
 
     def __call__(self, decision: dict[str, Any], horizon_sec: int, now: datetime) -> dict[str, Any]:
-        code = str(decision.get("code") or "").strip()
+        code = _normalize_code(decision.get("code"))
         decision_at = _parse_dt(decision.get("decision_at"))
         if not code or decision_at is None:
             return {"source": "theme_lab_flow_snapshot", "samples": []}
         horizon_at = decision_at + timedelta(seconds=max(1, int(horizon_sec or 1)))
-        rows = self._load_rows(decision_at, min(horizon_at, now))
         samples: list[dict[str, Any]] = []
         seen: set[tuple[str, float]] = set()
-        for row in rows:
-            for sample in self._samples_for_row(row):
-                if sample.get("code") != code:
-                    continue
-                sample_dt = _parse_dt(sample.get("at"))
-                if sample_dt is None or sample_dt < decision_at or sample_dt > horizon_at:
-                    continue
-                price = _positive_float(sample.get("price"))
-                if not price:
-                    continue
-                key = (sample_dt.isoformat(timespec="seconds"), float(price))
-                if key in seen:
-                    continue
-                seen.add(key)
-                samples.append({"at": key[0], "price": price, "source": sample.get("source") or "theme_lab_flow_snapshot"})
+        effective_horizon_at = min(horizon_at, now)
+        indexed = self._samples_by_code_for_trade_date(decision_at.date().isoformat()).get(code, [])
+        timestamps = [item[0] for item in indexed]
+        start_index = bisect_left(timestamps, decision_at)
+        end_index = bisect_right(timestamps, effective_horizon_at)
+        for sample_dt, sample in indexed[start_index:end_index]:
+            price = _positive_float(sample.get("price"))
+            if not price:
+                continue
+            key = (sample_dt.isoformat(timespec="seconds"), float(price))
+            if key in seen:
+                continue
+            seen.add(key)
+            samples.append({"at": key[0], "price": price, "source": sample.get("source") or "theme_lab_flow_snapshot"})
         samples.sort(key=lambda item: item["at"])
         return {"source": "theme_lab_flow_snapshot", "samples": samples}
 
-    def _load_rows(self, start_at: datetime, end_at: datetime) -> list[dict[str, Any]]:
+    def _load_rows(self, start_at: datetime, end_at: datetime, *, limit: Optional[int] = None) -> list[dict[str, Any]]:
         if not hasattr(self.db, "conn"):
             return []
+        trade_date = start_at.date().isoformat()
         try:
             exists = self.db.conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='theme_lab_flow_snapshots'"
             ).fetchone()
             if not exists:
                 return []
-            return [
-                dict(row)
+            rows = self._rows_by_trade_date_cache.get(trade_date)
+            if rows is None:
+                rows = []
                 for row in self.db.conn.execute(
                     """
                     SELECT id, calculated_at, watchset_snapshots_json, gate_decisions_json,
                            condition_hit_snapshots_json, theme_condition_snapshots_json,
                            theme_rankings_json
                     FROM theme_lab_flow_snapshots
-                    WHERE calculated_at >= ?
-                      AND calculated_at <= ?
+                    WHERE substr(calculated_at, 1, 10) = ?
                     ORDER BY calculated_at ASC, id ASC
-                    LIMIT ?
                     """,
-                    (start_at.isoformat(timespec="seconds"), end_at.isoformat(timespec="seconds"), self.max_rows),
-                ).fetchall()
+                    (trade_date,),
+                ).fetchall():
+                    payload = dict(row)
+                    payload["_calculated_dt"] = _parse_dt(payload.get("calculated_at"))
+                    rows.append(payload)
+                self._rows_by_trade_date_cache[trade_date] = rows
+            filtered = [
+                row
+                for row in rows
+                if row.get("_calculated_dt") is not None and start_at <= row["_calculated_dt"] <= end_at
             ]
+            row_limit = self.max_rows if limit is None else int(limit or 0)
+            return filtered if row_limit <= 0 else filtered[:row_limit]
         except Exception:
             return []
 
@@ -405,6 +416,25 @@ class ThemeLabFlowPricePathProvider:
             samples.extend(_extract_price_samples(payload, at=calculated_at, source=source))
         self._row_sample_cache[row_id] = samples
         return samples
+
+    def _samples_by_code_for_trade_date(self, trade_date: str) -> dict[str, list[tuple[datetime, dict[str, Any]]]]:
+        cached = self._samples_by_code_cache.get(trade_date)
+        if cached is not None:
+            return cached
+        by_code: dict[str, list[tuple[datetime, dict[str, Any]]]] = {}
+        start_at = _parse_dt(f"{trade_date}T00:00:00") or datetime.min
+        end_at = _parse_dt(f"{trade_date}T23:59:59") or datetime.max
+        for row in self._load_rows(start_at, end_at, limit=0):
+            for sample in self._samples_for_row(row):
+                code = _normalize_code(sample.get("code"))
+                sample_dt = _parse_dt(sample.get("at"))
+                if not code or sample_dt is None:
+                    continue
+                by_code.setdefault(code, []).append((sample_dt, sample))
+        for items in by_code.values():
+            items.sort(key=lambda item: item[0])
+        self._samples_by_code_cache[trade_date] = by_code
+        return by_code
 
 
 def config_from_settings(settings: Any) -> IntradayOutcomeConfig:
@@ -593,10 +623,17 @@ def _extract_price_samples(payload: Any, *, at: str, source: str) -> list[dict[s
 
 def _snapshot_code(payload: dict[str, Any]) -> str:
     for key in ("code", "symbol", "stock_code"):
-        value = str(payload.get(key) or "").strip()
+        value = _normalize_code(payload.get(key))
         if value:
             return value
     return ""
+
+
+def _normalize_code(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if len(text) == 7 and text.startswith("A") and text[1:].isdigit():
+        return text[1:]
+    return text
 
 
 def _outcome_details(

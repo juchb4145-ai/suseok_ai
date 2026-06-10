@@ -25,6 +25,7 @@ DISPLAY_WAIT_ORDER = {
     "WAIT_DATA_SUPPORT_NOT_READY": 2,
     "WAIT_DATA_LATEST_TICK_STALE": 2,
 }
+NAVER_THEME_SYNC_SOURCE = "naver_theme_universe"
 
 
 def build_theme_lab_dashboard_snapshot(
@@ -35,8 +36,9 @@ def build_theme_lab_dashboard_snapshot(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     raw = db.latest_theme_lab_flow_result()
+    theme_source_sync = _theme_source_sync_status(db)
     if not raw:
-        return _empty_snapshot(runtime_status=runtime_status)
+        return _empty_snapshot(runtime_status=runtime_status, theme_source_sync=theme_source_sync)
 
     themes = _as_list(raw.get("theme_rankings") or raw.get("theme_condition_snapshots"))
     gate_decisions = _as_list(raw.get("gate_decisions"))
@@ -66,6 +68,7 @@ def build_theme_lab_dashboard_snapshot(
         "runtime": runtime,
         "gateway": gateway,
         "theme_backfill_runtime": backfill_runtime,
+        "theme_source_sync": theme_source_sync,
         **_freshness_quality_fields(freshness),
         "market": _market(raw.get("market_status") or {}),
         "condition_statuses": _condition_statuses(db, gateway_state),
@@ -80,7 +83,11 @@ def build_theme_lab_dashboard_snapshot(
     }
 
 
-def _empty_snapshot(*, runtime_status: dict[str, Any] | None = None) -> dict[str, Any]:
+def _empty_snapshot(
+    *,
+    runtime_status: dict[str, Any] | None = None,
+    theme_source_sync: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     runtime = _runtime_context(runtime_status)
     freshness = _empty_freshness()
     return {
@@ -91,6 +98,7 @@ def _empty_snapshot(*, runtime_status: dict[str, Any] | None = None) -> dict[str
         "last_updated_at": _now_time(),
         "runtime": runtime,
         "gateway": _gateway_context(None),
+        "theme_source_sync": theme_source_sync or _empty_theme_source_sync_status(),
         "theme_backfill_runtime": {
             "enabled": False,
             "paused_reason": "SNAPSHOT_UNAVAILABLE",
@@ -134,6 +142,39 @@ def _empty_snapshot(*, runtime_status: dict[str, Any] | None = None) -> dict[str
         "selected_chart": {"symbol": "KOSDAQ", "name": "KOSDAQ", "type": "index", "chart_data_status": "NO_CANDLE_DATA"},
         "gate_detail": {"gate_status": "OBSERVE", "summary_message": "선택된 WatchSet 종목이 없습니다."},
         "summary": _empty_summary(runtime=runtime, freshness=freshness),
+    }
+
+
+def _theme_source_sync_status(db: TradingDatabase) -> dict[str, Any]:
+    run = ThemeEngineRepository(db).latest_source_sync_run(NAVER_THEME_SYNC_SOURCE)
+    if run is None:
+        return _empty_theme_source_sync_status()
+    return {
+        "id": run.id,
+        "source": run.source,
+        "status": run.status,
+        "theme_count": run.theme_count,
+        "member_count": run.member_count,
+        "error_count": run.error_count,
+        "message": run.message,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "details": dict(run.details or {}),
+    }
+
+
+def _empty_theme_source_sync_status() -> dict[str, Any]:
+    return {
+        "id": None,
+        "source": NAVER_THEME_SYNC_SOURCE,
+        "status": "NOT_SYNCED",
+        "theme_count": 0,
+        "member_count": 0,
+        "error_count": 0,
+        "message": "",
+        "started_at": "",
+        "finished_at": "",
+        "details": {},
     }
 
 

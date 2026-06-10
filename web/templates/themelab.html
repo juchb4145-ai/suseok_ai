@@ -23,6 +23,8 @@
             <p id="operation-message">ThemeLabFlow 결과 대기 중</p>
           </div>
           <div class="cockpit-actions">
+            <button id="naver-theme-sync" class="action-button" type="button">네이버 테마 업데이트</button>
+            <span id="naver-theme-sync-status" class="counter">테마 sync 대기</span>
             <button id="kiwoom-gateway-start" class="action-button" type="button">32bit Gateway 실행</button>
             <span id="operation-status" class="badge observe">SNAPSHOT_UNAVAILABLE</span>
             <span id="cockpit-snapshot-state" class="counter">대기</span>
@@ -396,6 +398,6 @@
         </div>
       </div>
     </main>
-    <script src="/static/themelab.js?v=theme-backfill-gateway-start"></script>
+    <script src="/static/themelab.js?v=local-token-dialog"></script>
   </body>
 </html>

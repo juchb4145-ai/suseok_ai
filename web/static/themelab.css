@@ -415,6 +415,28 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
 .action-status-pending,
 .action-status-skipped { color: var(--muted); }
 
+.local-token-dialog {
+  max-width: 420px;
+}
+
+.local-token-input {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--border-active);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  color: var(--text);
+  font: inherit;
+  font-weight: 800;
+  margin-top: 8px;
+  padding: 8px 10px;
+}
+
+.local-token-input:focus {
+  border-color: var(--ready-small);
+  outline: none;
+}
+
 .runbook-panel {
   border-color: rgba(56, 189, 248, 0.25);
 }

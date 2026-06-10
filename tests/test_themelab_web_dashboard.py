@@ -15,7 +15,7 @@ from trading.strategy.conditions import ConditionProfile, ConditionProfileReposi
 from trading.strategy.models import Candidate, CandidateState
 from trading.strategy.models import StrategyProfile
 from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE
-from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeStatus
+from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeSourceSyncResult, ThemeStatus
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading_app.themelab_dashboard import build_theme_lab_dashboard_snapshot
 
@@ -32,6 +32,8 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one(".terminal-shell") is not None
     assert soup.select_one("#operating-cockpit") is not None
     assert soup.select_one("#operation-status") is not None
+    assert soup.select_one("#naver-theme-sync") is not None
+    assert soup.select_one("#naver-theme-sync-status") is not None
     assert soup.select_one("#kiwoom-gateway-start") is not None
     assert soup.select_one("#operator-alert-panel") is not None
     assert soup.select_one("#operator-alert-count") is not None
@@ -102,6 +104,12 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "snapshot.theme_lab && isFullThemeLabSnapshot(snapshot.theme_lab)" in js
     assert "/api/gateway/kiwoom/start" in js
     assert "startKiwoomGateway" in js
+    assert "/api/themes/sync/naver" in js
+    assert "syncNaverThemeUniverse" in js
+    assert "renderNaverThemeSyncStatus" in js
+    assert "requestLocalToken" in js
+    assert "local-token-modal" in js
+    assert "window.prompt" not in js
     assert "gateway_unhealthy_display" in js
     assert "matchesFilters" in js
     assert "renderCockpit" in js
@@ -1134,6 +1142,40 @@ def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, 
     assert page.status_code == 200
     assert direct["summary"]["ready_count"] == 1
     assert snapshot["theme_lab"]["summary"]["ready_count"] == 1
+
+
+def test_theme_lab_snapshot_exposes_naver_sync_status(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        ThemeEngineRepository(db).save_source_sync_run(
+            ThemeSourceSyncResult(
+                source="naver_theme_universe",
+                status="success",
+                theme_count=3,
+                member_count=42,
+                started_at="2026-06-10T09:00:00",
+                finished_at="2026-06-10T09:01:00",
+            )
+        )
+        db.save_theme_lab_flow_result(
+            "09:02:00",
+            {
+                "market_status": {"market_status": "EXPANSION"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [_watch("000001", "READY")],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    assert payload["theme_source_sync"]["source"] == "naver_theme_universe"
+    assert payload["theme_source_sync"]["status"] == "success"
+    assert payload["theme_source_sync"]["theme_count"] == 3
+    assert payload["theme_source_sync"]["member_count"] == 42
 
 
 def test_theme_lab_snapshot_exposes_defensive_gate_observability_columns(tmp_path):

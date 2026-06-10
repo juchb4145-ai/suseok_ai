@@ -35,6 +35,7 @@
   postmarketReviewSelectedItem: null,
   postmarketReviewLoading: false,
   postmarketReviewLastGeneratedAt: "",
+  naverThemeSyncBusy: false,
   alertFilters: {
     category: "ALL",
     hideAcknowledged: false,
@@ -203,9 +204,58 @@ function forgetStoredToken() {
 }
 
 function promptForToken(message = "TRADING_CORE_TOKEN") {
-  const token = window.prompt(message) || "";
-  rememberToken(token);
-  return token;
+  return requestLocalToken(message);
+}
+
+function requestLocalToken(message = "TRADING_CORE_TOKEN") {
+  return new Promise((resolve) => {
+    let modal = document.getElementById("local-token-modal");
+    if (!modal) {
+      modal = document.createElement("div");
+      modal.id = "local-token-modal";
+      modal.className = "action-confirm-modal";
+      modal.hidden = true;
+      modal.innerHTML = `
+        <div class="action-confirm-dialog local-token-dialog" role="dialog" aria-modal="true" aria-labelledby="local-token-title">
+          <h2 id="local-token-title">로컬 토큰 입력</h2>
+          <div class="action-confirm-body">
+            <div class="operator-alert-empty" id="local-token-message">TRADING_CORE_TOKEN</div>
+            <input id="local-token-input" class="local-token-input" type="password" autocomplete="current-password" />
+          </div>
+          <div class="operator-alert-actions">
+            <button id="local-token-cancel" type="button">취소</button>
+            <button id="local-token-submit" type="button">확인</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(modal);
+    }
+    const input = modal.querySelector("#local-token-input");
+    const label = modal.querySelector("#local-token-message");
+    const submit = modal.querySelector("#local-token-submit");
+    const cancel = modal.querySelector("#local-token-cancel");
+    const cleanup = (token = "") => {
+      modal.hidden = true;
+      submit.removeEventListener("click", onSubmit);
+      cancel.removeEventListener("click", onCancel);
+      input.removeEventListener("keydown", onKeydown);
+      rememberToken(token);
+      resolve(token);
+    };
+    const onSubmit = () => cleanup(String(input.value || "").trim());
+    const onCancel = () => cleanup("");
+    const onKeydown = (event) => {
+      if (event.key === "Enter") onSubmit();
+      if (event.key === "Escape") onCancel();
+    };
+    if (label) label.textContent = message;
+    input.value = "";
+    submit.addEventListener("click", onSubmit);
+    cancel.addEventListener("click", onCancel);
+    input.addEventListener("keydown", onKeydown);
+    modal.hidden = false;
+    setTimeout(() => input.focus(), 0);
+  });
 }
 
 function isInvalidTokenResponse(response, payload) {
@@ -226,12 +276,12 @@ async function parseResponsePayload(response) {
 }
 
 async function runWithLocalTokenRetry(requestFn) {
-  let token = getStoredToken() || promptForToken();
+  let token = getStoredToken() || await promptForToken();
   if (!token) return null;
   let result = await requestFn(token);
   if (!result.response.ok && isInvalidTokenResponse(result.response, result.payload)) {
     forgetStoredToken();
-    token = promptForToken("TRADING_CORE_TOKEN");
+    token = await promptForToken("TRADING_CORE_TOKEN");
     if (!token) return null;
     result = await requestFn(token);
   }
@@ -1483,6 +1533,8 @@ function render(snapshot) {
   renderDecisionTimeline();
   renderOperatorSessionReview();
   renderOperatorEventJournal();
+  if (!state.naverThemeSyncBusy) renderNaverThemeSyncStatus(currentSnapshot.theme_source_sync || {});
+  updateNaverThemeSyncButton();
   updateKiwoomGatewayButton(currentSnapshot);
   state.previousSnapshot = currentSnapshot;
 }
@@ -1597,6 +1649,70 @@ function updateKiwoomGatewayButton(snapshot) {
     button.textContent = "\uc790\ub3d9\ub85c\uadf8\uc778 \ub300\uae30";
   } else {
     button.textContent = "32bit Gateway \uc2e4\ud589";
+  }
+}
+
+function updateNaverThemeSyncButton() {
+  const button = document.getElementById("naver-theme-sync");
+  if (!button) return;
+  const busy = state.naverThemeSyncBusy || button.dataset.busy === "1";
+  button.disabled = busy;
+  button.textContent = busy ? "네이버 업데이트 중" : "네이버 테마 업데이트";
+}
+
+function renderNaverThemeSyncStatus(sync = {}) {
+  const node = document.getElementById("naver-theme-sync-status");
+  if (!node) return;
+  const status = String(sync.status || "NOT_SYNCED").toUpperCase();
+  const themeCount = Number(sync.theme_count || 0);
+  const memberCount = Number(sync.member_count || 0);
+  const finishedAt = sync.finished_at ? formatEventTime(sync.finished_at) : "";
+  const message = sync.message ? ` · ${sync.message}` : "";
+  if (status === "SUCCESS") {
+    node.textContent = `Naver ${themeCount}개 테마 / ${memberCount}종목${finishedAt ? ` · ${finishedAt}` : ""}`;
+  } else if (status === "FAILED") {
+    node.textContent = `Naver sync 실패${message}`;
+  } else {
+    node.textContent = "Naver sync 없음";
+  }
+  node.title = [
+    `source=${sync.source || "naver_theme_universe"}`,
+    `status=${status}`,
+    sync.started_at ? `started=${sync.started_at}` : "",
+    sync.finished_at ? `finished=${sync.finished_at}` : "",
+  ].filter(Boolean).join(" / ");
+}
+
+async function syncNaverThemeUniverse(button) {
+  if (!button || state.naverThemeSyncBusy) return;
+  state.naverThemeSyncBusy = true;
+  button.dataset.busy = "1";
+  updateNaverThemeSyncButton();
+  text("naver-theme-sync-status", "네이버 테마 크롤링 중");
+  try {
+    const payload = await runWithLocalTokenRetry(async (token) => {
+      const response = await fetch("/api/themes/sync/naver?replace=true&max_pages=20", {
+        method: "POST",
+        headers: { "X-Local-Token": token },
+      });
+      return { response, payload: await parseResponsePayload(response) };
+    });
+    if (!payload) return;
+    if (String(payload.status || "").toLowerCase() !== "success") {
+      throw new Error(payload.message || "Naver theme sync failed");
+    }
+    renderNaverThemeSyncStatus(payload);
+    await fetchSnapshot().catch(() => {});
+  } catch (error) {
+    renderNaverThemeSyncStatus({
+      source: "naver_theme_universe",
+      status: "failed",
+      message: error.message || String(error),
+    });
+  } finally {
+    state.naverThemeSyncBusy = false;
+    button.dataset.busy = "0";
+    updateNaverThemeSyncButton();
   }
 }
 
@@ -2641,6 +2757,9 @@ function initFilters() {
   });
   document.getElementById("kiwoom-gateway-start")?.addEventListener("click", (event) => {
     startKiwoomGateway(event.currentTarget).catch(() => {});
+  });
+  document.getElementById("naver-theme-sync")?.addEventListener("click", (event) => {
+    syncNaverThemeUniverse(event.currentTarget).catch(() => {});
   });
 }
 
