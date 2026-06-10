@@ -662,6 +662,32 @@ class TradingDatabase:
                 payload_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS gateway_price_ticks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                trade_date TEXT NOT NULL DEFAULT '',
+                timestamp TEXT NOT NULL,
+                received_at TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                price REAL,
+                change_rate REAL,
+                cum_volume REAL,
+                trade_value REAL,
+                execution_strength REAL,
+                best_bid REAL,
+                best_ask REAL,
+                spread_ticks INTEGER,
+                source TEXT NOT NULL DEFAULT '',
+                transport_mode TEXT NOT NULL DEFAULT '',
+                instrument_type TEXT NOT NULL DEFAULT '',
+                trade_time TEXT NOT NULL DEFAULT '',
+                day_high REAL,
+                day_low REAL,
+                raw_payload_json TEXT NOT NULL DEFAULT '{}',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS gateway_command_dedupe_keys (
                 dedupe_key TEXT PRIMARY KEY,
                 command_id TEXT NOT NULL,
@@ -1286,6 +1312,8 @@ class TradingDatabase:
                 ON theme_membership_current(theme_id);
             CREATE INDEX IF NOT EXISTS idx_theme_activity_snapshots_created_rank
                 ON theme_activity_snapshots(created_at, rank);
+            CREATE INDEX IF NOT EXISTS idx_theme_lab_flow_snapshots_calculated
+                ON theme_lab_flow_snapshots(calculated_at);
             CREATE INDEX IF NOT EXISTS idx_dynamic_theme_clusters_status
                 ON dynamic_theme_clusters(status);
             CREATE INDEX IF NOT EXISTS idx_theme_source_sync_runs_source_started
@@ -1328,6 +1356,12 @@ class TradingDatabase:
                 ON gateway_command_events(command_id, id);
             CREATE INDEX IF NOT EXISTS idx_gateway_command_events_type_created_at
                 ON gateway_command_events(event_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_gateway_price_ticks_trade_date_ts
+                ON gateway_price_ticks(trade_date, timestamp, id);
+            CREATE INDEX IF NOT EXISTS idx_gateway_price_ticks_code_ts
+                ON gateway_price_ticks(code, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_gateway_price_ticks_source_ts
+                ON gateway_price_ticks(source, timestamp);
             CREATE INDEX IF NOT EXISTS idx_gateway_command_dedupe_command_id
                 ON gateway_command_dedupe_keys(command_id);
             CREATE INDEX IF NOT EXISTS idx_gateway_command_dedupe_type_trade_date
@@ -2141,6 +2175,33 @@ class TradingDatabase:
             ),
         )
         self.conn.commit()
+
+    def save_gateway_price_ticks_batch(self, ticks: Iterable[dict]) -> int:
+        rows = [_gateway_price_tick_params(tick) for tick in ticks if isinstance(tick, dict)]
+        rows = [row for row in rows if row.get("event_id") and row.get("code") and row.get("timestamp")]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT OR IGNORE INTO gateway_price_ticks(
+                    event_id, trade_date, timestamp, received_at,
+                    code, name, price, change_rate, cum_volume, trade_value,
+                    execution_strength, best_bid, best_ask, spread_ticks,
+                    source, transport_mode, instrument_type, trade_time,
+                    day_high, day_low, raw_payload_json, metadata_json, created_at
+                ) VALUES (
+                    :event_id, :trade_date, :timestamp, :received_at,
+                    :code, :name, :price, :change_rate, :cum_volume, :trade_value,
+                    :execution_strength, :best_bid, :best_ask, :spread_ticks,
+                    :source, :transport_mode, :instrument_type, :trade_time,
+                    :day_high, :day_low, :raw_payload_json, :metadata_json, :created_at
+                )
+                """,
+                rows,
+            )
+        return int(self.conn.total_changes - before)
 
     def save_strategy_decision_events(self, events: Iterable[dict]) -> int:
         rows = [_strategy_decision_event_params(event) for event in events if isinstance(event, dict)]
@@ -7188,6 +7249,47 @@ def _default_review_key(review: TradeReview) -> str:
     return f"{review.gate_result_key}:{status}:{review.virtual_order_id or ''}:{review.virtual_position_id or ''}"
 
 
+def _gateway_price_tick_params(payload: dict) -> dict:
+    raw_payload = payload.get("raw_payload") if isinstance(payload.get("raw_payload"), dict) else payload
+    metadata = raw_payload.get("metadata") if isinstance(raw_payload.get("metadata"), dict) else {}
+    timestamp = str(payload.get("timestamp") or raw_payload.get("timestamp") or payload.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+    received_at = str(payload.get("received_at") or payload.get("created_at") or timestamp)
+    source = str(payload.get("source") or raw_payload.get("source") or "")
+    trace = raw_payload.get("_transport_trace") if isinstance(raw_payload.get("_transport_trace"), dict) else {}
+    transport_mode = str(payload.get("transport_mode") or raw_payload.get("transport_mode") or trace.get("transport_mode") or "")
+    return {
+        "event_id": str(payload.get("event_id") or raw_payload.get("event_id") or ""),
+        "trade_date": str(payload.get("trade_date") or _trade_date_from_timestamp(timestamp) or ""),
+        "timestamp": timestamp,
+        "received_at": received_at,
+        "code": _clean_stock_code(payload.get("code") or raw_payload.get("code")),
+        "name": str(payload.get("name") or raw_payload.get("name") or ""),
+        "price": _nullable_float(payload.get("price") if "price" in payload else raw_payload.get("price")),
+        "change_rate": _nullable_float(payload.get("change_rate") if "change_rate" in payload else raw_payload.get("change_rate")),
+        "cum_volume": _nullable_float(
+            payload.get("cum_volume")
+            if "cum_volume" in payload
+            else raw_payload.get("cum_volume", raw_payload.get("volume"))
+        ),
+        "trade_value": _nullable_float(payload.get("trade_value") if "trade_value" in payload else raw_payload.get("trade_value")),
+        "execution_strength": _nullable_float(
+            payload.get("execution_strength") if "execution_strength" in payload else raw_payload.get("execution_strength")
+        ),
+        "best_bid": _nullable_float(payload.get("best_bid") if "best_bid" in payload else raw_payload.get("best_bid")),
+        "best_ask": _nullable_float(payload.get("best_ask") if "best_ask" in payload else raw_payload.get("best_ask")),
+        "spread_ticks": _nullable_int(payload.get("spread_ticks") if "spread_ticks" in payload else raw_payload.get("spread_ticks")),
+        "source": source,
+        "transport_mode": transport_mode,
+        "instrument_type": str(payload.get("instrument_type") or raw_payload.get("instrument_type") or ""),
+        "trade_time": str(payload.get("trade_time") or raw_payload.get("trade_time") or ""),
+        "day_high": _nullable_float(payload.get("day_high") if "day_high" in payload else raw_payload.get("day_high")),
+        "day_low": _nullable_float(payload.get("day_low") if "day_low" in payload else raw_payload.get("day_low")),
+        "raw_payload_json": _json_payload(_redact_sensitive_payload(raw_payload)),
+        "metadata_json": _json_payload(_redact_sensitive_payload(metadata)),
+        "created_at": str(payload.get("created_at") or received_at),
+    }
+
+
 def _strategy_decision_event_params(payload: dict) -> dict:
     now = str(payload.get("created_at") or payload.get("decision_at") or datetime.now().isoformat(timespec="seconds"))
     decision_at = str(payload.get("decision_at") or now)
@@ -8845,6 +8947,22 @@ def _json_payload(value: object) -> str:
     if value is None:
         value = {}
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _redact_sensitive_payload(value: object) -> object:
+    sensitive_tokens = ("account", "token", "secret", "password", "credential", "auth")
+    if isinstance(value, dict):
+        redacted: dict[str, object] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if any(token in key_text.lower() for token in sensitive_tokens):
+                redacted[key_text] = "***REDACTED***"
+            else:
+                redacted[key_text] = _redact_sensitive_payload(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive_payload(item) for item in value]
+    return value
 
 
 def _json_list(value: object) -> str:

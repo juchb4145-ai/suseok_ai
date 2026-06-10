@@ -2650,13 +2650,19 @@ async function fetchSnapshot() {
   render(await response.json());
 }
 
+function isFullThemeLabSnapshot(snapshot) {
+  const payload = snapshot || {};
+  const market = payload.market || {};
+  return Array.isArray(payload.ranked_themes) || Array.isArray(payload.watchset) || Array.isArray(market.sides);
+}
+
 function connectWs() {
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${protocol}://${window.location.host}/ws/dashboard`);
   ws.onmessage = (event) => {
     const payload = JSON.parse(event.data);
     const snapshot = payload.snapshot || {};
-    if (snapshot.theme_lab) render(snapshot.theme_lab);
+    if (snapshot.theme_lab && isFullThemeLabSnapshot(snapshot.theme_lab)) render(snapshot.theme_lab);
   };
   ws.onclose = () => setTimeout(connectWs, 1500);
 }

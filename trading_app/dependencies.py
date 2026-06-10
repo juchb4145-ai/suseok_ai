@@ -109,6 +109,11 @@ class CoreSettings:
     change_proposal_strong_min_confidence: float = 0.7
     change_proposal_allow_auto_apply: bool = False
     change_proposal_default_expire_days: int = 5
+    replay_tick_history_enabled: bool = True
+    replay_tick_history_queue_max_size: int = 5000
+    replay_tick_history_batch_size: int = 200
+    replay_tick_history_flush_interval_sec: float = 1.0
+    replay_tick_history_min_interval_ms: float = 500.0
 
     @property
     def live_order_enabled(self) -> bool:
@@ -226,6 +231,11 @@ def get_settings() -> CoreSettings:
         change_proposal_strong_min_confidence=_float_env("TRADING_CHANGE_PROPOSAL_STRONG_MIN_CONFIDENCE", 0.7),
         change_proposal_allow_auto_apply=_bool_env("TRADING_CHANGE_PROPOSAL_ALLOW_AUTO_APPLY", False),
         change_proposal_default_expire_days=_int_env("TRADING_CHANGE_PROPOSAL_DEFAULT_EXPIRE_DAYS", 5),
+        replay_tick_history_enabled=_bool_env("TRADING_REPLAY_TICK_HISTORY_ENABLED", True),
+        replay_tick_history_queue_max_size=_int_env("TRADING_REPLAY_TICK_HISTORY_QUEUE_MAX_SIZE", 5000),
+        replay_tick_history_batch_size=_int_env("TRADING_REPLAY_TICK_HISTORY_BATCH_SIZE", 200),
+        replay_tick_history_flush_interval_sec=_float_env("TRADING_REPLAY_TICK_HISTORY_FLUSH_INTERVAL_SEC", 1.0),
+        replay_tick_history_min_interval_ms=_float_env("TRADING_REPLAY_TICK_HISTORY_MIN_INTERVAL_MS", 500.0),
     )
 
 

@@ -14,7 +14,11 @@ from trading.broker.models import GatewayEvent
 from trading.strategy.readiness import build_readiness_report
 from trading.strategy.runtime import StrategyRuntime
 from trading_app.dependencies import CoreSettings
-from trading_app.intraday_outcomes import IntradayOutcomeLabeler, config_from_settings as outcome_config_from_settings
+from trading_app.intraday_outcomes import (
+    IntradayOutcomeLabeler,
+    ThemeLabFlowPricePathProvider,
+    config_from_settings as outcome_config_from_settings,
+)
 from trading_app.runtime_factory import CoreRuntimeBundle, build_core_strategy_runtime
 from trading_app.shadow_strategy import ShadowStrategyEvaluator, config_from_settings as shadow_config_from_settings
 
@@ -567,7 +571,11 @@ class RuntimeSupervisor:
                 return {"status": "DISABLED", "persisted_count": 0, "outcome_count": 0}
             active_db = self._bundle.db
         try:
-            labeler = IntradayOutcomeLabeler(active_db, config=outcome_config_from_settings(self.settings))
+            labeler = IntradayOutcomeLabeler(
+                active_db,
+                config=outcome_config_from_settings(self.settings),
+                price_provider=ThemeLabFlowPricePathProvider(active_db),
+            )
             return labeler.rebuild(
                 trade_date=datetime.now().date().isoformat(),
                 limit=int(getattr(self.settings, "intraday_outcome_max_batch_size", 500)),

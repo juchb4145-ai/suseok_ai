@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable, Optional
@@ -319,6 +320,93 @@ class IntradayOutcomeLabeler:
         return None
 
 
+class ThemeLabFlowPricePathProvider:
+    """Build a decision-time price path from persisted ThemeLab flow snapshots.
+
+    The provider is read-only and only returns samples between decision_at and
+    decision_at + horizon_sec, so outcome labeling keeps the look-ahead boundary
+    explicit.
+    """
+
+    def __init__(self, db: TradingDatabase, *, max_rows: int = 300) -> None:
+        self.db = db
+        self.max_rows = max(1, int(max_rows or 300))
+        self._row_sample_cache: dict[int, list[dict[str, Any]]] = {}
+
+    def __call__(self, decision: dict[str, Any], horizon_sec: int, now: datetime) -> dict[str, Any]:
+        code = str(decision.get("code") or "").strip()
+        decision_at = _parse_dt(decision.get("decision_at"))
+        if not code or decision_at is None:
+            return {"source": "theme_lab_flow_snapshot", "samples": []}
+        horizon_at = decision_at + timedelta(seconds=max(1, int(horizon_sec or 1)))
+        rows = self._load_rows(decision_at, min(horizon_at, now))
+        samples: list[dict[str, Any]] = []
+        seen: set[tuple[str, float]] = set()
+        for row in rows:
+            for sample in self._samples_for_row(row):
+                if sample.get("code") != code:
+                    continue
+                sample_dt = _parse_dt(sample.get("at"))
+                if sample_dt is None or sample_dt < decision_at or sample_dt > horizon_at:
+                    continue
+                price = _positive_float(sample.get("price"))
+                if not price:
+                    continue
+                key = (sample_dt.isoformat(timespec="seconds"), float(price))
+                if key in seen:
+                    continue
+                seen.add(key)
+                samples.append({"at": key[0], "price": price, "source": sample.get("source") or "theme_lab_flow_snapshot"})
+        samples.sort(key=lambda item: item["at"])
+        return {"source": "theme_lab_flow_snapshot", "samples": samples}
+
+    def _load_rows(self, start_at: datetime, end_at: datetime) -> list[dict[str, Any]]:
+        if not hasattr(self.db, "conn"):
+            return []
+        try:
+            exists = self.db.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='theme_lab_flow_snapshots'"
+            ).fetchone()
+            if not exists:
+                return []
+            return [
+                dict(row)
+                for row in self.db.conn.execute(
+                    """
+                    SELECT id, calculated_at, watchset_snapshots_json, gate_decisions_json,
+                           condition_hit_snapshots_json, theme_condition_snapshots_json,
+                           theme_rankings_json
+                    FROM theme_lab_flow_snapshots
+                    WHERE calculated_at >= ?
+                      AND calculated_at <= ?
+                    ORDER BY calculated_at ASC, id ASC
+                    LIMIT ?
+                    """,
+                    (start_at.isoformat(timespec="seconds"), end_at.isoformat(timespec="seconds"), self.max_rows),
+                ).fetchall()
+            ]
+        except Exception:
+            return []
+
+    def _samples_for_row(self, row: dict[str, Any]) -> list[dict[str, Any]]:
+        row_id = int(row.get("id") or 0)
+        if row_id in self._row_sample_cache:
+            return self._row_sample_cache[row_id]
+        calculated_at = str(row.get("calculated_at") or "")
+        samples: list[dict[str, Any]] = []
+        for column, source in (
+            ("watchset_snapshots_json", "theme_lab_flow:watchset"),
+            ("gate_decisions_json", "theme_lab_flow:gate_decision"),
+            ("condition_hit_snapshots_json", "theme_lab_flow:condition_hit"),
+            ("theme_condition_snapshots_json", "theme_lab_flow:theme_condition"),
+            ("theme_rankings_json", "theme_lab_flow:theme_ranking"),
+        ):
+            payload = _safe_json(row.get(column), [])
+            samples.extend(_extract_price_samples(payload, at=calculated_at, source=source))
+        self._row_sample_cache[row_id] = samples
+        return samples
+
+
 def config_from_settings(settings: Any) -> IntradayOutcomeConfig:
     return IntradayOutcomeConfig(
         enabled=bool(getattr(settings, "intraday_outcome_enabled", True)),
@@ -452,6 +540,63 @@ def _normalize_samples(samples: Iterable[dict[str, Any]], *, default_source: str
         )
     normalized.sort(key=lambda item: item.get("dt") or datetime.min)
     return normalized
+
+
+def _safe_json(value: Any, default: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if value in (None, ""):
+        return default
+    try:
+        return json.loads(str(value))
+    except Exception:
+        return default
+
+
+def _extract_price_samples(payload: Any, *, at: str, source: str) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    if isinstance(payload, list):
+        for item in payload:
+            samples.extend(_extract_price_samples(item, at=at, source=source))
+        return samples
+    if not isinstance(payload, dict):
+        return samples
+
+    code = _snapshot_code(payload)
+    price = _positive_float(
+        payload.get("current_price")
+        or payload.get("price")
+        or payload.get("last_price")
+        or payload.get("close")
+        or payload.get("trade_price")
+    )
+    sample_at = str(payload.get("calculated_at") or payload.get("timestamp") or payload.get("created_at") or at or "")
+    if code and price:
+        samples.append({"code": code, "at": sample_at, "price": price, "source": source})
+
+    for key in (
+        "member_hits",
+        "top_stocks",
+        "stocks",
+        "items",
+        "watchset_snapshots",
+        "gate_decisions",
+        "condition_hit_snapshots",
+        "theme_condition_snapshots",
+        "theme_rankings",
+    ):
+        nested = payload.get(key)
+        if nested:
+            samples.extend(_extract_price_samples(nested, at=sample_at or at, source=source))
+    return samples
+
+
+def _snapshot_code(payload: dict[str, Any]) -> str:
+    for key in ("code", "symbol", "stock_code"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _outcome_details(

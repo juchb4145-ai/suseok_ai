@@ -427,6 +427,7 @@ More detail:
 - [Runtime DRY_RUN Exit/Sell Intent Runbook](docs/runtime_dry_run_exit_sell_intent_runbook.md)
 - [DRY_RUN 성과 리포트 Runbook](docs/dry_run_performance_report_runbook.md)
 - [DRY_RUN 기준 A/B 제안 Runbook](docs/dry_run_threshold_ab_runbook.md)
+- [Strategy Feedback Loop 검증 Runbook](docs/strategy_feedback_loop_validation_runbook.md)
 - [Gateway 전송 지연 Runbook](docs/gateway_transport_latency_runbook.md)
 - [Gateway WebSocket Mock 실험 Runbook](docs/gateway_websocket_mock_experiment_runbook.md)
 - [Gateway WebSocket Real Pilot Runbook](docs/gateway_websocket_real_pilot_runbook.md)

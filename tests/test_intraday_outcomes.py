@@ -6,7 +6,7 @@ from datetime import datetime
 from fastapi.testclient import TestClient
 
 from storage.db import TradingDatabase
-from trading_app.intraday_outcomes import IntradayOutcomeConfig, IntradayOutcomeLabeler
+from trading_app.intraday_outcomes import IntradayOutcomeConfig, IntradayOutcomeLabeler, ThemeLabFlowPricePathProvider
 
 
 def _decision(decision_id: str, *, gate_status: str = "READY", action_type: str = "READY", reason_codes=None) -> dict:
@@ -97,6 +97,94 @@ def test_outcome_label_rules_cover_entry_block_risk_exit_hold_and_insufficient(t
         ]
 
         assert labels == [expected for _decision_payload, expected in cases]
+    finally:
+        db.close()
+
+
+def test_theme_lab_flow_price_provider_labels_from_persisted_snapshots(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        decision = _decision("flow-ready")
+        db.save_strategy_decision_events([decision])
+        db.save_theme_lab_flow_result(
+            "2026-06-01T09:00:30",
+            {
+                "watchset_snapshots": [
+                    {"symbol": "000001", "current_price": 101.0, "calculated_at": "2026-06-01T09:00:30"},
+                    {"symbol": "000002", "current_price": 50.0, "calculated_at": "2026-06-01T09:00:30"},
+                ],
+                "gate_decisions": [],
+                "condition_hit_snapshots": [],
+                "theme_condition_snapshots": [],
+                "theme_rankings": [],
+            },
+        )
+        db.save_theme_lab_flow_result(
+            "2026-06-01T09:01:00",
+            {
+                "watchset_snapshots": [
+                    {"symbol": "000001", "current_price": 103.0, "calculated_at": "2026-06-01T09:01:00"}
+                ],
+            },
+        )
+        db.save_theme_lab_flow_result(
+            "2026-06-01T09:02:00",
+            {
+                "watchset_snapshots": [
+                    {"symbol": "000001", "current_price": 80.0, "calculated_at": "2026-06-01T09:02:00"}
+                ],
+            },
+        )
+
+        labeler = IntradayOutcomeLabeler(
+            db,
+            config=IntradayOutcomeConfig(horizons_sec=(60,), min_price_samples=2),
+            price_provider=ThemeLabFlowPricePathProvider(db),
+        )
+        result = labeler.rebuild(
+            trade_date="2026-06-01",
+            horizon_sec=60,
+            now=datetime.fromisoformat("2026-06-01T09:01:05"),
+        )
+        outcome = db.get_strategy_decision_outcome("flow-ready", 60)
+
+        assert result["persisted_count"] == 1
+        assert outcome["outcome_label"] == "EARLY_TRUE_POSITIVE"
+        assert outcome["price_at_horizon"] == 103.0
+        assert outcome["data_status"] in {"SPARSE", "OK"}
+    finally:
+        db.close()
+
+
+def test_theme_lab_flow_price_provider_does_not_use_future_snapshots(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        decision = _decision("future-only")
+        db.save_strategy_decision_events([decision])
+        db.save_theme_lab_flow_result(
+            "2026-06-01T09:02:00",
+            {
+                "watchset_snapshots": [
+                    {"symbol": "000001", "current_price": 103.0, "calculated_at": "2026-06-01T09:02:00"}
+                ],
+            },
+        )
+
+        labeler = IntradayOutcomeLabeler(
+            db,
+            config=IntradayOutcomeConfig(horizons_sec=(60,), min_price_samples=2),
+            price_provider=ThemeLabFlowPricePathProvider(db),
+        )
+        result = labeler.rebuild(
+            trade_date="2026-06-01",
+            horizon_sec=60,
+            now=datetime.fromisoformat("2026-06-01T09:01:05"),
+        )
+        outcome = db.get_strategy_decision_outcome("future-only", 60)
+
+        assert result["persisted_count"] == 1
+        assert outcome["outcome_label"] == "INSUFFICIENT_OUTCOME_DATA"
+        assert outcome["data_quality_issues"] == ["INSUFFICIENT_PRICE_SAMPLES"]
     finally:
         db.close()
 

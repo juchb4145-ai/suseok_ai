@@ -98,6 +98,8 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "cockpit-grid" in css
     assert "/ws/dashboard" in js
     assert "/api/themelab/snapshot" in js
+    assert "isFullThemeLabSnapshot" in js
+    assert "snapshot.theme_lab && isFullThemeLabSnapshot(snapshot.theme_lab)" in js
     assert "/api/gateway/kiwoom/start" in js
     assert "startKiwoomGateway" in js
     assert "gateway_unhealthy_display" in js

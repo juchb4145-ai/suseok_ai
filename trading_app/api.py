@@ -60,10 +60,15 @@ from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThe
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
 from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, config_from_settings
 from trading_app.dry_run_threshold_ab import DryRunThresholdABAnalyzer, config_from_settings as threshold_ab_config_from_settings
-from trading_app.intraday_outcomes import IntradayOutcomeLabeler, config_from_settings as outcome_config_from_settings
+from trading_app.intraday_outcomes import (
+    IntradayOutcomeLabeler,
+    ThemeLabFlowPricePathProvider,
+    config_from_settings as outcome_config_from_settings,
+)
 from trading_app.market_gate_review import MarketGateReviewAnalyzer
 from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
+from trading_app.replay_tick_buffer import ReplayGradeTickBuffer, replay_tick_writer_config_from_settings
 from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
 from trading_app.shadow_strategy import ShadowStrategyEvaluator, config_from_settings as shadow_config_from_settings
@@ -94,6 +99,7 @@ WEB_ROOT = PROJECT_ROOT / "web"
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    replay_tick_buffer.start()
     await _start_gateway_condition_event_worker()
     await _start_core_ws_event_worker()
     await runtime_supervisor.startup()
@@ -102,6 +108,7 @@ async def lifespan(_: FastAPI):
     finally:
         await _stop_core_ws_event_worker()
         await _stop_gateway_condition_event_worker()
+        replay_tick_buffer.stop()
         await runtime_supervisor.shutdown()
 
 
@@ -540,7 +547,16 @@ def _build_runtime_supervisor() -> RuntimeSupervisor:
     return RuntimeSupervisor(settings=get_settings(), gateway_state=gateway_state)
 
 
+def _build_replay_tick_buffer() -> ReplayGradeTickBuffer:
+    settings = get_settings()
+    return ReplayGradeTickBuffer(
+        settings.db_path,
+        config=replay_tick_writer_config_from_settings(settings),
+    )
+
+
 runtime_supervisor = _build_runtime_supervisor()
+replay_tick_buffer = _build_replay_tick_buffer()
 
 
 def _order_service() -> OrderEnqueueService:
@@ -553,7 +569,11 @@ def _performance_analyzer(db: TradingDatabase) -> DryRunPerformanceAnalyzer:
 
 
 def _intraday_outcome_labeler(db: TradingDatabase) -> IntradayOutcomeLabeler:
-    return IntradayOutcomeLabeler(db, config=outcome_config_from_settings(get_settings()))
+    return IntradayOutcomeLabeler(
+        db,
+        config=outcome_config_from_settings(get_settings()),
+        price_provider=ThemeLabFlowPricePathProvider(db),
+    )
 
 
 def _shadow_strategy_evaluator(db: TradingDatabase) -> ShadowStrategyEvaluator:
@@ -720,6 +740,7 @@ def _transport_status_payload(db: TradingDatabase) -> dict[str, Any]:
         "recent_errors": recent_errors,
         "latest_report_id": latest_reports[0].get("report_id") if latest_reports else "",
         "real_gateway_websocket_pilot": real_pilot,
+        "replay_tick_history": replay_tick_buffer.snapshot(),
         "gateway": {
             "reconnect_count": gateway_snapshot.get("reconnect_count", 0),
             "network_last_error": heartbeat_payload.get("gateway_network_last_error") or heartbeat_payload.get("last_error") or "",
@@ -1282,7 +1303,9 @@ def gateway_transport_websocket_pilot_status() -> dict[str, Any]:
 
 @app.get("/api/runtime/status")
 def runtime_status() -> dict[str, Any]:
-    return runtime_supervisor.status()
+    payload = runtime_supervisor.status()
+    payload["replay_tick_history"] = replay_tick_buffer.snapshot()
+    return payload
 
 
 @app.post("/api/runtime/start")
@@ -3400,6 +3423,7 @@ def _process_gateway_event_persist(event: GatewayEvent) -> dict[str, Any]:
                     "core_event_persisted_monotonic_ms": monotonic_ms(),
                 },
             )
+            _queue_replay_tick_history(event)
             _save_gateway_event_transport_sample(
                 db,
                 event,
@@ -5013,6 +5037,7 @@ def _process_condition_event_with_db(db: TradingDatabase, collector: CandidateCo
                 "core_event_persisted_monotonic_ms": monotonic_ms(),
             },
         )
+        _queue_replay_tick_history(event)
         _save_gateway_event_transport_sample(
             db,
             event,
@@ -6988,6 +7013,15 @@ def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
                 payload=dict(event.payload or {}),
             )
         db.save_log(f"[gateway][WARN] {message}")
+
+
+def _queue_replay_tick_history(event: GatewayEvent) -> None:
+    if event.type != "price_tick":
+        return
+    try:
+        replay_tick_buffer.enqueue_event(event)
+    except Exception:
+        pass
 
 
 def _handle_market_symbols_event(db: TradingDatabase, payload: dict[str, Any]) -> int:
