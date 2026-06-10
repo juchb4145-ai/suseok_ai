@@ -81,6 +81,17 @@ def test_realtime_reliability_gate_default_guards_themelab_dry_run():
     assert settings.value("theme_lab_realtime_reliability_gate.require_high_for_shadow_small_entry") is True
 
 
+def test_promotion_controller_default_requires_manual_real_micro_approval():
+    settings = StrategyRuntimeSettings.legacy_default()
+
+    assert settings.value("promotion_controller.enabled") is True
+    assert settings.integer("promotion_controller.rolling_decision_limit", 0) == 100
+    assert settings.value("promotion_controller.allow_real_micro") is False
+    assert settings.integer("promotion_controller.dry_run.min_decision_count", 0) == 50
+    assert settings.integer("promotion_controller.live_sim.min_order_count", 0) == 30
+    assert settings.integer("promotion_controller.real_micro.min_fill_count", 0) == 20
+
+
 def test_partial_settings_fallback_records_missing_keys_in_entry_plan_details(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     payload = legacy_profile_payload()
