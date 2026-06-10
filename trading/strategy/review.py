@@ -352,6 +352,20 @@ def _hybrid_details(gate_result: Optional[GatePipelineResult]) -> dict:
         "chase_risk",
         "hybrid_observe_only",
         "hybrid_live_applied",
+        "risk_off_entry",
+        "risk_off_entry_enabled",
+        "risk_off_entry_observe_only",
+        "risk_off_entry_allowed",
+        "risk_off_entry_rejected_reason",
+        "risk_off_entry_failed_checks",
+        "risk_off_entry_passed_checks",
+        "risk_off_entry_blocking_data_flags",
+        "risk_off_shadow_entry",
+        "risk_off_relative_strength_pct",
+        "risk_off_candidate_breadth_pct",
+        "risk_off_candidate_index_return_pct",
+        "risk_off_max_position_size_multiplier",
+        "risk_off_exit_hint",
     ]
     hybrid = {key: details.get(key) for key in flat_keys if key in details}
     if payload:

@@ -21,7 +21,7 @@ from trading.theme_engine.lab import ThemeBreadthEngine
 from trading.theme_engine.models import StockSnapshot, ThemeMembership
 
 
-NOW = datetime(2026, 6, 5, 9, 10, 0)
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def test_theme_backfill_planner_enqueues_high_before_medium_and_limits_cycle():

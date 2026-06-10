@@ -119,6 +119,16 @@ class CandidateCollector:
     def set_condition_event_allowed(self, callback: Optional[Callable[[datetime], bool]]) -> None:
         self.condition_event_allowed = callback
 
+    def reject_condition_event(
+        self,
+        event: ConditionCandidateEvent,
+        event_action: str,
+        *,
+        warning: Optional[str] = None,
+        reason: str = "invalid condition code",
+    ) -> None:
+        self._reject_condition_event(event, event_action, warning=warning, reason=reason)
+
     def handle_condition_include(self, event: ConditionCandidateEvent) -> Optional[Candidate]:
         now = self._now_text()
         trade_date = self._trade_date()

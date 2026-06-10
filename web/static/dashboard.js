@@ -1,9 +1,17 @@
 const state = {
   ws: null,
   pollTimer: null,
+  reconnectTimer: null,
+  pollInFlight: false,
+  wsConnected: false,
+  lastSnapshotAt: 0,
   latestSnapshot: null,
   tables: {},
 };
+
+const SNAPSHOT_POLL_INTERVAL_MS = 30000;
+const SNAPSHOT_INITIAL_FALLBACK_MS = 7000;
+const SNAPSHOT_RECONNECT_MS = 3000;
 
 const tableConfigs = {
   transportLatency: {
@@ -76,6 +84,85 @@ const tableConfigs = {
       (item) => item.live_would_pass ? badge("PASS", "ok") : badge(item.live_reject_reason || "REJECT", "warn"),
       (item) => textCell(item.candidate_id ?? "-"),
       (item) => textCell([item.virtual_order_id, item.virtual_position_id, item.exit_decision_id].filter(Boolean).join(" / ") || "-"),
+    ],
+  },
+  intradayDecisions: {
+    endpoint: "/api/runtime/decisions/intraday",
+    bodyId: "intradayDecisions-body",
+    statusId: "intradayDecisions-status",
+    paginationId: "intradayDecisions-pagination",
+    defaultLimit: 50,
+    detailTitle: (item) => `Intraday Decision ${item.decision_id || ""}`,
+    columns: [
+      (item) => textCell(formatDateTime(item.decision_at || item.created_at)),
+      (item) => textCell(`${item.code || "-"} ${item.name || ""}`.trim()),
+      (item) => textCell(item.theme_name || "-"),
+      (item) => badge(item.gate_status || "-"),
+      (item) => textCell(item.action_type || "-"),
+      (item) => badge(item.action_result || "-"),
+      (item) => textCell((item.reason_codes || []).slice(0, 3).join(", ") || item.gate_reason || "-"),
+      (item) => textCell([item.gate_score, item.hybrid_score, item.theme_score].map((value) => value == null ? "-" : fmtNumber(value, 1)).join(" / ")),
+      (item) => compactId(item.order_intent_id || item.virtual_order_id || item.virtual_position_id || item.exit_decision_id || item.candidate_instance_id || "-"),
+    ],
+  },
+  intradayOutcomes: {
+    endpoint: "/api/runtime/outcomes/intraday",
+    bodyId: "intradayOutcomes-body",
+    statusId: "intradayOutcomes-status",
+    paginationId: "intradayOutcomes-pagination",
+    defaultLimit: 50,
+    detailTitle: (item) => `Intraday Outcome ${item.outcome_id || ""}`,
+    columns: [
+      (item) => textCell(formatDateTime(item.evaluated_at || item.decision_at)),
+      (item) => textCell(`${item.code || "-"} ${item.name || ""}`.trim()),
+      (item) => badge(item.gate_status || "-"),
+      (item) => textCell(item.action_type || "-"),
+      (item) => textCell(`${item.horizon_sec || 0}s`),
+      (item) => textCell(formatPercentValue(item.max_return_pct)),
+      (item) => textCell(formatPercentValue(item.max_drawdown_pct)),
+      (item) => textCell(formatPercentValue(item.current_return_pct)),
+      (item) => badge(item.outcome_label || "-"),
+      (item) => textCell((item.reason_codes || []).slice(0, 3).join(", ") || item.outcome_reason || "-"),
+    ],
+  },
+  shadowEvaluations: {
+    endpoint: "/api/runtime/shadow-strategies/evaluations",
+    bodyId: "shadowEvaluations-body",
+    statusId: "shadowEvaluations-status",
+    paginationId: "shadowEvaluations-pagination",
+    defaultLimit: 50,
+    detailTitle: (item) => `Shadow Evaluation ${item.evaluation_id || ""}`,
+    columns: [
+      (item) => textCell(`${item.code || "-"} ${item.name || ""}`.trim()),
+      (item) => textCell(item.theme_name || "-"),
+      (item) => textCell(item.policy_name || item.policy_id || "-"),
+      (item) => badge(item.baseline_gate_status || "-"),
+      (item) => badge(item.shadow_gate_status || "-"),
+      (item) => badge(item.change_type || "-"),
+      (item) => textCell((item.baseline_reason_codes || []).slice(0, 3).join(", ") || "-"),
+      (item) => textCell((item.shadow_reason_codes || []).slice(0, 3).join(", ") || "-"),
+      (item) => badge(item.outcome_label || "PENDING"),
+      (item) => textCell(formatPercentValue(item.max_return_pct)),
+      (item) => textCell(formatPercentValue(item.max_drawdown_pct)),
+    ],
+  },
+  shadowRiskCandidates: {
+    endpoint: "/api/runtime/shadow-strategies/evaluations",
+    bodyId: "shadowRiskCandidates-body",
+    statusId: "shadowRiskCandidates-status",
+    paginationId: "shadowRiskCandidates-pagination",
+    defaultLimit: 50,
+    defaultFilters: { changed_decision: true },
+    detailTitle: (item) => `Shadow Risk ${item.evaluation_id || ""}`,
+    columns: [
+      (item) => textCell(item.policy_name || item.policy_id || "-"),
+      (item) => textCell(`${item.code || "-"} ${item.name || ""}`.trim()),
+      (item) => badge(item.change_type || "-"),
+      (item) => textCell(item.expected_risk || "-"),
+      (item) => textCell(item.expected_effect || "-"),
+      (item) => badge(item.outcome_label || "PENDING"),
+      (item) => textCell(formatPercentValue(item.max_return_pct)),
+      (item) => textCell(formatPercentValue(item.max_drawdown_pct)),
     ],
   },
   dryRunPerformance: {
@@ -153,6 +240,72 @@ const tableConfigs = {
       (item) => textCell((((item.result || {}).delta || {}).avoided_false_positive_count ?? item.avoided_false_positive_count ?? 0)),
       (item) => textCell((((item.result || {}).delta || {}).newly_created_false_negative_count ?? item.newly_created_false_negative_count ?? 0)),
       (item) => textCell(formatRate((((item.result || {}).recommendation || {}).confidence ?? item.confidence))),
+    ],
+  },
+  changeProposals: {
+    endpoint: "/api/runtime/change-proposals",
+    bodyId: "changeProposals-body",
+    statusId: "changeProposals-status",
+    paginationId: "changeProposals-pagination",
+    defaultLimit: 50,
+    detailTitle: (item) => `Strategy Change Proposal ${item.proposal_id || ""}`,
+    detailEndpoint: (item) => item.proposal_id ? `/api/runtime/change-proposals/${encodeURIComponent(item.proposal_id)}` : "",
+    actionLabel: "Generate proposals",
+    actionEndpoint: (filters) => {
+      const tradeDate = filters.trade_date || new Date().toISOString().substring(0, 10);
+      const params = buildQuery({ trade_date: tradeDate, source_type: filters.source_type || "combined", persist: true });
+      return `/api/runtime/change-proposals/generate?${params}`;
+    },
+    columns: [
+      (item) => textCell(formatDateTime(item.created_at)),
+      (item) => badge(item.recommendation_grade || "-"),
+      (item) => badge(item.status || "-"),
+      (item) => textCell(item.category || "-"),
+      (item) => textCell(item.target_component || "-"),
+      (item) => textCell(item.title || "-"),
+      (item) => textCell(formatRate(item.confidence)),
+      (item) => textCell(fmtNumber(item.net_benefit_score, 2)),
+      (item) => textCell(item.expected_effect_ko || "-"),
+      (item) => textCell(item.expected_risk_ko || "-"),
+      (item) => item.guardrail_passed ? badge("PASS", "ok") : badge(item.blocked_by_guardrail_reason || "BLOCKED", "warn"),
+    ],
+  },
+  changeProposalEvidence: {
+    endpoint: "/api/runtime/change-proposals/evidence",
+    bodyId: "changeProposalEvidence-body",
+    statusId: "changeProposalEvidence-status",
+    paginationId: "changeProposalEvidence-pagination",
+    defaultLimit: 50,
+    detailTitle: (item) => `Change Evidence ${item.evidence_id || ""}`,
+    columns: [
+      (item) => compactId(item.proposal_id || "-"),
+      (item) => textCell(item.source_type || "-"),
+      (item) => textCell(item.sample_count ?? 0),
+      (item) => textCell(item.baseline_value || "-"),
+      (item) => textCell(item.candidate_value || "-"),
+      (item) => textCell(item.delta_value ?? "-"),
+      (item) => textCell(formatRate(item.confidence)),
+      (item) => textCell(item.metric_name || "-"),
+    ],
+  },
+  strategyReplayRuns: {
+    endpoint: "/api/runtime/replay/runs",
+    bodyId: "strategyReplayRuns-body",
+    statusId: "strategyReplayRuns-status",
+    paginationId: "strategyReplayRuns-pagination",
+    defaultLimit: 25,
+    detailTitle: (item) => `Strategy Replay ${item.replay_id || ""}`,
+    detailEndpoint: (item) => item.replay_id ? `/api/runtime/replay/runs/${encodeURIComponent(item.replay_id)}` : "",
+    columns: [
+      (item) => compactId(item.replay_id || "-"),
+      (item) => textCell(item.trade_date || "-"),
+      (item) => badge(item.mode || "-"),
+      (item) => badge(item.status || "-"),
+      (item) => textCell(item.processed_tick_count ?? 0),
+      (item) => textCell(((item.metadata || {}).summary || {}).candidate_count ?? item.processed_candidate_event_count ?? 0),
+      (item) => textCell(((item.metadata || {}).summary || {}).ready_count ?? "-"),
+      (item) => textCell(((item.metadata || {}).summary || {}).order_intent_count ?? "-"),
+      (item) => textCell(formatDateTime(item.started_at || item.created_at)),
     ],
   },
   gatewayCommands: {
@@ -322,10 +475,13 @@ async function parseResponsePayload(response) {
   }
 }
 
-async function postWithLocalToken(endpoint, token) {
+async function postWithLocalToken(endpoint, token, body = null) {
+  const headers = { "X-Local-Token": token };
+  if (body != null) headers["Content-Type"] = "application/json";
   const response = await fetch(endpoint, {
     method: "POST",
-    headers: { "X-Local-Token": token },
+    headers,
+    body: body == null ? undefined : JSON.stringify(body),
   });
   const payload = await parseResponsePayload(response);
   return { response, payload };
@@ -490,7 +646,7 @@ async function fetchTable(tableKey) {
   updateTableState(tableKey, { requestSeq: seq, loading: true, error: "" });
   setTableStatus(tableKey, "불러오는 중", "warn");
   const filters = tableFilters(tableKey);
-  const params = { ...filters, limit: table.limit, offset: table.offset };
+  const params = { ...(config.defaultFilters || {}), ...filters, limit: table.limit, offset: table.offset };
   try {
     const payload = await apiGet(config.endpoint, params, tableKey);
     if (state.tables[tableKey].requestSeq !== seq) return;
@@ -607,11 +763,70 @@ function openDetailPanel(title, payload) {
   text("detail-title", title);
   const summary = document.getElementById("detail-summary");
   const raw = document.getElementById("detail-json");
-  if (summary) summary.innerHTML = detailSummaryHtml(payload);
+  if (summary) {
+    summary.innerHTML = detailSummaryHtml(payload) + detailActionHtml(payload);
+    bindDetailActions(payload);
+  }
   if (raw) raw.textContent = JSON.stringify(payload, null, 2);
   document.getElementById("detail-drawer")?.classList.add("open");
   document.getElementById("detail-drawer")?.setAttribute("aria-hidden", "false");
   document.getElementById("detail-backdrop")?.classList.remove("hidden");
+}
+
+function detailActionHtml(payload) {
+  const proposal = actionProposal(payload);
+  if (!proposal) return "";
+  return `
+    <div class="detail-actions">
+      <p class="help-text">자동 적용 아님: 승인 상태만 저장하고 runtime config는 변경하지 않습니다.</p>
+      <button type="button" data-proposal-action="approve-observe">Approve Observe</button>
+      <button type="button" data-proposal-action="approve-dry-run">Approve DRY_RUN</button>
+      <button type="button" data-proposal-action="reject">Reject</button>
+      <button type="button" data-proposal-action="expire">Expire</button>
+      <button type="button" data-proposal-action="note">Note</button>
+    </div>
+  `;
+}
+
+function bindDetailActions(payload) {
+  const proposal = actionProposal(payload);
+  if (!proposal) return;
+  document.querySelectorAll("[data-proposal-action]").forEach((button) => {
+    button.addEventListener("click", () => runProposalAction(proposal.proposal_id, button.dataset.proposalAction).catch((error) => {
+      openDetailPanel("Strategy Change Proposal action error", { proposal_id: proposal.proposal_id, error: error.message });
+    }));
+  });
+}
+
+function actionProposal(payload) {
+  const proposal = (payload || {}).proposal || {};
+  return proposal.proposal_id ? proposal : null;
+}
+
+async function runProposalAction(proposalId, action) {
+  const endpointMap = {
+    "approve-observe": "approve-observe",
+    "approve-dry-run": "approve-dry-run",
+    reject: "reject",
+    expire: "expire",
+    note: "note",
+  };
+  const endpointAction = endpointMap[action];
+  if (!endpointAction) return;
+  let note = "";
+  if (action === "reject" || action === "note") {
+    note = window.prompt("note") || "";
+    if (!note) return;
+  } else if (action === "expire") {
+    note = window.prompt("note (optional)") || "";
+  }
+  const body = { operator: "dashboard", note };
+  const payload = await runWithLocalTokenRetry((token) => postWithLocalToken(`/api/runtime/change-proposals/${encodeURIComponent(proposalId)}/${endpointAction}`, token, body));
+  if (!payload) return;
+  openDetailPanel("Strategy Change Proposal action result", payload);
+  fetchTable("changeProposals").catch(() => {});
+  fetchTable("changeProposalEvidence").catch(() => {});
+  pollSnapshot().catch(() => {});
 }
 
 function closeDetailPanel() {
@@ -622,7 +837,7 @@ function closeDetailPanel() {
 
 function detailSummaryHtml(payload) {
   const record = payload.record || payload.item || payload.report || payload.candidate || payload;
-  const keys = ["command_id", "intent_id", "candidate_id", "report_id", "sample_id", "experiment_id", "lifecycle_id", "status", "command_type", "code", "reason", "error"];
+  const keys = ["decision_id", "command_id", "intent_id", "candidate_id", "report_id", "sample_id", "experiment_id", "lifecycle_id", "status", "action_type", "action_result", "command_type", "code", "reason", "error"];
   return keys
     .filter((key) => record && record[key] != null && record[key] !== "")
     .map((key) => `<div><span>${escapeHtml(key)}</span><strong>${escapeHtml(summaryValue(record[key]))}</strong></div>`)
@@ -673,6 +888,15 @@ function renderThresholdRecommendations(id, rows) {
     return `${item.label_ko || item.candidate_id || "-"} - ${gradeKo(item.grade)} - FP -${delta.avoided_false_positive_count || 0} / FN +${delta.newly_created_false_negative_count || 0}`;
   });
   node.innerHTML = lines.length ? lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">아직 추천 후보가 없습니다. DRY_RUN 표본이 더 쌓이면 자동으로 표시됩니다.</span>';
+}
+
+function renderShadowPolicyRanking(id, rows) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const lines = firstItems(rows || [], 8).map((item) => (
+    `${item.policy_name || item.policy_id || "-"} - ${item.recommendation_grade || "-"} - score ${fmtNumber(item.estimated_net_benefit_score, 1)} / changed ${item.changed_decision_count || 0} / ready ${item.ready_delta || 0}`
+  ));
+  node.innerHTML = lines.length ? lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">Shadow policy ranking이 없습니다</span>';
 }
 
 function renderOpsAlerts(payload) {
@@ -750,8 +974,13 @@ function render(snapshot) {
   const transportExperiment = snapshot.transport_experiment || {};
   const runtime = snapshot.runtime || {};
   const dryRunOrders = snapshot.dry_run_orders || runtime.dry_run_orders || { summary: {} };
+  const intradayDecisions = snapshot.intraday_decisions || runtime.intraday_decisions || { funnel: {} };
+  const intradayOutcomes = snapshot.intraday_outcomes || runtime.intraday_outcomes || {};
+  const shadowStrategies = snapshot.shadow_strategies || runtime.shadow_strategies || {};
   const dryRunPerformance = snapshot.dry_run_performance || runtime.dry_run_performance || {};
   const thresholdAB = snapshot.threshold_ab || runtime.threshold_ab || { summary: {}, recommendations: [] };
+  const strategyReplay = snapshot.strategy_replay || runtime.strategy_replay || { summary: {}, funnel: {}, shadow_ranking: [], data_quality: [], diff_summary: {} };
+  const changeProposals = snapshot.change_proposals || runtime.change_proposals || { summary: {}, top_recommendations: [] };
   const candidates = snapshot.candidates || { summary: {}, items: [] };
   const themes = snapshot.themes || { summary: {}, items: [] };
   const orders = snapshot.orders || { summary: {}, order_results: [], executions: [] };
@@ -837,6 +1066,59 @@ function render(snapshot) {
   const runtimeNode = document.getElementById("runtime-warning-lines");
   if (runtimeNode) runtimeNode.innerHTML = runtimeWarnings.length ? runtimeWarnings.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">Runtime 경고가 없습니다</span>';
 
+  const decisionFunnel = intradayDecisions.funnel || {};
+  text("decision-ledger-event-count", `${intradayDecisions.event_count || 0} events`);
+  text("decision-funnel-detected", decisionFunnel.detected || 0);
+  text("decision-funnel-evaluated", decisionFunnel.evaluated || 0);
+  text("decision-funnel-ready", decisionFunnel.ready || 0);
+  text("decision-funnel-wait", decisionFunnel.wait || 0);
+  text("decision-funnel-blocked", decisionFunnel.blocked || 0);
+  text("decision-funnel-entry-plan", decisionFunnel.entry_plan || 0);
+  text("decision-funnel-order-intent", decisionFunnel.order_intent || 0);
+  text("decision-funnel-open-position", decisionFunnel.open_position || 0);
+  text("decision-funnel-exit-decision", decisionFunnel.exit_decision || 0);
+  text("decision-ready-without-order", intradayDecisions.ready_without_order_count || 0);
+  text("decision-order-rejected", intradayDecisions.order_rejected_count || 0);
+  renderInlineCounts("decision-block-reason-lines", intradayDecisions.top_block_reasons || [], "reason", "BLOCK reason이 없습니다");
+  renderInlineCounts("decision-wait-reason-lines", intradayDecisions.top_wait_reasons || [], "reason", "WAIT reason이 없습니다");
+  renderInlineCounts("decision-data-quality-lines", [
+    ...((intradayDecisions.major_reason_distribution || []).map((item) => ({ ...item, reason: `major:${item.reason}` }))),
+    ...((intradayDecisions.top_data_quality_issues || []).map((item) => ({ ...item, reason: `data:${item.reason}` }))),
+  ], "reason", "데이터 품질 이슈가 없습니다");
+
+  text("outcome-labeled-count", intradayOutcomes.labeled_count || 0);
+  text("outcome-insufficient-count", intradayOutcomes.insufficient_count || 0);
+  text("outcome-early-tp-count", intradayOutcomes.early_true_positive_count || 0);
+  text("outcome-early-fp-count", intradayOutcomes.early_false_positive_count || 0);
+  text("outcome-opportunity-loss-count", intradayOutcomes.wait_block_opportunity_loss_count || 0);
+  text("outcome-risk-effective-count", (intradayOutcomes.by_label || {}).RISK_BLOCK_EFFECTIVE || 0);
+  text("outcome-exit-late-count", intradayOutcomes.exit_too_late_count || 0);
+  text("outcome-exit-early-count", intradayOutcomes.exit_too_early_count || 0);
+  renderInlineCounts(
+    "outcome-label-lines",
+    Object.entries(intradayOutcomes.by_label || {}).map(([label, count]) => ({ label, count })),
+    "label",
+    "Outcome label이 없습니다"
+  );
+  renderInlineCounts("outcome-quality-lines", intradayOutcomes.data_quality_issues || [], "reason", "Outcome data quality 이슈가 없습니다");
+
+  text("shadow-evaluation-total", shadowStrategies.total_evaluations || 0);
+  text("shadow-changed-count", shadowStrategies.changed_decision_count || 0);
+  text("shadow-baseline-ready", shadowStrategies.baseline_ready_count || 0);
+  text("shadow-ready", shadowStrategies.shadow_ready_count || 0);
+  text("shadow-ready-delta", shadowStrategies.ready_delta || 0);
+  text("shadow-opportunity-reduced", shadowStrategies.estimated_opportunity_loss_reduced_count || 0);
+  text("shadow-fp-increase", shadowStrategies.estimated_false_positive_increase_count || 0);
+  text("shadow-risk-effective", shadowStrategies.estimated_risk_block_effective_count || 0);
+  text("shadow-exit-late-reduced", shadowStrategies.estimated_exit_too_late_reduced_count || 0);
+  renderInlineCounts(
+    "shadow-change-lines",
+    Object.entries(shadowStrategies.by_change_type || {}).map(([reason, count]) => ({ reason, count })),
+    "reason",
+    "Shadow change가 없습니다"
+  );
+  renderShadowPolicyRanking("shadow-policy-ranking-lines", shadowStrategies.policy_ranking || []);
+
   const drySummary = dryRunOrders.summary || {};
   text("dryrun-order-policy", runtime.dry_run_order_sink_enabled ? runtime.dry_run_order_policy || "enabled" : runtime.dry_run_order_policy || "disabled");
   text("dryrun-order-total", drySummary.total ?? runtime.dry_run_order_intent_count ?? 0);
@@ -877,6 +1159,68 @@ function render(snapshot) {
   text("threshold-ab-fn-increase", thresholdSummary.total_new_false_negative_count || 0);
   text("threshold-ab-opp-delta", thresholdSummary.total_opportunity_loss_delta || 0);
   renderThresholdRecommendations("threshold-ab-recommendations", thresholdAB.recommendations || []);
+
+  const changeSummary = changeProposals.summary || {};
+  const byStatus = changeSummary.by_status || {};
+  const byGrade = changeSummary.by_grade || {};
+  text("change-proposal-total", changeSummary.total_count || 0);
+  text("change-proposal-review-ready", byStatus.REVIEW_READY || 0);
+  text("change-proposal-strong", byGrade.STRONG_CANDIDATE || 0);
+  text("change-proposal-watch", byGrade.WATCH_CANDIDATE || 0);
+  text("change-proposal-risky", byGrade.RISKY_CANDIDATE || 0);
+  text("change-proposal-insufficient", byGrade.DATA_INSUFFICIENT || 0);
+  text("change-proposal-pending", (byStatus.REVIEW_READY || 0) + (byStatus.DRAFT || 0));
+  text("change-proposal-expiring", changeSummary.expiring_soon_count || 0);
+  renderRows("change-proposal-top-rows", firstItems(changeSummary.top_recommendations || [], 5).map((item) => rowHtml([
+    item.recommendation_grade || "-",
+    item.status || "-",
+    item.category || "-",
+    item.title || "-",
+    fmtNumber(item.net_benefit_score, 2),
+    item.guardrail_passed ? "PASS" : (item.blocked_by_guardrail_reason || "BLOCKED"),
+  ])), 6);
+
+  const replaySummary = strategyReplay.summary || {};
+  const replayFunnel = strategyReplay.funnel || replaySummary.funnel || {};
+  const replayLatest = strategyReplay.latest || {};
+  text("strategy-replay-latest-id", replayLatest.replay_id || replaySummary.replay_id || "-");
+  text("strategy-replay-status", replaySummary.status || replayLatest.status || "-");
+  text("strategy-replay-ticks", replaySummary.processed_tick_count || 0);
+  text("strategy-replay-candidates", replaySummary.candidate_count || 0);
+  text("strategy-replay-ready", replaySummary.ready_count || 0);
+  text("strategy-replay-orders", replaySummary.order_intent_count || 0);
+  text("strategy-replay-outcomes", replaySummary.outcome_labeled_count || 0);
+  text("strategy-replay-shadow", replaySummary.shadow_evaluation_count || 0);
+  text("strategy-replay-funnel", [
+    replayFunnel.candidate_detected || 0,
+    replayFunnel.gate_evaluated || 0,
+    replayFunnel.ready || 0,
+    replayFunnel.order_intent_created || 0,
+    replayFunnel.position_opened || 0,
+    replayFunnel.position_closed || 0,
+    replayFunnel.outcome_labeled || 0,
+  ].join(" -> "));
+  renderRows("strategy-replay-ranking-rows", firstItems(strategyReplay.shadow_ranking || [], 8).map((item) => rowHtml([
+    item.policy_name || item.policy_id || "-",
+    item.ready_delta ?? 0,
+    item.estimated_opportunity_loss_reduced_count ?? 0,
+    item.estimated_false_positive_increase_count ?? 0,
+    item.net_benefit_score ?? 0,
+    item.recommendation_grade || "-",
+  ])), 6);
+  const replayWarnings = replaySummary.warnings || strategyReplay.data_quality || [];
+  const replayWarningNode = document.getElementById("strategy-replay-quality-lines");
+  if (replayWarningNode) replayWarningNode.innerHTML = replayWarnings.length ? replayWarnings.map((line) => `<div>${escapeHtml(line)}</div>`).join("") : '<span class="empty">Replay data quality warnings are empty</span>';
+  const replayDiff = strategyReplay.diff_summary || {};
+  const replayDiffNode = document.getElementById("strategy-replay-diff-lines");
+  if (replayDiffNode) {
+    const lines = [
+      `status: ${replayDiff.status || "NO_REPORT"}`,
+      `diff_count: ${replayDiff.diff_count || 0}`,
+      ...(replayDiff.notes || []),
+    ];
+    replayDiffNode.innerHTML = lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("");
+  }
 
   text("command-queued", commands.queued_count || 0);
   text("command-dispatched", commands.dispatched_count || 0);
@@ -930,9 +1274,17 @@ function compactPlain(value) {
 }
 
 async function pollSnapshot() {
-  const response = await fetch("/api/snapshot");
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-  render(await response.json());
+  if (state.pollInFlight) return;
+  state.pollInFlight = true;
+  try {
+    const response = await fetch("/api/snapshot");
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    const snapshot = await response.json();
+    state.lastSnapshotAt = Date.now();
+    render(snapshot);
+  } finally {
+    state.pollInFlight = false;
+  }
 }
 
 async function runtimeCommand(action, button) {
@@ -955,25 +1307,53 @@ async function runtimeCommand(action, button) {
   }
 }
 
-function startPolling() {
+function stopPolling() {
+  if (!state.pollTimer) return;
+  clearInterval(state.pollTimer);
+  state.pollTimer = null;
+}
+
+function startPolling({ immediate = false } = {}) {
   if (state.pollTimer) return;
-  pollSnapshot().catch(() => {});
-  state.pollTimer = setInterval(() => pollSnapshot().catch(() => {}), 3000);
+  if (immediate && !state.wsConnected) pollSnapshot().catch(() => {});
+  state.pollTimer = setInterval(() => {
+    if (!state.wsConnected) pollSnapshot().catch(() => {});
+  }, SNAPSHOT_POLL_INTERVAL_MS);
 }
 
 function connectWebSocket() {
+  if (state.ws && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.ws.readyState)) return;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(`${protocol}//${window.location.host}/ws/dashboard`);
   state.ws = ws;
+  ws.onopen = () => {
+    state.wsConnected = true;
+    stopPolling();
+  };
   ws.onmessage = (event) => {
     const payload = JSON.parse(event.data);
-    if (payload.type === "snapshot") render(payload.snapshot);
+    if (payload.type === "snapshot") {
+      state.wsConnected = true;
+      state.lastSnapshotAt = Date.now();
+      stopPolling();
+      render(payload.snapshot);
+    }
   };
   ws.onclose = () => {
-    startPolling();
-    setTimeout(connectWebSocket, 3000);
+    if (state.ws === ws) state.ws = null;
+    state.wsConnected = false;
+    startPolling({ immediate: true });
+    if (!state.reconnectTimer) {
+      state.reconnectTimer = setTimeout(() => {
+        state.reconnectTimer = null;
+        connectWebSocket();
+      }, SNAPSHOT_RECONNECT_MS);
+    }
   };
-  ws.onerror = () => startPolling();
+  ws.onerror = () => {
+    state.wsConnected = false;
+    startPolling({ immediate: true });
+  };
 }
 
 function initTabs() {
@@ -998,7 +1378,9 @@ function initTables() {
 function initDashboard() {
   initTabs();
   connectWebSocket();
-  setTimeout(startPolling, 2000);
+  setTimeout(() => {
+    if (!state.lastSnapshotAt) startPolling({ immediate: true });
+  }, SNAPSHOT_INITIAL_FALLBACK_MS);
   initTables();
   document.getElementById("runtime-start")?.addEventListener("click", (event) => runtimeCommand("start", event.currentTarget).catch(() => {}));
   document.getElementById("runtime-stop")?.addEventListener("click", (event) => runtimeCommand("stop", event.currentTarget).catch(() => {}));

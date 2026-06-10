@@ -7,6 +7,7 @@ from typing import Any, Deque
 
 from trading.strategy.candidates import normalize_code
 from trading.strategy.candles import CandleBuilder, minute_start
+from trading.strategy.reason_codes import normalize_reason_codes
 from trading.rules import tick_size
 
 
@@ -48,6 +49,8 @@ class RealtimeFeatureCalculator:
         clean_code = normalize_code(code)
         enriched = dict(metadata or {})
         reason_codes = set(str(value) for value in enriched.get("reason_codes") or [] if str(value or "").strip())
+        effective_change_rate = _effective_change_rate(enriched, change_rate)
+        enriched["change_rate"] = round(effective_change_rate, 4)
 
         raw_trade_value = max(0.0, _float(trade_value))
         effective_trade_value = raw_trade_value
@@ -66,13 +69,24 @@ class RealtimeFeatureCalculator:
             timestamp=timestamp,
         )
         enriched.update(price_context)
-        prev_close = self._prev_close(enriched, price=price, change_rate=change_rate)
+        prev_close = self._prev_close(enriched, price=price, change_rate=effective_change_rate)
         if prev_close is not None:
             enriched.setdefault("prev_close", prev_close)
             upper_limit = self._upper_limit_price(prev_close)
             if upper_limit is not None:
                 enriched["upper_limit_price"] = upper_limit
-                enriched["upper_limit_gap_pct"] = round(((upper_limit - price) / max(1.0, float(price))) * 100.0, 4)
+                if price > 0:
+                    enriched["upper_limit_gap_pct"] = round(((upper_limit - price) / float(price)) * 100.0, 4)
+                else:
+                    reason_codes.add("DATA_INSUFFICIENT")
+        elif price <= 0:
+            reason_codes.add("DATA_INSUFFICIENT")
+        self._attach_session_high_context(enriched, price=price)
+        vi_metadata = self._vi_metadata(enriched, timestamp)
+        enriched.update(vi_metadata)
+        entry_risk_missing = self._entry_risk_input_missing(enriched, price=price)
+        enriched["entry_risk_input_missing_fields"] = entry_risk_missing
+        enriched["entry_risk_input_ready"] = not entry_risk_missing
         breakout_level = self._breakout_level(price_context)
         if breakout_level is not None:
             enriched["breakout_level"] = breakout_level
@@ -173,14 +187,85 @@ class RealtimeFeatureCalculator:
         for key in ("prev_close", "previous_close", "yesterday_close"):
             value = _float(metadata.get(key))
             if value > 0:
+                metadata.setdefault("prev_close_source", key)
+                metadata.setdefault("prev_close_inferred_from_change_rate", False)
                 return value
         rate = _float(change_rate)
         if price > 0 and rate != -100.0:
             inferred = float(price) / (1.0 + (rate / 100.0))
             if inferred > 0:
                 metadata["prev_close_inferred_from_change_rate"] = True
+                metadata["prev_close_source"] = "change_rate_inferred"
                 return round(inferred, 4)
         return None
+
+    @staticmethod
+    def _attach_session_high_context(metadata: dict[str, Any], *, price: int) -> None:
+        high = _first_positive(
+            metadata.get("session_high"),
+            metadata.get("day_high"),
+            metadata.get("high_price"),
+            metadata.get("intraday_high"),
+        )
+        if high <= 0:
+            candles = metadata.get("recent_candles_1m") or []
+            highs = [_float(candle.get("high")) for candle in candles if isinstance(candle, dict)]
+            high = max([value for value in highs if value > 0], default=0.0)
+        if high > 0:
+            metadata.setdefault("session_high", high)
+            metadata.setdefault("day_high", high)
+            if price > 0:
+                metadata["pullback_from_high_pct"] = round(((high - float(price)) / high) * 100.0, 4)
+
+    @staticmethod
+    def _vi_metadata(metadata: dict[str, Any], timestamp: datetime) -> dict[str, Any]:
+        raw_status = str(metadata.get("vi_status") or "").strip().upper()
+        raw_source = str(metadata.get("vi_signal_source") or "").strip().lower()
+        has_active_payload = "vi_active" in metadata
+        vi_active = _bool_like(metadata.get("vi_active")) if has_active_payload else False
+        seconds_since_release = _seconds_since_vi_release(metadata, timestamp)
+        if seconds_since_release is None:
+            raw_seconds_since_release = metadata.get("seconds_since_vi_release")
+            if raw_seconds_since_release is not None:
+                seconds_since_release = max(0.0, _float(raw_seconds_since_release))
+
+        status = raw_status if raw_status in {"ACTIVE", "COOLDOWN", "INACTIVE", "UNKNOWN"} else ""
+        source = raw_source if raw_source in {"payload", "inferred", "unknown"} else ""
+        if vi_active:
+            status = "ACTIVE"
+            source = source or "payload"
+        elif status:
+            source = source or "payload"
+        elif seconds_since_release is not None and seconds_since_release >= 0:
+            status = "COOLDOWN"
+            source = source or "inferred"
+        elif has_active_payload:
+            status = "INACTIVE"
+            source = source or "payload"
+        else:
+            status = "UNKNOWN"
+            source = "unknown"
+        return {
+            "vi_status": status,
+            "vi_signal_source": source,
+            "vi_active": status == "ACTIVE",
+            "seconds_since_vi_release": round(seconds_since_release, 4) if seconds_since_release is not None else None,
+        }
+
+    @staticmethod
+    def _entry_risk_input_missing(metadata: dict[str, Any], *, price: int) -> list[str]:
+        missing: list[str] = []
+        if price <= 0:
+            missing.append("price_missing")
+        if _float(metadata.get("prev_close")) <= 0:
+            missing.append("prev_close_missing")
+        if metadata.get("upper_limit_gap_pct") is None:
+            missing.append("upper_limit_gap_pct_missing")
+        if metadata.get("pullback_from_high_pct") is None:
+            missing.append("session_high_missing")
+        if str(metadata.get("vi_status") or "") == "UNKNOWN":
+            missing.append("vi_signal_missing")
+        return normalize_reason_codes(missing)
 
     @staticmethod
     def _upper_limit_price(prev_close: float) -> int | None:
@@ -281,3 +366,43 @@ def _float(value: Any) -> float:
         return float(text)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _float_or_none(value: Any) -> float | None:
+    number = _float(value)
+    return number if number != 0.0 else None
+
+
+def _first_positive(*values: Any) -> float:
+    for value in values:
+        number = _float(value)
+        if number > 0:
+            return number
+    return 0.0
+
+
+def _effective_change_rate(metadata: dict[str, Any], change_rate: float) -> float:
+    explicit = _float(change_rate)
+    if explicit != 0.0:
+        return explicit
+    return _float(metadata.get("change_rate"))
+
+
+def _bool_like(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "on", "active"}
+
+
+def _seconds_since_vi_release(metadata: dict[str, Any], timestamp: datetime) -> float | None:
+    for key in ("vi_released_at", "vi_release_at", "vi_release_time"):
+        raw = metadata.get(key)
+        if not raw:
+            continue
+        try:
+            released_at = datetime.fromisoformat(str(raw))
+        except ValueError:
+            continue
+        return max(0.0, (timestamp.replace(microsecond=0) - released_at.replace(microsecond=0)).total_seconds())
+    return None

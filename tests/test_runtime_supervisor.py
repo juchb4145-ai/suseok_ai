@@ -60,7 +60,7 @@ class _FakeDb:
         pass
 
 
-def _settings(tmp_path, *, enabled=True):
+def _settings(tmp_path, *, enabled=True, intraday_outcome_enabled=False, shadow_strategy_enabled=False):
     return CoreSettings(
         db_path=Path(tmp_path) / "runtime.sqlite3",
         local_token="test-token",
@@ -68,16 +68,29 @@ def _settings(tmp_path, *, enabled=True):
         runtime_auto_start=False,
         runtime_evaluation_interval_sec=60,
         runtime_cycle_timeout_sec=5,
+        intraday_outcome_enabled=intraday_outcome_enabled,
+        shadow_strategy_enabled=shadow_strategy_enabled,
     )
 
 
-def _supervisor(tmp_path, runtime):
+def _supervisor(tmp_path, runtime, **settings_kwargs):
     bridge = _FakeBridge()
 
     def builder(*args, **kwargs):
         return CoreRuntimeBundle(runtime=runtime, market_data_bridge=bridge, db=_FakeDb())
 
-    return RuntimeSupervisor(settings=_settings(tmp_path), gateway_state=GatewayStateStore(), runtime_builder=builder), bridge
+    return RuntimeSupervisor(settings=_settings(tmp_path, **settings_kwargs), gateway_state=GatewayStateStore(), runtime_builder=builder), bridge
+
+
+async def _wait_for_post_cycle_diagnostics(supervisor, *, timeout_sec=2.0):
+    deadline = time.perf_counter() + timeout_sec
+    while time.perf_counter() < deadline:
+        status = supervisor.status()
+        diagnostics = status["post_cycle_diagnostics"]
+        if not diagnostics["running"] and (diagnostics["run_count"] or diagnostics["failed_count"]):
+            return status
+        await asyncio.sleep(0.01)
+    raise AssertionError("post-cycle diagnostics did not finish")
 
 
 def test_disabled_runtime_start_is_safe(tmp_path):
@@ -254,3 +267,77 @@ def test_gateway_price_tick_coalescing_keeps_trade_tick_over_later_quote_only_ti
     assert len(bridge.events) == 1
     assert bridge.events[0].payload["price"] == 70000
     assert bridge.events[0].payload["metadata"]["real_type"] == "trade"
+
+
+def test_post_cycle_diagnostics_runs_in_background(tmp_path):
+    runtime = _FakeRuntime()
+    supervisor, _ = _supervisor(
+        tmp_path,
+        runtime,
+        intraday_outcome_enabled=True,
+        shadow_strategy_enabled=True,
+    )
+
+    def slow_labeler(db=None):
+        time.sleep(0.4)
+        return {"status": "OK", "persisted_count": 1, "outcome_count": 1}
+
+    def shadow_evaluator(db=None):
+        return {"status": "OK", "persisted_count": 2, "evaluated_count": 2}
+
+    supervisor._label_intraday_outcomes_in_worker = slow_labeler
+    supervisor._evaluate_shadow_strategies_in_worker = shadow_evaluator
+
+    async def scenario():
+        await supervisor.start()
+        started = time.perf_counter()
+        status = await supervisor.run_once()
+        elapsed = time.perf_counter() - started
+        completed = await _wait_for_post_cycle_diagnostics(supervisor)
+        await supervisor.shutdown()
+        return elapsed, status, completed
+
+    elapsed, status, completed = asyncio.run(scenario())
+
+    assert elapsed < 0.25
+    assert status["cycle_count"] == 1
+    assert status["post_cycle_diagnostics"]["running"] is True
+    assert status["latest_snapshot"]["post_cycle_diagnostics"]["status"] == "QUEUED"
+    assert completed["post_cycle_diagnostics"]["run_count"] == 1
+    assert completed["latest_snapshot"]["intraday_outcome_labeler"]["outcome_count"] == 1
+    assert completed["latest_snapshot"]["shadow_strategy_evaluator"]["evaluated_count"] == 2
+
+
+def test_post_cycle_diagnostics_skips_overlapping_runs(tmp_path):
+    runtime = _FakeRuntime()
+    supervisor, _ = _supervisor(
+        tmp_path,
+        runtime,
+        intraday_outcome_enabled=True,
+        shadow_strategy_enabled=True,
+    )
+
+    def slow_labeler(db=None):
+        time.sleep(0.35)
+        return {"status": "OK", "persisted_count": 1, "outcome_count": 1}
+
+    def shadow_evaluator(db=None):
+        return {"status": "OK", "persisted_count": 1, "evaluated_count": 1}
+
+    supervisor._label_intraday_outcomes_in_worker = slow_labeler
+    supervisor._evaluate_shadow_strategies_in_worker = shadow_evaluator
+
+    async def scenario():
+        await supervisor.start()
+        first = await supervisor.run_once()
+        second = await supervisor.run_once()
+        completed = await _wait_for_post_cycle_diagnostics(supervisor)
+        await supervisor.shutdown()
+        return first, second, completed
+
+    first, second, completed = asyncio.run(scenario())
+
+    assert first["post_cycle_diagnostics"]["running"] is True
+    assert second["post_cycle_diagnostics"]["skipped_count"] == 1
+    assert completed["post_cycle_diagnostics"]["run_count"] == 1
+    assert runtime.cycle_calls == 2

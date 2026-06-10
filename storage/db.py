@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional, Union
+from uuid import uuid4
 
 from trading.broker.models import BrokerExecutionEvent, BrokerOrderResult
 from trading.models import BuyLeg, LegStatus, WatchItem
@@ -266,6 +268,124 @@ class TradingDatabase:
                 data_quality_json TEXT NOT NULL DEFAULT '{}',
                 payload_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS dashboard_operator_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                trade_date TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'themelab_dashboard',
+                event_type TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                category TEXT NOT NULL,
+                symbol TEXT,
+                stock_name TEXT,
+                primary_theme TEXT,
+                stock_role TEXT,
+                candidate_instance_id TEXT,
+                from_status TEXT,
+                to_status TEXT,
+                gate_status TEXT,
+                display_status TEXT,
+                message_ko TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                acknowledged_at TEXT,
+                acknowledged_by TEXT,
+                hidden INTEGER NOT NULL DEFAULT 0,
+                snoozed_until TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_events_trade_date_occurred
+                ON dashboard_operator_events(trade_date, occurred_at);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_events_trade_date_severity
+                ON dashboard_operator_events(trade_date, severity);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_events_trade_date_category
+                ON dashboard_operator_events(trade_date, category);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_events_symbol_trade_date
+                ON dashboard_operator_events(symbol, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_events_candidate_instance
+                ON dashboard_operator_events(candidate_instance_id);
+            CREATE TABLE IF NOT EXISTS dashboard_operator_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_id TEXT NOT NULL UNIQUE,
+                trade_date TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                completed_at TEXT,
+                action_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'themelab_dashboard',
+                requested_by TEXT,
+                event_id TEXT,
+                symbol TEXT,
+                stock_name TEXT,
+                candidate_instance_id TEXT,
+                requires_token INTEGER NOT NULL DEFAULT 0,
+                confirmation_required INTEGER NOT NULL DEFAULT 1,
+                endpoint TEXT,
+                request_payload_json TEXT NOT NULL DEFAULT '{}',
+                response_payload_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_actions_trade_date_requested
+                ON dashboard_operator_actions(trade_date, requested_at);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_actions_type_trade_date
+                ON dashboard_operator_actions(action_type, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_actions_status_trade_date
+                ON dashboard_operator_actions(status, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_actions_event
+                ON dashboard_operator_actions(event_id);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_actions_symbol_trade_date
+                ON dashboard_operator_actions(symbol, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_operator_actions_candidate_instance
+                ON dashboard_operator_actions(candidate_instance_id);
+            CREATE TABLE IF NOT EXISTS dashboard_postmarket_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                review_id TEXT NOT NULL UNIQUE,
+                trade_date TEXT NOT NULL,
+                generated_at TEXT NOT NULL,
+                review_scope TEXT NOT NULL,
+                symbol TEXT,
+                stock_name TEXT,
+                primary_theme TEXT,
+                stock_role TEXT,
+                candidate_instance_id TEXT,
+                event_id TEXT,
+                event_type TEXT,
+                source_status TEXT,
+                block_reason TEXT,
+                block_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                base_time TEXT,
+                base_price REAL,
+                price_1m REAL,
+                price_3m REAL,
+                price_5m REAL,
+                price_10m REAL,
+                price_close_or_last REAL,
+                return_1m_pct REAL,
+                return_3m_pct REAL,
+                return_5m_pct REAL,
+                return_10m_pct REAL,
+                return_close_or_last_pct REAL,
+                outcome_label TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                confidence_reason TEXT,
+                recommendation_ko TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_dashboard_postmarket_reviews_trade_date_generated
+                ON dashboard_postmarket_reviews(trade_date, generated_at);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_postmarket_reviews_trade_date_outcome
+                ON dashboard_postmarket_reviews(trade_date, outcome_label);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_postmarket_reviews_trade_date_event_type
+                ON dashboard_postmarket_reviews(trade_date, event_type);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_postmarket_reviews_symbol_trade_date
+                ON dashboard_postmarket_reviews(symbol, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_postmarket_reviews_candidate_instance
+                ON dashboard_postmarket_reviews(candidate_instance_id);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_postmarket_reviews_event
+                ON dashboard_postmarket_reviews(event_id);
             CREATE TABLE IF NOT EXISTS market_side_confirmation_state (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trade_date TEXT NOT NULL,
@@ -542,6 +662,32 @@ class TradingDatabase:
                 payload_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS gateway_price_ticks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                trade_date TEXT NOT NULL DEFAULT '',
+                timestamp TEXT NOT NULL,
+                received_at TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                price REAL,
+                change_rate REAL,
+                cum_volume REAL,
+                trade_value REAL,
+                execution_strength REAL,
+                best_bid REAL,
+                best_ask REAL,
+                spread_ticks INTEGER,
+                source TEXT NOT NULL DEFAULT '',
+                transport_mode TEXT NOT NULL DEFAULT '',
+                instrument_type TEXT NOT NULL DEFAULT '',
+                trade_time TEXT NOT NULL DEFAULT '',
+                day_high REAL,
+                day_low REAL,
+                raw_payload_json TEXT NOT NULL DEFAULT '{}',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS gateway_command_dedupe_keys (
                 dedupe_key TEXT PRIMARY KEY,
                 command_id TEXT NOT NULL,
@@ -695,6 +841,222 @@ class TradingDatabase:
                 message TEXT NOT NULL DEFAULT '',
                 payload_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS strategy_decision_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_id TEXT UNIQUE NOT NULL,
+                runtime_cycle_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                decision_at TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                candidate_generation_seq INTEGER NOT NULL DEFAULT 0,
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                strategy_name TEXT NOT NULL DEFAULT '',
+                strategy_version TEXT NOT NULL DEFAULT '',
+                config_hash TEXT NOT NULL DEFAULT '',
+                gate_status TEXT NOT NULL DEFAULT '',
+                gate_reason TEXT NOT NULL DEFAULT '',
+                reason_status TEXT NOT NULL DEFAULT '',
+                reason_family TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                block_type TEXT NOT NULL DEFAULT '',
+                action_type TEXT NOT NULL DEFAULT '',
+                action_result TEXT NOT NULL DEFAULT '',
+                price REAL,
+                change_rate REAL,
+                trade_value REAL,
+                execution_strength REAL,
+                vwap REAL,
+                momentum_1m REAL,
+                momentum_3m REAL,
+                momentum_5m REAL,
+                gate_score REAL,
+                hybrid_score REAL,
+                theme_score REAL,
+                data_status TEXT NOT NULL DEFAULT '',
+                data_quality_issues_json TEXT NOT NULL DEFAULT '[]',
+                order_intent_id TEXT NOT NULL DEFAULT '',
+                entry_plan_id INTEGER,
+                virtual_order_id INTEGER,
+                virtual_position_id INTEGER,
+                exit_decision_id INTEGER,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS strategy_decision_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                outcome_id TEXT UNIQUE NOT NULL,
+                decision_id TEXT NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                candidate_generation_seq INTEGER NOT NULL DEFAULT 0,
+                decision_at TEXT NOT NULL DEFAULT '',
+                evaluated_at TEXT NOT NULL DEFAULT '',
+                horizon_sec INTEGER NOT NULL DEFAULT 0,
+                price_at_decision REAL,
+                price_at_horizon REAL,
+                max_price_after_decision REAL,
+                min_price_after_decision REAL,
+                max_return_pct REAL,
+                max_drawdown_pct REAL,
+                current_return_pct REAL,
+                outcome_label TEXT NOT NULL DEFAULT '',
+                outcome_reason TEXT NOT NULL DEFAULT '',
+                label_confidence REAL,
+                data_status TEXT NOT NULL DEFAULT '',
+                data_quality_issues_json TEXT NOT NULL DEFAULT '[]',
+                source TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(decision_id, horizon_sec)
+            );
+            CREATE TABLE IF NOT EXISTS shadow_strategy_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                evaluation_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                evaluated_at TEXT NOT NULL DEFAULT '',
+                runtime_cycle_id TEXT NOT NULL DEFAULT '',
+                decision_id TEXT NOT NULL DEFAULT '',
+                policy_id TEXT NOT NULL DEFAULT '',
+                policy_name TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                candidate_generation_seq INTEGER NOT NULL DEFAULT 0,
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                baseline_gate_status TEXT NOT NULL DEFAULT '',
+                baseline_action_type TEXT NOT NULL DEFAULT '',
+                baseline_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                shadow_gate_status TEXT NOT NULL DEFAULT '',
+                shadow_action_type TEXT NOT NULL DEFAULT '',
+                shadow_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                baseline_score REAL,
+                shadow_score REAL,
+                baseline_position_size_multiplier REAL,
+                shadow_position_size_multiplier REAL,
+                changed_decision INTEGER NOT NULL DEFAULT 0,
+                change_type TEXT NOT NULL DEFAULT '',
+                expected_effect TEXT NOT NULL DEFAULT '',
+                expected_risk TEXT NOT NULL DEFAULT '',
+                data_status TEXT NOT NULL DEFAULT '',
+                data_quality_issues_json TEXT NOT NULL DEFAULT '[]',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(decision_id, policy_id)
+            );
+            CREATE TABLE IF NOT EXISTS strategy_replay_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                replay_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT '',
+                source_bundle_path TEXT NOT NULL DEFAULT '',
+                replay_db_path TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL DEFAULT '',
+                finished_at TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                runtime_config_hash TEXT NOT NULL DEFAULT '',
+                strategy_version TEXT NOT NULL DEFAULT '',
+                processed_tick_count INTEGER NOT NULL DEFAULT 0,
+                processed_candidate_event_count INTEGER NOT NULL DEFAULT 0,
+                processed_theme_snapshot_count INTEGER NOT NULL DEFAULT 0,
+                cycle_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS strategy_replay_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id TEXT UNIQUE NOT NULL,
+                replay_id TEXT NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT '',
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                funnel_json TEXT NOT NULL DEFAULT '{}',
+                outcome_summary_json TEXT NOT NULL DEFAULT '{}',
+                shadow_summary_json TEXT NOT NULL DEFAULT '{}',
+                diff_summary_json TEXT NOT NULL DEFAULT '{}',
+                recommendations_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS strategy_change_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                status TEXT NOT NULL DEFAULT 'DRAFT',
+                recommendation_grade TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                summary_ko TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
+                target_component TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL DEFAULT '',
+                source_ids_json TEXT NOT NULL DEFAULT '[]',
+                baseline_config_hash TEXT NOT NULL DEFAULT '',
+                candidate_config_hash TEXT NOT NULL DEFAULT '',
+                baseline_config_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                candidate_config_patch_json TEXT NOT NULL DEFAULT '{}',
+                expected_effect_ko TEXT NOT NULL DEFAULT '',
+                expected_risk_ko TEXT NOT NULL DEFAULT '',
+                confidence REAL,
+                net_benefit_score REAL,
+                guardrail_passed INTEGER NOT NULL DEFAULT 0,
+                blocked_by_guardrail_reason TEXT NOT NULL DEFAULT '',
+                data_quality_status TEXT NOT NULL DEFAULT '',
+                data_quality_issues_json TEXT NOT NULL DEFAULT '[]',
+                rollout_plan_json TEXT NOT NULL DEFAULT '{}',
+                rollback_plan_json TEXT NOT NULL DEFAULT '{}',
+                operator_note TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                superseded_by_proposal_id TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS strategy_change_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                evidence_id TEXT UNIQUE NOT NULL,
+                proposal_id TEXT NOT NULL,
+                source_type TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                metric_name TEXT NOT NULL DEFAULT '',
+                metric_value REAL,
+                metric_unit TEXT NOT NULL DEFAULT '',
+                baseline_value TEXT NOT NULL DEFAULT '',
+                candidate_value TEXT NOT NULL DEFAULT '',
+                delta_value REAL,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                confidence REAL,
+                evidence_payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS strategy_change_approvals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                approval_id TEXT UNIQUE NOT NULL,
+                proposal_id TEXT NOT NULL,
+                action TEXT NOT NULL DEFAULT '',
+                previous_status TEXT NOT NULL DEFAULT '',
+                next_status TEXT NOT NULL DEFAULT '',
+                operator TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS strategy_config_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                config_hash TEXT UNIQUE NOT NULL,
+                config_source TEXT NOT NULL DEFAULT '',
+                config_payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                description TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS live_sim_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -950,6 +1312,8 @@ class TradingDatabase:
                 ON theme_membership_current(theme_id);
             CREATE INDEX IF NOT EXISTS idx_theme_activity_snapshots_created_rank
                 ON theme_activity_snapshots(created_at, rank);
+            CREATE INDEX IF NOT EXISTS idx_theme_lab_flow_snapshots_calculated
+                ON theme_lab_flow_snapshots(calculated_at);
             CREATE INDEX IF NOT EXISTS idx_dynamic_theme_clusters_status
                 ON dynamic_theme_clusters(status);
             CREATE INDEX IF NOT EXISTS idx_theme_source_sync_runs_source_started
@@ -992,6 +1356,12 @@ class TradingDatabase:
                 ON gateway_command_events(command_id, id);
             CREATE INDEX IF NOT EXISTS idx_gateway_command_events_type_created_at
                 ON gateway_command_events(event_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_gateway_price_ticks_trade_date_ts
+                ON gateway_price_ticks(trade_date, timestamp, id);
+            CREATE INDEX IF NOT EXISTS idx_gateway_price_ticks_code_ts
+                ON gateway_price_ticks(code, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_gateway_price_ticks_source_ts
+                ON gateway_price_ticks(source, timestamp);
             CREATE INDEX IF NOT EXISTS idx_gateway_command_dedupe_command_id
                 ON gateway_command_dedupe_keys(command_id);
             CREATE INDEX IF NOT EXISTS idx_gateway_command_dedupe_type_trade_date
@@ -1036,6 +1406,70 @@ class TradingDatabase:
                 ON runtime_order_intent_events(intent_id, id);
             CREATE INDEX IF NOT EXISTS idx_runtime_order_intent_events_type_created_at
                 ON runtime_order_intent_events(event_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_trade_date_at
+                ON strategy_decision_events(trade_date, decision_at, id);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_code_at
+                ON strategy_decision_events(code, decision_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_candidate
+                ON strategy_decision_events(candidate_id, decision_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_candidate_instance
+                ON strategy_decision_events(candidate_instance_id, decision_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_gate_status
+                ON strategy_decision_events(gate_status, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_action
+                ON strategy_decision_events(action_type, action_result, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_reason
+                ON strategy_decision_events(reason_status, reason_family, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_events_order_intent
+                ON strategy_decision_events(order_intent_id);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_trade_date_eval
+                ON strategy_decision_outcomes(trade_date, evaluated_at, id);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_decision
+                ON strategy_decision_outcomes(decision_id, horizon_sec);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_code_eval
+                ON strategy_decision_outcomes(code, evaluated_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_label
+                ON strategy_decision_outcomes(outcome_label, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_horizon
+                ON strategy_decision_outcomes(horizon_sec, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_candidate_instance
+                ON strategy_decision_outcomes(candidate_instance_id);
+            CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_trade_date
+                ON shadow_strategy_evaluations(trade_date, evaluated_at, id);
+            CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_policy
+                ON shadow_strategy_evaluations(policy_id, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_decision
+                ON shadow_strategy_evaluations(decision_id, policy_id);
+            CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_code
+                ON shadow_strategy_evaluations(code, evaluated_at);
+            CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_change
+                ON shadow_strategy_evaluations(change_type, changed_decision, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_shadow_gate
+                ON shadow_strategy_evaluations(shadow_gate_status, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_replay_runs_trade_date
+                ON strategy_replay_runs(trade_date, started_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_replay_runs_status
+                ON strategy_replay_runs(status, mode);
+            CREATE INDEX IF NOT EXISTS idx_strategy_replay_reports_replay
+                ON strategy_replay_reports(replay_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_replay_reports_trade_date
+                ON strategy_replay_reports(trade_date, mode, created_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_proposals_trade_date
+                ON strategy_change_proposals(trade_date, created_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_proposals_status
+                ON strategy_change_proposals(status, recommendation_grade);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_proposals_category
+                ON strategy_change_proposals(category, target_component);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_proposals_source
+                ON strategy_change_proposals(source_type, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_evidence_proposal
+                ON strategy_change_evidence(proposal_id, id);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_evidence_source
+                ON strategy_change_evidence(source_type, source_id);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_evidence_trade_date
+                ON strategy_change_evidence(trade_date, id);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_approvals_proposal
+                ON strategy_change_approvals(proposal_id, id);
             CREATE INDEX IF NOT EXISTS idx_live_sim_orders_trade_date
                 ON live_sim_orders(trade_date, created_at);
             CREATE INDEX IF NOT EXISTS idx_live_sim_orders_code_status
@@ -1268,51 +1702,94 @@ class TradingDatabase:
         )
 
     def _sync_live_sim_execution(self, event: BrokerExecutionEvent) -> None:
+        fill_link_method = ""
         order = self.find_live_sim_order_by_broker_order_id(event.order_no)
+        if order is not None:
+            fill_link_method = "broker_order_id"
         if order is None and event.command_id:
             order = self.find_live_sim_order_by_command_id(event.command_id)
+            if order is not None:
+                fill_link_method = "command_id"
         if order is None and event.idempotency_key:
             order = self.find_live_sim_order_by_idempotency(event.idempotency_key)
+            if order is not None:
+                fill_link_method = "idempotency_key"
+        if order is None and event.order_no:
+            order = self.find_live_sim_order_by_execution_fingerprint(event)
+            if order is not None:
+                fill_link_method = "execution_fingerprint"
         if order is None:
+            self._sync_manual_live_sim_execution(event)
             return
         now = str(event.timestamp or "")
+        order_intent_id = str(order.get("order_intent_id") or "")
+        broker_order_id = str(event.order_no or order.get("broker_order_id") or "")
+        cumulative_fill_qty = _execution_cumulative_fill_qty(event)
+        previous_cumulative_fill_qty = self._previous_live_sim_cumulative_fill_qty(
+            order_intent_id=order_intent_id,
+            broker_order_id=broker_order_id,
+        )
+        fill_qty = max(0, cumulative_fill_qty - previous_cumulative_fill_qty)
+        remaining_qty = max(0, int(event.remaining_quantity or 0))
+        fill_price = max(0, int(event.price or 0))
+        raw_event = {
+            **event.to_dict(),
+            "reported_filled_quantity": int(event.filled_quantity or 0),
+            "computed_fill_qty": fill_qty,
+            "computed_cumulative_fill_qty": cumulative_fill_qty,
+            "previous_cumulative_fill_qty": previous_cumulative_fill_qty,
+            "fill_link_method": fill_link_method,
+            "manual_intervention": False,
+        }
         fill_id = event.execution_id or f"{event.order_no}:{event.filled_quantity}:{event.remaining_quantity}:{event.price}:{now}"
         fill_payload = {
-            "order_intent_id": order.get("order_intent_id"),
-            "broker_order_id": event.order_no or order.get("broker_order_id"),
+            "order_intent_id": order_intent_id,
+            "broker_order_id": broker_order_id,
             "fill_id": fill_id,
             "event_id": event.execution_id,
             "code": event.code or order.get("code"),
             "side": event.side or order.get("side"),
             "account_id_masked": order.get("account_id_masked"),
-            "fill_qty": event.filled_quantity,
-            "fill_price": event.price,
-            "cumulative_fill_qty": max(0, int(event.quantity or 0) - max(0, int(event.remaining_quantity or 0))),
-            "remaining_qty": event.remaining_quantity,
-            "fill_amount": max(0, int(event.filled_quantity or 0)) * max(0, int(event.price or 0)),
+            "fill_qty": fill_qty,
+            "fill_price": fill_price,
+            "cumulative_fill_qty": cumulative_fill_qty,
+            "remaining_qty": remaining_qty,
+            "fill_amount": fill_qty * fill_price,
             "commission": event.raw.get("commission", 0),
             "tax": event.raw.get("tax", 0),
             "event_time": now,
             "received_at": now,
-            "raw_event": event.to_dict(),
+            "raw_event": raw_event,
         }
         inserted, fill = self.save_live_sim_fill_event(fill_payload)
         if not inserted:
             return
         status_from = str(order.get("order_status") or "")
-        status_to = "PARTIAL_FILLED" if int(event.remaining_quantity or 0) > 0 else "FILLED"
-        reason = "LIVE_SIM_PARTIAL_FILL_TRACKED" if status_to == "PARTIAL_FILLED" else "ORDER_RECONCILED_FROM_KIWOOM"
+        if fill_qty <= 0 and cumulative_fill_qty <= 0:
+            status_to = status_from or "ACCEPTED"
+            reason = "LIVE_SIM_EXECUTION_ACK_TRACKED"
+        else:
+            status_to = "PARTIAL_FILLED" if remaining_qty > 0 else "FILLED"
+            if status_from == "FILLED" and status_to == "PARTIAL_FILLED":
+                status_to = status_from
+            if fill_qty <= 0:
+                reason = "LIVE_SIM_EXECUTION_NO_DELTA_TRACKED"
+            else:
+                reason = "LIVE_SIM_PARTIAL_FILL_TRACKED" if status_to == "PARTIAL_FILLED" else "ORDER_RECONCILED_FROM_KIWOOM"
         details = dict(order.get("details") or {})
-        position = self.upsert_live_sim_position_from_fill(order, fill, exit_guard=dict(details.get("exit_guard") or {}))
+        position = dict(details.get("position") or {})
+        if fill_qty > 0:
+            position = self.upsert_live_sim_position_from_fill(order, fill, exit_guard=dict(details.get("exit_guard") or {}))
         updates = {
-            "broker_order_id": event.order_no or order.get("broker_order_id"),
+            "broker_order_id": broker_order_id,
             "order_status": status_to,
-            "first_fill_at": order.get("first_fill_at") or now,
+            "first_fill_at": order.get("first_fill_at") or (now if fill_qty > 0 else ""),
             "last_fill_at": now,
             "updated_at": now,
             "reason_codes": _merge_reason_codes(order, [reason]),
             "details": {
                 **details,
+                "fill_link_method": fill_link_method,
                 "last_fill": fill,
                 "position": position,
             },
@@ -1327,6 +1804,162 @@ class TradingDatabase:
             payload={"execution": event.to_dict(), "fill": fill, "position": position},
             created_at=now,
         )
+
+    def _sync_manual_live_sim_execution(self, event: BrokerExecutionEvent) -> None:
+        now = str(event.timestamp or "")
+        broker_order_id = str(event.order_no or "")
+        cumulative_fill_qty = _execution_cumulative_fill_qty(event)
+        previous_cumulative_fill_qty = self._previous_live_sim_cumulative_fill_qty(
+            order_intent_id="",
+            broker_order_id=broker_order_id,
+        )
+        fill_qty = max(0, cumulative_fill_qty - previous_cumulative_fill_qty)
+        if fill_qty <= 0 and cumulative_fill_qty <= 0:
+            return
+        account_id_masked = _mask_account(
+            str(
+                event.account
+                or event.raw.get("account_id_masked")
+                or event.raw.get("account")
+                or ""
+            )
+        )
+        position = self._find_live_sim_position_for_manual_execution(event, account_id_masked=account_id_masked)
+        if position and not account_id_masked:
+            account_id_masked = str(position.get("account_id_masked") or "")
+        raw_event = {
+            **event.to_dict(),
+            "reported_filled_quantity": int(event.filled_quantity or 0),
+            "computed_fill_qty": fill_qty,
+            "computed_cumulative_fill_qty": cumulative_fill_qty,
+            "previous_cumulative_fill_qty": previous_cumulative_fill_qty,
+            "fill_link_method": "manual_unmatched_execution",
+            "manual_intervention": True,
+        }
+        fill_id = event.execution_id or f"{event.order_no}:{event.filled_quantity}:{event.remaining_quantity}:{event.price}:{now}"
+        fill_payload = {
+            "order_intent_id": "",
+            "broker_order_id": broker_order_id,
+            "fill_id": fill_id,
+            "event_id": event.execution_id,
+            "code": event.code,
+            "side": event.side,
+            "account_id_masked": account_id_masked,
+            "fill_qty": fill_qty,
+            "fill_price": max(0, int(event.price or 0)),
+            "cumulative_fill_qty": cumulative_fill_qty,
+            "remaining_qty": max(0, int(event.remaining_quantity or 0)),
+            "fill_amount": fill_qty * max(0, int(event.price or 0)),
+            "commission": event.raw.get("commission", 0),
+            "tax": event.raw.get("tax", 0),
+            "event_time": now,
+            "received_at": now,
+            "raw_event": raw_event,
+        }
+        inserted, fill = self.save_live_sim_fill_event(fill_payload)
+        if not inserted:
+            return
+        updated_position: dict = {}
+        if fill_qty > 0 and position is not None:
+            order = {
+                "code": position.get("code") or event.code,
+                "name": position.get("name") or "",
+                "side": event.side,
+                "account_id_masked": account_id_masked,
+                "candidate_instance_id": position.get("candidate_instance_id") or "",
+            }
+            updated_position = self.upsert_live_sim_position_from_fill(order, fill)
+            updated_position = self.save_live_sim_position(
+                {
+                    **updated_position,
+                    "details": {
+                        **dict(updated_position.get("details") or {}),
+                        "manual_intervention": True,
+                        "last_manual_execution": fill,
+                    },
+                    "updated_at": now,
+                }
+            )
+        elif fill_qty > 0 and str(event.side or "").lower() == "buy":
+            order = {
+                "code": event.code,
+                "name": "",
+                "side": event.side,
+                "account_id_masked": account_id_masked,
+                "candidate_instance_id": "MANUAL_INTERVENTION",
+            }
+            updated_position = self.upsert_live_sim_position_from_fill(order, fill)
+            updated_position = self.save_live_sim_position(
+                {
+                    **updated_position,
+                    "status": "RECONCILE_REQUIRED",
+                    "details": {
+                        **dict(updated_position.get("details") or {}),
+                        "manual_intervention": True,
+                        "external_position_detected": True,
+                        "last_manual_execution": fill,
+                    },
+                    "updated_at": now,
+                }
+            )
+        self.save_live_sim_runtime_health(
+            "reconcile",
+            status="RECONCILE_REQUIRED",
+            reason="LIVE_SIM_MANUAL_EXECUTION_DETECTED",
+            details={
+                "code": event.code,
+                "side": event.side,
+                "broker_order_id": broker_order_id,
+                "account_id_masked": account_id_masked,
+                "position_id": updated_position.get("position_id") if updated_position else "",
+            },
+            updated_at=now,
+        )
+
+    def _find_live_sim_position_for_manual_execution(
+        self,
+        event: BrokerExecutionEvent,
+        *,
+        account_id_masked: str,
+    ) -> Optional[dict]:
+        code = str(event.code or "")
+        if not code:
+            return None
+        statuses = {"OPEN", "PARTIAL", "EXIT_ORDERED", "RECONCILE_REQUIRED"}
+        positions = [
+            position
+            for position in self.list_live_sim_positions(
+                code=code,
+                account_id_masked=account_id_masked or None,
+                limit=50,
+            )
+            if str(position.get("status") or "") in statuses
+            and int(position.get("current_qty") or 0) > 0
+        ]
+        if len(positions) == 1:
+            return positions[0]
+        return None
+
+    def _previous_live_sim_cumulative_fill_qty(self, *, order_intent_id: str, broker_order_id: str) -> int:
+        clauses: list[str] = []
+        params: list[object] = []
+        if order_intent_id:
+            clauses.append("order_intent_id = ?")
+            params.append(order_intent_id)
+        if broker_order_id:
+            clauses.append("broker_order_id = ?")
+            params.append(broker_order_id)
+        if not clauses:
+            return 0
+        row = self.conn.execute(
+            f"""
+            SELECT COALESCE(MAX(cumulative_fill_qty), 0) AS cumulative_fill_qty
+            FROM live_sim_fill_events
+            WHERE {' OR '.join(clauses)}
+            """,
+            tuple(params),
+        ).fetchone()
+        return max(0, int(row["cumulative_fill_qty"] or 0)) if row else 0
 
     def save_log(self, message: str) -> None:
         self.conn.execute("INSERT INTO logs(message) VALUES (?)", (message,))
@@ -1543,6 +2176,1288 @@ class TradingDatabase:
         )
         self.conn.commit()
 
+    def save_gateway_price_ticks_batch(self, ticks: Iterable[dict]) -> int:
+        rows = [_gateway_price_tick_params(tick) for tick in ticks if isinstance(tick, dict)]
+        rows = [row for row in rows if row.get("event_id") and row.get("code") and row.get("timestamp")]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT OR IGNORE INTO gateway_price_ticks(
+                    event_id, trade_date, timestamp, received_at,
+                    code, name, price, change_rate, cum_volume, trade_value,
+                    execution_strength, best_bid, best_ask, spread_ticks,
+                    source, transport_mode, instrument_type, trade_time,
+                    day_high, day_low, raw_payload_json, metadata_json, created_at
+                ) VALUES (
+                    :event_id, :trade_date, :timestamp, :received_at,
+                    :code, :name, :price, :change_rate, :cum_volume, :trade_value,
+                    :execution_strength, :best_bid, :best_ask, :spread_ticks,
+                    :source, :transport_mode, :instrument_type, :trade_time,
+                    :day_high, :day_low, :raw_payload_json, :metadata_json, :created_at
+                )
+                """,
+                rows,
+            )
+        return int(self.conn.total_changes - before)
+
+    def save_strategy_decision_events(self, events: Iterable[dict]) -> int:
+        rows = [_strategy_decision_event_params(event) for event in events if isinstance(event, dict)]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT OR IGNORE INTO strategy_decision_events(
+                    decision_id, runtime_cycle_id, trade_date, created_at, decision_at,
+                    candidate_id, candidate_instance_id, candidate_generation_seq,
+                    code, name, theme_name, strategy_name, strategy_version, config_hash,
+                    gate_status, gate_reason, reason_status, reason_family, reason_codes_json,
+                    block_type, action_type, action_result,
+                    price, change_rate, trade_value, execution_strength, vwap,
+                    momentum_1m, momentum_3m, momentum_5m,
+                    gate_score, hybrid_score, theme_score,
+                    data_status, data_quality_issues_json,
+                    order_intent_id, entry_plan_id, virtual_order_id, virtual_position_id,
+                    exit_decision_id, details_json
+                ) VALUES (
+                    :decision_id, :runtime_cycle_id, :trade_date, :created_at, :decision_at,
+                    :candidate_id, :candidate_instance_id, :candidate_generation_seq,
+                    :code, :name, :theme_name, :strategy_name, :strategy_version, :config_hash,
+                    :gate_status, :gate_reason, :reason_status, :reason_family, :reason_codes_json,
+                    :block_type, :action_type, :action_result,
+                    :price, :change_rate, :trade_value, :execution_strength, :vwap,
+                    :momentum_1m, :momentum_3m, :momentum_5m,
+                    :gate_score, :hybrid_score, :theme_score,
+                    :data_status, :data_quality_issues_json,
+                    :order_intent_id, :entry_plan_id, :virtual_order_id, :virtual_position_id,
+                    :exit_decision_id, :details_json
+                )
+                """,
+                rows,
+            )
+        return int(self.conn.total_changes - before)
+
+    def list_strategy_decision_events(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        theme_name: Optional[str] = None,
+        gate_status: Optional[str] = None,
+        action_type: Optional[str] = None,
+        action_result: Optional[str] = None,
+        reason_status: Optional[str] = None,
+        reason_family: Optional[str] = None,
+        window_sec: Optional[int] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses, params = _strategy_decision_event_filters(
+            trade_date=trade_date,
+            code=code,
+            theme_name=theme_name,
+            gate_status=gate_status,
+            action_type=action_type,
+            action_result=action_result,
+            reason_status=reason_status,
+            reason_family=reason_family,
+            window_sec=window_sec,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_decision_events
+            {where}
+            ORDER BY decision_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_strategy_decision_event(row) for row in rows]
+
+    def strategy_decision_event_count(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        theme_name: Optional[str] = None,
+        gate_status: Optional[str] = None,
+        action_type: Optional[str] = None,
+        action_result: Optional[str] = None,
+        reason_status: Optional[str] = None,
+        reason_family: Optional[str] = None,
+        window_sec: Optional[int] = None,
+    ) -> int:
+        clauses, params = _strategy_decision_event_filters(
+            trade_date=trade_date,
+            code=code,
+            theme_name=theme_name,
+            gate_status=gate_status,
+            action_type=action_type,
+            action_result=action_result,
+            reason_status=reason_status,
+            reason_family=reason_family,
+            window_sec=window_sec,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM strategy_decision_events {where}",
+            tuple(params),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+
+    def get_strategy_decision_event(self, decision_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_decision_events WHERE decision_id = ?",
+            (decision_id,),
+        ).fetchone()
+        return _row_to_strategy_decision_event(row) if row else None
+
+    def strategy_decision_summary(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        window_sec: Optional[int] = None,
+    ) -> dict:
+        clauses, params = _strategy_decision_event_filters(trade_date=trade_date, window_sec=window_sec)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_decision_events
+            {where}
+            ORDER BY decision_at ASC, id ASC
+            """,
+            tuple(params),
+        ).fetchall()
+        events = [_row_to_strategy_decision_event(row) for row in rows]
+        return _strategy_decision_summary(events, trade_date=trade_date or "", window_sec=window_sec)
+
+    def list_strategy_decision_events_due_for_outcomes(
+        self,
+        *,
+        evaluated_at: str,
+        horizons_sec: Iterable[int],
+        trade_date: Optional[str] = None,
+        limit: int = 500,
+        force: bool = False,
+    ) -> list[dict]:
+        normalized_horizons = [max(1, int(horizon or 0)) for horizon in horizons_sec if int(horizon or 0) > 0]
+        if not normalized_horizons or not evaluated_at:
+            return []
+        rows: list[dict] = []
+        seen: set[tuple[str, int]] = set()
+        normalized_limit = max(1, int(limit or 500))
+        for horizon_sec in normalized_horizons:
+            if len(rows) >= normalized_limit:
+                break
+            clauses = [
+                "d.decision_id <> ''",
+                "d.decision_at <> ''",
+                "julianday(replace(substr(d.decision_at, 1, 19), 'T', ' ')) <= julianday(replace(substr(?, 1, 19), 'T', ' '), ?)",
+            ]
+            params: list[object] = [str(evaluated_at), f"-{horizon_sec} seconds"]
+            if trade_date:
+                clauses.append("d.trade_date = ?")
+                params.append(str(trade_date))
+            if not force:
+                clauses.append(
+                    """
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM strategy_decision_outcomes o
+                        WHERE o.decision_id = d.decision_id AND o.horizon_sec = ?
+                    )
+                    """
+                )
+                params.append(horizon_sec)
+            query_limit = max(1, normalized_limit - len(rows))
+            params.append(query_limit)
+            result_rows = self.conn.execute(
+                f"""
+                SELECT d.*
+                FROM strategy_decision_events d
+                WHERE {" AND ".join(clauses)}
+                ORDER BY d.decision_at ASC, d.id ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+            for row in result_rows:
+                event = _row_to_strategy_decision_event(row)
+                key = (str(event.get("decision_id") or ""), horizon_sec)
+                if key in seen:
+                    continue
+                seen.add(key)
+                event["horizon_sec"] = horizon_sec
+                rows.append(event)
+                if len(rows) >= normalized_limit:
+                    break
+        return rows
+
+    def save_strategy_decision_outcomes(self, outcomes: Iterable[dict], *, force: bool = False) -> int:
+        rows = [_strategy_decision_outcome_params(outcome) for outcome in outcomes if isinstance(outcome, dict)]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        if force:
+            sql = """
+                INSERT INTO strategy_decision_outcomes(
+                    outcome_id, decision_id, trade_date, code, candidate_id,
+                    candidate_instance_id, candidate_generation_seq, decision_at,
+                    evaluated_at, horizon_sec, price_at_decision, price_at_horizon,
+                    max_price_after_decision, min_price_after_decision, max_return_pct,
+                    max_drawdown_pct, current_return_pct, outcome_label, outcome_reason,
+                    label_confidence, data_status, data_quality_issues_json, source,
+                    details_json, created_at, updated_at
+                ) VALUES (
+                    :outcome_id, :decision_id, :trade_date, :code, :candidate_id,
+                    :candidate_instance_id, :candidate_generation_seq, :decision_at,
+                    :evaluated_at, :horizon_sec, :price_at_decision, :price_at_horizon,
+                    :max_price_after_decision, :min_price_after_decision, :max_return_pct,
+                    :max_drawdown_pct, :current_return_pct, :outcome_label, :outcome_reason,
+                    :label_confidence, :data_status, :data_quality_issues_json, :source,
+                    :details_json, :created_at, :updated_at
+                )
+                ON CONFLICT(decision_id, horizon_sec) DO UPDATE SET
+                    outcome_id=excluded.outcome_id,
+                    trade_date=excluded.trade_date,
+                    code=excluded.code,
+                    candidate_id=excluded.candidate_id,
+                    candidate_instance_id=excluded.candidate_instance_id,
+                    candidate_generation_seq=excluded.candidate_generation_seq,
+                    decision_at=excluded.decision_at,
+                    evaluated_at=excluded.evaluated_at,
+                    price_at_decision=excluded.price_at_decision,
+                    price_at_horizon=excluded.price_at_horizon,
+                    max_price_after_decision=excluded.max_price_after_decision,
+                    min_price_after_decision=excluded.min_price_after_decision,
+                    max_return_pct=excluded.max_return_pct,
+                    max_drawdown_pct=excluded.max_drawdown_pct,
+                    current_return_pct=excluded.current_return_pct,
+                    outcome_label=excluded.outcome_label,
+                    outcome_reason=excluded.outcome_reason,
+                    label_confidence=excluded.label_confidence,
+                    data_status=excluded.data_status,
+                    data_quality_issues_json=excluded.data_quality_issues_json,
+                    source=excluded.source,
+                    details_json=excluded.details_json,
+                    updated_at=excluded.updated_at
+                """
+        else:
+            sql = """
+                INSERT OR IGNORE INTO strategy_decision_outcomes(
+                    outcome_id, decision_id, trade_date, code, candidate_id,
+                    candidate_instance_id, candidate_generation_seq, decision_at,
+                    evaluated_at, horizon_sec, price_at_decision, price_at_horizon,
+                    max_price_after_decision, min_price_after_decision, max_return_pct,
+                    max_drawdown_pct, current_return_pct, outcome_label, outcome_reason,
+                    label_confidence, data_status, data_quality_issues_json, source,
+                    details_json, created_at, updated_at
+                ) VALUES (
+                    :outcome_id, :decision_id, :trade_date, :code, :candidate_id,
+                    :candidate_instance_id, :candidate_generation_seq, :decision_at,
+                    :evaluated_at, :horizon_sec, :price_at_decision, :price_at_horizon,
+                    :max_price_after_decision, :min_price_after_decision, :max_return_pct,
+                    :max_drawdown_pct, :current_return_pct, :outcome_label, :outcome_reason,
+                    :label_confidence, :data_status, :data_quality_issues_json, :source,
+                    :details_json, :created_at, :updated_at
+                )
+                """
+        with self.conn:
+            self.conn.executemany(sql, rows)
+        return int(self.conn.total_changes - before)
+
+    def list_strategy_decision_outcomes(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        outcome_label: Optional[str] = None,
+        action_type: Optional[str] = None,
+        gate_status: Optional[str] = None,
+        reason_family: Optional[str] = None,
+        reason_code: Optional[str] = None,
+        horizon_sec: Optional[int] = None,
+        min_max_return_pct: Optional[float] = None,
+        max_drawdown_pct: Optional[float] = None,
+        window_sec: Optional[int] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses, params = _strategy_decision_outcome_filters(
+            trade_date=trade_date,
+            code=code,
+            outcome_label=outcome_label,
+            action_type=action_type,
+            gate_status=gate_status,
+            reason_family=reason_family,
+            reason_code=reason_code,
+            horizon_sec=horizon_sec,
+            min_max_return_pct=min_max_return_pct,
+            max_drawdown_pct=max_drawdown_pct,
+            window_sec=window_sec,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                o.*,
+                d.name AS decision_name,
+                d.theme_name AS decision_theme_name,
+                d.strategy_name AS decision_strategy_name,
+                d.gate_status AS decision_gate_status,
+                d.gate_reason AS decision_gate_reason,
+                d.reason_status AS decision_reason_status,
+                d.reason_family AS decision_reason_family,
+                d.reason_codes_json AS decision_reason_codes_json,
+                d.action_type AS decision_action_type,
+                d.action_result AS decision_action_result,
+                d.order_intent_id AS decision_order_intent_id,
+                d.virtual_order_id AS decision_virtual_order_id,
+                d.virtual_position_id AS decision_virtual_position_id,
+                d.exit_decision_id AS decision_exit_decision_id
+            FROM strategy_decision_outcomes o
+            LEFT JOIN strategy_decision_events d ON d.decision_id = o.decision_id
+            {where}
+            ORDER BY o.evaluated_at DESC, o.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_strategy_decision_outcome(row) for row in rows]
+
+    def strategy_decision_outcome_count(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        outcome_label: Optional[str] = None,
+        action_type: Optional[str] = None,
+        gate_status: Optional[str] = None,
+        reason_family: Optional[str] = None,
+        reason_code: Optional[str] = None,
+        horizon_sec: Optional[int] = None,
+        min_max_return_pct: Optional[float] = None,
+        max_drawdown_pct: Optional[float] = None,
+        window_sec: Optional[int] = None,
+    ) -> int:
+        clauses, params = _strategy_decision_outcome_filters(
+            trade_date=trade_date,
+            code=code,
+            outcome_label=outcome_label,
+            action_type=action_type,
+            gate_status=gate_status,
+            reason_family=reason_family,
+            reason_code=reason_code,
+            horizon_sec=horizon_sec,
+            min_max_return_pct=min_max_return_pct,
+            max_drawdown_pct=max_drawdown_pct,
+            window_sec=window_sec,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM strategy_decision_outcomes o
+            LEFT JOIN strategy_decision_events d ON d.decision_id = o.decision_id
+            {where}
+            """,
+            tuple(params),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+
+    def get_strategy_decision_outcome(self, decision_id: str, horizon_sec: int) -> Optional[dict]:
+        row = self.conn.execute(
+            """
+            SELECT
+                o.*,
+                d.name AS decision_name,
+                d.theme_name AS decision_theme_name,
+                d.strategy_name AS decision_strategy_name,
+                d.gate_status AS decision_gate_status,
+                d.gate_reason AS decision_gate_reason,
+                d.reason_status AS decision_reason_status,
+                d.reason_family AS decision_reason_family,
+                d.reason_codes_json AS decision_reason_codes_json,
+                d.action_type AS decision_action_type,
+                d.action_result AS decision_action_result,
+                d.order_intent_id AS decision_order_intent_id,
+                d.virtual_order_id AS decision_virtual_order_id,
+                d.virtual_position_id AS decision_virtual_position_id,
+                d.exit_decision_id AS decision_exit_decision_id
+            FROM strategy_decision_outcomes o
+            LEFT JOIN strategy_decision_events d ON d.decision_id = o.decision_id
+            WHERE o.decision_id = ? AND o.horizon_sec = ?
+            """,
+            (str(decision_id or ""), max(1, int(horizon_sec or 1))),
+        ).fetchone()
+        return _row_to_strategy_decision_outcome(row) if row else None
+
+    def strategy_decision_outcome_summary(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        window_sec: Optional[int] = None,
+        horizon_sec: Optional[int] = None,
+    ) -> dict:
+        items = self.list_strategy_decision_outcomes(
+            trade_date=trade_date,
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+            limit=10000,
+            offset=0,
+        )
+        return _strategy_decision_outcome_summary(
+            items,
+            trade_date=trade_date or "",
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+        )
+
+    def list_strategy_decision_events_due_for_shadow(
+        self,
+        *,
+        policy_ids: Iterable[str],
+        trade_date: Optional[str] = None,
+        limit: int = 500,
+        force: bool = False,
+    ) -> list[dict]:
+        normalized_policy_ids = [str(policy_id) for policy_id in policy_ids if str(policy_id or "")]
+        if not normalized_policy_ids:
+            return []
+        clauses = ["d.decision_id <> ''"]
+        params: list[object] = []
+        if trade_date:
+            clauses.append("d.trade_date = ?")
+            params.append(str(trade_date))
+        if not force:
+            placeholders = ",".join("?" for _ in normalized_policy_ids)
+            clauses.append(
+                f"""
+                (
+                    SELECT COUNT(DISTINCT e.policy_id)
+                    FROM shadow_strategy_evaluations e
+                    WHERE e.decision_id = d.decision_id
+                      AND e.policy_id IN ({placeholders})
+                ) < ?
+                """
+            )
+            params.extend(normalized_policy_ids)
+            params.append(len(normalized_policy_ids))
+        params.append(max(1, int(limit or 500)))
+        rows = self.conn.execute(
+            f"""
+            SELECT d.*
+            FROM strategy_decision_events d
+            WHERE {" AND ".join(clauses)}
+            ORDER BY d.decision_at DESC, d.id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        return [_row_to_strategy_decision_event(row) for row in rows]
+
+    def save_shadow_strategy_evaluations(self, evaluations: Iterable[dict], *, force: bool = False) -> int:
+        rows = [_shadow_strategy_evaluation_params(evaluation) for evaluation in evaluations if isinstance(evaluation, dict)]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        if force:
+            sql = """
+                INSERT INTO shadow_strategy_evaluations(
+                    evaluation_id, trade_date, evaluated_at, runtime_cycle_id, decision_id,
+                    policy_id, policy_name, candidate_id, candidate_instance_id,
+                    candidate_generation_seq, code, name, theme_name,
+                    baseline_gate_status, baseline_action_type, baseline_reason_codes_json,
+                    shadow_gate_status, shadow_action_type, shadow_reason_codes_json,
+                    baseline_score, shadow_score, baseline_position_size_multiplier,
+                    shadow_position_size_multiplier, changed_decision, change_type,
+                    expected_effect, expected_risk, data_status, data_quality_issues_json,
+                    details_json, created_at, updated_at
+                ) VALUES (
+                    :evaluation_id, :trade_date, :evaluated_at, :runtime_cycle_id, :decision_id,
+                    :policy_id, :policy_name, :candidate_id, :candidate_instance_id,
+                    :candidate_generation_seq, :code, :name, :theme_name,
+                    :baseline_gate_status, :baseline_action_type, :baseline_reason_codes_json,
+                    :shadow_gate_status, :shadow_action_type, :shadow_reason_codes_json,
+                    :baseline_score, :shadow_score, :baseline_position_size_multiplier,
+                    :shadow_position_size_multiplier, :changed_decision, :change_type,
+                    :expected_effect, :expected_risk, :data_status, :data_quality_issues_json,
+                    :details_json, :created_at, :updated_at
+                )
+                ON CONFLICT(decision_id, policy_id) DO UPDATE SET
+                    evaluation_id=excluded.evaluation_id,
+                    trade_date=excluded.trade_date,
+                    evaluated_at=excluded.evaluated_at,
+                    runtime_cycle_id=excluded.runtime_cycle_id,
+                    policy_name=excluded.policy_name,
+                    candidate_id=excluded.candidate_id,
+                    candidate_instance_id=excluded.candidate_instance_id,
+                    candidate_generation_seq=excluded.candidate_generation_seq,
+                    code=excluded.code,
+                    name=excluded.name,
+                    theme_name=excluded.theme_name,
+                    baseline_gate_status=excluded.baseline_gate_status,
+                    baseline_action_type=excluded.baseline_action_type,
+                    baseline_reason_codes_json=excluded.baseline_reason_codes_json,
+                    shadow_gate_status=excluded.shadow_gate_status,
+                    shadow_action_type=excluded.shadow_action_type,
+                    shadow_reason_codes_json=excluded.shadow_reason_codes_json,
+                    baseline_score=excluded.baseline_score,
+                    shadow_score=excluded.shadow_score,
+                    baseline_position_size_multiplier=excluded.baseline_position_size_multiplier,
+                    shadow_position_size_multiplier=excluded.shadow_position_size_multiplier,
+                    changed_decision=excluded.changed_decision,
+                    change_type=excluded.change_type,
+                    expected_effect=excluded.expected_effect,
+                    expected_risk=excluded.expected_risk,
+                    data_status=excluded.data_status,
+                    data_quality_issues_json=excluded.data_quality_issues_json,
+                    details_json=excluded.details_json,
+                    updated_at=excluded.updated_at
+                """
+        else:
+            sql = """
+                INSERT OR IGNORE INTO shadow_strategy_evaluations(
+                    evaluation_id, trade_date, evaluated_at, runtime_cycle_id, decision_id,
+                    policy_id, policy_name, candidate_id, candidate_instance_id,
+                    candidate_generation_seq, code, name, theme_name,
+                    baseline_gate_status, baseline_action_type, baseline_reason_codes_json,
+                    shadow_gate_status, shadow_action_type, shadow_reason_codes_json,
+                    baseline_score, shadow_score, baseline_position_size_multiplier,
+                    shadow_position_size_multiplier, changed_decision, change_type,
+                    expected_effect, expected_risk, data_status, data_quality_issues_json,
+                    details_json, created_at, updated_at
+                ) VALUES (
+                    :evaluation_id, :trade_date, :evaluated_at, :runtime_cycle_id, :decision_id,
+                    :policy_id, :policy_name, :candidate_id, :candidate_instance_id,
+                    :candidate_generation_seq, :code, :name, :theme_name,
+                    :baseline_gate_status, :baseline_action_type, :baseline_reason_codes_json,
+                    :shadow_gate_status, :shadow_action_type, :shadow_reason_codes_json,
+                    :baseline_score, :shadow_score, :baseline_position_size_multiplier,
+                    :shadow_position_size_multiplier, :changed_decision, :change_type,
+                    :expected_effect, :expected_risk, :data_status, :data_quality_issues_json,
+                    :details_json, :created_at, :updated_at
+                )
+                """
+        with self.conn:
+            self.conn.executemany(sql, rows)
+        return int(self.conn.total_changes - before)
+
+    def list_shadow_strategy_evaluations(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        policy_id: Optional[str] = None,
+        code: Optional[str] = None,
+        theme_name: Optional[str] = None,
+        baseline_gate_status: Optional[str] = None,
+        shadow_gate_status: Optional[str] = None,
+        change_type: Optional[str] = None,
+        changed_decision: Optional[bool] = None,
+        outcome_label: Optional[str] = None,
+        expected_risk: Optional[str] = None,
+        window_sec: Optional[int] = None,
+        horizon_sec: Optional[int] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses, params = _shadow_strategy_evaluation_filters(
+            trade_date=trade_date,
+            policy_id=policy_id,
+            code=code,
+            theme_name=theme_name,
+            baseline_gate_status=baseline_gate_status,
+            shadow_gate_status=shadow_gate_status,
+            change_type=change_type,
+            changed_decision=changed_decision,
+            outcome_label=outcome_label,
+            expected_risk=expected_risk,
+            window_sec=window_sec,
+        )
+        join_sql, join_params = _shadow_strategy_outcome_join(horizon_sec)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                e.*,
+                o.outcome_label AS outcome_label,
+                o.horizon_sec AS outcome_horizon_sec,
+                o.max_return_pct AS outcome_max_return_pct,
+                o.max_drawdown_pct AS outcome_max_drawdown_pct,
+                o.current_return_pct AS outcome_current_return_pct,
+                o.label_confidence AS outcome_label_confidence,
+                o.data_status AS outcome_data_status,
+                o.data_quality_issues_json AS outcome_data_quality_issues_json
+            FROM shadow_strategy_evaluations e
+            {join_sql}
+            {where}
+            ORDER BY e.evaluated_at DESC, e.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(join_params + params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_shadow_strategy_evaluation(row) for row in rows]
+
+    def shadow_strategy_evaluation_count(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        policy_id: Optional[str] = None,
+        code: Optional[str] = None,
+        theme_name: Optional[str] = None,
+        baseline_gate_status: Optional[str] = None,
+        shadow_gate_status: Optional[str] = None,
+        change_type: Optional[str] = None,
+        changed_decision: Optional[bool] = None,
+        outcome_label: Optional[str] = None,
+        expected_risk: Optional[str] = None,
+        window_sec: Optional[int] = None,
+        horizon_sec: Optional[int] = None,
+    ) -> int:
+        clauses, params = _shadow_strategy_evaluation_filters(
+            trade_date=trade_date,
+            policy_id=policy_id,
+            code=code,
+            theme_name=theme_name,
+            baseline_gate_status=baseline_gate_status,
+            shadow_gate_status=shadow_gate_status,
+            change_type=change_type,
+            changed_decision=changed_decision,
+            outcome_label=outcome_label,
+            expected_risk=expected_risk,
+            window_sec=window_sec,
+        )
+        join_sql, join_params = _shadow_strategy_outcome_join(horizon_sec)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM shadow_strategy_evaluations e
+            {join_sql}
+            {where}
+            """,
+            tuple(join_params + params),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+
+    def shadow_strategy_summary(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        window_sec: Optional[int] = None,
+        horizon_sec: Optional[int] = None,
+        policy_id: Optional[str] = None,
+    ) -> dict:
+        items = self.list_shadow_strategy_evaluations(
+            trade_date=trade_date,
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+            policy_id=policy_id,
+            limit=10000,
+            offset=0,
+        )
+        return _shadow_strategy_summary(
+            items,
+            trade_date=trade_date or "",
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+            policy_id=policy_id or "",
+        )
+
+    def save_strategy_replay_run(self, run: dict) -> dict:
+        replay_id = str(run.get("replay_id") or "").strip()
+        if not replay_id:
+            raise ValueError("replay_id is required")
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO strategy_replay_runs(
+                    replay_id, trade_date, mode, source_bundle_path, replay_db_path,
+                    started_at, finished_at, status, runtime_config_hash, strategy_version,
+                    processed_tick_count, processed_candidate_event_count,
+                    processed_theme_snapshot_count, cycle_count, error, warnings_json,
+                    metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(replay_id) DO UPDATE SET
+                    trade_date=excluded.trade_date,
+                    mode=excluded.mode,
+                    source_bundle_path=excluded.source_bundle_path,
+                    replay_db_path=excluded.replay_db_path,
+                    started_at=excluded.started_at,
+                    finished_at=excluded.finished_at,
+                    status=excluded.status,
+                    runtime_config_hash=excluded.runtime_config_hash,
+                    strategy_version=excluded.strategy_version,
+                    processed_tick_count=excluded.processed_tick_count,
+                    processed_candidate_event_count=excluded.processed_candidate_event_count,
+                    processed_theme_snapshot_count=excluded.processed_theme_snapshot_count,
+                    cycle_count=excluded.cycle_count,
+                    error=excluded.error,
+                    warnings_json=excluded.warnings_json,
+                    metadata_json=excluded.metadata_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    replay_id,
+                    str(run.get("trade_date") or ""),
+                    str(run.get("mode") or ""),
+                    str(run.get("source_bundle_path") or ""),
+                    str(run.get("replay_db_path") or ""),
+                    str(run.get("started_at") or now),
+                    str(run.get("finished_at") or ""),
+                    str(run.get("status") or ""),
+                    str(run.get("runtime_config_hash") or ""),
+                    str(run.get("strategy_version") or ""),
+                    int(run.get("processed_tick_count") or 0),
+                    int(run.get("processed_candidate_event_count") or 0),
+                    int(run.get("processed_theme_snapshot_count") or 0),
+                    int(run.get("cycle_count") or 0),
+                    str(run.get("error") or ""),
+                    _json_list(run.get("warnings_json", run.get("warnings", []))),
+                    _json_payload(run.get("metadata_json", run.get("metadata", {}))),
+                    str(run.get("created_at") or now),
+                    str(run.get("updated_at") or now),
+                ),
+            )
+        return self.get_strategy_replay_run(replay_id) or {"replay_id": replay_id}
+
+    def list_strategy_replay_runs(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        mode: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if mode:
+            clauses.append("mode = ?")
+            params.append(str(mode))
+        if status:
+            clauses.append("status = ?")
+            params.append(str(status))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_replay_runs
+            {where}
+            ORDER BY started_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 50)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_strategy_replay_run(row) for row in rows]
+
+    def get_strategy_replay_run(self, replay_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_replay_runs WHERE replay_id = ?",
+            (str(replay_id or ""),),
+        ).fetchone()
+        return _row_to_strategy_replay_run(row) if row else None
+
+    def save_strategy_replay_report(self, report: dict) -> dict:
+        report_id = str(report.get("report_id") or "").strip()
+        replay_id = str(report.get("replay_id") or "").strip()
+        if not report_id:
+            raise ValueError("report_id is required")
+        if not replay_id:
+            raise ValueError("replay_id is required")
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO strategy_replay_reports(
+                    report_id, replay_id, trade_date, mode, summary_json, funnel_json,
+                    outcome_summary_json, shadow_summary_json, diff_summary_json,
+                    recommendations_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_id) DO UPDATE SET
+                    replay_id=excluded.replay_id,
+                    trade_date=excluded.trade_date,
+                    mode=excluded.mode,
+                    summary_json=excluded.summary_json,
+                    funnel_json=excluded.funnel_json,
+                    outcome_summary_json=excluded.outcome_summary_json,
+                    shadow_summary_json=excluded.shadow_summary_json,
+                    diff_summary_json=excluded.diff_summary_json,
+                    recommendations_json=excluded.recommendations_json
+                """,
+                (
+                    report_id,
+                    replay_id,
+                    str(report.get("trade_date") or ""),
+                    str(report.get("mode") or ""),
+                    _json_payload(report.get("summary") or {}),
+                    _json_payload(report.get("funnel") or {}),
+                    _json_payload(report.get("outcome_summary") or {}),
+                    _json_payload(report.get("shadow_summary") or {}),
+                    _json_payload(report.get("diff_summary") or {}),
+                    _json_list(report.get("recommendations") or []),
+                    str(report.get("created_at") or now),
+                ),
+            )
+        return self.get_strategy_replay_report(report_id) or {"report_id": report_id}
+
+    def list_strategy_replay_reports(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        replay_id: Optional[str] = None,
+        mode: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if replay_id:
+            clauses.append("replay_id = ?")
+            params.append(str(replay_id))
+        if mode:
+            clauses.append("mode = ?")
+            params.append(str(mode))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_replay_reports
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 50)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_strategy_replay_report(row) for row in rows]
+
+    def get_strategy_replay_report(self, report_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_replay_reports WHERE report_id = ?",
+            (str(report_id or ""),),
+        ).fetchone()
+        return _row_to_strategy_replay_report(row) if row else None
+
+    def latest_strategy_replay_report(self, replay_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            """
+            SELECT * FROM strategy_replay_reports
+            WHERE replay_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (str(replay_id or ""),),
+        ).fetchone()
+        return _row_to_strategy_replay_report(row) if row else None
+
+    def save_strategy_change_proposals(self, proposals: Iterable[dict]) -> int:
+        rows = [_strategy_change_proposal_params(proposal) for proposal in proposals if isinstance(proposal, dict)]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT INTO strategy_change_proposals(
+                    proposal_id, trade_date, created_at, updated_at, status,
+                    recommendation_grade, title, summary_ko, category, target_component,
+                    source_type, source_ids_json, baseline_config_hash, candidate_config_hash,
+                    baseline_config_snapshot_json, candidate_config_patch_json,
+                    expected_effect_ko, expected_risk_ko, confidence, net_benefit_score,
+                    guardrail_passed, blocked_by_guardrail_reason, data_quality_status,
+                    data_quality_issues_json, rollout_plan_json, rollback_plan_json,
+                    operator_note, expires_at, superseded_by_proposal_id
+                ) VALUES (
+                    :proposal_id, :trade_date, :created_at, :updated_at, :status,
+                    :recommendation_grade, :title, :summary_ko, :category, :target_component,
+                    :source_type, :source_ids_json, :baseline_config_hash, :candidate_config_hash,
+                    :baseline_config_snapshot_json, :candidate_config_patch_json,
+                    :expected_effect_ko, :expected_risk_ko, :confidence, :net_benefit_score,
+                    :guardrail_passed, :blocked_by_guardrail_reason, :data_quality_status,
+                    :data_quality_issues_json, :rollout_plan_json, :rollback_plan_json,
+                    :operator_note, :expires_at, :superseded_by_proposal_id
+                )
+                ON CONFLICT(proposal_id) DO UPDATE SET
+                    trade_date=excluded.trade_date,
+                    updated_at=excluded.updated_at,
+                    recommendation_grade=excluded.recommendation_grade,
+                    title=excluded.title,
+                    summary_ko=excluded.summary_ko,
+                    category=excluded.category,
+                    target_component=excluded.target_component,
+                    source_type=excluded.source_type,
+                    source_ids_json=excluded.source_ids_json,
+                    baseline_config_hash=excluded.baseline_config_hash,
+                    candidate_config_hash=excluded.candidate_config_hash,
+                    baseline_config_snapshot_json=excluded.baseline_config_snapshot_json,
+                    candidate_config_patch_json=excluded.candidate_config_patch_json,
+                    expected_effect_ko=excluded.expected_effect_ko,
+                    expected_risk_ko=excluded.expected_risk_ko,
+                    confidence=excluded.confidence,
+                    net_benefit_score=excluded.net_benefit_score,
+                    guardrail_passed=excluded.guardrail_passed,
+                    blocked_by_guardrail_reason=excluded.blocked_by_guardrail_reason,
+                    data_quality_status=excluded.data_quality_status,
+                    data_quality_issues_json=excluded.data_quality_issues_json,
+                    rollout_plan_json=excluded.rollout_plan_json,
+                    rollback_plan_json=excluded.rollback_plan_json,
+                    expires_at=excluded.expires_at,
+                    superseded_by_proposal_id=excluded.superseded_by_proposal_id
+                """,
+                rows,
+            )
+        return int(self.conn.total_changes - before)
+
+    def list_strategy_change_proposals(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        status: Optional[str] = None,
+        category: Optional[str] = None,
+        recommendation_grade: Optional[str] = None,
+        source_type: Optional[str] = None,
+        target_component: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses, params = _strategy_change_proposal_filters(
+            trade_date=trade_date,
+            status=status,
+            category=category,
+            recommendation_grade=recommendation_grade,
+            source_type=source_type,
+            target_component=target_component,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_change_proposals
+            {where}
+            ORDER BY
+                CASE recommendation_grade
+                    WHEN 'STRONG_CANDIDATE' THEN 0
+                    WHEN 'WATCH_CANDIDATE' THEN 1
+                    WHEN 'RISKY_CANDIDATE' THEN 2
+                    WHEN 'DATA_INSUFFICIENT' THEN 3
+                    ELSE 4
+                END,
+                net_benefit_score DESC,
+                created_at DESC,
+                id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_strategy_change_proposal(row) for row in rows]
+
+    def strategy_change_proposal_count(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        status: Optional[str] = None,
+        category: Optional[str] = None,
+        recommendation_grade: Optional[str] = None,
+        source_type: Optional[str] = None,
+        target_component: Optional[str] = None,
+    ) -> int:
+        clauses, params = _strategy_change_proposal_filters(
+            trade_date=trade_date,
+            status=status,
+            category=category,
+            recommendation_grade=recommendation_grade,
+            source_type=source_type,
+            target_component=target_component,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM strategy_change_proposals {where}",
+            tuple(params),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+
+    def get_strategy_change_proposal(self, proposal_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_change_proposals WHERE proposal_id = ?",
+            (str(proposal_id or ""),),
+        ).fetchone()
+        return _row_to_strategy_change_proposal(row) if row else None
+
+    def save_strategy_change_evidence(self, evidence: Iterable[dict]) -> int:
+        rows = [_strategy_change_evidence_params(item) for item in evidence if isinstance(item, dict)]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT INTO strategy_change_evidence(
+                    evidence_id, proposal_id, source_type, source_id, trade_date,
+                    metric_name, metric_value, metric_unit, baseline_value,
+                    candidate_value, delta_value, sample_count, confidence,
+                    evidence_payload_json, created_at
+                ) VALUES (
+                    :evidence_id, :proposal_id, :source_type, :source_id, :trade_date,
+                    :metric_name, :metric_value, :metric_unit, :baseline_value,
+                    :candidate_value, :delta_value, :sample_count, :confidence,
+                    :evidence_payload_json, :created_at
+                )
+                ON CONFLICT(evidence_id) DO UPDATE SET
+                    source_type=excluded.source_type,
+                    source_id=excluded.source_id,
+                    trade_date=excluded.trade_date,
+                    metric_name=excluded.metric_name,
+                    metric_value=excluded.metric_value,
+                    metric_unit=excluded.metric_unit,
+                    baseline_value=excluded.baseline_value,
+                    candidate_value=excluded.candidate_value,
+                    delta_value=excluded.delta_value,
+                    sample_count=excluded.sample_count,
+                    confidence=excluded.confidence,
+                    evidence_payload_json=excluded.evidence_payload_json
+                """,
+                rows,
+            )
+        return int(self.conn.total_changes - before)
+
+    def list_strategy_change_evidence(
+        self,
+        proposal_id: Optional[str] = None,
+        *,
+        trade_date: Optional[str] = None,
+        source_type: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if proposal_id:
+            clauses.append("proposal_id = ?")
+            params.append(str(proposal_id))
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if source_type:
+            clauses.append("source_type = ?")
+            params.append(str(source_type))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_change_evidence
+            {where}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_strategy_change_evidence(row) for row in rows]
+
+    def save_strategy_change_approval(self, approval: dict) -> dict:
+        proposal_id = str(approval.get("proposal_id") or "")
+        if not proposal_id:
+            raise ValueError("proposal_id is required")
+        approval_id = str(approval.get("approval_id") or f"approval:{proposal_id}:{uuid4().hex}")
+        created_at = str(approval.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO strategy_change_approvals(
+                    approval_id, proposal_id, action, previous_status, next_status,
+                    operator, note, created_at, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    approval_id,
+                    proposal_id,
+                    str(approval.get("action") or ""),
+                    str(approval.get("previous_status") or ""),
+                    str(approval.get("next_status") or ""),
+                    str(approval.get("operator") or ""),
+                    str(approval.get("note") or ""),
+                    created_at,
+                    _json_payload(_sanitize_decision_details(approval.get("details") or {})),
+                ),
+            )
+            if approval.get("next_status"):
+                self.conn.execute(
+                    """
+                    UPDATE strategy_change_proposals
+                    SET status = ?, operator_note = CASE WHEN ? <> '' THEN ? ELSE operator_note END,
+                        updated_at = ?
+                    WHERE proposal_id = ?
+                    """,
+                    (
+                        str(approval.get("next_status") or ""),
+                        str(approval.get("note") or ""),
+                        str(approval.get("note") or ""),
+                        created_at,
+                        proposal_id,
+                    ),
+                )
+        return self.get_strategy_change_approval(approval_id) or {"approval_id": approval_id}
+
+    def get_strategy_change_approval(self, approval_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_change_approvals WHERE approval_id = ?",
+            (str(approval_id or ""),),
+        ).fetchone()
+        return _row_to_strategy_change_approval(row) if row else None
+
+    def list_strategy_change_approvals(self, proposal_id: str, *, limit: int = 100) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM strategy_change_approvals
+            WHERE proposal_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (str(proposal_id or ""), max(1, int(limit or 100))),
+        ).fetchall()
+        return [_row_to_strategy_change_approval(row) for row in rows]
+
+    def save_strategy_config_snapshot(self, snapshot: dict) -> dict:
+        config_hash = str(snapshot.get("config_hash") or "")
+        if not config_hash:
+            raise ValueError("config_hash is required")
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO strategy_config_snapshots(
+                    config_hash, config_source, config_payload_json, created_at, description
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(config_hash) DO UPDATE SET
+                    config_source=excluded.config_source,
+                    config_payload_json=excluded.config_payload_json,
+                    description=excluded.description
+                """,
+                (
+                    config_hash,
+                    str(snapshot.get("config_source") or ""),
+                    _json_payload(_sanitize_decision_details(snapshot.get("config_payload") or {})),
+                    str(snapshot.get("created_at") or datetime.now().isoformat(timespec="seconds")),
+                    str(snapshot.get("description") or ""),
+                ),
+            )
+        return self.get_strategy_config_snapshot(config_hash) or {"config_hash": config_hash}
+
+    def get_strategy_config_snapshot(self, config_hash: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_config_snapshots WHERE config_hash = ?",
+            (str(config_hash or ""),),
+        ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        data["config_payload"] = _safe_json_loads(data.get("config_payload_json"), {})
+        return data
+
+    def strategy_change_proposal_summary(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        window_sec: Optional[int] = None,
+    ) -> dict:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if window_sec is not None:
+            clauses.append("julianday(replace(substr(created_at, 1, 19), 'T', ' ')) >= julianday('now', ?)")
+            params.append(f"-{max(1, int(window_sec or 1))} seconds")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        total_row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM strategy_change_proposals {where}",
+            tuple(params),
+        ).fetchone()
+        by_status = _group_count_map(
+            self.conn.execute(
+                f"""
+                SELECT status AS key, COUNT(*) AS count
+                FROM strategy_change_proposals
+                {where}
+                {'AND' if where else 'WHERE'} status <> ''
+                GROUP BY status
+                """,
+                tuple(params),
+            ).fetchall()
+        )
+        by_grade = _group_count_map(
+            self.conn.execute(
+                f"""
+                SELECT recommendation_grade AS key, COUNT(*) AS count
+                FROM strategy_change_proposals
+                {where}
+                {'AND' if where else 'WHERE'} recommendation_grade <> ''
+                GROUP BY recommendation_grade
+                """,
+                tuple(params),
+            ).fetchall()
+        )
+        by_category = _group_count_map(
+            self.conn.execute(
+                f"""
+                SELECT category AS key, COUNT(*) AS count
+                FROM strategy_change_proposals
+                {where}
+                {'AND' if where else 'WHERE'} category <> ''
+                GROUP BY category
+                """,
+                tuple(params),
+            ).fetchall()
+        )
+        soon_cutoff = (datetime.now() + timedelta(days=1)).isoformat(timespec="seconds")
+        expiring_clauses = list(clauses)
+        expiring_params = list(params)
+        expiring_clauses.append("expires_at <> ''")
+        expiring_clauses.append("expires_at <= ?")
+        expiring_params.append(soon_cutoff)
+        expiring_where = f"WHERE {' AND '.join(expiring_clauses)}"
+        expiring_row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM strategy_change_proposals {expiring_where}",
+            tuple(expiring_params),
+        ).fetchone()
+        top_rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_change_proposals
+            {where}
+            ORDER BY
+                CASE recommendation_grade
+                    WHEN 'STRONG_CANDIDATE' THEN 0
+                    WHEN 'WATCH_CANDIDATE' THEN 1
+                    WHEN 'RISKY_CANDIDATE' THEN 2
+                    WHEN 'DATA_INSUFFICIENT' THEN 3
+                    ELSE 4
+                END,
+                net_benefit_score DESC,
+                created_at DESC,
+                id DESC
+            LIMIT 10
+            """,
+            tuple(params),
+        ).fetchall()
+        return {
+            "trade_date": trade_date or "",
+            "window_sec": window_sec,
+            "total_count": int(total_row["count"] or 0) if total_row else 0,
+            "by_status": by_status,
+            "by_grade": by_grade,
+            "by_category": by_category,
+            "top_recommendations": [_row_to_strategy_change_proposal(row) for row in top_rows],
+            "risky_count": int(by_grade.get("RISKY_CANDIDATE", 0)),
+            "data_insufficient_count": int(by_grade.get("DATA_INSUFFICIENT", 0)),
+            "expiring_soon_count": int(expiring_row["count"] or 0) if expiring_row else 0,
+        }
+
     def save_live_sim_order(self, record: dict) -> dict:
         payload = _live_sim_order_params(record)
         with self.conn:
@@ -1633,6 +3548,36 @@ class TradingDatabase:
         row = self.conn.execute(
             "SELECT * FROM live_sim_orders WHERE broker_order_id = ? ORDER BY id DESC LIMIT 1",
             (broker_order_id,),
+        ).fetchone()
+        return _row_to_live_sim_order(row) if row else None
+
+    def find_live_sim_order_by_execution_fingerprint(self, event: BrokerExecutionEvent) -> Optional[dict]:
+        if not event.order_no:
+            return None
+        row = self.conn.execute(
+            """
+            SELECT * FROM live_sim_orders
+            WHERE broker_order_id = ''
+              AND code = ?
+              AND lower(side) = lower(?)
+              AND submitted_qty = ?
+              AND submitted_price = ?
+              AND order_status IN ('SUBMITTED', 'ACCEPTED', 'PARTIAL_FILLED')
+            ORDER BY
+              CASE
+                WHEN accepted_at != '' THEN accepted_at
+                WHEN submitted_at != '' THEN submitted_at
+                ELSE created_at
+              END DESC,
+              id DESC
+            LIMIT 1
+            """,
+            (
+                event.code,
+                event.side,
+                int(event.quantity or 0),
+                int(event.price or 0),
+            ),
         ).fetchone()
         return _row_to_live_sim_order(row) if row else None
 
@@ -1981,6 +3926,8 @@ class TradingDatabase:
                 )
                 ON CONFLICT(position_id) DO UPDATE SET
                     closed_at=excluded.closed_at,
+                    entry_qty=excluded.entry_qty,
+                    entry_avg_price=excluded.entry_avg_price,
                     current_qty=excluded.current_qty,
                     realized_qty=excluded.realized_qty,
                     realized_pnl=excluded.realized_pnl,
@@ -2142,17 +4089,36 @@ class TradingDatabase:
                 if text:
                     reason_counts[text] = reason_counts.get(text, 0) + 1
         positions = self.conn.execute("SELECT status, realized_pnl, realized_pnl_pct FROM live_sim_positions").fetchall()
+        position_status_counts: dict[str, int] = {}
+        for row in positions:
+            status = str(row["status"] or "")
+            position_status_counts[status] = position_status_counts.get(status, 0) + 1
+        manual_row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM live_sim_fill_events
+            WHERE raw_event_json LIKE '%"manual_intervention": true%'
+            """
+        ).fetchone()
+        manual_intervention_count = int(manual_row["count"] or 0) if manual_row else 0
+        reconcile_required_count = counts.get("RECONCILE_REQUIRED", 0) + position_status_counts.get("RECONCILE_REQUIRED", 0)
         realized = [float(row["realized_pnl"] or 0.0) for row in positions]
         realized_pct = [float(row["realized_pnl_pct"] or 0.0) for row in positions if float(row["realized_pnl_pct"] or 0.0) != 0.0]
         return {
+            "ledger_ok": reconcile_required_count == 0 and counts.get("UNKNOWN_SUBMIT", 0) == 0,
             "submitted_order_count": counts.get("SUBMITTED", 0) + counts.get("ACCEPTED", 0),
             "accepted_order_count": counts.get("ACCEPTED", 0),
             "rejected_order_count": counts.get("REJECTED", 0) + counts.get("FAILED", 0),
+            "reconcile_required_order_count": counts.get("RECONCILE_REQUIRED", 0),
+            "reconcile_required_position_count": position_status_counts.get("RECONCILE_REQUIRED", 0),
+            "reconcile_required_count": reconcile_required_count,
+            "manual_intervention_count": manual_intervention_count,
             "filled_order_count": counts.get("FILLED", 0),
             "partial_fill_count": counts.get("PARTIAL_FILLED", 0),
             "cancelled_order_count": counts.get("CANCELLED", 0),
             "duplicate_order_blocked_count": counts.get("DUPLICATE", 0),
             "unknown_submit_count": counts.get("UNKNOWN_SUBMIT", 0),
+            "open_position_count": sum(1 for row in positions if str(row["status"]) in {"OPEN", "PARTIAL"}),
             "opened_position_count": sum(1 for row in positions if str(row["status"]) in {"OPEN", "PARTIAL"}),
             "closed_position_count": sum(1 for row in positions if str(row["status"]) in {"CLOSED", "FORCE_CLOSED"}),
             "unfilled_buy_cancel_due_count": reason_counts.get("LIVE_SIM_UNFILLED_BUY_CANCEL_DUE", 0),
@@ -2824,6 +4790,66 @@ class TradingDatabase:
         ).fetchone()
         return _row_to_gateway_transport_latency_sample(row) if row else None
 
+    def find_gateway_transport_latency_sample_by_ws_message(
+        self,
+        *,
+        ws_session_id: str,
+        ws_message_sequence: int,
+        message_type: str,
+        event_id: str = "",
+        command_id: str = "",
+    ) -> Optional[dict]:
+        clauses = ["ws_session_id = ?", "ws_message_sequence = ?", "message_type = ?"]
+        params: list[object] = [ws_session_id, int(ws_message_sequence or 0), message_type]
+        if event_id:
+            clauses.append("event_id = ?")
+            params.append(event_id)
+        if command_id:
+            clauses.append("command_id = ?")
+            params.append(command_id)
+        row = self.conn.execute(
+            f"""
+            SELECT * FROM gateway_transport_latency_samples
+            WHERE {" AND ".join(clauses)}
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            tuple(params),
+        ).fetchone()
+        return _row_to_gateway_transport_latency_sample(row) if row else None
+
+    def update_gateway_transport_latency_sample_stage(
+        self,
+        sample_id: str,
+        *,
+        stage_updates: dict,
+        metadata_updates: Optional[dict] = None,
+    ) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT stage_ms_json, metadata_json FROM gateway_transport_latency_samples WHERE sample_id = ?",
+            (sample_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        stage = _safe_json_loads(row["stage_ms_json"], {})
+        metadata = _safe_json_loads(row["metadata_json"], {})
+        stage.update({key: value for key, value in dict(stage_updates or {}).items() if value is not None})
+        metadata.update({key: value for key, value in dict(metadata_updates or {}).items() if value is not None})
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE gateway_transport_latency_samples
+                SET stage_ms_json = ?, metadata_json = ?
+                WHERE sample_id = ?
+                """,
+                (
+                    json.dumps(stage, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True, default=str),
+                    sample_id,
+                ),
+            )
+        return self.get_gateway_transport_latency_sample(sample_id)
+
     def list_gateway_transport_latency_samples(
         self,
         *,
@@ -3169,6 +5195,460 @@ class TradingDatabase:
         payload["created_at"] = row["created_at"]
         payload["calculated_at"] = row["calculated_at"]
         return payload
+
+    def save_operator_event(self, event: dict) -> bool:
+        normalized = _normalize_operator_event(event)
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO dashboard_operator_events(
+                    event_id, trade_date, occurred_at, received_at, source,
+                    event_type, severity, category, symbol, stock_name,
+                    primary_theme, stock_role, candidate_instance_id,
+                    from_status, to_status, gate_status, display_status,
+                    message_ko, payload_json, acknowledged_at, acknowledged_by,
+                    hidden, snoozed_until
+                ) VALUES (
+                    :event_id, :trade_date, :occurred_at, :received_at, :source,
+                    :event_type, :severity, :category, :symbol, :stock_name,
+                    :primary_theme, :stock_role, :candidate_instance_id,
+                    :from_status, :to_status, :gate_status, :display_status,
+                    :message_ko, :payload_json, :acknowledged_at, :acknowledged_by,
+                    :hidden, :snoozed_until
+                )
+                """,
+                normalized,
+            )
+        return cursor.rowcount == 1
+
+    def save_operator_events(self, events: list[dict]) -> dict:
+        inserted = 0
+        duplicate = 0
+        rejected = 0
+        for event in events or []:
+            try:
+                if self.save_operator_event(event):
+                    inserted += 1
+                else:
+                    duplicate += 1
+            except (TypeError, ValueError, sqlite3.Error):
+                rejected += 1
+        return {"inserted_count": inserted, "duplicate_count": duplicate, "rejected_count": rejected}
+
+    def list_operator_events(
+        self,
+        trade_date: str,
+        *,
+        severity: str | None = None,
+        category: str | None = None,
+        symbol: str | None = None,
+        include_acknowledged: bool = True,
+        include_hidden: bool = False,
+        limit: int = 200,
+    ) -> list[dict]:
+        where = ["trade_date = ?"]
+        params: list[object] = [str(trade_date or "")]
+        if severity:
+            where.append("severity = ?")
+            params.append(str(severity).upper())
+        if category:
+            where.append("category = ?")
+            params.append(str(category).lower())
+        if symbol:
+            where.append("symbol = ?")
+            params.append(str(symbol))
+        if not include_acknowledged:
+            where.append("acknowledged_at IS NULL")
+        if not include_hidden:
+            where.append("hidden = 0")
+        normalized_limit = max(1, min(1000, int(limit or 200)))
+        params.append(normalized_limit)
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM dashboard_operator_events
+            WHERE {" AND ".join(where)}
+            ORDER BY occurred_at DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [_operator_event_row_to_dict(row) for row in rows]
+
+    def acknowledge_operator_event(self, event_id: str, acknowledged_by: str | None = None) -> int:
+        return self.acknowledge_operator_events([event_id], acknowledged_by=acknowledged_by)
+
+    def acknowledge_operator_events(self, event_ids: list[str], acknowledged_by: str | None = None) -> int:
+        ids = [str(event_id or "") for event_id in event_ids or [] if str(event_id or "")]
+        if not ids:
+            return 0
+        acknowledged_at = datetime.now().isoformat(timespec="seconds")
+        updated = 0
+        with self.conn:
+            for event_id in ids:
+                cursor = self.conn.execute(
+                    """
+                    UPDATE dashboard_operator_events
+                    SET acknowledged_at = COALESCE(acknowledged_at, ?),
+                        acknowledged_by = COALESCE(NULLIF(?, ''), acknowledged_by)
+                    WHERE event_id = ?
+                    """,
+                    (acknowledged_at, str(acknowledged_by or ""), event_id),
+                )
+                updated += cursor.rowcount
+        return updated
+
+    def hide_operator_event(self, event_id: str) -> int:
+        return self.hide_operator_events([event_id])
+
+    def hide_operator_events(self, event_ids: list[str]) -> int:
+        ids = [str(event_id or "") for event_id in event_ids or [] if str(event_id or "")]
+        if not ids:
+            return 0
+        updated = 0
+        with self.conn:
+            for event_id in ids:
+                cursor = self.conn.execute(
+                    "UPDATE dashboard_operator_events SET hidden = 1 WHERE event_id = ?",
+                    (event_id,),
+                )
+                updated += cursor.rowcount
+        return updated
+
+    def summarize_operator_events(self, trade_date: str) -> dict:
+        events = self.list_operator_events(trade_date, include_acknowledged=True, include_hidden=False, limit=1000)
+        severity_counts = Counter(str(event.get("severity") or "").upper() for event in events)
+        type_counts = Counter(str(event.get("event_type") or "") for event in events)
+        symbol_counts = Counter(str(event.get("symbol") or "") for event in events if event.get("symbol"))
+        theme_counts = Counter(str(event.get("primary_theme") or "") for event in events if event.get("primary_theme"))
+        return {
+            "trade_date": str(trade_date or ""),
+            "total_count": len(events),
+            "critical_count": severity_counts.get("CRITICAL", 0),
+            "warning_count": severity_counts.get("WARNING", 0),
+            "opportunity_count": severity_counts.get("OPPORTUNITY", 0),
+            "info_count": severity_counts.get("INFO", 0),
+            "ready_event_count": type_counts.get("BUY_READY_NEW", 0),
+            "ready_small_event_count": type_counts.get("BUY_READY_SMALL_NEW", 0),
+            "live_guard_blocked_count": type_counts.get("READY_BUT_LIVE_BLOCKED", 0),
+            "order_intent_created_count": type_counts.get("ORDER_INTENT_CREATED", 0),
+            "virtual_order_created_count": type_counts.get("VIRTUAL_ORDER_CREATED", 0),
+            "market_wait_started_count": type_counts.get("MARKET_WAIT_STARTED", 0),
+            "data_quality_degraded_count": type_counts.get("DATA_QUALITY_DEGRADED", 0),
+            "chase_risk_blocked_count": type_counts.get("CHASE_RISK_BLOCKED", 0),
+            "gateway_disconnected_count": type_counts.get("GATEWAY_DISCONNECTED", 0),
+            "snapshot_stale_count": type_counts.get("SNAPSHOT_STALE", 0),
+            "by_event_type": dict(type_counts),
+            "by_symbol": [{"symbol": symbol, "count": count} for symbol, count in symbol_counts.most_common(20)],
+            "by_theme": [{"primary_theme": theme, "count": count} for theme, count in theme_counts.most_common(20)],
+        }
+
+    def get_operator_event(self, event_id: str) -> Optional[dict]:
+        if not event_id:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM dashboard_operator_events WHERE event_id = ?",
+            (str(event_id),),
+        ).fetchone()
+        return _operator_event_row_to_dict(row) if row else None
+
+    def snooze_operator_event(self, event_id: str, snoozed_until: str) -> int:
+        if not event_id:
+            return 0
+        with self.conn:
+            cursor = self.conn.execute(
+                "UPDATE dashboard_operator_events SET snoozed_until = ? WHERE event_id = ?",
+                (str(snoozed_until or ""), str(event_id)),
+            )
+        return cursor.rowcount
+
+    def save_operator_action(self, action: dict) -> dict:
+        normalized = _normalize_operator_action(action)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO dashboard_operator_actions(
+                    action_id, trade_date, requested_at, completed_at,
+                    action_type, status, source, requested_by, event_id,
+                    symbol, stock_name, candidate_instance_id, requires_token,
+                    confirmation_required, endpoint, request_payload_json,
+                    response_payload_json, error_message
+                ) VALUES (
+                    :action_id, :trade_date, :requested_at, :completed_at,
+                    :action_type, :status, :source, :requested_by, :event_id,
+                    :symbol, :stock_name, :candidate_instance_id, :requires_token,
+                    :confirmation_required, :endpoint, :request_payload_json,
+                    :response_payload_json, :error_message
+                )
+                """,
+                normalized,
+            )
+        return self.get_operator_action(normalized["action_id"]) or dict(normalized)
+
+    def get_operator_action(self, action_id: str) -> Optional[dict]:
+        if not action_id:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM dashboard_operator_actions WHERE action_id = ?",
+            (str(action_id),),
+        ).fetchone()
+        return _operator_action_row_to_dict(row) if row else None
+
+    def update_operator_action_status(
+        self,
+        action_id: str,
+        status: str,
+        response: Optional[dict] = None,
+        error_message: Optional[str] = None,
+    ) -> Optional[dict]:
+        if not action_id:
+            return None
+        completed_at = datetime.now().isoformat(timespec="seconds")
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE dashboard_operator_actions
+                SET status = ?,
+                    completed_at = ?,
+                    response_payload_json = ?,
+                    error_message = ?
+                WHERE action_id = ?
+                """,
+                (
+                    str(status or "").upper(),
+                    completed_at,
+                    json.dumps(response or {}, ensure_ascii=False, sort_keys=True, default=str),
+                    str(error_message or "") or None,
+                    str(action_id),
+                ),
+            )
+        return self.get_operator_action(action_id)
+
+    def list_operator_actions(
+        self,
+        trade_date: str,
+        *,
+        action_type: str | None = None,
+        status: str | None = None,
+        symbol: str | None = None,
+        event_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        where = ["trade_date = ?"]
+        params: list[object] = [str(trade_date or "")]
+        if action_type:
+            where.append("action_type = ?")
+            params.append(str(action_type).upper())
+        if status:
+            where.append("status = ?")
+            params.append(str(status).upper())
+        if symbol:
+            where.append("symbol = ?")
+            params.append(str(symbol))
+        if event_id:
+            where.append("event_id = ?")
+            params.append(str(event_id))
+        normalized_limit = max(1, min(1000, int(limit or 100)))
+        normalized_offset = max(0, int(offset or 0))
+        params.extend([normalized_limit, normalized_offset])
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM dashboard_operator_actions
+            WHERE {" AND ".join(where)}
+            ORDER BY requested_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            params,
+        ).fetchall()
+        return [_operator_action_row_to_dict(row) for row in rows]
+
+    def summarize_operator_actions(self, trade_date: str) -> dict:
+        actions = self.list_operator_actions(trade_date, limit=1000)
+        status_counts = Counter(str(action.get("status") or "").upper() for action in actions)
+        type_counts = Counter(str(action.get("action_type") or "") for action in actions)
+        return {
+            "trade_date": str(trade_date or ""),
+            "total_count": len(actions),
+            "pending_count": status_counts.get("PENDING", 0),
+            "running_count": status_counts.get("RUNNING", 0),
+            "success_count": status_counts.get("SUCCESS", 0),
+            "failed_count": status_counts.get("FAILED", 0),
+            "blocked_count": status_counts.get("BLOCKED", 0),
+            "skipped_count": status_counts.get("SKIPPED", 0),
+            "by_status": dict(status_counts),
+            "by_action_type": dict(type_counts),
+        }
+
+    def save_postmarket_review_item(self, item: dict) -> bool:
+        normalized = _normalize_postmarket_review_item(item)
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO dashboard_postmarket_reviews(
+                    review_id, trade_date, generated_at, review_scope,
+                    symbol, stock_name, primary_theme, stock_role,
+                    candidate_instance_id, event_id, event_type, source_status,
+                    block_reason, block_reason_codes_json, base_time, base_price,
+                    price_1m, price_3m, price_5m, price_10m,
+                    price_close_or_last, return_1m_pct, return_3m_pct,
+                    return_5m_pct, return_10m_pct, return_close_or_last_pct,
+                    outcome_label, confidence, confidence_reason,
+                    recommendation_ko, payload_json
+                ) VALUES (
+                    :review_id, :trade_date, :generated_at, :review_scope,
+                    :symbol, :stock_name, :primary_theme, :stock_role,
+                    :candidate_instance_id, :event_id, :event_type, :source_status,
+                    :block_reason, :block_reason_codes_json, :base_time, :base_price,
+                    :price_1m, :price_3m, :price_5m, :price_10m,
+                    :price_close_or_last, :return_1m_pct, :return_3m_pct,
+                    :return_5m_pct, :return_10m_pct, :return_close_or_last_pct,
+                    :outcome_label, :confidence, :confidence_reason,
+                    :recommendation_ko, :payload_json
+                )
+                """,
+                normalized,
+            )
+        return cursor.rowcount == 1
+
+    def save_postmarket_review_items(self, items: list[dict]) -> dict:
+        inserted = 0
+        duplicate = 0
+        rejected = 0
+        for item in items or []:
+            try:
+                if self.save_postmarket_review_item(item):
+                    inserted += 1
+                else:
+                    duplicate += 1
+            except (TypeError, ValueError, sqlite3.Error):
+                rejected += 1
+        return {"inserted_count": inserted, "duplicate_count": duplicate, "rejected_count": rejected}
+
+    def list_postmarket_review_items(
+        self,
+        trade_date: str,
+        *,
+        review_scope: str | None = None,
+        outcome_label: str | None = None,
+        event_type: str | None = None,
+        symbol: str | None = None,
+        primary_theme: str | None = None,
+        min_return_5m_pct: float | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[dict]:
+        where = ["trade_date = ?"]
+        params: list[object] = [str(trade_date or "")]
+        if review_scope:
+            where.append("review_scope = ?")
+            params.append(str(review_scope).lower())
+        if outcome_label:
+            where.append("outcome_label = ?")
+            params.append(str(outcome_label).upper())
+        if event_type:
+            where.append("event_type = ?")
+            params.append(str(event_type).upper())
+        if symbol:
+            where.append("symbol = ?")
+            params.append(str(symbol))
+        if primary_theme:
+            where.append("primary_theme = ?")
+            params.append(str(primary_theme))
+        if min_return_5m_pct is not None:
+            where.append("return_5m_pct >= ?")
+            params.append(float(min_return_5m_pct))
+        normalized_limit = max(1, min(1000, int(limit or 200)))
+        normalized_offset = max(0, int(offset or 0))
+        params.extend([normalized_limit, normalized_offset])
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM dashboard_postmarket_reviews
+            WHERE {" AND ".join(where)}
+            ORDER BY generated_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            params,
+        ).fetchall()
+        return [_postmarket_review_row_to_dict(row) for row in rows]
+
+    def summarize_postmarket_reviews(self, trade_date: str) -> dict:
+        items = self.list_postmarket_review_items(trade_date, limit=1000)
+        outcome_counts = Counter(str(item.get("outcome_label") or "").upper() for item in items)
+        type_counts = Counter(str(item.get("event_type") or "") for item in items if item.get("event_type"))
+        reason_counts = Counter(str(item.get("block_reason") or "") for item in items if item.get("block_reason"))
+        symbol_counts = Counter(str(item.get("symbol") or "") for item in items if item.get("symbol"))
+        theme_counts = Counter(str(item.get("primary_theme") or "") for item in items if item.get("primary_theme"))
+        return {
+            "trade_date": str(trade_date or ""),
+            "total_count": len(items),
+            "ready_count": type_counts.get("BUY_READY_NEW", 0),
+            "ready_small_count": type_counts.get("BUY_READY_SMALL_NEW", 0),
+            "ready_without_order_count": sum(
+                1
+                for item in items
+                if str(item.get("event_type") or "").upper() in {"BUY_READY_NEW", "BUY_READY_SMALL_NEW", "READY_BUT_LIVE_BLOCKED"}
+                and not bool((item.get("payload") or {}).get("has_order"))
+            ),
+            "ready_but_live_blocked_count": type_counts.get("READY_BUT_LIVE_BLOCKED", 0),
+            "order_intent_created_count": type_counts.get("ORDER_INTENT_CREATED", 0),
+            "virtual_order_created_count": type_counts.get("VIRTUAL_ORDER_CREATED", 0),
+            "data_wait_count": type_counts.get("DATA_QUALITY_DEGRADED", 0) + type_counts.get("SNAPSHOT_STALE", 0),
+            "market_wait_count": type_counts.get("MARKET_WAIT_STARTED", 0),
+            "chase_blocked_count": type_counts.get("CHASE_RISK_BLOCKED", 0),
+            "late_chase_temp_wait_count": type_counts.get("LATE_CHASE_TEMP_WAIT", 0),
+            "observe_count": type_counts.get("READY_TO_WAIT", 0),
+            "blocked_count": sum(
+                type_counts.get(event_type, 0)
+                for event_type in {
+                    "READY_TO_WAIT",
+                    "MARKET_WAIT_STARTED",
+                    "DATA_QUALITY_DEGRADED",
+                    "SNAPSHOT_STALE",
+                    "GATEWAY_DISCONNECTED",
+                    "CHASE_RISK_BLOCKED",
+                    "LATE_CHASE_TEMP_WAIT",
+                }
+            ),
+            "missed_opportunity_count": outcome_counts.get("MISSED_OPPORTUNITY", 0),
+            "good_block_count": outcome_counts.get("GOOD_BLOCK", 0),
+            "review_needed_count": outcome_counts.get("REVIEW_NEEDED", 0),
+            "protected_from_chase_count": outcome_counts.get("PROTECTED_FROM_CHASE", 0),
+            "protected_from_loss_count": outcome_counts.get("PROTECTED_FROM_CHASE", 0) + outcome_counts.get("GOOD_BLOCK", 0),
+            "data_insufficient_count": outcome_counts.get("DATA_INSUFFICIENT", 0),
+            "uncertain_block_count": outcome_counts.get("REVIEW_NEEDED", 0) + outcome_counts.get("DATA_INSUFFICIENT", 0),
+            "neutral_count": outcome_counts.get("NEUTRAL", 0),
+            "by_outcome_label": dict(outcome_counts),
+            "by_event_type": dict(type_counts),
+            "by_block_reason": [{"block_reason": reason, "count": count} for reason, count in reason_counts.most_common(20)],
+            "by_symbol": [{"symbol": symbol, "count": count} for symbol, count in symbol_counts.most_common(20)],
+            "by_theme": [{"primary_theme": theme, "count": count} for theme, count in theme_counts.most_common(20)],
+            "top_missed_opportunities": _top_postmarket_items(items, "MISSED_OPPORTUNITY"),
+            "top_good_blocks": _top_postmarket_items(items, "GOOD_BLOCK"),
+            "top_review_needed": _top_postmarket_items(items, "REVIEW_NEEDED"),
+        }
+
+    def delete_postmarket_reviews_for_date(self, trade_date: str, review_scope: str | None = None) -> int:
+        where = ["trade_date = ?"]
+        params: list[object] = [str(trade_date or "")]
+        if review_scope:
+            where.append("review_scope = ?")
+            params.append(str(review_scope).lower())
+        with self.conn:
+            cursor = self.conn.execute(
+                f"DELETE FROM dashboard_postmarket_reviews WHERE {' AND '.join(where)}",
+                params,
+            )
+        return cursor.rowcount
+
+    def rebuild_postmarket_reviews(self, trade_date: str, review_scope: str = "postmarket") -> dict:
+        from trading_app.dashboard_postmarket_review import build_postmarket_review
+
+        report = build_postmarket_review(self, trade_date=trade_date, review_scope=review_scope)
+        result = self.save_postmarket_review_items(list(report.get("items") or []))
+        return {**report, **result}
 
     def upsert_market_side_confirmation_state(self, payload: dict) -> dict:
         normalized = _market_side_confirmation_state_params(payload)
@@ -4769,6 +7249,958 @@ def _default_review_key(review: TradeReview) -> str:
     return f"{review.gate_result_key}:{status}:{review.virtual_order_id or ''}:{review.virtual_position_id or ''}"
 
 
+def _gateway_price_tick_params(payload: dict) -> dict:
+    raw_payload = payload.get("raw_payload") if isinstance(payload.get("raw_payload"), dict) else payload
+    metadata = raw_payload.get("metadata") if isinstance(raw_payload.get("metadata"), dict) else {}
+    timestamp = str(payload.get("timestamp") or raw_payload.get("timestamp") or payload.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+    received_at = str(payload.get("received_at") or payload.get("created_at") or timestamp)
+    source = str(payload.get("source") or raw_payload.get("source") or "")
+    trace = raw_payload.get("_transport_trace") if isinstance(raw_payload.get("_transport_trace"), dict) else {}
+    transport_mode = str(payload.get("transport_mode") or raw_payload.get("transport_mode") or trace.get("transport_mode") or "")
+    return {
+        "event_id": str(payload.get("event_id") or raw_payload.get("event_id") or ""),
+        "trade_date": str(payload.get("trade_date") or _trade_date_from_timestamp(timestamp) or ""),
+        "timestamp": timestamp,
+        "received_at": received_at,
+        "code": _clean_stock_code(payload.get("code") or raw_payload.get("code")),
+        "name": str(payload.get("name") or raw_payload.get("name") or ""),
+        "price": _nullable_float(payload.get("price") if "price" in payload else raw_payload.get("price")),
+        "change_rate": _nullable_float(payload.get("change_rate") if "change_rate" in payload else raw_payload.get("change_rate")),
+        "cum_volume": _nullable_float(
+            payload.get("cum_volume")
+            if "cum_volume" in payload
+            else raw_payload.get("cum_volume", raw_payload.get("volume"))
+        ),
+        "trade_value": _nullable_float(payload.get("trade_value") if "trade_value" in payload else raw_payload.get("trade_value")),
+        "execution_strength": _nullable_float(
+            payload.get("execution_strength") if "execution_strength" in payload else raw_payload.get("execution_strength")
+        ),
+        "best_bid": _nullable_float(payload.get("best_bid") if "best_bid" in payload else raw_payload.get("best_bid")),
+        "best_ask": _nullable_float(payload.get("best_ask") if "best_ask" in payload else raw_payload.get("best_ask")),
+        "spread_ticks": _nullable_int(payload.get("spread_ticks") if "spread_ticks" in payload else raw_payload.get("spread_ticks")),
+        "source": source,
+        "transport_mode": transport_mode,
+        "instrument_type": str(payload.get("instrument_type") or raw_payload.get("instrument_type") or ""),
+        "trade_time": str(payload.get("trade_time") or raw_payload.get("trade_time") or ""),
+        "day_high": _nullable_float(payload.get("day_high") if "day_high" in payload else raw_payload.get("day_high")),
+        "day_low": _nullable_float(payload.get("day_low") if "day_low" in payload else raw_payload.get("day_low")),
+        "raw_payload_json": _json_payload(_redact_sensitive_payload(raw_payload)),
+        "metadata_json": _json_payload(_redact_sensitive_payload(metadata)),
+        "created_at": str(payload.get("created_at") or received_at),
+    }
+
+
+def _strategy_decision_event_params(payload: dict) -> dict:
+    now = str(payload.get("created_at") or payload.get("decision_at") or datetime.now().isoformat(timespec="seconds"))
+    decision_at = str(payload.get("decision_at") or now)
+    return {
+        "decision_id": str(payload.get("decision_id") or f"decision:{uuid4().hex}"),
+        "runtime_cycle_id": str(payload.get("runtime_cycle_id") or payload.get("cycle_id") or ""),
+        "trade_date": str(payload.get("trade_date") or _trade_date_from_timestamp(decision_at) or ""),
+        "created_at": now,
+        "decision_at": decision_at,
+        "candidate_id": _nullable_int(payload.get("candidate_id")),
+        "candidate_instance_id": str(payload.get("candidate_instance_id") or ""),
+        "candidate_generation_seq": int(payload.get("candidate_generation_seq") or 0),
+        "code": _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+        "name": str(payload.get("name") or ""),
+        "theme_name": str(payload.get("theme_name") or ""),
+        "strategy_name": str(payload.get("strategy_name") or ""),
+        "strategy_version": str(payload.get("strategy_version") or ""),
+        "config_hash": str(payload.get("config_hash") or ""),
+        "gate_status": str(payload.get("gate_status") or ""),
+        "gate_reason": str(payload.get("gate_reason") or ""),
+        "reason_status": str(payload.get("reason_status") or ""),
+        "reason_family": str(payload.get("reason_family") or ""),
+        "reason_codes_json": _json_list(payload.get("reason_codes_json", payload.get("reason_codes", []))),
+        "block_type": str(payload.get("block_type") or ""),
+        "action_type": str(payload.get("action_type") or ""),
+        "action_result": str(payload.get("action_result") or ""),
+        "price": _nullable_float(payload.get("price")),
+        "change_rate": _nullable_float(payload.get("change_rate")),
+        "trade_value": _nullable_float(payload.get("trade_value")),
+        "execution_strength": _nullable_float(payload.get("execution_strength")),
+        "vwap": _nullable_float(payload.get("vwap")),
+        "momentum_1m": _nullable_float(payload.get("momentum_1m")),
+        "momentum_3m": _nullable_float(payload.get("momentum_3m")),
+        "momentum_5m": _nullable_float(payload.get("momentum_5m")),
+        "gate_score": _nullable_float(payload.get("gate_score")),
+        "hybrid_score": _nullable_float(payload.get("hybrid_score")),
+        "theme_score": _nullable_float(payload.get("theme_score")),
+        "data_status": str(payload.get("data_status") or ""),
+        "data_quality_issues_json": _json_list(payload.get("data_quality_issues_json", payload.get("data_quality_issues", []))),
+        "order_intent_id": str(payload.get("order_intent_id") or payload.get("intent_id") or ""),
+        "entry_plan_id": _nullable_int(payload.get("entry_plan_id")),
+        "virtual_order_id": _nullable_int(payload.get("virtual_order_id")),
+        "virtual_position_id": _nullable_int(payload.get("virtual_position_id")),
+        "exit_decision_id": _nullable_int(payload.get("exit_decision_id")),
+        "details_json": _json_payload(_sanitize_decision_details(payload.get("details_json", payload.get("details", {})))),
+    }
+
+
+def _strategy_decision_event_filters(
+    *,
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    theme_name: Optional[str] = None,
+    gate_status: Optional[str] = None,
+    action_type: Optional[str] = None,
+    action_result: Optional[str] = None,
+    reason_status: Optional[str] = None,
+    reason_family: Optional[str] = None,
+    window_sec: Optional[int] = None,
+) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if trade_date:
+        clauses.append("trade_date = ?")
+        params.append(str(trade_date))
+    if code:
+        clauses.append("code = ?")
+        params.append(_clean_stock_code(code) or str(code))
+    if theme_name:
+        clauses.append("theme_name = ?")
+        params.append(str(theme_name))
+    if gate_status:
+        clauses.append("gate_status = ?")
+        params.append(str(gate_status))
+    if action_type:
+        clauses.append("action_type = ?")
+        params.append(str(action_type))
+    if action_result:
+        clauses.append("action_result = ?")
+        params.append(str(action_result))
+    if reason_status:
+        clauses.append("reason_status = ?")
+        params.append(str(reason_status))
+    if reason_family:
+        clauses.append("reason_family = ?")
+        params.append(str(reason_family))
+    if window_sec is not None:
+        clauses.append("julianday(replace(substr(decision_at, 1, 19), 'T', ' ')) >= julianday('now', ?)")
+        params.append(f"-{max(1, int(window_sec or 1))} seconds")
+    return clauses, params
+
+
+def _row_to_strategy_decision_event(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["reason_codes"] = _safe_json_loads(data.get("reason_codes_json"), [])
+    data["data_quality_issues"] = _safe_json_loads(data.get("data_quality_issues_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    return data
+
+
+def _strategy_decision_outcome_params(outcome: dict) -> dict:
+    now = datetime.now().isoformat(timespec="seconds")
+    decision_id = str(outcome.get("decision_id") or "").strip()
+    horizon_sec = max(0, int(outcome.get("horizon_sec") or 0))
+    outcome_id = str(outcome.get("outcome_id") or f"outcome:{decision_id}:{horizon_sec}").strip()
+    details = _sanitize_decision_details(outcome.get("details", outcome.get("details_json", {})))
+    return {
+        "outcome_id": outcome_id,
+        "decision_id": decision_id,
+        "trade_date": str(outcome.get("trade_date") or ""),
+        "code": _clean_stock_code(outcome.get("code")) or str(outcome.get("code") or ""),
+        "candidate_id": _nullable_int(outcome.get("candidate_id")),
+        "candidate_instance_id": str(outcome.get("candidate_instance_id") or ""),
+        "candidate_generation_seq": int(outcome.get("candidate_generation_seq") or 0),
+        "decision_at": str(outcome.get("decision_at") or ""),
+        "evaluated_at": str(outcome.get("evaluated_at") or now),
+        "horizon_sec": horizon_sec,
+        "price_at_decision": _nullable_float(outcome.get("price_at_decision")),
+        "price_at_horizon": _nullable_float(outcome.get("price_at_horizon")),
+        "max_price_after_decision": _nullable_float(outcome.get("max_price_after_decision")),
+        "min_price_after_decision": _nullable_float(outcome.get("min_price_after_decision")),
+        "max_return_pct": _nullable_float(outcome.get("max_return_pct")),
+        "max_drawdown_pct": _nullable_float(outcome.get("max_drawdown_pct")),
+        "current_return_pct": _nullable_float(outcome.get("current_return_pct")),
+        "outcome_label": str(outcome.get("outcome_label") or ""),
+        "outcome_reason": str(outcome.get("outcome_reason") or ""),
+        "label_confidence": _nullable_float(outcome.get("label_confidence")),
+        "data_status": str(outcome.get("data_status") or ""),
+        "data_quality_issues_json": _json_list(outcome.get("data_quality_issues", outcome.get("data_quality_issues_json", []))),
+        "source": str(outcome.get("source") or ""),
+        "details_json": _json_payload(details),
+        "created_at": str(outcome.get("created_at") or now),
+        "updated_at": str(outcome.get("updated_at") or now),
+    }
+
+
+def _strategy_decision_outcome_filters(
+    *,
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    outcome_label: Optional[str] = None,
+    action_type: Optional[str] = None,
+    gate_status: Optional[str] = None,
+    reason_family: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    horizon_sec: Optional[int] = None,
+    min_max_return_pct: Optional[float] = None,
+    max_drawdown_pct: Optional[float] = None,
+    window_sec: Optional[int] = None,
+) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if trade_date:
+        clauses.append("o.trade_date = ?")
+        params.append(str(trade_date))
+    if code:
+        clauses.append("o.code = ?")
+        params.append(_clean_stock_code(code) or str(code))
+    if outcome_label:
+        clauses.append("o.outcome_label = ?")
+        params.append(str(outcome_label).upper())
+    if action_type:
+        clauses.append("d.action_type = ?")
+        params.append(str(action_type).upper())
+    if gate_status:
+        clauses.append("d.gate_status = ?")
+        params.append(str(gate_status).upper())
+    if reason_family:
+        clauses.append("d.reason_family = ?")
+        params.append(str(reason_family))
+    if reason_code:
+        clauses.append("d.reason_codes_json LIKE ?")
+        params.append(f"%{str(reason_code)}%")
+    if horizon_sec is not None:
+        clauses.append("o.horizon_sec = ?")
+        params.append(max(1, int(horizon_sec or 1)))
+    if min_max_return_pct is not None:
+        clauses.append("o.max_return_pct >= ?")
+        params.append(float(min_max_return_pct))
+    if max_drawdown_pct is not None:
+        clauses.append("o.max_drawdown_pct <= ?")
+        params.append(float(max_drawdown_pct))
+    if window_sec is not None:
+        clauses.append("julianday(replace(substr(o.evaluated_at, 1, 19), 'T', ' ')) >= julianday('now', ?)")
+        params.append(f"-{max(1, int(window_sec or 1))} seconds")
+    return clauses, params
+
+
+def _row_to_strategy_decision_outcome(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["data_quality_issues"] = _safe_json_loads(data.get("data_quality_issues_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    data["name"] = data.pop("decision_name", "") if "decision_name" in data else ""
+    data["theme_name"] = data.pop("decision_theme_name", "") if "decision_theme_name" in data else ""
+    data["strategy_name"] = data.pop("decision_strategy_name", "") if "decision_strategy_name" in data else ""
+    data["gate_status"] = data.pop("decision_gate_status", "") if "decision_gate_status" in data else ""
+    data["gate_reason"] = data.pop("decision_gate_reason", "") if "decision_gate_reason" in data else ""
+    data["reason_status"] = data.pop("decision_reason_status", "") if "decision_reason_status" in data else ""
+    data["reason_family"] = data.pop("decision_reason_family", "") if "decision_reason_family" in data else ""
+    reason_codes_json = data.pop("decision_reason_codes_json", "[]") if "decision_reason_codes_json" in data else "[]"
+    data["reason_codes"] = _safe_json_loads(reason_codes_json, [])
+    data["action_type"] = data.pop("decision_action_type", "") if "decision_action_type" in data else ""
+    data["action_result"] = data.pop("decision_action_result", "") if "decision_action_result" in data else ""
+    data["order_intent_id"] = data.pop("decision_order_intent_id", "") if "decision_order_intent_id" in data else ""
+    data["virtual_order_id"] = data.pop("decision_virtual_order_id", None) if "decision_virtual_order_id" in data else None
+    data["virtual_position_id"] = (
+        data.pop("decision_virtual_position_id", None) if "decision_virtual_position_id" in data else None
+    )
+    data["exit_decision_id"] = data.pop("decision_exit_decision_id", None) if "decision_exit_decision_id" in data else None
+    return data
+
+
+def _strategy_decision_summary(events: list[dict], *, trade_date: str = "", window_sec: Optional[int] = None) -> dict:
+    def key(event: dict) -> str:
+        return str(
+            event.get("candidate_instance_id")
+            or event.get("candidate_id")
+            or event.get("code")
+            or event.get("decision_id")
+            or ""
+        )
+
+    by_action: dict[str, set[str]] = {
+        "detected": set(),
+        "evaluated": set(),
+        "ready": set(),
+        "wait": set(),
+        "blocked": set(),
+        "entry_plan": set(),
+        "order_intent": set(),
+        "open_position": set(),
+        "exit_decision": set(),
+    }
+    ready_keys: set[str] = set()
+    order_any_keys: set[str] = set()
+    block_reasons: Counter[str] = Counter()
+    wait_reasons: Counter[str] = Counter()
+    data_quality: Counter[str] = Counter()
+    major_reasons: Counter[str] = Counter()
+    order_rejected_count = 0
+    exit_decision_count = 0
+
+    for event in events:
+        event_key = key(event)
+        if event_key:
+            by_action["detected"].add(event_key)
+        action_type = str(event.get("action_type") or "")
+        action_result = str(event.get("action_result") or "")
+        gate_status = str(event.get("gate_status") or "")
+        if action_type == "EVALUATE":
+            by_action["evaluated"].add(event_key)
+        if action_type == "READY" or gate_status == "READY":
+            by_action["ready"].add(event_key)
+            ready_keys.add(event_key)
+        if action_type == "WAIT" or gate_status == "WAIT":
+            by_action["wait"].add(event_key)
+        if action_type == "BLOCK" or gate_status == "BLOCKED":
+            by_action["blocked"].add(event_key)
+        if action_type == "ENTRY_PLAN" and action_result == "ACCEPTED":
+            by_action["entry_plan"].add(event_key)
+        if action_type == "ENTRY_ORDER_INTENT":
+            order_any_keys.add(event_key)
+            if action_result in {"ACCEPTED", "DUPLICATE"}:
+                by_action["order_intent"].add(event_key)
+            if action_result == "REJECTED":
+                order_rejected_count += 1
+        if action_type == "HOLD" and event.get("virtual_position_id") is not None:
+            by_action["open_position"].add(event_key)
+        if action_type == "EXIT_DECISION":
+            by_action["exit_decision"].add(event_key)
+            exit_decision_count += 1
+
+        reason_codes = [str(reason) for reason in event.get("reason_codes") or [] if str(reason)]
+        major_reasons.update(_major_reason_keys(reason_codes))
+        if action_type == "BLOCK" or gate_status == "BLOCKED":
+            block_reasons.update(reason_codes or [str(event.get("gate_reason") or "UNKNOWN")])
+        if action_type == "WAIT" or gate_status == "WAIT":
+            wait_reasons.update(reason_codes or [str(event.get("gate_reason") or "UNKNOWN")])
+        data_quality.update(str(issue) for issue in event.get("data_quality_issues") or [] if str(issue))
+
+    return {
+        "trade_date": trade_date,
+        "window_sec": window_sec,
+        "event_count": len(events),
+        "funnel": {name: len(values) for name, values in by_action.items()},
+        "top_block_reasons": _counter_rows(block_reasons),
+        "top_wait_reasons": _counter_rows(wait_reasons),
+        "top_data_quality_issues": _counter_rows(data_quality),
+        "major_reason_distribution": _counter_rows(major_reasons, limit=20),
+        "ready_without_order_count": len(ready_keys - order_any_keys),
+        "order_rejected_count": order_rejected_count,
+        "exit_decision_count": exit_decision_count,
+    }
+
+
+def _strategy_decision_outcome_summary(
+    items: list[dict],
+    *,
+    trade_date: str = "",
+    window_sec: Optional[int] = None,
+    horizon_sec: Optional[int] = None,
+) -> dict:
+    by_label: Counter[str] = Counter()
+    by_action: Counter[str] = Counter()
+    by_gate: Counter[str] = Counter()
+    by_reason: Counter[str] = Counter()
+    data_quality: Counter[str] = Counter()
+    opportunity_loss_reasons: Counter[str] = Counter()
+    false_positive_reasons: Counter[str] = Counter()
+    effective_risk_reasons: Counter[str] = Counter()
+    decision_ids: set[str] = set()
+    ready_count = 0
+    insufficient_count = 0
+    for item in items:
+        decision_id = str(item.get("decision_id") or "")
+        if decision_id:
+            decision_ids.add(decision_id)
+        label = str(item.get("outcome_label") or "UNKNOWN")
+        by_label[label] += 1
+        action_type = str(item.get("action_type") or "")
+        gate_status = str(item.get("gate_status") or "")
+        if action_type:
+            by_action[action_type] += 1
+        if gate_status:
+            by_gate[gate_status] += 1
+        if gate_status == "READY" or action_type in {"READY", "ENTRY_ORDER_INTENT"}:
+            ready_count += 1
+        if label == "INSUFFICIENT_OUTCOME_DATA" or str(item.get("data_status") or "").upper() == "INSUFFICIENT":
+            insufficient_count += 1
+        reason_codes = [str(reason) for reason in item.get("reason_codes") or [] if str(reason)]
+        by_reason.update(reason_codes)
+        data_quality.update(str(issue) for issue in item.get("data_quality_issues") or [] if str(issue))
+        if "OPPORTUNITY_LOSS" in label:
+            opportunity_loss_reasons.update(reason_codes or [str(item.get("gate_reason") or "UNKNOWN")])
+        if label in {"EARLY_FALSE_POSITIVE", "ENTRY_TOO_EARLY_CANDIDATE"}:
+            false_positive_reasons.update(reason_codes or [str(item.get("gate_reason") or "UNKNOWN")])
+        if label == "RISK_BLOCK_EFFECTIVE":
+            effective_risk_reasons.update(reason_codes or [str(item.get("gate_reason") or "UNKNOWN")])
+    return {
+        "trade_date": trade_date,
+        "window_sec": window_sec,
+        "horizon_sec": horizon_sec,
+        "total_decisions": len(decision_ids),
+        "outcome_count": len(items),
+        "labeled_count": max(0, len(items) - insufficient_count),
+        "insufficient_count": insufficient_count,
+        "by_label": dict(by_label),
+        "by_action_type": dict(by_action),
+        "by_gate_status": dict(by_gate),
+        "by_reason_code": dict(by_reason),
+        "top_opportunity_loss_reasons": _counter_rows(opportunity_loss_reasons),
+        "top_false_positive_reasons": _counter_rows(false_positive_reasons),
+        "top_effective_risk_blocks": _counter_rows(effective_risk_reasons),
+        "ready_count": ready_count,
+        "early_true_positive_count": by_label.get("EARLY_TRUE_POSITIVE", 0),
+        "early_false_positive_count": by_label.get("EARLY_FALSE_POSITIVE", 0),
+        "wait_block_opportunity_loss_count": by_label.get("EARLY_OPPORTUNITY_LOSS", 0)
+        + by_label.get("RISK_BLOCK_OPPORTUNITY_LOSS", 0),
+        "exit_too_late_count": by_label.get("EXIT_TOO_LATE_CANDIDATE", 0),
+        "exit_too_early_count": by_label.get("EXIT_TOO_EARLY_CANDIDATE", 0),
+        "data_quality_issues": _counter_rows(data_quality),
+    }
+
+
+def _shadow_strategy_evaluation_params(evaluation: dict) -> dict:
+    now = datetime.now().isoformat(timespec="seconds")
+    decision_id = str(evaluation.get("decision_id") or "").strip()
+    policy_id = str(evaluation.get("policy_id") or "").strip()
+    evaluation_id = str(evaluation.get("evaluation_id") or f"shadow:{decision_id}:{policy_id}").strip()
+    details = _sanitize_decision_details(evaluation.get("details_json", evaluation.get("details", {})))
+    return {
+        "evaluation_id": evaluation_id,
+        "trade_date": str(evaluation.get("trade_date") or ""),
+        "evaluated_at": str(evaluation.get("evaluated_at") or now),
+        "runtime_cycle_id": str(evaluation.get("runtime_cycle_id") or evaluation.get("cycle_id") or ""),
+        "decision_id": decision_id,
+        "policy_id": policy_id,
+        "policy_name": str(evaluation.get("policy_name") or ""),
+        "candidate_id": _nullable_int(evaluation.get("candidate_id")),
+        "candidate_instance_id": str(evaluation.get("candidate_instance_id") or ""),
+        "candidate_generation_seq": int(evaluation.get("candidate_generation_seq") or 0),
+        "code": _clean_stock_code(evaluation.get("code")) or str(evaluation.get("code") or ""),
+        "name": str(evaluation.get("name") or ""),
+        "theme_name": str(evaluation.get("theme_name") or ""),
+        "baseline_gate_status": str(evaluation.get("baseline_gate_status") or ""),
+        "baseline_action_type": str(evaluation.get("baseline_action_type") or ""),
+        "baseline_reason_codes_json": _json_list(
+            evaluation.get("baseline_reason_codes_json", evaluation.get("baseline_reason_codes", []))
+        ),
+        "shadow_gate_status": str(evaluation.get("shadow_gate_status") or ""),
+        "shadow_action_type": str(evaluation.get("shadow_action_type") or ""),
+        "shadow_reason_codes_json": _json_list(
+            evaluation.get("shadow_reason_codes_json", evaluation.get("shadow_reason_codes", []))
+        ),
+        "baseline_score": _nullable_float(evaluation.get("baseline_score")),
+        "shadow_score": _nullable_float(evaluation.get("shadow_score")),
+        "baseline_position_size_multiplier": _nullable_float(evaluation.get("baseline_position_size_multiplier")),
+        "shadow_position_size_multiplier": _nullable_float(evaluation.get("shadow_position_size_multiplier")),
+        "changed_decision": 1 if bool(evaluation.get("changed_decision")) else 0,
+        "change_type": str(evaluation.get("change_type") or ""),
+        "expected_effect": str(evaluation.get("expected_effect") or ""),
+        "expected_risk": str(evaluation.get("expected_risk") or ""),
+        "data_status": str(evaluation.get("data_status") or ""),
+        "data_quality_issues_json": _json_list(
+            evaluation.get("data_quality_issues_json", evaluation.get("data_quality_issues", []))
+        ),
+        "details_json": _json_payload(details),
+        "created_at": str(evaluation.get("created_at") or now),
+        "updated_at": str(evaluation.get("updated_at") or now),
+    }
+
+
+def _shadow_strategy_evaluation_filters(
+    *,
+    trade_date: Optional[str] = None,
+    policy_id: Optional[str] = None,
+    code: Optional[str] = None,
+    theme_name: Optional[str] = None,
+    baseline_gate_status: Optional[str] = None,
+    shadow_gate_status: Optional[str] = None,
+    change_type: Optional[str] = None,
+    changed_decision: Optional[bool] = None,
+    outcome_label: Optional[str] = None,
+    expected_risk: Optional[str] = None,
+    window_sec: Optional[int] = None,
+) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if trade_date:
+        clauses.append("e.trade_date = ?")
+        params.append(str(trade_date))
+    if policy_id:
+        clauses.append("e.policy_id = ?")
+        params.append(str(policy_id))
+    if code:
+        clauses.append("e.code = ?")
+        params.append(_clean_stock_code(code) or str(code))
+    if theme_name:
+        clauses.append("e.theme_name = ?")
+        params.append(str(theme_name))
+    if baseline_gate_status:
+        clauses.append("e.baseline_gate_status = ?")
+        params.append(str(baseline_gate_status).upper())
+    if shadow_gate_status:
+        clauses.append("e.shadow_gate_status = ?")
+        params.append(str(shadow_gate_status).upper())
+    if change_type:
+        clauses.append("e.change_type = ?")
+        params.append(str(change_type).upper())
+    if changed_decision is not None:
+        clauses.append("e.changed_decision = ?")
+        params.append(1 if bool(changed_decision) else 0)
+    if outcome_label:
+        clauses.append("o.outcome_label = ?")
+        params.append(str(outcome_label).upper())
+    if expected_risk:
+        clauses.append("e.expected_risk = ?")
+        params.append(str(expected_risk))
+    if window_sec is not None:
+        clauses.append("julianday(replace(substr(e.evaluated_at, 1, 19), 'T', ' ')) >= julianday('now', ?)")
+        params.append(f"-{max(1, int(window_sec or 1))} seconds")
+    return clauses, params
+
+
+def _shadow_strategy_outcome_join(horizon_sec: Optional[int]) -> tuple[str, list[object]]:
+    params: list[object] = []
+    horizon_clause = ""
+    if horizon_sec is not None:
+        horizon_clause = "AND oo.horizon_sec = ?"
+        params.append(max(1, int(horizon_sec or 1)))
+    return (
+        f"""
+        LEFT JOIN strategy_decision_outcomes o ON o.id = (
+            SELECT oo.id
+            FROM strategy_decision_outcomes oo
+            WHERE oo.decision_id = e.decision_id
+              {horizon_clause}
+            ORDER BY oo.horizon_sec DESC, oo.id DESC
+            LIMIT 1
+        )
+        """,
+        params,
+    )
+
+
+def _row_to_shadow_strategy_evaluation(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["baseline_reason_codes"] = _safe_json_loads(data.get("baseline_reason_codes_json"), [])
+    data["shadow_reason_codes"] = _safe_json_loads(data.get("shadow_reason_codes_json"), [])
+    data["data_quality_issues"] = _safe_json_loads(data.get("data_quality_issues_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    data["changed_decision"] = bool(data.get("changed_decision"))
+    outcome_issues = _safe_json_loads(data.pop("outcome_data_quality_issues_json", "[]"), [])
+    data["outcome"] = {
+        "label": data.pop("outcome_label", "") or "",
+        "horizon_sec": data.pop("outcome_horizon_sec", None),
+        "max_return_pct": data.pop("outcome_max_return_pct", None),
+        "max_drawdown_pct": data.pop("outcome_max_drawdown_pct", None),
+        "current_return_pct": data.pop("outcome_current_return_pct", None),
+        "label_confidence": data.pop("outcome_label_confidence", None),
+        "data_status": data.pop("outcome_data_status", "") or "",
+        "data_quality_issues": outcome_issues,
+    }
+    data["outcome_label"] = data["outcome"]["label"]
+    data["outcome_horizon_sec"] = data["outcome"]["horizon_sec"]
+    data["max_return_pct"] = data["outcome"]["max_return_pct"]
+    data["max_drawdown_pct"] = data["outcome"]["max_drawdown_pct"]
+    return data
+
+
+def _row_to_strategy_replay_run(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["warnings"] = _safe_json_loads(data.get("warnings_json"), [])
+    data["metadata"] = _safe_json_loads(data.get("metadata_json"), {})
+    return data
+
+
+def _row_to_strategy_replay_report(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["summary"] = _safe_json_loads(data.get("summary_json"), {})
+    data["funnel"] = _safe_json_loads(data.get("funnel_json"), {})
+    data["outcome_summary"] = _safe_json_loads(data.get("outcome_summary_json"), {})
+    data["shadow_summary"] = _safe_json_loads(data.get("shadow_summary_json"), {})
+    data["diff_summary"] = _safe_json_loads(data.get("diff_summary_json"), {})
+    data["recommendations"] = _safe_json_loads(data.get("recommendations_json"), [])
+    return data
+
+
+def _strategy_change_proposal_params(payload: dict) -> dict:
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "proposal_id": str(payload.get("proposal_id") or f"proposal:{uuid4().hex}"),
+        "trade_date": str(payload.get("trade_date") or ""),
+        "created_at": str(payload.get("created_at") or now),
+        "updated_at": str(payload.get("updated_at") or now),
+        "status": str(payload.get("status") or "DRAFT"),
+        "recommendation_grade": str(payload.get("recommendation_grade") or ""),
+        "title": str(payload.get("title") or ""),
+        "summary_ko": str(payload.get("summary_ko") or ""),
+        "category": str(payload.get("category") or ""),
+        "target_component": str(payload.get("target_component") or ""),
+        "source_type": str(payload.get("source_type") or ""),
+        "source_ids_json": _json_list(payload.get("source_ids_json", payload.get("source_ids", []))),
+        "baseline_config_hash": str(payload.get("baseline_config_hash") or ""),
+        "candidate_config_hash": str(payload.get("candidate_config_hash") or ""),
+        "baseline_config_snapshot_json": _json_payload(
+            _sanitize_decision_details(payload.get("baseline_config_snapshot_json", payload.get("baseline_config_snapshot", {})))
+        ),
+        "candidate_config_patch_json": _json_payload(
+            _sanitize_decision_details(payload.get("candidate_config_patch_json", payload.get("candidate_config_patch", {})))
+        ),
+        "expected_effect_ko": str(payload.get("expected_effect_ko") or ""),
+        "expected_risk_ko": str(payload.get("expected_risk_ko") or ""),
+        "confidence": _nullable_float(payload.get("confidence")),
+        "net_benefit_score": _nullable_float(payload.get("net_benefit_score")),
+        "guardrail_passed": 1 if bool(payload.get("guardrail_passed")) else 0,
+        "blocked_by_guardrail_reason": str(payload.get("blocked_by_guardrail_reason") or ""),
+        "data_quality_status": str(payload.get("data_quality_status") or ""),
+        "data_quality_issues_json": _json_list(payload.get("data_quality_issues_json", payload.get("data_quality_issues", []))),
+        "rollout_plan_json": _json_payload(payload.get("rollout_plan_json", payload.get("rollout_plan", {}))),
+        "rollback_plan_json": _json_payload(payload.get("rollback_plan_json", payload.get("rollback_plan", {}))),
+        "operator_note": str(payload.get("operator_note") or ""),
+        "expires_at": str(payload.get("expires_at") or ""),
+        "superseded_by_proposal_id": str(payload.get("superseded_by_proposal_id") or ""),
+    }
+
+
+def _strategy_change_proposal_filters(
+    *,
+    trade_date: Optional[str] = None,
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    recommendation_grade: Optional[str] = None,
+    source_type: Optional[str] = None,
+    target_component: Optional[str] = None,
+) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if trade_date:
+        clauses.append("trade_date = ?")
+        params.append(str(trade_date))
+    if status:
+        clauses.append("status = ?")
+        params.append(str(status))
+    if category:
+        clauses.append("category = ?")
+        params.append(str(category))
+    if recommendation_grade:
+        clauses.append("recommendation_grade = ?")
+        params.append(str(recommendation_grade))
+    if source_type:
+        clauses.append("source_type = ?")
+        params.append(str(source_type))
+    if target_component:
+        clauses.append("target_component = ?")
+        params.append(str(target_component))
+    return clauses, params
+
+
+def _row_to_strategy_change_proposal(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["source_ids"] = _safe_json_loads(data.get("source_ids_json"), [])
+    data["baseline_config_snapshot"] = _safe_json_loads(data.get("baseline_config_snapshot_json"), {})
+    data["candidate_config_patch"] = _safe_json_loads(data.get("candidate_config_patch_json"), {})
+    data["guardrail_passed"] = bool(data.get("guardrail_passed"))
+    data["data_quality_issues"] = _safe_json_loads(data.get("data_quality_issues_json"), [])
+    data["rollout_plan"] = _safe_json_loads(data.get("rollout_plan_json"), {})
+    data["rollback_plan"] = _safe_json_loads(data.get("rollback_plan_json"), {})
+    return data
+
+
+def _strategy_change_evidence_params(payload: dict) -> dict:
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "evidence_id": str(payload.get("evidence_id") or f"evidence:{uuid4().hex}"),
+        "proposal_id": str(payload.get("proposal_id") or ""),
+        "source_type": str(payload.get("source_type") or ""),
+        "source_id": str(payload.get("source_id") or ""),
+        "trade_date": str(payload.get("trade_date") or ""),
+        "metric_name": str(payload.get("metric_name") or ""),
+        "metric_value": _nullable_float(payload.get("metric_value")),
+        "metric_unit": str(payload.get("metric_unit") or ""),
+        "baseline_value": str(payload.get("baseline_value") if payload.get("baseline_value") is not None else ""),
+        "candidate_value": str(payload.get("candidate_value") if payload.get("candidate_value") is not None else ""),
+        "delta_value": _nullable_float(payload.get("delta_value")),
+        "sample_count": int(payload.get("sample_count") or 0),
+        "confidence": _nullable_float(payload.get("confidence")),
+        "evidence_payload_json": _json_payload(_sanitize_decision_details(payload.get("evidence_payload") or {})),
+        "created_at": str(payload.get("created_at") or now),
+    }
+
+
+def _row_to_strategy_change_evidence(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["evidence_payload"] = _safe_json_loads(data.get("evidence_payload_json"), {})
+    return data
+
+
+def _row_to_strategy_change_approval(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    return data
+
+
+def _group_count_map(rows: Iterable[sqlite3.Row]) -> dict[str, int]:
+    return {str(row["key"] or ""): int(row["count"] or 0) for row in rows if str(row["key"] or "")}
+
+
+def _strategy_change_proposal_summary(
+    proposals: list[dict],
+    *,
+    trade_date: str = "",
+    window_sec: Optional[int] = None,
+) -> dict:
+    by_status: Counter[str] = Counter()
+    by_grade: Counter[str] = Counter()
+    by_category: Counter[str] = Counter()
+    risky_count = 0
+    data_insufficient_count = 0
+    expiring_soon_count = 0
+    now = datetime.now()
+    for proposal in proposals:
+        status = str(proposal.get("status") or "")
+        grade = str(proposal.get("recommendation_grade") or "")
+        category = str(proposal.get("category") or "")
+        if status:
+            by_status[status] += 1
+        if grade:
+            by_grade[grade] += 1
+        if category:
+            by_category[category] += 1
+        if grade == "RISKY_CANDIDATE":
+            risky_count += 1
+        if grade == "DATA_INSUFFICIENT":
+            data_insufficient_count += 1
+        expires_at = str(proposal.get("expires_at") or "")
+        try:
+            if expires_at and datetime.fromisoformat(expires_at[:19]) <= now + timedelta(days=1):
+                expiring_soon_count += 1
+        except ValueError:
+            pass
+    top = sorted(
+        proposals,
+        key=lambda row: (
+            {"STRONG_CANDIDATE": 0, "WATCH_CANDIDATE": 1, "RISKY_CANDIDATE": 2, "DATA_INSUFFICIENT": 3}.get(
+                str(row.get("recommendation_grade") or ""),
+                4,
+            ),
+            -float(row.get("net_benefit_score") or 0),
+        ),
+    )[:10]
+    return {
+        "trade_date": trade_date,
+        "window_sec": window_sec,
+        "total_count": len(proposals),
+        "by_status": dict(by_status),
+        "by_grade": dict(by_grade),
+        "by_category": dict(by_category),
+        "top_recommendations": top,
+        "risky_count": risky_count,
+        "data_insufficient_count": data_insufficient_count,
+        "expiring_soon_count": expiring_soon_count,
+    }
+
+
+def _shadow_strategy_summary(
+    items: list[dict],
+    *,
+    trade_date: str = "",
+    window_sec: Optional[int] = None,
+    horizon_sec: Optional[int] = None,
+    policy_id: str = "",
+) -> dict:
+    by_policy: dict[str, dict] = {}
+    by_change_type: Counter[str] = Counter()
+    by_shadow_gate: Counter[str] = Counter()
+    by_outcome: Counter[str] = Counter()
+    data_quality: Counter[str] = Counter()
+    baseline_ready_count = 0
+    shadow_ready_count = 0
+    changed_count = 0
+    for item in items:
+        policy_key = str(item.get("policy_id") or "")
+        policy = by_policy.setdefault(
+            policy_key,
+            {
+                "policy_id": policy_key,
+                "policy_name": item.get("policy_name") or policy_key,
+                "label_ko": "",
+                "total_count": 0,
+                "changed_decision_count": 0,
+                "baseline_ready_count": 0,
+                "shadow_ready_count": 0,
+                "opportunity_loss_reduced_count": 0,
+                "false_positive_increase_count": 0,
+                "risk_block_effective_count": 0,
+                "exit_too_late_reduced_count": 0,
+                "exit_too_early_risk_count": 0,
+                "insufficient_count": 0,
+            },
+        )
+        policy["total_count"] += 1
+        if _is_ready_like(item.get("baseline_gate_status")) or str(item.get("baseline_action_type") or "") == "ENTRY_ORDER_INTENT":
+            baseline_ready_count += 1
+            policy["baseline_ready_count"] += 1
+        if _is_ready_like(item.get("shadow_gate_status")) or str(item.get("shadow_action_type") or "") == "SHADOW_ENTRY_CANDIDATE":
+            shadow_ready_count += 1
+            policy["shadow_ready_count"] += 1
+        if bool(item.get("changed_decision")):
+            changed_count += 1
+            policy["changed_decision_count"] += 1
+        change_type = str(item.get("change_type") or "NO_CHANGE")
+        shadow_gate = str(item.get("shadow_gate_status") or "")
+        outcome_label = str(item.get("outcome_label") or "PENDING")
+        by_change_type[change_type] += 1
+        if shadow_gate:
+            by_shadow_gate[shadow_gate] += 1
+        by_outcome[outcome_label] += 1
+        data_quality.update(str(issue) for issue in item.get("data_quality_issues") or [] if str(issue))
+        data_quality.update(str(issue) for issue in (item.get("outcome") or {}).get("data_quality_issues") or [] if str(issue))
+        _apply_shadow_policy_counters(policy, item, outcome_label)
+
+    ranking = []
+    for policy in by_policy.values():
+        policy["ready_delta"] = int(policy["shadow_ready_count"] or 0) - int(policy["baseline_ready_count"] or 0)
+        policy["estimated_net_benefit_score"] = _shadow_policy_score(policy)
+        policy["confidence"] = _shadow_policy_confidence(policy)
+        policy["recommendation_grade"] = _shadow_policy_grade(policy)
+        ranking.append(policy)
+    ranking.sort(key=lambda row: (float(row.get("estimated_net_benefit_score") or 0.0), int(row.get("changed_decision_count") or 0)), reverse=True)
+    return {
+        "trade_date": trade_date,
+        "window_sec": window_sec,
+        "horizon_sec": horizon_sec,
+        "policy_id": policy_id,
+        "total_evaluations": len(items),
+        "changed_decision_count": changed_count,
+        "by_policy": {key: value["total_count"] for key, value in by_policy.items()},
+        "by_change_type": dict(by_change_type),
+        "by_shadow_gate_status": dict(by_shadow_gate),
+        "by_outcome_label": dict(by_outcome),
+        "policy_ranking": ranking,
+        "baseline_ready_count": baseline_ready_count,
+        "shadow_ready_count": shadow_ready_count,
+        "ready_delta": shadow_ready_count - baseline_ready_count,
+        "estimated_opportunity_loss_reduced_count": sum(int(row.get("opportunity_loss_reduced_count") or 0) for row in ranking),
+        "estimated_false_positive_increase_count": sum(int(row.get("false_positive_increase_count") or 0) for row in ranking),
+        "estimated_risk_block_effective_count": sum(int(row.get("risk_block_effective_count") or 0) for row in ranking),
+        "estimated_exit_too_late_reduced_count": sum(int(row.get("exit_too_late_reduced_count") or 0) for row in ranking),
+        "data_quality_issues": _counter_rows(data_quality),
+        "recommendation_cards": ranking[:5],
+        "disclaimer_ko": "Shadow 결과는 장중 진단용이며 실제 전략 설정에 자동 적용되지 않습니다.",
+    }
+
+
+def _apply_shadow_policy_counters(policy: dict, item: dict, outcome_label: str) -> None:
+    change_type = str(item.get("change_type") or "")
+    expected_effect = str(item.get("expected_effect") or "")
+    if outcome_label in {"INSUFFICIENT_OUTCOME_DATA", "PENDING", ""}:
+        policy["insufficient_count"] += 1
+    if change_type in {"WAIT_TO_READY", "BLOCK_TO_READY"}:
+        if "OPPORTUNITY_LOSS" in outcome_label or outcome_label == "EARLY_TRUE_POSITIVE":
+            policy["opportunity_loss_reduced_count"] += 1
+        if outcome_label in {"EARLY_FALSE_POSITIVE", "ENTRY_TOO_EARLY_CANDIDATE"}:
+            policy["false_positive_increase_count"] += 1
+    if change_type == "READY_TO_BLOCK":
+        if outcome_label in {"RISK_BLOCK_EFFECTIVE", "GOOD_BLOCK", "TRUE_NEGATIVE", "EARLY_FALSE_POSITIVE", "ENTRY_TOO_EARLY_CANDIDATE"}:
+            policy["risk_block_effective_count"] += 1
+        if "OPPORTUNITY_LOSS" in outcome_label or outcome_label == "EARLY_TRUE_POSITIVE":
+            policy["false_positive_increase_count"] += 1
+    if change_type == "HOLD_TO_EXIT":
+        if outcome_label == "EXIT_TOO_LATE_CANDIDATE" or expected_effect == "reduce_giveback":
+            policy["exit_too_late_reduced_count"] += 1
+        if outcome_label == "EXIT_TOO_EARLY_CANDIDATE":
+            policy["exit_too_early_risk_count"] += 1
+
+
+def _shadow_policy_score(policy: dict) -> float:
+    return round(
+        float(policy.get("opportunity_loss_reduced_count") or 0) * 2.0
+        + float(policy.get("risk_block_effective_count") or 0)
+        + float(policy.get("exit_too_late_reduced_count") or 0) * 1.5
+        - float(policy.get("false_positive_increase_count") or 0) * 3.0
+        - float(policy.get("exit_too_early_risk_count") or 0) * 2.0
+        - float(policy.get("insufficient_count") or 0) * 0.25,
+        3,
+    )
+
+
+def _shadow_policy_confidence(policy: dict) -> float:
+    total = max(1, int(policy.get("total_count") or 0))
+    labeled = max(0, total - int(policy.get("insufficient_count") or 0))
+    changed = int(policy.get("changed_decision_count") or 0)
+    return round(min(1.0, (labeled / total) * min(1.0, changed / 3.0 if changed else 0.25)), 3)
+
+
+def _shadow_policy_grade(policy: dict) -> str:
+    total = int(policy.get("total_count") or 0)
+    changed = int(policy.get("changed_decision_count") or 0)
+    insufficient = int(policy.get("insufficient_count") or 0)
+    fp_increase = int(policy.get("false_positive_increase_count") or 0)
+    score = float(policy.get("estimated_net_benefit_score") or 0.0)
+    confidence = float(policy.get("confidence") or 0.0)
+    policy_id = str(policy.get("policy_id") or "")
+    if total == 0 or changed == 0 or insufficient >= max(1, total):
+        return "DATA_INSUFFICIENT"
+    if fp_increase >= 2 or score < -1:
+        return "DO_NOT_APPLY"
+    if fp_increase >= 1 or score < 1:
+        return "RISKY_CANDIDATE"
+    if policy_id.startswith("relaxed_") and changed < 3:
+        return "WATCH_CANDIDATE"
+    if ("vi" in policy_id or "entry_risk" in policy_id) and score >= 3:
+        return "WATCH_CANDIDATE"
+    if score >= 3 and confidence >= 0.6:
+        return "STRONG_CANDIDATE"
+    return "WATCH_CANDIDATE"
+
+
+def _is_ready_like(value: object) -> bool:
+    return str(value or "").upper() in {"READY", "READY_SMALL", "OBSERVE_READY"}
+
+
+def _major_reason_keys(reason_codes: list[str]) -> list[str]:
+    result: list[str] = []
+    for reason in reason_codes:
+        text = str(reason or "").upper()
+        if "DATA_INSUFFICIENT" in text:
+            result.append("DATA_INSUFFICIENT")
+        if text == "VI_UNKNOWN" or "VI_UNKNOWN" in text:
+            result.append("VI_UNKNOWN")
+        if "RISK_OFF" in text or text in {"MARKET_RISK_OFF", "RISK_OFF_ENTRY"}:
+            result.append("RISK_OFF")
+        if "LATE_CHASE" in text or "CHASE_RISK" in text:
+            result.append("LATE_CHASE")
+    return list(dict.fromkeys(result))
+
+
+def _counter_rows(counter: Counter[str], limit: int = 10) -> list[dict]:
+    return [{"reason": key, "count": int(count)} for key, count in counter.most_common(limit) if key]
+
+
+def _nullable_int(value) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sanitize_decision_details(value: object) -> object:
+    parsed = _safe_json_loads(value, {}) if isinstance(value, str) else value
+    sensitive_terms = ("token", "secret", "password", "authorization", "account")
+
+    def clean(item):
+        if isinstance(item, dict):
+            result = {}
+            for key, child in item.items():
+                key_text = str(key)
+                if any(term in key_text.lower() for term in sensitive_terms):
+                    continue
+                result[key_text] = clean(child)
+            return result
+        if isinstance(item, list):
+            return [clean(child) for child in item]
+        return item
+
+    return clean(parsed if parsed is not None else {})
+
+
 def _runtime_order_intent_params(payload: dict) -> dict:
     json_fields = {
         "safety_json": payload.get("safety_json", payload.get("safety", {})),
@@ -5046,6 +8478,18 @@ def _row_to_live_sim_cancel(row: sqlite3.Row) -> dict:
     return data
 
 
+def _execution_cumulative_fill_qty(event: BrokerExecutionEvent) -> int:
+    order_qty = max(0, int(event.quantity or 0))
+    remaining_qty = max(0, int(event.remaining_quantity or 0))
+    reported_fill_qty = max(0, int(event.filled_quantity or 0))
+    if order_qty > 0 and (
+        remaining_qty > 0
+        or reported_fill_qty > 0
+    ):
+        return max(0, min(order_qty, order_qty - remaining_qty))
+    return reported_fill_qty
+
+
 def _live_sim_fill_params(payload: dict) -> dict:
     raw_event = payload.get("raw_event_json", payload.get("raw_event", {}))
     fill_qty = int(payload.get("fill_qty") or payload.get("filled_quantity") or 0)
@@ -5080,7 +8524,7 @@ def _row_to_live_sim_fill(row: sqlite3.Row) -> dict:
 
 
 def _live_sim_position_params(payload: dict) -> dict:
-    details = payload.get("details_json", payload.get("details", {}))
+    details = payload.get("details") if "details" in payload else payload.get("details_json", {})
     return {
         "position_id": str(payload.get("position_id") or ""),
         "candidate_instance_id": str(payload.get("candidate_instance_id") or ""),
@@ -5301,6 +8745,244 @@ def _row_to_gateway_transport_latency_report(row: sqlite3.Row) -> dict:
         "generated_at": row["generated_at"],
         "created_at": row["created_at"],
     }
+
+
+def _normalize_operator_event(event: dict) -> dict:
+    if not isinstance(event, dict):
+        raise ValueError("operator event must be a dict")
+    event_id = str(event.get("event_id") or event.get("id") or "").strip()
+    event_type = str(event.get("event_type") or event.get("type") or "").strip()
+    severity = str(event.get("severity") or "").strip().upper()
+    category = str(event.get("category") or "").strip().lower()
+    message = str(event.get("message_ko") or event.get("message") or "").strip()
+    occurred_at = str(event.get("occurred_at") or event.get("created_at") or datetime.now().isoformat(timespec="seconds")).strip()
+    if not event_id or not event_type or not severity or not category or not message:
+        raise ValueError("operator event missing required fields")
+    trade_date = str(event.get("trade_date") or _trade_date_from_timestamp(occurred_at) or datetime.now().date().isoformat()).strip()
+    payload = dict(event.get("payload") or event)
+    return {
+        "event_id": event_id,
+        "trade_date": trade_date,
+        "occurred_at": occurred_at,
+        "received_at": str(event.get("received_at") or datetime.now().isoformat(timespec="seconds")),
+        "source": str(event.get("source") or "themelab_dashboard"),
+        "event_type": event_type,
+        "severity": severity,
+        "category": category,
+        "symbol": str(event.get("symbol") or "") or None,
+        "stock_name": str(event.get("stock_name") or "") or None,
+        "primary_theme": str(event.get("primary_theme") or "") or None,
+        "stock_role": str(event.get("stock_role") or "") or None,
+        "candidate_instance_id": str(event.get("candidate_instance_id") or "") or None,
+        "from_status": str(event.get("from_status") or "") or None,
+        "to_status": str(event.get("to_status") or "") or None,
+        "gate_status": str(event.get("gate_status") or "") or None,
+        "display_status": str(event.get("display_status") or "") or None,
+        "message_ko": message,
+        "payload_json": json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+        "acknowledged_at": str(event.get("acknowledged_at") or "") or None,
+        "acknowledged_by": str(event.get("acknowledged_by") or "") or None,
+        "hidden": 1 if bool(event.get("hidden")) else 0,
+        "snoozed_until": str(event.get("snoozed_until") or "") or None,
+    }
+
+
+def _operator_event_row_to_dict(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    data["payload"] = payload if isinstance(payload, dict) else {}
+    data["hidden"] = bool(data.get("hidden"))
+    data["acknowledged"] = bool(data.get("acknowledged_at"))
+    data["message"] = data.get("message_ko", "")
+    data["type"] = data.get("event_type", "")
+    return data
+
+
+def _trade_date_from_timestamp(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    return ""
+
+
+def _normalize_operator_action(action: dict) -> dict:
+    if not isinstance(action, dict):
+        raise ValueError("operator action must be a dict")
+    action_id = str(action.get("action_id") or action.get("id") or f"act_{uuid4().hex}").strip()
+    action_type = str(action.get("action_type") or "").strip().upper()
+    status = str(action.get("status") or "PENDING").strip().upper()
+    requested_at = str(action.get("requested_at") or datetime.now().isoformat(timespec="seconds")).strip()
+    trade_date = str(action.get("trade_date") or _trade_date_from_timestamp(requested_at) or datetime.now().date().isoformat()).strip()
+    if not action_id or not action_type or not status:
+        raise ValueError("operator action missing required fields")
+    request_payload = action.get("request_payload")
+    if request_payload is None:
+        request_payload = action.get("request_payload_json")
+    response_payload = action.get("response_payload")
+    if response_payload is None:
+        response_payload = action.get("response_payload_json")
+    return {
+        "action_id": action_id,
+        "trade_date": trade_date,
+        "requested_at": requested_at,
+        "completed_at": str(action.get("completed_at") or "") or None,
+        "action_type": action_type,
+        "status": status,
+        "source": str(action.get("source") or "themelab_dashboard"),
+        "requested_by": str(action.get("requested_by") or "") or None,
+        "event_id": str(action.get("event_id") or "") or None,
+        "symbol": str(action.get("symbol") or "") or None,
+        "stock_name": str(action.get("stock_name") or "") or None,
+        "candidate_instance_id": str(action.get("candidate_instance_id") or "") or None,
+        "requires_token": 1 if bool(action.get("requires_token")) else 0,
+        "confirmation_required": 1 if bool(action.get("confirmation_required", True)) else 0,
+        "endpoint": str(action.get("endpoint") or "") or None,
+        "request_payload_json": _json_payload(request_payload),
+        "response_payload_json": _json_payload(response_payload),
+        "error_message": str(action.get("error_message") or "") or None,
+    }
+
+
+def _operator_action_row_to_dict(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    request_payload = _safe_json_loads(data.pop("request_payload_json", "{}"), {})
+    response_payload = _safe_json_loads(data.pop("response_payload_json", "{}"), {})
+    data["request_payload"] = request_payload if isinstance(request_payload, dict) else {}
+    data["response_payload"] = response_payload if isinstance(response_payload, dict) else {}
+    data["requires_token"] = bool(data.get("requires_token"))
+    data["confirmation_required"] = bool(data.get("confirmation_required"))
+    return data
+
+
+def _normalize_postmarket_review_item(item: dict) -> dict:
+    if not isinstance(item, dict):
+        raise ValueError("postmarket review item must be a dict")
+    generated_at = str(item.get("generated_at") or datetime.now().isoformat(timespec="seconds"))
+    event_id = str(item.get("event_id") or "")
+    candidate_instance_id = str(item.get("candidate_instance_id") or "")
+    event_type = str(item.get("event_type") or "").upper()
+    symbol = str(item.get("symbol") or "")
+    review_id = str(item.get("review_id") or "").strip()
+    if not review_id:
+        review_id = ":".join(
+            [
+                "postmarket",
+                str(item.get("trade_date") or _trade_date_from_timestamp(generated_at) or datetime.now().date().isoformat()),
+                str(item.get("review_scope") or "postmarket"),
+                event_id or candidate_instance_id or symbol or f"item_{uuid4().hex}",
+                event_type or "UNKNOWN",
+            ]
+        )
+    outcome_label = str(item.get("outcome_label") or "").strip().upper()
+    confidence = str(item.get("confidence") or "LOW").strip().upper()
+    if not outcome_label:
+        raise ValueError("postmarket review item missing outcome_label")
+    block_reason_codes = item.get("block_reason_codes")
+    if block_reason_codes is None:
+        block_reason_codes = item.get("block_reason_codes_json")
+    return {
+        "review_id": review_id,
+        "trade_date": str(item.get("trade_date") or _trade_date_from_timestamp(generated_at) or datetime.now().date().isoformat()),
+        "generated_at": generated_at,
+        "review_scope": str(item.get("review_scope") or "postmarket").lower(),
+        "symbol": symbol or None,
+        "stock_name": str(item.get("stock_name") or "") or None,
+        "primary_theme": str(item.get("primary_theme") or "") or None,
+        "stock_role": str(item.get("stock_role") or "") or None,
+        "candidate_instance_id": candidate_instance_id or None,
+        "event_id": event_id or None,
+        "event_type": event_type or None,
+        "source_status": str(item.get("source_status") or "") or None,
+        "block_reason": str(item.get("block_reason") or "") or None,
+        "block_reason_codes_json": _json_list(block_reason_codes),
+        "base_time": str(item.get("base_time") or "") or None,
+        "base_price": _float_or_none(item.get("base_price")),
+        "price_1m": _float_or_none(item.get("price_1m")),
+        "price_3m": _float_or_none(item.get("price_3m")),
+        "price_5m": _float_or_none(item.get("price_5m")),
+        "price_10m": _float_or_none(item.get("price_10m")),
+        "price_close_or_last": _float_or_none(item.get("price_close_or_last")),
+        "return_1m_pct": _float_or_none(item.get("return_1m_pct")),
+        "return_3m_pct": _float_or_none(item.get("return_3m_pct")),
+        "return_5m_pct": _float_or_none(item.get("return_5m_pct")),
+        "return_10m_pct": _float_or_none(item.get("return_10m_pct")),
+        "return_close_or_last_pct": _float_or_none(item.get("return_close_or_last_pct")),
+        "outcome_label": outcome_label,
+        "confidence": confidence,
+        "confidence_reason": str(item.get("confidence_reason") or "") or None,
+        "recommendation_ko": str(item.get("recommendation_ko") or "") or None,
+        "payload_json": _json_payload(item.get("payload") or item),
+    }
+
+
+def _postmarket_review_row_to_dict(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["block_reason_codes"] = _safe_json_loads(data.pop("block_reason_codes_json", "[]"), [])
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    data["payload"] = payload if isinstance(payload, dict) else {}
+    return data
+
+
+def _top_postmarket_items(items: list[dict], outcome_label: str) -> list[dict]:
+    filtered = [item for item in items if str(item.get("outcome_label") or "") == outcome_label]
+    filtered.sort(key=lambda item: abs(float(item.get("return_5m_pct") or item.get("return_3m_pct") or 0)), reverse=True)
+    return [
+        {
+            "review_id": item.get("review_id"),
+            "symbol": item.get("symbol"),
+            "stock_name": item.get("stock_name"),
+            "event_type": item.get("event_type"),
+            "return_3m_pct": item.get("return_3m_pct"),
+            "return_5m_pct": item.get("return_5m_pct"),
+            "recommendation_ko": item.get("recommendation_ko"),
+        }
+        for item in filtered[:10]
+    ]
+
+
+def _json_payload(value: object) -> str:
+    if isinstance(value, str):
+        parsed = _safe_json_loads(value, {})
+        value = parsed if isinstance(parsed, (dict, list)) else {}
+    if value is None:
+        value = {}
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _redact_sensitive_payload(value: object) -> object:
+    sensitive_tokens = ("account", "token", "secret", "password", "credential", "auth")
+    if isinstance(value, dict):
+        redacted: dict[str, object] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if any(token in key_text.lower() for token in sensitive_tokens):
+                redacted[key_text] = "***REDACTED***"
+            else:
+                redacted[key_text] = _redact_sensitive_payload(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive_payload(item) for item in value]
+    return value
+
+
+def _json_list(value: object) -> str:
+    if isinstance(value, str):
+        parsed = _safe_json_loads(value, [])
+        value = parsed if isinstance(parsed, list) else [value] if value else []
+    if value is None:
+        value = []
+    if not isinstance(value, list):
+        value = list(value) if isinstance(value, tuple) else [value]
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _float_or_none(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _safe_json_loads(value: object, default):

@@ -309,6 +309,165 @@
 
         <section class="band">
           <div class="section-head">
+            <h2>전략 흐름 Funnel</h2>
+            <span id="decision-ledger-event-count" class="counter">0 events</span>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>후보</span><strong id="decision-funnel-detected">0</strong></div>
+            <div><span>평가</span><strong id="decision-funnel-evaluated">0</strong></div>
+            <div><span>READY</span><strong id="decision-funnel-ready">0</strong></div>
+            <div><span>WAIT</span><strong id="decision-funnel-wait">0</strong></div>
+            <div><span>BLOCKED</span><strong id="decision-funnel-blocked">0</strong></div>
+            <div><span>EntryPlan</span><strong id="decision-funnel-entry-plan">0</strong></div>
+            <div><span>주문의도</span><strong id="decision-funnel-order-intent">0</strong></div>
+            <div><span>포지션</span><strong id="decision-funnel-open-position">0</strong></div>
+            <div><span>청산판단</span><strong id="decision-funnel-exit-decision">0</strong></div>
+            <div><span>READY 주문 없음</span><strong id="decision-ready-without-order">0</strong></div>
+            <div><span>주문 거절</span><strong id="decision-order-rejected">0</strong></div>
+          </div>
+          <div id="decision-block-reason-lines" class="inline-log"></div>
+          <div id="decision-wait-reason-lines" class="inline-log"></div>
+          <div id="decision-data-quality-lines" class="inline-log"></div>
+        </section>
+
+        <section class="band table-panel" data-table-section="intradayDecisions">
+          <div class="section-head">
+            <h2>Why Not Bought</h2>
+            <span id="intradayDecisions-status" class="counter">대기</span>
+          </div>
+          <div class="filter-grid">
+            <label>거래일<input data-table="intradayDecisions" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>종목코드<input data-table="intradayDecisions" data-filter="code" /></label>
+            <label>테마<input data-table="intradayDecisions" data-filter="theme_name" /></label>
+            <label>Gate<select data-table="intradayDecisions" data-filter="gate_status"><option value="">전체</option><option>READY</option><option>WAIT</option><option>BLOCKED</option></select></label>
+            <label>Action<select data-table="intradayDecisions" data-filter="action_type"><option value="">전체</option><option>EVALUATE</option><option>WAIT</option><option>BLOCK</option><option>READY</option><option>ENTRY_PLAN</option><option>ENTRY_ORDER_INTENT</option><option>EXIT_DECISION</option><option>HOLD</option></select></label>
+            <label>Result<select data-table="intradayDecisions" data-filter="action_result"><option value="">전체</option><option>ACCEPTED</option><option>REJECTED</option><option>SKIPPED</option><option>DUPLICATE</option><option>NOT_APPLICABLE</option></select></label>
+            <label>Reason Status<input data-table="intradayDecisions" data-filter="reason_status" /></label>
+            <label>Reason Family<input data-table="intradayDecisions" data-filter="reason_family" /></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="intradayDecisions"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>시간</th><th>종목</th><th>테마</th><th>Gate</th><th>Action</th><th>Result</th><th>Reason</th><th>Score</th><th>연결</th></tr></thead>
+              <tbody id="intradayDecisions-body"></tbody>
+            </table>
+          </div>
+          <div id="intradayDecisions-pagination" class="pagination"></div>
+        </section>
+
+        <section class="band">
+          <div class="section-head">
+            <h2>Intraday Outcome Label</h2>
+            <span id="outcome-label-status" class="counter">0</span>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>Labeled</span><strong id="outcome-labeled-count">0</strong></div>
+            <div><span>Insufficient</span><strong id="outcome-insufficient-count">0</strong></div>
+            <div><span>EARLY_TRUE_POSITIVE</span><strong id="outcome-early-tp-count">0</strong></div>
+            <div><span>EARLY_FALSE_POSITIVE</span><strong id="outcome-early-fp-count">0</strong></div>
+            <div><span>OPPORTUNITY_LOSS</span><strong id="outcome-opportunity-loss-count">0</strong></div>
+            <div><span>RISK_BLOCK_EFFECTIVE</span><strong id="outcome-risk-effective-count">0</strong></div>
+            <div><span>EXIT_TOO_LATE</span><strong id="outcome-exit-late-count">0</strong></div>
+            <div><span>EXIT_TOO_EARLY</span><strong id="outcome-exit-early-count">0</strong></div>
+          </div>
+          <div id="outcome-label-lines" class="inline-log"></div>
+          <div id="outcome-quality-lines" class="inline-log"></div>
+        </section>
+
+        <section class="band table-panel" data-table-section="intradayOutcomes">
+          <div class="section-head">
+            <h2>Outcome Label Timeline</h2>
+            <span id="intradayOutcomes-status" class="counter">대기</span>
+          </div>
+          <div class="filter-grid">
+            <label>거래일<input data-table="intradayOutcomes" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>종목코드<input data-table="intradayOutcomes" data-filter="code" /></label>
+            <label>Label<input data-table="intradayOutcomes" data-filter="outcome_label" /></label>
+            <label>Action<input data-table="intradayOutcomes" data-filter="action_type" /></label>
+            <label>Gate<input data-table="intradayOutcomes" data-filter="gate_status" /></label>
+            <label>Reason<input data-table="intradayOutcomes" data-filter="reason_code" /></label>
+            <label>Horizon<input data-table="intradayOutcomes" data-filter="horizon_sec" /></label>
+            <label>Min Max Return<input data-table="intradayOutcomes" data-filter="min_max_return_pct" /></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="intradayOutcomes"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>평가시각</th><th>종목</th><th>Gate</th><th>Action</th><th>Horizon</th><th>Max</th><th>MDD</th><th>Current</th><th>Label</th><th>Reason</th></tr></thead>
+              <tbody id="intradayOutcomes-body"></tbody>
+            </table>
+          </div>
+          <div id="intradayOutcomes-pagination" class="pagination"></div>
+        </section>
+
+        <section class="band">
+          <div class="section-head">
+            <h2>Shadow Strategy Comparison</h2>
+            <span id="shadow-evaluation-total" class="counter">0</span>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>Changed</span><strong id="shadow-changed-count">0</strong></div>
+            <div><span>Baseline READY</span><strong id="shadow-baseline-ready">0</strong></div>
+            <div><span>Shadow READY</span><strong id="shadow-ready">0</strong></div>
+            <div><span>READY Delta</span><strong id="shadow-ready-delta">0</strong></div>
+            <div><span>Opportunity Reduced</span><strong id="shadow-opportunity-reduced">0</strong></div>
+            <div><span>FP Risk</span><strong id="shadow-fp-increase">0</strong></div>
+            <div><span>Risk Block Effective</span><strong id="shadow-risk-effective">0</strong></div>
+            <div><span>Exit Late Reduced</span><strong id="shadow-exit-late-reduced">0</strong></div>
+          </div>
+          <div id="shadow-policy-ranking-lines" class="inline-log"></div>
+          <div id="shadow-change-lines" class="inline-log"></div>
+        </section>
+
+        <section class="band table-panel" data-table-section="shadowEvaluations">
+          <div class="section-head">
+            <h2>Shadow Different Decisions</h2>
+            <span id="shadowEvaluations-status" class="counter">대기</span>
+          </div>
+          <div class="filter-grid">
+            <label>거래일<input data-table="shadowEvaluations" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>Policy<input data-table="shadowEvaluations" data-filter="policy_id" /></label>
+            <label>종목코드<input data-table="shadowEvaluations" data-filter="code" /></label>
+            <label>테마<input data-table="shadowEvaluations" data-filter="theme_name" /></label>
+            <label>Baseline Gate<input data-table="shadowEvaluations" data-filter="baseline_gate_status" /></label>
+            <label>Shadow Gate<input data-table="shadowEvaluations" data-filter="shadow_gate_status" /></label>
+            <label>Change<input data-table="shadowEvaluations" data-filter="change_type" /></label>
+            <label>Outcome<input data-table="shadowEvaluations" data-filter="outcome_label" /></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="shadowEvaluations"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>종목</th><th>테마</th><th>Policy</th><th>Baseline</th><th>Shadow</th><th>Change</th><th>Base Reason</th><th>Shadow Reason</th><th>Outcome</th><th>Max</th><th>MDD</th></tr></thead>
+              <tbody id="shadowEvaluations-body"></tbody>
+            </table>
+          </div>
+          <div id="shadowEvaluations-pagination" class="pagination"></div>
+        </section>
+
+        <section class="band table-panel" data-table-section="shadowRiskCandidates">
+          <div class="section-head">
+            <h2>Shadow Apply Risk Candidates</h2>
+            <span id="shadowRiskCandidates-status" class="counter">대기</span>
+          </div>
+          <div class="filter-grid">
+            <input type="hidden" data-table="shadowRiskCandidates" data-filter="changed_decision" value="true" />
+            <label>거래일<input data-table="shadowRiskCandidates" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>Policy<input data-table="shadowRiskCandidates" data-filter="policy_id" /></label>
+            <label>Risk<input data-table="shadowRiskCandidates" data-filter="expected_risk" /></label>
+            <label>Outcome<input data-table="shadowRiskCandidates" data-filter="outcome_label" /></label>
+            <label>Change<input data-table="shadowRiskCandidates" data-filter="change_type" /></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="shadowRiskCandidates"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Policy</th><th>종목</th><th>Change</th><th>Expected Risk</th><th>Expected Effect</th><th>Outcome</th><th>Max</th><th>MDD</th></tr></thead>
+              <tbody id="shadowRiskCandidates-body"></tbody>
+            </table>
+          </div>
+          <div id="shadowRiskCandidates-pagination" class="pagination"></div>
+        </section>
+
+        <section class="band">
+          <div class="section-head">
             <h2>Runtime DRY_RUN 주문 의도</h2>
             <span id="dryrun-order-policy" class="counter">disabled</span>
           </div>
@@ -356,6 +515,118 @@
       </section>
 
       <section id="analysis" class="tab-panel" data-tab-panel="analysis">
+        <section class="band">
+          <div class="section-head">
+            <div>
+              <h2>Strategy Change Proposals</h2>
+              <p class="help-text">자동 적용 아님 / 승인 상태만 저장 / 다음 PR에서 observe-only rollout 가능</p>
+            </div>
+            <span id="change-proposal-total" class="counter">0</span>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>REVIEW_READY</span><strong id="change-proposal-review-ready">0</strong></div>
+            <div><span>STRONG</span><strong id="change-proposal-strong">0</strong></div>
+            <div><span>WATCH</span><strong id="change-proposal-watch">0</strong></div>
+            <div><span>RISKY</span><strong id="change-proposal-risky">0</strong></div>
+            <div><span>DATA_INSUFFICIENT</span><strong id="change-proposal-insufficient">0</strong></div>
+            <div><span>Pending</span><strong id="change-proposal-pending">0</strong></div>
+            <div><span>Expiring soon</span><strong id="change-proposal-expiring">0</strong></div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Grade</th><th>Status</th><th>Category</th><th>Title</th><th>Score</th><th>Guardrail</th></tr></thead>
+              <tbody id="change-proposal-top-rows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="band table-panel" data-table-section="changeProposals">
+          <div class="section-head">
+            <h2>Proposal Board</h2>
+            <span id="changeProposals-status" class="counter">waiting</span>
+          </div>
+          <div class="filter-grid">
+            <label>Trade date<input data-table="changeProposals" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>Status<input data-table="changeProposals" data-filter="status" placeholder="REVIEW_READY" /></label>
+            <label>Category<input data-table="changeProposals" data-filter="category" placeholder="risk" /></label>
+            <label>Grade<input data-table="changeProposals" data-filter="recommendation_grade" placeholder="WATCH_CANDIDATE" /></label>
+            <label>Source<select data-table="changeProposals" data-filter="source_type"><option value="">all</option><option>intraday_outcome</option><option>shadow_strategy</option><option>replay</option><option>dry_run_threshold_ab</option><option>combined</option></select></label>
+            <label>Target<input data-table="changeProposals" data-filter="target_component" placeholder="entry_risk_gate" /></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="changeProposals"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Created</th><th>Grade</th><th>Status</th><th>Category</th><th>Target</th><th>Title</th><th>Confidence</th><th>Score</th><th>Effect</th><th>Risk</th><th>Guardrail</th></tr></thead>
+              <tbody id="changeProposals-body"></tbody>
+            </table>
+          </div>
+          <div id="changeProposals-pagination" class="pagination"></div>
+        </section>
+
+        <section class="band table-panel" data-table-section="changeProposalEvidence">
+          <div class="section-head">
+            <h2>Proposal Evidence</h2>
+            <span id="changeProposalEvidence-status" class="counter">waiting</span>
+          </div>
+          <div class="filter-grid">
+            <label>Proposal ID<input data-table="changeProposalEvidence" data-filter="proposal_id" /></label>
+            <label>Trade date<input data-table="changeProposalEvidence" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>Source<input data-table="changeProposalEvidence" data-filter="source_type" /></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="changeProposalEvidence"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Proposal</th><th>Source</th><th>Sample</th><th>Baseline</th><th>Candidate</th><th>Delta</th><th>Confidence</th><th>Metric</th></tr></thead>
+              <tbody id="changeProposalEvidence-body"></tbody>
+            </table>
+          </div>
+          <div id="changeProposalEvidence-pagination" class="pagination"></div>
+        </section>
+
+        <section class="band">
+          <div class="section-head">
+            <h2>Strategy Replay</h2>
+            <span id="strategy-replay-latest-id" class="counter">-</span>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>Status</span><strong id="strategy-replay-status">-</strong></div>
+            <div><span>Ticks</span><strong id="strategy-replay-ticks">0</strong></div>
+            <div><span>Candidates</span><strong id="strategy-replay-candidates">0</strong></div>
+            <div><span>READY</span><strong id="strategy-replay-ready">0</strong></div>
+            <div><span>Order Intents</span><strong id="strategy-replay-orders">0</strong></div>
+            <div><span>Outcome Labels</span><strong id="strategy-replay-outcomes">0</strong></div>
+            <div><span>Shadow Evals</span><strong id="strategy-replay-shadow">0</strong></div>
+            <div><span>Funnel</span><strong id="strategy-replay-funnel">0 -> 0 -> 0</strong></div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Policy</th><th>Ready Delta</th><th>Opp Reduced</th><th>FP Increase</th><th>Net Score</th><th>Grade</th></tr></thead>
+              <tbody id="strategy-replay-ranking-rows"></tbody>
+            </table>
+          </div>
+          <div id="strategy-replay-quality-lines" class="inline-log"></div>
+          <div id="strategy-replay-diff-lines" class="inline-log"></div>
+        </section>
+
+        <section class="band table-panel" data-table-section="strategyReplayRuns">
+          <div class="section-head">
+            <h2>Replay Runs</h2>
+            <span id="strategyReplayRuns-status" class="counter">waiting</span>
+          </div>
+          <div class="filter-grid">
+            <label>Trade date<input data-table="strategyReplayRuns" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>Mode<select data-table="strategyReplayRuns" data-filter="mode"><option value="">all</option><option>data_only</option><option>decision_led</option><option>full_runtime</option></select></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="strategyReplayRuns"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Replay ID</th><th>Date</th><th>Mode</th><th>Status</th><th>Ticks</th><th>Candidates</th><th>READY</th><th>Orders</th><th>Started</th></tr></thead>
+              <tbody id="strategyReplayRuns-body"></tbody>
+            </table>
+          </div>
+          <div id="strategyReplayRuns-pagination" class="pagination"></div>
+        </section>
+
         <section class="band">
           <div class="section-head">
             <h2>DRY_RUN 성과 분석</h2>

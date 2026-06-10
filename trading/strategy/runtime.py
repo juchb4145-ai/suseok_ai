@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from inspect import Parameter, signature
 from time import perf_counter
 from typing import Callable, Optional
+from uuid import uuid4
 
 from trading.strategy.candidates import (
     QUALITY_ACTIONABLE,
@@ -184,6 +185,18 @@ class StrategyRuntimeSnapshot:
     last_dry_run_exit_order_reject_reason: str = ""
     dry_run_order_policy: str = ""
     dry_run_order_sink_enabled: bool = False
+    live_sim_order_sink_enabled: bool = False
+    live_sim_order_policy: str = ""
+    live_sim_order_intent_count: int = 0
+    live_sim_order_accepted_count: int = 0
+    live_sim_order_blocked_count: int = 0
+    live_sim_order_duplicate_count: int = 0
+    live_sim_exit_accepted_count: int = 0
+    live_sim_exit_blocked_count: int = 0
+    last_live_sim_order_intent_at: str = ""
+    last_live_sim_reject_reason: str = ""
+    live_sim_summary: dict = field(default_factory=dict)
+    live_sim_maintenance_summary: dict = field(default_factory=dict)
     subscription_active_count: int = 0
     virtual_order_status_change_count: int = 0
     condition_profiles_count: int = 0
@@ -371,6 +384,8 @@ class StrategyRuntime:
 
         current = timed("prepare", lambda: _clean_time(now or self.clock()))
         self._last_runtime_time = current
+        runtime_cycle_id = f"runtime:{current.date().isoformat()}:{current.isoformat()}:{uuid4().hex[:8]}"
+        decision_events: list[dict] = []
         snapshot = timed("snapshot", lambda: self._snapshot(current))
         timed("drain_candidate_warnings", lambda: self._drain_candidate_collector_warnings(snapshot))
         try:
@@ -378,6 +393,7 @@ class StrategyRuntime:
                 snapshot.warnings.append("RUNTIME_NOT_STARTED")
                 return snapshot
 
+            timed("order_sink_maintenance", lambda: self._run_order_sink_maintenance(snapshot, current))
             trade_date = timed("trade_date", self.candidate_collector._trade_date)
             timed("prune_position_context_history", lambda: self._prune_position_context_history(snapshot, current))
             timed("theme_lab_flow", lambda: self._run_theme_lab_flow(snapshot, current))
@@ -417,26 +433,72 @@ class StrategyRuntime:
 
             gate_results = timed("evaluate_gates", lambda: self._evaluate_gates(candidates, snapshot))
             snapshot.gate_result_count = len(gate_results)
+            timed(
+                "record_gate_decisions",
+                lambda: self._record_gate_decisions(decision_events, gate_results, current, runtime_cycle_id, trade_date),
+            )
             context_by_candidate: dict[int, _ReviewContext] = {}
             lifecycle_changed = timed("apply_lifecycle", lambda: self._apply_lifecycle(candidates, gate_results, snapshot, current))
             for candidate_id, result in lifecycle_changed.items():
                 context_by_candidate[candidate_id] = _ReviewContext(gate_result=result, review_needed=True)
+            timed(
+                "record_lifecycle_decisions",
+                lambda: self._record_lifecycle_decisions(decision_events, lifecycle_changed, current, runtime_cycle_id, trade_date),
+            )
 
             def process_entries() -> None:
-                for result in self._entry_results(gate_results):
+                entry_results = self._entry_results(gate_results)
+                entry_keys = {(result.candidate_id, result.theme_id) for result in entry_results}
+                self._record_entry_plan_skips(
+                    decision_events,
+                    gate_results,
+                    entry_keys,
+                    current,
+                    runtime_cycle_id,
+                    trade_date,
+                )
+                for result in entry_results:
                     if result.candidate_id is None:
                         continue
                     context = context_by_candidate.setdefault(result.candidate_id, _ReviewContext(gate_result=result))
                     context.gate_result = result
                     try:
-                        self._process_gate_result(result, context, snapshot, current)
+                        self._process_gate_result(
+                            result,
+                            context,
+                            snapshot,
+                            current,
+                            decision_events=decision_events,
+                            runtime_cycle_id=runtime_cycle_id,
+                            trade_date=trade_date,
+                        )
                     except Exception as exc:
                         snapshot.warnings.append(f"CANDIDATE_PROCESS_FAILED:{result.code}:{exc}")
 
             timed("process_entries", process_entries)
             timed("evaluate_virtual_orders", lambda: self._evaluate_virtual_orders(context_by_candidate, snapshot, current))
-            timed("open_filled_orders", lambda: self._open_filled_orders(context_by_candidate, snapshot, current))
-            timed("evaluate_positions", lambda: self._evaluate_positions(context_by_candidate, snapshot, current))
+            timed(
+                "open_filled_orders",
+                lambda: self._open_filled_orders(
+                    context_by_candidate,
+                    snapshot,
+                    current,
+                    decision_events=decision_events,
+                    runtime_cycle_id=runtime_cycle_id,
+                    trade_date=trade_date,
+                ),
+            )
+            timed(
+                "evaluate_positions",
+                lambda: self._evaluate_positions(
+                    context_by_candidate,
+                    snapshot,
+                    current,
+                    decision_events=decision_events,
+                    runtime_cycle_id=runtime_cycle_id,
+                    trade_date=trade_date,
+                ),
+            )
             timed("save_reviews", lambda: self._save_reviews(context_by_candidate, expired, snapshot, current))
             timed("readiness_snapshot_final", lambda: self._refresh_readiness_snapshot(snapshot, current, trade_date))
             snapshot.warnings = timed("dedupe_warnings", lambda: dedupe_warnings(snapshot.warnings))
@@ -444,6 +506,7 @@ class StrategyRuntime:
         finally:
             self._apply_reason_summary(snapshot)
             self._apply_context_history_prune_snapshot(snapshot)
+            self._flush_decision_events(decision_events, snapshot)
             snapshot.cycle_duration_ms = int(round((perf_counter() - started) * 1000))
 
     def _process_gate_result(
@@ -452,9 +515,24 @@ class StrategyRuntime:
         context: "_ReviewContext",
         snapshot: StrategyRuntimeSnapshot,
         now: datetime,
+        *,
+        decision_events: Optional[list[dict]] = None,
+        runtime_cycle_id: str = "",
+        trade_date: str = "",
     ) -> None:
         if not result.strategy_eligible:
             context.review_needed = result.block_type != BlockType.NONE
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=None,
+                gate_result=result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_PLAN",
+                action_result="NOT_APPLICABLE",
+                details={"reason": "strategy_not_eligible"},
+            )
             return
         if result.candidate_id is None:
             return
@@ -462,10 +540,32 @@ class StrategyRuntime:
         if candidate is None:
             return
         if not self._entry_allowed_for_candidate(candidate, result):
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_PLAN",
+                action_result="SKIPPED",
+                details={"reason": "entry_not_allowed_for_candidate"},
+            )
             return
         plan = self.entry_plan_builder.build(result, now)
         if plan is None:
             context.review_needed = True
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_PLAN",
+                action_result="SKIPPED",
+                details={"reason": "entry_plan_not_created"},
+            )
             return
         plan.fill_policy = self.config.virtual_fill_policy
         gate_result_key = str(plan.cancel_condition.get("gate_result_key") or "")
@@ -477,14 +577,50 @@ class StrategyRuntime:
         )
         if existing_plan is not None:
             plan = existing_plan
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_PLAN",
+                action_result="DUPLICATE",
+                entry_plan=plan,
+                details={"reason": "existing_entry_plan"},
+            )
         else:
             plan = self.db.save_entry_plan(plan)
             snapshot.entry_plan_count += 1
             snapshot.db_write_count_per_cycle += 1
             context.review_needed = True
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_PLAN",
+                action_result="ACCEPTED",
+                entry_plan=plan,
+                details={"reason": "entry_plan_created"},
+            )
         context.entry_plan = plan
         if not plan.cancel_condition.get("submittable", True):
             context.review_needed = True
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_ORDER_INTENT",
+                action_result="NOT_APPLICABLE",
+                entry_plan=plan,
+                details={"reason": plan.cancel_condition.get("reason") or "entry_plan_not_submittable"},
+            )
             return
         existing_order = self.db.find_active_virtual_order(
             result.candidate_id,
@@ -493,7 +629,18 @@ class StrategyRuntime:
         )
         if existing_order is not None:
             context.virtual_order = existing_order
-            self._emit_entry_order_intent(candidate, result, plan, existing_order, context, snapshot, now)
+            self._emit_entry_order_intent(
+                candidate,
+                result,
+                plan,
+                existing_order,
+                context,
+                snapshot,
+                now,
+                decision_events=decision_events,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+            )
             return
         submitted = self.virtual_order_service.submit_virtual_order(plan, now)
         if submitted.submitted and submitted.order is not None:
@@ -505,7 +652,31 @@ class StrategyRuntime:
         if submitted.submitted and context.virtual_order is not None:
             snapshot.virtual_order_count += 1
             context.review_needed = True
-            self._emit_entry_order_intent(candidate, result, plan, context.virtual_order, context, snapshot, now)
+            self._emit_entry_order_intent(
+                candidate,
+                result,
+                plan,
+                context.virtual_order,
+                context,
+                snapshot,
+                now,
+                decision_events=decision_events,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+            )
+        elif not submitted.submitted:
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_ORDER_INTENT",
+                action_result="SKIPPED",
+                entry_plan=plan,
+                details={"reason": submitted.rejected_reason or "virtual_order_not_submitted"},
+            )
 
     def _start_condition_adapter(self, snapshot: StrategyRuntimeSnapshot, now: datetime) -> None:
         if not self.config.condition_profiles_enabled or self.condition_adapter is None:
@@ -986,6 +1157,10 @@ class StrategyRuntime:
         contexts: dict[int, "_ReviewContext"],
         snapshot: StrategyRuntimeSnapshot,
         now: datetime,
+        *,
+        decision_events: Optional[list[dict]] = None,
+        runtime_cycle_id: str = "",
+        trade_date: str = "",
     ) -> None:
         for order in self.db.list_virtual_orders_by_status(VirtualOrderStatus.FILLED):
             try:
@@ -1016,9 +1191,37 @@ class StrategyRuntime:
                         snapshot.open_position_count += 1
                         snapshot.db_write_count_per_cycle += 1
                         context.review_needed = True
+                        self._append_strategy_decision_event(
+                            decision_events,
+                            candidate=candidate,
+                            gate_result=context.gate_result,
+                            now=now,
+                            runtime_cycle_id=runtime_cycle_id,
+                            trade_date=trade_date,
+                            action_type="HOLD",
+                            action_result="ACCEPTED",
+                            entry_plan=plan,
+                            virtual_order=order,
+                            virtual_position=opened.position,
+                            details={"reason": "virtual_position_opened"},
+                        )
                     elif opened.aggregated:
                         snapshot.db_write_count_per_cycle += 1
                         context.review_needed = True
+                        self._append_strategy_decision_event(
+                            decision_events,
+                            candidate=candidate,
+                            gate_result=context.gate_result,
+                            now=now,
+                            runtime_cycle_id=runtime_cycle_id,
+                            trade_date=trade_date,
+                            action_type="HOLD",
+                            action_result="DUPLICATE",
+                            entry_plan=plan,
+                            virtual_order=order,
+                            virtual_position=opened.position,
+                            details={"reason": "virtual_position_aggregated"},
+                        )
             except Exception as exc:
                 snapshot.warnings.append(f"VIRTUAL_POSITION_OPEN_FAILED:{order.id}:{exc}")
 
@@ -1027,6 +1230,10 @@ class StrategyRuntime:
         contexts: dict[int, "_ReviewContext"],
         snapshot: StrategyRuntimeSnapshot,
         now: datetime,
+        *,
+        decision_events: Optional[list[dict]] = None,
+        runtime_cycle_id: str = "",
+        trade_date: str = "",
     ) -> None:
         for position in self.db.list_open_virtual_positions():
             try:
@@ -1044,6 +1251,20 @@ class StrategyRuntime:
                     context.virtual_order = order
                     if order is not None and order.entry_plan_id is not None:
                         context.entry_plan = self.db.load_entry_plan(order.entry_plan_id)
+                self._append_strategy_decision_event(
+                    decision_events,
+                    candidate=candidate,
+                    gate_result=context.gate_result,
+                    now=now,
+                    runtime_cycle_id=runtime_cycle_id,
+                    trade_date=trade_date,
+                    action_type="HOLD",
+                    action_result="ACCEPTED",
+                    entry_plan=context.entry_plan,
+                    virtual_order=context.virtual_order,
+                    virtual_position=position,
+                    details={"reason": "position_evaluated", "performance_changed": performance.changed},
+                )
                 snapshot_for_exit = _snapshot_for_exit(context)
                 existing_decisions = self.db.list_exit_decisions(position.id) if position.id is not None else []
                 context_risk = self._exit_context_risk_snapshot(
@@ -1082,8 +1303,37 @@ class StrategyRuntime:
                         saved_decision = self.db.save_exit_decision(decision)
                         snapshot.db_write_count_per_cycle += 1
                     saved_decisions.append(saved_decision)
+                    self._append_strategy_decision_event(
+                        decision_events,
+                        candidate=candidate,
+                        gate_result=context.gate_result,
+                        now=now,
+                        runtime_cycle_id=runtime_cycle_id,
+                        trade_date=trade_date,
+                        action_type="EXIT_DECISION",
+                        action_result="ACCEPTED" if saved_decision.filled else "SKIPPED",
+                        entry_plan=context.entry_plan,
+                        virtual_order=context.virtual_order,
+                        virtual_position=position,
+                        exit_decision=saved_decision,
+                        details={
+                            "reason": saved_decision.decision_type,
+                            "reason_codes": list(saved_decision.reason_codes or []),
+                            "position_closed": bool(saved_decision.details.get("position_closed")),
+                        },
+                    )
                     if candidate is not None:
-                        self._emit_exit_order_intent(candidate, position, saved_decision, context, snapshot, now)
+                        self._emit_exit_order_intent(
+                            candidate,
+                            position,
+                            saved_decision,
+                            context,
+                            snapshot,
+                            now,
+                            decision_events=decision_events,
+                            runtime_cycle_id=runtime_cycle_id,
+                            trade_date=trade_date,
+                        )
                 if position_details_changed and not position.closed_at:
                     position = self.db.save_virtual_position(position)
                     snapshot.db_write_count_per_cycle += 1
@@ -1927,8 +2177,25 @@ class StrategyRuntime:
         context: "_ReviewContext",
         snapshot: StrategyRuntimeSnapshot,
         now: datetime,
+        *,
+        decision_events: Optional[list[dict]] = None,
+        runtime_cycle_id: str = "",
+        trade_date: str = "",
     ) -> None:
         if self.order_sink is None:
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_ORDER_INTENT",
+                action_result="NOT_APPLICABLE",
+                entry_plan=plan,
+                virtual_order=virtual_order,
+                details={"reason": "order_sink_missing"},
+            )
             return
         try:
             payload = self.order_sink.on_entry_order_decision(
@@ -1943,8 +2210,35 @@ class StrategyRuntime:
             if payload and payload.get("status") not in {"SKIPPED", ""}:
                 context.review_needed = True
             self._apply_order_sink_snapshot(snapshot)
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_ORDER_INTENT",
+                action_result=_order_intent_action_result(dict(payload or {})),
+                entry_plan=plan,
+                virtual_order=virtual_order,
+                order_result=dict(payload or {}),
+                details={"reason": (payload or {}).get("reason") or "", "order_result": dict(payload or {})},
+            )
         except Exception as exc:
             snapshot.warnings.append(f"RUNTIME_DRY_RUN_ORDER_SINK_FAILED:{candidate.code}:{exc}")
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_ORDER_INTENT",
+                action_result="REJECTED",
+                entry_plan=plan,
+                virtual_order=virtual_order,
+                details={"reason": str(exc), "error": "order_sink_failed"},
+            )
 
     def _emit_exit_order_intent(
         self,
@@ -1954,8 +2248,25 @@ class StrategyRuntime:
         context: "_ReviewContext",
         snapshot: StrategyRuntimeSnapshot,
         now: datetime,
+        *,
+        decision_events: Optional[list[dict]] = None,
+        runtime_cycle_id: str = "",
+        trade_date: str = "",
     ) -> None:
         if self.order_sink is None:
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=context.gate_result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_ORDER_INTENT",
+                action_result="NOT_APPLICABLE",
+                virtual_position=position,
+                exit_decision=decision,
+                details={"reason": "order_sink_missing", "order_phase": "exit"},
+            )
             return
         if not bool(decision.filled):
             return
@@ -1976,8 +2287,35 @@ class StrategyRuntime:
             if result and result.get("status") not in {"SKIPPED", ""}:
                 context.review_needed = True
             self._apply_order_sink_snapshot(snapshot)
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=context.gate_result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_ORDER_INTENT",
+                action_result=_order_intent_action_result(result),
+                virtual_position=position,
+                exit_decision=decision,
+                order_result=result,
+                details={"reason": result.get("reason") or "", "order_phase": "exit", "order_result": result},
+            )
         except Exception as exc:
             snapshot.warnings.append(f"RUNTIME_DRY_RUN_EXIT_ORDER_SINK_FAILED:{candidate.code}:{decision.id}:{exc}")
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=context.gate_result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_ORDER_INTENT",
+                action_result="REJECTED",
+                virtual_position=position,
+                exit_decision=decision,
+                details={"reason": str(exc), "error": "exit_order_sink_failed", "order_phase": "exit"},
+            )
 
     def _apply_order_sink_snapshot(self, snapshot: StrategyRuntimeSnapshot) -> None:
         if self.order_sink is None or not hasattr(self.order_sink, "snapshot"):
@@ -2007,6 +2345,157 @@ class StrategyRuntime:
         snapshot.last_dry_run_exit_order_reject_reason = str(payload.get("last_dry_run_exit_order_reject_reason") or "")
         snapshot.dry_run_order_policy = str(payload.get("dry_run_order_policy") or "")
         snapshot.dry_run_order_sink_enabled = bool(payload.get("dry_run_order_sink_enabled"))
+        snapshot.live_sim_order_sink_enabled = bool(payload.get("live_sim_order_sink_enabled"))
+        snapshot.live_sim_order_policy = str(payload.get("live_sim_order_policy") or "")
+        snapshot.live_sim_order_intent_count = int(payload.get("live_sim_order_intent_count") or 0)
+        snapshot.live_sim_order_accepted_count = int(payload.get("live_sim_order_accepted_count") or 0)
+        snapshot.live_sim_order_blocked_count = int(payload.get("live_sim_order_blocked_count") or 0)
+        snapshot.live_sim_order_duplicate_count = int(payload.get("live_sim_order_duplicate_count") or 0)
+        snapshot.live_sim_exit_accepted_count = int(payload.get("live_sim_exit_accepted_count") or 0)
+        snapshot.live_sim_exit_blocked_count = int(payload.get("live_sim_exit_blocked_count") or 0)
+        snapshot.last_live_sim_order_intent_at = str(payload.get("last_live_sim_order_intent_at") or "")
+        snapshot.last_live_sim_reject_reason = str(payload.get("last_live_sim_reject_reason") or "")
+        snapshot.live_sim_summary = dict(payload.get("live_sim_summary") or {})
+        snapshot.live_sim_maintenance_summary = dict(payload.get("live_sim_maintenance_summary") or {})
+
+    def _run_order_sink_maintenance(self, snapshot: StrategyRuntimeSnapshot, now: datetime) -> None:
+        if self.order_sink is None or not hasattr(self.order_sink, "run_maintenance"):
+            self._apply_order_sink_snapshot(snapshot)
+            return
+        try:
+            result = self.order_sink.run_maintenance(runtime_cycle_at=now.isoformat())
+            snapshot.live_sim_maintenance_summary = dict(result or {})
+            lifecycle = dict((result or {}).get("lifecycle") or {})
+            if str(lifecycle.get("status") or "") == "UNHEALTHY":
+                snapshot.warnings.append(f"LIVE_SIM_ORDER_LIFECYCLE_UNHEALTHY:{lifecycle.get('reason') or 'UNKNOWN'}")
+            self._apply_order_sink_snapshot(snapshot)
+        except Exception as exc:
+            snapshot.warnings.append(f"RUNTIME_ORDER_SINK_MAINTENANCE_FAILED:{exc}")
+
+    def _record_gate_decisions(
+        self,
+        decision_events: list[dict],
+        gate_results: list[GatePipelineResult],
+        now: datetime,
+        runtime_cycle_id: str,
+        trade_date: str,
+    ) -> None:
+        for result in gate_results:
+            candidate = self.db.load_candidate_by_id(result.candidate_id) if result.candidate_id is not None else None
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="EVALUATE",
+                action_result=_gate_action_result(result),
+                details={"reason": "gate_result_evaluated"},
+            )
+
+    def _record_lifecycle_decisions(
+        self,
+        decision_events: list[dict],
+        lifecycle_changed: dict[int, GatePipelineResult],
+        now: datetime,
+        runtime_cycle_id: str,
+        trade_date: str,
+    ) -> None:
+        for candidate_id, result in lifecycle_changed.items():
+            candidate = self.db.load_candidate_by_id(candidate_id)
+            if candidate is None:
+                continue
+            action_type = _lifecycle_action_type(candidate)
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type=action_type,
+                action_result=_lifecycle_action_result(candidate),
+                details={"reason": "candidate_lifecycle_updated", "state": candidate.state.value},
+            )
+
+    def _record_entry_plan_skips(
+        self,
+        decision_events: list[dict],
+        gate_results: list[GatePipelineResult],
+        entry_keys: set[tuple[Optional[int], str]],
+        now: datetime,
+        runtime_cycle_id: str,
+        trade_date: str,
+    ) -> None:
+        for result in gate_results:
+            if result.candidate_id is None or (result.candidate_id, result.theme_id) in entry_keys:
+                continue
+            candidate = self.db.load_candidate_by_id(result.candidate_id)
+            action_result = "NOT_APPLICABLE" if not result.strategy_eligible else "SKIPPED"
+            reason = "strategy_not_eligible" if not result.strategy_eligible else "entry_not_allowed_for_candidate"
+            self._append_strategy_decision_event(
+                decision_events,
+                candidate=candidate,
+                gate_result=result,
+                now=now,
+                runtime_cycle_id=runtime_cycle_id,
+                trade_date=trade_date,
+                action_type="ENTRY_PLAN",
+                action_result=action_result,
+                details={"reason": reason},
+            )
+
+    def _append_strategy_decision_event(
+        self,
+        decision_events: Optional[list[dict]],
+        *,
+        candidate: Optional[Candidate],
+        gate_result: Optional[GatePipelineResult],
+        now: datetime,
+        runtime_cycle_id: str,
+        trade_date: str,
+        action_type: str,
+        action_result: str,
+        entry_plan: Optional[EntryPlan] = None,
+        virtual_order: Optional[VirtualOrder] = None,
+        virtual_position: Optional[VirtualPosition] = None,
+        exit_decision: Optional[ExitDecision] = None,
+        order_result: Optional[dict] = None,
+        details: Optional[dict] = None,
+    ) -> None:
+        if decision_events is None:
+            return
+        try:
+            decision_events.append(
+                _strategy_decision_event(
+                    candidate=candidate,
+                    gate_result=gate_result,
+                    now=now,
+                    runtime_cycle_id=runtime_cycle_id,
+                    trade_date=trade_date,
+                    action_type=action_type,
+                    action_result=action_result,
+                    entry_plan=entry_plan,
+                    virtual_order=virtual_order,
+                    virtual_position=virtual_position,
+                    exit_decision=exit_decision,
+                    order_result=order_result,
+                    details=details or {},
+                )
+            )
+        except Exception:
+            return
+
+    def _flush_decision_events(self, decision_events: list[dict], snapshot: StrategyRuntimeSnapshot) -> None:
+        if not decision_events or not hasattr(self.db, "save_strategy_decision_events"):
+            return
+        try:
+            inserted = int(self.db.save_strategy_decision_events(decision_events) or 0)
+            if inserted:
+                snapshot.db_write_count_per_cycle += inserted
+        except Exception as exc:
+            snapshot.warnings.append(f"STRATEGY_DECISION_EVENT_FLUSH_FAILED:{exc}")
 
     def _apply_reason_summary(self, snapshot: StrategyRuntimeSnapshot) -> None:
         try:
@@ -2109,6 +2598,339 @@ class _ReviewContext:
     dry_run_entry_order_result: dict = field(default_factory=dict)
     dry_run_exit_order_results: list[dict] = field(default_factory=list)
     review_needed: bool = False
+
+
+def _strategy_decision_event(
+    *,
+    candidate: Optional[Candidate],
+    gate_result: Optional[GatePipelineResult],
+    now: datetime,
+    runtime_cycle_id: str,
+    trade_date: str,
+    action_type: str,
+    action_result: str,
+    entry_plan: Optional[EntryPlan] = None,
+    virtual_order: Optional[VirtualOrder] = None,
+    virtual_position: Optional[VirtualPosition] = None,
+    exit_decision: Optional[ExitDecision] = None,
+    order_result: Optional[dict] = None,
+    details: Optional[dict] = None,
+) -> dict:
+    gate_details = dict(gate_result.details or {}) if gate_result is not None else {}
+    candidate_metadata = dict(candidate.metadata or {}) if candidate is not None else {}
+    plan_cancel = dict(entry_plan.cancel_condition or {}) if entry_plan is not None else {}
+    order_details = dict(virtual_order.details or {}) if virtual_order is not None else {}
+    position_details = dict(virtual_position.details or {}) if virtual_position is not None else {}
+    exit_details = dict(exit_decision.details or {}) if exit_decision is not None else {}
+    order_payload = dict(order_result or {})
+    order_request = dict(order_payload.get("request") or {})
+    order_metadata = dict(order_request.get("metadata") or order_payload.get("metadata") or {})
+    reason_codes = _decision_reason_codes(gate_result, exit_decision, details or {}, order_payload)
+    gate_status = _gate_status_for_decision(candidate, gate_result, action_type)
+    block_type = _first_text(
+        _enum_value(gate_result.block_type) if gate_result is not None else "",
+        _enum_value(candidate.block_type) if candidate is not None else "",
+    )
+    reason_status = normalize_reason_status(
+        reason_codes=reason_codes,
+        display_state=gate_status or action_type,
+        existing_status=_first_text(
+            (details or {}).get("reason_status"),
+            gate_details.get("sub_status"),
+            candidate_metadata.get("sub_status"),
+            (details or {}).get("reason"),
+        ),
+        block_type=block_type,
+        can_recover=bool(
+            (gate_result.can_recover if gate_result is not None else False)
+            or (candidate.can_recover if candidate is not None else False)
+        ),
+    )
+    snapshot = gate_result.snapshot if gate_result is not None else None
+    merged_details = {
+        "runtime_cycle_id": runtime_cycle_id,
+        "gate_result_key": _gate_result_key(gate_result) if gate_result is not None else "",
+        "gate_details": gate_details,
+        "action_details": dict(details or {}),
+    }
+    if entry_plan is not None:
+        merged_details["entry_plan"] = entry_plan.to_dict()
+    if virtual_order is not None:
+        merged_details["virtual_order"] = virtual_order.to_dict()
+    if virtual_position is not None:
+        merged_details["virtual_position"] = virtual_position.to_dict()
+    if exit_decision is not None:
+        merged_details["exit_decision"] = exit_decision.to_dict()
+    if order_payload:
+        merged_details["order_result"] = order_payload
+
+    decision_at = _clean_time(now).isoformat()
+    return {
+        "decision_id": f"decision:{uuid4().hex}",
+        "runtime_cycle_id": runtime_cycle_id,
+        "trade_date": trade_date or (candidate.trade_date if candidate is not None else decision_at[:10]),
+        "created_at": decision_at,
+        "decision_at": decision_at,
+        "candidate_id": _first_value(
+            candidate.id if candidate is not None else None,
+            gate_result.candidate_id if gate_result is not None else None,
+            order_request.get("candidate_id"),
+        ),
+        "candidate_instance_id": _first_text(
+            gate_details.get("candidate_instance_id"),
+            plan_cancel.get("candidate_instance_id"),
+            order_details.get("candidate_instance_id"),
+            position_details.get("candidate_instance_id"),
+            exit_details.get("candidate_instance_id"),
+            order_metadata.get("candidate_instance_id"),
+            candidate_metadata.get("candidate_instance_id"),
+        ),
+        "candidate_generation_seq": _int_or_zero(
+            _first_value(
+                gate_details.get("candidate_generation_seq"),
+                plan_cancel.get("candidate_generation_seq"),
+                order_details.get("candidate_generation_seq"),
+                position_details.get("candidate_generation_seq"),
+                exit_details.get("candidate_generation_seq"),
+                order_metadata.get("candidate_generation_seq"),
+                candidate_metadata.get("candidate_generation_seq"),
+            )
+        ),
+        "code": _first_text(
+            candidate.code if candidate is not None else "",
+            gate_result.code if gate_result is not None else "",
+            order_request.get("code"),
+        ),
+        "name": candidate.name if candidate is not None else "",
+        "theme_name": _first_text(
+            gate_details.get("theme_name"),
+            plan_cancel.get("theme_name"),
+            order_metadata.get("theme_name"),
+            candidate_metadata.get("theme_name"),
+            candidate_metadata.get("theme_lab_primary_theme"),
+        ),
+        "strategy_name": _first_text(
+            order_request.get("strategy_name"),
+            candidate.strategy_profile.value if candidate is not None and candidate.strategy_profile else "",
+            plan_cancel.get("strategy_profile"),
+            gate_details.get("strategy_name"),
+        ),
+        "strategy_version": _first_text(gate_details.get("strategy_settings_version"), gate_details.get("profile_version")),
+        "config_hash": _first_text(gate_details.get("config_hash"), gate_details.get("settings_hash")),
+        "gate_status": gate_status,
+        "gate_reason": _decision_gate_reason(gate_result, details or {}, order_payload),
+        "reason_status": reason_status,
+        "reason_family": reason_status_family(reason_status),
+        "reason_codes": reason_codes,
+        "block_type": block_type,
+        "action_type": action_type,
+        "action_result": action_result,
+        "price": _first_float(snapshot.price if snapshot is not None else None, gate_details.get("base_price"), order_request.get("price")),
+        "change_rate": _first_float(gate_details.get("change_rate")),
+        "trade_value": _first_float(gate_details.get("trade_value"), gate_details.get("turnover_krw")),
+        "execution_strength": _first_float(gate_details.get("execution_strength")),
+        "vwap": _first_float(snapshot.vwap if snapshot is not None else None, gate_details.get("vwap")),
+        "momentum_1m": _first_float(gate_details.get("momentum_1m"), gate_details.get("return_1m_pct")),
+        "momentum_3m": _first_float(gate_details.get("momentum_3m"), gate_details.get("return_3m_pct")),
+        "momentum_5m": _first_float(gate_details.get("momentum_5m"), gate_details.get("return_5m_pct")),
+        "gate_score": _first_float(gate_result.final_score if gate_result is not None else None, gate_details.get("score")),
+        "hybrid_score": _first_float(gate_details.get("hybrid_score"), gate_details.get("score")),
+        "theme_score": _first_float(gate_details.get("theme_score"), gate_details.get("dynamic_theme_score")),
+        "data_status": _decision_data_status(gate_details, reason_codes),
+        "data_quality_issues": _decision_data_quality_issues(gate_details, reason_codes),
+        "order_intent_id": _first_text(order_payload.get("intent_id"), order_request.get("order_intent_id")),
+        "entry_plan_id": _first_value(entry_plan.id if entry_plan is not None else None, order_request.get("entry_plan_id")),
+        "virtual_order_id": _first_value(
+            virtual_order.id if virtual_order is not None else None,
+            virtual_position.virtual_order_id if virtual_position is not None else None,
+            order_request.get("virtual_order_id"),
+        ),
+        "virtual_position_id": _first_value(
+            virtual_position.id if virtual_position is not None else None,
+            order_request.get("virtual_position_id"),
+        ),
+        "exit_decision_id": _first_value(exit_decision.id if exit_decision is not None else None, order_request.get("exit_decision_id")),
+        "details": merged_details,
+    }
+
+
+def _decision_reason_codes(
+    gate_result: Optional[GatePipelineResult],
+    exit_decision: Optional[ExitDecision],
+    details: dict,
+    order_result: dict,
+) -> list[str]:
+    values: list[str] = []
+    if gate_result is not None:
+        values.extend(_result_reason_codes(gate_result))
+        values.extend(str(code) for code in _as_list(gate_result.details.get("entry_risk_reason_codes")))
+        values.extend(str(code) for code in _as_list(gate_result.details.get("risk_reason_codes")))
+        values.extend(str(code) for code in _as_list(gate_result.details.get("market_side_reason_codes")))
+    if exit_decision is not None:
+        values.extend(str(code) for code in exit_decision.reason_codes or [])
+        values.extend(str(code) for code in _as_list(exit_decision.details.get("risk_reason_codes")))
+    values.extend(str(code) for code in _as_list(details.get("reason_codes")))
+    reason = str(details.get("reason") or order_result.get("reason") or "")
+    if reason:
+        values.append(reason)
+    if gate_result is not None and str(gate_result.details.get("vi_status") or "").upper() == "UNKNOWN":
+        values.append("VI_UNKNOWN")
+    return _dedupe(values)
+
+
+def _gate_status_for_decision(
+    candidate: Optional[Candidate],
+    gate_result: Optional[GatePipelineResult],
+    action_type: str,
+) -> str:
+    if action_type == "READY":
+        return "READY"
+    if action_type == "WAIT":
+        return "WAIT"
+    if action_type == "BLOCK":
+        return "BLOCKED"
+    if gate_result is not None:
+        if gate_result.strategy_eligible:
+            return "READY"
+        if gate_result.block_type == BlockType.FINAL:
+            return "BLOCKED"
+        return "WAIT"
+    if candidate is not None:
+        if candidate.state == CandidateState.READY:
+            return "READY"
+        if candidate.state == CandidateState.BLOCKED and candidate.block_type == BlockType.FINAL:
+            return "BLOCKED"
+        if candidate.state in {CandidateState.DETECTED, CandidateState.WATCHING, CandidateState.BLOCKED}:
+            return "WAIT"
+    return ""
+
+
+def _decision_gate_reason(gate_result: Optional[GatePipelineResult], details: dict, order_result: dict) -> str:
+    if details.get("reason"):
+        return str(details.get("reason") or "")
+    if order_result.get("reason"):
+        return str(order_result.get("reason") or "")
+    if gate_result is None:
+        return ""
+    result_details = dict(gate_result.details or {})
+    return _first_text(
+        result_details.get("primary_reason_code"),
+        result_details.get("sub_status"),
+        next(iter(_result_reason_codes(gate_result)), ""),
+        gate_result.final_grade,
+    )
+
+
+def _decision_data_status(details: dict, reason_codes: list[str]) -> str:
+    if "DATA_INSUFFICIENT" in reason_codes or any(str(code).endswith("DATA_INSUFFICIENT") for code in reason_codes):
+        return "DATA_INSUFFICIENT"
+    if details.get("latest_tick_stale"):
+        return "STALE"
+    if str(details.get("vi_status") or "").upper() == "UNKNOWN":
+        return "PARTIAL"
+    return str(details.get("data_status") or "OK")
+
+
+def _decision_data_quality_issues(details: dict, reason_codes: list[str]) -> list[str]:
+    values: list[str] = []
+    for key in (
+        "data_quality_issues",
+        "data_quality_flags",
+        "market_side_data_quality_flags",
+        "input_missing_fields",
+        "risk_off_entry_blocking_data_flags",
+    ):
+        values.extend(str(item) for item in details.get(key) or [])
+    if details.get("latest_tick_stale"):
+        values.append("LATEST_TICK_STALE")
+    if str(details.get("vi_status") or "").upper() == "UNKNOWN":
+        values.append("VI_UNKNOWN")
+    values.extend(code for code in reason_codes if "DATA_INSUFFICIENT" in str(code))
+    return _dedupe(values)
+
+
+def _gate_action_result(result: GatePipelineResult) -> str:
+    if result.strategy_eligible:
+        return "ACCEPTED"
+    if result.block_type == BlockType.FINAL:
+        return "REJECTED"
+    return "SKIPPED"
+
+
+def _lifecycle_action_type(candidate: Candidate) -> str:
+    if candidate.state == CandidateState.READY:
+        return "READY"
+    if candidate.state == CandidateState.BLOCKED and candidate.block_type == BlockType.FINAL:
+        return "BLOCK"
+    if candidate.state == CandidateState.BLOCKED and (candidate.block_type == BlockType.TEMPORARY or candidate.can_recover):
+        return "WAIT"
+    if candidate.state in {CandidateState.DETECTED, CandidateState.WATCHING}:
+        return "WAIT"
+    return "EVALUATE"
+
+
+def _lifecycle_action_result(candidate: Candidate) -> str:
+    if candidate.state == CandidateState.READY:
+        return "ACCEPTED"
+    if candidate.state == CandidateState.BLOCKED and candidate.block_type == BlockType.FINAL:
+        return "REJECTED"
+    return "SKIPPED"
+
+
+def _order_intent_action_result(payload: dict) -> str:
+    status = str(payload.get("status") or "").upper()
+    if status == "DUPLICATE":
+        return "DUPLICATE"
+    if status in {"SKIPPED", ""}:
+        return "SKIPPED"
+    if bool(payload.get("accepted")) or "ACCEPTED" in status:
+        return "ACCEPTED"
+    if "REJECTED" in status or status == "ERROR":
+        return "REJECTED"
+    return "NOT_APPLICABLE"
+
+
+def _first_text(*values) -> str:
+    value = _first_value(*values)
+    return "" if value is None else str(value)
+
+
+def _first_value(*values):
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _first_float(*values) -> Optional[float]:
+    for value in values:
+        parsed = _float_or_none(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _int_or_zero(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _enum_value(value) -> str:
+    return value.value if hasattr(value, "value") else str(value or "")
+
+
+def _as_list(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return [value]
 
 
 def _snapshot_for_exit(context: _ReviewContext):
@@ -2636,11 +3458,32 @@ def _gate_result_record(result: GatePipelineResult, evaluated_at: str) -> dict:
         "late_chase_recheck_after_sec": result.details.get("late_chase_recheck_after_sec", 0),
         "risk_soft_block": bool(result.details.get("risk_soft_block")),
         "risk_soft_block_reason_codes": list(result.details.get("risk_soft_block_reason_codes") or []),
+        "entry_risk_diagnostics": dict(result.details.get("entry_risk_diagnostics") or {}),
+        "entry_risk_feature_version": result.details.get("entry_risk_feature_version", ""),
+        "entry_risk_action": result.details.get("entry_risk_action", ""),
+        "entry_risk_level": result.details.get("entry_risk_level", ""),
+        "entry_risk_score": result.details.get("entry_risk_score"),
+        "entry_risk_reason_codes": list(result.details.get("entry_risk_reason_codes") or []),
+        "entry_risk_recovery_checks": dict(result.details.get("entry_risk_recovery_checks") or {}),
+        "vi_status": result.details.get("vi_status", "UNKNOWN"),
+        "vi_signal_source": result.details.get("vi_signal_source", "unknown"),
+        "seconds_since_vi_release": result.details.get("seconds_since_vi_release"),
+        "upper_limit_price": result.details.get("upper_limit_price"),
+        "upper_limit_gap_pct": result.details.get("upper_limit_gap_pct"),
+        "change_rate": result.details.get("change_rate"),
+        "pullback_from_high_pct": result.details.get("pullback_from_high_pct"),
+        "leadership_role": result.details.get("leadership_role", ""),
+        "stock_role": result.details.get("stock_role", ""),
+        "position_size_multiplier": result.details.get("position_size_multiplier", 1.0),
         "risk_off_entry": dict(result.details.get("risk_off_entry") or {}),
         "risk_off_entry_enabled": bool(result.details.get("risk_off_entry_enabled")),
         "risk_off_entry_observe_only": bool(result.details.get("risk_off_entry_observe_only")),
         "risk_off_entry_allowed": bool(result.details.get("risk_off_entry_allowed")),
         "risk_off_entry_rejected_reason": result.details.get("risk_off_entry_rejected_reason", ""),
+        "risk_off_entry_failed_checks": list(result.details.get("risk_off_entry_failed_checks") or []),
+        "risk_off_entry_passed_checks": list(result.details.get("risk_off_entry_passed_checks") or []),
+        "risk_off_entry_blocking_data_flags": list(result.details.get("risk_off_entry_blocking_data_flags") or []),
+        "risk_off_shadow_entry": dict(result.details.get("risk_off_shadow_entry") or {}),
         "risk_off_relative_strength_pct": result.details.get("risk_off_relative_strength_pct"),
         "risk_off_candidate_breadth_pct": result.details.get("risk_off_candidate_breadth_pct"),
         "risk_off_candidate_index_return_pct": result.details.get("risk_off_candidate_index_return_pct"),
@@ -2778,11 +3621,32 @@ def _block_record(result: GatePipelineResult) -> dict:
         "late_chase_recheck_after_sec": result.details.get("late_chase_recheck_after_sec", 0),
         "risk_soft_block": bool(result.details.get("risk_soft_block")),
         "risk_soft_block_reason_codes": list(result.details.get("risk_soft_block_reason_codes") or []),
+        "entry_risk_diagnostics": dict(result.details.get("entry_risk_diagnostics") or {}),
+        "entry_risk_feature_version": result.details.get("entry_risk_feature_version", ""),
+        "entry_risk_action": result.details.get("entry_risk_action", ""),
+        "entry_risk_level": result.details.get("entry_risk_level", ""),
+        "entry_risk_score": result.details.get("entry_risk_score"),
+        "entry_risk_reason_codes": list(result.details.get("entry_risk_reason_codes") or []),
+        "entry_risk_recovery_checks": dict(result.details.get("entry_risk_recovery_checks") or {}),
+        "vi_status": result.details.get("vi_status", "UNKNOWN"),
+        "vi_signal_source": result.details.get("vi_signal_source", "unknown"),
+        "seconds_since_vi_release": result.details.get("seconds_since_vi_release"),
+        "upper_limit_price": result.details.get("upper_limit_price"),
+        "upper_limit_gap_pct": result.details.get("upper_limit_gap_pct"),
+        "change_rate": result.details.get("change_rate"),
+        "pullback_from_high_pct": result.details.get("pullback_from_high_pct"),
+        "leadership_role": result.details.get("leadership_role", ""),
+        "stock_role": result.details.get("stock_role", ""),
+        "position_size_multiplier": result.details.get("position_size_multiplier", 1.0),
         "risk_off_entry": dict(result.details.get("risk_off_entry") or {}),
         "risk_off_entry_enabled": bool(result.details.get("risk_off_entry_enabled")),
         "risk_off_entry_observe_only": bool(result.details.get("risk_off_entry_observe_only")),
         "risk_off_entry_allowed": bool(result.details.get("risk_off_entry_allowed")),
         "risk_off_entry_rejected_reason": result.details.get("risk_off_entry_rejected_reason", ""),
+        "risk_off_entry_failed_checks": list(result.details.get("risk_off_entry_failed_checks") or []),
+        "risk_off_entry_passed_checks": list(result.details.get("risk_off_entry_passed_checks") or []),
+        "risk_off_entry_blocking_data_flags": list(result.details.get("risk_off_entry_blocking_data_flags") or []),
+        "risk_off_shadow_entry": dict(result.details.get("risk_off_shadow_entry") or {}),
         "risk_off_relative_strength_pct": result.details.get("risk_off_relative_strength_pct"),
         "risk_off_candidate_breadth_pct": result.details.get("risk_off_candidate_breadth_pct"),
         "risk_off_candidate_index_return_pct": result.details.get("risk_off_candidate_index_return_pct"),

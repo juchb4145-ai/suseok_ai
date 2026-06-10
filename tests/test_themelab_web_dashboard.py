@@ -15,7 +15,7 @@ from trading.strategy.conditions import ConditionProfile, ConditionProfileReposi
 from trading.strategy.models import Candidate, CandidateState
 from trading.strategy.models import StrategyProfile
 from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE
-from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeStatus
+from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeSourceSyncResult, ThemeStatus
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading_app.themelab_dashboard import build_theme_lab_dashboard_snapshot
 
@@ -32,10 +32,56 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one(".terminal-shell") is not None
     assert soup.select_one("#operating-cockpit") is not None
     assert soup.select_one("#operation-status") is not None
+    assert soup.select_one("#naver-theme-sync") is not None
+    assert soup.select_one("#naver-theme-sync-status") is not None
     assert soup.select_one("#kiwoom-gateway-start") is not None
+    assert soup.select_one("#operator-alert-panel") is not None
+    assert soup.select_one("#operator-alert-count") is not None
+    assert soup.select_one("#operator-alert-filters") is not None
+    assert soup.select_one("#operator-alert-list") is not None
+    assert soup.select_one("#operator-timeline-list") is not None
+    assert soup.select_one("#operator-alert-ack-all") is not None
+    assert soup.select_one("#operator-alert-hide-acknowledged") is not None
+    assert soup.select_one("#operator-session-review") is not None
+    assert soup.select_one("#operator-event-sync-status") is not None
+    assert soup.select_one("#operator-session-summary-cards") is not None
+    assert soup.select_one("#operator-event-journal") is not None
+    assert soup.select_one("#operator-event-journal-filters") is not None
+    assert soup.select_one("#operator-event-journal-list") is not None
+    assert soup.select_one("#operator-action-center") is not None
+    assert soup.select_one("#operator-action-context") is not None
+    assert soup.select_one("#operator-action-recommendations") is not None
+    assert soup.select_one("#operator-action-history") is not None
+    assert soup.select_one("#operator-action-summary") is not None
+    assert soup.select_one("#operator-action-confirm-modal") is not None
+    assert soup.select_one("#operator-runbook-panel") is not None
+    assert soup.select_one("#operator-runbook-title") is not None
+    assert soup.select_one("#operator-runbook-body") is not None
+    assert soup.select_one("#postmarket-review-panel") is not None
+    assert soup.select_one(".postmarket-review-toolbar") is not None
+    assert soup.select_one("#postmarket-review-summary") is not None
+    assert soup.select_one("#postmarket-review-tabs") is not None
+    assert soup.select_one("#missed-opportunity-list") is not None
+    assert soup.select_one("#good-block-list") is not None
+    assert soup.select_one("#review-needed-list") is not None
+    assert soup.select_one("#protected-from-chase-list") is not None
+    assert soup.select_one("#data-insufficient-list") is not None
+    assert soup.select_one("#block-reason-summary") is not None
+    assert soup.select_one("#postmarket-review-detail") is not None
+    assert soup.select_one('[data-alert-filter="OPPORTUNITY"]') is not None
+    assert soup.select_one('[data-alert-filter="CRITICAL"]') is not None
+    assert soup.select_one('[data-journal-filter="SYMBOL"]') is not None
     assert soup.select_one("#cockpit-market-sides") is not None
     assert soup.select_one("#cockpit-live-readiness") is not None
     assert soup.select_one("#theme-rank-list") is not None
+    assert soup.select_one("#candidate-focus-panel") is not None
+    assert soup.select_one("#focus-summary") is not None
+    assert soup.select_one("#decision-checklist") is not None
+    assert soup.select_one("#price-map") is not None
+    assert soup.select_one("#chart-timeframe") is not None
+    assert soup.select_one('[data-chart-interval="1m"]') is not None
+    assert soup.select_one('[data-chart-interval="3m"]') is not None
+    assert soup.select_one('[data-chart-interval="5m"][disabled]') is not None
     assert soup.select_one("#chart-stage") is not None
     assert soup.select_one("#gate-status") is not None
     assert soup.select_one("#gate-display-status") is not None
@@ -54,15 +100,172 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "cockpit-grid" in css
     assert "/ws/dashboard" in js
     assert "/api/themelab/snapshot" in js
+    assert "isFullThemeLabSnapshot" in js
+    assert "snapshot.theme_lab && isFullThemeLabSnapshot(snapshot.theme_lab)" in js
     assert "/api/gateway/kiwoom/start" in js
     assert "startKiwoomGateway" in js
+    assert "/api/themes/sync/naver" in js
+    assert "syncNaverThemeUniverse" in js
+    assert "renderNaverThemeSyncStatus" in js
+    assert "requestLocalToken" in js
+    assert "local-token-modal" in js
+    assert "window.prompt" not in js
     assert "gateway_unhealthy_display" in js
     assert "matchesFilters" in js
     assert "renderCockpit" in js
+    assert "previousSnapshot" in js
+    assert "operatorEvents" in js
+    assert "acknowledgedEventIds" in js
+    assert "persistedEventIds" in js
+    assert "operatorSessionSummary" in js
+    assert "journalFilter" in js
+    assert "actionCatalog" in js
+    assert "actionRecommendations" in js
+    assert "selectedEventId" in js
+    assert "selectedActionContext" in js
+    assert "pendingAction" in js
+    assert "actionSummary" in js
+    assert "postmarketReviewSummary" in js
+    assert "postmarketReviewItems" in js
+    assert "postmarketReviewFilters" in js
+    assert "postmarketReviewSelectedItem" in js
+    assert "postmarketReviewLoading" in js
+    assert "postmarketReviewLastGeneratedAt" in js
+    assert "alertFilters" in js
+    assert "maxOperatorEvents: 200" in js
+    assert "deriveOperatorEvents" in js
+    assert "appendOperatorEvents" in js
+    assert "makeEventId" in js
+    assert "persistOperatorEvents" in js
+    assert "fetchOperatorEvents" in js
+    assert "fetchOperatorSessionReview" in js
+    assert "renderOperatorAlerts" in js
+    assert "renderDecisionTimeline" in js
+    assert "renderOperatorSessionReview" in js
+    assert "renderOperatorEventJournal" in js
+    assert "acknowledgeOperatorEvents" in js
+    assert "hideOperatorEvents" in js
+    assert "fetchActionCatalog" in js
+    assert "fetchActionRecommendations" in js
+    assert "executeOperatorAction" in js
+    assert "confirmOperatorAction" in js
+    assert "renderOperatorActionCenter" in js
+    assert "renderActionRecommendations" in js
+    assert "renderActionHistory" in js
+    assert "renderActionSummary" in js
+    assert "renderRunbook" in js
+    assert "fetchPostmarketReviewSummary" in js
+    assert "fetchPostmarketReviewItems" in js
+    assert "rebuildPostmarketReview" in js
+    assert "renderPostmarketReviewPanel" in js
+    assert "renderPostmarketReviewSummary" in js
+    assert "renderMissedOpportunityList" in js
+    assert "renderGoodBlockList" in js
+    assert "renderReviewNeededList" in js
+    assert "renderProtectedFromChaseList" in js
+    assert "renderDataInsufficientList" in js
+    assert "renderBlockReasonSummary" in js
+    assert "renderPostmarketReviewDetail" in js
+    assert "formatReturnPct" in js
+    assert "outcomeLabelKo" in js
+    assert "confidenceBadge" in js
+    assert "selectReviewItem" in js
+    assert "runbookForEvent" in js
+    assert "runbookForStatus" in js
+    assert "appendActionResultToEvents" in js
+    assert "/api/themelab/operator-events" in js
+    assert "/api/themelab/operator-events/summary" in js
+    assert "/api/themelab/operator-events/ack" in js
+    assert "/api/themelab/operator-actions/catalog" in js
+    assert "/api/themelab/operator-actions/recommendations" in js
+    assert "/api/themelab/operator-actions/execute" in js
+    assert "/api/themelab/postmarket-review" in js
+    assert "/api/themelab/postmarket-review/summary" in js
+    assert "REBUILD_POSTMARKET_REVIEW" in js
+    assert "LIVE_BUY" in js
+    assert "LIVE_SELL" in js
+    assert "CANCEL_LIVE_ORDER" in js
+    assert "OVERRIDE_LIVE_GUARD" in js
+    assert "RUNTIME_CYCLE_ONCE" in js
+    assert "CHECK_GATEWAY_STATUS" in js
+    assert "START_KIWOOM_GATEWAY" in js
+    assert "ADD_OPERATOR_NOTE" in js
+    assert "OPEN_RUNBOOK" in js
+    assert "MISSED_OPPORTUNITY" in js
+    assert "GOOD_BLOCK" in js
+    assert "REVIEW_NEEDED" in js
+    assert "DATA_INSUFFICIENT" in js
+    assert "PROTECTED_FROM_CHASE" in js
+    assert "eventSeverity" in js
+    assert "eventCategory" in js
+    assert "selectSymbol" in js
+    assert "watchsetBySymbol" in js
+    assert "summaryDiffEvents" in js
+    assert "watchsetDiffEvents" in js
+    assert "gatewayDiffEvents" in js
+    assert "dataQualityDiffEvents" in js
+    assert "themeDiffEvents" in js
+    assert 'selectSymbol(row.dataset.symbol, { source: "watchset" })' in js
+    assert 'selectSymbol(eventItem.symbol, { source: "alert", acknowledgeEventId: eventItem.id })' in js
+    for event_type in (
+        "BUY_READY_NEW",
+        "READY_BUT_LIVE_BLOCKED",
+        "DATA_QUALITY_DEGRADED",
+        "MARKET_WAIT_STARTED",
+        "ORDER_INTENT_CREATED",
+        "GATEWAY_DISCONNECTED",
+        "SNAPSHOT_STALE",
+    ):
+        assert event_type in js
+    assert 'chartInterval: "1m"' in js
+    assert "renderFocusPanel" in js
+    assert "selectedChartForSymbol" in js
+    assert "chartFromWatchItem" in js
+    assert "renderDecisionChecklist" in js
+    assert "renderPriceMap" in js
+    assert "renderFocusPanel(item, selectedChart)" in js
+    assert "renderChart(selectedChart)" in js
     assert "minuteChartSvg" in js
     assert "RUNTIME_INACTIVE" in js
     assert "snapshot_age_label" in js
     assert ".chart-ref.vwap" in css
+    assert "operator-alert-panel" in css
+    assert "session-review-card" in css
+    assert "operator-event-journal-list" in css
+    assert "action-center-panel" in css
+    assert "action-card" in css
+    assert "action-history-row" in css
+    assert "action-confirm-modal" in css
+    assert "runbook-panel" in css
+    assert "runbook-step" in css
+    assert "action-status-success" in css
+    assert "action-status-failed" in css
+    assert "action-status-blocked" in css
+    assert "action-status-running" in css
+    assert "postmarket-review-panel" in css
+    assert "postmarket-review-toolbar" in css
+    assert "postmarket-summary-grid" in css
+    assert "postmarket-summary-card" in css
+    assert "outcome-missed" in css
+    assert "outcome-good-block" in css
+    assert "outcome-review-needed" in css
+    assert "outcome-data-insufficient" in css
+    assert "outcome-protected" in css
+    assert "confidence-high" in css
+    assert "confidence-medium" in css
+    assert "confidence-low" in css
+    assert "review-table" in css
+    assert "review-detail-panel" in css
+    assert "return-positive" in css
+    assert "return-negative" in css
+    assert "return-neutral" in css
+    assert ".critical" in css
+    assert ".warning" in css
+    assert ".opportunity" in css
+    assert ".info" in css
+    assert "candidate-focus-panel" in css
+    assert "decision-checklist" in css
+    assert "price-track" in css
     assert "button:disabled" in css
 
 
@@ -101,6 +304,58 @@ def test_theme_lab_snapshot_sorts_watchset_and_filters_entry_candidates(tmp_path
     assert {"KOSPI", "KOSDAQ", "000001", "000002"}.issubset(universe)
     assert "000004" not in universe
     assert payload["data_quality"]["vi_status_supported"] is False
+
+
+def test_theme_lab_snapshot_adds_candidate_focus_operating_fields(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        ready = _watch("000101", "READY", role="LEADER")
+        ready.update(
+            {
+                "current_price": 1060,
+                "vwap": 1055,
+                "recent_support_price": 1030,
+                "support_price": 1020,
+                "breakout_level": 1050,
+                "upper_limit_price": 1300,
+                "live_order_enabled": True,
+                "live_order_guard_passed": True,
+                "submittable": True,
+                "recheck_after_sec": 45,
+            }
+        )
+        data_wait = _watch("000102", "WAIT")
+        data_wait.update({"support_ready_reason": "WAIT_DATA_SUPPORT_NOT_READY", "diagnostic_only": True})
+        market_wait = _watch("000103", "WAIT")
+        market_wait.update({"candidate_market": "KOSDAQ", "candidate_market_confirmation_pending": True, "market_side_recheck_after_sec": 30})
+        chase_blocked = _watch("000104", "BLOCKED")
+        chase_blocked.update({"chase_risk": True, "risk_reason_codes": ["CHASE_RISK"]})
+        db.save_theme_lab_flow_result(
+            "09:01:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [data_wait, market_wait, chase_blocked, ready],
+                "gate_decisions": [],
+                "data_quality": {"status": "OK"},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    rows = {item["symbol"]: item for item in payload["watchset"]}
+    assert rows["000101"]["operator_action"] == "BUY_READY"
+    assert rows["000101"]["next_recheck_after_sec"] == 45
+    assert rows["000101"]["decision_checklist"]["order_link"] == "READY"
+    assert rows["000101"]["price_map"]["current_price"] == 1060
+    assert rows["000102"]["operator_action"] == "DATA_WAIT"
+    assert rows["000102"]["decision_checklist"]["data"] == "DEGRADED"
+    assert rows["000103"]["operator_action"] == "MARKET_WAIT"
+    assert rows["000103"]["decision_checklist"]["market"] == "WAIT"
+    assert rows["000104"]["operator_action"] == "CHASE_BLOCKED"
+    assert rows["000104"]["decision_checklist"]["chase_risk"] == "BLOCK"
 
 
 def test_theme_lab_snapshot_merges_risk_off_details_from_gate_decisions(tmp_path):
@@ -788,6 +1043,75 @@ def test_condition_status_uses_send_condition_ack_not_resolved_index(tmp_path):
     assert leader["warning"] == "CONDITION_SEND_FAILED"
 
 
+def test_condition_status_prefers_current_session_ack_over_later_failed_duplicate(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        repo = ConditionProfileRepository(db)
+        repo.upsert_profile(
+            ConditionProfile(
+                condition_name="theme-lab-leader",
+                strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+                enabled=True,
+                priority=200,
+                purpose="theme_lab_leader",
+                last_resolved_index=85,
+            )
+        )
+        state = GatewayStateStore()
+        state.status.connected = True
+        state.status.last_heartbeat_at = utc_timestamp()
+        state.status.last_heartbeat_payload = {"ws_session_id": "current-session"}
+        state.enqueue_command(
+            GatewayCommand(
+                type="send_condition",
+                command_id="cmd-cond-acked",
+                payload={
+                    "condition_name": "theme-lab-leader",
+                    "condition_index": 85,
+                    "screen_no": "7602",
+                },
+            )
+        )
+        state.ack_command(
+            "cmd-cond-acked",
+            status="ACKED",
+            result_payload={"message": "condition sent", "transport_trace": {"ws_session_id": "current-session"}},
+        )
+        state.enqueue_command(
+            GatewayCommand(
+                type="send_condition",
+                command_id="cmd-cond-failed-later",
+                idempotency_key="runtime:send_condition_recover:theme-lab-leader:85:7602:20260608094500",
+                payload={
+                    "condition_name": "theme-lab-leader",
+                    "condition_index": 85,
+                    "screen_no": "7602",
+                },
+            )
+        )
+        state.ack_command("cmd-cond-failed-later", status="FAILED", error="condition sent")
+        db.save_theme_lab_flow_result(
+            "2026-06-02T09:04:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [],
+                "watchset_snapshots": [],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db, gateway_state=state)
+    finally:
+        db.close()
+
+    leader = next(item for item in payload["condition_statuses"] if item["purpose"] == "theme_lab_leader")
+    assert leader["registered"] is True
+    assert leader["command_status"] == "ACKED"
+    assert leader["screen_no"] == "7602"
+    assert leader["warning"] == ""
+
+
 def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, monkeypatch):
     db_path = tmp_path / "trader.sqlite3"
     monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
@@ -818,6 +1142,40 @@ def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, 
     assert page.status_code == 200
     assert direct["summary"]["ready_count"] == 1
     assert snapshot["theme_lab"]["summary"]["ready_count"] == 1
+
+
+def test_theme_lab_snapshot_exposes_naver_sync_status(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        ThemeEngineRepository(db).save_source_sync_run(
+            ThemeSourceSyncResult(
+                source="naver_theme_universe",
+                status="success",
+                theme_count=3,
+                member_count=42,
+                started_at="2026-06-10T09:00:00",
+                finished_at="2026-06-10T09:01:00",
+            )
+        )
+        db.save_theme_lab_flow_result(
+            "09:02:00",
+            {
+                "market_status": {"market_status": "EXPANSION"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [_watch("000001", "READY")],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    assert payload["theme_source_sync"]["source"] == "naver_theme_universe"
+    assert payload["theme_source_sync"]["status"] == "success"
+    assert payload["theme_source_sync"]["theme_count"] == 3
+    assert payload["theme_source_sync"]["member_count"] == 42
 
 
 def test_theme_lab_snapshot_exposes_defensive_gate_observability_columns(tmp_path):
