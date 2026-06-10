@@ -273,9 +273,9 @@ def test_dashboard_snapshot_payload_uses_shared_cache(tmp_path, monkeypatch):
     api = importlib.reload(api)
     calls = []
 
-    def fake_snapshot(_db):
+    def fake_snapshot(_db, *, detail="slim"):
         calls.append(time.monotonic())
-        return {"gateway": {}, "runtime": {"call_count": len(calls)}}
+        return {"snapshot_detail": detail, "gateway": {}, "runtime": {"call_count": len(calls)}}
 
     monkeypatch.setattr(api, "build_dashboard_snapshot", fake_snapshot)
     monkeypatch.setattr(api, "DASHBOARD_SNAPSHOT_CACHE_TTL_SEC", 60.0)
@@ -291,6 +291,52 @@ def test_dashboard_snapshot_payload_uses_shared_cache(tmp_path, monkeypatch):
     assert len(calls) == 2
     assert first["runtime"]["call_count"] == 1
     assert forced["runtime"]["call_count"] == 2
+
+
+def test_dashboard_snapshot_defaults_to_slim_detail(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch, enabled="0") as client:
+        import trading_app.api as api
+
+        api.gateway_state.record_event(
+            GatewayEvent(
+                type="heartbeat",
+                event_id="evt-dashboard-slim-heartbeat",
+                payload={
+                    "kiwoom_logged_in": True,
+                    "orderable": True,
+                    "transport_mode": "websocket_real_pilot",
+                    "ws_session_id": "session-slim",
+                    "large_raw_blob": "x" * 1000,
+                },
+            )
+        )
+
+        def fake_theme_lab_snapshot(*args, **kwargs):
+            return {
+                "available": True,
+                "source": "test",
+                "created_at": "2026-06-10T09:00:00+09:00",
+                "calculated_at": "2026-06-10T09:00:01+09:00",
+                "last_updated_at": "09:00:02",
+                "summary": {"ready_count": 1, "operation_status": "READY_TO_TRADE"},
+                "data_quality": {"status": "OK", "message": "ok", "watchset_size": 1},
+                "watchset": [{"symbol": "000001", "large_raw_blob": "x" * 1000}],
+                "ranked_themes": [{"theme_id": "theme-a", "large_raw_blob": "x" * 1000}],
+                "entry_candidates": [{"symbol": "000001", "large_raw_blob": "x" * 1000}],
+            }
+
+        monkeypatch.setattr(api, "build_theme_lab_dashboard_snapshot", fake_theme_lab_snapshot)
+        slim = client.get("/api/snapshot?refresh=true").json()
+        full = client.get("/api/snapshot?refresh=true&detail=full").json()
+
+    assert slim["snapshot_detail"] == "slim"
+    assert "last_heartbeat_payload" not in slim["gateway"]
+    assert slim["gateway"]["last_heartbeat_summary"]["ws_session_id"] == "session-slim"
+    assert "watchset" not in slim["theme_lab"]
+    assert "ranked_themes" not in slim["theme_lab"]
+    assert full["snapshot_detail"] == "full"
+    assert full["gateway"]["last_heartbeat_payload"]["large_raw_blob"]
+    assert full["theme_lab"]["watchset"][0]["large_raw_blob"]
 
 
 def test_dashboard_logs_display_kst(tmp_path, monkeypatch):

@@ -115,6 +115,8 @@ DASHBOARD_EVENT_PUSH_MIN_INTERVAL_SEC = 1.0
 DASHBOARD_SNAPSHOT_CACHE_TTL_SEC = 5.0
 DASHBOARD_HEAVY_SECTION_CACHE_TTL_SEC = 30.0
 DASHBOARD_WS_PUSH_INTERVAL_SEC = 5.0
+DASHBOARD_SNAPSHOT_DETAIL_SLIM = "slim"
+DASHBOARD_SNAPSHOT_DETAIL_FULL = "full"
 THEMELAB_OPERATOR_EVENT_TYPES = {
     "BUY_READY_NEW",
     "BUY_READY_SMALL_NEW",
@@ -2414,8 +2416,8 @@ def reviews(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
 
 
 @app.get("/api/snapshot")
-def snapshot(refresh: bool = Query(False)) -> dict[str, Any]:
-    return _build_dashboard_snapshot_payload(force=refresh)
+def snapshot(refresh: bool = Query(False), detail: str = Query(DASHBOARD_SNAPSHOT_DETAIL_SLIM)) -> dict[str, Any]:
+    return _build_dashboard_snapshot_payload(force=refresh, detail=detail)
 
 
 @app.get("/api/themelab/snapshot")
@@ -5127,6 +5129,13 @@ def _dashboard_ws_push_interval_sec() -> float:
     return _dashboard_float_env("TRADING_DASHBOARD_WS_PUSH_INTERVAL_SEC", DASHBOARD_WS_PUSH_INTERVAL_SEC, minimum=1.0)
 
 
+def _dashboard_snapshot_detail(detail: str | None = None) -> str:
+    value = str(detail or DASHBOARD_SNAPSHOT_DETAIL_SLIM).strip().lower()
+    if value in {DASHBOARD_SNAPSHOT_DETAIL_FULL, "debug", "verbose"}:
+        return DASHBOARD_SNAPSHOT_DETAIL_FULL
+    return DASHBOARD_SNAPSHOT_DETAIL_SLIM
+
+
 def _dashboard_database_cache_key(db: TradingDatabase | None = None) -> str:
     if db is not None and getattr(db, "path", None) is not None:
         return str(Path(db.path).resolve())
@@ -5157,25 +5166,26 @@ def _cached_dashboard_fragment(
         return value
 
 
-def _build_dashboard_snapshot_payload_uncached() -> dict[str, Any]:
+def _build_dashboard_snapshot_payload_uncached(*, detail: str = DASHBOARD_SNAPSHOT_DETAIL_SLIM) -> dict[str, Any]:
     db = open_database()
     try:
-        return build_dashboard_snapshot(db)
+        return build_dashboard_snapshot(db, detail=detail)
     finally:
         close_database(db)
 
 
-def _build_dashboard_snapshot_payload(*, force: bool = False) -> dict[str, Any]:
+def _build_dashboard_snapshot_payload(*, force: bool = False, detail: str = DASHBOARD_SNAPSHOT_DETAIL_SLIM) -> dict[str, Any]:
     global _dashboard_snapshot_cache_payload
     global _dashboard_snapshot_cache_db_path
     global _dashboard_snapshot_cache_monotonic
     global _dashboard_snapshot_cache_build_ms
     global _dashboard_snapshot_cache_hit_count
     global _dashboard_snapshot_cache_miss_count
+    resolved_detail = _dashboard_snapshot_detail(detail)
     ttl = _dashboard_snapshot_cache_ttl_sec()
-    db_path = _dashboard_database_cache_key()
+    db_path = f"{_dashboard_database_cache_key()}:{resolved_detail}"
     if ttl <= 0.0:
-        return _build_dashboard_snapshot_payload_uncached()
+        return _build_dashboard_snapshot_payload_uncached(detail=resolved_detail)
     now = time.monotonic()
     with _dashboard_snapshot_cache_lock:
         if (
@@ -5188,7 +5198,7 @@ def _build_dashboard_snapshot_payload(*, force: bool = False) -> dict[str, Any]:
             return _dashboard_snapshot_cache_payload
         _dashboard_snapshot_cache_miss_count += 1
         started = time.perf_counter()
-        payload = _build_dashboard_snapshot_payload_uncached()
+        payload = _build_dashboard_snapshot_payload_uncached(detail=resolved_detail)
         _dashboard_snapshot_cache_build_ms = (time.perf_counter() - started) * 1000.0
         _dashboard_snapshot_cache_payload = payload
         _dashboard_snapshot_cache_db_path = db_path
@@ -5199,6 +5209,7 @@ def _build_dashboard_snapshot_payload(*, force: bool = False) -> dict[str, Any]:
 def _dashboard_snapshot_for_client_count(payload: dict[str, Any], client_count: int) -> dict[str, Any]:
     snapshot = dict(payload)
     gateway = dict(snapshot.get("gateway") or {})
+    gateway["dashboard_snapshot_detail"] = _dashboard_snapshot_detail(snapshot.get("snapshot_detail"))
     gateway["dashboard_ws_client_count"] = int(client_count)
     with _dashboard_snapshot_cache_lock:
         cache_age_sec = max(0.0, time.monotonic() - _dashboard_snapshot_cache_monotonic) if _dashboard_snapshot_cache_payload is not None else 0.0
@@ -6041,24 +6052,244 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
         await _stop_core_ws_outbound_writer(outbound_writer_task, outbound_queue)
 
 
+def _dashboard_field_subset(payload: dict[str, Any], fields: tuple[str, ...] | list[str]) -> dict[str, Any]:
+    return {field: payload.get(field) for field in fields if field in payload}
 
-def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
+
+def _dashboard_slim_gateway_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    gateway = _dashboard_field_subset(
+        dict(payload or {}),
+        (
+            "connection_state",
+            "connected",
+            "kiwoom_logged_in",
+            "orderable",
+            "mode",
+            "account",
+            "last_heartbeat_at",
+            "last_event_at",
+            "last_error",
+            "heartbeat_timeout_sec",
+            "heartbeat_age_sec",
+            "heartbeat_ok",
+            "pending_command_count",
+            "received_event_count",
+            "deduped_event_count",
+            "reconnect_count",
+            "gateway_client_id",
+        ),
+    )
+    heartbeat = dict((payload or {}).get("last_heartbeat_payload") or {})
+    if heartbeat:
+        gateway["last_heartbeat_summary"] = _dashboard_field_subset(
+            heartbeat,
+            (
+                "transport_mode",
+                "ws_connection_state",
+                "ws_session_id",
+                "ws_reconnect_count",
+                "ws_fallback_reason",
+                "gateway_event_queue_size",
+                "gateway_command_queue_size",
+            ),
+        )
+    return gateway
+
+
+def _dashboard_slim_command_record(record: dict[str, Any]) -> dict[str, Any]:
+    command = dict(record.get("command") or {})
+    return {
+        "command_id": record.get("command_id") or command.get("command_id") or "",
+        "command_type": record.get("command_type") or command.get("type") or "",
+        "status": record.get("status") or "",
+        "priority": record.get("priority") or "",
+        "created_at": record.get("created_at") or command.get("timestamp") or "",
+        "dispatched_at": record.get("dispatched_at") or "",
+        "acked_at": record.get("acked_at") or "",
+        "finished_at": record.get("finished_at") or "",
+        "expires_at": record.get("expires_at") or "",
+        "attempts": record.get("attempts") or 0,
+        "max_attempts": record.get("max_attempts") or 0,
+        "last_error": record.get("last_error") or "",
+        "source": record.get("source") or command.get("source") or "",
+    }
+
+
+def _dashboard_slim_commands_payload(payload: dict[str, Any], *, recent_limit: int = 5) -> dict[str, Any]:
+    commands = dict(payload or {})
+    commands["recent"] = [
+        _dashboard_slim_command_record(dict(item or {}))
+        for item in list(commands.get("recent") or [])[:recent_limit]
+    ]
+    return commands
+
+
+def _dashboard_slim_themes_payload(payload: dict[str, Any], *, item_limit: int = 20) -> dict[str, Any]:
+    return {
+        "summary": dict((payload or {}).get("summary") or {}),
+        "items": [
+            _dashboard_field_subset(
+                dict(item or {}),
+                ("rank", "theme_id", "theme_name", "theme_score", "breadth", "leader_gap", "top3_concentration", "status"),
+            )
+            for item in list((payload or {}).get("items") or [])[:item_limit]
+        ],
+    }
+
+
+def _dashboard_slim_orders_payload(payload: dict[str, Any], *, item_limit: int = 10) -> dict[str, Any]:
+    order_results = []
+    for item in list((payload or {}).get("order_results") or [])[:item_limit]:
+        row = dict(item or {})
+        request = dict(row.get("request") or {})
+        order_results.append(
+            {
+                "id": row.get("id"),
+                "created_at": row.get("created_at") or "",
+                "ok": bool(row.get("ok")),
+                "result_code": row.get("result_code") or "",
+                "message": row.get("message") or "",
+                "request": _dashboard_field_subset(request, ("code", "side", "quantity", "price", "order_type", "tag")),
+            }
+        )
+    return {
+        "summary": dict((payload or {}).get("summary") or {}),
+        "order_results": order_results,
+        "executions": [
+            _dashboard_field_subset(
+                dict(item or {}),
+                (
+                    "id",
+                    "created_at",
+                    "code",
+                    "order_no",
+                    "side",
+                    "quantity",
+                    "price",
+                    "filled_quantity",
+                    "remaining_quantity",
+                    "tag",
+                ),
+            )
+            for item in list((payload or {}).get("executions") or [])[:item_limit]
+        ],
+        "positions": list((payload or {}).get("positions") or [])[:item_limit],
+        "virtual_orders": [
+            _dashboard_field_subset(
+                dict(item or {}),
+                ("id", "candidate_id", "entry_plan_id", "leg_index", "weight_pct", "status", "limit_price", "submitted_at"),
+            )
+            for item in list((payload or {}).get("virtual_orders") or [])[:item_limit]
+        ],
+    }
+
+
+def _dashboard_slim_reviews_payload(payload: dict[str, Any], *, item_limit: int = 10) -> dict[str, Any]:
+    review_fields = (
+        "id",
+        "candidate_id",
+        "code",
+        "trade_date",
+        "final_status",
+        "max_return_5m",
+        "max_return_10m",
+        "max_return_20m",
+        "false_positive_flag",
+        "false_negative_flag",
+        "blocked_but_later_rallied",
+        "expired_but_later_rallied",
+    )
+    return {
+        "summary": dict((payload or {}).get("summary") or {}),
+        "items": [
+            _dashboard_field_subset(dict(item or {}), review_fields)
+            for item in list((payload or {}).get("items") or [])[:item_limit]
+        ],
+    }
+
+
+def _dashboard_slim_theme_lab_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    data_quality = dict((payload or {}).get("data_quality") or {})
+    return {
+        "available": bool((payload or {}).get("available")),
+        "source": (payload or {}).get("source") or "",
+        "created_at": (payload or {}).get("created_at") or "",
+        "calculated_at": (payload or {}).get("calculated_at") or "",
+        "last_updated_at": (payload or {}).get("last_updated_at") or "",
+        "summary": dict((payload or {}).get("summary") or {}),
+        "data_quality": _dashboard_field_subset(
+            data_quality,
+            (
+                "status",
+                "message",
+                "watchset_size",
+                "stale",
+                "age_sec",
+                "snapshot_age_sec",
+                "calculated_age_sec",
+                "vi_status_supported",
+                "condition_coverage_pct",
+                "candle_missing_count",
+            ),
+        ),
+        "runtime": _dashboard_field_subset(dict((payload or {}).get("runtime") or {}), ("enabled", "running", "mode")),
+        "gateway": _dashboard_field_subset(
+            dict((payload or {}).get("gateway") or {}),
+            ("connected", "heartbeat_ok", "kiwoom_logged_in", "orderable", "connection_state"),
+        ),
+    }
+
+
+def _dashboard_slim_logs_payload(payload: dict[str, Any], *, item_limit: int = 40) -> dict[str, Any]:
+    return {
+        "core": list((payload or {}).get("core") or [])[:item_limit],
+        "gateway": list((payload or {}).get("gateway") or [])[: max(10, item_limit // 4)],
+        "items": list((payload or {}).get("items") or [])[:item_limit],
+        "warnings": list((payload or {}).get("warnings") or [])[:10],
+        "timezone": (payload or {}).get("timezone") or "Asia/Seoul",
+        "live_window_sec": (payload or {}).get("live_window_sec") or LOG_LIVE_WINDOW_SEC,
+        "stale_core_log_count": (payload or {}).get("stale_core_log_count") or 0,
+        "hidden_gateway_event_counts": dict((payload or {}).get("hidden_gateway_event_counts") or {}),
+    }
+
+
+def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNAPSHOT_DETAIL_SLIM) -> dict[str, Any]:
+    resolved_detail = _dashboard_snapshot_detail(detail)
+    full_detail = resolved_detail == DASHBOARD_SNAPSHOT_DETAIL_FULL
     status_payload = api_status()
     commands_payload = dict(status_payload["commands"])
-    commands_payload["recent"] = gateway_state.list_commands(limit=12, include_finished=True)
-    candidates_payload = build_candidates_snapshot(db)
-    themes_payload = _cached_dashboard_fragment(db, "themes:v1:30", lambda: build_themes_snapshot(db, limit=30))
-    orders_payload = build_orders_snapshot(db)
-    reviews_payload = _cached_dashboard_fragment(db, "reviews:v1:30", lambda: build_reviews_snapshot(db, limit=30))
-    logs_payload = build_logs_snapshot(db)
+    commands_payload["recent"] = gateway_state.list_commands(limit=12 if full_detail else 5, include_finished=True)
+    if not full_detail:
+        commands_payload = _dashboard_slim_commands_payload(commands_payload, recent_limit=5)
+    candidates_payload = build_candidates_snapshot(db, limit=200 if full_detail else 40)
+    themes_payload = _cached_dashboard_fragment(
+        db,
+        "themes:v2:50" if full_detail else "themes:v2:20",
+        lambda: build_themes_snapshot(db, limit=50 if full_detail else 20),
+    )
+    if not full_detail:
+        themes_payload = _dashboard_slim_themes_payload(themes_payload, item_limit=20)
+    orders_payload = build_orders_snapshot(db, limit=100 if full_detail else 10)
+    if not full_detail:
+        orders_payload = _dashboard_slim_orders_payload(orders_payload, item_limit=10)
+    reviews_payload = _cached_dashboard_fragment(
+        db,
+        "reviews:v2:100" if full_detail else "reviews:v2:10",
+        lambda: build_reviews_snapshot(db, limit=100 if full_detail else 10),
+    )
+    if not full_detail:
+        reviews_payload = _dashboard_slim_reviews_payload(reviews_payload, item_limit=10)
+    logs_payload = build_logs_snapshot(db, limit=100 if full_detail else 40)
+    if not full_detail:
+        logs_payload = _dashboard_slim_logs_payload(logs_payload, item_limit=40)
     transport_payload = dict(status_payload.get("transport") or _transport_dashboard_payload(_transport_status_payload(db)))
     transport_experiment_payload = _transport_experiment_dashboard_payload(db)
     runtime_status = runtime_supervisor.status()
     runtime_payload = _runtime_dashboard_payload(runtime_status)
     dry_run_orders_payload = {
         "summary": db.runtime_order_intent_summary(),
-        "items": db.list_runtime_order_intents(limit=12),
-        "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=12),
+        "items": db.list_runtime_order_intents(limit=12) if full_detail else [],
+        "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=12) if full_detail else [],
     }
     decision_summary_payload = db.strategy_decision_summary(trade_date=datetime.now().date().isoformat())
     outcome_summary_payload = db.strategy_decision_outcome_summary(trade_date=datetime.now().date().isoformat())
@@ -6114,7 +6345,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
             item
             for item in dry_run_performance_report.get("items", [])
             if item.get("dry_run_false_positive_type") or item.get("opportunity_loss_type")
-        ][:10],
+        ][: 10 if full_detail else 3],
         "intraday_outcomes": outcome_summary_payload,
         "shadow_strategies": shadow_summary_payload,
     }
@@ -6135,19 +6366,28 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     runtime_payload["change_proposals"] = change_proposal_payload
     runtime_payload["dry_run_performance"] = dry_run_performance_payload
     runtime_payload["threshold_ab"] = threshold_ab_payload
+    gateway_payload = dict(status_payload["gateway"]) if full_detail else _dashboard_slim_gateway_payload(status_payload["gateway"])
     ops_alerts_payload = build_ops_alerts(
         core=status_payload["core"],
-        gateway=status_payload["gateway"],
+        gateway=gateway_payload,
         commands=status_payload["commands"],
         transport=transport_payload,
         runtime=runtime_payload,
         dry_run_performance=dry_run_performance_payload,
         logs=logs_payload,
     )
+    theme_lab_payload = _cached_dashboard_fragment(
+        db,
+        "theme_lab:v2:full" if full_detail else "theme_lab:v2:summary",
+        lambda: build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_status, gateway_state=gateway_state),
+    )
+    if not full_detail:
+        theme_lab_payload = _dashboard_slim_theme_lab_payload(theme_lab_payload)
     return {
+        "snapshot_detail": resolved_detail,
         "timestamp": utc_timestamp(),
         "core": status_payload["core"],
-        "gateway": status_payload["gateway"],
+        "gateway": gateway_payload,
         "commands": commands_payload,
         "transport": transport_payload,
         "transport_experiment": transport_experiment_payload,
@@ -6167,9 +6407,9 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "orders": orders_payload,
         "reviews": reviews_payload,
         "logs": logs_payload,
-        "theme_lab": build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_status, gateway_state=gateway_state),
+        "theme_lab": theme_lab_payload,
         "market_data": {
-            "latest_ticks": gateway_state.latest_ticks(limit=30),
+            "latest_ticks": gateway_state.latest_ticks(limit=30 if full_detail else 10),
             "raw_tick_rendering": "disabled",
         },
     }

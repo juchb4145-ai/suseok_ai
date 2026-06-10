@@ -107,6 +107,7 @@ Core API:
 
 Dashboard performance flags:
 
+- `GET /api/snapshot`: returns the slim dashboard snapshot by default. Use `?detail=full` only for debugging large raw sections.
 - `TRADING_DASHBOARD_SNAPSHOT_CACHE_TTL_SEC`: shared `/api/snapshot` and `/ws/dashboard` snapshot cache TTL; default `5`.
 - `TRADING_DASHBOARD_HEAVY_SECTION_CACHE_TTL_SEC`: cache TTL for heavy dashboard sections such as themes, reviews, and dry-run performance; default `30`.
 - `TRADING_DASHBOARD_WS_PUSH_INTERVAL_SEC`: per-client dashboard WebSocket push interval; default `5`. The browser uses `/api/snapshot` polling only as a WebSocket fallback.
