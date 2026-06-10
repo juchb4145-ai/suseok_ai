@@ -71,6 +71,16 @@ def test_risk_off_entry_default_is_disabled_observe_only():
     assert settings.number("risk_off_entry.max_position_size_multiplier", 0) == 0.25
 
 
+def test_realtime_reliability_gate_default_guards_themelab_dry_run():
+    settings = StrategyRuntimeSettings.legacy_default()
+
+    assert settings.value("theme_lab_realtime_reliability_gate.enabled") is True
+    assert settings.value("theme_lab_realtime_reliability_gate.wait_buckets") == ["LOW", "BROKEN"]
+    assert settings.value("theme_lab_realtime_reliability_gate.scale_buckets") == ["MEDIUM"]
+    assert settings.number("theme_lab_realtime_reliability_gate.medium_position_size_multiplier", 0) == 0.5
+    assert settings.value("theme_lab_realtime_reliability_gate.require_high_for_shadow_small_entry") is True
+
+
 def test_partial_settings_fallback_records_missing_keys_in_entry_plan_details(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     payload = legacy_profile_payload()

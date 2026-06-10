@@ -115,6 +115,70 @@ def test_ready_small_leader_good_pullback_creates_scaled_small_intent(tmp_path):
     assert intent["metadata"]["weight_pct"] == 25.0
 
 
+def test_realtime_reliability_low_waits_without_entry_plan_or_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=True,
+        tick_metadata=_ready_tick_metadata(
+            realtime_reliability_score=60.0,
+            realtime_reliability_bucket="LOW",
+            realtime_reliability_reasons=["missing_best_bid_ask"],
+            realtime_reliability_missing_fields=["best_bid", "best_ask"],
+        ),
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+
+    assert candidate.state == CandidateState.WATCHING
+    assert candidate.metadata["quality_status"] == "data_wait"
+    assert details["sub_status"] == "WAIT_DATA_REALTIME_RELIABILITY_LOW"
+    assert details["normalized_status"] == "WAIT_DATA_REALTIME_RELIABILITY_LOW"
+    assert details["order_eligibility"] == "NOT_ELIGIBLE_DATA"
+    assert details["realtime_reliability_gate_status"] == "WAIT"
+    assert details["realtime_reliability_bucket"] == "LOW"
+    assert "REALTIME_RELIABILITY_LOW" in details["reason_codes"]
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
+def test_realtime_reliability_medium_scales_ready_intent_and_metadata(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=True,
+        tick_metadata=_ready_tick_metadata(
+            realtime_reliability_score=80.0,
+            realtime_reliability_bucket="MEDIUM",
+            realtime_transport_latency_ms=800.0,
+            realtime_transport_latency_bucket="STABLE",
+        ),
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+    plan = db.list_entry_plans(candidate.id)[0]
+    intent = db.list_runtime_order_intents(candidate_id=candidate.id)[0]
+
+    assert candidate.state == CandidateState.READY
+    assert details["realtime_reliability_gate_status"] == "SIZE_REDUCED"
+    assert details["position_size_multiplier"] == pytest.approx(0.5)
+    assert "REALTIME_RELIABILITY_SIZE_REDUCED" in details["reason_codes"]
+    assert plan.cancel_condition["realtime_reliability_bucket"] == "MEDIUM"
+    assert plan.cancel_condition["position_size_multiplier"] == pytest.approx(0.5)
+    assert plan.split_plan[0]["weight_pct"] == pytest.approx(20.0)
+    assert intent["metadata"]["realtime_reliability_gate_status"] == "SIZE_REDUCED"
+    assert intent["metadata"]["realtime_reliability_bucket"] == "MEDIUM"
+    assert intent["metadata"]["weight_pct"] == pytest.approx(20.0)
+
+
 def test_risk_off_small_entry_creates_one_scaled_dry_run_intent(tmp_path):
     runtime, db, _gateway_state = _runtime(
         tmp_path,
@@ -246,6 +310,58 @@ def test_provisional_shadow_ab_promising_creates_scaled_dry_run_intent(tmp_path)
     assert intent["metadata"]["shadow_small_entry_scenario_id"] == "leader_pass_l3_x10"
     assert intent["metadata"]["weight_pct"] == pytest.approx(6.0)
     assert gateway_state.command_snapshot()["queued_count"] == 0
+
+
+def test_shadow_ab_requires_high_realtime_reliability_when_signal_present(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.WAIT,
+            PriceLocationStatus.PULLBACK_RECLAIM,
+            reasons=("PRICE_LOCATION_PROVISIONAL",),
+            role=StockRole.LEADER,
+            risk=TradeabilityRiskLevel.PASS,
+            price_location_readiness=PriceLocationReadiness.PROVISIONAL,
+            price_location_provisional=True,
+        ),
+        dry_run_orders=True,
+        tick_metadata=_ready_tick_metadata(
+            realtime_reliability_score=82.0,
+            realtime_reliability_bucket="MEDIUM",
+        ),
+        shadow_policy={
+            "enabled": True,
+            "min_labeled_count": 1,
+            "min_win_rate_15m": 0.0,
+            "max_risk_case_rate_15m": 1.0,
+            "min_net_shadow_score": 0.0,
+        },
+        shadow_ab_provider=lambda trade_date: _shadow_ab_report(
+            labeled_count=20,
+            win_rate=0.70,
+            risk_rate=0.05,
+            score=44.0,
+            multiplier=0.10,
+        ),
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+
+    assert candidate.state == CandidateState.WATCHING
+    assert candidate.metadata["quality_status"] == "data_wait"
+    assert details["sub_status"] == "WAIT_DATA_REALTIME_RELIABILITY_LOW"
+    assert details["shadow_small_entry_dry_run_candidate"] is True
+    assert details["shadow_small_entry_dry_run_promoted"] is False
+    assert details["shadow_small_entry_guard_status"] == "BLOCKED"
+    assert details["shadow_small_entry_guard_reason"] == "REALTIME_RELIABILITY_NOT_HIGH"
+    assert details["realtime_reliability_gate_status"] == "SIZE_REDUCED"
+    assert details["realtime_reliability_bucket"] == "MEDIUM"
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 
 
 def test_shadow_ab_insufficient_sample_keeps_provisional_wait_without_intent(tmp_path):
@@ -929,6 +1045,22 @@ class StaticThemeLabPipeline:
         return [item.symbol for item in self.result.watchset]
 
 
+def _ready_tick_metadata(**overrides) -> dict:
+    metadata = {
+        "prev_close": 10000,
+        "recent_support_price": 9950,
+        "recent_support_ready": True,
+        "recent_support_candle_count": 3,
+        "vwap": 9950,
+        "vwap_ready": True,
+        "base_line_120": 9800,
+        "base_line_120_ready": True,
+        "base_line_120_candle_count": 120,
+    }
+    metadata.update(overrides)
+    return metadata
+
+
 def _runtime(
     tmp_path,
     result: ThemeLabFlowResult,
@@ -958,17 +1090,7 @@ def _runtime(
     market_index_store.update_index_tick(IndexTick.from_realtime("KOSPI", "KOSPI", 2500, 0.1, timestamp=NOW))
     market_index_store.update_index_tick(IndexTick.from_realtime("KOSDAQ", "KOSDAQ", 850, 0.2, timestamp=NOW))
     metadata = (
-        {
-            "prev_close": 10000,
-            "recent_support_price": 9950,
-            "recent_support_ready": True,
-            "recent_support_candle_count": 3,
-            "vwap": 9950,
-            "vwap_ready": True,
-            "base_line_120": 9800,
-            "base_line_120_ready": True,
-            "base_line_120_candle_count": 120,
-        }
+        _ready_tick_metadata()
         if tick_metadata is None
         else dict(tick_metadata)
     )

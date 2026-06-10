@@ -59,6 +59,10 @@ LATE_CHASE_TEMP_WAIT = "LATE_CHASE_TEMP_WAIT"
 RISK_SOFT_BLOCK_TEMP_WAIT = "RISK_SOFT_BLOCK_TEMP_WAIT"
 READY_SHADOW_SMALL_ENTRY = "READY_SHADOW_SMALL_ENTRY"
 SHADOW_SMALL_ENTRY_REASON_CODE = "SHADOW_SMALL_ENTRY_DRY_RUN"
+WAIT_DATA_REALTIME_RELIABILITY_LOW = "WAIT_DATA_REALTIME_RELIABILITY_LOW"
+REALTIME_RELIABILITY_REASON_CODE = "REALTIME_RELIABILITY_LOW"
+REALTIME_RELIABILITY_SIZE_REDUCED_REASON_CODE = "REALTIME_RELIABILITY_SIZE_REDUCED"
+REALTIME_RELIABILITY_SHADOW_BLOCK_REASON_CODE = "REALTIME_RELIABILITY_NOT_HIGH"
 LATE_CHASE_SOFT_BLOCK_CODES = {"HIGH_CHASE_RISK", "LATE_CHASE", "CHASE_RISK"}
 MARKET_WEAK_WAIT_CODES = {"CANDIDATE_MARKET_WEAK", "KOSDAQ_MARKET_WEAK", "KOSPI_MARKET_WEAK"}
 MARKET_RISK_OFF_WAIT_CODES = {
@@ -155,6 +159,7 @@ class ThemeLabBridgeMapping:
     latest_tick_age_sec: float | None = None
     position_size_multiplier: float = 0.0
     shadow_small_entry_guard: dict[str, Any] = field(default_factory=dict)
+    realtime_reliability_guard: dict[str, Any] = field(default_factory=dict)
 
 
 class ThemeLabDryRunLifecycleBridge:
@@ -568,6 +573,8 @@ def _map_decision(
     price_location = decision.price_location_status
     role = watch.stock_role
     latest = latest_tick_readiness(tick, now or datetime.now(), active_settings)
+    reliability_policy = _realtime_reliability_settings(active_settings)
+    reliability_guard = _realtime_reliability_guard(metadata, reliability_policy)
 
     if _has_any(reason_codes, DATA_INSUFFICIENT_CODES):
         return ThemeLabBridgeMapping(
@@ -582,6 +589,7 @@ def _map_decision(
             _dedupe(["DATA_INSUFFICIENT", "WAIT_DATA"] + reason_codes),
             latest_tick_ready=latest.ready,
             latest_tick_age_sec=latest.age_sec,
+            realtime_reliability_guard=reliability_guard,
         )
     if _is_theme_weak(reason_codes, theme):
         return ThemeLabBridgeMapping(
@@ -596,6 +604,7 @@ def _map_decision(
             _dedupe(["THEME_WEAK", "BLOCK_THEME"] + reason_codes),
             latest_tick_ready=latest.ready,
             latest_tick_age_sec=latest.age_sec,
+            realtime_reliability_guard=reliability_guard,
         )
     if not latest.ready:
         return ThemeLabBridgeMapping(
@@ -611,6 +620,7 @@ def _map_decision(
             ready_type=WAIT_DATA,
             latest_tick_ready=False,
             latest_tick_age_sec=latest.age_sec,
+            realtime_reliability_guard=reliability_guard,
         )
     market_wait_status = _market_wait_status(reason_codes)
     if market_wait_status:
@@ -627,6 +637,7 @@ def _map_decision(
             ready_type=market_wait_status,
             latest_tick_ready=latest.ready,
             latest_tick_age_sec=latest.age_sec,
+            realtime_reliability_guard=reliability_guard,
         )
     if price_location in OBSERVE_ONLY_LOCATIONS:
         final_status = {
@@ -647,8 +658,24 @@ def _map_decision(
             ready_type=OBSERVE,
             latest_tick_ready=latest.ready,
             latest_tick_age_sec=latest.age_sec,
+            realtime_reliability_guard=reliability_guard,
         )
     support = _selected_support_profile(price_location, _support_candidates(metadata), metadata)
+    shadow_guard = _shadow_small_entry_guard(decision, watch, shadow_policy, promotion_available=shadow_promotion_available)
+    if _realtime_reliability_waits(reliability_guard):
+        blocked_shadow_guard = (
+            _shadow_guard_with_realtime_reliability_block(shadow_guard, reliability_guard)
+            if shadow_guard.get("promoted")
+            else shadow_guard
+        )
+        return _wait_data_for_realtime_reliability(
+            decision,
+            recheck_after_sec,
+            reason_codes,
+            latest,
+            reliability_guard,
+            shadow_small_entry_guard=blocked_shadow_guard,
+        )
     risk_off_small_entry = _is_risk_off_small_entry(reason_codes)
     risk_off_details = dict(getattr(decision, "risk_off_entry_details", {}) or {})
     risk_off_observe_only = bool(risk_off_details.get("risk_off_entry_observe_only")) or "OBSERVE_RISK_OFF_SMALL_ENTRY" in {
@@ -662,6 +689,7 @@ def _map_decision(
                 reason_codes,
                 support,
                 latest,
+                realtime_reliability_guard=reliability_guard,
             )
         support_reason_codes = [SUPPORT_SOURCE_FALLBACK_USED] if support["fallback_used"] else []
         final_status = "OBSERVE_RISK_OFF_SMALL_ENTRY" if risk_off_observe_only or decision.status == LabGateStatus.OBSERVE else "READY_RISK_OFF_SMALL"
@@ -676,7 +704,7 @@ def _map_decision(
             0 if strategy_eligible else recheck_after_sec,
             "B_RISK_OFF",
             min(75.0, max(65.0, float(decision.price_location_score or 65.0))),
-            _dedupe([final_status, ready_type] + support_reason_codes + reason_codes),
+            _dedupe([final_status, ready_type] + support_reason_codes + _realtime_reliability_reason_codes(reliability_guard) + reason_codes),
             ready_type=ready_type,
             selected_support_source=support["source"],
             selected_support_price=int(support["price"]),
@@ -684,9 +712,23 @@ def _map_decision(
             support_source_fallback_used=bool(support["fallback_used"]),
             latest_tick_ready=True,
             latest_tick_age_sec=latest.age_sec,
+            position_size_multiplier=_realtime_reliability_apply_multiplier(
+                _positive_float(decision.position_size_multiplier) or 1.0,
+                reliability_guard,
+            ),
+            realtime_reliability_guard=reliability_guard,
         )
-    shadow_guard = _shadow_small_entry_guard(decision, watch, shadow_policy, promotion_available=shadow_promotion_available)
     if shadow_guard.get("promoted"):
+        if not _realtime_reliability_allows_shadow_small_entry(reliability_guard, reliability_policy):
+            blocked_guard = _shadow_guard_with_realtime_reliability_block(shadow_guard, reliability_guard)
+            return _wait_data_for_realtime_reliability(
+                decision,
+                recheck_after_sec,
+                reason_codes,
+                latest,
+                reliability_guard,
+                shadow_small_entry_guard=blocked_guard,
+            )
         if not support["ready"]:
             blocked_guard = {
                 **shadow_guard,
@@ -701,6 +743,7 @@ def _map_decision(
                 support,
                 latest,
                 shadow_small_entry_guard=blocked_guard,
+                realtime_reliability_guard=reliability_guard,
             )
         support_reason_codes = [SUPPORT_SOURCE_FALLBACK_USED] if support["fallback_used"] else []
         multiplier = _shadow_position_size_multiplier(shadow_guard, shadow_policy)
@@ -732,6 +775,7 @@ def _map_decision(
             latest_tick_age_sec=latest.age_sec,
             position_size_multiplier=multiplier,
             shadow_small_entry_guard=shadow_guard,
+            realtime_reliability_guard=reliability_guard,
         )
     if (
         decision.status == LabGateStatus.READY
@@ -745,6 +789,7 @@ def _map_decision(
                 reason_codes,
                 support,
                 latest,
+                realtime_reliability_guard=reliability_guard,
             )
         base_line_ready = support_source_readiness(BASE_LINE_120, metadata).ready
         ready_type = READY_FULL
@@ -755,6 +800,10 @@ def _map_decision(
             final_status = READY_EARLY_SMALL
             order_eligibility = "BUY_ELIGIBLE_EARLY_SMALL"
         support_reason_codes = [SUPPORT_SOURCE_FALLBACK_USED] if support["fallback_used"] else []
+        position_size_multiplier = _realtime_reliability_apply_multiplier(
+            _positive_float(decision.position_size_multiplier) or 1.0,
+            reliability_guard,
+        )
         return ThemeLabBridgeMapping(
             final_status,
             order_eligibility,
@@ -764,7 +813,7 @@ def _map_decision(
             0,
             "A",
             max(80.0, float(decision.price_location_score or 0.0)),
-            _dedupe([final_status, ready_type] + support_reason_codes + reason_codes),
+            _dedupe([final_status, ready_type] + support_reason_codes + _realtime_reliability_reason_codes(reliability_guard) + reason_codes),
             ready_type=ready_type,
             selected_support_source=support["source"],
             selected_support_price=int(support["price"]),
@@ -772,6 +821,8 @@ def _map_decision(
             support_source_fallback_used=bool(support["fallback_used"]),
             latest_tick_ready=True,
             latest_tick_age_sec=latest.age_sec,
+            position_size_multiplier=position_size_multiplier,
+            realtime_reliability_guard=reliability_guard,
         )
     if (
         decision.status == LabGateStatus.READY_SMALL
@@ -786,8 +837,13 @@ def _map_decision(
                 reason_codes,
                 support,
                 latest,
+                realtime_reliability_guard=reliability_guard,
             )
         support_reason_codes = [SUPPORT_SOURCE_FALLBACK_USED] if support["fallback_used"] else []
+        position_size_multiplier = _realtime_reliability_apply_multiplier(
+            _positive_float(decision.position_size_multiplier) or 1.0,
+            reliability_guard,
+        )
         return ThemeLabBridgeMapping(
             "READY_SMALL_PULLBACK",
             "BUY_ELIGIBLE_SMALL_PULLBACK",
@@ -797,7 +853,7 @@ def _map_decision(
             0,
             "B+",
             max(70.0, float(decision.price_location_score or 0.0)),
-            _dedupe(["READY_SMALL_PULLBACK", READY_EARLY_SMALL] + support_reason_codes + reason_codes),
+            _dedupe(["READY_SMALL_PULLBACK", READY_EARLY_SMALL] + support_reason_codes + _realtime_reliability_reason_codes(reliability_guard) + reason_codes),
             ready_type=READY_EARLY_SMALL,
             selected_support_source=support["source"],
             selected_support_price=int(support["price"]),
@@ -805,6 +861,8 @@ def _map_decision(
             support_source_fallback_used=bool(support["fallback_used"]),
             latest_tick_ready=True,
             latest_tick_age_sec=latest.age_sec,
+            position_size_multiplier=position_size_multiplier,
+            realtime_reliability_guard=reliability_guard,
         )
     if decision.status == LabGateStatus.WAIT or decision.risk_level == TradeabilityRiskLevel.SOFT_BLOCK:
         wait_reasons = ["WAIT"] + reason_codes
@@ -829,6 +887,7 @@ def _map_decision(
             latest_tick_ready=latest.ready,
             latest_tick_age_sec=latest.age_sec,
             shadow_small_entry_guard=shadow_guard,
+            realtime_reliability_guard=reliability_guard,
         )
     if decision.status == LabGateStatus.BLOCKED or decision.risk_level == TradeabilityRiskLevel.HARD_BLOCK:
         return ThemeLabBridgeMapping(
@@ -843,6 +902,7 @@ def _map_decision(
             _dedupe(["BLOCKED"] + reason_codes),
             latest_tick_ready=latest.ready,
             latest_tick_age_sec=latest.age_sec,
+            realtime_reliability_guard=reliability_guard,
         )
     return ThemeLabBridgeMapping(
         "OBSERVE",
@@ -858,6 +918,7 @@ def _map_decision(
         latest_tick_ready=latest.ready,
         latest_tick_age_sec=latest.age_sec,
         shadow_small_entry_guard=shadow_guard,
+        realtime_reliability_guard=reliability_guard,
     )
 
 
@@ -869,6 +930,7 @@ def _wait_data_for_support(
     latest,
     *,
     shadow_small_entry_guard: dict[str, Any] | None = None,
+    realtime_reliability_guard: dict[str, Any] | None = None,
 ) -> ThemeLabBridgeMapping:
     support_reason_codes = list(support.get("reason_codes") or [])
     reason = str(support.get("reason") or SUPPORT_NOT_READY)
@@ -891,6 +953,37 @@ def _wait_data_for_support(
         latest_tick_ready=latest.ready,
         latest_tick_age_sec=latest.age_sec,
         shadow_small_entry_guard=dict(shadow_small_entry_guard or {}),
+        realtime_reliability_guard=dict(realtime_reliability_guard or {}),
+    )
+
+
+def _wait_data_for_realtime_reliability(
+    decision: LabGateDecision,
+    recheck_after_sec: int,
+    reason_codes: list[str],
+    latest,
+    reliability_guard: dict[str, Any],
+    *,
+    shadow_small_entry_guard: dict[str, Any] | None = None,
+) -> ThemeLabBridgeMapping:
+    wait_status = str(reliability_guard.get("wait_status") or WAIT_DATA_REALTIME_RELIABILITY_LOW)
+    guard_reason_codes = _realtime_reliability_reason_codes(reliability_guard)
+    recheck = int(reliability_guard.get("recheck_after_sec") or recheck_after_sec or 30)
+    return ThemeLabBridgeMapping(
+        wait_status,
+        "NOT_ELIGIBLE_DATA",
+        False,
+        BlockType.TEMPORARY,
+        True,
+        recheck,
+        "C",
+        max(0.0, float(decision.price_location_score or 0.0)),
+        _dedupe(["DATA_INSUFFICIENT", WAIT_DATA, wait_status] + guard_reason_codes + reason_codes),
+        ready_type=WAIT_DATA,
+        latest_tick_ready=latest.ready,
+        latest_tick_age_sec=latest.age_sec,
+        shadow_small_entry_guard=dict(shadow_small_entry_guard or {}),
+        realtime_reliability_guard=dict(reliability_guard or {}),
     )
 
 
@@ -900,6 +993,169 @@ def _is_late_chase_soft_block(reason_codes: Iterable[str]) -> bool:
 
 def _is_risk_off_small_entry(reason_codes: Iterable[str]) -> bool:
     return bool({str(code).upper() for code in reason_codes} & RISK_OFF_SMALL_ENTRY_CODES)
+
+
+def _realtime_reliability_settings(settings: StrategyRuntimeSettings | None) -> dict[str, Any]:
+    active_settings = settings or legacy_strategy_runtime_settings()
+    raw = dict(active_settings.value("theme_lab_realtime_reliability_gate", {}) or {})
+    return {
+        "enabled": _shadow_bool(raw.get("enabled"), True),
+        "wait_buckets": _shadow_upper_tuple(raw.get("wait_buckets") or ("LOW", "BROKEN")),
+        "scale_buckets": _shadow_upper_tuple(raw.get("scale_buckets") or ("MEDIUM",)),
+        "medium_position_size_multiplier": max(0.0, min(1.0, _shadow_float(raw.get("medium_position_size_multiplier"), 0.50))),
+        "min_ready_score": max(0.0, _shadow_float(raw.get("min_ready_score"), 55.0)),
+        "recheck_after_sec": max(1, _shadow_int(raw.get("recheck_after_sec"), 30)),
+        "wait_status": str(raw.get("wait_status") or WAIT_DATA_REALTIME_RELIABILITY_LOW).strip() or WAIT_DATA_REALTIME_RELIABILITY_LOW,
+        "reason_code": str(raw.get("reason_code") or REALTIME_RELIABILITY_REASON_CODE).strip() or REALTIME_RELIABILITY_REASON_CODE,
+        "size_reduced_reason_code": str(raw.get("size_reduced_reason_code") or REALTIME_RELIABILITY_SIZE_REDUCED_REASON_CODE).strip()
+        or REALTIME_RELIABILITY_SIZE_REDUCED_REASON_CODE,
+        "require_high_for_shadow_small_entry": _shadow_bool(raw.get("require_high_for_shadow_small_entry"), True),
+        "shadow_allowed_buckets": _shadow_upper_tuple(raw.get("shadow_allowed_buckets") or ("HIGH",)),
+        "min_shadow_small_entry_score": max(0.0, _shadow_float(raw.get("min_shadow_small_entry_score"), 90.0)),
+        "shadow_block_reason_code": str(raw.get("shadow_block_reason_code") or REALTIME_RELIABILITY_SHADOW_BLOCK_REASON_CODE).strip()
+        or REALTIME_RELIABILITY_SHADOW_BLOCK_REASON_CODE,
+    }
+
+
+def _realtime_reliability_guard(metadata: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    reliability = dict(metadata.get("realtime_reliability") or {})
+    score = _number_or_none(metadata.get("realtime_reliability_score"))
+    if score is None:
+        score = _number_or_none(reliability.get("score"))
+    bucket = str(metadata.get("realtime_reliability_bucket") or reliability.get("bucket") or "").strip().upper()
+    present = score is not None or bool(bucket) or bool(reliability)
+    guard = {
+        "enabled": bool(policy.get("enabled")),
+        "present": present,
+        "status": "PASS",
+        "reason": "PASS",
+        "score": score,
+        "bucket": bucket,
+        "reasons": list(metadata.get("realtime_reliability_reasons") or reliability.get("reasons") or []),
+        "missing_fields": list(metadata.get("realtime_reliability_missing_fields") or reliability.get("missing_fields") or []),
+        "field_score": _number_or_none(metadata.get("realtime_reliability_field_score") or reliability.get("field_score")),
+        "penalty": _number_or_none(metadata.get("realtime_reliability_penalty") or reliability.get("penalty")),
+        "transport_latency_ms": _number_or_none(metadata.get("realtime_transport_latency_ms") or reliability.get("transport_latency_ms")),
+        "transport_latency_bucket": str(metadata.get("realtime_transport_latency_bucket") or reliability.get("transport_latency_bucket") or ""),
+        "position_size_multiplier": 1.0,
+        "wait_status": str(policy.get("wait_status") or WAIT_DATA_REALTIME_RELIABILITY_LOW),
+        "recheck_after_sec": int(policy.get("recheck_after_sec") or 30),
+        "reason_code": str(policy.get("reason_code") or REALTIME_RELIABILITY_REASON_CODE),
+        "size_reduced_reason_code": str(policy.get("size_reduced_reason_code") or REALTIME_RELIABILITY_SIZE_REDUCED_REASON_CODE),
+        "shadow_block_reason_code": str(policy.get("shadow_block_reason_code") or REALTIME_RELIABILITY_SHADOW_BLOCK_REASON_CODE),
+    }
+    if not guard["enabled"]:
+        return {**guard, "status": "DISABLED", "reason": "DISABLED"}
+    if not present:
+        return {**guard, "status": "NO_SIGNAL", "reason": "NO_SIGNAL"}
+
+    wait_buckets = set(_shadow_upper_tuple(policy.get("wait_buckets") or ()))
+    min_ready_score = _shadow_float(policy.get("min_ready_score"), 55.0)
+    if bucket in wait_buckets or (score is not None and score < min_ready_score):
+        return {**guard, "status": "WAIT", "reason": str(policy.get("reason_code") or REALTIME_RELIABILITY_REASON_CODE)}
+
+    scale_buckets = set(_shadow_upper_tuple(policy.get("scale_buckets") or ()))
+    if bucket in scale_buckets:
+        multiplier = max(0.0, min(1.0, _shadow_float(policy.get("medium_position_size_multiplier"), 0.50)))
+        return {
+            **guard,
+            "status": "SIZE_REDUCED",
+            "reason": str(policy.get("size_reduced_reason_code") or REALTIME_RELIABILITY_SIZE_REDUCED_REASON_CODE),
+            "position_size_multiplier": multiplier,
+        }
+    return guard
+
+
+def _realtime_reliability_waits(guard: dict[str, Any]) -> bool:
+    return bool(guard.get("enabled")) and bool(guard.get("present")) and str(guard.get("status") or "").upper() == "WAIT"
+
+
+def _realtime_reliability_reason_codes(guard: dict[str, Any]) -> list[str]:
+    if not bool(guard.get("enabled")) or not bool(guard.get("present")):
+        return []
+    status = str(guard.get("status") or "").upper()
+    if status not in {"WAIT", "SIZE_REDUCED", "BLOCKED"}:
+        return []
+    reason = str(guard.get("reason") or "")
+    bucket = str(guard.get("bucket") or "").upper()
+    values = [reason]
+    if status == "WAIT":
+        values.append(str(guard.get("wait_status") or WAIT_DATA_REALTIME_RELIABILITY_LOW))
+        values.append(str(guard.get("reason_code") or REALTIME_RELIABILITY_REASON_CODE))
+    elif status == "SIZE_REDUCED":
+        values.append(str(guard.get("size_reduced_reason_code") or REALTIME_RELIABILITY_SIZE_REDUCED_REASON_CODE))
+    elif status == "BLOCKED":
+        values.append(str(guard.get("shadow_block_reason_code") or REALTIME_RELIABILITY_SHADOW_BLOCK_REASON_CODE))
+    if bucket:
+        values.append(f"REALTIME_RELIABILITY_BUCKET_{bucket}")
+    latency_bucket = str(guard.get("transport_latency_bucket") or "").upper()
+    if latency_bucket in {"DEGRADED", "BROKEN"}:
+        values.append(f"REALTIME_TRANSPORT_LATENCY_{latency_bucket}")
+    return _dedupe(values)
+
+
+def _realtime_reliability_apply_multiplier(base_multiplier: float, guard: dict[str, Any]) -> float:
+    multiplier = max(0.0, min(1.0, float(base_multiplier or 1.0)))
+    if str(guard.get("status") or "").upper() != "SIZE_REDUCED":
+        return multiplier
+    reliability_multiplier = max(0.0, min(1.0, _shadow_float(guard.get("position_size_multiplier"), multiplier)))
+    if reliability_multiplier <= 0:
+        return multiplier
+    return min(multiplier, reliability_multiplier)
+
+
+def _realtime_reliability_allows_shadow_small_entry(guard: dict[str, Any], policy: dict[str, Any]) -> bool:
+    if not bool(policy.get("require_high_for_shadow_small_entry")):
+        return True
+    if not bool(guard.get("enabled")) or not bool(guard.get("present")):
+        return True
+    allowed_buckets = set(_shadow_upper_tuple(policy.get("shadow_allowed_buckets") or ("HIGH",)))
+    bucket = str(guard.get("bucket") or "").upper()
+    score = _number_or_none(guard.get("score"))
+    min_score = _shadow_float(policy.get("min_shadow_small_entry_score"), 90.0)
+    if bucket and bucket not in allowed_buckets:
+        return False
+    if score is not None and score < min_score:
+        return False
+    return True
+
+
+def _shadow_guard_with_realtime_reliability_block(
+    shadow_guard: dict[str, Any],
+    reliability_guard: dict[str, Any],
+) -> dict[str, Any]:
+    reason = str(reliability_guard.get("shadow_block_reason_code") or REALTIME_RELIABILITY_SHADOW_BLOCK_REASON_CODE)
+    return {
+        **dict(shadow_guard or {}),
+        "promoted": False,
+        "status": "BLOCKED",
+        "reason": reason,
+        "realtime_reliability_gate_status": reliability_guard.get("status", ""),
+        "realtime_reliability_score": reliability_guard.get("score"),
+        "realtime_reliability_bucket": reliability_guard.get("bucket", ""),
+        "realtime_transport_latency_ms": reliability_guard.get("transport_latency_ms"),
+        "realtime_transport_latency_bucket": reliability_guard.get("transport_latency_bucket", ""),
+    }
+
+
+def _realtime_reliability_details(guard: dict[str, Any] | None) -> dict[str, Any]:
+    payload = dict(guard or {})
+    return {
+        "realtime_reliability_gate": payload,
+        "realtime_reliability_gate_enabled": bool(payload.get("enabled")),
+        "realtime_reliability_gate_present": bool(payload.get("present")),
+        "realtime_reliability_gate_status": str(payload.get("status") or ""),
+        "realtime_reliability_gate_reason": str(payload.get("reason") or ""),
+        "realtime_reliability_score": payload.get("score"),
+        "realtime_reliability_bucket": str(payload.get("bucket") or ""),
+        "realtime_reliability_reasons": list(payload.get("reasons") or []),
+        "realtime_reliability_missing_fields": list(payload.get("missing_fields") or []),
+        "realtime_reliability_field_score": payload.get("field_score"),
+        "realtime_reliability_penalty": payload.get("penalty"),
+        "realtime_transport_latency_ms": payload.get("transport_latency_ms"),
+        "realtime_transport_latency_bucket": str(payload.get("transport_latency_bucket") or ""),
+        "realtime_reliability_position_size_multiplier": payload.get("position_size_multiplier"),
+    }
 
 
 def _shadow_small_entry_settings(settings: StrategyRuntimeSettings | None) -> dict[str, Any]:
@@ -1369,6 +1625,7 @@ def _stock_pullback_details(
         position_size_multiplier = 1.0
     risk_off_details = dict(getattr(decision, "risk_off_entry_details", {}) or {})
     shadow_guard = dict(mapping.shadow_small_entry_guard or {})
+    realtime_fields = _realtime_reliability_details(mapping.realtime_reliability_guard)
     return {
         "source": SOURCE,
         "profile": candidate.strategy_profile.value if candidate.strategy_profile else StrategyProfile.KOSDAQ_THEME_PROFILE.value,
@@ -1388,6 +1645,7 @@ def _stock_pullback_details(
         "ready_type": mapping.ready_type,
         "latest_tick_ready": mapping.latest_tick_ready,
         "latest_tick_age_sec": mapping.latest_tick_age_sec,
+        **realtime_fields,
         **support_details,
         "support_reclaimed": decision.price_location_status in READY_PULLBACK_LOCATIONS,
         "support_touched": decision.price_location_status in READY_PULLBACK_LOCATIONS,
@@ -1471,6 +1729,7 @@ def _base_details(
     decision_cycle_id = str(decision_cycle_id or metadata.get("decision_cycle_id") or "")
     market_fields = _market_side_fields(decision, watch)
     observability = _observability_status_fields(mapping, stock_details, market_fields)
+    realtime_fields = _realtime_reliability_details(mapping.realtime_reliability_guard)
     shadow_fields = {
         "shadow_small_entry_dry_run": dict(stock_details.get("shadow_small_entry_dry_run") or {}),
         "shadow_small_entry_dry_run_enabled": bool(stock_details.get("shadow_small_entry_dry_run_enabled")),
@@ -1515,6 +1774,7 @@ def _base_details(
         "risk_level": decision.risk_level.value,
         "risk_reason_codes": list(decision.risk_reason_codes),
         **market_fields,
+        **realtime_fields,
         "reason_codes": list(mapping.reason_codes),
         "cap_rules_applied": list(mapping.reason_codes),
         "primary_reason_code": mapping.reason_codes[0] if mapping.reason_codes else "",
@@ -1598,6 +1858,7 @@ def _base_details(
             "risk_level": decision.risk_level.value,
             "risk_reason_codes": list(decision.risk_reason_codes),
             **market_fields,
+            **realtime_fields,
             "reason_codes": list(mapping.reason_codes),
             "support_price": support_price,
             "selected_support_source": stock_details.get("selected_support_source", ""),
@@ -1670,6 +1931,9 @@ def _observability_status_fields(
     if stock_details.get("chase_risk") or "CHASE_RISK" in reason_codes:
         normalized = "CHASE_RISK_BLOCKED"
         display = "CHASE_RISK_BLOCKED"
+    elif mapping.final_gate_status == WAIT_DATA_REALTIME_RELIABILITY_LOW or REALTIME_RELIABILITY_REASON_CODE in reason_codes:
+        normalized = WAIT_DATA_REALTIME_RELIABILITY_LOW
+        display = WAIT_DATA_REALTIME_RELIABILITY_LOW
     elif late_chase_level == "soft_block" or mapping.final_gate_status == LATE_CHASE_TEMP_WAIT:
         normalized = "LATE_CHASE_TEMP_WAIT"
         display = "LATE_CHASE_TEMP_WAIT"
@@ -1702,7 +1966,12 @@ def _observability_status_fields(
         "normalized_status": normalized,
         "display_status": display,
         "display_status_source": "themelab_observability",
-        "display_status_reason": support_reason or restore_reason or reset_reason or late_chase_block_type or price_location,
+        "display_status_reason": str(stock_details.get("realtime_reliability_gate_reason") or "")
+        or support_reason
+        or restore_reason
+        or reset_reason
+        or late_chase_block_type
+        or price_location,
         "late_chase_temp_wait": normalized == "LATE_CHASE_TEMP_WAIT",
         "chase_risk_reason": "CHASE_RISK" if normalized == "CHASE_RISK_BLOCKED" else "",
         "price_location_block_reason": price_location if normalized in {"CHASE_RISK_BLOCKED", "LATE_CHASE_TEMP_WAIT"} else "",
@@ -1864,6 +2133,15 @@ def _dedupe(values: Iterable[str]) -> list[str]:
 def _float_or_none(value: Any) -> float | None:
     number = _positive_float(value)
     return number if number > 0 else None
+
+
+def _number_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _positive_float(value: Any) -> float:

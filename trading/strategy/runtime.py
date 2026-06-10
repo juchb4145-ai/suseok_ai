@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from inspect import Parameter, signature
 from time import perf_counter
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from trading.strategy.candidates import (
     QUALITY_ACTIONABLE,
@@ -2718,6 +2718,26 @@ def _best_result(results: list[GatePipelineResult]) -> GatePipelineResult:
     return sorted(results, key=lambda result: (result.strategy_eligible, result.final_score, result.final_grade), reverse=True)[0]
 
 
+def _realtime_reliability_record_fields(result: GatePipelineResult) -> dict[str, Any]:
+    details = dict(result.details or {})
+    return {
+        "realtime_reliability_gate": dict(details.get("realtime_reliability_gate") or {}),
+        "realtime_reliability_gate_enabled": bool(details.get("realtime_reliability_gate_enabled")),
+        "realtime_reliability_gate_present": bool(details.get("realtime_reliability_gate_present")),
+        "realtime_reliability_gate_status": details.get("realtime_reliability_gate_status", ""),
+        "realtime_reliability_gate_reason": details.get("realtime_reliability_gate_reason", ""),
+        "realtime_reliability_score": details.get("realtime_reliability_score"),
+        "realtime_reliability_bucket": details.get("realtime_reliability_bucket", ""),
+        "realtime_reliability_reasons": list(details.get("realtime_reliability_reasons") or []),
+        "realtime_reliability_missing_fields": list(details.get("realtime_reliability_missing_fields") or []),
+        "realtime_reliability_field_score": details.get("realtime_reliability_field_score"),
+        "realtime_reliability_penalty": details.get("realtime_reliability_penalty"),
+        "realtime_transport_latency_ms": details.get("realtime_transport_latency_ms"),
+        "realtime_transport_latency_bucket": details.get("realtime_transport_latency_bucket", ""),
+        "realtime_reliability_position_size_multiplier": details.get("realtime_reliability_position_size_multiplier"),
+    }
+
+
 def _gate_result_record(result: GatePipelineResult, evaluated_at: str) -> dict:
     return {
         "theme_id": result.theme_id,
@@ -2824,6 +2844,7 @@ def _gate_result_record(result: GatePipelineResult, evaluated_at: str) -> dict:
         "support_ready_reason": result.details.get("support_ready_reason", ""),
         "latest_tick_ready": bool(result.details.get("latest_tick_ready", True)),
         "latest_tick_age_sec": result.details.get("latest_tick_age_sec"),
+        **_realtime_reliability_record_fields(result),
         "vwap_ready": bool(result.details.get("vwap_ready")),
         "base_line_120_ready": bool(result.details.get("base_line_120_ready")),
         "base_line_120_candle_count": result.details.get("base_line_120_candle_count", 0),
@@ -2831,6 +2852,7 @@ def _gate_result_record(result: GatePipelineResult, evaluated_at: str) -> dict:
         "price_location_status": result.details.get("price_location_status", ""),
         "risk_level": result.details.get("risk_level", ""),
         "risk_reason_codes": list(result.details.get("risk_reason_codes") or []),
+        "position_size_multiplier": result.details.get("position_size_multiplier", 1.0),
         "late_chase_level": result.details.get("late_chase_level", ""),
         "late_chase_score": result.details.get("late_chase_score"),
         "late_chase_block_type": result.details.get("late_chase_block_type", ""),
@@ -2978,6 +3000,7 @@ def _block_record(result: GatePipelineResult) -> dict:
         "support_ready_reason": result.details.get("support_ready_reason", ""),
         "latest_tick_ready": bool(result.details.get("latest_tick_ready", True)),
         "latest_tick_age_sec": result.details.get("latest_tick_age_sec"),
+        **_realtime_reliability_record_fields(result),
         "vwap_ready": bool(result.details.get("vwap_ready")),
         "base_line_120_ready": bool(result.details.get("base_line_120_ready")),
         "base_line_120_candle_count": result.details.get("base_line_120_candle_count", 0),
@@ -2985,6 +3008,7 @@ def _block_record(result: GatePipelineResult) -> dict:
         "price_location_status": result.details.get("price_location_status", ""),
         "risk_level": result.details.get("risk_level", ""),
         "risk_reason_codes": list(result.details.get("risk_reason_codes") or []),
+        "position_size_multiplier": result.details.get("position_size_multiplier", 1.0),
         "late_chase_level": result.details.get("late_chase_level", ""),
         "late_chase_score": result.details.get("late_chase_score"),
         "late_chase_block_type": result.details.get("late_chase_block_type", ""),

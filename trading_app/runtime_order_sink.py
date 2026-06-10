@@ -584,6 +584,12 @@ def _theme_lab_bridge_metadata(
         or cancel.get("shadow_small_entry_dry_run")
         or {}
     )
+    reliability_gate = dict(
+        details.get("realtime_reliability_gate")
+        or bridge.get("realtime_reliability_gate")
+        or cancel.get("realtime_reliability_gate")
+        or {}
+    )
     metadata = {
         "source": THEMELAB_SOURCE,
         "code": candidate.code,
@@ -601,6 +607,75 @@ def _theme_lab_bridge_metadata(
         "risk_level": details.get("risk_level") or bridge.get("risk_level") or "",
         "risk_reason_codes": list(details.get("risk_reason_codes") or bridge.get("risk_reason_codes") or []),
         "reason_codes": list(details.get("reason_codes") or bridge.get("reason_codes") or []),
+        "realtime_reliability_gate": reliability_gate,
+        "realtime_reliability_gate_enabled": bool(
+            details.get("realtime_reliability_gate_enabled")
+            or bridge.get("realtime_reliability_gate_enabled")
+            or cancel.get("realtime_reliability_gate_enabled")
+        ),
+        "realtime_reliability_gate_present": bool(
+            details.get("realtime_reliability_gate_present")
+            or bridge.get("realtime_reliability_gate_present")
+            or cancel.get("realtime_reliability_gate_present")
+        ),
+        "realtime_reliability_gate_status": details.get("realtime_reliability_gate_status")
+        or bridge.get("realtime_reliability_gate_status")
+        or cancel.get("realtime_reliability_gate_status")
+        or "",
+        "realtime_reliability_gate_reason": details.get("realtime_reliability_gate_reason")
+        or bridge.get("realtime_reliability_gate_reason")
+        or cancel.get("realtime_reliability_gate_reason")
+        or "",
+        "realtime_reliability_score": _first_text(
+            details.get("realtime_reliability_score"),
+            bridge.get("realtime_reliability_score"),
+            cancel.get("realtime_reliability_score"),
+            None,
+        ),
+        "realtime_reliability_bucket": details.get("realtime_reliability_bucket")
+        or bridge.get("realtime_reliability_bucket")
+        or cancel.get("realtime_reliability_bucket")
+        or "",
+        "realtime_reliability_reasons": list(
+            details.get("realtime_reliability_reasons")
+            or bridge.get("realtime_reliability_reasons")
+            or cancel.get("realtime_reliability_reasons")
+            or []
+        ),
+        "realtime_reliability_missing_fields": list(
+            details.get("realtime_reliability_missing_fields")
+            or bridge.get("realtime_reliability_missing_fields")
+            or cancel.get("realtime_reliability_missing_fields")
+            or []
+        ),
+        "realtime_reliability_field_score": _first_text(
+            details.get("realtime_reliability_field_score"),
+            bridge.get("realtime_reliability_field_score"),
+            cancel.get("realtime_reliability_field_score"),
+            None,
+        ),
+        "realtime_reliability_penalty": _first_text(
+            details.get("realtime_reliability_penalty"),
+            bridge.get("realtime_reliability_penalty"),
+            cancel.get("realtime_reliability_penalty"),
+            None,
+        ),
+        "realtime_transport_latency_ms": _first_text(
+            details.get("realtime_transport_latency_ms"),
+            bridge.get("realtime_transport_latency_ms"),
+            cancel.get("realtime_transport_latency_ms"),
+            None,
+        ),
+        "realtime_transport_latency_bucket": details.get("realtime_transport_latency_bucket")
+        or bridge.get("realtime_transport_latency_bucket")
+        or cancel.get("realtime_transport_latency_bucket")
+        or "",
+        "realtime_reliability_position_size_multiplier": _first_text(
+            details.get("realtime_reliability_position_size_multiplier"),
+            bridge.get("realtime_reliability_position_size_multiplier"),
+            cancel.get("realtime_reliability_position_size_multiplier"),
+            None,
+        ),
         "support_price": cancel.get("support_price") or bridge.get("support_price") or details.get("support_price") or 0,
         "support_missing_reason": cancel.get("support_missing_reason") or bridge.get("support_missing_reason") or details.get("support_missing_reason") or "",
         "support_taxonomy": cancel.get("support_taxonomy") or bridge.get("support_taxonomy") or details.get("support_taxonomy") or "",
