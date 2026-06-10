@@ -100,6 +100,15 @@ class CoreSettings:
     shadow_strategy_ready_small_multiplier: float = 0.3
     shadow_strategy_observe_only: bool = True
     shadow_strategy_allow_apply: bool = False
+    change_proposal_enabled: bool = True
+    change_proposal_min_sample_count: int = 20
+    change_proposal_min_trade_days: int = 2
+    change_proposal_min_replay_count: int = 1
+    change_proposal_max_fp_increase: int = 1
+    change_proposal_max_opportunity_loss_increase: int = 1
+    change_proposal_strong_min_confidence: float = 0.7
+    change_proposal_allow_auto_apply: bool = False
+    change_proposal_default_expire_days: int = 5
 
     @property
     def live_order_enabled(self) -> bool:
@@ -205,6 +214,18 @@ def get_settings() -> CoreSettings:
         shadow_strategy_ready_small_multiplier=_float_env("TRADING_SHADOW_STRATEGY_READY_SMALL_MULTIPLIER", 0.3),
         shadow_strategy_observe_only=_bool_env("TRADING_SHADOW_STRATEGY_OBSERVE_ONLY", True),
         shadow_strategy_allow_apply=_bool_env("TRADING_SHADOW_STRATEGY_ALLOW_APPLY", False),
+        change_proposal_enabled=_bool_env("TRADING_CHANGE_PROPOSAL_ENABLED", True),
+        change_proposal_min_sample_count=_int_env("TRADING_CHANGE_PROPOSAL_MIN_SAMPLE_COUNT", 20),
+        change_proposal_min_trade_days=_int_env("TRADING_CHANGE_PROPOSAL_MIN_TRADE_DAYS", 2),
+        change_proposal_min_replay_count=_int_env("TRADING_CHANGE_PROPOSAL_MIN_REPLAY_COUNT", 1),
+        change_proposal_max_fp_increase=_int_env("TRADING_CHANGE_PROPOSAL_MAX_FP_INCREASE", 1),
+        change_proposal_max_opportunity_loss_increase=_int_env(
+            "TRADING_CHANGE_PROPOSAL_MAX_OPPORTUNITY_LOSS_INCREASE",
+            1,
+        ),
+        change_proposal_strong_min_confidence=_float_env("TRADING_CHANGE_PROPOSAL_STRONG_MIN_CONFIDENCE", 0.7),
+        change_proposal_allow_auto_apply=_bool_env("TRADING_CHANGE_PROPOSAL_ALLOW_AUTO_APPLY", False),
+        change_proposal_default_expire_days=_int_env("TRADING_CHANGE_PROPOSAL_DEFAULT_EXPIRE_DAYS", 5),
     )
 
 

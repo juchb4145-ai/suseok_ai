@@ -962,6 +962,76 @@ class TradingDatabase:
                 recommendations_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS strategy_change_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                status TEXT NOT NULL DEFAULT 'DRAFT',
+                recommendation_grade TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                summary_ko TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
+                target_component TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL DEFAULT '',
+                source_ids_json TEXT NOT NULL DEFAULT '[]',
+                baseline_config_hash TEXT NOT NULL DEFAULT '',
+                candidate_config_hash TEXT NOT NULL DEFAULT '',
+                baseline_config_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                candidate_config_patch_json TEXT NOT NULL DEFAULT '{}',
+                expected_effect_ko TEXT NOT NULL DEFAULT '',
+                expected_risk_ko TEXT NOT NULL DEFAULT '',
+                confidence REAL,
+                net_benefit_score REAL,
+                guardrail_passed INTEGER NOT NULL DEFAULT 0,
+                blocked_by_guardrail_reason TEXT NOT NULL DEFAULT '',
+                data_quality_status TEXT NOT NULL DEFAULT '',
+                data_quality_issues_json TEXT NOT NULL DEFAULT '[]',
+                rollout_plan_json TEXT NOT NULL DEFAULT '{}',
+                rollback_plan_json TEXT NOT NULL DEFAULT '{}',
+                operator_note TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                superseded_by_proposal_id TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS strategy_change_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                evidence_id TEXT UNIQUE NOT NULL,
+                proposal_id TEXT NOT NULL,
+                source_type TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                metric_name TEXT NOT NULL DEFAULT '',
+                metric_value REAL,
+                metric_unit TEXT NOT NULL DEFAULT '',
+                baseline_value TEXT NOT NULL DEFAULT '',
+                candidate_value TEXT NOT NULL DEFAULT '',
+                delta_value REAL,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                confidence REAL,
+                evidence_payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS strategy_change_approvals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                approval_id TEXT UNIQUE NOT NULL,
+                proposal_id TEXT NOT NULL,
+                action TEXT NOT NULL DEFAULT '',
+                previous_status TEXT NOT NULL DEFAULT '',
+                next_status TEXT NOT NULL DEFAULT '',
+                operator TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS strategy_config_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                config_hash TEXT UNIQUE NOT NULL,
+                config_source TEXT NOT NULL DEFAULT '',
+                config_payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                description TEXT NOT NULL DEFAULT ''
+            );
             CREATE TABLE IF NOT EXISTS live_sim_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 order_intent_id TEXT UNIQUE NOT NULL,
@@ -1350,6 +1420,20 @@ class TradingDatabase:
                 ON strategy_replay_reports(replay_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_strategy_replay_reports_trade_date
                 ON strategy_replay_reports(trade_date, mode, created_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_proposals_trade_date
+                ON strategy_change_proposals(trade_date, created_at);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_proposals_status
+                ON strategy_change_proposals(status, recommendation_grade);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_proposals_category
+                ON strategy_change_proposals(category, target_component);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_proposals_source
+                ON strategy_change_proposals(source_type, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_evidence_proposal
+                ON strategy_change_evidence(proposal_id, id);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_evidence_source
+                ON strategy_change_evidence(source_type, source_id);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_approvals_proposal
+                ON strategy_change_approvals(proposal_id, id);
             CREATE INDEX IF NOT EXISTS idx_live_sim_orders_trade_date
                 ON live_sim_orders(trade_date, created_at);
             CREATE INDEX IF NOT EXISTS idx_live_sim_orders_code_status
@@ -2912,6 +2996,332 @@ class TradingDatabase:
             (str(replay_id or ""),),
         ).fetchone()
         return _row_to_strategy_replay_report(row) if row else None
+
+    def save_strategy_change_proposals(self, proposals: Iterable[dict]) -> int:
+        rows = [_strategy_change_proposal_params(proposal) for proposal in proposals if isinstance(proposal, dict)]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT INTO strategy_change_proposals(
+                    proposal_id, trade_date, created_at, updated_at, status,
+                    recommendation_grade, title, summary_ko, category, target_component,
+                    source_type, source_ids_json, baseline_config_hash, candidate_config_hash,
+                    baseline_config_snapshot_json, candidate_config_patch_json,
+                    expected_effect_ko, expected_risk_ko, confidence, net_benefit_score,
+                    guardrail_passed, blocked_by_guardrail_reason, data_quality_status,
+                    data_quality_issues_json, rollout_plan_json, rollback_plan_json,
+                    operator_note, expires_at, superseded_by_proposal_id
+                ) VALUES (
+                    :proposal_id, :trade_date, :created_at, :updated_at, :status,
+                    :recommendation_grade, :title, :summary_ko, :category, :target_component,
+                    :source_type, :source_ids_json, :baseline_config_hash, :candidate_config_hash,
+                    :baseline_config_snapshot_json, :candidate_config_patch_json,
+                    :expected_effect_ko, :expected_risk_ko, :confidence, :net_benefit_score,
+                    :guardrail_passed, :blocked_by_guardrail_reason, :data_quality_status,
+                    :data_quality_issues_json, :rollout_plan_json, :rollback_plan_json,
+                    :operator_note, :expires_at, :superseded_by_proposal_id
+                )
+                ON CONFLICT(proposal_id) DO UPDATE SET
+                    trade_date=excluded.trade_date,
+                    updated_at=excluded.updated_at,
+                    recommendation_grade=excluded.recommendation_grade,
+                    title=excluded.title,
+                    summary_ko=excluded.summary_ko,
+                    category=excluded.category,
+                    target_component=excluded.target_component,
+                    source_type=excluded.source_type,
+                    source_ids_json=excluded.source_ids_json,
+                    baseline_config_hash=excluded.baseline_config_hash,
+                    candidate_config_hash=excluded.candidate_config_hash,
+                    baseline_config_snapshot_json=excluded.baseline_config_snapshot_json,
+                    candidate_config_patch_json=excluded.candidate_config_patch_json,
+                    expected_effect_ko=excluded.expected_effect_ko,
+                    expected_risk_ko=excluded.expected_risk_ko,
+                    confidence=excluded.confidence,
+                    net_benefit_score=excluded.net_benefit_score,
+                    guardrail_passed=excluded.guardrail_passed,
+                    blocked_by_guardrail_reason=excluded.blocked_by_guardrail_reason,
+                    data_quality_status=excluded.data_quality_status,
+                    data_quality_issues_json=excluded.data_quality_issues_json,
+                    rollout_plan_json=excluded.rollout_plan_json,
+                    rollback_plan_json=excluded.rollback_plan_json,
+                    expires_at=excluded.expires_at,
+                    superseded_by_proposal_id=excluded.superseded_by_proposal_id
+                """,
+                rows,
+            )
+        return int(self.conn.total_changes - before)
+
+    def list_strategy_change_proposals(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        status: Optional[str] = None,
+        category: Optional[str] = None,
+        recommendation_grade: Optional[str] = None,
+        source_type: Optional[str] = None,
+        target_component: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses, params = _strategy_change_proposal_filters(
+            trade_date=trade_date,
+            status=status,
+            category=category,
+            recommendation_grade=recommendation_grade,
+            source_type=source_type,
+            target_component=target_component,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_change_proposals
+            {where}
+            ORDER BY
+                CASE recommendation_grade
+                    WHEN 'STRONG_CANDIDATE' THEN 0
+                    WHEN 'WATCH_CANDIDATE' THEN 1
+                    WHEN 'RISKY_CANDIDATE' THEN 2
+                    WHEN 'DATA_INSUFFICIENT' THEN 3
+                    ELSE 4
+                END,
+                net_benefit_score DESC,
+                created_at DESC,
+                id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_strategy_change_proposal(row) for row in rows]
+
+    def strategy_change_proposal_count(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        status: Optional[str] = None,
+        category: Optional[str] = None,
+        recommendation_grade: Optional[str] = None,
+        source_type: Optional[str] = None,
+        target_component: Optional[str] = None,
+    ) -> int:
+        clauses, params = _strategy_change_proposal_filters(
+            trade_date=trade_date,
+            status=status,
+            category=category,
+            recommendation_grade=recommendation_grade,
+            source_type=source_type,
+            target_component=target_component,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM strategy_change_proposals {where}",
+            tuple(params),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+
+    def get_strategy_change_proposal(self, proposal_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_change_proposals WHERE proposal_id = ?",
+            (str(proposal_id or ""),),
+        ).fetchone()
+        return _row_to_strategy_change_proposal(row) if row else None
+
+    def save_strategy_change_evidence(self, evidence: Iterable[dict]) -> int:
+        rows = [_strategy_change_evidence_params(item) for item in evidence if isinstance(item, dict)]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT INTO strategy_change_evidence(
+                    evidence_id, proposal_id, source_type, source_id, trade_date,
+                    metric_name, metric_value, metric_unit, baseline_value,
+                    candidate_value, delta_value, sample_count, confidence,
+                    evidence_payload_json, created_at
+                ) VALUES (
+                    :evidence_id, :proposal_id, :source_type, :source_id, :trade_date,
+                    :metric_name, :metric_value, :metric_unit, :baseline_value,
+                    :candidate_value, :delta_value, :sample_count, :confidence,
+                    :evidence_payload_json, :created_at
+                )
+                ON CONFLICT(evidence_id) DO UPDATE SET
+                    source_type=excluded.source_type,
+                    source_id=excluded.source_id,
+                    trade_date=excluded.trade_date,
+                    metric_name=excluded.metric_name,
+                    metric_value=excluded.metric_value,
+                    metric_unit=excluded.metric_unit,
+                    baseline_value=excluded.baseline_value,
+                    candidate_value=excluded.candidate_value,
+                    delta_value=excluded.delta_value,
+                    sample_count=excluded.sample_count,
+                    confidence=excluded.confidence,
+                    evidence_payload_json=excluded.evidence_payload_json
+                """,
+                rows,
+            )
+        return int(self.conn.total_changes - before)
+
+    def list_strategy_change_evidence(
+        self,
+        proposal_id: Optional[str] = None,
+        *,
+        trade_date: Optional[str] = None,
+        source_type: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if proposal_id:
+            clauses.append("proposal_id = ?")
+            params.append(str(proposal_id))
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if source_type:
+            clauses.append("source_type = ?")
+            params.append(str(source_type))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_change_evidence
+            {where}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_strategy_change_evidence(row) for row in rows]
+
+    def save_strategy_change_approval(self, approval: dict) -> dict:
+        proposal_id = str(approval.get("proposal_id") or "")
+        if not proposal_id:
+            raise ValueError("proposal_id is required")
+        approval_id = str(approval.get("approval_id") or f"approval:{proposal_id}:{uuid4().hex}")
+        created_at = str(approval.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO strategy_change_approvals(
+                    approval_id, proposal_id, action, previous_status, next_status,
+                    operator, note, created_at, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    approval_id,
+                    proposal_id,
+                    str(approval.get("action") or ""),
+                    str(approval.get("previous_status") or ""),
+                    str(approval.get("next_status") or ""),
+                    str(approval.get("operator") or ""),
+                    str(approval.get("note") or ""),
+                    created_at,
+                    _json_payload(_sanitize_decision_details(approval.get("details") or {})),
+                ),
+            )
+            if approval.get("next_status"):
+                self.conn.execute(
+                    """
+                    UPDATE strategy_change_proposals
+                    SET status = ?, operator_note = CASE WHEN ? <> '' THEN ? ELSE operator_note END,
+                        updated_at = ?
+                    WHERE proposal_id = ?
+                    """,
+                    (
+                        str(approval.get("next_status") or ""),
+                        str(approval.get("note") or ""),
+                        str(approval.get("note") or ""),
+                        created_at,
+                        proposal_id,
+                    ),
+                )
+        return self.get_strategy_change_approval(approval_id) or {"approval_id": approval_id}
+
+    def get_strategy_change_approval(self, approval_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_change_approvals WHERE approval_id = ?",
+            (str(approval_id or ""),),
+        ).fetchone()
+        return _row_to_strategy_change_approval(row) if row else None
+
+    def list_strategy_change_approvals(self, proposal_id: str, *, limit: int = 100) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM strategy_change_approvals
+            WHERE proposal_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (str(proposal_id or ""), max(1, int(limit or 100))),
+        ).fetchall()
+        return [_row_to_strategy_change_approval(row) for row in rows]
+
+    def save_strategy_config_snapshot(self, snapshot: dict) -> dict:
+        config_hash = str(snapshot.get("config_hash") or "")
+        if not config_hash:
+            raise ValueError("config_hash is required")
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO strategy_config_snapshots(
+                    config_hash, config_source, config_payload_json, created_at, description
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(config_hash) DO UPDATE SET
+                    config_source=excluded.config_source,
+                    config_payload_json=excluded.config_payload_json,
+                    description=excluded.description
+                """,
+                (
+                    config_hash,
+                    str(snapshot.get("config_source") or ""),
+                    _json_payload(_sanitize_decision_details(snapshot.get("config_payload") or {})),
+                    str(snapshot.get("created_at") or datetime.now().isoformat(timespec="seconds")),
+                    str(snapshot.get("description") or ""),
+                ),
+            )
+        return self.get_strategy_config_snapshot(config_hash) or {"config_hash": config_hash}
+
+    def get_strategy_config_snapshot(self, config_hash: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_config_snapshots WHERE config_hash = ?",
+            (str(config_hash or ""),),
+        ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        data["config_payload"] = _safe_json_loads(data.get("config_payload_json"), {})
+        return data
+
+    def strategy_change_proposal_summary(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        window_sec: Optional[int] = None,
+    ) -> dict:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if window_sec is not None:
+            clauses.append("julianday(replace(substr(created_at, 1, 19), 'T', ' ')) >= julianday('now', ?)")
+            params.append(f"-{max(1, int(window_sec or 1))} seconds")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM strategy_change_proposals
+            {where}
+            ORDER BY created_at DESC, id DESC
+            """,
+            tuple(params),
+        ).fetchall()
+        proposals = [_row_to_strategy_change_proposal(row) for row in rows]
+        return _strategy_change_proposal_summary(proposals, trade_date=trade_date or "", window_sec=window_sec)
 
     def save_live_sim_order(self, record: dict) -> dict:
         payload = _live_sim_order_params(record)
@@ -7230,6 +7640,179 @@ def _row_to_strategy_replay_report(row: sqlite3.Row) -> dict:
     data["diff_summary"] = _safe_json_loads(data.get("diff_summary_json"), {})
     data["recommendations"] = _safe_json_loads(data.get("recommendations_json"), [])
     return data
+
+
+def _strategy_change_proposal_params(payload: dict) -> dict:
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "proposal_id": str(payload.get("proposal_id") or f"proposal:{uuid4().hex}"),
+        "trade_date": str(payload.get("trade_date") or ""),
+        "created_at": str(payload.get("created_at") or now),
+        "updated_at": str(payload.get("updated_at") or now),
+        "status": str(payload.get("status") or "DRAFT"),
+        "recommendation_grade": str(payload.get("recommendation_grade") or ""),
+        "title": str(payload.get("title") or ""),
+        "summary_ko": str(payload.get("summary_ko") or ""),
+        "category": str(payload.get("category") or ""),
+        "target_component": str(payload.get("target_component") or ""),
+        "source_type": str(payload.get("source_type") or ""),
+        "source_ids_json": _json_list(payload.get("source_ids_json", payload.get("source_ids", []))),
+        "baseline_config_hash": str(payload.get("baseline_config_hash") or ""),
+        "candidate_config_hash": str(payload.get("candidate_config_hash") or ""),
+        "baseline_config_snapshot_json": _json_payload(
+            _sanitize_decision_details(payload.get("baseline_config_snapshot_json", payload.get("baseline_config_snapshot", {})))
+        ),
+        "candidate_config_patch_json": _json_payload(
+            _sanitize_decision_details(payload.get("candidate_config_patch_json", payload.get("candidate_config_patch", {})))
+        ),
+        "expected_effect_ko": str(payload.get("expected_effect_ko") or ""),
+        "expected_risk_ko": str(payload.get("expected_risk_ko") or ""),
+        "confidence": _nullable_float(payload.get("confidence")),
+        "net_benefit_score": _nullable_float(payload.get("net_benefit_score")),
+        "guardrail_passed": 1 if bool(payload.get("guardrail_passed")) else 0,
+        "blocked_by_guardrail_reason": str(payload.get("blocked_by_guardrail_reason") or ""),
+        "data_quality_status": str(payload.get("data_quality_status") or ""),
+        "data_quality_issues_json": _json_list(payload.get("data_quality_issues_json", payload.get("data_quality_issues", []))),
+        "rollout_plan_json": _json_payload(payload.get("rollout_plan_json", payload.get("rollout_plan", {}))),
+        "rollback_plan_json": _json_payload(payload.get("rollback_plan_json", payload.get("rollback_plan", {}))),
+        "operator_note": str(payload.get("operator_note") or ""),
+        "expires_at": str(payload.get("expires_at") or ""),
+        "superseded_by_proposal_id": str(payload.get("superseded_by_proposal_id") or ""),
+    }
+
+
+def _strategy_change_proposal_filters(
+    *,
+    trade_date: Optional[str] = None,
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    recommendation_grade: Optional[str] = None,
+    source_type: Optional[str] = None,
+    target_component: Optional[str] = None,
+) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if trade_date:
+        clauses.append("trade_date = ?")
+        params.append(str(trade_date))
+    if status:
+        clauses.append("status = ?")
+        params.append(str(status))
+    if category:
+        clauses.append("category = ?")
+        params.append(str(category))
+    if recommendation_grade:
+        clauses.append("recommendation_grade = ?")
+        params.append(str(recommendation_grade))
+    if source_type:
+        clauses.append("source_type = ?")
+        params.append(str(source_type))
+    if target_component:
+        clauses.append("target_component = ?")
+        params.append(str(target_component))
+    return clauses, params
+
+
+def _row_to_strategy_change_proposal(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["source_ids"] = _safe_json_loads(data.get("source_ids_json"), [])
+    data["baseline_config_snapshot"] = _safe_json_loads(data.get("baseline_config_snapshot_json"), {})
+    data["candidate_config_patch"] = _safe_json_loads(data.get("candidate_config_patch_json"), {})
+    data["guardrail_passed"] = bool(data.get("guardrail_passed"))
+    data["data_quality_issues"] = _safe_json_loads(data.get("data_quality_issues_json"), [])
+    data["rollout_plan"] = _safe_json_loads(data.get("rollout_plan_json"), {})
+    data["rollback_plan"] = _safe_json_loads(data.get("rollback_plan_json"), {})
+    return data
+
+
+def _strategy_change_evidence_params(payload: dict) -> dict:
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "evidence_id": str(payload.get("evidence_id") or f"evidence:{uuid4().hex}"),
+        "proposal_id": str(payload.get("proposal_id") or ""),
+        "source_type": str(payload.get("source_type") or ""),
+        "source_id": str(payload.get("source_id") or ""),
+        "trade_date": str(payload.get("trade_date") or ""),
+        "metric_name": str(payload.get("metric_name") or ""),
+        "metric_value": _nullable_float(payload.get("metric_value")),
+        "metric_unit": str(payload.get("metric_unit") or ""),
+        "baseline_value": str(payload.get("baseline_value") if payload.get("baseline_value") is not None else ""),
+        "candidate_value": str(payload.get("candidate_value") if payload.get("candidate_value") is not None else ""),
+        "delta_value": _nullable_float(payload.get("delta_value")),
+        "sample_count": int(payload.get("sample_count") or 0),
+        "confidence": _nullable_float(payload.get("confidence")),
+        "evidence_payload_json": _json_payload(_sanitize_decision_details(payload.get("evidence_payload") or {})),
+        "created_at": str(payload.get("created_at") or now),
+    }
+
+
+def _row_to_strategy_change_evidence(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["evidence_payload"] = _safe_json_loads(data.get("evidence_payload_json"), {})
+    return data
+
+
+def _row_to_strategy_change_approval(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    return data
+
+
+def _strategy_change_proposal_summary(
+    proposals: list[dict],
+    *,
+    trade_date: str = "",
+    window_sec: Optional[int] = None,
+) -> dict:
+    by_status: Counter[str] = Counter()
+    by_grade: Counter[str] = Counter()
+    by_category: Counter[str] = Counter()
+    risky_count = 0
+    data_insufficient_count = 0
+    expiring_soon_count = 0
+    now = datetime.now()
+    for proposal in proposals:
+        status = str(proposal.get("status") or "")
+        grade = str(proposal.get("recommendation_grade") or "")
+        category = str(proposal.get("category") or "")
+        if status:
+            by_status[status] += 1
+        if grade:
+            by_grade[grade] += 1
+        if category:
+            by_category[category] += 1
+        if grade == "RISKY_CANDIDATE":
+            risky_count += 1
+        if grade == "DATA_INSUFFICIENT":
+            data_insufficient_count += 1
+        expires_at = str(proposal.get("expires_at") or "")
+        try:
+            if expires_at and datetime.fromisoformat(expires_at[:19]) <= now + timedelta(days=1):
+                expiring_soon_count += 1
+        except ValueError:
+            pass
+    top = sorted(
+        proposals,
+        key=lambda row: (
+            {"STRONG_CANDIDATE": 0, "WATCH_CANDIDATE": 1, "RISKY_CANDIDATE": 2, "DATA_INSUFFICIENT": 3}.get(
+                str(row.get("recommendation_grade") or ""),
+                4,
+            ),
+            -float(row.get("net_benefit_score") or 0),
+        ),
+    )[:10]
+    return {
+        "trade_date": trade_date,
+        "window_sec": window_sec,
+        "total_count": len(proposals),
+        "by_status": dict(by_status),
+        "by_grade": dict(by_grade),
+        "by_category": dict(by_category),
+        "top_recommendations": top,
+        "risky_count": risky_count,
+        "data_insufficient_count": data_insufficient_count,
+        "expiring_soon_count": expiring_soon_count,
+    }
 
 
 def _shadow_strategy_summary(

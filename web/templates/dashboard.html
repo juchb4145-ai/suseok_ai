@@ -517,6 +517,74 @@
       <section id="analysis" class="tab-panel" data-tab-panel="analysis">
         <section class="band">
           <div class="section-head">
+            <div>
+              <h2>Strategy Change Proposals</h2>
+              <p class="help-text">자동 적용 아님 / 승인 상태만 저장 / 다음 PR에서 observe-only rollout 가능</p>
+            </div>
+            <span id="change-proposal-total" class="counter">0</span>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>REVIEW_READY</span><strong id="change-proposal-review-ready">0</strong></div>
+            <div><span>STRONG</span><strong id="change-proposal-strong">0</strong></div>
+            <div><span>WATCH</span><strong id="change-proposal-watch">0</strong></div>
+            <div><span>RISKY</span><strong id="change-proposal-risky">0</strong></div>
+            <div><span>DATA_INSUFFICIENT</span><strong id="change-proposal-insufficient">0</strong></div>
+            <div><span>Pending</span><strong id="change-proposal-pending">0</strong></div>
+            <div><span>Expiring soon</span><strong id="change-proposal-expiring">0</strong></div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Grade</th><th>Status</th><th>Category</th><th>Title</th><th>Score</th><th>Guardrail</th></tr></thead>
+              <tbody id="change-proposal-top-rows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="band table-panel" data-table-section="changeProposals">
+          <div class="section-head">
+            <h2>Proposal Board</h2>
+            <span id="changeProposals-status" class="counter">waiting</span>
+          </div>
+          <div class="filter-grid">
+            <label>Trade date<input data-table="changeProposals" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>Status<input data-table="changeProposals" data-filter="status" placeholder="REVIEW_READY" /></label>
+            <label>Category<input data-table="changeProposals" data-filter="category" placeholder="risk" /></label>
+            <label>Grade<input data-table="changeProposals" data-filter="recommendation_grade" placeholder="WATCH_CANDIDATE" /></label>
+            <label>Source<select data-table="changeProposals" data-filter="source_type"><option value="">all</option><option>intraday_outcome</option><option>shadow_strategy</option><option>replay</option><option>dry_run_threshold_ab</option><option>combined</option></select></label>
+            <label>Target<input data-table="changeProposals" data-filter="target_component" placeholder="entry_risk_gate" /></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="changeProposals"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Created</th><th>Grade</th><th>Status</th><th>Category</th><th>Target</th><th>Title</th><th>Confidence</th><th>Score</th><th>Effect</th><th>Risk</th><th>Guardrail</th></tr></thead>
+              <tbody id="changeProposals-body"></tbody>
+            </table>
+          </div>
+          <div id="changeProposals-pagination" class="pagination"></div>
+        </section>
+
+        <section class="band table-panel" data-table-section="changeProposalEvidence">
+          <div class="section-head">
+            <h2>Proposal Evidence</h2>
+            <span id="changeProposalEvidence-status" class="counter">waiting</span>
+          </div>
+          <div class="filter-grid">
+            <label>Proposal ID<input data-table="changeProposalEvidence" data-filter="proposal_id" /></label>
+            <label>Trade date<input data-table="changeProposalEvidence" data-filter="trade_date" placeholder="YYYY-MM-DD" /></label>
+            <label>Source<input data-table="changeProposalEvidence" data-filter="source_type" /></label>
+          </div>
+          <div class="table-toolbar" data-table-toolbar="changeProposalEvidence"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Proposal</th><th>Source</th><th>Sample</th><th>Baseline</th><th>Candidate</th><th>Delta</th><th>Confidence</th><th>Metric</th></tr></thead>
+              <tbody id="changeProposalEvidence-body"></tbody>
+            </table>
+          </div>
+          <div id="changeProposalEvidence-pagination" class="pagination"></div>
+        </section>
+
+        <section class="band">
+          <div class="section-head">
             <h2>Strategy Replay</h2>
             <span id="strategy-replay-latest-id" class="counter">-</span>
           </div>

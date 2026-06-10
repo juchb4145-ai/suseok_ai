@@ -234,6 +234,52 @@ const tableConfigs = {
       (item) => textCell(formatRate((((item.result || {}).recommendation || {}).confidence ?? item.confidence))),
     ],
   },
+  changeProposals: {
+    endpoint: "/api/runtime/change-proposals",
+    bodyId: "changeProposals-body",
+    statusId: "changeProposals-status",
+    paginationId: "changeProposals-pagination",
+    defaultLimit: 50,
+    detailTitle: (item) => `Strategy Change Proposal ${item.proposal_id || ""}`,
+    detailEndpoint: (item) => item.proposal_id ? `/api/runtime/change-proposals/${encodeURIComponent(item.proposal_id)}` : "",
+    actionLabel: "Generate proposals",
+    actionEndpoint: (filters) => {
+      const tradeDate = filters.trade_date || new Date().toISOString().substring(0, 10);
+      const params = buildQuery({ trade_date: tradeDate, source_type: filters.source_type || "combined", persist: true });
+      return `/api/runtime/change-proposals/generate?${params}`;
+    },
+    columns: [
+      (item) => textCell(formatDateTime(item.created_at)),
+      (item) => badge(item.recommendation_grade || "-"),
+      (item) => badge(item.status || "-"),
+      (item) => textCell(item.category || "-"),
+      (item) => textCell(item.target_component || "-"),
+      (item) => textCell(item.title || "-"),
+      (item) => textCell(formatRate(item.confidence)),
+      (item) => textCell(fmtNumber(item.net_benefit_score, 2)),
+      (item) => textCell(item.expected_effect_ko || "-"),
+      (item) => textCell(item.expected_risk_ko || "-"),
+      (item) => item.guardrail_passed ? badge("PASS", "ok") : badge(item.blocked_by_guardrail_reason || "BLOCKED", "warn"),
+    ],
+  },
+  changeProposalEvidence: {
+    endpoint: "/api/runtime/change-proposals/evidence",
+    bodyId: "changeProposalEvidence-body",
+    statusId: "changeProposalEvidence-status",
+    paginationId: "changeProposalEvidence-pagination",
+    defaultLimit: 50,
+    detailTitle: (item) => `Change Evidence ${item.evidence_id || ""}`,
+    columns: [
+      (item) => compactId(item.proposal_id || "-"),
+      (item) => textCell(item.source_type || "-"),
+      (item) => textCell(item.sample_count ?? 0),
+      (item) => textCell(item.baseline_value || "-"),
+      (item) => textCell(item.candidate_value || "-"),
+      (item) => textCell(item.delta_value ?? "-"),
+      (item) => textCell(formatRate(item.confidence)),
+      (item) => textCell(item.metric_name || "-"),
+    ],
+  },
   strategyReplayRuns: {
     endpoint: "/api/runtime/replay/runs",
     bodyId: "strategyReplayRuns-body",
@@ -421,10 +467,13 @@ async function parseResponsePayload(response) {
   }
 }
 
-async function postWithLocalToken(endpoint, token) {
+async function postWithLocalToken(endpoint, token, body = null) {
+  const headers = { "X-Local-Token": token };
+  if (body != null) headers["Content-Type"] = "application/json";
   const response = await fetch(endpoint, {
     method: "POST",
-    headers: { "X-Local-Token": token },
+    headers,
+    body: body == null ? undefined : JSON.stringify(body),
   });
   const payload = await parseResponsePayload(response);
   return { response, payload };
@@ -706,11 +755,65 @@ function openDetailPanel(title, payload) {
   text("detail-title", title);
   const summary = document.getElementById("detail-summary");
   const raw = document.getElementById("detail-json");
-  if (summary) summary.innerHTML = detailSummaryHtml(payload);
+  if (summary) {
+    summary.innerHTML = detailSummaryHtml(payload) + detailActionHtml(payload);
+    bindDetailActions(payload);
+  }
   if (raw) raw.textContent = JSON.stringify(payload, null, 2);
   document.getElementById("detail-drawer")?.classList.add("open");
   document.getElementById("detail-drawer")?.setAttribute("aria-hidden", "false");
   document.getElementById("detail-backdrop")?.classList.remove("hidden");
+}
+
+function detailActionHtml(payload) {
+  const proposal = (payload || {}).proposal || payload || {};
+  if (!proposal.proposal_id) return "";
+  return `
+    <div class="detail-actions">
+      <p class="help-text">자동 적용 아님: 승인 상태만 저장하고 runtime config는 변경하지 않습니다.</p>
+      <button type="button" data-proposal-action="approve-observe">Approve Observe</button>
+      <button type="button" data-proposal-action="approve-dry-run">Approve DRY_RUN</button>
+      <button type="button" data-proposal-action="reject">Reject</button>
+      <button type="button" data-proposal-action="expire">Expire</button>
+      <button type="button" data-proposal-action="note">Note</button>
+    </div>
+  `;
+}
+
+function bindDetailActions(payload) {
+  const proposal = (payload || {}).proposal || payload || {};
+  if (!proposal.proposal_id) return;
+  document.querySelectorAll("[data-proposal-action]").forEach((button) => {
+    button.addEventListener("click", () => runProposalAction(proposal.proposal_id, button.dataset.proposalAction).catch((error) => {
+      openDetailPanel("Strategy Change Proposal action error", { proposal_id: proposal.proposal_id, error: error.message });
+    }));
+  });
+}
+
+async function runProposalAction(proposalId, action) {
+  const endpointMap = {
+    "approve-observe": "approve-observe",
+    "approve-dry-run": "approve-dry-run",
+    reject: "reject",
+    expire: "expire",
+    note: "note",
+  };
+  const endpointAction = endpointMap[action];
+  if (!endpointAction) return;
+  let note = "";
+  if (action === "reject" || action === "note") {
+    note = window.prompt("note") || "";
+    if (!note) return;
+  } else if (action === "expire") {
+    note = window.prompt("note (optional)") || "";
+  }
+  const body = { operator: "dashboard", note };
+  const payload = await runWithLocalTokenRetry((token) => postWithLocalToken(`/api/runtime/change-proposals/${encodeURIComponent(proposalId)}/${endpointAction}`, token, body));
+  if (!payload) return;
+  openDetailPanel("Strategy Change Proposal action result", payload);
+  fetchTable("changeProposals").catch(() => {});
+  fetchTable("changeProposalEvidence").catch(() => {});
+  pollSnapshot().catch(() => {});
 }
 
 function closeDetailPanel() {
@@ -864,6 +967,7 @@ function render(snapshot) {
   const dryRunPerformance = snapshot.dry_run_performance || runtime.dry_run_performance || {};
   const thresholdAB = snapshot.threshold_ab || runtime.threshold_ab || { summary: {}, recommendations: [] };
   const strategyReplay = snapshot.strategy_replay || runtime.strategy_replay || { summary: {}, funnel: {}, shadow_ranking: [], data_quality: [], diff_summary: {} };
+  const changeProposals = snapshot.change_proposals || runtime.change_proposals || { summary: {}, top_recommendations: [] };
   const candidates = snapshot.candidates || { summary: {}, items: [] };
   const themes = snapshot.themes || { summary: {}, items: [] };
   const orders = snapshot.orders || { summary: {}, order_results: [], executions: [] };
@@ -1042,6 +1146,26 @@ function render(snapshot) {
   text("threshold-ab-fn-increase", thresholdSummary.total_new_false_negative_count || 0);
   text("threshold-ab-opp-delta", thresholdSummary.total_opportunity_loss_delta || 0);
   renderThresholdRecommendations("threshold-ab-recommendations", thresholdAB.recommendations || []);
+
+  const changeSummary = changeProposals.summary || {};
+  const byStatus = changeSummary.by_status || {};
+  const byGrade = changeSummary.by_grade || {};
+  text("change-proposal-total", changeSummary.total_count || 0);
+  text("change-proposal-review-ready", byStatus.REVIEW_READY || 0);
+  text("change-proposal-strong", byGrade.STRONG_CANDIDATE || 0);
+  text("change-proposal-watch", byGrade.WATCH_CANDIDATE || 0);
+  text("change-proposal-risky", byGrade.RISKY_CANDIDATE || 0);
+  text("change-proposal-insufficient", byGrade.DATA_INSUFFICIENT || 0);
+  text("change-proposal-pending", (byStatus.REVIEW_READY || 0) + (byStatus.DRAFT || 0));
+  text("change-proposal-expiring", changeSummary.expiring_soon_count || 0);
+  renderRows("change-proposal-top-rows", firstItems(changeSummary.top_recommendations || [], 5).map((item) => rowHtml([
+    item.recommendation_grade || "-",
+    item.status || "-",
+    item.category || "-",
+    item.title || "-",
+    fmtNumber(item.net_benefit_score, 2),
+    item.guardrail_passed ? "PASS" : (item.blocked_by_guardrail_reason || "BLOCKED"),
+  ])), 6);
 
   const replaySummary = strategyReplay.summary || {};
   const replayFunnel = strategyReplay.funnel || replaySummary.funnel || {};

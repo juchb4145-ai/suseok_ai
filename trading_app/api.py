@@ -18,7 +18,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -67,6 +67,11 @@ from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
 from trading_app.shadow_strategy import ShadowStrategyEvaluator, config_from_settings as shadow_config_from_settings
+from trading_app.strategy_change_proposals import (
+    StrategyChangeProposalGenerator,
+    build_config_diff,
+    config_from_settings as change_proposal_config_from_settings,
+)
 from trading_app.strategy_replay import (
     DEFAULT_BUNDLE_ROOT,
     DEFAULT_REPLAY_DB_ROOT,
@@ -535,6 +540,14 @@ def _intraday_outcome_labeler(db: TradingDatabase) -> IntradayOutcomeLabeler:
 
 def _shadow_strategy_evaluator(db: TradingDatabase) -> ShadowStrategyEvaluator:
     return ShadowStrategyEvaluator(db, config=shadow_config_from_settings(get_settings()))
+
+
+def _change_proposal_generator(db: TradingDatabase) -> StrategyChangeProposalGenerator:
+    return StrategyChangeProposalGenerator(
+        db,
+        config=change_proposal_config_from_settings(get_settings()),
+        replay_db_root=DEFAULT_REPLAY_DB_ROOT,
+    )
 
 
 def _market_gate_review_analyzer(db: TradingDatabase) -> MarketGateReviewAnalyzer:
@@ -1794,6 +1807,192 @@ def runtime_replay_summary(
         "pagination": pagination,
         "filters": {"trade_date": trade_date or "", "replay_id": replay_id or "", "mode": mode or "", "limit": limit, "offset": offset},
     }
+
+
+@app.get("/api/runtime/change-proposals")
+def runtime_change_proposals(
+    trade_date: Optional[str] = None,
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    recommendation_grade: Optional[str] = None,
+    source_type: Optional[str] = None,
+    target_component: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_strategy_change_proposals(
+            trade_date=trade_date,
+            status=status,
+            category=category,
+            recommendation_grade=recommendation_grade,
+            source_type=source_type,
+            target_component=target_component,
+            limit=limit,
+            offset=offset,
+        )
+        total = db.strategy_change_proposal_count(
+            trade_date=trade_date,
+            status=status,
+            category=category,
+            recommendation_grade=recommendation_grade,
+            source_type=source_type,
+            target_component=target_component,
+        )
+        return {
+            "items": items,
+            "pagination": _pagination_payload(limit=limit, offset=offset, count=len(items), total=total),
+            "filters": {
+                "trade_date": trade_date or "",
+                "status": status or "",
+                "category": category or "",
+                "recommendation_grade": recommendation_grade or "",
+                "source_type": source_type or "",
+                "target_component": target_component or "",
+                "limit": limit,
+                "offset": offset,
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/change-proposals/evidence")
+def runtime_change_proposal_evidence(
+    proposal_id: Optional[str] = None,
+    trade_date: Optional[str] = None,
+    source_type: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_strategy_change_evidence(
+            proposal_id=proposal_id,
+            trade_date=trade_date,
+            source_type=source_type,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "items": items,
+            "pagination": _pagination_payload(limit=limit, offset=offset, count=len(items)),
+            "filters": {"proposal_id": proposal_id or "", "trade_date": trade_date or "", "source_type": source_type or "", "limit": limit, "offset": offset},
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/change-proposals/summary")
+def runtime_change_proposal_summary(
+    trade_date: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        summary = db.strategy_change_proposal_summary(trade_date=trade_date, window_sec=window_sec)
+        return {"summary": summary, "filters": {"trade_date": trade_date or "", "window_sec": window_sec}}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/change-proposals/{proposal_id}")
+def runtime_change_proposal_detail(proposal_id: str) -> dict[str, Any]:
+    db = open_database()
+    try:
+        proposal = db.get_strategy_change_proposal(proposal_id)
+        if proposal is None:
+            return {"found": False, "proposal_id": proposal_id}
+        evidence = db.list_strategy_change_evidence(proposal_id, limit=1000)
+        approvals = db.list_strategy_change_approvals(proposal_id, limit=200)
+        config_diff = build_config_diff(proposal)
+        return {
+            "found": True,
+            "proposal": proposal,
+            "evidence": evidence,
+            "approvals": approvals,
+            "config_diff": config_diff,
+            "rollout_plan": proposal.get("rollout_plan") or {},
+            "rollback_plan": proposal.get("rollback_plan") or {},
+            "related_reports": _proposal_related_reports(proposal),
+            "disclaimer_ko": "승인해도 실제 runtime config에 자동 반영하지 않습니다. 후속 PR에서 observe-only rollout에 연결할 수 있습니다.",
+        }
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/change-proposals/generate")
+def generate_runtime_change_proposals(
+    trade_date: str,
+    source_type: Optional[str] = Query("combined", pattern="^(intraday_outcome|shadow_strategy|replay|threshold_ab|combined)$"),
+    replay_id: Optional[str] = None,
+    force: bool = False,
+    persist: bool = True,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        # force is accepted for API symmetry. Stable proposal IDs make generation idempotent without deleting approvals.
+        result = _change_proposal_generator(db).generate(
+            trade_date=trade_date,
+            source_type=source_type or "combined",
+            replay_id=replay_id,
+            persist=persist,
+        )
+        result["force"] = bool(force)
+        return result
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/change-proposals/{proposal_id}/approve-observe")
+def approve_observe_change_proposal(
+    proposal_id: str,
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    return _record_change_proposal_action(proposal_id, "approve_observe", "APPROVED_FOR_OBSERVE", body or {})
+
+
+@app.post("/api/runtime/change-proposals/{proposal_id}/approve-dry-run")
+def approve_dry_run_change_proposal(
+    proposal_id: str,
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    return _record_change_proposal_action(proposal_id, "approve_dry_run", "APPROVED_FOR_DRY_RUN", body or {})
+
+
+@app.post("/api/runtime/change-proposals/{proposal_id}/reject")
+def reject_change_proposal(
+    proposal_id: str,
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    if not str((body or {}).get("note") or "").strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="note is required")
+    return _record_change_proposal_action(proposal_id, "reject", "REJECTED", body or {})
+
+
+@app.post("/api/runtime/change-proposals/{proposal_id}/expire")
+def expire_change_proposal(
+    proposal_id: str,
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    return _record_change_proposal_action(proposal_id, "expire", "EXPIRED", body or {})
+
+
+@app.post("/api/runtime/change-proposals/{proposal_id}/note")
+def note_change_proposal(
+    proposal_id: str,
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    if not str((body or {}).get("note") or "").strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="note is required")
+    return _record_change_proposal_action(proposal_id, "note", "", body or {})
 
 
 @app.get("/api/runtime/performance/dry-run")
@@ -3083,6 +3282,58 @@ def _theme_lab_trade_date(trade_date: str | None, *, occurred_at: str | None = N
 
 def _csv_values(value: Optional[str]) -> list[str]:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _record_change_proposal_action(
+    proposal_id: str,
+    action: str,
+    next_status: str,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        proposal = db.get_strategy_change_proposal(proposal_id)
+        if proposal is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="proposal not found")
+        previous_status = str(proposal.get("status") or "")
+        approval = db.save_strategy_change_approval(
+            {
+                "proposal_id": proposal_id,
+                "action": action,
+                "previous_status": previous_status,
+                "next_status": next_status,
+                "operator": str((body or {}).get("operator") or ""),
+                "note": str((body or {}).get("note") or ""),
+                "details": {
+                    "auto_apply": False,
+                    "config_changed": False,
+                    "message_ko": "승인 상태만 저장했습니다. 실제 runtime config는 변경하지 않았습니다.",
+                },
+            }
+        )
+        updated = db.get_strategy_change_proposal(proposal_id)
+        return {
+            "proposal_id": proposal_id,
+            "action": action,
+            "approval": approval,
+            "proposal": updated,
+            "config_changed": False,
+            "auto_apply": False,
+            "disclaimer_ko": "이번 PR은 자동 적용을 하지 않습니다. 승인 상태만 저장합니다.",
+        }
+    finally:
+        close_database(db)
+
+
+def _proposal_related_reports(proposal: dict[str, Any]) -> dict[str, Any]:
+    source_ids = [str(item) for item in proposal.get("source_ids") or [] if str(item)]
+    return {
+        "source_type": proposal.get("source_type") or "",
+        "source_ids": source_ids,
+        "replay_report_ids": [item for item in source_ids if item.startswith("replay_report")],
+        "threshold_ab_report_ids": [item for item in source_ids if item.startswith("threshold_ab")],
+        "shadow_policy_ids": [item.rsplit(":", 1)[-1] for item in source_ids if item.startswith("shadow_strategy:")],
+    }
 
 
 @app.post("/api/gateway/events")
@@ -5622,6 +5873,12 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "data_quality": ((replay_reports[0].get("summary") or {}).get("warnings") if replay_reports else []) or [],
         "diff_summary": (replay_reports[0].get("diff_summary") if replay_reports else {}) or {},
     }
+    change_proposal_summary_payload = db.strategy_change_proposal_summary(trade_date=datetime.now().date().isoformat())
+    change_proposal_payload = {
+        "summary": change_proposal_summary_payload,
+        "top_recommendations": change_proposal_summary_payload.get("top_recommendations", []),
+        "disclaimer_ko": "자동 적용 아님: 승인 상태만 저장하며 runtime config는 변경하지 않습니다.",
+    }
     dry_run_performance_report = _performance_analyzer(db).build_report(limit=10000)
     threshold_ab_report = _threshold_ab_analyzer().build_report(dry_run_performance_report, limit=10, offset=0)
     dry_run_performance_payload = {
@@ -5670,6 +5927,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     runtime_payload["intraday_outcomes"] = outcome_summary_payload
     runtime_payload["shadow_strategies"] = shadow_summary_payload
     runtime_payload["strategy_replay"] = replay_payload
+    runtime_payload["change_proposals"] = change_proposal_payload
     runtime_payload["dry_run_performance"] = dry_run_performance_payload
     runtime_payload["threshold_ab"] = threshold_ab_payload
     ops_alerts_payload = build_ops_alerts(
@@ -5694,6 +5952,7 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "intraday_outcomes": outcome_summary_payload,
         "shadow_strategies": shadow_summary_payload,
         "strategy_replay": replay_payload,
+        "change_proposals": change_proposal_payload,
         "dry_run_performance": dry_run_performance_payload,
         "threshold_ab": threshold_ab_payload,
         "ops_alerts": ops_alerts_payload,
