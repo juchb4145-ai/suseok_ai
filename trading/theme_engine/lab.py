@@ -3712,6 +3712,9 @@ def _risk_off_small_entry_candidate(
         "risk_off_entry_observe_only": bool(config.observe_only),
         "risk_off_entry_allowed": False,
         "risk_off_entry_rejected_reason": "",
+        "risk_off_entry_failed_checks": [],
+        "risk_off_entry_passed_checks": [],
+        "risk_off_entry_blocking_data_flags": [],
         "risk_off_relative_strength_pct": relative_strength,
         "risk_off_candidate_breadth_pct": breadth_pct,
         "risk_off_candidate_index_return_pct": index_return,
@@ -3729,14 +3732,39 @@ def _risk_off_small_entry_candidate(
         },
     }
 
-    def reject(reason: str) -> dict[str, Any]:
-        details["risk_off_entry_rejected_reason"] = reason
+    failed_checks: list[str] = []
+    passed_checks: list[str] = []
+
+    def fail(reason: str) -> None:
+        if reason and reason not in failed_checks:
+            failed_checks.append(reason)
+
+    def passed(reason: str) -> None:
+        if reason and reason not in passed_checks:
+            passed_checks.append(reason)
+
+    def finalize() -> dict[str, Any]:
+        details["risk_off_entry_failed_checks"] = list(failed_checks)
+        details["risk_off_entry_passed_checks"] = list(passed_checks)
+        details["risk_off_entry_rejected_reason"] = failed_checks[0] if failed_checks else ""
+        details["risk_off_entry_allowed"] = not failed_checks
+        details["risk_off_shadow_entry"] = _risk_off_shadow_entry_details(
+            details,
+            watch=watch,
+            snapshot=snapshot,
+            metadata=metadata,
+            price_location=price_location,
+            risk=risk,
+            config=config,
+        )
         return details
 
     if not config.enabled:
-        return reject("RISK_OFF_ENTRY_DISABLED")
+        fail("RISK_OFF_ENTRY_DISABLED")
+        return finalize()
     if market.market_status != MarketStatus.RISK_OFF and candidate_status != MarketStatus.RISK_OFF:
-        return reject("NOT_RISK_OFF")
+        fail("NOT_RISK_OFF")
+        return finalize()
     if bool(market_context.get("candidate_market_confirmation_pending")) or bool(
         set(context_reason_codes)
         & {
@@ -3746,7 +3774,9 @@ def _risk_off_small_entry_candidate(
             "CANDIDATE_MARKET_RISK_OFF_UNCONFIRMED",
         }
     ):
-        return reject("MARKET_CONFIRMATION_PENDING")
+        fail("MARKET_CONFIRMATION_PENDING")
+    else:
+        passed("MARKET_CONFIRMED")
     if bool(market_context.get("candidate_market_recovery_pending")) or bool(
         set(context_reason_codes)
         & {
@@ -3756,62 +3786,147 @@ def _risk_off_small_entry_candidate(
             "MARKET_WAIT_HYSTERESIS_HOLD",
         }
     ):
-        return reject("MARKET_RECOVERY_PENDING")
+        fail("MARKET_RECOVERY_PENDING")
+    else:
+        passed("NO_MARKET_RECOVERY_HOLD")
     if "SIDE_BREADTH_SOURCE_CONFLICT" in set(context_reason_codes) | set(context_data_flags):
-        return reject("SIDE_BREADTH_SOURCE_CONFLICT")
-    if bool(config.block_extreme_risk_off) and extreme:
-        return reject("EXTREME_RISK_OFF")
+        fail("SIDE_BREADTH_SOURCE_CONFLICT")
+    else:
+        passed("NO_SIDE_BREADTH_SOURCE_CONFLICT")
+    if extreme:
+        if bool(config.block_extreme_risk_off):
+            fail("EXTREME_RISK_OFF")
+        else:
+            passed("EXTREME_RISK_OFF_ALLOWED_BY_CONFIG")
+    else:
+        passed("NOT_EXTREME_RISK_OFF")
     blocking_data_flags = set(context_data_flags) & RISK_OFF_ENTRY_BLOCKING_DATA_FLAGS
+    details["risk_off_entry_blocking_data_flags"] = sorted(str(flag) for flag in blocking_data_flags)
     if "STALE_QUOTE" in blocking_data_flags:
-        return reject("STALE_QUOTE")
+        fail("STALE_QUOTE")
     if blocking_data_flags:
-        return reject("DATA_INSUFFICIENT")
+        fail("DATA_INSUFFICIENT")
+    else:
+        passed("DATA_QUALITY_READY")
     if config.require_latest_tick_ready:
         if snapshot is None:
-            return reject("LATEST_TICK_MISSING")
-        quote_ready, quote_reason = _quote_valid_for_breadth(snapshot, watch.calculated_at or theme.calculated_at, 60)
-        if not quote_ready:
-            return reject(quote_reason or "LATEST_TICK_NOT_READY")
+            fail("LATEST_TICK_MISSING")
+        else:
+            quote_ready, quote_reason = _quote_valid_for_breadth(snapshot, watch.calculated_at or theme.calculated_at, 60)
+            if not quote_ready:
+                fail(quote_reason or "LATEST_TICK_NOT_READY")
+            else:
+                passed("LATEST_TICK_READY")
     if theme.theme_status.value not in {str(value).upper() for value in config.allowed_theme_statuses}:
-        return reject("THEME_STATUS_NOT_ALLOWED")
+        fail("THEME_STATUS_NOT_ALLOWED")
+    else:
+        passed("THEME_STATUS_ALLOWED")
     if float(theme.condition_score or 0.0) < float(config.min_theme_score):
-        return reject("THEME_SCORE_TOO_LOW")
+        fail("THEME_SCORE_TOO_LOW")
+    else:
+        passed("THEME_SCORE_OK")
     if float(theme.alive_ratio or 0.0) < float(config.min_theme_alive_ratio):
-        return reject("THEME_ALIVE_RATIO_TOO_LOW")
+        fail("THEME_ALIVE_RATIO_TOO_LOW")
+    else:
+        passed("THEME_ALIVE_RATIO_OK")
     if float(theme.strong_ratio or 0.0) < float(config.min_theme_strong_ratio):
-        return reject("THEME_STRONG_RATIO_TOO_LOW")
+        fail("THEME_STRONG_RATIO_TOO_LOW")
+    else:
+        passed("THEME_STRONG_RATIO_OK")
     if int(theme.leader_count or 0) < int(config.min_theme_leader_count):
-        return reject("THEME_LEADER_COUNT_TOO_LOW")
+        fail("THEME_LEADER_COUNT_TOO_LOW")
+    else:
+        passed("THEME_LEADER_COUNT_OK")
     if watch.stock_role.value not in {str(value).upper() for value in config.allowed_roles}:
-        return reject("ROLE_NOT_ALLOWED")
+        fail("ROLE_NOT_ALLOWED")
+    else:
+        passed("ROLE_ALLOWED")
     if price_location.status.value not in {str(value).upper() for value in config.allowed_price_locations}:
-        return reject("PRICE_LOCATION_NOT_ALLOWED")
+        fail("PRICE_LOCATION_NOT_ALLOWED")
+    else:
+        passed("PRICE_LOCATION_ALLOWED")
     if price_location.status in RISK_OFF_ENTRY_BLOCKING_PRICE_LOCATIONS:
-        return reject("PRICE_LOCATION_BLOCKED")
+        fail("PRICE_LOCATION_BLOCKED")
     if risk.risk_level not in {TradeabilityRiskLevel.PASS, TradeabilityRiskLevel.RISK_ADJUST}:
-        return reject("RISK_LEVEL_NOT_ALLOWED")
+        fail("RISK_LEVEL_NOT_ALLOWED")
+    else:
+        passed("RISK_LEVEL_ALLOWED")
     if config.require_candidate_breadth_ready and not bool(market_context.get("candidate_breadth_ready")):
-        return reject("CANDIDATE_BREADTH_NOT_READY")
+        fail("CANDIDATE_BREADTH_NOT_READY")
+    elif config.require_candidate_breadth_ready:
+        passed("CANDIDATE_BREADTH_READY")
     if config.require_candidate_breadth_gate_usable and not bool(market_context.get("candidate_breadth_gate_usable")):
-        return reject("CANDIDATE_BREADTH_NOT_GATE_USABLE")
+        fail("CANDIDATE_BREADTH_NOT_GATE_USABLE")
+    elif config.require_candidate_breadth_gate_usable:
+        passed("CANDIDATE_BREADTH_GATE_USABLE")
     if sample_count < required_sample_count:
-        return reject("CANDIDATE_BREADTH_SAMPLE_TOO_SMALL")
+        fail("CANDIDATE_BREADTH_SAMPLE_TOO_SMALL")
+    else:
+        passed("CANDIDATE_BREADTH_SAMPLE_OK")
     if breadth_pct is None or breadth_pct < float(config.min_candidate_breadth_pct):
-        return reject("CANDIDATE_BREADTH_TOO_WEAK")
+        fail("CANDIDATE_BREADTH_TOO_WEAK")
+    else:
+        passed("CANDIDATE_BREADTH_OK")
     if relative_strength is None:
-        return reject("RELATIVE_STRENGTH_MISSING")
-    if relative_strength < float(config.min_relative_strength_vs_index_pct):
-        return reject("RELATIVE_STRENGTH_TOO_LOW")
+        fail("RELATIVE_STRENGTH_MISSING")
+    elif relative_strength < float(config.min_relative_strength_vs_index_pct):
+        fail("RELATIVE_STRENGTH_TOO_LOW")
+    else:
+        passed("RELATIVE_STRENGTH_OK")
     if (config.require_support_ready or config.require_vwap_or_recent_support_ready) and not _risk_off_support_ready(
         price_location.status,
         watch,
         metadata,
     ):
-        return reject("SUPPORT_NOT_READY")
+        fail("SUPPORT_NOT_READY")
+    elif config.require_support_ready or config.require_vwap_or_recent_support_ready:
+        passed("SUPPORT_READY")
 
-    details["risk_off_entry_allowed"] = True
-    details["risk_off_entry_rejected_reason"] = ""
-    return details
+    return finalize()
+
+
+def _risk_off_shadow_entry_details(
+    details: dict[str, Any],
+    *,
+    watch: WatchSetSnapshot,
+    snapshot: StockSnapshot | None,
+    metadata: dict[str, Any],
+    price_location: PriceLocationResult,
+    risk: TradeabilityRiskResult,
+    config: RiskOffEntryConfig,
+) -> dict[str, Any]:
+    current_price = _positive_float_or_none(getattr(snapshot, "current_price", None) if snapshot is not None else None)
+    if current_price is None:
+        current_price = _positive_float_or_none(watch.current_price)
+    support_price = (
+        _positive_float_or_none(watch.recent_support_price)
+        or _positive_float_or_none(metadata.get("recent_support_price"))
+        or _positive_float_or_none(watch.vwap)
+        or _positive_float_or_none(metadata.get("vwap"))
+    )
+    stop_price = None
+    take_profit_price = None
+    if current_price is not None:
+        stop_price = int(round(current_price * (1.0 + float(config.exit_stop_loss_pct) / 100.0)))
+        take_profit_price = int(round(current_price * (1.0 + float(config.exit_take_profit_pct) / 100.0)))
+    allowed = bool(details.get("risk_off_entry_allowed"))
+    observe_only = bool(details.get("risk_off_entry_observe_only"))
+    return {
+        "feature_version": "risk_off_shadow_entry_v1",
+        "record_only": True,
+        "status": "READY_OBSERVE_ONLY" if allowed and observe_only else ("READY" if allowed else "BLOCKED"),
+        "hypothetical_entry_price": int(round(current_price)) if current_price is not None else 0,
+        "hypothetical_support_price": int(round(support_price)) if support_price is not None else 0,
+        "hypothetical_stop_price": stop_price or 0,
+        "hypothetical_take_profit_price": take_profit_price or 0,
+        "max_hold_minutes": int(config.exit_max_hold_minutes),
+        "max_position_size_multiplier": float(config.max_position_size_multiplier),
+        "risk_position_size_multiplier": float(risk.position_size_multiplier or 0.0),
+        "price_location_status": price_location.status.value,
+        "primary_reject_reason": str(details.get("risk_off_entry_rejected_reason") or ""),
+        "failed_checks": list(details.get("risk_off_entry_failed_checks") or []),
+        "passed_checks": list(details.get("risk_off_entry_passed_checks") or []),
+    }
 
 
 def _risk_off_min_breadth_sample_count(config: RiskOffEntryConfig, side: MarketSide) -> int:

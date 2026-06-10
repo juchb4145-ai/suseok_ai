@@ -717,6 +717,41 @@ def test_risk_off_small_entry_blocks_stale_quote_data():
     assert decision.risk_off_entry_details["risk_off_entry_rejected_reason"] == "STALE_QUOTE"
 
 
+def test_risk_off_small_entry_records_all_failed_checks_for_shadow_review():
+    gate = ThemeLabHybridGate(
+        risk_off_entry_config=RiskOffEntryConfig(enabled=True, observe_only=True),
+        market_side_confirmation_config=MarketSideGateConfirmationConfig(),
+    )
+
+    decision = gate.evaluate(
+        market=_risk_off_market(breadth_pct=0.10),
+        theme=_risk_off_leading_theme(),
+        watch=_risk_off_watch(),
+        price_location=_price_location(
+            PriceLocationStatus.UNKNOWN,
+            reason_codes=("PRICE_LOCATION_UNKNOWN",),
+            data_quality_flags=("STALE_QUOTE",),
+        ),
+        snapshot=_risk_off_snapshot(),
+    )
+
+    details = decision.risk_off_entry_details
+    failed = details["risk_off_entry_failed_checks"]
+    shadow = details["risk_off_shadow_entry"]
+
+    assert decision.status == LabGateStatus.BLOCKED
+    assert details["risk_off_entry_rejected_reason"] == "EXTREME_RISK_OFF"
+    assert "EXTREME_RISK_OFF" in failed
+    assert "STALE_QUOTE" in failed
+    assert "PRICE_LOCATION_NOT_ALLOWED" in failed
+    assert "PRICE_LOCATION_BLOCKED" in failed
+    assert details["risk_off_entry_allowed"] is False
+    assert shadow["record_only"] is True
+    assert shadow["status"] == "BLOCKED"
+    assert shadow["primary_reject_reason"] == "EXTREME_RISK_OFF"
+    assert shadow["hypothetical_entry_price"] == 10000
+
+
 def test_market_side_recovery_requires_confirmed_healthy_cycles():
     engine = ThemeLabFlowEngine(
         ThemeLabConfig(

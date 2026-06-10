@@ -419,6 +419,7 @@ class LiveSimRuntimeOrderSink(DryRunRuntimeOrderSink):
     live_sim_exit_blocked_count: int = 0
     last_live_sim_order_intent_at: str = ""
     last_live_sim_reject_reason: str = ""
+    last_live_sim_maintenance: dict[str, Any] = field(default_factory=dict)
 
     def on_entry_order_decision(
         self,
@@ -474,9 +475,32 @@ class LiveSimRuntimeOrderSink(DryRunRuntimeOrderSink):
                 "last_live_sim_order_intent_at": self.last_live_sim_order_intent_at,
                 "last_live_sim_reject_reason": self.last_live_sim_reject_reason,
                 "live_sim_summary": summary,
+                "live_sim_maintenance_summary": dict(self.last_live_sim_maintenance or {}),
             }
         )
         return payload
+
+    def run_maintenance(self, *, runtime_cycle_at: str = "") -> dict[str, Any]:
+        try:
+            lifecycle = self.service.run_live_sim_order_lifecycle(
+                execution_config=self._execution_config(),
+                lifecycle_config=self._lifecycle_config(),
+            )
+            result = {
+                "runtime_cycle_at": runtime_cycle_at,
+                "lifecycle": lifecycle,
+            }
+        except Exception as exc:
+            message = f"RUNTIME_LIVE_SIM_MAINTENANCE_FAILED:{exc}"
+            self.errors.append(message)
+            if self.warning_sink is not None:
+                self.warning_sink(message)
+            result = {
+                "runtime_cycle_at": runtime_cycle_at,
+                "lifecycle": {"status": "UNHEALTHY", "reason": str(exc)},
+            }
+        self.last_live_sim_maintenance = result
+        return result
 
     def _submit_live_sim_from_dry_payload(self, dry_payload: dict[str, Any], *, phase: str) -> dict[str, Any]:
         if not dry_payload.get("accepted"):

@@ -46,6 +46,7 @@ class OrderSafetyConfig:
     max_order_amount: int = 3_000_000
     max_daily_orders_per_code: int = 5
     allow_zero_price: bool = False
+    limit_sell_amount: bool = True
 
 
 class OrderCommandSafetyGuard:
@@ -87,7 +88,7 @@ class OrderCommandSafetyGuard:
         checks.append(
             SafetyCheck(
                 "order_amount_limit",
-                amount <= self.config.max_order_amount,
+                request.side == "sell" and not self.config.limit_sell_amount or amount <= self.config.max_order_amount,
                 "ORDER_AMOUNT_LIMIT",
                 {"amount": amount, "max_order_amount": self.config.max_order_amount},
             )

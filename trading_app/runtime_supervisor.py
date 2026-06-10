@@ -14,7 +14,13 @@ from trading.broker.models import GatewayEvent
 from trading.strategy.readiness import build_readiness_report
 from trading.strategy.runtime import StrategyRuntime
 from trading_app.dependencies import CoreSettings
+from trading_app.intraday_outcomes import (
+    IntradayOutcomeLabeler,
+    ThemeLabFlowPricePathProvider,
+    config_from_settings as outcome_config_from_settings,
+)
 from trading_app.runtime_factory import CoreRuntimeBundle, build_core_strategy_runtime
+from trading_app.shadow_strategy import ShadowStrategyEvaluator, config_from_settings as shadow_config_from_settings
 
 
 RuntimeBuilder = Callable[..., CoreRuntimeBundle]
@@ -58,6 +64,19 @@ class RuntimeSupervisor:
         self._pending_price_ticks: dict[str, GatewayEvent] = {}
         self._dropped_price_tick_count = 0
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strategy-runtime")
+        self._diagnostics_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strategy-diagnostics")
+        self._diagnostics_future: asyncio.Future | None = None
+        self._diagnostics_started_perf = 0.0
+        self.post_cycle_diagnostics_stage = "idle"
+        self.post_cycle_diagnostics_running = False
+        self.post_cycle_diagnostics_last_started_at = ""
+        self.post_cycle_diagnostics_last_finished_at = ""
+        self.post_cycle_diagnostics_last_duration_ms = 0
+        self.post_cycle_diagnostics_last_error = ""
+        self.post_cycle_diagnostics_run_count = 0
+        self.post_cycle_diagnostics_failed_count = 0
+        self.post_cycle_diagnostics_skipped_count = 0
+        self.post_cycle_diagnostics_last_result: dict[str, Any] = {}
         self._bundle: CoreRuntimeBundle | None = None
         self._shutdown = False
         self._last_gateway_logged_in: bool | None = None
@@ -187,6 +206,9 @@ class RuntimeSupervisor:
                 return self.status()
             duration_ms = int(round((perf_counter() - started) * 1000))
             snapshot["cycle_duration_ms"] = snapshot.get("cycle_duration_ms") or duration_ms
+            diagnostics_status = self._schedule_post_cycle_diagnostics(started_at)
+            snapshot["post_cycle_diagnostics"] = diagnostics_status
+            self._attach_diagnostics_placeholders(snapshot, diagnostics_status)
             with self._state_lock:
                 self.cycle_count += 1
                 self.last_cycle_at = started_at
@@ -243,6 +265,7 @@ class RuntimeSupervisor:
                 "manual_cycle_count": self.manual_cycle_count,
                 "last_error": self.last_error,
                 "worker_stage": self.worker_stage,
+                "post_cycle_diagnostics": self._post_cycle_diagnostics_status_locked(),
                 "last_cycle_timings": dict(self.last_cycle_timings),
                 "warnings": warnings,
                 "latest_snapshot": snapshot,
@@ -309,7 +332,11 @@ class RuntimeSupervisor:
     async def shutdown(self) -> None:
         self._shutdown = True
         await self.stop()
+        future = self._diagnostics_future
+        if future is not None and not future.done():
+            future.cancel()
         self._executor.shutdown(wait=True, cancel_futures=True)
+        self._diagnostics_executor.shutdown(wait=True, cancel_futures=True)
 
     def _start_in_worker(self) -> dict[str, Any]:
         self._set_worker_stage("start")
@@ -348,6 +375,147 @@ class RuntimeSupervisor:
             return snapshot
         finally:
             self._set_worker_stage("idle")
+
+    def _schedule_post_cycle_diagnostics(self, cycle_started_at: str) -> dict[str, Any]:
+        if not self._post_cycle_diagnostics_enabled():
+            return {"status": "DISABLED", "running": False, "cycle_started_at": cycle_started_at}
+        if self._shutdown:
+            return {"status": "SKIPPED", "running": False, "skip_reason": "SHUTTING_DOWN", "cycle_started_at": cycle_started_at}
+        with self._state_lock:
+            if self._diagnostics_future is not None and not self._diagnostics_future.done():
+                self.post_cycle_diagnostics_skipped_count += 1
+                skipped = self._post_cycle_diagnostics_status_locked()
+                skipped.update(
+                    {
+                        "status": "SKIPPED",
+                        "running": True,
+                        "skip_reason": "ALREADY_RUNNING",
+                        "cycle_started_at": cycle_started_at,
+                    }
+                )
+                return skipped
+            queued_at = _utc_now()
+            self.post_cycle_diagnostics_running = True
+            self.post_cycle_diagnostics_stage = "queued"
+            self.post_cycle_diagnostics_last_started_at = queued_at
+            self.post_cycle_diagnostics_last_finished_at = ""
+            self.post_cycle_diagnostics_last_duration_ms = 0
+            self.post_cycle_diagnostics_last_error = ""
+            self._diagnostics_started_perf = perf_counter()
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            self._diagnostics_executor,
+            self._post_cycle_diagnostics_in_worker,
+            cycle_started_at,
+            queued_at,
+        )
+        with self._state_lock:
+            self._diagnostics_future = future
+            queued = self._post_cycle_diagnostics_status_locked()
+            queued.update({"status": "QUEUED", "cycle_started_at": cycle_started_at})
+        future.add_done_callback(self._consume_post_cycle_diagnostics)
+        return queued
+
+    def _post_cycle_diagnostics_in_worker(self, cycle_started_at: str, queued_at: str) -> dict[str, Any]:
+        started = perf_counter()
+        db = TradingDatabase(str(self.settings.db_path))
+        try:
+            self._set_post_cycle_diagnostics_stage("intraday_outcome_labeler")
+            outcome = self._label_intraday_outcomes_in_worker(db)
+            self._set_post_cycle_diagnostics_stage("shadow_strategy_evaluator")
+            shadow = self._evaluate_shadow_strategies_in_worker(db)
+            outcome_error = str((outcome or {}).get("error") or "") if isinstance(outcome, dict) else ""
+            shadow_error = str((shadow or {}).get("error") or "") if isinstance(shadow, dict) else ""
+            failed = (
+                isinstance(outcome, dict)
+                and str(outcome.get("status") or "").upper() == "FAILED"
+                or isinstance(shadow, dict)
+                and str(shadow.get("status") or "").upper() == "FAILED"
+            )
+            status = "FAILED" if failed else "OK"
+            error = outcome_error or shadow_error
+        except Exception as exc:
+            status = "FAILED"
+            error = _exception_message(exc)
+            outcome = {"status": "FAILED", "error": error, "persisted_count": 0, "outcome_count": 0}
+            shadow = {"status": "FAILED", "error": error, "persisted_count": 0, "evaluated_count": 0}
+        finally:
+            try:
+                db.close()
+            finally:
+                self._set_post_cycle_diagnostics_stage("idle")
+        finished_at = _utc_now()
+        duration_ms = int(round((perf_counter() - started) * 1000))
+        return {
+            "intraday_outcome_labeler": _jsonable(outcome),
+            "shadow_strategy_evaluator": _jsonable(shadow),
+            "post_cycle_diagnostics": {
+                "status": status,
+                "running": False,
+                "cycle_started_at": cycle_started_at,
+                "queued_at": queued_at,
+                "started_at": queued_at,
+                "finished_at": finished_at,
+                "duration_ms": duration_ms,
+                "error": error,
+            },
+        }
+
+    def _consume_post_cycle_diagnostics(self, future: asyncio.Future) -> None:
+        duration_ms = 0
+        with self._state_lock:
+            if self._diagnostics_started_perf:
+                duration_ms = int(round((perf_counter() - self._diagnostics_started_perf) * 1000))
+        try:
+            result = _jsonable(future.result())
+        except asyncio.CancelledError:
+            result = {
+                "post_cycle_diagnostics": {
+                    "status": "CANCELLED",
+                    "running": False,
+                    "finished_at": _utc_now(),
+                    "duration_ms": duration_ms,
+                    "error": "CancelledError",
+                },
+                "intraday_outcome_labeler": {"status": "CANCELLED", "persisted_count": 0, "outcome_count": 0},
+                "shadow_strategy_evaluator": {"status": "CANCELLED", "persisted_count": 0, "evaluated_count": 0},
+            }
+        except Exception as exc:
+            error = _exception_message(exc)
+            result = {
+                "post_cycle_diagnostics": {
+                    "status": "FAILED",
+                    "running": False,
+                    "finished_at": _utc_now(),
+                    "duration_ms": duration_ms,
+                    "error": error,
+                },
+                "intraday_outcome_labeler": {"status": "FAILED", "error": error, "persisted_count": 0, "outcome_count": 0},
+                "shadow_strategy_evaluator": {"status": "FAILED", "error": error, "persisted_count": 0, "evaluated_count": 0},
+            }
+        metadata = dict(result.get("post_cycle_diagnostics") or {})
+        status = str(metadata.get("status") or "OK")
+        error = str(metadata.get("error") or "")
+        if not duration_ms:
+            duration_ms = int(metadata.get("duration_ms") or 0)
+        with self._state_lock:
+            self.post_cycle_diagnostics_running = False
+            self.post_cycle_diagnostics_stage = "idle"
+            self.post_cycle_diagnostics_last_finished_at = str(metadata.get("finished_at") or _utc_now())
+            self.post_cycle_diagnostics_last_duration_ms = duration_ms
+            self.post_cycle_diagnostics_last_error = error
+            if status == "OK":
+                self.post_cycle_diagnostics_run_count += 1
+            else:
+                self.post_cycle_diagnostics_failed_count += 1
+            self.post_cycle_diagnostics_last_result = result
+            snapshot = dict(self.last_snapshot or {})
+            snapshot["intraday_outcome_labeler"] = result.get("intraday_outcome_labeler")
+            snapshot["shadow_strategy_evaluator"] = result.get("shadow_strategy_evaluator")
+            snapshot["post_cycle_diagnostics"] = metadata
+            self.last_snapshot = snapshot
+        if error and status not in {"CANCELLED"}:
+            self._warn(f"POST_CYCLE_DIAGNOSTICS_FAILED:{error}")
 
     def _handle_gateway_event_in_worker(self, event: GatewayEvent) -> None:
         if self._bundle is None:
@@ -407,6 +575,51 @@ class RuntimeSupervisor:
         with self._event_lock:
             self._pending_price_ticks.clear()
 
+    def _label_intraday_outcomes_in_worker(self, db: TradingDatabase | None = None) -> dict[str, Any]:
+        if not bool(getattr(self.settings, "intraday_outcome_enabled", True)):
+            return {"status": "DISABLED", "persisted_count": 0, "outcome_count": 0}
+        active_db = db
+        if active_db is None:
+            if self._bundle is None:
+                return {"status": "DISABLED", "persisted_count": 0, "outcome_count": 0}
+            active_db = self._bundle.db
+        try:
+            labeler = IntradayOutcomeLabeler(
+                active_db,
+                config=outcome_config_from_settings(self.settings),
+                price_provider=ThemeLabFlowPricePathProvider(active_db),
+            )
+            return labeler.rebuild(
+                trade_date=datetime.now().date().isoformat(),
+                limit=int(getattr(self.settings, "intraday_outcome_max_batch_size", 500)),
+                persist=True,
+            )
+        except Exception as exc:
+            self._warn(f"INTRADAY_OUTCOME_LABELER_FAILED:{exc}")
+            return {"status": "FAILED", "error": str(exc), "persisted_count": 0, "outcome_count": 0}
+
+    def _evaluate_shadow_strategies_in_worker(self, db: TradingDatabase | None = None) -> dict[str, Any]:
+        if (
+            not bool(getattr(self.settings, "shadow_strategy_enabled", True))
+            or not bool(getattr(self.settings, "shadow_strategy_runtime_hook_enabled", True))
+        ):
+            return {"status": "DISABLED", "persisted_count": 0, "evaluated_count": 0}
+        active_db = db
+        if active_db is None:
+            if self._bundle is None:
+                return {"status": "DISABLED", "persisted_count": 0, "evaluated_count": 0}
+            active_db = self._bundle.db
+        try:
+            evaluator = ShadowStrategyEvaluator(active_db, config=shadow_config_from_settings(self.settings))
+            return evaluator.rebuild(
+                trade_date=datetime.now().date().isoformat(),
+                limit=int(getattr(self.settings, "shadow_strategy_max_batch_size", 500)),
+                persist=True,
+            )
+        except Exception as exc:
+            self._warn(f"SHADOW_STRATEGY_EVALUATOR_FAILED:{exc}")
+            return {"status": "FAILED", "error": str(exc), "persisted_count": 0, "evaluated_count": 0}
+
     def _pending_price_tick_count(self) -> int:
         with self._event_lock:
             return len(self._pending_price_ticks)
@@ -456,6 +669,51 @@ class RuntimeSupervisor:
     def _set_worker_stage(self, stage: str) -> None:
         with self._state_lock:
             self.worker_stage = str(stage or "idle")
+
+    def _set_post_cycle_diagnostics_stage(self, stage: str) -> None:
+        with self._state_lock:
+            self.post_cycle_diagnostics_stage = str(stage or "idle")
+
+    def _post_cycle_diagnostics_enabled(self) -> bool:
+        return bool(getattr(self.settings, "intraday_outcome_enabled", True)) or (
+            bool(getattr(self.settings, "shadow_strategy_enabled", True))
+            and bool(getattr(self.settings, "shadow_strategy_runtime_hook_enabled", True))
+        )
+
+    def _post_cycle_diagnostics_status_locked(self) -> dict[str, Any]:
+        enabled = self._post_cycle_diagnostics_enabled()
+        status = "DISABLED"
+        if enabled:
+            status = "RUNNING" if self.post_cycle_diagnostics_running else "IDLE"
+            if self.post_cycle_diagnostics_last_error and not self.post_cycle_diagnostics_running:
+                status = "FAILED"
+        return {
+            "enabled": enabled,
+            "status": status,
+            "running": self.post_cycle_diagnostics_running,
+            "stage": self.post_cycle_diagnostics_stage,
+            "last_started_at": self.post_cycle_diagnostics_last_started_at,
+            "last_finished_at": self.post_cycle_diagnostics_last_finished_at,
+            "last_duration_ms": self.post_cycle_diagnostics_last_duration_ms,
+            "last_error": self.post_cycle_diagnostics_last_error,
+            "run_count": self.post_cycle_diagnostics_run_count,
+            "failed_count": self.post_cycle_diagnostics_failed_count,
+            "skipped_count": self.post_cycle_diagnostics_skipped_count,
+        }
+
+    def _attach_diagnostics_placeholders(self, snapshot: dict[str, Any], diagnostics_status: dict[str, Any]) -> None:
+        with self._state_lock:
+            last_outcome = (self.post_cycle_diagnostics_last_result or {}).get("intraday_outcome_labeler")
+            last_shadow = (self.post_cycle_diagnostics_last_result or {}).get("shadow_strategy_evaluator")
+        placeholder_status = str(diagnostics_status.get("status") or "QUEUED")
+        snapshot.setdefault(
+            "intraday_outcome_labeler",
+            last_outcome or {"status": placeholder_status, "persisted_count": 0, "outcome_count": 0},
+        )
+        snapshot.setdefault(
+            "shadow_strategy_evaluator",
+            last_shadow or {"status": placeholder_status, "persisted_count": 0, "evaluated_count": 0},
+        )
 
     def _reset_cycle_timings(self) -> None:
         with self._state_lock:

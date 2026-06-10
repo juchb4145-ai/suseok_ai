@@ -1,4 +1,4 @@
-from apps.kiwoom_gateway import GatewayRuntime, _wire_kiwoom_signals
+from apps.kiwoom_gateway import GatewayRuntime, _kiwoom_heartbeat_payload, _wire_kiwoom_signals
 from trading.broker.models import BrokerPriceTick, ConditionInfo, Signal
 
 
@@ -108,6 +108,43 @@ def test_gateway_runtime_emits_market_symbols_after_login_success():
         {"market_code": "0", "market": "KOSPI", "symbols": ["005930", "084670"]},
         {"market_code": "10", "market": "KOSDAQ", "symbols": ["035720"]},
     ]
+
+
+def test_kiwoom_heartbeat_payload_reports_simulation_broker_environment():
+    class Client:
+        def get_accounts(self):
+            return ["1234567890"]
+
+        def get_server_gubun(self):
+            return "1"
+
+    runtime = GatewayRuntime(FakeCoreClient())
+    payload = _kiwoom_heartbeat_payload(Client(), runtime)
+
+    assert payload["kiwoom_logged_in"] is True
+    assert payload["account"] == "1234567890"
+    assert payload["broker_name"] == "KIWOOM"
+    assert payload["broker_env"] == "SIMULATION"
+    assert payload["server_mode"] == "SIMULATION"
+    assert payload["account_mode"] == "SIMULATION"
+    assert payload["server_gubun"] == "1"
+
+
+def test_kiwoom_heartbeat_payload_keeps_unknown_environment_fail_closed():
+    class Client:
+        def get_accounts(self):
+            return ["1234567890"]
+
+        def get_server_gubun(self):
+            return ""
+
+    runtime = GatewayRuntime(FakeCoreClient())
+    payload = _kiwoom_heartbeat_payload(Client(), runtime)
+
+    assert payload["kiwoom_logged_in"] is True
+    assert payload["broker_env"] == "UNKNOWN"
+    assert payload["server_mode"] == "UNKNOWN"
+    assert payload["account_mode"] == "UNKNOWN"
 
 
 def test_gateway_runtime_emits_condition_load_events():

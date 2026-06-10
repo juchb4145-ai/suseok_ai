@@ -185,20 +185,26 @@ class RealTimeSubscriptionManager:
 
     def _register_records(self, records: list[SubscriptionRecord]) -> None:
         screen_to_codes = {screen_no: set(codes) for screen_no, codes in self.screen_to_codes.items()}
-        batches: dict[str, list[str]] = {}
+        batches: dict[str, list[SubscriptionRecord]] = {}
         for record in sorted(records, key=self._registration_sort_key):
             screen_no = self._screen_for_new_code(screen_to_codes)
             screen_to_codes.setdefault(screen_no, set()).add(record.code)
-            batches.setdefault(screen_no, []).append(record.code)
+            batches.setdefault(screen_no, []).append(record)
 
-        for screen_no, codes in batches.items():
-            self.client.register_realtime(codes, screen_no=screen_no)
+        for screen_no, records_for_screen in batches.items():
+            codes = [record.code for record in records_for_screen]
+            register_records = getattr(self.client, "register_realtime_records", None)
+            if callable(register_records):
+                register_records(records_for_screen, screen_no=screen_no)
+            else:
+                self.client.register_realtime(codes, screen_no=screen_no)
             for code in codes:
                 self.code_to_screen[code] = screen_no
             self.screen_to_codes.setdefault(screen_no, set()).update(codes)
 
-        for screen_no, codes in batches.items():
-            for code in codes:
+        for screen_no, records_for_screen in batches.items():
+            for record_for_screen in records_for_screen:
+                code = record_for_screen.code
                 record = self.records.get(code)
                 if record is not None:
                     record.screen_no = screen_no

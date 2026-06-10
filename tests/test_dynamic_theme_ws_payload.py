@@ -62,6 +62,23 @@ def test_subscribe_request_parsing():
     assert request["stock_codes"] == ["000001"]
 
 
+def test_subscribe_request_parsing_normalizes_untrusted_values():
+    request = parse_subscribe_request(
+        {
+            "action": "subscribe",
+            "channels": "theme_detail",
+            "top_n": "not-a-number",
+            "theme_ids": "ai",
+            "stock_codes": "000001",
+        }
+    )
+
+    assert request["channels"] == ["theme_detail"]
+    assert request["top_n"] == 20
+    assert request["theme_ids"] == ["ai"]
+    assert request["stock_codes"] == ["000001"]
+
+
 def test_ws_server_module_imports_without_fastapi_requirement():
     import trading.theme_engine.ws.server as server
 

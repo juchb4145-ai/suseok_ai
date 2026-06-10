@@ -63,7 +63,46 @@ WAIT_DATA_REALTIME_RELIABILITY_LOW = "WAIT_DATA_REALTIME_RELIABILITY_LOW"
 REALTIME_RELIABILITY_REASON_CODE = "REALTIME_RELIABILITY_LOW"
 REALTIME_RELIABILITY_SIZE_REDUCED_REASON_CODE = "REALTIME_RELIABILITY_SIZE_REDUCED"
 REALTIME_RELIABILITY_SHADOW_BLOCK_REASON_CODE = "REALTIME_RELIABILITY_NOT_HIGH"
+ENTRY_RISK_TEMP_WAIT = "ENTRY_RISK_TEMP_WAIT"
+ENTRY_RISK_FINAL_BLOCK = "ENTRY_RISK_FINAL_BLOCK"
+ENTRY_RISK_RECOVERY_PENDING = "ENTRY_RISK_RECOVERY_PENDING"
+ENTRY_RISK_RECOVERED = "ENTRY_RISK_RECOVERED"
+RISK_ADJUST_POSITION_SIZE = "RISK_ADJUST_POSITION_SIZE"
 LATE_CHASE_SOFT_BLOCK_CODES = {"HIGH_CHASE_RISK", "LATE_CHASE", "CHASE_RISK"}
+ENTRY_RISK_CODES = {
+    "VI_ACTIVE",
+    "VI_COOLDOWN",
+    "VI_UNKNOWN_LIMIT_RISK",
+    "UPPER_LIMIT_NEAR",
+    "UPPER_LIMIT_HARD_NEAR",
+    "HIGH_RETURN_LEADER",
+    "HIGH_RETURN_CO_LEADER",
+    "HIGH_RETURN_FOLLOWER",
+    "HIGH_RETURN_LATE_LAGGARD",
+    "HIGH_RETURN_UNKNOWN_ROLE",
+    ENTRY_RISK_TEMP_WAIT,
+    ENTRY_RISK_FINAL_BLOCK,
+    ENTRY_RISK_RECOVERY_PENDING,
+    ENTRY_RISK_RECOVERED,
+    RISK_ADJUST_POSITION_SIZE,
+}
+ENTRY_RISK_FINAL_CODES = {
+    "VI_ACTIVE",
+    "UPPER_LIMIT_HARD_NEAR",
+    "HIGH_RETURN_FOLLOWER",
+    "HIGH_RETURN_LATE_LAGGARD",
+    "HIGH_RETURN_UNKNOWN_ROLE",
+    ENTRY_RISK_FINAL_BLOCK,
+}
+ENTRY_RISK_TEMP_CODES = {
+    "VI_COOLDOWN",
+    "VI_UNKNOWN_LIMIT_RISK",
+    "UPPER_LIMIT_NEAR",
+    "HIGH_RETURN_LEADER",
+    "HIGH_RETURN_CO_LEADER",
+    ENTRY_RISK_TEMP_WAIT,
+    ENTRY_RISK_RECOVERY_PENDING,
+}
 MARKET_WEAK_WAIT_CODES = {"CANDIDATE_MARKET_WEAK", "KOSDAQ_MARKET_WEAK", "KOSPI_MARKET_WEAK"}
 MARKET_RISK_OFF_WAIT_CODES = {
     "GLOBAL_MARKET_RISK_OFF",
@@ -639,6 +678,9 @@ def _map_decision(
             latest_tick_age_sec=latest.age_sec,
             realtime_reliability_guard=reliability_guard,
         )
+    entry_risk_mapping = _entry_risk_mapping(decision, watch, reason_codes, latest, active_settings)
+    if entry_risk_mapping is not None:
+        return entry_risk_mapping
     if price_location in OBSERVE_ONLY_LOCATIONS:
         final_status = {
             PriceLocationStatus.CHASE_HIGH: "OBSERVE_CHASE",
@@ -920,6 +962,61 @@ def _map_decision(
         shadow_small_entry_guard=shadow_guard,
         realtime_reliability_guard=reliability_guard,
     )
+
+
+def _entry_risk_mapping(
+    decision: LabGateDecision,
+    watch: WatchSetSnapshot,
+    reason_codes: list[str],
+    latest,
+    settings: StrategyRuntimeSettings,
+) -> ThemeLabBridgeMapping | None:
+    upper_codes = {str(code).upper() for code in reason_codes}
+    if not (upper_codes & ENTRY_RISK_CODES):
+        return None
+    recheck_after_sec = settings.integer("entry_risk_gate.risk_recheck_after_sec", 30)
+    if recheck_after_sec <= 0:
+        recheck_after_sec = int(decision.recheck_after_sec or 30)
+    role = watch.stock_role
+    final = bool(upper_codes & ENTRY_RISK_FINAL_CODES)
+    temporary = bool(upper_codes & ENTRY_RISK_TEMP_CODES)
+    if "UPPER_LIMIT_NEAR" in upper_codes and role not in LEADER_ROLES:
+        final = True
+    if "VI_UNKNOWN_LIMIT_RISK" in upper_codes and role not in LEADER_ROLES and not temporary:
+        final = True
+    if final:
+        final_status = ENTRY_RISK_FINAL_BLOCK
+        return ThemeLabBridgeMapping(
+            final_status,
+            "NOT_ELIGIBLE_ENTRY_RISK_FINAL",
+            False,
+            BlockType.FINAL,
+            False,
+            0,
+            "C",
+            max(0.0, float(decision.price_location_score or 0.0)),
+            _dedupe([final_status] + reason_codes + [ENTRY_RISK_FINAL_BLOCK]),
+            ready_type=final_status,
+            latest_tick_ready=latest.ready,
+            latest_tick_age_sec=latest.age_sec,
+        )
+    if temporary:
+        final_status = ENTRY_RISK_TEMP_WAIT
+        return ThemeLabBridgeMapping(
+            final_status,
+            "NOT_ELIGIBLE_ENTRY_RISK_TEMP",
+            False,
+            BlockType.TEMPORARY,
+            True,
+            recheck_after_sec,
+            "B",
+            max(0.0, float(decision.price_location_score or 0.0)),
+            _dedupe([final_status] + reason_codes + [ENTRY_RISK_TEMP_WAIT]),
+            ready_type=final_status,
+            latest_tick_ready=latest.ready,
+            latest_tick_age_sec=latest.age_sec,
+        )
+    return None
 
 
 def _wait_data_for_support(
@@ -1594,6 +1691,9 @@ def _stock_pullback_details(
     coverage = support_coverage(tick_metadata, support_candidates)
     is_late_chase_wait = mapping.final_gate_status == LATE_CHASE_TEMP_WAIT
     is_risk_soft_block_wait = mapping.final_gate_status == RISK_SOFT_BLOCK_TEMP_WAIT
+    is_entry_risk_wait = mapping.final_gate_status == ENTRY_RISK_TEMP_WAIT
+    is_entry_risk_final = mapping.final_gate_status == ENTRY_RISK_FINAL_BLOCK
+    entry_risk_reason_codes = [code for code in mapping.reason_codes if str(code).upper() in ENTRY_RISK_CODES]
     market_fields = _market_side_fields(decision, watch)
     if mapping.selected_support_source:
         nearest_support = mapping.selected_support_source
@@ -1626,6 +1726,7 @@ def _stock_pullback_details(
     risk_off_details = dict(getattr(decision, "risk_off_entry_details", {}) or {})
     shadow_guard = dict(mapping.shadow_small_entry_guard or {})
     realtime_fields = _realtime_reliability_details(mapping.realtime_reliability_guard)
+    risk_off_shadow_entry = dict(risk_off_details.get("risk_off_shadow_entry") or {})
     return {
         "source": SOURCE,
         "profile": candidate.strategy_profile.value if candidate.strategy_profile else StrategyProfile.KOSDAQ_THEME_PROFILE.value,
@@ -1679,6 +1780,10 @@ def _stock_pullback_details(
         "risk_off_entry_observe_only": bool(risk_off_details.get("risk_off_entry_observe_only")),
         "risk_off_entry_allowed": bool(risk_off_details.get("risk_off_entry_allowed")),
         "risk_off_entry_rejected_reason": str(risk_off_details.get("risk_off_entry_rejected_reason") or ""),
+        "risk_off_entry_failed_checks": list(risk_off_details.get("risk_off_entry_failed_checks") or []),
+        "risk_off_entry_passed_checks": list(risk_off_details.get("risk_off_entry_passed_checks") or []),
+        "risk_off_entry_blocking_data_flags": list(risk_off_details.get("risk_off_entry_blocking_data_flags") or []),
+        "risk_off_shadow_entry": risk_off_shadow_entry,
         "risk_off_relative_strength_pct": risk_off_details.get("risk_off_relative_strength_pct"),
         "risk_off_candidate_breadth_pct": risk_off_details.get("risk_off_candidate_breadth_pct"),
         "risk_off_candidate_index_return_pct": risk_off_details.get("risk_off_candidate_index_return_pct"),
@@ -1704,7 +1809,61 @@ def _stock_pullback_details(
         ] if is_late_chase_wait else [],
         "risk_soft_block": is_risk_soft_block_wait,
         "risk_soft_block_reason_codes": list(mapping.reason_codes) if is_risk_soft_block_wait else [],
+        "entry_risk_diagnostics": _entry_risk_details_from_bridge(decision, watch, tick_metadata, mapping),
+        "entry_risk_feature_version": "entry_risk_diagnostics_v1",
+        "entry_risk_action": "final_block" if is_entry_risk_final else ("temporary_wait" if is_entry_risk_wait else ""),
+        "entry_risk_level": "final" if is_entry_risk_final else ("temporary" if is_entry_risk_wait else ""),
+        "entry_risk_score": 100.0 if is_entry_risk_final else (60.0 if is_entry_risk_wait else 0.0),
+        "entry_risk_reason_codes": entry_risk_reason_codes,
+        "entry_risk_recovery_checks": {},
+        "vi_status": str(tick_metadata.get("vi_status") or ("ACTIVE" if "VI_ACTIVE" in entry_risk_reason_codes else ("COOLDOWN" if "VI_COOLDOWN" in entry_risk_reason_codes else "UNKNOWN"))),
+        "vi_signal_source": str(tick_metadata.get("vi_signal_source") or "unknown"),
+        "seconds_since_vi_release": tick_metadata.get("seconds_since_vi_release"),
+        "upper_limit_price": tick_metadata.get("upper_limit_price"),
+        "upper_limit_gap_pct": tick_metadata.get("upper_limit_gap_pct"),
+        "change_rate": tick_metadata.get("change_rate", watch.return_pct),
+        "pullback_from_high_pct": tick_metadata.get("pullback_from_high_pct"),
+        "leadership_role": watch.stock_role.value,
         "comparison_reason_codes": list(mapping.reason_codes),
+    }
+
+
+def _entry_risk_details_from_bridge(
+    decision: LabGateDecision,
+    watch: WatchSetSnapshot,
+    tick_metadata: dict[str, Any],
+    mapping: ThemeLabBridgeMapping,
+) -> dict[str, Any]:
+    reason_codes = [code for code in mapping.reason_codes if str(code).upper() in ENTRY_RISK_CODES]
+    action = "none"
+    level = "none"
+    if mapping.final_gate_status == ENTRY_RISK_FINAL_BLOCK:
+        action = "final_block"
+        level = "final"
+    elif mapping.final_gate_status == ENTRY_RISK_TEMP_WAIT:
+        action = "temporary_wait"
+        level = "temporary"
+    return {
+        "feature_version": "entry_risk_diagnostics_v1",
+        "source": SOURCE,
+        "entry_risk_action": action,
+        "entry_risk_level": level,
+        "entry_risk_score": 100.0 if level == "final" else (60.0 if level == "temporary" else 0.0),
+        "entry_risk_reason_codes": reason_codes,
+        "entry_risk_recovery_checks": {},
+        "vi_status": str(
+            tick_metadata.get("vi_status")
+            or ("ACTIVE" if "VI_ACTIVE" in reason_codes else ("COOLDOWN" if "VI_COOLDOWN" in reason_codes else "UNKNOWN"))
+        ),
+        "vi_signal_source": str(tick_metadata.get("vi_signal_source") or "unknown"),
+        "seconds_since_vi_release": tick_metadata.get("seconds_since_vi_release"),
+        "upper_limit_price": tick_metadata.get("upper_limit_price"),
+        "upper_limit_gap_pct": tick_metadata.get("upper_limit_gap_pct"),
+        "change_rate": tick_metadata.get("change_rate", watch.return_pct),
+        "pullback_from_high_pct": tick_metadata.get("pullback_from_high_pct"),
+        "leadership_role": watch.stock_role.value,
+        "stock_role": watch.stock_role.value,
+        "position_size_multiplier": decision.position_size_multiplier,
     }
 
 
@@ -1818,6 +1977,21 @@ def _base_details(
         "risk_soft_block": bool(stock_details.get("risk_soft_block")),
         "risk_soft_block_reason_codes": list(stock_details.get("risk_soft_block_reason_codes") or []),
         "stock_role": watch.stock_role.value,
+        "entry_risk_diagnostics": dict(stock_details.get("entry_risk_diagnostics") or {}),
+        "entry_risk_feature_version": stock_details.get("entry_risk_feature_version", ""),
+        "entry_risk_action": stock_details.get("entry_risk_action", ""),
+        "entry_risk_level": stock_details.get("entry_risk_level", ""),
+        "entry_risk_score": stock_details.get("entry_risk_score"),
+        "entry_risk_reason_codes": list(stock_details.get("entry_risk_reason_codes") or []),
+        "entry_risk_recovery_checks": dict(stock_details.get("entry_risk_recovery_checks") or {}),
+        "vi_status": stock_details.get("vi_status", "UNKNOWN"),
+        "vi_signal_source": stock_details.get("vi_signal_source", "unknown"),
+        "seconds_since_vi_release": stock_details.get("seconds_since_vi_release"),
+        "upper_limit_price": stock_details.get("upper_limit_price"),
+        "upper_limit_gap_pct": stock_details.get("upper_limit_gap_pct"),
+        "change_rate": stock_details.get("change_rate"),
+        "pullback_from_high_pct": stock_details.get("pullback_from_high_pct"),
+        "leadership_role": stock_details.get("leadership_role", watch.stock_role.value),
         "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
         **shadow_fields,
         "risk_off_entry": dict(stock_details.get("risk_off_entry") or {}),
@@ -1825,6 +1999,10 @@ def _base_details(
         "risk_off_entry_observe_only": bool(stock_details.get("risk_off_entry_observe_only")),
         "risk_off_entry_allowed": bool(stock_details.get("risk_off_entry_allowed")),
         "risk_off_entry_rejected_reason": stock_details.get("risk_off_entry_rejected_reason", ""),
+        "risk_off_entry_failed_checks": list(stock_details.get("risk_off_entry_failed_checks") or []),
+        "risk_off_entry_passed_checks": list(stock_details.get("risk_off_entry_passed_checks") or []),
+        "risk_off_entry_blocking_data_flags": list(stock_details.get("risk_off_entry_blocking_data_flags") or []),
+        "risk_off_shadow_entry": dict(stock_details.get("risk_off_shadow_entry") or {}),
         "risk_off_relative_strength_pct": stock_details.get("risk_off_relative_strength_pct"),
         "risk_off_candidate_breadth_pct": stock_details.get("risk_off_candidate_breadth_pct"),
         "risk_off_candidate_index_return_pct": stock_details.get("risk_off_candidate_index_return_pct"),
@@ -1881,6 +2059,22 @@ def _base_details(
             "late_chase_recheck_after_sec": stock_details.get("late_chase_recheck_after_sec", 0),
             "risk_soft_block": bool(stock_details.get("risk_soft_block")),
             "risk_soft_block_reason_codes": list(stock_details.get("risk_soft_block_reason_codes") or []),
+            "entry_risk_diagnostics": dict(stock_details.get("entry_risk_diagnostics") or {}),
+            "entry_risk_feature_version": stock_details.get("entry_risk_feature_version", ""),
+            "entry_risk_action": stock_details.get("entry_risk_action", ""),
+            "entry_risk_level": stock_details.get("entry_risk_level", ""),
+            "entry_risk_score": stock_details.get("entry_risk_score"),
+            "entry_risk_reason_codes": list(stock_details.get("entry_risk_reason_codes") or []),
+            "entry_risk_recovery_checks": dict(stock_details.get("entry_risk_recovery_checks") or {}),
+            "vi_status": stock_details.get("vi_status", "UNKNOWN"),
+            "vi_signal_source": stock_details.get("vi_signal_source", "unknown"),
+            "seconds_since_vi_release": stock_details.get("seconds_since_vi_release"),
+            "upper_limit_price": stock_details.get("upper_limit_price"),
+            "upper_limit_gap_pct": stock_details.get("upper_limit_gap_pct"),
+            "change_rate": stock_details.get("change_rate"),
+            "pullback_from_high_pct": stock_details.get("pullback_from_high_pct"),
+            "leadership_role": stock_details.get("leadership_role", watch.stock_role.value),
+            "stock_role": watch.stock_role.value,
             "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
             **shadow_fields,
             "risk_off_entry": dict(stock_details.get("risk_off_entry") or {}),
@@ -1888,6 +2082,10 @@ def _base_details(
             "risk_off_entry_observe_only": bool(stock_details.get("risk_off_entry_observe_only")),
             "risk_off_entry_allowed": bool(stock_details.get("risk_off_entry_allowed")),
             "risk_off_entry_rejected_reason": stock_details.get("risk_off_entry_rejected_reason", ""),
+            "risk_off_entry_failed_checks": list(stock_details.get("risk_off_entry_failed_checks") or []),
+            "risk_off_entry_passed_checks": list(stock_details.get("risk_off_entry_passed_checks") or []),
+            "risk_off_entry_blocking_data_flags": list(stock_details.get("risk_off_entry_blocking_data_flags") or []),
+            "risk_off_shadow_entry": dict(stock_details.get("risk_off_shadow_entry") or {}),
             "risk_off_relative_strength_pct": stock_details.get("risk_off_relative_strength_pct"),
             "risk_off_candidate_breadth_pct": stock_details.get("risk_off_candidate_breadth_pct"),
             "risk_off_candidate_index_return_pct": stock_details.get("risk_off_candidate_index_return_pct"),
@@ -1937,6 +2135,9 @@ def _observability_status_fields(
     elif late_chase_level == "soft_block" or mapping.final_gate_status == LATE_CHASE_TEMP_WAIT:
         normalized = "LATE_CHASE_TEMP_WAIT"
         display = "LATE_CHASE_TEMP_WAIT"
+    elif mapping.final_gate_status in {ENTRY_RISK_TEMP_WAIT, ENTRY_RISK_FINAL_BLOCK}:
+        normalized = str(mapping.final_gate_status)
+        display = str(mapping.final_gate_status)
     elif restore_reason == "MARKET_CONFIRMATION_STATE_DB_ERROR" or "MARKET_CONFIRMATION_STATE_CONSERVATIVE_FALLBACK" in reason_codes:
         normalized = "WAIT_MARKET_STATE_CONSERVATIVE_FALLBACK"
         display = "WAIT_MARKET_STATE_CONSERVATIVE_FALLBACK"

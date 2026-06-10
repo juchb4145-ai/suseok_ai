@@ -29,6 +29,7 @@ DISPLAY_WAIT_ORDER = {
     "WAIT_DATA_SUPPORT_NOT_READY": 2,
     "WAIT_DATA_LATEST_TICK_STALE": 2,
 }
+NAVER_THEME_SYNC_SOURCE = "naver_theme_universe"
 
 
 def build_theme_lab_dashboard_snapshot(
@@ -39,8 +40,9 @@ def build_theme_lab_dashboard_snapshot(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     raw = db.latest_theme_lab_flow_result()
+    theme_source_sync = _theme_source_sync_status(db)
     if not raw:
-        return _empty_snapshot(runtime_status=runtime_status)
+        return _empty_snapshot(runtime_status=runtime_status, theme_source_sync=theme_source_sync)
 
     themes = _as_list(raw.get("theme_rankings") or raw.get("theme_condition_snapshots"))
     gate_decisions = _as_list(raw.get("gate_decisions"))
@@ -71,6 +73,7 @@ def build_theme_lab_dashboard_snapshot(
         "runtime": runtime,
         "gateway": gateway,
         "theme_backfill_runtime": backfill_runtime,
+        "theme_source_sync": theme_source_sync,
         **_freshness_quality_fields(freshness),
         "market": _market(raw.get("market_status") or {}),
         "condition_statuses": _condition_statuses(db, gateway_state),
@@ -88,7 +91,11 @@ def build_theme_lab_dashboard_snapshot(
     }
 
 
-def _empty_snapshot(*, runtime_status: dict[str, Any] | None = None) -> dict[str, Any]:
+def _empty_snapshot(
+    *,
+    runtime_status: dict[str, Any] | None = None,
+    theme_source_sync: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     runtime = _runtime_context(runtime_status)
     freshness = _empty_freshness()
     return {
@@ -99,6 +106,7 @@ def _empty_snapshot(*, runtime_status: dict[str, Any] | None = None) -> dict[str
         "last_updated_at": _now_time(),
         "runtime": runtime,
         "gateway": _gateway_context(None),
+        "theme_source_sync": theme_source_sync or _empty_theme_source_sync_status(),
         "theme_backfill_runtime": {
             "enabled": False,
             "paused_reason": "SNAPSHOT_UNAVAILABLE",
@@ -226,6 +234,39 @@ def _empty_shadow_small_entry_ab() -> dict[str, Any]:
     }
 
 
+def _theme_source_sync_status(db: TradingDatabase) -> dict[str, Any]:
+    run = ThemeEngineRepository(db).latest_source_sync_run(NAVER_THEME_SYNC_SOURCE)
+    if run is None:
+        return _empty_theme_source_sync_status()
+    return {
+        "id": run.id,
+        "source": run.source,
+        "status": run.status,
+        "theme_count": run.theme_count,
+        "member_count": run.member_count,
+        "error_count": run.error_count,
+        "message": run.message,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "details": dict(run.details or {}),
+    }
+
+
+def _empty_theme_source_sync_status() -> dict[str, Any]:
+    return {
+        "id": None,
+        "source": NAVER_THEME_SYNC_SOURCE,
+        "status": "NOT_SYNCED",
+        "theme_count": 0,
+        "member_count": 0,
+        "error_count": 0,
+        "message": "",
+        "started_at": "",
+        "finished_at": "",
+        "details": {},
+    }
+
+
 def _merge_watchset_gate_decisions(watchset: list[dict[str, Any]], decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     decisions_by_symbol = {str(item.get("symbol") or ""): item for item in decisions if item.get("symbol")}
     decision_fields = (
@@ -283,6 +324,10 @@ def _merge_watchset_gate_decisions(watchset: list[dict[str, Any]], decisions: li
                     "risk_off_entry_observe_only",
                     "risk_off_entry_allowed",
                     "risk_off_entry_rejected_reason",
+                    "risk_off_entry_failed_checks",
+                    "risk_off_entry_passed_checks",
+                    "risk_off_entry_blocking_data_flags",
+                    "risk_off_shadow_entry",
                     "risk_off_relative_strength_pct",
                     "risk_off_candidate_breadth_pct",
                     "risk_off_candidate_index_return_pct",
@@ -837,6 +882,7 @@ def _latest_condition_commands(gateway_state: Any | None) -> dict[str, dict[str,
     if gateway_state is None:
         return {}
     try:
+        current_session = _gateway_session_tokens(gateway_state.snapshot().to_dict().get("last_heartbeat_payload") or {})
         records = gateway_state.list_commands(limit=500, include_finished=True, command_type="send_condition")
     except Exception:
         return {}
@@ -847,15 +893,63 @@ def _latest_condition_commands(gateway_state: Any | None) -> dict[str, dict[str,
         if not name:
             continue
         current = latest.get(name)
-        if current is not None and str(current.get("created_at") or "") >= str(record.get("created_at") or ""):
-            continue
-        latest[name] = {
+        candidate = {
             "status": str(record.get("status") or ""),
             "last_error": str(record.get("last_error") or ""),
             "created_at": str(record.get("created_at") or ""),
+            "updated_at": str(record.get("updated_at") or ""),
             "payload": payload,
+            "result_payload": dict(record.get("result_payload") or {}),
         }
+        if current is not None and not _prefer_condition_command_record(candidate, current, current_session):
+            continue
+        latest[name] = candidate
     return latest
+
+
+def _prefer_condition_command_record(
+    candidate: dict[str, Any],
+    current: dict[str, Any],
+    current_session: set[str],
+) -> bool:
+    candidate_current_ack = str(candidate.get("status") or "").upper() == "ACKED" and _record_matches_session(
+        candidate,
+        current_session,
+    )
+    current_current_ack = str(current.get("status") or "").upper() == "ACKED" and _record_matches_session(
+        current,
+        current_session,
+    )
+    if candidate_current_ack != current_current_ack:
+        return candidate_current_ack
+    candidate_created = str(candidate.get("created_at") or "")
+    current_created = str(current.get("created_at") or "")
+    if candidate_created != current_created:
+        return candidate_created > current_created
+    return str(candidate.get("updated_at") or "") > str(current.get("updated_at") or "")
+
+
+def _record_matches_session(record: dict[str, Any], current_session: set[str]) -> bool:
+    if not current_session:
+        return True
+    record_session = _gateway_session_tokens(record.get("result_payload") or {})
+    if not record_session:
+        return True
+    return not record_session.isdisjoint(current_session)
+
+
+def _gateway_session_tokens(payload: Any) -> set[str]:
+    if not isinstance(payload, dict):
+        return set()
+    tokens: set[str] = set()
+    for key in ("ws_session_id", "websocket_session_id", "ws_connection_id", "connection_id"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            tokens.add(value)
+    trace = payload.get("transport_trace")
+    if isinstance(trace, dict):
+        tokens.update(_gateway_session_tokens(trace))
+    return tokens
 
 
 def _condition_command_warning(status: str, error: str) -> str:
@@ -1658,7 +1752,7 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
         "momentum_1m_missing_reason": momentum_1m_missing_reason,
         "momentum_3m_missing_reason": momentum_3m_missing_reason,
     }
-    return {
+    row = {
         "gate_status": gate,
         "final_status": gate,
         "display_status": display_status,
@@ -1794,6 +1888,10 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
         "risk_off_entry_observe_only": bool(item.get("risk_off_entry_observe_only")),
         "risk_off_entry_allowed": bool(item.get("risk_off_entry_allowed")),
         "risk_off_entry_rejected_reason": item.get("risk_off_entry_rejected_reason", ""),
+        "risk_off_entry_failed_checks": list(item.get("risk_off_entry_failed_checks") or []),
+        "risk_off_entry_passed_checks": list(item.get("risk_off_entry_passed_checks") or []),
+        "risk_off_entry_blocking_data_flags": list(item.get("risk_off_entry_blocking_data_flags") or []),
+        "risk_off_shadow_entry": dict(item.get("risk_off_shadow_entry") or {}),
         "risk_off_relative_strength_pct": item.get("risk_off_relative_strength_pct"),
         "risk_off_candidate_breadth_pct": item.get("risk_off_candidate_breadth_pct"),
         "risk_off_candidate_index_return_pct": item.get("risk_off_candidate_index_return_pct"),
@@ -1821,6 +1919,12 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
             "seconds_since_vi_release": item.get("seconds_since_vi_release"),
         },
     }
+    next_recheck_after_sec = _recheck_seconds(row)
+    row["operator_action"] = _operator_action(row)
+    row["next_recheck_after_sec"] = next_recheck_after_sec if next_recheck_after_sec != 999999 else None
+    row["decision_checklist"] = _decision_checklist(row)
+    row["price_map"] = _price_map(row)
+    return row
 
 
 def _entry_row(item: dict[str, Any], priority: int) -> dict[str, Any]:
@@ -2002,6 +2106,112 @@ def _recheck_seconds(row: dict[str, Any]) -> int:
     ]
     positives = [value for value in candidates if value > 0]
     return min(positives) if positives else 999999
+
+
+def _operator_action(row: dict[str, Any]) -> str:
+    gate = str(row.get("gate_status") or "")
+    display = str(row.get("display_status") or gate)
+    ready_like = gate in {"READY", "READY_SMALL"}
+    if ready_like and row.get("submittable") and row.get("live_order_guard_passed"):
+        return "BUY_READY"
+    if ready_like and not row.get("live_order_guard_passed"):
+        return "LIVE_GUARD_BLOCKED"
+    if row.get("diagnostic_only") or display.startswith("WAIT_DATA"):
+        return "DATA_WAIT"
+    if _is_market_pending(row) or display.startswith("WAIT_CANDIDATE_MARKET") or str(row.get("market_confirmed_status") or "") == "RISK_OFF":
+        return "MARKET_WAIT"
+    if row.get("chase_risk") or display == "CHASE_RISK_BLOCKED":
+        return "CHASE_BLOCKED"
+    return "OBSERVE"
+
+
+def _decision_checklist(row: dict[str, Any]) -> dict[str, str]:
+    return {
+        "market": _market_decision(row),
+        "theme": _theme_decision(row),
+        "role": _role_decision(row),
+        "price_location": _price_location_decision(row),
+        "data": _data_decision(row),
+        "chase_risk": _chase_decision(row),
+        "order_link": _order_decision(row),
+    }
+
+
+def _market_decision(row: dict[str, Any]) -> str:
+    display = str(row.get("display_status") or "")
+    status = str(row.get("market_confirmed_status") or row.get("candidate_market_status") or "")
+    if status == "RISK_OFF" or "RISK_OFF" in display:
+        return "BLOCK"
+    if _is_market_pending(row) or status in {"WEAK", "CHOPPY"}:
+        return "WAIT"
+    return "PASS"
+
+
+def _theme_decision(row: dict[str, Any]) -> str:
+    status = str(row.get("theme_status") or "").upper()
+    try:
+        theme_score = float(row.get("theme_score") or 0)
+    except (TypeError, ValueError):
+        theme_score = 0.0
+    if "WEAK" in status or theme_score < 40:
+        return "WEAK"
+    if "WATCH" in status or theme_score < 65:
+        return "WATCH"
+    return "PASS"
+
+
+def _role_decision(row: dict[str, Any]) -> str:
+    role = str(row.get("stock_role") or "WEAK_MEMBER")
+    return role if role in {"LEADER", "CO_LEADER", "FOLLOWER", "LATE_LAGGARD", "WEAK_MEMBER"} else "WEAK_MEMBER"
+
+
+def _price_location_decision(row: dict[str, Any]) -> str:
+    display = str(row.get("display_status") or "")
+    status = str(row.get("price_location_status") or "")
+    if display.startswith("WAIT_DATA") or status == "UNKNOWN":
+        return "DATA_WAIT"
+    if status in {"FAILED_BREAKOUT", "DEEP_PULLBACK"}:
+        return "WAIT"
+    if row.get("chase_risk") or display == "CHASE_RISK_BLOCKED":
+        return "BLOCK"
+    return "PASS"
+
+
+def _data_decision(row: dict[str, Any]) -> str:
+    flags = set(row.get("data_quality_flags") or []) | set(row.get("price_location_data_quality_flags") or [])
+    if _is_data_not_ready(row):
+        return "DEGRADED"
+    return "WARNING" if flags else "OK"
+
+
+def _chase_decision(row: dict[str, Any]) -> str:
+    display = str(row.get("display_status") or "")
+    if row.get("chase_risk") or display == "CHASE_RISK_BLOCKED":
+        return "BLOCK"
+    if display == "LATE_CHASE_TEMP_WAIT" or row.get("late_chase_level"):
+        return "WAIT"
+    return "PASS"
+
+
+def _order_decision(row: dict[str, Any]) -> str:
+    if row.get("runtime_order_intent_created"):
+        return "INTENT_CREATED"
+    if str(row.get("gate_status") or "") in {"READY", "READY_SMALL"} and not row.get("live_order_guard_passed"):
+        return "LIVE_BLOCKED"
+    if row.get("submittable") and row.get("live_order_guard_passed"):
+        return "READY"
+    return "OBSERVE"
+
+
+def _price_map(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "current_price": row.get("current_price"),
+        "vwap": row.get("vwap"),
+        "recent_support_price": row.get("recent_support_price"),
+        "support_price": row.get("support_price"),
+        "breakout_level": row.get("breakout_level"),
+        "upper_limit_price": row.get("upper_limit_price"),
+    }
 
 
 PRICE_LOCATION_MISSING_LABELS = {

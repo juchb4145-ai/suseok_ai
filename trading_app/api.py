@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import os
 import subprocess
 import time
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from contextlib import asynccontextmanager
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
+from itertools import count
 from pathlib import Path
+from threading import RLock
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
-from fastapi.responses import HTMLResponse
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -27,6 +33,7 @@ from trading.broker.models import (
     BrokerOrderResult,
     GatewayCommand,
     GatewayEvent,
+    new_message_id,
     utc_timestamp,
 )
 from trading.broker.transport_metrics import (
@@ -34,6 +41,7 @@ from trading.broker.transport_metrics import (
     TRANSPORT_MODE_WEBSOCKET_REAL_PILOT,
     TransportLatencySample,
     ensure_transport_trace,
+    monotonic_delta_ms,
     monotonic_ms,
     payload_size_bytes,
     should_sample_transport_message,
@@ -52,12 +60,35 @@ from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThe
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
 from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, config_from_settings
 from trading_app.dry_run_threshold_ab import DryRunThresholdABAnalyzer, config_from_settings as threshold_ab_config_from_settings
+from trading_app.intraday_outcomes import (
+    IntradayOutcomeLabeler,
+    ThemeLabFlowPricePathProvider,
+    config_from_settings as outcome_config_from_settings,
+)
 from trading_app.market_gate_review import MarketGateReviewAnalyzer
 from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
+from trading_app.replay_tick_buffer import ReplayGradeTickBuffer, replay_tick_writer_config_from_settings
 from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
 from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
+from trading_app.shadow_strategy import ShadowStrategyEvaluator, config_from_settings as shadow_config_from_settings
+from trading_app.strategy_change_proposals import (
+    StrategyChangeProposalGenerator,
+    build_config_diff,
+    config_from_settings as change_proposal_config_from_settings,
+)
+from trading_app.strategy_replay import (
+    DEFAULT_BUNDLE_ROOT,
+    DEFAULT_REPLAY_DB_ROOT,
+    StrategyReplayBundleExporter,
+    StrategyRuntimeReplayRunner,
+    get_replay_report_detail,
+    get_replay_run_detail,
+    list_replay_bundles,
+    scan_replay_reports,
+    scan_replay_runs,
+)
 from trading_app.themelab_dashboard import build_theme_lab_dashboard_snapshot
 from trading_app.transport_latency import TransportLatencyAnalyzer, TransportLatencyConfig
 from trading_app.websocket import DashboardConnectionManager
@@ -69,10 +100,16 @@ WEB_ROOT = PROJECT_ROOT / "web"
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    replay_tick_buffer.start()
+    await _start_gateway_condition_event_worker()
+    await _start_core_ws_event_worker()
     await runtime_supervisor.startup()
     try:
         yield
     finally:
+        await _stop_core_ws_event_worker()
+        await _stop_gateway_condition_event_worker()
+        replay_tick_buffer.stop()
         await runtime_supervisor.shutdown()
 
 
@@ -83,6 +120,212 @@ KST = timezone(timedelta(hours=9), "KST")
 TRANSPORT_LIVE_WINDOW_SEC = 15 * 60
 LOG_LIVE_WINDOW_SEC = 5 * 60
 DASHBOARD_EVENT_PUSH_MIN_INTERVAL_SEC = 1.0
+DASHBOARD_SNAPSHOT_CACHE_TTL_SEC = 5.0
+DASHBOARD_HEAVY_SECTION_CACHE_TTL_SEC = 30.0
+DASHBOARD_WS_PUSH_INTERVAL_SEC = 5.0
+DASHBOARD_SNAPSHOT_DETAIL_SLIM = "slim"
+DASHBOARD_SNAPSHOT_DETAIL_FULL = "full"
+THEMELAB_OPERATOR_EVENT_TYPES = {
+    "BUY_READY_NEW",
+    "BUY_READY_SMALL_NEW",
+    "READY_TO_WAIT",
+    "READY_BUT_LIVE_BLOCKED",
+    "ORDER_INTENT_CREATED",
+    "VIRTUAL_ORDER_CREATED",
+    "MARKET_WAIT_STARTED",
+    "MARKET_RECOVERED",
+    "DATA_QUALITY_DEGRADED",
+    "DATA_QUALITY_RECOVERED",
+    "CHASE_RISK_BLOCKED",
+    "LATE_CHASE_TEMP_WAIT",
+    "GATEWAY_DISCONNECTED",
+    "GATEWAY_RECOVERED",
+    "SNAPSHOT_STALE",
+    "SNAPSHOT_RECOVERED",
+    "TOP_THEME_CHANGED",
+    "TOP_LEADER_CHANGED",
+    "ACTION_EXECUTED",
+    "ACTION_FAILED",
+    "ACTION_BLOCKED",
+}
+THEMELAB_OPERATOR_EVENT_SEVERITIES = {"CRITICAL", "WARNING", "OPPORTUNITY", "INFO"}
+THEMELAB_OPERATOR_EVENT_CATEGORIES = {
+    "opportunity",
+    "warning",
+    "critical",
+    "order",
+    "data",
+    "market",
+    "gateway",
+    "snapshot",
+    "theme",
+    "risk",
+    "action",
+    "info",
+}
+THEMELAB_OPERATOR_ACTION_STATUSES = {"PENDING", "RUNNING", "SUCCESS", "FAILED", "BLOCKED", "SKIPPED"}
+FORBIDDEN_OPERATOR_ACTIONS = {
+    "LIVE_BUY": {
+        "label_ko": "LIVE 매수",
+        "reason_ko": "이번 PR 범위 제외: LIVE 주문 금지",
+    },
+    "LIVE_SELL": {
+        "label_ko": "LIVE 매도",
+        "reason_ko": "이번 PR 범위 제외: LIVE 주문 금지",
+    },
+    "CANCEL_LIVE_ORDER": {
+        "label_ko": "LIVE 주문 취소",
+        "reason_ko": "이번 PR 범위 제외: LIVE 주문 취소 금지",
+    },
+    "OVERRIDE_LIVE_GUARD": {
+        "label_ko": "LIVE Guard 우회",
+        "reason_ko": "LIVE Guard 우회는 지원하지 않습니다.",
+    },
+    "FORCE_READY": {
+        "label_ko": "강제 READY",
+        "reason_ko": "운영자가 상태를 강제로 바꾸는 액션은 금지됩니다.",
+    },
+    "CHANGE_RISK_THRESHOLD": {
+        "label_ko": "리스크 임계값 변경",
+        "reason_ko": "전략/리스크 파라미터 변경은 이번 PR 범위가 아닙니다.",
+    },
+    "CHANGE_STRATEGY_PARAMETER": {
+        "label_ko": "전략 파라미터 변경",
+        "reason_ko": "전략 파라미터 변경은 이번 PR 범위가 아닙니다.",
+    },
+    "DISABLE_RISK_GATE": {
+        "label_ko": "Risk Gate 비활성화",
+        "reason_ko": "리스크 게이트 비활성화는 지원하지 않습니다.",
+    },
+}
+OPERATOR_ACTION_CATALOG = {
+    "REFRESH_SNAPSHOT": {
+        "label_ko": "스냅샷 새로고침",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "/api/themelab/snapshot",
+    },
+    "RUNTIME_CYCLE_ONCE": {
+        "label_ko": "Runtime 1회 평가",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/runtime/cycle",
+    },
+    "RUNTIME_START": {
+        "label_ko": "Runtime 시작",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/runtime/start",
+    },
+    "RUNTIME_STOP": {
+        "label_ko": "Runtime 중지",
+        "risk_level": "HIGH",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/runtime/stop",
+    },
+    "RUNTIME_RESTART": {
+        "label_ko": "Runtime 재시작",
+        "risk_level": "HIGH",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/runtime/restart",
+    },
+    "CHECK_RUNTIME_READINESS": {
+        "label_ko": "Runtime 준비 상태 확인",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "/api/runtime/readiness",
+    },
+    "CHECK_GATEWAY_STATUS": {
+        "label_ko": "Gateway 상태 확인",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "/api/gateway/status",
+    },
+    "START_KIWOOM_GATEWAY": {
+        "label_ko": "32bit Gateway 실행",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/gateway/kiwoom/start",
+    },
+    "OPEN_DRY_RUN_ORDER_DETAIL": {
+        "label_ko": "DRY_RUN 주문 상세",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "/api/runtime/orders/dry-run/{intent_id}",
+    },
+    "REBUILD_DRY_RUN_PERFORMANCE": {
+        "label_ko": "DRY_RUN 성과 재계산",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/runtime/performance/dry-run/rebuild",
+    },
+    "REBUILD_POSTMARKET_REVIEW": {
+        "label_ko": "Post-market 리뷰 재생성",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/themelab/postmarket-review/rebuild",
+    },
+    "REBUILD_TRANSPORT_LATENCY_REPORT": {
+        "label_ko": "전송 지연 리포트 재계산",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/gateway/transport/latency/rebuild",
+    },
+    "EXPORT_TRANSPORT_LATENCY_REPORT": {
+        "label_ko": "전송 지연 리포트 내보내기",
+        "risk_level": "MEDIUM",
+        "requires_token": True,
+        "confirmation_required": True,
+        "endpoint": "/api/gateway/transport/latency/export",
+    },
+    "ACK_EVENT": {
+        "label_ko": "이벤트 확인",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "/api/themelab/operator-events/ack",
+    },
+    "HIDE_EVENT": {
+        "label_ko": "이벤트 숨김",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": True,
+        "endpoint": "/api/themelab/operator-events/hide",
+    },
+    "SNOOZE_EVENT": {
+        "label_ko": "이벤트 잠시 보류",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": True,
+        "endpoint": "/api/themelab/operator-events/snooze",
+    },
+    "ADD_OPERATOR_NOTE": {
+        "label_ko": "운영 메모 추가",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "/api/themelab/operator-actions/execute",
+    },
+    "OPEN_RUNBOOK": {
+        "label_ko": "Runbook 열기",
+        "risk_level": "LOW",
+        "requires_token": False,
+        "confirmation_required": False,
+        "endpoint": "client:runbook",
+    },
+}
 
 
 def _build_gateway_state() -> GatewayStateStore:
@@ -124,18 +367,197 @@ gateway_ws_transport_state: dict[str, Any] = {
     "session_loss_count": 0,
     "duplicate_ack_count": 0,
     "unknown_ack_count": 0,
+    "last_send_ms": 0.0,
+    "last_receive_ms": 0.0,
+    "gateway_ws_send_completed_count": 0,
+    "gateway_ws_send_completed_update_count": 0,
+    "gateway_ws_send_completed_miss_count": 0,
+    "gateway_ws_last_send_completed_duration_ms": 0.0,
+    "gateway_ws_last_send_completed_to_core_receive_ms": 0.0,
+    "gateway_ws_last_send_completed_message_type": "",
+    "gateway_ws_last_send_completed_at": "",
+    "outbound_queue_size": 0,
+    "control_outbound_queue_size": 0,
+    "data_outbound_queue_size": 0,
+    "core_ws_outbound_writer_active": False,
+    "core_ws_outbound_queue_size": 0,
+    "core_ws_outbound_queue_max_size": 0,
+    "core_ws_outbound_queued_count": 0,
+    "core_ws_outbound_sent_count": 0,
+    "core_ws_outbound_dropped_count": 0,
+    "core_ws_last_send_json_ms": 0.0,
+    "core_ws_last_send_queue_wait_ms": 0.0,
+    "core_ws_last_send_json_type": "",
+    "core_ws_last_send_json_at": "",
+    "core_ws_slow_send_count": 0,
+    "core_ws_last_slow_send_json_ms": 0.0,
+    "core_ws_last_slow_send_at": "",
+    "core_ws_last_receive_text_ms": 0.0,
+    "core_ws_receive_loop_gap_ms": 0.0,
+    "condition_event_queue_size": 0,
+    "command_queue_size": 0,
     "last_ws_event_at": "",
     "last_ws_ack_at": "",
 }
+gateway_condition_event_worker_state: dict[str, Any] = {
+    "enabled": False,
+    "queue_size": 0,
+    "queue_sizes_by_worker": [],
+    "queue_batch_count": 0,
+    "queue_batch_counts_by_worker": [],
+    "queue_max_size": 0,
+    "worker_count": 1,
+    "active_worker_count": 0,
+    "active_count": 0,
+    "received_count": 0,
+    "queued_count": 0,
+    "coalesced_count": 0,
+    "stale_skipped_count": 0,
+    "stale_queue_wait_skipped_count": 0,
+    "processed_count": 0,
+    "failed_count": 0,
+    "dropped_count": 0,
+    "last_batch_size": 0,
+    "last_drained_batch_count": 0,
+    "last_received_count": 0,
+    "last_queued_count": 0,
+    "last_queued_batch_count": 0,
+    "last_coalesced_count": 0,
+    "last_stale_skipped_count": 0,
+    "last_stale_queue_wait_skipped_count": 0,
+    "last_stale_queue_wait_ms": 0.0,
+    "last_queue_wait_ms": 0.0,
+    "stale_include_skip_ms": 15000.0,
+    "batch_chunk_size": 64,
+    "last_batch_duration_ms": 0.0,
+    "last_worker_index": 0,
+    "last_shard_key": "",
+    "last_queued_at": "",
+    "last_processed_at": "",
+    "last_error": "",
+}
+gateway_core_ws_event_worker_state: dict[str, Any] = {
+    "enabled": False,
+    "queue_size": 0,
+    "queue_max_size": 0,
+    "active_count": 0,
+    "queued_count": 0,
+    "processed_count": 0,
+    "failed_count": 0,
+    "dropped_count": 0,
+    "priority_enabled": True,
+    "split_enabled": True,
+    "control_worker_count": 1,
+    "control_queue_size": 0,
+    "control_queue_sizes": [],
+    "data_queue_size": 0,
+    "control_active_count": 0,
+    "data_active_count": 0,
+    "control_queued_count": 0,
+    "data_queued_count": 0,
+    "last_priority": 0,
+    "last_worker_kind": "",
+    "last_control_worker_index": 0,
+    "price_tick_coalesce_enabled": True,
+    "price_tick_pending_key_count": 0,
+    "price_tick_received_count": 0,
+    "price_tick_queued_count": 0,
+    "price_tick_coalesced_count": 0,
+    "price_tick_processed_count": 0,
+    "price_tick_dropped_count": 0,
+    "price_tick_last_key": "",
+    "last_message_type": "",
+    "last_event_id": "",
+    "last_queue_wait_ms": 0.0,
+    "last_duration_ms": 0.0,
+    "last_queued_at": "",
+    "last_processed_at": "",
+    "last_error": "",
+}
+
+
+@dataclass
+class _ConditionEventBatchWorkItem:
+    events: list[GatewayEvent]
+    queued_at: str
+    queued_monotonic_ms: float
+
+
+@dataclass
+class _CoreWsEventWorkItem:
+    kind: str
+    metadata: dict[str, Any]
+    queued_at: str = field(default_factory=utc_now_ms)
+    queued_monotonic_ms: float = field(default_factory=monotonic_ms)
+    event: GatewayEvent | None = None
+    message: GatewayWsMessage | None = None
+    coalesce_key: str = ""
+
+
+@dataclass(order=True)
+class _CoreWsEventQueuedItem:
+    priority: int
+    sequence: int
+    work_item: _CoreWsEventWorkItem = field(compare=False)
+
+
+@dataclass
+class _CoreWsOutboundMessage:
+    payload: dict[str, Any]
+    message_type: str
+    queued_at: str
+    queued_monotonic_ms: float
+    connection_id: str
+
+
+_gateway_condition_event_queue: asyncio.Queue[_ConditionEventBatchWorkItem] | None = None
+_gateway_condition_event_worker_task: asyncio.Task | None = None
+_gateway_condition_event_queues: list[asyncio.Queue[_ConditionEventBatchWorkItem]] = []
+_gateway_condition_event_worker_tasks: list[asyncio.Task] = []
+_gateway_condition_event_worker_loop: asyncio.AbstractEventLoop | None = None
+_gateway_condition_event_executor: ThreadPoolExecutor | None = None
+_gateway_condition_event_executor_worker_count = 0
+_gateway_condition_event_coalesce_lock = RLock()
+_gateway_condition_event_generation = 0
+_gateway_condition_event_latest_generation: dict[str, int] = {}
+_core_ws_event_queue: asyncio.PriorityQueue[_CoreWsEventQueuedItem] | None = None
+_core_ws_event_control_queue: asyncio.PriorityQueue[_CoreWsEventQueuedItem] | None = None
+_core_ws_event_data_queue: asyncio.PriorityQueue[_CoreWsEventQueuedItem] | None = None
+_core_ws_event_control_queues: list[asyncio.PriorityQueue[_CoreWsEventQueuedItem]] = []
+_core_ws_event_worker_task: asyncio.Task | None = None
+_core_ws_event_control_worker_task: asyncio.Task | None = None
+_core_ws_event_data_worker_task: asyncio.Task | None = None
+_core_ws_event_control_worker_tasks: list[asyncio.Task] = []
+_core_ws_event_worker_loop: asyncio.AbstractEventLoop | None = None
+_core_ws_event_queue_sequence = count()
+_core_ws_price_tick_coalesce_lock = RLock()
+_core_ws_price_tick_latest_by_key: dict[str, _CoreWsEventWorkItem] = {}
 _dashboard_snapshot_task: asyncio.Task | None = None
 _dashboard_snapshot_last_sent_monotonic = 0.0
+_dashboard_snapshot_cache_lock = RLock()
+_dashboard_snapshot_cache_payload: dict[str, Any] | None = None
+_dashboard_snapshot_cache_db_path = ""
+_dashboard_snapshot_cache_monotonic = 0.0
+_dashboard_snapshot_cache_build_ms = 0.0
+_dashboard_snapshot_cache_hit_count = 0
+_dashboard_snapshot_cache_miss_count = 0
+_dashboard_fragment_cache: dict[tuple[str, str], tuple[float, Any]] = {}
 
 
 def _build_runtime_supervisor() -> RuntimeSupervisor:
     return RuntimeSupervisor(settings=get_settings(), gateway_state=gateway_state)
 
 
+def _build_replay_tick_buffer() -> ReplayGradeTickBuffer:
+    settings = get_settings()
+    return ReplayGradeTickBuffer(
+        settings.db_path,
+        config=replay_tick_writer_config_from_settings(settings),
+    )
+
+
 runtime_supervisor = _build_runtime_supervisor()
+replay_tick_buffer = _build_replay_tick_buffer()
 
 
 def _order_service() -> OrderEnqueueService:
@@ -145,6 +567,26 @@ def _order_service() -> OrderEnqueueService:
 
 def _performance_analyzer(db: TradingDatabase) -> DryRunPerformanceAnalyzer:
     return DryRunPerformanceAnalyzer(db, config=config_from_settings(get_settings()))
+
+
+def _intraday_outcome_labeler(db: TradingDatabase) -> IntradayOutcomeLabeler:
+    return IntradayOutcomeLabeler(
+        db,
+        config=outcome_config_from_settings(get_settings()),
+        price_provider=ThemeLabFlowPricePathProvider(db),
+    )
+
+
+def _shadow_strategy_evaluator(db: TradingDatabase) -> ShadowStrategyEvaluator:
+    return ShadowStrategyEvaluator(db, config=shadow_config_from_settings(get_settings()))
+
+
+def _change_proposal_generator(db: TradingDatabase) -> StrategyChangeProposalGenerator:
+    return StrategyChangeProposalGenerator(
+        db,
+        config=change_proposal_config_from_settings(get_settings()),
+        replay_db_root=DEFAULT_REPLAY_DB_ROOT,
+    )
 
 
 def _market_gate_review_analyzer(db: TradingDatabase) -> MarketGateReviewAnalyzer:
@@ -303,6 +745,7 @@ def _transport_status_payload(db: TradingDatabase) -> dict[str, Any]:
         "recent_errors": recent_errors,
         "latest_report_id": latest_reports[0].get("report_id") if latest_reports else "",
         "real_gateway_websocket_pilot": real_pilot,
+        "replay_tick_history": replay_tick_buffer.snapshot(),
         "gateway": {
             "reconnect_count": gateway_snapshot.get("reconnect_count", 0),
             "network_last_error": heartbeat_payload.get("gateway_network_last_error") or heartbeat_payload.get("last_error") or "",
@@ -411,6 +854,10 @@ def gateway_status() -> dict[str, Any]:
 
 @app.post("/api/gateway/kiwoom/start")
 def start_kiwoom_gateway(_: None = Depends(verify_gateway_token)) -> dict[str, Any]:
+    return _start_kiwoom_gateway_response()
+
+
+def _start_kiwoom_gateway_response() -> dict[str, Any]:
     snapshot = gateway_state.snapshot().to_dict()
     if snapshot.get("connected") and snapshot.get("heartbeat_ok"):
         return {
@@ -861,7 +1308,9 @@ def gateway_transport_websocket_pilot_status() -> dict[str, Any]:
 
 @app.get("/api/runtime/status")
 def runtime_status() -> dict[str, Any]:
-    return runtime_supervisor.status()
+    payload = runtime_supervisor.status()
+    payload["replay_tick_history"] = replay_tick_buffer.snapshot()
+    return payload
 
 
 @app.post("/api/runtime/start")
@@ -951,6 +1400,645 @@ def runtime_dry_run_order_detail(intent_id: str) -> dict[str, Any]:
         return {"intent_id": intent_id, "record": None, "events": [], "linked": {}, "found": False}
     payload["found"] = True
     return payload
+
+
+@app.get("/api/runtime/decisions/intraday")
+def runtime_intraday_decisions(
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    theme_name: Optional[str] = None,
+    gate_status: Optional[str] = None,
+    action_type: Optional[str] = None,
+    action_result: Optional[str] = None,
+    reason_status: Optional[str] = None,
+    reason_family: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        filters = {
+            "trade_date": trade_date or "",
+            "code": code or "",
+            "theme_name": theme_name or "",
+            "gate_status": gate_status or "",
+            "action_type": action_type or "",
+            "action_result": action_result or "",
+            "reason_status": reason_status or "",
+            "reason_family": reason_family or "",
+            "limit": limit,
+            "offset": offset,
+        }
+        items = db.list_strategy_decision_events(
+            trade_date=trade_date,
+            code=code,
+            theme_name=theme_name,
+            gate_status=gate_status,
+            action_type=action_type,
+            action_result=action_result,
+            reason_status=reason_status,
+            reason_family=reason_family,
+            limit=limit,
+            offset=offset,
+        )
+        total = db.strategy_decision_event_count(
+            trade_date=trade_date,
+            code=code,
+            theme_name=theme_name,
+            gate_status=gate_status,
+            action_type=action_type,
+            action_result=action_result,
+            reason_status=reason_status,
+            reason_family=reason_family,
+        )
+        return {
+            "items": items,
+            "pagination": _pagination_payload(limit=limit, offset=offset, count=len(items), total=total),
+            "filters": filters,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/decisions/summary")
+def runtime_intraday_decision_summary(
+    trade_date: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        summary = db.strategy_decision_summary(trade_date=trade_date, window_sec=window_sec)
+        return {"summary": summary, "filters": {"trade_date": trade_date or "", "window_sec": window_sec}}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/outcomes/intraday")
+def runtime_intraday_outcomes(
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    outcome_label: Optional[str] = None,
+    action_type: Optional[str] = None,
+    gate_status: Optional[str] = None,
+    reason_family: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+    min_max_return_pct: Optional[float] = None,
+    max_drawdown_pct: Optional[float] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_strategy_decision_outcomes(
+            trade_date=trade_date,
+            code=code,
+            outcome_label=outcome_label,
+            action_type=action_type,
+            gate_status=gate_status,
+            reason_family=reason_family,
+            reason_code=reason_code,
+            horizon_sec=horizon_sec,
+            min_max_return_pct=min_max_return_pct,
+            max_drawdown_pct=max_drawdown_pct,
+            limit=limit,
+            offset=offset,
+        )
+        total = db.strategy_decision_outcome_count(
+            trade_date=trade_date,
+            code=code,
+            outcome_label=outcome_label,
+            action_type=action_type,
+            gate_status=gate_status,
+            reason_family=reason_family,
+            reason_code=reason_code,
+            horizon_sec=horizon_sec,
+            min_max_return_pct=min_max_return_pct,
+            max_drawdown_pct=max_drawdown_pct,
+        )
+        filters = {
+            "trade_date": trade_date or "",
+            "code": code or "",
+            "outcome_label": outcome_label or "",
+            "action_type": action_type or "",
+            "gate_status": gate_status or "",
+            "reason_family": reason_family or "",
+            "reason_code": reason_code or "",
+            "horizon_sec": horizon_sec,
+            "min_max_return_pct": min_max_return_pct,
+            "max_drawdown_pct": max_drawdown_pct,
+            "limit": limit,
+            "offset": offset,
+        }
+        return {
+            "items": items,
+            "pagination": _pagination_payload(limit=limit, offset=offset, count=len(items), total=total),
+            "filters": filters,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/outcomes/intraday/summary")
+def runtime_intraday_outcome_summary(
+    trade_date: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        summary = db.strategy_decision_outcome_summary(
+            trade_date=trade_date,
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+        )
+        return {
+            "summary": summary,
+            "filters": {"trade_date": trade_date or "", "window_sec": window_sec, "horizon_sec": horizon_sec},
+        }
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/outcomes/intraday/rebuild")
+def rebuild_runtime_intraday_outcomes(
+    trade_date: Optional[str] = None,
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+    force: bool = False,
+    limit: int = Query(10000, ge=1, le=100000),
+    persist: bool = True,
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        result = _intraday_outcome_labeler(db).rebuild(
+            trade_date=trade_date,
+            horizon_sec=horizon_sec,
+            force=force,
+            limit=limit,
+            persist=persist,
+        )
+        result["summary"] = db.strategy_decision_outcome_summary(trade_date=trade_date, horizon_sec=horizon_sec) if persist else {}
+        return result
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/shadow-strategies/policies")
+def runtime_shadow_strategy_policies() -> dict[str, Any]:
+    db = open_database()
+    try:
+        evaluator = _shadow_strategy_evaluator(db)
+        policies = [policy.to_dict() for policy in evaluator.load_policies(include_baseline=True)]
+        return {
+            "policies": policies,
+            "items": policies,
+            "enabled": bool(evaluator.config.enabled),
+            "observe_only": bool(evaluator.config.observe_only),
+            "allow_apply": False,
+            "disclaimer_ko": "Shadow 결과는 장중 진단용이며 실제 전략 설정에 자동 적용되지 않습니다.",
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/shadow-strategies/evaluations")
+def runtime_shadow_strategy_evaluations(
+    trade_date: Optional[str] = None,
+    policy_id: Optional[str] = None,
+    code: Optional[str] = None,
+    theme_name: Optional[str] = None,
+    baseline_gate_status: Optional[str] = None,
+    shadow_gate_status: Optional[str] = None,
+    change_type: Optional[str] = None,
+    changed_decision: Optional[bool] = None,
+    outcome_label: Optional[str] = None,
+    expected_risk: Optional[str] = None,
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_shadow_strategy_evaluations(
+            trade_date=trade_date,
+            policy_id=policy_id,
+            code=code,
+            theme_name=theme_name,
+            baseline_gate_status=baseline_gate_status,
+            shadow_gate_status=shadow_gate_status,
+            change_type=change_type,
+            changed_decision=changed_decision,
+            outcome_label=outcome_label,
+            expected_risk=expected_risk,
+            horizon_sec=horizon_sec,
+            limit=limit,
+            offset=offset,
+        )
+        total = db.shadow_strategy_evaluation_count(
+            trade_date=trade_date,
+            policy_id=policy_id,
+            code=code,
+            theme_name=theme_name,
+            baseline_gate_status=baseline_gate_status,
+            shadow_gate_status=shadow_gate_status,
+            change_type=change_type,
+            changed_decision=changed_decision,
+            outcome_label=outcome_label,
+            expected_risk=expected_risk,
+            horizon_sec=horizon_sec,
+        )
+        filters = {
+            "trade_date": trade_date or "",
+            "policy_id": policy_id or "",
+            "code": code or "",
+            "theme_name": theme_name or "",
+            "baseline_gate_status": baseline_gate_status or "",
+            "shadow_gate_status": shadow_gate_status or "",
+            "change_type": change_type or "",
+            "changed_decision": changed_decision,
+            "outcome_label": outcome_label or "",
+            "expected_risk": expected_risk or "",
+            "horizon_sec": horizon_sec,
+            "limit": limit,
+            "offset": offset,
+        }
+        return {
+            "items": items,
+            "pagination": _pagination_payload(limit=limit, offset=offset, count=len(items), total=total),
+            "filters": filters,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/shadow-strategies/summary")
+def runtime_shadow_strategy_summary(
+    trade_date: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+    policy_id: Optional[str] = None,
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        summary = db.shadow_strategy_summary(
+            trade_date=trade_date,
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+            policy_id=policy_id,
+        )
+        return {
+            "summary": summary,
+            "filters": {
+                "trade_date": trade_date or "",
+                "window_sec": window_sec,
+                "horizon_sec": horizon_sec,
+                "policy_id": policy_id or "",
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/shadow-strategies/rebuild")
+def rebuild_runtime_shadow_strategies(
+    trade_date: Optional[str] = None,
+    policy_id: Optional[str] = None,
+    force: bool = False,
+    limit: int = Query(10000, ge=1, le=100000),
+    persist: bool = True,
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        result = _shadow_strategy_evaluator(db).rebuild(
+            trade_date=trade_date,
+            policy_id=policy_id,
+            force=force,
+            limit=limit,
+            persist=persist,
+        )
+        result["summary"] = db.shadow_strategy_summary(trade_date=trade_date, policy_id=policy_id) if persist else {}
+        return result
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/replay/bundles")
+def runtime_replay_bundles(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    items = list_replay_bundles(DEFAULT_BUNDLE_ROOT, limit=limit + 1, offset=offset)
+    items, pagination = _trim_page(items, limit=limit, offset=offset)
+    return {"items": items, "pagination": pagination, "filters": {"limit": limit, "offset": offset}}
+
+
+@app.post("/api/runtime/replay/bundles/export")
+def export_runtime_replay_bundle(
+    trade_date: str,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    codes: Optional[str] = None,
+    theme_names: Optional[str] = None,
+    force: bool = False,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    settings = get_settings()
+    exporter = StrategyReplayBundleExporter(settings.db_path, output_root=DEFAULT_BUNDLE_ROOT)
+    bundle = exporter.export_bundle(
+        trade_date,
+        start_time=start_time,
+        end_time=end_time,
+        codes=_csv_values(codes),
+        theme_names=_csv_values(theme_names),
+        force=force,
+    )
+    return {
+        "replay_id": bundle.manifest.replay_id,
+        "bundle_path": str(bundle.path),
+        "manifest": bundle.manifest.to_dict(),
+        "summary": bundle.manifest.data_quality,
+        "warnings": bundle.manifest.warnings,
+    }
+
+
+@app.get("/api/runtime/replay/runs")
+def runtime_replay_runs(
+    trade_date: Optional[str] = None,
+    mode: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    items = scan_replay_runs(DEFAULT_REPLAY_DB_ROOT, trade_date=trade_date, mode=mode, limit=limit + 1, offset=offset)
+    items, pagination = _trim_page(items, limit=limit, offset=offset)
+    return {
+        "items": items,
+        "pagination": pagination,
+        "filters": {"trade_date": trade_date or "", "mode": mode or "", "limit": limit, "offset": offset},
+    }
+
+
+@app.post("/api/runtime/replay/run")
+def run_runtime_replay(
+    bundle_path: Optional[str] = None,
+    trade_date: Optional[str] = None,
+    mode: str = Query("decision_led", pattern="^(data_only|decision_led|full_runtime)$"),
+    cycle_interval_sec: Optional[float] = Query(None, ge=0.1, le=3600),
+    speed: float = Query(1.0, ge=0.0, le=1000),
+    replay_db: Optional[str] = None,
+    force: bool = False,
+    limit: Optional[int] = Query(None, ge=1, le=100000),
+    export_report: bool = True,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    settings = get_settings()
+    runner = StrategyRuntimeReplayRunner(
+        source_db_path=settings.db_path,
+        replay_db_root=DEFAULT_REPLAY_DB_ROOT,
+        bundle_root=DEFAULT_BUNDLE_ROOT,
+    )
+    result = runner.run(
+        bundle_path=bundle_path,
+        trade_date=trade_date,
+        mode=mode,
+        cycle_interval_sec=cycle_interval_sec,
+        speed=speed,
+        replay_db=replay_db,
+        force=force,
+        limit=limit,
+        export_report=export_report,
+    )
+    return {
+        "replay_id": result.replay_id,
+        "status": result.status,
+        "replay_db_path": result.replay_db_path,
+        "source_bundle_path": result.source_bundle_path,
+        "report_id": (result.report or {}).get("report_id", ""),
+        "summary": result.summary,
+        "warnings": result.warnings,
+        "error": result.error,
+    }
+
+
+@app.get("/api/runtime/replay/runs/{replay_id}")
+def runtime_replay_run_detail(replay_id: str) -> dict[str, Any]:
+    return get_replay_run_detail(replay_id, DEFAULT_REPLAY_DB_ROOT)
+
+
+@app.get("/api/runtime/replay/reports/{report_id}")
+def runtime_replay_report_detail(report_id: str) -> dict[str, Any]:
+    return get_replay_report_detail(report_id, DEFAULT_REPLAY_DB_ROOT)
+
+
+@app.get("/api/runtime/replay/summary")
+def runtime_replay_summary(
+    trade_date: Optional[str] = None,
+    replay_id: Optional[str] = None,
+    mode: Optional[str] = None,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    reports = scan_replay_reports(
+        DEFAULT_REPLAY_DB_ROOT,
+        trade_date=trade_date,
+        replay_id=replay_id,
+        mode=mode,
+        limit=limit + 1,
+        offset=offset,
+    )
+    items, pagination = _trim_page(reports, limit=limit, offset=offset)
+    latest = items[0] if items else None
+    return {
+        "latest": latest,
+        "items": items,
+        "pagination": pagination,
+        "filters": {"trade_date": trade_date or "", "replay_id": replay_id or "", "mode": mode or "", "limit": limit, "offset": offset},
+    }
+
+
+@app.get("/api/runtime/change-proposals")
+def runtime_change_proposals(
+    trade_date: Optional[str] = None,
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    recommendation_grade: Optional[str] = None,
+    source_type: Optional[str] = None,
+    target_component: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_strategy_change_proposals(
+            trade_date=trade_date,
+            status=status,
+            category=category,
+            recommendation_grade=recommendation_grade,
+            source_type=source_type,
+            target_component=target_component,
+            limit=limit,
+            offset=offset,
+        )
+        total = db.strategy_change_proposal_count(
+            trade_date=trade_date,
+            status=status,
+            category=category,
+            recommendation_grade=recommendation_grade,
+            source_type=source_type,
+            target_component=target_component,
+        )
+        return {
+            "items": items,
+            "pagination": _pagination_payload(limit=limit, offset=offset, count=len(items), total=total),
+            "filters": {
+                "trade_date": trade_date or "",
+                "status": status or "",
+                "category": category or "",
+                "recommendation_grade": recommendation_grade or "",
+                "source_type": source_type or "",
+                "target_component": target_component or "",
+                "limit": limit,
+                "offset": offset,
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/change-proposals/evidence")
+def runtime_change_proposal_evidence(
+    proposal_id: Optional[str] = None,
+    trade_date: Optional[str] = None,
+    source_type: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_strategy_change_evidence(
+            proposal_id=proposal_id,
+            trade_date=trade_date,
+            source_type=source_type,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "items": items,
+            "pagination": _pagination_payload(limit=limit, offset=offset, count=len(items)),
+            "filters": {"proposal_id": proposal_id or "", "trade_date": trade_date or "", "source_type": source_type or "", "limit": limit, "offset": offset},
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/change-proposals/summary")
+def runtime_change_proposal_summary(
+    trade_date: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        summary = db.strategy_change_proposal_summary(trade_date=trade_date, window_sec=window_sec)
+        return {"summary": summary, "filters": {"trade_date": trade_date or "", "window_sec": window_sec}}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/change-proposals/{proposal_id}")
+def runtime_change_proposal_detail(proposal_id: str) -> dict[str, Any]:
+    db = open_database()
+    try:
+        proposal = db.get_strategy_change_proposal(proposal_id)
+        if proposal is None:
+            return {"found": False, "proposal_id": proposal_id}
+        evidence = db.list_strategy_change_evidence(proposal_id, limit=1000)
+        approvals = db.list_strategy_change_approvals(proposal_id, limit=200)
+        config_diff = build_config_diff(proposal)
+        return {
+            "found": True,
+            "proposal": proposal,
+            "evidence": evidence,
+            "approvals": approvals,
+            "config_diff": config_diff,
+            "rollout_plan": proposal.get("rollout_plan") or {},
+            "rollback_plan": proposal.get("rollback_plan") or {},
+            "related_reports": _proposal_related_reports(proposal),
+            "disclaimer_ko": "승인해도 실제 runtime config에 자동 반영하지 않습니다. 후속 PR에서 observe-only rollout에 연결할 수 있습니다.",
+        }
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/change-proposals/generate")
+def generate_runtime_change_proposals(
+    trade_date: str,
+    source_type: Optional[str] = Query("combined", pattern="^(intraday_outcome|shadow_strategy|replay|threshold_ab|combined)$"),
+    replay_id: Optional[str] = None,
+    force: bool = False,
+    persist: bool = True,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        # force is accepted for API symmetry. Stable proposal IDs make generation idempotent without deleting approvals.
+        result = _change_proposal_generator(db).generate(
+            trade_date=trade_date,
+            source_type=source_type or "combined",
+            replay_id=replay_id,
+            persist=persist,
+        )
+        result["force"] = bool(force)
+        return result
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/change-proposals/{proposal_id}/approve-observe")
+def approve_observe_change_proposal(
+    proposal_id: str,
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    return _record_change_proposal_action(proposal_id, "approve_observe", "APPROVED_FOR_OBSERVE", body or {})
+
+
+@app.post("/api/runtime/change-proposals/{proposal_id}/approve-dry-run")
+def approve_dry_run_change_proposal(
+    proposal_id: str,
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    return _record_change_proposal_action(proposal_id, "approve_dry_run", "APPROVED_FOR_DRY_RUN", body or {})
+
+
+@app.post("/api/runtime/change-proposals/{proposal_id}/reject")
+def reject_change_proposal(
+    proposal_id: str,
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    if not str((body or {}).get("note") or "").strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="note is required")
+    return _record_change_proposal_action(proposal_id, "reject", "REJECTED", body or {})
+
+
+@app.post("/api/runtime/change-proposals/{proposal_id}/expire")
+def expire_change_proposal(
+    proposal_id: str,
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    return _record_change_proposal_action(proposal_id, "expire", "EXPIRED", body or {})
+
+
+@app.post("/api/runtime/change-proposals/{proposal_id}/note")
+def note_change_proposal(
+    proposal_id: str,
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    if not str((body or {}).get("note") or "").strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="note is required")
+    return _record_change_proposal_action(proposal_id, "note", "", body or {})
 
 
 @app.get("/api/runtime/performance/dry-run")
@@ -1388,12 +2476,8 @@ def reviews(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
 
 
 @app.get("/api/snapshot")
-def snapshot() -> dict[str, Any]:
-    db = open_database()
-    try:
-        return build_dashboard_snapshot(db)
-    finally:
-        close_database(db)
+def snapshot(refresh: bool = Query(False), detail: str = Query(DASHBOARD_SNAPSHOT_DETAIL_SLIM)) -> dict[str, Any]:
+    return _build_dashboard_snapshot_payload(force=refresh, detail=detail)
 
 
 @app.get("/api/themelab/snapshot")
@@ -1403,6 +2487,927 @@ def theme_lab_snapshot() -> dict[str, Any]:
         return build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_supervisor.status(), gateway_state=gateway_state)
     finally:
         close_database(db)
+
+
+@app.post("/api/themelab/operator-events")
+def ingest_theme_lab_operator_events(body: dict[str, Any]) -> dict[str, Any]:
+    events = body.get("events") if isinstance(body, dict) else []
+    if not isinstance(events, list):
+        raise HTTPException(status_code=400, detail="events must be a list")
+    normalized: list[dict[str, Any]] = []
+    rejected_count = 0
+    for event in events:
+        try:
+            normalized.append(_validate_theme_lab_operator_event(event))
+        except ValueError:
+            rejected_count += 1
+    db = open_database()
+    try:
+        result = db.save_operator_events(normalized)
+    finally:
+        close_database(db)
+    return {
+        "inserted_count": int(result.get("inserted_count") or 0),
+        "duplicate_count": int(result.get("duplicate_count") or 0),
+        "rejected_count": int(result.get("rejected_count") or 0) + rejected_count,
+    }
+
+
+@app.get("/api/themelab/operator-events")
+def list_theme_lab_operator_events(
+    trade_date: str | None = Query(None),
+    severity: str | None = Query(None),
+    category: str | None = Query(None),
+    symbol: str | None = Query(None),
+    include_acknowledged: bool = Query(True),
+    include_hidden: bool = Query(False),
+    limit: int = Query(200, ge=1, le=1000),
+) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    normalized_severity = str(severity or "").upper() or None
+    normalized_category = str(category or "").lower() or None
+    if normalized_severity and normalized_severity not in THEMELAB_OPERATOR_EVENT_SEVERITIES:
+        raise HTTPException(status_code=400, detail="invalid severity")
+    if normalized_category and normalized_category not in THEMELAB_OPERATOR_EVENT_CATEGORIES:
+        raise HTTPException(status_code=400, detail="invalid category")
+    db = open_database()
+    try:
+        events = db.list_operator_events(
+            resolved_trade_date,
+            severity=normalized_severity,
+            category=normalized_category,
+            symbol=symbol,
+            include_acknowledged=include_acknowledged,
+            include_hidden=include_hidden,
+            limit=limit,
+        )
+    finally:
+        close_database(db)
+    return {"trade_date": resolved_trade_date, "events": events}
+
+
+@app.post("/api/themelab/operator-events/ack")
+def acknowledge_theme_lab_operator_events(body: dict[str, Any]) -> dict[str, Any]:
+    event_ids = body.get("event_ids") if isinstance(body, dict) else []
+    if not isinstance(event_ids, list):
+        raise HTTPException(status_code=400, detail="event_ids must be a list")
+    db = open_database()
+    try:
+        updated_count = db.acknowledge_operator_events(
+            [str(event_id) for event_id in event_ids],
+            acknowledged_by=str(body.get("acknowledged_by") or "") if isinstance(body, dict) else "",
+        )
+    finally:
+        close_database(db)
+    return {"updated_count": updated_count}
+
+
+@app.post("/api/themelab/operator-events/hide")
+def hide_theme_lab_operator_events(body: dict[str, Any]) -> dict[str, Any]:
+    event_ids = body.get("event_ids") if isinstance(body, dict) else []
+    if not isinstance(event_ids, list):
+        raise HTTPException(status_code=400, detail="event_ids must be a list")
+    db = open_database()
+    try:
+        updated_count = db.hide_operator_events([str(event_id) for event_id in event_ids])
+    finally:
+        close_database(db)
+    return {"updated_count": updated_count}
+
+
+@app.get("/api/themelab/operator-events/summary")
+def theme_lab_operator_event_summary(trade_date: str | None = Query(None)) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    db = open_database()
+    try:
+        return db.summarize_operator_events(resolved_trade_date)
+    finally:
+        close_database(db)
+
+
+@app.get("/api/themelab/operator-actions/catalog")
+def theme_lab_operator_action_catalog() -> dict[str, Any]:
+    return {
+        "actions": [_operator_action_catalog_item(action_type, meta) for action_type, meta in OPERATOR_ACTION_CATALOG.items()],
+        "disabled_actions": [_disabled_operator_action_item(action_type, meta) for action_type, meta in FORBIDDEN_OPERATOR_ACTIONS.items()],
+    }
+
+
+@app.get("/api/themelab/operator-actions/recommendations")
+def theme_lab_operator_action_recommendations(
+    event_id: str | None = Query(None),
+    symbol: str | None = Query(None),
+    candidate_instance_id: str | None = Query(None),
+    trade_date: str | None = Query(None),
+) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    db = open_database()
+    try:
+        return _build_operator_action_recommendations(
+            db,
+            trade_date=resolved_trade_date,
+            event_id=str(event_id or ""),
+            symbol=str(symbol or ""),
+            candidate_instance_id=str(candidate_instance_id or ""),
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/themelab/operator-actions/execute")
+async def execute_theme_lab_operator_action(body: dict[str, Any], request: Request) -> dict[str, Any]:
+    payload = body if isinstance(body, dict) else {}
+    action_type = str(payload.get("action_type") or "").strip().upper()
+    if not action_type:
+        raise HTTPException(status_code=400, detail="action_type is required")
+    if action_type not in OPERATOR_ACTION_CATALOG and action_type not in FORBIDDEN_OPERATOR_ACTIONS:
+        raise HTTPException(status_code=400, detail="unknown operator action")
+
+    action_id = str(payload.get("action_id") or new_message_id("act"))
+    requested_at = datetime.now(KST).isoformat(timespec="seconds")
+    db = open_database()
+    try:
+        existing = db.get_operator_action(action_id)
+        if existing and existing.get("status") in {"SUCCESS", "FAILED", "BLOCKED", "SKIPPED"}:
+            return {"status": existing.get("status"), "duplicate": True, "action": existing}
+
+        event = db.get_operator_event(str(payload.get("event_id") or "")) if payload.get("event_id") else None
+        if action_type in FORBIDDEN_OPERATOR_ACTIONS:
+            action = db.save_operator_action(
+                _operator_action_record(
+                    action_id=action_id,
+                    action_type=action_type,
+                    status="BLOCKED",
+                    requested_at=requested_at,
+                    payload=payload,
+                    event=event,
+                    meta=_disabled_operator_action_item(action_type, FORBIDDEN_OPERATOR_ACTIONS[action_type]),
+                    error_message=FORBIDDEN_OPERATOR_ACTIONS[action_type]["reason_ko"],
+                )
+            )
+            _save_operator_action_result_event(db, action, "BLOCKED", {"blocked_reason": action.get("error_message")})
+            return {
+                "status": "BLOCKED",
+                "blocked": True,
+                "reason_ko": FORBIDDEN_OPERATOR_ACTIONS[action_type]["reason_ko"],
+                "action": action,
+            }
+
+        meta = _operator_action_catalog_item(action_type, OPERATOR_ACTION_CATALOG[action_type])
+        if meta["confirmation_required"] and not bool(payload.get("confirm")):
+            action = db.save_operator_action(
+                _operator_action_record(
+                    action_id=action_id,
+                    action_type=action_type,
+                    status="PENDING",
+                    requested_at=requested_at,
+                    payload=payload,
+                    event=event,
+                    meta=meta,
+                )
+            )
+            return {"status": "PENDING", "confirmation_required": True, "action": action, "catalog_item": meta}
+
+        action = db.save_operator_action(
+            _operator_action_record(
+                action_id=action_id,
+                action_type=action_type,
+                status="RUNNING",
+                requested_at=requested_at,
+                payload=payload,
+                event=event,
+                meta=meta,
+            )
+        )
+        if meta["requires_token"]:
+            try:
+                _verify_operator_action_token(request)
+            except HTTPException as exc:
+                failed = db.update_operator_action_status(action_id, "FAILED", error_message=str(exc.detail)) or action
+                _save_operator_action_result_event(db, failed, "FAILED", {"error": str(exc.detail)})
+                raise
+
+        try:
+            response_payload = await _execute_operator_action(action_type, payload, db=db, event=event)
+        except Exception as exc:
+            failed = db.update_operator_action_status(action_id, "FAILED", error_message=str(exc)) or action
+            _save_operator_action_result_event(db, failed, "FAILED", {"error": str(exc)})
+            return {"status": "FAILED", "action": failed, "error": str(exc)}
+
+        saved = db.update_operator_action_status(action_id, "SUCCESS", response=response_payload) or action
+        _save_operator_action_result_event(db, saved, "SUCCESS", response_payload)
+        return {"status": "SUCCESS", "action": saved, "result": response_payload}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/themelab/operator-actions")
+def list_theme_lab_operator_actions(
+    trade_date: str | None = Query(None),
+    action_type: str | None = Query(None),
+    status: str | None = Query(None),
+    symbol: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    normalized_status = str(status or "").upper() or None
+    if normalized_status and normalized_status not in THEMELAB_OPERATOR_ACTION_STATUSES:
+        raise HTTPException(status_code=400, detail="invalid status")
+    db = open_database()
+    try:
+        items = db.list_operator_actions(
+            resolved_trade_date,
+            action_type=action_type,
+            status=normalized_status,
+            symbol=symbol,
+            limit=limit + 1,
+            offset=offset,
+        )
+        page, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {
+            "trade_date": resolved_trade_date,
+            "actions": page,
+            "items": page,
+            "pagination": pagination,
+            "filters": {
+                "trade_date": resolved_trade_date,
+                "action_type": action_type or "",
+                "status": normalized_status or "",
+                "symbol": symbol or "",
+                "limit": limit,
+                "offset": offset,
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/themelab/operator-actions/summary")
+def theme_lab_operator_action_summary(trade_date: str | None = Query(None)) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    db = open_database()
+    try:
+        return db.summarize_operator_actions(resolved_trade_date)
+    finally:
+        close_database(db)
+
+
+@app.post("/api/themelab/postmarket-review/rebuild")
+def rebuild_theme_lab_postmarket_review(body: dict[str, Any], request: Request) -> dict[str, Any]:
+    _verify_operator_action_token(request)
+    payload = body if isinstance(body, dict) else {}
+    action_id = str(payload.get("action_id") or new_message_id("act"))
+    requested_at = datetime.now(KST).isoformat(timespec="seconds")
+    db = open_database()
+    try:
+        meta = _operator_action_catalog_item("REBUILD_POSTMARKET_REVIEW", OPERATOR_ACTION_CATALOG["REBUILD_POSTMARKET_REVIEW"])
+        action = db.save_operator_action(
+            _operator_action_record(
+                action_id=action_id,
+                action_type="REBUILD_POSTMARKET_REVIEW",
+                status="RUNNING",
+                requested_at=requested_at,
+                payload={**payload, "confirm": True},
+                event=None,
+                meta=meta,
+            )
+        )
+        try:
+            response_payload = _rebuild_postmarket_review_payload(db, payload)
+        except Exception as exc:
+            failed = db.update_operator_action_status(action_id, "FAILED", error_message=str(exc)) or action
+            _save_operator_action_result_event(db, failed, "FAILED", {"error": str(exc)})
+            raise
+        saved = db.update_operator_action_status(action_id, "SUCCESS", response=response_payload) or action
+        _save_operator_action_result_event(db, saved, "SUCCESS", response_payload)
+        return response_payload
+    finally:
+        close_database(db)
+
+
+@app.get("/api/themelab/postmarket-review")
+def list_theme_lab_postmarket_review(
+    trade_date: str | None = Query(None),
+    review_scope: str | None = Query(None),
+    outcome_label: str | None = Query(None),
+    event_type: str | None = Query(None),
+    symbol: str | None = Query(None),
+    primary_theme: str | None = Query(None),
+    min_return_5m_pct: float | None = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    db = open_database()
+    try:
+        items = db.list_postmarket_review_items(
+            resolved_trade_date,
+            review_scope=review_scope,
+            outcome_label=outcome_label,
+            event_type=event_type,
+            symbol=symbol,
+            primary_theme=primary_theme,
+            min_return_5m_pct=min_return_5m_pct,
+            limit=limit + 1,
+            offset=offset,
+        )
+        page, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {
+            "trade_date": resolved_trade_date,
+            "items": page,
+            "pagination": pagination,
+            "filters": {
+                "trade_date": resolved_trade_date,
+                "review_scope": review_scope or "",
+                "outcome_label": str(outcome_label or "").upper(),
+                "event_type": str(event_type or "").upper(),
+                "symbol": symbol or "",
+                "primary_theme": primary_theme or "",
+                "min_return_5m_pct": min_return_5m_pct,
+                "limit": limit,
+                "offset": offset,
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/themelab/postmarket-review/summary")
+def theme_lab_postmarket_review_summary(trade_date: str | None = Query(None)) -> dict[str, Any]:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    db = open_database()
+    try:
+        return db.summarize_postmarket_reviews(resolved_trade_date)
+    finally:
+        close_database(db)
+
+
+@app.get("/api/themelab/postmarket-review/export", response_model=None)
+def export_theme_lab_postmarket_review(
+    trade_date: str | None = Query(None),
+    format: str = Query("csv"),
+) -> dict[str, Any] | PlainTextResponse:
+    resolved_trade_date = _theme_lab_trade_date(trade_date)
+    export_format = str(format or "csv").lower()
+    db = open_database()
+    try:
+        items = db.list_postmarket_review_items(resolved_trade_date, limit=1000)
+        summary = db.summarize_postmarket_reviews(resolved_trade_date)
+    finally:
+        close_database(db)
+    if export_format == "json":
+        return {"trade_date": resolved_trade_date, "summary": summary, "items": items}
+    if export_format != "csv":
+        raise HTTPException(status_code=400, detail="format must be csv or json")
+    csv_body = _postmarket_review_csv(items)
+    return PlainTextResponse(
+        csv_body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="postmarket-review-{resolved_trade_date}.csv"'},
+    )
+
+
+def _rebuild_postmarket_review_payload(db: TradingDatabase, payload: dict[str, Any]) -> dict[str, Any]:
+    trade_date = _theme_lab_trade_date(str(payload.get("trade_date") or "") or None)
+    review_scope = str(payload.get("review_scope") or "postmarket").lower()
+    if review_scope not in {"postmarket", "intraday"}:
+        raise HTTPException(status_code=400, detail="review_scope must be postmarket or intraday")
+    deleted_count = 0
+    if bool(payload.get("force")):
+        deleted_count = db.delete_postmarket_reviews_for_date(trade_date, review_scope=review_scope)
+    report = db.rebuild_postmarket_reviews(trade_date, review_scope=review_scope)
+    persisted_summary = db.summarize_postmarket_reviews(trade_date)
+    analysis_summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    summary = {**analysis_summary, **persisted_summary}
+    return {
+        "trade_date": trade_date,
+        "review_scope": review_scope,
+        "generated_at": report.get("generated_at") or "",
+        "generated_count": int(report.get("generated_count") or len(report.get("items") or [])),
+        "inserted_count": int(report.get("inserted_count") or 0),
+        "duplicate_count": int(report.get("duplicate_count") or 0),
+        "rejected_count": int(report.get("rejected_count") or 0),
+        "deleted_count": deleted_count,
+        "data_insufficient_count": int(summary.get("data_insufficient_count") or 0),
+        "summary": summary,
+    }
+
+
+def _postmarket_review_csv(items: list[dict[str, Any]]) -> str:
+    fields = [
+        "review_id",
+        "trade_date",
+        "generated_at",
+        "review_scope",
+        "symbol",
+        "stock_name",
+        "primary_theme",
+        "stock_role",
+        "candidate_instance_id",
+        "event_id",
+        "event_type",
+        "source_status",
+        "block_reason",
+        "base_time",
+        "base_price",
+        "price_1m",
+        "price_3m",
+        "price_5m",
+        "price_10m",
+        "price_close_or_last",
+        "return_1m_pct",
+        "return_3m_pct",
+        "return_5m_pct",
+        "return_10m_pct",
+        "return_close_or_last_pct",
+        "outcome_label",
+        "confidence",
+        "confidence_reason",
+        "recommendation_ko",
+    ]
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for item in items:
+        writer.writerow({field: item.get(field) if item.get(field) is not None else "" for field in fields})
+    return output.getvalue()
+
+
+def _operator_action_catalog_item(action_type: str, meta: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "action_type": action_type,
+        "label_ko": str(meta.get("label_ko") or action_type),
+        "risk_level": str(meta.get("risk_level") or "LOW"),
+        "requires_token": bool(meta.get("requires_token")),
+        "confirmation_required": bool(meta.get("confirmation_required")),
+        "enabled": True,
+        "endpoint": str(meta.get("endpoint") or ""),
+    }
+
+
+def _disabled_operator_action_item(action_type: str, meta: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "action_type": action_type,
+        "label_ko": str(meta.get("label_ko") or action_type),
+        "risk_level": "BLOCKED",
+        "requires_token": False,
+        "confirmation_required": False,
+        "enabled": False,
+        "reason_ko": str(meta.get("reason_ko") or "이번 PR 범위에서 금지된 액션입니다."),
+    }
+
+
+def _build_operator_action_recommendations(
+    db: TradingDatabase,
+    *,
+    trade_date: str,
+    event_id: str = "",
+    symbol: str = "",
+    candidate_instance_id: str = "",
+) -> dict[str, Any]:
+    event = db.get_operator_event(event_id) if event_id else None
+    context = _operator_action_context(event=event, symbol=symbol, candidate_instance_id=candidate_instance_id)
+    event_type = str((event or {}).get("event_type") or "")
+    recommendations: list[dict[str, Any]] = []
+    disabled: list[dict[str, Any]] = []
+
+    def add(action_type: str, reason_ko: str) -> None:
+        recommendations.append(_operator_action_recommendation(action_type, reason_ko))
+
+    def block(action_type: str) -> None:
+        if action_type in FORBIDDEN_OPERATOR_ACTIONS:
+            disabled.append(_disabled_operator_action_item(action_type, FORBIDDEN_OPERATOR_ACTIONS[action_type]))
+
+    if event_type == "GATEWAY_DISCONNECTED":
+        add("CHECK_GATEWAY_STATUS", "Gateway 연결 끊김 이벤트가 발생했습니다.")
+        add("START_KIWOOM_GATEWAY", "Gateway 프로세스 또는 heartbeat 회복이 필요할 수 있습니다.")
+        add("OPEN_RUNBOOK", "Gateway 복구 순서를 확인합니다.")
+    elif event_type == "SNAPSHOT_STALE":
+        add("REFRESH_SNAPSHOT", "스냅샷 지연 상태를 다시 확인합니다.")
+        add("RUNTIME_CYCLE_ONCE", "Runtime 평가를 1회 트리거해 최신 결과 생성을 시도합니다.")
+        add("CHECK_RUNTIME_READINESS", "Runtime 준비 상태와 차단 요인을 확인합니다.")
+    elif event_type == "DATA_QUALITY_DEGRADED":
+        add("REFRESH_SNAPSHOT", "데이터 품질 상태를 다시 조회합니다.")
+        add("RUNTIME_CYCLE_ONCE", "Runtime 재평가로 보조 데이터 회복 여부를 확인합니다.")
+        add("OPEN_RUNBOOK", "데이터 품질 저하 대응 절차를 확인합니다.")
+    elif event_type == "READY_BUT_LIVE_BLOCKED":
+        add("OPEN_RUNBOOK", "LIVE Guard 차단 사유 확인 절차를 봅니다.")
+        add("ADD_OPERATOR_NOTE", "차단 사유와 수동 판단을 감사 로그에 남깁니다.")
+        add("ACK_EVENT", "확인한 이벤트를 ACK 처리합니다.")
+        block("OVERRIDE_LIVE_GUARD")
+        block("LIVE_BUY")
+    elif event_type == "ORDER_INTENT_CREATED":
+        add("OPEN_DRY_RUN_ORDER_DETAIL", "생성된 DRY_RUN 주문 의도 상세를 확인합니다.")
+        add("ADD_OPERATOR_NOTE", "주문 의도 검토 내용을 남깁니다.")
+    elif event_type == "MARKET_WAIT_STARTED":
+        add("OPEN_RUNBOOK", "시장 대기 상태 대응 절차를 확인합니다.")
+        add("SNOOZE_EVENT", "재확인 전까지 이벤트를 잠시 보류합니다.")
+        add("ADD_OPERATOR_NOTE", "시장 대기 판단 근거를 남깁니다.")
+    elif event_type in {"CHASE_RISK_BLOCKED", "LATE_CHASE_TEMP_WAIT"}:
+        add("SNOOZE_EVENT", "late chase 재확인 시점까지 알림을 보류합니다.")
+        add("ADD_OPERATOR_NOTE", "추격 차단 판단 근거를 남깁니다.")
+        add("OPEN_RUNBOOK", "추격 리스크 대응 절차를 확인합니다.")
+
+    candidate = _find_operator_action_candidate(db, context)
+    if candidate:
+        context.update(
+            {
+                "symbol": candidate.get("symbol") or context.get("symbol") or "",
+                "candidate_instance_id": candidate.get("candidate_instance_id") or context.get("candidate_instance_id") or "",
+                "gate_status": candidate.get("gate_status") or "",
+                "display_status": candidate.get("display_status") or "",
+                "stock_name": candidate.get("stock_name") or candidate.get("name") or context.get("stock_name") or "",
+            }
+        )
+        if str(candidate.get("gate_status") or "") in {"READY", "READY_SMALL"}:
+            add("RUNTIME_CYCLE_ONCE", "선택 후보가 READY 계열이므로 최신 평가를 1회 확인합니다.")
+            add("ADD_OPERATOR_NOTE", "READY 판단을 운영 메모로 남깁니다.")
+            add("OPEN_RUNBOOK", "READY 후보 점검 절차를 확인합니다.")
+            block("LIVE_BUY")
+
+    if not recommendations:
+        add("REFRESH_SNAPSHOT", "현재 컨텍스트의 최신 상태를 확인합니다.")
+        add("OPEN_RUNBOOK", "일반 운영 점검 절차를 확인합니다.")
+
+    deduped = list({item["action_type"]: item for item in recommendations}.values())
+    disabled_deduped = list({item["action_type"]: item for item in disabled}.values())
+    return {
+        "trade_date": trade_date,
+        "context": context,
+        "recommendations": deduped,
+        "disabled_actions": disabled_deduped,
+        "runbook": _runbook_payload(event_type or str(context.get("display_status") or context.get("gate_status") or "")),
+    }
+
+
+def _operator_action_recommendation(action_type: str, reason_ko: str) -> dict[str, Any]:
+    meta = _operator_action_catalog_item(action_type, OPERATOR_ACTION_CATALOG[action_type])
+    return {**meta, "reason_ko": reason_ko}
+
+
+def _operator_action_context(*, event: Optional[dict], symbol: str, candidate_instance_id: str) -> dict[str, Any]:
+    event = event or {}
+    payload = dict(event.get("payload") or {})
+    return {
+        "event_id": event.get("event_id") or "",
+        "event_type": event.get("event_type") or "",
+        "symbol": symbol or event.get("symbol") or payload.get("symbol") or "",
+        "stock_name": event.get("stock_name") or payload.get("stock_name") or "",
+        "candidate_instance_id": candidate_instance_id or event.get("candidate_instance_id") or payload.get("candidate_instance_id") or "",
+    }
+
+
+def _find_operator_action_candidate(db: TradingDatabase, context: dict[str, Any]) -> Optional[dict[str, Any]]:
+    symbol = str(context.get("symbol") or "")
+    candidate_instance_id = str(context.get("candidate_instance_id") or "")
+    if not symbol and not candidate_instance_id:
+        return None
+    snapshot = build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_supervisor.status(), gateway_state=gateway_state)
+    for item in snapshot.get("watchset") or []:
+        if symbol and str(item.get("symbol") or "") == symbol:
+            return item
+        if candidate_instance_id and str(item.get("candidate_instance_id") or "") == candidate_instance_id:
+            return item
+    return None
+
+
+def _operator_action_record(
+    *,
+    action_id: str,
+    action_type: str,
+    status: str,
+    requested_at: str,
+    payload: dict[str, Any],
+    event: Optional[dict],
+    meta: dict[str, Any],
+    error_message: str = "",
+) -> dict[str, Any]:
+    event = event or {}
+    request_payload = dict(payload or {})
+    return {
+        "action_id": action_id,
+        "trade_date": str(
+            payload.get("trade_date")
+            or event.get("trade_date")
+            or _theme_lab_trade_date(None, occurred_at=requested_at)
+        ),
+        "requested_at": requested_at,
+        "action_type": action_type,
+        "status": status,
+        "requested_by": str(payload.get("requested_by") or "operator"),
+        "event_id": str(payload.get("event_id") or event.get("event_id") or ""),
+        "symbol": str(payload.get("symbol") or event.get("symbol") or ""),
+        "stock_name": str(payload.get("stock_name") or event.get("stock_name") or ""),
+        "candidate_instance_id": str(payload.get("candidate_instance_id") or event.get("candidate_instance_id") or ""),
+        "requires_token": bool(meta.get("requires_token")),
+        "confirmation_required": bool(meta.get("confirmation_required")),
+        "endpoint": str(meta.get("endpoint") or ""),
+        "request_payload": request_payload,
+        "response_payload": {},
+        "error_message": error_message,
+    }
+
+
+def _verify_operator_action_token(request: Request) -> None:
+    verify_gateway_token(
+        request,
+        authorization=request.headers.get("authorization"),
+        x_local_token=request.headers.get("x-local-token"),
+    )
+
+
+async def _execute_operator_action(
+    action_type: str,
+    payload: dict[str, Any],
+    *,
+    db: TradingDatabase,
+    event: Optional[dict],
+) -> dict[str, Any]:
+    if action_type == "REFRESH_SNAPSHOT":
+        snapshot = build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_supervisor.status(), gateway_state=gateway_state)
+        return {"refreshed": True, "summary": snapshot.get("summary", {})}
+    if action_type == "CHECK_GATEWAY_STATUS":
+        return gateway_status()
+    if action_type == "START_KIWOOM_GATEWAY":
+        return _start_kiwoom_gateway_response()
+    if action_type == "CHECK_RUNTIME_READINESS":
+        return await runtime_supervisor.readiness()
+    if action_type == "RUNTIME_CYCLE_ONCE":
+        return await runtime_supervisor.run_once(reason="operator_action_center")
+    if action_type == "RUNTIME_START":
+        return await runtime_supervisor.start()
+    if action_type == "RUNTIME_STOP":
+        return await runtime_supervisor.stop()
+    if action_type == "RUNTIME_RESTART":
+        return await runtime_supervisor.restart()
+    if action_type == "OPEN_DRY_RUN_ORDER_DETAIL":
+        intent_id = _operator_action_intent_id(payload, event)
+        return _order_service().get_dry_run_order(intent_id) if intent_id else {"found": False, "reason": "INTENT_ID_MISSING"}
+    if action_type == "REBUILD_DRY_RUN_PERFORMANCE":
+        trade_date = str(payload.get("trade_date") or "") or None
+        report = _performance_analyzer(db).build_report(trade_date=trade_date, limit=10000)
+        persisted = _performance_analyzer(db).persist_report(report)
+        return {"report_id": report.get("report_id"), "persisted": persisted is not None, "summary": report.get("summary", {})}
+    if action_type == "REBUILD_POSTMARKET_REVIEW":
+        return _rebuild_postmarket_review_payload(db, payload)
+    if action_type == "REBUILD_TRANSPORT_LATENCY_REPORT":
+        trade_date = str(payload.get("trade_date") or "") or None
+        report = _transport_analyzer(db).build_report(trade_date=trade_date, limit=10000)
+        saved = db.save_gateway_transport_latency_report(report)
+        return {"report_id": report.get("report_id"), "saved": saved, "summary": report.get("summary", {})}
+    if action_type == "EXPORT_TRANSPORT_LATENCY_REPORT":
+        trade_date = str(payload.get("trade_date") or "") or None
+        report = _transport_analyzer(db).build_report(trade_date=trade_date, limit=10000)
+        return {"report_id": report.get("report_id"), "export_paths": _transport_analyzer(db).export_report(report)}
+    if action_type == "ACK_EVENT":
+        event_id = str(payload.get("event_id") or (event or {}).get("event_id") or "")
+        return {"updated_count": db.acknowledge_operator_event(event_id, acknowledged_by=str(payload.get("requested_by") or "operator"))}
+    if action_type == "HIDE_EVENT":
+        event_id = str(payload.get("event_id") or (event or {}).get("event_id") or "")
+        return {"updated_count": db.hide_operator_event(event_id)}
+    if action_type == "SNOOZE_EVENT":
+        event_id = str(payload.get("event_id") or (event or {}).get("event_id") or "")
+        minutes = max(1, min(240, int(payload.get("snooze_minutes") or 15)))
+        snoozed_until = (datetime.now(KST) + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        return {"updated_count": db.snooze_operator_event(event_id, snoozed_until), "snoozed_until": snoozed_until}
+    if action_type == "ADD_OPERATOR_NOTE":
+        return {"noted": True, "note": str(payload.get("note") or ""), "event_id": str(payload.get("event_id") or "")}
+    if action_type == "OPEN_RUNBOOK":
+        key = str((event or {}).get("event_type") or payload.get("status") or payload.get("display_status") or "")
+        return {"opened": True, "runbook": _runbook_payload(key)}
+    raise ValueError(f"unsupported action: {action_type}")
+
+
+def _operator_action_intent_id(payload: dict[str, Any], event: Optional[dict]) -> str:
+    event = event or {}
+    event_payload = dict(event.get("payload") or {})
+    for source in (payload, event_payload, event):
+        for key in ("intent_id", "order_intent_id", "runtime_order_intent_id", "candidate_instance_id"):
+            value = str(source.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _save_operator_action_result_event(db: TradingDatabase, action: dict[str, Any], status: str, response_payload: Optional[dict] = None) -> None:
+    action_id = str(action.get("action_id") or "")
+    if not action_id:
+        return
+    event_type = "ACTION_EXECUTED" if status == "SUCCESS" else "ACTION_BLOCKED" if status == "BLOCKED" else "ACTION_FAILED"
+    severity = "INFO" if status == "SUCCESS" else "WARNING"
+    message = {
+        "SUCCESS": "운영 액션 실행 완료",
+        "BLOCKED": "운영 액션 차단",
+        "FAILED": "운영 액션 실패",
+    }.get(status, "운영 액션 상태 변경")
+    try:
+        db.save_operator_event(
+            {
+                "event_id": f"operator-action:{action_id}:{status}",
+                "trade_date": action.get("trade_date") or _theme_lab_trade_date(None),
+                "occurred_at": datetime.now(KST).isoformat(timespec="seconds"),
+                "source": "themelab_dashboard",
+                "event_type": event_type,
+                "severity": severity,
+                "category": "action",
+                "symbol": action.get("symbol") or "",
+                "stock_name": action.get("stock_name") or "",
+                "candidate_instance_id": action.get("candidate_instance_id") or "",
+                "message_ko": f"{message}: {action.get('action_type')}",
+                "payload": {"action": action, "response": response_payload or {}},
+            }
+        )
+    except Exception:
+        return
+
+
+def _runbook_payload(key: str) -> dict[str, Any]:
+    normalized = str(key or "").upper()
+    runbooks = {
+        "GATEWAY_DISCONNECTED": (
+            "Gateway 연결 복구",
+            [
+                "Gateway 상태에서 connected, heartbeat_ok, kiwoom_logged_in, orderable을 확인합니다.",
+                "이미 실행 중인 32bit Gateway 프로세스가 있는지 확인합니다.",
+                "START_KIWOOM_GATEWAY 실행 후 30초 내 heartbeat 회복 여부를 봅니다.",
+                "회복되지 않으면 HTS 로그인 상태와 Gateway 로그를 수동 확인합니다.",
+            ],
+        ),
+        "SNAPSHOT_STALE": (
+            "스냅샷 지연 복구",
+            [
+                "Runtime 준비 상태를 확인합니다.",
+                "Runtime 1회 평가를 실행합니다.",
+                "snapshot_age가 줄어드는지 확인합니다.",
+                "반복 stale이면 Runtime restart 필요 여부를 판단합니다.",
+            ],
+        ),
+        "READY_BUT_LIVE_BLOCKED": (
+            "LIVE Guard 차단 점검",
+            [
+                "LIVE Guard 차단 사유와 candidate_instance_id를 확인합니다.",
+                "주문 실행이나 Guard 우회는 하지 않습니다.",
+                "차단 사유를 운영 메모로 남깁니다.",
+                "장 마감 후 guard 정책 개선 대상으로 검토합니다.",
+            ],
+        ),
+        "DATA_QUALITY_DEGRADED": (
+            "데이터 품질 저하 점검",
+            [
+                "latest tick, VWAP, support 데이터 준비 상태를 확인합니다.",
+                "Runtime 1회 평가 또는 스냅샷 새로고침으로 회복 여부를 확인합니다.",
+                "회복 후 READY 전환이 정상인지 확인합니다.",
+            ],
+        ),
+        "CHASE_RISK_BLOCKED": (
+            "추격 리스크 차단 점검",
+            [
+                "late_chase_level과 점수, 재확인 시간을 확인합니다.",
+                "강제 매수하지 않습니다.",
+                "재확인 시점까지 알림을 보류하고, 장 마감 후 late chase 차단 효율을 리뷰합니다.",
+            ],
+        ),
+        "LATE_CHASE_TEMP_WAIT": (
+            "추격 대기 점검",
+            [
+                "재확인까지 남은 시간을 확인합니다.",
+                "즉시 주문하지 않고 다음 Runtime 평가를 기다립니다.",
+                "필요하면 운영 메모를 남깁니다.",
+            ],
+        ),
+        "MARKET_WAIT_STARTED": (
+            "시장 대기 점검",
+            [
+                "후보의 candidate_market과 시장 breadth를 확인합니다.",
+                "시장 확인 또는 회복 조건을 기다립니다.",
+                "재확인 시점까지 알림을 보류할 수 있습니다.",
+            ],
+        ),
+    }
+    title, steps = runbooks.get(
+        normalized,
+        (
+            "일반 운영 점검",
+            [
+                "스냅샷과 Runtime 준비 상태를 확인합니다.",
+                "필요하면 이벤트를 ACK 처리하고 운영 메모를 남깁니다.",
+                "LIVE 주문, 취소, Guard 우회는 이번 Action Center에서 수행하지 않습니다.",
+            ],
+        ),
+    )
+    return {"key": normalized or "GENERAL", "title_ko": title, "steps_ko": steps}
+
+
+def _validate_theme_lab_operator_event(event: Any) -> dict[str, Any]:
+    if not isinstance(event, dict):
+        raise ValueError("event must be an object")
+    event_type = str(event.get("event_type") or event.get("type") or "").strip()
+    severity = str(event.get("severity") or "").strip().upper()
+    category = str(event.get("category") or "").strip().lower()
+    event_id = str(event.get("event_id") or event.get("id") or "").strip()
+    occurred_at = str(event.get("occurred_at") or event.get("created_at") or datetime.now(KST).isoformat(timespec="seconds")).strip()
+    message = str(event.get("message_ko") or event.get("message") or "").strip()
+    if event_type not in THEMELAB_OPERATOR_EVENT_TYPES:
+        raise ValueError("invalid event_type")
+    if severity not in THEMELAB_OPERATOR_EVENT_SEVERITIES:
+        raise ValueError("invalid severity")
+    if category not in THEMELAB_OPERATOR_EVENT_CATEGORIES:
+        raise ValueError("invalid category")
+    if not event_id or not message:
+        raise ValueError("missing required fields")
+    payload = dict(event.get("payload") or event)
+    return {
+        "event_id": event_id,
+        "trade_date": str(event.get("trade_date") or _theme_lab_trade_date(None, occurred_at=occurred_at)),
+        "occurred_at": occurred_at,
+        "received_at": datetime.now(KST).isoformat(timespec="seconds"),
+        "source": str(event.get("source") or "themelab_dashboard"),
+        "event_type": event_type,
+        "severity": severity,
+        "category": category,
+        "symbol": str(event.get("symbol") or ""),
+        "stock_name": str(event.get("stock_name") or ""),
+        "primary_theme": str(event.get("primary_theme") or ""),
+        "stock_role": str(event.get("stock_role") or ""),
+        "candidate_instance_id": str(event.get("candidate_instance_id") or ""),
+        "from_status": str(event.get("from_status") or ""),
+        "to_status": str(event.get("to_status") or ""),
+        "gate_status": str(event.get("gate_status") or ""),
+        "display_status": str(event.get("display_status") or ""),
+        "message_ko": message,
+        "payload": payload,
+        "acknowledged_at": str(event.get("acknowledged_at") or ""),
+        "acknowledged_by": str(event.get("acknowledged_by") or ""),
+        "hidden": bool(event.get("hidden")),
+        "snoozed_until": str(event.get("snoozed_until") or ""),
+    }
+
+
+def _theme_lab_trade_date(trade_date: str | None, *, occurred_at: str | None = None) -> str:
+    explicit = str(trade_date or "").strip()
+    if explicit:
+        return explicit[:10]
+    timestamp = str(occurred_at or "").strip()
+    if len(timestamp) >= 10 and timestamp[4] == "-" and timestamp[7] == "-":
+        return timestamp[:10]
+    return datetime.now(KST).date().isoformat()
+
+
+def _csv_values(value: Optional[str]) -> list[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _record_change_proposal_action(
+    proposal_id: str,
+    action: str,
+    next_status: str,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        proposal = db.get_strategy_change_proposal(proposal_id)
+        if proposal is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="proposal not found")
+        previous_status = str(proposal.get("status") or "")
+        approval = db.save_strategy_change_approval(
+            {
+                "proposal_id": proposal_id,
+                "action": action,
+                "previous_status": previous_status,
+                "next_status": next_status,
+                "operator": str((body or {}).get("operator") or ""),
+                "note": str((body or {}).get("note") or ""),
+                "details": {
+                    "auto_apply": False,
+                    "config_changed": False,
+                    "message_ko": "승인 상태만 저장했습니다. 실제 runtime config는 변경하지 않았습니다.",
+                },
+            }
+        )
+        updated = db.get_strategy_change_proposal(proposal_id)
+        return {
+            "proposal_id": proposal_id,
+            "action": action,
+            "approval": approval,
+            "proposal": updated,
+            "config_changed": False,
+            "auto_apply": False,
+            "disclaimer_ko": "이번 PR은 자동 적용을 하지 않습니다. 승인 상태만 저장합니다.",
+        }
+    finally:
+        close_database(db)
+
+
+def _proposal_related_reports(proposal: dict[str, Any]) -> dict[str, Any]:
+    source_ids = [str(item) for item in proposal.get("source_ids") or [] if str(item)]
+    return {
+        "source_type": proposal.get("source_type") or "",
+        "source_ids": source_ids,
+        "replay_report_ids": [item for item in source_ids if item.startswith("replay_report")],
+        "threshold_ab_report_ids": [item for item in source_ids if item.startswith("threshold_ab")],
+        "shadow_policy_ids": [item.rsplit(":", 1)[-1] for item in source_ids if item.startswith("shadow_strategy:")],
+    }
 
 
 @app.post("/api/gateway/events")
@@ -1418,6 +3423,19 @@ async def gateway_events(
 
 
 async def _process_gateway_event(event: GatewayEvent) -> dict[str, Any]:
+    processed = await asyncio.to_thread(_process_gateway_event_persist, event)
+    event = GatewayEvent.from_dict(processed["event"])
+    result = dict(processed["result"])
+    if bool(processed.get("accepted")):
+        runtime_started = time.perf_counter()
+        await runtime_supervisor.handle_gateway_event(event)
+        runtime_forward_ms = (time.perf_counter() - runtime_started) * 1000.0
+        result.setdefault("transport", {})["runtime_forward_ms"] = runtime_forward_ms
+    await _schedule_dashboard_snapshot_broadcast()
+    return result
+
+
+def _process_gateway_event_persist(event: GatewayEvent) -> dict[str, Any]:
     core_received_at = utc_now_ms()
     core_received_monotonic = monotonic_ms()
     event = _event_with_trace(
@@ -1429,7 +3447,6 @@ async def _process_gateway_event(event: GatewayEvent) -> dict[str, Any]:
     )
     accepted = gateway_state.record_event(event)
     persist_ms = 0.0
-    runtime_forward_ms = 0.0
     if accepted:
         db = open_database()
         try:
@@ -1443,6 +3460,7 @@ async def _process_gateway_event(event: GatewayEvent) -> dict[str, Any]:
                     "core_event_persisted_monotonic_ms": monotonic_ms(),
                 },
             )
+            _queue_replay_tick_history(event)
             _save_gateway_event_transport_sample(
                 db,
                 event,
@@ -1452,9 +3470,6 @@ async def _process_gateway_event(event: GatewayEvent) -> dict[str, Any]:
             )
         finally:
             close_database(db)
-        runtime_started = time.perf_counter()
-        await runtime_supervisor.handle_gateway_event(event)
-        runtime_forward_ms = (time.perf_counter() - runtime_started) * 1000.0
     else:
         db = open_database()
         try:
@@ -1468,7 +3483,1622 @@ async def _process_gateway_event(event: GatewayEvent) -> dict[str, Any]:
             )
         finally:
             close_database(db)
-    await _schedule_dashboard_snapshot_broadcast()
+    return {
+        "event": event.to_dict(),
+        "accepted": accepted,
+        "result": {
+            "accepted": accepted,
+            "event_id": event.event_id,
+            "type": event.type,
+            "transport": {
+                "core_receive_ms": wall_ms(trace_from_payload(event.payload).get("gateway_event_post_end_at_utc"), core_received_at),
+                "core_persist_ms": persist_ms,
+                "runtime_forward_ms": 0.0,
+            },
+        },
+    }
+
+
+async def _start_gateway_condition_event_worker() -> None:
+    if not _gateway_condition_event_async_enabled():
+        _update_gateway_condition_event_worker_state({"enabled": False})
+        return
+    _ensure_gateway_condition_event_worker()
+
+
+async def _stop_gateway_condition_event_worker() -> None:
+    global _gateway_condition_event_queue, _gateway_condition_event_queues
+    global _gateway_condition_event_worker_task, _gateway_condition_event_worker_tasks, _gateway_condition_event_executor
+    global _gateway_condition_event_executor_worker_count
+    tasks = [task for task in _gateway_condition_event_worker_tasks if task is not None and not task.done()]
+    if tasks:
+        try:
+            queues = list(_gateway_condition_event_queues)
+            if queues:
+                await asyncio.wait_for(asyncio.gather(*(queue.join() for queue in queues)), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _gateway_condition_event_worker_task = None
+    _gateway_condition_event_worker_tasks = []
+    _gateway_condition_event_queue = None
+    _gateway_condition_event_queues = []
+    if _gateway_condition_event_executor is not None:
+        _gateway_condition_event_executor.shutdown(wait=False, cancel_futures=True)
+        _gateway_condition_event_executor = None
+        _gateway_condition_event_executor_worker_count = 0
+    _update_gateway_condition_event_worker_state(
+        {
+            "enabled": False,
+            "queue_size": 0,
+            "queue_batch_count": 0,
+            "worker_count": 0,
+            "active_worker_count": 0,
+            "active_count": 0,
+        }
+    )
+
+
+async def _start_core_ws_event_worker() -> None:
+    if not _core_ws_event_async_enabled():
+        _update_gateway_core_ws_event_worker_state({"enabled": False})
+        return
+    _ensure_core_ws_event_worker()
+
+
+async def _stop_core_ws_event_worker() -> None:
+    global _core_ws_event_worker_task
+    global _core_ws_event_control_worker_task
+    global _core_ws_event_data_worker_task
+    global _core_ws_event_control_worker_tasks
+    global _core_ws_event_queue
+    global _core_ws_event_control_queue
+    global _core_ws_event_data_queue
+    global _core_ws_event_control_queues
+    task_candidates = [
+        _core_ws_event_worker_task,
+        _core_ws_event_control_worker_task,
+        _core_ws_event_data_worker_task,
+        *_core_ws_event_control_worker_tasks,
+    ]
+    tasks = []
+    seen_task_ids: set[int] = set()
+    for task in task_candidates:
+        if task is not None and not task.done() and id(task) not in seen_task_ids:
+            tasks.append(task)
+            seen_task_ids.add(id(task))
+    queue_candidates = [
+        _core_ws_event_queue,
+        _core_ws_event_control_queue,
+        _core_ws_event_data_queue,
+        *_core_ws_event_control_queues,
+    ]
+    queues = []
+    seen_queue_ids: set[int] = set()
+    for queue in queue_candidates:
+        if queue is not None and id(queue) not in seen_queue_ids:
+            queues.append(queue)
+            seen_queue_ids.add(id(queue))
+    if tasks:
+        try:
+            if queues:
+                await asyncio.wait_for(asyncio.gather(*(queue.join() for queue in queues)), timeout=_core_ws_event_drain_timeout_sec())
+        except asyncio.TimeoutError:
+            pass
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _core_ws_event_worker_task = None
+    _core_ws_event_control_worker_task = None
+    _core_ws_event_data_worker_task = None
+    _core_ws_event_control_worker_tasks = []
+    _core_ws_event_queue = None
+    _core_ws_event_control_queue = None
+    _core_ws_event_data_queue = None
+    _core_ws_event_control_queues = []
+    with _core_ws_price_tick_coalesce_lock:
+        _core_ws_price_tick_latest_by_key.clear()
+    _update_gateway_core_ws_event_worker_state(
+        {
+            "enabled": False,
+            "queue_size": 0,
+            "control_worker_count": 0,
+            "control_queue_size": 0,
+            "control_queue_sizes": [],
+            "data_queue_size": 0,
+            "active_count": 0,
+            "control_active_count": 0,
+            "data_active_count": 0,
+            "price_tick_pending_key_count": 0,
+        }
+    )
+
+
+def _gateway_condition_event_async_enabled() -> bool:
+    return os.environ.get("TRADING_CORE_WS_CONDITION_EVENT_ASYNC_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _gateway_condition_event_worker_count() -> int:
+    try:
+        value = int(os.environ.get("TRADING_CORE_WS_CONDITION_EVENT_WORKERS", "4"))
+    except ValueError:
+        value = 4
+    return max(1, min(8, value))
+
+
+def _gateway_condition_event_stale_include_skip_ms() -> float:
+    try:
+        value = float(os.environ.get("TRADING_CORE_WS_CONDITION_EVENT_STALE_INCLUDE_SKIP_MS", "15000"))
+    except ValueError:
+        value = 15000.0
+    return max(0.0, value)
+
+
+def _gateway_condition_event_batch_chunk_size() -> int:
+    try:
+        value = int(os.environ.get("TRADING_CORE_WS_CONDITION_EVENT_BATCH_CHUNK_SIZE", "64"))
+    except ValueError:
+        value = 64
+    return max(1, min(500, value))
+
+
+def _core_ws_event_async_enabled() -> bool:
+    return os.environ.get("TRADING_CORE_WS_EVENT_ASYNC_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _core_ws_event_priority_enabled() -> bool:
+    return os.environ.get("TRADING_CORE_WS_EVENT_PRIORITY_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _core_ws_event_worker_split_enabled() -> bool:
+    return os.environ.get("TRADING_CORE_WS_EVENT_WORKER_SPLIT_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _core_ws_event_control_worker_count() -> int:
+    try:
+        value = int(os.environ.get("TRADING_CORE_WS_EVENT_CONTROL_WORKERS", "2"))
+    except ValueError:
+        value = 2
+    return max(1, min(8, value))
+
+
+def _core_ws_price_tick_coalesce_enabled() -> bool:
+    return os.environ.get("TRADING_CORE_WS_PRICE_TICK_COALESCE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _gateway_condition_event_queue_max_size() -> int:
+    try:
+        value = int(os.environ.get("TRADING_CORE_WS_CONDITION_EVENT_QUEUE_SIZE", "5000"))
+    except ValueError:
+        value = 5000
+    return max(1, value)
+
+
+def _core_ws_event_queue_max_size() -> int:
+    try:
+        value = int(os.environ.get("TRADING_CORE_WS_EVENT_QUEUE_SIZE", "10000"))
+    except ValueError:
+        value = 10000
+    return max(1, value)
+
+
+def _core_ws_event_drain_timeout_sec() -> float:
+    try:
+        value = float(os.environ.get("TRADING_CORE_WS_EVENT_DRAIN_TIMEOUT_SEC", "2.0"))
+    except ValueError:
+        value = 2.0
+    return max(0.1, value)
+
+
+def _ensure_gateway_condition_event_worker() -> None:
+    global _gateway_condition_event_queue
+    global _gateway_condition_event_worker_task
+    global _gateway_condition_event_queues
+    global _gateway_condition_event_worker_tasks
+    global _gateway_condition_event_worker_loop
+    global _gateway_condition_event_executor
+    global _gateway_condition_event_executor_worker_count
+    if not _gateway_condition_event_async_enabled():
+        _update_gateway_condition_event_worker_state({"enabled": False})
+        return
+    loop = asyncio.get_running_loop()
+    worker_count = _gateway_condition_event_worker_count()
+    queue_max_size = _gateway_condition_event_queue_max_size()
+    if _gateway_condition_event_worker_loop is not loop or len(_gateway_condition_event_queues) != worker_count:
+        _gateway_condition_event_queues = [asyncio.Queue(maxsize=queue_max_size) for _ in range(worker_count)]
+        _gateway_condition_event_queue = _gateway_condition_event_queues[0] if _gateway_condition_event_queues else None
+        _gateway_condition_event_worker_task = None
+        _gateway_condition_event_worker_tasks = []
+        _gateway_condition_event_worker_loop = loop
+        _update_gateway_condition_event_worker_state(
+            {
+                "queue_size": 0,
+                "queue_sizes_by_worker": [0 for _ in range(worker_count)],
+                "queue_batch_count": 0,
+                "queue_batch_counts_by_worker": [0 for _ in range(worker_count)],
+                "worker_count": worker_count,
+                "active_worker_count": 0,
+                "active_count": 0,
+            }
+        )
+    if _gateway_condition_event_executor is None or _gateway_condition_event_executor_worker_count != worker_count:
+        if _gateway_condition_event_executor is not None:
+            _gateway_condition_event_executor.shutdown(wait=False, cancel_futures=True)
+        _gateway_condition_event_executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="core-condition-events")
+        _gateway_condition_event_executor_worker_count = worker_count
+    active_tasks = [task for task in _gateway_condition_event_worker_tasks if task is not None and not task.done()]
+    if len(active_tasks) != worker_count:
+        for task in active_tasks:
+            task.cancel()
+        _gateway_condition_event_worker_tasks = [
+            loop.create_task(_gateway_condition_event_worker_loop_main(worker_index)) for worker_index in range(worker_count)
+        ]
+        _gateway_condition_event_worker_task = _gateway_condition_event_worker_tasks[0] if _gateway_condition_event_worker_tasks else None
+    _update_gateway_condition_event_worker_state(
+        {
+            "enabled": True,
+            "queue_size": int(gateway_condition_event_worker_state.get("queue_size") or 0),
+            "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+            "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
+            "queue_max_size": queue_max_size,
+            "worker_count": worker_count,
+            "stale_include_skip_ms": _gateway_condition_event_stale_include_skip_ms(),
+            "batch_chunk_size": _gateway_condition_event_batch_chunk_size(),
+        }
+    )
+
+
+def _ensure_core_ws_event_worker() -> None:
+    global _core_ws_event_queue
+    global _core_ws_event_worker_task
+    global _core_ws_event_control_queue
+    global _core_ws_event_data_queue
+    global _core_ws_event_control_queues
+    global _core_ws_event_control_worker_task
+    global _core_ws_event_data_worker_task
+    global _core_ws_event_control_worker_tasks
+    global _core_ws_event_worker_loop
+    if not _core_ws_event_async_enabled():
+        _update_gateway_core_ws_event_worker_state({"enabled": False})
+        return
+    loop = asyncio.get_running_loop()
+    split_enabled = _core_ws_event_worker_split_enabled()
+    control_worker_count = _core_ws_event_control_worker_count() if split_enabled else 0
+    queue_max_size = _core_ws_event_queue_max_size()
+    if (
+        _core_ws_event_worker_loop is not loop
+        or (split_enabled and len(_core_ws_event_control_queues) != control_worker_count)
+    ):
+        if split_enabled:
+            _core_ws_event_queue = None
+            _core_ws_event_control_queues = [
+                asyncio.PriorityQueue(maxsize=queue_max_size) for _ in range(control_worker_count)
+            ]
+            _core_ws_event_control_queue = _core_ws_event_control_queues[0] if _core_ws_event_control_queues else None
+            _core_ws_event_data_queue = asyncio.PriorityQueue(maxsize=queue_max_size)
+        else:
+            _core_ws_event_queue = asyncio.PriorityQueue(maxsize=queue_max_size)
+            _core_ws_event_control_queue = None
+            _core_ws_event_control_queues = []
+            _core_ws_event_data_queue = None
+        _core_ws_event_worker_task = None
+        _core_ws_event_control_worker_task = None
+        _core_ws_event_data_worker_task = None
+        _core_ws_event_control_worker_tasks = []
+        _core_ws_event_worker_loop = loop
+        with _core_ws_price_tick_coalesce_lock:
+            _core_ws_price_tick_latest_by_key.clear()
+        _update_gateway_core_ws_event_worker_state(
+            {
+                "queue_size": 0,
+                "control_worker_count": control_worker_count,
+                "control_queue_size": 0,
+                "control_queue_sizes": [0 for _ in range(control_worker_count)],
+                "data_queue_size": 0,
+                "active_count": 0,
+                "control_active_count": 0,
+                "data_active_count": 0,
+                "split_enabled": split_enabled,
+                "priority_enabled": _core_ws_event_priority_enabled(),
+                "price_tick_pending_key_count": 0,
+            }
+        )
+    if split_enabled:
+        if len(_core_ws_event_control_queues) != control_worker_count:
+            _core_ws_event_control_queues = [
+                asyncio.PriorityQueue(maxsize=queue_max_size) for _ in range(control_worker_count)
+            ]
+            _core_ws_event_control_worker_tasks = []
+        if _core_ws_event_control_queue is None:
+            _core_ws_event_control_queue = _core_ws_event_control_queues[0] if _core_ws_event_control_queues else None
+        if _core_ws_event_data_queue is None:
+            _core_ws_event_data_queue = asyncio.PriorityQueue(maxsize=queue_max_size)
+        active_control_tasks = [
+            task for task in _core_ws_event_control_worker_tasks if task is not None and not task.done()
+        ]
+        if len(active_control_tasks) != control_worker_count:
+            for task in active_control_tasks:
+                task.cancel()
+            _core_ws_event_control_worker_tasks = [
+                loop.create_task(_core_ws_event_worker_loop_main("control", worker_index))
+                for worker_index in range(control_worker_count)
+            ]
+            _core_ws_event_control_worker_task = (
+                _core_ws_event_control_worker_tasks[0] if _core_ws_event_control_worker_tasks else None
+            )
+        if _core_ws_event_data_worker_task is None or _core_ws_event_data_worker_task.done():
+            _core_ws_event_data_worker_task = loop.create_task(_core_ws_event_worker_loop_main("data"))
+        _core_ws_event_worker_task = _core_ws_event_control_worker_task
+    else:
+        if _core_ws_event_queue is None:
+            _core_ws_event_queue = asyncio.PriorityQueue(maxsize=queue_max_size)
+        if _core_ws_event_worker_task is None or _core_ws_event_worker_task.done():
+            _core_ws_event_worker_task = loop.create_task(_core_ws_event_worker_loop_main("single"))
+    _update_gateway_core_ws_event_worker_state(
+        {
+            "enabled": True,
+            "queue_size": _core_ws_event_total_queue_size(),
+            "queue_max_size": queue_max_size,
+            "control_worker_count": control_worker_count,
+            "control_queue_size": _core_ws_event_queue_size("control"),
+            "control_queue_sizes": _core_ws_event_control_queue_sizes(),
+            "data_queue_size": _core_ws_event_queue_size("data"),
+            "split_enabled": split_enabled,
+            "priority_enabled": _core_ws_event_priority_enabled(),
+            "price_tick_coalesce_enabled": _core_ws_price_tick_coalesce_enabled(),
+            "price_tick_pending_key_count": _core_ws_price_tick_pending_key_count(),
+        }
+    )
+
+
+def _core_ws_price_tick_coalesce_key(event: GatewayEvent | None) -> str:
+    if event is None or event.type != "price_tick":
+        return ""
+    payload = dict(event.payload or {})
+    code = str(payload.get("code") or payload.get("stock_code") or "").strip()
+    if not code:
+        return ""
+    instrument_type = str(payload.get("instrument_type") or "stock").strip() or "stock"
+    return f"{instrument_type}:{code}"
+
+
+def _gateway_condition_event_queue_batch_count() -> int:
+    return sum(queue.qsize() for queue in _gateway_condition_event_queues)
+
+
+def _gateway_condition_event_queue_batch_counts() -> list[int]:
+    return [queue.qsize() for queue in _gateway_condition_event_queues]
+
+
+def _gateway_condition_event_queue_sizes_by_worker() -> list[int]:
+    worker_count = len(_gateway_condition_event_queues) or _gateway_condition_event_worker_count()
+    sizes = list(gateway_condition_event_worker_state.get("queue_sizes_by_worker") or [])
+    if len(sizes) < worker_count:
+        sizes.extend([0 for _ in range(worker_count - len(sizes))])
+    return [max(0, int(size or 0)) for size in sizes[:worker_count]]
+
+
+def _condition_event_queue_sizes_with_delta(worker_index: int, delta: int) -> list[int]:
+    sizes = _gateway_condition_event_queue_sizes_by_worker()
+    if 0 <= worker_index < len(sizes):
+        sizes[worker_index] = max(0, int(sizes[worker_index]) + int(delta))
+    return sizes
+
+
+def _chunk_condition_event_worker_batches(
+    batches_by_worker: dict[int, list[GatewayEvent]],
+    chunk_size: int | None = None,
+) -> dict[int, list[list[GatewayEvent]]]:
+    size = max(1, int(chunk_size or _gateway_condition_event_batch_chunk_size()))
+    chunked: dict[int, list[list[GatewayEvent]]] = {}
+    for worker_index, worker_events in batches_by_worker.items():
+        chunks = [worker_events[index : index + size] for index in range(0, len(worker_events), size)]
+        chunked[worker_index] = [chunk for chunk in chunks if chunk]
+    return chunked
+
+
+def _condition_event_shard_key(event: GatewayEvent) -> str:
+    payload = dict(event.payload or {})
+    code = str(payload.get("code") or payload.get("stock_code") or "").strip()
+    if code:
+        return code
+    return _condition_event_coalesce_key(event) or str(event.event_id or "")
+
+
+def _gateway_condition_event_worker_index(event: GatewayEvent, worker_count: int | None = None) -> int:
+    count = max(1, int(worker_count or len(_gateway_condition_event_queues) or _gateway_condition_event_worker_count()))
+    key = _condition_event_shard_key(event)
+    if not key:
+        key = str(event.event_id or "")
+    return zlib.crc32(key.encode("utf-8", errors="ignore")) % count
+
+
+def _core_ws_price_tick_pending_key_count() -> int:
+    with _core_ws_price_tick_coalesce_lock:
+        return len(_core_ws_price_tick_latest_by_key)
+
+
+_CORE_WS_CONTROL_MESSAGE_TYPES = {
+    "command_ack",
+    "command_started",
+    "command_failed",
+    "rate_limited",
+    "heartbeat",
+    "transport_heartbeat",
+    "login_status",
+    "order_result",
+    "execution_event",
+    "execution",
+}
+
+
+def _core_ws_event_priority(kind: str, event: GatewayEvent | None = None, message: GatewayWsMessage | None = None) -> int:
+    if not _core_ws_event_priority_enabled():
+        return 10
+    message_type = _core_ws_event_work_message_type(kind, event=event, message=message)
+    if message_type in _CORE_WS_CONTROL_MESSAGE_TYPES:
+        return 0
+    if message_type == "price_tick":
+        return 50
+    return 10
+
+
+def _core_ws_event_queue_item(item: _CoreWsEventWorkItem) -> _CoreWsEventQueuedItem:
+    return _CoreWsEventQueuedItem(
+        priority=_core_ws_event_priority(item.kind, event=item.event, message=item.message),
+        sequence=next(_core_ws_event_queue_sequence),
+        work_item=item,
+    )
+
+
+def _core_ws_event_queue_name_for_priority(priority: int) -> str:
+    if not _core_ws_event_worker_split_enabled():
+        return "single"
+    return "control" if int(priority) <= 0 else "data"
+
+
+def _core_ws_event_queue_for_name(queue_name: str) -> asyncio.PriorityQueue[_CoreWsEventQueuedItem] | None:
+    if queue_name.startswith("control:"):
+        try:
+            index = int(queue_name.split(":", 1)[1])
+        except (IndexError, ValueError):
+            index = 0
+        if 0 <= index < len(_core_ws_event_control_queues):
+            return _core_ws_event_control_queues[index]
+        return _core_ws_event_control_queue
+    if queue_name == "control":
+        if _core_ws_event_control_queues:
+            return _core_ws_event_control_queues[0]
+        return _core_ws_event_control_queue
+    if queue_name == "data":
+        return _core_ws_event_data_queue
+    return _core_ws_event_queue
+
+
+def _core_ws_event_queue_size(queue_name: str) -> int:
+    if queue_name == "control" and _core_ws_event_control_queues:
+        return sum(queue.qsize() for queue in _core_ws_event_control_queues)
+    queue = _core_ws_event_queue_for_name(queue_name)
+    return queue.qsize() if queue is not None else 0
+
+
+def _core_ws_event_control_queue_sizes() -> list[int]:
+    if _core_ws_event_control_queues:
+        return [queue.qsize() for queue in _core_ws_event_control_queues]
+    return [_core_ws_event_control_queue.qsize()] if _core_ws_event_control_queue is not None else []
+
+
+def _core_ws_event_total_queue_size() -> int:
+    if _core_ws_event_worker_split_enabled():
+        return _core_ws_event_queue_size("control") + _core_ws_event_queue_size("data")
+    return _core_ws_event_queue_size("single")
+
+
+def _core_ws_event_worker_state_patch(queue_name: str = "") -> dict[str, Any]:
+    return {
+        "queue_size": _core_ws_event_total_queue_size(),
+        "control_queue_size": _core_ws_event_queue_size("control"),
+        "control_queue_sizes": _core_ws_event_control_queue_sizes(),
+        "data_queue_size": _core_ws_event_queue_size("data"),
+        "queue_max_size": _core_ws_event_queue_max_size(),
+        "split_enabled": _core_ws_event_worker_split_enabled(),
+        "control_worker_count": len(_core_ws_event_control_queues)
+        or (1 if _core_ws_event_control_queue is not None and _core_ws_event_worker_split_enabled() else 0),
+        "priority_enabled": _core_ws_event_priority_enabled(),
+        "last_worker_kind": queue_name or gateway_core_ws_event_worker_state.get("last_worker_kind") or "",
+    }
+
+
+def _core_ws_event_active_state_patch(worker_kind: str, *, active: bool, worker_index: int = 0) -> dict[str, int]:
+    if worker_kind == "single":
+        return {"active_count": 1 if active else 0, "control_active_count": 0, "data_active_count": 0}
+    control_active = int(gateway_core_ws_event_worker_state.get("control_active_count") or 0)
+    data_active = int(gateway_core_ws_event_worker_state.get("data_active_count") or 0)
+    delta = 1 if active else -1
+    if worker_kind == "control":
+        control_active = max(0, control_active + delta)
+    elif worker_kind == "data":
+        data_active = max(0, data_active + delta)
+    return {
+        "active_count": control_active + data_active,
+        "control_active_count": control_active,
+        "data_active_count": data_active,
+        "last_control_worker_index": worker_index if worker_kind == "control" else int(
+            gateway_core_ws_event_worker_state.get("last_control_worker_index") or 0
+        ),
+    }
+
+
+def _core_ws_event_control_shard_key(
+    kind: str,
+    *,
+    event: GatewayEvent | None = None,
+    message: GatewayWsMessage | None = None,
+) -> str:
+    payload = dict(event.payload if event is not None else (message.payload if message is not None else {}) or {})
+    command_id = str(payload.get("command_id") or (event.command_id if event is not None else "") or (message.command_id if message is not None else "") or "").strip()
+    if command_id:
+        return f"command:{command_id}"
+    order_id = str(
+        payload.get("order_id")
+        or payload.get("order_no")
+        or payload.get("original_order_no")
+        or payload.get("order_number")
+        or ""
+    ).strip()
+    if order_id:
+        return f"order:{order_id}"
+    code = str(payload.get("code") or payload.get("stock_code") or payload.get("symbol") or "").strip()
+    message_type = _core_ws_event_work_message_type(kind, event=event, message=message)
+    if message_type in {"execution_event", "execution", "order_result"} and code:
+        return f"{message_type}:{code}"
+    event_id = str((event.event_id if event is not None else "") or (message.event_id if message is not None else "") or "").strip()
+    if event_id:
+        return f"event:{event_id}"
+    return f"type:{message_type}"
+
+
+def _core_ws_event_control_worker_index(
+    kind: str,
+    *,
+    event: GatewayEvent | None = None,
+    message: GatewayWsMessage | None = None,
+    worker_count: int | None = None,
+) -> int:
+    count = max(1, int(worker_count or len(_core_ws_event_control_queues) or _core_ws_event_control_worker_count()))
+    key = _core_ws_event_control_shard_key(kind, event=event, message=message)
+    return zlib.crc32(key.encode("utf-8", errors="ignore")) % count
+
+
+def _core_ws_event_target_queue_name(
+    kind: str,
+    *,
+    priority: int,
+    event: GatewayEvent | None = None,
+    message: GatewayWsMessage | None = None,
+) -> str:
+    queue_name = _core_ws_event_queue_name_for_priority(priority)
+    if queue_name == "control" and _core_ws_event_worker_split_enabled():
+        return f"control:{_core_ws_event_control_worker_index(kind, event=event, message=message)}"
+    return queue_name
+
+
+def _build_core_ws_event_work_item(
+    *,
+    kind: str,
+    metadata: dict[str, Any],
+    queue_size: int,
+    queued_at: str,
+    queued_monotonic: float,
+    event: GatewayEvent | None = None,
+    message: GatewayWsMessage | None = None,
+    coalesce_key: str = "",
+) -> _CoreWsEventWorkItem:
+    queued_event = event
+    if event is not None:
+        trace_updates = {
+            "core_ws_event_queued_at_utc": queued_at,
+            "core_ws_event_queued_monotonic_ms": queued_monotonic,
+            "core_ws_event_queue_size": queue_size,
+        }
+        if coalesce_key:
+            trace_updates["core_ws_price_tick_coalesce_key"] = coalesce_key
+        queued_event = _event_with_trace(event, trace_updates)
+    return _CoreWsEventWorkItem(
+        kind=kind,
+        metadata=dict(metadata or {}),
+        queued_at=queued_at,
+        queued_monotonic_ms=queued_monotonic,
+        event=queued_event,
+        message=message,
+        coalesce_key=coalesce_key,
+    )
+
+
+def _enqueue_core_ws_event_work(
+    *,
+    kind: str,
+    metadata: dict[str, Any],
+    event: GatewayEvent | None = None,
+    message: GatewayWsMessage | None = None,
+) -> dict[str, Any]:
+    if not _core_ws_event_async_enabled():
+        return {
+            "accepted": False,
+            "queued": False,
+            "reason": "WORKER_DISABLED",
+            "queue_size": 0,
+            "queue_max_size": _core_ws_event_queue_max_size(),
+        }
+    _ensure_core_ws_event_worker()
+    priority = _core_ws_event_priority(kind, event=event, message=message)
+    queue_name = _core_ws_event_queue_name_for_priority(priority)
+    target_queue_name = _core_ws_event_target_queue_name(kind, priority=priority, event=event, message=message)
+    queue = _core_ws_event_queue_for_name(target_queue_name)
+    if queue is None:
+        return {
+            "accepted": False,
+            "queued": False,
+            "reason": "WORKER_UNAVAILABLE",
+            "queue_size": 0,
+            "queue_max_size": _core_ws_event_queue_max_size(),
+        }
+    queue_size = queue.qsize()
+    if _core_ws_price_tick_coalesce_enabled() and kind == "gateway_event":
+        coalesce_key = _core_ws_price_tick_coalesce_key(event)
+        if coalesce_key:
+            return _enqueue_core_ws_price_tick_work(
+                queue,
+                queue_size=queue_size,
+                queue_name=target_queue_name,
+                kind=kind,
+                metadata=metadata,
+                event=event,
+                coalesce_key=coalesce_key,
+            )
+    queued_at = utc_now_ms()
+    queued_monotonic = monotonic_ms()
+    item = _build_core_ws_event_work_item(
+        kind=kind,
+        metadata=dict(metadata or {}),
+        queue_size=queue_size + 1,
+        queued_at=queued_at,
+        queued_monotonic=queued_monotonic,
+        event=event,
+        message=message,
+    )
+    queued_item = _core_ws_event_queue_item(item)
+    message_type = _core_ws_event_work_message_type(kind, event=event, message=message)
+    try:
+        queue.put_nowait(queued_item)
+    except asyncio.QueueFull:
+        _update_gateway_core_ws_event_worker_state(
+            {
+                "enabled": True,
+                **_core_ws_event_worker_state_patch(target_queue_name),
+                "last_priority": queued_item.priority,
+                "dropped_count": int(gateway_core_ws_event_worker_state.get("dropped_count") or 0) + 1,
+                "last_message_type": message_type,
+                "last_event_id": event.event_id if event is not None else (message.event_id if message is not None else ""),
+                "last_queued_at": queued_at,
+                "last_error": "CORE_WS_EVENT_QUEUE_FULL",
+            }
+        )
+        return {
+            "accepted": False,
+            "queued": False,
+            "reason": "QUEUE_FULL",
+            "queue_size": _core_ws_event_total_queue_size(),
+            "queue_max_size": queue.maxsize,
+        }
+    _update_gateway_core_ws_event_worker_state(
+        {
+            "enabled": True,
+            **_core_ws_event_worker_state_patch(target_queue_name),
+            "control_queued_count": int(gateway_core_ws_event_worker_state.get("control_queued_count") or 0)
+            + (1 if queue_name == "control" else 0),
+            "data_queued_count": int(gateway_core_ws_event_worker_state.get("data_queued_count") or 0)
+            + (1 if queue_name == "data" else 0),
+            "last_priority": queued_item.priority,
+            "queued_count": int(gateway_core_ws_event_worker_state.get("queued_count") or 0) + 1,
+            "last_message_type": message_type,
+            "last_event_id": event.event_id if event is not None else (message.event_id if message is not None else ""),
+            "last_queued_at": queued_at,
+            "last_error": "",
+        }
+    )
+    return {
+        "accepted": True,
+        "queued": True,
+        "reason": "",
+        "queue_size": _core_ws_event_total_queue_size(),
+        "queue_max_size": queue.maxsize,
+    }
+
+
+def _enqueue_core_ws_price_tick_work(
+    queue: asyncio.PriorityQueue[_CoreWsEventQueuedItem],
+    *,
+    queue_size: int,
+    queue_name: str,
+    kind: str,
+    metadata: dict[str, Any],
+    event: GatewayEvent | None,
+    coalesce_key: str,
+) -> dict[str, Any]:
+    queued_at = utc_now_ms()
+    queued_monotonic = monotonic_ms()
+    with _core_ws_price_tick_coalesce_lock:
+        already_pending = coalesce_key in _core_ws_price_tick_latest_by_key
+    item = _build_core_ws_event_work_item(
+        kind=kind,
+        metadata=metadata,
+        queue_size=queue_size if already_pending else queue_size + 1,
+        queued_at=queued_at,
+        queued_monotonic=queued_monotonic,
+        event=event,
+        coalesce_key=coalesce_key,
+    )
+    if already_pending:
+        with _core_ws_price_tick_coalesce_lock:
+            _core_ws_price_tick_latest_by_key[coalesce_key] = item
+            pending_key_count = len(_core_ws_price_tick_latest_by_key)
+        priority = _core_ws_event_priority(kind, event=event)
+        _update_gateway_core_ws_event_worker_state(
+            {
+                "enabled": True,
+                **_core_ws_event_worker_state_patch(queue_name),
+                "last_priority": priority,
+                "price_tick_coalesce_enabled": True,
+                "price_tick_pending_key_count": pending_key_count,
+                "price_tick_received_count": int(gateway_core_ws_event_worker_state.get("price_tick_received_count") or 0) + 1,
+                "price_tick_coalesced_count": int(gateway_core_ws_event_worker_state.get("price_tick_coalesced_count") or 0) + 1,
+                "price_tick_last_key": coalesce_key,
+                "last_message_type": event.type if event is not None else "price_tick",
+                "last_event_id": event.event_id if event is not None else "",
+                "last_queued_at": queued_at,
+                "last_error": "",
+            }
+        )
+        return {
+            "accepted": True,
+            "queued": True,
+            "coalesced": True,
+            "reason": "",
+            "queue_size": _core_ws_event_total_queue_size(),
+            "queue_max_size": queue.maxsize,
+        }
+    queued_item = _core_ws_event_queue_item(item)
+    try:
+        queue.put_nowait(queued_item)
+    except asyncio.QueueFull:
+        _update_gateway_core_ws_event_worker_state(
+            {
+                "enabled": True,
+                **_core_ws_event_worker_state_patch(queue_name),
+                "last_priority": queued_item.priority,
+                "dropped_count": int(gateway_core_ws_event_worker_state.get("dropped_count") or 0) + 1,
+                "price_tick_coalesce_enabled": True,
+                "price_tick_pending_key_count": _core_ws_price_tick_pending_key_count(),
+                "price_tick_received_count": int(gateway_core_ws_event_worker_state.get("price_tick_received_count") or 0) + 1,
+                "price_tick_dropped_count": int(gateway_core_ws_event_worker_state.get("price_tick_dropped_count") or 0) + 1,
+                "price_tick_last_key": coalesce_key,
+                "last_message_type": event.type if event is not None else "price_tick",
+                "last_event_id": event.event_id if event is not None else "",
+                "last_queued_at": queued_at,
+                "last_error": "CORE_WS_EVENT_QUEUE_FULL",
+            }
+        )
+        return {
+            "accepted": False,
+            "queued": False,
+            "coalesced": False,
+            "reason": "QUEUE_FULL",
+            "queue_size": _core_ws_event_total_queue_size(),
+            "queue_max_size": queue.maxsize,
+        }
+    with _core_ws_price_tick_coalesce_lock:
+        _core_ws_price_tick_latest_by_key[coalesce_key] = item
+        pending_key_count = len(_core_ws_price_tick_latest_by_key)
+    _update_gateway_core_ws_event_worker_state(
+        {
+            "enabled": True,
+            **_core_ws_event_worker_state_patch(queue_name),
+            "data_queued_count": int(gateway_core_ws_event_worker_state.get("data_queued_count") or 0) + 1,
+            "last_priority": queued_item.priority,
+            "queued_count": int(gateway_core_ws_event_worker_state.get("queued_count") or 0) + 1,
+            "price_tick_coalesce_enabled": True,
+            "price_tick_pending_key_count": pending_key_count,
+            "price_tick_received_count": int(gateway_core_ws_event_worker_state.get("price_tick_received_count") or 0) + 1,
+            "price_tick_queued_count": int(gateway_core_ws_event_worker_state.get("price_tick_queued_count") or 0) + 1,
+            "price_tick_last_key": coalesce_key,
+            "last_message_type": event.type if event is not None else "price_tick",
+            "last_event_id": event.event_id if event is not None else "",
+            "last_queued_at": queued_at,
+            "last_error": "",
+        }
+    )
+    return {
+        "accepted": True,
+        "queued": True,
+        "coalesced": False,
+        "reason": "",
+        "queue_size": _core_ws_event_total_queue_size(),
+        "queue_max_size": queue.maxsize,
+    }
+
+
+def _prepare_condition_events_for_queue(
+    events: list[GatewayEvent],
+    *,
+    metadata: dict[str, Any],
+    queue_size: int,
+) -> dict[str, Any]:
+    latest_by_key: dict[str, tuple[int, GatewayEvent]] = {}
+    passthrough: list[tuple[int, GatewayEvent]] = []
+    coalesced_count = 0
+    for index, event in enumerate(events):
+        _record_ws_message_side_effects(event, metadata)
+        key = _condition_event_coalesce_key(event)
+        if key:
+            if key in latest_by_key:
+                coalesced_count += 1
+            latest_by_key[key] = (index, event)
+        else:
+            passthrough.append((index, event))
+    merged = passthrough + list(latest_by_key.values())
+    merged.sort(key=lambda item: item[0])
+    return {
+        "events": [event for _, event in merged],
+        "received_count": len(events),
+        "coalesced_count": coalesced_count,
+        "queue_size": queue_size,
+    }
+
+
+def _condition_event_coalesce_key(event: GatewayEvent) -> str:
+    if event.type != "condition_event":
+        return ""
+    payload = dict(event.payload or {})
+    code = str(payload.get("code") or payload.get("stock_code") or "").strip()
+    condition_index = str(payload.get("condition_index") or payload.get("index") or "").strip()
+    condition_name = str(payload.get("condition_name") or payload.get("name") or "").strip()
+    if not code or not (condition_index or condition_name):
+        return ""
+    return f"condition:{condition_index}|name:{condition_name}|code:{code}"
+
+
+def _assign_condition_event_generation(event: GatewayEvent) -> GatewayEvent:
+    key = _condition_event_coalesce_key(event)
+    if not key:
+        return event
+    global _gateway_condition_event_generation
+    with _gateway_condition_event_coalesce_lock:
+        _gateway_condition_event_generation += 1
+        generation = _gateway_condition_event_generation
+        _gateway_condition_event_latest_generation[key] = generation
+    return _event_with_trace(
+        event,
+        {
+            "core_condition_event_coalesce_key": key,
+            "core_condition_event_generation": generation,
+        },
+    )
+
+
+def _condition_event_is_stale(event: GatewayEvent) -> bool:
+    trace = trace_from_payload(event.payload)
+    key = str(trace.get("core_condition_event_coalesce_key") or _condition_event_coalesce_key(event) or "")
+    generation = _optional_int_value(trace.get("core_condition_event_generation"))
+    if not key or generation is None:
+        return False
+    with _gateway_condition_event_coalesce_lock:
+        latest_generation = _gateway_condition_event_latest_generation.get(key)
+    return latest_generation is not None and latest_generation != generation
+
+
+def _condition_event_action(event: GatewayEvent) -> str:
+    payload = dict(event.payload or {})
+    return str(payload.get("event_type") or "include").strip().lower()
+
+
+def _condition_event_queue_wait_ms(event: GatewayEvent, worker_started_monotonic: float) -> float | None:
+    trace = trace_from_payload(event.payload)
+    return monotonic_delta_ms(trace.get("core_condition_event_queued_monotonic_ms"), worker_started_monotonic)
+
+
+def _condition_event_should_skip_stale_include(event: GatewayEvent, worker_started_monotonic: float) -> tuple[bool, float | None, float]:
+    threshold_ms = _gateway_condition_event_stale_include_skip_ms()
+    if threshold_ms <= 0.0 or event.type != "condition_event" or _condition_event_action(event) != "include":
+        return False, None, threshold_ms
+    queue_wait_ms = _condition_event_queue_wait_ms(event, worker_started_monotonic)
+    if queue_wait_ms is None:
+        return False, None, threshold_ms
+    return queue_wait_ms > threshold_ms, queue_wait_ms, threshold_ms
+
+
+def _clear_condition_event_generation_if_current(event: GatewayEvent) -> None:
+    trace = trace_from_payload(event.payload)
+    key = str(trace.get("core_condition_event_coalesce_key") or _condition_event_coalesce_key(event) or "")
+    generation = _optional_int_value(trace.get("core_condition_event_generation"))
+    if not key or generation is None:
+        return
+    with _gateway_condition_event_coalesce_lock:
+        if _gateway_condition_event_latest_generation.get(key) == generation:
+            _gateway_condition_event_latest_generation.pop(key, None)
+
+
+def _enqueue_gateway_condition_events(events: list[GatewayEvent], metadata: dict[str, Any]) -> dict[str, Any]:
+    if not events:
+        return {"accepted": True, "queued": True, "count": 0, "queued_count": 0, "dropped_count": 0, "queue_size": 0}
+    _ensure_gateway_condition_event_worker()
+    queues = list(_gateway_condition_event_queues)
+    if not queues:
+        return {"accepted": False, "queued": False, "count": len(events), "queued_count": 0, "dropped_count": len(events), "queue_size": 0, "reason": "WORKER_DISABLED"}
+    queue_size = int(gateway_condition_event_worker_state.get("queue_size") or 0)
+    queue_max_size = _gateway_condition_event_queue_max_size()
+    worker_count = len(queues)
+    prepared = _prepare_condition_events_for_queue(events, metadata=metadata, queue_size=queue_size)
+    queued_events = prepared["events"]
+    received_count = int(prepared["received_count"])
+    coalesced_count = int(prepared["coalesced_count"])
+    if not queued_events:
+        now = utc_now_ms()
+        _update_gateway_condition_event_worker_state(
+            {
+                "enabled": True,
+                "queue_size": queue_size,
+                "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                "queue_max_size": queue_max_size,
+                "worker_count": worker_count,
+                "received_count": int(gateway_condition_event_worker_state.get("received_count") or 0) + received_count,
+                "coalesced_count": int(gateway_condition_event_worker_state.get("coalesced_count") or 0) + coalesced_count,
+                "last_received_count": received_count,
+                "last_queued_count": 0,
+                "last_coalesced_count": coalesced_count,
+                "last_queued_at": now,
+                "last_error": "",
+            }
+        )
+        return {
+            "accepted": True,
+            "queued": True,
+            "count": received_count,
+            "queued_count": 0,
+            "coalesced_count": coalesced_count,
+            "dropped_count": 0,
+            "queue_size": queue_size,
+            "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+            "queue_max_size": queue_max_size,
+        }
+    if queue_size + len(queued_events) > queue_max_size:
+        now = utc_now_ms()
+        _update_gateway_condition_event_worker_state(
+            {
+                "enabled": True,
+                "queue_size": queue_size,
+                "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                "queue_max_size": queue_max_size,
+                "worker_count": worker_count,
+                "received_count": int(gateway_condition_event_worker_state.get("received_count") or 0) + received_count,
+                "coalesced_count": int(gateway_condition_event_worker_state.get("coalesced_count") or 0) + coalesced_count,
+                "dropped_count": int(gateway_condition_event_worker_state.get("dropped_count") or 0) + len(queued_events),
+                "last_received_count": received_count,
+                "last_queued_count": 0,
+                "last_coalesced_count": coalesced_count,
+                "last_error": "CONDITION_EVENT_QUEUE_FULL",
+                "last_queued_at": now,
+            }
+        )
+        return {
+            "accepted": False,
+            "queued": False,
+            "count": received_count,
+            "queued_count": 0,
+            "coalesced_count": coalesced_count,
+            "dropped_count": len(queued_events),
+            "queue_size": queue_size,
+            "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+            "queue_max_size": queue_max_size,
+            "reason": "QUEUE_FULL",
+        }
+    queued_at = utc_now_ms()
+    queued_monotonic = monotonic_ms()
+    traced_events: list[GatewayEvent] = []
+    for index, event in enumerate(queued_events):
+        event = _assign_condition_event_generation(event)
+        traced_events.append(
+            _event_with_trace(
+                event,
+                {
+                    "core_condition_event_queued_at_utc": queued_at,
+                    "core_condition_event_queued_monotonic_ms": queued_monotonic,
+                    "core_condition_event_queue_size": queue_size + index + 1,
+                    "core_condition_event_queue_batch_size": len(queued_events),
+                    "core_condition_event_queue_batch_index": index,
+                },
+            )
+        )
+    batches_by_worker: dict[int, list[GatewayEvent]] = {}
+    for event in traced_events:
+        worker_index = _gateway_condition_event_worker_index(event, worker_count)
+        batches_by_worker.setdefault(worker_index, []).append(event)
+    chunk_size = _gateway_condition_event_batch_chunk_size()
+    chunked_batches_by_worker = _chunk_condition_event_worker_batches(batches_by_worker, chunk_size)
+    queued_worker_indexes: list[int] = []
+    queue_full = False
+    for worker_index, worker_batches in chunked_batches_by_worker.items():
+        queue = queues[worker_index]
+        if queue.maxsize > 0 and queue.qsize() + len(worker_batches) > queue.maxsize:
+            queue_full = True
+            break
+    if queue_full:
+        for event in traced_events:
+            _clear_condition_event_generation_if_current(event)
+        _update_gateway_condition_event_worker_state(
+            {
+                "enabled": True,
+                "queue_size": queue_size,
+                "queue_sizes_by_worker": _gateway_condition_event_queue_sizes_by_worker(),
+                "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
+                "queue_max_size": queue_max_size,
+                "worker_count": worker_count,
+                "batch_chunk_size": chunk_size,
+                "received_count": int(gateway_condition_event_worker_state.get("received_count") or 0) + received_count,
+                "coalesced_count": int(gateway_condition_event_worker_state.get("coalesced_count") or 0) + coalesced_count,
+                "dropped_count": int(gateway_condition_event_worker_state.get("dropped_count") or 0) + len(traced_events),
+                "last_received_count": received_count,
+                "last_queued_count": 0,
+                "last_coalesced_count": coalesced_count,
+                "last_error": "CONDITION_EVENT_SHARD_QUEUE_FULL",
+                "last_queued_at": queued_at,
+            }
+        )
+        return {
+            "accepted": False,
+            "queued": False,
+            "count": received_count,
+            "queued_count": 0,
+            "coalesced_count": coalesced_count,
+            "dropped_count": len(traced_events),
+            "queue_size": queue_size,
+            "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+            "queue_max_size": queue_max_size,
+            "reason": "QUEUE_FULL",
+        }
+    try:
+        for worker_index, worker_batches in chunked_batches_by_worker.items():
+            for worker_events in worker_batches:
+                queues[worker_index].put_nowait(
+                    _ConditionEventBatchWorkItem(
+                        events=worker_events,
+                        queued_at=queued_at,
+                        queued_monotonic_ms=queued_monotonic,
+                    )
+                )
+                queued_worker_indexes.append(worker_index)
+    except asyncio.QueueFull:
+        for event in traced_events:
+            _clear_condition_event_generation_if_current(event)
+        _update_gateway_condition_event_worker_state(
+            {
+                "enabled": True,
+                "queue_size": queue_size,
+                "queue_sizes_by_worker": _gateway_condition_event_queue_sizes_by_worker(),
+                "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
+                "queue_max_size": queue_max_size,
+                "worker_count": worker_count,
+                "batch_chunk_size": chunk_size,
+                "received_count": int(gateway_condition_event_worker_state.get("received_count") or 0) + received_count,
+                "coalesced_count": int(gateway_condition_event_worker_state.get("coalesced_count") or 0) + coalesced_count,
+                "dropped_count": int(gateway_condition_event_worker_state.get("dropped_count") or 0) + len(traced_events),
+                "last_received_count": received_count,
+                "last_queued_count": 0,
+                "last_coalesced_count": coalesced_count,
+                "last_error": "CONDITION_EVENT_BATCH_QUEUE_FULL",
+                "last_queued_at": queued_at,
+            }
+        )
+        return {
+            "accepted": False,
+            "queued": False,
+            "count": received_count,
+            "queued_count": 0,
+            "coalesced_count": coalesced_count,
+            "dropped_count": len(traced_events),
+            "queue_size": queue_size,
+            "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+            "queue_max_size": queue_max_size,
+            "reason": "QUEUE_FULL",
+        }
+    next_queue_size = queue_size + len(traced_events)
+    queue_sizes_by_worker = _gateway_condition_event_queue_sizes_by_worker()
+    for worker_index, worker_events in batches_by_worker.items():
+        if 0 <= worker_index < len(queue_sizes_by_worker):
+            queue_sizes_by_worker[worker_index] += len(worker_events)
+    _update_gateway_condition_event_worker_state(
+        {
+            "enabled": True,
+            "queue_size": next_queue_size,
+            "queue_sizes_by_worker": queue_sizes_by_worker,
+            "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+            "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
+            "queue_max_size": queue_max_size,
+            "worker_count": worker_count,
+            "batch_chunk_size": chunk_size,
+            "received_count": int(gateway_condition_event_worker_state.get("received_count") or 0) + received_count,
+            "queued_count": int(gateway_condition_event_worker_state.get("queued_count") or 0) + len(traced_events),
+            "coalesced_count": int(gateway_condition_event_worker_state.get("coalesced_count") or 0) + coalesced_count,
+            "last_received_count": received_count,
+            "last_queued_count": len(traced_events),
+            "last_queued_batch_count": len(queued_worker_indexes),
+            "last_coalesced_count": coalesced_count,
+            "last_worker_index": queued_worker_indexes[-1] if queued_worker_indexes else 0,
+            "last_shard_key": _condition_event_shard_key(traced_events[-1]) if traced_events else "",
+            "last_queued_at": queued_at,
+            "last_error": "",
+        }
+    )
+    return {
+        "accepted": True,
+        "queued": True,
+        "count": received_count,
+        "queued_count": len(traced_events),
+        "coalesced_count": coalesced_count,
+        "dropped_count": 0,
+        "queue_size": next_queue_size,
+        "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+        "queue_max_size": queue_max_size,
+    }
+
+
+async def _gateway_condition_event_worker_loop_main(worker_index: int = 0) -> None:
+    while True:
+        if worker_index >= len(_gateway_condition_event_queues):
+            await asyncio.sleep(0.1)
+            continue
+        queue = _gateway_condition_event_queues[worker_index]
+        item = await queue.get()
+        drained_items = [item]
+        events = list(item.events)
+        chunk_size = _gateway_condition_event_batch_chunk_size()
+        while queue.qsize() > 0 and len(events) < chunk_size:
+            try:
+                drained_item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            drained_items.append(drained_item)
+            events.extend(drained_item.events)
+        batch_size = len(events)
+        batch_queue_wait_ms = monotonic_delta_ms(item.queued_monotonic_ms, monotonic_ms()) or 0.0
+        queue_size = max(0, int(gateway_condition_event_worker_state.get("queue_size") or 0) - batch_size)
+        _update_gateway_condition_event_worker_state(
+            {
+                "queue_size": queue_size,
+                "queue_sizes_by_worker": _condition_event_queue_sizes_with_delta(worker_index, -batch_size),
+                "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
+                "active_worker_count": int(gateway_condition_event_worker_state.get("active_worker_count") or 0) + 1,
+                "active_count": int(gateway_condition_event_worker_state.get("active_count") or 0) + batch_size,
+                "last_batch_size": batch_size,
+                "last_drained_batch_count": len(drained_items),
+                "last_queue_wait_ms": round(batch_queue_wait_ms, 3),
+                "last_worker_index": worker_index,
+                "last_shard_key": _condition_event_shard_key(events[-1]) if events else "",
+            }
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            if _gateway_condition_event_executor is None:
+                raise RuntimeError("condition event worker executor is not initialized")
+            batch_started = time.perf_counter()
+            result = await loop.run_in_executor(
+                _gateway_condition_event_executor,
+                _process_condition_event_batch_in_worker,
+                events,
+            )
+            batch_duration_ms = (time.perf_counter() - batch_started) * 1000.0
+            processed_count = int(result.get("processed_count") or 0)
+            failed_count = int(result.get("failed_count") or 0)
+            stale_skipped_count = int(result.get("stale_skipped_count") or 0)
+            stale_queue_wait_skipped_count = int(result.get("stale_queue_wait_skipped_count") or 0)
+            _update_gateway_condition_event_worker_state(
+                {
+                    "queue_size": int(gateway_condition_event_worker_state.get("queue_size") or 0),
+                    "queue_sizes_by_worker": _gateway_condition_event_queue_sizes_by_worker(),
+                    "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                    "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
+                    "active_worker_count": max(0, int(gateway_condition_event_worker_state.get("active_worker_count") or 0) - 1),
+                    "active_count": max(0, int(gateway_condition_event_worker_state.get("active_count") or 0) - batch_size),
+                    "processed_count": int(gateway_condition_event_worker_state.get("processed_count") or 0) + processed_count,
+                    "failed_count": int(gateway_condition_event_worker_state.get("failed_count") or 0) + failed_count,
+                    "stale_skipped_count": int(gateway_condition_event_worker_state.get("stale_skipped_count") or 0) + stale_skipped_count,
+                    "stale_queue_wait_skipped_count": int(gateway_condition_event_worker_state.get("stale_queue_wait_skipped_count") or 0)
+                    + stale_queue_wait_skipped_count,
+                    "last_stale_skipped_count": stale_skipped_count,
+                    "last_stale_queue_wait_skipped_count": stale_queue_wait_skipped_count,
+                    "last_stale_queue_wait_ms": round(float(result.get("last_stale_queue_wait_ms") or 0.0), 3),
+                    "last_queue_wait_ms": round(float(result.get("last_queue_wait_ms") or batch_queue_wait_ms), 3),
+                    "last_batch_duration_ms": round(batch_duration_ms, 3),
+                    "last_worker_index": worker_index,
+                    "last_processed_at": utc_now_ms(),
+                    "last_error": "" if failed_count == 0 else str(result.get("last_error") or ""),
+                }
+            )
+            if int(result.get("accepted_count") or 0) > 0:
+                await _schedule_dashboard_snapshot_broadcast()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _update_gateway_condition_event_worker_state(
+                {
+                    "queue_size": int(gateway_condition_event_worker_state.get("queue_size") or 0),
+                    "queue_sizes_by_worker": _gateway_condition_event_queue_sizes_by_worker(),
+                    "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                    "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
+                    "active_worker_count": max(0, int(gateway_condition_event_worker_state.get("active_worker_count") or 0) - 1),
+                    "active_count": max(0, int(gateway_condition_event_worker_state.get("active_count") or 0) - batch_size),
+                    "failed_count": int(gateway_condition_event_worker_state.get("failed_count") or 0) + batch_size,
+                    "last_worker_index": worker_index,
+                    "last_error": str(exc) or repr(exc),
+                }
+            )
+        finally:
+            for _drained_item in drained_items:
+                queue.task_done()
+            _update_gateway_condition_event_worker_state(
+                {
+                    "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                    "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
+                }
+            )
+
+
+async def _core_ws_event_worker_loop_main(worker_kind: str = "single", worker_index: int = 0) -> None:
+    while True:
+        worker_queue_name = f"control:{worker_index}" if worker_kind == "control" else worker_kind
+        queue = _core_ws_event_queue_for_name(worker_queue_name)
+        if queue is None:
+            await asyncio.sleep(0.1)
+            continue
+        queued_item = await queue.get()
+        item = _resolve_core_ws_event_work_item(queued_item.work_item)
+        item = replace(
+            item,
+            metadata={
+                **dict(item.metadata or {}),
+                "core_ws_event_worker_kind": worker_kind,
+                "core_ws_event_worker_index": worker_index,
+                "core_ws_event_worker_queue_name": worker_queue_name,
+            },
+        )
+        message_type = _core_ws_event_work_message_type(item.kind, event=item.event, message=item.message)
+        event_id = item.event.event_id if item.event is not None else (item.message.event_id if item.message is not None else "")
+        queue_wait_ms = monotonic_delta_ms(item.queued_monotonic_ms, monotonic_ms()) or 0.0
+        _update_gateway_core_ws_event_worker_state(
+            {
+                **_core_ws_event_worker_state_patch(worker_queue_name),
+                **_core_ws_event_active_state_patch(worker_kind, active=True, worker_index=worker_index),
+                "last_priority": queued_item.priority,
+                "price_tick_pending_key_count": _core_ws_price_tick_pending_key_count(),
+                "last_message_type": message_type,
+                "last_event_id": event_id,
+                "last_queue_wait_ms": round(queue_wait_ms, 3),
+            }
+        )
+        try:
+            started = time.perf_counter()
+            await _process_core_ws_event_work_item(item, queue_wait_ms=queue_wait_ms)
+            duration_ms = (time.perf_counter() - started) * 1000.0
+            _update_gateway_core_ws_event_worker_state(
+                {
+                    **_core_ws_event_worker_state_patch(worker_queue_name),
+                    **_core_ws_event_active_state_patch(worker_kind, active=False, worker_index=worker_index),
+                    "processed_count": int(gateway_core_ws_event_worker_state.get("processed_count") or 0) + 1,
+                    "price_tick_processed_count": int(gateway_core_ws_event_worker_state.get("price_tick_processed_count") or 0)
+                    + (1 if message_type == "price_tick" else 0),
+                    "price_tick_pending_key_count": _core_ws_price_tick_pending_key_count(),
+                    "last_duration_ms": round(duration_ms, 3),
+                    "last_processed_at": utc_now_ms(),
+                    "last_error": "",
+                }
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _update_gateway_core_ws_event_worker_state(
+                {
+                    **_core_ws_event_worker_state_patch(worker_queue_name),
+                    **_core_ws_event_active_state_patch(worker_kind, active=False, worker_index=worker_index),
+                    "price_tick_pending_key_count": _core_ws_price_tick_pending_key_count(),
+                    "failed_count": int(gateway_core_ws_event_worker_state.get("failed_count") or 0) + 1,
+                    "last_error": _truncate_log_detail(str(exc) or repr(exc)),
+                }
+            )
+        finally:
+            queue.task_done()
+            _update_gateway_core_ws_event_worker_state(
+                {
+                    **_core_ws_event_worker_state_patch(worker_queue_name),
+                    "price_tick_pending_key_count": _core_ws_price_tick_pending_key_count(),
+                }
+            )
+
+
+def _resolve_core_ws_event_work_item(item: _CoreWsEventWorkItem) -> _CoreWsEventWorkItem:
+    if not item.coalesce_key:
+        return item
+    with _core_ws_price_tick_coalesce_lock:
+        latest = _core_ws_price_tick_latest_by_key.pop(item.coalesce_key, None)
+    return latest or item
+
+
+async def _process_core_ws_event_work_item(item: _CoreWsEventWorkItem, *, queue_wait_ms: float) -> dict[str, Any]:
+    if item.kind == "send_completed":
+        if item.message is None:
+            raise ValueError("send_completed work item missing message")
+        return await asyncio.to_thread(_record_gateway_ws_send_completed, item.message, item.metadata)
+    if item.event is None:
+        raise ValueError(f"{item.kind} work item missing event")
+    started_at = utc_now_ms()
+    started_monotonic = monotonic_ms()
+    event = _event_with_trace(
+        item.event,
+        {
+            "core_ws_event_worker_started_at_utc": started_at,
+            "core_ws_event_worker_started_monotonic_ms": started_monotonic,
+            "core_ws_event_queue_wait_ms": queue_wait_ms,
+            "core_ws_event_worker_kind": item.metadata.get("core_ws_event_worker_kind"),
+            "core_ws_event_worker_index": item.metadata.get("core_ws_event_worker_index"),
+            "core_ws_event_worker_queue_name": item.metadata.get("core_ws_event_worker_queue_name"),
+        },
+    )
+    if item.kind == "transport_heartbeat":
+        _record_ws_message_side_effects(event, item.metadata)
+        await asyncio.to_thread(_maybe_record_ws_pilot_diagnostic_log, dict(event.payload or {}))
+        return {"accepted": True, "event_id": event.event_id, "type": event.type, "transport_only": True}
+    if item.kind == "gateway_event":
+        _record_ws_message_side_effects(event, item.metadata)
+        return await _process_gateway_event(event)
+    raise ValueError(f"unsupported core ws event work kind: {item.kind}")
+
+
+def _core_ws_event_work_message_type(
+    kind: str,
+    *,
+    event: GatewayEvent | None = None,
+    message: GatewayWsMessage | None = None,
+) -> str:
+    if event is not None:
+        return event.type
+    if message is not None:
+        return message.type
+    return kind
+
+
+def _update_gateway_core_ws_event_worker_state(patch: dict[str, Any]) -> None:
+    gateway_core_ws_event_worker_state.update({key: value for key, value in patch.items() if value is not None})
+
+
+def _process_condition_event_in_worker(event: GatewayEvent) -> dict[str, Any]:
+    result = _process_condition_event_batch_in_worker([event])
+    results = list(result.get("results") or [])
+    if not results:
+        return {"accepted": False, "event_id": event.event_id, "type": event.type, "failed": True, "error": "EMPTY_BATCH_RESULT"}
+    return results[0]
+
+
+def _process_condition_event_batch_in_worker(events: list[GatewayEvent]) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    accepted_count = 0
+    processed_count = 0
+    failed_count = 0
+    stale_skipped_count = 0
+    stale_queue_wait_skipped_count = 0
+    last_queue_wait_ms = 0.0
+    last_stale_queue_wait_ms = 0.0
+    last_error = ""
+    if not events:
+        return {
+            "processed_count": 0,
+            "accepted_count": 0,
+            "failed_count": 0,
+            "stale_skipped_count": 0,
+            "stale_queue_wait_skipped_count": 0,
+            "results": [],
+        }
+    db: TradingDatabase | None = None
+    try:
+        collector: CandidateCollector | None = None
+        for event in events:
+            if _condition_event_is_stale(event):
+                stale_skipped_count += 1
+                results.append(_condition_event_stale_skip_result(event))
+                continue
+            if db is None:
+                db = open_database()
+                collector = CandidateCollector(db)
+            worker_started_monotonic = monotonic_ms()
+            skip_stale_include, queue_wait_ms, _threshold_ms = _condition_event_should_skip_stale_include(event, worker_started_monotonic)
+            if queue_wait_ms is not None:
+                last_queue_wait_ms = queue_wait_ms
+            if skip_stale_include:
+                stale_skipped_count += 1
+                stale_queue_wait_skipped_count += 1
+                last_stale_queue_wait_ms = float(queue_wait_ms or 0.0)
+                try:
+                    result = _record_condition_event_stale_include_skip(
+                        db,
+                        collector,
+                        event,
+                        worker_started_monotonic=worker_started_monotonic,
+                        queue_wait_ms=last_stale_queue_wait_ms,
+                    )
+                except Exception as exc:
+                    result = _record_condition_event_worker_failure(db, event, exc)
+                    failed_count += 1
+                    last_error = str(result.get("error") or last_error)
+                finally:
+                    _clear_condition_event_generation_if_current(event)
+                results.append(result)
+                continue
+            try:
+                result = _process_condition_event_with_db(db, collector, event)
+            except Exception as exc:
+                result = _record_condition_event_worker_failure(db, event, exc)
+            finally:
+                _clear_condition_event_generation_if_current(event)
+            results.append(result)
+            processed_count += 1
+            if result.get("accepted"):
+                accepted_count += 1
+            if result.get("failed"):
+                failed_count += 1
+                last_error = str(result.get("error") or last_error)
+    finally:
+        if db is not None:
+            close_database(db)
+    return {
+        "processed_count": processed_count,
+        "accepted_count": accepted_count,
+        "failed_count": failed_count,
+        "stale_skipped_count": stale_skipped_count,
+        "stale_queue_wait_skipped_count": stale_queue_wait_skipped_count,
+        "last_queue_wait_ms": last_queue_wait_ms,
+        "last_stale_queue_wait_ms": last_stale_queue_wait_ms,
+        "last_error": last_error,
+        "results": results,
+    }
+
+
+def _condition_event_stale_skip_result(event: GatewayEvent) -> dict[str, Any]:
+    trace = trace_from_payload(event.payload)
+    return {
+        "accepted": False,
+        "event_id": event.event_id,
+        "type": event.type,
+        "skipped": True,
+        "skip_reason": "STALE_CONDITION_EVENT_COALESCED",
+        "coalesce_key": str(trace.get("core_condition_event_coalesce_key") or _condition_event_coalesce_key(event) or ""),
+    }
+
+
+def _record_condition_event_stale_include_skip(
+    db: TradingDatabase,
+    collector: CandidateCollector,
+    event: GatewayEvent,
+    *,
+    worker_started_monotonic: float,
+    queue_wait_ms: float,
+) -> dict[str, Any]:
+    core_received_at = utc_now_ms()
+    trace = trace_from_payload(event.payload)
+    threshold_ms = _gateway_condition_event_stale_include_skip_ms()
+    event = _event_with_trace(
+        event,
+        {
+            "core_condition_event_worker_started_at_utc": core_received_at,
+            "core_condition_event_worker_started_monotonic_ms": worker_started_monotonic,
+            "core_condition_event_queue_wait_ms": queue_wait_ms,
+            "core_condition_event_stale_include_skipped": True,
+            "core_condition_event_stale_include_skip_ms": threshold_ms,
+            "core_condition_event_stale_reason": "STALE_CONDITION_INCLUDE_QUEUE_WAIT",
+            "core_event_received_at_utc": core_received_at,
+            "core_event_received_monotonic_ms": worker_started_monotonic,
+            "core_event_persisted_at_utc": utc_now_ms(),
+            "core_event_persisted_monotonic_ms": monotonic_ms(),
+        },
+    )
+    condition_event = BrokerConditionEvent.from_dict(event.payload)
+    collector.reject_condition_event(
+        condition_event,
+        "include",
+        warning=f"STALE_CONDITION_INCLUDE_QUEUE_WAIT:{condition_event.condition_name}:{condition_event.code}",
+        reason="stale condition include queue wait",
+    )
+    _save_gateway_event_transport_sample(
+        db,
+        event,
+        accepted=False,
+        core_receive_ms=wall_ms(trace.get("gateway_event_post_end_at_utc"), core_received_at),
+        core_persist_ms=0.0,
+        error="STALE_CONDITION_INCLUDE_QUEUE_WAIT",
+    )
+    return {
+        "accepted": False,
+        "event_id": event.event_id,
+        "type": event.type,
+        "skipped": True,
+        "skip_reason": "STALE_CONDITION_INCLUDE_QUEUE_WAIT",
+        "queue_wait_ms": queue_wait_ms,
+        "threshold_ms": threshold_ms,
+    }
+
+
+def _process_condition_event_with_db(db: TradingDatabase, collector: CandidateCollector, event: GatewayEvent) -> dict[str, Any]:
+    if event.type != "condition_event":
+        raise ValueError(f"unsupported async condition event type: {event.type}")
+    core_received_at = utc_now_ms()
+    core_received_monotonic = monotonic_ms()
+    trace = trace_from_payload(event.payload)
+    condition_queue_wait_ms = monotonic_delta_ms(
+        trace.get("core_condition_event_queued_monotonic_ms"),
+        core_received_monotonic,
+    )
+    event = _event_with_trace(
+        event,
+        {
+            "core_condition_event_worker_started_at_utc": core_received_at,
+            "core_condition_event_worker_started_monotonic_ms": core_received_monotonic,
+            "core_condition_event_queue_wait_ms": condition_queue_wait_ms,
+            "core_event_received_at_utc": core_received_at,
+            "core_event_received_monotonic_ms": core_received_monotonic,
+        },
+    )
+    process_started = time.perf_counter()
+    accepted = gateway_state.record_event(event)
+    persist_ms = 0.0
+    if accepted:
+        persist_started = time.perf_counter()
+        _persist_condition_event_with_collector(db, collector, event)
+        persist_ms = (time.perf_counter() - persist_started) * 1000.0
+        event = _event_with_trace(
+            event,
+            {
+                "core_condition_event_process_ms": (time.perf_counter() - process_started) * 1000.0,
+                "core_event_persisted_at_utc": utc_now_ms(),
+                "core_event_persisted_monotonic_ms": monotonic_ms(),
+            },
+        )
+        _queue_replay_tick_history(event)
+        _save_gateway_event_transport_sample(
+            db,
+            event,
+            accepted=True,
+            core_receive_ms=wall_ms(trace_from_payload(event.payload).get("gateway_event_post_end_at_utc"), core_received_at),
+            core_persist_ms=persist_ms,
+        )
+    else:
+        event = _event_with_trace(
+            event,
+            {
+                "core_condition_event_process_ms": (time.perf_counter() - process_started) * 1000.0,
+                "core_event_persisted_at_utc": utc_now_ms(),
+                "core_event_persisted_monotonic_ms": monotonic_ms(),
+            },
+        )
+        _save_gateway_event_transport_sample(
+            db,
+            event,
+            accepted=False,
+            core_receive_ms=wall_ms(trace_from_payload(event.payload).get("gateway_event_post_end_at_utc"), core_received_at),
+            core_persist_ms=persist_ms,
+            error="DUPLICATE_OR_REJECTED_EVENT",
+        )
     return {
         "accepted": accepted,
         "event_id": event.event_id,
@@ -1476,9 +5106,181 @@ async def _process_gateway_event(event: GatewayEvent) -> dict[str, Any]:
         "transport": {
             "core_receive_ms": wall_ms(trace_from_payload(event.payload).get("gateway_event_post_end_at_utc"), core_received_at),
             "core_persist_ms": persist_ms,
-            "runtime_forward_ms": runtime_forward_ms,
         },
     }
+
+
+def _record_condition_event_worker_failure(db: TradingDatabase, event: GatewayEvent, exc: Exception) -> dict[str, Any]:
+    core_received_at = utc_now_ms()
+    core_received_monotonic = monotonic_ms()
+    trace = trace_from_payload(event.payload)
+    condition_queue_wait_ms = monotonic_delta_ms(
+        trace.get("core_condition_event_queued_monotonic_ms"),
+        core_received_monotonic,
+    )
+    event = _event_with_trace(
+        event,
+        {
+            "core_condition_event_worker_started_at_utc": core_received_at,
+            "core_condition_event_worker_started_monotonic_ms": core_received_monotonic,
+            "core_condition_event_queue_wait_ms": condition_queue_wait_ms,
+            "core_condition_event_process_ms": 0.0,
+            "core_event_received_at_utc": core_received_at,
+            "core_event_received_monotonic_ms": core_received_monotonic,
+            "core_event_persisted_at_utc": utc_now_ms(),
+            "core_event_persisted_monotonic_ms": monotonic_ms(),
+        },
+    )
+    error = str(exc) or repr(exc)
+    try:
+        _save_gateway_event_transport_sample(
+            db,
+            event,
+            accepted=False,
+            core_receive_ms=wall_ms(trace.get("gateway_event_post_end_at_utc"), core_received_at),
+            core_persist_ms=0.0,
+            error=error,
+        )
+    except Exception:
+        pass
+    return {
+        "accepted": False,
+        "event_id": event.event_id,
+        "type": event.type,
+        "failed": True,
+        "error": error,
+        "transport": {
+            "core_receive_ms": wall_ms(trace.get("gateway_event_post_end_at_utc"), core_received_at),
+            "core_persist_ms": 0.0,
+        },
+    }
+
+
+def _persist_condition_event_with_collector(db: TradingDatabase, collector: CandidateCollector, event: GatewayEvent) -> None:
+    if event.type != "condition_event":
+        _persist_gateway_event(db, event)
+        return
+    condition_event = BrokerConditionEvent.from_dict(event.payload)
+    if condition_event.event_type == "remove":
+        collector.handle_condition_remove(condition_event)
+    else:
+        collector.handle_condition_include(condition_event)
+
+
+def _update_gateway_condition_event_worker_state(patch: dict[str, Any]) -> None:
+    gateway_condition_event_worker_state.update({key: value for key, value in patch.items() if value is not None})
+
+
+def _dashboard_float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, value)
+
+
+def _dashboard_snapshot_cache_ttl_sec() -> float:
+    return _dashboard_float_env("TRADING_DASHBOARD_SNAPSHOT_CACHE_TTL_SEC", DASHBOARD_SNAPSHOT_CACHE_TTL_SEC)
+
+
+def _dashboard_heavy_section_cache_ttl_sec() -> float:
+    return _dashboard_float_env("TRADING_DASHBOARD_HEAVY_SECTION_CACHE_TTL_SEC", DASHBOARD_HEAVY_SECTION_CACHE_TTL_SEC)
+
+
+def _dashboard_ws_push_interval_sec() -> float:
+    return _dashboard_float_env("TRADING_DASHBOARD_WS_PUSH_INTERVAL_SEC", DASHBOARD_WS_PUSH_INTERVAL_SEC, minimum=1.0)
+
+
+def _dashboard_snapshot_detail(detail: str | None = None) -> str:
+    value = str(detail or DASHBOARD_SNAPSHOT_DETAIL_SLIM).strip().lower()
+    if value in {DASHBOARD_SNAPSHOT_DETAIL_FULL, "debug", "verbose"}:
+        return DASHBOARD_SNAPSHOT_DETAIL_FULL
+    return DASHBOARD_SNAPSHOT_DETAIL_SLIM
+
+
+def _dashboard_database_cache_key(db: TradingDatabase | None = None) -> str:
+    if db is not None and getattr(db, "path", None) is not None:
+        return str(Path(db.path).resolve())
+    try:
+        return str(Path(get_settings().db_path).resolve())
+    except Exception:
+        return ""
+
+
+def _cached_dashboard_fragment(
+    db: TradingDatabase,
+    key: str,
+    builder,
+    *,
+    ttl_sec: float | None = None,
+):
+    ttl = _dashboard_heavy_section_cache_ttl_sec() if ttl_sec is None else max(0.0, float(ttl_sec))
+    if ttl <= 0.0:
+        return builder()
+    cache_key = (_dashboard_database_cache_key(db), key)
+    now = time.monotonic()
+    with _dashboard_snapshot_cache_lock:
+        cached = _dashboard_fragment_cache.get(cache_key)
+        if cached is not None and now - cached[0] <= ttl:
+            return cached[1]
+        value = builder()
+        _dashboard_fragment_cache[cache_key] = (time.monotonic(), value)
+        return value
+
+
+def _build_dashboard_snapshot_payload_uncached(*, detail: str = DASHBOARD_SNAPSHOT_DETAIL_SLIM) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return build_dashboard_snapshot(db, detail=detail)
+    finally:
+        close_database(db)
+
+
+def _build_dashboard_snapshot_payload(*, force: bool = False, detail: str = DASHBOARD_SNAPSHOT_DETAIL_SLIM) -> dict[str, Any]:
+    global _dashboard_snapshot_cache_payload
+    global _dashboard_snapshot_cache_db_path
+    global _dashboard_snapshot_cache_monotonic
+    global _dashboard_snapshot_cache_build_ms
+    global _dashboard_snapshot_cache_hit_count
+    global _dashboard_snapshot_cache_miss_count
+    resolved_detail = _dashboard_snapshot_detail(detail)
+    ttl = _dashboard_snapshot_cache_ttl_sec()
+    db_path = f"{_dashboard_database_cache_key()}:{resolved_detail}"
+    if ttl <= 0.0:
+        return _build_dashboard_snapshot_payload_uncached(detail=resolved_detail)
+    now = time.monotonic()
+    with _dashboard_snapshot_cache_lock:
+        if (
+            not force
+            and _dashboard_snapshot_cache_payload is not None
+            and _dashboard_snapshot_cache_db_path == db_path
+            and now - _dashboard_snapshot_cache_monotonic <= ttl
+        ):
+            _dashboard_snapshot_cache_hit_count += 1
+            return _dashboard_snapshot_cache_payload
+        _dashboard_snapshot_cache_miss_count += 1
+        started = time.perf_counter()
+        payload = _build_dashboard_snapshot_payload_uncached(detail=resolved_detail)
+        _dashboard_snapshot_cache_build_ms = (time.perf_counter() - started) * 1000.0
+        _dashboard_snapshot_cache_payload = payload
+        _dashboard_snapshot_cache_db_path = db_path
+        _dashboard_snapshot_cache_monotonic = time.monotonic()
+        return payload
+
+
+def _dashboard_snapshot_for_client_count(payload: dict[str, Any], client_count: int) -> dict[str, Any]:
+    snapshot = dict(payload)
+    gateway = dict(snapshot.get("gateway") or {})
+    gateway["dashboard_snapshot_detail"] = _dashboard_snapshot_detail(snapshot.get("snapshot_detail"))
+    gateway["dashboard_ws_client_count"] = int(client_count)
+    with _dashboard_snapshot_cache_lock:
+        cache_age_sec = max(0.0, time.monotonic() - _dashboard_snapshot_cache_monotonic) if _dashboard_snapshot_cache_payload is not None else 0.0
+        gateway["dashboard_snapshot_cache_age_sec"] = round(cache_age_sec, 3)
+        gateway["dashboard_snapshot_cache_build_ms"] = round(float(_dashboard_snapshot_cache_build_ms or 0.0), 3)
+        gateway["dashboard_snapshot_cache_hit_count"] = int(_dashboard_snapshot_cache_hit_count)
+        gateway["dashboard_snapshot_cache_miss_count"] = int(_dashboard_snapshot_cache_miss_count)
+    snapshot["gateway"] = gateway
+    return snapshot
 
 
 async def _schedule_dashboard_snapshot_broadcast() -> None:
@@ -1501,8 +5303,8 @@ async def _broadcast_dashboard_snapshot_after(delay_sec: float) -> None:
     if dashboard_connections.client_count <= 0:
         return
     payload = await asyncio.to_thread(_build_dashboard_snapshot_payload)
-    payload["gateway"]["dashboard_ws_client_count"] = dashboard_connections.client_count
-    await dashboard_connections.broadcast_json({"type": "snapshot", "snapshot": payload})
+    snapshot = _dashboard_snapshot_for_client_count(payload, dashboard_connections.client_count)
+    await dashboard_connections.broadcast_json({"type": "snapshot", "snapshot": snapshot})
     _dashboard_snapshot_last_sent_monotonic = time.monotonic()
 
 
@@ -1511,14 +5313,6 @@ def _consume_dashboard_snapshot_task(task: asyncio.Task) -> None:
         task.result()
     except Exception:
         pass
-
-
-def _build_dashboard_snapshot_payload() -> dict[str, Any]:
-    db = open_database()
-    try:
-        return build_dashboard_snapshot(db)
-    finally:
-        close_database(db)
 
 
 @app.get("/api/gateway/commands", response_model=GatewayCommandBatch)
@@ -1764,13 +5558,153 @@ async def dashboard_ws(websocket: WebSocket) -> None:
     try:
         while True:
             payload = await asyncio.to_thread(_build_dashboard_snapshot_payload)
-            payload["gateway"]["dashboard_ws_client_count"] = dashboard_connections.client_count
-            await dashboard_connections.send_json(websocket, {"type": "snapshot", "snapshot": payload})
-            await asyncio.sleep(2.0)
+            snapshot_payload = _dashboard_snapshot_for_client_count(payload, dashboard_connections.client_count)
+            await dashboard_connections.send_json(websocket, {"type": "snapshot", "snapshot": snapshot_payload})
+            await asyncio.sleep(_dashboard_ws_push_interval_sec())
     except WebSocketDisconnect:
         dashboard_connections.disconnect(websocket)
     except Exception:
         dashboard_connections.disconnect(websocket)
+
+
+def _core_ws_outbound_queue_max_size() -> int:
+    try:
+        value = int(os.environ.get("TRADING_CORE_WS_OUTBOUND_QUEUE_SIZE", "1000"))
+    except ValueError:
+        value = 1000
+    return max(1, value)
+
+
+def _core_ws_send_slow_ms() -> float:
+    try:
+        value = float(os.environ.get("TRADING_CORE_WS_SEND_SLOW_MS", "1000"))
+    except ValueError:
+        value = 1000.0
+    return max(1.0, value)
+
+
+def _core_ws_outbound_metadata(queue: asyncio.Queue[_CoreWsOutboundMessage]) -> dict[str, Any]:
+    return {
+        "core_ws_outbound_queue_size": queue.qsize(),
+        "core_ws_outbound_queue_max_size": queue.maxsize,
+        "core_ws_last_send_json_ms": float(gateway_ws_transport_state.get("core_ws_last_send_json_ms") or 0.0),
+        "core_ws_last_send_queue_wait_ms": float(
+            gateway_ws_transport_state.get("core_ws_last_send_queue_wait_ms") or 0.0
+        ),
+    }
+
+
+def _queue_core_ws_outbound(
+    queue: asyncio.Queue[_CoreWsOutboundMessage],
+    payload: dict[str, Any],
+    *,
+    connection_id: str,
+) -> None:
+    queued_at = utc_now_ms()
+    item = _CoreWsOutboundMessage(
+        payload=payload,
+        message_type=str(payload.get("type") or ""),
+        queued_at=queued_at,
+        queued_monotonic_ms=monotonic_ms(),
+        connection_id=connection_id,
+    )
+    try:
+        queue.put_nowait(item)
+    except asyncio.QueueFull as exc:
+        dropped_count = int(gateway_ws_transport_state.get("core_ws_outbound_dropped_count") or 0) + 1
+        _update_gateway_ws_transport_state(
+            {
+                "core_ws_outbound_writer_active": True,
+                "core_ws_outbound_queue_size": queue.qsize(),
+                "core_ws_outbound_queue_max_size": queue.maxsize,
+                "core_ws_outbound_dropped_count": dropped_count,
+                "last_error": "CORE_WS_OUTBOUND_QUEUE_FULL",
+                "last_error_type": type(exc).__name__,
+                "last_error_stage": "core_ws_outbound_enqueue",
+                "last_error_at": queued_at,
+            }
+        )
+        raise RuntimeError("CORE_WS_OUTBOUND_QUEUE_FULL") from exc
+    _update_gateway_ws_transport_state(
+        {
+            "core_ws_outbound_writer_active": True,
+            "core_ws_outbound_queue_size": queue.qsize(),
+            "core_ws_outbound_queue_max_size": queue.maxsize,
+            "core_ws_outbound_queued_count": int(gateway_ws_transport_state.get("core_ws_outbound_queued_count") or 0) + 1,
+        }
+    )
+
+
+async def _core_ws_outbound_writer_loop(
+    websocket: WebSocket,
+    queue: asyncio.Queue[_CoreWsOutboundMessage],
+) -> None:
+    while True:
+        item = await queue.get()
+        try:
+            queue_wait_ms = monotonic_delta_ms(item.queued_monotonic_ms, monotonic_ms()) or 0.0
+            send_started = time.perf_counter()
+            await websocket.send_json(item.payload)
+            send_ms = (time.perf_counter() - send_started) * 1000.0
+            sent_at = utc_now_ms()
+            patch: dict[str, Any] = {
+                "core_ws_outbound_writer_active": True,
+                "core_ws_outbound_queue_size": queue.qsize(),
+                "core_ws_outbound_queue_max_size": queue.maxsize,
+                "core_ws_outbound_sent_count": int(gateway_ws_transport_state.get("core_ws_outbound_sent_count") or 0) + 1,
+                "core_ws_last_send_json_ms": send_ms,
+                "core_ws_last_send_queue_wait_ms": queue_wait_ms,
+                "core_ws_last_send_json_type": item.message_type,
+                "core_ws_last_send_json_at": sent_at,
+            }
+            if send_ms >= _core_ws_send_slow_ms():
+                patch.update(
+                    {
+                        "core_ws_slow_send_count": int(gateway_ws_transport_state.get("core_ws_slow_send_count") or 0) + 1,
+                        "core_ws_last_slow_send_json_ms": send_ms,
+                        "core_ws_last_slow_send_at": sent_at,
+                    }
+                )
+            _update_gateway_ws_transport_state(patch)
+        except Exception as exc:
+            _update_gateway_ws_transport_state(
+                {
+                    "core_ws_outbound_writer_active": False,
+                    "core_ws_outbound_queue_size": queue.qsize(),
+                    "last_error": _truncate_log_detail(str(exc) or repr(exc)),
+                    "last_error_type": type(exc).__name__,
+                    "last_error_stage": "core_ws_send_json",
+                    "last_error_at": utc_now_ms(),
+                }
+            )
+            raise
+        finally:
+            queue.task_done()
+
+
+async def _stop_core_ws_outbound_writer(
+    task: asyncio.Task,
+    queue: asyncio.Queue[_CoreWsOutboundMessage],
+) -> None:
+    if not task.done():
+        try:
+            await asyncio.wait_for(queue.join(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+    _update_gateway_ws_transport_state(
+        {
+            "core_ws_outbound_writer_active": False,
+            "core_ws_outbound_queue_size": 0,
+            "core_ws_outbound_queue_max_size": queue.maxsize,
+        }
+    )
 
 
 @app.websocket("/ws/gateway/transport")
@@ -1783,6 +5717,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
     connection_id = f"ws_conn_{id(websocket)}"
     sequence = 0
     connection_transport_mode = TRANSPORT_MODE_WEBSOCKET_MOCK
+    outbound_queue: asyncio.Queue[_CoreWsOutboundMessage] = asyncio.Queue(maxsize=_core_ws_outbound_queue_max_size())
+    outbound_writer_task = asyncio.create_task(_core_ws_outbound_writer_loop(websocket, outbound_queue))
     _update_gateway_ws_transport_state(
         {
             "connected": True,
@@ -1790,9 +5726,13 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
             "transport_mode": connection_transport_mode,
             "ws_session_id": session_id,
             "ws_connection_id": connection_id,
+            "core_ws_outbound_writer_active": True,
+            "core_ws_outbound_queue_size": 0,
+            "core_ws_outbound_queue_max_size": outbound_queue.maxsize,
         }
     )
-    await websocket.send_json(
+    _queue_core_ws_outbound(
+        outbound_queue,
         GatewayWsMessage(
             type="hello_ack",
             source="core",
@@ -1802,14 +5742,72 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                 "real_gateway_switch_ready": False,
             },
             metadata={"connection_id": connection_id, "websocket_session_id": session_id},
-        ).to_dict()
+        ).to_dict(),
+        connection_id=connection_id,
     )
+    last_receive_done_monotonic = monotonic_ms()
     try:
         while True:
+            if outbound_writer_task.done():
+                await outbound_writer_task
+            receive_ready_monotonic = monotonic_ms()
+            receive_loop_gap_ms = monotonic_delta_ms(last_receive_done_monotonic, receive_ready_monotonic) or 0.0
             receive_started = time.perf_counter()
-            raw = await websocket.receive_json()
+            raw_text = await websocket.receive_text()
             receive_ms = (time.perf_counter() - receive_started) * 1000.0
-            message = GatewayWsMessage.from_dict(raw)
+            last_receive_done_monotonic = monotonic_ms()
+            _update_gateway_ws_transport_state(
+                {
+                    "core_ws_last_receive_text_ms": receive_ms,
+                    "core_ws_receive_loop_gap_ms": receive_loop_gap_ms,
+                    "core_ws_outbound_queue_size": outbound_queue.qsize(),
+                    "core_ws_outbound_queue_max_size": outbound_queue.maxsize,
+                }
+            )
+            try:
+                raw = json.loads(raw_text)
+                if not isinstance(raw, dict):
+                    raise ValueError("websocket message must be a JSON object")
+                message = GatewayWsMessage.from_dict(raw)
+            except Exception as exc:
+                metadata = {
+                    "connection_id": connection_id,
+                    "websocket_session_id": session_id,
+                    "ws_connection_id": connection_id,
+                    "ws_session_id": session_id,
+                    "transport_mode": connection_transport_mode,
+                    "ws_receive_ms": receive_ms,
+                    "ws_message_sequence": sequence,
+                    "core_ws_receive_loop_gap_ms": receive_loop_gap_ms,
+                    **_core_ws_outbound_metadata(outbound_queue),
+                }
+                _record_gateway_ws_protocol_error(
+                    exc,
+                    stage="receive_decode",
+                    connection_transport_mode=connection_transport_mode,
+                    session_id=session_id,
+                    connection_id=connection_id,
+                )
+                await _send_gateway_ws_error(
+                    websocket,
+                    code="BAD_MESSAGE",
+                    message="invalid websocket message",
+                    metadata=metadata,
+                    sequence=sequence,
+                    outbound_queue=outbound_queue,
+                    connection_id=connection_id,
+                )
+                continue
+            if gateway_ws_transport_state.get("state") == "PROTOCOL_ERROR":
+                _update_gateway_ws_transport_state(
+                    {
+                        "connected": True,
+                        "state": "CONNECTED",
+                        "transport_mode": connection_transport_mode,
+                        "ws_session_id": session_id,
+                        "ws_connection_id": connection_id,
+                    }
+                )
             sequence = message.sequence or sequence + 1
             if message.type == "hello":
                 connection_transport_mode = _ws_message_transport_mode(message, default=connection_transport_mode)
@@ -1823,6 +5821,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                 "transport_mode": message_transport_mode,
                 "ws_receive_ms": receive_ms,
                 "ws_message_sequence": sequence,
+                "core_ws_receive_loop_gap_ms": receive_loop_gap_ms,
+                **_core_ws_outbound_metadata(outbound_queue),
             }
             if message.type == "hello":
                 _update_gateway_ws_transport_state(
@@ -1836,7 +5836,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                         "reconnect_count": int(message.payload.get("reconnect_count") or message.metadata.get("ws_reconnect_count") or 0),
                     }
                 )
-                await websocket.send_json(
+                _queue_core_ws_outbound(
+                    outbound_queue,
                     GatewayWsMessage(
                         type="hello_ack",
                         trace_id=message.trace_id,
@@ -1848,10 +5849,12 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                         },
                         metadata=metadata,
                         sequence=sequence,
-                    ).to_dict()
+                    ).to_dict(),
+                    connection_id=connection_id,
                 )
             elif message.type == "ping":
-                await websocket.send_json(
+                _queue_core_ws_outbound(
+                    outbound_queue,
                     GatewayWsMessage(
                         type="pong",
                         trace_id=message.trace_id,
@@ -1859,7 +5862,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                         payload={"received_at": utc_now_ms()},
                         metadata=metadata,
                         sequence=sequence,
-                    ).to_dict()
+                    ).to_dict(),
+                    connection_id=connection_id,
                 )
             elif message.type == "ready_for_commands":
                 limit = int(message.payload.get("limit") or 20)
@@ -1891,7 +5895,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                             )
                     finally:
                         close_database(db)
-                await websocket.send_json(
+                _queue_core_ws_outbound(
+                    outbound_queue,
                     GatewayWsMessage(
                         type="core_command_batch",
                         trace_id=message.trace_id,
@@ -1899,13 +5904,18 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                         payload={"commands": payloads, "count": len(payloads), "timestamp": sent_at},
                         metadata=metadata,
                         sequence=sequence,
-                    ).to_dict()
+                    ).to_dict(),
+                    connection_id=connection_id,
                 )
             elif message.type == "transport_heartbeat":
                 event = _gateway_event_from_ws_message(message, metadata=metadata)
-                _record_ws_message_side_effects(event, metadata)
-                _maybe_record_ws_pilot_diagnostic_log(dict(event.payload or {}))
-                await websocket.send_json(
+                queue_result = _enqueue_core_ws_event_work(
+                    kind="transport_heartbeat",
+                    event=event,
+                    metadata=metadata,
+                )
+                _queue_core_ws_outbound(
+                    outbound_queue,
                     GatewayWsMessage(
                         type="event_ack",
                         trace_id=message.trace_id,
@@ -1913,20 +5923,135 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                         event_id=event.event_id,
                         command_id=event.command_id,
                         payload={
-                            "accepted": True,
+                            "accepted": bool(queue_result.get("accepted")),
                             "event_id": event.event_id,
                             "type": event.type,
                             "transport_only": True,
+                            "queued": bool(queue_result.get("queued")),
+                            "queue_size": int(queue_result.get("queue_size") or 0),
+                            "queue_max_size": int(queue_result.get("queue_max_size") or 0),
+                            "reason": str(queue_result.get("reason") or ""),
                         },
                         metadata=metadata,
                         sequence=sequence,
-                    ).to_dict()
+                    ).to_dict(),
+                    connection_id=connection_id,
+                )
+            elif message.type == "transport_send_completed":
+                queue_result = _enqueue_core_ws_event_work(
+                    kind="send_completed",
+                    message=message,
+                    metadata=metadata,
+                )
+                result = {
+                    "accepted": bool(queue_result.get("accepted")),
+                    "type": "transport_send_completed",
+                    "queued": bool(queue_result.get("queued")),
+                    "updated": False,
+                    "queue_size": int(queue_result.get("queue_size") or 0),
+                    "queue_max_size": int(queue_result.get("queue_max_size") or 0),
+                    "reason": str(queue_result.get("reason") or ""),
+                }
+                _queue_core_ws_outbound(
+                    outbound_queue,
+                    GatewayWsMessage(
+                        type="event_ack",
+                        trace_id=message.trace_id,
+                        source="core",
+                        event_id=message.event_id,
+                        command_id=message.command_id,
+                        payload=result,
+                        metadata=metadata,
+                        sequence=sequence,
+                    ).to_dict(),
+                    connection_id=connection_id,
+                )
+            elif message.type == "condition_event_batch":
+                events = _gateway_events_from_ws_batch_message(message, metadata=metadata)
+                if _gateway_condition_event_async_enabled():
+                    queue_result = _enqueue_gateway_condition_events(events, metadata)
+                    accepted_count = int(queue_result.get("queued_count") or 0)
+                    ack_payload = {
+                        "accepted": bool(queue_result.get("accepted")),
+                        "queued": bool(queue_result.get("queued")),
+                        "type": "condition_event_batch",
+                        "batch_id": message.payload.get("batch_id") or message.event_id,
+                        "count": len(events),
+                        "accepted_count": accepted_count,
+                        "queued_count": accepted_count,
+                        "coalesced_count": int(queue_result.get("coalesced_count") or 0),
+                        "dropped_count": int(queue_result.get("dropped_count") or 0),
+                        "queue_size": int(queue_result.get("queue_size") or 0),
+                        "queue_batch_count": int(queue_result.get("queue_batch_count") or 0),
+                        "queue_max_size": int(queue_result.get("queue_max_size") or 0),
+                        "reason": str(queue_result.get("reason") or ""),
+                        "event_ids": [event.event_id for event in events],
+                    }
+                else:
+                    results = []
+                    for event in events:
+                        _record_ws_message_side_effects(event, metadata)
+                        results.append(await _process_gateway_event(event))
+                    accepted_count = sum(1 for result in results if result.get("accepted"))
+                    ack_payload = {
+                        "accepted": accepted_count == len(events),
+                        "queued": False,
+                        "type": "condition_event_batch",
+                        "batch_id": message.payload.get("batch_id") or message.event_id,
+                        "count": len(events),
+                        "accepted_count": accepted_count,
+                        "queued_count": 0,
+                        "dropped_count": 0,
+                        "event_ids": [str(result.get("event_id") or "") for result in results],
+                    }
+                _queue_core_ws_outbound(
+                    outbound_queue,
+                    GatewayWsMessage(
+                        type="event_ack",
+                        trace_id=message.trace_id,
+                        source="core",
+                        event_id=message.event_id,
+                        command_id=message.command_id,
+                        payload=ack_payload,
+                        metadata={**metadata, "condition_event_batch_count": len(events)},
+                        sequence=sequence,
+                    ).to_dict(),
+                    connection_id=connection_id,
                 )
             elif message.type in {"gateway_event", "heartbeat", "command_started", "command_ack", "command_failed", "rate_limited"}:
                 event = _gateway_event_from_ws_message(message, metadata=metadata)
-                _record_ws_message_side_effects(event, metadata)
-                result = await _process_gateway_event(event)
-                await websocket.send_json(
+                if event.type == "condition_event" and _gateway_condition_event_async_enabled():
+                    queue_result = _enqueue_gateway_condition_events([event], metadata)
+                    result = {
+                        "accepted": bool(queue_result.get("accepted")),
+                        "event_id": event.event_id,
+                        "type": event.type,
+                        "queued": bool(queue_result.get("queued")),
+                        "queued_count": int(queue_result.get("queued_count") or 0),
+                        "coalesced_count": int(queue_result.get("coalesced_count") or 0),
+                        "dropped_count": int(queue_result.get("dropped_count") or 0),
+                        "queue_size": int(queue_result.get("queue_size") or 0),
+                        "queue_max_size": int(queue_result.get("queue_max_size") or 0),
+                        "reason": str(queue_result.get("reason") or ""),
+                    }
+                else:
+                    queue_result = _enqueue_core_ws_event_work(
+                        kind="gateway_event",
+                        event=event,
+                        metadata=metadata,
+                    )
+                    result = {
+                        "accepted": bool(queue_result.get("accepted")),
+                        "event_id": event.event_id,
+                        "type": event.type,
+                        "queued": bool(queue_result.get("queued")),
+                        "coalesced": bool(queue_result.get("coalesced")),
+                        "queue_size": int(queue_result.get("queue_size") or 0),
+                        "queue_max_size": int(queue_result.get("queue_max_size") or 0),
+                        "reason": str(queue_result.get("reason") or ""),
+                    }
+                _queue_core_ws_outbound(
+                    outbound_queue,
                     GatewayWsMessage(
                         type="event_ack",
                         trace_id=message.trace_id,
@@ -1936,7 +6061,8 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                         payload=result,
                         metadata=metadata,
                         sequence=sequence,
-                    ).to_dict()
+                    ).to_dict(),
+                    connection_id=connection_id,
                 )
             else:
                 event = GatewayEvent(
@@ -1945,6 +6071,16 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                     payload={"message": f"unsupported websocket message type: {message.type}", "metadata": metadata},
                 )
                 await _process_gateway_event(event)
+                await _send_gateway_ws_error(
+                    websocket,
+                    code="UNSUPPORTED_MESSAGE_TYPE",
+                    message=f"unsupported websocket message type: {message.type}",
+                    metadata=metadata,
+                    trace_id=message.trace_id,
+                    sequence=sequence,
+                    outbound_queue=outbound_queue,
+                    connection_id=connection_id,
+                )
     except WebSocketDisconnect:
         _update_gateway_ws_transport_state(
             {
@@ -1956,28 +6092,292 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
             }
         )
         return
+    except Exception as exc:
+        _record_gateway_ws_protocol_error(
+            exc,
+            stage="connection_loop",
+            connection_transport_mode=connection_transport_mode,
+            session_id=session_id,
+            connection_id=connection_id,
+        )
+        _update_gateway_ws_transport_state(
+            {
+                "connected": False,
+                "state": "ERROR",
+                "transport_mode": connection_transport_mode,
+                "ws_session_id": session_id,
+                "ws_connection_id": connection_id,
+            }
+        )
+        return
+    finally:
+        await _stop_core_ws_outbound_writer(outbound_writer_task, outbound_queue)
 
 
+def _dashboard_field_subset(payload: dict[str, Any], fields: tuple[str, ...] | list[str]) -> dict[str, Any]:
+    return {field: payload.get(field) for field in fields if field in payload}
 
-def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
+
+def _dashboard_slim_gateway_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    gateway = _dashboard_field_subset(
+        dict(payload or {}),
+        (
+            "connection_state",
+            "connected",
+            "kiwoom_logged_in",
+            "orderable",
+            "mode",
+            "account",
+            "last_heartbeat_at",
+            "last_event_at",
+            "last_error",
+            "heartbeat_timeout_sec",
+            "heartbeat_age_sec",
+            "heartbeat_ok",
+            "pending_command_count",
+            "received_event_count",
+            "deduped_event_count",
+            "reconnect_count",
+            "gateway_client_id",
+        ),
+    )
+    heartbeat = dict((payload or {}).get("last_heartbeat_payload") or {})
+    if heartbeat:
+        gateway["last_heartbeat_summary"] = _dashboard_field_subset(
+            heartbeat,
+            (
+                "transport_mode",
+                "ws_connection_state",
+                "ws_session_id",
+                "ws_reconnect_count",
+                "ws_fallback_reason",
+                "gateway_event_queue_size",
+                "gateway_command_queue_size",
+            ),
+        )
+    return gateway
+
+
+def _dashboard_slim_command_record(record: dict[str, Any]) -> dict[str, Any]:
+    command = dict(record.get("command") or {})
+    return {
+        "command_id": record.get("command_id") or command.get("command_id") or "",
+        "command_type": record.get("command_type") or command.get("type") or "",
+        "status": record.get("status") or "",
+        "priority": record.get("priority") or "",
+        "created_at": record.get("created_at") or command.get("timestamp") or "",
+        "dispatched_at": record.get("dispatched_at") or "",
+        "acked_at": record.get("acked_at") or "",
+        "finished_at": record.get("finished_at") or "",
+        "expires_at": record.get("expires_at") or "",
+        "attempts": record.get("attempts") or 0,
+        "max_attempts": record.get("max_attempts") or 0,
+        "last_error": record.get("last_error") or "",
+        "source": record.get("source") or command.get("source") or "",
+    }
+
+
+def _dashboard_slim_commands_payload(payload: dict[str, Any], *, recent_limit: int = 5) -> dict[str, Any]:
+    commands = dict(payload or {})
+    commands["recent"] = [
+        _dashboard_slim_command_record(dict(item or {}))
+        for item in list(commands.get("recent") or [])[:recent_limit]
+    ]
+    return commands
+
+
+def _dashboard_slim_themes_payload(payload: dict[str, Any], *, item_limit: int = 20) -> dict[str, Any]:
+    return {
+        "summary": dict((payload or {}).get("summary") or {}),
+        "items": [
+            _dashboard_field_subset(
+                dict(item or {}),
+                ("rank", "theme_id", "theme_name", "theme_score", "breadth", "leader_gap", "top3_concentration", "status"),
+            )
+            for item in list((payload or {}).get("items") or [])[:item_limit]
+        ],
+    }
+
+
+def _dashboard_slim_orders_payload(payload: dict[str, Any], *, item_limit: int = 10) -> dict[str, Any]:
+    order_results = []
+    for item in list((payload or {}).get("order_results") or [])[:item_limit]:
+        row = dict(item or {})
+        request = dict(row.get("request") or {})
+        order_results.append(
+            {
+                "id": row.get("id"),
+                "created_at": row.get("created_at") or "",
+                "ok": bool(row.get("ok")),
+                "result_code": row.get("result_code") or "",
+                "message": row.get("message") or "",
+                "request": _dashboard_field_subset(request, ("code", "side", "quantity", "price", "order_type", "tag")),
+            }
+        )
+    return {
+        "summary": dict((payload or {}).get("summary") or {}),
+        "order_results": order_results,
+        "executions": [
+            _dashboard_field_subset(
+                dict(item or {}),
+                (
+                    "id",
+                    "created_at",
+                    "code",
+                    "order_no",
+                    "side",
+                    "quantity",
+                    "price",
+                    "filled_quantity",
+                    "remaining_quantity",
+                    "tag",
+                ),
+            )
+            for item in list((payload or {}).get("executions") or [])[:item_limit]
+        ],
+        "positions": list((payload or {}).get("positions") or [])[:item_limit],
+        "virtual_orders": [
+            _dashboard_field_subset(
+                dict(item or {}),
+                ("id", "candidate_id", "entry_plan_id", "leg_index", "weight_pct", "status", "limit_price", "submitted_at"),
+            )
+            for item in list((payload or {}).get("virtual_orders") or [])[:item_limit]
+        ],
+    }
+
+
+def _dashboard_slim_reviews_payload(payload: dict[str, Any], *, item_limit: int = 10) -> dict[str, Any]:
+    review_fields = (
+        "id",
+        "candidate_id",
+        "code",
+        "trade_date",
+        "final_status",
+        "max_return_5m",
+        "max_return_10m",
+        "max_return_20m",
+        "false_positive_flag",
+        "false_negative_flag",
+        "blocked_but_later_rallied",
+        "expired_but_later_rallied",
+    )
+    return {
+        "summary": dict((payload or {}).get("summary") or {}),
+        "items": [
+            _dashboard_field_subset(dict(item or {}), review_fields)
+            for item in list((payload or {}).get("items") or [])[:item_limit]
+        ],
+    }
+
+
+def _dashboard_slim_theme_lab_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    data_quality = dict((payload or {}).get("data_quality") or {})
+    return {
+        "available": bool((payload or {}).get("available")),
+        "source": (payload or {}).get("source") or "",
+        "created_at": (payload or {}).get("created_at") or "",
+        "calculated_at": (payload or {}).get("calculated_at") or "",
+        "last_updated_at": (payload or {}).get("last_updated_at") or "",
+        "summary": dict((payload or {}).get("summary") or {}),
+        "data_quality": _dashboard_field_subset(
+            data_quality,
+            (
+                "status",
+                "message",
+                "watchset_size",
+                "stale",
+                "age_sec",
+                "snapshot_age_sec",
+                "calculated_age_sec",
+                "vi_status_supported",
+                "condition_coverage_pct",
+                "candle_missing_count",
+            ),
+        ),
+        "runtime": _dashboard_field_subset(dict((payload or {}).get("runtime") or {}), ("enabled", "running", "mode")),
+        "gateway": _dashboard_field_subset(
+            dict((payload or {}).get("gateway") or {}),
+            ("connected", "heartbeat_ok", "kiwoom_logged_in", "orderable", "connection_state"),
+        ),
+    }
+
+
+def _dashboard_slim_logs_payload(payload: dict[str, Any], *, item_limit: int = 40) -> dict[str, Any]:
+    return {
+        "core": list((payload or {}).get("core") or [])[:item_limit],
+        "gateway": list((payload or {}).get("gateway") or [])[: max(10, item_limit // 4)],
+        "items": list((payload or {}).get("items") or [])[:item_limit],
+        "warnings": list((payload or {}).get("warnings") or [])[:10],
+        "timezone": (payload or {}).get("timezone") or "Asia/Seoul",
+        "live_window_sec": (payload or {}).get("live_window_sec") or LOG_LIVE_WINDOW_SEC,
+        "stale_core_log_count": (payload or {}).get("stale_core_log_count") or 0,
+        "hidden_gateway_event_counts": dict((payload or {}).get("hidden_gateway_event_counts") or {}),
+    }
+
+
+def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNAPSHOT_DETAIL_SLIM) -> dict[str, Any]:
+    resolved_detail = _dashboard_snapshot_detail(detail)
+    full_detail = resolved_detail == DASHBOARD_SNAPSHOT_DETAIL_FULL
     status_payload = api_status()
     commands_payload = dict(status_payload["commands"])
-    commands_payload["recent"] = gateway_state.list_commands(limit=12, include_finished=True)
-    candidates_payload = build_candidates_snapshot(db)
-    themes_payload = build_themes_snapshot(db)
-    orders_payload = build_orders_snapshot(db)
-    reviews_payload = build_reviews_snapshot(db)
-    logs_payload = build_logs_snapshot(db)
+    commands_payload["recent"] = gateway_state.list_commands(limit=12 if full_detail else 5, include_finished=True)
+    if not full_detail:
+        commands_payload = _dashboard_slim_commands_payload(commands_payload, recent_limit=5)
+    candidates_payload = build_candidates_snapshot(db, limit=200 if full_detail else 40)
+    themes_payload = _cached_dashboard_fragment(
+        db,
+        "themes:v2:50" if full_detail else "themes:v2:20",
+        lambda: build_themes_snapshot(db, limit=50 if full_detail else 20),
+    )
+    if not full_detail:
+        themes_payload = _dashboard_slim_themes_payload(themes_payload, item_limit=20)
+    orders_payload = build_orders_snapshot(db, limit=100 if full_detail else 10)
+    if not full_detail:
+        orders_payload = _dashboard_slim_orders_payload(orders_payload, item_limit=10)
+    reviews_payload = _cached_dashboard_fragment(
+        db,
+        "reviews:v2:100" if full_detail else "reviews:v2:10",
+        lambda: build_reviews_snapshot(db, limit=100 if full_detail else 10),
+    )
+    if not full_detail:
+        reviews_payload = _dashboard_slim_reviews_payload(reviews_payload, item_limit=10)
+    logs_payload = build_logs_snapshot(db, limit=100 if full_detail else 40)
+    if not full_detail:
+        logs_payload = _dashboard_slim_logs_payload(logs_payload, item_limit=40)
     transport_payload = dict(status_payload.get("transport") or _transport_dashboard_payload(_transport_status_payload(db)))
     transport_experiment_payload = _transport_experiment_dashboard_payload(db)
     runtime_status = runtime_supervisor.status()
     runtime_payload = _runtime_dashboard_payload(runtime_status)
     dry_run_orders_payload = {
         "summary": db.runtime_order_intent_summary(),
-        "items": db.list_runtime_order_intents(limit=20),
-        "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=20),
+        "items": db.list_runtime_order_intents(limit=12) if full_detail else [],
+        "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=12) if full_detail else [],
     }
-    dry_run_performance_report = _performance_analyzer(db).build_report(limit=10000)
+    decision_summary_payload = db.strategy_decision_summary(trade_date=datetime.now().date().isoformat())
+    outcome_summary_payload = db.strategy_decision_outcome_summary(trade_date=datetime.now().date().isoformat())
+    shadow_summary_payload = db.shadow_strategy_summary(trade_date=datetime.now().date().isoformat())
+    replay_reports = scan_replay_reports(DEFAULT_REPLAY_DB_ROOT, limit=1)
+    replay_runs = scan_replay_runs(DEFAULT_REPLAY_DB_ROOT, limit=5)
+    replay_payload = {
+        "latest": replay_reports[0] if replay_reports else {},
+        "recent_runs": replay_runs,
+        "summary": (replay_reports[0].get("summary") if replay_reports else {}) or {},
+        "funnel": (replay_reports[0].get("funnel") if replay_reports else {}) or {},
+        "shadow_ranking": (replay_reports[0].get("recommendations") if replay_reports else []) or [],
+        "data_quality": ((replay_reports[0].get("summary") or {}).get("warnings") if replay_reports else []) or [],
+        "diff_summary": (replay_reports[0].get("diff_summary") if replay_reports else {}) or {},
+    }
+    change_proposal_summary_payload = db.strategy_change_proposal_summary(trade_date=datetime.now().date().isoformat())
+    change_proposal_payload = {
+        "summary": change_proposal_summary_payload,
+        "top_recommendations": change_proposal_summary_payload.get("top_recommendations", []),
+        "disclaimer_ko": "자동 적용 아님: 승인 상태만 저장하며 runtime config는 변경하지 않습니다.",
+    }
+    dry_run_performance_report = _cached_dashboard_fragment(
+        db,
+        "dry_run_performance:v1:500",
+        lambda: _performance_analyzer(db).build_report(limit=500),
+    )
     threshold_ab_report = _threshold_ab_analyzer().build_report(dry_run_performance_report, limit=10, offset=0)
     dry_run_performance_payload = {
         "generated_at": dry_run_performance_report.get("generated_at", ""),
@@ -2007,7 +6407,9 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
             item
             for item in dry_run_performance_report.get("items", [])
             if item.get("dry_run_false_positive_type") or item.get("opportunity_loss_type")
-        ][:10],
+        ][: 10 if full_detail else 3],
+        "intraday_outcomes": outcome_summary_payload,
+        "shadow_strategies": shadow_summary_payload,
     }
     threshold_ab_payload = {
         "generated_at": threshold_ab_report.get("generated_at", ""),
@@ -2019,26 +6421,45 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "disclaimer_ko": threshold_ab_report.get("disclaimer_ko", ""),
     }
     runtime_payload["dry_run_orders"] = dry_run_orders_payload
+    runtime_payload["intraday_decisions"] = decision_summary_payload
+    runtime_payload["intraday_outcomes"] = outcome_summary_payload
+    runtime_payload["shadow_strategies"] = shadow_summary_payload
+    runtime_payload["strategy_replay"] = replay_payload
+    runtime_payload["change_proposals"] = change_proposal_payload
     runtime_payload["dry_run_performance"] = dry_run_performance_payload
     runtime_payload["threshold_ab"] = threshold_ab_payload
+    gateway_payload = dict(status_payload["gateway"]) if full_detail else _dashboard_slim_gateway_payload(status_payload["gateway"])
     ops_alerts_payload = build_ops_alerts(
         core=status_payload["core"],
-        gateway=status_payload["gateway"],
+        gateway=gateway_payload,
         commands=status_payload["commands"],
         transport=transport_payload,
         runtime=runtime_payload,
         dry_run_performance=dry_run_performance_payload,
         logs=logs_payload,
     )
+    theme_lab_payload = _cached_dashboard_fragment(
+        db,
+        "theme_lab:v2:full" if full_detail else "theme_lab:v2:summary",
+        lambda: build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_status, gateway_state=gateway_state),
+    )
+    if not full_detail:
+        theme_lab_payload = _dashboard_slim_theme_lab_payload(theme_lab_payload)
     return {
+        "snapshot_detail": resolved_detail,
         "timestamp": utc_timestamp(),
         "core": status_payload["core"],
-        "gateway": status_payload["gateway"],
+        "gateway": gateway_payload,
         "commands": commands_payload,
         "transport": transport_payload,
         "transport_experiment": transport_experiment_payload,
         "runtime": runtime_payload,
         "dry_run_orders": dry_run_orders_payload,
+        "intraday_decisions": decision_summary_payload,
+        "intraday_outcomes": outcome_summary_payload,
+        "shadow_strategies": shadow_summary_payload,
+        "strategy_replay": replay_payload,
+        "change_proposals": change_proposal_payload,
         "dry_run_performance": dry_run_performance_payload,
         "threshold_ab": threshold_ab_payload,
         "ops_alerts": ops_alerts_payload,
@@ -2048,9 +6469,9 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "orders": orders_payload,
         "reviews": reviews_payload,
         "logs": logs_payload,
-        "theme_lab": build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_status, gateway_state=gateway_state),
+        "theme_lab": theme_lab_payload,
         "market_data": {
-            "latest_ticks": gateway_state.latest_ticks(limit=30),
+            "latest_ticks": gateway_state.latest_ticks(limit=30 if full_detail else 10),
             "raw_tick_rendering": "disabled",
         },
     }
@@ -2631,6 +7052,15 @@ def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
         db.save_log(f"[gateway][WARN] {message}")
 
 
+def _queue_replay_tick_history(event: GatewayEvent) -> None:
+    if event.type != "price_tick":
+        return
+    try:
+        replay_tick_buffer.enqueue_event(event)
+    except Exception:
+        pass
+
+
 def _handle_market_symbols_event(db: TradingDatabase, payload: dict[str, Any]) -> int:
     rows: list[dict[str, Any]] = []
     market_payloads = list(payload.get("markets") or [])
@@ -2874,6 +7304,101 @@ def _active_command_count(summary: dict[str, Any]) -> int:
     return count
 
 
+def _record_gateway_ws_send_completed(message: GatewayWsMessage, metadata: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(message.payload or {})
+    original_sequence = int(payload.get("original_sequence") or metadata.get("original_sequence") or 0)
+    sample_message_type = str(payload.get("sample_message_type") or metadata.get("sample_message_type") or payload.get("original_type") or "")
+    ws_session_id = str(payload.get("ws_session_id") or metadata.get("ws_session_id") or metadata.get("websocket_session_id") or "")
+    send_started_at = str(payload.get("gateway_ws_send_started_at_utc") or "")
+    send_completed_at = str(payload.get("gateway_ws_send_completed_at_utc") or "")
+    send_duration_ms = _optional_float_value(payload.get("gateway_ws_send_duration_ms"))
+    if send_duration_ms is None:
+        send_duration_ms = wall_ms(send_started_at, send_completed_at)
+    stage_updates: dict[str, Any] = {
+        "gateway_ws_send_start_to_send_complete_ms": send_duration_ms,
+    }
+    metadata_updates: dict[str, Any] = {
+        "gateway_ws_send_completed_at_utc": send_completed_at,
+        "gateway_ws_send_completed_monotonic_ms": payload.get("gateway_ws_send_completed_monotonic_ms"),
+        "gateway_ws_send_duration_ms": send_duration_ms,
+        "gateway_ws_send_completed_diagnostic_received_at_utc": utc_now_ms(),
+        "gateway_ws_payload_size_bytes": payload.get("gateway_ws_payload_size_bytes"),
+        "gateway_ws_original_message_id": payload.get("original_message_id"),
+        "gateway_ws_original_type": payload.get("original_type"),
+        "gateway_ws_original_sequence": original_sequence,
+    }
+    updated = False
+    sample_id = ""
+    complete_to_core_receive_ms: float | None = None
+    db = open_database()
+    try:
+        sample = db.find_gateway_transport_latency_sample_by_ws_message(
+            ws_session_id=ws_session_id,
+            ws_message_sequence=original_sequence,
+            message_type=sample_message_type,
+            event_id=str(payload.get("original_event_id") or message.event_id or ""),
+            command_id=str(payload.get("original_command_id") or message.command_id or ""),
+        )
+        if sample is None:
+            sample = db.find_gateway_transport_latency_sample_by_ws_message(
+                ws_session_id=ws_session_id,
+                ws_message_sequence=original_sequence,
+                message_type=sample_message_type,
+            )
+        if sample is not None:
+            sample_id = str(sample.get("sample_id") or "")
+            core_received_at = str((sample.get("metadata") or {}).get("core_ws_received_at_utc") or "")
+            complete_to_core_receive_ms = wall_ms(send_completed_at, core_received_at)
+            stage_updates["gateway_ws_send_complete_to_core_receive_ms"] = complete_to_core_receive_ms
+            db.update_gateway_transport_latency_sample_stage(
+                sample_id,
+                stage_updates=stage_updates,
+                metadata_updates=metadata_updates,
+            )
+            updated = True
+    finally:
+        close_database(db)
+    _update_gateway_ws_transport_state(
+        {
+            "gateway_ws_send_completed_count": int(gateway_ws_transport_state.get("gateway_ws_send_completed_count") or 0) + 1,
+            "gateway_ws_send_completed_update_count": int(gateway_ws_transport_state.get("gateway_ws_send_completed_update_count") or 0) + (1 if updated else 0),
+            "gateway_ws_send_completed_miss_count": int(gateway_ws_transport_state.get("gateway_ws_send_completed_miss_count") or 0) + (0 if updated else 1),
+            "gateway_ws_last_send_completed_duration_ms": send_duration_ms,
+            "gateway_ws_last_send_completed_to_core_receive_ms": complete_to_core_receive_ms,
+            "gateway_ws_last_send_completed_message_type": sample_message_type,
+            "gateway_ws_last_send_completed_at": send_completed_at,
+        }
+    )
+    return {
+        "accepted": True,
+        "type": "transport_send_completed",
+        "updated": updated,
+        "sample_id": sample_id,
+        "message_type": sample_message_type,
+        "original_sequence": original_sequence,
+        "gateway_ws_send_duration_ms": send_duration_ms,
+        "gateway_ws_send_complete_to_core_receive_ms": complete_to_core_receive_ms,
+    }
+
+
+def _optional_float_value(value: Any) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int_value(value: Any) -> int | None:
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _valid_gateway_ws_token(websocket: WebSocket) -> bool:
     expected = get_settings().local_token
     provided = str(websocket.query_params.get("token") or websocket.headers.get("x-local-token") or "")
@@ -2881,6 +7406,58 @@ def _valid_gateway_ws_token(websocket: WebSocket) -> bool:
     if authorization.lower().startswith("bearer "):
         provided = authorization.split(" ", 1)[1].strip()
     return bool(expected and provided == expected)
+
+
+async def _send_gateway_ws_error(
+    websocket: WebSocket,
+    *,
+    code: str,
+    message: str,
+    metadata: dict[str, Any],
+    trace_id: str = "",
+    sequence: int = 0,
+    outbound_queue: asyncio.Queue[_CoreWsOutboundMessage] | None = None,
+    connection_id: str = "",
+) -> None:
+    payload = GatewayWsMessage(
+        type="error",
+        trace_id=trace_id or f"trace_ws_error_{int(time.time() * 1000)}",
+        source="core",
+        payload={
+            "accepted": False,
+            "code": code,
+            "message": message,
+        },
+        metadata=metadata,
+        sequence=sequence,
+    ).to_dict()
+    if outbound_queue is not None:
+        _queue_core_ws_outbound(outbound_queue, payload, connection_id=connection_id)
+        return
+    await websocket.send_json(payload)
+
+
+def _record_gateway_ws_protocol_error(
+    exc: Exception,
+    *,
+    stage: str,
+    connection_transport_mode: str,
+    session_id: str,
+    connection_id: str,
+) -> None:
+    _update_gateway_ws_transport_state(
+        {
+            "connected": True,
+            "state": "PROTOCOL_ERROR",
+            "transport_mode": connection_transport_mode,
+            "ws_session_id": session_id,
+            "ws_connection_id": connection_id,
+            "last_error": _truncate_log_detail(str(exc) or repr(exc)),
+            "last_error_type": type(exc).__name__,
+            "last_error_stage": stage,
+            "last_error_at": utc_now_ms(),
+        }
+    )
 
 
 def _ws_message_transport_mode(message: GatewayWsMessage, *, default: str = TRANSPORT_MODE_WEBSOCKET_MOCK) -> str:
@@ -2933,6 +7510,31 @@ def _record_ws_message_side_effects(event: GatewayEvent, metadata: dict[str, Any
         ("ws_session_loss_count", "session_loss_count"),
         ("ws_duplicate_ack_count", "duplicate_ack_count"),
         ("ws_unknown_ack_count", "unknown_ack_count"),
+        ("ws_priority_price_tick_code_count", "priority_price_tick_code_count"),
+        ("ws_priority_price_tick_sampled_count", "priority_price_tick_sampled_count"),
+        ("ws_condition_event_batch_queued_count", "condition_event_batch_queued_count"),
+        ("ws_condition_event_batch_sent_count", "condition_event_batch_sent_count"),
+        ("ws_condition_event_batched_count", "condition_event_batched_count"),
+        ("ws_condition_event_batch_coalesced_count", "condition_event_batch_coalesced_count"),
+        ("ws_last_send_ms", "last_send_ms"),
+        ("ws_last_send_completed_at", "gateway_ws_last_send_completed_at"),
+        ("ws_last_send_completed_message_type", "gateway_ws_last_send_completed_message_type"),
+        ("ws_last_send_completed_duration_ms", "gateway_ws_last_send_completed_duration_ms"),
+        ("ws_last_receive_ms", "last_receive_ms"),
+        ("ws_outbound_queue_size", "outbound_queue_size"),
+        ("ws_control_outbound_queue_size", "control_outbound_queue_size"),
+        ("ws_data_outbound_queue_size", "data_outbound_queue_size"),
+        ("ws_condition_event_queue_size", "condition_event_queue_size"),
+        ("ws_command_queue_size", "command_queue_size"),
+    ):
+        if source_key in payload:
+            patch[target_key] = payload.get(source_key)
+    if "ws_priority_price_tick_sources" in payload:
+        patch["priority_price_tick_sources"] = list(payload.get("ws_priority_price_tick_sources") or [])
+    for source_key, target_key in (
+        ("ws_condition_event_batch_enabled", "condition_event_batch_enabled"),
+        ("ws_condition_event_batch_max_size", "condition_event_batch_max_size"),
+        ("ws_condition_event_batch_max_wait_ms", "condition_event_batch_max_wait_ms"),
     ):
         if source_key in payload:
             patch[target_key] = payload.get(source_key)
@@ -3011,6 +7613,8 @@ def _ws_pilot_diagnostic_fields(payload: dict[str, Any]) -> dict[str, str]:
 def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | None = None) -> dict[str, Any]:
     heartbeat = dict(heartbeat_payload or {})
     state = dict(gateway_ws_transport_state)
+    condition_worker = dict(gateway_condition_event_worker_state)
+    core_event_worker = dict(gateway_core_ws_event_worker_state)
     enabled = bool(
         state.get("enabled")
         or heartbeat.get("ws_pilot_enabled")
@@ -3047,6 +7651,91 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         "session_loss_count": int(heartbeat.get("ws_session_loss_count") or state.get("session_loss_count") or 0),
         "duplicate_ack_count": int(heartbeat.get("ws_duplicate_ack_count") or state.get("duplicate_ack_count") or 0),
         "unknown_ack_count": int(heartbeat.get("ws_unknown_ack_count") or state.get("unknown_ack_count") or 0),
+        "last_send_ms": float(heartbeat.get("ws_last_send_ms") or state.get("last_send_ms") or 0.0),
+        "gateway_ws_send_completed_count": int(state.get("gateway_ws_send_completed_count") or 0),
+        "gateway_ws_send_completed_update_count": int(state.get("gateway_ws_send_completed_update_count") or 0),
+        "gateway_ws_send_completed_miss_count": int(state.get("gateway_ws_send_completed_miss_count") or 0),
+        "gateway_ws_last_send_completed_duration_ms": float(
+            heartbeat.get("ws_last_send_completed_duration_ms")
+            or state.get("gateway_ws_last_send_completed_duration_ms")
+            or 0.0
+        ),
+        "gateway_ws_last_send_completed_to_core_receive_ms": float(
+            state.get("gateway_ws_last_send_completed_to_core_receive_ms") or 0.0
+        ),
+        "gateway_ws_last_send_completed_message_type": (
+            heartbeat.get("ws_last_send_completed_message_type")
+            or state.get("gateway_ws_last_send_completed_message_type")
+            or ""
+        ),
+        "gateway_ws_last_send_completed_at": (
+            heartbeat.get("ws_last_send_completed_at")
+            or state.get("gateway_ws_last_send_completed_at")
+            or ""
+        ),
+        "last_receive_ms": float(heartbeat.get("ws_last_receive_ms") or state.get("last_receive_ms") or 0.0),
+        "outbound_queue_size": int(heartbeat.get("ws_outbound_queue_size") or state.get("outbound_queue_size") or 0),
+        "control_outbound_queue_size": int(
+            heartbeat.get("ws_control_outbound_queue_size") or state.get("control_outbound_queue_size") or 0
+        ),
+        "data_outbound_queue_size": int(
+            heartbeat.get("ws_data_outbound_queue_size") or state.get("data_outbound_queue_size") or 0
+        ),
+        "condition_event_queue_size": int(
+            heartbeat.get("ws_condition_event_queue_size") or state.get("condition_event_queue_size") or 0
+        ),
+        "command_queue_size": int(heartbeat.get("ws_command_queue_size") or state.get("command_queue_size") or 0),
+        "core_ws_outbound_writer_active": bool(state.get("core_ws_outbound_writer_active")),
+        "core_ws_outbound_queue_size": int(state.get("core_ws_outbound_queue_size") or 0),
+        "core_ws_outbound_queue_max_size": int(state.get("core_ws_outbound_queue_max_size") or 0),
+        "core_ws_outbound_queued_count": int(state.get("core_ws_outbound_queued_count") or 0),
+        "core_ws_outbound_sent_count": int(state.get("core_ws_outbound_sent_count") or 0),
+        "core_ws_outbound_dropped_count": int(state.get("core_ws_outbound_dropped_count") or 0),
+        "core_ws_last_send_json_ms": float(state.get("core_ws_last_send_json_ms") or 0.0),
+        "core_ws_last_send_queue_wait_ms": float(state.get("core_ws_last_send_queue_wait_ms") or 0.0),
+        "core_ws_last_send_json_type": state.get("core_ws_last_send_json_type") or "",
+        "core_ws_last_send_json_at": state.get("core_ws_last_send_json_at") or "",
+        "core_ws_slow_send_count": int(state.get("core_ws_slow_send_count") or 0),
+        "core_ws_last_slow_send_json_ms": float(state.get("core_ws_last_slow_send_json_ms") or 0.0),
+        "core_ws_last_slow_send_at": state.get("core_ws_last_slow_send_at") or "",
+        "core_ws_last_receive_text_ms": float(state.get("core_ws_last_receive_text_ms") or 0.0),
+        "core_ws_receive_loop_gap_ms": float(state.get("core_ws_receive_loop_gap_ms") or 0.0),
+        "core_ws_event_async_enabled": bool(core_event_worker.get("enabled")),
+        "core_ws_event_queue_size": int(core_event_worker.get("queue_size") or 0),
+        "core_ws_event_queue_max_size": int(core_event_worker.get("queue_max_size") or 0),
+        "core_ws_event_active_count": int(core_event_worker.get("active_count") or 0),
+        "core_ws_event_split_enabled": bool(core_event_worker.get("split_enabled")),
+        "core_ws_event_control_worker_count": int(core_event_worker.get("control_worker_count") or 0),
+        "core_ws_event_control_queue_size": int(core_event_worker.get("control_queue_size") or 0),
+        "core_ws_event_control_queue_sizes": list(core_event_worker.get("control_queue_sizes") or []),
+        "core_ws_event_data_queue_size": int(core_event_worker.get("data_queue_size") or 0),
+        "core_ws_event_control_active_count": int(core_event_worker.get("control_active_count") or 0),
+        "core_ws_event_data_active_count": int(core_event_worker.get("data_active_count") or 0),
+        "core_ws_event_queued_count": int(core_event_worker.get("queued_count") or 0),
+        "core_ws_event_processed_count": int(core_event_worker.get("processed_count") or 0),
+        "core_ws_event_failed_count": int(core_event_worker.get("failed_count") or 0),
+        "core_ws_event_dropped_count": int(core_event_worker.get("dropped_count") or 0),
+        "core_ws_event_priority_enabled": bool(core_event_worker.get("priority_enabled")),
+        "core_ws_event_control_queued_count": int(core_event_worker.get("control_queued_count") or 0),
+        "core_ws_event_data_queued_count": int(core_event_worker.get("data_queued_count") or 0),
+        "core_ws_event_last_priority": int(core_event_worker.get("last_priority") or 0),
+        "core_ws_event_last_worker_kind": core_event_worker.get("last_worker_kind") or "",
+        "core_ws_event_last_control_worker_index": int(core_event_worker.get("last_control_worker_index") or 0),
+        "core_ws_price_tick_coalesce_enabled": bool(core_event_worker.get("price_tick_coalesce_enabled")),
+        "core_ws_price_tick_pending_key_count": int(core_event_worker.get("price_tick_pending_key_count") or 0),
+        "core_ws_price_tick_received_count": int(core_event_worker.get("price_tick_received_count") or 0),
+        "core_ws_price_tick_queued_count": int(core_event_worker.get("price_tick_queued_count") or 0),
+        "core_ws_price_tick_coalesced_count": int(core_event_worker.get("price_tick_coalesced_count") or 0),
+        "core_ws_price_tick_processed_count": int(core_event_worker.get("price_tick_processed_count") or 0),
+        "core_ws_price_tick_dropped_count": int(core_event_worker.get("price_tick_dropped_count") or 0),
+        "core_ws_price_tick_last_key": core_event_worker.get("price_tick_last_key") or "",
+        "core_ws_event_last_message_type": core_event_worker.get("last_message_type") or "",
+        "core_ws_event_last_event_id": core_event_worker.get("last_event_id") or "",
+        "core_ws_event_last_queue_wait_ms": float(core_event_worker.get("last_queue_wait_ms") or 0.0),
+        "core_ws_event_last_duration_ms": float(core_event_worker.get("last_duration_ms") or 0.0),
+        "core_ws_event_last_queued_at": core_event_worker.get("last_queued_at") or "",
+        "core_ws_event_last_processed_at": core_event_worker.get("last_processed_at") or "",
+        "core_ws_event_last_error": core_event_worker.get("last_error") or "",
         "price_tick_sample_rate": float(heartbeat.get("ws_price_tick_sample_rate") or state.get("price_tick_sample_rate") or 0),
         "price_tick_sampled_count": int(
             heartbeat.get("ws_price_tick_sampled_count") or state.get("price_tick_sampled_count") or 0
@@ -3054,7 +7743,78 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         "price_tick_fallback_count": int(
             heartbeat.get("ws_price_tick_fallback_count") or state.get("price_tick_fallback_count") or 0
         ),
+        "priority_price_tick_code_count": int(
+            heartbeat.get("ws_priority_price_tick_code_count") or state.get("priority_price_tick_code_count") or 0
+        ),
+        "priority_price_tick_sampled_count": int(
+            heartbeat.get("ws_priority_price_tick_sampled_count") or state.get("priority_price_tick_sampled_count") or 0
+        ),
+        "priority_price_tick_sources": list(
+            heartbeat.get("ws_priority_price_tick_sources") or state.get("priority_price_tick_sources") or []
+        ),
         "event_fallback_count": int(heartbeat.get("ws_event_fallback_count") or state.get("event_fallback_count") or 0),
+        "condition_event_batch_enabled": bool(
+            heartbeat.get("ws_condition_event_batch_enabled") or state.get("condition_event_batch_enabled") or False
+        ),
+        "condition_event_batch_max_size": int(
+            heartbeat.get("ws_condition_event_batch_max_size") or state.get("condition_event_batch_max_size") or 0
+        ),
+        "condition_event_batch_max_wait_ms": float(
+            heartbeat.get("ws_condition_event_batch_max_wait_ms") or state.get("condition_event_batch_max_wait_ms") or 0
+        ),
+        "condition_event_batch_queued_count": int(
+            heartbeat.get("ws_condition_event_batch_queued_count") or state.get("condition_event_batch_queued_count") or 0
+        ),
+        "condition_event_batch_sent_count": int(
+            heartbeat.get("ws_condition_event_batch_sent_count") or state.get("condition_event_batch_sent_count") or 0
+        ),
+        "condition_event_batched_count": int(
+            heartbeat.get("ws_condition_event_batched_count") or state.get("condition_event_batched_count") or 0
+        ),
+        "condition_event_batch_coalesced_count": int(
+            heartbeat.get("ws_condition_event_batch_coalesced_count") or state.get("condition_event_batch_coalesced_count") or 0
+        ),
+        "core_condition_event_async_enabled": bool(condition_worker.get("enabled")),
+        "core_condition_event_queue_size": int(condition_worker.get("queue_size") or 0),
+        "core_condition_event_queue_sizes_by_worker": list(condition_worker.get("queue_sizes_by_worker") or []),
+        "core_condition_event_queue_batch_count": int(condition_worker.get("queue_batch_count") or 0),
+        "core_condition_event_queue_batch_counts_by_worker": list(condition_worker.get("queue_batch_counts_by_worker") or []),
+        "core_condition_event_queue_max_size": int(condition_worker.get("queue_max_size") or 0),
+        "core_condition_event_worker_count": int(condition_worker.get("worker_count") or 0),
+        "core_condition_event_active_worker_count": int(condition_worker.get("active_worker_count") or 0),
+        "core_condition_event_active_count": int(condition_worker.get("active_count") or 0),
+        "core_condition_event_received_count": int(condition_worker.get("received_count") or 0),
+        "core_condition_event_queued_count": int(condition_worker.get("queued_count") or 0),
+        "core_condition_event_coalesced_count": int(condition_worker.get("coalesced_count") or 0),
+        "core_condition_event_stale_skipped_count": int(condition_worker.get("stale_skipped_count") or 0),
+        "core_condition_event_stale_queue_wait_skipped_count": int(condition_worker.get("stale_queue_wait_skipped_count") or 0),
+        "core_condition_event_processed_count": int(condition_worker.get("processed_count") or 0),
+        "core_condition_event_failed_count": int(condition_worker.get("failed_count") or 0),
+        "core_condition_event_dropped_count": int(condition_worker.get("dropped_count") or 0),
+        "core_condition_event_last_batch_size": int(condition_worker.get("last_batch_size") or 0),
+        "core_condition_event_last_drained_batch_count": int(condition_worker.get("last_drained_batch_count") or 0),
+        "core_condition_event_last_received_count": int(condition_worker.get("last_received_count") or 0),
+        "core_condition_event_last_queued_count": int(condition_worker.get("last_queued_count") or 0),
+        "core_condition_event_last_queued_batch_count": int(condition_worker.get("last_queued_batch_count") or 0),
+        "core_condition_event_last_coalesced_count": int(condition_worker.get("last_coalesced_count") or 0),
+        "core_condition_event_last_stale_skipped_count": int(condition_worker.get("last_stale_skipped_count") or 0),
+        "core_condition_event_last_stale_queue_wait_skipped_count": int(
+            condition_worker.get("last_stale_queue_wait_skipped_count") or 0
+        ),
+        "core_condition_event_last_stale_queue_wait_ms": float(condition_worker.get("last_stale_queue_wait_ms") or 0.0),
+        "core_condition_event_last_queue_wait_ms": float(condition_worker.get("last_queue_wait_ms") or 0.0),
+        "core_condition_event_stale_include_skip_ms": float(
+            condition_worker.get("stale_include_skip_ms") or _gateway_condition_event_stale_include_skip_ms()
+        ),
+        "core_condition_event_batch_chunk_size": int(
+            condition_worker.get("batch_chunk_size") or _gateway_condition_event_batch_chunk_size()
+        ),
+        "core_condition_event_last_batch_duration_ms": float(condition_worker.get("last_batch_duration_ms") or 0.0),
+        "core_condition_event_last_worker_index": int(condition_worker.get("last_worker_index") or 0),
+        "core_condition_event_last_shard_key": condition_worker.get("last_shard_key") or "",
+        "core_condition_event_last_queued_at": condition_worker.get("last_queued_at") or "",
+        "core_condition_event_last_processed_at": condition_worker.get("last_processed_at") or "",
+        "core_condition_event_last_error": condition_worker.get("last_error") or "",
         "last_ws_event_at": heartbeat.get("last_ws_event_at") or state.get("last_ws_event_at") or "",
         "last_ws_ack_at": heartbeat.get("last_ws_ack_at") or state.get("last_ws_ack_at") or "",
     }
@@ -3105,6 +7865,46 @@ def _gateway_event_from_ws_message(message: GatewayWsMessage, *, metadata: dict[
     data["source"] = event.source or message.source
     data["command_id"] = event.command_id or message.command_id
     return GatewayEvent.from_dict(data)
+
+
+def _gateway_events_from_ws_batch_message(message: GatewayWsMessage, *, metadata: dict[str, Any]) -> list[GatewayEvent]:
+    payload = dict(message.payload or {})
+    raw_events = list(payload.get("events") or [])
+    batch_id = str(payload.get("batch_id") or message.event_id or message.message_id)
+    batch_size = len(raw_events)
+    received_at = utc_now_ms()
+    events: list[GatewayEvent] = []
+    for index, raw_event in enumerate(raw_events):
+        if not isinstance(raw_event, dict):
+            continue
+        event = GatewayEvent.from_dict(raw_event)
+        if event.type != "condition_event":
+            continue
+        trace = trace_from_payload(event.payload)
+        trace_payload = ensure_transport_trace(
+            event.payload,
+            trace_id=trace.get("trace_id") or f"trace:{event.event_id or batch_id}:{index}",
+            process="gateway",
+            extra={
+                **metadata,
+                "transport_mode": metadata.get("transport_mode") or TRANSPORT_MODE_WEBSOCKET_MOCK,
+                "gateway_ws_message_id": message.message_id,
+                "gateway_ws_message_type": message.type,
+                "gateway_ws_message_timestamp": message.timestamp,
+                "gateway_ws_message_sequence": message.sequence,
+                "gateway_ws_message_trace_id": message.trace_id,
+                "gateway_ws_condition_batch_id": batch_id,
+                "gateway_ws_condition_batch_size": batch_size,
+                "gateway_ws_condition_batch_index": index,
+                "core_ws_received_at_utc": received_at,
+            },
+        )
+        data = event.to_dict()
+        data["payload"] = trace_payload
+        data["event_id"] = event.event_id or f"evt_ws_{batch_id}_{index}"
+        data["source"] = event.source or message.source
+        events.append(GatewayEvent.from_dict(data))
+    return events
 
 
 def _ws_command_dict_with_trace(command: GatewayCommand, trace_updates: dict[str, Any], *, transport_mode: str = TRANSPORT_MODE_WEBSOCKET_MOCK) -> dict[str, Any]:

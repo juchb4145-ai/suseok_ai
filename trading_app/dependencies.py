@@ -78,6 +78,42 @@ class CoreSettings:
     threshold_ab_confidence_min: float = 0.5
     threshold_ab_export_root: Path = PROJECT_ROOT / "reports" / "dry_run_threshold_ab"
     threshold_ab_enable_apply: bool = False
+    intraday_outcome_enabled: bool = True
+    intraday_outcome_horizons_sec: str = "60,180,300,600,1200"
+    intraday_outcome_min_price_samples: int = 2
+    intraday_outcome_tp_threshold_pct: float = 2.0
+    intraday_outcome_fn_threshold_pct: float = 2.5
+    intraday_outcome_fp_drawdown_pct: float = -1.5
+    intraday_outcome_fp_return_pct: float = -1.0
+    intraday_outcome_exit_giveback_pct: float = -2.0
+    intraday_outcome_max_batch_size: int = 500
+    shadow_strategy_enabled: bool = True
+    shadow_strategy_policies: str = (
+        "relaxed_risk_off_leader,strict_late_chase,strict_entry_risk,"
+        "relaxed_data_wait_for_leader,fast_theme_exit_shadow"
+    )
+    shadow_strategy_max_batch_size: int = 500
+    shadow_strategy_runtime_hook_enabled: bool = True
+    shadow_strategy_rebuild_limit: int = 10000
+    shadow_strategy_min_theme_score: float = 70.0
+    shadow_strategy_min_hybrid_score: float = 65.0
+    shadow_strategy_ready_small_multiplier: float = 0.3
+    shadow_strategy_observe_only: bool = True
+    shadow_strategy_allow_apply: bool = False
+    change_proposal_enabled: bool = True
+    change_proposal_min_sample_count: int = 20
+    change_proposal_min_trade_days: int = 2
+    change_proposal_min_replay_count: int = 1
+    change_proposal_max_fp_increase: int = 1
+    change_proposal_max_opportunity_loss_increase: int = 1
+    change_proposal_strong_min_confidence: float = 0.7
+    change_proposal_allow_auto_apply: bool = False
+    change_proposal_default_expire_days: int = 5
+    replay_tick_history_enabled: bool = True
+    replay_tick_history_queue_max_size: int = 5000
+    replay_tick_history_batch_size: int = 200
+    replay_tick_history_flush_interval_sec: float = 1.0
+    replay_tick_history_min_interval_ms: float = 500.0
 
     @property
     def live_order_enabled(self) -> bool:
@@ -161,6 +197,45 @@ def get_settings() -> CoreSettings:
             os.environ.get("TRADING_THRESHOLD_AB_EXPORT_ROOT", str(PROJECT_ROOT / "reports" / "dry_run_threshold_ab"))
         ).expanduser(),
         threshold_ab_enable_apply=_bool_env("TRADING_THRESHOLD_AB_ENABLE_APPLY", False),
+        intraday_outcome_enabled=_bool_env("TRADING_INTRADAY_OUTCOME_ENABLED", True),
+        intraday_outcome_horizons_sec=os.environ.get("TRADING_INTRADAY_OUTCOME_HORIZONS_SEC", "60,180,300,600,1200"),
+        intraday_outcome_min_price_samples=_int_env("TRADING_INTRADAY_OUTCOME_MIN_PRICE_SAMPLES", 2),
+        intraday_outcome_tp_threshold_pct=_float_env("TRADING_INTRADAY_OUTCOME_TP_THRESHOLD_PCT", 2.0),
+        intraday_outcome_fn_threshold_pct=_float_env("TRADING_INTRADAY_OUTCOME_FN_THRESHOLD_PCT", 2.5),
+        intraday_outcome_fp_drawdown_pct=_float_env("TRADING_INTRADAY_OUTCOME_FP_DRAWDOWN_PCT", -1.5),
+        intraday_outcome_fp_return_pct=_float_env("TRADING_INTRADAY_OUTCOME_FP_RETURN_PCT", -1.0),
+        intraday_outcome_exit_giveback_pct=_float_env("TRADING_INTRADAY_OUTCOME_EXIT_GIVEBACK_PCT", -2.0),
+        intraday_outcome_max_batch_size=_int_env("TRADING_INTRADAY_OUTCOME_MAX_BATCH_SIZE", 500),
+        shadow_strategy_enabled=_bool_env("TRADING_SHADOW_STRATEGY_ENABLED", True),
+        shadow_strategy_policies=os.environ.get(
+            "TRADING_SHADOW_STRATEGY_POLICIES",
+            "relaxed_risk_off_leader,strict_late_chase,strict_entry_risk,relaxed_data_wait_for_leader,fast_theme_exit_shadow",
+        ),
+        shadow_strategy_max_batch_size=_int_env("TRADING_SHADOW_STRATEGY_MAX_BATCH_SIZE", 500),
+        shadow_strategy_runtime_hook_enabled=_bool_env("TRADING_SHADOW_STRATEGY_RUNTIME_HOOK_ENABLED", True),
+        shadow_strategy_rebuild_limit=_int_env("TRADING_SHADOW_STRATEGY_REBUILD_LIMIT", 10000),
+        shadow_strategy_min_theme_score=_float_env("TRADING_SHADOW_STRATEGY_MIN_THEME_SCORE", 70.0),
+        shadow_strategy_min_hybrid_score=_float_env("TRADING_SHADOW_STRATEGY_MIN_HYBRID_SCORE", 65.0),
+        shadow_strategy_ready_small_multiplier=_float_env("TRADING_SHADOW_STRATEGY_READY_SMALL_MULTIPLIER", 0.3),
+        shadow_strategy_observe_only=_bool_env("TRADING_SHADOW_STRATEGY_OBSERVE_ONLY", True),
+        shadow_strategy_allow_apply=_bool_env("TRADING_SHADOW_STRATEGY_ALLOW_APPLY", False),
+        change_proposal_enabled=_bool_env("TRADING_CHANGE_PROPOSAL_ENABLED", True),
+        change_proposal_min_sample_count=_int_env("TRADING_CHANGE_PROPOSAL_MIN_SAMPLE_COUNT", 20),
+        change_proposal_min_trade_days=_int_env("TRADING_CHANGE_PROPOSAL_MIN_TRADE_DAYS", 2),
+        change_proposal_min_replay_count=_int_env("TRADING_CHANGE_PROPOSAL_MIN_REPLAY_COUNT", 1),
+        change_proposal_max_fp_increase=_int_env("TRADING_CHANGE_PROPOSAL_MAX_FP_INCREASE", 1),
+        change_proposal_max_opportunity_loss_increase=_int_env(
+            "TRADING_CHANGE_PROPOSAL_MAX_OPPORTUNITY_LOSS_INCREASE",
+            1,
+        ),
+        change_proposal_strong_min_confidence=_float_env("TRADING_CHANGE_PROPOSAL_STRONG_MIN_CONFIDENCE", 0.7),
+        change_proposal_allow_auto_apply=_bool_env("TRADING_CHANGE_PROPOSAL_ALLOW_AUTO_APPLY", False),
+        change_proposal_default_expire_days=_int_env("TRADING_CHANGE_PROPOSAL_DEFAULT_EXPIRE_DAYS", 5),
+        replay_tick_history_enabled=_bool_env("TRADING_REPLAY_TICK_HISTORY_ENABLED", True),
+        replay_tick_history_queue_max_size=_int_env("TRADING_REPLAY_TICK_HISTORY_QUEUE_MAX_SIZE", 5000),
+        replay_tick_history_batch_size=_int_env("TRADING_REPLAY_TICK_HISTORY_BATCH_SIZE", 200),
+        replay_tick_history_flush_interval_sec=_float_env("TRADING_REPLAY_TICK_HISTORY_FLUSH_INTERVAL_SEC", 1.0),
+        replay_tick_history_min_interval_ms=_float_env("TRADING_REPLAY_TICK_HISTORY_MIN_INTERVAL_MS", 500.0),
     )
 
 

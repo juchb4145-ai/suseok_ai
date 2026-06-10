@@ -19,9 +19,16 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
         "transportLatency",
         "transportExperiments",
         "dryRunOrders",
+        "intradayDecisions",
+        "intradayOutcomes",
+        "shadowEvaluations",
+        "shadowRiskCandidates",
         "dryRunPerformance",
         "falseSignals",
         "thresholdAB",
+        "changeProposals",
+        "changeProposalEvidence",
+        "strategyReplayRuns",
         "gatewayCommands",
     ]:
         assert soup.select_one(f'[data-table-section="{table_key}"]') is not None
@@ -77,6 +84,11 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "invalid local gateway token" in js
     assert "function renderOpsAlerts" in js
     assert "function renderThemeLabSummary" in js
+    assert "SNAPSHOT_POLL_INTERVAL_MS = 30000" in js
+    assert "SNAPSHOT_INITIAL_FALLBACK_MS = 7000" in js
+    assert "function stopPolling" in js
+    assert "state.wsConnected" in js
+    assert "setTimeout(startPolling, 2000)" not in js
     assert "ops_alerts" in js
     assert "theme_lab" in js
     assert "price_tick_sample_rate" in js
@@ -86,8 +98,20 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "last_ws_event_at" in js
     assert "last_ws_ack_at" in js
     assert "thresholdAB" in js
+    assert "changeProposals" in js
+    assert "changeProposalEvidence" in js
+    assert "strategyReplayRuns" in js
+    assert "/api/runtime/change-proposals" in js
+    assert "Approve Observe" in js
+    assert "자동 적용 아님" in js
+    assert "function actionProposal" in js
+    assert "(payload || {}).proposal" in js
+    assert "/api/runtime/replay/runs" in js
     assert "gradeLabelsKo" in js
     assert "/api/runtime/threshold-ab/dry-run" in js
+    assert "/api/runtime/shadow-strategies/evaluations" in js
+    assert "shadowEvaluations" in js
+    assert "shadowRiskCandidates" in js
     assert ".slice(0, 10)" not in js
     assert ".slice(0, 20)" not in js
     assert "/api/gateway/transport/latency" in js

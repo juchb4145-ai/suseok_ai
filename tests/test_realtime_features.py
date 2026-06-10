@@ -96,8 +96,11 @@ def test_realtime_feature_adds_vwap_recent_candles_and_support():
     assert result.metadata["recent_support_source"] == "completed_1m_low"
     assert result.metadata["breakout_level"] == 1050.0
     assert result.metadata["upper_limit_price"] == 1300
+    assert result.metadata["upper_limit_gap_pct"] == 22.6415
     assert result.metadata["prev_close"] == 1000.0
     assert result.metadata["prev_close_inferred_from_change_rate"] is True
+    assert result.metadata["prev_close_source"] == "change_rate_inferred"
+    assert result.metadata["change_rate"] == 6.0
     assert result.metadata["completed_minute_bar_count"] == 1
 
 
@@ -149,3 +152,46 @@ def test_realtime_feature_does_not_mark_vwap_ready_for_estimated_turnover():
     assert "vwap" not in result.metadata
     assert "vwap_ready" not in result.metadata
     assert "TURNOVER_ESTIMATED" in result.metadata["reason_codes"]
+
+
+def test_realtime_feature_adds_entry_risk_metadata_with_unknown_vi():
+    result = RealtimeFeatureCalculator().enrich(
+        code="005930",
+        price=1270,
+        cum_volume=1000,
+        trade_value=1_270_000,
+        timestamp=datetime(2026, 5, 29, 9, 0, 1),
+        candle_builder=CandleBuilder(),
+        metadata={"prev_close": 1000, "day_high": 1300},
+        change_rate=27.0,
+    )
+
+    assert result.metadata["prev_close"] == 1000
+    assert result.metadata["prev_close_source"] == "prev_close"
+    assert result.metadata["prev_close_inferred_from_change_rate"] is False
+    assert result.metadata["upper_limit_price"] == 1300
+    assert result.metadata["upper_limit_gap_pct"] == 2.3622
+    assert result.metadata["session_high"] == 1300.0
+    assert result.metadata["pullback_from_high_pct"] == 2.3077
+    assert result.metadata["vi_status"] == "UNKNOWN"
+    assert result.metadata["vi_signal_source"] == "unknown"
+    assert result.metadata["vi_active"] is False
+    assert result.metadata["seconds_since_vi_release"] is None
+    assert "vi_signal_missing" in result.metadata["entry_risk_input_missing_fields"]
+
+
+def test_realtime_feature_marks_vi_payload_active():
+    result = RealtimeFeatureCalculator().enrich(
+        code="005930",
+        price=1200,
+        cum_volume=1000,
+        trade_value=1_200_000,
+        timestamp=datetime(2026, 5, 29, 9, 0, 1),
+        candle_builder=CandleBuilder(),
+        metadata={"prev_close": 1000, "day_high": 1210, "vi_active": True},
+        change_rate=20.0,
+    )
+
+    assert result.metadata["vi_status"] == "ACTIVE"
+    assert result.metadata["vi_signal_source"] == "payload"
+    assert result.metadata["vi_active"] is True

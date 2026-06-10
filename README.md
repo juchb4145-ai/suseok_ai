@@ -104,6 +104,13 @@ Core API:
 - `GET /api/runtime/status`
 - `POST /api/runtime/start`
 - `POST /api/runtime/stop`
+
+Dashboard performance flags:
+
+- `GET /api/snapshot`: returns the slim dashboard snapshot by default. Use `?detail=full` only for debugging large raw sections.
+- `TRADING_DASHBOARD_SNAPSHOT_CACHE_TTL_SEC`: shared `/api/snapshot` and `/ws/dashboard` snapshot cache TTL; default `5`.
+- `TRADING_DASHBOARD_HEAVY_SECTION_CACHE_TTL_SEC`: cache TTL for heavy dashboard sections such as themes, reviews, and dry-run performance; default `30`.
+- `TRADING_DASHBOARD_WS_PUSH_INTERVAL_SEC`: per-client dashboard WebSocket push interval; default `5`. The browser uses `/api/snapshot` polling only as a WebSocket fallback.
 - `POST /api/runtime/restart`
 - `POST /api/runtime/cycle`
 - `GET /api/runtime/snapshot`
@@ -323,6 +330,28 @@ Pilot safety flags:
 
 - `TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOWED_COMMANDS`: default allows login/condition/realtime/TR commands.
 - `TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS=1`: default blocks `send_order`, `cancel_order`, `modify_order`.
+- `TRADING_GATEWAY_WEBSOCKET_PRICE_TICK_SAMPLE_RATE`: broad real-time tick WebSocket sample rate; default `0`.
+- `TRADING_GATEWAY_WEBSOCKET_PRIORITY_TICK_SOURCES`: sources that bypass broad tick sampling; default `holding,theme_lab_watchset`.
+- `TRADING_GATEWAY_WEBSOCKET_PRIORITY_TICK_CODES`: optional comma-separated codes that always use the WebSocket pilot tick path.
+- `TRADING_GATEWAY_WEBSOCKET_CONDITION_EVENT_BATCH_ENABLED`: coalesce condition-event bursts into WebSocket batches; default `1`.
+- `TRADING_GATEWAY_WEBSOCKET_CONDITION_EVENT_BATCH_MAX_SIZE`: max `condition_event` items per batch; default `100`.
+- `TRADING_GATEWAY_WEBSOCKET_CONDITION_EVENT_BATCH_MAX_WAIT_MS`: max micro-batch wait before flush; default `200`.
+- `TRADING_CORE_WS_CONDITION_EVENT_ASYNC_ENABLED`: process WS condition-event batches on a Core worker instead of the receive loop; default `1`.
+- `TRADING_CORE_WS_CONDITION_EVENT_QUEUE_SIZE`: Core bounded queued event count for async condition-event processing; default `5000`. Status exposes pending events as `core_condition_event_queue_size`, pending batches as `core_condition_event_queue_batch_count`, and in-flight work as `core_condition_event_active_count`.
+- `TRADING_CORE_WS_CONDITION_EVENT_WORKERS`: shard Core WS `condition_event` batches by stock code across worker queues while preserving per-code order; default `4`, allowed range `1..8`. Status exposes `core_condition_event_worker_count`, `core_condition_event_active_worker_count`, `core_condition_event_last_worker_index`, and `core_condition_event_last_shard_key`.
+- `TRADING_CORE_WS_CONDITION_EVENT_BATCH_CHUNK_SIZE`: split and adaptively drain per-shard Core WS `condition_event` batches up to this event count per worker execution; default `64`, allowed range `1..500`. Status exposes `core_condition_event_batch_chunk_size`, `core_condition_event_queue_sizes_by_worker`, `core_condition_event_queue_batch_counts_by_worker`, `core_condition_event_last_drained_batch_count`, and `core_condition_event_last_queued_batch_count`.
+- `TRADING_CORE_WS_CONDITION_EVENT_STALE_INCLUDE_SKIP_MS`: skip stale WS `condition_event` include items that waited in the Core condition queue longer than this threshold before candidate creation; default `15000`, set `0` to disable. Remove events are still processed. Status exposes `core_condition_event_stale_queue_wait_skipped_count`, `core_condition_event_last_stale_queue_wait_ms`, and `core_condition_event_stale_include_skip_ms`.
+- Core coalesces duplicate WS `condition_event` bursts by `condition_index/name + code` before enqueueing and skips stale queued events when a newer state for the same key arrived. Status exposes `core_condition_event_received_count`, `core_condition_event_queued_count`, `core_condition_event_coalesced_count`, and `core_condition_event_stale_skipped_count`.
+- `TRADING_CORE_WS_EVENT_ASYNC_ENABLED`: queue non-batch WS Gateway events and send-completed diagnostics on a Core worker instead of blocking the receive loop; default `1`. `TRADING_CORE_WS_EVENT_QUEUE_SIZE` defaults to `10000`, and status exposes `core_ws_event_queue_size`, `core_ws_event_last_queue_wait_ms`, `core_ws_event_processed_count`, `core_ws_event_failed_count`, and `core_ws_event_dropped_count`.
+- `TRADING_CORE_WS_EVENT_PRIORITY_ENABLED`: process control WS events (`command_ack`, `command_started`, `command_failed`, `rate_limited`, heartbeats, and order/execution events) ahead of data events such as `price_tick` and send-completed diagnostics; default `1`. Status exposes `core_ws_event_priority_enabled`, `core_ws_event_control_queued_count`, `core_ws_event_data_queued_count`, and `core_ws_event_last_priority`.
+- `TRADING_CORE_WS_EVENT_WORKER_SPLIT_ENABLED`: run separate Core WS workers for control and data events so price tick/send-completed bursts do not block command/heartbeat processing; default `1`. Status exposes `core_ws_event_split_enabled`, `core_ws_event_control_queue_size`, `core_ws_event_data_queue_size`, `core_ws_event_control_active_count`, `core_ws_event_data_active_count`, and `core_ws_event_last_worker_kind`.
+- `TRADING_CORE_WS_EVENT_CONTROL_WORKERS`: shard Core WS control events across workers while keeping the same `command_id`/order key on one worker; default `2`, allowed range `1..8`. Status exposes `core_ws_event_control_worker_count`, `core_ws_event_control_queue_sizes`, and `core_ws_event_last_control_worker_index`.
+- `TRADING_CORE_WS_PRICE_TICK_COALESCE_ENABLED`: keep only the latest pending Core WS `price_tick` per `instrument_type + code` so watchset/holding 100% tick bursts do not delay heartbeat/command processing; default `1`. Status exposes `core_ws_price_tick_received_count`, `core_ws_price_tick_queued_count`, `core_ws_price_tick_coalesced_count`, `core_ws_price_tick_processed_count`, `core_ws_price_tick_pending_key_count`, and `core_ws_price_tick_dropped_count`.
+- WebSocket send diagnostics split Gateway-to-Core latency into `gateway_ws_queue_to_send_start_ms`, `gateway_ws_send_start_to_core_receive_ms`, and the legacy combined `gateway_ws_to_core_receive_ms`.
+- `TRADING_GATEWAY_WEBSOCKET_SEND_COMPLETED_DIAGNOSTICS`: emit Gateway send-completed diagnostics for control messages; default `1`. Samples can then expose `gateway_ws_send_start_to_send_complete_ms` and `gateway_ws_send_complete_to_core_receive_ms`.
+- WebSocket pilot compacts Kiwoom status heartbeats before sending them to Core: essential login/order/queue/error counters are kept, while nested `rate_limit`, fallback snapshots, and long priority-code lists are summarized or omitted to reduce heartbeat tail latency.
+- Gateway WebSocket pilot drains Core responses on a dedicated receiver task so event acks cannot build up behind outbound bursts.
+- Core WebSocket replies use a bounded outbound writer queue (`TRADING_CORE_WS_OUTBOUND_QUEUE_SIZE`, default `1000`) so the receive loop can return to `receive_text()` quickly. Status exposes `core_ws_outbound_queue_size`, `core_ws_last_send_json_ms`, and `core_ws_receive_loop_gap_ms`.
 - `TRADING_GATEWAY_WEBSOCKET_FALLBACK_AFTER_ERRORS=3`
 - `TRADING_GATEWAY_WEBSOCKET_FALLBACK_AFTER_RECONNECTS=5`
 
@@ -398,6 +427,7 @@ More detail:
 - [Runtime DRY_RUN Exit/Sell Intent Runbook](docs/runtime_dry_run_exit_sell_intent_runbook.md)
 - [DRY_RUN 성과 리포트 Runbook](docs/dry_run_performance_report_runbook.md)
 - [DRY_RUN 기준 A/B 제안 Runbook](docs/dry_run_threshold_ab_runbook.md)
+- [Strategy Feedback Loop 검증 Runbook](docs/strategy_feedback_loop_validation_runbook.md)
 - [Gateway 전송 지연 Runbook](docs/gateway_transport_latency_runbook.md)
 - [Gateway WebSocket Mock 실험 Runbook](docs/gateway_websocket_mock_experiment_runbook.md)
 - [Gateway WebSocket Real Pilot Runbook](docs/gateway_websocket_real_pilot_runbook.md)
