@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import time
 
 from fastapi.testclient import TestClient
 from storage.db import TradingDatabase
@@ -261,6 +262,35 @@ def test_dashboard_event_push_is_coalesced(tmp_path, monkeypatch):
 
     assert len(calls) == 1
     assert calls[0]["snapshot"]["gateway"]["dashboard_ws_client_count"] == 1
+
+
+def test_dashboard_snapshot_payload_uses_shared_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    monkeypatch.delenv("TRADING_DASHBOARD_SNAPSHOT_CACHE_TTL_SEC", raising=False)
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    calls = []
+
+    def fake_snapshot(_db):
+        calls.append(time.monotonic())
+        return {"gateway": {}, "runtime": {"call_count": len(calls)}}
+
+    monkeypatch.setattr(api, "build_dashboard_snapshot", fake_snapshot)
+    monkeypatch.setattr(api, "DASHBOARD_SNAPSHOT_CACHE_TTL_SEC", 60.0)
+    api._dashboard_snapshot_cache_payload = None
+    api._dashboard_snapshot_cache_db_path = ""
+    api._dashboard_snapshot_cache_monotonic = 0.0
+
+    first = api._build_dashboard_snapshot_payload()
+    second = api._build_dashboard_snapshot_payload()
+    forced = api._build_dashboard_snapshot_payload(force=True)
+
+    assert first is second
+    assert len(calls) == 2
+    assert first["runtime"]["call_count"] == 1
+    assert forced["runtime"]["call_count"] == 2
 
 
 def test_dashboard_logs_display_kst(tmp_path, monkeypatch):

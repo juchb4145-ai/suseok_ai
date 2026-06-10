@@ -476,7 +476,38 @@ def test_gateway_transport_ws_condition_event_batch_persists_individual_samples(
     assert status["core_condition_event_queue_size"] == 0
     assert status["core_condition_event_queue_batch_count"] == 0
     assert status["core_condition_event_worker_count"] == 4
+    assert status["core_condition_event_batch_chunk_size"] == 64
+    assert status["core_condition_event_queue_sizes_by_worker"] == [0, 0, 0, 0]
+    assert status["core_condition_event_queue_batch_counts_by_worker"] == [0, 0, 0, 0]
+    assert status["core_condition_event_last_drained_batch_count"] >= 1
     assert 1 <= status["core_condition_event_last_batch_size"] <= 2
+
+
+def test_gateway_transport_ws_condition_event_chunks_preserve_worker_order(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "trader.sqlite3"
+    monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    monkeypatch.setenv("TRADING_CORE_WS_CONDITION_EVENT_BATCH_CHUNK_SIZE", "2")
+
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    events = [
+        GatewayEvent(
+            type="condition_event",
+            event_id=f"evt-cond-chunk-{index}",
+            payload={"condition_name": "mock", "condition_index": 1, "code": f"00000{index}", "event_type": "include"},
+        )
+        for index in range(5)
+    ]
+
+    chunks = api._chunk_condition_event_worker_batches({0: events})
+
+    assert [[event.event_id for event in chunk] for chunk in chunks[0]] == [
+        ["evt-cond-chunk-0", "evt-cond-chunk-1"],
+        ["evt-cond-chunk-2", "evt-cond-chunk-3"],
+        ["evt-cond-chunk-4"],
+    ]
 
 
 def test_gateway_transport_ws_condition_event_batch_coalesces_duplicate_keys(tmp_path, monkeypatch):

@@ -1432,6 +1432,8 @@ class TradingDatabase:
                 ON strategy_change_evidence(proposal_id, id);
             CREATE INDEX IF NOT EXISTS idx_strategy_change_evidence_source
                 ON strategy_change_evidence(source_type, source_id);
+            CREATE INDEX IF NOT EXISTS idx_strategy_change_evidence_trade_date
+                ON strategy_change_evidence(trade_date, id);
             CREATE INDEX IF NOT EXISTS idx_strategy_change_approvals_proposal
                 ON strategy_change_approvals(proposal_id, id);
             CREATE INDEX IF NOT EXISTS idx_live_sim_orders_trade_date
@@ -3312,16 +3314,88 @@ class TradingDatabase:
             clauses.append("julianday(replace(substr(created_at, 1, 19), 'T', ' ')) >= julianday('now', ?)")
             params.append(f"-{max(1, int(window_sec or 1))} seconds")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self.conn.execute(
+        total_row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM strategy_change_proposals {where}",
+            tuple(params),
+        ).fetchone()
+        by_status = _group_count_map(
+            self.conn.execute(
+                f"""
+                SELECT status AS key, COUNT(*) AS count
+                FROM strategy_change_proposals
+                {where}
+                {'AND' if where else 'WHERE'} status <> ''
+                GROUP BY status
+                """,
+                tuple(params),
+            ).fetchall()
+        )
+        by_grade = _group_count_map(
+            self.conn.execute(
+                f"""
+                SELECT recommendation_grade AS key, COUNT(*) AS count
+                FROM strategy_change_proposals
+                {where}
+                {'AND' if where else 'WHERE'} recommendation_grade <> ''
+                GROUP BY recommendation_grade
+                """,
+                tuple(params),
+            ).fetchall()
+        )
+        by_category = _group_count_map(
+            self.conn.execute(
+                f"""
+                SELECT category AS key, COUNT(*) AS count
+                FROM strategy_change_proposals
+                {where}
+                {'AND' if where else 'WHERE'} category <> ''
+                GROUP BY category
+                """,
+                tuple(params),
+            ).fetchall()
+        )
+        soon_cutoff = (datetime.now() + timedelta(days=1)).isoformat(timespec="seconds")
+        expiring_clauses = list(clauses)
+        expiring_params = list(params)
+        expiring_clauses.append("expires_at <> ''")
+        expiring_clauses.append("expires_at <= ?")
+        expiring_params.append(soon_cutoff)
+        expiring_where = f"WHERE {' AND '.join(expiring_clauses)}"
+        expiring_row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM strategy_change_proposals {expiring_where}",
+            tuple(expiring_params),
+        ).fetchone()
+        top_rows = self.conn.execute(
             f"""
             SELECT * FROM strategy_change_proposals
             {where}
-            ORDER BY created_at DESC, id DESC
+            ORDER BY
+                CASE recommendation_grade
+                    WHEN 'STRONG_CANDIDATE' THEN 0
+                    WHEN 'WATCH_CANDIDATE' THEN 1
+                    WHEN 'RISKY_CANDIDATE' THEN 2
+                    WHEN 'DATA_INSUFFICIENT' THEN 3
+                    ELSE 4
+                END,
+                net_benefit_score DESC,
+                created_at DESC,
+                id DESC
+            LIMIT 10
             """,
             tuple(params),
         ).fetchall()
-        proposals = [_row_to_strategy_change_proposal(row) for row in rows]
-        return _strategy_change_proposal_summary(proposals, trade_date=trade_date or "", window_sec=window_sec)
+        return {
+            "trade_date": trade_date or "",
+            "window_sec": window_sec,
+            "total_count": int(total_row["count"] or 0) if total_row else 0,
+            "by_status": by_status,
+            "by_grade": by_grade,
+            "by_category": by_category,
+            "top_recommendations": [_row_to_strategy_change_proposal(row) for row in top_rows],
+            "risky_count": int(by_grade.get("RISKY_CANDIDATE", 0)),
+            "data_insufficient_count": int(by_grade.get("DATA_INSUFFICIENT", 0)),
+            "expiring_soon_count": int(expiring_row["count"] or 0) if expiring_row else 0,
+        }
 
     def save_live_sim_order(self, record: dict) -> dict:
         payload = _live_sim_order_params(record)
@@ -7756,6 +7830,10 @@ def _row_to_strategy_change_approval(row: sqlite3.Row) -> dict:
     data = dict(row)
     data["details"] = _safe_json_loads(data.get("details_json"), {})
     return data
+
+
+def _group_count_map(rows: Iterable[sqlite3.Row]) -> dict[str, int]:
+    return {str(row["key"] or ""): int(row["count"] or 0) for row in rows if str(row["key"] or "")}
 
 
 def _strategy_change_proposal_summary(

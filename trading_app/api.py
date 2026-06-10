@@ -112,6 +112,9 @@ KST = timezone(timedelta(hours=9), "KST")
 TRANSPORT_LIVE_WINDOW_SEC = 15 * 60
 LOG_LIVE_WINDOW_SEC = 5 * 60
 DASHBOARD_EVENT_PUSH_MIN_INTERVAL_SEC = 1.0
+DASHBOARD_SNAPSHOT_CACHE_TTL_SEC = 5.0
+DASHBOARD_HEAVY_SECTION_CACHE_TTL_SEC = 30.0
+DASHBOARD_WS_PUSH_INTERVAL_SEC = 5.0
 THEMELAB_OPERATOR_EVENT_TYPES = {
     "BUY_READY_NEW",
     "BUY_READY_SMALL_NEW",
@@ -389,7 +392,9 @@ gateway_ws_transport_state: dict[str, Any] = {
 gateway_condition_event_worker_state: dict[str, Any] = {
     "enabled": False,
     "queue_size": 0,
+    "queue_sizes_by_worker": [],
     "queue_batch_count": 0,
+    "queue_batch_counts_by_worker": [],
     "queue_max_size": 0,
     "worker_count": 1,
     "active_worker_count": 0,
@@ -403,14 +408,17 @@ gateway_condition_event_worker_state: dict[str, Any] = {
     "failed_count": 0,
     "dropped_count": 0,
     "last_batch_size": 0,
+    "last_drained_batch_count": 0,
     "last_received_count": 0,
     "last_queued_count": 0,
+    "last_queued_batch_count": 0,
     "last_coalesced_count": 0,
     "last_stale_skipped_count": 0,
     "last_stale_queue_wait_skipped_count": 0,
     "last_stale_queue_wait_ms": 0.0,
     "last_queue_wait_ms": 0.0,
     "stale_include_skip_ms": 15000.0,
+    "batch_chunk_size": 64,
     "last_batch_duration_ms": 0.0,
     "last_worker_index": 0,
     "last_shard_key": "",
@@ -516,6 +524,14 @@ _core_ws_price_tick_coalesce_lock = RLock()
 _core_ws_price_tick_latest_by_key: dict[str, _CoreWsEventWorkItem] = {}
 _dashboard_snapshot_task: asyncio.Task | None = None
 _dashboard_snapshot_last_sent_monotonic = 0.0
+_dashboard_snapshot_cache_lock = RLock()
+_dashboard_snapshot_cache_payload: dict[str, Any] | None = None
+_dashboard_snapshot_cache_db_path = ""
+_dashboard_snapshot_cache_monotonic = 0.0
+_dashboard_snapshot_cache_build_ms = 0.0
+_dashboard_snapshot_cache_hit_count = 0
+_dashboard_snapshot_cache_miss_count = 0
+_dashboard_fragment_cache: dict[tuple[str, str], tuple[float, Any]] = {}
 
 
 def _build_runtime_supervisor() -> RuntimeSupervisor:
@@ -2398,12 +2414,8 @@ def reviews(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
 
 
 @app.get("/api/snapshot")
-def snapshot() -> dict[str, Any]:
-    db = open_database()
-    try:
-        return build_dashboard_snapshot(db)
-    finally:
-        close_database(db)
+def snapshot(refresh: bool = Query(False)) -> dict[str, Any]:
+    return _build_dashboard_snapshot_payload(force=refresh)
 
 
 @app.get("/api/themelab/snapshot")
@@ -3561,6 +3573,14 @@ def _gateway_condition_event_stale_include_skip_ms() -> float:
     return max(0.0, value)
 
 
+def _gateway_condition_event_batch_chunk_size() -> int:
+    try:
+        value = int(os.environ.get("TRADING_CORE_WS_CONDITION_EVENT_BATCH_CHUNK_SIZE", "64"))
+    except ValueError:
+        value = 64
+    return max(1, min(500, value))
+
+
 def _core_ws_event_async_enabled() -> bool:
     return os.environ.get("TRADING_CORE_WS_EVENT_ASYNC_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 
@@ -3630,7 +3650,15 @@ def _ensure_gateway_condition_event_worker() -> None:
         _gateway_condition_event_worker_tasks = []
         _gateway_condition_event_worker_loop = loop
         _update_gateway_condition_event_worker_state(
-            {"queue_size": 0, "queue_batch_count": 0, "worker_count": worker_count, "active_worker_count": 0, "active_count": 0}
+            {
+                "queue_size": 0,
+                "queue_sizes_by_worker": [0 for _ in range(worker_count)],
+                "queue_batch_count": 0,
+                "queue_batch_counts_by_worker": [0 for _ in range(worker_count)],
+                "worker_count": worker_count,
+                "active_worker_count": 0,
+                "active_count": 0,
+            }
         )
     if _gateway_condition_event_executor is None or _gateway_condition_event_executor_worker_count != worker_count:
         if _gateway_condition_event_executor is not None:
@@ -3650,9 +3678,11 @@ def _ensure_gateway_condition_event_worker() -> None:
             "enabled": True,
             "queue_size": int(gateway_condition_event_worker_state.get("queue_size") or 0),
             "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+            "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
             "queue_max_size": queue_max_size,
             "worker_count": worker_count,
             "stale_include_skip_ms": _gateway_condition_event_stale_include_skip_ms(),
+            "batch_chunk_size": _gateway_condition_event_batch_chunk_size(),
         }
     )
 
@@ -3773,6 +3803,37 @@ def _core_ws_price_tick_coalesce_key(event: GatewayEvent | None) -> str:
 
 def _gateway_condition_event_queue_batch_count() -> int:
     return sum(queue.qsize() for queue in _gateway_condition_event_queues)
+
+
+def _gateway_condition_event_queue_batch_counts() -> list[int]:
+    return [queue.qsize() for queue in _gateway_condition_event_queues]
+
+
+def _gateway_condition_event_queue_sizes_by_worker() -> list[int]:
+    worker_count = len(_gateway_condition_event_queues) or _gateway_condition_event_worker_count()
+    sizes = list(gateway_condition_event_worker_state.get("queue_sizes_by_worker") or [])
+    if len(sizes) < worker_count:
+        sizes.extend([0 for _ in range(worker_count - len(sizes))])
+    return [max(0, int(size or 0)) for size in sizes[:worker_count]]
+
+
+def _condition_event_queue_sizes_with_delta(worker_index: int, delta: int) -> list[int]:
+    sizes = _gateway_condition_event_queue_sizes_by_worker()
+    if 0 <= worker_index < len(sizes):
+        sizes[worker_index] = max(0, int(sizes[worker_index]) + int(delta))
+    return sizes
+
+
+def _chunk_condition_event_worker_batches(
+    batches_by_worker: dict[int, list[GatewayEvent]],
+    chunk_size: int | None = None,
+) -> dict[int, list[list[GatewayEvent]]]:
+    size = max(1, int(chunk_size or _gateway_condition_event_batch_chunk_size()))
+    chunked: dict[int, list[list[GatewayEvent]]] = {}
+    for worker_index, worker_events in batches_by_worker.items():
+        chunks = [worker_events[index : index + size] for index in range(0, len(worker_events), size)]
+        chunked[worker_index] = [chunk for chunk in chunks if chunk]
+    return chunked
 
 
 def _condition_event_shard_key(event: GatewayEvent) -> str:
@@ -4401,17 +4462,28 @@ def _enqueue_gateway_condition_events(events: list[GatewayEvent], metadata: dict
     for event in traced_events:
         worker_index = _gateway_condition_event_worker_index(event, worker_count)
         batches_by_worker.setdefault(worker_index, []).append(event)
+    chunk_size = _gateway_condition_event_batch_chunk_size()
+    chunked_batches_by_worker = _chunk_condition_event_worker_batches(batches_by_worker, chunk_size)
     queued_worker_indexes: list[int] = []
-    if any(queues[worker_index].full() for worker_index in batches_by_worker):
+    queue_full = False
+    for worker_index, worker_batches in chunked_batches_by_worker.items():
+        queue = queues[worker_index]
+        if queue.maxsize > 0 and queue.qsize() + len(worker_batches) > queue.maxsize:
+            queue_full = True
+            break
+    if queue_full:
         for event in traced_events:
             _clear_condition_event_generation_if_current(event)
         _update_gateway_condition_event_worker_state(
             {
                 "enabled": True,
                 "queue_size": queue_size,
+                "queue_sizes_by_worker": _gateway_condition_event_queue_sizes_by_worker(),
                 "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
                 "queue_max_size": queue_max_size,
                 "worker_count": worker_count,
+                "batch_chunk_size": chunk_size,
                 "received_count": int(gateway_condition_event_worker_state.get("received_count") or 0) + received_count,
                 "coalesced_count": int(gateway_condition_event_worker_state.get("coalesced_count") or 0) + coalesced_count,
                 "dropped_count": int(gateway_condition_event_worker_state.get("dropped_count") or 0) + len(traced_events),
@@ -4435,15 +4507,16 @@ def _enqueue_gateway_condition_events(events: list[GatewayEvent], metadata: dict
             "reason": "QUEUE_FULL",
         }
     try:
-        for worker_index, worker_events in batches_by_worker.items():
-            queues[worker_index].put_nowait(
-                _ConditionEventBatchWorkItem(
-                    events=worker_events,
-                    queued_at=queued_at,
-                    queued_monotonic_ms=queued_monotonic,
+        for worker_index, worker_batches in chunked_batches_by_worker.items():
+            for worker_events in worker_batches:
+                queues[worker_index].put_nowait(
+                    _ConditionEventBatchWorkItem(
+                        events=worker_events,
+                        queued_at=queued_at,
+                        queued_monotonic_ms=queued_monotonic,
+                    )
                 )
-            )
-            queued_worker_indexes.append(worker_index)
+                queued_worker_indexes.append(worker_index)
     except asyncio.QueueFull:
         for event in traced_events:
             _clear_condition_event_generation_if_current(event)
@@ -4451,9 +4524,12 @@ def _enqueue_gateway_condition_events(events: list[GatewayEvent], metadata: dict
             {
                 "enabled": True,
                 "queue_size": queue_size,
+                "queue_sizes_by_worker": _gateway_condition_event_queue_sizes_by_worker(),
                 "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
                 "queue_max_size": queue_max_size,
                 "worker_count": worker_count,
+                "batch_chunk_size": chunk_size,
                 "received_count": int(gateway_condition_event_worker_state.get("received_count") or 0) + received_count,
                 "coalesced_count": int(gateway_condition_event_worker_state.get("coalesced_count") or 0) + coalesced_count,
                 "dropped_count": int(gateway_condition_event_worker_state.get("dropped_count") or 0) + len(traced_events),
@@ -4477,18 +4553,26 @@ def _enqueue_gateway_condition_events(events: list[GatewayEvent], metadata: dict
             "reason": "QUEUE_FULL",
         }
     next_queue_size = queue_size + len(traced_events)
+    queue_sizes_by_worker = _gateway_condition_event_queue_sizes_by_worker()
+    for worker_index, worker_events in batches_by_worker.items():
+        if 0 <= worker_index < len(queue_sizes_by_worker):
+            queue_sizes_by_worker[worker_index] += len(worker_events)
     _update_gateway_condition_event_worker_state(
         {
             "enabled": True,
             "queue_size": next_queue_size,
+            "queue_sizes_by_worker": queue_sizes_by_worker,
             "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+            "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
             "queue_max_size": queue_max_size,
             "worker_count": worker_count,
+            "batch_chunk_size": chunk_size,
             "received_count": int(gateway_condition_event_worker_state.get("received_count") or 0) + received_count,
             "queued_count": int(gateway_condition_event_worker_state.get("queued_count") or 0) + len(traced_events),
             "coalesced_count": int(gateway_condition_event_worker_state.get("coalesced_count") or 0) + coalesced_count,
             "last_received_count": received_count,
             "last_queued_count": len(traced_events),
+            "last_queued_batch_count": len(queued_worker_indexes),
             "last_coalesced_count": coalesced_count,
             "last_worker_index": queued_worker_indexes[-1] if queued_worker_indexes else 0,
             "last_shard_key": _condition_event_shard_key(traced_events[-1]) if traced_events else "",
@@ -4516,17 +4600,29 @@ async def _gateway_condition_event_worker_loop_main(worker_index: int = 0) -> No
             continue
         queue = _gateway_condition_event_queues[worker_index]
         item = await queue.get()
-        events = item.events
+        drained_items = [item]
+        events = list(item.events)
+        chunk_size = _gateway_condition_event_batch_chunk_size()
+        while queue.qsize() > 0 and len(events) < chunk_size:
+            try:
+                drained_item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            drained_items.append(drained_item)
+            events.extend(drained_item.events)
         batch_size = len(events)
         batch_queue_wait_ms = monotonic_delta_ms(item.queued_monotonic_ms, monotonic_ms()) or 0.0
         queue_size = max(0, int(gateway_condition_event_worker_state.get("queue_size") or 0) - batch_size)
         _update_gateway_condition_event_worker_state(
             {
                 "queue_size": queue_size,
+                "queue_sizes_by_worker": _condition_event_queue_sizes_with_delta(worker_index, -batch_size),
                 "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
                 "active_worker_count": int(gateway_condition_event_worker_state.get("active_worker_count") or 0) + 1,
                 "active_count": int(gateway_condition_event_worker_state.get("active_count") or 0) + batch_size,
                 "last_batch_size": batch_size,
+                "last_drained_batch_count": len(drained_items),
                 "last_queue_wait_ms": round(batch_queue_wait_ms, 3),
                 "last_worker_index": worker_index,
                 "last_shard_key": _condition_event_shard_key(events[-1]) if events else "",
@@ -4550,7 +4646,9 @@ async def _gateway_condition_event_worker_loop_main(worker_index: int = 0) -> No
             _update_gateway_condition_event_worker_state(
                 {
                     "queue_size": int(gateway_condition_event_worker_state.get("queue_size") or 0),
+                    "queue_sizes_by_worker": _gateway_condition_event_queue_sizes_by_worker(),
                     "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                    "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
                     "active_worker_count": max(0, int(gateway_condition_event_worker_state.get("active_worker_count") or 0) - 1),
                     "active_count": max(0, int(gateway_condition_event_worker_state.get("active_count") or 0) - batch_size),
                     "processed_count": int(gateway_condition_event_worker_state.get("processed_count") or 0) + processed_count,
@@ -4576,7 +4674,9 @@ async def _gateway_condition_event_worker_loop_main(worker_index: int = 0) -> No
             _update_gateway_condition_event_worker_state(
                 {
                     "queue_size": int(gateway_condition_event_worker_state.get("queue_size") or 0),
+                    "queue_sizes_by_worker": _gateway_condition_event_queue_sizes_by_worker(),
                     "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                    "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
                     "active_worker_count": max(0, int(gateway_condition_event_worker_state.get("active_worker_count") or 0) - 1),
                     "active_count": max(0, int(gateway_condition_event_worker_state.get("active_count") or 0) - batch_size),
                     "failed_count": int(gateway_condition_event_worker_state.get("failed_count") or 0) + batch_size,
@@ -4585,8 +4685,14 @@ async def _gateway_condition_event_worker_loop_main(worker_index: int = 0) -> No
                 }
             )
         finally:
-            queue.task_done()
-            _update_gateway_condition_event_worker_state({"queue_batch_count": _gateway_condition_event_queue_batch_count()})
+            for _drained_item in drained_items:
+                queue.task_done()
+            _update_gateway_condition_event_worker_state(
+                {
+                    "queue_batch_count": _gateway_condition_event_queue_batch_count(),
+                    "queue_batch_counts_by_worker": _gateway_condition_event_queue_batch_counts(),
+                }
+            )
 
 
 async def _core_ws_event_worker_loop_main(worker_kind: str = "single", worker_index: int = 0) -> None:
@@ -5001,6 +5107,109 @@ def _update_gateway_condition_event_worker_state(patch: dict[str, Any]) -> None:
     gateway_condition_event_worker_state.update({key: value for key, value in patch.items() if value is not None})
 
 
+def _dashboard_float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, value)
+
+
+def _dashboard_snapshot_cache_ttl_sec() -> float:
+    return _dashboard_float_env("TRADING_DASHBOARD_SNAPSHOT_CACHE_TTL_SEC", DASHBOARD_SNAPSHOT_CACHE_TTL_SEC)
+
+
+def _dashboard_heavy_section_cache_ttl_sec() -> float:
+    return _dashboard_float_env("TRADING_DASHBOARD_HEAVY_SECTION_CACHE_TTL_SEC", DASHBOARD_HEAVY_SECTION_CACHE_TTL_SEC)
+
+
+def _dashboard_ws_push_interval_sec() -> float:
+    return _dashboard_float_env("TRADING_DASHBOARD_WS_PUSH_INTERVAL_SEC", DASHBOARD_WS_PUSH_INTERVAL_SEC, minimum=1.0)
+
+
+def _dashboard_database_cache_key(db: TradingDatabase | None = None) -> str:
+    if db is not None and getattr(db, "path", None) is not None:
+        return str(Path(db.path).resolve())
+    try:
+        return str(Path(get_settings().db_path).resolve())
+    except Exception:
+        return ""
+
+
+def _cached_dashboard_fragment(
+    db: TradingDatabase,
+    key: str,
+    builder,
+    *,
+    ttl_sec: float | None = None,
+):
+    ttl = _dashboard_heavy_section_cache_ttl_sec() if ttl_sec is None else max(0.0, float(ttl_sec))
+    if ttl <= 0.0:
+        return builder()
+    cache_key = (_dashboard_database_cache_key(db), key)
+    now = time.monotonic()
+    with _dashboard_snapshot_cache_lock:
+        cached = _dashboard_fragment_cache.get(cache_key)
+        if cached is not None and now - cached[0] <= ttl:
+            return cached[1]
+        value = builder()
+        _dashboard_fragment_cache[cache_key] = (time.monotonic(), value)
+        return value
+
+
+def _build_dashboard_snapshot_payload_uncached() -> dict[str, Any]:
+    db = open_database()
+    try:
+        return build_dashboard_snapshot(db)
+    finally:
+        close_database(db)
+
+
+def _build_dashboard_snapshot_payload(*, force: bool = False) -> dict[str, Any]:
+    global _dashboard_snapshot_cache_payload
+    global _dashboard_snapshot_cache_db_path
+    global _dashboard_snapshot_cache_monotonic
+    global _dashboard_snapshot_cache_build_ms
+    global _dashboard_snapshot_cache_hit_count
+    global _dashboard_snapshot_cache_miss_count
+    ttl = _dashboard_snapshot_cache_ttl_sec()
+    db_path = _dashboard_database_cache_key()
+    if ttl <= 0.0:
+        return _build_dashboard_snapshot_payload_uncached()
+    now = time.monotonic()
+    with _dashboard_snapshot_cache_lock:
+        if (
+            not force
+            and _dashboard_snapshot_cache_payload is not None
+            and _dashboard_snapshot_cache_db_path == db_path
+            and now - _dashboard_snapshot_cache_monotonic <= ttl
+        ):
+            _dashboard_snapshot_cache_hit_count += 1
+            return _dashboard_snapshot_cache_payload
+        _dashboard_snapshot_cache_miss_count += 1
+        started = time.perf_counter()
+        payload = _build_dashboard_snapshot_payload_uncached()
+        _dashboard_snapshot_cache_build_ms = (time.perf_counter() - started) * 1000.0
+        _dashboard_snapshot_cache_payload = payload
+        _dashboard_snapshot_cache_db_path = db_path
+        _dashboard_snapshot_cache_monotonic = time.monotonic()
+        return payload
+
+
+def _dashboard_snapshot_for_client_count(payload: dict[str, Any], client_count: int) -> dict[str, Any]:
+    snapshot = dict(payload)
+    gateway = dict(snapshot.get("gateway") or {})
+    gateway["dashboard_ws_client_count"] = int(client_count)
+    with _dashboard_snapshot_cache_lock:
+        cache_age_sec = max(0.0, time.monotonic() - _dashboard_snapshot_cache_monotonic) if _dashboard_snapshot_cache_payload is not None else 0.0
+        gateway["dashboard_snapshot_cache_age_sec"] = round(cache_age_sec, 3)
+        gateway["dashboard_snapshot_cache_build_ms"] = round(float(_dashboard_snapshot_cache_build_ms or 0.0), 3)
+        gateway["dashboard_snapshot_cache_hit_count"] = int(_dashboard_snapshot_cache_hit_count)
+        gateway["dashboard_snapshot_cache_miss_count"] = int(_dashboard_snapshot_cache_miss_count)
+    snapshot["gateway"] = gateway
+    return snapshot
+
+
 async def _schedule_dashboard_snapshot_broadcast() -> None:
     global _dashboard_snapshot_task
     if dashboard_connections.client_count <= 0:
@@ -5021,8 +5230,8 @@ async def _broadcast_dashboard_snapshot_after(delay_sec: float) -> None:
     if dashboard_connections.client_count <= 0:
         return
     payload = await asyncio.to_thread(_build_dashboard_snapshot_payload)
-    payload["gateway"]["dashboard_ws_client_count"] = dashboard_connections.client_count
-    await dashboard_connections.broadcast_json({"type": "snapshot", "snapshot": payload})
+    snapshot = _dashboard_snapshot_for_client_count(payload, dashboard_connections.client_count)
+    await dashboard_connections.broadcast_json({"type": "snapshot", "snapshot": snapshot})
     _dashboard_snapshot_last_sent_monotonic = time.monotonic()
 
 
@@ -5031,14 +5240,6 @@ def _consume_dashboard_snapshot_task(task: asyncio.Task) -> None:
         task.result()
     except Exception:
         pass
-
-
-def _build_dashboard_snapshot_payload() -> dict[str, Any]:
-    db = open_database()
-    try:
-        return build_dashboard_snapshot(db)
-    finally:
-        close_database(db)
 
 
 @app.get("/api/gateway/commands", response_model=GatewayCommandBatch)
@@ -5284,9 +5485,9 @@ async def dashboard_ws(websocket: WebSocket) -> None:
     try:
         while True:
             payload = await asyncio.to_thread(_build_dashboard_snapshot_payload)
-            payload["gateway"]["dashboard_ws_client_count"] = dashboard_connections.client_count
-            await dashboard_connections.send_json(websocket, {"type": "snapshot", "snapshot": payload})
-            await asyncio.sleep(2.0)
+            snapshot_payload = _dashboard_snapshot_for_client_count(payload, dashboard_connections.client_count)
+            await dashboard_connections.send_json(websocket, {"type": "snapshot", "snapshot": snapshot_payload})
+            await asyncio.sleep(_dashboard_ws_push_interval_sec())
     except WebSocketDisconnect:
         dashboard_connections.disconnect(websocket)
     except Exception:
@@ -5846,9 +6047,9 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     commands_payload = dict(status_payload["commands"])
     commands_payload["recent"] = gateway_state.list_commands(limit=12, include_finished=True)
     candidates_payload = build_candidates_snapshot(db)
-    themes_payload = build_themes_snapshot(db)
+    themes_payload = _cached_dashboard_fragment(db, "themes:v1:30", lambda: build_themes_snapshot(db, limit=30))
     orders_payload = build_orders_snapshot(db)
-    reviews_payload = build_reviews_snapshot(db)
+    reviews_payload = _cached_dashboard_fragment(db, "reviews:v1:30", lambda: build_reviews_snapshot(db, limit=30))
     logs_payload = build_logs_snapshot(db)
     transport_payload = dict(status_payload.get("transport") or _transport_dashboard_payload(_transport_status_payload(db)))
     transport_experiment_payload = _transport_experiment_dashboard_payload(db)
@@ -5856,8 +6057,8 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
     runtime_payload = _runtime_dashboard_payload(runtime_status)
     dry_run_orders_payload = {
         "summary": db.runtime_order_intent_summary(),
-        "items": db.list_runtime_order_intents(limit=20),
-        "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=20),
+        "items": db.list_runtime_order_intents(limit=12),
+        "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=12),
     }
     decision_summary_payload = db.strategy_decision_summary(trade_date=datetime.now().date().isoformat())
     outcome_summary_payload = db.strategy_decision_outcome_summary(trade_date=datetime.now().date().isoformat())
@@ -5879,7 +6080,11 @@ def build_dashboard_snapshot(db: TradingDatabase) -> dict[str, Any]:
         "top_recommendations": change_proposal_summary_payload.get("top_recommendations", []),
         "disclaimer_ko": "자동 적용 아님: 승인 상태만 저장하며 runtime config는 변경하지 않습니다.",
     }
-    dry_run_performance_report = _performance_analyzer(db).build_report(limit=10000)
+    dry_run_performance_report = _cached_dashboard_fragment(
+        db,
+        "dry_run_performance:v1:500",
+        lambda: _performance_analyzer(db).build_report(limit=500),
+    )
     threshold_ab_report = _threshold_ab_analyzer().build_report(dry_run_performance_report, limit=10, offset=0)
     dry_run_performance_payload = {
         "generated_at": dry_run_performance_report.get("generated_at", ""),
@@ -7259,7 +7464,9 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         ),
         "core_condition_event_async_enabled": bool(condition_worker.get("enabled")),
         "core_condition_event_queue_size": int(condition_worker.get("queue_size") or 0),
+        "core_condition_event_queue_sizes_by_worker": list(condition_worker.get("queue_sizes_by_worker") or []),
         "core_condition_event_queue_batch_count": int(condition_worker.get("queue_batch_count") or 0),
+        "core_condition_event_queue_batch_counts_by_worker": list(condition_worker.get("queue_batch_counts_by_worker") or []),
         "core_condition_event_queue_max_size": int(condition_worker.get("queue_max_size") or 0),
         "core_condition_event_worker_count": int(condition_worker.get("worker_count") or 0),
         "core_condition_event_active_worker_count": int(condition_worker.get("active_worker_count") or 0),
@@ -7273,8 +7480,10 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         "core_condition_event_failed_count": int(condition_worker.get("failed_count") or 0),
         "core_condition_event_dropped_count": int(condition_worker.get("dropped_count") or 0),
         "core_condition_event_last_batch_size": int(condition_worker.get("last_batch_size") or 0),
+        "core_condition_event_last_drained_batch_count": int(condition_worker.get("last_drained_batch_count") or 0),
         "core_condition_event_last_received_count": int(condition_worker.get("last_received_count") or 0),
         "core_condition_event_last_queued_count": int(condition_worker.get("last_queued_count") or 0),
+        "core_condition_event_last_queued_batch_count": int(condition_worker.get("last_queued_batch_count") or 0),
         "core_condition_event_last_coalesced_count": int(condition_worker.get("last_coalesced_count") or 0),
         "core_condition_event_last_stale_skipped_count": int(condition_worker.get("last_stale_skipped_count") or 0),
         "core_condition_event_last_stale_queue_wait_skipped_count": int(
@@ -7284,6 +7493,9 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         "core_condition_event_last_queue_wait_ms": float(condition_worker.get("last_queue_wait_ms") or 0.0),
         "core_condition_event_stale_include_skip_ms": float(
             condition_worker.get("stale_include_skip_ms") or _gateway_condition_event_stale_include_skip_ms()
+        ),
+        "core_condition_event_batch_chunk_size": int(
+            condition_worker.get("batch_chunk_size") or _gateway_condition_event_batch_chunk_size()
         ),
         "core_condition_event_last_batch_duration_ms": float(condition_worker.get("last_batch_duration_ms") or 0.0),
         "core_condition_event_last_worker_index": int(condition_worker.get("last_worker_index") or 0),

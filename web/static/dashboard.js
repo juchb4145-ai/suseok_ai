@@ -1,9 +1,17 @@
 const state = {
   ws: null,
   pollTimer: null,
+  reconnectTimer: null,
+  pollInFlight: false,
+  wsConnected: false,
+  lastSnapshotAt: 0,
   latestSnapshot: null,
   tables: {},
 };
+
+const SNAPSHOT_POLL_INTERVAL_MS = 30000;
+const SNAPSHOT_INITIAL_FALLBACK_MS = 7000;
+const SNAPSHOT_RECONNECT_MS = 3000;
 
 const tableConfigs = {
   transportLatency: {
@@ -766,8 +774,8 @@ function openDetailPanel(title, payload) {
 }
 
 function detailActionHtml(payload) {
-  const proposal = (payload || {}).proposal || payload || {};
-  if (!proposal.proposal_id) return "";
+  const proposal = actionProposal(payload);
+  if (!proposal) return "";
   return `
     <div class="detail-actions">
       <p class="help-text">자동 적용 아님: 승인 상태만 저장하고 runtime config는 변경하지 않습니다.</p>
@@ -781,13 +789,18 @@ function detailActionHtml(payload) {
 }
 
 function bindDetailActions(payload) {
-  const proposal = (payload || {}).proposal || payload || {};
-  if (!proposal.proposal_id) return;
+  const proposal = actionProposal(payload);
+  if (!proposal) return;
   document.querySelectorAll("[data-proposal-action]").forEach((button) => {
     button.addEventListener("click", () => runProposalAction(proposal.proposal_id, button.dataset.proposalAction).catch((error) => {
       openDetailPanel("Strategy Change Proposal action error", { proposal_id: proposal.proposal_id, error: error.message });
     }));
   });
+}
+
+function actionProposal(payload) {
+  const proposal = (payload || {}).proposal || {};
+  return proposal.proposal_id ? proposal : null;
 }
 
 async function runProposalAction(proposalId, action) {
@@ -1261,9 +1274,17 @@ function compactPlain(value) {
 }
 
 async function pollSnapshot() {
-  const response = await fetch("/api/snapshot");
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-  render(await response.json());
+  if (state.pollInFlight) return;
+  state.pollInFlight = true;
+  try {
+    const response = await fetch("/api/snapshot");
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    const snapshot = await response.json();
+    state.lastSnapshotAt = Date.now();
+    render(snapshot);
+  } finally {
+    state.pollInFlight = false;
+  }
 }
 
 async function runtimeCommand(action, button) {
@@ -1286,25 +1307,53 @@ async function runtimeCommand(action, button) {
   }
 }
 
-function startPolling() {
+function stopPolling() {
+  if (!state.pollTimer) return;
+  clearInterval(state.pollTimer);
+  state.pollTimer = null;
+}
+
+function startPolling({ immediate = false } = {}) {
   if (state.pollTimer) return;
-  pollSnapshot().catch(() => {});
-  state.pollTimer = setInterval(() => pollSnapshot().catch(() => {}), 3000);
+  if (immediate && !state.wsConnected) pollSnapshot().catch(() => {});
+  state.pollTimer = setInterval(() => {
+    if (!state.wsConnected) pollSnapshot().catch(() => {});
+  }, SNAPSHOT_POLL_INTERVAL_MS);
 }
 
 function connectWebSocket() {
+  if (state.ws && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.ws.readyState)) return;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(`${protocol}//${window.location.host}/ws/dashboard`);
   state.ws = ws;
+  ws.onopen = () => {
+    state.wsConnected = true;
+    stopPolling();
+  };
   ws.onmessage = (event) => {
     const payload = JSON.parse(event.data);
-    if (payload.type === "snapshot") render(payload.snapshot);
+    if (payload.type === "snapshot") {
+      state.wsConnected = true;
+      state.lastSnapshotAt = Date.now();
+      stopPolling();
+      render(payload.snapshot);
+    }
   };
   ws.onclose = () => {
-    startPolling();
-    setTimeout(connectWebSocket, 3000);
+    if (state.ws === ws) state.ws = null;
+    state.wsConnected = false;
+    startPolling({ immediate: true });
+    if (!state.reconnectTimer) {
+      state.reconnectTimer = setTimeout(() => {
+        state.reconnectTimer = null;
+        connectWebSocket();
+      }, SNAPSHOT_RECONNECT_MS);
+    }
   };
-  ws.onerror = () => startPolling();
+  ws.onerror = () => {
+    state.wsConnected = false;
+    startPolling({ immediate: true });
+  };
 }
 
 function initTabs() {
@@ -1329,7 +1378,9 @@ function initTables() {
 function initDashboard() {
   initTabs();
   connectWebSocket();
-  setTimeout(startPolling, 2000);
+  setTimeout(() => {
+    if (!state.lastSnapshotAt) startPolling({ immediate: true });
+  }, SNAPSHOT_INITIAL_FALLBACK_MS);
   initTables();
   document.getElementById("runtime-start")?.addEventListener("click", (event) => runtimeCommand("start", event.currentTarget).catch(() => {}));
   document.getElementById("runtime-stop")?.addEventListener("click", (event) => runtimeCommand("stop", event.currentTarget).catch(() => {}));

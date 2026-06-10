@@ -104,6 +104,12 @@ Core API:
 - `GET /api/runtime/status`
 - `POST /api/runtime/start`
 - `POST /api/runtime/stop`
+
+Dashboard performance flags:
+
+- `TRADING_DASHBOARD_SNAPSHOT_CACHE_TTL_SEC`: shared `/api/snapshot` and `/ws/dashboard` snapshot cache TTL; default `5`.
+- `TRADING_DASHBOARD_HEAVY_SECTION_CACHE_TTL_SEC`: cache TTL for heavy dashboard sections such as themes, reviews, and dry-run performance; default `30`.
+- `TRADING_DASHBOARD_WS_PUSH_INTERVAL_SEC`: per-client dashboard WebSocket push interval; default `5`. The browser uses `/api/snapshot` polling only as a WebSocket fallback.
 - `POST /api/runtime/restart`
 - `POST /api/runtime/cycle`
 - `GET /api/runtime/snapshot`
@@ -332,6 +338,7 @@ Pilot safety flags:
 - `TRADING_CORE_WS_CONDITION_EVENT_ASYNC_ENABLED`: process WS condition-event batches on a Core worker instead of the receive loop; default `1`.
 - `TRADING_CORE_WS_CONDITION_EVENT_QUEUE_SIZE`: Core bounded queued event count for async condition-event processing; default `5000`. Status exposes pending events as `core_condition_event_queue_size`, pending batches as `core_condition_event_queue_batch_count`, and in-flight work as `core_condition_event_active_count`.
 - `TRADING_CORE_WS_CONDITION_EVENT_WORKERS`: shard Core WS `condition_event` batches by stock code across worker queues while preserving per-code order; default `4`, allowed range `1..8`. Status exposes `core_condition_event_worker_count`, `core_condition_event_active_worker_count`, `core_condition_event_last_worker_index`, and `core_condition_event_last_shard_key`.
+- `TRADING_CORE_WS_CONDITION_EVENT_BATCH_CHUNK_SIZE`: split and adaptively drain per-shard Core WS `condition_event` batches up to this event count per worker execution; default `64`, allowed range `1..500`. Status exposes `core_condition_event_batch_chunk_size`, `core_condition_event_queue_sizes_by_worker`, `core_condition_event_queue_batch_counts_by_worker`, `core_condition_event_last_drained_batch_count`, and `core_condition_event_last_queued_batch_count`.
 - `TRADING_CORE_WS_CONDITION_EVENT_STALE_INCLUDE_SKIP_MS`: skip stale WS `condition_event` include items that waited in the Core condition queue longer than this threshold before candidate creation; default `15000`, set `0` to disable. Remove events are still processed. Status exposes `core_condition_event_stale_queue_wait_skipped_count`, `core_condition_event_last_stale_queue_wait_ms`, and `core_condition_event_stale_include_skip_ms`.
 - Core coalesces duplicate WS `condition_event` bursts by `condition_index/name + code` before enqueueing and skips stale queued events when a newer state for the same key arrived. Status exposes `core_condition_event_received_count`, `core_condition_event_queued_count`, `core_condition_event_coalesced_count`, and `core_condition_event_stale_skipped_count`.
 - `TRADING_CORE_WS_EVENT_ASYNC_ENABLED`: queue non-batch WS Gateway events and send-completed diagnostics on a Core worker instead of blocking the receive loop; default `1`. `TRADING_CORE_WS_EVENT_QUEUE_SIZE` defaults to `10000`, and status exposes `core_ws_event_queue_size`, `core_ws_event_last_queue_wait_ms`, `core_ws_event_processed_count`, `core_ws_event_failed_count`, and `core_ws_event_dropped_count`.
