@@ -226,7 +226,8 @@ class GatewayRuntime:
     def emit(self, event_type: str, payload: dict[str, Any] | None = None, **kwargs) -> None:
         raw_payload = dict(payload or {})
         if event_type == "price_tick":
-            self.data_quality.observe_price_tick(raw_payload)
+            assessment = self.data_quality.observe_price_tick(raw_payload)
+            raw_payload = _payload_with_gateway_reliability(raw_payload, assessment)
         created_at = utc_now_ms()
         traced_payload = ensure_transport_trace(
             raw_payload,
@@ -694,6 +695,20 @@ def _price_tick_payload(tick: BrokerPriceTick | dict[str, Any]) -> dict[str, Any
         metadata.setdefault("session_low", payload.get("day_low"))
     payload["metadata"] = metadata
     return payload
+
+
+def _payload_with_gateway_reliability(payload: dict[str, Any], assessment) -> dict[str, Any]:
+    result = dict(payload or {})
+    reliability = assessment.to_dict() if hasattr(assessment, "to_dict") else dict(assessment or {})
+    metadata = dict(result.get("metadata") or {})
+    metadata["gateway_realtime_reliability"] = reliability
+    metadata["gateway_realtime_reliability_score"] = reliability.get("score")
+    metadata["gateway_realtime_reliability_bucket"] = reliability.get("bucket")
+    result["metadata"] = metadata
+    result["gateway_realtime_reliability"] = reliability
+    result["gateway_realtime_reliability_score"] = reliability.get("score")
+    result["gateway_realtime_reliability_bucket"] = reliability.get("bucket")
+    return result
 
 
 def _drain_real_commands(client, runtime: GatewayRuntime) -> None:

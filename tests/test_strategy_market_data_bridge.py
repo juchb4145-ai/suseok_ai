@@ -121,11 +121,15 @@ def test_bridge_preserves_rich_tick_metadata_and_realtime_features():
     assert latest.metadata["recent_support_source"] == "active_1m_low_provisional"
     assert "MOMENTUM_WARMUP" in latest.metadata["reason_codes"]
     assert "SPREAD_APPROXIMATED" in latest.metadata["reason_codes"]
+    assert latest.metadata["realtime_reliability_bucket"] == "HIGH"
+    assert latest.metadata["realtime_reliability_score"] >= 90.0
+    assert latest.metadata["realtime_reliability"]["field_score"] == 100.0
 
     quality = bridge.data_quality_snapshot()
     assert quality["total_price_ticks"] == 1
     assert quality["field_coverage"]["trade_value"] == 1.0
     assert quality["field_coverage"]["momentum"] == 1.0
+    assert quality["reliability"]["bucket_counts"]["HIGH"] == 1
 
 
 def test_bridge_uses_previous_valid_price_for_zero_price_candles():

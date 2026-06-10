@@ -25,6 +25,9 @@ const statusClass = {
   WAIT_CANDIDATE_MARKET_WEAK: "wait",
   WAIT_FAILED_BREAKOUT: "wait",
   WAIT_DEEP_PULLBACK: "wait",
+  WAIT_PRICE_LOCATION_DATA: "wait",
+  WAIT_PRICE_LOCATION_WARMUP: "wait",
+  WAIT_PRICE_LOCATION_PROVISIONAL: "wait",
   WAIT_PRICE_LOCATION_UNKNOWN: "wait",
   WAIT_DATA_SUPPORT_NOT_READY: "warning",
   WAIT_DATA_LATEST_TICK_STALE: "warning",
@@ -50,6 +53,14 @@ const statusClass = {
   BROKEN: "blocked",
   WARNING: "warning",
   OK: "ready",
+  PROMISING_SHADOW: "ready",
+  OBSERVE_MORE: "ready-small",
+  INSUFFICIENT_SAMPLE: "warning",
+  RISK_TOO_HIGH: "blocked",
+  DO_NOT_PROMOTE: "blocked",
+  NO_CANDIDATES: "observe",
+  NO_DATA: "observe",
+  ERROR: "blocked",
 };
 
 const displayStatusDescriptions = {
@@ -61,6 +72,9 @@ const displayStatusDescriptions = {
   WAIT_MARKET_RECOVERY_PENDING: "시장 회복 대기",
   WAIT_FAILED_BREAKOUT: "돌파 실패 대기",
   WAIT_DEEP_PULLBACK: "과도한 눌림 대기",
+  WAIT_PRICE_LOCATION_DATA: "가격 위치 데이터 대기",
+  WAIT_PRICE_LOCATION_WARMUP: "가격 위치 워밍업",
+  WAIT_PRICE_LOCATION_PROVISIONAL: "임시 가격 위치",
   WAIT_PRICE_LOCATION_UNKNOWN: "가격 위치 확인 대기",
   WAIT_DATA_SUPPORT_NOT_READY: "지지선 데이터 대기",
   WAIT_DATA_LATEST_TICK_STALE: "틱 데이터 갱신 대기",
@@ -190,6 +204,18 @@ function score(value, digits = 1) {
   return number.toFixed(digits);
 }
 
+function compactNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return number.toLocaleString("ko-KR");
+}
+
+function multiplier(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return `x${number.toFixed(2)}`;
+}
+
 function shortId(value) {
   const label = String(value || "");
   if (!label) return "-";
@@ -204,6 +230,7 @@ function render(snapshot) {
   }
   renderHeader(snapshot);
   renderCockpit(snapshot);
+  renderShadowAb(snapshot);
   renderThemes(snapshot.ranked_themes || []);
   renderWatchset(snapshot.watchset || []);
   renderOrders(snapshot.entry_candidates || []);
@@ -356,6 +383,68 @@ async function startKiwoomGateway(button) {
 
 function countLine(label, value) {
   return `<div class="cockpit-line"><strong>${escapeHtml(label)}</strong><span>${Number(value || 0).toLocaleString("ko-KR")}</span></div>`;
+}
+
+function renderShadowAb(snapshot) {
+  const body = document.getElementById("shadow-ab-body");
+  if (!body) return;
+  const outcomes = (snapshot || {}).gate_reason_outcomes || {};
+  const shadow = (snapshot || {}).shadow_small_entry || outcomes.shadow_small_entry || {};
+  const ab = (snapshot || {}).shadow_small_entry_ab || outcomes.shadow_small_entry_ab || {};
+  const summary = shadow.summary || {};
+  const scenarios = ab.scenarios || [];
+  const best = (ab.best_scenarios || [])[0] || scenarios.find((row) => Number(row.candidate_count || 0) > 0) || null;
+  const panelStatus = best ? best.recommendation || "OBSERVE_MORE" : scenarios.length ? "NO_CANDIDATES" : outcomes.status || "NO_DATA";
+
+  setBadge("shadow-ab-status", panelStatus);
+  text("shadow-ab-best", best ? best.scenario_id || best.label : "-");
+  text(
+    "shadow-ab-message",
+    outcomes.status === "ERROR"
+      ? `Outcome report error: ${outcomes.error || "-"}`
+      : `trade_date ${outcomes.trade_date || "-"} / generated ${outcomes.generated_at || "-"}`
+  );
+
+  const summaryNode = document.getElementById("shadow-ab-summary");
+  if (summaryNode) {
+    summaryNode.innerHTML = [
+      shadowMetric("events", outcomes.summary?.event_count),
+      shadowMetric("labeled", outcomes.summary?.labeled_event_count),
+      shadowMetric("shadow cand", summary.candidate_count),
+      shadowMetric("win15", summary.win_rate_15m, ratio),
+      shadowMetric("risk15", summary.risk_case_rate_15m, ratio),
+      shadowMetric("capture", summary.missed_opportunity_reduction_estimate, ratio),
+      shadowMetric("size", summary.position_size_multiplier, multiplier),
+    ].join("");
+  }
+
+  if (!scenarios.length) {
+    body.innerHTML = `<tr><td colspan="10" class="muted">No shadow A/B scenarios yet.</td></tr>`;
+    return;
+  }
+  body.innerHTML = scenarios.slice(0, 8).map((row) => `
+    <tr>
+      <td><strong>${escapeHtml(row.label || row.scenario_id || "-")}</strong><br><span class="muted">${escapeHtml(row.scenario_id || "-")}</span></td>
+      <td class="num">${compactNumber(row.candidate_count)} / ${compactNumber(row.labeled_count)}</td>
+      <td class="num">${ratio(row.win_rate_15m)}</td>
+      <td class="num">${ratio(row.risk_case_rate_15m)}</td>
+      <td class="num ${Number(row.avg_mfe_15m_pct || 0) >= 0 ? "positive" : "negative"}">${pct(row.avg_mfe_15m_pct)}</td>
+      <td class="num ${Number(row.avg_mae_15m_pct || 0) >= 0 ? "positive" : "negative"}">${pct(row.avg_mae_15m_pct)}</td>
+      <td class="num">${ratio(row.missed_opportunity_reduction_estimate)}</td>
+      <td class="num">${multiplier(row.position_size_multiplier)}</td>
+      <td class="num">${score(row.net_shadow_score, 1)}</td>
+      <td>${badge(row.recommendation || "UNKNOWN")}</td>
+    </tr>
+  `).join("");
+}
+
+function shadowMetric(label, value, formatter = compactNumber) {
+  return `
+    <div class="shadow-ab-metric">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(formatter(value))}</strong>
+    </div>
+  `;
 }
 
 function renderThemes(themes) {
@@ -788,6 +877,9 @@ function matchesStatus(item, value) {
   if (value === "LATE_CHASE_TEMP_WAIT") return display === "LATE_CHASE_TEMP_WAIT";
   if (value === "WAIT_FAILED_BREAKOUT") return display === "WAIT_FAILED_BREAKOUT";
   if (value === "WAIT_DEEP_PULLBACK") return display === "WAIT_DEEP_PULLBACK";
+  if (value === "WAIT_PRICE_LOCATION_DATA") return display === "WAIT_PRICE_LOCATION_DATA";
+  if (value === "WAIT_PRICE_LOCATION_WARMUP") return display === "WAIT_PRICE_LOCATION_WARMUP";
+  if (value === "WAIT_PRICE_LOCATION_PROVISIONAL") return display === "WAIT_PRICE_LOCATION_PROVISIONAL";
   if (value === "WAIT_PRICE_LOCATION_UNKNOWN") return display === "WAIT_PRICE_LOCATION_UNKNOWN";
   if (value === "MARKET_PENDING") return isMarketPending(item);
   if (value === "DATA_NOT_READY") return isDataNotReady(item);

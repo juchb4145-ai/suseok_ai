@@ -15,6 +15,7 @@ from trading.theme_engine.lab import (
     PriceLocationConfig,
     PriceLocationEvaluator,
     PriceLocationInput,
+    PriceLocationReadiness,
     PriceLocationResult,
     PriceLocationStatus,
     RiskOffEntryConfig,
@@ -170,6 +171,40 @@ def test_watchset_promotes_condition_two_or_three_and_respects_limits():
     assert [item.symbol for item in watchset] == ["000001", "000002", "000004"]
     assert "000003" not in {item.symbol for item in watchset}
     assert all(item.condition_level >= 2 for item in watchset)
+
+
+def test_watchset_retains_recently_demoted_symbols_for_subscription_stability():
+    manager = WatchSetManager(
+        WatchSetLimits(
+            max_watchset_size=5,
+            max_watch_per_theme=5,
+            top_theme_count=2,
+            retain_cycles_after_demotion=2,
+        )
+    )
+    members = [("t1", "theme1", [_member("t1", "000001"), _member("t1", "000002")])]
+    first_themes = ThemeBreadthEngine().calculate(
+        members,
+        [_snapshot("000001", 5.5, turnover=3_000_000), _snapshot("000002", 0.2, turnover=1_000_000)],
+    )
+    first = manager.build(first_themes, [_snapshot("000001", 5.5), _snapshot("000002", 0.2)])
+
+    second_themes = ThemeBreadthEngine().calculate(
+        members,
+        [_snapshot("000001", 0.5, turnover=3_000_000), _snapshot("000002", 0.2, turnover=1_000_000)],
+    )
+    second = manager.build(second_themes, [_snapshot("000001", 0.5), _snapshot("000002", 0.2)])
+    third = manager.build(second_themes, [_snapshot("000001", 0.4), _snapshot("000002", 0.2)])
+    fourth = manager.build(second_themes, [_snapshot("000001", 0.3), _snapshot("000002", 0.2)])
+
+    assert [item.symbol for item in first] == ["000001"]
+    assert [item.symbol for item in second] == ["000001"]
+    assert second[0].watchset_retained is True
+    assert second[0].condition_level == 1
+    assert second[0].watchset_retention_cycles == 1
+    assert second[0].watch_reason == "WATCHSET_RETAINED_AFTER_DEMOTION"
+    assert third[0].watchset_retention_cycles == 2
+    assert fourth == []
 
 
 def test_hybrid_gate_waits_risk_off_and_blocks_late_laggard():
@@ -1234,6 +1269,37 @@ def test_price_location_flat_recent_candle_is_neutral_not_invalid():
     assert "INVALID_RECENT_CANDLE" not in price.data_quality_flags
 
 
+def test_price_location_ready_when_core_intraday_context_is_complete():
+    price = PriceLocationEvaluator().evaluate(
+        PriceLocationInput(
+            symbol="000001",
+            current_price=100,
+            return_pct=3,
+            session_high=102,
+            vwap=99,
+            vwap_ready=True,
+            recent_support_price=99,
+            recent_support_ready=True,
+            recent_support_candle_count=3,
+            completed_minute_bar_count=3,
+            minute_bar_present=True,
+            recent_candles_1m=(
+                {"high": 101, "low": 99, "close": 100, "completed": True},
+                {"high": 102, "low": 99, "close": 100, "completed": True},
+            ),
+            momentum_1m=0.2,
+            momentum_3m=0.1,
+            stock_role=StockRole.LEADER,
+            theme_status=ThemeLabThemeStatus.LEADING_THEME,
+            market_status=MarketStatus.SELECTIVE,
+        )
+    )
+
+    assert price.readiness == PriceLocationReadiness.READY
+    assert price.readiness_reason_codes == ()
+    assert price.provisional is False
+
+
 def test_price_location_deep_pullback_below_vwap_with_weak_momentum_is_not_ready():
     price = PriceLocationEvaluator().evaluate(
         PriceLocationInput(
@@ -1296,7 +1362,53 @@ def test_price_location_missing_session_high_keeps_pullback_unknown():
 
     assert price.pullback_from_high_pct is None
     assert price.status == PriceLocationStatus.UNKNOWN
+    assert price.readiness == PriceLocationReadiness.MISSING_CORE
+    assert "PRICE_LOCATION_SESSION_HIGH_MISSING" in price.readiness_reason_codes
     assert "MISSING_SESSION_HIGH" in price.data_quality_flags
+
+
+def test_price_location_active_minute_support_is_provisional_during_open_warmup():
+    price = PriceLocationEvaluator().evaluate(
+        PriceLocationInput(
+            symbol="000001",
+            current_price=100,
+            return_pct=4,
+            session_high=101,
+            vwap=99.5,
+            recent_support_price=99,
+            recent_support_source="active_1m_low_provisional",
+            recent_support_ready=False,
+            completed_minute_bar_count=0,
+            minute_bar_present=True,
+            stock_role=StockRole.LEADER,
+            theme_status=ThemeLabThemeStatus.LEADING_THEME,
+            market_status=MarketStatus.SELECTIVE,
+        )
+    )
+
+    assert price.readiness == PriceLocationReadiness.PROVISIONAL
+    assert price.provisional is True
+    assert "PRICE_LOCATION_ACTIVE_1M_SUPPORT_PROVISIONAL" in price.readiness_reason_codes
+    assert "PRICE_LOCATION_PROVISIONAL" in price.reason_codes
+
+
+def test_price_location_no_minute_bar_is_warmup_not_generic_unknown():
+    price = PriceLocationEvaluator().evaluate(
+        PriceLocationInput(
+            symbol="000001",
+            current_price=100,
+            return_pct=4,
+            session_high=101,
+            stock_role=StockRole.LEADER,
+            theme_status=ThemeLabThemeStatus.LEADING_THEME,
+            market_status=MarketStatus.SELECTIVE,
+        )
+    )
+
+    assert price.readiness == PriceLocationReadiness.WARMUP
+    assert price.provisional is False
+    assert "PRICE_LOCATION_WARMUP" in price.reason_codes
+    assert "PRICE_LOCATION_NO_MINUTE_BAR" in price.readiness_reason_codes
 
 
 def test_unknown_price_location_waits_or_observes_not_always_blocked():

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, Callable, Optional
 
-from trading.broker.data_quality import RealtimeDataQualityTracker
+from trading.broker.data_quality import RealtimeDataQualityTracker, RealtimeReliabilityAssessment
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.market_index import IndexCodeMapper, IndexTick, MarketIndexStore
 from trading.strategy.market_data import MarketDataStore, StrategyTick
@@ -137,9 +138,18 @@ class StrategyMarketDataBridge:
             timestamp=timestamp,
             metadata=feature_result.metadata,
         )
+        quality_payload = _quality_payload(tick)
+        reliability = self.data_quality.assess_price_tick(quality_payload)
+        tick = replace(
+            tick,
+            metadata={
+                **dict(tick.metadata or {}),
+                **_reliability_metadata(reliability),
+            },
+        )
         if not self.market_data.update_tick(tick):
             return False
-        self.data_quality.observe_price_tick(_quality_payload(tick))
+        self.data_quality.record_assessment(_quality_payload(tick), reliability)
         return self.candle_builder.update(tick)
 
     def _route_index_tick(
@@ -220,6 +230,21 @@ def _quality_payload(tick: StrategyTick) -> dict[str, Any]:
         "day_high": tick.metadata.get("day_high") or tick.metadata.get("session_high") or 0,
         "day_low": tick.metadata.get("day_low") or tick.metadata.get("session_low") or 0,
         "metadata": dict(tick.metadata or {}),
+    }
+
+
+def _reliability_metadata(assessment: RealtimeReliabilityAssessment) -> dict[str, Any]:
+    payload = assessment.to_dict()
+    return {
+        "realtime_reliability": payload,
+        "realtime_reliability_score": assessment.score,
+        "realtime_reliability_bucket": assessment.bucket,
+        "realtime_reliability_reasons": list(assessment.reasons),
+        "realtime_reliability_missing_fields": list(assessment.missing_fields),
+        "realtime_reliability_field_score": assessment.field_score,
+        "realtime_reliability_penalty": assessment.penalty,
+        "realtime_transport_latency_ms": assessment.transport_latency_ms,
+        "realtime_transport_latency_bucket": assessment.transport_latency_bucket,
     }
 
 

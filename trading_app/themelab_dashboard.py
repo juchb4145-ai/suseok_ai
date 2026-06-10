@@ -7,6 +7,7 @@ from typing import Any
 from storage.db import TradingDatabase
 from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE
 from trading.theme_engine.repository import ThemeEngineRepository
+from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
 
 
 GATE_ORDER = {"READY": 0, "READY_SMALL": 1, "WAIT": 2, "OBSERVE": 3, "BLOCKED": 4}
@@ -21,6 +22,9 @@ DISPLAY_WAIT_ORDER = {
     "WAIT_CANDIDATE_MARKET_WEAK": 1,
     "WAIT_FAILED_BREAKOUT": 2,
     "WAIT_DEEP_PULLBACK": 2,
+    "WAIT_PRICE_LOCATION_DATA": 2,
+    "WAIT_PRICE_LOCATION_WARMUP": 2,
+    "WAIT_PRICE_LOCATION_PROVISIONAL": 2,
     "WAIT_PRICE_LOCATION_UNKNOWN": 2,
     "WAIT_DATA_SUPPORT_NOT_READY": 2,
     "WAIT_DATA_LATEST_TICK_STALE": 2,
@@ -56,6 +60,7 @@ def build_theme_lab_dashboard_snapshot(
     backfill_status_by_theme = _theme_backfill_status_by_theme(gateway_state)
     ranked_themes = _ranked_theme_rows(themes, condition_counts, backfill_status_by_theme=backfill_status_by_theme)
     summary = _summary(ranked_themes, watchset, entry_candidates, data_quality, runtime=runtime, freshness=freshness)
+    gate_reason_outcomes = _theme_lab_gate_reason_outcomes(db, trade_date=_snapshot_trade_date(raw))
 
     return {
         "available": True,
@@ -76,6 +81,9 @@ def build_theme_lab_dashboard_snapshot(
         "chart_universe": chart_universe,
         "selected_chart": selected,
         "gate_detail": _gate_detail(selected_watch),
+        "gate_reason_outcomes": gate_reason_outcomes,
+        "shadow_small_entry": gate_reason_outcomes.get("shadow_small_entry") or _empty_shadow_small_entry(),
+        "shadow_small_entry_ab": gate_reason_outcomes.get("shadow_small_entry_ab") or _empty_shadow_small_entry_ab(),
         "summary": summary,
     }
 
@@ -133,7 +141,88 @@ def _empty_snapshot(*, runtime_status: dict[str, Any] | None = None) -> dict[str
         "chart_universe": _index_chart_items(),
         "selected_chart": {"symbol": "KOSDAQ", "name": "KOSDAQ", "type": "index", "chart_data_status": "NO_CANDLE_DATA"},
         "gate_detail": {"gate_status": "OBSERVE", "summary_message": "선택된 WatchSet 종목이 없습니다."},
+        "gate_reason_outcomes": _empty_gate_reason_outcomes(),
+        "shadow_small_entry": _empty_shadow_small_entry(),
+        "shadow_small_entry_ab": _empty_shadow_small_entry_ab(),
         "summary": _empty_summary(runtime=runtime, freshness=freshness),
+    }
+
+
+def _theme_lab_gate_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
+    try:
+        report = ThemeLabGateReasonOutcomeAnalyzer(db).build_report(trade_date=trade_date or None, limit=10000)
+    except Exception as exc:
+        empty = _empty_gate_reason_outcomes()
+        empty.update({"status": "ERROR", "error": str(exc)})
+        return empty
+    return {
+        "status": report.get("status") or "READY",
+        "report_id": report.get("report_id") or "",
+        "trade_date": report.get("trade_date") or "",
+        "generated_at": report.get("generated_at") or "",
+        "summary": report.get("summary") or {},
+        "top_missed_opportunity_reasons": list(report.get("top_missed_opportunity_reasons") or [])[:10],
+        "shadow_small_entry": report.get("shadow_small_entry") or _empty_shadow_small_entry(),
+        "shadow_small_entry_ab": report.get("shadow_small_entry_ab") or _empty_shadow_small_entry_ab(),
+    }
+
+
+def _snapshot_trade_date(raw: dict[str, Any]) -> str:
+    for key in ("calculated_at", "created_at"):
+        value = str(raw.get(key) or "")
+        if len(value) >= 10 and value[4:5] == "-" and value[7:8] == "-":
+            return value[:10]
+    return ""
+
+
+def _empty_gate_reason_outcomes() -> dict[str, Any]:
+    return {
+        "status": "NO_DATA",
+        "report_id": "",
+        "trade_date": "",
+        "generated_at": "",
+        "summary": {},
+        "top_missed_opportunity_reasons": [],
+        "shadow_small_entry": _empty_shadow_small_entry(),
+        "shadow_small_entry_ab": _empty_shadow_small_entry_ab(),
+    }
+
+
+def _empty_shadow_small_entry() -> dict[str, Any]:
+    return {
+        "summary": {
+            "candidate_count": 0,
+            "labeled_count": 0,
+            "win_count_15m": 0,
+            "win_rate_15m": 0.0,
+            "risk_case_count_15m": 0,
+            "risk_case_rate_15m": 0.0,
+            "avg_mfe_15m_pct": None,
+            "avg_mae_15m_pct": None,
+            "missed_opportunity_capture_count": 0,
+            "missed_opportunity_reduction_estimate": 0.0,
+            "position_size_multiplier": 0.25,
+        },
+        "by_reason": [],
+        "by_role": [],
+        "by_market_status": [],
+        "top_candidates": [],
+        "rejected_reason_counts": {},
+    }
+
+
+def _empty_shadow_small_entry_ab() -> dict[str, Any]:
+    return {
+        "scenario_count": 0,
+        "scenarios": [],
+        "best_scenarios": [],
+        "matrix": {
+            "by_multiplier": [],
+            "by_min_condition_level": [],
+            "by_roles": [],
+            "by_risk_set": [],
+        },
+        "notes": [],
     }
 
 
@@ -501,8 +590,12 @@ def _runtime_context(runtime_status: dict[str, Any] | None) -> dict[str, Any]:
             "cycle_count": 0,
             "worker_stage": "",
             "status": "UNKNOWN",
+            "realtime_data_quality": {},
+            "realtime_reliability_score": 0.0,
+            "realtime_reliability_bucket": "NO_DATA",
         }
     running = bool(runtime_status.get("running"))
+    realtime_quality = dict(runtime_status.get("realtime_data_quality") or {})
     return {
         "known": True,
         "enabled": bool(runtime_status.get("enabled")),
@@ -513,6 +606,9 @@ def _runtime_context(runtime_status: dict[str, Any] | None) -> dict[str, Any]:
         "cycle_count": int(runtime_status.get("cycle_count") or 0),
         "worker_stage": str(runtime_status.get("worker_stage") or ""),
         "status": "ACTIVE" if running else "RUNTIME_INACTIVE",
+        "realtime_data_quality": realtime_quality,
+        "realtime_reliability_score": float(realtime_quality.get("realtime_reliability_score") or 0.0),
+        "realtime_reliability_bucket": str(realtime_quality.get("realtime_reliability_bucket") or "NO_DATA"),
     }
 
 
@@ -1452,7 +1548,7 @@ def _display_status(item: dict[str, Any], gate: str) -> str:
             return "READY_RISK_OFF_SMALL"
         return "OBSERVE_RISK_OFF_SMALL_ENTRY"
     reason_values: list[Any] = []
-    for key in ("reason_codes", "risk_reason_codes", "price_location_reason_codes"):
+    for key in ("reason_codes", "risk_reason_codes", "price_location_reason_codes", "price_location_readiness_reason_codes"):
         reason_values.extend(item.get(key) or [])
     reasons = {str(reason or "") for reason in reason_values}
     market_reasons = {str(reason or "") for reason in item.get("market_side_reason_codes") or []}
@@ -1493,6 +1589,31 @@ def _display_status(item: dict[str, Any], gate: str) -> str:
         )
     ):
         return "WAIT_DEEP_PULLBACK"
+    if (
+        gate == "WAIT"
+        and (
+            "PRICE_LOCATION_CORE_DATA_MISSING" in all_reasons
+            or str(item.get("price_location_readiness") or "") == "MISSING_CORE"
+        )
+    ):
+        return "WAIT_PRICE_LOCATION_DATA"
+    if (
+        gate == "WAIT"
+        and (
+            "PRICE_LOCATION_PROVISIONAL" in all_reasons
+            or bool(item.get("price_location_provisional"))
+            or str(item.get("price_location_readiness") or "") == "PROVISIONAL"
+        )
+    ):
+        return "WAIT_PRICE_LOCATION_PROVISIONAL"
+    if (
+        gate == "WAIT"
+        and (
+            "PRICE_LOCATION_WARMUP" in all_reasons
+            or str(item.get("price_location_readiness") or "") == "WARMUP"
+        )
+    ):
+        return "WAIT_PRICE_LOCATION_WARMUP"
     if (
         gate == "WAIT"
         and (
@@ -1571,9 +1692,16 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
         "return_pct": item.get("return_pct"),
         "turnover_krw": item.get("turnover_krw"),
         "condition_level": int(item.get("condition_level") or 0),
+        "watch_reason": item.get("watch_reason", ""),
+        "watchset_retained": bool(item.get("watchset_retained")),
+        "watchset_retention_cycles": int(item.get("watchset_retention_cycles") or 0),
+        "watchset_retention_reason": item.get("watchset_retention_reason", ""),
         "price_location_status": _value(item.get("price_location_status") or item.get("price_location") or "UNKNOWN"),
         "price_location": _value(item.get("price_location_status") or item.get("price_location") or "UNKNOWN"),
         "price_location_score": float(item.get("price_location_score") or 0),
+        "price_location_readiness": _value(item.get("price_location_readiness") or "UNKNOWN"),
+        "price_location_readiness_reason_codes": list(item.get("price_location_readiness_reason_codes") or []),
+        "price_location_provisional": bool(item.get("price_location_provisional")),
         "price_location_block_reason": item.get("price_location_block_reason", ""),
         "risk_level": _value(item.get("risk_level") or "UNKNOWN"),
         "chase_risk": bool(item.get("chase_risk")),
@@ -1891,7 +2019,11 @@ PRICE_LOCATION_MISSING_LABELS = {
 
 
 def _price_location_wait_summary(item: dict[str, Any]) -> str:
-    reasons = [str(reason) for reason in item.get("price_location_reason_codes") or [] if reason]
+    reasons = [
+        str(reason)
+        for reason in list(item.get("price_location_reason_codes") or []) + list(item.get("price_location_readiness_reason_codes") or [])
+        if reason
+    ]
     flags = {
         str(flag)
         for flag in list(item.get("data_quality_flags") or []) + list(item.get("price_location_data_quality_flags") or [])
@@ -2039,7 +2171,11 @@ def _summary_message(item: dict[str, Any], gate: str, display_status: str = "") 
     role = _value(item.get("stock_role") or "UNKNOWN")
     location = _value(item.get("price_location_status") or "UNKNOWN")
     multiplier = float(item.get("position_size_multiplier") or 1.0)
-    reasons = list(item.get("risk_reason_codes") or item.get("price_location_reason_codes") or [])
+    reasons = (
+        list(item.get("risk_reason_codes") or [])
+        + list(item.get("price_location_reason_codes") or [])
+        + list(item.get("price_location_readiness_reason_codes") or [])
+    )
     display_status = str(display_status or item.get("display_status") or "")
     if display_status == "LATE_CHASE_TEMP_WAIT":
         seconds = int(item.get("late_chase_recheck_after_sec") or item.get("recheck_after_sec") or 0)
@@ -2057,7 +2193,12 @@ def _summary_message(item: dict[str, Any], gate: str, display_status: str = "") 
         return _failed_breakout_wait_summary(item)
     if display_status == "WAIT_DEEP_PULLBACK":
         return _deep_pullback_wait_summary(item)
-    if display_status == "WAIT_PRICE_LOCATION_UNKNOWN":
+    if display_status in {
+        "WAIT_PRICE_LOCATION_UNKNOWN",
+        "WAIT_PRICE_LOCATION_DATA",
+        "WAIT_PRICE_LOCATION_WARMUP",
+        "WAIT_PRICE_LOCATION_PROVISIONAL",
+    }:
         return _price_location_wait_summary(item)
     if gate == "READY":
         live_note = "" if item.get("live_order_guard_passed") else " / LIVE Guard 미통과"
@@ -2070,7 +2211,14 @@ def _summary_message(item: dict[str, Any], gate: str, display_status: str = "") 
             return _failed_breakout_wait_summary(item)
         if location == "DEEP_PULLBACK" or "DEEP_PULLBACK" in reasons:
             return _deep_pullback_wait_summary(item)
-        if location == "UNKNOWN" or "PRICE_LOCATION_UNKNOWN" in reasons or "PRICE_LOCATION_DATA_MISSING" in reasons:
+        if (
+            location == "UNKNOWN"
+            or "PRICE_LOCATION_UNKNOWN" in reasons
+            or "PRICE_LOCATION_DATA_MISSING" in reasons
+            or "PRICE_LOCATION_CORE_DATA_MISSING" in reasons
+            or "PRICE_LOCATION_WARMUP" in reasons
+            or "PRICE_LOCATION_PROVISIONAL" in reasons
+        ):
             return _price_location_wait_summary(item)
         return f"{location} 또는 리스크 확인 필요로 WAIT"
     if gate == "BLOCKED":

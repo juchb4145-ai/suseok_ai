@@ -31,4 +31,62 @@ def test_realtime_data_quality_counts_coverage_and_reason_codes():
     assert snapshot["reason_code_counts"]["REAL_PARSE_FALLBACK"] == 1
     assert snapshot["estimated_turnover_count"] == 1
     assert snapshot["parse_fallback_count"] == 1
+    assert snapshot["realtime_reliability_bucket"] in {"BROKEN", "LOW", "MEDIUM", "HIGH"}
+    assert snapshot["reliability"]["bucket_counts"]
     assert snapshot["summary"].startswith("REALTIME_DATA_QUALITY total_ticks=1")
+
+
+def test_realtime_data_quality_scores_latency_and_missing_fields():
+    tracker = RealtimeDataQualityTracker()
+
+    high = tracker.observe_price_tick(
+        {
+            "code": "005930",
+            "price": 70000,
+            "change_rate": 1.2,
+            "volume": 1200,
+            "trade_value": 84_000_000,
+            "execution_strength": 123.4,
+            "best_ask": 70100,
+            "best_bid": 70000,
+            "day_high": 71000,
+            "day_low": 69000,
+            "metadata": {
+                "momentum_1m": 0.1,
+                "momentum_3m": 0.2,
+                "momentum_5m": 0.3,
+                "transport_trace": {
+                    "gateway_event_created_at_utc": "2026-06-01T00:00:00+00:00",
+                    "core_event_received_at_utc": "2026-06-01T00:00:00.500000+00:00",
+                },
+            },
+        }
+    )
+    assert high.bucket == "HIGH"
+    assert high.transport_latency_ms == 500.0
+    assert high.transport_latency_bucket == "STABLE"
+
+    degraded = tracker.observe_price_tick(
+        {
+            "code": "000001",
+            "price": 0,
+            "change_rate": 0.0,
+            "volume": 0,
+            "metadata": {
+                "reason_codes": ["REAL_PARSE_FALLBACK", "BEST_BID_ASK_MISSING"],
+                "transport_trace": {
+                    "gateway_event_created_at_utc": "2026-06-01T00:00:00+00:00",
+                    "core_event_received_at_utc": "2026-06-01T00:00:12+00:00",
+                },
+            },
+        }
+    )
+
+    snapshot = tracker.snapshot()
+    assert degraded.bucket == "BROKEN"
+    assert "PRICE_MISSING" in degraded.reasons
+    assert degraded.transport_latency_bucket == "BROKEN"
+    assert snapshot["reliability"]["bucket_counts"]["HIGH"] == 1
+    assert snapshot["reliability"]["bucket_counts"]["BROKEN"] == 1
+    assert snapshot["reliability"]["low_reliability_count"] == 1
+    assert snapshot["reliability"]["transport_latency_sample_count"] == 2

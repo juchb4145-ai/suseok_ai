@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, time, timedelta
 from typing import Any, Optional
@@ -18,6 +19,7 @@ from trading.theme_engine.lab import (
     ThemeLabConfig,
     ThemeLabFlowEngine,
     ThemeLabFlowResult,
+    WatchSetLimits,
     WatchSetSnapshot,
     normalize_market_side,
 )
@@ -144,8 +146,37 @@ class MarketSessionContext:
 
 def theme_lab_config_from_settings(settings: Any | None = None) -> ThemeLabConfig:
     active = settings or legacy_strategy_runtime_settings()
-    payload = dict(active.value("risk_off_entry", {}) or {}) if hasattr(active, "value") else {}
-    return ThemeLabConfig(risk_off_entry=_risk_off_entry_config_from_settings(payload))
+    risk_off_payload = dict(active.value("risk_off_entry", {}) or {}) if hasattr(active, "value") else {}
+    watchset_payload = dict(active.value("watchset_limits", {}) or {}) if hasattr(active, "value") else {}
+    return ThemeLabConfig(
+        risk_off_entry=_risk_off_entry_config_from_settings(risk_off_payload),
+        watchset_limits=_watchset_limits_from_settings(watchset_payload),
+    )
+
+
+def _watchset_limits_from_settings(payload: dict[str, Any]) -> WatchSetLimits:
+    defaults = WatchSetLimits()
+
+    def _int(name: str, env_name: str, default: int, *, minimum: int = 0) -> int:
+        raw = os.environ.get(env_name, payload.get(name, default))
+        try:
+            return max(minimum, int(raw))
+        except (TypeError, ValueError):
+            return default
+
+    return replace(
+        defaults,
+        retain_cycles_after_demotion=_int(
+            "retain_cycles_after_demotion",
+            "TRADING_THEME_LAB_WATCHSET_RETAIN_CYCLES",
+            defaults.retain_cycles_after_demotion,
+        ),
+        retain_min_condition_level=_int(
+            "retain_min_condition_level",
+            "TRADING_THEME_LAB_WATCHSET_RETAIN_MIN_CONDITION_LEVEL",
+            defaults.retain_min_condition_level,
+        ),
+    )
 
 
 def _risk_off_entry_config_from_settings(payload: dict[str, Any]) -> RiskOffEntryConfig:
@@ -775,7 +806,7 @@ class ThemeLabRuntimePipeline:
                 codes.append(code)
 
         for item in self.last_result.watchset:
-            if int(item.condition_level or 0) >= 2:
+            if int(item.condition_level or 0) >= 2 or bool(getattr(item, "watchset_retained", False)):
                 add_code(item.symbol)
         if len(codes) >= limit:
             return codes

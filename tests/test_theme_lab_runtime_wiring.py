@@ -11,20 +11,23 @@ from trading.strategy.market_data import StrategyTick
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import IndexTick, MarketIndexStore
 from trading.strategy.models import Candidate, CandidateState, OrderMode
-from trading.strategy.runtime import StrategyRuntimeConfig
+from trading.strategy.runtime import StrategyRuntimeConfig, StrategyRuntimeSnapshot
 from trading.strategy.runtime_settings import LEGACY_DEFAULT_SETTINGS, legacy_profile_payload
 from trading.theme_engine.lab import (
     ConditionHitSnapshot,
+    LabGateStatus,
     MarketStatus,
     MarketStrengthSnapshot,
+    PriceLocationReadiness,
     PriceLocationStatus,
     ThemeConditionSnapshot,
     ThemeLabFlowResult,
     ThemeLabThemeStatus,
+    WatchSetSnapshot,
 )
 from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeStatus
 from trading.theme_engine.repository import ThemeEngineRepository
-from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline
+from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline, theme_lab_config_from_settings
 
 
 def test_themelab_flow_is_default_and_runtime_contains_pipeline(tmp_path):
@@ -60,6 +63,16 @@ def test_themelab_runtime_uses_saved_risk_off_entry_settings(tmp_path):
     assert config.min_relative_strength_vs_index_pct == 5.5
     assert config.max_position_size_multiplier == 0.15
     db.close()
+
+
+def test_theme_lab_watchset_retention_env_settings(monkeypatch):
+    monkeypatch.setenv("TRADING_THEME_LAB_WATCHSET_RETAIN_CYCLES", "4")
+    monkeypatch.setenv("TRADING_THEME_LAB_WATCHSET_RETAIN_MIN_CONDITION_LEVEL", "0")
+
+    config = theme_lab_config_from_settings()
+
+    assert config.watchset_limits.retain_cycles_after_demotion == 4
+    assert config.watchset_limits.retain_min_condition_level == 0
 
 
 def test_legacy_mode_uses_gate_pipeline_without_theme_lab_pipeline(tmp_path):
@@ -264,6 +277,34 @@ def test_theme_lab_pipeline_watchset_codes_bootstraps_from_condition_hits(tmp_pa
     db.close()
 
 
+def test_theme_lab_pipeline_watchset_codes_keeps_retained_symbols(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    pipeline = ThemeLabRuntimePipeline(
+        db=db,
+        market_data=MarketDataStore(),
+        market_index_store=MarketIndexStore(),
+    )
+    pipeline.last_result = ThemeLabFlowResult(
+        market=MarketStrengthSnapshot(MarketStatus.CHOPPY),
+        themes=(),
+        watchset=(
+            WatchSetSnapshot(
+                calculated_at="2026-06-04T09:01:00",
+                symbol="000001",
+                name="retained",
+                condition_level=1,
+                watchset_retained=True,
+                watchset_retention_cycles=1,
+            ),
+        ),
+        gate_decisions=(),
+        data_quality={},
+    )
+
+    assert pipeline.watchset_codes() == ["000001"]
+    db.close()
+
+
 def test_theme_lab_empty_watchset_bootstraps_candidate_realtime_subscriptions(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     client = MockKiwoomClient()
@@ -293,6 +334,61 @@ def test_theme_lab_empty_watchset_bootstraps_candidate_realtime_subscriptions(tm
         record = runtime.subscription_manager.records[code]
         assert "theme_lab_bootstrap" in record.sources
         assert "candidate_watch" not in record.sources
+    db.close()
+
+
+def test_theme_lab_outcome_tracking_keeps_price_warmup_symbol_subscribed(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRADING_THEME_LAB_OUTCOME_TRACKING_TTL_SEC", "60")
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    client = MockKiwoomClient()
+    runtime = build_observe_runtime(client, db)
+    now = datetime(2026, 6, 1, 9, 1, 0)
+    runtime._last_runtime_time = now
+    runtime.theme_lab_pipeline.market_data.update_tick(_tick("000001", 100, 0.0, now))
+    runtime.theme_lab_pipeline.last_run_at = now
+    runtime.theme_lab_pipeline.last_result = ThemeLabFlowResult(
+        market=MarketStrengthSnapshot(MarketStatus.CHOPPY),
+        themes=(),
+        watchset=(
+            WatchSetSnapshot(
+                calculated_at=now.isoformat(),
+                symbol="000001",
+                name="warmup",
+                condition_level=1,
+                gate_status=LabGateStatus.WAIT,
+                final_gate_status=LabGateStatus.WAIT,
+                price_location_status=PriceLocationStatus.UNKNOWN,
+                price_location_reason_codes=("PRICE_LOCATION_UNKNOWN",),
+                price_location_readiness=PriceLocationReadiness.WARMUP,
+                price_location_readiness_reason_codes=("PRICE_LOCATION_WARMUP",),
+            ),
+        ),
+        gate_decisions=(),
+        data_quality={},
+    )
+
+    snapshot = StrategyRuntimeSnapshot(cycle_at=now.isoformat())
+    selected_count = runtime._sync_theme_lab_watchset_subscriptions(snapshot, [])
+    runtime.subscription_manager.sync()
+
+    assert selected_count == 0
+    assert snapshot.theme_lab_outcome_tracking_count == 1
+    assert "THEME_LAB_OUTCOME_TRACKING_SUBSCRIPTIONS=1" in snapshot.warnings
+    assert "theme_lab_outcome_tracking" in runtime.subscription_manager.records["000001"].sources
+    assert client.registered_codes == {"000001"}
+    observations = db.list_theme_lab_outcome_observations(trade_date="2026-06-01", codes=["000001"])
+    assert len(observations) == 1
+    assert observations[0]["price"] == 100
+
+    runtime.theme_lab_pipeline.last_result = None
+    runtime._last_runtime_time = now + timedelta(seconds=61)
+    expired_snapshot = StrategyRuntimeSnapshot(cycle_at=runtime._last_runtime_time.isoformat())
+    runtime._sync_theme_lab_watchset_subscriptions(expired_snapshot, [])
+    runtime.subscription_manager.sync()
+
+    assert expired_snapshot.theme_lab_outcome_tracking_count == 0
+    assert "000001" not in runtime.subscription_manager.records
+    assert "000001" not in client.registered_codes
     db.close()
 
 

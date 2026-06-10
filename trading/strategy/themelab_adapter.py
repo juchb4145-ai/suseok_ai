@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from trading.strategy.candidates import CandidateLifecycle, is_valid_stock_code, normalize_code
 from trading.strategy.candidate_identity import CandidateGenerationConfig, CandidateInstanceDecision, build_candidate_instance_id, decide_candidate_instance, identity_metadata
@@ -57,6 +57,8 @@ SOURCE = "themelab_flow"
 ORDER_PHASE_ENTRY = "entry"
 LATE_CHASE_TEMP_WAIT = "LATE_CHASE_TEMP_WAIT"
 RISK_SOFT_BLOCK_TEMP_WAIT = "RISK_SOFT_BLOCK_TEMP_WAIT"
+READY_SHADOW_SMALL_ENTRY = "READY_SHADOW_SMALL_ENTRY"
+SHADOW_SMALL_ENTRY_REASON_CODE = "SHADOW_SMALL_ENTRY_DRY_RUN"
 LATE_CHASE_SOFT_BLOCK_CODES = {"HIGH_CHASE_RISK", "LATE_CHASE", "CHASE_RISK"}
 MARKET_WEAK_WAIT_CODES = {"CANDIDATE_MARKET_WEAK", "KOSDAQ_MARKET_WEAK", "KOSPI_MARKET_WEAK"}
 MARKET_RISK_OFF_WAIT_CODES = {
@@ -151,6 +153,8 @@ class ThemeLabBridgeMapping:
     support_source_fallback_used: bool = False
     latest_tick_ready: bool = True
     latest_tick_age_sec: float | None = None
+    position_size_multiplier: float = 0.0
+    shadow_small_entry_guard: dict[str, Any] = field(default_factory=dict)
 
 
 class ThemeLabDryRunLifecycleBridge:
@@ -164,12 +168,14 @@ class ThemeLabDryRunLifecycleBridge:
         default_ttl_minutes: int = 30,
         settings: StrategyRuntimeSettings | None = None,
         generation_config: CandidateGenerationConfig | None = None,
+        shadow_ab_provider: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         self.db = db
         self.market_data = market_data
         self.default_ttl_minutes = max(1, int(default_ttl_minutes or 30))
         self.settings = settings or legacy_strategy_runtime_settings()
         self.generation_config = generation_config or CandidateGenerationConfig.from_env()
+        self.shadow_ab_provider = shadow_ab_provider
 
     def build(
         self,
@@ -184,6 +190,9 @@ class ThemeLabDryRunLifecycleBridge:
         watch_by_code = {normalize_code(item.symbol): item for item in result.watchset}
         themes_by_id = {str(item.theme_id): item for item in result.themes}
         gate_results: list[GatePipelineResult] = []
+        shadow_policy = self._shadow_small_entry_policy(trade_date)
+        shadow_promotions = 0
+        shadow_max_promotions = int(shadow_policy.get("max_promotions_per_cycle") or 0)
 
         for decision in result.gate_decisions:
             code = normalize_code(decision.symbol)
@@ -209,13 +218,37 @@ class ThemeLabDryRunLifecycleBridge:
             if candidate.id is None:
                 warnings.append(f"THEME_LAB_BRIDGE_CANDIDATE_ID_MISSING:{code}")
                 continue
-            gate_results.append(self._gate_result(candidate, decision, watch, theme, now, decision_cycle_id=decision_cycle_id))
+            gate_result = self._gate_result(
+                candidate,
+                decision,
+                watch,
+                theme,
+                now,
+                decision_cycle_id=decision_cycle_id,
+                shadow_policy=shadow_policy,
+                shadow_promotion_available=shadow_promotions < shadow_max_promotions,
+            )
+            if gate_result.details.get("shadow_small_entry_dry_run_promoted"):
+                shadow_promotions += 1
+            gate_results.append(gate_result)
 
         return ThemeLabBridgeBuildResult(
             gate_results=gate_results,
             candidate_save_count=candidate_saves,
             warnings=warnings,
         )
+
+    def _shadow_small_entry_policy(self, trade_date: str) -> dict[str, Any]:
+        config = _shadow_small_entry_settings(self.settings)
+        if not config["enabled"]:
+            return {"enabled": False, "active": False, "status": "DISABLED", **config}
+        if self.shadow_ab_provider is None:
+            return {"enabled": True, "active": False, "status": "NO_AB_PROVIDER", **config}
+        try:
+            report = self.shadow_ab_provider(trade_date)
+        except Exception as exc:
+            return {"enabled": True, "active": False, "status": "AB_PROVIDER_ERROR", "error": str(exc), **config}
+        return {**config, **_shadow_small_entry_policy_from_report(report, config)}
 
     def _ensure_candidate(
         self,
@@ -385,6 +418,8 @@ class ThemeLabDryRunLifecycleBridge:
         now: datetime,
         *,
         decision_cycle_id: str,
+        shadow_policy: dict[str, Any] | None = None,
+        shadow_promotion_available: bool = True,
     ) -> GatePipelineResult:
         tick = self.market_data.latest_tick(candidate.code) if self.market_data is not None else None
         tick_metadata = dict(tick.metadata or {}) if tick is not None else {}
@@ -396,6 +431,8 @@ class ThemeLabDryRunLifecycleBridge:
             tick=tick,
             now=now,
             settings=self.settings,
+            shadow_policy=shadow_policy,
+            shadow_promotion_available=shadow_promotion_available,
         )
         snapshot = self._indicator_snapshot(candidate, decision, watch, now)
         stock_details = _stock_pullback_details(candidate, decision, watch, snapshot, tick_metadata, mapping)
@@ -499,6 +536,9 @@ class ThemeLabDryRunLifecycleBridge:
                 "watch_return_pct": watch.return_pct,
                 "price_location_status": decision.price_location_status.value,
                 "price_location_reason_codes": list(decision.price_location_reason_codes),
+                "price_location_readiness": watch.price_location_readiness.value,
+                "price_location_readiness_reason_codes": list(watch.price_location_readiness_reason_codes),
+                "price_location_provisional": bool(watch.price_location_provisional),
                 **_market_side_fields(decision, watch),
             },
         )
@@ -517,6 +557,8 @@ def _map_decision(
     tick: Any = None,
     now: datetime | None = None,
     settings: StrategyRuntimeSettings | None = None,
+    shadow_policy: dict[str, Any] | None = None,
+    shadow_promotion_available: bool = True,
 ) -> ThemeLabBridgeMapping:
     metadata = dict(tick_metadata or {})
     active_settings = settings or legacy_strategy_runtime_settings()
@@ -643,6 +685,54 @@ def _map_decision(
             latest_tick_ready=True,
             latest_tick_age_sec=latest.age_sec,
         )
+    shadow_guard = _shadow_small_entry_guard(decision, watch, shadow_policy, promotion_available=shadow_promotion_available)
+    if shadow_guard.get("promoted"):
+        if not support["ready"]:
+            blocked_guard = {
+                **shadow_guard,
+                "promoted": False,
+                "status": "BLOCKED",
+                "reason": "SUPPORT_NOT_READY",
+            }
+            return _wait_data_for_support(
+                decision,
+                recheck_after_sec,
+                reason_codes,
+                support,
+                latest,
+                shadow_small_entry_guard=blocked_guard,
+            )
+        support_reason_codes = [SUPPORT_SOURCE_FALLBACK_USED] if support["fallback_used"] else []
+        multiplier = _shadow_position_size_multiplier(shadow_guard, shadow_policy)
+        return ThemeLabBridgeMapping(
+            READY_SHADOW_SMALL_ENTRY,
+            "BUY_ELIGIBLE_SHADOW_SMALL_ENTRY",
+            True,
+            BlockType.NONE,
+            False,
+            0,
+            "B_SHADOW",
+            min(75.0, max(65.0, float(decision.price_location_score or 65.0))),
+            _dedupe(
+                [
+                    READY_SHADOW_SMALL_ENTRY,
+                    SHADOW_SMALL_ENTRY_REASON_CODE,
+                    "SHADOW_AB_PROMOTED",
+                    _shadow_scenario_reason_code(shadow_guard.get("scenario_id")),
+                ]
+                + support_reason_codes
+                + reason_codes
+            ),
+            ready_type=READY_SHADOW_SMALL_ENTRY,
+            selected_support_source=support["source"],
+            selected_support_price=int(support["price"]),
+            selected_support_ready=True,
+            support_source_fallback_used=bool(support["fallback_used"]),
+            latest_tick_ready=True,
+            latest_tick_age_sec=latest.age_sec,
+            position_size_multiplier=multiplier,
+            shadow_small_entry_guard=shadow_guard,
+        )
     if (
         decision.status == LabGateStatus.READY
         and price_location in READY_PULLBACK_LOCATIONS
@@ -738,6 +828,7 @@ def _map_decision(
             _dedupe(wait_reasons),
             latest_tick_ready=latest.ready,
             latest_tick_age_sec=latest.age_sec,
+            shadow_small_entry_guard=shadow_guard,
         )
     if decision.status == LabGateStatus.BLOCKED or decision.risk_level == TradeabilityRiskLevel.HARD_BLOCK:
         return ThemeLabBridgeMapping(
@@ -766,6 +857,7 @@ def _map_decision(
         ready_type=OBSERVE,
         latest_tick_ready=latest.ready,
         latest_tick_age_sec=latest.age_sec,
+        shadow_small_entry_guard=shadow_guard,
     )
 
 
@@ -775,6 +867,8 @@ def _wait_data_for_support(
     reason_codes: list[str],
     support: dict[str, Any],
     latest,
+    *,
+    shadow_small_entry_guard: dict[str, Any] | None = None,
 ) -> ThemeLabBridgeMapping:
     support_reason_codes = list(support.get("reason_codes") or [])
     reason = str(support.get("reason") or SUPPORT_NOT_READY)
@@ -796,6 +890,7 @@ def _wait_data_for_support(
         support_source_fallback_used=bool(support.get("fallback_used")),
         latest_tick_ready=latest.ready,
         latest_tick_age_sec=latest.age_sec,
+        shadow_small_entry_guard=dict(shadow_small_entry_guard or {}),
     )
 
 
@@ -805,6 +900,284 @@ def _is_late_chase_soft_block(reason_codes: Iterable[str]) -> bool:
 
 def _is_risk_off_small_entry(reason_codes: Iterable[str]) -> bool:
     return bool({str(code).upper() for code in reason_codes} & RISK_OFF_SMALL_ENTRY_CODES)
+
+
+def _shadow_small_entry_settings(settings: StrategyRuntimeSettings | None) -> dict[str, Any]:
+    active_settings = settings or legacy_strategy_runtime_settings()
+    raw = dict(active_settings.value("theme_lab_shadow_small_entry", {}) or {})
+    return {
+        "enabled": _shadow_bool(raw.get("enabled"), False),
+        "allowed_recommendations": _shadow_upper_tuple(raw.get("allowed_recommendations") or ("PROMISING_SHADOW",)),
+        "active_scenario_id": str(raw.get("active_scenario_id") or "").strip(),
+        "report_trade_date": str(raw.get("report_trade_date") or "").strip(),
+        "min_labeled_count": max(0, _shadow_int(raw.get("min_labeled_count"), 10)),
+        "min_win_rate_15m": max(0.0, _shadow_float(raw.get("min_win_rate_15m"), 0.55)),
+        "max_risk_case_rate_15m": max(0.0, _shadow_float(raw.get("max_risk_case_rate_15m"), 0.15)),
+        "min_net_shadow_score": _shadow_float(raw.get("min_net_shadow_score"), 35.0),
+        "max_position_size_multiplier": max(0.0, min(1.0, _shadow_float(raw.get("max_position_size_multiplier"), 0.25))),
+        "max_promotions_per_cycle": max(0, _shadow_int(raw.get("max_promotions_per_cycle"), 1)),
+        "require_support_ready": _shadow_bool(raw.get("require_support_ready"), True),
+        "require_latest_tick_ready": _shadow_bool(raw.get("require_latest_tick_ready"), True),
+        "reason_code": str(raw.get("reason_code") or SHADOW_SMALL_ENTRY_REASON_CODE).strip() or SHADOW_SMALL_ENTRY_REASON_CODE,
+    }
+
+
+def _shadow_small_entry_policy_from_report(report: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(report, dict):
+        return {"active": False, "status": "NO_AB_REPORT", "reason": "NO_AB_REPORT", "scenario": {}}
+    ab = report.get("shadow_small_entry_ab")
+    if not isinstance(ab, dict):
+        return {"active": False, "status": "NO_AB_REPORT", "reason": "NO_AB_REPORT", "scenario": {}}
+    rows: list[dict[str, Any]] = []
+    seen_scenarios: set[str] = set()
+    for source_rows in (ab.get("best_scenarios") or (), ab.get("scenarios") or ()):
+        for row in source_rows or ():
+            if not isinstance(row, dict):
+                continue
+            scenario_id = str(row.get("scenario_id") or len(rows))
+            if scenario_id in seen_scenarios:
+                continue
+            seen_scenarios.add(scenario_id)
+            rows.append(dict(row))
+    if not rows:
+        return {"active": False, "status": "NO_SHADOW_SCENARIO", "reason": "NO_SHADOW_SCENARIO", "scenario": {}}
+
+    active_scenario_id = str(config.get("active_scenario_id") or "").strip()
+    rejection: tuple[dict[str, Any], str] | None = None
+    for row in rows:
+        scenario = _shadow_scenario_from_row(row)
+        if active_scenario_id and str(scenario.get("scenario_id") or "") != active_scenario_id:
+            continue
+        passed, reason = _shadow_policy_row_passes(scenario, config)
+        if passed:
+            return {
+                "active": True,
+                "status": "SCENARIO_READY",
+                "reason": "PASS",
+                "scenario": scenario,
+            }
+        if rejection is None or active_scenario_id:
+            rejection = (scenario, reason)
+        if active_scenario_id:
+            break
+
+    if rejection is not None:
+        scenario, reason = rejection
+        return {
+            "active": False,
+            "status": "SCENARIO_POLICY_BLOCKED",
+            "reason": reason,
+            "scenario": scenario,
+        }
+    return {
+        "active": False,
+        "status": "NO_MATCHING_SCENARIO",
+        "reason": "NO_MATCHING_SCENARIO",
+        "scenario": {},
+    }
+
+
+def _shadow_policy_row_passes(row: dict[str, Any], config: dict[str, Any]) -> tuple[bool, str]:
+    recommendation = str(row.get("recommendation") or "").strip().upper()
+    allowed_recommendations = set(_shadow_upper_tuple(config.get("allowed_recommendations") or ("PROMISING_SHADOW",)))
+    if recommendation not in allowed_recommendations:
+        return False, recommendation or "RECOMMENDATION_NOT_ALLOWED"
+    if _shadow_int(row.get("labeled_count"), 0) < _shadow_int(config.get("min_labeled_count"), 10):
+        return False, "INSUFFICIENT_SAMPLE"
+    if _shadow_float(row.get("win_rate_15m"), 0.0) < _shadow_float(config.get("min_win_rate_15m"), 0.55):
+        return False, "WIN_RATE_BELOW_THRESHOLD"
+    if _shadow_float(row.get("risk_case_rate_15m"), 1.0) > _shadow_float(config.get("max_risk_case_rate_15m"), 0.15):
+        return False, "RISK_CASE_RATE_ABOVE_THRESHOLD"
+    if _shadow_float(row.get("net_shadow_score"), 0.0) < _shadow_float(config.get("min_net_shadow_score"), 35.0):
+        return False, "NET_SHADOW_SCORE_BELOW_THRESHOLD"
+    return True, "PASS"
+
+
+def _shadow_small_entry_guard(
+    decision: LabGateDecision,
+    watch: WatchSetSnapshot,
+    policy: dict[str, Any] | None,
+    *,
+    promotion_available: bool = True,
+) -> dict[str, Any]:
+    active_policy = dict(policy or {})
+    scenario = dict(active_policy.get("scenario") or {})
+    guard = _shadow_guard_base(active_policy, scenario)
+    if not guard["enabled"]:
+        return {**guard, "status": "DISABLED", "reason": "DISABLED"}
+    if not scenario:
+        status = str(active_policy.get("status") or "NO_ACTIVE_SCENARIO")
+        return {**guard, "status": status, "reason": str(active_policy.get("reason") or status)}
+
+    basic_passed, basic_reason = _shadow_basic_candidate_passes(decision, watch)
+    if not basic_passed:
+        return {**guard, "status": "REJECTED", "reason": basic_reason}
+    matched, match_reason = _shadow_scenario_matches(decision, watch, scenario)
+    if not matched:
+        return {**guard, "status": "REJECTED", "reason": match_reason}
+    guard["candidate"] = True
+
+    if not bool(active_policy.get("active")):
+        status = str(active_policy.get("status") or "BLOCKED")
+        return {**guard, "status": "BLOCKED", "reason": str(active_policy.get("reason") or status)}
+    if not promotion_available:
+        return {**guard, "status": "BLOCKED", "reason": "MAX_PROMOTIONS_PER_CYCLE"}
+    return {**guard, "status": "PROMOTED", "reason": "PASS", "promoted": True}
+
+
+def _shadow_basic_candidate_passes(decision: LabGateDecision, watch: WatchSetSnapshot) -> tuple[bool, str]:
+    if decision.status not in {LabGateStatus.WAIT, LabGateStatus.OBSERVE}:
+        return False, "STATUS_NOT_WAIT_OR_OBSERVE"
+    readiness = _shadow_text(getattr(watch, "price_location_readiness", ""))
+    if readiness != "PROVISIONAL" and not bool(getattr(watch, "price_location_provisional", False)):
+        return False, "PRICE_LOCATION_NOT_PROVISIONAL"
+    return True, "PASS"
+
+
+def _shadow_scenario_matches(
+    decision: LabGateDecision,
+    watch: WatchSetSnapshot,
+    scenario: dict[str, Any],
+) -> tuple[bool, str]:
+    statuses = set(_shadow_upper_tuple(scenario.get("statuses") or ()))
+    if statuses and _shadow_text(decision.status) not in statuses:
+        return False, "STATUS_NOT_IN_SCENARIO"
+    roles = set(_shadow_upper_tuple(scenario.get("roles") or ()))
+    if roles and _shadow_text(watch.stock_role) not in roles:
+        return False, "ROLE_NOT_IN_SCENARIO"
+    if int(getattr(watch, "condition_level", 0) or 0) < _shadow_int(scenario.get("min_condition_level"), 0):
+        return False, "CONDITION_LEVEL_BELOW_SCENARIO"
+    risks = set(_shadow_upper_tuple(scenario.get("allowed_risks") or ()))
+    if risks and _shadow_text(decision.risk_level) not in risks:
+        return False, "RISK_NOT_IN_SCENARIO"
+    market_status = _shadow_market_status(decision, watch)
+    excluded_markets = set(_shadow_upper_tuple(scenario.get("excluded_market_statuses") or ()))
+    if market_status and market_status in excluded_markets:
+        return False, "MARKET_STATUS_EXCLUDED"
+    allowed_markets = set(_shadow_upper_tuple(scenario.get("allowed_market_statuses") or ()))
+    if allowed_markets and market_status not in allowed_markets:
+        return False, "MARKET_STATUS_NOT_ALLOWED"
+    return True, "PASS"
+
+
+def _shadow_position_size_multiplier(guard: dict[str, Any], policy: dict[str, Any] | None) -> float:
+    max_multiplier = _shadow_float((policy or {}).get("max_position_size_multiplier"), 0.25)
+    scenario_multiplier = _shadow_float(guard.get("position_size_multiplier"), max_multiplier)
+    if scenario_multiplier <= 0:
+        scenario_multiplier = max_multiplier
+    return max(0.0, min(1.0, scenario_multiplier, max_multiplier))
+
+
+def _shadow_scenario_reason_code(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    safe = "".join(ch if ch.isalnum() else "_" for ch in text).strip("_")
+    return f"SHADOW_SCENARIO_{safe}" if safe else "SHADOW_SCENARIO"
+
+
+def _shadow_guard_base(policy: dict[str, Any], scenario: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled": bool(policy.get("enabled")),
+        "active": bool(policy.get("active")),
+        "status": str(policy.get("status") or ""),
+        "reason": str(policy.get("reason") or ""),
+        "candidate": False,
+        "promoted": False,
+        "scenario_id": str(scenario.get("scenario_id") or ""),
+        "label": str(scenario.get("label") or ""),
+        "recommendation": str(scenario.get("recommendation") or ""),
+        "position_size_multiplier": _shadow_float(scenario.get("position_size_multiplier"), 0.0),
+        "candidate_count": _shadow_int(scenario.get("candidate_count"), 0),
+        "labeled_count": _shadow_int(scenario.get("labeled_count"), 0),
+        "win_rate_15m": _shadow_float(scenario.get("win_rate_15m"), 0.0),
+        "risk_case_rate_15m": _shadow_float(scenario.get("risk_case_rate_15m"), 0.0),
+        "net_shadow_score": _shadow_float(scenario.get("net_shadow_score"), 0.0),
+    }
+
+
+def _shadow_scenario_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **dict(row),
+        "scenario_id": str(row.get("scenario_id") or "").strip(),
+        "label": str(row.get("label") or "").strip(),
+        "recommendation": str(row.get("recommendation") or "").strip().upper(),
+        "position_size_multiplier": _shadow_float(row.get("position_size_multiplier"), 0.0),
+        "candidate_count": _shadow_int(row.get("candidate_count"), 0),
+        "labeled_count": _shadow_int(row.get("labeled_count"), 0),
+        "win_rate_15m": _shadow_float(row.get("win_rate_15m"), 0.0),
+        "risk_case_rate_15m": _shadow_float(row.get("risk_case_rate_15m"), 0.0),
+        "net_shadow_score": _shadow_float(row.get("net_shadow_score"), 0.0),
+        "statuses": _shadow_upper_tuple(row.get("statuses") or ()),
+        "roles": _shadow_upper_tuple(row.get("roles") or ()),
+        "min_condition_level": _shadow_int(row.get("min_condition_level"), 0),
+        "allowed_risks": _shadow_upper_tuple(row.get("allowed_risks") or ()),
+        "allowed_market_statuses": _shadow_upper_tuple(row.get("allowed_market_statuses") or ()),
+        "excluded_market_statuses": _shadow_upper_tuple(row.get("excluded_market_statuses") or ()),
+    }
+
+
+def _shadow_market_status(decision: LabGateDecision, watch: WatchSetSnapshot) -> str:
+    for item in (
+        getattr(decision, "candidate_market_confirmed_status", ""),
+        getattr(decision, "candidate_market_status", ""),
+        getattr(decision, "candidate_market_raw_status", ""),
+        getattr(watch, "candidate_market_confirmed_status", ""),
+        getattr(watch, "candidate_market_status", ""),
+        getattr(watch, "candidate_market_raw_status", ""),
+    ):
+        text = _shadow_text(item)
+        if text:
+            return text
+    return ""
+
+
+def _shadow_bool(value: Any, default: bool = False) -> bool:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _shadow_float(value: Any, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _shadow_int(value: Any, default: int = 0) -> int:
+    if value in (None, ""):
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return int(default)
+
+
+def _shadow_upper_tuple(value: Any) -> tuple[str, ...]:
+    if value in (None, ""):
+        return ()
+    if isinstance(value, str):
+        raw_values = value.replace("|", ",").split(",")
+    elif isinstance(value, Iterable):
+        raw_values = list(value)
+    else:
+        raw_values = [value]
+    return tuple(_dedupe(_shadow_text(item) for item in raw_values if _shadow_text(item)))
+
+
+def _shadow_text(value: Any) -> str:
+    return str(getattr(value, "value", value) or "").strip().upper()
 
 
 def _market_wait_status(reason_codes: Iterable[str]) -> str:
@@ -991,10 +1364,11 @@ def _stock_pullback_details(
         support_details["support_ready"] = mapping.selected_support_ready
         support_details["selected_support_ready_reason"] = mapping.selected_support_ready_reason
         support_details["support_ready_reason"] = mapping.selected_support_ready_reason
-    position_size_multiplier = max(0.0, float(decision.position_size_multiplier or 0.0))
+    position_size_multiplier = max(0.0, float(mapping.position_size_multiplier or decision.position_size_multiplier or 0.0))
     if position_size_multiplier <= 0:
         position_size_multiplier = 1.0
     risk_off_details = dict(getattr(decision, "risk_off_entry_details", {}) or {})
+    shadow_guard = dict(mapping.shadow_small_entry_guard or {})
     return {
         "source": SOURCE,
         "profile": candidate.strategy_profile.value if candidate.strategy_profile else StrategyProfile.KOSDAQ_THEME_PROFILE.value,
@@ -1024,7 +1398,22 @@ def _stock_pullback_details(
         "price_location_status": decision.price_location_status.value,
         "price_location_score": decision.price_location_score,
         "price_location_reason_codes": list(decision.price_location_reason_codes),
+        "price_location_readiness": watch.price_location_readiness.value,
+        "price_location_readiness_reason_codes": list(watch.price_location_readiness_reason_codes),
+        "price_location_provisional": bool(watch.price_location_provisional),
         "stock_role": watch.stock_role.value,
+        "shadow_small_entry_dry_run": shadow_guard,
+        "shadow_small_entry_dry_run_enabled": bool(shadow_guard.get("enabled")),
+        "shadow_small_entry_dry_run_candidate": bool(shadow_guard.get("candidate")),
+        "shadow_small_entry_dry_run_promoted": bool(shadow_guard.get("promoted")),
+        "shadow_small_entry_guard_status": str(shadow_guard.get("status") or ""),
+        "shadow_small_entry_guard_reason": str(shadow_guard.get("reason") or ""),
+        "shadow_small_entry_scenario_id": str(shadow_guard.get("scenario_id") or ""),
+        "shadow_small_entry_recommendation": str(shadow_guard.get("recommendation") or ""),
+        "shadow_small_entry_net_score": shadow_guard.get("net_shadow_score"),
+        "shadow_small_entry_win_rate_15m": shadow_guard.get("win_rate_15m"),
+        "shadow_small_entry_risk_case_rate_15m": shadow_guard.get("risk_case_rate_15m"),
+        "shadow_small_entry_labeled_count": shadow_guard.get("labeled_count"),
         **market_fields,
         "position_size_multiplier": position_size_multiplier,
         "risk_off_entry": risk_off_details,
@@ -1082,6 +1471,20 @@ def _base_details(
     decision_cycle_id = str(decision_cycle_id or metadata.get("decision_cycle_id") or "")
     market_fields = _market_side_fields(decision, watch)
     observability = _observability_status_fields(mapping, stock_details, market_fields)
+    shadow_fields = {
+        "shadow_small_entry_dry_run": dict(stock_details.get("shadow_small_entry_dry_run") or {}),
+        "shadow_small_entry_dry_run_enabled": bool(stock_details.get("shadow_small_entry_dry_run_enabled")),
+        "shadow_small_entry_dry_run_candidate": bool(stock_details.get("shadow_small_entry_dry_run_candidate")),
+        "shadow_small_entry_dry_run_promoted": bool(stock_details.get("shadow_small_entry_dry_run_promoted")),
+        "shadow_small_entry_guard_status": str(stock_details.get("shadow_small_entry_guard_status") or ""),
+        "shadow_small_entry_guard_reason": str(stock_details.get("shadow_small_entry_guard_reason") or ""),
+        "shadow_small_entry_scenario_id": str(stock_details.get("shadow_small_entry_scenario_id") or ""),
+        "shadow_small_entry_recommendation": str(stock_details.get("shadow_small_entry_recommendation") or ""),
+        "shadow_small_entry_net_score": stock_details.get("shadow_small_entry_net_score"),
+        "shadow_small_entry_win_rate_15m": stock_details.get("shadow_small_entry_win_rate_15m"),
+        "shadow_small_entry_risk_case_rate_15m": stock_details.get("shadow_small_entry_risk_case_rate_15m"),
+        "shadow_small_entry_labeled_count": stock_details.get("shadow_small_entry_labeled_count"),
+    }
     details = {
         "source": SOURCE,
         "candidate_instance_id": candidate_instance_id,
@@ -1106,6 +1509,9 @@ def _base_details(
         "price_location_status": decision.price_location_status.value,
         "price_location_score": decision.price_location_score,
         "price_location_reason_codes": list(decision.price_location_reason_codes),
+        "price_location_readiness": watch.price_location_readiness.value,
+        "price_location_readiness_reason_codes": list(watch.price_location_readiness_reason_codes),
+        "price_location_provisional": bool(watch.price_location_provisional),
         "risk_level": decision.risk_level.value,
         "risk_reason_codes": list(decision.risk_reason_codes),
         **market_fields,
@@ -1153,6 +1559,7 @@ def _base_details(
         "risk_soft_block_reason_codes": list(stock_details.get("risk_soft_block_reason_codes") or []),
         "stock_role": watch.stock_role.value,
         "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
+        **shadow_fields,
         "risk_off_entry": dict(stock_details.get("risk_off_entry") or {}),
         "risk_off_entry_enabled": bool(stock_details.get("risk_off_entry_enabled")),
         "risk_off_entry_observe_only": bool(stock_details.get("risk_off_entry_observe_only")),
@@ -1185,6 +1592,9 @@ def _base_details(
             "order_eligibility": mapping.order_eligibility,
             "ready_type": mapping.ready_type,
             "price_location_status": decision.price_location_status.value,
+            "price_location_readiness": watch.price_location_readiness.value,
+            "price_location_readiness_reason_codes": list(watch.price_location_readiness_reason_codes),
+            "price_location_provisional": bool(watch.price_location_provisional),
             "risk_level": decision.risk_level.value,
             "risk_reason_codes": list(decision.risk_reason_codes),
             **market_fields,
@@ -1211,6 +1621,7 @@ def _base_details(
             "risk_soft_block": bool(stock_details.get("risk_soft_block")),
             "risk_soft_block_reason_codes": list(stock_details.get("risk_soft_block_reason_codes") or []),
             "position_size_multiplier": stock_details.get("position_size_multiplier", 1.0),
+            **shadow_fields,
             "risk_off_entry": dict(stock_details.get("risk_off_entry") or {}),
             "risk_off_entry_enabled": bool(stock_details.get("risk_off_entry_enabled")),
             "risk_off_entry_observe_only": bool(stock_details.get("risk_off_entry_observe_only")),

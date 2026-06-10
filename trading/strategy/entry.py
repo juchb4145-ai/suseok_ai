@@ -22,6 +22,7 @@ from trading.strategy.support_readiness import (
 )
 
 READY_RISK_OFF_SMALL = "READY_RISK_OFF_SMALL"
+READY_SHADOW_SMALL_ENTRY = "READY_SHADOW_SMALL_ENTRY"
 
 
 class TickSizeProvider:
@@ -133,7 +134,20 @@ class EntryPlanBuilder:
                 "later_legs_require_previous_fill": True,
                 "early_small_first_leg_only": ready_type == READY_EARLY_SMALL,
                 "risk_off_small_first_leg_only": ready_type == READY_RISK_OFF_SMALL,
+                "shadow_small_entry_first_leg_only": ready_type == READY_SHADOW_SMALL_ENTRY,
             },
+            "shadow_small_entry_dry_run": dict(stock_details.get("shadow_small_entry_dry_run") or {}),
+            "shadow_small_entry_dry_run_enabled": bool(stock_details.get("shadow_small_entry_dry_run_enabled")),
+            "shadow_small_entry_dry_run_candidate": bool(stock_details.get("shadow_small_entry_dry_run_candidate")),
+            "shadow_small_entry_dry_run_promoted": bool(stock_details.get("shadow_small_entry_dry_run_promoted")),
+            "shadow_small_entry_guard_status": stock_details.get("shadow_small_entry_guard_status", ""),
+            "shadow_small_entry_guard_reason": stock_details.get("shadow_small_entry_guard_reason", ""),
+            "shadow_small_entry_scenario_id": stock_details.get("shadow_small_entry_scenario_id", ""),
+            "shadow_small_entry_recommendation": stock_details.get("shadow_small_entry_recommendation", ""),
+            "shadow_small_entry_net_score": stock_details.get("shadow_small_entry_net_score"),
+            "shadow_small_entry_win_rate_15m": stock_details.get("shadow_small_entry_win_rate_15m"),
+            "shadow_small_entry_risk_case_rate_15m": stock_details.get("shadow_small_entry_risk_case_rate_15m"),
+            "shadow_small_entry_labeled_count": stock_details.get("shadow_small_entry_labeled_count"),
             "risk_off_entry": dict(stock_details.get("risk_off_entry") or {}),
             "risk_off_entry_enabled": bool(stock_details.get("risk_off_entry_enabled")),
             "risk_off_entry_observe_only": bool(stock_details.get("risk_off_entry_observe_only")),
@@ -204,9 +218,14 @@ class EntryPlanBuilder:
             if index == 1 and submittable and not first_support_readiness["ready"]:
                 submittable = False
                 reason = str(first_support_readiness["reason"] or WAIT_DATA_SUPPORT_NOT_READY)
-            if index > 1 and ready_type in {READY_EARLY_SMALL, READY_RISK_OFF_SMALL}:
+            if index > 1 and ready_type in {READY_EARLY_SMALL, READY_RISK_OFF_SMALL, READY_SHADOW_SMALL_ENTRY}:
                 submittable = False
-                reason = "risk_off_small_later_leg_pending" if ready_type == READY_RISK_OFF_SMALL else "early_small_later_leg_pending"
+                if ready_type == READY_RISK_OFF_SMALL:
+                    reason = "risk_off_small_later_leg_pending"
+                elif ready_type == READY_SHADOW_SMALL_ENTRY:
+                    reason = "shadow_small_entry_later_leg_pending"
+                else:
+                    reason = "early_small_later_leg_pending"
             tick_offset = self.settings.integer("entry_plan_thresholds.tick_offset", 1) if submittable else 0
             limit_price = self.tick_provider.add_ticks(int(support_price), tick_offset) if submittable else 0
             plan.append(
@@ -220,7 +239,7 @@ class EntryPlanBuilder:
                     "submittable": submittable,
                     "requires_previous_leg": index > 1,
                     "confirmation_required": index > 1 and not submittable,
-                    "pending_after_first_fill": index > 1 and ready_type in {READY_EARLY_SMALL, READY_RISK_OFF_SMALL},
+                    "pending_after_first_fill": index > 1 and ready_type in {READY_EARLY_SMALL, READY_RISK_OFF_SMALL, READY_SHADOW_SMALL_ENTRY},
                     "current_price_at_plan": current_price,
                     "reason": reason,
                 }

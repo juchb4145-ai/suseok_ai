@@ -592,6 +592,14 @@ def _condition_infos(raw_conditions: Iterable[Any]) -> list[ConditionInfo]:
 
 def _tick_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     metadata = dict(payload.get("metadata") or {})
+    if payload.get("transport_trace"):
+        metadata.setdefault("transport_trace", dict(payload.get("transport_trace") or {}))
+    if payload.get("trace"):
+        metadata.setdefault("transport_trace", dict(payload.get("trace") or {}))
+    if payload.get("timestamp"):
+        metadata.setdefault("broker_tick_timestamp", str(payload.get("timestamp") or ""))
+    if payload.get("gateway_realtime_reliability"):
+        metadata.setdefault("gateway_realtime_reliability", dict(payload.get("gateway_realtime_reliability") or {}))
     reason_codes = set(str(value) for value in metadata.get("reason_codes") or [] if str(value or "").strip())
     reason_codes.update(str(value) for value in payload.get("reason_codes") or [] if str(value or "").strip())
     if reason_codes:

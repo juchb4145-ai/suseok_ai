@@ -71,7 +71,10 @@ def test_gateway_runtime_uses_rich_price_tick_signal_payload():
     assert payload["day_low"] == 69000
     assert payload["trade_time"] == "093015"
     assert payload["metadata"]["reason_codes"] == ["SPREAD_APPROXIMATED"]
+    assert payload["metadata"]["gateway_realtime_reliability_bucket"] == "HIGH"
+    assert payload["gateway_realtime_reliability_score"] >= 90.0
     assert runtime.data_quality.snapshot()["total_price_ticks"] == 1
+    assert runtime.data_quality.snapshot()["reliability"]["bucket_counts"]["HIGH"] == 1
 
 
 def test_gateway_runtime_keeps_old_price_received_fallback_path():

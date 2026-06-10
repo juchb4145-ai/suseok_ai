@@ -53,6 +53,11 @@ def test_gateway_price_tick_passes_rich_payload_to_strategy_tick():
             "day_high": 71000,
             "day_low": 69000,
             "trade_time": "093015",
+            "timestamp": "2026-06-01T00:00:00+00:00",
+            "transport_trace": {
+                "gateway_event_created_at_utc": "2026-06-01T00:00:00+00:00",
+                "core_event_received_at_utc": "2026-06-01T00:00:00.250000+00:00",
+            },
             "metadata": {"reason_codes": ["SPREAD_APPROXIMATED"], "raw_fids_present": [10, 14, 228]},
         }
     ) is True
@@ -65,11 +70,15 @@ def test_gateway_price_tick_passes_rich_payload_to_strategy_tick():
     assert tick.metadata["session_low"] == 69000
     assert tick.metadata["trade_time"] == "093015"
     assert tick.metadata["raw_fids_present"] == [10, 14, 228]
+    assert tick.metadata["transport_trace"]["core_event_received_at_utc"] == "2026-06-01T00:00:00.250000+00:00"
+    assert tick.metadata["realtime_transport_latency_ms"] == 250.0
+    assert tick.metadata["realtime_reliability_bucket"] == "HIGH"
     assert "SPREAD_APPROXIMATED" in tick.metadata["reason_codes"]
 
     quality = bridge.data_quality_snapshot()
     assert quality["total_price_ticks"] == 1
     assert quality["field_coverage"]["execution_strength"] == 1.0
+    assert quality["reliability"]["transport_latency_sample_count"] == 1
 
 
 def test_gateway_price_tick_updates_index_store():

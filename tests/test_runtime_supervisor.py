@@ -41,10 +41,18 @@ class _FakeRuntime:
 class _FakeBridge:
     def __init__(self):
         self.events = []
+        self.quality_snapshot = {
+            "total_price_ticks": 1,
+            "realtime_reliability_score": 96.0,
+            "realtime_reliability_bucket": "HIGH",
+        }
 
     def handle_event(self, event):
         self.events.append(event)
         return True
+
+    def data_quality_snapshot(self):
+        return dict(self.quality_snapshot)
 
 
 class _FakeSubscriptionManager:
@@ -110,6 +118,23 @@ def test_start_stop_and_manual_cycle(tmp_path):
     assert runtime.cycle_calls == 1
     assert runtime.stop_calls == 1
     assert stopped["running"] is False
+
+
+def test_status_exposes_realtime_data_quality_snapshot(tmp_path):
+    runtime = _FakeRuntime()
+    supervisor, bridge = _supervisor(tmp_path, runtime)
+    bridge.quality_snapshot["reliability"] = {"bucket_counts": {"HIGH": 1}}
+
+    async def scenario():
+        await supervisor.start()
+        status = supervisor.status()
+        await supervisor.shutdown()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert status["realtime_data_quality"]["realtime_reliability_bucket"] == "HIGH"
+    assert status["realtime_data_quality"]["reliability"]["bucket_counts"]["HIGH"] == 1
 
 
 def test_duplicate_cycle_is_skipped(tmp_path):

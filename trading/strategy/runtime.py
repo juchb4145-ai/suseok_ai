@@ -71,6 +71,33 @@ DATA_WARMUP_WAITING_CANDIDATE_TICKS = "waiting_candidate_ticks"
 DATA_WARMUP_CLOSED = "closed"
 GATE_SKIP_MARKET_SESSION_CLOSED = "MARKET_SESSION_CLOSED"
 GATE_SKIP_DATA_WARMUP = "DATA_WARMUP"
+THEME_LAB_WATCHSET_SOURCE = "theme_lab_watchset"
+THEME_LAB_BOOTSTRAP_SOURCE = "theme_lab_bootstrap"
+THEME_LAB_OUTCOME_TRACKING_SOURCE = "theme_lab_outcome_tracking"
+THEME_LAB_OUTCOME_TRACKING_DEFAULT_TTL_SEC = 30 * 60
+THEME_LAB_OUTCOME_TRACKING_DEFAULT_MAX_CODES = 40
+THEME_LAB_OUTCOME_TRACKING_READINESS = {"WARMUP", "PROVISIONAL", "MISSING_CORE", "STALE"}
+THEME_LAB_OUTCOME_TRACKING_REASON_CODES = {
+    "NO_GATE_RESULT",
+    "WATCHSET_RETAINED_AFTER_DEMOTION",
+    "WATCHSET_WAIT_CONFIRMATION",
+    "WAIT_MARKET_CONFIRMATION_PENDING",
+    "MARKET_CONFIRMATION_PENDING",
+    "MARKET_WEAK_CONFIRMED",
+    "MARKET_RISK_OFF_CONFIRMED",
+    "MARKET_WAIT_STATE_RESET",
+    "SIDE_BREADTH_SAMPLE_TOO_SMALL",
+    "SIDE_BREADTH_VALID_QUOTE_RATIO_LOW",
+    "SIDE_BREADTH_LOW_TRUST",
+    "SIDE_BREADTH_SOURCE_CONFLICT",
+}
+THEME_LAB_OUTCOME_TRACKING_REASON_PREFIXES = (
+    "PRICE_LOCATION_",
+    "WAIT_PRICE_LOCATION_",
+    "WAIT_CANDIDATE_MARKET_",
+    "DATA_WARMUP",
+    "MISSING_",
+)
 
 
 @dataclass
@@ -211,6 +238,7 @@ class StrategyRuntimeSnapshot:
     data_warmup_status: str = DATA_WARMUP_READY
     gate_skip_reason: str = ""
     candidate_subscription_selected_count: int = 0
+    theme_lab_outcome_tracking_count: int = 0
     candidate_subscription_skipped_discovery_count: int = 0
     candidate_subscription_skipped_unmapped_count: int = 0
     protected_subscription_usage: str = ""
@@ -247,6 +275,7 @@ class StrategyRuntime:
         holding_provider: Optional[HoldingProvider] = None,
         order_sink=None,
         theme_lab_pipeline: Optional[ThemeLabRuntimePipeline] = None,
+        theme_lab_shadow_ab_provider: Optional[Callable[[str], dict]] = None,
     ) -> None:
         self.db = db
         self.candidate_collector = candidate_collector
@@ -264,7 +293,9 @@ class StrategyRuntime:
         self.holding_provider = holding_provider or StaticHoldingProvider()
         self.order_sink = order_sink
         self.theme_lab_pipeline = theme_lab_pipeline
+        self.theme_lab_shadow_ab_provider = theme_lab_shadow_ab_provider
         self._theme_lab_bridge_results: list[GatePipelineResult] = []
+        self._theme_lab_outcome_tracking: dict[str, datetime] = {}
         self.started = False
         self._warnings: list[str] = []
         self.startup_warnings: list[str] = []
@@ -1296,6 +1327,7 @@ class StrategyRuntime:
                 market_data=market_data,
                 default_ttl_minutes=getattr(self.candidate_collector, "default_ttl_minutes", 30),
                 settings=getattr(self.entry_plan_builder, "settings", None),
+                shadow_ab_provider=self.theme_lab_shadow_ab_provider,
             )
             built = bridge.build(
                 active_result,
@@ -1334,20 +1366,123 @@ class StrategyRuntime:
         if not target_codes:
             bootstrap_codes = set(self._theme_lab_bootstrap_codes(candidates or [], snapshot))
         for code, record in list(self.subscription_manager.records.items()):
-            if "theme_lab_watchset" in record.sources and code not in target_codes:
-                self.subscription_manager.remove_subscription(code, "theme_lab_watchset")
-            if "theme_lab_bootstrap" in record.sources and code not in bootstrap_codes:
-                self.subscription_manager.remove_subscription(code, "theme_lab_bootstrap")
+            if THEME_LAB_WATCHSET_SOURCE in record.sources and code not in target_codes:
+                self.subscription_manager.remove_subscription(code, THEME_LAB_WATCHSET_SOURCE)
+            if THEME_LAB_BOOTSTRAP_SOURCE in record.sources and code not in bootstrap_codes:
+                self.subscription_manager.remove_subscription(code, THEME_LAB_BOOTSTRAP_SOURCE)
         for code in sorted(target_codes):
-            self.subscription_manager.ensure_subscription(code, "theme_lab_watchset", protected=False)
+            self.subscription_manager.ensure_subscription(code, THEME_LAB_WATCHSET_SOURCE, protected=False)
         for code in sorted(bootstrap_codes):
-            self.subscription_manager.ensure_subscription(code, "theme_lab_bootstrap", protected=False)
+            self.subscription_manager.ensure_subscription(code, THEME_LAB_BOOTSTRAP_SOURCE, protected=False)
+        self._sync_theme_lab_outcome_tracking_subscriptions(snapshot)
         if target_codes:
             snapshot.warnings.append(f"THEME_LAB_WATCHSET_SUBSCRIPTIONS={len(target_codes)}")
             return len(target_codes)
         if bootstrap_codes:
             snapshot.warnings.append(f"THEME_LAB_BOOTSTRAP_SUBSCRIPTIONS={len(bootstrap_codes)}")
         return len(bootstrap_codes)
+
+    def _sync_theme_lab_outcome_tracking_subscriptions(self, snapshot: StrategyRuntimeSnapshot) -> int:
+        ttl_sec = max(0, _env_int("TRADING_THEME_LAB_OUTCOME_TRACKING_TTL_SEC", THEME_LAB_OUTCOME_TRACKING_DEFAULT_TTL_SEC))
+        max_codes = max(0, _env_int("TRADING_THEME_LAB_OUTCOME_TRACKING_MAX_CODES", THEME_LAB_OUTCOME_TRACKING_DEFAULT_MAX_CODES))
+        now = self._last_runtime_time
+        if ttl_sec <= 0 or max_codes <= 0:
+            self._theme_lab_outcome_tracking.clear()
+            self._remove_theme_lab_outcome_tracking_subscriptions(set())
+            snapshot.theme_lab_outcome_tracking_count = 0
+            return 0
+
+        result = self._fresh_theme_lab_result(now)
+        if result is not None:
+            expires_at = now + timedelta(seconds=ttl_sec)
+            for code in self._theme_lab_outcome_tracking_codes(result):
+                self._theme_lab_outcome_tracking[code] = expires_at
+
+        self._theme_lab_outcome_tracking = {
+            code: expires_at
+            for code, expires_at in self._theme_lab_outcome_tracking.items()
+            if expires_at > now
+        }
+        if not self._theme_lab_outcome_tracking:
+            self._remove_theme_lab_outcome_tracking_subscriptions(set())
+            snapshot.theme_lab_outcome_tracking_count = 0
+            return 0
+
+        ranked_codes = sorted(
+            self._theme_lab_outcome_tracking,
+            key=lambda code: (self._theme_lab_outcome_tracking[code], code),
+            reverse=True,
+        )
+        selected_codes = set(ranked_codes[:max_codes])
+        if len(ranked_codes) > max_codes:
+            snapshot.warnings.append(f"THEME_LAB_OUTCOME_TRACKING_TRUNCATED={len(ranked_codes)}/{max_codes}")
+            self._theme_lab_outcome_tracking = {
+                code: expires_at
+                for code, expires_at in self._theme_lab_outcome_tracking.items()
+                if code in selected_codes
+            }
+        self._remove_theme_lab_outcome_tracking_subscriptions(selected_codes)
+        for code in sorted(selected_codes):
+            self.subscription_manager.ensure_subscription(code, THEME_LAB_OUTCOME_TRACKING_SOURCE, protected=False)
+        self._save_theme_lab_outcome_tracking_observations(selected_codes, snapshot)
+        snapshot.theme_lab_outcome_tracking_count = len(selected_codes)
+        snapshot.warnings.append(f"THEME_LAB_OUTCOME_TRACKING_SUBSCRIPTIONS={len(selected_codes)}")
+        return len(selected_codes)
+
+    def _remove_theme_lab_outcome_tracking_subscriptions(self, selected_codes: set[str]) -> None:
+        for code, record in list(self.subscription_manager.records.items()):
+            if THEME_LAB_OUTCOME_TRACKING_SOURCE in record.sources and code not in selected_codes:
+                self.subscription_manager.remove_subscription(code, THEME_LAB_OUTCOME_TRACKING_SOURCE)
+
+    def _save_theme_lab_outcome_tracking_observations(self, selected_codes: set[str], snapshot: StrategyRuntimeSnapshot) -> None:
+        if not selected_codes or self.theme_lab_pipeline is None:
+            return
+        save = getattr(self.db, "save_theme_lab_outcome_observations", None)
+        market_data = getattr(self.theme_lab_pipeline, "market_data", None)
+        latest_tick = getattr(market_data, "latest_tick", None)
+        if not callable(save) or not callable(latest_tick):
+            return
+        observations: list[dict] = []
+        for code in sorted(selected_codes):
+            tick = latest_tick(code)
+            if tick is None or int(getattr(tick, "price", 0) or 0) <= 0:
+                continue
+            tick_at = _clean_time(getattr(tick, "timestamp", self._last_runtime_time) or self._last_runtime_time)
+            observations.append(
+                {
+                    "observed_at": tick_at.isoformat(),
+                    "trade_date": tick_at.date().isoformat(),
+                    "stock_code": code,
+                    "price": float(getattr(tick, "price", 0) or 0),
+                    "source": THEME_LAB_OUTCOME_TRACKING_SOURCE,
+                    "payload": {
+                        "change_rate": float(getattr(tick, "change_rate", 0.0) or 0.0),
+                        "cum_volume": int(getattr(tick, "cum_volume", 0) or 0),
+                        "trade_value": float(getattr(tick, "trade_value", 0.0) or 0.0),
+                        "execution_strength": float(getattr(tick, "execution_strength", 0.0) or 0.0),
+                        "saved_at": self._last_runtime_time.isoformat(),
+                    },
+                }
+            )
+        if not observations:
+            return
+        try:
+            save(observations)
+        except Exception as exc:
+            snapshot.warnings.append(f"THEME_LAB_OUTCOME_OBSERVATION_SAVE_FAILED:{exc}")
+
+    @staticmethod
+    def _theme_lab_outcome_tracking_codes(result) -> set[str]:
+        codes: set[str] = set()
+        for watch in getattr(result, "watchset", ()) or ():
+            code = normalize_code(getattr(watch, "symbol", ""))
+            if code and _theme_lab_watch_needs_outcome_tracking(watch):
+                codes.add(code)
+        for decision in getattr(result, "gate_decisions", ()) or ():
+            code = normalize_code(getattr(decision, "symbol", ""))
+            if code and _theme_lab_decision_needs_outcome_tracking(decision):
+                codes.add(code)
+        return codes
 
     def _theme_lab_bootstrap_codes(self, candidates: list[Candidate], snapshot: StrategyRuntimeSnapshot) -> list[str]:
         limit = self._theme_lab_bootstrap_subscription_limit(snapshot)
@@ -2149,6 +2284,74 @@ def _candidate_generation_summary(candidates: list[Candidate]) -> dict:
     }
 
 
+def _theme_lab_watch_needs_outcome_tracking(watch) -> bool:
+    if bool(getattr(watch, "watchset_retained", False)):
+        return True
+    readiness = _status_text(getattr(watch, "price_location_readiness", ""))
+    if readiness in THEME_LAB_OUTCOME_TRACKING_READINESS:
+        return True
+    if bool(getattr(watch, "price_location_provisional", False)):
+        return True
+    return _theme_lab_outcome_reasons_interesting(
+        _theme_lab_reason_values(
+            watch,
+            (
+                "price_location_readiness_reason_codes",
+                "price_location_reason_codes",
+                "price_location_data_quality_flags",
+                "market_side_reason_codes",
+                "market_session_reason_codes",
+                "risk_reason_codes",
+            ),
+        )
+    )
+
+
+def _theme_lab_decision_needs_outcome_tracking(decision) -> bool:
+    status = _status_text(getattr(decision, "status", ""))
+    if status not in {"WAIT", "OBSERVE", "BLOCKED"}:
+        return False
+    return _theme_lab_outcome_reasons_interesting(
+        _theme_lab_reason_values(
+            decision,
+            (
+                "reason_codes",
+                "price_location_reason_codes",
+                "market_side_reason_codes",
+                "market_session_reason_codes",
+                "market_side_data_quality_flags",
+                "risk_reason_codes",
+            ),
+        )
+    )
+
+
+def _theme_lab_outcome_reasons_interesting(reasons: tuple[str, ...]) -> bool:
+    for reason in reasons:
+        if reason in THEME_LAB_OUTCOME_TRACKING_REASON_CODES:
+            return True
+        if any(reason.startswith(prefix) for prefix in THEME_LAB_OUTCOME_TRACKING_REASON_PREFIXES):
+            return True
+    return False
+
+
+def _theme_lab_reason_values(item, names: tuple[str, ...]) -> tuple[str, ...]:
+    values: list[str] = []
+    for name in names:
+        raw = getattr(item, name, ()) or ()
+        if isinstance(raw, str):
+            raw = (raw,)
+        for value in raw:
+            text = str(getattr(value, "value", value) or "").strip().upper()
+            if text and text not in values:
+                values.append(text)
+    return tuple(values)
+
+
+def _status_text(value) -> str:
+    return str(getattr(value, "value", value) or "").strip().upper()
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
@@ -2636,6 +2839,18 @@ def _gate_result_record(result: GatePipelineResult, evaluated_at: str) -> dict:
         "late_chase_recheck_after_sec": result.details.get("late_chase_recheck_after_sec", 0),
         "risk_soft_block": bool(result.details.get("risk_soft_block")),
         "risk_soft_block_reason_codes": list(result.details.get("risk_soft_block_reason_codes") or []),
+        "shadow_small_entry_dry_run": dict(result.details.get("shadow_small_entry_dry_run") or {}),
+        "shadow_small_entry_dry_run_enabled": bool(result.details.get("shadow_small_entry_dry_run_enabled")),
+        "shadow_small_entry_dry_run_candidate": bool(result.details.get("shadow_small_entry_dry_run_candidate")),
+        "shadow_small_entry_dry_run_promoted": bool(result.details.get("shadow_small_entry_dry_run_promoted")),
+        "shadow_small_entry_guard_status": result.details.get("shadow_small_entry_guard_status", ""),
+        "shadow_small_entry_guard_reason": result.details.get("shadow_small_entry_guard_reason", ""),
+        "shadow_small_entry_scenario_id": result.details.get("shadow_small_entry_scenario_id", ""),
+        "shadow_small_entry_recommendation": result.details.get("shadow_small_entry_recommendation", ""),
+        "shadow_small_entry_net_score": result.details.get("shadow_small_entry_net_score"),
+        "shadow_small_entry_win_rate_15m": result.details.get("shadow_small_entry_win_rate_15m"),
+        "shadow_small_entry_risk_case_rate_15m": result.details.get("shadow_small_entry_risk_case_rate_15m"),
+        "shadow_small_entry_labeled_count": result.details.get("shadow_small_entry_labeled_count"),
         "risk_off_entry": dict(result.details.get("risk_off_entry") or {}),
         "risk_off_entry_enabled": bool(result.details.get("risk_off_entry_enabled")),
         "risk_off_entry_observe_only": bool(result.details.get("risk_off_entry_observe_only")),
@@ -2778,6 +2993,18 @@ def _block_record(result: GatePipelineResult) -> dict:
         "late_chase_recheck_after_sec": result.details.get("late_chase_recheck_after_sec", 0),
         "risk_soft_block": bool(result.details.get("risk_soft_block")),
         "risk_soft_block_reason_codes": list(result.details.get("risk_soft_block_reason_codes") or []),
+        "shadow_small_entry_dry_run": dict(result.details.get("shadow_small_entry_dry_run") or {}),
+        "shadow_small_entry_dry_run_enabled": bool(result.details.get("shadow_small_entry_dry_run_enabled")),
+        "shadow_small_entry_dry_run_candidate": bool(result.details.get("shadow_small_entry_dry_run_candidate")),
+        "shadow_small_entry_dry_run_promoted": bool(result.details.get("shadow_small_entry_dry_run_promoted")),
+        "shadow_small_entry_guard_status": result.details.get("shadow_small_entry_guard_status", ""),
+        "shadow_small_entry_guard_reason": result.details.get("shadow_small_entry_guard_reason", ""),
+        "shadow_small_entry_scenario_id": result.details.get("shadow_small_entry_scenario_id", ""),
+        "shadow_small_entry_recommendation": result.details.get("shadow_small_entry_recommendation", ""),
+        "shadow_small_entry_net_score": result.details.get("shadow_small_entry_net_score"),
+        "shadow_small_entry_win_rate_15m": result.details.get("shadow_small_entry_win_rate_15m"),
+        "shadow_small_entry_risk_case_rate_15m": result.details.get("shadow_small_entry_risk_case_rate_15m"),
+        "shadow_small_entry_labeled_count": result.details.get("shadow_small_entry_labeled_count"),
         "risk_off_entry": dict(result.details.get("risk_off_entry") or {}),
         "risk_off_entry_enabled": bool(result.details.get("risk_off_entry_enabled")),
         "risk_off_entry_observe_only": bool(result.details.get("risk_off_entry_observe_only")),

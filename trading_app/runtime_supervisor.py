@@ -222,6 +222,7 @@ class RuntimeSupervisor:
         gateway = self.gateway_state.snapshot().to_dict()
         command_summary = self.gateway_state.command_snapshot()
         dry_run_order_summary = _dry_run_order_summary(self.settings.db_path)
+        realtime_data_quality = self._realtime_data_quality_snapshot()
         with self._state_lock:
             snapshot = dict(self.last_snapshot or {})
             warnings = list(self.warnings[-50:])
@@ -254,6 +255,7 @@ class RuntimeSupervisor:
                 },
                 "commands": command_summary,
                 "dry_run_orders": dry_run_order_summary,
+                "realtime_data_quality": realtime_data_quality,
                 "pending_price_tick_count": self._pending_price_tick_count(),
                 "dropped_price_tick_count": self._dropped_price_tick_count,
                 "db_path": str(self.settings.db_path),
@@ -262,6 +264,17 @@ class RuntimeSupervisor:
     def snapshot(self) -> dict[str, Any]:
         with self._state_lock:
             return dict(self.last_snapshot or {})
+
+    def _realtime_data_quality_snapshot(self) -> dict[str, Any]:
+        bundle = self._bundle
+        bridge = getattr(bundle, "market_data_bridge", None) if bundle is not None else None
+        snapshot = getattr(bridge, "data_quality_snapshot", None)
+        if not callable(snapshot):
+            return {}
+        try:
+            return dict(snapshot() or {})
+        except Exception as exc:
+            return {"status": "ERROR", "error": str(exc)}
 
     async def handle_gateway_event(self, event: GatewayEvent) -> None:
         if not self.enabled or self._bundle is None:

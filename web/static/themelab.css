@@ -221,6 +221,47 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   padding: 10px;
 }
 
+.shadow-ab-summary {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(92px, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.shadow-ab-metric {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  padding: 8px 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.shadow-ab-metric span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.shadow-ab-metric strong {
+  display: block;
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shadow-ab-table-wrap {
+  max-height: 260px;
+}
+
+.shadow-ab-table {
+  min-width: 980px;
+}
+
 .theme-row {
   cursor: pointer;
 }
@@ -538,7 +579,8 @@ tbody tr.selected {
   .cockpit-grid,
   .flow-grid,
   .bottom-grid,
-  .quality-grid {
+  .quality-grid,
+  .shadow-ab-summary {
     grid-template-columns: 1fr;
   }
   .market-header {

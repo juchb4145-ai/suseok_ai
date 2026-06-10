@@ -109,6 +109,7 @@ def build_core_strategy_runtime(
     theme_runtime = RealTimeThemeRuntime(theme_repository)
     theme_runtime_bridge = GatewayEventThemeRuntimeBridge(theme_runtime, warning_sink=warning_sink)
     order_sink = _build_order_sink(settings, gateway_state, warning_sink, runtime_settings=runtime_settings)
+    theme_lab_shadow_ab_provider = _theme_lab_shadow_ab_provider(db, runtime_settings)
     theme_lab_pipeline = None
     if config.theme_engine_mode == "themelab_flow":
         theme_backfill_service = ThemeBackfillService(
@@ -139,6 +140,7 @@ def build_core_strategy_runtime(
         holding_provider=StaticHoldingProvider(set(config.holding_watch_codes)),
         order_sink=order_sink,
         theme_lab_pipeline=theme_lab_pipeline,
+        theme_lab_shadow_ab_provider=theme_lab_shadow_ab_provider,
     )
     readiness_report = build_readiness_report(
         db,
@@ -163,6 +165,27 @@ def build_core_strategy_runtime(
         db=db,
         order_sink=order_sink,
     )
+
+
+def _theme_lab_shadow_ab_provider(
+    db: TradingDatabase,
+    runtime_settings: Any,
+) -> Callable[[str], dict[str, Any]] | None:
+    policy = dict(runtime_settings.value("theme_lab_shadow_small_entry", {}) or {})
+    if str(policy.get("enabled") or "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+
+    def provider(trade_date: str) -> dict[str, Any]:
+        from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
+
+        configured_date = str(policy.get("report_trade_date") or "").strip()
+        report_trade_date = configured_date or str(trade_date or "").strip() or None
+        return ThemeLabGateReasonOutcomeAnalyzer(db).build_report(
+            trade_date=report_trade_date,
+            limit=10_000,
+        )
+
+    return provider
 
 
 def _build_order_sink(

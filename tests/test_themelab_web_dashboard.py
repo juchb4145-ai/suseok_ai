@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -35,6 +35,10 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#kiwoom-gateway-start") is not None
     assert soup.select_one("#cockpit-market-sides") is not None
     assert soup.select_one("#cockpit-live-readiness") is not None
+    assert soup.select_one("#shadow-ab-status") is not None
+    assert soup.select_one("#shadow-ab-best") is not None
+    assert soup.select_one("#shadow-ab-summary") is not None
+    assert soup.select_one("#shadow-ab-body") is not None
     assert soup.select_one("#theme-rank-list") is not None
     assert soup.select_one("#chart-stage") is not None
     assert soup.select_one("#gate-status") is not None
@@ -47,6 +51,8 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one('[data-filter-value="ORDER_INTENT_CREATED"]') is not None
     assert soup.select_one('[data-filter-value="WAIT_FAILED_BREAKOUT"]') is not None
     assert soup.select_one('[data-filter-value="WAIT_DEEP_PULLBACK"]') is not None
+    assert soup.select_one('[data-filter-value="WAIT_PRICE_LOCATION_WARMUP"]') is not None
+    assert soup.select_one('[data-filter-value="WAIT_PRICE_LOCATION_PROVISIONAL"]') is not None
     assert soup.select_one('[data-filter-value="WAIT_PRICE_LOCATION_UNKNOWN"]') is not None
     assert "/static/themelab.css" in html
     assert "/static/themelab.js" in html
@@ -57,6 +63,8 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "/api/gateway/kiwoom/start" in js
     assert "startKiwoomGateway" in js
     assert "gateway_unhealthy_display" in js
+    assert "shadow_small_entry_ab" in js
+    assert "renderShadowAb" in js
     assert "matchesFilters" in js
     assert "renderCockpit" in js
     assert "minuteChartSvg" in js
@@ -101,6 +109,55 @@ def test_theme_lab_snapshot_sorts_watchset_and_filters_entry_candidates(tmp_path
     assert {"KOSPI", "KOSDAQ", "000001", "000002"}.issubset(universe)
     assert "000004" not in universe
     assert payload["data_quality"]["vi_status_supported"] is False
+
+
+def test_theme_lab_snapshot_includes_shadow_small_entry_ab_outcomes(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    at = datetime(2026, 6, 4, 9, 1, 0)
+    try:
+        wait = _watch("000901", "WAIT", role="LEADER")
+        wait.update(
+            {
+                "current_price": 100,
+                "price_location_readiness": "PROVISIONAL",
+                "price_location_provisional": True,
+                "price_location_readiness_reason_codes": ["PRICE_LOCATION_PROVISIONAL"],
+                "candidate_market_status": "HEALTHY",
+            }
+        )
+        db.save_theme_lab_flow_result(
+            at.isoformat(),
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [wait],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+        db.save_theme_lab_outcome_observations(
+            [
+                {
+                    "observed_at": (at + timedelta(minutes=15)).isoformat(),
+                    "trade_date": "2026-06-04",
+                    "stock_code": "000901",
+                    "price": 104,
+                    "source": "theme_lab_outcome_tracking",
+                }
+            ]
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    assert payload["gate_reason_outcomes"]["trade_date"] == "2026-06-04"
+    assert payload["gate_reason_outcomes"]["summary"]["event_count"] == 1
+    assert payload["shadow_small_entry"]["summary"]["candidate_count"] == 1
+    assert payload["shadow_small_entry"]["summary"]["win_rate_15m"] == 1.0
+    assert payload["shadow_small_entry_ab"]["scenarios"]
+    assert payload["shadow_small_entry_ab"]["best_scenarios"]
+    assert payload["shadow_small_entry_ab"]["best_scenarios"][0]["candidate_count"] == 1
 
 
 def test_theme_lab_snapshot_merges_risk_off_details_from_gate_decisions(tmp_path):
@@ -916,6 +973,39 @@ def test_theme_lab_snapshot_explains_unknown_price_location_wait(tmp_path):
     assert "돌파선 +0.00%" in row["summary_reason"]
     assert "지지선 +0.35%" in row["summary_reason"]
     assert "30초 후 재확인" in row["summary_reason"]
+
+
+def test_theme_lab_snapshot_splits_price_location_warmup_status(tmp_path):
+    db = TradingDatabase(str(tmp_path / "dashboard.sqlite3"))
+    try:
+        wait = _watch("000001", "WAIT", role="LEADER")
+        wait.update(
+            {
+                "price_location_status": "UNKNOWN",
+                "price_location_reason_codes": ["PRICE_LOCATION_UNKNOWN", "PRICE_LOCATION_WARMUP"],
+                "price_location_readiness": "WARMUP",
+                "price_location_readiness_reason_codes": ["PRICE_LOCATION_WARMUP", "PRICE_LOCATION_NO_MINUTE_BAR"],
+            }
+        )
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:05:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [wait],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    row = payload["watchset"][0]
+    assert row["display_status"] == "WAIT_PRICE_LOCATION_WARMUP"
+    assert row["price_location_readiness"] == "WARMUP"
+    assert "PRICE_LOCATION_NO_MINUTE_BAR" in row["price_location_readiness_reason_codes"]
 
 
 def test_theme_lab_snapshot_explains_deep_pullback_wait(tmp_path):

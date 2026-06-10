@@ -32,6 +32,7 @@ from trading.theme_engine.lab import (
     MarketSide,
     MarketStrengthSnapshot,
     PriceLocationStatus,
+    PriceLocationReadiness,
     StockRole,
     ThemeConditionSnapshot,
     ThemeLabFlowResult,
@@ -188,6 +189,100 @@ def test_risk_off_small_entry_observe_only_does_not_create_intent(tmp_path):
     assert details["sub_status"] == "OBSERVE_RISK_OFF_SMALL_ENTRY"
     assert details["risk_off_entry_allowed"] is True
     assert details["risk_off_entry_observe_only"] is True
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
+def test_provisional_shadow_ab_promising_creates_scaled_dry_run_intent(tmp_path):
+    runtime, db, gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.WAIT,
+            PriceLocationStatus.PULLBACK_RECLAIM,
+            reasons=("PRICE_LOCATION_PROVISIONAL",),
+            role=StockRole.LEADER,
+            risk=TradeabilityRiskLevel.PASS,
+            price_location_readiness=PriceLocationReadiness.PROVISIONAL,
+            price_location_provisional=True,
+        ),
+        dry_run_orders=True,
+        shadow_policy={
+            "enabled": True,
+            "min_labeled_count": 1,
+            "min_win_rate_15m": 0.0,
+            "max_risk_case_rate_15m": 1.0,
+            "min_net_shadow_score": 0.0,
+        },
+        shadow_ab_provider=lambda trade_date: _shadow_ab_report(
+            labeled_count=20,
+            win_rate=0.70,
+            risk_rate=0.05,
+            score=44.0,
+            multiplier=0.10,
+        ),
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+    plan = db.list_entry_plans(candidate.id)[0]
+    intent = db.list_runtime_order_intents(candidate_id=candidate.id)[0]
+
+    assert candidate.state == CandidateState.READY
+    assert details["sub_status"] == "READY_SHADOW_SMALL_ENTRY"
+    assert details["order_eligibility"] == "BUY_ELIGIBLE_SHADOW_SMALL_ENTRY"
+    assert details["shadow_small_entry_dry_run_promoted"] is True
+    assert details["shadow_small_entry_scenario_id"] == "leader_pass_l3_x10"
+    assert plan.cancel_condition["ready_type"] == "READY_SHADOW_SMALL_ENTRY"
+    assert plan.cancel_condition["shadow_small_entry_dry_run_promoted"] is True
+    assert plan.split_plan[0]["weight_pct"] == pytest.approx(6.0)
+    assert plan.split_plan[1]["submittable"] is False
+    assert plan.split_plan[1]["reason"] == "shadow_small_entry_later_leg_pending"
+    assert intent["metadata"]["final_gate_status"] == "READY_SHADOW_SMALL_ENTRY"
+    assert intent["metadata"]["order_eligibility"] == "BUY_ELIGIBLE_SHADOW_SMALL_ENTRY"
+    assert intent["metadata"]["shadow_small_entry_dry_run_promoted"] is True
+    assert intent["metadata"]["shadow_small_entry_scenario_id"] == "leader_pass_l3_x10"
+    assert intent["metadata"]["weight_pct"] == pytest.approx(6.0)
+    assert gateway_state.command_snapshot()["queued_count"] == 0
+
+
+def test_shadow_ab_insufficient_sample_keeps_provisional_wait_without_intent(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(
+            LabGateStatus.WAIT,
+            PriceLocationStatus.PULLBACK_RECLAIM,
+            reasons=("PRICE_LOCATION_PROVISIONAL",),
+            role=StockRole.LEADER,
+            risk=TradeabilityRiskLevel.PASS,
+            price_location_readiness=PriceLocationReadiness.PROVISIONAL,
+            price_location_provisional=True,
+        ),
+        dry_run_orders=True,
+        shadow_policy={"enabled": True},
+        shadow_ab_provider=lambda trade_date: _shadow_ab_report(
+            labeled_count=1,
+            win_rate=0.70,
+            risk_rate=0.05,
+            score=44.0,
+            multiplier=0.10,
+        ),
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
+
+    assert candidate.state != CandidateState.READY
+    assert details["sub_status"] == "WAIT"
+    assert details["shadow_small_entry_dry_run_candidate"] is True
+    assert details["shadow_small_entry_dry_run_promoted"] is False
+    assert details["shadow_small_entry_guard_status"] == "BLOCKED"
+    assert details["shadow_small_entry_guard_reason"] == "INSUFFICIENT_SAMPLE"
     assert db.list_entry_plans(candidate.id) == []
     assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 
@@ -845,11 +940,18 @@ def _runtime(
     price: int = 10000,
     tick_timestamp: datetime = NOW,
     with_tick: bool = True,
+    shadow_ab_provider=None,
+    shadow_policy: dict | None = None,
 ):
     db_path = Path(tmp_path) / "trader.sqlite3"
     db = TradingDatabase(str(db_path))
     client = MockKiwoomClient()
     settings = legacy_strategy_runtime_settings()
+    if shadow_policy is not None:
+        settings.settings_json["theme_lab_shadow_small_entry"] = {
+            **dict(settings.settings_json.get("theme_lab_shadow_small_entry") or {}),
+            **dict(shadow_policy),
+        }
     market_data = MarketDataStore()
     candle_builder = CandleBuilder()
     market_index_store = MarketIndexStore()
@@ -935,6 +1037,7 @@ def _runtime(
         holding_provider=StaticHoldingProvider(),
         order_sink=order_sink,
         theme_lab_pipeline=StaticThemeLabPipeline(result),
+        theme_lab_shadow_ab_provider=shadow_ab_provider,
     )
     return runtime, db, gateway_state
 
@@ -1002,6 +1105,8 @@ def _flow_result(
     market_session_reason_codes: tuple[str, ...] = (),
     market_confirmation_metrics: dict | None = None,
     risk_off_entry_details: dict | None = None,
+    price_location_readiness: PriceLocationReadiness = PriceLocationReadiness.READY,
+    price_location_provisional: bool = False,
 ) -> ThemeLabFlowResult:
     theme = ThemeConditionSnapshot(
         calculated_at=NOW.isoformat(),
@@ -1036,6 +1141,9 @@ def _flow_result(
         price_location_status=price_location,
         price_location_score=80.0,
         price_location_reason_codes=(price_location.value,),
+        price_location_readiness=price_location_readiness,
+        price_location_readiness_reason_codes=("PRICE_LOCATION_PROVISIONAL",) if price_location_readiness == PriceLocationReadiness.PROVISIONAL else (),
+        price_location_provisional=price_location_provisional,
         candidate_market=candidate_market,
         candidate_market_source="test",
         candidate_market_status=candidate_market_status,
@@ -1208,6 +1316,43 @@ def _risk_off_entry_details(*, observe_only: bool) -> dict:
             "stop_loss_pct": -1.2,
             "take_profit_pct": 1.8,
             "max_hold_minutes": 20,
+        },
+    }
+
+
+def _shadow_ab_report(
+    *,
+    labeled_count: int,
+    win_rate: float,
+    risk_rate: float,
+    score: float,
+    multiplier: float,
+    recommendation: str = "PROMISING_SHADOW",
+) -> dict:
+    row = {
+        "scenario_id": "leader_pass_l3_x10",
+        "label": "LEADER PASS L3 x0.10",
+        "candidate_count": max(labeled_count, 1),
+        "labeled_count": labeled_count,
+        "win_rate_15m": win_rate,
+        "risk_case_rate_15m": risk_rate,
+        "net_shadow_score": score,
+        "recommendation": recommendation,
+        "position_size_multiplier": multiplier,
+        "statuses": ("WAIT",),
+        "roles": ("LEADER",),
+        "min_condition_level": 3,
+        "allowed_risks": ("PASS",),
+        "allowed_market_statuses": ("EXPANSION", "SELECTIVE", "CHOPPY"),
+        "excluded_market_statuses": ("WEAK", "RISK_OFF"),
+    }
+    return {
+        "trade_date": "2026-06-01",
+        "shadow_small_entry_ab": {
+            "summary": {},
+            "best_scenarios": [row],
+            "scenarios": [row],
+            "matrix": {},
         },
     }
 

@@ -266,6 +266,19 @@ class TradingDatabase:
                 data_quality_json TEXT NOT NULL DEFAULT '{}',
                 payload_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS theme_lab_outcome_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                observed_at TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                stock_code TEXT NOT NULL,
+                price REAL NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'theme_lab_outcome_tracking',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(observed_at, stock_code, source)
+            );
+            CREATE INDEX IF NOT EXISTS idx_theme_lab_outcome_observations_date_code
+                ON theme_lab_outcome_observations(trade_date, stock_code, observed_at);
             CREATE TABLE IF NOT EXISTS market_side_confirmation_state (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trade_date TEXT NOT NULL,
@@ -3170,6 +3183,137 @@ class TradingDatabase:
         payload["calculated_at"] = row["calculated_at"]
         return payload
 
+    def list_theme_lab_flow_results(
+        self,
+        *,
+        trade_date: str | None = None,
+        limit: int = 10000,
+        offset: int = 0,
+    ) -> list[dict]:
+        where = ""
+        params: list[object] = []
+        if trade_date:
+            where = "WHERE substr(calculated_at, 1, 10) = ?"
+            params.append(str(trade_date))
+        params.extend([max(1, int(limit or 10000)), max(0, int(offset or 0))])
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM (
+                SELECT *
+                FROM theme_lab_flow_snapshots
+                {where}
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+            )
+            ORDER BY id ASC
+            """,
+            params,
+        ).fetchall()
+        return [self._theme_lab_flow_row_payload(row) for row in rows]
+
+    def save_theme_lab_outcome_observations(self, observations: Iterable[dict]) -> int:
+        cleaned: list[tuple] = []
+        for item in observations:
+            code = _clean_stock_code(item.get("stock_code") or item.get("code"))
+            observed_at = str(item.get("observed_at") or "").strip()
+            if not code or not observed_at:
+                continue
+            price = _float_value(item.get("price"))
+            if price <= 0:
+                continue
+            payload = dict(item.get("payload") or item.get("details") or {})
+            cleaned.append(
+                (
+                    observed_at,
+                    str(item.get("trade_date") or observed_at[:10]),
+                    code,
+                    price,
+                    str(item.get("source") or "theme_lab_outcome_tracking"),
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+                )
+            )
+        if not cleaned:
+            return 0
+        with self.conn:
+            before = self.conn.total_changes
+            self.conn.executemany(
+                """
+                INSERT OR IGNORE INTO theme_lab_outcome_observations(
+                    observed_at, trade_date, stock_code, price, source, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                cleaned,
+            )
+            return int(self.conn.total_changes - before)
+
+    def list_theme_lab_outcome_observations(
+        self,
+        *,
+        trade_date: str | None = None,
+        codes: Iterable[str] | None = None,
+        start_at: str | None = None,
+        end_at: str | None = None,
+        limit: int = 50000,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        clean_codes = sorted({_clean_stock_code(code) for code in (codes or []) if _clean_stock_code(code)})
+        if clean_codes:
+            placeholders = ",".join("?" for _ in clean_codes)
+            clauses.append(f"stock_code IN ({placeholders})")
+            params.extend(clean_codes)
+        if start_at:
+            clauses.append("observed_at >= ?")
+            params.append(str(start_at))
+        if end_at:
+            clauses.append("observed_at <= ?")
+            params.append(str(end_at))
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, int(limit or 50000)))
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM theme_lab_outcome_observations
+            {where}
+            ORDER BY observed_at ASC, id ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "created_at": row["created_at"],
+                "observed_at": row["observed_at"],
+                "trade_date": row["trade_date"],
+                "stock_code": row["stock_code"],
+                "price": row["price"],
+                "source": row["source"],
+                "payload": _safe_json_loads(row["payload_json"], {}),
+            }
+            for row in rows
+        ]
+
+    def _theme_lab_flow_row_payload(self, row) -> dict:
+        payload = _safe_json_loads(row["payload_json"], {})
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.setdefault("market_status", _safe_json_loads(row["market_status_json"], {}))
+        payload.setdefault("theme_rankings", _safe_json_loads(row["theme_rankings_json"], []))
+        payload.setdefault("theme_condition_snapshots", _safe_json_loads(row["theme_condition_snapshots_json"], []))
+        payload.setdefault("condition_hit_snapshots", _safe_json_loads(row["condition_hit_snapshots_json"], []))
+        payload.setdefault("watchset_snapshots", _safe_json_loads(row["watchset_snapshots_json"], []))
+        payload.setdefault("gate_decisions", _safe_json_loads(row["gate_decisions_json"], []))
+        payload.setdefault("data_quality", _safe_json_loads(row["data_quality_json"], {}))
+        payload["id"] = row["id"]
+        payload["created_at"] = row["created_at"]
+        payload["calculated_at"] = row["calculated_at"]
+        return payload
+
     def upsert_market_side_confirmation_state(self, payload: dict) -> dict:
         normalized = _market_side_confirmation_state_params(payload)
         with self.conn:
@@ -5310,6 +5454,15 @@ def _safe_json_loads(value: object, default):
         return json.loads(str(value or ""))
     except Exception:
         return default
+
+
+def _float_value(value: object) -> float:
+    if value in (None, ""):
+        return 0.0
+    try:
+        return float(str(value).strip().replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _clean_stock_code(value: object) -> str:

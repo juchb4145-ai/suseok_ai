@@ -56,6 +56,39 @@
         </div>
       </section>
 
+      <section class="panel shadow-ab-panel" aria-label="PROVISIONAL Shadow A/B">
+        <div class="panel-head">
+          <div>
+            <h2>PROVISIONAL Shadow A/B</h2>
+            <p id="shadow-ab-message">Gate reason outcome replay</p>
+          </div>
+          <div class="gate-status-strip">
+            <span id="shadow-ab-best" class="counter">-</span>
+            <span id="shadow-ab-status" class="badge observe">NO_DATA</span>
+          </div>
+        </div>
+        <div id="shadow-ab-summary" class="shadow-ab-summary"></div>
+        <div class="table-wrap shadow-ab-table-wrap">
+          <table class="shadow-ab-table">
+            <thead>
+              <tr>
+                <th>Scenario</th>
+                <th>Cand</th>
+                <th>Win15</th>
+                <th>Risk15</th>
+                <th>MFE15</th>
+                <th>MAE15</th>
+                <th>Capture</th>
+                <th>Size</th>
+                <th>Score</th>
+                <th>Recommendation</th>
+              </tr>
+            </thead>
+            <tbody id="shadow-ab-body"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="flow-grid">
         <aside class="panel theme-panel">
           <div class="panel-head">
@@ -116,6 +149,8 @@
               <button data-filter-kind="status" data-filter-value="LATE_CHASE_TEMP_WAIT" type="button">추격대기</button>
               <button data-filter-kind="status" data-filter-value="WAIT_FAILED_BREAKOUT" type="button">돌파실패</button>
               <button data-filter-kind="status" data-filter-value="WAIT_DEEP_PULLBACK" type="button">눌림과다</button>
+              <button data-filter-kind="status" data-filter-value="WAIT_PRICE_LOCATION_WARMUP" type="button">위치워밍업</button>
+              <button data-filter-kind="status" data-filter-value="WAIT_PRICE_LOCATION_PROVISIONAL" type="button">임시위치</button>
               <button data-filter-kind="status" data-filter-value="WAIT_PRICE_LOCATION_UNKNOWN" type="button">가격위치</button>
               <button data-filter-kind="status" data-filter-value="MARKET_PENDING" type="button">시장대기</button>
               <button data-filter-kind="status" data-filter-value="DATA_NOT_READY" type="button">데이터대기</button>
@@ -192,6 +227,6 @@
         </section>
       </section>
     </main>
-    <script src="/static/themelab.js?v=theme-backfill-gateway-start"></script>
+    <script src="/static/themelab.js?v=theme-shadow-ab"></script>
   </body>
 </html>

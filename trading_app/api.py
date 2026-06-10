@@ -57,6 +57,7 @@ from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
+from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
 from trading_app.themelab_dashboard import build_theme_lab_dashboard_snapshot
 from trading_app.transport_latency import TransportLatencyAnalyzer, TransportLatencyConfig
 from trading_app.websocket import DashboardConnectionManager
@@ -148,6 +149,10 @@ def _performance_analyzer(db: TradingDatabase) -> DryRunPerformanceAnalyzer:
 
 def _market_gate_review_analyzer(db: TradingDatabase) -> MarketGateReviewAnalyzer:
     return MarketGateReviewAnalyzer(db)
+
+
+def _theme_lab_gate_reason_outcome_analyzer(db: TradingDatabase) -> ThemeLabGateReasonOutcomeAnalyzer:
+    return ThemeLabGateReasonOutcomeAnalyzer(db)
 
 
 def _transport_config_from_settings() -> TransportLatencyConfig:
@@ -1081,6 +1086,38 @@ def export_runtime_market_gate_review(
     try:
         analyzer = _market_gate_review_analyzer(db)
         report = analyzer.build_report(trade_date=trade_date, limit=10000)
+        return {
+            "report_id": report["report_id"],
+            "exports": analyzer.export_report(report, fmt=format),
+            "notes": report.get("notes", []),
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/performance/theme-lab-gate-reasons")
+def runtime_theme_lab_gate_reason_outcomes(
+    trade_date: Optional[str] = None,
+    limit: int = Query(10000, ge=1, le=50000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return _theme_lab_gate_reason_outcome_analyzer(db).build_report(trade_date=trade_date, limit=limit, offset=offset)
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/performance/theme-lab-gate-reasons/export")
+def export_runtime_theme_lab_gate_reason_outcomes(
+    trade_date: Optional[str] = None,
+    format: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        analyzer = _theme_lab_gate_reason_outcome_analyzer(db)
+        report = analyzer.build_report(trade_date=trade_date, limit=50000)
         return {
             "report_id": report["report_id"],
             "exports": analyzer.export_report(report, fmt=format),
@@ -2705,6 +2742,7 @@ def _runtime_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
         "market_session_status": readiness.get("market_session_status", ""),
         "data_warmup_status": readiness.get("data_warmup_status", ""),
         "gate_skip_reason": readiness.get("gate_skip_reason", ""),
+        "realtime_data_quality": dict(status.get("realtime_data_quality") or {}),
         "warnings": (status.get("warnings") or [])[-10:],
         "last_error": status.get("last_error", ""),
     }

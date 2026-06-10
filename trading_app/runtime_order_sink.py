@@ -578,6 +578,12 @@ def _theme_lab_bridge_metadata(
     cancel = dict(entry_plan.cancel_condition or {})
     leg = _split_leg(entry_plan, virtual_order.leg_index)
     candidate_metadata = dict(candidate.metadata or {})
+    shadow_guard = dict(
+        details.get("shadow_small_entry_dry_run")
+        or bridge.get("shadow_small_entry_dry_run")
+        or cancel.get("shadow_small_entry_dry_run")
+        or {}
+    )
     metadata = {
         "source": THEMELAB_SOURCE,
         "code": candidate.code,
@@ -621,6 +627,62 @@ def _theme_lab_bridge_metadata(
         "max_chase_pct": cancel.get("max_chase_pct"),
         "split_leg": virtual_order.leg_index,
         "weight_pct": virtual_order.weight_pct,
+        "shadow_small_entry_dry_run": shadow_guard,
+        "shadow_small_entry_dry_run_enabled": bool(
+            details.get("shadow_small_entry_dry_run_enabled")
+            or bridge.get("shadow_small_entry_dry_run_enabled")
+            or cancel.get("shadow_small_entry_dry_run_enabled")
+        ),
+        "shadow_small_entry_dry_run_candidate": bool(
+            details.get("shadow_small_entry_dry_run_candidate")
+            or bridge.get("shadow_small_entry_dry_run_candidate")
+            or cancel.get("shadow_small_entry_dry_run_candidate")
+        ),
+        "shadow_small_entry_dry_run_promoted": bool(
+            details.get("shadow_small_entry_dry_run_promoted")
+            or bridge.get("shadow_small_entry_dry_run_promoted")
+            or cancel.get("shadow_small_entry_dry_run_promoted")
+        ),
+        "shadow_small_entry_guard_status": details.get("shadow_small_entry_guard_status")
+        or bridge.get("shadow_small_entry_guard_status")
+        or cancel.get("shadow_small_entry_guard_status")
+        or "",
+        "shadow_small_entry_guard_reason": details.get("shadow_small_entry_guard_reason")
+        or bridge.get("shadow_small_entry_guard_reason")
+        or cancel.get("shadow_small_entry_guard_reason")
+        or "",
+        "shadow_small_entry_scenario_id": details.get("shadow_small_entry_scenario_id")
+        or bridge.get("shadow_small_entry_scenario_id")
+        or cancel.get("shadow_small_entry_scenario_id")
+        or "",
+        "shadow_small_entry_recommendation": details.get("shadow_small_entry_recommendation")
+        or bridge.get("shadow_small_entry_recommendation")
+        or cancel.get("shadow_small_entry_recommendation")
+        or "",
+        "shadow_small_entry_net_score": _first_text(
+            details.get("shadow_small_entry_net_score"),
+            bridge.get("shadow_small_entry_net_score"),
+            cancel.get("shadow_small_entry_net_score"),
+            None,
+        ),
+        "shadow_small_entry_win_rate_15m": _first_text(
+            details.get("shadow_small_entry_win_rate_15m"),
+            bridge.get("shadow_small_entry_win_rate_15m"),
+            cancel.get("shadow_small_entry_win_rate_15m"),
+            None,
+        ),
+        "shadow_small_entry_risk_case_rate_15m": _first_text(
+            details.get("shadow_small_entry_risk_case_rate_15m"),
+            bridge.get("shadow_small_entry_risk_case_rate_15m"),
+            cancel.get("shadow_small_entry_risk_case_rate_15m"),
+            None,
+        ),
+        "shadow_small_entry_labeled_count": _first_text(
+            details.get("shadow_small_entry_labeled_count"),
+            bridge.get("shadow_small_entry_labeled_count"),
+            cancel.get("shadow_small_entry_labeled_count"),
+            None,
+        ),
         "risk_off_entry": dict(details.get("risk_off_entry") or bridge.get("risk_off_entry") or cancel.get("risk_off_entry") or {}),
         "risk_off_entry_enabled": bool(details.get("risk_off_entry_enabled") or bridge.get("risk_off_entry_enabled") or cancel.get("risk_off_entry_enabled")),
         "risk_off_entry_observe_only": bool(

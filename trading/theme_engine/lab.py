@@ -67,6 +67,15 @@ class PriceLocationStatus(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+class PriceLocationReadiness(str, Enum):
+    READY = "READY"
+    PROVISIONAL = "PROVISIONAL"
+    WARMUP = "WARMUP"
+    MISSING_CORE = "MISSING_CORE"
+    STALE = "STALE"
+    UNKNOWN = "UNKNOWN"
+
+
 @dataclass(frozen=True)
 class ThemeLabConditionConfig:
     alive_threshold_pct: float = -1.0
@@ -102,6 +111,8 @@ class WatchSetLimits:
     max_ready_candidates: int = 20
     max_order_candidates: int = 5
     top_theme_count: int = 5
+    retain_cycles_after_demotion: int = 2
+    retain_min_condition_level: int = 1
 
 
 @dataclass(frozen=True)
@@ -523,9 +534,15 @@ class WatchSetSnapshot:
     upper_limit_gap_pct: float = 100.0
     pullback_from_high_pct: float = 100.0
     final_gate_status: LabGateStatus = LabGateStatus.OBSERVE
+    watchset_retained: bool = False
+    watchset_retention_cycles: int = 0
+    watchset_retention_reason: str = ""
     price_location_status: PriceLocationStatus = PriceLocationStatus.UNKNOWN
     price_location_score: float = 0.0
     price_location_reason_codes: tuple[str, ...] = ()
+    price_location_readiness: PriceLocationReadiness = PriceLocationReadiness.UNKNOWN
+    price_location_readiness_reason_codes: tuple[str, ...] = ()
+    price_location_provisional: bool = False
     distance_to_session_high_pct: float | None = None
     vwap_gap_pct: float | None = None
     breakout_level_gap_pct: float | None = None
@@ -686,6 +703,14 @@ class PriceLocationInput:
     momentum_5m: float | None = None
     recent_candles_1m: tuple[Any, ...] = ()
     recent_candles_3m: tuple[Any, ...] = ()
+    vwap_ready: bool = False
+    recent_support_ready: bool = False
+    recent_support_source: str = ""
+    recent_support_candle_count: int = 0
+    completed_minute_bar_count: int = 0
+    recent_3m_bar_count: int = 0
+    minute_bar_present: bool = False
+    prev_close_inferred_from_change_rate: bool = False
     stock_role: StockRole | None = None
     theme_status: ThemeLabThemeStatus | None = None
     market_status: MarketStatus | None = None
@@ -708,6 +733,9 @@ class PriceLocationResult:
     failed_breakout: bool | None = None
     pullback_reclaim: bool | None = None
     breakout_continuation: bool | None = None
+    readiness: PriceLocationReadiness = PriceLocationReadiness.UNKNOWN
+    readiness_reason_codes: tuple[str, ...] = ()
+    provisional: bool = False
     data_quality_flags: tuple[str, ...] = ()
 
 
@@ -1987,6 +2015,8 @@ class MarketSideConfirmationTracker:
 class WatchSetManager:
     def __init__(self, limits: WatchSetLimits | None = None) -> None:
         self.limits = limits or WatchSetLimits()
+        self._previous_by_symbol: dict[str, WatchSetSnapshot] = {}
+        self._retention_cycles_by_symbol: dict[str, int] = {}
 
     def build(
         self,
@@ -1999,7 +2029,8 @@ class WatchSetManager:
         snapshot_by_symbol = _snapshot_map(snapshots)
         instrument_by_symbol = _instrument_metadata_map(metadata_by_symbol)
         selected: dict[str, WatchSetSnapshot] = {}
-        for theme in list(ranked_themes)[: self.limits.top_theme_count]:
+        ranked_theme_list = list(ranked_themes)[: self.limits.top_theme_count]
+        for theme in ranked_theme_list:
             if theme.theme_status not in {
                 ThemeLabThemeStatus.LEADING_THEME,
                 ThemeLabThemeStatus.SPREADING_THEME,
@@ -2028,7 +2059,7 @@ class WatchSetManager:
                 snapshot = snapshot_by_symbol.get(hit.symbol)
                 existing = selected.get(hit.symbol)
                 themes = tuple(dict.fromkeys(((existing.themes if existing else ()) + (theme.theme_id,))))
-                condition_level = 3 if hit.leader_hit else 2 if hit.strong_hit else 1 if hit.alive_hit else 0
+                condition_level = _condition_level_from_hit(hit)
                 market_side, market_source, market_reason_codes = _infer_candidate_market(
                     snapshot=snapshot,
                     instrument_metadata=instrument_by_symbol.get(hit.symbol),
@@ -2050,7 +2081,122 @@ class WatchSetManager:
                     market_side_reason_codes=market_reason_codes,
                 )
                 per_theme_count += 1
+        self._retain_demoted_previous_watchset(
+            selected,
+            ranked_theme_list,
+            snapshot_by_symbol,
+            instrument_by_symbol,
+            calculated_at=calculated_at,
+        )
+        self._remember_watchset(selected)
         return list(selected.values())
+
+    def _retain_demoted_previous_watchset(
+        self,
+        selected: dict[str, WatchSetSnapshot],
+        ranked_themes: list[ThemeConditionSnapshot],
+        snapshot_by_symbol: dict[str, StockSnapshot],
+        instrument_by_symbol: dict[str, InstrumentMetadata],
+        *,
+        calculated_at: str,
+    ) -> None:
+        retain_cycles = max(0, int(self.limits.retain_cycles_after_demotion or 0))
+        if retain_cycles <= 0 or not self._previous_by_symbol:
+            return
+        min_condition_level = max(0, int(self.limits.retain_min_condition_level or 0))
+        current_hits = self._retention_hits_by_symbol(ranked_themes, min_condition_level=min_condition_level)
+        for symbol, previous in list(self._previous_by_symbol.items()):
+            if symbol in selected:
+                continue
+            if len(selected) >= self.limits.max_watchset_size:
+                break
+            candidates = current_hits.get(symbol) or []
+            if not candidates:
+                continue
+            theme, hit = _preferred_retention_hit(previous, candidates)
+            condition_level = _condition_level_from_hit(hit)
+            if condition_level >= 2:
+                continue
+            next_cycle = int(self._retention_cycles_by_symbol.get(symbol, 0) or 0) + 1
+            if next_cycle > retain_cycles:
+                continue
+            snapshot = snapshot_by_symbol.get(symbol)
+            market_side, market_source, market_reason_codes = _infer_candidate_market(
+                snapshot=snapshot,
+                instrument_metadata=instrument_by_symbol.get(symbol),
+                theme=theme,
+                existing=previous,
+            )
+            themes = tuple(dict.fromkeys(tuple(previous.themes or ()) + (theme.theme_id,)))
+            selected[symbol] = WatchSetSnapshot(
+                calculated_at=calculated_at,
+                symbol=symbol,
+                name=hit.name or previous.name,
+                themes=themes,
+                primary_theme=previous.primary_theme if previous.primary_theme in themes else theme.theme_id,
+                return_pct=hit.return_pct,
+                turnover_krw=_turnover(snapshot),
+                condition_level=condition_level,
+                watch_reason="WATCHSET_RETAINED_AFTER_DEMOTION",
+                removal_reason="STRONG_OR_LEADER_SIGNAL_LOST_RETAINED",
+                candidate_market=market_side.value,
+                candidate_market_source=market_source,
+                market_side_reason_codes=market_reason_codes,
+                watchset_retained=True,
+                watchset_retention_cycles=next_cycle,
+                watchset_retention_reason="STRONG_OR_LEADER_SIGNAL_LOST",
+            )
+
+    def _retention_hits_by_symbol(
+        self,
+        ranked_themes: list[ThemeConditionSnapshot],
+        *,
+        min_condition_level: int,
+    ) -> dict[str, list[tuple[ThemeConditionSnapshot, ConditionHitSnapshot]]]:
+        hits_by_symbol: dict[str, list[tuple[ThemeConditionSnapshot, ConditionHitSnapshot]]] = {}
+        for theme in ranked_themes:
+            if theme.theme_status not in {
+                ThemeLabThemeStatus.LEADING_THEME,
+                ThemeLabThemeStatus.SPREADING_THEME,
+                ThemeLabThemeStatus.LEADER_ONLY_THEME,
+                ThemeLabThemeStatus.WATCH_THEME,
+            }:
+                continue
+            for hit in theme.member_hits:
+                if hit.excluded:
+                    continue
+                if _condition_level_from_hit(hit) < min_condition_level:
+                    continue
+                hits_by_symbol.setdefault(hit.symbol, []).append((theme, hit))
+        return hits_by_symbol
+
+    def _remember_watchset(self, selected: dict[str, WatchSetSnapshot]) -> None:
+        self._previous_by_symbol = dict(selected)
+        self._retention_cycles_by_symbol = {
+            symbol: int(item.watchset_retention_cycles or 0) if item.watchset_retained else 0
+            for symbol, item in selected.items()
+        }
+
+
+def _condition_level_from_hit(hit: ConditionHitSnapshot) -> int:
+    return 3 if hit.leader_hit else 2 if hit.strong_hit else 1 if hit.alive_hit else 0
+
+
+def _preferred_retention_hit(
+    previous: WatchSetSnapshot,
+    candidates: list[tuple[ThemeConditionSnapshot, ConditionHitSnapshot]],
+) -> tuple[ThemeConditionSnapshot, ConditionHitSnapshot]:
+    for theme, hit in candidates:
+        if theme.theme_id == previous.primary_theme:
+            return theme, hit
+    return max(
+        candidates,
+        key=lambda item: (
+            _condition_level_from_hit(item[1]),
+            float(item[1].return_pct or 0),
+            float(item[1].turnover_krw or 0),
+        ),
+    )
 
 
 class StockRoleDetector:
@@ -2109,6 +2255,7 @@ class PriceLocationEvaluator:
         if data.market_status is None:
             _add_flag(flags, "MISSING_MARKET_STATUS")
         if _has_core_price_missing(flags):
+            readiness, readiness_reasons = _price_location_readiness(data, flags, PriceLocationStatus.UNKNOWN)
             return self._result(
                 data,
                 PriceLocationStatus.UNKNOWN,
@@ -2124,6 +2271,8 @@ class PriceLocationEvaluator:
                 pullback_reclaim,
                 breakout_continuation,
                 flags,
+                readiness=readiness,
+                readiness_reasons=readiness_reasons,
             )
 
         status = self._status(
@@ -2137,6 +2286,8 @@ class PriceLocationEvaluator:
             breakout_continuation,
             reasons,
         )
+        readiness, readiness_reasons = _price_location_readiness(data, flags, status)
+        reasons = list(dict.fromkeys(reasons + list(readiness_reasons)))
         return self._result(
             data,
             status,
@@ -2152,6 +2303,8 @@ class PriceLocationEvaluator:
             pullback_reclaim,
             breakout_continuation,
             flags,
+            readiness=readiness,
+            readiness_reasons=readiness_reasons,
         )
 
     def _status(
@@ -2228,6 +2381,8 @@ class PriceLocationEvaluator:
         pullback_reclaim: bool | None,
         breakout_continuation: bool | None,
         flags: list[str],
+        readiness: PriceLocationReadiness = PriceLocationReadiness.UNKNOWN,
+        readiness_reasons: tuple[str, ...] = (),
     ) -> PriceLocationResult:
         return PriceLocationResult(
             symbol=normalize_stock_code(data.symbol),
@@ -2244,6 +2399,9 @@ class PriceLocationEvaluator:
             failed_breakout=failed_breakout,
             pullback_reclaim=pullback_reclaim,
             breakout_continuation=breakout_continuation,
+            readiness=readiness,
+            readiness_reason_codes=tuple(dict.fromkeys(readiness_reasons)),
+            provisional=readiness == PriceLocationReadiness.PROVISIONAL,
             data_quality_flags=tuple(dict.fromkeys(flags)),
         )
 
@@ -2692,12 +2850,13 @@ class ThemeLabHybridGate:
                     price_location.reason_codes,
                 )
             )
+        retained_reasons = ("WATCHSET_RETAINED_AFTER_DEMOTION",) if watch.watchset_retained else ()
         if watch.condition_level >= 2:
             return finalize(
                 LabGateDecision(
                     watch.symbol,
                     LabGateStatus.WAIT,
-                    ("WATCHSET_WAIT_CONFIRMATION",) + price_location.reason_codes + risk.reason_codes,
+                    retained_reasons + ("WATCHSET_WAIT_CONFIRMATION",) + price_location.reason_codes + risk.reason_codes,
                     "",
                     risk.risk_level,
                     risk.reason_codes,
@@ -2712,7 +2871,7 @@ class ThemeLabHybridGate:
             LabGateDecision(
                 watch.symbol,
                 LabGateStatus.OBSERVE,
-                ("THEME_LAB_OBSERVE",) + price_location.reason_codes,
+                retained_reasons + ("THEME_LAB_OBSERVE",) + price_location.reason_codes,
                 "",
                 risk.risk_level,
                 risk.reason_codes,
@@ -2838,6 +2997,9 @@ class ThemeLabFlowEngine:
                     "price_location_status": price_location.status,
                     "price_location_score": price_location.score,
                     "price_location_reason_codes": price_location.reason_codes,
+                    "price_location_readiness": price_location.readiness,
+                    "price_location_readiness_reason_codes": price_location.readiness_reason_codes,
+                    "price_location_provisional": price_location.provisional,
                     "distance_to_session_high_pct": price_location.distance_to_session_high_pct,
                     "vwap_gap_pct": price_location.vwap_gap_pct,
                     "breakout_level_gap_pct": price_location.breakout_level_gap_pct,
@@ -3358,6 +3520,15 @@ def _price_location_input(
     data_quality_flags: Iterable[str] = (),
 ) -> PriceLocationInput:
     metadata = dict(snapshot.metadata if snapshot else {})
+    recent_candles_1m = tuple(metadata.get("recent_candles_1m") or ())
+    recent_candles_3m = tuple(metadata.get("recent_candles_3m") or ())
+    completed_minute_bar_count = _metadata_int(metadata, "completed_minute_bar_count")
+    if completed_minute_bar_count <= 0:
+        completed_minute_bar_count = sum(1 for candle in recent_candles_1m if _candle_dict(candle).get("completed", True))
+    recent_3m_bar_count = _metadata_int(metadata, "recent_3m_bar_count")
+    if recent_3m_bar_count <= 0:
+        recent_3m_bar_count = sum(1 for candle in recent_candles_3m if _candle_dict(candle).get("completed", True))
+    minute_bar_present = _metadata_bool(metadata, "minute_bar_present") or bool(recent_candles_1m)
     return PriceLocationInput(
         symbol=watch.symbol,
         current_price=_positive_float_or_none(snapshot.current_price if snapshot else None),
@@ -3375,8 +3546,16 @@ def _price_location_input(
         momentum_1m=float(snapshot.momentum_1m) if snapshot and snapshot.momentum_1m is not None else None,
         momentum_3m=float(snapshot.momentum_3m) if snapshot and snapshot.momentum_3m is not None else None,
         momentum_5m=float(snapshot.momentum_5m) if snapshot and snapshot.momentum_5m is not None else None,
-        recent_candles_1m=tuple(metadata.get("recent_candles_1m") or ()),
-        recent_candles_3m=tuple(metadata.get("recent_candles_3m") or ()),
+        recent_candles_1m=recent_candles_1m,
+        recent_candles_3m=recent_candles_3m,
+        vwap_ready=_metadata_bool(metadata, "vwap_ready"),
+        recent_support_ready=_metadata_bool(metadata, "recent_support_ready"),
+        recent_support_source=str(metadata.get("recent_support_source") or ""),
+        recent_support_candle_count=_metadata_int(metadata, "recent_support_candle_count"),
+        completed_minute_bar_count=completed_minute_bar_count,
+        recent_3m_bar_count=recent_3m_bar_count,
+        minute_bar_present=minute_bar_present,
+        prev_close_inferred_from_change_rate=_metadata_bool(metadata, "prev_close_inferred_from_change_rate"),
         stock_role=watch.stock_role,
         theme_status=theme.theme_status,
         market_status=market.market_status,
@@ -3763,6 +3942,60 @@ def _has_core_price_missing(flags: Iterable[str]) -> bool:
     return bool({"MISSING_CURRENT_PRICE", "MISSING_RETURN_PCT", "MISSING_STOCK_ROLE", "MISSING_THEME_STATUS", "MISSING_MARKET_STATUS"} & set(flags))
 
 
+def _price_location_readiness(
+    data: PriceLocationInput,
+    flags: Iterable[str],
+    status: PriceLocationStatus,
+) -> tuple[PriceLocationReadiness, tuple[str, ...]]:
+    flag_set = {str(flag) for flag in flags}
+    if {"STALE_QUOTE", "STALE_MINUTE_BARS"} & flag_set:
+        return PriceLocationReadiness.STALE, ("PRICE_LOCATION_STALE_DATA",)
+
+    core_missing = []
+    core_map = {
+        "MISSING_CURRENT_PRICE": "PRICE_LOCATION_CURRENT_PRICE_MISSING",
+        "MISSING_RETURN_PCT": "PRICE_LOCATION_RETURN_PCT_MISSING",
+        "MISSING_STOCK_ROLE": "PRICE_LOCATION_STOCK_ROLE_MISSING",
+        "MISSING_THEME_STATUS": "PRICE_LOCATION_THEME_STATUS_MISSING",
+        "MISSING_MARKET_STATUS": "PRICE_LOCATION_MARKET_STATUS_MISSING",
+        "MISSING_SESSION_HIGH": "PRICE_LOCATION_SESSION_HIGH_MISSING",
+    }
+    for flag, reason in core_map.items():
+        if flag in flag_set:
+            core_missing.append(reason)
+    if core_missing:
+        return PriceLocationReadiness.MISSING_CORE, _dedupe_tuple(("PRICE_LOCATION_CORE_DATA_MISSING", *core_missing))
+
+    warmup_reasons: list[str] = []
+    completed_1m = max(0, int(data.completed_minute_bar_count or 0))
+    if completed_1m <= 0:
+        warmup_reasons.append("PRICE_LOCATION_NO_COMPLETED_1M_BAR" if data.minute_bar_present else "PRICE_LOCATION_NO_MINUTE_BAR")
+    elif completed_1m < 2:
+        warmup_reasons.append("PRICE_LOCATION_LOW_COMPLETED_1M_BAR_COUNT")
+    if data.momentum_1m is None or data.momentum_3m is None:
+        warmup_reasons.append("PRICE_LOCATION_MOMENTUM_WARMUP")
+    if data.vwap is None or not data.vwap_ready:
+        warmup_reasons.append("PRICE_LOCATION_VWAP_WARMUP")
+    if data.recent_support_price is None or not data.recent_support_ready:
+        warmup_reasons.append("PRICE_LOCATION_SUPPORT_WARMUP")
+    if str(data.recent_support_source or "") == "active_1m_low_provisional":
+        warmup_reasons.append("PRICE_LOCATION_ACTIVE_1M_SUPPORT_PROVISIONAL")
+    if data.prev_close_inferred_from_change_rate:
+        warmup_reasons.append("PRICE_LOCATION_PREV_CLOSE_INFERRED")
+
+    if not warmup_reasons:
+        return PriceLocationReadiness.READY, ()
+
+    provisional_sources = {
+        "PRICE_LOCATION_ACTIVE_1M_SUPPORT_PROVISIONAL",
+        "PRICE_LOCATION_NO_COMPLETED_1M_BAR",
+        "PRICE_LOCATION_LOW_COMPLETED_1M_BAR_COUNT",
+    }
+    if status != PriceLocationStatus.FAILED_BREAKOUT and (set(warmup_reasons) & provisional_sources) and data.minute_bar_present:
+        return PriceLocationReadiness.PROVISIONAL, _dedupe_tuple(("PRICE_LOCATION_PROVISIONAL", *warmup_reasons))
+    return PriceLocationReadiness.WARMUP, _dedupe_tuple(("PRICE_LOCATION_WARMUP", *warmup_reasons))
+
+
 def _negative_or_missing(value: float | None) -> bool:
     return value is None or value < 0
 
@@ -3981,4 +4214,5 @@ def _market_classification_summary(
         "market_classification_unknown_ratio": round(unknown / total, 4) if total else 0.0,
         "unknown_market_wait_count": unknown_wait,
         "unknown_market_ready_possible_count": ready_possible,
+        "watchset_retained_count": sum(1 for item in watch_items if item.watchset_retained),
     }
