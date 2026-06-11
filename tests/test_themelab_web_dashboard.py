@@ -144,6 +144,9 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "promotionDrilldownGroup" in js
     assert "renderPromotionStageMatrix" in js
     assert "promotionStageMatrixRow" in js
+    assert "promotionReasonLabel" in js
+    assert "실시간 신뢰도 부족" in js or "label_ko" in js
+    assert "승격확신" in js
     assert "failed_checks" in js
     assert "grouped_items" in js
     assert "initPromotionCockpit" in js

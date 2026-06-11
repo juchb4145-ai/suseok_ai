@@ -17,6 +17,8 @@ from trading_app.promotion_controller import (
     build_promotion_evidence,
     config_from_settings,
     normalize_stage,
+    promotion_reason_detail,
+    promotion_reason_details,
     realtime_bucket_from_row,
 )
 
@@ -98,6 +100,9 @@ class PromotionEvidenceAdapter:
         )
         decision = self.controller.evaluate(evidence)
         stage_matrix = self.controller.stage_matrix(evidence)
+        decision_payload = decision.to_dict()
+        decision_payload["blocker_details"] = promotion_reason_details(decision.blockers)
+        decision_payload["warning_details"] = promotion_reason_details(decision.warnings)
         return {
             "policy_id": evidence.policy_id,
             "current_stage": evidence.current_stage,
@@ -106,7 +111,7 @@ class PromotionEvidenceAdapter:
             "action": decision.action,
             "eligible": decision.eligible,
             "confidence": decision.confidence,
-            "decision": decision.to_dict(),
+            "decision": decision_payload,
             "stage_matrix": stage_matrix,
             "evidence": evidence.to_dict(),
             "config": self.config.to_dict(),
@@ -182,7 +187,9 @@ class PromotionEvidenceAdapter:
         return {
             "policy_id": decision_payload.get("policy_id") or policy_id or DEFAULT_PROMOTION_POLICY_ID,
             "selected_blocker": selected,
+            "selected_blocker_detail": promotion_reason_detail(selected) if selected else {},
             "available_blockers": available,
+            "available_blocker_details": promotion_reason_details(available),
             "decision": decision_payload.get("decision", {}),
             "evidence": decision_payload.get("evidence", {}),
             "sections": sections,
@@ -311,6 +318,7 @@ class PromotionEvidenceAdapter:
         groups = _group_drilldown_items(items)
         limited_groups = groups[:detail_limit]
         metrics = dict(decision_payload.get("decision", {}).get("metrics") or {})
+        reason_detail = promotion_reason_detail(key)
         return {
             "blocker": key,
             "title": _blocker_title(key),
@@ -323,6 +331,7 @@ class PromotionEvidenceAdapter:
                 "intent_count": len(intents),
                 "live_order_count": len(live_orders),
                 "metric_value": _blocker_metric_value(key, metrics),
+                "blocker_detail": reason_detail,
                 "explanation_ko": _blocker_explanation(key),
             },
             "grouped_items": limited_groups,
@@ -561,6 +570,14 @@ def _blocker_metric_value(blocker: str, metrics: dict[str, Any]) -> Any:
     }
     key = mapping.get(blocker)
     return metrics.get(key) if key else None
+
+
+def _blocker_title(blocker: str) -> str:
+    return "승격 근거 샘플" if blocker == "NO_BLOCKER" else promotion_reason_detail(blocker)["label_ko"]
+
+
+def _blocker_explanation(blocker: str) -> str:
+    return promotion_reason_detail(blocker)["description_ko"]
 
 
 def _metadata(row: dict[str, Any]) -> dict[str, Any]:

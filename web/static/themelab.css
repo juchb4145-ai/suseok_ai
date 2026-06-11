@@ -284,6 +284,17 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   white-space: nowrap;
 }
 
+.promotion-reason-row small {
+  grid-column: 2;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .promotion-reason-row.blocked { border-color: rgba(239, 68, 68, 0.45); }
 .promotion-reason-row.warning { border-color: rgba(245, 158, 11, 0.45); }
 .promotion-reason-row.ready { border-color: rgba(16, 185, 129, 0.45); }

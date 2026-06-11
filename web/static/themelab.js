@@ -1702,6 +1702,8 @@ function renderPromotionDecisionPanel() {
   const rollout = decision.rollout_plan || {};
   const blockers = decision.blockers || [];
   const warnings = decision.warnings || [];
+  const blockerDetails = promotionReasonDetailMap(decision.blocker_details || []);
+  const warningDetails = promotionReasonDetailMap(decision.warning_details || []);
   const hasDecision = Boolean(decision.action || payload.action);
   const status = state.promotionDecisionError
     ? "ERROR"
@@ -1710,7 +1712,9 @@ function renderPromotionDecisionPanel() {
       : decision.action || payload.action || "NO_DATA";
 
   setBadge("promotion-action-status", status);
-  text("promotion-confidence", hasDecision ? `confidence ${ratio(decision.confidence ?? payload.confidence)}` : "confidence -");
+  const actionStatusNode = document.getElementById("promotion-action-status");
+  if (actionStatusNode) actionStatusNode.textContent = promotionActionLabel(status);
+  text("promotion-confidence", hasDecision ? `승격확신 ${ratio(decision.confidence ?? payload.confidence)}` : "승격확신 -");
   text("promotion-decision-message", promotionDecisionMessage(payload, decision, filters));
   renderPromotionWindowButtons();
 
@@ -1720,32 +1724,32 @@ function renderPromotionDecisionPanel() {
   const stageNode = document.getElementById("promotion-stage-lines");
   if (stageNode) {
     stageNode.innerHTML = [
-      `<div class="cockpit-line"><strong>Current</strong>${promotionStageBadge(currentStage)}<span>${escapeHtml(currentStage)}</span></div>`,
-      `<div class="cockpit-line"><strong>Target</strong>${promotionStageBadge(targetStage)}<span>${escapeHtml(targetStage)}</span></div>`,
-      `<div class="cockpit-line"><strong>Recommend</strong>${promotionStageBadge(recommendedStage)}<span>${escapeHtml(recommendedStage)}</span></div>`,
-      `<div class="cockpit-line"><strong>Evidence</strong><span>${escapeHtml(promotionWindowLabel(filters))}</span></div>`,
+      `<div class="cockpit-line"><strong>현재</strong>${promotionStageBadge(currentStage)}<span>${escapeHtml(currentStage)}</span></div>`,
+      `<div class="cockpit-line"><strong>목표</strong>${promotionStageBadge(targetStage)}<span>${escapeHtml(targetStage)}</span></div>`,
+      `<div class="cockpit-line"><strong>추천</strong>${promotionStageBadge(recommendedStage)}<span>${escapeHtml(recommendedStage)}</span></div>`,
+      `<div class="cockpit-line"><strong>근거</strong><span>${escapeHtml(promotionWindowLabel(filters))}</span></div>`,
     ].join("");
   }
 
   const metricNode = document.getElementById("promotion-metric-lines");
   if (metricNode) {
     metricNode.innerHTML = [
-      promotionMetric("Decisions", metrics.decision_count ?? evidence.decision_count, compactNumber),
-      promotionMetric("Trade Days", metrics.trade_day_count ?? evidence.trade_day_count, compactNumber),
-      promotionMetric("RT High", metrics.realtime_high_ratio, ratio),
-      promotionMetric("Opp Loss", metrics.opportunity_loss_rate, ratio),
-      promotionMetric("False Pos", metrics.false_positive_rate, ratio),
-      promotionMetric("Order Err", metrics.order_error_rate, ratio),
-      promotionMetric("Avg Return", metrics.avg_return_pct ?? evidence.avg_return_pct, pct),
-      promotionMetric("Low Missed", metrics.realtime_low_missed_count ?? evidence.realtime_low_missed_count, compactNumber),
+      promotionMetric("판단 수", metrics.decision_count ?? evidence.decision_count, compactNumber),
+      promotionMetric("거래일", metrics.trade_day_count ?? evidence.trade_day_count, compactNumber),
+      promotionMetric("실시간 HIGH", metrics.realtime_high_ratio, ratio),
+      promotionMetric("기회손실", metrics.opportunity_loss_rate, ratio),
+      promotionMetric("오진입", metrics.false_positive_rate, ratio),
+      promotionMetric("주문오류", metrics.order_error_rate, ratio),
+      promotionMetric("평균수익", metrics.avg_return_pct ?? evidence.avg_return_pct, pct),
+      promotionMetric("LOW 후 손실", metrics.realtime_low_missed_count ?? evidence.realtime_low_missed_count, compactNumber),
     ].join("");
   }
 
   const blockerNode = document.getElementById("promotion-blocker-list");
   if (blockerNode) {
     const rows = [
-      ...blockers.slice(0, 5).map((item) => promotionReasonRow(item, "blocked")),
-      ...warnings.slice(0, 3).map((item) => promotionReasonRow(item, "warning")),
+      ...blockers.slice(0, 5).map((item) => promotionReasonRow(item, "blocked", blockerDetails[item])),
+      ...warnings.slice(0, 3).map((item) => promotionReasonRow(item, "warning", warningDetails[item])),
     ];
     blockerNode.innerHTML = rows.length
       ? rows.join("")
@@ -1758,11 +1762,11 @@ function renderPromotionDecisionPanel() {
   if (rolloutNode) {
     rolloutNode.innerHTML = [
       `<div class="cockpit-line"><strong>Mode</strong><span>${escapeHtml(rollout.mode || "-")}</span></div>`,
-      `<div class="cockpit-line"><strong>Notional</strong><span>${money(rollout.order_notional_krw)}</span></div>`,
-      `<div class="cockpit-line"><strong>Symbols</strong><span>${compactNumber(rollout.max_symbols)}</span></div>`,
-      `<div class="cockpit-line"><strong>Manual</strong>${boolBadge(rollout.requires_operator_approval, "필요", "불필요")}</div>`,
+      `<div class="cockpit-line"><strong>금액</strong><span>${money(rollout.order_notional_krw)}</span></div>`,
+      `<div class="cockpit-line"><strong>종목수</strong><span>${compactNumber(rollout.max_symbols)}</span></div>`,
+      `<div class="cockpit-line"><strong>승인</strong>${boolBadge(rollout.requires_operator_approval, "필요", "불필요")}</div>`,
       state.promotionDecisionLastFetchedAt
-        ? `<div class="cockpit-line"><strong>Fetched</strong><span>${escapeHtml(formatEventTime(state.promotionDecisionLastFetchedAt))}</span></div>`
+        ? `<div class="cockpit-line"><strong>갱신</strong><span>${escapeHtml(formatEventTime(state.promotionDecisionLastFetchedAt))}</span></div>`
         : "",
     ].filter(Boolean).join("");
   }
@@ -1778,14 +1782,33 @@ function promotionDecisionMessage(payload = {}, decision = {}, filters = {}) {
   const current = decision.current_stage || payload.current_stage || "-";
   const recommended = decision.recommended_stage || payload.recommended_stage || "-";
   const blockers = decision.blockers || [];
-  const blockerText = blockers.length ? ` / blocker ${blockers.slice(0, 2).join(", ")}` : "";
-  return `${action}: ${current} → ${recommended} / ${promotionWindowLabel(filters)}${blockerText}`;
+  const blockerDetails = promotionReasonDetailMap(decision.blocker_details || []);
+  const blockerText = blockers.length
+    ? ` / 확인 필요 ${blockers.slice(0, 2).map((item) => promotionReasonLabel(item, blockerDetails[item])).join(", ")}`
+    : "";
+  return `${promotionActionLabel(action)}: ${current} → ${recommended} / ${promotionWindowLabel(filters)}${blockerText}`;
+}
+
+function promotionActionLabel(action) {
+  return {
+    PROMOTE: "승격",
+    HOLD: "보류",
+    DEMOTE: "강등",
+    BLOCK: "차단",
+    LOADING: "갱신 중",
+    NO_DATA: "데이터 대기",
+    ERROR: "오류",
+  }[String(action || "").toUpperCase()] || String(action || "-");
+}
+
+function promotionActionBadge(action, tone = "") {
+  return `<span class="badge ${tone || statusClass[action] || "observe"}">${escapeHtml(promotionActionLabel(action))}</span>`;
 }
 
 function promotionWindowLabel(filters = {}) {
   const windowSec = Number(filters.window_sec || state.promotionWindowSec || 0);
-  if (windowSec > 0) return `${Math.round(windowSec / 60)}m window`;
-  return `trade_date ${filters.trade_date || "latest"}`;
+  if (windowSec > 0) return `최근 ${Math.round(windowSec / 60)}분`;
+  return `거래일 ${filters.trade_date || "최근 데이터"}`;
 }
 
 function renderPromotionStageMatrix(payload = {}) {
@@ -1802,10 +1825,11 @@ function renderPromotionStageMatrix(payload = {}) {
 function promotionStageMatrixRow(row = {}) {
   const failedChecks = row.failed_checks || [];
   const blockers = row.blockers || [];
+  const blockerDetails = promotionReasonDetailMap(row.blocker_details || []);
   const metrics = row.metrics || {};
   const transition = row.transition_type === "maintain"
-    ? `${String(row.current_stage || "-")} maintain`
-    : `${String(row.current_stage || "-")} to ${String(row.target_stage || "-")}`;
+    ? `${String(row.current_stage || "-")} 유지 점검`
+    : `${String(row.current_stage || "-")} → ${String(row.target_stage || "-")}`;
   const outcomeTone = row.action === "PROMOTE"
     ? "ready"
     : row.action === "DEMOTE"
@@ -1816,24 +1840,26 @@ function promotionStageMatrixRow(row = {}) {
   const requirementLines = failedChecks.length
     ? failedChecks.slice(0, 4).map((check) => `<span>${escapeHtml(promotionRequirementText(check))}</span>`).join("")
     : `<span>필수 조건 충족</span>`;
-  const blockerText = blockers.length ? blockers.slice(0, 3).join(", ") : "READY";
+  const blockerText = blockers.length
+    ? blockers.slice(0, 3).map((item) => promotionReasonLabel(item, blockerDetails[item])).join(", ")
+    : "조건 충족";
   return `
     <div class="promotion-stage-matrix-row ${outcomeTone}">
       <div class="promotion-stage-matrix-main">
         <strong>${escapeHtml(transition)}</strong>
-        ${badge(row.action || "NO_DATA", outcomeTone)}
+        ${promotionActionBadge(row.action || "NO_DATA", outcomeTone)}
         <span>${promotionStageBadge(row.recommended_stage || "-")}</span>
       </div>
       <div class="promotion-stage-matrix-metrics">
-        <span>sample ${compactNumber(metrics.decision_count)}</span>
-        <span>days ${compactNumber(metrics.trade_day_count)}</span>
-        <span>orders ${compactNumber(metrics.order_count)}</span>
-        <span>rt ${ratio(metrics.realtime_high_ratio)}</span>
-        <span>avg ${pct(metrics.avg_return_pct)}</span>
+        <span>판단 ${compactNumber(metrics.decision_count)}</span>
+        <span>거래일 ${compactNumber(metrics.trade_day_count)}</span>
+        <span>주문 ${compactNumber(metrics.order_count)}</span>
+        <span>실시간 ${ratio(metrics.realtime_high_ratio)}</span>
+        <span>평균 ${pct(metrics.avg_return_pct)}</span>
       </div>
       <div class="promotion-stage-matrix-blockers">
         <strong>${escapeHtml(blockerText)}</strong>
-        <span>confidence ${ratio(row.confidence)}</span>
+        <span>승격확신 ${ratio(row.confidence)}</span>
       </div>
       <div class="promotion-stage-matrix-requirements">${requirementLines}</div>
     </div>
@@ -1842,11 +1868,11 @@ function promotionStageMatrixRow(row = {}) {
 
 function promotionRequirementText(check = {}) {
   const label = check.label || check.code || "Requirement";
-  const direction = check.direction === "max" ? "<=" : check.direction === "min" ? ">=" : "";
+  const direction = check.direction === "max" ? "기준 이하" : check.direction === "min" ? "기준 이상" : "";
   const actual = promotionRequirementValue(check.actual, check.unit);
   const threshold = promotionRequirementValue(check.threshold, check.unit);
   if (check.unit === "flag") return label;
-  return `${label} ${actual} / ${direction} ${threshold}`;
+  return `${label}: 현재 ${actual}, 필요 ${direction} ${threshold}`;
 }
 
 function promotionRequirementValue(value, unit) {
@@ -1866,20 +1892,36 @@ function promotionMetric(label, value, formatter = compactNumber) {
   `;
 }
 
-function promotionReasonRow(reason, tone = "warning") {
+function promotionReasonDetailMap(details = []) {
+  return Object.fromEntries((details || []).map((item) => [String(item.code || ""), item]));
+}
+
+function promotionReasonLabel(reason, detail = null) {
+  return String((detail || {}).label_ko || reason || "-");
+}
+
+function promotionReasonDescription(reason, detail = null) {
+  return String((detail || {}).description_ko || reason || "");
+}
+
+function promotionReasonRow(reason, tone = "warning", detail = null) {
   const selected = state.promotionSelectedBlocker === reason;
+  const label = promotionReasonLabel(reason, detail);
+  const description = promotionReasonDescription(reason, detail);
   if (tone === "blocked") {
     return `
       <button type="button" class="promotion-reason-row blocked ${selected ? "selected" : ""}" data-promotion-blocker="${escapeHtml(reason)}" aria-pressed="${selected ? "true" : "false"}">
-        <strong>BLOCK</strong>
-        <span>${escapeHtml(reason)}</span>
+        <strong>차단</strong>
+        <span>${escapeHtml(label)}</span>
+        <small>${escapeHtml(description || reason)}</small>
       </button>
     `;
   }
   return `
     <div class="promotion-reason-row ${escapeHtml(tone)}">
-      <strong>${escapeHtml(tone === "blocked" ? "BLOCK" : "WARN")}</strong>
-      <span>${escapeHtml(reason)}</span>
+      <strong>${escapeHtml(tone === "blocked" ? "차단" : "주의")}</strong>
+      <span>${escapeHtml(label)}</span>
+      <small>${escapeHtml(description || reason)}</small>
     </div>
   `;
 }
@@ -1893,7 +1935,8 @@ function renderPromotionDrilldownPanel() {
   const selected = state.promotionSelectedBlocker;
   const section = ((state.promotionDrilldown || {}).sections || [])[0] || {};
   const summary = section.summary || {};
-  titleNode.textContent = selected ? `Blocker Drilldown · ${selected}` : "Blocker Drilldown";
+  const selectedDetail = (state.promotionDrilldown || {}).selected_blocker_detail || summary.blocker_detail || null;
+  titleNode.textContent = selected ? `원인 상세 · ${promotionReasonLabel(selected, selectedDetail)}` : "원인 상세";
   if (state.promotionDrilldownError) {
     statusNode.textContent = "load failed";
     summaryNode.innerHTML = `<div class="operator-alert-empty">Promotion drilldown API 실패: ${escapeHtml(state.promotionDrilldownError)}</div>`;
@@ -1907,8 +1950,8 @@ function renderPromotionDrilldownPanel() {
     return;
   }
   if (!selected) {
-    statusNode.textContent = "select blocker";
-    summaryNode.innerHTML = `<div class="operator-alert-empty">blocker를 선택하면 관련 decision/outcome/order evidence가 표시됩니다.</div>`;
+    statusNode.textContent = "원인 선택";
+    summaryNode.innerHTML = `<div class="operator-alert-empty">확인할 원인을 선택하면 관련 판단, 결과, 주문 근거가 표시됩니다.</div>`;
     listNode.innerHTML = "";
     return;
   }
@@ -1916,14 +1959,14 @@ function renderPromotionDrilldownPanel() {
   const groups = (state.promotionDrilldown || {}).grouped_items || section.grouped_items || [];
   const hasGroups = groups.length > 0;
   statusNode.textContent = hasGroups
-    ? `${compactNumber(summary.shown_group_count || groups.length)} / ${compactNumber(summary.group_count || groups.length)} symbols · ${compactNumber(summary.matching_count || items.length)} rows`
-    : `${compactNumber(summary.shown_count || items.length)} / ${compactNumber(summary.matching_count || items.length)} rows`;
+    ? `${compactNumber(summary.shown_group_count || groups.length)} / ${compactNumber(summary.group_count || groups.length)} 종목 · 원시 ${compactNumber(summary.matching_count || items.length)}건`
+    : `${compactNumber(summary.shown_count || items.length)} / ${compactNumber(summary.matching_count || items.length)}건`;
   summaryNode.innerHTML = [
-    promotionDrilldownSummaryMetric("Metric", summary.metric_value, promotionMetricFormatter(selected)),
-    promotionDrilldownSummaryMetric("Symbols", summary.group_count, compactNumber),
-    promotionDrilldownSummaryMetric("Outcomes", summary.outcome_count, compactNumber),
-    promotionDrilldownSummaryMetric("Intents", summary.intent_count, compactNumber),
-    promotionDrilldownSummaryMetric("LiveSim", summary.live_order_count, compactNumber),
+    promotionDrilldownSummaryMetric("지표값", summary.metric_value, promotionMetricFormatter(selected)),
+    promotionDrilldownSummaryMetric("종목", summary.group_count, compactNumber),
+    promotionDrilldownSummaryMetric("결과", summary.outcome_count, compactNumber),
+    promotionDrilldownSummaryMetric("주문의도", summary.intent_count, compactNumber),
+    promotionDrilldownSummaryMetric("가상주문", summary.live_order_count, compactNumber),
     `<div class="promotion-drilldown-explain">${escapeHtml(summary.explanation_ko || "관련 evidence rows를 확인합니다.")}</div>`,
   ].join("");
   listNode.innerHTML = hasGroups

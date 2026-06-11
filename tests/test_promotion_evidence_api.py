@@ -105,6 +105,8 @@ def test_promotion_api_exposes_evidence_and_decision(tmp_path, monkeypatch):
     live_sim_row = {row["stage"]: row for row in matrix["stage_matrix"]["rows"]}["live_sim"]
     assert "REAL_MICRO_REQUIRES_OPERATOR_APPROVAL" in live_sim_row["blockers"]
     assert live_sim_row["failed_checks"]
+    assert live_sim_row["blocker_details"][0]["label_ko"]
+    assert live_sim_row["failed_checks"][0]["description_ko"]
 
 
 def test_promotion_drilldown_returns_blocker_evidence_rows(tmp_path, monkeypatch):
@@ -125,7 +127,9 @@ def test_promotion_drilldown_returns_blocker_evidence_rows(tmp_path, monkeypatch
         },
     ).json()
     assert drilldown["selected_blocker"] == "REALTIME_HIGH_RATIO_LOW"
+    assert drilldown["selected_blocker_detail"]["label_ko"] == "실시간 신뢰도 부족"
     assert drilldown["sections"][0]["summary"]["matching_count"] >= 50
+    assert drilldown["sections"][0]["summary"]["blocker_detail"]["description_ko"]
     assert len(drilldown["items"]) == 5
     assert {item["realtime_bucket"] for item in drilldown["items"]} == {"LOW"}
     assert drilldown["items"][0]["source_type"] == "decision_outcome"

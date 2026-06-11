@@ -63,6 +63,101 @@ REALTIME_LOW_REASONS = {
     "REALTIME_RELIABILITY_BUCKET_BROKEN",
 }
 
+PROMOTION_REASON_DETAILS = {
+    "PROMOTION_CONTROLLER_DISABLED": {
+        "label_ko": "승격 컨트롤러 꺼짐",
+        "description_ko": "설정에서 승격 판단 기능이 꺼져 있어 단계 변경을 하지 않습니다.",
+    },
+    "KILL_SWITCH_ACTIVE": {
+        "label_ko": "킬스위치 작동 중",
+        "description_ko": "운영 안전장치가 켜져 있어 모든 승격을 차단합니다.",
+    },
+    "CONSECUTIVE_ORDER_ERRORS": {
+        "label_ko": "연속 주문 오류",
+        "description_ko": "최근 주문 오류가 연속으로 발생해 단계 상향을 막습니다.",
+    },
+    "REAL_MICRO_REQUIRES_OPERATOR_APPROVAL": {
+        "label_ko": "실매매 소액 전환 승인 필요",
+        "description_ko": "real_micro 단계는 운영자 승인 없이는 자동 승격하지 않습니다.",
+    },
+    "INSUFFICIENT_DECISION_SAMPLE": {
+        "label_ko": "판단 샘플 부족",
+        "description_ko": "최근 판단 결과 수가 해당 단계 기준보다 부족합니다.",
+    },
+    "INSUFFICIENT_TRADE_DAYS": {
+        "label_ko": "거래일 샘플 부족",
+        "description_ko": "하루 데이터만으로 다음 단계 안정성을 판단하기 어렵습니다.",
+    },
+    "INSUFFICIENT_DRY_RUN_ORDERS": {
+        "label_ko": "드라이런 주문 샘플 부족",
+        "description_ko": "가상 주문 의도 수가 live_sim 전환 기준보다 부족합니다.",
+    },
+    "INSUFFICIENT_LIVE_SIM_ORDERS": {
+        "label_ko": "가상 계좌 주문 샘플 부족",
+        "description_ko": "live_sim 주문 샘플이 real_micro 전환 기준보다 부족합니다.",
+    },
+    "INSUFFICIENT_FILL_SAMPLE": {
+        "label_ko": "체결 샘플 부족",
+        "description_ko": "체결 데이터가 부족해 실매매 전환 품질을 확인하기 어렵습니다.",
+    },
+    "FALSE_POSITIVE_RATE_HIGH": {
+        "label_ko": "오진입 비율 높음",
+        "description_ko": "READY 판단 뒤 손실 또는 약한 흐름으로 이어진 비율이 높습니다.",
+    },
+    "OPPORTUNITY_LOSS_RATE_HIGH": {
+        "label_ko": "기회손실 비율 높음",
+        "description_ko": "기다리거나 차단한 뒤 상승 기회를 놓친 비율이 높습니다.",
+    },
+    "RISK_CASE_RATE_HIGH": {
+        "label_ko": "리스크 케이스 비율 높음",
+        "description_ko": "손실, 추격, 리스크 차단 관련 케이스가 기준보다 많습니다.",
+    },
+    "DATA_INSUFFICIENT_RATE_HIGH": {
+        "label_ko": "데이터 부족 비율 높음",
+        "description_ko": "판단에 필요한 가격, 지표, 실시간 데이터가 부족한 케이스가 많습니다.",
+    },
+    "ORDER_ERROR_RATE_HIGH": {
+        "label_ko": "주문 오류 비율 높음",
+        "description_ko": "주문 거절 또는 실패 비율이 기준보다 높습니다.",
+    },
+    "DUPLICATE_ORDER_DETECTED": {
+        "label_ko": "중복 주문 감지",
+        "description_ko": "같은 의도나 종목에 중복 주문 가능성이 감지됐습니다.",
+    },
+    "EXPECTANCY_BELOW_THRESHOLD": {
+        "label_ko": "기대수익률 기준 미달",
+        "description_ko": "최근 판단의 평균 수익률이 다음 단계 기준보다 낮습니다.",
+    },
+    "REALTIME_HIGH_RATIO_LOW": {
+        "label_ko": "실시간 신뢰도 부족",
+        "description_ko": "HIGH 등급 실시간 근거 비율이 낮아 지금 단계 상향은 위험합니다.",
+    },
+    "REALTIME_LOW_MISSED_RATE_HIGH": {
+        "label_ko": "낮은 실시간 신뢰도 후 기회손실",
+        "description_ko": "실시간 신뢰도가 낮아 기다렸지만 이후 상승 기회를 놓친 케이스가 많습니다.",
+    },
+    "REAL_MICRO_REQUIRES_ZERO_ORDER_ERRORS": {
+        "label_ko": "실매매 전 주문 오류 0건 필요",
+        "description_ko": "real_micro 단계는 주문 오류가 하나라도 있으면 유지 또는 승격하지 않습니다.",
+    },
+    "SAMPLE_STILL_THIN": {
+        "label_ko": "샘플 여유 부족",
+        "description_ko": "최소 기준은 넘었더라도 아직 안정성을 보기에는 샘플 여유가 얇습니다.",
+    },
+    "REALTIME_QUALITY_MARGIN_THIN": {
+        "label_ko": "실시간 품질 여유 부족",
+        "description_ko": "실시간 HIGH 비율이 기준 근처라 여유가 충분하지 않습니다.",
+    },
+    "REAL_MICRO_USE_ONE_SYMBOL_AND_SMALL_NOTIONAL": {
+        "label_ko": "실매매는 1종목 소액만",
+        "description_ko": "real_micro 단계는 한 종목, 매우 작은 주문금액으로만 검증해야 합니다.",
+    },
+    "NO_BLOCKER": {
+        "label_ko": "승격 차단 없음",
+        "description_ko": "현재 선택된 차단 원인이 없습니다.",
+    },
+}
+
 
 @dataclass(frozen=True)
 class PromotionThresholds:
@@ -292,7 +387,9 @@ class PromotionController:
                     "passed": not decision.blockers,
                     "confidence": decision.confidence,
                     "blockers": decision.blockers,
+                    "blocker_details": promotion_reason_details(decision.blockers),
                     "warnings": decision.warnings,
+                    "warning_details": promotion_reason_details(decision.warnings),
                     "metrics": {key: decision.metrics.get(key) for key in MATRIX_METRIC_KEYS if key in decision.metrics},
                     "thresholds": thresholds.to_dict(),
                     "checks": checks,
@@ -423,6 +520,20 @@ def build_promotion_evidence(
         source_ids=list(dict.fromkeys(source_ids))[:50],
         generated_at=datetime.now().isoformat(timespec="seconds"),
     )
+
+
+def promotion_reason_detail(code: Any) -> dict[str, Any]:
+    key = str(code or "").strip().upper()
+    detail = dict(PROMOTION_REASON_DETAILS.get(key) or {})
+    return {
+        "code": key,
+        "label_ko": detail.get("label_ko") or key or "알 수 없는 원인",
+        "description_ko": detail.get("description_ko") or "해당 원인의 상세 근거를 확인하세요.",
+    }
+
+
+def promotion_reason_details(codes: Iterable[Any]) -> list[dict[str, Any]]:
+    return [promotion_reason_detail(code) for code in codes or []]
 
 
 def evidence_from_summary(payload: dict[str, Any]) -> PromotionEvidence:
@@ -570,23 +681,23 @@ def _stage_matrix_checks(
     blockers: list[str],
 ) -> list[dict[str, Any]]:
     checks = [
-        _min_check("INSUFFICIENT_DECISION_SAMPLE", "Decision sample", evidence.decision_count, thresholds.min_decision_count, "count"),
-        _min_check("INSUFFICIENT_TRADE_DAYS", "Trade days", evidence.trade_day_count, thresholds.min_trade_day_count, "count"),
-        _min_check("INSUFFICIENT_DRY_RUN_ORDERS", "Dry-run orders", evidence.order_count, thresholds.min_order_count, "count"),
-        _min_check("INSUFFICIENT_LIVE_SIM_ORDERS", "Live-sim orders", evidence.live_sim_order_count, thresholds.min_live_sim_order_count, "count"),
-        _min_check("INSUFFICIENT_FILL_SAMPLE", "Fill sample", evidence.fill_count, thresholds.min_fill_count, "count"),
-        _max_check("FALSE_POSITIVE_RATE_HIGH", "False-positive rate", metrics["false_positive_rate"], thresholds.max_false_positive_rate, "ratio"),
-        _max_check("OPPORTUNITY_LOSS_RATE_HIGH", "Opportunity-loss rate", metrics["opportunity_loss_rate"], thresholds.max_opportunity_loss_rate, "ratio"),
-        _max_check("RISK_CASE_RATE_HIGH", "Risk-case rate", metrics["risk_case_rate"], thresholds.max_risk_case_rate, "ratio"),
-        _max_check("DATA_INSUFFICIENT_RATE_HIGH", "Data-insufficient rate", metrics["data_insufficient_rate"], thresholds.max_data_insufficient_rate, "ratio"),
-        _max_check("ORDER_ERROR_RATE_HIGH", "Order-error rate", metrics["order_error_rate"], thresholds.max_order_error_rate, "ratio"),
-        _max_check("DUPLICATE_ORDER_DETECTED", "Duplicate orders", evidence.duplicate_order_count, thresholds.max_duplicate_order_count, "count"),
-        _min_check("EXPECTANCY_BELOW_THRESHOLD", "Average return", evidence.avg_return_pct, thresholds.min_avg_return_pct, "pct"),
-        _min_check("REALTIME_HIGH_RATIO_LOW", "Realtime HIGH ratio", metrics["realtime_high_ratio"], thresholds.min_realtime_high_ratio, "ratio"),
-        _max_check("REALTIME_LOW_MISSED_RATE_HIGH", "Realtime-low missed rate", metrics["realtime_low_missed_rate"], thresholds.max_realtime_low_missed_rate, "ratio"),
+        _min_check("INSUFFICIENT_DECISION_SAMPLE", evidence.decision_count, thresholds.min_decision_count, "count"),
+        _min_check("INSUFFICIENT_TRADE_DAYS", evidence.trade_day_count, thresholds.min_trade_day_count, "count"),
+        _min_check("INSUFFICIENT_DRY_RUN_ORDERS", evidence.order_count, thresholds.min_order_count, "count"),
+        _min_check("INSUFFICIENT_LIVE_SIM_ORDERS", evidence.live_sim_order_count, thresholds.min_live_sim_order_count, "count"),
+        _min_check("INSUFFICIENT_FILL_SAMPLE", evidence.fill_count, thresholds.min_fill_count, "count"),
+        _max_check("FALSE_POSITIVE_RATE_HIGH", metrics["false_positive_rate"], thresholds.max_false_positive_rate, "ratio"),
+        _max_check("OPPORTUNITY_LOSS_RATE_HIGH", metrics["opportunity_loss_rate"], thresholds.max_opportunity_loss_rate, "ratio"),
+        _max_check("RISK_CASE_RATE_HIGH", metrics["risk_case_rate"], thresholds.max_risk_case_rate, "ratio"),
+        _max_check("DATA_INSUFFICIENT_RATE_HIGH", metrics["data_insufficient_rate"], thresholds.max_data_insufficient_rate, "ratio"),
+        _max_check("ORDER_ERROR_RATE_HIGH", metrics["order_error_rate"], thresholds.max_order_error_rate, "ratio"),
+        _max_check("DUPLICATE_ORDER_DETECTED", evidence.duplicate_order_count, thresholds.max_duplicate_order_count, "count"),
+        _min_check("EXPECTANCY_BELOW_THRESHOLD", evidence.avg_return_pct, thresholds.min_avg_return_pct, "pct"),
+        _min_check("REALTIME_HIGH_RATIO_LOW", metrics["realtime_high_ratio"], thresholds.min_realtime_high_ratio, "ratio"),
+        _max_check("REALTIME_LOW_MISSED_RATE_HIGH", metrics["realtime_low_missed_rate"], thresholds.max_realtime_low_missed_rate, "ratio"),
     ]
     if target_stage == "real_micro":
-        checks.append(_max_check("REAL_MICRO_REQUIRES_ZERO_ORDER_ERRORS", "Real micro order errors", evidence.order_error_count, 0, "count"))
+        checks.append(_max_check("REAL_MICRO_REQUIRES_ZERO_ORDER_ERRORS", evidence.order_error_count, 0, "count"))
     known = {str(item.get("code") or "") for item in checks}
     for blocker in blockers:
         if blocker not in known:
@@ -594,6 +705,7 @@ def _stage_matrix_checks(
                 {
                     "code": blocker,
                     "label": _blocker_label(blocker),
+                    "description_ko": promotion_reason_detail(blocker)["description_ko"],
                     "actual": None,
                     "threshold": None,
                     "gap": None,
@@ -605,12 +717,14 @@ def _stage_matrix_checks(
     return checks
 
 
-def _min_check(code: str, label: str, actual: Any, threshold: Any, unit: str) -> dict[str, Any]:
+def _min_check(code: str, actual: Any, threshold: Any, unit: str) -> dict[str, Any]:
     actual_value = _number(actual) or 0.0
     threshold_value = _number(threshold) or 0.0
+    detail = promotion_reason_detail(code)
     return {
         "code": code,
-        "label": label,
+        "label": detail["label_ko"],
+        "description_ko": detail["description_ko"],
         "actual": actual_value,
         "threshold": threshold_value,
         "gap": round(max(0.0, threshold_value - actual_value), 4),
@@ -620,12 +734,14 @@ def _min_check(code: str, label: str, actual: Any, threshold: Any, unit: str) ->
     }
 
 
-def _max_check(code: str, label: str, actual: Any, threshold: Any, unit: str) -> dict[str, Any]:
+def _max_check(code: str, actual: Any, threshold: Any, unit: str) -> dict[str, Any]:
     actual_value = _number(actual) or 0.0
     threshold_value = _number(threshold) or 0.0
+    detail = promotion_reason_detail(code)
     return {
         "code": code,
-        "label": label,
+        "label": detail["label_ko"],
+        "description_ko": detail["description_ko"],
         "actual": actual_value,
         "threshold": threshold_value,
         "gap": round(max(0.0, actual_value - threshold_value), 4),
@@ -636,12 +752,7 @@ def _max_check(code: str, label: str, actual: Any, threshold: Any, unit: str) ->
 
 
 def _blocker_label(blocker: str) -> str:
-    return {
-        "PROMOTION_CONTROLLER_DISABLED": "Promotion controller",
-        "KILL_SWITCH_ACTIVE": "Kill switch",
-        "CONSECUTIVE_ORDER_ERRORS": "Consecutive order errors",
-        "REAL_MICRO_REQUIRES_OPERATOR_APPROVAL": "Operator approval",
-    }.get(str(blocker or "").upper(), str(blocker or "Blocker"))
+    return promotion_reason_detail(blocker)["label_ko"]
 
 
 def _confidence(metrics: dict[str, Any], blockers: list[str], warnings: list[str]) -> float:
