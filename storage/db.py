@@ -2532,7 +2532,8 @@ class TradingDatabase:
                 d.order_intent_id AS decision_order_intent_id,
                 d.virtual_order_id AS decision_virtual_order_id,
                 d.virtual_position_id AS decision_virtual_position_id,
-                d.exit_decision_id AS decision_exit_decision_id
+                d.exit_decision_id AS decision_exit_decision_id,
+                d.details_json AS decision_details_json
             FROM strategy_decision_outcomes o
             LEFT JOIN strategy_decision_events d ON d.decision_id = o.decision_id
             {where}
@@ -2601,7 +2602,8 @@ class TradingDatabase:
                 d.order_intent_id AS decision_order_intent_id,
                 d.virtual_order_id AS decision_virtual_order_id,
                 d.virtual_position_id AS decision_virtual_position_id,
-                d.exit_decision_id AS decision_exit_decision_id
+                d.exit_decision_id AS decision_exit_decision_id,
+                d.details_json AS decision_details_json
             FROM strategy_decision_outcomes o
             LEFT JOIN strategy_decision_events d ON d.decision_id = o.decision_id
             WHERE o.decision_id = ? AND o.horizon_sec = ?
@@ -7626,6 +7628,9 @@ def _row_to_strategy_decision_outcome(row: sqlite3.Row) -> dict:
     data = dict(row)
     data["data_quality_issues"] = _safe_json_loads(data.get("data_quality_issues_json"), [])
     data["details"] = _safe_json_loads(data.get("details_json"), {})
+    data["decision_details"] = (
+        _safe_json_loads(data.pop("decision_details_json", "{}"), {}) if "decision_details_json" in data else {}
+    )
     data["name"] = data.pop("decision_name", "") if "decision_name" in data else ""
     data["theme_name"] = data.pop("decision_theme_name", "") if "decision_theme_name" in data else ""
     data["strategy_name"] = data.pop("decision_strategy_name", "") if "decision_strategy_name" in data else ""

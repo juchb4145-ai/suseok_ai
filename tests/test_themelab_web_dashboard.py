@@ -83,6 +83,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#promotion-metric-lines") is not None
     assert soup.select_one("#promotion-blocker-list") is not None
     assert soup.select_one("#promotion-rollout-lines") is not None
+    assert soup.select_one("#promotion-stage-matrix") is not None
     assert soup.select_one("#promotion-drilldown-panel") is not None
     assert soup.select_one("#promotion-drilldown-title") is not None
     assert soup.select_one("#promotion-drilldown-status") is not None
@@ -140,6 +141,11 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "fetchPromotionDecision" in js
     assert "fetchPromotionDrilldown" in js
     assert "renderPromotionDrilldownPanel" in js
+    assert "promotionDrilldownGroup" in js
+    assert "renderPromotionStageMatrix" in js
+    assert "promotionStageMatrixRow" in js
+    assert "failed_checks" in js
+    assert "grouped_items" in js
     assert "initPromotionCockpit" in js
     assert "/api/runtime/promotion/decision" in js
     assert "/api/runtime/promotion/drilldown" in js
@@ -147,9 +153,12 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "promotionWindowSec" in js
     assert "promotion-decision-grid" in css
     assert "promotion-metric-grid" in css
+    assert "promotion-stage-matrix" in css
+    assert "promotion-stage-matrix-row" in css
     assert "promotion-reason-row" in css
     assert "promotion-drilldown-panel" in css
     assert "promotion-drilldown-row" in css
+    assert "promotion-drilldown-group" in css
     assert "previousSnapshot" in js
     assert "operatorEvents" in js
     assert "acknowledgedEventIds" in js

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from trading_app.promotion_controller import (
+    DEMOTE_ACTION,
     HOLD_ACTION,
     PROMOTE_ACTION,
     PromotionController,
@@ -34,6 +35,40 @@ def test_build_evidence_counts_realtime_low_missed_and_order_errors():
     assert evidence.order_error_count == 1
     assert evidence.outcome_counts["EARLY_OPPORTUNITY_LOSS"] == 1
     assert evidence.realtime_bucket_counts["HIGH"] == 3
+
+
+def test_build_evidence_recovers_nested_decision_realtime_bucket_and_counts_no_data():
+    outcomes = [
+        {
+            "decision_id": "nested-high",
+            "outcome_id": "outcome:nested-high:300",
+            "trade_date": "2026-06-01",
+            "outcome_label": "GOOD_READY",
+            "current_return_pct": 0.5,
+            "decision_details": {
+                "gate_details": {
+                    "realtime_reliability_bucket": "HIGH",
+                    "realtime_reliability_score": 96.0,
+                }
+            },
+        },
+        {
+            "decision_id": "missing-bucket",
+            "outcome_id": "outcome:missing-bucket:300",
+            "trade_date": "2026-06-01",
+            "outcome_label": "NEUTRAL_OUTCOME",
+            "current_return_pct": 0.0,
+        },
+    ]
+
+    evidence = build_promotion_evidence(
+        policy_id="theme_lab_realtime_reliability_gate",
+        current_stage="observe",
+        decision_outcomes=outcomes,
+    )
+
+    assert evidence.realtime_bucket_counts["HIGH"] == 1
+    assert evidence.realtime_bucket_counts["NO_DATA"] == 1
 
 
 def test_observe_promotes_to_dry_run_with_rolling_intraday_evidence():
@@ -107,6 +142,49 @@ def test_live_sim_to_real_micro_requires_operator_approval_even_when_metrics_pas
     assert approved.recommended_stage == "real_micro"
     assert approved.rollout_plan["order_notional_krw"] == 50000
     assert approved.rollout_plan["requires_operator_approval"] is True
+
+
+def test_real_micro_demotes_when_maintenance_health_fails():
+    outcomes = [
+        _outcome(f"weak-{idx}", "2026-06-01", "EARLY_FALSE_POSITIVE", ["READY_PULLBACK"], bucket="NO_DATA", ret=-0.5)
+        for idx in range(20)
+    ]
+
+    evidence = build_promotion_evidence(
+        policy_id="theme_lab_realtime_reliability_gate",
+        current_stage="real_micro",
+        decision_outcomes=outcomes,
+    )
+    decision = PromotionController(config=PromotionControllerConfig(allow_real_micro=True)).evaluate(evidence)
+
+    assert decision.action == DEMOTE_ACTION
+    assert decision.recommended_stage == "live_sim"
+    assert "INSUFFICIENT_TRADE_DAYS" in decision.blockers
+    assert "EXPECTANCY_BELOW_THRESHOLD" in decision.blockers
+    assert "REALTIME_HIGH_RATIO_LOW" in decision.blockers
+
+
+def test_stage_matrix_compares_all_promotion_steps():
+    outcomes = [_outcome(f"good-{idx}", "2026-06-01", "GOOD_READY", ["READY_PULLBACK"], bucket="HIGH", ret=0.4) for idx in range(55)]
+
+    evidence = build_promotion_evidence(
+        policy_id="theme_lab_realtime_reliability_gate",
+        current_stage="observe",
+        decision_outcomes=outcomes,
+    )
+    matrix = PromotionController().stage_matrix(evidence)
+
+    rows = {row["stage"]: row for row in matrix["rows"]}
+    assert list(rows) == ["observe", "dry_run", "live_sim", "real_micro"]
+    assert rows["observe"]["action"] == PROMOTE_ACTION
+    assert rows["observe"]["target_stage"] == "dry_run"
+    assert rows["dry_run"]["action"] == HOLD_ACTION
+    assert "INSUFFICIENT_DRY_RUN_ORDERS" in rows["dry_run"]["blockers"]
+    assert "REAL_MICRO_REQUIRES_OPERATOR_APPROVAL" in rows["live_sim"]["blockers"]
+    assert rows["real_micro"]["transition_type"] == "maintain"
+    assert rows["real_micro"]["action"] == DEMOTE_ACTION
+    failed_codes = {item["code"] for item in rows["real_micro"]["failed_checks"]}
+    assert {"INSUFFICIENT_TRADE_DAYS", "INSUFFICIENT_DRY_RUN_ORDERS", "INSUFFICIENT_LIVE_SIM_ORDERS"} <= failed_codes
 
 
 def test_kill_switch_blocks_promotion():

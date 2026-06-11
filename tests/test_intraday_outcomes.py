@@ -101,6 +101,38 @@ def test_outcome_label_rules_cover_entry_block_risk_exit_hold_and_insufficient(t
         db.close()
 
 
+def test_outcome_details_preserve_realtime_reliability_from_decision_details(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        decision = {
+            **_decision("realtime-medium"),
+            "details": {
+                "gate_details": {
+                    "realtime_reliability_bucket": "MEDIUM",
+                    "realtime_reliability_score": 81.5,
+                    "realtime_reliability_gate": {"bucket": "MEDIUM", "status": "SIZE_REDUCED"},
+                }
+            },
+        }
+        labeler = IntradayOutcomeLabeler(
+            db,
+            config=IntradayOutcomeConfig(min_price_samples=2),
+            price_provider=lambda _decision, _horizon, _now: _samples(100, 101),
+        )
+
+        outcome = labeler.build_outcome_for_decision(
+            decision,
+            60,
+            now=datetime.fromisoformat("2026-06-01T09:01:00"),
+        )
+
+        assert outcome["details"]["realtime_reliability_bucket"] == "MEDIUM"
+        assert outcome["details"]["realtime_reliability_score"] == 81.5
+        assert outcome["details"]["realtime_reliability_gate"]["status"] == "SIZE_REDUCED"
+    finally:
+        db.close()
+
+
 def test_theme_lab_flow_price_provider_labels_from_persisted_snapshots(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     try:

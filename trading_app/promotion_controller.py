@@ -2,12 +2,29 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from typing import Any, Iterable
 
 
 STAGES = ("observe", "dry_run", "live_sim", "real_micro")
+MATRIX_METRIC_KEYS = (
+    "decision_count",
+    "trade_day_count",
+    "order_count",
+    "live_sim_order_count",
+    "fill_count",
+    "avg_return_pct",
+    "false_positive_rate",
+    "opportunity_loss_rate",
+    "risk_case_rate",
+    "data_insufficient_rate",
+    "order_error_rate",
+    "duplicate_order_count",
+    "realtime_high_ratio",
+    "realtime_no_data_ratio",
+    "realtime_low_missed_rate",
+)
 PROMOTE_ACTION = "PROMOTE"
 HOLD_ACTION = "HOLD"
 DEMOTE_ACTION = "DEMOTE"
@@ -217,6 +234,9 @@ class PromotionController:
         if ev.consecutive_error_count > self.config.max_consecutive_error_count:
             blockers.append("CONSECUTIVE_ORDER_ERRORS")
         if current_stage == "real_micro":
+            thresholds = self.config.threshold_for("real_micro")
+            blockers.extend(_threshold_blockers(ev, metrics, thresholds, "real_micro"))
+            warnings.extend(_threshold_warnings(ev, metrics, thresholds, "real_micro"))
             return self._decision(
                 ev,
                 current_stage=current_stage,
@@ -249,6 +269,42 @@ class PromotionController:
             metrics=metrics,
             confidence=confidence,
         )
+
+    def stage_matrix(self, evidence: PromotionEvidence | dict[str, Any]) -> dict[str, Any]:
+        ev = evidence if isinstance(evidence, PromotionEvidence) else evidence_from_summary(evidence)
+        rows: list[dict[str, Any]] = []
+        for stage in STAGES:
+            staged_evidence = replace(ev, current_stage=stage)
+            decision = self.evaluate(staged_evidence)
+            target_for_threshold = "real_micro" if stage == "real_micro" else decision.target_stage
+            thresholds = self.config.threshold_for(target_for_threshold)
+            checks = _stage_matrix_checks(staged_evidence, decision.metrics, thresholds, target_for_threshold, decision.blockers)
+            failed_checks = [item for item in checks if not item.get("passed")]
+            rows.append(
+                {
+                    "stage": stage,
+                    "transition_type": "maintain" if stage == "real_micro" else "promote",
+                    "current_stage": decision.current_stage,
+                    "target_stage": decision.target_stage,
+                    "recommended_stage": decision.recommended_stage,
+                    "action": decision.action,
+                    "eligible": decision.eligible,
+                    "passed": not decision.blockers,
+                    "confidence": decision.confidence,
+                    "blockers": decision.blockers,
+                    "warnings": decision.warnings,
+                    "metrics": {key: decision.metrics.get(key) for key in MATRIX_METRIC_KEYS if key in decision.metrics},
+                    "thresholds": thresholds.to_dict(),
+                    "checks": checks,
+                    "failed_checks": failed_checks,
+                }
+            )
+        return {
+            "policy_id": ev.policy_id,
+            "current_stage": normalize_stage(ev.current_stage),
+            "rows": rows,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+        }
 
     def _decision(
         self,
@@ -317,9 +373,7 @@ def build_promotion_evidence(
         reason_codes = _reason_codes_from_row(row)
         for reason in reason_codes:
             reason_counts[reason] += 1
-        bucket = _realtime_bucket(row)
-        if bucket:
-            bucket_counts[bucket] += 1
+        bucket_counts[_realtime_bucket(row) or "NO_DATA"] += 1
         if label in OPPORTUNITY_LOSS_LABELS and any(reason in REALTIME_LOW_REASONS for reason in reason_codes):
             low_missed += 1
         source_id = str(row.get("outcome_id") or row.get("decision_id") or "")
@@ -336,9 +390,7 @@ def build_promotion_evidence(
             order_error_count += 1
         if _bool(intent.get("duplicate")) or _bool(metadata.get("duplicate")) or "DUPLICATE_ORDER" in reason_codes:
             duplicate_order_count += 1
-        bucket = _realtime_bucket(intent) or _realtime_bucket(metadata)
-        if bucket:
-            bucket_counts[bucket] += 1
+        bucket_counts[_realtime_bucket(intent) or _realtime_bucket(metadata) or "NO_DATA"] += 1
 
     live_error_count = 0
     fill_count = 0
@@ -348,6 +400,7 @@ def build_promotion_evidence(
             fill_count += 1
         if status in {"ERROR", "FAILED", "REJECTED", "CANCEL_FAILED"}:
             live_error_count += 1
+        bucket_counts[_realtime_bucket(order) or "NO_DATA"] += 1
 
     decision_count = len(outcomes)
     avg_return = round(sum(returns) / len(returns), 4) if returns else 0.0
@@ -475,6 +528,7 @@ def _metrics(evidence: PromotionEvidence) -> dict[str, Any]:
     bucket_total = max(1, sum(bucket_counts.values()))
     order_total = max(1, evidence.order_count + evidence.live_sim_order_count)
     low_bucket_count = bucket_counts.get("LOW", 0) + bucket_counts.get("BROKEN", 0)
+    no_data_bucket_count = bucket_counts.get("NO_DATA", 0)
     return {
         "decision_count": evidence.decision_count,
         "trade_day_count": evidence.trade_day_count,
@@ -497,12 +551,97 @@ def _metrics(evidence: PromotionEvidence) -> dict[str, Any]:
         "duplicate_order_count": evidence.duplicate_order_count,
         "realtime_high_ratio": round(bucket_counts.get("HIGH", 0) / bucket_total, 4),
         "realtime_low_ratio": round(low_bucket_count / bucket_total, 4),
+        "realtime_no_data_count": no_data_bucket_count,
+        "realtime_no_data_ratio": round(no_data_bucket_count / bucket_total, 4),
+        "realtime_bucket_total": sum(bucket_counts.values()),
         "realtime_low_missed_count": evidence.realtime_low_missed_count,
         "realtime_low_missed_rate": round(evidence.realtime_low_missed_count / max(1, low_bucket_count), 4),
         "outcome_counts": outcome_counts,
         "realtime_bucket_counts": bucket_counts,
         "gate_reason_counts": dict(evidence.gate_reason_counts or {}),
     }
+
+
+def _stage_matrix_checks(
+    evidence: PromotionEvidence,
+    metrics: dict[str, Any],
+    thresholds: PromotionThresholds,
+    target_stage: str,
+    blockers: list[str],
+) -> list[dict[str, Any]]:
+    checks = [
+        _min_check("INSUFFICIENT_DECISION_SAMPLE", "Decision sample", evidence.decision_count, thresholds.min_decision_count, "count"),
+        _min_check("INSUFFICIENT_TRADE_DAYS", "Trade days", evidence.trade_day_count, thresholds.min_trade_day_count, "count"),
+        _min_check("INSUFFICIENT_DRY_RUN_ORDERS", "Dry-run orders", evidence.order_count, thresholds.min_order_count, "count"),
+        _min_check("INSUFFICIENT_LIVE_SIM_ORDERS", "Live-sim orders", evidence.live_sim_order_count, thresholds.min_live_sim_order_count, "count"),
+        _min_check("INSUFFICIENT_FILL_SAMPLE", "Fill sample", evidence.fill_count, thresholds.min_fill_count, "count"),
+        _max_check("FALSE_POSITIVE_RATE_HIGH", "False-positive rate", metrics["false_positive_rate"], thresholds.max_false_positive_rate, "ratio"),
+        _max_check("OPPORTUNITY_LOSS_RATE_HIGH", "Opportunity-loss rate", metrics["opportunity_loss_rate"], thresholds.max_opportunity_loss_rate, "ratio"),
+        _max_check("RISK_CASE_RATE_HIGH", "Risk-case rate", metrics["risk_case_rate"], thresholds.max_risk_case_rate, "ratio"),
+        _max_check("DATA_INSUFFICIENT_RATE_HIGH", "Data-insufficient rate", metrics["data_insufficient_rate"], thresholds.max_data_insufficient_rate, "ratio"),
+        _max_check("ORDER_ERROR_RATE_HIGH", "Order-error rate", metrics["order_error_rate"], thresholds.max_order_error_rate, "ratio"),
+        _max_check("DUPLICATE_ORDER_DETECTED", "Duplicate orders", evidence.duplicate_order_count, thresholds.max_duplicate_order_count, "count"),
+        _min_check("EXPECTANCY_BELOW_THRESHOLD", "Average return", evidence.avg_return_pct, thresholds.min_avg_return_pct, "pct"),
+        _min_check("REALTIME_HIGH_RATIO_LOW", "Realtime HIGH ratio", metrics["realtime_high_ratio"], thresholds.min_realtime_high_ratio, "ratio"),
+        _max_check("REALTIME_LOW_MISSED_RATE_HIGH", "Realtime-low missed rate", metrics["realtime_low_missed_rate"], thresholds.max_realtime_low_missed_rate, "ratio"),
+    ]
+    if target_stage == "real_micro":
+        checks.append(_max_check("REAL_MICRO_REQUIRES_ZERO_ORDER_ERRORS", "Real micro order errors", evidence.order_error_count, 0, "count"))
+    known = {str(item.get("code") or "") for item in checks}
+    for blocker in blockers:
+        if blocker not in known:
+            checks.append(
+                {
+                    "code": blocker,
+                    "label": _blocker_label(blocker),
+                    "actual": None,
+                    "threshold": None,
+                    "gap": None,
+                    "unit": "flag",
+                    "direction": "flag",
+                    "passed": False,
+                }
+            )
+    return checks
+
+
+def _min_check(code: str, label: str, actual: Any, threshold: Any, unit: str) -> dict[str, Any]:
+    actual_value = _number(actual) or 0.0
+    threshold_value = _number(threshold) or 0.0
+    return {
+        "code": code,
+        "label": label,
+        "actual": actual_value,
+        "threshold": threshold_value,
+        "gap": round(max(0.0, threshold_value - actual_value), 4),
+        "unit": unit,
+        "direction": "min",
+        "passed": actual_value >= threshold_value,
+    }
+
+
+def _max_check(code: str, label: str, actual: Any, threshold: Any, unit: str) -> dict[str, Any]:
+    actual_value = _number(actual) or 0.0
+    threshold_value = _number(threshold) or 0.0
+    return {
+        "code": code,
+        "label": label,
+        "actual": actual_value,
+        "threshold": threshold_value,
+        "gap": round(max(0.0, actual_value - threshold_value), 4),
+        "unit": unit,
+        "direction": "max",
+        "passed": actual_value <= threshold_value,
+    }
+
+
+def _blocker_label(blocker: str) -> str:
+    return {
+        "PROMOTION_CONTROLLER_DISABLED": "Promotion controller",
+        "KILL_SWITCH_ACTIVE": "Kill switch",
+        "CONSECUTIVE_ORDER_ERRORS": "Consecutive order errors",
+        "REAL_MICRO_REQUIRES_OPERATOR_APPROVAL": "Operator approval",
+    }.get(str(blocker or "").upper(), str(blocker or "Blocker"))
 
 
 def _confidence(metrics: dict[str, Any], blockers: list[str], warnings: list[str]) -> float:
@@ -588,16 +727,65 @@ def _metadata(row: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _realtime_bucket(row: dict[str, Any]) -> str:
-    metadata = _metadata(row)
-    for source in (row, metadata):
+def realtime_bucket_from_row(row: dict[str, Any]) -> str:
+    for source in _realtime_sources(row):
         value = source.get("realtime_reliability_bucket") or source.get("gateway_realtime_reliability_bucket")
         if value:
             return _upper(value)
         gate = source.get("realtime_reliability_gate")
         if isinstance(gate, dict) and gate.get("bucket"):
             return _upper(gate.get("bucket"))
+        reliability = source.get("realtime_reliability") or source.get("gateway_realtime_reliability")
+        if isinstance(reliability, dict) and reliability.get("bucket"):
+            return _upper(reliability.get("bucket"))
+        if source.get("bucket") and (
+            "score" in source
+            or "enabled" in source
+            or "status" in source
+            or "reasons" in source
+            or "missing_fields" in source
+        ):
+            return _upper(source.get("bucket"))
     return ""
+
+
+def _realtime_bucket(row: dict[str, Any]) -> str:
+    return realtime_bucket_from_row(row)
+
+
+def _realtime_sources(row: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(row, dict):
+        return []
+    queue: list[dict[str, Any]] = [row, _metadata(row)]
+    sources: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    nested_keys = (
+        "metadata",
+        "details",
+        "decision_details",
+        "gate_details",
+        "action_details",
+        "theme_lab_bridge",
+        "cancel_condition",
+        "request",
+        "realtime_reliability",
+        "gateway_realtime_reliability",
+        "realtime_reliability_gate",
+    )
+    while queue and len(sources) < 64:
+        source = queue.pop(0)
+        if not isinstance(source, dict):
+            continue
+        ident = id(source)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        sources.append(source)
+        for key in nested_keys:
+            child = source.get(key)
+            if isinstance(child, dict):
+                queue.append(child)
+    return sources
 
 
 def _tail_error_count(rows: list[dict[str, Any]]) -> int:

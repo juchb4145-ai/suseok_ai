@@ -1648,6 +1648,29 @@ def runtime_promotion_decision(
         close_database(db)
 
 
+@app.get("/api/runtime/promotion/matrix")
+def runtime_promotion_matrix(
+    trade_date: Optional[str] = None,
+    policy_id: str = DEFAULT_PROMOTION_POLICY_ID,
+    current_stage: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+    limit: Optional[int] = Query(None, ge=1, le=10000),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return _promotion_evidence_adapter(db).matrix(
+            policy_id=policy_id,
+            current_stage=current_stage,
+            trade_date=trade_date,
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+            limit=limit,
+        )
+    finally:
+        close_database(db)
+
+
 @app.get("/api/runtime/promotion/drilldown")
 def runtime_promotion_drilldown(
     trade_date: Optional[str] = None,

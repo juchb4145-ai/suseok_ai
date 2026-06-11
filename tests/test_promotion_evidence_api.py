@@ -39,6 +39,49 @@ def test_promotion_adapter_builds_evidence_from_runtime_database(tmp_path):
     assert payload["decision"]["metrics"]["realtime_high_ratio"] >= 0.80
 
 
+def test_promotion_adapter_recovers_bucket_from_joined_decision_details(tmp_path):
+    db_path = Path(tmp_path) / "trader.sqlite3"
+    db = TradingDatabase(str(db_path))
+    try:
+        events = []
+        outcomes = []
+        for idx in range(5):
+            decision_id = f"nested-high-{idx}"
+            event = _decision_event_for_date(
+                decision_id,
+                idx,
+                ["READY_PULLBACK"],
+                gate_status="READY",
+                trade_date="2026-06-03",
+            )
+            event["details"] = {
+                "gate_details": {
+                    "realtime_reliability_bucket": "HIGH",
+                    "realtime_reliability_score": 96.0,
+                }
+            }
+            outcome = _outcome_for_date(
+                decision_id,
+                idx,
+                "GOOD_READY",
+                bucket="",
+                current_return_pct=0.3,
+                trade_date="2026-06-03",
+            )
+            outcome["details"] = {"decision": {"reason_codes": ["READY_PULLBACK"]}}
+            events.append(event)
+            outcomes.append(outcome)
+        db.save_strategy_decision_events(events)
+        db.save_strategy_decision_outcomes(outcomes, force=True)
+
+        evidence = PromotionEvidenceAdapter(db).build_evidence(trade_date="2026-06-03")
+    finally:
+        db.close()
+
+    assert evidence.realtime_bucket_counts["HIGH"] == 5
+    assert "NO_DATA" not in evidence.realtime_bucket_counts
+
+
 def test_promotion_api_exposes_evidence_and_decision(tmp_path, monkeypatch):
     client, db_path = _client(tmp_path, monkeypatch)
     _seed_promotion_sample(db_path)
@@ -53,6 +96,15 @@ def test_promotion_api_exposes_evidence_and_decision(tmp_path, monkeypatch):
     assert decision["recommended_stage"] == "dry_run"
     assert decision["decision"]["eligible"] is True
     assert decision["decision"]["blockers"] == []
+    assert [row["stage"] for row in decision["stage_matrix"]["rows"]] == ["observe", "dry_run", "live_sim", "real_micro"]
+    assert decision["stage_matrix"]["rows"][0]["action"] == "PROMOTE"
+
+    matrix = client.get("/api/runtime/promotion/matrix?trade_date=2026-06-01&current_stage=observe").json()
+    assert matrix["stage_matrix"]["current_stage"] == "observe"
+    assert len(matrix["stage_matrix"]["rows"]) == 4
+    live_sim_row = {row["stage"]: row for row in matrix["stage_matrix"]["rows"]}["live_sim"]
+    assert "REAL_MICRO_REQUIRES_OPERATOR_APPROVAL" in live_sim_row["blockers"]
+    assert live_sim_row["failed_checks"]
 
 
 def test_promotion_drilldown_returns_blocker_evidence_rows(tmp_path, monkeypatch):
@@ -77,6 +129,65 @@ def test_promotion_drilldown_returns_blocker_evidence_rows(tmp_path, monkeypatch
     assert len(drilldown["items"]) == 5
     assert {item["realtime_bucket"] for item in drilldown["items"]} == {"LOW"}
     assert drilldown["items"][0]["source_type"] == "decision_outcome"
+
+
+def test_promotion_drilldown_groups_duplicate_symbol_rows(tmp_path):
+    db_path = Path(tmp_path) / "trader.sqlite3"
+    db = TradingDatabase(str(db_path))
+    try:
+        events = []
+        outcomes = []
+        for idx, (code, horizon) in enumerate(
+            [
+                ("000001", 60),
+                ("000001", 180),
+                ("000001", 300),
+                ("000002", 60),
+                ("000002", 180),
+            ]
+        ):
+            decision_id = f"group-low-{idx}"
+            event = _decision_event_for_date(
+                decision_id,
+                idx,
+                ["REALTIME_RELIABILITY_LOW"],
+                gate_status="READY",
+                trade_date="2026-06-04",
+            )
+            event["code"] = code
+            outcome = _outcome_for_date(
+                decision_id,
+                idx,
+                "GOOD_READY",
+                bucket="LOW",
+                current_return_pct=-0.2,
+                trade_date="2026-06-04",
+            )
+            outcome["code"] = code
+            outcome["horizon_sec"] = horizon
+            outcome["outcome_id"] = f"outcome:{decision_id}:{horizon}"
+            events.append(event)
+            outcomes.append(outcome)
+        db.save_strategy_decision_events(events)
+        db.save_strategy_decision_outcomes(outcomes, force=True)
+
+        drilldown = PromotionEvidenceAdapter(db).drilldown(
+            trade_date="2026-06-04",
+            current_stage="observe",
+            blocker="REALTIME_HIGH_RATIO_LOW",
+            detail_limit=5,
+        )
+    finally:
+        db.close()
+
+    section = drilldown["sections"][0]
+    assert section["summary"]["matching_count"] == 5
+    assert section["summary"]["group_count"] == 2
+    groups = {item["code"]: item for item in section["grouped_items"]}
+    assert groups["000001"]["row_count"] == 3
+    assert groups["000001"]["horizons_sec"] == [60, 180, 300]
+    assert groups["000001"]["bucket_counts"] == {"LOW": 3}
+    assert groups["000002"]["row_count"] == 2
 
 
 def _seed_promotion_sample(db_path: Path) -> None:

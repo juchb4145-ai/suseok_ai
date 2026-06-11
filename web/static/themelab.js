@@ -1766,6 +1766,7 @@ function renderPromotionDecisionPanel() {
         : "",
     ].filter(Boolean).join("");
   }
+  renderPromotionStageMatrix(payload);
   renderPromotionDrilldownPanel();
 }
 
@@ -1785,6 +1786,75 @@ function promotionWindowLabel(filters = {}) {
   const windowSec = Number(filters.window_sec || state.promotionWindowSec || 0);
   if (windowSec > 0) return `${Math.round(windowSec / 60)}m window`;
   return `trade_date ${filters.trade_date || "latest"}`;
+}
+
+function renderPromotionStageMatrix(payload = {}) {
+  const node = document.getElementById("promotion-stage-matrix");
+  if (!node) return;
+  const rows = (((payload || {}).stage_matrix || {}).rows || []);
+  if (!rows.length) {
+    node.innerHTML = `<div class="operator-alert-empty">Stage matrix 데이터 대기</div>`;
+    return;
+  }
+  node.innerHTML = rows.map((row) => promotionStageMatrixRow(row)).join("");
+}
+
+function promotionStageMatrixRow(row = {}) {
+  const failedChecks = row.failed_checks || [];
+  const blockers = row.blockers || [];
+  const metrics = row.metrics || {};
+  const transition = row.transition_type === "maintain"
+    ? `${String(row.current_stage || "-")} maintain`
+    : `${String(row.current_stage || "-")} to ${String(row.target_stage || "-")}`;
+  const outcomeTone = row.action === "PROMOTE"
+    ? "ready"
+    : row.action === "DEMOTE"
+      ? "blocked"
+      : blockers.length
+        ? "wait"
+        : "ready-small";
+  const requirementLines = failedChecks.length
+    ? failedChecks.slice(0, 4).map((check) => `<span>${escapeHtml(promotionRequirementText(check))}</span>`).join("")
+    : `<span>필수 조건 충족</span>`;
+  const blockerText = blockers.length ? blockers.slice(0, 3).join(", ") : "READY";
+  return `
+    <div class="promotion-stage-matrix-row ${outcomeTone}">
+      <div class="promotion-stage-matrix-main">
+        <strong>${escapeHtml(transition)}</strong>
+        ${badge(row.action || "NO_DATA", outcomeTone)}
+        <span>${promotionStageBadge(row.recommended_stage || "-")}</span>
+      </div>
+      <div class="promotion-stage-matrix-metrics">
+        <span>sample ${compactNumber(metrics.decision_count)}</span>
+        <span>days ${compactNumber(metrics.trade_day_count)}</span>
+        <span>orders ${compactNumber(metrics.order_count)}</span>
+        <span>rt ${ratio(metrics.realtime_high_ratio)}</span>
+        <span>avg ${pct(metrics.avg_return_pct)}</span>
+      </div>
+      <div class="promotion-stage-matrix-blockers">
+        <strong>${escapeHtml(blockerText)}</strong>
+        <span>confidence ${ratio(row.confidence)}</span>
+      </div>
+      <div class="promotion-stage-matrix-requirements">${requirementLines}</div>
+    </div>
+  `;
+}
+
+function promotionRequirementText(check = {}) {
+  const label = check.label || check.code || "Requirement";
+  const direction = check.direction === "max" ? "<=" : check.direction === "min" ? ">=" : "";
+  const actual = promotionRequirementValue(check.actual, check.unit);
+  const threshold = promotionRequirementValue(check.threshold, check.unit);
+  if (check.unit === "flag") return label;
+  return `${label} ${actual} / ${direction} ${threshold}`;
+}
+
+function promotionRequirementValue(value, unit) {
+  if (unit === "ratio") return ratio(value);
+  if (unit === "pct") return pct(value);
+  if (unit === "count") return compactNumber(value);
+  if (value == null || value === "") return "-";
+  return String(value);
 }
 
 function promotionMetric(label, value, formatter = compactNumber) {
@@ -1843,16 +1913,23 @@ function renderPromotionDrilldownPanel() {
     return;
   }
   const items = (state.promotionDrilldown || {}).items || section.items || [];
-  statusNode.textContent = `${compactNumber(summary.shown_count || items.length)} / ${compactNumber(summary.matching_count || items.length)} rows`;
+  const groups = (state.promotionDrilldown || {}).grouped_items || section.grouped_items || [];
+  const hasGroups = groups.length > 0;
+  statusNode.textContent = hasGroups
+    ? `${compactNumber(summary.shown_group_count || groups.length)} / ${compactNumber(summary.group_count || groups.length)} symbols · ${compactNumber(summary.matching_count || items.length)} rows`
+    : `${compactNumber(summary.shown_count || items.length)} / ${compactNumber(summary.matching_count || items.length)} rows`;
   summaryNode.innerHTML = [
     promotionDrilldownSummaryMetric("Metric", summary.metric_value, promotionMetricFormatter(selected)),
+    promotionDrilldownSummaryMetric("Symbols", summary.group_count, compactNumber),
     promotionDrilldownSummaryMetric("Outcomes", summary.outcome_count, compactNumber),
     promotionDrilldownSummaryMetric("Intents", summary.intent_count, compactNumber),
     promotionDrilldownSummaryMetric("LiveSim", summary.live_order_count, compactNumber),
     `<div class="promotion-drilldown-explain">${escapeHtml(summary.explanation_ko || "관련 evidence rows를 확인합니다.")}</div>`,
   ].join("");
-  listNode.innerHTML = items.length
-    ? items.map((item) => promotionDrilldownRow(item)).join("")
+  listNode.innerHTML = hasGroups
+    ? groups.map((group) => promotionDrilldownGroup(group)).join("")
+    : items.length
+      ? items.map((item) => promotionDrilldownRow(item)).join("")
     : `<div class="operator-alert-empty">선택한 blocker에 매칭되는 evidence row가 없습니다.</div>`;
 }
 
@@ -1889,6 +1966,57 @@ function promotionDrilldownRow(item = {}) {
       <div class="operator-event-meta">${escapeHtml(reasons || item.summary || "-")}</div>
     </article>
   `;
+}
+
+function promotionDrilldownGroup(group = {}) {
+  const code = [group.code, group.name].filter(Boolean).join(" ");
+  const label = group.representative_label || topCountLabel(group.outcome_counts) || "-";
+  const horizons = (group.horizons_sec || []).slice(0, 6).map((item) => `${item}s`).join(", ");
+  const bucketCounts = countSummary(group.bucket_counts);
+  const outcomeCounts = countSummary(group.outcome_counts);
+  const returns = `ret ${pct(group.current_return_pct)} / mfe ${pct(group.max_return_pct)} / mae ${pct(group.max_drawdown_pct)}`;
+  const rawItems = (group.items || []).slice(0, 3);
+  return `
+    <article class="promotion-drilldown-row promotion-drilldown-group">
+      <div class="promotion-drilldown-main">
+        <strong>${escapeHtml(code || group.key || "-")}</strong>
+        ${badge(group.realtime_bucket || "NO_DATA")}
+        ${badge(`${compactNumber(group.row_count || 0)} rows`)}
+        ${badge(label)}
+      </div>
+      <div class="operator-event-meta">${escapeHtml(group.theme_name || "-")} · ${escapeHtml(formatEventTime(group.latest_event_at))} · ${escapeHtml(returns)}</div>
+      <div class="operator-event-meta">bucket ${escapeHtml(bucketCounts || "-")} · outcome ${escapeHtml(outcomeCounts || "-")}${horizons ? ` · horizon ${escapeHtml(horizons)}` : ""}</div>
+      ${rawItems.length ? `<div class="promotion-drilldown-subrows">${rawItems.map((item) => promotionDrilldownSubrow(item)).join("")}</div>` : ""}
+    </article>
+  `;
+}
+
+function promotionDrilldownSubrow(item = {}) {
+  const horizon = item.horizon_sec ? `${item.horizon_sec}s` : "";
+  const label = item.outcome_label || item.status || item.reason || "-";
+  return `
+    <div class="promotion-drilldown-subrow">
+      <span>${escapeHtml([item.source_type, horizon].filter(Boolean).join(" · ") || "-")}</span>
+      <strong>${escapeHtml(label)}</strong>
+      <span>${escapeHtml(item.summary || formatEventTime(item.event_at) || "-")}</span>
+    </div>
+  `;
+}
+
+function countSummary(counts = {}) {
+  return Object.entries(counts || {})
+    .filter(([, value]) => Number(value || 0) > 0)
+    .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0) || String(a[0]).localeCompare(String(b[0])))
+    .slice(0, 4)
+    .map(([key, value]) => `${key}:${compactNumber(value)}`)
+    .join(", ");
+}
+
+function topCountLabel(counts = {}) {
+  const first = Object.entries(counts || {})
+    .filter(([, value]) => Number(value || 0) > 0)
+    .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0) || String(a[0]).localeCompare(String(b[0])))[0];
+  return first ? first[0] : "";
 }
 
 function promotionStageBadge(stage) {

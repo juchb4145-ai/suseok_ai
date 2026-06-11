@@ -643,7 +643,8 @@ def _outcome_details(
     *,
     label: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    return {
+    realtime_details = _realtime_details_from_decision(decision)
+    payload = {
         "decision": {
             "gate_status": decision.get("gate_status"),
             "action_type": decision.get("action_type"),
@@ -666,6 +667,87 @@ def _outcome_details(
         },
         "label": label or {},
     }
+    if realtime_details:
+        payload.update(realtime_details)
+    return payload
+
+
+_REALTIME_DETAIL_KEYS = (
+    "realtime_reliability_gate",
+    "realtime_reliability_gate_enabled",
+    "realtime_reliability_gate_present",
+    "realtime_reliability_gate_status",
+    "realtime_reliability_gate_reason",
+    "realtime_reliability_score",
+    "realtime_reliability_bucket",
+    "realtime_reliability_reasons",
+    "realtime_reliability_missing_fields",
+    "realtime_reliability_field_score",
+    "realtime_reliability_penalty",
+    "realtime_transport_latency_ms",
+    "realtime_transport_latency_bucket",
+    "realtime_reliability_position_size_multiplier",
+    "gateway_realtime_reliability",
+    "gateway_realtime_reliability_score",
+    "gateway_realtime_reliability_bucket",
+)
+
+
+def _realtime_details_from_decision(decision: dict[str, Any]) -> dict[str, Any]:
+    for source in _realtime_detail_sources(decision):
+        details = {
+            key: source.get(key)
+            for key in _REALTIME_DETAIL_KEYS
+            if source.get(key) not in (None, "", [], {})
+        }
+        reliability = source.get("realtime_reliability") or source.get("gateway_realtime_reliability")
+        if isinstance(reliability, dict) and reliability.get("bucket"):
+            details.setdefault("realtime_reliability_bucket", reliability.get("bucket"))
+            details.setdefault("realtime_reliability_score", reliability.get("score"))
+            details.setdefault("realtime_reliability", reliability)
+        gate = source.get("realtime_reliability_gate")
+        if isinstance(gate, dict) and gate.get("bucket"):
+            details.setdefault("realtime_reliability_bucket", gate.get("bucket"))
+            details.setdefault("realtime_reliability_gate", gate)
+        if details.get("gateway_realtime_reliability_bucket") and not details.get("realtime_reliability_bucket"):
+            details["realtime_reliability_bucket"] = details["gateway_realtime_reliability_bucket"]
+        if details:
+            return details
+    return {}
+
+
+def _realtime_detail_sources(decision: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(decision, dict):
+        return []
+    queue: list[dict[str, Any]] = [decision]
+    sources: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    nested_keys = (
+        "details",
+        "gate_details",
+        "action_details",
+        "metadata",
+        "theme_lab_bridge",
+        "cancel_condition",
+        "request",
+        "realtime_reliability",
+        "gateway_realtime_reliability",
+        "realtime_reliability_gate",
+    )
+    while queue and len(sources) < 64:
+        source = queue.pop(0)
+        if not isinstance(source, dict):
+            continue
+        ident = id(source)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        sources.append(source)
+        for key in nested_keys:
+            child = source.get(key)
+            if isinstance(child, dict):
+                queue.append(child)
+    return sources
 
 
 def _label(outcome_label: str, outcome_reason: str, confidence: float) -> dict[str, Any]:

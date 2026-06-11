@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any, Optional
 
 from storage.db import TradingDatabase
@@ -16,11 +17,13 @@ from trading_app.promotion_controller import (
     build_promotion_evidence,
     config_from_settings,
     normalize_stage,
+    realtime_bucket_from_row,
 )
 
 
 DEFAULT_PROMOTION_POLICY_ID = "theme_lab_realtime_reliability_gate"
 MAX_PROMOTION_EVIDENCE_LIMIT = 10000
+MAX_GROUP_PREVIEW_ITEMS = 4
 
 
 class PromotionEvidenceAdapter:
@@ -94,6 +97,7 @@ class PromotionEvidenceAdapter:
             limit=limit,
         )
         decision = self.controller.evaluate(evidence)
+        stage_matrix = self.controller.stage_matrix(evidence)
         return {
             "policy_id": evidence.policy_id,
             "current_stage": evidence.current_stage,
@@ -103,9 +107,43 @@ class PromotionEvidenceAdapter:
             "eligible": decision.eligible,
             "confidence": decision.confidence,
             "decision": decision.to_dict(),
+            "stage_matrix": stage_matrix,
             "evidence": evidence.to_dict(),
             "config": self.config.to_dict(),
             "filters": filters,
+        }
+
+    def matrix(
+        self,
+        *,
+        policy_id: str = DEFAULT_PROMOTION_POLICY_ID,
+        current_stage: Optional[str] = None,
+        trade_date: Optional[str] = None,
+        window_sec: Optional[int] = None,
+        horizon_sec: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> dict[str, Any]:
+        evidence = self.build_evidence(
+            policy_id=policy_id,
+            current_stage=current_stage,
+            trade_date=trade_date,
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+            limit=limit,
+        )
+        return {
+            "policy_id": evidence.policy_id,
+            "stage_matrix": self.controller.stage_matrix(evidence),
+            "evidence": evidence.to_dict(),
+            "config": self.config.to_dict(),
+            "filters": self.filters(
+                policy_id=policy_id,
+                current_stage=current_stage,
+                trade_date=trade_date,
+                window_sec=window_sec,
+                horizon_sec=horizon_sec,
+                limit=limit,
+            ),
         }
 
     def drilldown(
@@ -148,6 +186,7 @@ class PromotionEvidenceAdapter:
             "decision": decision_payload.get("decision", {}),
             "evidence": decision_payload.get("evidence", {}),
             "sections": sections,
+            "grouped_items": sections[0]["grouped_items"] if sections else [],
             "items": sections[0]["items"] if sections else [],
             "filters": {
                 **dict(decision_payload.get("filters") or {}),
@@ -234,9 +273,9 @@ class PromotionEvidenceAdapter:
         live_orders = list(rows.get("live_orders") or [])
         items: list[dict[str, Any]]
         if key in {"REALTIME_HIGH_RATIO_LOW"}:
-            items = [_outcome_item(row) for row in outcomes if _realtime_bucket(row) and _realtime_bucket(row) != "HIGH"]
-            items += [_intent_item(row) for row in intents if _realtime_bucket(row) and _realtime_bucket(row) != "HIGH"]
-            items += [_live_order_item(row) for row in live_orders if _realtime_bucket(row) and _realtime_bucket(row) != "HIGH"]
+            items = [_outcome_item(row) for row in outcomes if (_realtime_bucket(row) or "NO_DATA") != "HIGH"]
+            items += [_intent_item(row) for row in intents if (_realtime_bucket(row) or "NO_DATA") != "HIGH"]
+            items += [_live_order_item(row) for row in live_orders if (_realtime_bucket(row) or "NO_DATA") != "HIGH"]
         elif key in {"EXPECTANCY_BELOW_THRESHOLD"}:
             sorted_rows = sorted(outcomes, key=lambda row: _number(row.get("current_return_pct"), row.get("max_return_pct")) or 0.0)
             items = [_outcome_item(row) for row in sorted_rows]
@@ -269,6 +308,8 @@ class PromotionEvidenceAdapter:
         if not items and key != "NO_BLOCKER":
             items = [_outcome_item(row) for row in outcomes[:detail_limit]]
         limited = items[:detail_limit]
+        groups = _group_drilldown_items(items)
+        limited_groups = groups[:detail_limit]
         metrics = dict(decision_payload.get("decision", {}).get("metrics") or {})
         return {
             "blocker": key,
@@ -276,12 +317,15 @@ class PromotionEvidenceAdapter:
             "summary": {
                 "matching_count": len(items),
                 "shown_count": len(limited),
+                "group_count": len(groups),
+                "shown_group_count": len(limited_groups),
                 "outcome_count": len(outcomes),
                 "intent_count": len(intents),
                 "live_order_count": len(live_orders),
                 "metric_value": _blocker_metric_value(key, metrics),
                 "explanation_ko": _blocker_explanation(key),
             },
+            "grouped_items": limited_groups,
             "items": limited,
         }
 
@@ -299,6 +343,7 @@ def _outcome_item(row: dict[str, Any]) -> dict[str, Any]:
         "gate_status": str(row.get("gate_status") or ""),
         "action_type": str(row.get("action_type") or ""),
         "outcome_label": str(row.get("outcome_label") or ""),
+        "horizon_sec": _int_or_none(row.get("horizon_sec")),
         "current_return_pct": _number(row.get("current_return_pct"), row.get("return_pct")),
         "max_return_pct": _number(row.get("max_return_pct")),
         "max_drawdown_pct": _number(row.get("max_drawdown_pct")),
@@ -343,6 +388,126 @@ def _live_order_item(row: dict[str, Any]) -> dict[str, Any]:
         "reason_codes": _reason_codes(row)[:8],
         "summary": str(row.get("broker_response_code") or row.get("broker_response_message") or ""),
     }
+
+
+def _group_drilldown_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for item in items:
+        key = _group_key(item)
+        if key not in groups:
+            groups[key] = _new_group(key, item)
+            order.append(key)
+        _add_group_item(groups[key], item)
+    return [_finalize_group(groups[key]) for key in order]
+
+
+def _group_key(item: dict[str, Any]) -> str:
+    code = str(item.get("code") or "").strip()
+    if code:
+        return f"code:{code}"
+    return f"{item.get('source_type') or 'row'}:{item.get('id') or item.get('decision_id') or len(str(item))}"
+
+
+def _new_group(key: str, item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "key": key,
+        "code": str(item.get("code") or ""),
+        "name": str(item.get("name") or ""),
+        "theme_name": str(item.get("theme_name") or ""),
+        "row_count": 0,
+        "bucket_counts": Counter(),
+        "outcome_counts": Counter(),
+        "source_type_counts": Counter(),
+        "action_type_counts": Counter(),
+        "gate_status_counts": Counter(),
+        "horizons_sec": [],
+        "latest_event_at": "",
+        "latest_summary": "",
+        "current_return_pct": None,
+        "max_return_pct": None,
+        "max_drawdown_pct": None,
+        "representative": dict(item),
+        "items": [],
+    }
+
+
+def _add_group_item(group: dict[str, Any], item: dict[str, Any]) -> None:
+    group["row_count"] += 1
+    bucket = str(item.get("realtime_bucket") or "NO_DATA").upper()
+    group["bucket_counts"].update([bucket])
+    for counter_key, item_key in (
+        ("outcome_counts", "outcome_label"),
+        ("source_type_counts", "source_type"),
+        ("action_type_counts", "action_type"),
+        ("gate_status_counts", "gate_status"),
+    ):
+        value = str(item.get(item_key) or "").strip()
+        if value:
+            group[counter_key].update([value])
+    horizon = _int_or_none(item.get("horizon_sec"))
+    if horizon is not None and horizon not in group["horizons_sec"]:
+        group["horizons_sec"].append(horizon)
+    event_at = str(item.get("event_at") or "")
+    if event_at >= str(group.get("latest_event_at") or ""):
+        group["latest_event_at"] = event_at
+        group["latest_summary"] = str(item.get("summary") or "")
+    current_return = _number(item.get("current_return_pct"))
+    if current_return is not None and (
+        group.get("current_return_pct") is None or current_return < float(group.get("current_return_pct") or 0.0)
+    ):
+        group["current_return_pct"] = current_return
+    max_return = _number(item.get("max_return_pct"))
+    if max_return is not None and (
+        group.get("max_return_pct") is None or max_return > float(group.get("max_return_pct") or 0.0)
+    ):
+        group["max_return_pct"] = max_return
+    max_drawdown = _number(item.get("max_drawdown_pct"))
+    if max_drawdown is not None and (
+        group.get("max_drawdown_pct") is None or max_drawdown < float(group.get("max_drawdown_pct") or 0.0)
+    ):
+        group["max_drawdown_pct"] = max_drawdown
+    if len(group["items"]) < MAX_GROUP_PREVIEW_ITEMS:
+        group["items"].append(dict(item))
+
+
+def _finalize_group(group: dict[str, Any]) -> dict[str, Any]:
+    bucket_counts = dict(group["bucket_counts"])
+    outcome_counts = dict(group["outcome_counts"])
+    return {
+        "key": group["key"],
+        "code": group["code"],
+        "name": group["name"],
+        "theme_name": group["theme_name"],
+        "row_count": group["row_count"],
+        "realtime_bucket": _group_bucket(bucket_counts),
+        "bucket_counts": bucket_counts,
+        "outcome_counts": outcome_counts,
+        "source_type_counts": dict(group["source_type_counts"]),
+        "action_type_counts": dict(group["action_type_counts"]),
+        "gate_status_counts": dict(group["gate_status_counts"]),
+        "horizons_sec": sorted(group["horizons_sec"]),
+        "latest_event_at": group["latest_event_at"],
+        "latest_summary": group["latest_summary"],
+        "representative_label": _top_counter_key(outcome_counts) or str(group["representative"].get("status") or ""),
+        "current_return_pct": group["current_return_pct"],
+        "max_return_pct": group["max_return_pct"],
+        "max_drawdown_pct": group["max_drawdown_pct"],
+        "items": group["items"],
+    }
+
+
+def _group_bucket(bucket_counts: dict[str, int]) -> str:
+    for bucket in ("BROKEN", "LOW", "NO_DATA", "MEDIUM", "HIGH"):
+        if int(bucket_counts.get(bucket) or 0) > 0:
+            return bucket
+    return "NO_DATA"
+
+
+def _top_counter_key(counts: dict[str, int]) -> str:
+    if not counts:
+        return ""
+    return sorted(counts.items(), key=lambda item: (-int(item[1] or 0), item[0]))[0][0]
 
 
 def _blocker_title(blocker: str) -> str:
@@ -404,15 +569,7 @@ def _metadata(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _realtime_bucket(row: dict[str, Any]) -> str:
-    metadata = _metadata(row)
-    for source in (row, metadata):
-        value = source.get("realtime_reliability_bucket") or source.get("gateway_realtime_reliability_bucket")
-        if value:
-            return _upper(value)
-        gate = source.get("realtime_reliability_gate")
-        if isinstance(gate, dict) and gate.get("bucket"):
-            return _upper(gate.get("bucket"))
-    return ""
+    return realtime_bucket_from_row(row)
 
 
 def _reason_codes(row: dict[str, Any]) -> list[str]:
@@ -449,6 +606,15 @@ def _number(*values: Any) -> float | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _upper(value: Any) -> str:
