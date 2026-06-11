@@ -73,6 +73,21 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one('[data-journal-filter="SYMBOL"]') is not None
     assert soup.select_one("#cockpit-market-sides") is not None
     assert soup.select_one("#cockpit-live-readiness") is not None
+    assert soup.select_one("#promotion-cockpit") is not None
+    assert soup.select_one("#promotion-window-controls") is not None
+    assert soup.select_one('[data-promotion-window="300"]') is not None
+    assert soup.select_one("#promotion-decision-refresh") is not None
+    assert soup.select_one("#promotion-action-status") is not None
+    assert soup.select_one("#promotion-confidence") is not None
+    assert soup.select_one("#promotion-stage-lines") is not None
+    assert soup.select_one("#promotion-metric-lines") is not None
+    assert soup.select_one("#promotion-blocker-list") is not None
+    assert soup.select_one("#promotion-rollout-lines") is not None
+    assert soup.select_one("#promotion-drilldown-panel") is not None
+    assert soup.select_one("#promotion-drilldown-title") is not None
+    assert soup.select_one("#promotion-drilldown-status") is not None
+    assert soup.select_one("#promotion-drilldown-summary") is not None
+    assert soup.select_one("#promotion-drilldown-list") is not None
     assert soup.select_one("#shadow-ab-status") is not None
     assert soup.select_one("#shadow-ab-best") is not None
     assert soup.select_one("#shadow-ab-summary") is not None
@@ -121,6 +136,20 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "renderShadowAb" in js
     assert "matchesFilters" in js
     assert "renderCockpit" in js
+    assert "renderPromotionDecisionPanel" in js
+    assert "fetchPromotionDecision" in js
+    assert "fetchPromotionDrilldown" in js
+    assert "renderPromotionDrilldownPanel" in js
+    assert "initPromotionCockpit" in js
+    assert "/api/runtime/promotion/decision" in js
+    assert "/api/runtime/promotion/drilldown" in js
+    assert "data-promotion-blocker" in js
+    assert "promotionWindowSec" in js
+    assert "promotion-decision-grid" in css
+    assert "promotion-metric-grid" in css
+    assert "promotion-reason-row" in css
+    assert "promotion-drilldown-panel" in css
+    assert "promotion-drilldown-row" in css
     assert "previousSnapshot" in js
     assert "operatorEvents" in js
     assert "acknowledgedEventIds" in js

@@ -138,6 +138,22 @@ class PromotionControllerConfig:
         return payload
 
 
+def config_from_settings(settings: Any) -> PromotionControllerConfig:
+    raw = _settings_mapping(settings, "promotion_controller")
+    default = PromotionControllerConfig()
+    return PromotionControllerConfig(
+        enabled=_bool_value(raw.get("enabled"), default.enabled),
+        rolling_decision_limit=max(1, _int_value(raw.get("rolling_decision_limit"), default.rolling_decision_limit)),
+        default_current_stage=normalize_stage(raw.get("default_current_stage") or default.default_current_stage),
+        dry_run=_thresholds_from_settings(raw.get("dry_run"), default.dry_run),
+        live_sim=_thresholds_from_settings(raw.get("live_sim"), default.live_sim),
+        real_micro=_thresholds_from_settings(raw.get("real_micro"), default.real_micro),
+        kill_switch_active=_bool_value(raw.get("kill_switch_active"), default.kill_switch_active),
+        max_consecutive_error_count=max(0, _int_value(raw.get("max_consecutive_error_count"), default.max_consecutive_error_count)),
+        allow_real_micro=_bool_value(raw.get("allow_real_micro"), default.allow_real_micro),
+    )
+
+
 @dataclass(frozen=True)
 class PromotionEvidence:
     policy_id: str
@@ -349,7 +365,7 @@ def build_promotion_evidence(
         gate_reason_counts=dict(reason_counts),
         order_error_count=order_error_count + live_error_count,
         duplicate_order_count=duplicate_order_count,
-        consecutive_error_count=_tail_error_count(intents + live_orders),
+        consecutive_error_count=_tail_error_count(_chronological_order_rows(intents + live_orders)),
         realtime_low_missed_count=low_missed,
         source_ids=list(dict.fromkeys(source_ids))[:50],
         generated_at=datetime.now().isoformat(timespec="seconds"),
@@ -595,6 +611,23 @@ def _tail_error_count(rows: list[dict[str, Any]]) -> int:
     return count
 
 
+def _chronological_order_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def key(row: dict[str, Any]) -> tuple[str, str]:
+        timestamp = (
+            row.get("updated_at")
+            or row.get("created_at")
+            or row.get("submitted_at")
+            or row.get("accepted_at")
+            or row.get("rejected_at")
+            or row.get("first_fill_at")
+            or row.get("last_fill_at")
+            or ""
+        )
+        return (str(timestamp), str(row.get("intent_id") or row.get("order_intent_id") or row.get("id") or ""))
+
+    return sorted(rows, key=key)
+
+
 def _number(*values: Any) -> float | None:
     for value in values:
         if value in (None, ""):
@@ -614,3 +647,65 @@ def _bool(value: Any) -> bool:
 
 def _upper(value: Any) -> str:
     return str(value or "").strip().upper()
+
+
+def _settings_mapping(settings: Any, key: str) -> dict[str, Any]:
+    if settings is None:
+        return {}
+    if isinstance(settings, dict):
+        value = settings.get(key, {})
+        return dict(value or {}) if isinstance(value, dict) else {}
+    getter = getattr(settings, "value", None)
+    if callable(getter):
+        value = getter(key, {})
+        return dict(value or {}) if isinstance(value, dict) else {}
+    value = getattr(settings, key, {})
+    return dict(value or {}) if isinstance(value, dict) else {}
+
+
+def _thresholds_from_settings(raw: Any, default: PromotionThresholds) -> PromotionThresholds:
+    payload = dict(raw or {}) if isinstance(raw, dict) else {}
+    values = default.to_dict()
+    for key, default_value in list(values.items()):
+        if key not in payload:
+            continue
+        raw_value = payload.get(key)
+        if isinstance(default_value, int) and not isinstance(default_value, bool):
+            values[key] = max(0, _int_value(raw_value, default_value))
+        elif isinstance(default_value, float):
+            values[key] = max(0.0, _float_value(raw_value, default_value))
+    return PromotionThresholds(**values)
+
+
+def _bool_value(value: Any, default: bool) -> bool:
+    if value in (None, ""):
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _int_value(value: Any, default: int) -> int:
+    if value in (None, ""):
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return int(default)
+
+
+def _float_value(value: Any, default: float) -> float:
+    if value in (None, ""):
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)

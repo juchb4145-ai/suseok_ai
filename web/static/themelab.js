@@ -35,6 +35,15 @@
   postmarketReviewSelectedItem: null,
   postmarketReviewLoading: false,
   postmarketReviewLastGeneratedAt: "",
+  promotionDecision: null,
+  promotionDecisionLoading: false,
+  promotionDecisionError: "",
+  promotionDecisionLastFetchedAt: "",
+  promotionWindowSec: 0,
+  promotionSelectedBlocker: "",
+  promotionDrilldown: null,
+  promotionDrilldownLoading: false,
+  promotionDrilldownError: "",
   naverThemeSyncBusy: false,
   alertFilters: {
     category: "ALL",
@@ -87,6 +96,11 @@ const statusClass = {
   BROKEN: "blocked",
   WARNING: "warning",
   OK: "ready",
+  PROMOTE: "ready",
+  HOLD: "wait",
+  DEMOTE: "blocked",
+  BLOCK: "blocked",
+  LOADING: "observe",
   PROMISING_SHADOW: "ready",
   OBSERVE_MORE: "ready-small",
   INSUFFICIENT_SAMPLE: "warning",
@@ -1452,6 +1466,29 @@ async function initPostmarketReviewPanel() {
   }
 }
 
+function initPromotionCockpit() {
+  renderPromotionDecisionPanel();
+  document.getElementById("promotion-window-controls")?.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-promotion-window]");
+    if (!button) return;
+    state.promotionWindowSec = Number(button.dataset.promotionWindow || 0);
+    state.promotionDrilldown = null;
+    state.promotionDrilldownError = "";
+    renderPromotionWindowButtons();
+    fetchPromotionDecision(state.snapshot || {}).catch(() => {});
+  });
+  document.getElementById("promotion-decision-refresh")?.addEventListener("click", () => {
+    fetchPromotionDecision(state.snapshot || {}).catch(() => {});
+  });
+  document.getElementById("promotion-blocker-list")?.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-promotion-blocker]");
+    if (!button) return;
+    state.promotionSelectedBlocker = button.dataset.promotionBlocker || "";
+    renderPromotionDecisionPanel();
+    fetchPromotionDrilldown(state.snapshot || {}).catch(() => {});
+  });
+}
+
 function renderRunbook(context) {
   const runbook = context && context.steps_ko ? context : runbookForStatus(String((context || {}).event_type || context || "GENERAL"));
   state.runbook = runbook;
@@ -1652,6 +1689,295 @@ function renderCockpit(snapshot) {
     countLine("추격 대기", summary.late_chase_wait_count),
     countLine("추격 차단", summary.chase_risk_blocked_count),
   ].join("");
+}
+
+function renderPromotionDecisionPanel() {
+  const panel = document.getElementById("promotion-cockpit");
+  if (!panel) return;
+  const payload = state.promotionDecision || {};
+  const decision = payload.decision || {};
+  const evidence = payload.evidence || {};
+  const metrics = decision.metrics || {};
+  const filters = payload.filters || {};
+  const rollout = decision.rollout_plan || {};
+  const blockers = decision.blockers || [];
+  const warnings = decision.warnings || [];
+  const hasDecision = Boolean(decision.action || payload.action);
+  const status = state.promotionDecisionError
+    ? "ERROR"
+    : state.promotionDecisionLoading && !hasDecision
+      ? "LOADING"
+      : decision.action || payload.action || "NO_DATA";
+
+  setBadge("promotion-action-status", status);
+  text("promotion-confidence", hasDecision ? `confidence ${ratio(decision.confidence ?? payload.confidence)}` : "confidence -");
+  text("promotion-decision-message", promotionDecisionMessage(payload, decision, filters));
+  renderPromotionWindowButtons();
+
+  const currentStage = decision.current_stage || payload.current_stage || evidence.current_stage || "-";
+  const targetStage = decision.target_stage || payload.target_stage || "-";
+  const recommendedStage = decision.recommended_stage || payload.recommended_stage || "-";
+  const stageNode = document.getElementById("promotion-stage-lines");
+  if (stageNode) {
+    stageNode.innerHTML = [
+      `<div class="cockpit-line"><strong>Current</strong>${promotionStageBadge(currentStage)}<span>${escapeHtml(currentStage)}</span></div>`,
+      `<div class="cockpit-line"><strong>Target</strong>${promotionStageBadge(targetStage)}<span>${escapeHtml(targetStage)}</span></div>`,
+      `<div class="cockpit-line"><strong>Recommend</strong>${promotionStageBadge(recommendedStage)}<span>${escapeHtml(recommendedStage)}</span></div>`,
+      `<div class="cockpit-line"><strong>Evidence</strong><span>${escapeHtml(promotionWindowLabel(filters))}</span></div>`,
+    ].join("");
+  }
+
+  const metricNode = document.getElementById("promotion-metric-lines");
+  if (metricNode) {
+    metricNode.innerHTML = [
+      promotionMetric("Decisions", metrics.decision_count ?? evidence.decision_count, compactNumber),
+      promotionMetric("Trade Days", metrics.trade_day_count ?? evidence.trade_day_count, compactNumber),
+      promotionMetric("RT High", metrics.realtime_high_ratio, ratio),
+      promotionMetric("Opp Loss", metrics.opportunity_loss_rate, ratio),
+      promotionMetric("False Pos", metrics.false_positive_rate, ratio),
+      promotionMetric("Order Err", metrics.order_error_rate, ratio),
+      promotionMetric("Avg Return", metrics.avg_return_pct ?? evidence.avg_return_pct, pct),
+      promotionMetric("Low Missed", metrics.realtime_low_missed_count ?? evidence.realtime_low_missed_count, compactNumber),
+    ].join("");
+  }
+
+  const blockerNode = document.getElementById("promotion-blocker-list");
+  if (blockerNode) {
+    const rows = [
+      ...blockers.slice(0, 5).map((item) => promotionReasonRow(item, "blocked")),
+      ...warnings.slice(0, 3).map((item) => promotionReasonRow(item, "warning")),
+    ];
+    blockerNode.innerHTML = rows.length
+      ? rows.join("")
+      : hasDecision
+        ? `<div class="promotion-reason-row ready"><strong>READY</strong><span>승급 조건 충족</span></div>`
+        : `<div class="operator-alert-empty">판단 데이터 대기</div>`;
+  }
+
+  const rolloutNode = document.getElementById("promotion-rollout-lines");
+  if (rolloutNode) {
+    rolloutNode.innerHTML = [
+      `<div class="cockpit-line"><strong>Mode</strong><span>${escapeHtml(rollout.mode || "-")}</span></div>`,
+      `<div class="cockpit-line"><strong>Notional</strong><span>${money(rollout.order_notional_krw)}</span></div>`,
+      `<div class="cockpit-line"><strong>Symbols</strong><span>${compactNumber(rollout.max_symbols)}</span></div>`,
+      `<div class="cockpit-line"><strong>Manual</strong>${boolBadge(rollout.requires_operator_approval, "필요", "불필요")}</div>`,
+      state.promotionDecisionLastFetchedAt
+        ? `<div class="cockpit-line"><strong>Fetched</strong><span>${escapeHtml(formatEventTime(state.promotionDecisionLastFetchedAt))}</span></div>`
+        : "",
+    ].filter(Boolean).join("");
+  }
+  renderPromotionDrilldownPanel();
+}
+
+function promotionDecisionMessage(payload = {}, decision = {}, filters = {}) {
+  if (state.promotionDecisionError) return `Promotion API 실패: ${state.promotionDecisionError}`;
+  if (state.promotionDecisionLoading && !(decision.action || payload.action)) return "승급 판단 갱신 중";
+  const action = decision.action || payload.action;
+  if (!action) return "승급 판단 대기";
+  const current = decision.current_stage || payload.current_stage || "-";
+  const recommended = decision.recommended_stage || payload.recommended_stage || "-";
+  const blockers = decision.blockers || [];
+  const blockerText = blockers.length ? ` / blocker ${blockers.slice(0, 2).join(", ")}` : "";
+  return `${action}: ${current} → ${recommended} / ${promotionWindowLabel(filters)}${blockerText}`;
+}
+
+function promotionWindowLabel(filters = {}) {
+  const windowSec = Number(filters.window_sec || state.promotionWindowSec || 0);
+  if (windowSec > 0) return `${Math.round(windowSec / 60)}m window`;
+  return `trade_date ${filters.trade_date || "latest"}`;
+}
+
+function promotionMetric(label, value, formatter = compactNumber) {
+  return `
+    <div class="promotion-metric">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(formatter(value))}</strong>
+    </div>
+  `;
+}
+
+function promotionReasonRow(reason, tone = "warning") {
+  const selected = state.promotionSelectedBlocker === reason;
+  if (tone === "blocked") {
+    return `
+      <button type="button" class="promotion-reason-row blocked ${selected ? "selected" : ""}" data-promotion-blocker="${escapeHtml(reason)}" aria-pressed="${selected ? "true" : "false"}">
+        <strong>BLOCK</strong>
+        <span>${escapeHtml(reason)}</span>
+      </button>
+    `;
+  }
+  return `
+    <div class="promotion-reason-row ${escapeHtml(tone)}">
+      <strong>${escapeHtml(tone === "blocked" ? "BLOCK" : "WARN")}</strong>
+      <span>${escapeHtml(reason)}</span>
+    </div>
+  `;
+}
+
+function renderPromotionDrilldownPanel() {
+  const titleNode = document.getElementById("promotion-drilldown-title");
+  const statusNode = document.getElementById("promotion-drilldown-status");
+  const summaryNode = document.getElementById("promotion-drilldown-summary");
+  const listNode = document.getElementById("promotion-drilldown-list");
+  if (!titleNode || !statusNode || !summaryNode || !listNode) return;
+  const selected = state.promotionSelectedBlocker;
+  const section = ((state.promotionDrilldown || {}).sections || [])[0] || {};
+  const summary = section.summary || {};
+  titleNode.textContent = selected ? `Blocker Drilldown · ${selected}` : "Blocker Drilldown";
+  if (state.promotionDrilldownError) {
+    statusNode.textContent = "load failed";
+    summaryNode.innerHTML = `<div class="operator-alert-empty">Promotion drilldown API 실패: ${escapeHtml(state.promotionDrilldownError)}</div>`;
+    listNode.innerHTML = "";
+    return;
+  }
+  if (state.promotionDrilldownLoading) {
+    statusNode.textContent = "loading";
+    summaryNode.innerHTML = `<div class="operator-alert-empty">관련 evidence 조회 중</div>`;
+    listNode.innerHTML = "";
+    return;
+  }
+  if (!selected) {
+    statusNode.textContent = "select blocker";
+    summaryNode.innerHTML = `<div class="operator-alert-empty">blocker를 선택하면 관련 decision/outcome/order evidence가 표시됩니다.</div>`;
+    listNode.innerHTML = "";
+    return;
+  }
+  const items = (state.promotionDrilldown || {}).items || section.items || [];
+  statusNode.textContent = `${compactNumber(summary.shown_count || items.length)} / ${compactNumber(summary.matching_count || items.length)} rows`;
+  summaryNode.innerHTML = [
+    promotionDrilldownSummaryMetric("Metric", summary.metric_value, promotionMetricFormatter(selected)),
+    promotionDrilldownSummaryMetric("Outcomes", summary.outcome_count, compactNumber),
+    promotionDrilldownSummaryMetric("Intents", summary.intent_count, compactNumber),
+    promotionDrilldownSummaryMetric("LiveSim", summary.live_order_count, compactNumber),
+    `<div class="promotion-drilldown-explain">${escapeHtml(summary.explanation_ko || "관련 evidence rows를 확인합니다.")}</div>`,
+  ].join("");
+  listNode.innerHTML = items.length
+    ? items.map((item) => promotionDrilldownRow(item)).join("")
+    : `<div class="operator-alert-empty">선택한 blocker에 매칭되는 evidence row가 없습니다.</div>`;
+}
+
+function promotionDrilldownSummaryMetric(label, value, formatter = compactNumber) {
+  return `
+    <div class="promotion-drilldown-metric">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(formatter(value))}</strong>
+    </div>
+  `;
+}
+
+function promotionMetricFormatter(blocker) {
+  if (String(blocker || "").includes("RATE") || blocker === "REALTIME_HIGH_RATIO_LOW") return ratio;
+  if (blocker === "EXPECTANCY_BELOW_THRESHOLD") return pct;
+  return compactNumber;
+}
+
+function promotionDrilldownRow(item = {}) {
+  const label = item.outcome_label || item.status || item.reason || "-";
+  const code = [item.code, item.name].filter(Boolean).join(" ");
+  const returns = item.source_type === "decision_outcome"
+    ? `ret ${pct(item.current_return_pct)} / mfe ${pct(item.max_return_pct)} / mae ${pct(item.max_drawdown_pct)}`
+    : `${escapeHtml(item.side || "-")} ${escapeHtml(item.order_phase || "")} ${escapeHtml(item.reason || "")}`;
+  const reasons = (item.reason_codes || []).slice(0, 4).join(", ");
+  return `
+    <article class="promotion-drilldown-row">
+      <div class="promotion-drilldown-main">
+        <strong>${escapeHtml(code || item.id || "-")}</strong>
+        ${badge(item.realtime_bucket || "NO_DATA")}
+        ${badge(label)}
+      </div>
+      <div class="operator-event-meta">${escapeHtml(item.source_type || "-")} · ${escapeHtml(formatEventTime(item.event_at))} · ${escapeHtml(returns)}</div>
+      <div class="operator-event-meta">${escapeHtml(reasons || item.summary || "-")}</div>
+    </article>
+  `;
+}
+
+function promotionStageBadge(stage) {
+  const label = String(stage || "-").toUpperCase();
+  const tone = {
+    OBSERVE: "observe",
+    DRY_RUN: "ready-small",
+    LIVE_SIM: "ready",
+    REAL_MICRO: "warning",
+  }[label] || "observe";
+  return badge(label, tone);
+}
+
+function renderPromotionWindowButtons() {
+  document.querySelectorAll("[data-promotion-window]").forEach((button) => {
+    const value = Number(button.dataset.promotionWindow || 0);
+    button.classList.toggle("active", value === Number(state.promotionWindowSec || 0));
+  });
+}
+
+function promotionTradeDate(snapshot = state.snapshot || {}) {
+  const outcomesDate = ((snapshot || {}).gate_reason_outcomes || {}).trade_date;
+  if (outcomesDate) return String(outcomesDate).slice(0, 10);
+  const calculatedAt = String((snapshot || {}).calculated_at || (snapshot || {}).created_at || "");
+  return calculatedAt.length >= 10 ? calculatedAt.slice(0, 10) : "";
+}
+
+async function fetchPromotionDecision(snapshot = state.snapshot || {}) {
+  if (state.promotionDecisionLoading) return;
+  state.promotionDecisionLoading = true;
+  state.promotionDecisionError = "";
+  renderPromotionDecisionPanel();
+  try {
+    const params = new URLSearchParams();
+    const windowSec = Number(state.promotionWindowSec || 0);
+    const tradeDate = promotionTradeDate(snapshot);
+    if (tradeDate) params.set("trade_date", tradeDate);
+    if (windowSec > 0) params.set("window_sec", String(windowSec));
+    const response = await fetch(`/api/runtime/promotion/decision?${params.toString()}`, { cache: "no-store" });
+    const payload = await parseResponsePayload(response);
+    if (!response.ok) throw new Error(payload.detail || payload.error || `promotion ${response.status}`);
+    state.promotionDecision = payload || {};
+    state.promotionDecisionError = "";
+    state.promotionDecisionLastFetchedAt = new Date().toISOString();
+    const blockers = ((payload || {}).decision || {}).blockers || [];
+    if (!blockers.length) {
+      state.promotionSelectedBlocker = "";
+      state.promotionDrilldown = null;
+      state.promotionDrilldownError = "";
+    } else if (!blockers.includes(state.promotionSelectedBlocker)) {
+      state.promotionSelectedBlocker = blockers[0];
+    }
+  } catch (error) {
+    state.promotionDecisionError = error.message || String(error);
+  } finally {
+    state.promotionDecisionLoading = false;
+    renderPromotionDecisionPanel();
+    if (state.promotionSelectedBlocker) {
+      fetchPromotionDrilldown(snapshot).catch(() => {});
+    } else {
+      renderPromotionDrilldownPanel();
+    }
+  }
+}
+
+async function fetchPromotionDrilldown(snapshot = state.snapshot || {}) {
+  if (!state.promotionSelectedBlocker || state.promotionDrilldownLoading) return;
+  state.promotionDrilldownLoading = true;
+  state.promotionDrilldownError = "";
+  renderPromotionDrilldownPanel();
+  try {
+    const params = new URLSearchParams();
+    const windowSec = Number(state.promotionWindowSec || 0);
+    const tradeDate = promotionTradeDate(snapshot);
+    params.set("blocker", state.promotionSelectedBlocker);
+    params.set("detail_limit", "20");
+    if (tradeDate) params.set("trade_date", tradeDate);
+    if (windowSec > 0) params.set("window_sec", String(windowSec));
+    const response = await fetch(`/api/runtime/promotion/drilldown?${params.toString()}`, { cache: "no-store" });
+    const payload = await parseResponsePayload(response);
+    if (!response.ok) throw new Error(payload.detail || payload.error || `promotion drilldown ${response.status}`);
+    state.promotionDrilldown = payload || {};
+    state.promotionDrilldownError = "";
+  } catch (error) {
+    state.promotionDrilldownError = error.message || String(error);
+  } finally {
+    state.promotionDrilldownLoading = false;
+    renderPromotionDrilldownPanel();
+  }
 }
 
 function backfillStatusText(backfill) {
@@ -2859,6 +3185,7 @@ async function fetchSnapshot() {
   const response = await fetch("/api/themelab/snapshot", { cache: "no-store" });
   if (!response.ok) throw new Error(`snapshot ${response.status}`);
   render(await response.json());
+  fetchPromotionDecision(state.snapshot || {}).catch(() => {});
 }
 
 function isFullThemeLabSnapshot(snapshot) {
@@ -2868,6 +3195,7 @@ function isFullThemeLabSnapshot(snapshot) {
 }
 
 function connectWs() {
+  if (typeof WebSocket !== "function") return;
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${protocol}://${window.location.host}/ws/dashboard`);
   ws.onmessage = (event) => {
@@ -2883,6 +3211,7 @@ initFilters();
 initOperatorEventJournal();
 initOperatorActionCenter();
 initPostmarketReviewPanel();
+initPromotionCockpit();
 fetchSnapshot().catch(() => {});
 connectWs();
 setInterval(() => fetchSnapshot().catch(() => {}), 5000);

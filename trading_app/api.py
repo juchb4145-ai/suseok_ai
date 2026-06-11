@@ -68,6 +68,7 @@ from trading_app.intraday_outcomes import (
 from trading_app.market_gate_review import MarketGateReviewAnalyzer
 from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
+from trading_app.promotion_evidence import DEFAULT_PROMOTION_POLICY_ID, PromotionEvidenceAdapter
 from trading_app.replay_tick_buffer import ReplayGradeTickBuffer, replay_tick_writer_config_from_settings
 from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
@@ -579,6 +580,10 @@ def _intraday_outcome_labeler(db: TradingDatabase) -> IntradayOutcomeLabeler:
 
 def _shadow_strategy_evaluator(db: TradingDatabase) -> ShadowStrategyEvaluator:
     return ShadowStrategyEvaluator(db, config=shadow_config_from_settings(get_settings()))
+
+
+def _promotion_evidence_adapter(db: TradingDatabase) -> PromotionEvidenceAdapter:
+    return PromotionEvidenceAdapter(db)
 
 
 def _change_proposal_generator(db: TradingDatabase) -> StrategyChangeProposalGenerator:
@@ -1579,6 +1584,93 @@ def rebuild_runtime_intraday_outcomes(
         )
         result["summary"] = db.strategy_decision_outcome_summary(trade_date=trade_date, horizon_sec=horizon_sec) if persist else {}
         return result
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/promotion/evidence")
+def runtime_promotion_evidence(
+    trade_date: Optional[str] = None,
+    policy_id: str = DEFAULT_PROMOTION_POLICY_ID,
+    current_stage: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+    limit: Optional[int] = Query(None, ge=1, le=10000),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        adapter = _promotion_evidence_adapter(db)
+        evidence = adapter.build_evidence(
+            policy_id=policy_id,
+            current_stage=current_stage,
+            trade_date=trade_date,
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+            limit=limit,
+        )
+        return {
+            "policy_id": evidence.policy_id,
+            "evidence": evidence.to_dict(),
+            "config": adapter.config.to_dict(),
+            "filters": adapter.filters(
+                policy_id=policy_id,
+                current_stage=current_stage,
+                trade_date=trade_date,
+                window_sec=window_sec,
+                horizon_sec=horizon_sec,
+                limit=limit,
+            ),
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/promotion/decision")
+def runtime_promotion_decision(
+    trade_date: Optional[str] = None,
+    policy_id: str = DEFAULT_PROMOTION_POLICY_ID,
+    current_stage: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+    limit: Optional[int] = Query(None, ge=1, le=10000),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return _promotion_evidence_adapter(db).evaluate(
+            policy_id=policy_id,
+            current_stage=current_stage,
+            trade_date=trade_date,
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+            limit=limit,
+        )
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/promotion/drilldown")
+def runtime_promotion_drilldown(
+    trade_date: Optional[str] = None,
+    blocker: Optional[str] = None,
+    policy_id: str = DEFAULT_PROMOTION_POLICY_ID,
+    current_stage: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+    horizon_sec: Optional[int] = Query(None, ge=1, le=86400),
+    limit: Optional[int] = Query(None, ge=1, le=10000),
+    detail_limit: int = Query(30, ge=1, le=200),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return _promotion_evidence_adapter(db).drilldown(
+            blocker=blocker,
+            policy_id=policy_id,
+            current_stage=current_stage,
+            trade_date=trade_date,
+            window_sec=window_sec,
+            horizon_sec=horizon_sec,
+            limit=limit,
+            detail_limit=detail_limit,
+        )
     finally:
         close_database(db)
 

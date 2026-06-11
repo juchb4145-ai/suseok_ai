@@ -168,6 +168,211 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   white-space: nowrap;
 }
 
+.promotion-cockpit-panel {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.promotion-cockpit-head {
+  align-items: center;
+  margin-bottom: 0;
+}
+
+.promotion-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.promotion-window-controls {
+  margin-bottom: 0;
+}
+
+.promotion-window-controls > span {
+  min-width: auto;
+}
+
+.promotion-decision-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(360px, 1.2fr) minmax(320px, 1fr) minmax(260px, 0.9fr);
+  gap: 10px;
+}
+
+.promotion-card {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  padding: 10px;
+}
+
+.promotion-card > span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.promotion-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(82px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.promotion-metric {
+  min-width: 0;
+  border: 1px solid rgba(51, 65, 85, 0.7);
+  border-radius: 6px;
+  background: rgba(9, 13, 18, 0.42);
+  padding: 7px 8px;
+}
+
+.promotion-metric span {
+  display: block;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.promotion-metric strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.promotion-list {
+  display: grid;
+  gap: 7px;
+  margin-top: 8px;
+}
+
+.promotion-reason-row {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(9, 13, 18, 0.42);
+  padding: 7px 8px;
+  text-align: left;
+}
+
+.promotion-reason-row strong {
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.promotion-reason-row span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--sub);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.promotion-reason-row.blocked { border-color: rgba(239, 68, 68, 0.45); }
+.promotion-reason-row.warning { border-color: rgba(245, 158, 11, 0.45); }
+.promotion-reason-row.ready { border-color: rgba(16, 185, 129, 0.45); }
+.promotion-reason-row.selected {
+  background: rgba(239, 68, 68, 0.10);
+  border-color: rgba(239, 68, 68, 0.72);
+}
+
+.promotion-drilldown-panel {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(9, 13, 18, 0.32);
+  padding: 10px;
+}
+
+.promotion-drilldown-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(90px, 0.2fr)) minmax(260px, 1fr);
+  gap: 8px;
+}
+
+.promotion-drilldown-metric,
+.promotion-drilldown-explain,
+.promotion-drilldown-row {
+  min-width: 0;
+  border: 1px solid rgba(51, 65, 85, 0.7);
+  border-radius: 6px;
+  background: var(--panel-alt);
+}
+
+.promotion-drilldown-metric {
+  padding: 7px 8px;
+}
+
+.promotion-drilldown-metric span {
+  display: block;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.promotion-drilldown-metric strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.promotion-drilldown-explain {
+  color: var(--sub);
+  line-height: 1.45;
+  padding: 8px 10px;
+}
+
+.promotion-drilldown-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(340px, 1fr));
+  gap: 8px;
+  max-height: 250px;
+  overflow: auto;
+}
+
+.promotion-drilldown-row {
+  display: grid;
+  gap: 5px;
+  padding: 8px 10px;
+}
+
+.promotion-drilldown-main {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.promotion-drilldown-main strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .operator-alert-panel {
   display: grid;
   gap: 10px;
@@ -1303,6 +1508,10 @@ tbody tr.selected {
 @media (max-width: 900px) {
   body { min-width: 0; }
   .cockpit-grid,
+  .promotion-decision-grid,
+  .promotion-metric-grid,
+  .promotion-drilldown-summary,
+  .promotion-drilldown-list,
   .operator-alert-grid,
   .session-summary-grid,
   .action-center-grid,

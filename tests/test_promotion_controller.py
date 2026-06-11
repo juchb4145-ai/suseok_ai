@@ -6,6 +6,7 @@ from trading_app.promotion_controller import (
     PromotionController,
     PromotionControllerConfig,
     build_promotion_evidence,
+    config_from_settings,
 )
 
 
@@ -123,6 +124,33 @@ def test_kill_switch_blocks_promotion():
     assert decision.action == HOLD_ACTION
     assert "KILL_SWITCH_ACTIVE" in decision.blockers
     assert decision.confidence == 0.0
+
+
+def test_config_from_settings_overrides_thresholds_and_safety_flags():
+    config = config_from_settings(
+        {
+            "promotion_controller": {
+                "enabled": "false",
+                "rolling_decision_limit": "250",
+                "default_current_stage": "dry_run",
+                "allow_real_micro": "true",
+                "max_consecutive_error_count": "3",
+                "live_sim": {
+                    "min_order_count": "45",
+                    "max_order_error_rate": "0.01",
+                },
+            }
+        }
+    )
+
+    assert config.enabled is False
+    assert config.rolling_decision_limit == 250
+    assert config.default_current_stage == "dry_run"
+    assert config.allow_real_micro is True
+    assert config.max_consecutive_error_count == 3
+    assert config.live_sim.min_order_count == 45
+    assert config.live_sim.max_order_error_rate == 0.01
+    assert config.live_sim.min_decision_count == PromotionControllerConfig().live_sim.min_decision_count
 
 
 def _outcome(

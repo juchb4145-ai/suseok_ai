@@ -58,6 +58,52 @@
         </div>
       </section>
 
+      <section id="promotion-cockpit" class="panel promotion-cockpit-panel" aria-label="Promotion Decision Cockpit">
+        <div class="panel-head promotion-cockpit-head">
+          <div>
+            <h2>Promotion Decision</h2>
+            <p id="promotion-decision-message">승급 판단 대기</p>
+          </div>
+          <div class="promotion-actions">
+            <div id="promotion-window-controls" class="filter-row promotion-window-controls" data-filter-group="promotion-window">
+              <span>Window</span>
+              <button class="active" data-promotion-window="0" type="button">Today</button>
+              <button data-promotion-window="300" type="button">5m</button>
+              <button data-promotion-window="900" type="button">15m</button>
+            </div>
+            <button id="promotion-decision-refresh" class="action-button" type="button">새로고침</button>
+            <span id="promotion-confidence" class="counter">confidence -</span>
+            <span id="promotion-action-status" class="badge observe">NO_DATA</span>
+          </div>
+        </div>
+        <div class="promotion-decision-grid">
+          <article class="promotion-card promotion-stage-card">
+            <span>Stage</span>
+            <div id="promotion-stage-lines" class="cockpit-lines"></div>
+          </article>
+          <article class="promotion-card">
+            <span>Core Metrics</span>
+            <div id="promotion-metric-lines" class="promotion-metric-grid"></div>
+          </article>
+          <article class="promotion-card">
+            <span>Blockers</span>
+            <div id="promotion-blocker-list" class="promotion-list"></div>
+          </article>
+          <article class="promotion-card">
+            <span>Rollout Guard</span>
+            <div id="promotion-rollout-lines" class="cockpit-lines"></div>
+          </article>
+        </div>
+        <div id="promotion-drilldown-panel" class="promotion-drilldown-panel">
+          <div class="operator-alert-subhead">
+            <h3 id="promotion-drilldown-title">Blocker Drilldown</h3>
+            <span id="promotion-drilldown-status" class="counter">select blocker</span>
+          </div>
+          <div id="promotion-drilldown-summary" class="promotion-drilldown-summary"></div>
+          <div id="promotion-drilldown-list" class="promotion-drilldown-list"></div>
+        </div>
+      </section>
+
       <section class="panel shadow-ab-panel" aria-label="PROVISIONAL Shadow A/B">
         <div class="panel-head">
           <div>
@@ -433,6 +479,6 @@
         </div>
       </div>
     </main>
-    <script src="/static/themelab.js?v=theme-shadow-ab-local-token-dialog"></script>
+    <script src="/static/themelab.js?v=promotion-drilldown-cockpit"></script>
   </body>
 </html>
