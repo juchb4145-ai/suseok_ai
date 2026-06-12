@@ -929,6 +929,55 @@ class TradingDatabase:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(decision_id, horizon_sec)
             );
+            CREATE TABLE IF NOT EXISTS buy_zero_rca_traces (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                runtime_cycle_id TEXT NOT NULL DEFAULT '',
+                decision_cycle_id TEXT NOT NULL DEFAULT '',
+                decision_id TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                candidate_generation_seq INTEGER NOT NULL DEFAULT 0,
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                theme_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                stage TEXT NOT NULL,
+                stage_status TEXT NOT NULL DEFAULT '',
+                pass_fail TEXT NOT NULL DEFAULT '',
+                passed INTEGER NOT NULL DEFAULT 0,
+                primary_block_reason TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                gate_status TEXT NOT NULL DEFAULT '',
+                gate_score REAL,
+                theme_score REAL,
+                stock_role TEXT NOT NULL DEFAULT '',
+                price_location_status TEXT NOT NULL DEFAULT '',
+                price_location_readiness TEXT NOT NULL DEFAULT '',
+                latest_tick_ready INTEGER,
+                latest_tick_age_sec REAL,
+                support_ready INTEGER,
+                selected_support_source TEXT NOT NULL DEFAULT '',
+                selected_support_price REAL,
+                vwap_ready INTEGER,
+                baseline120_ready INTEGER,
+                envelope_mid_ready INTEGER,
+                data_quality_bucket TEXT NOT NULL DEFAULT '',
+                entry_plan_id INTEGER,
+                entry_plan_submittable INTEGER,
+                entry_plan_diagnostic_only INTEGER,
+                dry_run_intent_id TEXT NOT NULL DEFAULT '',
+                dry_run_status TEXT NOT NULL DEFAULT '',
+                dry_run_reason TEXT NOT NULL DEFAULT '',
+                live_sim_intent_id TEXT NOT NULL DEFAULT '',
+                live_sim_status TEXT NOT NULL DEFAULT '',
+                live_sim_reason TEXT NOT NULL DEFAULT '',
+                command_id TEXT NOT NULL DEFAULT '',
+                broker_order_id TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS shadow_strategy_evaluations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 evaluation_id TEXT UNIQUE NOT NULL,
@@ -1447,6 +1496,24 @@ class TradingDatabase:
                 ON strategy_decision_outcomes(horizon_sec, trade_date);
             CREATE INDEX IF NOT EXISTS idx_strategy_decision_outcomes_candidate_instance
                 ON strategy_decision_outcomes(candidate_instance_id);
+            CREATE INDEX IF NOT EXISTS idx_buy_zero_rca_traces_trade_date_created
+                ON buy_zero_rca_traces(trade_date, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_buy_zero_rca_traces_candidate_instance
+                ON buy_zero_rca_traces(candidate_instance_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_buy_zero_rca_traces_code
+                ON buy_zero_rca_traces(code, trade_date, created_at);
+            CREATE INDEX IF NOT EXISTS idx_buy_zero_rca_traces_stage
+                ON buy_zero_rca_traces(stage, stage_status, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_buy_zero_rca_traces_reason
+                ON buy_zero_rca_traces(primary_block_reason, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_buy_zero_rca_traces_entry_plan
+                ON buy_zero_rca_traces(entry_plan_id);
+            CREATE INDEX IF NOT EXISTS idx_buy_zero_rca_traces_dry_run_intent
+                ON buy_zero_rca_traces(dry_run_intent_id);
+            CREATE INDEX IF NOT EXISTS idx_buy_zero_rca_traces_live_sim_intent
+                ON buy_zero_rca_traces(live_sim_intent_id);
+            CREATE INDEX IF NOT EXISTS idx_buy_zero_rca_traces_command
+                ON buy_zero_rca_traces(command_id);
             CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_trade_date
                 ON shadow_strategy_evaluations(trade_date, evaluated_at, id);
             CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_policy
@@ -2220,6 +2287,9 @@ class TradingDatabase:
         rows = [_strategy_decision_event_params(event) for event in events if isinstance(event, dict)]
         if not rows:
             return 0
+        trace_rows: list[dict] = []
+        for event in rows:
+            trace_rows.extend(_buy_zero_trace_events_from_strategy_decision_event(event))
         before = self.conn.total_changes
         with self.conn:
             self.conn.executemany(
@@ -2252,7 +2322,10 @@ class TradingDatabase:
                 """,
                 rows,
             )
-        return int(self.conn.total_changes - before)
+            after_decisions = self.conn.total_changes
+            if trace_rows:
+                self._save_buy_zero_trace_events_no_commit(trace_rows)
+        return int(after_decisions - before)
 
     def list_strategy_decision_events(
         self,
@@ -2348,6 +2421,122 @@ class TradingDatabase:
         ).fetchall()
         events = [_row_to_strategy_decision_event(row) for row in rows]
         return _strategy_decision_summary(events, trade_date=trade_date or "", window_sec=window_sec)
+
+    def save_buy_zero_trace_events(self, events: Iterable[dict]) -> int:
+        rows = [_buy_zero_trace_params(event) for event in events if isinstance(event, dict)]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        with self.conn:
+            self._save_buy_zero_trace_events_no_commit(rows)
+        return int(self.conn.total_changes - before)
+
+    def _save_buy_zero_trace_events_no_commit(self, rows: Iterable[dict]) -> None:
+        normalized = [_buy_zero_trace_params(row) for row in rows if isinstance(row, dict)]
+        if not normalized:
+            return
+        self.conn.executemany(
+            """
+            INSERT OR IGNORE INTO buy_zero_rca_traces(
+                trace_id, trade_date, runtime_cycle_id, decision_cycle_id, decision_id,
+                candidate_id, candidate_instance_id, candidate_generation_seq,
+                code, name, theme_id, theme_name,
+                stage, stage_status, pass_fail, passed,
+                primary_block_reason, reason_codes_json,
+                gate_status, gate_score, theme_score, stock_role,
+                price_location_status, price_location_readiness,
+                latest_tick_ready, latest_tick_age_sec, support_ready,
+                selected_support_source, selected_support_price,
+                vwap_ready, baseline120_ready, envelope_mid_ready,
+                data_quality_bucket, entry_plan_id, entry_plan_submittable,
+                entry_plan_diagnostic_only, dry_run_intent_id, dry_run_status,
+                dry_run_reason, live_sim_intent_id, live_sim_status,
+                live_sim_reason, command_id, broker_order_id, details_json, created_at
+            ) VALUES (
+                :trace_id, :trade_date, :runtime_cycle_id, :decision_cycle_id, :decision_id,
+                :candidate_id, :candidate_instance_id, :candidate_generation_seq,
+                :code, :name, :theme_id, :theme_name,
+                :stage, :stage_status, :pass_fail, :passed,
+                :primary_block_reason, :reason_codes_json,
+                :gate_status, :gate_score, :theme_score, :stock_role,
+                :price_location_status, :price_location_readiness,
+                :latest_tick_ready, :latest_tick_age_sec, :support_ready,
+                :selected_support_source, :selected_support_price,
+                :vwap_ready, :baseline120_ready, :envelope_mid_ready,
+                :data_quality_bucket, :entry_plan_id, :entry_plan_submittable,
+                :entry_plan_diagnostic_only, :dry_run_intent_id, :dry_run_status,
+                :dry_run_reason, :live_sim_intent_id, :live_sim_status,
+                :live_sim_reason, :command_id, :broker_order_id, :details_json, :created_at
+            )
+            """,
+            normalized,
+        )
+
+    def list_buy_zero_trace_events(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        candidate_instance_id: Optional[str] = None,
+        stage: Optional[str] = None,
+        stage_status: Optional[str] = None,
+        pass_fail: Optional[str] = None,
+        primary_block_reason: Optional[str] = None,
+        window_sec: Optional[int] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses, params = _buy_zero_trace_filters(
+            trade_date=trade_date,
+            code=code,
+            candidate_instance_id=candidate_instance_id,
+            stage=stage,
+            stage_status=stage_status,
+            pass_fail=pass_fail,
+            primary_block_reason=primary_block_reason,
+            window_sec=window_sec,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM buy_zero_rca_traces
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_buy_zero_trace(row) for row in rows]
+
+    def buy_zero_trace_count(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        candidate_instance_id: Optional[str] = None,
+        stage: Optional[str] = None,
+        stage_status: Optional[str] = None,
+        pass_fail: Optional[str] = None,
+        primary_block_reason: Optional[str] = None,
+        window_sec: Optional[int] = None,
+    ) -> int:
+        clauses, params = _buy_zero_trace_filters(
+            trade_date=trade_date,
+            code=code,
+            candidate_instance_id=candidate_instance_id,
+            stage=stage,
+            stage_status=stage_status,
+            pass_fail=pass_fail,
+            primary_block_reason=primary_block_reason,
+            window_sec=window_sec,
+        )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM buy_zero_rca_traces {where}",
+            tuple(params),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
 
     def list_strategy_decision_events_due_for_outcomes(
         self,
@@ -3664,6 +3853,17 @@ class TradingDatabase:
                 created_at,
             ),
         )
+        trace = _buy_zero_trace_from_live_sim_order_event(
+            self.get_live_sim_order(order_intent_id),
+            event_type=event_type,
+            status_from=status_from,
+            status_to=status_to,
+            message=message,
+            payload=payload or {},
+            created_at=created_at,
+        )
+        if trace:
+            self._save_buy_zero_trace_events_no_commit([trace])
         self.conn.commit()
 
     def save_live_sim_cancel_order(self, record: dict) -> dict:
@@ -5093,7 +5293,10 @@ class TradingDatabase:
             for event in events:
                 if event.candidate_id is None:
                     event.candidate_id = saved.id
-                self._save_candidate_event_no_commit(event)
+                saved_event = self._save_candidate_event_no_commit(event)
+                trace = _buy_zero_trace_from_candidate_event(saved, saved_event)
+                if trace:
+                    self._save_buy_zero_trace_events_no_commit([trace])
             return saved
 
     def transition_candidate_with_events(self, candidate: Candidate, events: Iterable[CandidateEvent]) -> Candidate:
@@ -7534,6 +7737,440 @@ def _row_to_strategy_decision_event(row: sqlite3.Row) -> dict:
     data["data_quality_issues"] = _safe_json_loads(data.get("data_quality_issues_json"), [])
     data["details"] = _safe_json_loads(data.get("details_json"), {})
     return data
+
+
+def _buy_zero_trace_params(payload: dict) -> dict:
+    details = _sanitize_decision_details(payload.get("details_json", payload.get("details", {})))
+    created_at = str(payload.get("created_at") or payload.get("decision_at") or datetime.now().isoformat(timespec="seconds"))
+    pass_fail = str(payload.get("pass_fail") or payload.get("pass/fail") or "").upper()
+    if not pass_fail:
+        pass_fail = "PASS" if bool(payload.get("passed")) else "FAIL"
+    reason_codes = payload.get("reason_codes_json", payload.get("reason_codes", []))
+    return {
+        "trace_id": str(payload.get("trace_id") or f"buy_zero_trace:{uuid4().hex}"),
+        "trade_date": str(payload.get("trade_date") or _trade_date_from_timestamp(created_at) or ""),
+        "runtime_cycle_id": str(payload.get("runtime_cycle_id") or ""),
+        "decision_cycle_id": str(payload.get("decision_cycle_id") or ""),
+        "decision_id": str(payload.get("decision_id") or ""),
+        "candidate_id": _nullable_int(payload.get("candidate_id")),
+        "candidate_instance_id": str(payload.get("candidate_instance_id") or ""),
+        "candidate_generation_seq": int(payload.get("candidate_generation_seq") or 0),
+        "code": _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+        "name": str(payload.get("name") or ""),
+        "theme_id": str(payload.get("theme_id") or ""),
+        "theme_name": str(payload.get("theme_name") or ""),
+        "stage": str(payload.get("stage") or ""),
+        "stage_status": str(payload.get("stage_status") or ""),
+        "pass_fail": pass_fail,
+        "passed": 1 if pass_fail == "PASS" or bool(payload.get("passed")) else 0,
+        "primary_block_reason": str(payload.get("primary_block_reason") or ""),
+        "reason_codes_json": reason_codes if isinstance(reason_codes, str) else _json_list(reason_codes),
+        "gate_status": str(payload.get("gate_status") or ""),
+        "gate_score": _nullable_float(payload.get("gate_score")),
+        "theme_score": _nullable_float(payload.get("theme_score")),
+        "stock_role": str(payload.get("stock_role") or ""),
+        "price_location_status": str(payload.get("price_location_status") or ""),
+        "price_location_readiness": str(payload.get("price_location_readiness") or ""),
+        "latest_tick_ready": _nullable_bool_int(payload.get("latest_tick_ready")),
+        "latest_tick_age_sec": _nullable_float(payload.get("latest_tick_age_sec")),
+        "support_ready": _nullable_bool_int(payload.get("support_ready")),
+        "selected_support_source": str(payload.get("selected_support_source") or ""),
+        "selected_support_price": _nullable_float(payload.get("selected_support_price")),
+        "vwap_ready": _nullable_bool_int(payload.get("vwap_ready")),
+        "baseline120_ready": _nullable_bool_int(payload.get("baseline120_ready")),
+        "envelope_mid_ready": _nullable_bool_int(payload.get("envelope_mid_ready")),
+        "data_quality_bucket": str(payload.get("data_quality_bucket") or ""),
+        "entry_plan_id": _nullable_int(payload.get("entry_plan_id")),
+        "entry_plan_submittable": _nullable_bool_int(payload.get("entry_plan_submittable")),
+        "entry_plan_diagnostic_only": _nullable_bool_int(payload.get("entry_plan_diagnostic_only")),
+        "dry_run_intent_id": str(payload.get("dry_run_intent_id") or ""),
+        "dry_run_status": str(payload.get("dry_run_status") or ""),
+        "dry_run_reason": str(payload.get("dry_run_reason") or ""),
+        "live_sim_intent_id": str(payload.get("live_sim_intent_id") or ""),
+        "live_sim_status": str(payload.get("live_sim_status") or ""),
+        "live_sim_reason": str(payload.get("live_sim_reason") or ""),
+        "command_id": str(payload.get("command_id") or ""),
+        "broker_order_id": str(payload.get("broker_order_id") or ""),
+        "details_json": details if isinstance(details, str) else _json_payload(details),
+        "created_at": created_at,
+    }
+
+
+def _row_to_buy_zero_trace(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["reason_codes"] = _safe_json_loads(data.get("reason_codes_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    for key in (
+        "passed",
+        "latest_tick_ready",
+        "support_ready",
+        "vwap_ready",
+        "baseline120_ready",
+        "envelope_mid_ready",
+        "entry_plan_submittable",
+        "entry_plan_diagnostic_only",
+    ):
+        if data.get(key) is not None:
+            data[key] = bool(data.get(key))
+    data["pass/fail"] = data.get("pass_fail")
+    return data
+
+
+def _buy_zero_trace_filters(
+    *,
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    candidate_instance_id: Optional[str] = None,
+    stage: Optional[str] = None,
+    stage_status: Optional[str] = None,
+    pass_fail: Optional[str] = None,
+    primary_block_reason: Optional[str] = None,
+    window_sec: Optional[int] = None,
+) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if trade_date:
+        clauses.append("trade_date = ?")
+        params.append(str(trade_date))
+    if code:
+        clauses.append("code = ?")
+        params.append(_clean_stock_code(code) or str(code))
+    if candidate_instance_id:
+        clauses.append("candidate_instance_id = ?")
+        params.append(str(candidate_instance_id))
+    if stage:
+        clauses.append("stage = ?")
+        params.append(str(stage))
+    if stage_status:
+        clauses.append("stage_status = ?")
+        params.append(str(stage_status))
+    if pass_fail:
+        clauses.append("pass_fail = ?")
+        params.append(str(pass_fail).upper())
+    if primary_block_reason:
+        clauses.append("primary_block_reason = ?")
+        params.append(str(primary_block_reason))
+    if window_sec is not None:
+        clauses.append("julianday(replace(substr(created_at, 1, 19), 'T', ' ')) >= julianday('now', ?)")
+        params.append(f"-{max(1, int(window_sec or 1))} seconds")
+    return clauses, params
+
+
+def _buy_zero_trace_from_candidate_event(candidate: Candidate, event: CandidateEvent) -> dict | None:
+    if event.event_type not in {"candidate_detected", "candidate_reactivated", "candidate_merged", "candidate_generation_changed"}:
+        return None
+    metadata = dict(candidate.metadata or {})
+    payload = dict(event.payload or {})
+    created_at = event.created_at or candidate.detected_at or datetime.now().isoformat(timespec="seconds")
+    status = event.to_state.value if hasattr(event.to_state, "value") else str(event.to_state or candidate.state.value)
+    reason_codes = _dedupe(
+        [
+            str(metadata.get("generation_reason") or metadata.get("candidate_generation_reason") or ""),
+            str(event.reason or ""),
+            *[str(item) for item in payload.get("reason_codes", []) or []],
+        ]
+    )
+    return {
+        "trace_id": f"candidate_event:{event.id or uuid4().hex}:CANDIDATE_GENERATED",
+        "trade_date": candidate.trade_date,
+        "candidate_id": candidate.id,
+        "candidate_instance_id": str(metadata.get("candidate_instance_id") or ""),
+        "candidate_generation_seq": int(metadata.get("candidate_generation_seq") or 0),
+        "code": candidate.code,
+        "name": candidate.name,
+        "theme_id": _first_string(metadata.get("theme_id"), payload.get("theme_id")),
+        "theme_name": _first_string(metadata.get("theme_name"), metadata.get("theme_lab_primary_theme"), payload.get("theme_name")),
+        "stage": "CANDIDATE_GENERATED",
+        "stage_status": status,
+        "pass_fail": "PASS",
+        "passed": True,
+        "primary_block_reason": "",
+        "reason_codes": reason_codes,
+        "details": {"candidate_event": event.event_type, "reason": event.reason, "payload": payload},
+        "created_at": created_at,
+    }
+
+
+def _buy_zero_trace_events_from_strategy_decision_event(event: dict) -> list[dict]:
+    action_type = str(event.get("action_type") or "")
+    action_result = str(event.get("action_result") or "")
+    details = _safe_json_loads(event.get("details_json"), {}) if isinstance(event.get("details_json"), str) else dict(event.get("details") or {})
+    gate_details = dict(details.get("gate_details") or {})
+    action_details = dict(details.get("action_details") or {})
+    entry_plan = dict(details.get("entry_plan") or {})
+    entry_cancel = dict(entry_plan.get("cancel_condition") or {})
+    virtual_order = dict(details.get("virtual_order") or {})
+    order_result = dict(details.get("order_result") or {})
+    created_at = str(event.get("decision_at") or event.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+    base = _buy_zero_trace_base_from_decision(event, details, gate_details, entry_cancel, created_at)
+    traces: list[dict] = []
+
+    def add(stage: str, *, status: str = "", passed: bool | None = None, reason: str = "", extra: dict | None = None) -> None:
+        stage_status = status or str(event.get("gate_status") or action_result or "")
+        primary = reason or _first_string(action_details.get("reason"), event.get("gate_reason"), base.get("primary_block_reason"))
+        is_pass = _buy_zero_stage_passed(stage, stage_status, action_result, primary) if passed is None else bool(passed)
+        traces.append(
+            {
+                **base,
+                "trace_id": f"{event.get('decision_id') or uuid4().hex}:{stage}:{len(traces)}",
+                "stage": stage,
+                "stage_status": stage_status,
+                "pass_fail": "PASS" if is_pass else "FAIL",
+                "passed": is_pass,
+                "primary_block_reason": "" if is_pass else primary,
+                "details": {**details, **dict(extra or {}), "source_action_type": action_type, "source_action_result": action_result},
+            }
+        )
+
+    if action_type == "EVALUATE":
+        if base.get("theme_id") or base.get("theme_name") or base.get("theme_score") is not None:
+            add("THEME_ENGINE_EVALUATED", status=_first_string(gate_details.get("theme_status"), event.get("gate_status")), passed=True)
+        add("THEMELAB_GATE_EVALUATED")
+        if _has_any_key(gate_details, ("hybrid_status", "hybrid_score", "hybrid_observe_only", "hybrid_gate_observe_only")):
+            hybrid_status = _first_string(gate_details.get("hybrid_status"), event.get("gate_status"))
+            hybrid_observe_only = bool(gate_details.get("hybrid_observe_only") or gate_details.get("hybrid_gate_observe_only"))
+            add(
+                "HYBRID_GATE_EVALUATED",
+                status=hybrid_status,
+                passed=not hybrid_observe_only and _is_ready_status(hybrid_status),
+                reason="READY_BUT_HYBRID_OBSERVE_ONLY" if hybrid_observe_only and _is_ready_status(event.get("gate_status")) else "",
+                extra={"hybrid_observe_only": hybrid_observe_only},
+            )
+        if _has_any_key(gate_details, ("risk_level", "risk_reason_codes", "entry_risk_reason_codes", "entry_risk_level")):
+            add("RISK_GATE_EVALUATED", status=_first_string(gate_details.get("risk_level"), event.get("gate_status")))
+        return traces
+
+    if action_type in {"READY", "WAIT", "BLOCK"}:
+        add("LIFECYCLE_UPDATED", status=str(event.get("gate_status") or action_type), passed=action_type == "READY")
+        return traces
+
+    if action_type == "ENTRY_PLAN":
+        stage = "ENTRY_PLAN_CREATED" if action_result == "ACCEPTED" else "ENTRY_PLAN_SKIPPED"
+        add(stage, status=action_result, passed=action_result == "ACCEPTED", reason=_first_string(entry_cancel.get("reason"), action_details.get("reason")))
+        return traces
+
+    if action_type == "ENTRY_ORDER_INTENT":
+        if virtual_order:
+            add("VIRTUAL_ORDER_SUBMITTED", status=str(virtual_order.get("status") or "SUBMITTED"), passed=True)
+        if not order_result:
+            add("DRY_RUN_INTENT_REJECTED", status=action_result, passed=False, reason=_first_string(action_details.get("reason"), "order_intent_missing"))
+            return traces
+        dry_status = str(order_result.get("status") or "")
+        dry_reason = str(order_result.get("reason") or "")
+        dry_passed = bool(order_result.get("accepted")) or dry_status in {"DRY_RUN_ACCEPTED", "ACCEPTED"}
+        add(
+            "DRY_RUN_INTENT_CREATED" if dry_passed or dry_status == "DUPLICATE" else "DRY_RUN_INTENT_REJECTED",
+            status=dry_status or action_result,
+            passed=dry_passed,
+            reason=dry_reason,
+            extra={"order_result": order_result},
+        )
+        live_sim = dict(order_result.get("live_sim") or {})
+        if live_sim:
+            live_status = str(live_sim.get("status") or "")
+            live_reason = str(live_sim.get("reason") or "")
+            add("LIVE_SIM_INTENT_CREATED", status=live_status, passed=bool(live_sim.get("intent_id")), reason=live_reason, extra={"live_sim": live_sim})
+            if bool(live_sim.get("accepted")) or live_status in {"SUBMITTED", "ACCEPTED"}:
+                add("LIVE_SIM_COMMAND_QUEUED", status=live_status, passed=True, extra={"live_sim": live_sim})
+            else:
+                add("LIVE_SIM_BLOCKED", status=live_status or "BLOCKED", passed=False, reason=live_reason or "LIVE_SIM_NOT_SUBMITTED", extra={"live_sim": live_sim})
+        return traces
+
+    return traces
+
+
+def _buy_zero_trace_base_from_decision(
+    event: dict,
+    details: dict,
+    gate_details: dict,
+    entry_cancel: dict,
+    created_at: str,
+) -> dict:
+    order_result = dict(details.get("order_result") or {})
+    order_request = dict(order_result.get("request") or {})
+    order_metadata = dict(order_request.get("metadata") or {})
+    live_sim = dict(order_result.get("live_sim") or {})
+    live_record = dict(live_sim.get("record") or {})
+    live_request = dict(live_sim.get("request") or {})
+    reason_codes = _dedupe(
+        [
+            *[
+                str(item)
+                for item in (
+                    event.get("reason_codes")
+                    if event.get("reason_codes") is not None
+                    else _safe_json_loads(event.get("reason_codes_json"), [])
+                )
+                or []
+            ],
+            *[str(item) for item in gate_details.get("reason_codes") or []],
+            *[str(item) for item in entry_cancel.get("support_readiness_reason_codes") or []],
+            *[str(item) for item in live_record.get("reason_codes") or []],
+        ]
+    )
+    data_bucket = _first_string(
+        gate_details.get("realtime_reliability_bucket"),
+        entry_cancel.get("realtime_reliability_bucket"),
+        event.get("data_status"),
+    )
+    return {
+        "trade_date": str(event.get("trade_date") or _trade_date_from_timestamp(created_at) or ""),
+        "runtime_cycle_id": str(event.get("runtime_cycle_id") or ""),
+        "decision_cycle_id": _first_string(gate_details.get("decision_cycle_id"), entry_cancel.get("decision_cycle_id"), order_metadata.get("decision_cycle_id")),
+        "decision_id": str(event.get("decision_id") or ""),
+        "candidate_id": event.get("candidate_id"),
+        "candidate_instance_id": _first_string(event.get("candidate_instance_id"), gate_details.get("candidate_instance_id"), entry_cancel.get("candidate_instance_id"), order_metadata.get("candidate_instance_id")),
+        "candidate_generation_seq": int(event.get("candidate_generation_seq") or gate_details.get("candidate_generation_seq") or entry_cancel.get("candidate_generation_seq") or 0),
+        "code": _first_string(event.get("code"), order_request.get("code"), live_request.get("code")),
+        "name": str(event.get("name") or ""),
+        "theme_id": _first_string(gate_details.get("theme_id"), entry_cancel.get("theme_id"), order_metadata.get("theme_id")),
+        "theme_name": _first_string(event.get("theme_name"), gate_details.get("theme_name"), entry_cancel.get("theme_name"), order_metadata.get("theme_name")),
+        "primary_block_reason": _first_string(event.get("gate_reason"), gate_details.get("primary_reason_code"), entry_cancel.get("reason"), live_sim.get("reason")),
+        "reason_codes": reason_codes,
+        "gate_status": str(event.get("gate_status") or ""),
+        "gate_score": event.get("gate_score"),
+        "theme_score": event.get("theme_score"),
+        "stock_role": _first_string(gate_details.get("stock_role"), gate_details.get("leadership_role"), entry_cancel.get("stock_role"), order_metadata.get("stock_role")),
+        "price_location_status": _first_string(gate_details.get("price_location_status"), entry_cancel.get("price_location_status"), order_metadata.get("price_location_status")),
+        "price_location_readiness": _first_string(gate_details.get("price_location_readiness"), entry_cancel.get("price_location_readiness"), order_metadata.get("price_location_readiness")),
+        "latest_tick_ready": _first_present(gate_details.get("latest_tick_ready"), entry_cancel.get("latest_tick_ready")),
+        "latest_tick_age_sec": _first_present(gate_details.get("latest_tick_age_sec"), entry_cancel.get("latest_tick_age_sec")),
+        "support_ready": _first_present(gate_details.get("support_ready"), entry_cancel.get("selected_support_ready"), entry_cancel.get("support_ready"), order_metadata.get("support_ready")),
+        "selected_support_source": _first_string(gate_details.get("selected_support_source"), entry_cancel.get("selected_support_source"), order_metadata.get("selected_support_source")),
+        "selected_support_price": _first_present(gate_details.get("selected_support_price"), entry_cancel.get("selected_support_price"), order_metadata.get("selected_support_price"), order_metadata.get("support_price")),
+        "vwap_ready": _first_present(gate_details.get("vwap_ready"), entry_cancel.get("vwap_ready"), order_metadata.get("vwap_ready")),
+        "baseline120_ready": _first_present(gate_details.get("baseline120_ready"), gate_details.get("base_line_120_ready"), entry_cancel.get("baseline120_ready"), entry_cancel.get("base_line_120_ready")),
+        "envelope_mid_ready": _first_present(gate_details.get("envelope_mid_ready"), entry_cancel.get("envelope_mid_ready")),
+        "data_quality_bucket": data_bucket,
+        "entry_plan_id": _first_present(event.get("entry_plan_id"), entry_cancel.get("entry_plan_id")),
+        "entry_plan_submittable": entry_cancel.get("submittable"),
+        "entry_plan_diagnostic_only": entry_cancel.get("diagnostic_only"),
+        "dry_run_intent_id": str(order_result.get("intent_id") or ""),
+        "dry_run_status": str(order_result.get("status") or ""),
+        "dry_run_reason": str(order_result.get("reason") or ""),
+        "live_sim_intent_id": str(live_sim.get("intent_id") or live_record.get("order_intent_id") or ""),
+        "live_sim_status": str(live_sim.get("status") or live_record.get("order_status") or ""),
+        "live_sim_reason": str(live_sim.get("reason") or ""),
+        "command_id": _first_string(live_sim.get("command_id"), live_record.get("command_id"), (live_sim.get("command") or {}).get("command_id") if isinstance(live_sim.get("command"), dict) else ""),
+        "broker_order_id": _first_string(live_sim.get("broker_order_id"), live_record.get("broker_order_id")),
+        "created_at": created_at,
+    }
+
+
+def _buy_zero_trace_from_live_sim_order_event(
+    order: dict | None,
+    *,
+    event_type: str,
+    status_from: str,
+    status_to: str,
+    message: str,
+    payload: dict,
+    created_at: str,
+) -> dict | None:
+    if order is None:
+        return None
+    stage_map = {
+        "submitted": "LIVE_SIM_COMMAND_QUEUED",
+        "duplicate_blocked": "LIVE_SIM_BLOCKED",
+        "blocked": "LIVE_SIM_BLOCKED",
+        "blocked_live_safety": "LIVE_SIM_BLOCKED",
+        "enqueue_rejected": "LIVE_SIM_BLOCKED",
+        "order_result": "BROKER_ORDER_ACCEPTED" if status_to == "ACCEPTED" else "LIVE_SIM_BLOCKED",
+        "execution": "PARTIAL_FILLED" if status_to == "PARTIAL_FILLED" else ("FILLED" if status_to == "FILLED" else "BROKER_ORDER_ACCEPTED"),
+        "cancel_requested": "CANCEL_REQUESTED",
+        "reconcile_open_order": "RECONCILE_REQUIRED",
+    }
+    stage = stage_map.get(str(event_type))
+    if not stage:
+        return None
+    passed = stage not in {"LIVE_SIM_BLOCKED", "RECONCILE_REQUIRED"}
+    reason_codes = _dedupe([*[str(item) for item in order.get("reason_codes") or []], str(message or status_to or event_type)])
+    details = dict(order.get("details") or {})
+    request = dict(details.get("request") or {})
+    metadata = dict(request.get("metadata") or {})
+    return {
+        "trace_id": f"live_sim_order:{order.get('order_intent_id') or ''}:{event_type}:{status_to}:{created_at}",
+        "trade_date": str(order.get("trade_date") or _trade_date_from_timestamp(created_at) or ""),
+        "decision_cycle_id": str(metadata.get("decision_cycle_id") or ""),
+        "candidate_id": order.get("candidate_id"),
+        "candidate_instance_id": _first_string(order.get("candidate_instance_id"), metadata.get("candidate_instance_id")),
+        "candidate_generation_seq": int(metadata.get("candidate_generation_seq") or 0),
+        "code": str(order.get("code") or ""),
+        "name": str(order.get("name") or ""),
+        "theme_id": str(metadata.get("theme_id") or ""),
+        "theme_name": str(metadata.get("theme_name") or ""),
+        "stage": stage,
+        "stage_status": status_to or str(order.get("order_status") or ""),
+        "pass_fail": "PASS" if passed else "FAIL",
+        "passed": passed,
+        "primary_block_reason": "" if passed else str(message or status_to or event_type),
+        "reason_codes": reason_codes,
+        "entry_plan_id": order.get("entry_plan_id"),
+        "live_sim_intent_id": str(order.get("order_intent_id") or ""),
+        "live_sim_status": status_to or str(order.get("order_status") or ""),
+        "live_sim_reason": str(message or ""),
+        "command_id": str(order.get("command_id") or ""),
+        "broker_order_id": str(order.get("broker_order_id") or ""),
+        "details": {"live_sim_order": order, "event_type": event_type, "status_from": status_from, "status_to": status_to, "payload": payload},
+        "created_at": created_at,
+    }
+
+
+def _buy_zero_stage_passed(stage: str, stage_status: str, action_result: str, reason: str) -> bool:
+    status = str(stage_status or "").upper()
+    result = str(action_result or "").upper()
+    if stage in {"ENTRY_PLAN_SKIPPED", "DRY_RUN_INTENT_REJECTED", "LIVE_SIM_BLOCKED", "RECONCILE_REQUIRED"}:
+        return False
+    if "REJECT" in status or "BLOCK" in status or status in {"SKIPPED", "NOT_APPLICABLE", "ERROR", "DUPLICATE"}:
+        return False
+    if "REJECT" in result or result in {"SKIPPED", "NOT_APPLICABLE"}:
+        return False
+    if str(reason or "").upper() in {"ORDER_SINK_MISSING", "DRY_RUN_ORDER_ENQUEUE_DISABLED", "OBSERVE_VIRTUAL_ONLY"}:
+        return False
+    return True
+
+
+def _nullable_bool_int(value) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        if value.strip().lower() in {"true", "1", "yes", "y"}:
+            return 1
+        if value.strip().lower() in {"false", "0", "no", "n"}:
+            return 0
+    return 1 if bool(value) else 0
+
+
+def _is_ready_status(value: object) -> bool:
+    return str(value or "").upper().startswith("READY")
+
+
+def _has_any_key(payload: dict, keys: Iterable[str]) -> bool:
+    return any(key in payload and payload.get(key) not in (None, "") for key in keys)
+
+
+def _first_string(*values: object) -> str:
+    value = _first_present(*values)
+    return "" if value is None else str(value)
+
+
+def _first_present(*values: object):
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _dedupe(values: Iterable[object]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
 
 
 def _strategy_decision_outcome_params(outcome: dict) -> dict:

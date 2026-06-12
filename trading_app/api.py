@@ -58,6 +58,7 @@ from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSourceSyncService
 from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThemeUniverseSource
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
+from trading_app.buy_zero_rca import BuyZeroRCAAnalyzer
 from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, config_from_settings
 from trading_app.dry_run_threshold_ab import DryRunThresholdABAnalyzer, config_from_settings as threshold_ab_config_from_settings
 from trading_app.intraday_outcomes import (
@@ -600,6 +601,10 @@ def _market_gate_review_analyzer(db: TradingDatabase) -> MarketGateReviewAnalyze
 
 def _theme_lab_gate_reason_outcome_analyzer(db: TradingDatabase) -> ThemeLabGateReasonOutcomeAnalyzer:
     return ThemeLabGateReasonOutcomeAnalyzer(db)
+
+
+def _buy_zero_rca_analyzer(db: TradingDatabase) -> BuyZeroRCAAnalyzer:
+    return BuyZeroRCAAnalyzer(db)
 
 
 def _transport_config_from_settings() -> TransportLatencyConfig:
@@ -1474,6 +1479,124 @@ def runtime_intraday_decision_summary(
     try:
         summary = db.strategy_decision_summary(trade_date=trade_date, window_sec=window_sec)
         return {"summary": summary, "filters": {"trade_date": trade_date or "", "window_sec": window_sec}}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/buy-zero/summary")
+def runtime_buy_zero_rca_summary(
+    trade_date: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+    limit: int = Query(50000, ge=1, le=100000),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        summary = _buy_zero_rca_analyzer(db).build_summary(
+            trade_date=trade_date,
+            window_sec=window_sec,
+            limit=limit,
+        )
+        return {
+            "summary": summary,
+            "operator": {
+                "today_buy_zero_top3_causes": summary.get("operator_top_3_causes", []),
+                "ready_not_ordered_candidates": summary.get("top_ready_not_ordered_candidates", []),
+                "observe_blocked_then_rally_candidates": summary.get("top_observe_then_rally_candidates", []),
+                "live_sim_block_reasons": summary.get("live_sim_block_reasons", []),
+                "data_quality_reasons": summary.get("data_quality_reasons", []),
+            },
+            "filters": {"trade_date": trade_date or "", "window_sec": window_sec, "limit": limit},
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/buy-zero/traces")
+def runtime_buy_zero_trace_events(
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    candidate_instance_id: Optional[str] = None,
+    stage: Optional[str] = None,
+    stage_status: Optional[str] = None,
+    pass_fail: Optional[str] = Query(None, pattern="^(PASS|FAIL|pass|fail)$"),
+    primary_block_reason: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_buy_zero_trace_events(
+            trade_date=trade_date,
+            code=code,
+            candidate_instance_id=candidate_instance_id,
+            stage=stage,
+            stage_status=stage_status,
+            pass_fail=pass_fail.upper() if pass_fail else None,
+            primary_block_reason=primary_block_reason,
+            window_sec=window_sec,
+            limit=limit,
+            offset=offset,
+        )
+        total = db.buy_zero_trace_count(
+            trade_date=trade_date,
+            code=code,
+            candidate_instance_id=candidate_instance_id,
+            stage=stage,
+            stage_status=stage_status,
+            pass_fail=pass_fail.upper() if pass_fail else None,
+            primary_block_reason=primary_block_reason,
+            window_sec=window_sec,
+        )
+        return {
+            "items": items,
+            "pagination": _pagination_payload(limit=limit, offset=offset, count=len(items), total=total),
+            "filters": {
+                "trade_date": trade_date or "",
+                "code": code or "",
+                "candidate_instance_id": candidate_instance_id or "",
+                "stage": stage or "",
+                "stage_status": stage_status or "",
+                "pass_fail": pass_fail or "",
+                "primary_block_reason": primary_block_reason or "",
+                "window_sec": window_sec,
+                "limit": limit,
+                "offset": offset,
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/buy-zero/ready-not-ordered")
+def runtime_buy_zero_ready_not_ordered(
+    trade_date: Optional[str] = None,
+    window_sec: Optional[int] = Query(None, ge=1, le=86400),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _buy_zero_rca_analyzer(db).ready_not_ordered_report(
+            trade_date=trade_date,
+            window_sec=window_sec,
+            limit=limit,
+        )
+        report["filters"] = {"trade_date": trade_date or "", "window_sec": window_sec, "limit": limit}
+        return report
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/buy-zero/missed-opportunities")
+def runtime_buy_zero_missed_opportunities(
+    trade_date: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _buy_zero_rca_analyzer(db).missed_opportunity_report(trade_date=trade_date, limit=limit)
+        report["filters"] = {"trade_date": trade_date or "", "limit": limit}
+        return report
     finally:
         close_database(db)
 
@@ -6470,6 +6593,11 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     }
     decision_summary_payload = db.strategy_decision_summary(trade_date=datetime.now().date().isoformat())
     outcome_summary_payload = db.strategy_decision_outcome_summary(trade_date=datetime.now().date().isoformat())
+    buy_zero_rca_payload = _buy_zero_rca_analyzer(db).build_summary(
+        trade_date=datetime.now().date().isoformat(),
+        limit=50000,
+        include_missed_opportunities=False,
+    )
     shadow_summary_payload = db.shadow_strategy_summary(trade_date=datetime.now().date().isoformat())
     replay_reports = scan_replay_reports(DEFAULT_REPLAY_DB_ROOT, limit=1)
     replay_runs = scan_replay_runs(DEFAULT_REPLAY_DB_ROOT, limit=5)
@@ -6538,6 +6666,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["dry_run_orders"] = dry_run_orders_payload
     runtime_payload["intraday_decisions"] = decision_summary_payload
     runtime_payload["intraday_outcomes"] = outcome_summary_payload
+    runtime_payload["buy_zero_rca"] = buy_zero_rca_payload
     runtime_payload["shadow_strategies"] = shadow_summary_payload
     runtime_payload["strategy_replay"] = replay_payload
     runtime_payload["change_proposals"] = change_proposal_payload
@@ -6572,6 +6701,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "dry_run_orders": dry_run_orders_payload,
         "intraday_decisions": decision_summary_payload,
         "intraday_outcomes": outcome_summary_payload,
+        "buy_zero_rca": buy_zero_rca_payload,
         "shadow_strategies": shadow_summary_payload,
         "strategy_replay": replay_payload,
         "change_proposals": change_proposal_payload,
