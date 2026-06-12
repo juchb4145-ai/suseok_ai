@@ -257,6 +257,19 @@ def test_buy_zero_rca_snapshot_lists_ready_live_sim_blocked_and_data_quality(tmp
         db.save_buy_zero_trace_events(
             [
                 {**_trace("ci-data", "000101", "THEMELAB_GATE_EVALUATED", "WAIT", False, "DATA_INSUFFICIENT"), "trade_date": today},
+                {
+                    **_trace("ci-taxonomy", "000103", "THEMELAB_GATE_EVALUATED", "WAIT_DATA_EARLY_SMALL_CANDIDATE", False, "BASE_LINE_120_INSUFFICIENT_CANDLES"),
+                    "trade_date": today,
+                    "data_quality_bucket": "WARMUP_OPTIONAL",
+                    "data_quality_action": "ALLOW_EARLY_SMALL_CANDIDATE",
+                    "missing_optional_fields": ["BASE_LINE_120_INSUFFICIENT_CANDLES"],
+                    "early_small_candidate": True,
+                    "early_small_order_enabled": False,
+                    "early_small_position_size_multiplier": 0.15,
+                    "early_small_rejected_reason": "EARLY_SMALL_OBSERVE_ONLY",
+                    "operator_message_ko": "보조지표만 부족해 관찰합니다.",
+                    "reason_codes": ["DATA_INSUFFICIENT", "WARMUP_OPTIONAL_ONLY", "BASE_LINE_120_INSUFFICIENT_CANDLES"],
+                },
                 {**_trace("ci-live-snapshot", "000102", "LIFECYCLE_UPDATED", "READY", True, ""), "trade_date": today},
                 {
                     **_trace("ci-live-snapshot", "000102", "LIVE_SIM_BLOCKED", "BLOCKED", False, "LIVE_SIM_BLOCKED"),
@@ -280,6 +293,11 @@ def test_buy_zero_rca_snapshot_lists_ready_live_sim_blocked_and_data_quality(tmp
     rca = snapshot["buy_zero_rca"]
     assert rca["available"] is True
     assert rca["data_quality_blocks"]["reasons"][0]["reason"] == "DATA_INSUFFICIENT"
+    assert {"bucket": "WARMUP_OPTIONAL", "count": 1} in rca["data_quality_blocks"]["buckets"]
+    assert {"action": "ALLOW_EARLY_SMALL_CANDIDATE", "count": 1} in rca["data_quality_blocks"]["actions"]
+    assert rca["data_quality_taxonomy"]["warmup_optional_count"] == 1
+    assert rca["data_quality_taxonomy"]["early_small_candidate_count"] == 1
+    assert rca["early_small_candidates"][0]["early_small_rejected_reason"] == "EARLY_SMALL_OBSERVE_ONLY"
     assert rca["live_sim_blocked"]["count"] == 1
     assert ready["items"][0]["classification"] == "READY_BUT_LIVE_SIM_BLOCKED"
     assert rca["ready_not_ordered_items"][0]["classification"] == "READY_BUT_LIVE_SIM_BLOCKED"

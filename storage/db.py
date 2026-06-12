@@ -964,6 +964,15 @@ class TradingDatabase:
                 baseline120_ready INTEGER,
                 envelope_mid_ready INTEGER,
                 data_quality_bucket TEXT NOT NULL DEFAULT '',
+                data_quality_action TEXT NOT NULL DEFAULT '',
+                missing_core_fields_json TEXT NOT NULL DEFAULT '[]',
+                missing_entry_fields_json TEXT NOT NULL DEFAULT '[]',
+                missing_optional_fields_json TEXT NOT NULL DEFAULT '[]',
+                early_small_candidate INTEGER,
+                early_small_order_enabled INTEGER,
+                early_small_position_size_multiplier REAL,
+                early_small_rejected_reason TEXT NOT NULL DEFAULT '',
+                operator_message_ko TEXT NOT NULL DEFAULT '',
                 entry_plan_id INTEGER,
                 entry_plan_submittable INTEGER,
                 entry_plan_diagnostic_only INTEGER,
@@ -1616,6 +1625,7 @@ class TradingDatabase:
         self._ensure_strategy_runtime_settings_columns()
         self._ensure_runtime_order_intent_columns()
         self._ensure_runtime_order_intent_indexes()
+        self._ensure_buy_zero_rca_trace_columns()
         self._ensure_gateway_transport_latency_columns()
         self._ensure_gateway_transport_latency_indexes()
         self._seed_legacy_strategy_runtime_settings()
@@ -2448,7 +2458,12 @@ class TradingDatabase:
                 latest_tick_ready, latest_tick_age_sec, support_ready,
                 selected_support_source, selected_support_price,
                 vwap_ready, baseline120_ready, envelope_mid_ready,
-                data_quality_bucket, entry_plan_id, entry_plan_submittable,
+                data_quality_bucket, data_quality_action,
+                missing_core_fields_json, missing_entry_fields_json,
+                missing_optional_fields_json, early_small_candidate,
+                early_small_order_enabled, early_small_position_size_multiplier,
+                early_small_rejected_reason, operator_message_ko,
+                entry_plan_id, entry_plan_submittable,
                 entry_plan_diagnostic_only, dry_run_intent_id, dry_run_status,
                 dry_run_reason, live_sim_intent_id, live_sim_status,
                 live_sim_reason, command_id, broker_order_id, details_json, created_at
@@ -2463,7 +2478,12 @@ class TradingDatabase:
                 :latest_tick_ready, :latest_tick_age_sec, :support_ready,
                 :selected_support_source, :selected_support_price,
                 :vwap_ready, :baseline120_ready, :envelope_mid_ready,
-                :data_quality_bucket, :entry_plan_id, :entry_plan_submittable,
+                :data_quality_bucket, :data_quality_action,
+                :missing_core_fields_json, :missing_entry_fields_json,
+                :missing_optional_fields_json, :early_small_candidate,
+                :early_small_order_enabled, :early_small_position_size_multiplier,
+                :early_small_rejected_reason, :operator_message_ko,
+                :entry_plan_id, :entry_plan_submittable,
                 :entry_plan_diagnostic_only, :dry_run_intent_id, :dry_run_status,
                 :dry_run_reason, :live_sim_intent_id, :live_sim_status,
                 :live_sim_reason, :command_id, :broker_order_id, :details_json, :created_at
@@ -7512,6 +7532,21 @@ class TradingDatabase:
             """
         )
 
+    def _ensure_buy_zero_rca_trace_columns(self) -> None:
+        columns = {
+            "data_quality_action": "TEXT NOT NULL DEFAULT ''",
+            "missing_core_fields_json": "TEXT NOT NULL DEFAULT '[]'",
+            "missing_entry_fields_json": "TEXT NOT NULL DEFAULT '[]'",
+            "missing_optional_fields_json": "TEXT NOT NULL DEFAULT '[]'",
+            "early_small_candidate": "INTEGER",
+            "early_small_order_enabled": "INTEGER",
+            "early_small_position_size_multiplier": "REAL",
+            "early_small_rejected_reason": "TEXT NOT NULL DEFAULT ''",
+            "operator_message_ko": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in columns.items():
+            self._ensure_column("buy_zero_rca_traces", name, definition)
+
     def _ensure_gateway_transport_latency_columns(self) -> None:
         sample_columns = {
             "experiment_id": "TEXT NOT NULL DEFAULT ''",
@@ -7780,6 +7815,15 @@ def _buy_zero_trace_params(payload: dict) -> dict:
         "baseline120_ready": _nullable_bool_int(payload.get("baseline120_ready")),
         "envelope_mid_ready": _nullable_bool_int(payload.get("envelope_mid_ready")),
         "data_quality_bucket": str(payload.get("data_quality_bucket") or ""),
+        "data_quality_action": str(payload.get("data_quality_action") or ""),
+        "missing_core_fields_json": _json_list(payload.get("missing_core_fields_json", payload.get("missing_core_fields", []))),
+        "missing_entry_fields_json": _json_list(payload.get("missing_entry_fields_json", payload.get("missing_entry_fields", []))),
+        "missing_optional_fields_json": _json_list(payload.get("missing_optional_fields_json", payload.get("missing_optional_fields", []))),
+        "early_small_candidate": _nullable_bool_int(payload.get("early_small_candidate")),
+        "early_small_order_enabled": _nullable_bool_int(payload.get("early_small_order_enabled")),
+        "early_small_position_size_multiplier": _nullable_float(payload.get("early_small_position_size_multiplier")),
+        "early_small_rejected_reason": str(payload.get("early_small_rejected_reason") or ""),
+        "operator_message_ko": str(payload.get("operator_message_ko") or payload.get("data_quality_operator_message_ko") or ""),
         "entry_plan_id": _nullable_int(payload.get("entry_plan_id")),
         "entry_plan_submittable": _nullable_bool_int(payload.get("entry_plan_submittable")),
         "entry_plan_diagnostic_only": _nullable_bool_int(payload.get("entry_plan_diagnostic_only")),
@@ -7800,6 +7844,9 @@ def _row_to_buy_zero_trace(row: sqlite3.Row) -> dict:
     data = dict(row)
     data["reason_codes"] = _safe_json_loads(data.get("reason_codes_json"), [])
     data["details"] = _safe_json_loads(data.get("details_json"), {})
+    data["missing_core_fields"] = _safe_json_loads(data.get("missing_core_fields_json"), [])
+    data["missing_entry_fields"] = _safe_json_loads(data.get("missing_entry_fields_json"), [])
+    data["missing_optional_fields"] = _safe_json_loads(data.get("missing_optional_fields_json"), [])
     for key in (
         "passed",
         "latest_tick_ready",
@@ -7809,6 +7856,8 @@ def _row_to_buy_zero_trace(row: sqlite3.Row) -> dict:
         "envelope_mid_ready",
         "entry_plan_submittable",
         "entry_plan_diagnostic_only",
+        "early_small_candidate",
+        "early_small_order_enabled",
     ):
         if data.get(key) is not None:
             data[key] = bool(data.get(key))
@@ -8009,6 +8058,9 @@ def _buy_zero_trace_base_from_decision(
         ]
     )
     data_bucket = _first_string(
+        gate_details.get("data_quality_bucket"),
+        entry_cancel.get("data_quality_bucket"),
+        order_metadata.get("data_quality_bucket"),
         gate_details.get("realtime_reliability_bucket"),
         entry_cancel.get("realtime_reliability_bucket"),
         event.get("data_status"),
@@ -8042,6 +8094,28 @@ def _buy_zero_trace_base_from_decision(
         "baseline120_ready": _first_present(gate_details.get("baseline120_ready"), gate_details.get("base_line_120_ready"), entry_cancel.get("baseline120_ready"), entry_cancel.get("base_line_120_ready")),
         "envelope_mid_ready": _first_present(gate_details.get("envelope_mid_ready"), entry_cancel.get("envelope_mid_ready")),
         "data_quality_bucket": data_bucket,
+        "data_quality_action": _first_string(gate_details.get("data_quality_action"), entry_cancel.get("data_quality_action"), order_metadata.get("data_quality_action")),
+        "missing_core_fields": _first_list(gate_details.get("missing_core_fields"), entry_cancel.get("missing_core_fields"), order_metadata.get("missing_core_fields")),
+        "missing_entry_fields": _first_list(gate_details.get("missing_entry_fields"), entry_cancel.get("missing_entry_fields"), order_metadata.get("missing_entry_fields")),
+        "missing_optional_fields": _first_list(gate_details.get("missing_optional_fields"), entry_cancel.get("missing_optional_fields"), order_metadata.get("missing_optional_fields")),
+        "early_small_candidate": _first_present(gate_details.get("early_small_candidate"), entry_cancel.get("early_small_candidate"), order_metadata.get("early_small_candidate")),
+        "early_small_order_enabled": _first_present(gate_details.get("early_small_order_enabled"), entry_cancel.get("early_small_order_enabled"), order_metadata.get("early_small_order_enabled")),
+        "early_small_position_size_multiplier": _first_present(
+            gate_details.get("early_small_position_size_multiplier"),
+            entry_cancel.get("early_small_position_size_multiplier"),
+            order_metadata.get("early_small_position_size_multiplier"),
+        ),
+        "early_small_rejected_reason": _first_string(
+            gate_details.get("early_small_rejected_reason"),
+            entry_cancel.get("early_small_rejected_reason"),
+            order_metadata.get("early_small_rejected_reason"),
+        ),
+        "operator_message_ko": _first_string(
+            gate_details.get("data_quality_operator_message_ko"),
+            gate_details.get("operator_message_ko"),
+            entry_cancel.get("data_quality_operator_message_ko"),
+            order_metadata.get("data_quality_operator_message_ko"),
+        ),
         "entry_plan_id": _first_present(event.get("entry_plan_id"), entry_cancel.get("entry_plan_id")),
         "entry_plan_submittable": entry_cancel.get("submittable"),
         "entry_plan_diagnostic_only": entry_cancel.get("diagnostic_only"),
@@ -8159,6 +8233,22 @@ def _first_present(*values: object):
         if value not in (None, ""):
             return value
     return None
+
+
+def _first_list(*values: object) -> list:
+    for value in values:
+        if value in (None, ""):
+            continue
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, str):
+            parsed = _safe_json_loads(value, None)
+            if isinstance(parsed, list):
+                return parsed
+            return [value]
+    return []
 
 
 def _dedupe(values: Iterable[object]) -> list[str]:

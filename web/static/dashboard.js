@@ -364,6 +364,12 @@ const BUY_ZERO_RCA_CRITICAL_REASONS = new Set([
   "ENTRY_PLAN_DIAGNOSTIC_ONLY",
   "ORDER_SINK_NOOP",
   "GATE_RESULT_KEY_MISMATCH",
+  "CORE_BLOCKING",
+  "ENTRY_BLOCKING",
+  "WARMUP_OPTIONAL",
+  "BACKFILL_ONLY_OBSERVE",
+  "WAIT_DATA_EARLY_SMALL_CANDIDATE",
+  "EARLY_SMALL_OBSERVE_ONLY",
 ]);
 
 const BUY_ZERO_RCA_STAGE_LABELS = {
@@ -1079,6 +1085,7 @@ function renderBuyZeroRca(snapshot) {
     "reason",
     "데이터 품질 부족 사유가 없습니다"
   );
+  renderBuyZeroDataQualityCounts("buy-zero-rca-data-quality-blocks", payload);
   renderBuyZeroStageFunnel(payload.stage_funnel || []);
   renderBuyZeroReadyRows(state.buyZeroRca.readyRows, available);
   renderBuyZeroRallyRows(state.buyZeroRca.rallyRows, available);
@@ -1099,6 +1106,28 @@ function renderBuyZeroInlineCounts(id, rows, key, emptyText) {
   node.innerHTML = items.length
     ? items.map((item) => `<div>${reasonBadge(item[key] || item.category || "-")} <strong>${escapeHtml(item.count ?? 0)}</strong></div>`).join("")
     : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
+function renderBuyZeroDataQualityCounts(id, payload) {
+  const blocks = (payload || {}).data_quality_blocks || {};
+  const taxonomy = (payload || {}).data_quality_taxonomy || ((payload || {}).summary || {}).data_quality_taxonomy || {};
+  const bucketRows = blocks.buckets || taxonomy.buckets || [];
+  const actionRows = blocks.actions || taxonomy.actions || [];
+  const reasonRows = blocks.reasons || (payload || {}).top_data_insufficient_reasons || [];
+  const rows = [];
+  bucketRows.forEach((item) => rows.push({ label: item.bucket || item.reason || "-", count: item.count || 0 }));
+  actionRows.forEach((item) => rows.push({ label: item.action || "-", count: item.count || 0 }));
+  [
+    ["early-small 후보", taxonomy.early_small_candidate_count],
+    ["주문 비활성 관찰", taxonomy.early_small_observe_only_count],
+    ["소액 주문 허용", taxonomy.early_small_order_enabled_count],
+  ].forEach(([label, count]) => {
+    if (Number(count || 0) > 0) rows.push({ label, count });
+  });
+  if (!rows.length) {
+    reasonRows.forEach((item) => rows.push({ label: item.reason || "-", count: item.count || 0 }));
+  }
+  renderBuyZeroInlineCounts(id, rows, "label", "데이터 품질 부족 사유가 없습니다");
 }
 
 function renderBuyZeroStageFunnel(rows) {

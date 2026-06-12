@@ -6,6 +6,16 @@ from typing import Any, Callable, Iterable, Optional
 
 from trading.strategy.candidates import CandidateLifecycle, is_valid_stock_code, normalize_code
 from trading.strategy.candidate_identity import CandidateGenerationConfig, CandidateInstanceDecision, build_candidate_instance_id, decide_candidate_instance, identity_metadata
+from trading.strategy.data_quality_taxonomy import (
+    ACTION_ALLOW_EARLY_SMALL_CANDIDATE,
+    BUCKET_BACKFILL_ONLY_OBSERVE,
+    BUCKET_CORE_BLOCKING,
+    BUCKET_ENTRY_BLOCKING,
+    BUCKET_WARMUP_OPTIONAL,
+    DataQualityClassification,
+    classify_entry_data_quality,
+    data_quality_action_for_candidate,
+)
 from trading.strategy.models import (
     BlockType,
     Candidate,
@@ -20,8 +30,6 @@ from trading.strategy.pipeline import GatePipelineResult
 from trading.strategy.reason_codes import normalize_reason_codes, standardize_details
 from trading.strategy.runtime_settings import StrategyRuntimeSettings, legacy_strategy_runtime_settings
 from trading.strategy.support_readiness import (
-    BASE_LINE_120,
-    EARLY_READY_SUPPORT_SOURCES,
     LATEST_TICK_MISSING,
     OBSERVE,
     READY_EARLY_SMALL,
@@ -199,6 +207,17 @@ class ThemeLabBridgeMapping:
     position_size_multiplier: float = 0.0
     shadow_small_entry_guard: dict[str, Any] = field(default_factory=dict)
     realtime_reliability_guard: dict[str, Any] = field(default_factory=dict)
+    data_quality_bucket: str = ""
+    data_quality_action: str = ""
+    missing_core_fields: list[str] = field(default_factory=list)
+    missing_entry_fields: list[str] = field(default_factory=list)
+    missing_optional_fields: list[str] = field(default_factory=list)
+    data_quality_confidence: str = ""
+    operator_message_ko: str = ""
+    early_small_candidate: bool = False
+    early_small_order_enabled: bool = False
+    early_small_position_size_multiplier: float = 0.0
+    early_small_rejected_reason: str = ""
 
 
 class ThemeLabDryRunLifecycleBridge:
@@ -614,10 +633,40 @@ def _map_decision(
     latest = latest_tick_readiness(tick, now or datetime.now(), active_settings)
     reliability_policy = _realtime_reliability_settings(active_settings)
     reliability_guard = _realtime_reliability_guard(metadata, reliability_policy)
+    support = _selected_support_profile(price_location, _support_candidates(metadata), metadata)
+    data_quality = _bridge_data_quality_classification(
+        decision,
+        watch,
+        theme,
+        tick=tick,
+        metadata=metadata,
+        support=support,
+        latest=latest,
+        reason_codes=reason_codes,
+        settings=active_settings,
+        now=now or datetime.now(),
+    )
 
-    if _has_any(reason_codes, DATA_INSUFFICIENT_CODES):
+    if data_quality.bucket == BUCKET_BACKFILL_ONLY_OBSERVE:
         return ThemeLabBridgeMapping(
-            "WAIT_DATA",
+            "OBSERVE_BACKFILL_ONLY",
+            "NOT_ELIGIBLE_DATA",
+            False,
+            BlockType.NONE,
+            False,
+            recheck_after_sec,
+            "C",
+            max(0.0, float(decision.price_location_score or 0.0)),
+            _dedupe(data_quality.reason_codes + reason_codes),
+            ready_type=OBSERVE,
+            latest_tick_ready=latest.ready,
+            latest_tick_age_sec=latest.age_sec,
+            realtime_reliability_guard=reliability_guard,
+            **_data_quality_mapping_fields(data_quality),
+        )
+    if data_quality.bucket == BUCKET_CORE_BLOCKING:
+        return ThemeLabBridgeMapping(
+            WAIT_DATA,
             "NOT_ELIGIBLE_DATA",
             False,
             BlockType.TEMPORARY,
@@ -625,10 +674,12 @@ def _map_decision(
             recheck_after_sec,
             "C",
             max(0.0, float(decision.price_location_score or 0.0)),
-            _dedupe(["DATA_INSUFFICIENT", "WAIT_DATA"] + reason_codes),
+            _dedupe(data_quality.reason_codes + reason_codes),
+            ready_type=WAIT_DATA,
             latest_tick_ready=latest.ready,
             latest_tick_age_sec=latest.age_sec,
             realtime_reliability_guard=reliability_guard,
+            **_data_quality_mapping_fields(data_quality),
         )
     if _is_theme_weak(reason_codes, theme):
         return ThemeLabBridgeMapping(
@@ -644,6 +695,7 @@ def _map_decision(
             latest_tick_ready=latest.ready,
             latest_tick_age_sec=latest.age_sec,
             realtime_reliability_guard=reliability_guard,
+            **_data_quality_mapping_fields(data_quality),
         )
     if not latest.ready:
         return ThemeLabBridgeMapping(
@@ -660,6 +712,7 @@ def _map_decision(
             latest_tick_ready=False,
             latest_tick_age_sec=latest.age_sec,
             realtime_reliability_guard=reliability_guard,
+            **_data_quality_mapping_fields(data_quality),
         )
     market_wait_status = _market_wait_status(reason_codes)
     if market_wait_status:
@@ -677,6 +730,7 @@ def _map_decision(
             latest_tick_ready=latest.ready,
             latest_tick_age_sec=latest.age_sec,
             realtime_reliability_guard=reliability_guard,
+            **_data_quality_mapping_fields(data_quality),
         )
     entry_risk_mapping = _entry_risk_mapping(decision, watch, reason_codes, latest, active_settings)
     if entry_risk_mapping is not None:
@@ -702,7 +756,6 @@ def _map_decision(
             latest_tick_age_sec=latest.age_sec,
             realtime_reliability_guard=reliability_guard,
         )
-    support = _selected_support_profile(price_location, _support_candidates(metadata), metadata)
     shadow_guard = _shadow_small_entry_guard(decision, watch, shadow_policy, promotion_available=shadow_promotion_available)
     if _realtime_reliability_waits(reliability_guard):
         blocked_shadow_guard = (
@@ -758,6 +811,36 @@ def _map_decision(
                 _positive_float(decision.position_size_multiplier) or 1.0,
                 reliability_guard,
             ),
+            realtime_reliability_guard=reliability_guard,
+        )
+    if data_quality.bucket == BUCKET_ENTRY_BLOCKING:
+        return _wait_data_for_data_quality(
+            decision,
+            recheck_after_sec,
+            reason_codes,
+            data_quality,
+            support,
+            latest,
+            realtime_reliability_guard=reliability_guard,
+        )
+    if data_quality.bucket == BUCKET_WARMUP_OPTIONAL:
+        if data_quality.action == ACTION_ALLOW_EARLY_SMALL_CANDIDATE:
+            return _data_quality_early_small_mapping(
+                decision,
+                recheck_after_sec,
+                reason_codes,
+                data_quality,
+                support,
+                latest,
+                realtime_reliability_guard=reliability_guard,
+            )
+        return _wait_data_for_data_quality(
+            decision,
+            recheck_after_sec,
+            reason_codes,
+            data_quality,
+            support,
+            latest,
             realtime_reliability_guard=reliability_guard,
         )
     if shadow_guard.get("promoted"):
@@ -833,14 +916,9 @@ def _map_decision(
                 latest,
                 realtime_reliability_guard=reliability_guard,
             )
-        base_line_ready = support_source_readiness(BASE_LINE_120, metadata).ready
         ready_type = READY_FULL
         final_status = "READY_PULLBACK"
         order_eligibility = "BUY_ELIGIBLE_PULLBACK"
-        if not base_line_ready and support["source"] in EARLY_READY_SUPPORT_SOURCES:
-            ready_type = READY_EARLY_SMALL
-            final_status = READY_EARLY_SMALL
-            order_eligibility = "BUY_ELIGIBLE_EARLY_SMALL"
         support_reason_codes = [SUPPORT_SOURCE_FALLBACK_USED] if support["fallback_used"] else []
         position_size_multiplier = _realtime_reliability_apply_multiplier(
             _positive_float(decision.position_size_multiplier) or 1.0,
@@ -1052,6 +1130,151 @@ def _wait_data_for_support(
         shadow_small_entry_guard=dict(shadow_small_entry_guard or {}),
         realtime_reliability_guard=dict(realtime_reliability_guard or {}),
     )
+
+
+def _wait_data_for_data_quality(
+    decision: LabGateDecision,
+    recheck_after_sec: int,
+    reason_codes: list[str],
+    data_quality: DataQualityClassification,
+    support: dict[str, Any],
+    latest,
+    *,
+    realtime_reliability_guard: dict[str, Any] | None = None,
+) -> ThemeLabBridgeMapping:
+    reason = data_quality.reason_codes[0] if data_quality.reason_codes else "DATA_INSUFFICIENT"
+    return ThemeLabBridgeMapping(
+        WAIT_DATA,
+        "NOT_ELIGIBLE_DATA",
+        False,
+        BlockType.TEMPORARY,
+        True,
+        recheck_after_sec,
+        "C",
+        max(0.0, float(decision.price_location_score or 0.0)),
+        _dedupe(data_quality.reason_codes + [WAIT_DATA, reason] + reason_codes),
+        ready_type=WAIT_DATA,
+        selected_support_source=str(support.get("source") or ""),
+        selected_support_price=int(float(support.get("price") or 0)),
+        selected_support_ready=bool(support.get("ready")),
+        selected_support_ready_reason=str(support.get("reason") or ""),
+        support_source_fallback_used=bool(support.get("fallback_used")),
+        latest_tick_ready=latest.ready,
+        latest_tick_age_sec=latest.age_sec,
+        realtime_reliability_guard=dict(realtime_reliability_guard or {}),
+        **_data_quality_mapping_fields(data_quality),
+    )
+
+
+def _data_quality_early_small_mapping(
+    decision: LabGateDecision,
+    recheck_after_sec: int,
+    reason_codes: list[str],
+    data_quality: DataQualityClassification,
+    support: dict[str, Any],
+    latest,
+    *,
+    realtime_reliability_guard: dict[str, Any] | None = None,
+) -> ThemeLabBridgeMapping:
+    support_reason_codes = [SUPPORT_SOURCE_FALLBACK_USED] if support.get("fallback_used") else []
+    order_enabled = bool(data_quality.early_small_order_enabled)
+    final_status = READY_EARLY_SMALL if order_enabled else "WAIT_DATA_EARLY_SMALL_CANDIDATE"
+    return ThemeLabBridgeMapping(
+        final_status,
+        "BUY_ELIGIBLE_EARLY_SMALL_DATA_WARMUP" if order_enabled else "NOT_ELIGIBLE_EARLY_SMALL_OBSERVE_ONLY",
+        order_enabled,
+        BlockType.NONE if order_enabled else BlockType.TEMPORARY,
+        not order_enabled,
+        0 if order_enabled else recheck_after_sec,
+        "B_EARLY_SMALL" if order_enabled else "B",
+        min(75.0, max(65.0, float(decision.price_location_score or 65.0))),
+        _dedupe([final_status, "WARMUP_OPTIONAL_ONLY"] + support_reason_codes + data_quality.reason_codes + reason_codes),
+        ready_type=READY_EARLY_SMALL if order_enabled else final_status,
+        selected_support_source=str(support.get("source") or ""),
+        selected_support_price=int(float(support.get("price") or 0)),
+        selected_support_ready=bool(support.get("ready")),
+        support_source_fallback_used=bool(support.get("fallback_used")),
+        latest_tick_ready=latest.ready,
+        latest_tick_age_sec=latest.age_sec,
+        position_size_multiplier=float(data_quality.early_small_position_size_multiplier if order_enabled else 0.0),
+        realtime_reliability_guard=dict(realtime_reliability_guard or {}),
+        **_data_quality_mapping_fields(data_quality),
+    )
+
+
+def _bridge_data_quality_classification(
+    decision: LabGateDecision,
+    watch: WatchSetSnapshot,
+    theme: ThemeConditionSnapshot | None,
+    *,
+    tick: Any,
+    metadata: dict[str, Any],
+    support: dict[str, Any],
+    latest,
+    reason_codes: list[str],
+    settings: StrategyRuntimeSettings,
+    now: datetime,
+) -> DataQualityClassification:
+    classification = classify_entry_data_quality(
+        reason_codes=reason_codes,
+        tick=tick,
+        metadata=metadata,
+        support=support,
+        latest_tick_ready=latest.ready,
+        latest_tick_reason=latest.reason,
+        now=now,
+        settings=settings,
+    )
+    current_price = float(getattr(tick, "price", 0) or 0)
+    trade_value = float(getattr(tick, "trade_value", 0) or metadata.get("trade_value") or metadata.get("turnover_krw") or 0)
+    theme_status = theme.theme_status.value if theme is not None else ""
+    return data_quality_action_for_candidate(
+        classification,
+        settings=settings,
+        status=decision.status.value,
+        stock_role=watch.stock_role.value,
+        theme_status=theme_status,
+        price_location_status=decision.price_location_status.value,
+        risk_level=decision.risk_level.value,
+        latest_tick_ready=latest.ready,
+        current_price=current_price,
+        trade_value=trade_value,
+        vwap_ready=bool(metadata.get("vwap_ready") or support.get("source") == "vwap" and support.get("ready")),
+        recent_support_ready=bool(metadata.get("recent_support_ready") or support.get("source") in {"recent_support_price", "support_price", "recent_swing_low"} and support.get("ready")),
+        reason_codes=reason_codes,
+        candidate_market_status=_first_market_status(decision, watch),
+    )
+
+
+def _data_quality_mapping_fields(data_quality: DataQualityClassification | None) -> dict[str, Any]:
+    if data_quality is None:
+        return {}
+    return {
+        "data_quality_bucket": data_quality.bucket,
+        "data_quality_action": data_quality.action,
+        "missing_core_fields": list(data_quality.missing_core_fields),
+        "missing_entry_fields": list(data_quality.missing_entry_fields),
+        "missing_optional_fields": list(data_quality.missing_optional_fields),
+        "data_quality_confidence": data_quality.confidence,
+        "operator_message_ko": data_quality.operator_message_ko,
+        "early_small_candidate": bool(data_quality.early_small_candidate),
+        "early_small_order_enabled": bool(data_quality.early_small_order_enabled),
+        "early_small_position_size_multiplier": float(data_quality.early_small_position_size_multiplier or 0.0),
+        "early_small_rejected_reason": data_quality.early_small_rejected_reason,
+    }
+
+
+def _first_market_status(decision: LabGateDecision, watch: WatchSetSnapshot) -> str:
+    for value in (
+        getattr(decision, "candidate_market_confirmed_status", ""),
+        getattr(decision, "candidate_market_status", ""),
+        getattr(watch, "candidate_market_confirmed_status", ""),
+        getattr(watch, "candidate_market_status", ""),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _wait_data_for_realtime_reliability(
@@ -1744,6 +1967,17 @@ def _stock_pullback_details(
         "minute_bar_present": coverage["minute_bar_present"],
         "minute_bar_count": coverage["minute_bar_count"],
         "ready_type": mapping.ready_type,
+        "data_quality_bucket": mapping.data_quality_bucket,
+        "data_quality_action": mapping.data_quality_action,
+        "missing_core_fields": list(mapping.missing_core_fields),
+        "missing_entry_fields": list(mapping.missing_entry_fields),
+        "missing_optional_fields": list(mapping.missing_optional_fields),
+        "data_quality_confidence": mapping.data_quality_confidence,
+        "data_quality_operator_message_ko": mapping.operator_message_ko,
+        "early_small_candidate": bool(mapping.early_small_candidate),
+        "early_small_order_enabled": bool(mapping.early_small_order_enabled),
+        "early_small_position_size_multiplier": mapping.early_small_position_size_multiplier,
+        "early_small_rejected_reason": mapping.early_small_rejected_reason,
         "latest_tick_ready": mapping.latest_tick_ready,
         "latest_tick_age_sec": mapping.latest_tick_age_sec,
         **realtime_fields,
@@ -1967,6 +2201,17 @@ def _base_details(
         "recent_support_ready": bool(stock_details.get("recent_support_ready")),
         "minute_bar_present": bool(stock_details.get("minute_bar_present")),
         "minute_bar_count": stock_details.get("minute_bar_count", 0),
+        "data_quality_bucket": stock_details.get("data_quality_bucket", ""),
+        "data_quality_action": stock_details.get("data_quality_action", ""),
+        "missing_core_fields": list(stock_details.get("missing_core_fields") or []),
+        "missing_entry_fields": list(stock_details.get("missing_entry_fields") or []),
+        "missing_optional_fields": list(stock_details.get("missing_optional_fields") or []),
+        "data_quality_confidence": stock_details.get("data_quality_confidence", ""),
+        "data_quality_operator_message_ko": stock_details.get("data_quality_operator_message_ko", ""),
+        "early_small_candidate": bool(stock_details.get("early_small_candidate")),
+        "early_small_order_enabled": bool(stock_details.get("early_small_order_enabled")),
+        "early_small_position_size_multiplier": stock_details.get("early_small_position_size_multiplier"),
+        "early_small_rejected_reason": stock_details.get("early_small_rejected_reason", ""),
         "late_chase_diagnostics": dict(stock_details.get("late_chase_diagnostics") or {}),
         "late_chase_level": stock_details.get("late_chase_level", ""),
         "late_chase_score": stock_details.get("late_chase_score"),
@@ -2053,6 +2298,17 @@ def _base_details(
             "recent_support_ready": bool(stock_details.get("recent_support_ready")),
             "minute_bar_present": bool(stock_details.get("minute_bar_present")),
             "minute_bar_count": stock_details.get("minute_bar_count", 0),
+            "data_quality_bucket": stock_details.get("data_quality_bucket", ""),
+            "data_quality_action": stock_details.get("data_quality_action", ""),
+            "missing_core_fields": list(stock_details.get("missing_core_fields") or []),
+            "missing_entry_fields": list(stock_details.get("missing_entry_fields") or []),
+            "missing_optional_fields": list(stock_details.get("missing_optional_fields") or []),
+            "data_quality_confidence": stock_details.get("data_quality_confidence", ""),
+            "data_quality_operator_message_ko": stock_details.get("data_quality_operator_message_ko", ""),
+            "early_small_candidate": bool(stock_details.get("early_small_candidate")),
+            "early_small_order_enabled": bool(stock_details.get("early_small_order_enabled")),
+            "early_small_position_size_multiplier": stock_details.get("early_small_position_size_multiplier"),
+            "early_small_rejected_reason": stock_details.get("early_small_rejected_reason", ""),
             "late_chase_level": stock_details.get("late_chase_level", ""),
             "late_chase_block_type": stock_details.get("late_chase_block_type", ""),
             "late_chase_recoverable": bool(stock_details.get("late_chase_recoverable")),

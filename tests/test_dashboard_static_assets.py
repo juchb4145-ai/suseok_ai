@@ -128,11 +128,13 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "shadowEvaluations" in js
     assert "shadowRiskCandidates" in js
     assert "function renderBuyZeroRca" in js
+    assert "function renderBuyZeroDataQualityCounts" in js
     assert "function openBuyZeroTraceDetail" in js
     assert "/api/runtime/buy-zero/ready-not-ordered" in js
     assert "/api/runtime/buy-zero/missed-opportunities" in js
     assert "/api/runtime/buy-zero/traces" in js
     assert "BUY_ZERO_RCA_CRITICAL_REASONS" in js
+    assert "WARMUP_OPTIONAL" in js
     assert "buy-zero-rca-timeline" in js
     assert ".slice(0, 10)" not in js
     assert ".slice(0, 20)" not in js

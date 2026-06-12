@@ -137,6 +137,41 @@ def test_intraday_outcome_summary_generates_proposals(tmp_path):
             ],
             force=True,
         )
+        db.save_theme_lab_flow_result(
+            "2026-06-01T09:00:00",
+            {
+                "market_status": {"market_status": "CHOPPY"},
+                "theme_rankings": [],
+                "theme_condition_snapshots": [],
+                "condition_hit_snapshots": [],
+                "watchset_snapshots": [
+                    {
+                        "symbol": "000777",
+                        "name": "Warmup",
+                        "current_price": 100,
+                        "final_gate_status": "WAIT",
+                        "price_location_status": "GOOD_PULLBACK",
+                        "price_location_readiness": "WARMUP",
+                        "price_location_readiness_reason_codes": ["BASE_LINE_120_INSUFFICIENT_CANDLES"],
+                        "data_quality_bucket": "WARMUP_OPTIONAL",
+                        "data_quality_action": "ALLOW_EARLY_SMALL_CANDIDATE",
+                    }
+                ],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+        db.save_theme_lab_outcome_observations(
+            [
+                {
+                    "observed_at": "2026-06-01T09:15:00",
+                    "trade_date": "2026-06-01",
+                    "stock_code": "000777",
+                    "price": 104,
+                    "source": "theme_lab_outcome_tracking",
+                }
+            ]
+        )
 
         result = _generator(db).generate(trade_date="2026-06-01", source_type="intraday_outcome")
 
@@ -144,6 +179,9 @@ def test_intraday_outcome_summary_generates_proposals(tmp_path):
         assert {item["source_type"] for item in result["proposals"]} == {"intraday_outcome"}
         assert {item["target_component"] for item in result["proposals"]} == {"data_quality_gate", "exit_engine"}
         assert all(item["evidence"] for item in result["proposals"])
+        metric_names = {evidence["metric_name"] for proposal in result["proposals"] for evidence in proposal["evidence"]}
+        assert "data_quality_bucket_warmup_optional_event_count" in metric_names
+        assert "data_quality_bucket_warmup_optional_missed_opportunity_count" in metric_names
     finally:
         db.close()
 

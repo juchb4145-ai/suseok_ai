@@ -73,6 +73,8 @@ class BuyZeroRCAAnalyzer:
         live_sim_reasons: Counter[str] = Counter()
         live_sim_block_rows: list[dict[str, Any]] = []
         data_quality_reasons: Counter[str] = Counter()
+        data_quality_actions: Counter[str] = Counter()
+        early_small_rows: list[dict[str, Any]] = []
         status_counts: Counter[str] = Counter()
         last_updated_at = ""
 
@@ -90,8 +92,13 @@ class BuyZeroRCAAnalyzer:
                 if any(marker in reason.upper() for marker in LATE_CHASE_MARKERS):
                     late_chase.append(_candidate_row(trace, reason=reason))
             bucket = str(trace.get("data_quality_bucket") or "")
-            if bucket:
+            if bucket and bucket != "OK":
                 data_quality_reasons[bucket] += 1
+            action = str(trace.get("data_quality_action") or "")
+            if action and action != "PASS":
+                data_quality_actions[action] += 1
+            if trace.get("early_small_candidate") is True:
+                early_small_rows.append(_candidate_row(trace, reason=trace.get("early_small_rejected_reason") or bucket or action))
             if trace.get("stage") == "LIVE_SIM_BLOCKED":
                 live_sim_reasons.update(reasons or [str(trace.get("live_sim_reason") or "UNKNOWN")])
                 live_sim_block_rows.append(_candidate_row(trace, reason=(reasons[0] if reasons else "")))
@@ -156,6 +163,22 @@ class BuyZeroRCAAnalyzer:
             "live_sim_submitted_count": len(live_sim_submitted),
             "live_sim_blocked_count": len(live_sim_blocked),
             "last_updated_at": last_updated_at,
+            "data_quality_taxonomy": {
+                "data_insufficient_total_count": sum(data_quality_reasons.values()),
+                "core_blocking_count": int(data_quality_reasons.get("CORE_BLOCKING", 0)),
+                "entry_blocking_count": int(data_quality_reasons.get("ENTRY_BLOCKING", 0)),
+                "warmup_optional_count": int(data_quality_reasons.get("WARMUP_OPTIONAL", 0)),
+                "backfill_only_observe_count": int(data_quality_reasons.get("BACKFILL_ONLY_OBSERVE", 0)),
+                "early_small_candidate_count": len(_dedupe_candidate_rows(early_small_rows)),
+                "early_small_order_enabled_count": len(
+                    _dedupe_candidate_rows([row for row in early_small_rows if row.get("early_small_order_enabled") is True])
+                ),
+                "early_small_observe_only_count": len(
+                    _dedupe_candidate_rows([row for row in early_small_rows if row.get("early_small_order_enabled") is not True])
+                ),
+                "actions": _counter_rows(data_quality_actions, key_name="action", limit=10),
+                "buckets": _counter_rows(data_quality_reasons, key_name="bucket", limit=10),
+            },
         }
         return {
             "trade_date": trade_date or "",
@@ -193,6 +216,9 @@ class BuyZeroRCAAnalyzer:
             "operator_top_3_causes": top_causes[:3],
             "live_sim_block_reasons": _counter_rows(live_sim_reasons, key_name="reason", limit=10),
             "data_quality_reasons": _counter_rows(data_quality_reasons, key_name="bucket", limit=10),
+            "data_quality_actions": _counter_rows(data_quality_actions, key_name="action", limit=10),
+            "data_quality_taxonomy": summary_fields["data_quality_taxonomy"],
+            "early_small_candidates": _dedupe_candidate_rows(early_small_rows)[:20],
             "ready_not_ordered": ready_not_ordered.get("summary", {}),
             "ready_not_ordered_report": ready_not_ordered,
             "ready_not_ordered_items": ready_not_ordered.get("items", [])[:20],
@@ -210,6 +236,10 @@ class BuyZeroRCAAnalyzer:
             "data_quality_blocks": {
                 "reasons": _counter_rows(data_reasons, key_name="reason", limit=10),
                 "buckets": _counter_rows(data_quality_reasons, key_name="bucket", limit=10),
+                "actions": _counter_rows(data_quality_actions, key_name="action", limit=10),
+                "early_small_candidate_count": summary_fields["data_quality_taxonomy"]["early_small_candidate_count"],
+                "early_small_order_enabled_count": summary_fields["data_quality_taxonomy"]["early_small_order_enabled_count"],
+                "early_small_observe_only_count": summary_fields["data_quality_taxonomy"]["early_small_observe_only_count"],
             },
         }
 
@@ -486,6 +516,15 @@ def _candidate_row(trace: dict[str, Any], *, reason: str = "") -> dict[str, Any]
         "price_location_readiness": trace.get("price_location_readiness") or "",
         "stock_role": trace.get("stock_role") or "",
         "data_quality_bucket": trace.get("data_quality_bucket") or "",
+        "data_quality_action": trace.get("data_quality_action") or "",
+        "missing_core_fields": list(trace.get("missing_core_fields") or []),
+        "missing_entry_fields": list(trace.get("missing_entry_fields") or []),
+        "missing_optional_fields": list(trace.get("missing_optional_fields") or []),
+        "early_small_candidate": trace.get("early_small_candidate"),
+        "early_small_order_enabled": trace.get("early_small_order_enabled"),
+        "early_small_position_size_multiplier": trace.get("early_small_position_size_multiplier"),
+        "early_small_rejected_reason": trace.get("early_small_rejected_reason") or "",
+        "operator_message_ko": trace.get("operator_message_ko") or "",
     }
 
 

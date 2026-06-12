@@ -859,7 +859,7 @@ def test_base_line_120_insufficient_candles_waits_without_plan(tmp_path):
     assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
 
 
-def test_base_line_120_insufficient_but_vwap_ready_allows_early_small_first_leg(tmp_path):
+def test_base_line_120_insufficient_but_vwap_ready_observes_early_small_by_default(tmp_path):
     runtime, db, _gateway_state = _runtime(
         tmp_path,
         _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
@@ -878,9 +878,48 @@ def test_base_line_120_insufficient_but_vwap_ready_allows_early_small_first_leg(
     runtime.cycle(NOW + timedelta(seconds=3))
 
     candidate = db.load_candidate("2026-06-01", "000001")
+    gate = candidate.metadata["gate_results_by_theme"]["ai"]
+    assert candidate.state == CandidateState.WATCHING
+    assert gate["sub_status"] == "WAIT_DATA_EARLY_SMALL_CANDIDATE"
+    assert gate["data_quality_bucket"] == "WARMUP_OPTIONAL"
+    assert gate["data_quality_action"] == "ALLOW_EARLY_SMALL_CANDIDATE"
+    assert gate["early_small_candidate"] is True
+    assert gate["early_small_order_enabled"] is False
+    assert "EARLY_SMALL_OBSERVE_ONLY" in gate["reason_codes"]
+    assert db.list_entry_plans(candidate.id) == []
+    assert db.list_runtime_order_intents(candidate_id=candidate.id) == []
+
+
+def test_data_quality_early_small_order_requires_explicit_enablement(tmp_path):
+    runtime, db, _gateway_state = _runtime(
+        tmp_path,
+        _flow_result(LabGateStatus.READY, PriceLocationStatus.GOOD_PULLBACK),
+        dry_run_orders=True,
+        tick_metadata={
+            "prev_close": 10000,
+            "vwap": 9950,
+            "vwap_ready": True,
+            "base_line_120": 9800,
+            "base_line_120_ready": False,
+            "base_line_120_candle_count": 80,
+        },
+        data_quality_early_small_policy={"order_enabled": True},
+    )
+
+    runtime.start(NOW)
+    runtime.cycle(NOW + timedelta(seconds=3))
+
+    candidate = db.load_candidate("2026-06-01", "000001")
     plan = db.list_entry_plans(candidate.id)[0]
+    gate = candidate.metadata["gate_results_by_theme"]["ai"]
     assert candidate.state == CandidateState.READY
+    assert gate["sub_status"] == "READY_EARLY_SMALL"
+    assert gate["data_quality_bucket"] == "WARMUP_OPTIONAL"
+    assert gate["early_small_order_enabled"] is True
+    assert gate["position_size_multiplier"] <= 0.15
     assert plan.cancel_condition["ready_type"] == "READY_EARLY_SMALL"
+    assert plan.cancel_condition["early_small_order_enabled"] is True
+    assert plan.cancel_condition["early_small_position_size_multiplier"] <= 0.15
     assert plan.split_plan[0]["submittable"] is True
     assert plan.split_plan[1]["submittable"] is False
     assert plan.split_plan[2]["reason"] == "early_small_later_leg_pending"
@@ -1169,6 +1208,7 @@ def _runtime(
     with_tick: bool = True,
     shadow_ab_provider=None,
     shadow_policy: dict | None = None,
+    data_quality_early_small_policy: dict | None = None,
 ):
     db_path = Path(tmp_path) / "trader.sqlite3"
     db = TradingDatabase(str(db_path))
@@ -1178,6 +1218,11 @@ def _runtime(
         settings.settings_json["theme_lab_shadow_small_entry"] = {
             **dict(settings.settings_json.get("theme_lab_shadow_small_entry") or {}),
             **dict(shadow_policy),
+        }
+    if data_quality_early_small_policy is not None:
+        settings.settings_json["data_quality_early_small"] = {
+            **dict(settings.settings_json.get("data_quality_early_small") or {}),
+            **dict(data_quality_early_small_policy),
         }
     market_data = MarketDataStore()
     candle_builder = CandleBuilder()

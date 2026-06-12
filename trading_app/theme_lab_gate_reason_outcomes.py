@@ -46,6 +46,10 @@ CSV_COLUMNS = [
     "condition_level",
     "risk_level",
     "candidate_market_status",
+    "data_quality_bucket",
+    "data_quality_action",
+    "early_small_candidate",
+    "early_small_order_enabled",
     "shadow_small_entry_candidate",
     "shadow_small_entry_reason",
     "shadow_small_entry_win_15m",
@@ -177,6 +181,10 @@ class _Event:
     candidate_market_status: str = ""
     condition_level: int = 0
     risk_level: str = ""
+    data_quality_bucket: str = ""
+    data_quality_action: str = ""
+    early_small_candidate: bool = False
+    early_small_order_enabled: bool = False
     source_snapshot_id: int = 0
 
 
@@ -416,6 +424,10 @@ class ThemeLabGateReasonOutcomeAnalyzer:
             "candidate_market_status": event.candidate_market_status,
             "condition_level": event.condition_level,
             "risk_level": event.risk_level,
+            "data_quality_bucket": event.data_quality_bucket,
+            "data_quality_action": event.data_quality_action,
+            "early_small_candidate": event.early_small_candidate,
+            "early_small_order_enabled": event.early_small_order_enabled,
             "source_snapshot_id": event.source_snapshot_id,
         }
         if event.base_price <= 0:
@@ -493,7 +505,19 @@ class ThemeLabGateReasonOutcomeAnalyzer:
             "snapshot_observation_count": sum(1 for obs in observations if obs.source == "theme_lab_snapshot"),
             "outcome_observation_count": sum(1 for obs in observations if obs.source != "theme_lab_snapshot"),
             "dedupe_window_sec": self.config.dedupe_window_sec,
+            "by_data_quality_bucket": self._by_data_quality_bucket(items),
         }
+
+    def _by_data_quality_bucket(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in items:
+            bucket = str(item.get("data_quality_bucket") or "UNKNOWN")
+            grouped[bucket].append(item)
+        return sorted(
+            (_performance_row(bucket, values, key_name="data_quality_bucket") for bucket, values in grouped.items()),
+            key=lambda row: (row["missed_opportunity_count"], row["event_count"], row["data_quality_bucket"]),
+            reverse=True,
+        )
 
     def _shadow_small_entry_fields(self, event: _Event, item: dict[str, Any], horizon_metrics: dict[str, Any]) -> dict[str, Any]:
         candidate, reason = _shadow_small_entry_candidate(event, self.config)
@@ -618,6 +642,10 @@ def _event_from_details(snapshot: dict[str, Any], snapshot_at: datetime, code: s
         ),
         condition_level=int(_float_or_zero(details.get("condition_level"))),
         risk_level=str(details.get("risk_level") or ""),
+        data_quality_bucket=str(details.get("data_quality_bucket") or ""),
+        data_quality_action=str(details.get("data_quality_action") or ""),
+        early_small_candidate=bool(details.get("early_small_candidate")),
+        early_small_order_enabled=bool(details.get("early_small_order_enabled")),
         source_snapshot_id=int(snapshot.get("id") or 0),
     )
 
@@ -647,6 +675,9 @@ def _reason_codes(details: dict[str, Any]) -> list[str]:
         "market_session_reason_codes",
         "risk_reason_codes",
         "price_location_data_quality_flags",
+        "missing_core_fields",
+        "missing_entry_fields",
+        "missing_optional_fields",
     ):
         values = details.get(key) or []
         if isinstance(values, str):

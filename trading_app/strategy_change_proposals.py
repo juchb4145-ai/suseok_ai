@@ -10,6 +10,7 @@ from typing import Any, Iterable, Optional
 
 from storage.db import TradingDatabase
 from trading_app.strategy_replay import DEFAULT_REPLAY_DB_ROOT, scan_replay_reports
+from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
 
 
 PROPOSAL_STATUSES = {
@@ -299,6 +300,7 @@ class StrategyChangeProposalGenerator:
         summary = self.db.strategy_decision_outcome_summary(trade_date=trade_date, window_sec=window_sec)
         proposals: list[StrategyChangeProposal] = []
         sample_count = int(summary.get("outcome_count") or 0)
+        data_quality_bucket_metrics = self._theme_lab_data_quality_bucket_metrics(trade_date)
         if int(summary.get("exit_too_late_count") or 0) > 0:
             proposals.append(
                 self._build_proposal(
@@ -312,6 +314,7 @@ class StrategyChangeProposalGenerator:
                         "false_positive_increase_count": 0,
                         "net_benefit_score": float(summary.get("exit_too_late_count") or 0),
                         "confidence": 0.55,
+                        **data_quality_bucket_metrics,
                     },
                     raw_source=summary,
                 )
@@ -329,11 +332,32 @@ class StrategyChangeProposalGenerator:
                         "false_positive_increase_count": 0,
                         "net_benefit_score": float(summary.get("wait_block_opportunity_loss_count") or 0),
                         "confidence": 0.5,
+                        **data_quality_bucket_metrics,
                     },
                     raw_source=summary,
                 )
             )
         return proposals
+
+    def _theme_lab_data_quality_bucket_metrics(self, trade_date: str) -> dict[str, Any]:
+        try:
+            report = ThemeLabGateReasonOutcomeAnalyzer(self.db).build_report(trade_date=trade_date or None, limit=10000)
+        except Exception:
+            return {}
+        rows = list(((report.get("summary") or {}).get("by_data_quality_bucket") or [])[:8])
+        metrics: dict[str, Any] = {"data_quality_bucket_group_count": len(rows)}
+        for row in rows:
+            bucket = _metric_key_segment(row.get("data_quality_bucket") or "unknown")
+            if not bucket:
+                continue
+            metrics[f"data_quality_bucket_{bucket}_event_count"] = int(row.get("event_count") or 0)
+            metrics[f"data_quality_bucket_{bucket}_missed_opportunity_count"] = int(row.get("missed_opportunity_count") or 0)
+            metrics[f"data_quality_bucket_{bucket}_good_block_count"] = int(row.get("good_block_count") or 0)
+            if row.get("avg_mfe_15m_pct") is not None:
+                metrics[f"data_quality_bucket_{bucket}_avg_mfe_15m_pct"] = float(row.get("avg_mfe_15m_pct") or 0)
+            if row.get("avg_mae_15m_pct") is not None:
+                metrics[f"data_quality_bucket_{bucket}_avg_mae_15m_pct"] = float(row.get("avg_mae_15m_pct") or 0)
+        return metrics
 
     def generate_from_shadow_summary(self, trade_date: str, horizon_sec: Optional[int] = None) -> list[StrategyChangeProposal]:
         summary = self.db.shadow_strategy_summary(trade_date=trade_date, horizon_sec=horizon_sec)
@@ -839,6 +863,12 @@ def _stable_proposal_id(*, source_type: str, source_ids: list[str], target_compo
 def _stable_evidence_id(proposal_id: str, source_type: str, source_id: str, metric_name: str) -> str:
     raw = f"{proposal_id}:{source_type}:{source_id}:{metric_name}"
     return f"sce_{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _metric_key_segment(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    chars = [char if char.isalnum() else "_" for char in text]
+    return "_".join(part for part in "".join(chars).split("_") if part)
 
 
 def _dedupe_proposals(proposals: list[StrategyChangeProposal]) -> list[StrategyChangeProposal]:

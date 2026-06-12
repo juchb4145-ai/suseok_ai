@@ -242,8 +242,11 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "/api/runtime/buy-zero/missed-opportunities" in js
     assert "/api/runtime/buy-zero/traces" in js
     assert "function renderBuyZeroRcaPanel" in js
+    assert "function renderBuyZeroDataQualityCounts" in js
     assert "function openBuyZeroTraceDetail" in js
     assert "BUY_ZERO_RCA_CRITICAL_REASONS" in js
+    assert "CORE_BLOCKING" in js
+    assert "WAIT_DATA_EARLY_SMALL_CANDIDATE" in js
     assert "REBUILD_POSTMARKET_REVIEW" in js
     assert "LIVE_BUY" in js
     assert "LIVE_SELL" in js

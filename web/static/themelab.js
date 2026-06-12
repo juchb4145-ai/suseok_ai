@@ -186,6 +186,12 @@ const BUY_ZERO_RCA_CRITICAL_REASONS = new Set([
   "ENTRY_PLAN_DIAGNOSTIC_ONLY",
   "ORDER_SINK_NOOP",
   "GATE_RESULT_KEY_MISMATCH",
+  "CORE_BLOCKING",
+  "ENTRY_BLOCKING",
+  "WARMUP_OPTIONAL",
+  "BACKFILL_ONLY_OBSERVE",
+  "WAIT_DATA_EARLY_SMALL_CANDIDATE",
+  "EARLY_SMALL_OBSERVE_ONLY",
 ]);
 
 const BUY_ZERO_RCA_STAGE_LABELS = {
@@ -1664,12 +1670,7 @@ function renderBuyZeroRcaPanel() {
   text("themelab-buy-zero-blocked-count", summary.blocked_count ?? payload.blocked_count ?? 0);
   text("themelab-buy-zero-live-blocked-count", summary.live_sim_blocked_count ?? payload.live_sim_blocked_count ?? 0);
   renderBuyZeroInlineCounts("themelab-buy-zero-top-causes", payload.operator_top_3_causes || payload.top_block_reasons || [], "reason", "아직 집계된 차단 사유가 없습니다");
-  renderBuyZeroInlineCounts(
-    "themelab-buy-zero-data-quality-blocks",
-    ((payload.data_quality_blocks || {}).reasons || payload.top_data_insufficient_reasons || []),
-    "reason",
-    "데이터 품질 부족 사유가 없습니다"
-  );
+  renderBuyZeroDataQualityCounts("themelab-buy-zero-data-quality-blocks", payload);
   renderBuyZeroStageFunnel(payload.stage_funnel || []);
   renderBuyZeroReadyRows(state.buyZeroRca.readyRows, available);
   renderBuyZeroRallyRows(state.buyZeroRca.rallyRows, available);
@@ -1683,6 +1684,28 @@ function renderBuyZeroInlineCounts(id, rows, key, emptyText) {
   node.innerHTML = items.length
     ? items.map((item) => `<div>${reasonBadge(item[key] || item.category || "-")} <strong>${escapeHtml(item.count ?? 0)}</strong></div>`).join("")
     : `<div class="muted">${escapeHtml(emptyText)}</div>`;
+}
+
+function renderBuyZeroDataQualityCounts(id, payload) {
+  const blocks = (payload || {}).data_quality_blocks || {};
+  const taxonomy = (payload || {}).data_quality_taxonomy || ((payload || {}).summary || {}).data_quality_taxonomy || {};
+  const bucketRows = blocks.buckets || taxonomy.buckets || [];
+  const actionRows = blocks.actions || taxonomy.actions || [];
+  const reasonRows = blocks.reasons || (payload || {}).top_data_insufficient_reasons || [];
+  const rows = [];
+  bucketRows.forEach((item) => rows.push({ label: item.bucket || item.reason || "-", count: item.count || 0 }));
+  actionRows.forEach((item) => rows.push({ label: item.action || "-", count: item.count || 0 }));
+  [
+    ["early-small 후보", taxonomy.early_small_candidate_count],
+    ["주문 비활성 관찰", taxonomy.early_small_observe_only_count],
+    ["소액 주문 허용", taxonomy.early_small_order_enabled_count],
+  ].forEach(([label, count]) => {
+    if (Number(count || 0) > 0) rows.push({ label, count });
+  });
+  if (!rows.length) {
+    reasonRows.forEach((item) => rows.push({ label: item.reason || "-", count: item.count || 0 }));
+  }
+  renderBuyZeroInlineCounts(id, rows, "label", "데이터 품질 부족 사유가 없습니다");
 }
 
 function renderBuyZeroStageFunnel(rows) {
@@ -1863,10 +1886,14 @@ function renderBuyZeroTraceDetail(selected, rows) {
       <div class="buy-zero-trace-fields">
         <span>사유 ${reasonBadges(item.reason_codes || [item.primary_block_reason].filter(Boolean))}</span>
         <span>Gate ${escapeHtml(item.gate_status || "-")} / score ${escapeHtml(optionalNumber(item.gate_score, 1))}</span>
+        <span>Data ${escapeHtml(item.data_quality_bucket || "-")} / ${escapeHtml(item.data_quality_action || "-")}</span>
+        <span>Missing ${reasonBadges([...(item.missing_core_fields || []), ...(item.missing_entry_fields || []), ...(item.missing_optional_fields || [])])}</span>
+        <span>Early-small ${escapeHtml(yesNoUnknown(item.early_small_candidate))} / order ${escapeHtml(yesNoUnknown(item.early_small_order_enabled))} / x${escapeHtml(optionalNumber(item.early_small_position_size_multiplier, 2))}</span>
         <span>Tick ${escapeHtml(yesNoUnknown(item.latest_tick_ready))} / ${escapeHtml(optionalNumber(item.latest_tick_age_sec, 1))}s</span>
         <span>Support ${escapeHtml(yesNoUnknown(item.support_ready))} / ${escapeHtml(item.selected_support_source || "-")}</span>
         <span>DRY_RUN ${escapeHtml(item.dry_run_status || "-")} ${escapeHtml(item.dry_run_reason || "")}</span>
         <span>LIVE_SIM ${escapeHtml(item.live_sim_status || "-")} ${escapeHtml(item.live_sim_reason || "")}</span>
+        <span>Early-small 거절 ${escapeHtml(item.early_small_rejected_reason || "-")}</span>
         <span>Command ${shortId(item.command_id || "-")}</span>
         <span>Broker ${shortId(item.broker_order_id || "-")}</span>
       </div>
@@ -1879,8 +1906,15 @@ function buyZeroTraceMessage(item) {
     item.primary_block_reason,
     item.dry_run_reason,
     item.live_sim_reason,
+    item.data_quality_bucket,
+    item.data_quality_action,
     ...(item.reason_codes || []),
   ].join(" ").toUpperCase();
+  if (item.operator_message_ko && item.data_quality_bucket) return item.operator_message_ko;
+  if (/CORE_BLOCKING/.test(textValue)) return "핵심 실시간 데이터 부족으로 주문 금지";
+  if (/ENTRY_BLOCKING/.test(textValue)) return "진입 판단 데이터 부족으로 WAIT_DATA";
+  if (/WARMUP_OPTIONAL/.test(textValue)) return "보조 warmup 부족으로 early-small 후보 관찰";
+  if (/BACKFILL_ONLY_OBSERVE/.test(textValue)) return "TR backfill만 있어 실시간 확인 전까지 관찰";
   if (/LATEST_TICK|TICK_.*OLD|REALTIME_RELIABILITY/.test(textValue)) return "실시간 틱이 오래되어 주문 보류";
   if (/SUPPORT_NOT_READY|SUPPORT/.test(textValue) && item.entry_plan_diagnostic_only) return "지지선 미확정으로 진단 전용";
   if (/LIVE_SIM|ACCOUNT_GUARD|EXIT_GUARD|KILL_SWITCH/.test(textValue)) return "LIVE_SIM guard에서 차단";

@@ -28,6 +28,8 @@ def test_theme_lab_gate_reason_outcome_labels_missed_after_watchset_drop(tmp_pat
                     "price_location_readiness_reason_codes": ["PRICE_LOCATION_WARMUP"],
                     "primary_theme": "AI",
                     "stock_role": "LEADER",
+                    "data_quality_bucket": "WARMUP_OPTIONAL",
+                    "data_quality_action": "ALLOW_EARLY_SMALL_CANDIDATE",
                 }
             ],
         )
@@ -59,6 +61,8 @@ def test_theme_lab_gate_reason_outcome_labels_missed_after_watchset_drop(tmp_pat
         assert item["return_5m_pct"] == 2.0
         assert item["mfe_15m_pct"] == 5.0
         assert item["outcome_label"] == "MISSED_OPPORTUNITY"
+        assert item["data_quality_bucket"] == "WARMUP_OPTIONAL"
+        assert report["summary"]["by_data_quality_bucket"][0]["data_quality_bucket"] == "WARMUP_OPTIONAL"
         reason = report["by_reason"][0]
         assert reason["reason_code"] == "PRICE_LOCATION_WARMUP"
         assert reason["missed_opportunity_rate"] == 1.0
