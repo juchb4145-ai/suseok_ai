@@ -7,6 +7,11 @@ from typing import Any
 from storage.db import TradingDatabase
 from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE
 from trading.theme_engine.repository import ThemeEngineRepository
+from trading_app.conservative_reason_outcomes import (
+    ConservativeReasonOutcomeAnalyzer,
+    empty_payload as conservative_reason_empty_payload,
+    snapshot_payload as conservative_reason_snapshot_payload,
+)
 from trading_app.live_sim_audit import LiveSimLifecycleAuditor
 from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
 
@@ -66,6 +71,7 @@ def build_theme_lab_dashboard_snapshot(
     trade_date = _snapshot_trade_date(raw)
     gate_reason_outcomes = _theme_lab_gate_reason_outcomes(db, trade_date=trade_date)
     live_sim_audit = _live_sim_audit(db, gateway_state=gateway_state, trade_date=trade_date)
+    conservative_reason_outcomes = _conservative_reason_outcomes(db, trade_date=trade_date)
 
     return {
         "available": True,
@@ -89,6 +95,7 @@ def build_theme_lab_dashboard_snapshot(
         "gate_detail": _gate_detail(selected_watch),
         "gate_reason_outcomes": gate_reason_outcomes,
         "live_sim_audit": live_sim_audit,
+        "conservative_reason_outcomes": conservative_reason_outcomes,
         "shadow_small_entry": gate_reason_outcomes.get("shadow_small_entry") or _empty_shadow_small_entry(),
         "shadow_small_entry_ab": gate_reason_outcomes.get("shadow_small_entry_ab") or _empty_shadow_small_entry_ab(),
         "summary": summary,
@@ -157,6 +164,7 @@ def _empty_snapshot(
         "gate_detail": {"gate_status": "OBSERVE", "summary_message": "선택된 WatchSet 종목이 없습니다."},
         "gate_reason_outcomes": _empty_gate_reason_outcomes(),
         "live_sim_audit": _live_sim_audit(db, gateway_state=gateway_state, trade_date=datetime.now().date().isoformat()) if db is not None else _live_sim_audit_empty(),
+        "conservative_reason_outcomes": _conservative_reason_outcomes(db, trade_date=datetime.now().date().isoformat()) if db is not None else conservative_reason_empty_payload(),
         "shadow_small_entry": _empty_shadow_small_entry(),
         "shadow_small_entry_ab": _empty_shadow_small_entry_ab(),
         "summary": _empty_summary(runtime=runtime, freshness=freshness),
@@ -185,6 +193,14 @@ def _live_sim_audit_empty() -> dict[str, Any]:
         "last_updated_at": "",
         "operator": {"status_message_ko": "LIVE_SIM audit 데이터가 아직 없습니다.", "top_actions": []},
     }
+
+
+def _conservative_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
+    try:
+        report = ConservativeReasonOutcomeAnalyzer(db).build_report(trade_date=trade_date or None, limit=10000)
+        return conservative_reason_snapshot_payload(report)
+    except Exception as exc:
+        return conservative_reason_empty_payload(str(exc))
 
 
 def _theme_lab_gate_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:

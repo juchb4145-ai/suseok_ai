@@ -378,6 +378,47 @@
           </div>
         </section>
 
+        <section id="conservative-reason-card" class="band conservative-reason-section">
+          <div class="section-head">
+            <div>
+              <h2>보수적 차단 사유 검증</h2>
+              <p id="conservative-reason-empty" class="help-text">아직 outcome 관측 데이터가 부족합니다. 이 리포트는 주문 설정을 자동 변경하지 않습니다.</p>
+            </div>
+            <div class="action-strip">
+              <span id="conservative-reason-status" class="counter muted">NO_DATA</span>
+              <span id="conservative-reason-updated" class="counter muted">-</span>
+            </div>
+          </div>
+          <div class="mini-grid conservative-reason-grid">
+            <div><span>관측 이벤트</span><strong id="conservative-reason-event-count">0</strong></div>
+            <div><span>기회손실률</span><strong id="conservative-reason-missed-rate">0.0%</strong></div>
+            <div><span>좋은 차단률</span><strong id="conservative-reason-good-rate">0.0%</strong></div>
+            <div><span>리스크 회피율</span><strong id="conservative-reason-risk-rate">0.0%</strong></div>
+            <div><span>False block 후보</span><strong id="conservative-reason-false-count">0</strong></div>
+            <div><span>소액 검토 후보</span><strong id="conservative-reason-small-count">0</strong></div>
+          </div>
+          <div class="two-col conservative-reason-detail-grid">
+            <div class="unframed-panel">
+              <h3>Group outcomes</h3>
+              <div id="conservative-reason-group-lines" class="inline-log"></div>
+            </div>
+            <div class="unframed-panel">
+              <h3>소액 진입 검토 후보</h3>
+              <div id="conservative-reason-small-lines" class="inline-log"></div>
+            </div>
+          </div>
+          <div class="two-col conservative-reason-detail-grid">
+            <div class="unframed-panel">
+              <h3>놓친 기회 상위 종목</h3>
+              <div id="conservative-reason-missed-lines" class="inline-log"></div>
+            </div>
+            <div class="unframed-panel">
+              <h3>좋은 차단 상위 종목</h3>
+              <div id="conservative-reason-good-lines" class="inline-log"></div>
+            </div>
+          </div>
+        </section>
+
         <section class="band buy-zero-rca-section">
           <div class="section-head">
             <div>

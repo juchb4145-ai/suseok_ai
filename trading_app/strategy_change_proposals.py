@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from storage.db import TradingDatabase
+from trading_app.conservative_reason_outcomes import ConservativeReasonOutcomeAnalyzer
 from trading_app.strategy_replay import DEFAULT_REPLAY_DB_ROOT, scan_replay_reports
 from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
 
@@ -464,6 +465,103 @@ class StrategyChangeProposalGenerator:
                 )
         return proposals
 
+    def generate_from_conservative_reason_outcomes(self, trade_date: str) -> list[StrategyChangeProposal]:
+        metrics, report = self._conservative_reason_metrics(trade_date)
+        if not metrics:
+            return []
+        proposals: list[StrategyChangeProposal] = []
+        source_id = str(report.get("report_id") or f"conservative_reason_outcome:{trade_date}")
+        candidate_specs = [
+            (
+                "warmup_optional_small_entry_candidate",
+                metrics.get("warmup_optional_missed_opportunity_rate", 0),
+                metrics.get("small_entry_candidate_count", 0),
+            ),
+            (
+                "leader_only_theme_leader_small_entry_candidate",
+                metrics.get("low_breadth_leader_missed_opportunity_rate", 0),
+                metrics.get("small_entry_candidate_count", 0),
+            ),
+            (
+                "risk_off_leader_small_entry_candidate",
+                metrics.get("conservative_reason_missed_opportunity_rate", 0),
+                metrics.get("small_entry_candidate_count", 0),
+            ),
+            (
+                "late_chase_keep_block_candidate",
+                metrics.get("late_chase_good_block_rate", 0),
+                metrics.get("late_chase_event_count", 0),
+            ),
+            (
+                "chase_high_keep_observe_candidate",
+                metrics.get("chase_high_risk_avoided_rate", 0),
+                metrics.get("chase_high_event_count", 0),
+            ),
+        ]
+        for policy_key, signal_rate, signal_count in candidate_specs:
+            if policy_key not in POLICY_PATCHES:
+                continue
+            if float(signal_rate or 0) <= 0 and int(signal_count or 0) <= 0:
+                continue
+            proposals.append(
+                self._build_proposal(
+                    trade_date=trade_date,
+                    source_type="conservative_reason_outcome",
+                    source_ids=[source_id, f"conservative_reason_policy:{policy_key}"],
+                    policy_key=policy_key,
+                    evidence_metrics={**metrics, "sample_count": int(metrics.get("conservative_reason_labeled_count") or 0), "source_grade": "WATCH_CANDIDATE"},
+                    raw_source={
+                        "summary": report.get("summary") or {},
+                        "by_group": report.get("by_group") or [],
+                        "by_reason_code": report.get("by_reason_code") or [],
+                        "review_for_small_entry": report.get("review_for_small_entry") or {},
+                    },
+                )
+            )
+        return proposals
+
+    def _conservative_reason_metrics(self, trade_date: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        try:
+            report = ConservativeReasonOutcomeAnalyzer(self.db).build_report(trade_date=trade_date or None, limit=50000)
+        except Exception:
+            return {}, {}
+        summary = report.get("summary") or {}
+        by_group = {str(row.get("group") or ""): row for row in report.get("by_group") or []}
+        by_reason = {str(row.get("reason_code") or ""): row for row in report.get("by_reason_code") or []}
+        data_quality = {str(row.get("data_quality_bucket") or ""): row for row in report.get("data_quality_bucket_summary") or []}
+        review_summary = ((report.get("review_for_small_entry") or {}).get("summary") or {})
+        late_chase = _merge_metric_rows(by_reason, ("LATE_CHASE", "LATE_CHASE_TEMP_WAIT", "CHASE_RISK"))
+        chase_high = _merge_metric_rows(by_reason, ("CHASE_HIGH", "HIGH_CHASE_RISK", "VWAP_OVEREXTENDED"))
+        low_breadth_leader = [
+            item
+            for item in report.get("items") or []
+            if "BREADTH_RISK" in set(item.get("all_groups") or []) and str(item.get("stock_role") or "").upper() in {"LEADER", "CO_LEADER"}
+        ]
+        metrics = {
+            "conservative_reason_event_count": int(summary.get("event_count") or 0),
+            "conservative_reason_labeled_count": int(summary.get("labeled_event_count") or 0),
+            "conservative_reason_missed_opportunity_rate": float(summary.get("missed_opportunity_rate") or 0),
+            "conservative_reason_good_block_rate": float(summary.get("good_block_rate") or 0),
+            "conservative_reason_risk_avoided_rate": float(summary.get("risk_avoided_rate") or 0),
+            "warmup_optional_missed_opportunity_rate": float((data_quality.get("WARMUP_OPTIONAL") or {}).get("missed_opportunity_rate") or 0),
+            "late_chase_good_block_rate": float(late_chase.get("good_block_rate") or 0),
+            "late_chase_event_count": int(late_chase.get("event_count") or 0),
+            "chase_high_risk_avoided_rate": float(chase_high.get("risk_avoided_rate") or 0),
+            "chase_high_event_count": int(chase_high.get("event_count") or 0),
+            "low_breadth_leader_missed_opportunity_rate": _item_rate(low_breadth_leader, "missed_opportunity"),
+            "small_entry_candidate_count": int(review_summary.get("candidate_count") or 0),
+            "small_entry_avg_mfe_15m_pct": float(review_summary.get("avg_mfe_15m_pct") or 0),
+            "small_entry_avg_mae_15m_pct": float(review_summary.get("avg_mae_15m_pct") or 0),
+            "small_entry_recommended_multiplier": float(review_summary.get("suggested_position_size_multiplier") or 0),
+            "market_risk_event_count": int((by_group.get("MARKET_RISK") or {}).get("event_count") or 0),
+            "breadth_risk_event_count": int((by_group.get("BREADTH_RISK") or {}).get("event_count") or 0),
+            "data_quality_risk_event_count": int((by_group.get("DATA_QUALITY_RISK") or {}).get("event_count") or 0),
+        }
+        metrics["net_benefit_score"] = float(metrics["small_entry_candidate_count"]) + float(metrics["conservative_reason_missed_opportunity_rate"] or 0)
+        metrics["confidence"] = 0.55 if metrics["conservative_reason_labeled_count"] >= self.config.min_sample_count else 0.3
+        metrics["false_positive_increase_count"] = 0
+        return metrics, report
+
     def generate_combined_proposals(self, trade_date: str) -> list[StrategyChangeProposal]:
         proposals = []
         proposals.extend(self.generate_from_intraday_outcomes(trade_date))
@@ -523,6 +621,8 @@ class StrategyChangeProposalGenerator:
             proposals = self.generate_from_replay_reports(trade_date, replay_id=replay_id)
         elif source_type == "threshold_ab":
             proposals = self.generate_from_threshold_ab(trade_date)
+        elif source_type == "conservative_reason_outcome":
+            proposals = self.generate_from_conservative_reason_outcomes(trade_date)
         else:
             proposals = self.generate_combined_proposals(trade_date)
         persisted = self.persist_proposals(proposals) if persist else {"proposal_count": len(proposals), "saved_count": 0, "evidence_count": 0}
@@ -675,6 +775,65 @@ class StrategyChangeProposalGenerator:
 
 
 POLICY_PATCHES: dict[str, dict[str, Any]] = {
+    "warmup_optional_small_entry_candidate": {
+        "title": "WARMUP_OPTIONAL small-entry review candidate",
+        "summary_ko": "WARMUP_OPTIONAL 차단 이후 상승한 후보를 소액 진입 검토 대상으로만 추적하는 REVIEW_READY 제안입니다.",
+        "category": "data_quality",
+        "target_component": "data_quality_gate",
+        "expected_effect_ko": "데이터 warmup 부족으로 놓친 주도주 후보를 observe-only 근거로 축적합니다.",
+        "expected_risk_ko": "주문 설정은 자동 변경하지 않으며, DATA_INSUFFICIENT 완화는 후속 검토가 필요합니다.",
+        "patch": {
+            "data_quality_gate.leader_observe_ready_enabled": True,
+            "data_quality_gate.leader_observe_ready_order_enabled": False,
+        },
+    },
+    "leader_only_theme_leader_small_entry_candidate": {
+        "title": "Leader-only breadth small-entry review candidate",
+        "summary_ko": "LOW_BREADTH/LEADER_ONLY_THEME에서도 리더만 별도 관측할지 검토하는 REVIEW_READY 제안입니다.",
+        "category": "theme",
+        "target_component": "theme_gate",
+        "expected_effect_ko": "테마 breadth가 약해도 리더 급등을 관측 신호로 보존합니다.",
+        "expected_risk_ko": "테마 확산 없는 단독 급등은 실패 가능성이 커서 주문 전환은 별도 PR 범위입니다.",
+        "patch": {
+            "theme_gate.leader_only_theme.observe_only": True,
+            "theme_gate.leader_only_theme.order_enabled": False,
+        },
+    },
+    "risk_off_leader_small_entry_candidate": {
+        "title": "RISK_OFF leader small-entry review candidate",
+        "summary_ko": "RISK_OFF 중 주도주 기회손실을 observe-only 소액 후보로만 검토하는 REVIEW_READY 제안입니다.",
+        "category": "gate",
+        "target_component": "market_gate",
+        "expected_effect_ko": "시장 리스크 구간의 주도주 놓침을 별도 근거로 수집합니다.",
+        "expected_risk_ko": "RISK_OFF 완화는 큰 손실 위험이 있어 실제 주문 연결은 금지되어 있습니다.",
+        "patch": {
+            "market_gate.risk_off.leader_ready_small_enabled": True,
+            "market_gate.risk_off.max_position_size_multiplier": 0.0,
+            "market_gate.risk_off.observe_only": True,
+        },
+    },
+    "late_chase_keep_block_candidate": {
+        "title": "Late-chase keep-block evidence",
+        "summary_ko": "LATE_CHASE 차단이 실제 손실 회피에 기여했는지 KEEP_BLOCK 근거로 저장하는 제안입니다.",
+        "category": "risk",
+        "target_component": "entry_gate",
+        "expected_effect_ko": "추격매수 차단 정책 유지 근거를 명확히 합니다.",
+        "expected_risk_ko": "완화가 아니라 유지 근거 축적이므로 주문 경로에는 영향이 없습니다.",
+        "patch": {
+            "entry_gate.late_chase.keep_block_observe_evidence": True,
+        },
+    },
+    "chase_high_keep_observe_candidate": {
+        "title": "CHASE_HIGH keep-observe evidence",
+        "summary_ko": "CHASE_HIGH/VWAP 과열 차단이 좋은 차단인지 KEEP_OBSERVE 근거로 저장하는 제안입니다.",
+        "category": "risk",
+        "target_component": "entry_risk_gate",
+        "expected_effect_ko": "과열 차단이 유효한지 장후 리뷰 근거를 강화합니다.",
+        "expected_risk_ko": "과열 기준을 완화하지 않으며 실제 주문 설정을 변경하지 않습니다.",
+        "patch": {
+            "entry_risk_gate.chase_high.keep_observe_evidence": True,
+        },
+    },
     "relaxed_risk_off_leader": {
         "title": "RISK_OFF leader READY_SMALL observe proposal",
         "summary_ko": "RISK_OFF 환경에서도 테마 주도주만 observe-only READY_SMALL 후보로 추적하는 제안입니다.",
@@ -869,6 +1028,35 @@ def _metric_key_segment(value: Any) -> str:
     text = str(value or "").strip().lower()
     chars = [char if char.isalnum() else "_" for char in text]
     return "_".join(part for part in "".join(chars).split("_") if part)
+
+
+def _merge_metric_rows(rows: dict[str, dict[str, Any]], keys: Iterable[str]) -> dict[str, Any]:
+    selected = [dict(rows.get(key) or {}) for key in keys if rows.get(key)]
+    if not selected:
+        return {}
+    event_count = sum(int(row.get("event_count") or 0) for row in selected)
+    labeled_count = sum(int(row.get("labeled_count") or row.get("labeled_event_count") or 0) for row in selected)
+    good_count = sum(int(row.get("good_block_count") or 0) for row in selected)
+    risk_count = sum(int(row.get("risk_avoided_count") or 0) for row in selected)
+    missed_count = sum(int(row.get("missed_opportunity_count") or 0) for row in selected)
+    return {
+        "event_count": event_count,
+        "labeled_count": labeled_count,
+        "good_block_count": good_count,
+        "good_block_rate": round(good_count / labeled_count, 4) if labeled_count else 0.0,
+        "risk_avoided_count": risk_count,
+        "risk_avoided_rate": round(risk_count / labeled_count, 4) if labeled_count else 0.0,
+        "missed_opportunity_count": missed_count,
+        "missed_opportunity_rate": round(missed_count / labeled_count, 4) if labeled_count else 0.0,
+    }
+
+
+def _item_rate(items: Iterable[dict[str, Any]], field: str) -> float:
+    values = list(items or [])
+    labeled = [item for item in values if item.get("labeled")]
+    if not labeled:
+        return 0.0
+    return round(sum(1 for item in labeled if item.get(field)) / len(labeled), 4)
 
 
 def _dedupe_proposals(proposals: list[StrategyChangeProposal]) -> list[StrategyChangeProposal]:

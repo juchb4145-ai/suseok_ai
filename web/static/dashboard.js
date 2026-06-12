@@ -1157,6 +1157,80 @@ function renderBuyZeroRca(snapshot) {
   }
 }
 
+function renderConservativeReasonOutcomes(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.conservative_reason_outcomes || runtime.conservative_reason_outcomes || {};
+  const summary = payload.summary || {};
+  const review = payload.review_for_small_entry || {};
+  const reviewSummary = review.summary || {};
+  const available = Boolean(payload.available);
+  const status = payload.status || (available ? "READY" : "NO_DATA");
+  text("conservative-reason-status", status);
+  cls("conservative-reason-status", `counter ${available ? "ok" : "muted"}`);
+  text(
+    "conservative-reason-empty",
+    available
+      ? "보수적 차단 사유 outcome을 읽기 전용으로 검증합니다. 주문 설정은 자동 변경하지 않습니다."
+      : "아직 outcome 관측 데이터가 부족합니다. 장중에는 5/15/30분 결과가 아직 확정되지 않을 수 있습니다."
+  );
+  text("conservative-reason-updated", formatDateTime(payload.last_updated_at || payload.generated_at));
+  text("conservative-reason-event-count", summary.event_count ?? 0);
+  text("conservative-reason-missed-rate", formatRate(summary.missed_opportunity_rate || 0));
+  text("conservative-reason-good-rate", formatRate(summary.good_block_rate || 0));
+  text("conservative-reason-risk-rate", formatRate(summary.risk_avoided_rate || 0));
+  text("conservative-reason-false-count", summary.false_block_candidate_count ?? 0);
+  text("conservative-reason-small-count", reviewSummary.candidate_count ?? 0);
+  renderConservativeReasonLines("conservative-reason-group-lines", payload.by_group || [], "아직 group outcome이 없습니다.");
+  renderConservativeSmallEntryLines("conservative-reason-small-lines", review.by_reason_code || [], "소액 진입 검토 후보가 없습니다.");
+  renderConservativeStockLines("conservative-reason-missed-lines", payload.top_missed_opportunity_stocks || [], "놓친 기회 상위 종목이 없습니다.");
+  renderConservativeStockLines("conservative-reason-good-lines", payload.top_good_block_stocks || [], "좋은 차단 상위 종목이 없습니다.");
+}
+
+function renderConservativeReasonLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = firstItems(rows || [], 6);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item ${item.recommendation === "REVIEW_FOR_SMALL_ENTRY" ? "warn" : item.recommendation === "KEEP_BLOCK" ? "ok" : "info"}">
+        <strong>${escapeHtml(item.group || item.reason_code || "-")}</strong>
+        <span>missed ${formatRate(item.missed_opportunity_rate || 0)} · good ${formatRate(item.good_block_rate || 0)} · risk ${formatRate(item.risk_avoided_rate || 0)}</span>
+        <em>${escapeHtml(item.recommendation || "-")}</em>
+      </div>
+    `).join("")
+    : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
+function renderConservativeSmallEntryLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = firstItems(rows || [], 6);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item warn">
+        <strong>${escapeHtml(item.reason_code || item.group || "-")}</strong>
+        <span>${escapeHtml(item.candidate_count ?? 0)} 후보 · MFE ${formatPercentValue(item.avg_mfe_15m_pct)} / MAE ${formatPercentValue(item.avg_mae_15m_pct)}</span>
+        <em>x${escapeHtml(fmtNumber(item.suggested_position_size_multiplier, 2))}</em>
+      </div>
+    `).join("")
+    : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
+function renderConservativeStockLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = firstItems(rows || [], 6);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item ${item.good_block ? "ok" : item.missed_opportunity ? "warn" : "info"}">
+        <strong>${escapeHtml(`${item.code || "-"} ${item.name || ""}`.trim())}</strong>
+        <span>${escapeHtml(item.primary_group || item.primary_reason || "-")} · MFE ${formatPercentValue(item.mfe_15m_pct)} / MAE ${formatPercentValue(item.mae_15m_pct)}</span>
+        <em>${escapeHtml(item.recommendation || item.outcome_label || "-")}</em>
+      </div>
+    `).join("")
+    : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
 function renderBuyZeroInlineCounts(id, rows, key, emptyText) {
   const node = document.getElementById(id);
   if (!node) return;
@@ -1464,6 +1538,7 @@ function render(snapshot) {
   renderThemeLabSummary(themeLab);
   renderLiveSimAudit(snapshot);
   renderBuyZeroRca(snapshot);
+  renderConservativeReasonOutcomes(snapshot);
 
   text("transport-mode", transport.mode || "rest_long_poll");
   text("transport-event-p95", formatMs(transport.event_latency_p95_ms));

@@ -60,6 +60,13 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
         "buy-zero-rca-ready-table-body",
         "buy-zero-rca-rally-table-body",
         "buy-zero-rca-refresh",
+        "conservative-reason-card",
+        "conservative-reason-status",
+        "conservative-reason-event-count",
+        "conservative-reason-group-lines",
+        "conservative-reason-small-lines",
+        "conservative-reason-missed-lines",
+        "conservative-reason-good-lines",
     ]:
         assert soup.select_one(f"#{node_id}") is not None
     assert soup.select_one("#transport-real-pilot-price-sample-rate") is not None
@@ -76,6 +83,7 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
     assert "LIVE 자동주문" in html
     assert "ThemeLab 운용 요약" in html
     assert "매수 0건 RCA" in html
+    assert "보수적 차단 사유 검증" in html
     assert "READY인데 주문 안 나간 종목" in html
     assert "OBSERVE/BLOCKED 이후 급등 후보" in html
 
@@ -137,6 +145,9 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "shadowRiskCandidates" in js
     assert "function renderBuyZeroRca" in js
     assert "function renderLiveSimAudit" in js
+    assert "function renderConservativeReasonOutcomes" in js
+    assert "function renderConservativeStockLines" in js
+    assert "conservative_reason_outcomes" in js
     assert "live_sim_audit" in js
     assert "function renderBuyZeroDataQualityCounts" in js
     assert "function openBuyZeroTraceDetail" in js

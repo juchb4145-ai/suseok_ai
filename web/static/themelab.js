@@ -54,6 +54,11 @@
     lastFetchedAt: 0,
     tradeDate: "",
   },
+  conservativeReason: {
+    payload: {},
+    loading: false,
+    lastFetchedAt: 0,
+  },
   naverThemeSyncBusy: false,
   alertFilters: {
     category: "ALL",
@@ -177,6 +182,7 @@ const blockedOperatorActionTypes = [
 ];
 
 const BUY_ZERO_RCA_REFRESH_MS = 30000;
+const CONSERVATIVE_REASON_REFRESH_MS = 60000;
 const BUY_ZERO_RCA_CRITICAL_REASONS = new Set([
   "DATA_INSUFFICIENT",
   "LATE_CHASE_TEMP_WAIT",
@@ -1726,6 +1732,135 @@ function renderLiveSimAuditLines(id, rows, emptyText) {
     : `<div class="muted">${escapeHtml(emptyText)}</div>`;
 }
 
+async function fetchConservativeReasonOutcomes(options = {}) {
+  const force = Boolean(options.force);
+  if (state.conservativeReason.loading) return;
+  if (!force && Date.now() - state.conservativeReason.lastFetchedAt < CONSERVATIVE_REASON_REFRESH_MS) return;
+  state.conservativeReason.loading = true;
+  try {
+    const tradeDate = localTradeDate();
+    const response = await fetch(`/api/conservative-reason-outcomes/summary?trade_date=${encodeURIComponent(tradeDate)}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`conservative ${response.status}`);
+    state.conservativeReason.payload = await response.json();
+    state.conservativeReason.lastFetchedAt = Date.now();
+    renderConservativeReasonPanel(state.conservativeReason.payload);
+  } catch (error) {
+    const status = document.getElementById("themelab-conservative-reason-status");
+    if (status) {
+      status.textContent = `조회 실패: ${error.message || error}`;
+      status.className = "badge critical";
+    }
+  } finally {
+    state.conservativeReason.loading = false;
+  }
+}
+
+function renderConservativeReasonPanel(payload = null) {
+  const data = payload || state.conservativeReason.payload || (state.snapshot || {}).conservative_reason_outcomes || {};
+  const summary = data.summary || {};
+  const review = data.review_for_small_entry || {};
+  const reviewSummary = review.summary || {};
+  const available = Boolean(data.available);
+  const status = document.getElementById("themelab-conservative-reason-status");
+  if (status) {
+    status.textContent = available ? data.status || "READY" : "NO_DATA";
+    status.className = `badge ${available ? "ready" : "observe"}`;
+  }
+  text("themelab-conservative-reason-empty", available ? "보수적 차단 사유 outcome을 읽기 전용으로 검증합니다. 주문 설정은 자동 변경하지 않습니다." : "아직 outcome 관측 데이터가 부족합니다.");
+  text("themelab-conservative-reason-updated", formatDateTime(data.last_updated_at || data.generated_at));
+  text("themelab-conservative-reason-event-count", summary.event_count ?? 0);
+  text("themelab-conservative-reason-missed-rate", ratio(summary.missed_opportunity_rate ?? 0));
+  text("themelab-conservative-reason-good-rate", ratio(summary.good_block_rate ?? 0));
+  text("themelab-conservative-reason-risk-rate", ratio(summary.risk_avoided_rate ?? 0));
+  text("themelab-conservative-reason-false-count", summary.false_block_candidate_count ?? 0);
+  text("themelab-conservative-reason-small-count", reviewSummary.candidate_count ?? 0);
+  renderConservativeReasonGroupRows("themelab-conservative-reason-group-body", data.by_group || [], available);
+  renderConservativeReasonCodeRows("themelab-conservative-reason-code-body", data.by_reason_code || [], available);
+  renderConservativeReasonSmallRows("themelab-conservative-reason-small-body", review.by_reason_code || [], available);
+  text("themelab-conservative-reason-small-status", reviewSummary.candidate_count ?? 0);
+  renderConservativeReasonDataRows("themelab-conservative-reason-data-body", data.data_quality_bucket_summary || [], available);
+  renderConservativeReasonStockRows("themelab-conservative-reason-missed-body", data.top_missed_opportunity_stocks || [], available, "놓친 기회 상위 종목이 없습니다.");
+  renderConservativeReasonStockRows("themelab-conservative-reason-good-body", data.top_good_block_stocks || [], available, "좋은 차단 상위 종목이 없습니다.");
+}
+
+function renderConservativeReasonGroupRows(id, rows, available) {
+  const body = document.getElementById(id);
+  if (!body) return;
+  if (!available) {
+    body.innerHTML = `<tr><td colspan="6" class="muted">아직 outcome 관측 데이터가 부족합니다.</td></tr>`;
+    return;
+  }
+  const items = (rows || []).slice(0, 8);
+  body.innerHTML = items.length ? items.map((item) => `
+    <tr>
+      <td>${reasonBadge(item.group || "-")}</td>
+      <td>${escapeHtml(`${item.labeled_count ?? 0}/${item.event_count ?? 0}`)}</td>
+      <td>${ratio(item.missed_opportunity_rate)}</td>
+      <td>${ratio(item.good_block_rate)}</td>
+      <td>${ratio(item.risk_avoided_rate)}</td>
+      <td>${reasonBadge(item.recommendation || "-")}</td>
+    </tr>
+  `).join("") : `<tr><td colspan="6" class="muted">표시할 그룹 결과가 없습니다.</td></tr>`;
+}
+
+function renderConservativeReasonCodeRows(id, rows, available) {
+  const body = document.getElementById(id);
+  if (!body) return;
+  if (!available) {
+    body.innerHTML = `<tr><td colspan="5" class="muted">아직 outcome 관측 데이터가 부족합니다.</td></tr>`;
+    return;
+  }
+  const items = (rows || []).slice(0, 10);
+  body.innerHTML = items.length ? items.map((item) => `
+    <tr>
+      <td>${reasonBadge(item.reason_code || "-")}</td>
+      <td>${escapeHtml(item.group || "-")}</td>
+      <td>${escapeHtml(`${item.labeled_count ?? 0}/${item.event_count ?? 0}`)}</td>
+      <td>${pct(item.avg_mfe_15m_pct)} / ${pct(item.avg_mae_15m_pct)}</td>
+      <td>${reasonBadge(item.recommendation || "-")}</td>
+    </tr>
+  `).join("") : `<tr><td colspan="5" class="muted">표시할 reason 결과가 없습니다.</td></tr>`;
+}
+
+function renderConservativeReasonSmallRows(id, rows, available) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  if (!available) {
+    node.innerHTML = `<div class="muted">아직 outcome 관측 데이터가 부족합니다.</div>`;
+    return;
+  }
+  const items = (rows || []).slice(0, 6);
+  node.innerHTML = items.length ? items.map((item) => `
+    <div>${reasonBadge(item.reason_code || item.group || "-")} <strong>${escapeHtml(item.candidate_count ?? 0)}</strong><span>MFE ${pct(item.avg_mfe_15m_pct)} / MAE ${pct(item.avg_mae_15m_pct)} / x${escapeHtml(optionalNumber(item.suggested_position_size_multiplier, 2))}</span></div>
+  `).join("") : `<div class="muted">소액 진입 검토 후보가 없습니다.</div>`;
+}
+
+function renderConservativeReasonDataRows(id, rows, available) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  if (!available) {
+    node.innerHTML = `<div class="muted">장중에는 outcome 확정까지 시간이 필요합니다.</div>`;
+    return;
+  }
+  const items = (rows || []).slice(0, 6);
+  node.innerHTML = items.length ? items.map((item) => `
+    <div>${reasonBadge(item.data_quality_bucket || "-")} <strong>${escapeHtml(item.event_count ?? 0)}</strong><span>missed ${ratio(item.missed_opportunity_rate)} · ${escapeHtml(item.recommendation || "-")}</span></div>
+  `).join("") : `<div class="muted">데이터 품질 bucket 결과가 없습니다.</div>`;
+}
+
+function renderConservativeReasonStockRows(id, rows, available, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  if (!available) {
+    node.innerHTML = `<div class="muted">아직 outcome 관측 데이터가 부족합니다.</div>`;
+    return;
+  }
+  const items = (rows || []).slice(0, 8);
+  node.innerHTML = items.length ? items.map((item) => `
+    <div>${reasonBadge(item.primary_group || item.primary_reason || "-")} <strong>${escapeHtml(`${item.code || "-"} ${item.name || ""}`.trim())}</strong><span>MFE ${pct(item.mfe_15m_pct)} / MAE ${pct(item.mae_15m_pct)} · ${escapeHtml(item.recommendation || item.outcome_label || "-")}</span></div>
+  `).join("") : `<div class="muted">${escapeHtml(emptyText)}</div>`;
+}
+
 function renderBuyZeroInlineCounts(id, rows, key, emptyText) {
   const node = document.getElementById(id);
   if (!node) return;
@@ -2041,6 +2176,8 @@ function render(snapshot) {
   renderCockpit(currentSnapshot);
   renderBuyZeroRcaPanel();
   renderLiveSimAuditPanel(currentSnapshot);
+  state.conservativeReason.payload = currentSnapshot.conservative_reason_outcomes || state.conservativeReason.payload || {};
+  renderConservativeReasonPanel(state.conservativeReason.payload);
   renderShadowAb(currentSnapshot);
   renderThemes(currentSnapshot.ranked_themes || []);
   renderWatchset(currentSnapshot.watchset || []);
@@ -3825,6 +3962,7 @@ async function fetchSnapshot() {
   if (!response.ok) throw new Error(`snapshot ${response.status}`);
   render(await response.json());
   fetchBuyZeroRca().catch(() => {});
+  fetchConservativeReasonOutcomes().catch(() => {});
   fetchPromotionDecision(state.snapshot || {}).catch(() => {});
 }
 
@@ -3835,6 +3973,14 @@ function initBuyZeroRcaPanel() {
     fetchBuyZeroRca({ force: true }).catch((error) => {
       setBuyZeroStatus(`조회 실패: ${error.message || error}`, "critical");
     });
+  });
+}
+
+function initConservativeReasonPanel() {
+  renderConservativeReasonPanel();
+  document.getElementById("themelab-conservative-reason-refresh")?.addEventListener("click", () => {
+    state.conservativeReason.lastFetchedAt = 0;
+    fetchConservativeReasonOutcomes({ force: true }).catch(() => {});
   });
 }
 
@@ -3863,6 +4009,7 @@ initOperatorActionCenter();
 initPostmarketReviewPanel();
 initPromotionCockpit();
 initBuyZeroRcaPanel();
+initConservativeReasonPanel();
 fetchSnapshot().catch(() => {});
 connectWs();
 setInterval(() => fetchSnapshot().catch(() => {}), 5000);

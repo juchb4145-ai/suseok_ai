@@ -59,6 +59,11 @@ from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSo
 from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThemeUniverseSource
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
 from trading_app.buy_zero_rca import BuyZeroRCAAnalyzer
+from trading_app.conservative_reason_outcomes import (
+    ConservativeReasonOutcomeAnalyzer,
+    empty_payload as conservative_reason_empty_payload,
+    snapshot_payload as conservative_reason_snapshot_payload,
+)
 from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, config_from_settings
 from trading_app.dry_run_threshold_ab import DryRunThresholdABAnalyzer, config_from_settings as threshold_ab_config_from_settings
 from trading_app.intraday_outcomes import (
@@ -602,6 +607,10 @@ def _market_gate_review_analyzer(db: TradingDatabase) -> MarketGateReviewAnalyze
 
 def _theme_lab_gate_reason_outcome_analyzer(db: TradingDatabase) -> ThemeLabGateReasonOutcomeAnalyzer:
     return ThemeLabGateReasonOutcomeAnalyzer(db)
+
+
+def _conservative_reason_outcome_analyzer(db: TradingDatabase) -> ConservativeReasonOutcomeAnalyzer:
+    return ConservativeReasonOutcomeAnalyzer(db)
 
 
 def _buy_zero_rca_analyzer(db: TradingDatabase) -> BuyZeroRCAAnalyzer:
@@ -2231,7 +2240,7 @@ def runtime_change_proposal_detail(proposal_id: str) -> dict[str, Any]:
 @app.post("/api/runtime/change-proposals/generate")
 def generate_runtime_change_proposals(
     trade_date: str,
-    source_type: Optional[str] = Query("combined", pattern="^(intraday_outcome|shadow_strategy|replay|threshold_ab|combined)$"),
+    source_type: Optional[str] = Query("combined", pattern="^(intraday_outcome|shadow_strategy|replay|threshold_ab|conservative_reason_outcome|combined)$"),
     replay_id: Optional[str] = None,
     force: bool = False,
     persist: bool = True,
@@ -2470,6 +2479,98 @@ def export_runtime_theme_lab_gate_reason_outcomes(
             "report_id": report["report_id"],
             "exports": analyzer.export_report(report, fmt=format),
             "notes": report.get("notes", []),
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/conservative-reason-outcomes")
+def conservative_reason_outcomes(
+    trade_date: Optional[str] = None,
+    limit: int = Query(10000, ge=1, le=50000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        return _conservative_reason_outcome_analyzer(db).build_report(trade_date=resolved_trade_date, limit=limit, offset=offset)
+    finally:
+        close_database(db)
+
+
+@app.get("/api/conservative-reason-outcomes/summary")
+def conservative_reason_outcomes_summary(
+    trade_date: Optional[str] = None,
+    limit: int = Query(10000, ge=1, le=50000),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        report = _conservative_reason_outcome_analyzer(db).build_report(trade_date=resolved_trade_date, limit=limit)
+        return conservative_reason_snapshot_payload(report)
+    finally:
+        close_database(db)
+
+
+@app.get("/api/conservative-reason-outcomes/items")
+def conservative_reason_outcomes_items(
+    trade_date: Optional[str] = None,
+    reason_group: str = "",
+    reason_code: str = "",
+    recommendation: str = "",
+    code: str = "",
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        analyzer = _conservative_reason_outcome_analyzer(db)
+        report = analyzer.build_report(trade_date=resolved_trade_date, limit=50000)
+        rows = analyzer.filter_items(
+            report,
+            reason_group=reason_group,
+            reason_code=reason_code,
+            recommendation=recommendation,
+            code=code,
+        )
+        start = max(0, int(offset or 0))
+        end = start + max(1, int(limit or 100))
+        return {
+            "trade_date": report.get("trade_date") or resolved_trade_date,
+            "generated_at": report.get("generated_at") or "",
+            "total": len(rows),
+            "items": rows[start:end],
+            "pagination": _pagination_payload(limit=limit, offset=offset, count=len(rows[start:end]), total=len(rows)),
+            "filters": {
+                "reason_group": reason_group,
+                "reason_code": reason_code,
+                "recommendation": recommendation,
+                "code": code,
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/conservative-reason-outcomes/generate")
+def generate_conservative_reason_outcomes(
+    trade_date: Optional[str] = None,
+    export: bool = False,
+    format: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+    limit: int = Query(50000, ge=1, le=100000),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        analyzer = _conservative_reason_outcome_analyzer(db)
+        report = analyzer.build_report(trade_date=resolved_trade_date, limit=limit)
+        return {
+            "report_id": report.get("report_id") or "",
+            "trade_date": report.get("trade_date") or resolved_trade_date,
+            "summary": report.get("summary") or {},
+            "exports": analyzer.export_report(report, fmt=format) if export else {},
+            "disclaimer_ko": report.get("disclaimer_ko") or "",
         }
     finally:
         close_database(db)
@@ -6622,6 +6723,11 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         include_missed_opportunities=False,
     )
     live_sim_audit_payload = _live_sim_auditor(db).build_report(trade_date=today, limit=2000)
+    try:
+        conservative_reason_report = _conservative_reason_outcome_analyzer(db).build_report(trade_date=today, limit=10000)
+        conservative_reason_payload = conservative_reason_snapshot_payload(conservative_reason_report)
+    except Exception as exc:
+        conservative_reason_payload = conservative_reason_empty_payload(str(exc))
     shadow_summary_payload = db.shadow_strategy_summary(trade_date=today)
     replay_reports = scan_replay_reports(DEFAULT_REPLAY_DB_ROOT, limit=1)
     replay_runs = scan_replay_runs(DEFAULT_REPLAY_DB_ROOT, limit=5)
@@ -6692,6 +6798,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["intraday_outcomes"] = outcome_summary_payload
     runtime_payload["buy_zero_rca"] = buy_zero_rca_payload
     runtime_payload["live_sim_audit"] = live_sim_audit_payload
+    runtime_payload["conservative_reason_outcomes"] = conservative_reason_payload
     runtime_payload["shadow_strategies"] = shadow_summary_payload
     runtime_payload["strategy_replay"] = replay_payload
     runtime_payload["change_proposals"] = change_proposal_payload
@@ -6728,6 +6835,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "intraday_outcomes": outcome_summary_payload,
         "buy_zero_rca": buy_zero_rca_payload,
         "live_sim_audit": live_sim_audit_payload,
+        "conservative_reason_outcomes": conservative_reason_payload,
         "shadow_strategies": shadow_summary_payload,
         "strategy_replay": replay_payload,
         "change_proposals": change_proposal_payload,

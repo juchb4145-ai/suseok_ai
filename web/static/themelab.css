@@ -1835,6 +1835,14 @@ tbody tr.selected {
   white-space: normal;
 }
 
+.conservative-reason-panel .table-wrap {
+  max-height: 300px;
+}
+
+.conservative-reason-summary-grid article strong {
+  overflow-wrap: anywhere;
+}
+
 .muted {
   color: var(--muted);
 }

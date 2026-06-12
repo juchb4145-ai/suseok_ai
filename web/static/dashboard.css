@@ -749,6 +749,15 @@ td {
   min-width: 1320px;
 }
 
+.conservative-reason-grid {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.conservative-reason-detail-grid .alert-item strong,
+.conservative-reason-detail-grid .alert-item span {
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 1180px) {
   .command-grid {
     grid-template-columns: repeat(4, minmax(0, 1fr));
