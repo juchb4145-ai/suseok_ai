@@ -1136,9 +1136,14 @@ def test_condition_status_uses_send_condition_ack_not_resolved_index(tmp_path):
     leader = next(item for item in payload["condition_statuses"] if item["purpose"] == "theme_lab_leader")
     assert leader["resolved_index"] == 85
     assert leader["registered"] is False
+    assert leader["registered_label"] == "확인 필요"
     assert leader["command_status"] == "FAILED"
+    assert leader["command_status_label"] == "등록 확인 실패"
     assert leader["screen_no"] == "7602"
     assert leader["warning"] == "CONDITION_SEND_FAILED"
+    assert leader["warning_label"] == "등록 확인 실패"
+    assert "ACK" in leader["warning_detail"]
+    assert leader["action_hint"]
 
 
 def test_condition_status_prefers_current_session_ack_over_later_failed_duplicate(tmp_path):
@@ -1205,9 +1210,13 @@ def test_condition_status_prefers_current_session_ack_over_later_failed_duplicat
 
     leader = next(item for item in payload["condition_statuses"] if item["purpose"] == "theme_lab_leader")
     assert leader["registered"] is True
+    assert leader["registered_label"] == "정상"
     assert leader["command_status"] == "ACKED"
+    assert leader["command_status_label"] == "등록 확인 완료"
     assert leader["screen_no"] == "7602"
     assert leader["warning"] == ""
+    assert leader["warning_label"] == "정상"
+    assert leader["action_hint"] == ""
 
 
 def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, monkeypatch):

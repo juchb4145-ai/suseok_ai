@@ -251,7 +251,10 @@ def check_outcomes(conn: sqlite3.Connection, *, trade_date: str = "", horizon_se
     )
     horizon_distribution = group_counts(conn, "strategy_decision_outcomes", "horizon_sec", where, params)
     label_distribution = group_counts(conn, "strategy_decision_outcomes", "outcome_label", where, params)
-    insufficient_filter = where_with_extra(where, "data_status = 'INSUFFICIENT_OUTCOME_DATA' OR outcome_label = 'INSUFFICIENT_OUTCOME_DATA'")
+    insufficient_filter = where_with_extra(
+        where,
+        "(data_status = 'INSUFFICIENT_OUTCOME_DATA' OR outcome_label = 'INSUFFICIENT_OUTCOME_DATA')",
+    )
     insufficient_count = scalar(
         conn,
         f"SELECT COUNT(*) FROM strategy_decision_outcomes {insufficient_filter}",
@@ -262,7 +265,7 @@ def check_outcomes(conn: sqlite3.Connection, *, trade_date: str = "", horizon_se
         conn,
         f"""
         SELECT COUNT(*) FROM strategy_decision_outcomes
-        {where_with_extra(where, "price_at_decision IS NULL OR price_at_decision <= 0 OR max_return_pct IS NULL OR max_drawdown_pct IS NULL")}
+        {where_with_extra(where, "(price_at_decision IS NULL OR price_at_decision <= 0 OR max_return_pct IS NULL OR max_drawdown_pct IS NULL)")}
         """,
         params,
     )

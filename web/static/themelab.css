@@ -1162,6 +1162,10 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   vertical-align: middle;
 }
 
+.row-meta.action-hint {
+  color: var(--warning);
+}
+
 .chart-panel {
   display: flex;
   flex-direction: column;

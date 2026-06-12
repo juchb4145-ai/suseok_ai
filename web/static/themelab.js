@@ -3156,19 +3156,30 @@ function orderCandidateBadges(item, liveBlocked, small) {
 
 function renderConditions(items) {
   const registered = items.filter((item) => item.registered).length;
-  text("condition-summary", `${registered}/${items.length || 3}`);
+  text("condition-summary", `${registered}/${items.length || 3} 등록 확인`);
   document.getElementById("condition-list").innerHTML = items.length
     ? items.map((item) => {
+      const statusTone = item.registered ? "ready" : "warning";
+      const title = item.purpose_label
+        ? `${item.purpose_label}: ${item.condition_name || "-"}`
+        : (item.condition_name || "-");
       const details = [
-        item.purpose,
-        `index=${item.resolved_index || "UNKNOWN"}`,
-        item.screen_no ? `screen=${item.screen_no}` : "",
+        item.command_status_label || item.command_status || "등록 확인 대기",
+        `인덱스 ${item.resolved_index || "UNKNOWN"}`,
+        item.screen_no ? `화면 ${item.screen_no}` : "",
+        item.gateway_heartbeat_ok === false ? "Heartbeat 확인 필요" : "",
       ].filter(Boolean).join(" · ");
+      const warningLabel = item.warning_label || (item.warning ? "확인 필요" : "정상");
+      const warningText = item.warning_detail || item.warning_label || item.warning || "정상";
+      const actionHint = item.action_hint
+        ? `<div class="row-meta action-hint">조치: ${escapeHtml(item.action_hint)}</div>`
+        : "";
       return `
         <div class="quality-row">
-          <div class="row-top"><span class="row-title">${escapeHtml(item.condition_name)}</span>${badge(item.registered ? "OK" : "WARNING")}</div>
+          <div class="row-top"><span class="row-title">${escapeHtml(title)}</span>${badge(item.registered_label || (item.registered ? "정상" : "확인 필요"), statusTone)}</div>
           <div class="row-meta">${escapeHtml(details)}</div>
-          <div class="row-meta">${escapeHtml(item.warning || "정상")}</div>
+          <div class="row-meta">${badge(warningLabel, statusTone)} ${escapeHtml(warningText)}</div>
+          ${actionHint}
         </div>
       `;
     }).join("")

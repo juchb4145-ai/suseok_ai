@@ -832,6 +832,13 @@ def _operation_status_message(
     return "OBSERVE_ONLY", "장중 매수 가능 후보를 관찰 중입니다."
 
 
+_CONDITION_PURPOSE_LABELS = {
+    "theme_lab_alive": "생존 조건식",
+    "theme_lab_strong": "강세 조건식",
+    "theme_lab_leader": "주도 조건식",
+}
+
+
 def _condition_statuses(db: TradingDatabase, gateway_state: Any | None = None) -> list[dict[str, Any]]:
     defaults = {
         "theme_lab_alive": "테마랩_생존_-1",
@@ -845,6 +852,9 @@ def _condition_statuses(db: TradingDatabase, gateway_state: Any | None = None) -
         profiles = []
     by_purpose = {profile.purpose: profile for profile in profiles}
     latest_commands = _latest_condition_commands(gateway_state)
+    gateway_snapshot = _gateway_status_dict(gateway_state)
+    heartbeat_ok = gateway_snapshot.get("heartbeat_ok")
+    gateway_connected = gateway_snapshot.get("connected")
     for purpose, default_name in defaults.items():
         profile = by_purpose.get(purpose)
         command = latest_commands.get(profile.condition_name if profile else default_name, {})
@@ -861,21 +871,48 @@ def _condition_statuses(db: TradingDatabase, gateway_state: Any | None = None) -
             warning = f"CONDITION_SEND_{command_status}"
         elif profile.last_resolved_index is not None and not command_status:
             warning = "CONDITION_SEND_NOT_CONFIRMED"
+        warning_label = _condition_warning_label(warning)
         rows.append(
             {
                 "condition_name": profile.condition_name if profile else default_name,
                 "purpose": purpose,
+                "purpose_label": _CONDITION_PURPOSE_LABELS.get(purpose, purpose),
                 "resolved_index": profile.last_resolved_index if profile and profile.last_resolved_index is not None else "UNKNOWN",
                 "registered": registered,
+                "registered_label": "정상" if registered else "확인 필요",
                 "command_status": command_status or "UNKNOWN",
+                "command_status_label": _condition_command_status_label(command_status, registered=registered),
                 "screen_no": str(command_payload.get("screen_no") or ""),
                 "include_count": 0,
                 "remove_count": 0,
                 "last_event_at": "",
                 "warning": warning,
+                "warning_label": warning_label,
+                "warning_detail": _condition_warning_detail(
+                    warning,
+                    command_status=command_status,
+                    heartbeat_ok=heartbeat_ok,
+                    gateway_connected=gateway_connected,
+                ),
+                "action_hint": _condition_action_hint(
+                    warning,
+                    heartbeat_ok=heartbeat_ok,
+                    gateway_connected=gateway_connected,
+                ),
+                "gateway_heartbeat_ok": heartbeat_ok,
+                "gateway_connected": gateway_connected,
             }
         )
     return rows
+
+
+def _gateway_status_dict(gateway_state: Any | None) -> dict[str, Any]:
+    if gateway_state is None:
+        return {}
+    try:
+        return dict(gateway_state.snapshot().to_dict())
+    except Exception:
+        return {}
 
 
 def _latest_condition_commands(gateway_state: Any | None) -> dict[str, dict[str, Any]]:
@@ -959,6 +996,77 @@ def _condition_command_warning(status: str, error: str) -> str:
     if status in {"EXPIRED", "EXPIRED_BEFORE_DISPATCH"} and clean_error in {"", status}:
         return "COMMAND_TTL_EXPIRED"
     return clean_error or status
+
+
+def _condition_command_status_label(status: str, *, registered: bool) -> str:
+    normalized = str(status or "").upper()
+    if registered or normalized == "ACKED":
+        return "등록 확인 완료"
+    if normalized == "FAILED":
+        return "등록 확인 실패"
+    if normalized in {"EXPIRED", "EXPIRED_BEFORE_DISPATCH"}:
+        return "등록 명령 만료"
+    if normalized in {"QUEUED", "DISPATCHED"}:
+        return "등록 처리 중"
+    if normalized:
+        return "등록 확인 필요"
+    return "등록 확인 대기"
+
+
+def _condition_warning_label(warning: str) -> str:
+    normalized = str(warning or "").strip().upper()
+    if not normalized:
+        return "정상"
+    labels = {
+        "CONDITION_PROFILE_UNRESOLVED": "조건식 설정 없음",
+        "CONDITION_SEND_FAILED": "등록 확인 실패",
+        "COMMAND_TTL_EXPIRED": "등록 명령 만료",
+        "CONDITION_SEND_NOT_CONFIRMED": "등록 확인 없음",
+    }
+    if normalized in labels:
+        return labels[normalized]
+    if normalized.startswith("CONDITION_SEND_"):
+        return "등록 확인 필요"
+    return "확인 필요"
+
+
+def _condition_warning_detail(
+    warning: str,
+    *,
+    command_status: str = "",
+    heartbeat_ok: Any = None,
+    gateway_connected: Any = None,
+) -> str:
+    normalized = str(warning or "").strip().upper()
+    if not normalized:
+        return "현재 세션에서 조건식 등록 ACK가 확인됐습니다."
+    if normalized == "CONDITION_PROFILE_UNRESOLVED":
+        return "조건식 목적에 매핑된 프로필을 찾지 못했습니다. 조건식 이름과 목적 설정을 확인해야 합니다."
+    if normalized == "CONDITION_SEND_FAILED":
+        detail = "키움 조건검색 등록 명령을 보낸 뒤 성공 ACK가 확정되지 않았습니다."
+    elif normalized == "COMMAND_TTL_EXPIRED":
+        detail = "조건식 등록 명령이 게이트웨이에서 처리되기 전에 유효 시간이 지났습니다."
+    elif normalized == "CONDITION_SEND_NOT_CONFIRMED":
+        detail = "조건식 인덱스는 해석됐지만 현재 세션의 등록 명령 이력이 확인되지 않았습니다."
+    elif normalized.startswith("CONDITION_SEND_"):
+        detail = f"조건식 등록 명령 상태가 {str(command_status or 'UNKNOWN').upper()}입니다."
+    else:
+        detail = str(warning or "조건식 등록 상태 확인이 필요합니다.")
+    if gateway_connected is False:
+        return f"{detail} 키움 게이트웨이 연결 상태부터 확인하세요."
+    if heartbeat_ok is False:
+        return f"{detail} 현재 게이트웨이 heartbeat가 정상으로 확인되지 않아 재등록 ACK가 지연될 수 있습니다."
+    return detail
+
+
+def _condition_action_hint(warning: str, *, heartbeat_ok: Any = None, gateway_connected: Any = None) -> str:
+    if not str(warning or "").strip():
+        return ""
+    if gateway_connected is False:
+        return "키움 Open API 게이트웨이 연결과 로그인을 먼저 정상화한 뒤 조건식 등록 상태를 다시 확인하세요."
+    if heartbeat_ok is False:
+        return "게이트웨이 heartbeat가 정상화되는지 확인한 뒤 런타임의 조건식 재등록 ACK를 다시 확인하세요."
+    return "조건식 재등록 명령이 ACK로 돌아오는지 런타임/게이트웨이 상태를 확인하세요."
 
 
 def _data_quality(raw: dict[str, Any], watchset: list[dict[str, Any]]) -> dict[str, Any]:
