@@ -307,6 +307,103 @@
           <div id="runtime-warning-lines" class="inline-log"></div>
         </section>
 
+        <section id="buy-zero-rca-card" class="band buy-zero-rca-section">
+          <div class="section-head">
+            <div>
+              <h2>매수 0건 RCA</h2>
+              <p id="buy-zero-rca-empty" class="help-text">아직 RCA trace가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.</p>
+            </div>
+            <div class="action-strip">
+              <span id="buy-zero-rca-market-session" class="counter muted">정규장 확인 중</span>
+              <span id="buy-zero-rca-status" class="counter muted">TRACE 대기</span>
+              <button id="buy-zero-rca-refresh" type="button">새로고침</button>
+            </div>
+          </div>
+          <div class="mini-grid rca-summary-grid">
+            <div><span>후보</span><strong id="buy-zero-rca-total-candidates">0</strong></div>
+            <div><span>Gate 평가</span><strong id="buy-zero-rca-gate-evaluated">0</strong></div>
+            <div><span>READY / SMALL</span><strong id="buy-zero-rca-ready-counts">0 / 0</strong></div>
+            <div><span>WAIT / OBSERVE</span><strong id="buy-zero-rca-wait-observe-counts">0 / 0</strong></div>
+            <div><span>BLOCKED</span><strong id="buy-zero-rca-blocked-count">0</strong></div>
+            <div><span>EntryPlan</span><strong id="buy-zero-rca-entry-plan-count">0</strong></div>
+            <div><span>제출 가능</span><strong id="buy-zero-rca-entry-submittable-count">0</strong></div>
+            <div><span>DRY_RUN</span><strong id="buy-zero-rca-dry-run-count">0</strong></div>
+            <div><span>LIVE_SIM 제출</span><strong id="buy-zero-rca-live-submitted-count">0</strong></div>
+            <div><span>LIVE_SIM 차단</span><strong id="buy-zero-rca-live-blocked-count">0</strong></div>
+            <div><span>Top stage</span><strong id="buy-zero-rca-top-block-stage">-</strong></div>
+            <div><span>마지막 trace</span><strong id="buy-zero-rca-last-updated">-</strong></div>
+          </div>
+          <div class="two-col rca-reason-grid">
+            <div class="unframed-panel">
+              <h3>오늘 매수 0건이면 가장 큰 원인 3개</h3>
+              <div id="buy-zero-rca-top-causes" class="inline-log"></div>
+            </div>
+            <div class="unframed-panel">
+              <h3>데이터 품질 부족 사유</h3>
+              <div id="buy-zero-rca-data-quality-blocks" class="inline-log"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="band buy-zero-rca-section">
+          <div class="section-head">
+            <div>
+              <h2>왜 주문이 안 나갔나</h2>
+              <p class="help-text">단계를 클릭하면 해당 stage에서 막힌 종목 trace를 조회합니다.</p>
+            </div>
+            <span id="buy-zero-rca-stage-funnel-status" class="counter muted">대기</span>
+          </div>
+          <div id="buy-zero-rca-stage-funnel" class="stage-funnel" aria-label="매수 0건 RCA stage funnel"></div>
+          <div class="table-wrap rca-stage-blocks">
+            <table>
+              <thead><tr><th>Stage</th><th>종목</th><th>상태</th><th>차단 사유</th><th>Gate</th><th>Trace</th></tr></thead>
+              <tbody id="buy-zero-rca-stage-candidates-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="band buy-zero-rca-section">
+          <div class="section-head">
+            <div>
+              <h2>READY인데 주문 안 나간 종목</h2>
+              <p class="help-text">row를 클릭하면 후보 생성부터 주문/차단까지 trace timeline을 엽니다.</p>
+            </div>
+            <span id="buy-zero-rca-ready-status" class="counter muted">대기</span>
+          </div>
+          <div class="table-wrap">
+            <table class="wide-table">
+              <thead>
+                <tr>
+                  <th>종목</th><th>Candidate</th><th>테마</th><th>분류</th><th>Gate</th><th>Score</th><th>차단 사유</th><th>Reason codes</th>
+                  <th>Entry</th><th>DRY_RUN</th><th>LIVE_SIM</th><th>Tick age</th><th>Support</th><th>Trace</th>
+                </tr>
+              </thead>
+              <tbody id="buy-zero-rca-ready-table-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="band buy-zero-rca-section">
+          <div class="section-head">
+            <div>
+              <h2>OBSERVE/BLOCKED 이후 급등 후보</h2>
+              <p class="help-text">ThemeLab outcome analyzer 결과를 trace와 연결해 놓친 기회를 보여줍니다.</p>
+            </div>
+            <span id="buy-zero-rca-rally-status" class="counter muted">대기</span>
+          </div>
+          <div class="table-wrap">
+            <table class="wide-table">
+              <thead>
+                <tr>
+                  <th>종목</th><th>상태</th><th>주요 사유</th><th>Reason codes</th><th>기준가</th><th>5m</th><th>15m</th><th>30m</th>
+                  <th>MFE/MAE 15m</th><th>기회손실</th><th>좋은 차단</th><th>READY까지</th><th>테마</th><th>Role</th><th>위치</th>
+                </tr>
+              </thead>
+              <tbody id="buy-zero-rca-rally-table-body"></tbody>
+            </table>
+          </div>
+        </section>
+
         <section class="band">
           <div class="section-head">
             <h2>전략 흐름 Funnel</h2>

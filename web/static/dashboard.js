@@ -7,6 +7,15 @@ const state = {
   lastSnapshotAt: 0,
   latestSnapshot: null,
   tables: {},
+  buyZeroRca: {
+    inFlight: false,
+    lastFetchedAt: 0,
+    readyRows: [],
+    rallyRows: [],
+    stageRows: [],
+    stage: "",
+    error: "",
+  },
 };
 
 const SNAPSHOT_POLL_INTERVAL_MS = 30000;
@@ -345,6 +354,33 @@ const categoryLabelsKo = {
 };
 
 const TOKEN_STORAGE_KEY = "TRADING_CORE_TOKEN";
+const BUY_ZERO_RCA_TABLE_REFRESH_MS = 30000;
+const BUY_ZERO_RCA_CRITICAL_REASONS = new Set([
+  "DATA_INSUFFICIENT",
+  "LATE_CHASE_TEMP_WAIT",
+  "CHASE_RISK",
+  "WAIT_MARKET_CONFIRMATION_PENDING",
+  "LIVE_SIM_BLOCKED",
+  "ENTRY_PLAN_DIAGNOSTIC_ONLY",
+  "ORDER_SINK_NOOP",
+  "GATE_RESULT_KEY_MISMATCH",
+]);
+
+const BUY_ZERO_RCA_STAGE_LABELS = {
+  CANDIDATE_GENERATED: "후보 생성",
+  THEME_ENGINE_EVALUATED: "테마 엔진",
+  THEMELAB_GATE_EVALUATED: "ThemeLab Gate",
+  HYBRID_GATE_EVALUATED: "Hybrid Gate",
+  RISK_GATE_EVALUATED: "Risk Gate",
+  LIFECYCLE_UPDATED: "Lifecycle",
+  ENTRY_PLAN_CREATED: "EntryPlan",
+  VIRTUAL_ORDER_SUBMITTED: "가상 주문",
+  DRY_RUN_INTENT_CREATED: "DRY_RUN 의도",
+  LIVE_SIM_COMMAND_QUEUED: "LIVE_SIM 큐",
+  BROKER_ORDER_ACCEPTED: "브로커 접수",
+  PARTIAL_FILLED: "부분체결",
+  FILLED: "체결",
+};
 
 function gradeKo(value) {
   return gradeLabelsKo[value] || value || "-";
@@ -415,6 +451,13 @@ function formatPercentValue(value) {
   return `${number.toFixed(2)}%`;
 }
 
+function fmtOptionalNumber(value, digits = 1) {
+  if (value == null || value === "") return "-";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return number.toFixed(digits);
+}
+
 function formatMs(value) {
   if (value == null || value === "") return "-";
   const number = Number(value);
@@ -438,6 +481,35 @@ function buildQuery(params) {
     search.set(key, String(value));
   });
   return search.toString();
+}
+
+function reasonBadge(reason) {
+  const textValue = String(reason || "-");
+  const upper = textValue.toUpperCase();
+  const critical = BUY_ZERO_RCA_CRITICAL_REASONS.has(upper) || /DATA_INSUFFICIENT|CHASE|LIVE_SIM_BLOCKED|DIAGNOSTIC_ONLY|ORDER_SINK_NOOP|GATE_RESULT_KEY_MISMATCH|WAIT_MARKET_CONFIRMATION/i.test(upper);
+  return badge(textValue, critical ? "bad" : "");
+}
+
+function reasonBadges(reasons) {
+  const values = [];
+  for (const reason of reasons || []) {
+    const textValue = String(reason || "").trim();
+    if (!textValue || values.includes(textValue)) continue;
+    values.push(textValue);
+  }
+  if (!values.length) return '<span class="empty">-</span>';
+  return values.map((reason) => reasonBadge(reason)).join(" ");
+}
+
+function yesNoUnknown(value) {
+  if (value === true) return "예";
+  if (value === false) return "아니오";
+  return "-";
+}
+
+function buyZeroTradeDate() {
+  const payload = (state.latestSnapshot || {}).buy_zero_rca || ((state.latestSnapshot || {}).runtime || {}).buy_zero_rca || {};
+  return payload.trade_date || new Date().toISOString().substring(0, 10);
 }
 
 function getStoredToken() {
@@ -836,6 +908,7 @@ function closeDetailPanel() {
 }
 
 function detailSummaryHtml(payload) {
+  if ((payload || {}).detail_type === "buy_zero_trace") return buyZeroTraceDetailHtml(payload);
   const record = payload.record || payload.item || payload.report || payload.candidate || payload;
   const keys = ["decision_id", "command_id", "intent_id", "candidate_id", "report_id", "sample_id", "experiment_id", "lifecycle_id", "status", "action_type", "action_result", "command_type", "code", "reason", "error"];
   return keys
@@ -965,6 +1038,305 @@ function renderThemeLabSummary(themeLab) {
   text("themelab-order-candidates", summary.order_candidate_count || 0);
 }
 
+function renderBuyZeroRca(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.buy_zero_rca || runtime.buy_zero_rca || {};
+  const summary = payload.summary || payload || {};
+  const available = Boolean(payload.available) || Number(payload.total_trace_events || 0) > 0;
+  const buyZero = Number(summary.live_sim_submitted_count ?? payload.live_sim_submitted_count ?? 0) === 0;
+  const statusText = !available ? "TRACE 대기" : buyZero ? "오늘 LIVE_SIM 매수 0건" : "LIVE_SIM 주문 발생";
+  const statusTone = !available ? "muted" : buyZero ? "warn" : "ok";
+  const sessionStatus = runtime.market_session_status || payload.market_session_status || "";
+  const isRegular = /REGULAR|OPEN|장중|정규/i.test(sessionStatus);
+
+  text("buy-zero-rca-status", statusText);
+  cls("buy-zero-rca-status", `counter ${statusTone}`);
+  text("buy-zero-rca-market-session", sessionStatus ? (isRegular ? `정규장 ${sessionStatus}` : `정규장 아님: ${sessionStatus}`) : "정규장 확인 중");
+  cls("buy-zero-rca-market-session", `counter ${sessionStatus && !isRegular ? "warn" : "muted"}`);
+  text(
+    "buy-zero-rca-empty",
+    available
+      ? "RCA trace는 PR 적용 이후 이벤트부터 표시됩니다. 과거 DB backfill은 하지 않습니다."
+      : "아직 RCA trace가 없습니다. PR 적용 이후 이벤트부터 쌓입니다."
+  );
+  text("buy-zero-rca-total-candidates", summary.total_candidates ?? payload.total_candidates ?? 0);
+  text("buy-zero-rca-gate-evaluated", summary.gate_evaluated_count ?? payload.gate_evaluated_count ?? 0);
+  text("buy-zero-rca-ready-counts", `${summary.ready_exact_count ?? payload.ready_exact_count ?? summary.ready_count ?? payload.ready_count ?? 0} / ${summary.ready_small_count ?? payload.ready_small_count ?? 0}`);
+  text("buy-zero-rca-wait-observe-counts", `${summary.wait_count ?? payload.wait_count ?? 0} / ${summary.observe_count ?? payload.observe_count ?? 0}`);
+  text("buy-zero-rca-blocked-count", summary.blocked_count ?? payload.blocked_count ?? 0);
+  text("buy-zero-rca-entry-plan-count", summary.entry_plan_created_count ?? payload.entry_plan_created_count ?? 0);
+  text("buy-zero-rca-entry-submittable-count", summary.entry_plan_submittable_count ?? payload.entry_plan_submittable_count ?? 0);
+  text("buy-zero-rca-dry-run-count", summary.dry_run_intent_count ?? payload.dry_run_intent_count ?? 0);
+  text("buy-zero-rca-live-submitted-count", summary.live_sim_submitted_count ?? payload.live_sim_submitted_count ?? 0);
+  text("buy-zero-rca-live-blocked-count", summary.live_sim_blocked_count ?? payload.live_sim_blocked_count ?? 0);
+  const topStage = firstItems(payload.top_block_stage || [], 1)[0] || {};
+  text("buy-zero-rca-top-block-stage", topStage.stage ? `${topStage.stage} (${topStage.count || 0})` : "-");
+  text("buy-zero-rca-last-updated", formatDateTime(summary.last_updated_at || payload.last_updated_at));
+  renderBuyZeroInlineCounts("buy-zero-rca-top-causes", payload.operator_top_3_causes || payload.top_block_reasons || [], "reason", "아직 집계된 차단 사유가 없습니다");
+  renderBuyZeroInlineCounts(
+    "buy-zero-rca-data-quality-blocks",
+    ((payload.data_quality_blocks || {}).reasons || payload.top_data_insufficient_reasons || []),
+    "reason",
+    "데이터 품질 부족 사유가 없습니다"
+  );
+  renderBuyZeroStageFunnel(payload.stage_funnel || []);
+  renderBuyZeroReadyRows(state.buyZeroRca.readyRows, available);
+  renderBuyZeroRallyRows(state.buyZeroRca.rallyRows, available);
+  renderBuyZeroStageRows(state.buyZeroRca.stageRows, state.buyZeroRca.stage);
+  if (available && Date.now() - state.buyZeroRca.lastFetchedAt > BUY_ZERO_RCA_TABLE_REFRESH_MS) {
+    refreshBuyZeroRcaTables().catch((error) => {
+      state.buyZeroRca.error = error.message;
+      text("buy-zero-rca-ready-status", `오류: ${error.message}`);
+      cls("buy-zero-rca-ready-status", "counter bad");
+    });
+  }
+}
+
+function renderBuyZeroInlineCounts(id, rows, key, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = firstItems(rows || [], 5);
+  node.innerHTML = items.length
+    ? items.map((item) => `<div>${reasonBadge(item[key] || item.category || "-")} <strong>${escapeHtml(item.count ?? 0)}</strong></div>`).join("")
+    : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
+function renderBuyZeroStageFunnel(rows) {
+  const node = document.getElementById("buy-zero-rca-stage-funnel");
+  if (!node) return;
+  const items = rows || [];
+  const visible = items.length ? items : Object.keys(BUY_ZERO_RCA_STAGE_LABELS).map((stage) => ({ stage, total: 0, passed: 0, failed: 0, top_reason: "" }));
+  const hasData = visible.some((item) => Number(item.total || 0) > 0);
+  text("buy-zero-rca-stage-funnel-status", hasData ? `${visible.reduce((sum, item) => sum + Number(item.total || 0), 0)} events` : "TRACE 대기");
+  cls("buy-zero-rca-stage-funnel-status", `counter ${hasData ? "ok" : "muted"}`);
+  node.innerHTML = visible.map((item) => {
+    const failed = Number(item.failed || 0);
+    const tone = failed > 0 ? "warn" : Number(item.total || 0) > 0 ? "ok" : "muted";
+    return `
+      <button type="button" class="stage-step ${tone}" data-buy-zero-stage="${escapeHtml(item.stage || "")}">
+        <span>${escapeHtml(BUY_ZERO_RCA_STAGE_LABELS[item.stage] || item.stage || "-")}</span>
+        <strong>${escapeHtml(item.total ?? 0)}</strong>
+        <em>${escapeHtml(item.passed ?? 0)} 통과 / ${escapeHtml(failed)} 차단</em>
+        <small>${escapeHtml(item.top_reason || "차단 사유 없음")}</small>
+      </button>
+    `;
+  }).join("");
+  node.querySelectorAll("[data-buy-zero-stage]").forEach((button) => {
+    button.addEventListener("click", () => fetchBuyZeroStageCandidates(button.dataset.buyZeroStage || "").catch((error) => {
+      text("buy-zero-rca-stage-funnel-status", `오류: ${error.message}`);
+      cls("buy-zero-rca-stage-funnel-status", "counter bad");
+    }));
+  });
+}
+
+async function refreshBuyZeroRcaTables({ force = false } = {}) {
+  if (state.buyZeroRca.inFlight) return;
+  if (!force && Date.now() - state.buyZeroRca.lastFetchedAt <= BUY_ZERO_RCA_TABLE_REFRESH_MS) return;
+  if (!document.getElementById("buy-zero-rca-ready-table-body")) return;
+  state.buyZeroRca.inFlight = true;
+  text("buy-zero-rca-ready-status", "조회 중");
+  text("buy-zero-rca-rally-status", "조회 중");
+  try {
+    const tradeDate = buyZeroTradeDate();
+    const [ready, rally] = await Promise.all([
+      apiGet("/api/runtime/buy-zero/ready-not-ordered", { trade_date: tradeDate, limit: 100 }),
+      apiGet("/api/runtime/buy-zero/missed-opportunities", { trade_date: tradeDate, limit: 100 }),
+    ]);
+    state.buyZeroRca.readyRows = ready.items || [];
+    state.buyZeroRca.rallyRows = rally.top_observe_then_rally_candidates || [];
+    state.buyZeroRca.lastFetchedAt = Date.now();
+    renderBuyZeroReadyRows(state.buyZeroRca.readyRows, true);
+    renderBuyZeroRallyRows(state.buyZeroRca.rallyRows, true);
+  } finally {
+    state.buyZeroRca.inFlight = false;
+  }
+}
+
+async function fetchBuyZeroStageCandidates(stage) {
+  if (!stage) return;
+  state.buyZeroRca.stage = stage;
+  text("buy-zero-rca-stage-funnel-status", `${stage} 조회 중`);
+  cls("buy-zero-rca-stage-funnel-status", "counter warn");
+  const payload = await apiGet("/api/runtime/buy-zero/traces", {
+    trade_date: buyZeroTradeDate(),
+    stage,
+    pass_fail: "FAIL",
+    limit: 100,
+  });
+  state.buyZeroRca.stageRows = payload.items || [];
+  renderBuyZeroStageRows(state.buyZeroRca.stageRows, stage);
+  text("buy-zero-rca-stage-funnel-status", `${stage} 차단 ${state.buyZeroRca.stageRows.length}`);
+  cls("buy-zero-rca-stage-funnel-status", `counter ${state.buyZeroRca.stageRows.length ? "warn" : "ok"}`);
+}
+
+function renderBuyZeroStageRows(rows, stage) {
+  const body = document.getElementById("buy-zero-rca-stage-candidates-body");
+  if (!body) return;
+  if (!stage) {
+    body.innerHTML = '<tr><td class="empty" colspan="6">퍼널 단계를 클릭하면 해당 단계에서 막힌 종목을 표시합니다</td></tr>';
+    return;
+  }
+  if (!rows.length) {
+    body.innerHTML = `<tr><td class="empty" colspan="6">${escapeHtml(stage)} 단계에서 막힌 trace가 없습니다</td></tr>`;
+    return;
+  }
+  body.innerHTML = firstItems(rows, 50).map((item, index) => `
+    <tr class="clickable-row" data-buy-zero-stage-row="${index}">
+      <td>${escapeHtml(item.stage || stage)}</td>
+      <td>${escapeHtml(`${item.code || "-"} ${item.name || ""}`.trim())}</td>
+      <td>${badge(item.stage_status || item.pass_fail || "-")}</td>
+      <td>${reasonBadges(item.reason_codes || [item.primary_block_reason].filter(Boolean))}</td>
+      <td>${badge(item.gate_status || "-")}</td>
+      <td>${compactId(item.candidate_instance_id || item.trace_id || "-")}</td>
+    </tr>
+  `).join("");
+  body.querySelectorAll("[data-buy-zero-stage-row]").forEach((row) => {
+    row.addEventListener("click", () => openBuyZeroTraceDetail(state.buyZeroRca.stageRows[Number(row.dataset.buyZeroStageRow)]));
+  });
+}
+
+function renderBuyZeroReadyRows(rows, traceAvailable = true) {
+  const body = document.getElementById("buy-zero-rca-ready-table-body");
+  if (!body) return;
+  text("buy-zero-rca-ready-status", `${rows.length}건`);
+  cls("buy-zero-rca-ready-status", `counter ${rows.length ? "warn" : "muted"}`);
+  if (!traceAvailable) {
+    body.innerHTML = '<tr><td class="empty" colspan="14">아직 수집된 RCA trace가 없습니다</td></tr>';
+    return;
+  }
+  if (!rows.length) {
+    body.innerHTML = '<tr><td class="empty" colspan="14">READY였지만 주문 안 나간 종목이 없습니다</td></tr>';
+    return;
+  }
+  body.innerHTML = firstItems(rows, 100).map((item, index) => {
+    const entry = `제출 ${yesNoUnknown(item.entry_plan_submittable)} / 지지 ${yesNoUnknown(item.support_ready)} / ${item.selected_support_source || "-"} ${fmtOptionalNumber(item.selected_support_price, 0)}`;
+    return `
+      <tr class="clickable-row" data-buy-zero-ready-row="${index}">
+        <td>${escapeHtml(`${item.code || "-"} ${item.name || ""}`.trim())}</td>
+        <td>${compactId(item.candidate_instance_id || "-")}</td>
+        <td>${escapeHtml(item.theme_name || "-")}</td>
+        <td>${reasonBadge(item.classification || "-")}</td>
+        <td>${badge(item.gate_status || "-")}</td>
+        <td>${escapeHtml(fmtOptionalNumber(item.gate_score, 1))}</td>
+        <td>${reasonBadge(item.primary_block_reason || "-")}</td>
+        <td>${reasonBadges(item.reason_codes || [])}</td>
+        <td>${escapeHtml(entry)}</td>
+        <td>${badge(item.dry_run_status || "-")} ${escapeHtml(item.dry_run_reason || "")}</td>
+        <td>${badge(item.live_sim_status || "-")} ${escapeHtml(item.live_sim_reason || "")}</td>
+        <td>${escapeHtml(fmtOptionalNumber(item.latest_tick_age_sec, 1))}s</td>
+        <td>${escapeHtml(yesNoUnknown(item.support_ready))}</td>
+        <td>${escapeHtml(formatDateTime(item.trace_updated_at || item.created_at))}</td>
+      </tr>
+    `;
+  }).join("");
+  body.querySelectorAll("[data-buy-zero-ready-row]").forEach((row) => {
+    row.addEventListener("click", () => openBuyZeroTraceDetail(state.buyZeroRca.readyRows[Number(row.dataset.buyZeroReadyRow)]));
+  });
+}
+
+function renderBuyZeroRallyRows(rows, traceAvailable = true) {
+  const body = document.getElementById("buy-zero-rca-rally-table-body");
+  if (!body) return;
+  text("buy-zero-rca-rally-status", `${rows.length}건`);
+  cls("buy-zero-rca-rally-status", `counter ${rows.length ? "warn" : "muted"}`);
+  if (!traceAvailable) {
+    body.innerHTML = '<tr><td class="empty" colspan="15">아직 수집된 RCA trace가 없습니다</td></tr>';
+    return;
+  }
+  if (!rows.length) {
+    body.innerHTML = '<tr><td class="empty" colspan="15">OBSERVE/BLOCKED 이후 급등 후보가 없습니다</td></tr>';
+    return;
+  }
+  body.innerHTML = firstItems(rows, 100).map((item, index) => `
+    <tr class="clickable-row" data-buy-zero-rally-row="${index}">
+      <td>${escapeHtml(`${item.code || "-"} ${item.name || ""}`.trim())}</td>
+      <td>${badge(item.status || "-")}</td>
+      <td>${reasonBadge(item.primary_reason || "-")}</td>
+      <td>${reasonBadges(item.reason_codes || [])}</td>
+      <td>${escapeHtml(fmtOptionalNumber(item.base_price, 0))}</td>
+      <td>${escapeHtml(formatPercentValue(item.return_5m_pct))}</td>
+      <td>${escapeHtml(formatPercentValue(item.return_15m_pct))}</td>
+      <td>${escapeHtml(formatPercentValue(item.return_30m_pct))}</td>
+      <td>${escapeHtml(`${formatPercentValue(item.mfe_15m_pct)} / ${formatPercentValue(item.mae_15m_pct)}`)}</td>
+      <td>${badge(item.missed_opportunity ? "기회손실" : "아님", item.missed_opportunity ? "bad" : "ok")}</td>
+      <td>${badge(item.good_block ? "좋은 차단" : "재검토", item.good_block ? "ok" : "warn")}</td>
+      <td>${escapeHtml(item.minutes_to_ready == null ? "-" : `${item.minutes_to_ready}분`)}</td>
+      <td>${escapeHtml(item.theme_name || "-")}</td>
+      <td>${escapeHtml(item.stock_role || "-")}</td>
+      <td>${escapeHtml(item.price_location_status || "-")}</td>
+    </tr>
+  `).join("");
+  body.querySelectorAll("[data-buy-zero-rally-row]").forEach((row) => {
+    row.addEventListener("click", () => openBuyZeroTraceDetail(state.buyZeroRca.rallyRows[Number(row.dataset.buyZeroRallyRow)]));
+  });
+}
+
+async function openBuyZeroTraceDetail(item) {
+  if (!item) return;
+  const params = {
+    trade_date: buyZeroTradeDate(),
+    candidate_instance_id: item.candidate_instance_id || "",
+    code: item.candidate_instance_id ? "" : item.code || "",
+    limit: 200,
+  };
+  const payload = await apiGet("/api/runtime/buy-zero/traces", params);
+  payload.detail_type = "buy_zero_trace";
+  payload.selected_candidate = item;
+  openDetailPanel(`RCA Trace ${item.code || ""} ${item.name || ""}`.trim(), payload);
+}
+
+function buyZeroTraceDetailHtml(payload) {
+  const selected = payload.selected_candidate || {};
+  const items = [...(payload.items || [])].sort((left, right) => String(left.created_at || "").localeCompare(String(right.created_at || "")));
+  const head = `
+    <div><span>종목</span><strong>${escapeHtml(`${selected.code || "-"} ${selected.name || ""}`.trim())}</strong></div>
+    <div><span>Candidate</span><strong>${compactId(selected.candidate_instance_id || "-")}</strong></div>
+    <div><span>분류</span><strong>${escapeHtml(selected.classification || selected.status || "-")}</strong></div>
+    <div><span>Trace events</span><strong>${escapeHtml(items.length)}</strong></div>
+  `;
+  if (!items.length) return `${head}<span class="empty">해당 종목의 RCA trace가 없습니다</span>`;
+  const timeline = items.map((item) => `
+    <div class="trace-event ${String(item.pass_fail || "").toLowerCase()}">
+      <div class="trace-event-head">
+        <strong>${escapeHtml(item.stage || "-")}</strong>
+        <span>${badge(item.stage_status || item.pass_fail || "-")}</span>
+        <time>${escapeHtml(formatDateTime(item.created_at))}</time>
+      </div>
+      <p>${escapeHtml(buyZeroTraceMessage(item))}</p>
+      <div class="trace-event-fields">
+        <span>사유 ${reasonBadges(item.reason_codes || [item.primary_block_reason].filter(Boolean))}</span>
+        <span>Gate ${escapeHtml(item.gate_status || "-")} / score ${escapeHtml(fmtOptionalNumber(item.gate_score, 1))}</span>
+        <span>Theme ${escapeHtml(fmtOptionalNumber(item.theme_score, 1))} / role ${escapeHtml(item.stock_role || "-")}</span>
+        <span>위치 ${escapeHtml(item.price_location_status || "-")} / ${escapeHtml(item.price_location_readiness || "-")}</span>
+        <span>Tick ${escapeHtml(yesNoUnknown(item.latest_tick_ready))} / age ${escapeHtml(fmtOptionalNumber(item.latest_tick_age_sec, 1))}s</span>
+        <span>Support ${escapeHtml(yesNoUnknown(item.support_ready))} / ${escapeHtml(item.selected_support_source || "-")} ${escapeHtml(fmtOptionalNumber(item.selected_support_price, 0))}</span>
+        <span>EntryPlan ${compactId(item.entry_plan_id || "-")}</span>
+        <span>DRY_RUN ${compactId(item.dry_run_intent_id || "-")} / ${escapeHtml(item.dry_run_status || "-")} ${escapeHtml(item.dry_run_reason || "")}</span>
+        <span>LIVE_SIM ${compactId(item.live_sim_intent_id || "-")} / ${escapeHtml(item.live_sim_status || "-")} ${escapeHtml(item.live_sim_reason || "")}</span>
+        <span>Command ${compactId(item.command_id || "-")} / Broker ${compactId(item.broker_order_id || "-")}</span>
+      </div>
+    </div>
+  `).join("");
+  return `${head}<div id="buy-zero-rca-timeline" class="trace-timeline">${timeline}</div>`;
+}
+
+function buyZeroTraceMessage(item) {
+  const textValue = [
+    item.primary_block_reason,
+    item.dry_run_reason,
+    item.live_sim_reason,
+    ...(item.reason_codes || []),
+  ].join(" ").toUpperCase();
+  if (/LATEST_TICK|TICK_.*OLD|REALTIME_RELIABILITY/.test(textValue)) return "실시간 틱이 오래되어 주문 보류";
+  if (/SUPPORT_NOT_READY|SUPPORT/.test(textValue) && item.entry_plan_diagnostic_only) return "지지선 미확정으로 진단 전용";
+  if (/LIVE_SIM|ACCOUNT_GUARD|EXIT_GUARD|KILL_SWITCH/.test(textValue)) return "LIVE_SIM guard에서 차단";
+  if (/GATE_RESULT_KEY_MISMATCH|CANDIDATE_STATE/.test(textValue)) return "READY였지만 candidate state/gate_result_key 불일치";
+  if (/DUPLICATE/.test(textValue)) return "중복 주문 방지로 차단";
+  if (/CHASE|LATE_CHASE|VWAP_OVEREXTENDED/.test(textValue)) return "추격 위험으로 OBSERVE";
+  if (String(item.pass_fail || "").toUpperCase() === "PASS") return "이 단계는 통과";
+  return item.primary_block_reason || item.stage_status || "trace event";
+}
+
 function render(snapshot) {
   state.latestSnapshot = snapshot;
   const core = snapshot.core || {};
@@ -1003,6 +1375,7 @@ function render(snapshot) {
   cls("orderable-state", `pill ${gateway.orderable ? "ok" : "muted"}`);
   renderOpsAlerts(opsAlerts);
   renderThemeLabSummary(themeLab);
+  renderBuyZeroRca(snapshot);
 
   text("transport-mode", transport.mode || "rest_long_poll");
   text("transport-event-p95", formatMs(transport.event_latency_p95_ms));
@@ -1385,6 +1758,14 @@ function initDashboard() {
   document.getElementById("runtime-start")?.addEventListener("click", (event) => runtimeCommand("start", event.currentTarget).catch(() => {}));
   document.getElementById("runtime-stop")?.addEventListener("click", (event) => runtimeCommand("stop", event.currentTarget).catch(() => {}));
   document.getElementById("runtime-cycle")?.addEventListener("click", (event) => runtimeCommand("cycle", event.currentTarget).catch(() => {}));
+  document.getElementById("buy-zero-rca-refresh")?.addEventListener("click", () => {
+    state.buyZeroRca.lastFetchedAt = 0;
+    refreshBuyZeroRcaTables({ force: true }).catch((error) => {
+      text("buy-zero-rca-ready-status", `오류: ${error.message}`);
+      cls("buy-zero-rca-ready-status", "counter bad");
+    });
+    pollSnapshot().catch(() => {});
+  });
   document.getElementById("detail-close")?.addEventListener("click", closeDetailPanel);
   document.getElementById("detail-backdrop")?.addEventListener("click", closeDetailPanel);
 }

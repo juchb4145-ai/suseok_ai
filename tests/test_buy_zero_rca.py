@@ -1,5 +1,5 @@
 import importlib
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -51,6 +51,10 @@ def test_decision_events_project_to_buy_zero_trace_and_summary_reasons(tmp_path)
         assert summary["gate_evaluated_count"] == 1
         assert {"reason": "DATA_INSUFFICIENT", "count": 1} in summary["top_block_reasons"]
         assert summary["top_data_insufficient_reasons"][0]["reason"] == "DATA_INSUFFICIENT"
+        assert summary["available"] is True
+        assert summary["stage_funnel"][0]["stage"] == "CANDIDATE_GENERATED"
+        assert any(row["stage"] == "THEMELAB_GATE_EVALUATED" and row["failed"] == 1 for row in summary["stage_funnel"])
+        assert summary["data_quality_blocks"]["reasons"][0]["reason"] == "DATA_INSUFFICIENT"
     finally:
         db.close()
 
@@ -217,6 +221,99 @@ def test_buy_zero_rca_api_exposes_operator_summary(tmp_path, monkeypatch):
     assert summary["operator"]["today_buy_zero_top3_causes"][0]["reason"] == "PRICE_INVALID"
     assert traces["pagination"]["total"] == 1
     assert ready["items"][0]["classification"] == "READY_BUT_DRY_RUN_REJECTED"
+
+
+def test_buy_zero_rca_snapshot_exposes_dashboard_fields_without_trace(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "trader.sqlite3"
+    monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    monkeypatch.setenv("TRADING_MODE", "OBSERVE")
+
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    with TestClient(api.app) as client:
+        snapshot = client.get("/api/snapshot?refresh=true").json()
+
+    rca = snapshot["buy_zero_rca"]
+    assert rca["available"] is False
+    assert "summary" in rca
+    assert "stage_funnel" in rca
+    assert "ready_not_ordered_report" in rca
+    assert "observe_blocked_after_rally" in rca
+    assert "live_sim_blocked" in rca
+    assert "data_quality_blocks" in rca
+    assert snapshot["runtime"]["buy_zero_rca"]["available"] is False
+
+
+def test_buy_zero_rca_snapshot_lists_ready_live_sim_blocked_and_data_quality(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "trader.sqlite3"
+    today = date.today().isoformat()
+    monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    monkeypatch.setenv("TRADING_MODE", "OBSERVE")
+    db = TradingDatabase(str(db_path))
+    try:
+        db.save_buy_zero_trace_events(
+            [
+                {**_trace("ci-data", "000101", "THEMELAB_GATE_EVALUATED", "WAIT", False, "DATA_INSUFFICIENT"), "trade_date": today},
+                {**_trace("ci-live-snapshot", "000102", "LIFECYCLE_UPDATED", "READY", True, ""), "trade_date": today},
+                {
+                    **_trace("ci-live-snapshot", "000102", "LIVE_SIM_BLOCKED", "BLOCKED", False, "LIVE_SIM_BLOCKED"),
+                    "trade_date": today,
+                    "live_sim_status": "BLOCKED",
+                    "live_sim_reason": "LIVE_SIM_BLOCKED",
+                    "reason_codes": ["LIVE_SIM_BLOCKED"],
+                },
+            ]
+        )
+    finally:
+        db.close()
+
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    with TestClient(api.app) as client:
+        snapshot = client.get("/api/snapshot?refresh=true").json()
+        ready = client.get(f"/api/runtime/buy-zero/ready-not-ordered?trade_date={today}").json()
+
+    rca = snapshot["buy_zero_rca"]
+    assert rca["available"] is True
+    assert rca["data_quality_blocks"]["reasons"][0]["reason"] == "DATA_INSUFFICIENT"
+    assert rca["live_sim_blocked"]["count"] == 1
+    assert ready["items"][0]["classification"] == "READY_BUT_LIVE_SIM_BLOCKED"
+    assert rca["ready_not_ordered_items"][0]["classification"] == "READY_BUT_LIVE_SIM_BLOCKED"
+
+
+def test_buy_zero_trace_detail_api_filters_by_code_and_candidate_instance_id(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "trader.sqlite3"
+    monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    monkeypatch.setenv("TRADING_MODE", "OBSERVE")
+    db = TradingDatabase(str(db_path))
+    try:
+        db.save_buy_zero_trace_events(
+            [
+                _trace("ci-filter-a", "000201", "CANDIDATE_GENERATED", "GENERATED", True, ""),
+                _trace("ci-filter-b", "000202", "CANDIDATE_GENERATED", "GENERATED", True, ""),
+                _trace("ci-filter-a", "000201", "LIVE_SIM_BLOCKED", "BLOCKED", False, "LIVE_SIM_BLOCKED"),
+            ]
+        )
+    finally:
+        db.close()
+
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    with TestClient(api.app) as client:
+        by_code = client.get("/api/runtime/buy-zero/traces?trade_date=2026-06-01&code=000201").json()
+        by_candidate = client.get(
+            "/api/runtime/buy-zero/traces?trade_date=2026-06-01&candidate_instance_id=ci-filter-a"
+        ).json()
+
+    assert by_code["pagination"]["total"] == 2
+    assert {item["code"] for item in by_candidate["items"]} == {"000201"}
+    assert {item["candidate_instance_id"] for item in by_candidate["items"]} == {"ci-filter-a"}
 
 
 def _trace(candidate_instance_id: str, code: str, stage: str, status: str, passed: bool, reason: str) -> dict:

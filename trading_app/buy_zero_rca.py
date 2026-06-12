@@ -22,6 +22,22 @@ READY_NOT_ORDERED_CLASSES = (
 
 DATA_REASON_MARKERS = ("DATA", "TICK", "SUPPORT", "VWAP", "BASELINE", "RELIABILITY", "WARMUP")
 LATE_CHASE_MARKERS = ("LATE_CHASE", "CHASE_HIGH", "CHASE_RISK", "VWAP_OVEREXTENDED")
+TRACE_STAGE_FUNNEL = (
+    "CANDIDATE_GENERATED",
+    "THEME_ENGINE_EVALUATED",
+    "THEMELAB_GATE_EVALUATED",
+    "HYBRID_GATE_EVALUATED",
+    "RISK_GATE_EVALUATED",
+    "LIFECYCLE_UPDATED",
+    "ENTRY_PLAN_CREATED",
+    "VIRTUAL_ORDER_SUBMITTED",
+    "DRY_RUN_INTENT_CREATED",
+    "LIVE_SIM_COMMAND_QUEUED",
+    "BROKER_ORDER_ACCEPTED",
+    "PARTIAL_FILLED",
+    "FILLED",
+)
+ORDER_SUBMITTED_STAGES = {"LIVE_SIM_COMMAND_QUEUED", "BROKER_ORDER_ACCEPTED", "PARTIAL_FILLED", "FILLED"}
 
 
 class BuyZeroRCAAnalyzer:
@@ -55,9 +71,15 @@ class BuyZeroRCAAnalyzer:
         data_reasons: Counter[str] = Counter()
         late_chase: list[dict[str, Any]] = []
         live_sim_reasons: Counter[str] = Counter()
+        live_sim_block_rows: list[dict[str, Any]] = []
         data_quality_reasons: Counter[str] = Counter()
+        status_counts: Counter[str] = Counter()
+        last_updated_at = ""
 
         for trace in traces:
+            created_at = str(trace.get("created_at") or "")
+            if created_at > last_updated_at:
+                last_updated_at = created_at
             reasons = _trace_reasons(trace)
             if trace.get("pass_fail") == "FAIL":
                 block_stages[str(trace.get("stage") or "UNKNOWN")] += 1
@@ -72,6 +94,7 @@ class BuyZeroRCAAnalyzer:
                 data_quality_reasons[bucket] += 1
             if trace.get("stage") == "LIVE_SIM_BLOCKED":
                 live_sim_reasons.update(reasons or [str(trace.get("live_sim_reason") or "UNKNOWN")])
+                live_sim_block_rows.append(_candidate_row(trace, reason=(reasons[0] if reasons else "")))
 
         total_candidates = len(by_candidate)
         mapped_candidates = {
@@ -98,23 +121,22 @@ class BuyZeroRCAAnalyzer:
         live_sim_submitted = {
             key
             for key, rows in by_candidate.items()
-            if any(row.get("stage") in {"LIVE_SIM_COMMAND_QUEUED", "BROKER_ORDER_ACCEPTED", "PARTIAL_FILLED", "FILLED"} for row in rows)
+            if any(row.get("stage") in ORDER_SUBMITTED_STAGES for row in rows)
         }
         live_sim_blocked = {
             key
             for key, rows in by_candidate.items()
             if any(row.get("stage") == "LIVE_SIM_BLOCKED" for row in rows)
         }
+        for rows in by_candidate.values():
+            status = _candidate_gate_status(rows)
+            if status:
+                status_counts[status] += 1
 
         top_causes = _operator_top_causes(block_reasons, block_stages, live_sim_reasons, data_reasons)
-        return {
-            "trade_date": trade_date or "",
-            "window_sec": window_sec,
-            "generated_at": datetime.now().isoformat(timespec="seconds"),
-            "total_trace_events": len(traces),
+        summary_fields = {
+            "available": bool(traces),
             "total_candidates": total_candidates,
-            "theme_mapped_count": len(mapped_candidates),
-            "unmapped_count": max(0, total_candidates - len(mapped_candidates)),
             "gate_evaluated_count": len(
                 {
                     key
@@ -123,12 +145,45 @@ class BuyZeroRCAAnalyzer:
                 }
             ),
             "ready_count": len(ready_candidates),
+            "ready_exact_count": int(status_counts.get("READY", 0)),
+            "ready_small_count": int(status_counts.get("READY_SMALL", 0)),
+            "wait_count": int(status_counts.get("WAIT", 0)),
+            "observe_count": int(status_counts.get("OBSERVE", 0)),
+            "blocked_count": int(status_counts.get("BLOCKED", 0)),
+            "entry_plan_created_count": len(entry_plan_candidates),
+            "entry_plan_submittable_count": len(entry_plan_submittable),
+            "dry_run_intent_count": len(dry_run_candidates),
+            "live_sim_submitted_count": len(live_sim_submitted),
+            "live_sim_blocked_count": len(live_sim_blocked),
+            "last_updated_at": last_updated_at,
+        }
+        return {
+            "trade_date": trade_date or "",
+            "window_sec": window_sec,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "available": bool(traces),
+            "today_buy_zero": len(live_sim_submitted) == 0,
+            "last_updated_at": last_updated_at,
+            "total_trace_events": len(traces),
+            "total_candidates": total_candidates,
+            "theme_mapped_count": len(mapped_candidates),
+            "unmapped_count": max(0, total_candidates - len(mapped_candidates)),
+            "gate_evaluated_count": summary_fields["gate_evaluated_count"],
+            "ready_count": len(ready_candidates),
+            "ready_exact_count": int(status_counts.get("READY", 0)),
+            "ready_small_count": int(status_counts.get("READY_SMALL", 0)),
+            "wait_count": int(status_counts.get("WAIT", 0)),
+            "observe_count": int(status_counts.get("OBSERVE", 0)),
+            "blocked_count": int(status_counts.get("BLOCKED", 0)),
+            "status_counts": _counter_rows(status_counts, key_name="status", limit=10),
             "ready_but_no_entry_plan_count": len(ready_candidates - entry_plan_candidates),
             "entry_plan_created_count": len(entry_plan_candidates),
             "entry_plan_submittable_count": len(entry_plan_submittable),
             "dry_run_intent_count": len(dry_run_candidates),
             "live_sim_submitted_count": len(live_sim_submitted),
             "live_sim_blocked_count": len(live_sim_blocked),
+            "summary": summary_fields,
+            "stage_funnel": _build_stage_funnel(traces),
             "top_block_stage": _counter_rows(block_stages, key_name="stage", limit=5),
             "top_block_reasons": _counter_rows(block_reasons, key_name="reason", limit=10),
             "top_data_insufficient_reasons": _counter_rows(data_reasons, key_name="reason", limit=10),
@@ -139,7 +194,23 @@ class BuyZeroRCAAnalyzer:
             "live_sim_block_reasons": _counter_rows(live_sim_reasons, key_name="reason", limit=10),
             "data_quality_reasons": _counter_rows(data_quality_reasons, key_name="bucket", limit=10),
             "ready_not_ordered": ready_not_ordered.get("summary", {}),
+            "ready_not_ordered_report": ready_not_ordered,
+            "ready_not_ordered_items": ready_not_ordered.get("items", [])[:20],
             "missed_opportunity": missed.get("summary", {}),
+            "observe_blocked_after_rally": {
+                "summary": missed.get("summary", {}),
+                "items": missed.get("top_observe_then_rally_candidates", [])[:20],
+                "reason_code_missed_opportunity_ranking": missed.get("reason_code_missed_opportunity_ranking", []),
+            },
+            "live_sim_blocked": {
+                "count": len(live_sim_blocked),
+                "reasons": _counter_rows(live_sim_reasons, key_name="reason", limit=10),
+                "items": _dedupe_candidate_rows(live_sim_block_rows)[:20],
+            },
+            "data_quality_blocks": {
+                "reasons": _counter_rows(data_reasons, key_name="reason", limit=10),
+                "buckets": _counter_rows(data_quality_reasons, key_name="bucket", limit=10),
+            },
         }
 
     def ready_not_ordered_report(
@@ -157,7 +228,7 @@ class BuyZeroRCAAnalyzer:
         for key, candidate_traces in by_candidate.items():
             if not any(_is_ready(row) for row in candidate_traces):
                 continue
-            if any(row.get("stage") in {"LIVE_SIM_COMMAND_QUEUED", "BROKER_ORDER_ACCEPTED", "PARTIAL_FILLED", "FILLED"} for row in candidate_traces):
+            if any(row.get("stage") in ORDER_SUBMITTED_STAGES for row in candidate_traces):
                 continue
             classification = _classify_ready_not_ordered(candidate_traces)
             classification_counts[classification] += 1
@@ -169,10 +240,19 @@ class BuyZeroRCAAnalyzer:
                     "stage_path": _stage_path(candidate_traces),
                     "primary_block_reason": _primary_candidate_reason(candidate_traces),
                     "reason_codes": sorted({reason for row in candidate_traces for reason in _trace_reasons(row)}),
+                    "gate_score": _latest_value(candidate_traces, "gate_score"),
+                    "theme_score": _latest_value(candidate_traces, "theme_score"),
+                    "entry_plan_submittable": _latest_value(candidate_traces, "entry_plan_submittable"),
+                    "entry_plan_diagnostic_only": _latest_value(candidate_traces, "entry_plan_diagnostic_only"),
                     "dry_run_status": _latest_non_empty(candidate_traces, "dry_run_status"),
                     "dry_run_reason": _latest_non_empty(candidate_traces, "dry_run_reason"),
                     "live_sim_status": _latest_non_empty(candidate_traces, "live_sim_status"),
                     "live_sim_reason": _latest_non_empty(candidate_traces, "live_sim_reason"),
+                    "latest_tick_age_sec": _latest_value(candidate_traces, "latest_tick_age_sec"),
+                    "support_ready": _latest_value(candidate_traces, "support_ready"),
+                    "selected_support_source": _latest_non_empty(candidate_traces, "selected_support_source"),
+                    "selected_support_price": _latest_value(candidate_traces, "selected_support_price"),
+                    "trace_updated_at": latest.get("created_at") or "",
                 }
             )
         rows.sort(key=lambda item: (item.get("classification") or "", item.get("created_at") or ""), reverse=True)
@@ -224,6 +304,7 @@ class BuyZeroRCAAnalyzer:
                     "status": status,
                     "primary_reason": item.get("primary_reason") or "",
                     "reason_codes": list(item.get("reason_codes") or []),
+                    "base_price": item.get("base_price"),
                     "return_5m_pct": item.get("return_5m_pct"),
                     "return_15m_pct": item.get("return_15m_pct"),
                     "return_30m_pct": item.get("return_30m_pct"),
@@ -231,6 +312,10 @@ class BuyZeroRCAAnalyzer:
                     "mae_15m_pct": item.get("mae_15m_pct"),
                     "minutes_to_ready": item.get("minutes_to_ready"),
                     "missed_opportunity": True,
+                    "good_block": item.get("good_block"),
+                    "theme_name": item.get("theme_name") or linked.get("theme_name") or "",
+                    "stock_role": item.get("stock_role") or linked.get("stock_role") or "",
+                    "price_location_status": item.get("price_location_status") or linked.get("price_location_status") or "",
                     "trace_id": linked.get("trace_id") or "",
                     "stage": linked.get("stage") or "",
                 }
@@ -281,6 +366,55 @@ def _candidate_key(trace: dict[str, Any]) -> str:
         or f"{trace.get('trade_date') or ''}:{trace.get('code') or ''}"
         or trace.get("trace_id")
     )
+
+
+def _build_stage_funnel(traces: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_stage: dict[str, dict[str, Any]] = {
+        stage: {"stage": stage, "total": 0, "passed": 0, "failed": 0, "reasons": Counter()}
+        for stage in TRACE_STAGE_FUNNEL
+    }
+    for trace in traces:
+        stage = str(trace.get("stage") or "UNKNOWN")
+        if stage not in by_stage:
+            continue
+        bucket = by_stage[stage]
+        bucket["total"] += 1
+        pass_fail = str(trace.get("pass_fail") or "").upper()
+        passed = trace.get("passed")
+        if pass_fail == "PASS" or passed is True:
+            bucket["passed"] += 1
+        elif pass_fail == "FAIL" or passed is False:
+            bucket["failed"] += 1
+            bucket["reasons"].update(_trace_reasons(trace) or [str(trace.get("primary_block_reason") or "UNKNOWN")])
+    rows: list[dict[str, Any]] = []
+    for stage in TRACE_STAGE_FUNNEL:
+        item = by_stage[stage]
+        top_reason, top_count = ("", 0)
+        if item["reasons"]:
+            top_reason, top_count = item["reasons"].most_common(1)[0]
+        rows.append(
+            {
+                "stage": stage,
+                "total": int(item["total"]),
+                "passed": int(item["passed"]),
+                "failed": int(item["failed"]),
+                "top_reason": top_reason,
+                "top_reason_count": int(top_count),
+            }
+        )
+    return rows
+
+
+def _candidate_gate_status(traces: list[dict[str, Any]]) -> str:
+    for row in reversed(traces):
+        status = str(row.get("gate_status") or "").upper()
+        if status in {"READY", "READY_SMALL", "WAIT", "OBSERVE", "BLOCKED"}:
+            return status
+    for row in reversed(traces):
+        status = str(row.get("stage_status") or "").upper()
+        if status in {"READY", "READY_SMALL", "WAIT", "OBSERVE", "BLOCKED"}:
+            return status
+    return ""
 
 
 def _is_ready(trace: dict[str, Any]) -> bool:
@@ -368,6 +502,14 @@ def _latest_non_empty(traces: list[dict[str, Any]], key: str) -> str:
         if value:
             return value
     return ""
+
+
+def _latest_value(traces: list[dict[str, Any]], key: str) -> Any:
+    for row in reversed(traces):
+        value = row.get(key)
+        if value is not None and value != "":
+            return value
+    return None
 
 
 def _stage_path(traces: list[dict[str, Any]]) -> list[dict[str, str]]:
