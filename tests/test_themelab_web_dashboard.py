@@ -73,6 +73,13 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one('[data-journal-filter="SYMBOL"]') is not None
     assert soup.select_one("#cockpit-market-sides") is not None
     assert soup.select_one("#cockpit-live-readiness") is not None
+    assert soup.select_one("#themelab-buy-zero-rca-card") is not None
+    assert soup.select_one("#themelab-buy-zero-rca-status") is not None
+    assert soup.select_one("#themelab-buy-zero-stage-funnel") is not None
+    assert soup.select_one("#themelab-buy-zero-ready-table-body") is not None
+    assert soup.select_one("#themelab-buy-zero-rally-table-body") is not None
+    assert soup.select_one("#themelab-buy-zero-rca-timeline") is not None
+    assert soup.select_one("#themelab-buy-zero-rca-refresh") is not None
     assert soup.select_one("#promotion-cockpit") is not None
     assert soup.select_one("#promotion-window-controls") is not None
     assert soup.select_one('[data-promotion-window="300"]') is not None
@@ -230,6 +237,13 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "/api/themelab/operator-actions/execute" in js
     assert "/api/themelab/postmarket-review" in js
     assert "/api/themelab/postmarket-review/summary" in js
+    assert "/api/runtime/buy-zero/summary" in js
+    assert "/api/runtime/buy-zero/ready-not-ordered" in js
+    assert "/api/runtime/buy-zero/missed-opportunities" in js
+    assert "/api/runtime/buy-zero/traces" in js
+    assert "function renderBuyZeroRcaPanel" in js
+    assert "function openBuyZeroTraceDetail" in js
+    assert "BUY_ZERO_RCA_CRITICAL_REASONS" in js
     assert "REBUILD_POSTMARKET_REVIEW" in js
     assert "LIVE_BUY" in js
     assert "LIVE_SELL" in js
@@ -295,6 +309,9 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "postmarket-review-toolbar" in css
     assert "postmarket-summary-grid" in css
     assert "postmarket-summary-card" in css
+    assert "buy-zero-rca-panel" in css
+    assert "buy-zero-stage-funnel" in css
+    assert "buy-zero-trace-timeline" in css
     assert "outcome-missed" in css
     assert "outcome-good-block" in css
     assert "outcome-review-needed" in css

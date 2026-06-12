@@ -168,6 +168,220 @@ h3 { margin: 16px 0 8px; color: var(--sub); font-size: 12px; }
   white-space: nowrap;
 }
 
+.buy-zero-rca-panel {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.buy-zero-head p {
+  color: var(--sub);
+}
+
+.buy-zero-summary-grid,
+.buy-zero-cause-grid,
+.buy-zero-drill-grid,
+.buy-zero-trace-summary {
+  display: grid;
+  gap: 10px;
+}
+
+.buy-zero-summary-grid {
+  grid-template-columns: repeat(6, minmax(120px, 1fr));
+}
+
+.buy-zero-cause-grid,
+.buy-zero-drill-grid {
+  grid-template-columns: repeat(2, minmax(360px, 1fr));
+}
+
+.buy-zero-summary-grid article {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  padding: 10px;
+}
+
+.buy-zero-summary-grid span,
+.buy-zero-trace-summary span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.buy-zero-summary-grid strong,
+.buy-zero-trace-summary strong {
+  display: block;
+  margin-top: 5px;
+  color: var(--text);
+  font-size: 18px;
+  overflow-wrap: anywhere;
+}
+
+.buy-zero-line-list,
+.buy-zero-compact-list,
+.buy-zero-trace-timeline {
+  display: grid;
+  gap: 7px;
+}
+
+.buy-zero-line-list div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  padding: 8px 10px;
+}
+
+.buy-zero-stage-funnel {
+  display: grid;
+  grid-template-columns: repeat(13, minmax(112px, 1fr));
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 5px;
+}
+
+.buy-zero-stage-step,
+.buy-zero-compact-list button {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.buy-zero-stage-step {
+  display: grid;
+  min-height: 118px;
+  align-content: start;
+  gap: 5px;
+  min-width: 112px;
+  padding: 10px;
+}
+
+.buy-zero-stage-step:hover,
+.buy-zero-compact-list button:hover,
+.buy-zero-table-wrap tbody tr:hover {
+  background: var(--panel-hover);
+}
+
+.buy-zero-stage-step.ready { border-color: rgba(16, 185, 129, 0.45); }
+.buy-zero-stage-step.warning { border-color: rgba(245, 158, 11, 0.55); }
+.buy-zero-stage-step.observe { border-color: var(--border); }
+
+.buy-zero-stage-step span,
+.buy-zero-stage-step em,
+.buy-zero-stage-step small {
+  overflow-wrap: anywhere;
+}
+
+.buy-zero-stage-step span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.buy-zero-stage-step strong {
+  font-size: 24px;
+  line-height: 1;
+}
+
+.buy-zero-stage-step em,
+.buy-zero-stage-step small {
+  color: var(--sub);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.buy-zero-table-wrap {
+  max-height: 280px;
+}
+
+.buy-zero-table-wrap table {
+  min-width: 860px;
+}
+
+.buy-zero-table-wrap tbody tr {
+  cursor: pointer;
+}
+
+.buy-zero-stage-candidates,
+.buy-zero-trace-detail {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  padding: 10px;
+}
+
+.buy-zero-compact-list button {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+}
+
+.buy-zero-compact-list span {
+  color: var(--sub);
+  font-size: 12px;
+}
+
+.buy-zero-trace-summary {
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  margin-bottom: 10px;
+}
+
+.buy-zero-trace-summary div {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  padding: 8px;
+}
+
+.buy-zero-trace-event {
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 6px;
+  background: var(--panel);
+  padding: 10px;
+}
+
+.buy-zero-trace-event.pass { border-left-color: var(--ready); }
+.buy-zero-trace-event.fail { border-left-color: var(--blocked); }
+
+.buy-zero-trace-event header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.buy-zero-trace-event time {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.buy-zero-trace-event p {
+  margin: 8px 0;
+  color: var(--text);
+  font-weight: 900;
+}
+
+.buy-zero-trace-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  color: var(--sub);
+  font-size: 12px;
+}
+
 .promotion-cockpit-panel {
   display: grid;
   gap: 10px;
@@ -1638,6 +1852,11 @@ tbody tr.selected {
   .operator-alert-grid,
   .session-summary-grid,
   .action-center-grid,
+  .buy-zero-summary-grid,
+  .buy-zero-cause-grid,
+  .buy-zero-drill-grid,
+  .buy-zero-trace-summary,
+  .buy-zero-trace-fields,
   .postmarket-summary-grid,
   .postmarket-review-grid,
   .flow-grid,

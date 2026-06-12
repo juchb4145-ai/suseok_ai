@@ -58,6 +58,70 @@
         </div>
       </section>
 
+      <section id="themelab-buy-zero-rca-card" class="panel buy-zero-rca-panel" aria-label="매수 0건 RCA">
+        <div class="panel-head buy-zero-head">
+          <div>
+            <h2>매수 0건 RCA</h2>
+            <p id="themelab-buy-zero-rca-empty">아직 RCA trace가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.</p>
+            <p id="themelab-buy-zero-rca-note" class="row-meta">trace는 PR 적용 이후 데이터만 표시하며, 과거 DB backfill은 하지 않습니다.</p>
+          </div>
+          <div class="gate-status-strip">
+            <button id="themelab-buy-zero-rca-refresh" class="action-button" type="button">새로고침</button>
+            <span id="themelab-buy-zero-rca-status" class="badge observe">TRACE 대기</span>
+            <span id="themelab-buy-zero-rca-updated" class="counter">trace -</span>
+          </div>
+        </div>
+        <div class="buy-zero-summary-grid">
+          <article><span>후보</span><strong id="themelab-buy-zero-total-candidates">0</strong></article>
+          <article><span>Gate 평가</span><strong id="themelab-buy-zero-gate-evaluated">0</strong></article>
+          <article><span>READY / SMALL</span><strong id="themelab-buy-zero-ready-counts">0 / 0</strong></article>
+          <article><span>WAIT / OBSERVE</span><strong id="themelab-buy-zero-wait-observe-counts">0 / 0</strong></article>
+          <article><span>BLOCKED</span><strong id="themelab-buy-zero-blocked-count">0</strong></article>
+          <article><span>LIVE_SIM 차단</span><strong id="themelab-buy-zero-live-blocked-count">0</strong></article>
+        </div>
+        <div class="buy-zero-cause-grid">
+          <div>
+            <div class="operator-alert-subhead"><h3>오늘 매수 0건이면 가장 큰 원인 3개</h3><span class="counter">top 3</span></div>
+            <div id="themelab-buy-zero-top-causes" class="buy-zero-line-list"></div>
+          </div>
+          <div>
+            <div class="operator-alert-subhead"><h3>데이터 품질 부족 사유</h3><span class="counter">top 5</span></div>
+            <div id="themelab-buy-zero-data-quality-blocks" class="buy-zero-line-list"></div>
+          </div>
+        </div>
+        <div class="operator-alert-subhead"><h3>왜 주문이 안 나갔나</h3><span id="themelab-buy-zero-stage-status" class="counter">stage 대기</span></div>
+        <div id="themelab-buy-zero-stage-funnel" class="buy-zero-stage-funnel" aria-label="매수 0건 RCA stage funnel"></div>
+        <div class="buy-zero-drill-grid">
+          <section>
+            <div class="operator-alert-subhead"><h3>READY인데 주문 안 나간 종목</h3><span id="themelab-buy-zero-ready-status" class="counter">0</span></div>
+            <div class="table-wrap buy-zero-table-wrap">
+              <table>
+                <thead><tr><th>종목</th><th>분류</th><th>Gate</th><th>차단 사유</th><th>DRY/LIVE</th><th>데이터</th></tr></thead>
+                <tbody id="themelab-buy-zero-ready-table-body"></tbody>
+              </table>
+            </div>
+          </section>
+          <section>
+            <div class="operator-alert-subhead"><h3>OBSERVE/BLOCKED 이후 급등 후보</h3><span id="themelab-buy-zero-rally-status" class="counter">0</span></div>
+            <div class="table-wrap buy-zero-table-wrap">
+              <table>
+                <thead><tr><th>종목</th><th>상태</th><th>사유</th><th>5m/15m/30m</th><th>MFE/MAE</th><th>위치</th></tr></thead>
+                <tbody id="themelab-buy-zero-rally-table-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+        <div id="themelab-buy-zero-stage-candidates-panel" class="buy-zero-stage-candidates">
+          <div class="operator-alert-subhead"><h3 id="themelab-buy-zero-stage-title">Stage 차단 후보</h3><span class="counter">click stage</span></div>
+          <div id="themelab-buy-zero-stage-candidates-body" class="buy-zero-compact-list"></div>
+        </div>
+        <div id="themelab-buy-zero-rca-trace-detail" class="buy-zero-trace-detail" hidden>
+          <div class="operator-alert-subhead"><h3 id="themelab-buy-zero-trace-title">Trace Drilldown</h3><span id="themelab-buy-zero-trace-status" class="counter">row click</span></div>
+          <div id="themelab-buy-zero-trace-summary" class="buy-zero-trace-summary"></div>
+          <div id="themelab-buy-zero-rca-timeline" class="buy-zero-trace-timeline"></div>
+        </div>
+      </section>
+
       <section id="promotion-cockpit" class="panel promotion-cockpit-panel" aria-label="Promotion Decision Cockpit">
         <div class="panel-head promotion-cockpit-head">
           <div>
