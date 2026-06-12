@@ -1677,6 +1677,55 @@ function renderBuyZeroRcaPanel() {
   renderBuyZeroStageRows(state.buyZeroRca.stageRows, state.buyZeroRca.stage);
 }
 
+function renderLiveSimAuditPanel(snapshot = state.snapshot || {}) {
+  const payload = (snapshot || {}).live_sim_audit || {};
+  const summary = payload.summary || {};
+  const available = Boolean(payload.available);
+  const status = payload.status || (available ? "UNKNOWN" : "NO_DATA");
+  const tone = status === "OK" ? "ready" : status === "BROKEN" ? "critical" : /RECONCILE|WARN/.test(status) ? "warning" : "observe";
+  const message = ((payload.operator || {}).status_message_ko) || (available ? "LIVE_SIM audit 확인 중" : "아직 LIVE_SIM 주문 audit 데이터가 없습니다.");
+  const statusNode = document.getElementById("themelab-live-sim-audit-status");
+  if (statusNode) {
+    statusNode.textContent = `${status} · ${message}`;
+    statusNode.className = `badge ${tone}`;
+  }
+  text("themelab-live-sim-audit-updated", `audit ${formatDateTime(payload.last_updated_at)}`);
+  text("themelab-live-sim-audit-empty", available ? "send_order부터 체결/취소/포지션/reconcile까지 audit 원장을 표시합니다." : "아직 LIVE_SIM 주문 audit 데이터가 없습니다.");
+  text("themelab-live-sim-audit-open-orders", summary.open_live_sim_order_count ?? 0);
+  text("themelab-live-sim-audit-unknown-submit", summary.unknown_submit_count ?? 0);
+  text("themelab-live-sim-audit-reconcile-orders", summary.reconcile_required_order_count ?? 0);
+  text("themelab-live-sim-audit-broker-missing", summary.broker_order_id_missing_count ?? 0);
+  text("themelab-live-sim-audit-cancel-stale", summary.cancel_requested_stale_count ?? 0);
+  text("themelab-live-sim-audit-position-mismatch", summary.position_qty_mismatch_count ?? 0);
+  renderLiveSimAuditLines(
+    "themelab-live-sim-audit-top-actions",
+    ((payload.operator || {}).top_actions || []).map((item) => ({
+      label: item.issue_type || "-",
+      value: item.count ?? 0,
+      detail: item.operator_message_ko || item.suggested_action || "",
+    })),
+    "필요한 운영 조치가 없습니다."
+  );
+  renderLiveSimAuditLines(
+    "themelab-live-sim-audit-issues",
+    (payload.issues || []).slice(0, 6).map((item) => ({
+      label: item.issue_type || "-",
+      value: item.severity || "-",
+      detail: `${item.code || ""} ${item.operator_message_ko || ""}`.trim(),
+    })),
+    "최근 audit 이슈가 없습니다."
+  );
+}
+
+function renderLiveSimAuditLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = (rows || []).slice(0, 6);
+  node.innerHTML = items.length
+    ? items.map((item) => `<div>${reasonBadge(item.label || "-")} <strong>${escapeHtml(item.value ?? "")}</strong><span>${escapeHtml(item.detail || "")}</span></div>`).join("")
+    : `<div class="muted">${escapeHtml(emptyText)}</div>`;
+}
+
 function renderBuyZeroInlineCounts(id, rows, key, emptyText) {
   const node = document.getElementById(id);
   if (!node) return;
@@ -1991,6 +2040,7 @@ function render(snapshot) {
   renderHeader(currentSnapshot);
   renderCockpit(currentSnapshot);
   renderBuyZeroRcaPanel();
+  renderLiveSimAuditPanel(currentSnapshot);
   renderShadowAb(currentSnapshot);
   renderThemes(currentSnapshot.ranked_themes || []);
   renderWatchset(currentSnapshot.watchset || []);

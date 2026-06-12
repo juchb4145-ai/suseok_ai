@@ -706,6 +706,20 @@ class OrderEnqueueService:
                     if not due_reason:
                         continue
                     cancel_qty = _remaining_cancel_qty(order)
+                    db.append_live_sim_order_event(
+                        str(order.get("order_intent_id") or ""),
+                        "cancel_due",
+                        status_from=str(order.get("order_status") or ""),
+                        status_to=str(order.get("order_status") or ""),
+                        message=due_reason,
+                        payload={
+                            "cancel_due": True,
+                            "cancel_due_reason": due_reason,
+                            "cancel_qty": cancel_qty,
+                            "lifecycle": lifecycle,
+                        },
+                        created_at=now,
+                    )
                     result = self.enqueue_live_sim_cancel_order(
                         order,
                         cancel_qty=cancel_qty,
@@ -809,6 +823,15 @@ class OrderEnqueueService:
                 saved = db.save_live_sim_cancel_order(
                     {**base_record, "status": "RECONCILE_REQUIRED", "reason_codes": ["LIVE_SIM_CANCEL_RECONCILE_REQUIRED"], "details": {**base_record["details"], "order": updated}}
                 )
+                db.append_live_sim_order_event(
+                    original_order_id,
+                    "reconcile_required",
+                    status_from=str(order.get("order_status") or ""),
+                    status_to="RECONCILE_REQUIRED",
+                    message="LIVE_SIM_CANCEL_RECONCILE_REQUIRED",
+                    payload={"cancel": saved, "issue_type": "BROKER_ORDER_ID_MISSING", "operator_message_ko": "주문번호가 없어 재조회가 필요합니다."},
+                    created_at=now,
+                )
                 return OrderEnqueueResult(False, "LIVE_SIM", False, intent_id=cancel_intent_id, idempotency_key=idempotency_key, status="RECONCILE_REQUIRED", reason="LIVE_SIM_CANCEL_RECONCILE_REQUIRED", record=saved)
             duplicate = db.find_pending_live_sim_cancel(broker_order_id=broker_order_id)
             if duplicate is not None:
@@ -830,6 +853,15 @@ class OrderEnqueueService:
                 )
                 saved = db.save_live_sim_cancel_order(
                     {**base_record, "status": "RECONCILE_REQUIRED", "reason_codes": ["LIVE_SIM_CANCEL_MAX_ATTEMPTS_EXCEEDED", "LIVE_SIM_CANCEL_RECONCILE_REQUIRED"], "details": {**base_record["details"], "order": updated}}
+                )
+                db.append_live_sim_order_event(
+                    original_order_id,
+                    "reconcile_required",
+                    status_from=str(order.get("order_status") or ""),
+                    status_to="RECONCILE_REQUIRED",
+                    message="LIVE_SIM_CANCEL_MAX_ATTEMPTS_EXCEEDED",
+                    payload={"cancel": saved, "issue_type": "CANCEL_MAX_ATTEMPTS_EXCEEDED", "operator_message_ko": "취소 시도 횟수를 초과해 재조회가 필요합니다."},
+                    created_at=now,
                 )
                 return OrderEnqueueResult(False, "LIVE_SIM", False, intent_id=cancel_intent_id, idempotency_key=idempotency_key, status="RECONCILE_REQUIRED", reason="LIVE_SIM_CANCEL_MAX_ATTEMPTS_EXCEEDED", record=saved)
             guard_request = BrokerOrderRequest(
@@ -1060,6 +1092,15 @@ class OrderEnqueueService:
                                 "updated_at": now,
                                 "reason_codes": _merge_reason_codes(order, ["LIVE_SIM_RECONCILE_ORDER_CANCELLED_FROM_BROKER"]),
                             },
+                        )
+                        db.append_live_sim_order_event(
+                            str(order.get("order_intent_id") or ""),
+                            "cancelled",
+                            status_from=str(order.get("order_status") or ""),
+                            status_to="CANCELLED",
+                            message="LIVE_SIM_RECONCILE_ORDER_CANCELLED_FROM_BROKER",
+                            payload=broker_order,
+                            created_at=now,
                         )
                         orders_reconciled += 1
                         reason_codes.append("LIVE_SIM_RECONCILE_ORDER_CANCELLED_FROM_BROKER")

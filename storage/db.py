@@ -9,6 +9,7 @@ from typing import Iterable, Optional, Union
 from uuid import uuid4
 
 from trading.broker.models import BrokerExecutionEvent, BrokerOrderResult
+from trading.live_sim.lifecycle import validate_live_sim_transition
 from trading.models import BuyLeg, LegStatus, WatchItem
 from trading.strategy.models import (
     BlockType,
@@ -1734,9 +1735,14 @@ class TradingDatabase:
 
     def _sync_live_sim_order_result(self, result: BrokerOrderResult) -> None:
         lookup = result.idempotency_key or result.request.idempotency_key
+        link_method = ""
         order = self.find_live_sim_order_by_idempotency(lookup) if lookup else None
+        if order is not None:
+            link_method = "idempotency_key"
         if order is None and result.command_id:
             order = self.find_live_sim_order_by_command_id(result.command_id)
+            if order is not None:
+                link_method = "command_id"
         if order is None:
             return
         now = str(result.raw.get("timestamp") or result.raw.get("received_at") or "")
@@ -1745,22 +1751,38 @@ class TradingDatabase:
 
             now = utc_timestamp()
         status_from = str(order.get("order_status") or "")
+        order_no = str(result.order_no or "")
+        broker_order_id_source = "order_result.order_no" if order_no else ("existing_live_sim_order" if order.get("broker_order_id") else "")
+        order_result_details = {
+            "order_result": result.to_dict(),
+            "order_result_received_at": now,
+            "order_result_ok": bool(result.ok),
+            "order_result_code": str(result.code),
+            "order_result_message": result.message,
+            "order_result_link_status": "LINKED",
+            "order_result_link_reason": link_method,
+            "broker_order_id_source": broker_order_id_source,
+        }
         if result.ok:
-            status_to = "ACCEPTED"
-            reason_codes = _merge_reason_codes(order, ["ORDER_RECONCILED_FROM_KIWOOM"])
+            status_to = "ACCEPTED" if order_no or order.get("broker_order_id") else "UNKNOWN_SUBMIT"
+            reason_codes = _merge_reason_codes(
+                order,
+                ["ORDER_RECONCILED_FROM_KIWOOM"]
+                if status_to == "ACCEPTED"
+                else ["ORDER_UNKNOWN_SUBMIT_REQUIRES_RECONCILE", "LIVE_SIM_ORDER_NO_MISSING"],
+            )
             updates = {
                 "command_id": result.command_id or order.get("command_id"),
-                "broker_order_id": result.order_no or order.get("broker_order_id"),
+                "broker_order_id": order_no or order.get("broker_order_id"),
                 "broker_response_code": str(result.code),
                 "broker_response_message": result.message,
                 "order_status": status_to,
-                "accepted_at": now,
+                "accepted_at": now if status_to == "ACCEPTED" else str(order.get("accepted_at") or ""),
                 "updated_at": now,
                 "reason_codes": reason_codes,
                 "details": {
                     **dict(order.get("details") or {}),
-                    "order_result": result.to_dict(),
-                    "order_result_ok": True,
+                    **order_result_details,
                 },
             }
         else:
@@ -1776,8 +1798,7 @@ class TradingDatabase:
                 "reason_codes": reason_codes,
                 "details": {
                     **dict(order.get("details") or {}),
-                    "order_result": result.to_dict(),
-                    "order_result_ok": False,
+                    **order_result_details,
                 },
             }
         saved = self.update_live_sim_order(str(order.get("order_intent_id") or ""), updates)
@@ -1822,6 +1843,35 @@ class TradingDatabase:
         fill_qty = max(0, cumulative_fill_qty - previous_cumulative_fill_qty)
         remaining_qty = max(0, int(event.remaining_quantity or 0))
         fill_price = max(0, int(event.price or 0))
+        audit_warnings: list[dict[str, object]] = []
+        if int(event.remaining_quantity or 0) < 0:
+            audit_warnings.append(
+                {
+                    "issue_type": "LIVE_SIM_REMAINING_QTY_NEGATIVE",
+                    "severity": "BROKEN",
+                    "operator_message_ko": "체결 이벤트의 미체결 수량이 음수입니다.",
+                }
+            )
+        if cumulative_fill_qty < previous_cumulative_fill_qty:
+            audit_warnings.append(
+                {
+                    "issue_type": "LIVE_SIM_CUMULATIVE_FILL_DECREASE",
+                    "severity": "RECONCILE_REQUIRED",
+                    "operator_message_ko": "누적 체결 수량이 이전 이벤트보다 감소했습니다.",
+                }
+            )
+        requested_qty = int(order.get("requested_qty") or event.quantity or 0)
+        if requested_qty > 0 and cumulative_fill_qty + remaining_qty != requested_qty:
+            audit_warnings.append(
+                {
+                    "issue_type": "LIVE_SIM_FILL_REMAINING_QTY_MISMATCH",
+                    "severity": "WARN",
+                    "operator_message_ko": "누적체결과 잔량 합계가 요청 수량과 다릅니다.",
+                    "requested_qty": requested_qty,
+                    "cumulative_fill_qty": cumulative_fill_qty,
+                    "remaining_qty": remaining_qty,
+                }
+            )
         raw_event = {
             **event.to_dict(),
             "reported_filled_quantity": int(event.filled_quantity or 0),
@@ -1830,6 +1880,7 @@ class TradingDatabase:
             "previous_cumulative_fill_qty": previous_cumulative_fill_qty,
             "fill_link_method": fill_link_method,
             "manual_intervention": False,
+            "audit_warnings": audit_warnings,
         }
         fill_id = event.execution_id or f"{event.order_no}:{event.filled_quantity}:{event.remaining_quantity}:{event.price}:{now}"
         fill_payload = {
@@ -1868,20 +1919,55 @@ class TradingDatabase:
                 reason = "LIVE_SIM_PARTIAL_FILL_TRACKED" if status_to == "PARTIAL_FILLED" else "ORDER_RECONCILED_FROM_KIWOOM"
         details = dict(order.get("details") or {})
         position = dict(details.get("position") or {})
+        position_pre_fill: dict | None = None
+        fill_side = str(fill.get("side") or order.get("side") or "").lower()
+        position_id_for_fill = (
+            f"LIVE_SIM:{order.get('account_id_masked') or fill.get('account_id_masked') or ''}:"
+            f"{order.get('code') or fill.get('code') or ''}:"
+            f"{order.get('candidate_instance_id') or 'no_ci'}"
+        )
         if fill_qty > 0:
+            position_pre_fill = self.get_live_sim_position(position_id_for_fill)
+            if fill_side == "sell":
+                current_position = position_pre_fill
+                open_qty = int((current_position or {}).get("current_qty") or 0)
+                if current_position is None:
+                    audit_warnings.append(
+                        {
+                            "issue_type": "LIVE_SIM_SELL_FILL_POSITION_MISSING",
+                            "severity": "RECONCILE_REQUIRED",
+                            "operator_message_ko": "매도 체결이 들어왔지만 연결된 열린 포지션이 없습니다.",
+                            "position_id": position_id_for_fill,
+                        }
+                    )
+                elif fill_qty > open_qty:
+                    audit_warnings.append(
+                        {
+                            "issue_type": "LIVE_SIM_SELL_FILL_EXCEEDS_POSITION",
+                            "severity": "RECONCILE_REQUIRED",
+                            "operator_message_ko": "매도 체결 수량이 DB 포지션 수량을 초과했습니다.",
+                            "position_id": position_id_for_fill,
+                            "fill_qty": fill_qty,
+                            "open_position_qty": open_qty,
+                        }
+                    )
             position = self.upsert_live_sim_position_from_fill(order, fill, exit_guard=dict(details.get("exit_guard") or {}))
+        if any(str(item.get("severity") or "") in {"BROKEN", "RECONCILE_REQUIRED"} for item in audit_warnings):
+            status_to = "RECONCILE_REQUIRED"
         updates = {
             "broker_order_id": broker_order_id,
             "order_status": status_to,
             "first_fill_at": order.get("first_fill_at") or (now if fill_qty > 0 else ""),
             "last_fill_at": now,
             "updated_at": now,
-            "reason_codes": _merge_reason_codes(order, [reason]),
+            "reason_codes": _merge_reason_codes(order, [reason, *[str(item.get("issue_type") or "") for item in audit_warnings]]),
             "details": {
                 **details,
                 "fill_link_method": fill_link_method,
                 "last_fill": fill,
                 "position": position,
+                "broker_order_id_source": details.get("broker_order_id_source") or ("execution.order_no" if event.order_no else ""),
+                "execution_audit_warnings": audit_warnings,
             },
         }
         saved = self.update_live_sim_order(str(order.get("order_intent_id") or ""), updates)
@@ -1891,9 +1977,30 @@ class TradingDatabase:
             status_from=status_from,
             status_to=str((saved or updates).get("order_status") or status_to),
             message=reason,
-            payload={"execution": event.to_dict(), "fill": fill, "position": position},
+            payload={"execution": event.to_dict(), "fill": fill, "position": position, "audit_warnings": audit_warnings},
             created_at=now,
         )
+        if fill_qty > 0 and position:
+            if fill_side == "buy" and (position_pre_fill is None or int(position_pre_fill.get("current_qty") or 0) <= 0):
+                self.append_live_sim_order_event(
+                    str(order.get("order_intent_id") or ""),
+                    "position_opened",
+                    status_from="",
+                    status_to=str(position.get("status") or "OPEN"),
+                    message="LIVE_SIM_POSITION_OPENED",
+                    payload={"fill": fill, "position": position},
+                    created_at=now,
+                )
+            elif fill_side == "sell" and str(position.get("status") or "") == "CLOSED":
+                self.append_live_sim_order_event(
+                    str(order.get("order_intent_id") or ""),
+                    "position_closed",
+                    status_from=str((position_pre_fill or {}).get("status") or ""),
+                    status_to="CLOSED",
+                    message="LIVE_SIM_POSITION_CLOSED",
+                    payload={"fill": fill, "position": position},
+                    created_at=now,
+                )
 
     def _sync_manual_live_sim_execution(self, event: BrokerExecutionEvent) -> None:
         now = str(event.timestamp or "")
@@ -3786,7 +3893,7 @@ class TradingDatabase:
               AND lower(side) = lower(?)
               AND submitted_qty = ?
               AND submitted_price = ?
-              AND order_status IN ('SUBMITTED', 'ACCEPTED', 'PARTIAL_FILLED')
+              AND order_status IN ('SUBMITTED', 'UNKNOWN_SUBMIT', 'ACCEPTED', 'PARTIAL_FILLED')
             ORDER BY
               CASE
                 WHEN accepted_at != '' THEN accepted_at
@@ -3857,6 +3964,10 @@ class TradingDatabase:
             from trading.broker.models import utc_timestamp
 
             created_at = utc_timestamp()
+        payload_body = dict(payload or {})
+        transition = validate_live_sim_transition(status_from, status_to)
+        if not transition.get("ok"):
+            payload_body["transition_warning"] = transition
         self.conn.execute(
             """
             INSERT INTO live_sim_order_events(
@@ -3869,7 +3980,7 @@ class TradingDatabase:
                 status_from,
                 status_to,
                 message,
-                json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str),
+                json.dumps(payload_body, ensure_ascii=False, sort_keys=True, default=str),
                 created_at,
             ),
         )
@@ -3879,12 +3990,53 @@ class TradingDatabase:
             status_from=status_from,
             status_to=status_to,
             message=message,
-            payload=payload or {},
+            payload=payload_body,
             created_at=created_at,
         )
         if trace:
             self._save_buy_zero_trace_events_no_commit([trace])
         self.conn.commit()
+
+    def list_live_sim_order_events(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        order_intent_id: Optional[str] = None,
+        event_type: Optional[str] = None,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("(o.trade_date = ? OR substr(e.created_at, 1, 10) = ?)")
+            params.extend([trade_date, trade_date])
+        if order_intent_id:
+            clauses.append("e.order_intent_id = ?")
+            params.append(order_intent_id)
+        if event_type:
+            clauses.append("e.event_type = ?")
+            params.append(event_type)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                e.*,
+                o.trade_date AS order_trade_date,
+                o.code AS order_code,
+                o.side AS order_side,
+                o.command_id AS order_command_id,
+                o.broker_order_id AS order_broker_order_id,
+                o.candidate_instance_id AS order_candidate_instance_id
+            FROM live_sim_order_events e
+            LEFT JOIN live_sim_orders o ON o.order_intent_id = e.order_intent_id
+            {where}
+            ORDER BY e.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 500)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_live_sim_order_event(row) for row in rows]
 
     def save_live_sim_cancel_order(self, record: dict) -> dict:
         payload = _live_sim_cancel_params(record)
@@ -3978,6 +4130,7 @@ class TradingDatabase:
     def list_live_sim_cancel_orders(
         self,
         *,
+        trade_date: Optional[str] = None,
         status: Optional[str] = None,
         code: Optional[str] = None,
         limit: int = 100,
@@ -3985,6 +4138,9 @@ class TradingDatabase:
     ) -> list[dict]:
         clauses: list[str] = []
         params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(trade_date)
         if status:
             clauses.append("status = ?")
             params.append(status)
@@ -4028,6 +4184,49 @@ class TradingDatabase:
             (params["broker_order_id"], params["fill_id"]),
         ).fetchone()
         return inserted, (_row_to_live_sim_fill(row) if row else dict(payload or {}))
+
+    def list_live_sim_fill_events(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        order_intent_id: Optional[str] = None,
+        broker_order_id: Optional[str] = None,
+        code: Optional[str] = None,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("(o.trade_date = ? OR substr(f.received_at, 1, 10) = ? OR substr(f.event_time, 1, 10) = ?)")
+            params.extend([trade_date, trade_date, trade_date])
+        if order_intent_id is not None:
+            clauses.append("f.order_intent_id = ?")
+            params.append(order_intent_id)
+        if broker_order_id is not None:
+            clauses.append("f.broker_order_id = ?")
+            params.append(broker_order_id)
+        if code:
+            clauses.append("f.code = ?")
+            params.append(code)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                f.*,
+                o.trade_date AS order_trade_date,
+                o.candidate_instance_id AS order_candidate_instance_id,
+                o.requested_qty AS order_requested_qty,
+                o.order_status AS order_status
+            FROM live_sim_fill_events f
+            LEFT JOIN live_sim_orders o ON o.order_intent_id = f.order_intent_id
+            {where}
+            ORDER BY f.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 500)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_live_sim_fill(row) for row in rows]
 
     def upsert_live_sim_position_from_fill(self, order: dict, fill: dict, *, exit_guard: Optional[dict] = None) -> dict:
         side = str(fill.get("side") or order.get("side") or "").lower()
@@ -4265,6 +4464,17 @@ class TradingDatabase:
         ).fetchone()
         return _row_to_live_sim_health(row) if row else None
 
+    def list_live_sim_runtime_health(self, *, limit: int = 100) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM live_sim_runtime_health
+            ORDER BY updated_at DESC, component ASC
+            LIMIT ?
+            """,
+            (max(1, int(limit or 100)),),
+        ).fetchall()
+        return [_row_to_live_sim_health(row) for row in rows]
+
     def save_live_sim_reconcile_event(self, payload: dict) -> dict:
         params = _live_sim_reconcile_params(payload)
         with self.conn:
@@ -4291,6 +4501,34 @@ class TradingDatabase:
             (params["event_id"],),
         ).fetchone()
         return _row_to_live_sim_reconcile(row) if row else dict(payload or {})
+
+    def list_live_sim_reconcile_events(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("(substr(started_at, 1, 10) = ? OR substr(completed_at, 1, 10) = ?)")
+            params.extend([trade_date, trade_date])
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM live_sim_reconcile_events
+            {where}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_live_sim_reconcile(row) for row in rows]
 
     def live_sim_summary(self, *, trade_date: Optional[str] = None) -> dict:
         params: list[object] = []
@@ -8143,25 +8381,91 @@ def _buy_zero_trace_from_live_sim_order_event(
 ) -> dict | None:
     if order is None:
         return None
-    stage_map = {
-        "submitted": "LIVE_SIM_COMMAND_QUEUED",
+    payload = dict(payload or {})
+    details = dict(order.get("details") or {})
+    request = dict(details.get("request") or {})
+    metadata = dict(request.get("metadata") or {})
+    side = str(order.get("side") or request.get("side") or "").lower()
+    order_phase = str(order.get("order_phase") or request.get("order_phase") or metadata.get("order_phase") or ("exit" if side == "sell" else "entry"))
+    fill = dict(payload.get("fill") or {})
+    position = dict(payload.get("position") or details.get("position") or {})
+    execution = dict(payload.get("execution") or {})
+    audit_warnings = list(payload.get("audit_warnings") or details.get("execution_audit_warnings") or [])
+    first_warning = dict(audit_warnings[0]) if audit_warnings and isinstance(audit_warnings[0], dict) else {}
+    if event_type == "submitted":
+        stage = "EXIT_ORDER_SUBMITTED" if order_phase == "exit" or side == "sell" else "LIVE_SIM_COMMAND_QUEUED"
+    elif event_type == "order_result":
+        if status_to == "ACCEPTED":
+            stage = "BROKER_ORDER_ACCEPTED"
+        elif status_to == "UNKNOWN_SUBMIT":
+            stage = "LIVE_SIM_UNKNOWN_SUBMIT"
+        else:
+            stage = "BROKER_ORDER_REJECTED"
+    elif event_type == "execution":
+        if status_to == "RECONCILE_REQUIRED":
+            stage = "RECONCILE_REQUIRED"
+        elif side == "sell" and status_to == "FILLED":
+            stage = "EXIT_FILLED"
+        elif status_to == "PARTIAL_FILLED":
+            stage = "PARTIAL_FILLED"
+        elif status_to == "FILLED":
+            stage = "FILLED"
+        else:
+            stage = "BROKER_ORDER_ACCEPTED"
+    elif event_type == "position_opened":
+        stage = "POSITION_OPENED"
+    elif event_type == "position_closed":
+        stage = "POSITION_CLOSED"
+    elif event_type == "cancel_due":
+        stage = "CANCEL_DUE"
+    elif event_type == "cancel_requested":
+        stage = "CANCEL_REQUESTED"
+    elif event_type == "cancelled":
+        stage = "CANCELLED"
+    elif event_type in {"command_dispatched", "command_started"}:
+        stage = "LIVE_SIM_COMMAND_DISPATCHED"
+    elif event_type == "command_acked":
+        stage = "LIVE_SIM_COMMAND_ACKED"
+    elif event_type == "command_rejected":
+        stage = "LIVE_SIM_COMMAND_REJECTED"
+    elif event_type in {"reconcile_open_order", "reconcile_required"}:
+        stage = "RECONCILE_REQUIRED"
+    else:
+        stage_map = {
         "duplicate_blocked": "LIVE_SIM_BLOCKED",
         "blocked": "LIVE_SIM_BLOCKED",
         "blocked_live_safety": "LIVE_SIM_BLOCKED",
         "enqueue_rejected": "LIVE_SIM_BLOCKED",
-        "order_result": "BROKER_ORDER_ACCEPTED" if status_to == "ACCEPTED" else "LIVE_SIM_BLOCKED",
-        "execution": "PARTIAL_FILLED" if status_to == "PARTIAL_FILLED" else ("FILLED" if status_to == "FILLED" else "BROKER_ORDER_ACCEPTED"),
-        "cancel_requested": "CANCEL_REQUESTED",
-        "reconcile_open_order": "RECONCILE_REQUIRED",
-    }
-    stage = stage_map.get(str(event_type))
+        }
+        stage = stage_map.get(str(event_type))
     if not stage:
         return None
-    passed = stage not in {"LIVE_SIM_BLOCKED", "RECONCILE_REQUIRED"}
+    passed = stage not in {"LIVE_SIM_BLOCKED", "RECONCILE_REQUIRED", "LIVE_SIM_UNKNOWN_SUBMIT", "BROKER_ORDER_REJECTED", "LIVE_SIM_COMMAND_REJECTED"}
     reason_codes = _dedupe([*[str(item) for item in order.get("reason_codes") or []], str(message or status_to or event_type)])
-    details = dict(order.get("details") or {})
-    request = dict(details.get("request") or {})
-    metadata = dict(request.get("metadata") or {})
+    operator_message_ko = _first_string(
+        first_warning.get("operator_message_ko"),
+        payload.get("operator_message_ko"),
+        "주문번호가 없어 재조회가 필요합니다." if stage == "LIVE_SIM_UNKNOWN_SUBMIT" else "",
+        "LIVE_SIM guard에서 차단되었습니다." if stage == "LIVE_SIM_BLOCKED" else "",
+    )
+    lifecycle_details = {
+        "event_type": event_type,
+        "status_from": status_from,
+        "status_to": status_to,
+        "order_status": status_to or str(order.get("order_status") or ""),
+        "fill_qty": fill.get("fill_qty"),
+        "cumulative_fill_qty": fill.get("cumulative_fill_qty"),
+        "remaining_qty": fill.get("remaining_qty"),
+        "position_id": position.get("position_id"),
+        "position_qty": position.get("current_qty"),
+        "cancel_intent_id": payload.get("cancel_intent_id") or payload.get("cancel", {}).get("cancel_intent_id") if isinstance(payload.get("cancel"), dict) else payload.get("cancel_intent_id"),
+        "reconcile_issue_type": first_warning.get("issue_type") or payload.get("issue_type") or "",
+        "operator_message_ko": operator_message_ko,
+        "broker_order_id_source": details.get("broker_order_id_source") or payload.get("broker_order_id_source") or "",
+        "order_result_link_status": details.get("order_result_link_status") or "",
+        "order_result_link_reason": details.get("order_result_link_reason") or "",
+        "audit_warnings": audit_warnings,
+    }
     return {
         "trace_id": f"live_sim_order:{order.get('order_intent_id') or ''}:{event_type}:{status_to}:{created_at}",
         "trade_date": str(order.get("trade_date") or _trade_date_from_timestamp(created_at) or ""),
@@ -8179,13 +8483,21 @@ def _buy_zero_trace_from_live_sim_order_event(
         "passed": passed,
         "primary_block_reason": "" if passed else str(message or status_to or event_type),
         "reason_codes": reason_codes,
+        "operator_message_ko": operator_message_ko,
         "entry_plan_id": order.get("entry_plan_id"),
         "live_sim_intent_id": str(order.get("order_intent_id") or ""),
         "live_sim_status": status_to or str(order.get("order_status") or ""),
         "live_sim_reason": str(message or ""),
         "command_id": str(order.get("command_id") or ""),
         "broker_order_id": str(order.get("broker_order_id") or ""),
-        "details": {"live_sim_order": order, "event_type": event_type, "status_from": status_from, "status_to": status_to, "payload": payload},
+        "details": {
+            "live_sim_order": order,
+            "event_type": event_type,
+            "status_from": status_from,
+            "status_to": status_to,
+            "payload": payload,
+            "live_sim_lifecycle": lifecycle_details,
+        },
         "created_at": created_at,
     }
 
@@ -9312,6 +9624,18 @@ def _row_to_live_sim_order(row: sqlite3.Row) -> dict:
     return data
 
 
+def _row_to_live_sim_order_event(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["payload"] = _safe_json_loads(data.get("payload_json"), {})
+    data["trade_date"] = str(data.get("order_trade_date") or _trade_date_from_timestamp(data.get("created_at")) or "")
+    data["code"] = str(data.get("order_code") or "")
+    data["side"] = str(data.get("order_side") or "")
+    data["command_id"] = str(data.get("order_command_id") or "")
+    data["broker_order_id"] = str(data.get("order_broker_order_id") or "")
+    data["candidate_instance_id"] = str(data.get("order_candidate_instance_id") or "")
+    return data
+
+
 def _live_sim_cancel_params(payload: dict) -> dict:
     details = payload.get("details") if "details" in payload else payload.get("details_json", {})
     reason_codes = payload.get("reason_codes") if "reason_codes" in payload else payload.get("reason_codes_json", [])
@@ -9396,6 +9720,8 @@ def _live_sim_fill_params(payload: dict) -> dict:
 def _row_to_live_sim_fill(row: sqlite3.Row) -> dict:
     data = dict(row)
     data["raw_event"] = _safe_json_loads(data.get("raw_event_json"), {})
+    data["trade_date"] = str(data.get("order_trade_date") or _trade_date_from_timestamp(data.get("received_at") or data.get("event_time")) or "")
+    data["candidate_instance_id"] = str(data.get("order_candidate_instance_id") or "")
     return data
 
 

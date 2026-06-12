@@ -122,6 +122,37 @@
         </div>
       </section>
 
+      <section id="themelab-live-sim-audit-card" class="panel live-sim-audit-panel" aria-label="LIVE_SIM lifecycle audit">
+        <div class="panel-head">
+          <div>
+            <h2>LIVE_SIM 주문 lifecycle audit</h2>
+            <p id="themelab-live-sim-audit-empty">아직 LIVE_SIM 주문 audit 데이터가 없습니다.</p>
+          </div>
+          <div class="gate-status-strip">
+            <span id="themelab-live-sim-audit-status" class="badge observe">대기</span>
+            <span id="themelab-live-sim-audit-updated" class="counter">-</span>
+          </div>
+        </div>
+        <div class="buy-zero-summary-grid">
+          <article><span>열린 주문</span><strong id="themelab-live-sim-audit-open-orders">0</strong></article>
+          <article><span>UNKNOWN_SUBMIT</span><strong id="themelab-live-sim-audit-unknown-submit">0</strong></article>
+          <article><span>Reconcile 주문</span><strong id="themelab-live-sim-audit-reconcile-orders">0</strong></article>
+          <article><span>주문번호 누락</span><strong id="themelab-live-sim-audit-broker-missing">0</strong></article>
+          <article><span>취소 지연</span><strong id="themelab-live-sim-audit-cancel-stale">0</strong></article>
+          <article><span>포지션 불일치</span><strong id="themelab-live-sim-audit-position-mismatch">0</strong></article>
+        </div>
+        <div class="buy-zero-cause-grid">
+          <div>
+            <div class="operator-alert-subhead"><h3>운영 조치</h3><span class="counter">top</span></div>
+            <div id="themelab-live-sim-audit-top-actions" class="buy-zero-line-list"></div>
+          </div>
+          <div>
+            <div class="operator-alert-subhead"><h3>최근 이슈</h3><span class="counter">audit</span></div>
+            <div id="themelab-live-sim-audit-issues" class="buy-zero-line-list"></div>
+          </div>
+        </div>
+      </section>
+
       <section id="promotion-cockpit" class="panel promotion-cockpit-panel" aria-label="Promotion Decision Cockpit">
         <div class="panel-head promotion-cockpit-head">
           <div>

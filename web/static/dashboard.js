@@ -1044,6 +1044,64 @@ function renderThemeLabSummary(themeLab) {
   text("themelab-order-candidates", summary.order_candidate_count || 0);
 }
 
+function renderLiveSimAudit(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.live_sim_audit || runtime.live_sim_audit || {};
+  const summary = payload.summary || {};
+  const available = Boolean(payload.available);
+  const status = payload.status || (available ? "UNKNOWN" : "NO_DATA");
+  const tone = status === "OK" ? "ok" : status === "BROKEN" ? "bad" : /RECONCILE|WARN/.test(status) ? "warn" : "muted";
+  const message = ((payload.operator || {}).status_message_ko) || (available ? "LIVE_SIM audit 확인 중" : "아직 LIVE_SIM 주문 audit 데이터가 없습니다.");
+
+  text("live-sim-audit-status", `${status} · ${message}`);
+  cls("live-sim-audit-status", `counter ${tone}`);
+  text("live-sim-audit-updated", formatDateTime(payload.last_updated_at));
+  text("live-sim-audit-empty", available ? "send_order부터 체결/취소/포지션/reconcile까지 audit 원장을 표시합니다." : "아직 LIVE_SIM 주문 audit 데이터가 없습니다.");
+  text("live-sim-audit-open-orders", summary.open_live_sim_order_count ?? 0);
+  text("live-sim-audit-unknown-submit", summary.unknown_submit_count ?? 0);
+  text("live-sim-audit-reconcile-orders", summary.reconcile_required_order_count ?? 0);
+  text("live-sim-audit-broker-missing", summary.broker_order_id_missing_count ?? 0);
+  text("live-sim-audit-cancel-stale", summary.cancel_requested_stale_count ?? 0);
+  text("live-sim-audit-orphan-exec", summary.orphan_execution_count ?? 0);
+  text("live-sim-audit-position-mismatch", summary.position_qty_mismatch_count ?? 0);
+  text("live-sim-audit-duplicate-open-position", summary.duplicate_open_position_count ?? 0);
+  renderLiveSimAuditLines(
+    "live-sim-audit-top-actions",
+    ((payload.operator || {}).top_actions || []).map((item) => ({
+      label: item.issue_type || "-",
+      value: item.count ?? 0,
+      detail: item.operator_message_ko || item.suggested_action || "",
+      tone: /BROKEN|MISMATCH|MISSING|UNKNOWN|RECONCILE/.test(String(item.issue_type || "")) ? "warn" : "muted",
+    })),
+    "필요한 운영 조치가 없습니다."
+  );
+  renderLiveSimAuditLines(
+    "live-sim-audit-issues",
+    (payload.issues || []).slice(0, 6).map((item) => ({
+      label: item.issue_type || "-",
+      value: item.severity || "-",
+      detail: `${item.code || ""} ${item.operator_message_ko || ""}`.trim(),
+      tone: item.severity === "BROKEN" ? "bad" : /RECONCILE|WARN/.test(String(item.severity || "")) ? "warn" : "muted",
+    })),
+    "최근 audit 이슈가 없습니다."
+  );
+}
+
+function renderLiveSimAuditLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = firstItems(rows || [], 6);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item ${escapeHtml(item.tone || "info")}">
+        <strong>${escapeHtml(item.label || "-")}</strong>
+        <span>${escapeHtml(item.detail || "")}</span>
+        <em>${escapeHtml(item.value ?? "")}</em>
+      </div>
+    `).join("")
+    : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
 function renderBuyZeroRca(snapshot) {
   const runtime = snapshot.runtime || {};
   const payload = snapshot.buy_zero_rca || runtime.buy_zero_rca || {};
@@ -1404,6 +1462,7 @@ function render(snapshot) {
   cls("orderable-state", `pill ${gateway.orderable ? "ok" : "muted"}`);
   renderOpsAlerts(opsAlerts);
   renderThemeLabSummary(themeLab);
+  renderLiveSimAudit(snapshot);
   renderBuyZeroRca(snapshot);
 
   text("transport-mode", transport.mode || "rest_long_poll");

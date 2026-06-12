@@ -80,6 +80,11 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#themelab-buy-zero-rally-table-body") is not None
     assert soup.select_one("#themelab-buy-zero-rca-timeline") is not None
     assert soup.select_one("#themelab-buy-zero-rca-refresh") is not None
+    assert soup.select_one("#themelab-live-sim-audit-card") is not None
+    assert soup.select_one("#themelab-live-sim-audit-status") is not None
+    assert soup.select_one("#themelab-live-sim-audit-open-orders") is not None
+    assert soup.select_one("#themelab-live-sim-audit-top-actions") is not None
+    assert soup.select_one("#themelab-live-sim-audit-issues") is not None
     assert soup.select_one("#promotion-cockpit") is not None
     assert soup.select_one("#promotion-window-controls") is not None
     assert soup.select_one('[data-promotion-window="300"]') is not None
@@ -242,6 +247,8 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "/api/runtime/buy-zero/missed-opportunities" in js
     assert "/api/runtime/buy-zero/traces" in js
     assert "function renderBuyZeroRcaPanel" in js
+    assert "function renderLiveSimAuditPanel" in js
+    assert "live_sim_audit" in js
     assert "function renderBuyZeroDataQualityCounts" in js
     assert "function openBuyZeroTraceDetail" in js
     assert "BUY_ZERO_RCA_CRITICAL_REASONS" in js

@@ -307,6 +307,39 @@
           <div id="runtime-warning-lines" class="inline-log"></div>
         </section>
 
+        <section id="live-sim-audit-card" class="band live-sim-audit-section">
+          <div class="section-head">
+            <div>
+              <h2>LIVE_SIM 주문 lifecycle audit</h2>
+              <p id="live-sim-audit-empty" class="help-text">아직 LIVE_SIM 주문 audit 데이터가 없습니다.</p>
+            </div>
+            <div class="action-strip">
+              <span id="live-sim-audit-status" class="counter muted">대기</span>
+              <span id="live-sim-audit-updated" class="counter muted">-</span>
+            </div>
+          </div>
+          <div class="mini-grid live-sim-audit-grid">
+            <div><span>열린 주문</span><strong id="live-sim-audit-open-orders">0</strong></div>
+            <div><span>UNKNOWN_SUBMIT</span><strong id="live-sim-audit-unknown-submit">0</strong></div>
+            <div><span>Reconcile 주문</span><strong id="live-sim-audit-reconcile-orders">0</strong></div>
+            <div><span>주문번호 누락</span><strong id="live-sim-audit-broker-missing">0</strong></div>
+            <div><span>취소 지연</span><strong id="live-sim-audit-cancel-stale">0</strong></div>
+            <div><span>Orphan 체결</span><strong id="live-sim-audit-orphan-exec">0</strong></div>
+            <div><span>포지션 불일치</span><strong id="live-sim-audit-position-mismatch">0</strong></div>
+            <div><span>중복 열린 포지션</span><strong id="live-sim-audit-duplicate-open-position">0</strong></div>
+          </div>
+          <div class="two-col live-sim-audit-detail-grid">
+            <div class="unframed-panel">
+              <h3>운영 조치</h3>
+              <div id="live-sim-audit-top-actions" class="inline-log"></div>
+            </div>
+            <div class="unframed-panel">
+              <h3>최근 이슈</h3>
+              <div id="live-sim-audit-issues" class="inline-log"></div>
+            </div>
+          </div>
+        </section>
+
         <section id="buy-zero-rca-card" class="band buy-zero-rca-section">
           <div class="section-head">
             <div>

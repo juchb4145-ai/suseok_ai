@@ -7,6 +7,7 @@ from typing import Any
 from storage.db import TradingDatabase
 from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE
 from trading.theme_engine.repository import ThemeEngineRepository
+from trading_app.live_sim_audit import LiveSimLifecycleAuditor
 from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
 
 
@@ -42,7 +43,7 @@ def build_theme_lab_dashboard_snapshot(
     raw = db.latest_theme_lab_flow_result()
     theme_source_sync = _theme_source_sync_status(db)
     if not raw:
-        return _empty_snapshot(runtime_status=runtime_status, theme_source_sync=theme_source_sync)
+        return _empty_snapshot(runtime_status=runtime_status, theme_source_sync=theme_source_sync, db=db, gateway_state=gateway_state)
 
     themes = _as_list(raw.get("theme_rankings") or raw.get("theme_condition_snapshots"))
     gate_decisions = _as_list(raw.get("gate_decisions"))
@@ -62,7 +63,9 @@ def build_theme_lab_dashboard_snapshot(
     backfill_status_by_theme = _theme_backfill_status_by_theme(gateway_state)
     ranked_themes = _ranked_theme_rows(themes, condition_counts, backfill_status_by_theme=backfill_status_by_theme)
     summary = _summary(ranked_themes, watchset, entry_candidates, data_quality, runtime=runtime, freshness=freshness)
-    gate_reason_outcomes = _theme_lab_gate_reason_outcomes(db, trade_date=_snapshot_trade_date(raw))
+    trade_date = _snapshot_trade_date(raw)
+    gate_reason_outcomes = _theme_lab_gate_reason_outcomes(db, trade_date=trade_date)
+    live_sim_audit = _live_sim_audit(db, gateway_state=gateway_state, trade_date=trade_date)
 
     return {
         "available": True,
@@ -85,6 +88,7 @@ def build_theme_lab_dashboard_snapshot(
         "selected_chart": selected,
         "gate_detail": _gate_detail(selected_watch),
         "gate_reason_outcomes": gate_reason_outcomes,
+        "live_sim_audit": live_sim_audit,
         "shadow_small_entry": gate_reason_outcomes.get("shadow_small_entry") or _empty_shadow_small_entry(),
         "shadow_small_entry_ab": gate_reason_outcomes.get("shadow_small_entry_ab") or _empty_shadow_small_entry_ab(),
         "summary": summary,
@@ -95,6 +99,8 @@ def _empty_snapshot(
     *,
     runtime_status: dict[str, Any] | None = None,
     theme_source_sync: dict[str, Any] | None = None,
+    db: TradingDatabase | None = None,
+    gateway_state: Any | None = None,
 ) -> dict[str, Any]:
     runtime = _runtime_context(runtime_status)
     freshness = _empty_freshness()
@@ -150,9 +156,34 @@ def _empty_snapshot(
         "selected_chart": {"symbol": "KOSDAQ", "name": "KOSDAQ", "type": "index", "chart_data_status": "NO_CANDLE_DATA"},
         "gate_detail": {"gate_status": "OBSERVE", "summary_message": "선택된 WatchSet 종목이 없습니다."},
         "gate_reason_outcomes": _empty_gate_reason_outcomes(),
+        "live_sim_audit": _live_sim_audit(db, gateway_state=gateway_state, trade_date=datetime.now().date().isoformat()) if db is not None else _live_sim_audit_empty(),
         "shadow_small_entry": _empty_shadow_small_entry(),
         "shadow_small_entry_ab": _empty_shadow_small_entry_ab(),
         "summary": _empty_summary(runtime=runtime, freshness=freshness),
+    }
+
+
+def _live_sim_audit(db: TradingDatabase, *, gateway_state: Any | None, trade_date: str = "") -> dict[str, Any]:
+    try:
+        return LiveSimLifecycleAuditor(db, gateway_state=gateway_state).build_report(trade_date=trade_date or None, limit=1000)
+    except Exception as exc:
+        payload = _live_sim_audit_empty()
+        payload.update({"status": "ERROR", "error": str(exc)})
+        return payload
+
+
+def _live_sim_audit_empty() -> dict[str, Any]:
+    return {
+        "available": False,
+        "status": "NO_DATA",
+        "summary": {},
+        "order_funnel": [],
+        "open_orders": [],
+        "reconcile_issues": [],
+        "position_issues": [],
+        "cancel_issues": [],
+        "last_updated_at": "",
+        "operator": {"status_message_ko": "LIVE_SIM audit 데이터가 아직 없습니다.", "top_actions": []},
     }
 
 

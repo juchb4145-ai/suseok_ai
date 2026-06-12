@@ -43,6 +43,14 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
     assert soup.select_one("#themelab-operation-status") is not None
     assert soup.select_one("#themelab-ready") is not None
     for node_id in [
+        "live-sim-audit-card",
+        "live-sim-audit-status",
+        "live-sim-audit-open-orders",
+        "live-sim-audit-unknown-submit",
+        "live-sim-audit-reconcile-orders",
+        "live-sim-audit-broker-missing",
+        "live-sim-audit-top-actions",
+        "live-sim-audit-issues",
         "buy-zero-rca-card",
         "buy-zero-rca-empty",
         "buy-zero-rca-market-session",
@@ -128,6 +136,8 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "shadowEvaluations" in js
     assert "shadowRiskCandidates" in js
     assert "function renderBuyZeroRca" in js
+    assert "function renderLiveSimAudit" in js
+    assert "live_sim_audit" in js
     assert "function renderBuyZeroDataQualityCounts" in js
     assert "function openBuyZeroTraceDetail" in js
     assert "/api/runtime/buy-zero/ready-not-ordered" in js

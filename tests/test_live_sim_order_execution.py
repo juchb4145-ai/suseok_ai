@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import importlib
 from datetime import datetime
 from pathlib import Path
+
+from fastapi.testclient import TestClient
 
 from storage.db import TradingDatabase
 from trading.broker.gateway_state import GatewayStateStore
@@ -9,6 +12,7 @@ from trading.broker.models import BrokerExecutionEvent, BrokerOrderRequest, Brok
 from trading.strategy.runtime import StrategyRuntime, StrategyRuntimeSnapshot
 from trading.strategy.runtime_settings import StrategyRuntimeSettings
 from trading_app.dependencies import CoreSettings
+from trading_app.live_sim_audit import LiveSimLifecycleAuditor
 from trading_app.order_enqueue_service import OrderEnqueueService, RuntimeOrderIntentRequest
 from trading_app.runtime_factory import _build_order_sink
 from trading_app.runtime_order_sink import DryRunRuntimeOrderSink, LiveSimRuntimeOrderSink, NoopRuntimeOrderSink
@@ -1152,3 +1156,363 @@ def test_repair_live_sim_positions_corrects_cumulative_delta_overcount(tmp_path)
     assert position["entry_qty"] == 10
     assert position["current_qty"] == 10
     assert position["status"] == "RECONCILE_REQUIRED"
+
+
+def test_live_sim_audit_reports_submitted_command_and_order_funnel(tmp_path):
+    service, settings, gateway_state = _service(tmp_path)
+    submit = service.enqueue_live_sim_order(_request(), execution_config=_live_sim_execution(), exit_guard_config=_exit_guard())
+
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        order = db.get_live_sim_order(submit.intent_id)
+        report = LiveSimLifecycleAuditor(db, gateway_state=gateway_state).build_report(trade_date=order["trade_date"])
+    finally:
+        db.close()
+
+    assert submit.accepted is True
+    assert report["available"] is True
+    assert report["summary"]["order_status_counts"]["SUBMITTED"] == 1
+    assert any(row["stage"] == "SUBMITTED" and row["count"] == 1 for row in report["order_funnel"])
+    assert report["command_audit"][0]["command_type"] == "send_order"
+    assert report["command_audit"][0]["live_sim_order_intent_id"] == submit.intent_id
+
+
+def test_live_sim_order_result_without_order_no_marks_unknown_submit_and_rca_trace(tmp_path):
+    service, settings, gateway_state = _service(tmp_path)
+    submit = service.enqueue_live_sim_order(_request(), execution_config=_live_sim_execution(), exit_guard_config=_exit_guard())
+    request = BrokerOrderRequest.from_dict(dict(submit.command["payload"]))
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        db.save_order_result(
+            BrokerOrderResult(
+                ok=True,
+                code=0,
+                message="accepted without order no",
+                request=request,
+                order_no="",
+                command_id=submit.command_id,
+                idempotency_key=submit.idempotency_key,
+            )
+        )
+        order = db.get_live_sim_order(submit.intent_id)
+        report = LiveSimLifecycleAuditor(db, gateway_state=gateway_state).build_report(trade_date=order["trade_date"])
+        traces = db.list_buy_zero_trace_events(trade_date=order["trade_date"], code="005930", limit=20)
+    finally:
+        db.close()
+
+    assert order["order_status"] == "UNKNOWN_SUBMIT"
+    assert "LIVE_SIM_ORDER_NO_MISSING" in order["reason_codes"]
+    assert order["details"]["order_result_link_status"] == "LINKED"
+    assert report["summary"]["unknown_submit_count"] == 1
+    assert any(issue["issue_type"] == "UNKNOWN_SUBMIT" for issue in report["reconcile_issues"])
+    assert any(trace["stage"] == "LIVE_SIM_UNKNOWN_SUBMIT" for trace in traces)
+
+
+def test_live_sim_audit_tracks_partial_final_fill_and_position_open_trace(tmp_path):
+    service, settings, gateway_state, submit = _submit_accepted_order(tmp_path, quantity=3)
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        db.save_execution(
+            BrokerExecutionEvent(
+                code="005930",
+                order_no="A0001",
+                side="buy",
+                quantity=3,
+                price=70000,
+                filled_quantity=1,
+                remaining_quantity=2,
+                execution_id="partial-audit-1",
+                command_id=submit.command_id,
+                idempotency_key=submit.idempotency_key,
+            )
+        )
+        db.save_execution(
+            BrokerExecutionEvent(
+                code="005930",
+                order_no="A0001",
+                side="buy",
+                quantity=3,
+                price=70000,
+                filled_quantity=3,
+                remaining_quantity=0,
+                execution_id="final-audit-3",
+                command_id=submit.command_id,
+                idempotency_key=submit.idempotency_key,
+            )
+        )
+        order = db.get_live_sim_order(submit.intent_id)
+        report = LiveSimLifecycleAuditor(db, gateway_state=gateway_state).build_report(trade_date=order["trade_date"])
+        traces = db.list_buy_zero_trace_events(trade_date=order["trade_date"], code="005930", limit=50)
+    finally:
+        db.close()
+
+    stages = {trace["stage"] for trace in traces}
+    assert order["order_status"] == "FILLED"
+    assert report["summary"]["position_qty_mismatch_count"] == 0
+    assert {"LIVE_SIM_COMMAND_QUEUED", "BROKER_ORDER_ACCEPTED", "PARTIAL_FILLED", "FILLED", "POSITION_OPENED"} <= stages
+
+
+def test_live_sim_sell_fill_decreases_position_and_full_exit_closes_position(tmp_path):
+    service, settings, gateway_state, submit = _submit_accepted_order(tmp_path, quantity=3)
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        db.save_execution(
+            BrokerExecutionEvent(
+                code="005930",
+                order_no="A0001",
+                side="buy",
+                quantity=3,
+                price=70000,
+                filled_quantity=3,
+                remaining_quantity=0,
+                execution_id="buy-fill-for-exit",
+                command_id=submit.command_id,
+                idempotency_key=submit.idempotency_key,
+            )
+        )
+    finally:
+        db.close()
+
+    exit_submit = service.enqueue_live_sim_order(
+        _request(
+            side="sell",
+            quantity=3,
+            price=71000,
+            order_type=2,
+            order_phase="exit",
+            metadata={"candidate_instance_id": "ci-1", "full_exit": True},
+            virtual_order_id=777,
+        ),
+        execution_config=_live_sim_execution(max_order_amount_krw=1_000_000),
+        exit_guard_config=_exit_guard(),
+        lifecycle_config=_lifecycle(),
+        reconcile_config=_reconcile(),
+    )
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        db.save_order_result(
+            BrokerOrderResult(
+                ok=True,
+                code=0,
+                message="sell accepted",
+                request=BrokerOrderRequest.from_dict(dict(exit_submit.command["payload"])),
+                order_no="S0001",
+                command_id=exit_submit.command_id,
+                idempotency_key=exit_submit.idempotency_key,
+            )
+        )
+        db.save_execution(
+            BrokerExecutionEvent(
+                code="005930",
+                order_no="S0001",
+                side="sell",
+                quantity=3,
+                price=71000,
+                filled_quantity=3,
+                remaining_quantity=0,
+                execution_id="sell-fill-close",
+                command_id=exit_submit.command_id,
+                idempotency_key=exit_submit.idempotency_key,
+            )
+        )
+        position = db.get_live_sim_position("LIVE_SIM:12******90:005930:ci-1")
+        order = db.get_live_sim_order(exit_submit.intent_id)
+        traces = db.list_buy_zero_trace_events(trade_date=order["trade_date"], code="005930", limit=100)
+        report = LiveSimLifecycleAuditor(db, gateway_state=gateway_state).build_report(trade_date=order["trade_date"])
+    finally:
+        db.close()
+
+    assert position["status"] == "CLOSED"
+    assert position["current_qty"] == 0
+    assert order["order_status"] == "FILLED"
+    assert any(trace["stage"] == "EXIT_FILLED" for trace in traces)
+    assert any(trace["stage"] == "POSITION_CLOSED" for trace in traces)
+    assert report["status"] in {"OK", "WARN"}
+
+
+def test_live_sim_cancel_without_broker_order_id_goes_to_reconcile_audit(tmp_path):
+    service, settings, gateway_state = _service(tmp_path)
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        order = db.save_live_sim_order(
+            {
+                "order_intent_id": "cancel-missing-broker",
+                "trade_date": "2026-05-30",
+                "code": "005930",
+                "account_id_masked": "12******90",
+                "candidate_instance_id": "ci-1",
+                "side": "buy",
+                "order_status": "ACCEPTED",
+                "requested_qty": 3,
+                "requested_price": 70000,
+                "submitted_qty": 3,
+                "submitted_price": 70000,
+                "updated_at": "2026-05-30T09:00:00",
+            }
+        )
+    finally:
+        db.close()
+
+    result = service.enqueue_live_sim_cancel_order(
+        order,
+        cancel_qty=3,
+        cancel_reason="unfilled_buy",
+        execution_config=_live_sim_execution(),
+        lifecycle_config=_lifecycle(),
+    )
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        updated = db.get_live_sim_order("cancel-missing-broker")
+        report = LiveSimLifecycleAuditor(db, gateway_state=gateway_state).build_report(trade_date="2026-05-30")
+    finally:
+        db.close()
+
+    assert result.accepted is False
+    assert result.status == "RECONCILE_REQUIRED"
+    assert updated["order_status"] == "RECONCILE_REQUIRED"
+    assert report["summary"]["broker_order_id_missing_count"] >= 1
+    assert any(issue["issue_type"] in {"BROKER_ORDER_ID_MISSING", "LIVE_SIM_CANCEL_RECONCILE_REQUIRED"} for issue in report["issues"])
+
+
+def test_live_sim_audit_flags_stale_cancel_requested(tmp_path):
+    settings = _settings(tmp_path)
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        db.save_live_sim_order(
+            {
+                "order_intent_id": "stale-cancel-order",
+                "trade_date": "2026-05-30",
+                "code": "005930",
+                "account_id_masked": "12******90",
+                "candidate_instance_id": "ci-1",
+                "side": "buy",
+                "order_status": "CANCEL_REQUESTED",
+                "broker_order_id": "A0001",
+                "requested_qty": 3,
+                "submitted_qty": 3,
+                "updated_at": "2026-05-30T09:00:00",
+            }
+        )
+        db.save_live_sim_cancel_order(
+            {
+                "cancel_intent_id": "cancel-stale-1",
+                "original_order_id": "stale-cancel-order",
+                "broker_order_id": "A0001",
+                "trade_date": "2026-05-30",
+                "code": "005930",
+                "side": "buy",
+                "cancel_qty": 3,
+                "cancel_reason": "unfilled_buy",
+                "status": "SUBMITTED",
+                "submitted_at": "2026-05-30T09:00:00",
+                "created_at": "2026-05-30T09:00:00",
+                "updated_at": "2026-05-30T09:00:00",
+            }
+        )
+        report = LiveSimLifecycleAuditor(db).build_report(
+            trade_date="2026-05-30",
+            now="2026-05-30T09:10:00",
+        )
+    finally:
+        db.close()
+
+    assert report["summary"]["cancel_requested_stale_count"] >= 1
+    assert any(issue["issue_type"] == "CANCEL_REQUESTED_STALE" for issue in report["cancel_issues"])
+
+
+def test_live_sim_position_qty_mismatch_marks_reconcile_required(tmp_path):
+    settings = _settings(tmp_path)
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        db.save_live_sim_order(
+            {
+                "order_intent_id": "mismatch-buy",
+                "trade_date": "2026-05-30",
+                "code": "005930",
+                "account_id_masked": "12******90",
+                "candidate_instance_id": "ci-1",
+                "side": "buy",
+                "order_status": "FILLED",
+                "broker_order_id": "A0001",
+                "requested_qty": 5,
+                "submitted_qty": 5,
+                "updated_at": "2026-05-30T09:00:00",
+            }
+        )
+        db.save_live_sim_fill_event(
+            {
+                "order_intent_id": "mismatch-buy",
+                "broker_order_id": "A0001",
+                "fill_id": "fill-5",
+                "code": "005930",
+                "side": "buy",
+                "account_id_masked": "12******90",
+                "fill_qty": 5,
+                "fill_price": 70000,
+                "cumulative_fill_qty": 5,
+                "remaining_qty": 0,
+                "event_time": "2026-05-30T09:00:00",
+                "received_at": "2026-05-30T09:00:00",
+            }
+        )
+        db.save_live_sim_position(
+            {
+                "position_id": "LIVE_SIM:12******90:005930:ci-1",
+                "candidate_instance_id": "ci-1",
+                "code": "005930",
+                "account_id_masked": "12******90",
+                "opened_at": "2026-05-30T09:00:00",
+                "entry_qty": 7,
+                "entry_avg_price": 70000,
+                "current_qty": 7,
+                "stop_loss_price": 68600,
+                "take_profit_price": 73500,
+                "max_hold_exit_at": "2026-05-30T10:00:00",
+                "status": "OPEN",
+                "updated_at": "2026-05-30T09:00:00",
+            }
+        )
+        report = LiveSimLifecycleAuditor(db).build_report(trade_date="2026-05-30")
+    finally:
+        db.close()
+
+    assert report["status"] == "RECONCILE_REQUIRED"
+    assert report["summary"]["position_qty_mismatch_count"] == 1
+    assert report["position_issues"][0]["issue_type"] == "POSITION_QTY_MISMATCH"
+
+
+def test_live_sim_audit_api_and_snapshot_include_summary(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "runtime.sqlite3"
+    monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    monkeypatch.setenv("TRADING_MODE", "OBSERVE")
+    db = TradingDatabase(str(db_path))
+    try:
+        db.save_live_sim_order(
+            {
+                "order_intent_id": "api-live-sim-order",
+                "trade_date": datetime.now().date().isoformat(),
+                "code": "005930",
+                "account_id_masked": "12******90",
+                "candidate_instance_id": "ci-api",
+                "side": "buy",
+                "order_status": "UNKNOWN_SUBMIT",
+                "requested_qty": 1,
+                "submitted_qty": 1,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+    finally:
+        db.close()
+
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    with TestClient(api.app) as client:
+        audit = client.get(f"/api/runtime/live-sim/audit?trade_date={datetime.now().date().isoformat()}").json()
+        snapshot = client.get("/api/snapshot?refresh=true").json()
+
+    assert audit["summary"]["unknown_submit_count"] == 1
+    assert "live_sim_audit" in snapshot
+    assert snapshot["live_sim_audit"]["summary"]["unknown_submit_count"] == 1
+    assert snapshot["runtime"]["live_sim_audit"]["summary"]["unknown_submit_count"] == 1

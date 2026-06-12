@@ -67,6 +67,7 @@ from trading_app.intraday_outcomes import (
     config_from_settings as outcome_config_from_settings,
 )
 from trading_app.market_gate_review import MarketGateReviewAnalyzer
+from trading_app.live_sim_audit import LiveSimLifecycleAuditor
 from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.promotion_evidence import DEFAULT_PROMOTION_POLICY_ID, PromotionEvidenceAdapter
@@ -605,6 +606,10 @@ def _theme_lab_gate_reason_outcome_analyzer(db: TradingDatabase) -> ThemeLabGate
 
 def _buy_zero_rca_analyzer(db: TradingDatabase) -> BuyZeroRCAAnalyzer:
     return BuyZeroRCAAnalyzer(db)
+
+
+def _live_sim_auditor(db: TradingDatabase) -> LiveSimLifecycleAuditor:
+    return LiveSimLifecycleAuditor(db, gateway_state=gateway_state)
 
 
 def _transport_config_from_settings() -> TransportLatencyConfig:
@@ -1595,6 +1600,23 @@ def runtime_buy_zero_missed_opportunities(
     db = open_database()
     try:
         report = _buy_zero_rca_analyzer(db).missed_opportunity_report(trade_date=trade_date, limit=limit)
+        report["filters"] = {"trade_date": trade_date or "", "limit": limit}
+        return report
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/live-sim/audit")
+def runtime_live_sim_lifecycle_audit(
+    trade_date: Optional[str] = None,
+    limit: int = Query(1000, ge=1, le=5000),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _live_sim_auditor(db).build_report(
+            trade_date=trade_date or datetime.now().date().isoformat(),
+            limit=limit,
+        )
         report["filters"] = {"trade_date": trade_date or "", "limit": limit}
         return report
     finally:
@@ -6591,14 +6613,16 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "items": db.list_runtime_order_intents(limit=12) if full_detail else [],
         "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=12) if full_detail else [],
     }
-    decision_summary_payload = db.strategy_decision_summary(trade_date=datetime.now().date().isoformat())
-    outcome_summary_payload = db.strategy_decision_outcome_summary(trade_date=datetime.now().date().isoformat())
+    today = datetime.now().date().isoformat()
+    decision_summary_payload = db.strategy_decision_summary(trade_date=today)
+    outcome_summary_payload = db.strategy_decision_outcome_summary(trade_date=today)
     buy_zero_rca_payload = _buy_zero_rca_analyzer(db).build_summary(
-        trade_date=datetime.now().date().isoformat(),
+        trade_date=today,
         limit=50000,
         include_missed_opportunities=False,
     )
-    shadow_summary_payload = db.shadow_strategy_summary(trade_date=datetime.now().date().isoformat())
+    live_sim_audit_payload = _live_sim_auditor(db).build_report(trade_date=today, limit=2000)
+    shadow_summary_payload = db.shadow_strategy_summary(trade_date=today)
     replay_reports = scan_replay_reports(DEFAULT_REPLAY_DB_ROOT, limit=1)
     replay_runs = scan_replay_runs(DEFAULT_REPLAY_DB_ROOT, limit=5)
     replay_payload = {
@@ -6610,7 +6634,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "data_quality": ((replay_reports[0].get("summary") or {}).get("warnings") if replay_reports else []) or [],
         "diff_summary": (replay_reports[0].get("diff_summary") if replay_reports else {}) or {},
     }
-    change_proposal_summary_payload = db.strategy_change_proposal_summary(trade_date=datetime.now().date().isoformat())
+    change_proposal_summary_payload = db.strategy_change_proposal_summary(trade_date=today)
     change_proposal_payload = {
         "summary": change_proposal_summary_payload,
         "top_recommendations": change_proposal_summary_payload.get("top_recommendations", []),
@@ -6667,6 +6691,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["intraday_decisions"] = decision_summary_payload
     runtime_payload["intraday_outcomes"] = outcome_summary_payload
     runtime_payload["buy_zero_rca"] = buy_zero_rca_payload
+    runtime_payload["live_sim_audit"] = live_sim_audit_payload
     runtime_payload["shadow_strategies"] = shadow_summary_payload
     runtime_payload["strategy_replay"] = replay_payload
     runtime_payload["change_proposals"] = change_proposal_payload
@@ -6702,6 +6727,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "intraday_decisions": decision_summary_payload,
         "intraday_outcomes": outcome_summary_payload,
         "buy_zero_rca": buy_zero_rca_payload,
+        "live_sim_audit": live_sim_audit_payload,
         "shadow_strategies": shadow_summary_payload,
         "strategy_replay": replay_payload,
         "change_proposals": change_proposal_payload,
@@ -7255,6 +7281,13 @@ def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
     elif event.type == "command_started":
         command_id = str(event.payload.get("command_id") or event.command_id or "")
         if command_id:
+            _append_live_sim_command_audit_event(
+                db,
+                command_id=command_id,
+                event_type="command_started",
+                status=str(event.payload.get("status") or CommandStatus.DISPATCHED.value),
+                payload=dict(event.payload or {}),
+            )
             gateway_state.ack_command(
                 command_id,
                 status=CommandStatus.DISPATCHED.value,
@@ -7347,6 +7380,14 @@ def _handle_command_ack(db: TradingDatabase, event: GatewayEvent) -> None:
             handled = gateway_state.fail_command(command_id, error, retryable=False)
         else:
             handled = gateway_state.ack_command(command_id, status=status, result_payload=payload, error=error)
+        _append_live_sim_command_audit_event(
+            db,
+            command_id=command_id,
+            event_type="command_rejected" if status in {CommandStatus.REJECTED.value, CommandStatus.FAILED.value} else "command_acked",
+            status=status,
+            payload=payload,
+            message=error or str(payload.get("message") or ""),
+        )
         trace = trace_from_payload(payload)
         if trace.get("transport_mode") == TRANSPORT_MODE_WEBSOCKET_REAL_PILOT:
             if existing_record is None and not handled:
@@ -7371,6 +7412,88 @@ def _handle_command_ack(db: TradingDatabase, event: GatewayEvent) -> None:
     order_result = payload.get("order_result")
     if command_type == "send_order" and isinstance(order_result, dict):
         db.save_order_result(BrokerOrderResult.from_dict(order_result))
+
+
+def _append_live_sim_command_audit_event(
+    db: TradingDatabase,
+    *,
+    command_id: str,
+    event_type: str,
+    status: str,
+    payload: dict[str, Any],
+    message: str = "",
+) -> None:
+    record = gateway_state.get_command(command_id)
+    record_payload: dict[str, Any] = {}
+    record_command_type = ""
+    if record is not None:
+        record_data = record.to_dict()
+        record_command = dict(record_data.get("command") or {})
+        record_payload = dict(record_command.get("payload") or {})
+        record_command_type = str(record_data.get("command_type") or record_command.get("type") or "")
+    command_type = str(payload.get("command_type") or record_command_type or "")
+    if command_type not in {"send_order", "cancel_order"}:
+        return
+    merged_payload = {**record_payload, **dict(payload or {})}
+    if str(merged_payload.get("order_mode") or "") != "LIVE_SIM" and str((record or {}).metadata.get("runtime") if record else "") != "LIVE_SIM":
+        return
+    order = None
+    if command_type == "send_order":
+        order = db.find_live_sim_order_by_command_id(command_id)
+    elif command_type == "cancel_order":
+        original_order_id = str(merged_payload.get("original_order_id") or "")
+        order = db.get_live_sim_order(original_order_id) if original_order_id else None
+    if order is None:
+        return
+    now = str(payload.get("timestamp") or payload.get("received_at") or "")
+    status_from = str(order.get("order_status") or "")
+    status_to = status_from
+    reason = message or str(payload.get("message") or status or event_type)
+    if command_type == "send_order" and status in {CommandStatus.REJECTED.value, CommandStatus.FAILED.value}:
+        status_to = "REJECTED" if status == CommandStatus.REJECTED.value else "FAILED"
+        codes = _append_reason_codes(order.get("reason_codes") or [], ["LIVE_SIM_COMMAND_REJECTED", status_to])
+        order = db.update_live_sim_order(
+            str(order.get("order_intent_id") or ""),
+            {
+                "order_status": status_to,
+                "rejected_at": now,
+                "updated_at": now,
+                "reason_codes": codes,
+                "details": {
+                    **dict(order.get("details") or {}),
+                    "command_audit": {
+                        "command_id": command_id,
+                        "command_type": command_type,
+                        "command_status": status,
+                        "message": reason,
+                        "payload": merged_payload,
+                    },
+                },
+            },
+        ) or order
+    db.append_live_sim_order_event(
+        str(order.get("order_intent_id") or ""),
+        event_type,
+        status_from=status_from,
+        status_to=status_to,
+        message=reason,
+        payload={
+            "command_id": command_id,
+            "command_type": command_type,
+            "command_status": status,
+            "command_payload": merged_payload,
+        },
+        created_at=now,
+    )
+
+
+def _append_reason_codes(existing: list[Any], additions: list[str]) -> list[str]:
+    merged: list[str] = []
+    for item in [*list(existing or []), *additions]:
+        text = str(item or "")
+        if text and text not in merged:
+            merged.append(text)
+    return merged
 
 
 def _runtime_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
