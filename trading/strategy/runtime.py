@@ -1612,9 +1612,9 @@ class StrategyRuntime:
             snapshot.warnings.append("THEME_LAB_FLOW_NOT_WIRED")
             return 0
         target_codes = set(self.theme_lab_pipeline.watchset_codes())
-        bootstrap_codes: set[str] = set()
-        if not target_codes:
-            bootstrap_codes = set(self._theme_lab_bootstrap_codes(candidates or [], snapshot))
+        bootstrap_codes = set(
+            self._theme_lab_bootstrap_codes(candidates or [], snapshot, excluded_codes=target_codes)
+        )
         for code, record in list(self.subscription_manager.records.items()):
             if THEME_LAB_WATCHSET_SOURCE in record.sources and code not in target_codes:
                 self.subscription_manager.remove_subscription(code, THEME_LAB_WATCHSET_SOURCE)
@@ -1627,10 +1627,9 @@ class StrategyRuntime:
         self._sync_theme_lab_outcome_tracking_subscriptions(snapshot)
         if target_codes:
             snapshot.warnings.append(f"THEME_LAB_WATCHSET_SUBSCRIPTIONS={len(target_codes)}")
-            return len(target_codes)
         if bootstrap_codes:
             snapshot.warnings.append(f"THEME_LAB_BOOTSTRAP_SUBSCRIPTIONS={len(bootstrap_codes)}")
-        return len(bootstrap_codes)
+        return len(target_codes | bootstrap_codes)
 
     def _sync_theme_lab_outcome_tracking_subscriptions(self, snapshot: StrategyRuntimeSnapshot) -> int:
         ttl_sec = max(0, _env_int("TRADING_THEME_LAB_OUTCOME_TRACKING_TTL_SEC", THEME_LAB_OUTCOME_TRACKING_DEFAULT_TTL_SEC))
@@ -1734,22 +1733,34 @@ class StrategyRuntime:
                 codes.add(code)
         return codes
 
-    def _theme_lab_bootstrap_codes(self, candidates: list[Candidate], snapshot: StrategyRuntimeSnapshot) -> list[str]:
-        limit = self._theme_lab_bootstrap_subscription_limit(snapshot)
+    def _theme_lab_bootstrap_codes(
+        self,
+        candidates: list[Candidate],
+        snapshot: StrategyRuntimeSnapshot,
+        *,
+        excluded_codes: set[str] | None = None,
+    ) -> list[str]:
+        excluded = {normalize_code(code) for code in (excluded_codes or set()) if normalize_code(code)}
+        limit = self._theme_lab_bootstrap_subscription_limit(snapshot, reserved_codes=excluded)
         if limit <= 0:
             return []
         codes: list[str] = []
-        for candidate in candidates:
+        for candidate in sorted(candidates, key=_theme_lab_bootstrap_candidate_sort_key):
             if len(codes) >= limit:
                 break
             if not _candidate_watchable(candidate):
                 continue
             code = normalize_code(candidate.code)
-            if code and code not in codes:
+            if code and code not in excluded and code not in codes:
                 codes.append(code)
         return codes
 
-    def _theme_lab_bootstrap_subscription_limit(self, snapshot: StrategyRuntimeSnapshot) -> int:
+    def _theme_lab_bootstrap_subscription_limit(
+        self,
+        snapshot: StrategyRuntimeSnapshot,
+        *,
+        reserved_codes: set[str] | None = None,
+    ) -> int:
         protected_codes = {
             normalize_code(code)
             for code in (
@@ -1762,7 +1773,15 @@ class StrategyRuntime:
             if normalize_code(code)
         }
         protected_codes.update(record.code for record in self.subscription_manager.records.values() if record.protected)
-        available = max(0, int(self.config.realtime_subscription_limit or 0) - len(protected_codes))
+        reserved_regular_codes = {
+            normalize_code(code)
+            for code in (reserved_codes or set())
+            if normalize_code(code) and normalize_code(code) not in protected_codes
+        }
+        available = max(
+            0,
+            int(self.config.realtime_subscription_limit or 0) - len(protected_codes) - len(reserved_regular_codes),
+        )
         return max(0, min(int(self.config.max_candidates_to_watch or 0), available))
 
     def _theme_lab_flow_active(self) -> bool:
@@ -3509,6 +3528,36 @@ def _candidate_entry_excluded(candidate: Candidate) -> bool:
     if "theme_broad_candidate" in purposes:
         return True
     return candidate.strategy_profile == StrategyProfile.THEME_DISCOVERY_PROFILE
+
+
+def _theme_lab_bootstrap_candidate_sort_key(candidate: Candidate) -> tuple[int, int, float, str]:
+    return (
+        -_theme_lab_candidate_condition_level(candidate),
+        _candidate_state_priority(candidate.state),
+        _last_seen_desc_value(candidate),
+        normalize_code(candidate.code),
+    )
+
+
+def _theme_lab_candidate_condition_level(candidate: Candidate) -> int:
+    metadata = dict(candidate.metadata or {})
+    purposes = dict(metadata.get("condition_purposes", {}) or {})
+    names = [str(name or "") for name in (candidate.condition_names or [])]
+    signals = [str(value or "") for value in purposes.values()]
+    signals.extend(str(purposes.get(name) or "") for name in names)
+    signals.extend(names)
+    level = 0
+    for value in signals:
+        text = value.strip().lower()
+        if not text:
+            continue
+        if "theme_lab_leader" in text or "leader" in text or text.endswith("_5"):
+            level = max(level, 3)
+        elif "theme_lab_strong" in text or "strong" in text or text.endswith("_3"):
+            level = max(level, 2)
+        elif "theme_lab_alive" in text or "alive" in text or text.endswith("_-1"):
+            level = max(level, 1)
+    return level
 
 
 def _candidate_state_priority(state: CandidateState) -> int:

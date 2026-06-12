@@ -11,7 +11,12 @@ from trading.strategy.market_data import StrategyTick
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import IndexTick, MarketIndexStore
 from trading.strategy.models import Candidate, CandidateState, OrderMode
-from trading.strategy.runtime import StrategyRuntimeConfig, StrategyRuntimeSnapshot
+from trading.strategy.runtime import (
+    THEME_LAB_BOOTSTRAP_SOURCE,
+    THEME_LAB_WATCHSET_SOURCE,
+    StrategyRuntimeConfig,
+    StrategyRuntimeSnapshot,
+)
 from trading.strategy.runtime_settings import LEGACY_DEFAULT_SETTINGS, legacy_profile_payload
 from trading.theme_engine.lab import (
     ConditionHitSnapshot,
@@ -334,6 +339,125 @@ def test_theme_lab_empty_watchset_bootstraps_candidate_realtime_subscriptions(tm
         record = runtime.subscription_manager.records[code]
         assert "theme_lab_bootstrap" in record.sources
         assert "candidate_watch" not in record.sources
+    db.close()
+
+
+def test_theme_lab_nonempty_watchset_still_bootstraps_exploration_candidates(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    client = MockKiwoomClient()
+    runtime = build_observe_runtime(client, db)
+    now = datetime(2026, 6, 1, 9, 1, 0)
+    runtime._last_runtime_time = now
+    runtime.theme_lab_pipeline.last_run_at = now
+    runtime.theme_lab_pipeline.last_result = ThemeLabFlowResult(
+        market=MarketStrengthSnapshot(MarketStatus.CHOPPY),
+        themes=(),
+        watchset=(
+            WatchSetSnapshot(
+                calculated_at=now.isoformat(),
+                symbol="000001",
+                name="watchset-leader",
+                condition_level=3,
+            ),
+        ),
+        gate_decisions=(),
+        data_quality={},
+    )
+    candidates = [
+        Candidate(
+            trade_date="2026-06-01",
+            code="000001",
+            state=CandidateState.DETECTED,
+            detected_at=now.isoformat(),
+            last_seen_at=now.isoformat(),
+            expires_at=(now + timedelta(minutes=30)).isoformat(),
+            condition_names=["leader"],
+            metadata={"condition_purposes": {"leader": "theme_lab_leader"}},
+        ),
+        Candidate(
+            trade_date="2026-06-01",
+            code="000002",
+            state=CandidateState.DETECTED,
+            detected_at=now.isoformat(),
+            last_seen_at=(now + timedelta(seconds=2)).isoformat(),
+            expires_at=(now + timedelta(minutes=30)).isoformat(),
+            condition_names=["strong"],
+            metadata={"condition_purposes": {"strong": "theme_lab_strong"}},
+        ),
+        Candidate(
+            trade_date="2026-06-01",
+            code="000003",
+            state=CandidateState.DETECTED,
+            detected_at=now.isoformat(),
+            last_seen_at=(now + timedelta(seconds=1)).isoformat(),
+            expires_at=(now + timedelta(minutes=30)).isoformat(),
+            condition_names=["alive"],
+            metadata={"condition_purposes": {"alive": "theme_lab_alive"}},
+        ),
+    ]
+
+    snapshot = StrategyRuntimeSnapshot(cycle_at=now.isoformat())
+    selected_count = runtime._sync_theme_lab_watchset_subscriptions(snapshot, candidates)
+    runtime.subscription_manager.sync()
+
+    assert selected_count == 3
+    assert {"000001", "000002", "000003"} <= set(client.registered_codes)
+    assert THEME_LAB_WATCHSET_SOURCE in runtime.subscription_manager.records["000001"].sources
+    assert THEME_LAB_BOOTSTRAP_SOURCE not in runtime.subscription_manager.records["000001"].sources
+    for code in ("000002", "000003"):
+        assert THEME_LAB_BOOTSTRAP_SOURCE in runtime.subscription_manager.records[code].sources
+        assert THEME_LAB_WATCHSET_SOURCE not in runtime.subscription_manager.records[code].sources
+    assert "THEME_LAB_WATCHSET_SUBSCRIPTIONS=1" in snapshot.warnings
+    assert "THEME_LAB_BOOTSTRAP_SUBSCRIPTIONS=2" in snapshot.warnings
+    db.close()
+
+
+def test_theme_lab_bootstrap_reserves_capacity_for_nonprotected_watchset(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    client = MockKiwoomClient()
+    runtime = build_observe_runtime(client, db)
+    runtime.config.realtime_subscription_limit = 7
+    runtime.config.max_candidates_to_watch = 10
+    now = datetime(2026, 6, 1, 9, 1, 0)
+    runtime._last_runtime_time = now
+    runtime.theme_lab_pipeline.last_run_at = now
+    runtime.theme_lab_pipeline.last_result = ThemeLabFlowResult(
+        market=MarketStrengthSnapshot(MarketStatus.CHOPPY),
+        themes=(),
+        watchset=(
+            WatchSetSnapshot(
+                calculated_at=now.isoformat(),
+                symbol="000001",
+                name="watchset-leader",
+                condition_level=3,
+            ),
+        ),
+        gate_decisions=(),
+        data_quality={},
+    )
+    candidates = [
+        Candidate(
+            trade_date="2026-06-01",
+            code=code,
+            state=CandidateState.DETECTED,
+            detected_at=now.isoformat(),
+            last_seen_at=(now + timedelta(seconds=offset)).isoformat(),
+            expires_at=(now + timedelta(minutes=30)).isoformat(),
+            condition_names=["leader"],
+            metadata={"condition_purposes": {"leader": "theme_lab_leader"}},
+        )
+        for offset, code in enumerate(("000002", "000003", "000004", "000005"))
+    ]
+
+    snapshot = StrategyRuntimeSnapshot(cycle_at=now.isoformat())
+    selected_count = runtime._sync_theme_lab_watchset_subscriptions(snapshot, candidates)
+
+    assert selected_count == 3
+    assert "THEME_LAB_BOOTSTRAP_SUBSCRIPTIONS=2" in snapshot.warnings
+    assert THEME_LAB_BOOTSTRAP_SOURCE in runtime.subscription_manager.records["000004"].sources
+    assert THEME_LAB_BOOTSTRAP_SOURCE in runtime.subscription_manager.records["000005"].sources
+    assert "000002" not in runtime.subscription_manager.records
+    assert "000003" not in runtime.subscription_manager.records
     db.close()
 
 
