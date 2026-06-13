@@ -30,6 +30,24 @@ def test_themelab_page_is_standalone_dark_terminal():
     soup = BeautifulSoup(html, "html.parser")
 
     assert soup.select_one(".terminal-shell") is not None
+    assert soup.select_one("#operator-main-action") is not None
+    assert soup.select_one("#operator-main-action-message") is not None
+    assert soup.select_one("#themelab-tab-nav") is not None
+    assert soup.select_one("#tab-main") is not None
+    assert "active" in soup.select_one("#tab-main").get("class", [])
+    assert soup.select_one("#tab-themes") is not None
+    assert soup.select_one("#tab-candidates") is not None
+    assert soup.select_one("#tab-no-buy") is not None
+    assert soup.select_one("#tab-orders-risk") is not None
+    assert soup.select_one("#tab-reports") is not None
+    assert soup.select_one("#tab-developer") is not None
+    assert soup.select_one("#tab-developer").has_attr("hidden")
+    assert soup.select_one("#operator-operating-status") is not None
+    assert soup.select_one("#operator-top-themes") is not None
+    assert soup.select_one("#operator-buy-candidates") is not None
+    assert soup.select_one("#operator-no-buy-reasons") is not None
+    assert soup.select_one("#operator-risk-status") is not None
+    assert soup.select_one('[data-tab-target="tab-main"].active') is not None
     assert soup.select_one("#operating-cockpit") is not None
     assert soup.select_one("#operation-status") is not None
     assert soup.select_one("#naver-theme-sync") is not None
@@ -74,6 +92,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#cockpit-market-sides") is not None
     assert soup.select_one("#cockpit-live-readiness") is not None
     assert soup.select_one("#themelab-buy-zero-rca-card") is not None
+    assert soup.select_one('#themelab-buy-zero-rca-card[data-operator-tab="no-buy"]') is not None
     assert soup.select_one("#themelab-buy-zero-rca-status") is not None
     assert soup.select_one("#themelab-buy-zero-stage-funnel") is not None
     assert soup.select_one("#themelab-buy-zero-ready-table-body") is not None
@@ -81,6 +100,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#themelab-buy-zero-rca-timeline") is not None
     assert soup.select_one("#themelab-buy-zero-rca-refresh") is not None
     assert soup.select_one("#themelab-live-sim-audit-card") is not None
+    assert soup.select_one('#themelab-live-sim-audit-card[data-operator-tab="orders-risk"]') is not None
     assert soup.select_one("#themelab-live-sim-audit-status") is not None
     assert soup.select_one("#themelab-live-sim-audit-open-orders") is not None
     assert soup.select_one("#themelab-live-sim-audit-top-actions") is not None
@@ -140,7 +160,15 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#watchset-body") is not None
     assert soup.select_one("#order-candidates") is not None
     assert soup.select_one("#themelab-shadow-small-entry-ops-card") is not None
+    assert soup.select_one('#themelab-shadow-small-entry-ops-card[data-operator-tab="orders-risk"]') is not None
     assert soup.select_one("#themelab-shadow-small-entry-ops-status") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-status").get_text(strip=True) == "관측 전용"
+    assert soup.select_one("#themelab-shadow-small-entry-ops-preflight").get_text(strip=True) == "사전 점검"
+    assert soup.select_one("#themelab-shadow-small-entry-ops-arm").get_text(strip=True) == "LIVE_SIM 준비"
+    assert soup.select_one("#themelab-shadow-small-entry-ops-confirm").get_text(strip=True) == "최종 확인"
+    assert soup.select_one("#themelab-shadow-small-entry-ops-pause").get_text(strip=True) == "일시 중단"
+    assert soup.select_one("#themelab-shadow-small-entry-ops-rollback").get_text(strip=True) == "관측 전용 복귀"
+    assert soup.select_one("#themelab-shadow-small-entry-ops-emergency-pause").get_text(strip=True) == "긴급 중단"
     assert soup.select_one("#themelab-shadow-small-entry-ops-mode") is not None
     assert soup.select_one("#themelab-shadow-small-entry-ops-preflight-status") is not None
     assert soup.select_one("#themelab-shadow-small-entry-ops-blocking-reasons") is not None
@@ -150,12 +178,19 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#themelab-shadow-small-entry-ops-rollback") is not None
     assert soup.select_one("#themelab-shadow-small-entry-pilot-card") is not None
     assert soup.select_one("#themelab-shadow-small-entry-pilot-status") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-status").get_text(strip=True) == "데이터 없음"
     assert soup.select_one("#themelab-shadow-small-entry-pilot-message") is not None
     assert soup.select_one("#themelab-shadow-small-entry-pilot-candidate-count") is not None
     assert soup.select_one("#themelab-shadow-small-entry-pilot-safety-lines") is not None
     assert soup.select_one("#themelab-shadow-small-entry-pilot-start") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-start").get_text(strip=True) == "파일럿 시작"
     assert soup.select_one("#themelab-shadow-small-entry-pilot-complete") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-complete").get_text(strip=True) == "리포트 마감"
     assert soup.select_one("#themelab-shadow-small-entry-pilot-generate-report") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-generate-report").get_text(strip=True) == "리포트 생성"
+    assert "권고" in html
+    assert "누적 손익" in html
+    assert "최대유리 / 최대불리" in html
     assert soup.select_one('[data-filter-value="LIVE_GUARD_BLOCKED"]') is not None
     assert soup.select_one('[data-filter-value="MISSING_VWAP"]') is not None
     assert soup.select_one('[data-filter-value="ORDER_INTENT_CREATED"]') is not None
@@ -170,6 +205,40 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "cockpit-grid" in css
     assert "/ws/dashboard" in js
     assert "/api/themelab/snapshot" in js
+    assert "function renderOperatorMain" in js
+    assert "function renderMainAction" in js
+    assert "function renderTopThemes" in js
+    assert "function renderBuyCandidates" in js
+    assert "function renderNoBuyReasons" in js
+    assert "function renderRiskStatus" in js
+    assert "function renderTabThemes" in js
+    assert "function renderTabCandidates" in js
+    assert "function renderTabNoBuy" in js
+    assert "function renderTabOrdersRisk" in js
+    assert "function renderTabReports" in js
+    assert "function renderDeveloperDetails" in js
+    assert "function translateReasonCode" in js
+    assert "function operatorMessageForReason" in js
+    assert "function shadowSmallEntryOpsStatusLabel" in js
+    assert "function shadowSmallEntryPreflightLabel" in js
+    assert "데이터 부족" in js
+    assert "뒤늦은 추격 위험" in js
+    assert "모의투자 주문 차단" in js
+    assert "게이트웨이 미연결" in js
+    assert "게이트웨이 응답 지연" in js
+    assert "키움 미로그인" in js
+    assert "키움 주문 불가" in js
+    assert "승격 근거 부족" in js
+    assert "translateReasonCode(reason)" in js
+    assert "themelab-tab-nav" in css
+    assert "operator-main-grid" in css
+    assert "status-ready" in css
+    assert "status-wait" in css
+    assert "status-observe" in css
+    assert "status-blocked" in css
+    assert "status-danger" in css
+    assert "status-muted" in css
+    assert '[data-operator-tab]' in css
     assert "isFullThemeLabSnapshot" in js
     assert "snapshot.theme_lab && isFullThemeLabSnapshot(snapshot.theme_lab)" in js
     assert "/api/gateway/kiwoom/start" in js
@@ -187,6 +256,16 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "renderShadowSmallEntryOpsPanel" in js
     assert "renderShadowSmallEntryPilotPanel" in js
     assert "shadowSmallEntryPilotAction" in js
+    assert "function shadowSmallEntryPilotStatusLabel" in js
+    assert "function shadowSmallEntryPilotRecommendationLabel" in js
+    assert "function shadowSmallEntryPilotReasonTerm" in js
+    assert "function shadowSmallEntryPilotCheckStatus" in js
+    assert "관측 전용 지속" in js
+    assert "가드 유지 LIVE_SIM 지속" in js
+    assert "LIVE_SIM 감사 실패" in js
+    assert "체결 표본 부족" in js
+    assert "실전 주문 비활성" in js
+    assert "미검증" in js
     assert "shadow_small_entry_ops" in js
     assert "shadow_small_entry_pilot" in js
     assert "/api/shadow-small-entry-ops/arm" in js
@@ -760,6 +839,53 @@ def test_theme_lab_snapshot_summary_counts_operating_cockpit_fields(tmp_path):
     assert payload["market"]["sides"][1]["breadth_trust_level"] == "MEDIUM"
 
 
+def test_theme_lab_snapshot_includes_operator_view_with_korean_reason_labels(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        live_blocked = _watch("000301", "READY", role="LEADER")
+        live_blocked.update({"live_order_enabled": True, "live_order_guard_passed": False})
+        late_chase = _watch("000302", "WAIT", role="FOLLOWER")
+        late_chase.update({"late_chase_level": "soft_block", "late_chase_recheck_after_sec": 45})
+        data_wait = _watch("000303", "WAIT")
+        data_wait.update(
+            {
+                "support_ready_reason": "WAIT_DATA_SUPPORT_NOT_READY",
+                "diagnostic_only": True,
+                "price_location_data_quality_flags": ["MISSING_VWAP"],
+            }
+        )
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:10:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [live_blocked, late_chase, data_wait],
+                "gate_decisions": [],
+                "data_quality": {"status": "DEGRADED", "candle_missing_count": 1, "vwap_missing_count": 1},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    view = payload["operator_view"]
+    assert view["main_action"]["message_ko"]
+    assert view["main_action"]["label_ko"] in {"데이터 준비중", "모의투자 주문 차단", "후보 있음, 주문 차단"}
+    assert len(view["top_themes"]) == 1
+    assert view["top_themes"][0]["theme_name"] == "전력기기"
+    assert view["buy_candidates"][0]["status_label_ko"] == "매수 가능"
+    assert view["buy_candidates"][0]["order_permission_label_ko"] == "차단"
+    labels = {item["label_ko"] for item in view["no_buy_reasons"]}
+    assert "데이터 부족" in labels
+    assert "뒤늦은 추격 위험" in labels
+    assert "모의투자 주문 차단" in labels
+    assert any(item["title_ko"] == "LIVE_SIM audit" for item in view["risk_status"])
+    assert view["panels"]["buy_zero_rca"]["visible_in_main"] is False
+    assert view["panels"]["live_sim_audit"]["tab"] == "orders-risk"
+    assert view["panels"]["developer_details"]["visible_in_main"] is False
+
+
 def test_theme_lab_snapshot_operation_status_for_ready_live_blocked_and_data_quality(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     try:
@@ -1326,7 +1452,10 @@ def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, 
 
     assert page.status_code == 200
     assert direct["summary"]["ready_count"] == 1
+    assert direct["operator_view"]["main_action"]["message_ko"]
+    assert direct["operator_view"]["buy_candidates"][0]["status_label_ko"] == "매수 가능"
     assert snapshot["theme_lab"]["summary"]["ready_count"] == 1
+    assert snapshot["theme_lab"]["operator_view"]["main_action"]["message_ko"]
 
 
 def test_theme_lab_snapshot_exposes_naver_sync_status(tmp_path):

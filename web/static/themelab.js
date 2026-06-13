@@ -147,6 +147,51 @@ const displayStatusDescriptions = {
   WAIT_DATA_LATEST_TICK_STALE: "틱 데이터 갱신 대기",
 };
 
+const operatorReasonTerms = {
+  READY: ["매수 가능", "가능", "positive", "매수 게이트를 통과한 후보입니다.", "후보 목록과 주문 안전 상태를 확인하세요."],
+  READY_SMALL: ["소액 매수 가능", "소액", "positive", "정상 비중보다 작은 관찰성 진입 후보입니다.", "소액 진입 조건과 당일 한도를 확인하세요."],
+  EARLY_SMALL: ["장초반 소액 후보", "초반소액", "neutral", "장초반 데이터가 완성되기 전 제한적으로 관찰하는 소액 후보입니다.", "분봉/VWAP/지지선 준비 상태를 확인하세요."],
+  WAIT: ["대기", "대기", "neutral", "조건 확인이 더 필요해 즉시 매수하지 않습니다.", "재확인 조건과 대기 사유를 확인하세요."],
+  OBSERVE: ["관측", "관측", "neutral", "주문보다 관찰이 우선인 후보입니다.", "테마와 가격 위치 변화를 지켜보세요."],
+  BLOCKED: ["차단", "차단", "danger", "리스크 또는 안전 조건 때문에 신규 진입을 막고 있습니다.", "차단 사유와 주문/리스크 상태를 확인하세요."],
+  DATA_INSUFFICIENT: ["데이터 부족", "데이터", "warning", "현재 판단에 필요한 실시간 가격/지표가 충분하지 않습니다.", "실시간 수신, 분봉 캐시, VWAP/지지선 상태를 확인하세요."],
+  CORE_BLOCKING: ["핵심 데이터 부족", "핵심부족", "warning", "진입 판단의 핵심 데이터가 없어 보수적으로 막았습니다.", "현재가, 분봉, VWAP, 지지선 수집 상태를 먼저 확인하세요."],
+  ENTRY_BLOCKING: ["진입 판단 데이터 부족", "진입부족", "warning", "진입 위치 판단에 필요한 데이터가 부족합니다.", "가격 위치와 지지선/VWAP 준비 상태를 확인하세요."],
+  WARMUP_OPTIONAL: ["보조지표 준비중", "준비중", "neutral", "보조지표가 장초반 또는 데이터 수집 과정에서 준비 중입니다.", "추가 분봉 수집을 기다리세요."],
+  BACKFILL_ONLY_OBSERVE: ["실시간 미확인", "미확인", "neutral", "TR 보강 데이터만 있고 실시간 흐름 확인이 부족합니다.", "실시간 조건식/틱 수신 여부를 확인하세요."],
+  LATE_CHASE: ["뒤늦은 추격 위험", "추격위험", "warning", "이미 오른 뒤 따라붙는 구간이라 진입을 기다립니다.", "눌림 또는 VWAP/지지선 회복을 기다리세요."],
+  LATE_CHASE_TEMP_WAIT: ["뒤늦은 추격 위험", "추격대기", "warning", "늦은 추격 위험이 있어 잠시 뒤 재확인합니다.", "재확인 시간 이후 가격 위치를 다시 확인하세요."],
+  CHASE_HIGH: ["고점 추격 위험", "고점추격", "warning", "고점 부근 추격 매수 위험이 큽니다.", "고점 이탈 여부와 눌림 전환을 확인하세요."],
+  CHASE_RISK: ["추격 위험", "추격", "warning", "가격 위치상 추격 매수 위험이 큽니다.", "즉시 진입보다 눌림 확인을 우선하세요."],
+  CHASE_RISK_BLOCKED: ["추격 위험 차단", "추격차단", "danger", "추격 매수 위험으로 신규 진입을 차단했습니다.", "가격 위치가 안정될 때까지 기다리세요."],
+  VWAP_OVEREXTENDED: ["VWAP 대비 과열", "VWAP과열", "warning", "현재가가 VWAP 대비 과도하게 벌어져 있습니다.", "VWAP 근처 재접근 또는 눌림을 기다리세요."],
+  LOW_BREADTH: ["테마 확산 부족", "확산부족", "neutral", "테마 내 동반 강세 폭이 충분하지 않습니다.", "동반 상승 종목 수와 거래대금 확산을 확인하세요."],
+  LEADER_ONLY_THEME: ["대장주 단독 흐름", "단독흐름", "neutral", "대장주는 강하지만 테마 전체 확산이 약합니다.", "공동대장과 후발주 확산 여부를 확인하세요."],
+  RISK_OFF: ["시장 위험", "시장위험", "danger", "시장 상태가 약해 신규 진입을 보수적으로 봅니다.", "KOSPI/KOSDAQ 회복 확인을 기다리세요."],
+  WAIT_MARKET_CONFIRMATION_PENDING: ["시장 회복 확인 대기", "시장대기", "neutral", "시장 회복이 확인될 때까지 대기합니다.", "시장 폭과 지수 회복 지속 여부를 확인하세요."],
+  SUPPORT_NOT_READY: ["지지선 확인 전", "지지전", "neutral", "최근 지지선이 아직 충분히 확인되지 않았습니다.", "지지선 수집과 가격 재확인을 기다리세요."],
+  VWAP_RECLAIM: ["VWAP 회복", "VWAP회복", "positive", "가격이 VWAP 위로 회복했습니다.", "다른 리스크 조건과 주문 가능 여부를 함께 확인하세요."],
+  GOOD_PULLBACK: ["좋은 눌림", "눌림", "positive", "과열을 피한 눌림 구간으로 판단됩니다.", "테마 강도와 주문 안전 상태를 확인하세요."],
+  PULLBACK_RECLAIM: ["눌림 후 회복", "회복", "positive", "눌림 이후 가격이 다시 회복하는 흐름입니다.", "회복이 유지되는지 확인하세요."],
+  LIVE_SIM_BLOCKED: ["모의투자 주문 차단", "모의차단", "danger", "LIVE_SIM 주문 안전장치가 신규 주문을 막고 있습니다.", "LIVE_SIM audit, reconcile, 주문번호 상태를 확인하세요."],
+  RECONCILE_REQUIRED: ["주문/잔고 재확인 필요", "재확인", "danger", "주문 또는 잔고 상태를 다시 맞춰야 합니다.", "미체결, 체결, 포지션 원장을 대조하세요."],
+  UNKNOWN_SUBMIT: ["주문 결과 확인 필요", "결과확인", "danger", "주문 제출 결과가 명확하지 않습니다.", "주문번호와 broker 응답을 확인하세요."],
+  ORDER_SINK_NOOP: ["주문 경로 비활성", "경로비활성", "neutral", "주문 sink가 실제 제출하지 않는 모드입니다.", "운영 모드가 관측 전용인지 확인하세요."],
+  ENTRY_PLAN_DIAGNOSTIC_ONLY: ["진단 전용 후보", "진단전용", "neutral", "주문 후보가 아니라 진단과 관찰을 위한 후보입니다.", "주문이 나가지 않는 것이 정상인지 확인하세요."],
+  GATEWAY_DISCONNECTED: ["게이트웨이 미연결", "미연결", "danger", "32bit Kiwoom Gateway가 Core와 연결되어 있지 않습니다.", "게이트웨이 실행 상태와 네트워크 연결을 확인하세요."],
+  GATEWAY_HEARTBEAT_BAD: ["게이트웨이 응답 지연", "응답지연", "danger", "게이트웨이 heartbeat가 정상으로 들어오지 않습니다.", "게이트웨이 프로세스가 멈췄는지 확인하고 재연결 상태를 보세요."],
+  KIWOOM_NOT_LOGGED_IN: ["키움 미로그인", "미로그인", "danger", "Kiwoom OpenAPI 로그인이 확인되지 않았습니다.", "키움 로그인 창과 계정 접속 상태를 확인하세요."],
+  KIWOOM_NOT_ORDERABLE: ["키움 주문 불가", "주문불가", "danger", "키움 연결은 있어도 주문 가능 상태가 아닙니다.", "계좌/모의투자 접속, 주문 가능 플래그, 장 상태를 확인하세요."],
+  SHADOW_PROMOTION_EVIDENCE_NOT_READY: ["승격 근거 부족", "근거부족", "warning", "Shadow Small Entry를 LIVE_SIM으로 올릴 충분한 승격 근거가 아직 없습니다.", "리포트 탭에서 승격 후보와 outcome 근거가 쌓였는지 확인하세요."],
+  READY_TO_TRADE: ["매수 가능", "가능", "positive", "매수 가능 후보와 주문 안전 상태가 확인되었습니다.", "후보 목록과 주문 상태를 확인하세요."],
+  WAIT_DATA_QUALITY: ["데이터 준비중", "데이터", "warning", "분봉/VWAP/지지선 등 판단 데이터가 준비 중입니다.", "실시간 데이터 수집 상태를 확인하세요."],
+  NO_SIGNAL: ["매수 후보 없음", "없음", "neutral", "현재 주문 후보가 없습니다.", "안 산 이유 탭에서 큰 사유를 확인하세요."],
+  OK: ["정상", "정상", "positive", "확인된 문제가 없습니다.", "특별 조치가 필요하지 않습니다."],
+  WARNING: ["확인 필요", "확인", "warning", "일부 상태 확인이 필요합니다.", "상세 탭에서 원인을 확인하세요."],
+  ERROR: ["문제 있음", "문제", "danger", "운영자가 확인해야 할 문제가 있습니다.", "상세 로그와 audit 상태를 확인하세요."],
+  NO_DATA: ["데이터 없음", "없음", "muted", "아직 표시할 데이터가 없습니다.", "데이터가 쌓일 때까지 기다리세요."],
+};
+
 const operatorStorageKeys = {
   acknowledged: "themeLabOperatorAcknowledgedEventIds",
   alertFilter: "themeLabOperatorAlertFilter",
@@ -259,6 +304,57 @@ function setBadge(id, value) {
 function badge(value, tone = "") {
   const label = String(value || "UNKNOWN");
   return `<span class="badge ${tone || statusClass[label] || "observe"}">${escapeHtml(label)}</span>`;
+}
+
+function translateReasonCode(code) {
+  const key = String(code || "UNKNOWN").trim().toUpperCase();
+  const values = operatorReasonTerms[key];
+  if (!values) {
+    const fallback = key.replaceAll("_", " ");
+    return {
+      code: key,
+      label_ko: fallback,
+      short_label_ko: fallback,
+      severity: "muted",
+      description_ko: "상세 탭에서 원문 상태를 확인하세요.",
+      operator_action_ko: "필요하면 개발자 상세 탭에서 원문 reason_code를 확인하세요.",
+    };
+  }
+  return {
+    code: key,
+    label_ko: values[0],
+    short_label_ko: values[1],
+    severity: values[2],
+    description_ko: values[3],
+    operator_action_ko: values[4],
+  };
+}
+
+function operatorMessageForReason(code) {
+  const term = translateReasonCode(code);
+  return {
+    DATA_INSUFFICIENT: "지지선/VWAP 데이터가 아직 부족합니다.",
+    LATE_CHASE: "후보는 강하지만 추격 위험이라 기다립니다.",
+    LATE_CHASE_TEMP_WAIT: "후보는 강하지만 추격 위험이라 기다립니다.",
+    LIVE_SIM_BLOCKED: "LIVE_SIM 주문 안전장치가 차단 중입니다.",
+    RECONCILE_REQUIRED: "주문/잔고 재확인이 필요해 신규 매수를 중단합니다.",
+    UNKNOWN_SUBMIT: "주문번호 확인이 필요해 신규 매수를 중단합니다.",
+    ENTRY_PLAN_DIAGNOSTIC_ONLY: "지금은 관측 전용입니다. 주문은 나가지 않습니다.",
+  }[term.code] || term.description_ko;
+}
+
+function operatorToneClass(severity) {
+  return {
+    positive: "status-ready",
+    neutral: "status-observe",
+    warning: "status-wait",
+    danger: "status-danger",
+    muted: "status-muted",
+  }[String(severity || "").toLowerCase()] || "status-muted";
+}
+
+function operatorBadge(label, severity = "muted") {
+  return `<span class="badge ${operatorToneClass(severity)}">${escapeHtml(label || "-")}</span>`;
 }
 
 function reasonBadge(reason) {
@@ -1851,23 +1947,23 @@ function renderShadowSmallEntryOpsPanel(payload = null) {
   const orderEnabled = Boolean(data.order_enabled);
   const statusNode = document.getElementById("themelab-shadow-small-entry-ops-status");
   if (statusNode) {
-    statusNode.textContent = status;
+    statusNode.textContent = shadowSmallEntryOpsStatusLabel(status);
     statusNode.className = `badge ${status === "LIVE_SIM_ACTIVE" ? "warning" : status.startsWith("PAUSED") || status === "BROKEN" ? "blocked" : "observe"}`;
   }
-  text("themelab-shadow-small-entry-ops-message", data.operator_message_ko || "현재는 관측 전용입니다. LIVE_SIM 활성화는 preflight와 2단계 확인이 필요합니다.");
-  text("themelab-shadow-small-entry-ops-mode", `${data.mode || "observe_only"} / ${orderEnabled ? "ON" : "OFF"}`);
-  text("themelab-shadow-small-entry-ops-order-enabled", orderEnabled ? "ON" : "OFF");
-  text("themelab-shadow-small-entry-ops-preflight-status", data.preflight_status || "NO_DATA");
-  text("themelab-shadow-small-entry-ops-activation", data.activation_armed ? `armed until ${formatDateTime(data.activation_expires_at)}` : "-");
+  text("themelab-shadow-small-entry-ops-message", data.operator_message_ko || "현재는 관측 전용입니다. LIVE_SIM 활성화는 사전 점검과 2단계 확인이 필요합니다.");
+  text("themelab-shadow-small-entry-ops-mode", `${shadowSmallEntryModeLabel(data.mode)} / ${onOffKo(orderEnabled)}`);
+  text("themelab-shadow-small-entry-ops-order-enabled", onOffKo(orderEnabled));
+  text("themelab-shadow-small-entry-ops-preflight-status", shadowSmallEntryPreflightLabel(data.preflight_status));
+  text("themelab-shadow-small-entry-ops-activation", data.activation_armed ? `${formatDateTime(data.activation_expires_at)}까지` : "-");
   text("themelab-shadow-small-entry-ops-promotion-count", today.promotion_count ?? 0);
   text("themelab-shadow-small-entry-ops-submitted-count", today.submitted_count ?? 0);
   text("themelab-shadow-small-entry-ops-filled-count", today.filled_count ?? 0);
   text("themelab-shadow-small-entry-ops-open-position-count", today.open_position_count ?? 0);
   text("themelab-shadow-small-entry-ops-notional", compactNumber(today.total_notional_krw ?? 0));
-  text("themelab-shadow-small-entry-ops-audit-status", audit.live_sim_audit_status || audit.status || "UNKNOWN");
-  text("themelab-shadow-small-entry-ops-reconcile-status", audit.reconcile_status || "UNKNOWN");
+  text("themelab-shadow-small-entry-ops-audit-status", shadowSmallEntryAuditLabel(audit.live_sim_audit_status || audit.status));
+  text("themelab-shadow-small-entry-ops-reconcile-status", shadowSmallEntryReconcileLabel(audit.reconcile_status));
   text("themelab-shadow-small-entry-ops-last-change", formatDateTime(data.last_status_change_at || data.last_updated_at));
-  renderShadowSmallEntryOpsReasonLines("themelab-shadow-small-entry-ops-blocking-reasons", data.preflight_blocking_reasons || [], "Preflight 차단 사유가 없습니다.");
+  renderShadowSmallEntryOpsReasonLines("themelab-shadow-small-entry-ops-blocking-reasons", data.preflight_blocking_reasons || [], "사전 점검 차단 사유가 없습니다.");
   renderShadowSmallEntryOpsUsageLines("themelab-shadow-small-entry-ops-risk-lines", today, limits, audit);
 }
 
@@ -1876,7 +1972,10 @@ function renderShadowSmallEntryOpsReasonLines(id, reasons, emptyText) {
   if (!node) return;
   const items = (reasons || []).slice(0, 8);
   node.innerHTML = items.length
-    ? items.map((reason) => reasonBadge(reason)).join(" ")
+    ? items.map((reason) => {
+      const term = translateReasonCode(reason);
+      return `<div title="${escapeHtml(term.code)}">${operatorBadge(term.label_ko, term.severity)}<span>${escapeHtml(term.description_ko)}</span></div>`;
+    }).join("")
     : `<div class="muted">${escapeHtml(emptyText)}</div>`;
 }
 
@@ -1884,16 +1983,41 @@ function renderShadowSmallEntryOpsUsageLines(id, today, limits, audit) {
   const node = document.getElementById(id);
   if (!node) return;
   const lines = [
-    `promotions ${today.promotion_count ?? 0}/${limits.max_promotions_per_day ?? "-"}`,
-    `submitted ${today.submitted_count ?? 0}/${limits.max_submitted_orders_per_day ?? "-"}`,
-    `notional ${compactNumber(today.total_notional_krw ?? 0)}/${compactNumber(limits.max_total_notional_krw ?? 0)}`,
-    `open ${today.open_position_count ?? 0}/${limits.max_open_positions ?? "-"}`,
-    `unknown ${today.unknown_submit_count ?? 0}`,
-    `reconcile ${today.reconcile_required_count ?? 0}`,
-    `heartbeat ${audit.gateway_heartbeat_ok ? "OK" : "BAD"}`,
+    `승격 후보 ${today.promotion_count ?? 0}/${limits.max_promotions_per_day ?? "-"}`,
+    `제출 주문 ${today.submitted_count ?? 0}/${limits.max_submitted_orders_per_day ?? "-"}`,
+    `주문 금액 ${compactNumber(today.total_notional_krw ?? 0)}/${compactNumber(limits.max_total_notional_krw ?? 0)}`,
+    `보유 포지션 ${today.open_position_count ?? 0}/${limits.max_open_positions ?? "-"}`,
+    `결과 확인 필요 ${today.unknown_submit_count ?? 0}`,
+    `잔고 재확인 ${today.reconcile_required_count ?? 0}`,
+    `게이트웨이 heartbeat ${audit.gateway_heartbeat_ok ? "정상" : "확인 필요"}`,
   ];
   node.innerHTML = lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("");
 }
+
+const shadowSmallEntryPilotReasonTerms = {
+  LIVE_SIM_AUDIT_BROKEN: ["LIVE_SIM 감사 실패", "danger", "LIVE_SIM 주문 감사가 BROKEN 상태라 관측 전용 복귀가 필요합니다."],
+  ORDER_LIFECYCLE_ISSUE: ["주문 흐름 문제", "danger", "UNKNOWN_SUBMIT 또는 주문 거절이 있어 주문 흐름 확인이 필요합니다."],
+  EXIT_GUARD_BLOCK: ["청산 가드 차단", "warning", "청산 가드 관련 차단이 있어 청산 로직 확인이 필요합니다."],
+  FILLED_SAMPLE_INSUFFICIENT: ["체결 표본 부족", "warning", "체결 표본이 아직 충분하지 않아 추가 관측이 필요합니다."],
+  ORDER_ENABLED_FALSE_AT_START: ["시작 시 주문 비활성", "neutral", "파일럿 시작 시 주문 활성 플래그가 꺼져 있었습니다."],
+  LOSS_LIMIT_REVIEW: ["손실 한도 점검", "warning", "손실 또는 연속 손실이 있어 비중 축소 검토가 필요합니다."],
+  PILOT_HEALTHY: ["파일럿 양호", "positive", "주문 흐름과 수익/MAE 지표가 안정적입니다."],
+  DATA_QUALITY_OR_PROMOTION_EVIDENCE_NOT_READY: ["데이터/승격 근거 부족", "warning", "후보 데이터 또는 승격 근거가 아직 충분하지 않습니다."],
+  KEEP_GUARDED_OBSERVATION: ["가드 관측 지속", "neutral", "큰 주문 흐름 문제는 없지만 추가 관측이 필요합니다."],
+};
+
+const shadowSmallEntryPilotCheckLabels = {
+  live_real_disabled: "실전 주문 비활성",
+  order_lifecycle_audit_clean: "주문 흐름 감사",
+  reconcile_clean: "잔고/체결 대조",
+  unknown_submit_zero: "미확인 제출 없음",
+  cancel_stale_zero: "장기 미확인 취소 없음",
+  loss_limit: "손실 한도",
+  exit_guard_preserved: "청산 가드 보존",
+  gateway_health: "게이트웨이 상태",
+  filled_sample: "체결 표본",
+  auto_pause_validation: "자동 중단 검증",
+};
 
 function renderShadowSmallEntryPilotPanel(payload = null) {
   const data = payload || (state.snapshot || {}).shadow_small_entry_pilot || {};
@@ -1901,12 +2025,12 @@ function renderShadowSmallEntryPilotPanel(payload = null) {
   const status = data.status || "NO_DATA";
   const statusNode = document.getElementById("themelab-shadow-small-entry-pilot-status");
   if (statusNode) {
-    statusNode.textContent = status;
-    statusNode.className = `badge ${status === "REVIEW_READY" || status === "COMPLETED" ? "ready" : status === "NO_DATA" ? "observe" : "warning"}`;
+    statusNode.textContent = shadowSmallEntryPilotStatusLabel(status);
+    statusNode.className = `badge ${shadowSmallEntryPilotStatusTone(status)}`;
   }
-  text("themelab-shadow-small-entry-pilot-message", data.operator_message_ko || "아직 Shadow Small Entry pilot run 데이터가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.");
+  text("themelab-shadow-small-entry-pilot-message", data.operator_message_ko || "아직 Shadow Small Entry 파일럿 실행 데이터가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.");
   text("themelab-shadow-small-entry-pilot-id", compactPilotId(data.pilot_id || "-"));
-  text("themelab-shadow-small-entry-pilot-recommendation", data.recommendation || "-");
+  text("themelab-shadow-small-entry-pilot-recommendation", shadowSmallEntryPilotRecommendationLabel(data.recommendation));
   text("themelab-shadow-small-entry-pilot-candidate-count", summary.candidate_count ?? 0);
   text("themelab-shadow-small-entry-pilot-promoted-count", summary.promoted_count ?? 0);
   text("themelab-shadow-small-entry-pilot-submitted-count", summary.submitted_order_count ?? 0);
@@ -1926,8 +2050,11 @@ function renderShadowSmallEntryPilotReasons(reasons) {
   if (!node) return;
   const items = (reasons || []).slice(0, 8);
   node.innerHTML = items.length
-    ? items.map((reason) => reasonBadge(reason)).join(" ")
-    : `<div class="muted">추천 reason code가 아직 없습니다.</div>`;
+    ? items.map((reason) => {
+      const term = shadowSmallEntryPilotReasonTerm(reason);
+      return `<div title="${escapeHtml(term.code)}">${operatorBadge(term.label_ko, term.severity)}<span>${escapeHtml(term.description_ko)}</span></div>`;
+    }).join("")
+    : `<div class="muted">추천 사유가 아직 없습니다.</div>`;
 }
 
 function renderShadowSmallEntryPilotSafety(checks) {
@@ -1935,8 +2062,91 @@ function renderShadowSmallEntryPilotSafety(checks) {
   if (!node) return;
   const items = (checks || []).slice(0, 8);
   node.innerHTML = items.length
-    ? items.map((item) => `<div><strong>${escapeHtml(item.status || "-")}</strong> ${escapeHtml(item.check_id || "-")} · ${escapeHtml(item.operator_message_ko || "")}</div>`).join("")
+    ? items.map((item) => {
+      const status = shadowSmallEntryPilotCheckStatus(item.status);
+      const checkId = String(item.check_id || "-");
+      return `<div title="${escapeHtml(checkId)}"><span>${operatorBadge(status.label_ko, status.severity)} <strong>${escapeHtml(shadowSmallEntryPilotCheckLabel(checkId))}</strong></span><span>${escapeHtml(item.operator_message_ko || "")}</span></div>`;
+    }).join("")
     : `<div class="muted">안전 체크리스트는 리포트 생성 후 표시됩니다.</div>`;
+}
+
+function shadowSmallEntryPilotStatusLabel(status) {
+  const value = String(status || "NO_DATA").toUpperCase();
+  if (value === "NO_DATA" || value === "UNKNOWN") return "데이터 없음";
+  if (value === "PLANNED") return "계획됨";
+  if (value === "PREFLIGHT_PASSED") return "사전 점검 통과";
+  if (value === "ARMED") return "준비됨";
+  if (value === "ACTIVE") return "진행 중";
+  if (value === "PAUSED") return "일시 중단";
+  if (value === "ROLLED_BACK") return "관측 전용 복귀";
+  if (value === "COMPLETED") return "완료";
+  if (value === "REVIEW_READY") return "리뷰 준비";
+  if (value === "ABORTED") return "중단됨";
+  if (value === "FAILED") return "실패";
+  return value;
+}
+
+function shadowSmallEntryPilotStatusTone(status) {
+  const value = String(status || "NO_DATA").toUpperCase();
+  if (["COMPLETED", "REVIEW_READY", "PREFLIGHT_PASSED"].includes(value)) return "ready";
+  if (["FAILED", "ABORTED"].includes(value)) return "blocked";
+  if (["ACTIVE", "ARMED", "PLANNED", "PAUSED", "ROLLED_BACK"].includes(value)) return "warning";
+  return "observe";
+}
+
+function shadowSmallEntryPilotRecommendationLabel(recommendation) {
+  const value = String(recommendation || "").toUpperCase();
+  const labels = {
+    CONTINUE_OBSERVE_ONLY: "관측 전용 지속",
+    CONTINUE_LIVE_SIM_GUARDED: "가드 유지 LIVE_SIM 지속",
+    REDUCE_SIZE: "비중 축소",
+    REDUCE_FREQUENCY: "빈도 축소",
+    KEEP_DISABLED: "비활성 유지",
+    ROLLBACK_TO_OBSERVE_ONLY: "관측 전용 복귀",
+    INVESTIGATE_ORDER_LIFECYCLE: "주문 흐름 점검",
+    INVESTIGATE_RECONCILE: "잔고/체결 재확인",
+    INVESTIGATE_DATA_QUALITY: "데이터 품질 점검",
+    INVESTIGATE_EXIT_LOGIC: "청산 로직 점검",
+  };
+  return labels[value] || (value ? value.replaceAll("_", " ") : "-");
+}
+
+function shadowSmallEntryPilotReasonTerm(reason) {
+  const code = String(reason || "UNKNOWN").trim().toUpperCase();
+  const values = shadowSmallEntryPilotReasonTerms[code];
+  if (values) {
+    return {
+      code,
+      label_ko: values[0],
+      severity: values[1],
+      description_ko: values[2],
+    };
+  }
+  const term = translateReasonCode(code);
+  return {
+    code: term.code,
+    label_ko: term.label_ko,
+    severity: term.severity,
+    description_ko: term.description_ko,
+  };
+}
+
+function shadowSmallEntryPilotCheckStatus(status) {
+  const value = String(status || "UNKNOWN").toUpperCase();
+  const labels = {
+    PASS: ["통과", "positive"],
+    WARN: ["확인 필요", "warning"],
+    FAIL: ["실패", "danger"],
+    NOT_TESTED: ["미검증", "neutral"],
+    UNKNOWN: ["확인중", "muted"],
+  };
+  const resolved = labels[value] || [value, "muted"];
+  return { label_ko: resolved[0], severity: resolved[1] };
+}
+
+function shadowSmallEntryPilotCheckLabel(checkId) {
+  const value = String(checkId || "").trim();
+  return shadowSmallEntryPilotCheckLabels[value] || (value ? value.replaceAll("_", " ") : "-");
 }
 
 function compactPilotId(value) {
@@ -1960,7 +2170,7 @@ async function shadowSmallEntryOpsAction(action, button) {
   const endpoint = SHADOW_SMALL_ENTRY_OPS_ENDPOINTS[action] || SHADOW_SMALL_ENTRY_OPS_ENDPOINTS.preflight;
   if (button) {
     button.disabled = true;
-    button.textContent = "running";
+    button.textContent = "실행 중";
   }
   try {
     const payload = await runWithLocalTokenRetry((token) => postJsonWithLocalToken(endpoint, token, body));
@@ -1987,6 +2197,7 @@ async function shadowSmallEntryOpsAction(action, button) {
 async function shadowSmallEntryPilotAction(action, button) {
   const originalText = button?.textContent || "";
   const body = { operator: "themelab", note: `themelab ${action}` };
+  const actionLabel = shadowSmallEntryPilotActionLabel(action);
   if (action === "generate-report") {
     body.export = true;
     body.format = "all";
@@ -1994,21 +2205,29 @@ async function shadowSmallEntryPilotAction(action, button) {
   const endpoint = SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS[action] || SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS["generate-report"];
   if (button) {
     button.disabled = true;
-    button.textContent = "running";
+    button.textContent = "실행 중";
   }
   try {
     const payload = await runWithLocalTokenRetry((token) => postJsonWithLocalToken(endpoint, token, body));
     if (!payload) return;
-    updateOperatorSyncStatus(`Shadow Small Entry pilot ${action} 완료`);
+    updateOperatorSyncStatus(`Shadow Small Entry 파일럿 ${actionLabel} 완료`);
     await fetchSnapshot();
   } catch (error) {
-    updateOperatorSyncStatus(`Shadow Small Entry pilot action failed: ${error.message || error}`);
+    updateOperatorSyncStatus(`Shadow Small Entry 파일럿 ${actionLabel} 실패: ${error.message || error}`);
   } finally {
     if (button) {
       button.disabled = false;
       button.textContent = originalText;
     }
   }
+}
+
+function shadowSmallEntryPilotActionLabel(action) {
+  return {
+    start: "시작",
+    complete: "마감",
+    "generate-report": "리포트 생성",
+  }[String(action || "")] || "작업";
 }
 
 function renderShadowPromotionLines(id, rows, emptyText) {
@@ -2037,6 +2256,57 @@ function renderShadowPromotionCandidates(id, rows, available) {
       <td>${escapeHtml(item.operator_message_ko || "-")}</td>
     </tr>
   `).join("") : `<tr><td colspan="5" class="muted">표시할 소액 승격 후보가 없습니다.</td></tr>`;
+}
+
+function shadowSmallEntryOpsStatusLabel(status) {
+  const value = String(status || "OBSERVE_ONLY").toUpperCase();
+  if (value === "OBSERVE_ONLY" || value === "NO_DATA") return "관측 전용";
+  if (value === "LIVE_SIM_ACTIVE" || value === "ACTIVE") return "LIVE_SIM 활성";
+  if (value === "ARMED" || value === "PENDING_CONFIRM") return "최종 확인 대기";
+  if (value === "PAUSED" || value.startsWith("PAUSED_")) return "일시 중단";
+  if (value === "EMERGENCY_PAUSED") return "긴급 중단";
+  if (value === "ROLLBACK" || value === "ROLLED_BACK") return "관측 전용 복귀";
+  if (value === "BROKEN" || value === "ERROR") return "문제 있음";
+  return value;
+}
+
+function shadowSmallEntryModeLabel(mode) {
+  const value = String(mode || "observe_only").toLowerCase();
+  if (value === "observe_only") return "관측 전용";
+  if (value === "live_sim") return "LIVE_SIM";
+  if (value === "paused") return "일시 중단";
+  return value || "확인중";
+}
+
+function shadowSmallEntryPreflightLabel(status) {
+  const value = String(status || "NO_DATA").toUpperCase();
+  if (["OK", "PASS", "PASSED", "READY"].includes(value)) return "통과";
+  if (["FAILED", "FAIL", "BLOCKED", "ERROR"].includes(value)) return "실패";
+  if (value === "RUNNING") return "점검 중";
+  if (value === "NO_DATA" || value === "UNKNOWN") return "점검 전";
+  return value;
+}
+
+function shadowSmallEntryAuditLabel(status) {
+  const value = String(status || "UNKNOWN").toUpperCase();
+  if (value === "OK") return "정상";
+  if (value === "NO_DATA" || value === "UNKNOWN") return "확인중";
+  if (value.includes("RECONCILE") || value.includes("WARN")) return "확인 필요";
+  if (value === "BROKEN" || value === "ERROR") return "문제 있음";
+  return value;
+}
+
+function shadowSmallEntryReconcileLabel(status) {
+  const value = String(status || "UNKNOWN").toUpperCase();
+  if (value === "OK") return "정상";
+  if (value === "NO_DATA" || value === "UNKNOWN") return "확인중";
+  if (value.includes("REQUIRED") || value.includes("WARN")) return "확인 필요";
+  if (value === "ERROR" || value === "BROKEN") return "문제 있음";
+  return value;
+}
+
+function onOffKo(value) {
+  return value ? "켜짐" : "꺼짐";
 }
 
 function renderConservativeReasonGroupRows(id, rows, available) {
@@ -2415,6 +2685,215 @@ function formatEventTime(value) {
   return date.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
+function operatorView(snapshot = state.snapshot || {}) {
+  if (snapshot.operator_view && Object.keys(snapshot.operator_view).length) return snapshot.operator_view;
+  const summary = snapshot.summary || {};
+  const dataQuality = snapshot.data_quality || {};
+  const market = snapshot.market || {};
+  const candidates = (snapshot.watchset || []).filter((item) => ["READY", "READY_SMALL", "EARLY_SMALL"].includes(item.gate_status || item.display_status));
+  const dataReason = translateReasonCode("DATA_INSUFFICIENT");
+  const noBuyReasons = candidates.length ? [] : [{
+    code: "NO_SIGNAL",
+    label_ko: summary.operation_status ? translateReasonCode(summary.operation_status).label_ko : "매수 후보 없음",
+    short_label_ko: "없음",
+    count: 1,
+    severity: "neutral",
+    description_ko: summary.operation_message_ko || "현재 매수 가능 후보가 없습니다.",
+    operator_action_ko: "후보와 데이터 상태를 확인하세요.",
+    operator_message_ko: summary.operation_message_ko || "현재 매수 가능 후보가 없습니다.",
+  }];
+  if (["BROKEN", "DEGRADED"].includes(String(dataQuality.status || "").toUpperCase())) {
+    noBuyReasons.unshift({ ...dataReason, count: dataQuality.candle_missing_count || 1, operator_message_ko: operatorMessageForReason("DATA_INSUFFICIENT") });
+  }
+  return {
+    main_action: {
+      status: summary.operation_status || (candidates.length ? "READY_TO_TRADE" : "NO_SIGNAL"),
+      label_ko: translateReasonCode(summary.operation_status || (candidates.length ? "READY_TO_TRADE" : "NO_SIGNAL")).label_ko,
+      message_ko: candidates.length ? "지금 매수 가능 후보가 있습니다. 후보 목록을 확인하세요." : summary.operation_message_ko || "현재 매수 가능 후보가 없습니다.",
+      severity: translateReasonCode(summary.operation_status || (candidates.length ? "READY_TO_TRADE" : "NO_SIGNAL")).severity,
+    },
+    market: {
+      status: market.market_status || "UNKNOWN",
+      label_ko: market.market_status || "확인중",
+      message_ko: "시장 상태 확인 중입니다.",
+      kospi: { side: "KOSPI", return_pct: market.kospi_return_pct },
+      kosdaq: { side: "KOSDAQ", return_pct: market.kosdaq_return_pct },
+    },
+    operating_status: [],
+    top_themes: (snapshot.ranked_themes || []).slice(0, 5).map((item) => ({
+      rank: item.rank,
+      theme_name: item.theme_name,
+      score: item.condition_score,
+      breadth_pct: item.alive_ratio == null ? null : Number(item.alive_ratio) * 100,
+      leader: item.top_leader_name || item.top_leader_symbol,
+      label_ko: item.theme_status || "확인중",
+      severity: "neutral",
+      operator_message_ko: "테마 상태를 확인 중입니다.",
+    })),
+    buy_candidates: candidates.slice(0, 10).map((item, index) => ({
+      priority: index + 1,
+      stock_name: item.stock_name || item.name || item.symbol,
+      symbol: item.symbol,
+      theme_name: item.theme_name || item.primary_theme,
+      status_label_ko: translateReasonCode(item.gate_status).label_ko,
+      role_label_ko: item.stock_role || "-",
+      entry_position_label_ko: translateReasonCode(item.price_location_status).label_ko,
+      order_permission_label_ko: item.live_order_guard_passed ? "가능" : "관측만",
+      severity: item.live_order_guard_passed ? "positive" : "warning",
+      operator_message_ko: item.summary_reason || "후보 조건을 확인 중입니다.",
+    })),
+    no_buy_reasons: noBuyReasons.slice(0, 3),
+    risk_status: [],
+    panels: {},
+  };
+}
+
+function renderOperatorMain(snapshot = state.snapshot || {}) {
+  const view = operatorView(snapshot);
+  renderMainAction(view.main_action || {});
+  renderOperatingStatus(view);
+  renderTopThemes(view.top_themes || []);
+  renderBuyCandidates(view.buy_candidates || []);
+  renderNoBuyReasons(view.no_buy_reasons || []);
+  renderRiskStatus(view.risk_status || []);
+  renderTabThemes(view);
+  renderTabCandidates(view);
+  renderTabNoBuy(view);
+  renderTabOrdersRisk(view);
+  renderTabReports(view);
+  renderDeveloperDetails(view);
+}
+
+function renderMainAction(action = {}) {
+  const term = translateReasonCode(action.status);
+  const severity = action.severity || term.severity;
+  text("operator-main-action-label", action.label_ko || term.label_ko);
+  text("operator-main-action-message", action.message_ko || term.description_ko);
+  text("operator-main-action-next", action.operator_action_ko || term.operator_action_ko || "자동 갱신");
+  const status = document.getElementById("operator-main-action-status");
+  if (status) {
+    status.textContent = action.label_ko || term.label_ko;
+    status.className = `badge ${operatorToneClass(severity)}`;
+  }
+}
+
+function renderOperatingStatus(view = {}) {
+  const rows = view.operating_status || [];
+  const node = document.getElementById("operator-operating-status");
+  if (!node) return;
+  text("operator-status-summary", `${rows.length || 5}개 핵심`);
+  node.innerHTML = rows.length ? rows.map((item) => `
+    <div class="operator-status-row">
+      <span>${escapeHtml(item.title_ko || "-")}</span>
+      ${operatorBadge(item.label_ko || translateReasonCode(item.status).label_ko, item.severity)}
+      <p>${escapeHtml(item.message_ko || "")}</p>
+    </div>
+  `).join("") : `
+    <div class="operator-status-row">
+      <span>운영 상태</span>
+      ${operatorBadge("확인중", "muted")}
+      <p>스냅샷을 기다리고 있습니다.</p>
+    </div>
+  `;
+}
+
+function renderTopThemes(items = []) {
+  const node = document.getElementById("operator-top-themes");
+  if (!node) return;
+  node.innerHTML = items.length ? items.slice(0, 5).map((item) => `
+    <article class="operator-list-row">
+      <div class="row-top">
+        <strong>${escapeHtml(item.rank ? `${item.rank}. ${item.theme_name}` : item.theme_name || "-")}</strong>
+        ${operatorBadge(item.label_ko || "-", item.severity)}
+      </div>
+      <div class="row-meta">점수 ${score(item.score, 0)} · 확산도 ${item.breadth_pct == null ? "-" : `${Number(item.breadth_pct).toFixed(1)}%`} · 대장 ${escapeHtml(item.leader || "-")}</div>
+      <p>${escapeHtml(item.operator_message_ko || "")}</p>
+    </article>
+  `).join("") : `<div class="operator-empty">주도테마가 형성되면 여기에 표시됩니다.</div>`;
+}
+
+function renderBuyCandidates(items = []) {
+  const node = document.getElementById("operator-buy-candidates");
+  if (!node) return;
+  node.innerHTML = items.length ? items.slice(0, 10).map((item) => `
+    <article class="operator-list-row">
+      <div class="row-top">
+        <strong>${escapeHtml(item.priority ? `${item.priority}. ${item.stock_name}` : item.stock_name || "-")}</strong>
+        ${operatorBadge(item.status_label_ko || "-", item.severity)}
+      </div>
+      <div class="row-meta">${escapeHtml(item.theme_name || "-")} · ${escapeHtml(item.role_label_ko || "-")} · ${escapeHtml(item.entry_position_label_ko || "-")} · 주문 ${escapeHtml(item.order_permission_label_ko || "-")}</div>
+      <p>${escapeHtml(item.operator_message_ko || "")}</p>
+    </article>
+  `).join("") : `<div class="operator-empty">READY / READY_SMALL 후보가 없습니다.</div>`;
+}
+
+function renderNoBuyReasons(items = []) {
+  const node = document.getElementById("operator-no-buy-reasons");
+  if (!node) return;
+  node.innerHTML = items.length ? items.slice(0, 3).map((item) => {
+    const term = translateReasonCode(item.code);
+    return `
+      <article class="operator-list-row">
+        <div class="row-top">
+          <strong>${escapeHtml(item.label_ko || term.label_ko)}</strong>
+          ${operatorBadge(`${item.count || 0}건`, item.severity || term.severity)}
+        </div>
+        <p>${escapeHtml(item.operator_message_ko || operatorMessageForReason(item.code))}</p>
+        <div class="row-meta">${escapeHtml(item.operator_action_ko || term.operator_action_ko)}</div>
+      </article>
+    `;
+  }).join("") : `<div class="operator-empty">안 산 이유가 집계되면 여기에 표시됩니다.</div>`;
+}
+
+function renderRiskStatus(items = []) {
+  const node = document.getElementById("operator-risk-status");
+  if (!node) return;
+  node.innerHTML = items.length ? items.slice(0, 5).map((item) => `
+    <article class="operator-list-row">
+      <div class="row-top">
+        <strong>${escapeHtml(item.title_ko || "-")}</strong>
+        ${operatorBadge(item.label_ko || translateReasonCode(item.code).label_ko, item.severity)}
+      </div>
+      <p>${escapeHtml(item.message_ko || "")}</p>
+      ${item.count ? `<div class="row-meta">집계 ${compactNumber(item.count)}</div>` : ""}
+    </article>
+  `).join("") : `<div class="operator-empty">위험/주문 안전 상태를 기다리고 있습니다.</div>`;
+}
+
+function renderTabThemes(view = {}) {
+  const node = document.querySelector("#tab-themes .operator-tab-intro");
+  if (node) node.textContent = `테마 상세: 메인에는 상위 ${view.limits?.top_themes || 5}개만 보이고, 전체 순위와 구성은 아래 패널에서 확인합니다.`;
+}
+
+function renderTabCandidates(view = {}) {
+  const node = document.querySelector("#tab-candidates .operator-tab-intro");
+  if (node) node.textContent = `매수 후보: 메인에는 READY/READY_SMALL 상위 ${view.limits?.buy_candidates || 10}개만 보이고, 전체 WatchSet은 아래 테이블에서 확인합니다.`;
+}
+
+function renderTabNoBuy(view = {}) {
+  const node = document.querySelector("#tab-no-buy .operator-tab-intro");
+  const reason = (view.no_buy_reasons || [])[0];
+  if (node) node.textContent = reason ? `안 산 이유: 가장 큰 이유는 ${reason.label_ko || translateReasonCode(reason.code).label_ko}입니다.` : "안 산 이유: Buy-Zero RCA와 보수적 차단 사유를 아래에서 확인합니다.";
+}
+
+function renderTabOrdersRisk(view = {}) {
+  const node = document.querySelector("#tab-orders-risk .operator-tab-intro");
+  const danger = (view.risk_status || []).find((item) => item.severity === "danger");
+  if (node) node.textContent = danger ? `주문/리스크: ${danger.title_ko} 확인이 필요합니다.` : "주문/리스크: LIVE_SIM audit, reconcile, 미체결 상태를 아래에서 확인합니다.";
+}
+
+function renderTabReports(view = {}) {
+  const node = document.querySelector("#tab-reports .operator-tab-intro");
+  const panels = view.panels || {};
+  if (node) node.textContent = panels.pilot_report?.summary_ko || "리포트: 파일럿, outcome, 승격 검토 결과를 아래에서 확인합니다.";
+}
+
+function renderDeveloperDetails(view = {}) {
+  const node = document.querySelector("#tab-developer .operator-tab-intro");
+  const panels = view.panels || {};
+  if (node) node.textContent = panels.developer_details?.summary_ko || "raw trace, reason_code, JSON, debug counter는 이 탭에서만 확인합니다.";
+}
+
 function render(snapshot) {
   const currentSnapshot = snapshot || {};
   const previousSnapshot = state.previousSnapshot;
@@ -2429,6 +2908,7 @@ function render(snapshot) {
   state.selectedSymbol = selected.symbol || state.selectedSymbol || "";
   const selectedChart = selectedChartForSymbol(state.snapshot, state.selectedSymbol);
   renderHeader(currentSnapshot);
+  renderOperatorMain(currentSnapshot);
   renderCockpit(currentSnapshot);
   renderBuyZeroRcaPanel();
   renderLiveSimAuditPanel(currentSnapshot);
@@ -4216,6 +4696,31 @@ function initFilters() {
   });
 }
 
+function initTabs() {
+  const nav = document.getElementById("themelab-tab-nav");
+  if (!nav) return;
+  const activate = (target) => {
+    const resolved = target || "tab-main";
+    document.body.dataset.activeTab = resolved;
+    nav.querySelectorAll("button[data-tab-target]").forEach((button) => {
+      const active = button.dataset.tabTarget === resolved;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", active ? "true" : "false");
+    });
+    document.querySelectorAll("[data-tab-panel]").forEach((panel) => {
+      const active = panel.dataset.tabPanel === resolved;
+      panel.classList.toggle("active", active);
+      panel.hidden = !active;
+    });
+  };
+  nav.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-tab-target]");
+    if (!button) return;
+    activate(button.dataset.tabTarget || "tab-main");
+  });
+  activate(document.body.dataset.activeTab || "tab-main");
+}
+
 async function fetchSnapshot() {
   const response = await fetch("/api/themelab/snapshot", { cache: "no-store" });
   if (!response.ok) throw new Error(`snapshot ${response.status}`);
@@ -4287,6 +4792,7 @@ function connectWs() {
 }
 
 loadOperatorPreferences();
+initTabs();
 initFilters();
 initOperatorEventJournal();
 initOperatorActionCenter();

@@ -6,7 +6,7 @@
     <title>ThemeLabFlow Trading Terminal</title>
     <link rel="stylesheet" href="/static/themelab.css" />
   </head>
-  <body>
+  <body data-active-tab="tab-main">
     <main class="terminal-shell">
       <header class="market-header">
         <div>
@@ -16,7 +16,95 @@
         <div id="market-strip" class="market-strip"></div>
       </header>
 
-      <section id="operating-cockpit" class="panel cockpit-panel" aria-label="운용 Cockpit">
+      <section id="operator-main-action" class="panel main-action-card" aria-label="오늘 액션">
+        <div>
+          <span class="section-kicker">오늘 액션</span>
+          <h2 id="operator-main-action-label">대시보드 준비 중</h2>
+          <p id="operator-main-action-message">ThemeLabFlow 결과를 기다리고 있습니다.</p>
+        </div>
+        <div class="main-action-meta">
+          <span id="operator-main-action-status" class="badge status-muted">대기</span>
+          <span id="operator-main-action-next" class="counter">자동 갱신</span>
+        </div>
+      </section>
+
+      <nav id="themelab-tab-nav" class="themelab-tabs" aria-label="ThemeLab 대시보드 탭">
+        <button class="active" data-tab-target="tab-main" type="button" aria-controls="tab-main" aria-pressed="true">메인</button>
+        <button data-tab-target="tab-themes" type="button" aria-controls="tab-themes" aria-pressed="false">테마 상세</button>
+        <button data-tab-target="tab-candidates" type="button" aria-controls="tab-candidates" aria-pressed="false">매수 후보</button>
+        <button data-tab-target="tab-no-buy" type="button" aria-controls="tab-no-buy" aria-pressed="false">안 산 이유</button>
+        <button data-tab-target="tab-orders-risk" type="button" aria-controls="tab-orders-risk" aria-pressed="false">주문/리스크</button>
+        <button data-tab-target="tab-reports" type="button" aria-controls="tab-reports" aria-pressed="false">리포트</button>
+        <button data-tab-target="tab-developer" type="button" aria-controls="tab-developer" aria-pressed="false">개발자 상세</button>
+      </nav>
+
+      <section id="tab-main" class="operator-tab-panel active" data-tab-panel="tab-main" aria-label="ThemeLab 메인">
+        <section class="operator-main-grid">
+          <article class="operator-card operator-status-card">
+            <div class="operator-card-head">
+              <h2>오늘 운영 상태</h2>
+              <span id="operator-status-summary" class="counter">5개 핵심</span>
+            </div>
+            <div id="operator-operating-status" class="operator-status-list"></div>
+          </article>
+
+          <article class="operator-card">
+            <div class="operator-card-head">
+              <h2>지금 주도테마</h2>
+              <span class="counter">상위 5</span>
+            </div>
+            <div id="operator-top-themes" class="operator-list"></div>
+          </article>
+
+          <article class="operator-card">
+            <div class="operator-card-head">
+              <h2>지금 매수 후보</h2>
+              <span class="counter">상위 10</span>
+            </div>
+            <div id="operator-buy-candidates" class="operator-list"></div>
+          </article>
+
+          <article class="operator-card">
+            <div class="operator-card-head">
+              <h2>왜 안 사고 있나</h2>
+              <span class="counter">상위 3</span>
+            </div>
+            <div id="operator-no-buy-reasons" class="operator-list"></div>
+          </article>
+
+          <article class="operator-card">
+            <div class="operator-card-head">
+              <h2>위험/주문 안전</h2>
+              <span class="counter">중요 5</span>
+            </div>
+            <div id="operator-risk-status" class="operator-list"></div>
+          </article>
+        </section>
+      </section>
+
+      <section id="tab-themes" class="operator-tab-panel" data-tab-panel="tab-themes" aria-label="테마 상세" hidden>
+        <div class="operator-tab-intro">테마 순위, 구성, 대장/공동대장/후발 흐름을 확인합니다.</div>
+      </section>
+      <section id="tab-candidates" class="operator-tab-panel" data-tab-panel="tab-candidates" aria-label="매수 후보" hidden>
+        <div class="operator-tab-intro">READY/WAIT/OBSERVE/BLOCKED 후보 테이블과 주문 후보를 확인합니다.</div>
+      </section>
+      <section id="tab-no-buy" class="operator-tab-panel" data-tab-panel="tab-no-buy" aria-label="안 산 이유" hidden>
+        <div class="operator-tab-intro">Buy-Zero RCA, 데이터 부족, 보수적 차단 사유를 확인합니다.</div>
+      </section>
+      <section id="tab-orders-risk" class="operator-tab-panel" data-tab-panel="tab-orders-risk" aria-label="주문/리스크" hidden>
+        <div class="operator-tab-intro">LIVE_SIM audit, reconcile, 미체결, Shadow Small Entry 운영 상태를 확인합니다.</div>
+      </section>
+      <section id="tab-reports" class="operator-tab-panel" data-tab-panel="tab-reports" aria-label="리포트" hidden>
+        <div class="operator-tab-intro">파일럿 리포트, outcome report, 승격 검토 리포트를 확인합니다.</div>
+      </section>
+      <section id="tab-developer" class="operator-tab-panel" data-tab-panel="tab-developer" aria-label="개발자 상세" hidden>
+        <details class="developer-disclosure">
+          <summary>개발자 상세 펼치기</summary>
+          <div class="operator-tab-intro">raw trace, reason_code, JSON, debug counter는 아래 상세 패널에서 확인합니다.</div>
+        </details>
+      </section>
+
+      <section id="operating-cockpit" class="panel cockpit-panel" data-operator-tab="developer" aria-label="운용 Cockpit">
         <div class="panel-head cockpit-head">
           <div>
             <h2>운용 Cockpit</h2>
@@ -58,7 +146,7 @@
         </div>
       </section>
 
-      <section id="themelab-buy-zero-rca-card" class="panel buy-zero-rca-panel" aria-label="매수 0건 RCA">
+      <section id="themelab-buy-zero-rca-card" class="panel buy-zero-rca-panel" data-operator-tab="no-buy" aria-label="매수 0건 RCA">
         <div class="panel-head buy-zero-head">
           <div>
             <h2>매수 0건 RCA</h2>
@@ -122,7 +210,7 @@
         </div>
       </section>
 
-      <section id="themelab-live-sim-audit-card" class="panel live-sim-audit-panel" aria-label="LIVE_SIM lifecycle audit">
+      <section id="themelab-live-sim-audit-card" class="panel live-sim-audit-panel" data-operator-tab="orders-risk" aria-label="LIVE_SIM lifecycle audit">
         <div class="panel-head">
           <div>
             <h2>LIVE_SIM 주문 lifecycle audit</h2>
@@ -153,74 +241,74 @@
         </div>
       </section>
 
-      <section id="themelab-shadow-small-entry-ops-card" class="panel conservative-reason-panel" aria-label="Shadow Small Entry 운영 제어">
+      <section id="themelab-shadow-small-entry-ops-card" class="panel conservative-reason-panel" data-operator-tab="orders-risk" aria-label="Shadow Small Entry 운영 제어">
         <div class="panel-head">
           <div>
             <h2>Shadow Small Entry 운영 제어</h2>
-            <p id="themelab-shadow-small-entry-ops-message">현재는 관측 전용입니다. LIVE_SIM 활성화는 preflight와 2단계 확인이 필요합니다.</p>
+            <p id="themelab-shadow-small-entry-ops-message">현재는 관측 전용입니다. LIVE_SIM 활성화는 사전 점검과 2단계 확인이 필요합니다.</p>
             <p class="row-meta">LIVE_REAL은 계속 차단되고, 이 패널은 shadow small entry의 관측/활성화/중단/롤백 상태만 제어합니다.</p>
           </div>
           <div class="gate-status-strip">
-            <button id="themelab-shadow-small-entry-ops-preflight" class="action-button" type="button">Preflight</button>
-            <button id="themelab-shadow-small-entry-ops-arm" class="action-button" type="button">Arm LIVE_SIM</button>
-            <button id="themelab-shadow-small-entry-ops-confirm" class="action-button" type="button">Confirm</button>
-            <button id="themelab-shadow-small-entry-ops-pause" class="action-button" type="button">Pause</button>
-            <button id="themelab-shadow-small-entry-ops-rollback" class="action-button" type="button">Rollback</button>
-            <button id="themelab-shadow-small-entry-ops-emergency-pause" class="action-button" type="button">Emergency Pause</button>
-            <span id="themelab-shadow-small-entry-ops-status" class="badge observe">OBSERVE_ONLY</span>
+            <button id="themelab-shadow-small-entry-ops-preflight" class="action-button" type="button">사전 점검</button>
+            <button id="themelab-shadow-small-entry-ops-arm" class="action-button" type="button">LIVE_SIM 준비</button>
+            <button id="themelab-shadow-small-entry-ops-confirm" class="action-button" type="button">최종 확인</button>
+            <button id="themelab-shadow-small-entry-ops-pause" class="action-button" type="button">일시 중단</button>
+            <button id="themelab-shadow-small-entry-ops-rollback" class="action-button" type="button">관측 전용 복귀</button>
+            <button id="themelab-shadow-small-entry-ops-emergency-pause" class="action-button" type="button">긴급 중단</button>
+            <span id="themelab-shadow-small-entry-ops-status" class="badge observe">관측 전용</span>
           </div>
         </div>
         <div class="buy-zero-summary-grid conservative-reason-summary-grid">
-          <article><span>Mode / Order</span><strong id="themelab-shadow-small-entry-ops-mode">observe_only / OFF</strong></article>
-          <article><span>Order Enabled</span><strong id="themelab-shadow-small-entry-ops-order-enabled">OFF</strong></article>
-          <article><span>Preflight</span><strong id="themelab-shadow-small-entry-ops-preflight-status">NO_DATA</strong></article>
-          <article><span>Arm TTL</span><strong id="themelab-shadow-small-entry-ops-activation">-</strong></article>
-          <article><span>Promotions</span><strong id="themelab-shadow-small-entry-ops-promotion-count">0</strong></article>
-          <article><span>Submitted</span><strong id="themelab-shadow-small-entry-ops-submitted-count">0</strong></article>
-          <article><span>Filled</span><strong id="themelab-shadow-small-entry-ops-filled-count">0</strong></article>
-          <article><span>Open Positions</span><strong id="themelab-shadow-small-entry-ops-open-position-count">0</strong></article>
-          <article><span>Total Notional</span><strong id="themelab-shadow-small-entry-ops-notional">0</strong></article>
-          <article><span>Live Audit</span><strong id="themelab-shadow-small-entry-ops-audit-status">UNKNOWN</strong></article>
-          <article><span>Reconcile</span><strong id="themelab-shadow-small-entry-ops-reconcile-status">UNKNOWN</strong></article>
-          <article><span>Last Change</span><strong id="themelab-shadow-small-entry-ops-last-change">-</strong></article>
+          <article><span>운영 모드 / 주문</span><strong id="themelab-shadow-small-entry-ops-mode">관측 전용 / 꺼짐</strong></article>
+          <article><span>주문 활성</span><strong id="themelab-shadow-small-entry-ops-order-enabled">꺼짐</strong></article>
+          <article><span>사전 점검</span><strong id="themelab-shadow-small-entry-ops-preflight-status">점검 전</strong></article>
+          <article><span>준비 유효시간</span><strong id="themelab-shadow-small-entry-ops-activation">-</strong></article>
+          <article><span>승격 후보</span><strong id="themelab-shadow-small-entry-ops-promotion-count">0</strong></article>
+          <article><span>제출 주문</span><strong id="themelab-shadow-small-entry-ops-submitted-count">0</strong></article>
+          <article><span>체결</span><strong id="themelab-shadow-small-entry-ops-filled-count">0</strong></article>
+          <article><span>보유 포지션</span><strong id="themelab-shadow-small-entry-ops-open-position-count">0</strong></article>
+          <article><span>주문 금액</span><strong id="themelab-shadow-small-entry-ops-notional">0</strong></article>
+          <article><span>주문 감사</span><strong id="themelab-shadow-small-entry-ops-audit-status">확인중</strong></article>
+          <article><span>잔고 재확인</span><strong id="themelab-shadow-small-entry-ops-reconcile-status">확인중</strong></article>
+          <article><span>최근 변경</span><strong id="themelab-shadow-small-entry-ops-last-change">-</strong></article>
         </div>
         <div id="themelab-shadow-small-entry-ops-blocking-reasons" class="buy-zero-line-list"></div>
         <div id="themelab-shadow-small-entry-ops-risk-lines" class="buy-zero-line-list"></div>
       </section>
 
-      <section id="themelab-shadow-small-entry-pilot-card" class="panel conservative-reason-panel" aria-label="Shadow Small Entry Pilot 리포트">
+      <section id="themelab-shadow-small-entry-pilot-card" class="panel conservative-reason-panel" data-operator-tab="reports" aria-label="Shadow Small Entry 파일럿 리포트">
         <div class="panel-head">
           <div>
-            <h2>Shadow Small Entry Pilot 리포트</h2>
-            <p id="themelab-shadow-small-entry-pilot-message">아직 Shadow Small Entry pilot run 데이터가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.</p>
-            <p class="row-meta">LIVE_REAL/guard/threshold를 바꾸지 않고, 1일 LIVE_SIM 파일럿 결과와 자동 중단 검증만 리뷰합니다.</p>
+            <h2>Shadow Small Entry 파일럿 리포트</h2>
+            <p id="themelab-shadow-small-entry-pilot-message">아직 Shadow Small Entry 파일럿 실행 데이터가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.</p>
+            <p class="row-meta">실전 주문(LIVE_REAL), 가드, 임계값은 바꾸지 않고 1일 LIVE_SIM 파일럿 결과와 자동 중단 검증만 리뷰합니다.</p>
           </div>
           <div class="gate-status-strip">
-            <button id="themelab-shadow-small-entry-pilot-start" class="action-button" type="button">Start Pilot</button>
-            <button id="themelab-shadow-small-entry-pilot-complete" class="action-button" type="button">Complete</button>
-            <button id="themelab-shadow-small-entry-pilot-generate-report" class="action-button" type="button">Generate Report</button>
-            <span id="themelab-shadow-small-entry-pilot-status" class="badge observe">NO_DATA</span>
+            <button id="themelab-shadow-small-entry-pilot-start" class="action-button" type="button">파일럿 시작</button>
+            <button id="themelab-shadow-small-entry-pilot-complete" class="action-button" type="button">리포트 마감</button>
+            <button id="themelab-shadow-small-entry-pilot-generate-report" class="action-button" type="button">리포트 생성</button>
+            <span id="themelab-shadow-small-entry-pilot-status" class="badge observe">데이터 없음</span>
           </div>
         </div>
         <div class="buy-zero-summary-grid conservative-reason-summary-grid">
-          <article><span>Pilot ID</span><strong id="themelab-shadow-small-entry-pilot-id">-</strong></article>
-          <article><span>Recommendation</span><strong id="themelab-shadow-small-entry-pilot-recommendation">-</strong></article>
-          <article><span>Candidates</span><strong id="themelab-shadow-small-entry-pilot-candidate-count">0</strong></article>
-          <article><span>Promoted</span><strong id="themelab-shadow-small-entry-pilot-promoted-count">0</strong></article>
-          <article><span>Submitted</span><strong id="themelab-shadow-small-entry-pilot-submitted-count">0</strong></article>
-          <article><span>Filled</span><strong id="themelab-shadow-small-entry-pilot-filled-count">0</strong></article>
-          <article><span>Open Positions</span><strong id="themelab-shadow-small-entry-pilot-open-position-count">0</strong></article>
-          <article><span>Total PnL</span><strong id="themelab-shadow-small-entry-pilot-total-pnl">0</strong></article>
-          <article><span>Win Rate</span><strong id="themelab-shadow-small-entry-pilot-win-rate">-</strong></article>
-          <article><span>Avg Return</span><strong id="themelab-shadow-small-entry-pilot-avg-return">-</strong></article>
-          <article><span>MFE / MAE</span><strong id="themelab-shadow-small-entry-pilot-mfe-mae">-</strong></article>
-          <article><span>Last Updated</span><strong id="themelab-shadow-small-entry-pilot-updated">-</strong></article>
+          <article><span>파일럿 ID</span><strong id="themelab-shadow-small-entry-pilot-id">-</strong></article>
+          <article><span>권고</span><strong id="themelab-shadow-small-entry-pilot-recommendation">-</strong></article>
+          <article><span>후보</span><strong id="themelab-shadow-small-entry-pilot-candidate-count">0</strong></article>
+          <article><span>승격</span><strong id="themelab-shadow-small-entry-pilot-promoted-count">0</strong></article>
+          <article><span>제출 주문</span><strong id="themelab-shadow-small-entry-pilot-submitted-count">0</strong></article>
+          <article><span>체결</span><strong id="themelab-shadow-small-entry-pilot-filled-count">0</strong></article>
+          <article><span>보유 포지션</span><strong id="themelab-shadow-small-entry-pilot-open-position-count">0</strong></article>
+          <article><span>누적 손익</span><strong id="themelab-shadow-small-entry-pilot-total-pnl">0</strong></article>
+          <article><span>승률</span><strong id="themelab-shadow-small-entry-pilot-win-rate">-</strong></article>
+          <article><span>평균 수익률</span><strong id="themelab-shadow-small-entry-pilot-avg-return">-</strong></article>
+          <article><span>최대유리 / 최대불리</span><strong id="themelab-shadow-small-entry-pilot-mfe-mae">-</strong></article>
+          <article><span>최근 갱신</span><strong id="themelab-shadow-small-entry-pilot-updated">-</strong></article>
         </div>
         <div id="themelab-shadow-small-entry-pilot-reasons" class="buy-zero-line-list"></div>
         <div id="themelab-shadow-small-entry-pilot-safety-lines" class="buy-zero-line-list"></div>
       </section>
 
-      <section id="themelab-shadow-small-entry-promotion-card" class="panel conservative-reason-panel" aria-label="Shadow 소액 승격 가드">
+      <section id="themelab-shadow-small-entry-promotion-card" class="panel conservative-reason-panel" data-operator-tab="reports" aria-label="Shadow 소액 승격 가드">
         <div class="panel-head">
           <div>
             <h2>Shadow 소액 승격 가드</h2>
@@ -259,7 +347,7 @@
         </div>
       </section>
 
-      <section id="themelab-conservative-reason-card" class="panel conservative-reason-panel" aria-label="보수적 차단 사유 검증">
+      <section id="themelab-conservative-reason-card" class="panel conservative-reason-panel" data-operator-tab="no-buy" aria-label="보수적 차단 사유 검증">
         <div class="panel-head">
           <div>
             <h2>보수적 차단 사유 검증</h2>
@@ -322,7 +410,7 @@
         </div>
       </section>
 
-      <section id="promotion-cockpit" class="panel promotion-cockpit-panel" aria-label="Promotion Decision Cockpit">
+      <section id="promotion-cockpit" class="panel promotion-cockpit-panel" data-operator-tab="reports" aria-label="Promotion Decision Cockpit">
         <div class="panel-head promotion-cockpit-head">
           <div>
             <h2>Promotion Decision</h2>
@@ -369,7 +457,7 @@
         </div>
       </section>
 
-      <section class="panel shadow-ab-panel" aria-label="PROVISIONAL Shadow A/B">
+      <section class="panel shadow-ab-panel" data-operator-tab="reports" aria-label="PROVISIONAL Shadow A/B">
         <div class="panel-head">
           <div>
             <h2>PROVISIONAL Shadow A/B</h2>
@@ -402,7 +490,7 @@
         </div>
       </section>
 
-      <section id="operator-alert-panel" class="panel operator-alert-panel" aria-label="Operator Alert Inbox">
+      <section id="operator-alert-panel" class="panel operator-alert-panel" data-operator-tab="developer" aria-label="Operator Alert Inbox">
         <div class="panel-head operator-alert-head">
           <div>
             <h2>Operator Alert Inbox</h2>
@@ -442,7 +530,7 @@
         </div>
       </section>
 
-      <section id="operator-session-review" class="panel session-review-panel" aria-label="Operator Session Review">
+      <section id="operator-session-review" class="panel session-review-panel" data-operator-tab="reports" aria-label="Operator Session Review">
         <div class="panel-head operator-alert-head">
           <div>
             <h2>Session Review</h2>
@@ -453,7 +541,7 @@
         <div id="operator-session-summary-cards" class="session-summary-grid"></div>
       </section>
 
-      <section id="operator-event-journal" class="panel event-journal-panel" aria-label="Operator Event Journal">
+      <section id="operator-event-journal" class="panel event-journal-panel" data-operator-tab="developer" aria-label="Operator Event Journal">
         <div class="panel-head operator-alert-head">
           <div>
             <h2>Event Journal</h2>
@@ -475,7 +563,7 @@
         <div id="operator-event-journal-list" class="operator-event-journal-list"></div>
       </section>
 
-      <section id="operator-action-center" class="panel action-center-panel" aria-label="Operator Action Center">
+      <section id="operator-action-center" class="panel action-center-panel" data-operator-tab="developer" aria-label="Operator Action Center">
         <div class="panel-head operator-alert-head">
           <div>
             <h2>Operator Action Center</h2>
@@ -504,7 +592,7 @@
         </div>
       </section>
 
-      <section id="operator-runbook-panel" class="panel runbook-panel" aria-label="Operator Runbook">
+      <section id="operator-runbook-panel" class="panel runbook-panel" data-operator-tab="developer" aria-label="Operator Runbook">
         <div class="panel-head operator-alert-head">
           <div>
             <h2 id="operator-runbook-title">Runbook</h2>
@@ -515,7 +603,7 @@
         <div id="operator-runbook-body" class="runbook-body"></div>
       </section>
 
-      <section id="postmarket-review-panel" class="panel postmarket-review-panel" aria-label="Post-market Review">
+      <section id="postmarket-review-panel" class="panel postmarket-review-panel" data-operator-tab="reports" aria-label="Post-market Review">
         <div class="panel-head operator-alert-head">
           <div>
             <h2>Post-market Review</h2>
@@ -570,7 +658,7 @@
         </div>
       </section>
 
-      <section class="flow-grid">
+      <section class="flow-grid" data-operator-tab="themes">
         <aside class="panel theme-panel">
           <div class="panel-head">
             <h2>Theme Rank</h2>
@@ -634,7 +722,7 @@
         </aside>
       </section>
 
-      <section class="bottom-grid">
+      <section class="bottom-grid" data-operator-tab="candidates">
         <section class="panel watch-panel">
           <div class="panel-head">
             <h2>WatchSet</h2>
@@ -713,7 +801,7 @@
         </aside>
       </section>
 
-      <section class="quality-grid">
+      <section class="quality-grid" data-operator-tab="developer">
         <section class="panel">
           <div class="panel-head">
             <h2>조건식 상태</h2>

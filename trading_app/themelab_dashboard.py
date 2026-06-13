@@ -33,6 +33,372 @@ from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcome
 GATE_ORDER = {"READY": 0, "READY_SMALL": 1, "WAIT": 2, "OBSERVE": 3, "BLOCKED": 4}
 ROLE_ORDER = {"LEADER": 0, "CO_LEADER": 1, "FOLLOWER": 2, "LATE_LAGGARD": 3, "WEAK_MEMBER": 4, "OVERHEATED": 5}
 SNAPSHOT_STALE_THRESHOLD_SEC = 60
+OPERATOR_TERM_DICTIONARY: dict[str, dict[str, str]] = {
+    "READY": {
+        "label_ko": "매수 가능",
+        "short_label_ko": "가능",
+        "description_ko": "매수 게이트를 통과한 후보입니다.",
+        "severity": "positive",
+        "operator_action_ko": "후보 목록과 주문 안전 상태를 확인하세요.",
+    },
+    "READY_SMALL": {
+        "label_ko": "소액 매수 가능",
+        "short_label_ko": "소액",
+        "description_ko": "정상 비중보다 작은 관찰성 진입 후보입니다.",
+        "severity": "positive",
+        "operator_action_ko": "소액 진입 조건과 당일 한도를 확인하세요.",
+    },
+    "EARLY_SMALL": {
+        "label_ko": "장초반 소액 후보",
+        "short_label_ko": "초반소액",
+        "description_ko": "장초반 데이터가 완성되기 전 제한적으로 관찰하는 소액 후보입니다.",
+        "severity": "neutral",
+        "operator_action_ko": "분봉/VWAP/지지선 준비 상태를 확인하세요.",
+    },
+    "WAIT": {
+        "label_ko": "대기",
+        "short_label_ko": "대기",
+        "description_ko": "조건 확인이 더 필요해 즉시 매수하지 않습니다.",
+        "severity": "neutral",
+        "operator_action_ko": "재확인 조건과 대기 사유를 확인하세요.",
+    },
+    "OBSERVE": {
+        "label_ko": "관측",
+        "short_label_ko": "관측",
+        "description_ko": "주문보다 관찰이 우선인 후보입니다.",
+        "severity": "neutral",
+        "operator_action_ko": "테마와 가격 위치 변화를 지켜보세요.",
+    },
+    "BLOCKED": {
+        "label_ko": "차단",
+        "short_label_ko": "차단",
+        "description_ko": "리스크 또는 안전 조건 때문에 신규 진입을 막고 있습니다.",
+        "severity": "danger",
+        "operator_action_ko": "차단 사유와 주문/리스크 상태를 확인하세요.",
+    },
+    "DATA_INSUFFICIENT": {
+        "label_ko": "데이터 부족",
+        "short_label_ko": "데이터",
+        "description_ko": "현재 판단에 필요한 실시간 가격/지표가 충분하지 않습니다.",
+        "severity": "warning",
+        "operator_action_ko": "실시간 수신, 분봉 캐시, VWAP/지지선 상태를 확인하세요.",
+    },
+    "CORE_BLOCKING": {
+        "label_ko": "핵심 데이터 부족",
+        "short_label_ko": "핵심부족",
+        "description_ko": "진입 판단의 핵심 데이터가 없어 보수적으로 막았습니다.",
+        "severity": "warning",
+        "operator_action_ko": "현재가, 분봉, VWAP, 지지선 수집 상태를 먼저 확인하세요.",
+    },
+    "ENTRY_BLOCKING": {
+        "label_ko": "진입 판단 데이터 부족",
+        "short_label_ko": "진입부족",
+        "description_ko": "진입 위치 판단에 필요한 데이터가 부족합니다.",
+        "severity": "warning",
+        "operator_action_ko": "가격 위치와 지지선/VWAP 준비 상태를 확인하세요.",
+    },
+    "WARMUP_OPTIONAL": {
+        "label_ko": "보조지표 준비중",
+        "short_label_ko": "준비중",
+        "description_ko": "보조지표가 장초반 또는 데이터 수집 과정에서 준비 중입니다.",
+        "severity": "neutral",
+        "operator_action_ko": "추가 분봉 수집을 기다리세요.",
+    },
+    "BACKFILL_ONLY_OBSERVE": {
+        "label_ko": "실시간 미확인",
+        "short_label_ko": "미확인",
+        "description_ko": "TR 보강 데이터만 있고 실시간 흐름 확인이 부족합니다.",
+        "severity": "neutral",
+        "operator_action_ko": "실시간 조건식/틱 수신 여부를 확인하세요.",
+    },
+    "LATE_CHASE": {
+        "label_ko": "뒤늦은 추격 위험",
+        "short_label_ko": "추격위험",
+        "description_ko": "이미 오른 뒤 따라붙는 구간이라 진입을 기다립니다.",
+        "severity": "warning",
+        "operator_action_ko": "눌림 또는 VWAP/지지선 회복을 기다리세요.",
+    },
+    "LATE_CHASE_TEMP_WAIT": {
+        "label_ko": "뒤늦은 추격 위험",
+        "short_label_ko": "추격대기",
+        "description_ko": "늦은 추격 위험이 있어 잠시 뒤 재확인합니다.",
+        "severity": "warning",
+        "operator_action_ko": "재확인 시간 이후 가격 위치를 다시 확인하세요.",
+    },
+    "CHASE_HIGH": {
+        "label_ko": "고점 추격 위험",
+        "short_label_ko": "고점추격",
+        "description_ko": "고점 부근 추격 매수 위험이 큽니다.",
+        "severity": "warning",
+        "operator_action_ko": "고점 이탈 여부와 눌림 전환을 확인하세요.",
+    },
+    "CHASE_RISK": {
+        "label_ko": "추격 위험",
+        "short_label_ko": "추격",
+        "description_ko": "가격 위치상 추격 매수 위험이 큽니다.",
+        "severity": "warning",
+        "operator_action_ko": "즉시 진입보다 눌림 확인을 우선하세요.",
+    },
+    "CHASE_RISK_BLOCKED": {
+        "label_ko": "추격 위험 차단",
+        "short_label_ko": "추격차단",
+        "description_ko": "추격 매수 위험으로 신규 진입을 차단했습니다.",
+        "severity": "danger",
+        "operator_action_ko": "가격 위치가 안정될 때까지 기다리세요.",
+    },
+    "VWAP_OVEREXTENDED": {
+        "label_ko": "VWAP 대비 과열",
+        "short_label_ko": "VWAP과열",
+        "description_ko": "현재가가 VWAP 대비 과도하게 벌어져 있습니다.",
+        "severity": "warning",
+        "operator_action_ko": "VWAP 근처 재접근 또는 눌림을 기다리세요.",
+    },
+    "LOW_BREADTH": {
+        "label_ko": "테마 확산 부족",
+        "short_label_ko": "확산부족",
+        "description_ko": "테마 내 동반 강세 폭이 충분하지 않습니다.",
+        "severity": "neutral",
+        "operator_action_ko": "동반 상승 종목 수와 거래대금 확산을 확인하세요.",
+    },
+    "LEADER_ONLY_THEME": {
+        "label_ko": "대장주 단독 흐름",
+        "short_label_ko": "단독흐름",
+        "description_ko": "대장주는 강하지만 테마 전체 확산이 약합니다.",
+        "severity": "neutral",
+        "operator_action_ko": "공동대장과 후발주 확산 여부를 확인하세요.",
+    },
+    "RISK_OFF": {
+        "label_ko": "시장 위험",
+        "short_label_ko": "시장위험",
+        "description_ko": "시장 상태가 약해 신규 진입을 보수적으로 봅니다.",
+        "severity": "danger",
+        "operator_action_ko": "KOSPI/KOSDAQ 회복 확인을 기다리세요.",
+    },
+    "WAIT_MARKET_CONFIRMATION_PENDING": {
+        "label_ko": "시장 회복 확인 대기",
+        "short_label_ko": "시장대기",
+        "description_ko": "시장 회복이 확인될 때까지 대기합니다.",
+        "severity": "neutral",
+        "operator_action_ko": "시장 폭과 지수 회복 지속 여부를 확인하세요.",
+    },
+    "WAIT_MARKET_RECOVERY_PENDING": {
+        "label_ko": "시장 회복 대기",
+        "short_label_ko": "회복대기",
+        "description_ko": "시장 약세 이후 회복 확인을 기다립니다.",
+        "severity": "neutral",
+        "operator_action_ko": "회복 연속 사이클을 확인하세요.",
+    },
+    "SUPPORT_NOT_READY": {
+        "label_ko": "지지선 확인 전",
+        "short_label_ko": "지지전",
+        "description_ko": "최근 지지선이 아직 충분히 확인되지 않았습니다.",
+        "severity": "neutral",
+        "operator_action_ko": "지지선 수집과 가격 재확인을 기다리세요.",
+    },
+    "VWAP_RECLAIM": {
+        "label_ko": "VWAP 회복",
+        "short_label_ko": "VWAP회복",
+        "description_ko": "가격이 VWAP 위로 회복했습니다.",
+        "severity": "positive",
+        "operator_action_ko": "다른 리스크 조건과 주문 가능 여부를 함께 확인하세요.",
+    },
+    "GOOD_PULLBACK": {
+        "label_ko": "좋은 눌림",
+        "short_label_ko": "눌림",
+        "description_ko": "과열을 피한 눌림 구간으로 판단됩니다.",
+        "severity": "positive",
+        "operator_action_ko": "테마 강도와 주문 안전 상태를 확인하세요.",
+    },
+    "PULLBACK_RECLAIM": {
+        "label_ko": "눌림 후 회복",
+        "short_label_ko": "회복",
+        "description_ko": "눌림 이후 가격이 다시 회복하는 흐름입니다.",
+        "severity": "positive",
+        "operator_action_ko": "회복이 유지되는지 확인하세요.",
+    },
+    "LIVE_SIM_BLOCKED": {
+        "label_ko": "모의투자 주문 차단",
+        "short_label_ko": "모의차단",
+        "description_ko": "LIVE_SIM 주문 안전장치가 신규 주문을 막고 있습니다.",
+        "severity": "danger",
+        "operator_action_ko": "LIVE_SIM audit, reconcile, 주문번호 상태를 확인하세요.",
+    },
+    "RECONCILE_REQUIRED": {
+        "label_ko": "주문/잔고 재확인 필요",
+        "short_label_ko": "재확인",
+        "description_ko": "주문 또는 잔고 상태를 다시 맞춰야 합니다.",
+        "severity": "danger",
+        "operator_action_ko": "미체결, 체결, 포지션 원장을 대조하세요.",
+    },
+    "UNKNOWN_SUBMIT": {
+        "label_ko": "주문 결과 확인 필요",
+        "short_label_ko": "결과확인",
+        "description_ko": "주문 제출 결과가 명확하지 않습니다.",
+        "severity": "danger",
+        "operator_action_ko": "주문번호와 broker 응답을 확인하세요.",
+    },
+    "ORDER_SINK_NOOP": {
+        "label_ko": "주문 경로 비활성",
+        "short_label_ko": "경로비활성",
+        "description_ko": "주문 sink가 실제 제출하지 않는 모드입니다.",
+        "severity": "neutral",
+        "operator_action_ko": "운영 모드가 관측 전용인지 확인하세요.",
+    },
+    "ENTRY_PLAN_DIAGNOSTIC_ONLY": {
+        "label_ko": "진단 전용 후보",
+        "short_label_ko": "진단전용",
+        "description_ko": "주문 후보가 아니라 진단과 관찰을 위한 후보입니다.",
+        "severity": "neutral",
+        "operator_action_ko": "주문이 나가지 않는 것이 정상인지 확인하세요.",
+    },
+    "GATEWAY_DISCONNECTED": {
+        "label_ko": "게이트웨이 미연결",
+        "short_label_ko": "미연결",
+        "description_ko": "32bit Kiwoom Gateway가 Core와 연결되어 있지 않습니다.",
+        "severity": "danger",
+        "operator_action_ko": "게이트웨이 실행 상태와 네트워크 연결을 확인하세요.",
+    },
+    "GATEWAY_HEARTBEAT_BAD": {
+        "label_ko": "게이트웨이 응답 지연",
+        "short_label_ko": "응답지연",
+        "description_ko": "게이트웨이 heartbeat가 정상으로 들어오지 않습니다.",
+        "severity": "danger",
+        "operator_action_ko": "게이트웨이 프로세스가 멈췄는지 확인하고 재연결 상태를 보세요.",
+    },
+    "KIWOOM_NOT_LOGGED_IN": {
+        "label_ko": "키움 미로그인",
+        "short_label_ko": "미로그인",
+        "description_ko": "Kiwoom OpenAPI 로그인이 확인되지 않았습니다.",
+        "severity": "danger",
+        "operator_action_ko": "키움 로그인 창과 계정 접속 상태를 확인하세요.",
+    },
+    "KIWOOM_NOT_ORDERABLE": {
+        "label_ko": "키움 주문 불가",
+        "short_label_ko": "주문불가",
+        "description_ko": "키움 연결은 있어도 주문 가능 상태가 아닙니다.",
+        "severity": "danger",
+        "operator_action_ko": "계좌/모의투자 접속, 주문 가능 플래그, 장 상태를 확인하세요.",
+    },
+    "SHADOW_PROMOTION_EVIDENCE_NOT_READY": {
+        "label_ko": "승격 근거 부족",
+        "short_label_ko": "근거부족",
+        "description_ko": "Shadow Small Entry를 LIVE_SIM으로 올릴 충분한 승격 근거가 아직 없습니다.",
+        "severity": "warning",
+        "operator_action_ko": "리포트 탭에서 승격 후보와 outcome 근거가 쌓였는지 확인하세요.",
+    },
+    "SNAPSHOT_UNAVAILABLE": {
+        "label_ko": "스냅샷 대기",
+        "short_label_ko": "대기",
+        "description_ko": "ThemeLabFlow 결과를 아직 받지 못했습니다.",
+        "severity": "neutral",
+        "operator_action_ko": "런타임과 데이터 수신 상태를 확인하세요.",
+    },
+    "RUNTIME_INACTIVE": {
+        "label_ko": "런타임 중지",
+        "short_label_ko": "중지",
+        "description_ko": "전략 런타임이 현재 동작하지 않습니다.",
+        "severity": "warning",
+        "operator_action_ko": "Runtime 상태를 확인하세요.",
+    },
+    "SNAPSHOT_STALE": {
+        "label_ko": "스냅샷 지연",
+        "short_label_ko": "지연",
+        "description_ko": "ThemeLab 스냅샷이 오래되어 최신 상태가 아닙니다.",
+        "severity": "warning",
+        "operator_action_ko": "스냅샷 갱신과 런타임 상태를 확인하세요.",
+    },
+    "READY_TO_TRADE": {
+        "label_ko": "매수 가능",
+        "short_label_ko": "가능",
+        "description_ko": "매수 가능 후보와 주문 안전 상태가 확인되었습니다.",
+        "severity": "positive",
+        "operator_action_ko": "후보 목록과 주문 상태를 확인하세요.",
+    },
+    "READY_BUT_LIVE_BLOCKED": {
+        "label_ko": "후보 있음, 주문 차단",
+        "short_label_ko": "주문차단",
+        "description_ko": "READY 후보는 있으나 주문 안전장치가 막고 있습니다.",
+        "severity": "warning",
+        "operator_action_ko": "LIVE_SIM guard와 audit 상태를 확인하세요.",
+    },
+    "WAIT_DATA_QUALITY": {
+        "label_ko": "데이터 준비중",
+        "short_label_ko": "데이터",
+        "description_ko": "분봉/VWAP/지지선 등 판단 데이터가 준비 중입니다.",
+        "severity": "warning",
+        "operator_action_ko": "실시간 데이터 수집 상태를 확인하세요.",
+    },
+    "WAIT_MARKET_CONFIRMATION": {
+        "label_ko": "시장 확인 대기",
+        "short_label_ko": "시장대기",
+        "description_ko": "시장 회복 또는 강도 확인이 필요합니다.",
+        "severity": "neutral",
+        "operator_action_ko": "지수와 시장 폭을 확인하세요.",
+    },
+    "WAIT_MARKET_RISK_OFF": {
+        "label_ko": "시장 위험 대기",
+        "short_label_ko": "위험대기",
+        "description_ko": "시장 위험 상태가 풀리기를 기다립니다.",
+        "severity": "warning",
+        "operator_action_ko": "시장 회복 연속성과 리스크 상태를 확인하세요.",
+    },
+    "WAIT_MARKET_CONDITION": {
+        "label_ko": "시장 조건 대기",
+        "short_label_ko": "시장조건",
+        "description_ko": "시장 조건이 충분히 우호적이지 않습니다.",
+        "severity": "neutral",
+        "operator_action_ko": "시장 조건이 개선되는지 확인하세요.",
+    },
+    "RISK_BLOCKED": {
+        "label_ko": "위험 차단",
+        "short_label_ko": "차단",
+        "description_ko": "리스크 조건 때문에 신규 진입을 막고 있습니다.",
+        "severity": "danger",
+        "operator_action_ko": "차단 사유와 재확인 시간을 확인하세요.",
+    },
+    "OBSERVE_ONLY": {
+        "label_ko": "관측전용",
+        "short_label_ko": "관측",
+        "description_ko": "현재는 주문보다 관측이 우선입니다.",
+        "severity": "neutral",
+        "operator_action_ko": "테마와 후보 변화를 지켜보세요.",
+    },
+    "NO_SIGNAL": {
+        "label_ko": "매수 후보 없음",
+        "short_label_ko": "없음",
+        "description_ko": "현재 주문 후보가 없습니다.",
+        "severity": "neutral",
+        "operator_action_ko": "안 산 이유 탭에서 큰 사유를 확인하세요.",
+    },
+    "OK": {
+        "label_ko": "정상",
+        "short_label_ko": "정상",
+        "description_ko": "확인된 문제가 없습니다.",
+        "severity": "positive",
+        "operator_action_ko": "특별 조치가 필요하지 않습니다.",
+    },
+    "WARNING": {
+        "label_ko": "확인 필요",
+        "short_label_ko": "확인",
+        "description_ko": "일부 상태 확인이 필요합니다.",
+        "severity": "warning",
+        "operator_action_ko": "상세 탭에서 원인을 확인하세요.",
+    },
+    "ERROR": {
+        "label_ko": "문제 있음",
+        "short_label_ko": "문제",
+        "description_ko": "운영자가 확인해야 할 문제가 있습니다.",
+        "severity": "danger",
+        "operator_action_ko": "상세 로그와 audit 상태를 확인하세요.",
+    },
+    "NO_DATA": {
+        "label_ko": "데이터 없음",
+        "short_label_ko": "없음",
+        "description_ko": "아직 표시할 데이터가 없습니다.",
+        "severity": "muted",
+        "operator_action_ko": "데이터가 쌓일 때까지 기다리세요.",
+    },
+}
 DISPLAY_WAIT_ORDER = {
     "LATE_CHASE_TEMP_WAIT": 0,
     "WAIT_MARKET_CONFIRMATION_PENDING": 1,
@@ -90,7 +456,7 @@ def build_theme_lab_dashboard_snapshot(
     shadow_small_entry_ops = _shadow_small_entry_ops(db, gateway_state=gateway_state, trade_date=trade_date)
     shadow_small_entry_pilot = _shadow_small_entry_pilot(db, gateway_state=gateway_state, trade_date=trade_date)
 
-    return {
+    payload = {
         "available": True,
         "source": "theme_lab_flow_snapshots",
         "created_at": raw.get("created_at", ""),
@@ -120,6 +486,8 @@ def build_theme_lab_dashboard_snapshot(
         "shadow_small_entry_ab": gate_reason_outcomes.get("shadow_small_entry_ab") or _empty_shadow_small_entry_ab(),
         "summary": summary,
     }
+    payload["operator_view"] = _operator_view(payload)
+    return payload
 
 
 def _empty_snapshot(
@@ -131,7 +499,7 @@ def _empty_snapshot(
 ) -> dict[str, Any]:
     runtime = _runtime_context(runtime_status)
     freshness = _empty_freshness()
-    return {
+    payload = {
         "available": False,
         "source": "theme_lab_flow_snapshots",
         "created_at": "",
@@ -192,6 +560,8 @@ def _empty_snapshot(
         "shadow_small_entry_ab": _empty_shadow_small_entry_ab(),
         "summary": _empty_summary(runtime=runtime, freshness=freshness),
     }
+    payload["operator_view"] = _operator_view(payload)
+    return payload
 
 
 def _live_sim_audit(db: TradingDatabase, *, gateway_state: Any | None, trade_date: str = "") -> dict[str, Any]:
@@ -964,6 +1334,602 @@ def _operation_status_message(
             return "OBSERVE_ONLY", "현재 READY 후보가 없어 관찰 우선입니다."
         return "NO_SIGNAL", "현재 주문 후보가 없습니다."
     return "OBSERVE_ONLY", "장중 매수 가능 후보를 관찰 중입니다."
+
+
+def _operator_term(code: Any) -> dict[str, str]:
+    key = _value(code).upper()
+    if key in OPERATOR_TERM_DICTIONARY:
+        return dict(OPERATOR_TERM_DICTIONARY[key])
+    label = key.replace("_", " ") if key else "UNKNOWN"
+    return {
+        "label_ko": label,
+        "short_label_ko": label,
+        "description_ko": "상세 탭에서 원문 상태를 확인하세요.",
+        "severity": "muted",
+        "operator_action_ko": "필요하면 개발자 상세 탭에서 원문 reason_code를 확인하세요.",
+    }
+
+
+def _operator_view(snapshot: dict[str, Any]) -> dict[str, Any]:
+    summary = dict(snapshot.get("summary") or {})
+    market = dict(snapshot.get("market") or {})
+    data_quality = dict(snapshot.get("data_quality") or {})
+    gateway = dict(snapshot.get("gateway") or {})
+    ranked_themes = _as_list(snapshot.get("ranked_themes"))
+    watchset = _as_list(snapshot.get("watchset"))
+    entry_candidates = [
+        item
+        for item in watchset
+        if str(item.get("gate_status") or item.get("display_status") or "") in {"READY", "READY_SMALL", "EARLY_SMALL"}
+        or str(item.get("display_status") or "") in {"READY", "READY_SMALL", "EARLY_SMALL"}
+    ]
+    no_buy_reasons = _operator_no_buy_reasons(summary, data_quality, watchset, snapshot)
+    risk_status = _operator_risk_status(summary, data_quality, gateway, snapshot)
+    main_action = _operator_main_action(summary, market, data_quality, entry_candidates, no_buy_reasons, risk_status)
+    return {
+        "main_action": main_action,
+        "market": _operator_market_view(market),
+        "operating_status": _operator_operating_status(summary, market, data_quality, gateway, snapshot),
+        "top_themes": [_operator_theme_row(item) for item in ranked_themes[:5]],
+        "buy_candidates": [_operator_candidate_row(item, index) for index, item in enumerate(entry_candidates[:10], start=1)],
+        "no_buy_reasons": no_buy_reasons[:3],
+        "risk_status": risk_status[:5],
+        "panels": _operator_panels(snapshot),
+        "limits": {
+            "top_themes": 5,
+            "buy_candidates": 10,
+            "no_buy_reasons": 3,
+            "risk_status": 5,
+        },
+    }
+
+
+def _operator_main_action(
+    summary: dict[str, Any],
+    market: dict[str, Any],
+    data_quality: dict[str, Any],
+    entry_candidates: list[dict[str, Any]],
+    no_buy_reasons: list[dict[str, Any]],
+    risk_status: list[dict[str, Any]],
+) -> dict[str, Any]:
+    market_status = _value(market.get("market_status")).upper()
+    critical_risk = next((item for item in risk_status if item.get("severity") == "danger"), None)
+    if market_status in {"CLOSED", "MARKET_CLOSED", "AFTER_MARKET", "POST_MARKET", "DONE"}:
+        status = "OBSERVE_ONLY"
+        message = "정규장이 종료되었습니다. 리포트 탭에서 장후 리뷰를 확인하세요."
+    elif critical_risk and critical_risk.get("code") in {"LIVE_SIM_BLOCKED", "RECONCILE_REQUIRED", "UNKNOWN_SUBMIT"}:
+        status = critical_risk["code"]
+        message = "주문/체결 상태 확인이 필요해 신규 진입을 막고 있습니다."
+    elif str(data_quality.get("status") or "").upper() in {"BROKEN", "DEGRADED"}:
+        status = "WAIT_DATA_QUALITY"
+        message = "실시간 데이터가 준비 중입니다. 분봉/VWAP/지지선 수집을 기다립니다."
+    elif entry_candidates:
+        status = "READY_TO_TRADE"
+        message = "지금 매수 가능 후보가 있습니다. 후보 목록을 확인하세요."
+    elif no_buy_reasons:
+        status = "NO_SIGNAL"
+        message = f"현재 매수 가능 후보가 없습니다. 가장 큰 이유는 {no_buy_reasons[0]['label_ko']}입니다."
+    else:
+        status = str(summary.get("operation_status") or "OBSERVE_ONLY")
+        message = str(summary.get("operation_message_ko") or "현재는 관측 전용입니다. 주문은 나가지 않습니다.")
+    term = _operator_term(status)
+    return {
+        "status": status,
+        "label_ko": term["label_ko"],
+        "message_ko": message,
+        "severity": term["severity"],
+        "operator_action_ko": term["operator_action_ko"],
+    }
+
+
+def _operator_market_view(market: dict[str, Any]) -> dict[str, Any]:
+    status = str(market.get("market_status") or "UNKNOWN")
+    sides = _as_list(market.get("sides"))
+    side_labels = []
+    for side in sides:
+        side_labels.append(f"{side.get('side') or '-'} {side.get('status') or 'UNKNOWN'}")
+    return {
+        "status": status,
+        "label_ko": _market_status_label(status),
+        "message_ko": " / ".join(side_labels) if side_labels else "시장 상태 확인 중입니다.",
+        "kospi": _operator_market_side(sides, "KOSPI", market.get("kospi_return_pct")),
+        "kosdaq": _operator_market_side(sides, "KOSDAQ", market.get("kosdaq_return_pct")),
+    }
+
+
+def _operator_market_side(sides: list[dict[str, Any]], side: str, fallback_return: Any) -> dict[str, Any]:
+    item = next((row for row in sides if str(row.get("side") or "").upper() == side), {})
+    return {
+        "side": side,
+        "status": item.get("status") or "UNKNOWN",
+        "return_pct": _first_not_none(item.get("index_return_pct"), fallback_return),
+        "breadth_pct": item.get("breadth_pct"),
+        "breadth_ready": bool(item.get("breadth_ready")),
+        "breadth_trust_level": item.get("breadth_trust_level") or "UNKNOWN",
+    }
+
+
+def _operator_operating_status(
+    summary: dict[str, Any],
+    market: dict[str, Any],
+    data_quality: dict[str, Any],
+    gateway: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> list[dict[str, Any]]:
+    live_enabled = bool(summary.get("live_order_enabled"))
+    live_guard_blocked = int(summary.get("live_guard_blocked_count") or 0)
+    operation_status = str(summary.get("operation_status") or "OBSERVE_ONLY")
+    return [
+        _operator_status_item(
+            "market_session",
+            "장 상태",
+            _market_session_code(str(market.get("market_status") or "")),
+            _market_session_label(str(market.get("market_status") or "")),
+            _market_status_message(str(market.get("market_status") or "")),
+        ),
+        _operator_status_item(
+            "kiwoom",
+            "Kiwoom 연결",
+            "OK" if gateway.get("connected") and gateway.get("heartbeat_ok") and gateway.get("kiwoom_logged_in") else "WARNING",
+            "정상" if gateway.get("connected") and gateway.get("heartbeat_ok") and gateway.get("kiwoom_logged_in") else "확인 필요",
+            "키움 연결과 heartbeat가 정상입니다." if gateway.get("connected") and gateway.get("heartbeat_ok") and gateway.get("kiwoom_logged_in") else "키움 연결, 로그인, heartbeat를 확인하세요.",
+        ),
+        _operator_status_item(
+            "data",
+            "데이터 상태",
+            str(data_quality.get("status") or "UNKNOWN"),
+            _data_status_label(str(data_quality.get("status") or "UNKNOWN")),
+            str(data_quality.get("message") or "데이터 상태 확인 중입니다."),
+        ),
+        _operator_status_item(
+            "orders",
+            "주문 상태",
+            "LIVE_SIM_BLOCKED" if live_guard_blocked else "READY" if live_enabled else "ORDER_SINK_NOOP",
+            "중단됨" if live_guard_blocked else "LIVE_SIM 가능" if live_enabled else "관측전용",
+            "LIVE Guard 차단 후보가 있습니다." if live_guard_blocked else "LIVE_SIM 주문 경로를 사용할 수 있습니다." if live_enabled else "지금은 관측 전용입니다. 주문은 나가지 않습니다.",
+        ),
+        _operator_status_item(
+            "auto_trading",
+            "오늘 자동매매 상태",
+            operation_status,
+            _operator_term(operation_status)["label_ko"],
+            str(summary.get("operation_message_ko") or "운영 상태 확인 중입니다."),
+        ),
+    ]
+
+
+def _operator_status_item(key: str, title: str, code: str, label: str, message: str) -> dict[str, str]:
+    term = _operator_term(code)
+    return {
+        "key": key,
+        "title_ko": title,
+        "status": code,
+        "label_ko": label,
+        "severity": term["severity"],
+        "message_ko": message,
+    }
+
+
+def _operator_theme_row(item: dict[str, Any]) -> dict[str, Any]:
+    status = _theme_status_bucket(item.get("theme_status"))
+    leader = item.get("top_leader_name") or item.get("top_leader_symbol") or "-"
+    breadth = _theme_breadth_pct(item)
+    co_leaders = _theme_member_names(item, role_key="CO_LEADER")[:3]
+    return {
+        "rank": int(item.get("rank") or 0),
+        "theme_id": item.get("theme_id") or "",
+        "theme_name": item.get("theme_name") or "-",
+        "score": item.get("condition_score") or item.get("theme_score") or 0,
+        "breadth_pct": breadth,
+        "leader": leader,
+        "co_leaders": co_leaders,
+        "status": status,
+        "label_ko": _theme_status_label(status),
+        "severity": _theme_status_severity(status),
+        "operator_message_ko": _theme_operator_message(item, status, breadth, leader),
+    }
+
+
+def _operator_candidate_row(item: dict[str, Any], priority: int) -> dict[str, Any]:
+    gate = str(item.get("gate_status") or item.get("display_status") or "OBSERVE")
+    display = str(item.get("display_status") or gate)
+    location = str(item.get("price_location_status") or item.get("price_location") or "UNKNOWN")
+    order_code = _candidate_order_permission_code(item)
+    return {
+        "priority": priority,
+        "symbol": item.get("symbol") or "",
+        "code": item.get("code") or item.get("symbol") or "",
+        "stock_name": item.get("stock_name") or item.get("name") or "-",
+        "theme_name": item.get("theme_name") or item.get("primary_theme") or "-",
+        "gate_status": gate,
+        "status_label_ko": _operator_term(gate)["label_ko"],
+        "display_status": display,
+        "display_label_ko": _operator_term(display)["label_ko"],
+        "role": item.get("stock_role") or "UNKNOWN",
+        "role_label_ko": _role_label(item.get("stock_role")),
+        "entry_position": location,
+        "entry_position_label_ko": _entry_position_label(location, display),
+        "order_permission": order_code,
+        "order_permission_label_ko": _order_permission_label(order_code),
+        "severity": _operator_term(order_code if order_code != "READY" else gate)["severity"],
+        "operator_message_ko": item.get("operator_message_ko") or _candidate_operator_message(item, location, order_code),
+    }
+
+
+def _operator_no_buy_reasons(
+    summary: dict[str, Any],
+    data_quality: dict[str, Any],
+    watchset: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+) -> list[dict[str, Any]]:
+    reasons: Counter[str] = Counter()
+    data_status = str(data_quality.get("status") or "").upper()
+    if data_status in {"BROKEN", "DEGRADED"}:
+        reasons["DATA_INSUFFICIENT"] += max(1, int(data_quality.get("candle_missing_count") or 0))
+    if int(summary.get("market_pending_count") or 0) or int(summary.get("market_confirmation_pending_count") or 0):
+        reasons["WAIT_MARKET_CONFIRMATION_PENDING"] += int(summary.get("market_pending_count") or 1)
+    if int(summary.get("live_guard_blocked_count") or 0):
+        reasons["LIVE_SIM_BLOCKED"] += int(summary.get("live_guard_blocked_count") or 0)
+    if int(summary.get("late_chase_wait_count") or 0) or int(summary.get("chase_risk_blocked_count") or 0):
+        reasons["LATE_CHASE"] += int(summary.get("late_chase_wait_count") or 0) + int(summary.get("chase_risk_blocked_count") or 0)
+    for item in watchset:
+        display = str(item.get("display_status") or "")
+        if display in OPERATOR_TERM_DICTIONARY:
+            reasons[display] += 1
+        for key in ("blocked_reason_codes", "risk_reason_codes", "price_location_reason_codes", "price_location_readiness_reason_codes", "data_quality_flags", "price_location_data_quality_flags"):
+            for reason in item.get(key) or []:
+                code = _normalize_operator_reason_code(reason)
+                if code:
+                    reasons[code] += 1
+        if item.get("diagnostic_only"):
+            reasons["ENTRY_PLAN_DIAGNOSTIC_ONLY"] += 1
+        if item.get("support_ready_reason"):
+            reasons["SUPPORT_NOT_READY"] += 1
+    live_sim = dict(snapshot.get("live_sim_audit") or {})
+    live_summary = dict(live_sim.get("summary") or {})
+    if int(live_summary.get("unknown_submit_count") or 0):
+        reasons["UNKNOWN_SUBMIT"] += int(live_summary.get("unknown_submit_count") or 0)
+    if int(live_summary.get("reconcile_required_order_count") or 0):
+        reasons["RECONCILE_REQUIRED"] += int(live_summary.get("reconcile_required_order_count") or 0)
+    if not reasons and int(summary.get("order_candidate_count") or 0) <= 0:
+        reasons["NO_SIGNAL"] += 1
+    rows = []
+    for code, count in reasons.most_common():
+        term = _operator_term(code)
+        rows.append(
+            {
+                "code": code,
+                "label_ko": term["label_ko"],
+                "short_label_ko": term["short_label_ko"],
+                "count": count,
+                "severity": term["severity"],
+                "description_ko": term["description_ko"],
+                "operator_action_ko": term["operator_action_ko"],
+                "operator_message_ko": _no_buy_message(code),
+            }
+        )
+    return rows
+
+
+def _operator_risk_status(
+    summary: dict[str, Any],
+    data_quality: dict[str, Any],
+    gateway: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> list[dict[str, Any]]:
+    live_sim = dict(snapshot.get("live_sim_audit") or {})
+    live_summary = dict(live_sim.get("summary") or {})
+    shadow_ops = dict(snapshot.get("shadow_small_entry_ops") or {})
+    unknown_submit = int(live_summary.get("unknown_submit_count") or 0)
+    reconcile_count = int(live_summary.get("reconcile_required_order_count") or 0)
+    open_orders = int(live_summary.get("open_live_sim_order_count") or 0)
+    cancel_wait = int(live_summary.get("cancel_requested_stale_count") or 0)
+    risk_rows = [
+        _risk_item(
+            "live_sim_audit",
+            "LIVE_SIM audit",
+            "UNKNOWN_SUBMIT" if unknown_submit else "RECONCILE_REQUIRED" if reconcile_count else str(live_sim.get("status") or "NO_DATA"),
+            "문제 있음" if unknown_submit else "확인 필요" if reconcile_count else "정상" if live_sim.get("status") == "OK" else "확인 필요",
+            ((live_sim.get("operator") or {}).get("status_message_ko") or "LIVE_SIM 주문 audit 상태를 확인하세요."),
+            count=unknown_submit or reconcile_count,
+        ),
+        _risk_item(
+            "reconcile",
+            "Reconcile",
+            "RECONCILE_REQUIRED" if reconcile_count else "OK",
+            "확인 필요" if reconcile_count else "정상",
+            "주문/잔고 재확인이 필요합니다." if reconcile_count else "주문/잔고 재확인 이슈가 없습니다.",
+            count=reconcile_count,
+        ),
+        _risk_item(
+            "open_orders",
+            "미체결",
+            "WARNING" if open_orders or cancel_wait else "OK",
+            "취소 대기" if cancel_wait else "있음" if open_orders else "없음",
+            "미체결 또는 취소 대기 주문을 확인하세요." if open_orders or cancel_wait else "미체결 주문이 없습니다.",
+            count=open_orders or cancel_wait,
+        ),
+        _risk_item(
+            "shadow_small_entry",
+            "Shadow Small Entry",
+            "READY" if shadow_ops.get("order_enabled") else "ORDER_SINK_NOOP",
+            "활성" if shadow_ops.get("order_enabled") else "관측전용",
+            shadow_ops.get("operator_message_ko") or "현재는 관측 전용입니다. 주문은 나가지 않습니다.",
+        ),
+        _risk_item(
+            "daily_risk",
+            "당일 리스크",
+            "WARNING" if int(summary.get("live_guard_blocked_count") or 0) or str(data_quality.get("status") or "").upper() in {"BROKEN", "DEGRADED"} else "OK",
+            "확인 필요" if int(summary.get("live_guard_blocked_count") or 0) or str(data_quality.get("status") or "").upper() in {"BROKEN", "DEGRADED"} else "정상",
+            "데이터 품질 또는 주문 Guard 차단 상태를 확인하세요." if int(summary.get("live_guard_blocked_count") or 0) or str(data_quality.get("status") or "").upper() in {"BROKEN", "DEGRADED"} else "당일 리스크 상태가 정상입니다.",
+        ),
+    ]
+    if not gateway.get("connected") or not gateway.get("heartbeat_ok"):
+        risk_rows.insert(
+            0,
+            _risk_item(
+                "kiwoom_gateway",
+                "Kiwoom 연결",
+                "WARNING",
+                "확인 필요",
+                "키움 게이트웨이 연결과 heartbeat를 확인하세요.",
+            ),
+        )
+    return risk_rows
+
+
+def _risk_item(key: str, title: str, code: str, label: str, message: str, *, count: int = 0) -> dict[str, Any]:
+    term = _operator_term(code)
+    return {
+        "key": key,
+        "title_ko": title,
+        "code": code,
+        "label_ko": label,
+        "severity": term["severity"],
+        "message_ko": message,
+        "count": count,
+    }
+
+
+def _operator_panels(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    live_sim = dict(snapshot.get("live_sim_audit") or {})
+    conservative = dict(snapshot.get("conservative_reason_outcomes") or {})
+    shadow_ops = dict(snapshot.get("shadow_small_entry_ops") or {})
+    shadow_pilot = dict(snapshot.get("shadow_small_entry_pilot") or {})
+    gate_outcomes = dict(snapshot.get("gate_reason_outcomes") or {})
+    return {
+        "buy_zero_rca": {
+            "summary_ko": "매수 0건 원인은 안 산 이유 탭에서 요약하고, trace는 개발자 상세에서 확인합니다.",
+            "visible_in_main": False,
+            "tab": "no-buy",
+            "status": gate_outcomes.get("status") or "NO_DATA",
+        },
+        "live_sim_audit": {
+            "summary_ko": ((live_sim.get("operator") or {}).get("status_message_ko") or "LIVE_SIM audit는 주문/리스크 탭에서 확인합니다."),
+            "visible_in_main": False,
+            "tab": "orders-risk",
+            "status": live_sim.get("status") or "NO_DATA",
+        },
+        "shadow_small_entry": {
+            "summary_ko": shadow_ops.get("operator_message_ko") or "Shadow Small Entry 운영 상태는 주문/리스크 또는 리포트 탭에서 확인합니다.",
+            "visible_in_main": False,
+            "tab": "orders-risk",
+            "status": shadow_ops.get("status") or "NO_DATA",
+        },
+        "conservative_reason": {
+            "summary_ko": "보수적 차단 사유 outcome은 안 산 이유 탭에서 확인합니다.",
+            "visible_in_main": False,
+            "tab": "no-buy",
+            "status": conservative.get("status") or "NO_DATA",
+        },
+        "pilot_report": {
+            "summary_ko": shadow_pilot.get("operator_message_ko") or "파일럿 리포트는 리포트 탭에서 확인합니다.",
+            "visible_in_main": False,
+            "tab": "reports",
+            "status": shadow_pilot.get("status") or "NO_DATA",
+        },
+        "developer_details": {
+            "summary_ko": "raw JSON, trace, reason_code 원문은 개발자 상세 탭에서만 표시합니다.",
+            "visible_in_main": False,
+            "tab": "developer",
+            "status": "HIDDEN",
+        },
+    }
+
+
+def _normalize_operator_reason_code(reason: Any) -> str:
+    text = _value(reason).upper()
+    if not text:
+        return ""
+    aliases = {
+        "PRICE_LOCATION_DATA_MISSING": "DATA_INSUFFICIENT",
+        "PRICE_LOCATION_CORE_DATA_MISSING": "CORE_BLOCKING",
+        "PRICE_LOCATION_WARMUP": "WARMUP_OPTIONAL",
+        "PRICE_LOCATION_UNKNOWN": "ENTRY_BLOCKING",
+        "WAIT_DATA_SUPPORT_NOT_READY": "SUPPORT_NOT_READY",
+        "MISSING_VWAP": "DATA_INSUFFICIENT",
+        "MISSING_CURRENT_PRICE": "DATA_INSUFFICIENT",
+        "MISSING_SESSION_HIGH": "DATA_INSUFFICIENT",
+        "MISSING_PREV_CLOSE": "DATA_INSUFFICIENT",
+        "STALE_TICK": "DATA_INSUFFICIENT",
+        "CHASE_RISK_BLOCKED": "LATE_CHASE",
+        "LATE_CHASE_TEMP_WAIT": "LATE_CHASE",
+    }
+    return aliases.get(text, text)
+
+
+def _theme_breadth_pct(item: dict[str, Any]) -> float | None:
+    total = int(item.get("eligible_total_members") or 0)
+    alive = int(item.get("alive_count") or item.get("strong_count") or 0)
+    if total <= 0:
+        ratio_value = item.get("alive_ratio") or item.get("strong_ratio")
+        try:
+            return round(float(ratio_value) * 100.0, 1)
+        except (TypeError, ValueError):
+            return None
+    return round(alive / total * 100.0, 1)
+
+
+def _theme_member_names(item: dict[str, Any], *, role_key: str) -> list[str]:
+    names = []
+    for member in item.get("member_hits") or []:
+        if not isinstance(member, dict):
+            continue
+        role = str(member.get("stock_role") or member.get("role") or "").upper()
+        if role == role_key:
+            names.append(str(member.get("name") or member.get("symbol") or ""))
+    return [name for name in names if name]
+
+
+def _theme_operator_message(item: dict[str, Any], status: str, breadth: float | None, leader: str) -> str:
+    score_value = item.get("condition_score") or item.get("theme_score") or 0
+    if status == "LEADING":
+        return f"{leader} 중심으로 점수 {float(score_value or 0):.0f}점, 확산도 {breadth if breadth is not None else '-'}%라 주도테마로 봅니다."
+    if status == "ACTIVE":
+        return f"테마 흐름은 살아 있고 확산도 {breadth if breadth is not None else '-'}%를 확인 중입니다."
+    if status == "WATCH":
+        return "관심 테마지만 확산 또는 대장주 지속성을 더 확인해야 합니다."
+    if status == "WEAK":
+        return "테마 강도가 약해 메인 매수 후보로 보기 어렵습니다."
+    return "테마 상태를 확인 중입니다."
+
+
+def _candidate_operator_message(item: dict[str, Any], location: str, order_code: str) -> str:
+    if order_code == "LIVE_SIM_BLOCKED":
+        return "후보는 있지만 LIVE_SIM 주문 안전장치가 차단 중입니다."
+    if str(item.get("gate_status") or "") == "READY_SMALL":
+        return "조건은 유효하지만 소액으로만 접근하는 후보입니다."
+    if location in {"GOOD_PULLBACK", "PULLBACK_RECLAIM"}:
+        return "테마와 가격 위치가 맞아 매수 후보로 볼 수 있습니다."
+    if location == "VWAP_RECLAIM":
+        return "VWAP 회복이 확인되어 진입 후보로 볼 수 있습니다."
+    if "CHASE" in str(item.get("display_status") or "") or item.get("chase_risk"):
+        return "테마는 강하지만 종목이 고점 추격 구간이라 매수하지 않습니다."
+    return item.get("summary_reason") or "후보 조건을 확인 중입니다."
+
+
+def _candidate_order_permission_code(item: dict[str, Any]) -> str:
+    if item.get("submittable") and item.get("live_order_guard_passed"):
+        return "READY"
+    if str(item.get("gate_status") or "") in {"READY", "READY_SMALL"} and not item.get("live_order_guard_passed"):
+        return "LIVE_SIM_BLOCKED"
+    if item.get("diagnostic_only"):
+        return "ENTRY_PLAN_DIAGNOSTIC_ONLY"
+    return "OBSERVE"
+
+
+def _no_buy_message(code: str) -> str:
+    return {
+        "DATA_INSUFFICIENT": "지지선/VWAP 데이터가 아직 부족합니다.",
+        "CORE_BLOCKING": "핵심 가격 데이터가 부족해 매수하지 않습니다.",
+        "ENTRY_BLOCKING": "진입 판단 데이터가 부족해 기다립니다.",
+        "SUPPORT_NOT_READY": "지지선 확인 전이라 매수하지 않습니다.",
+        "WAIT_MARKET_CONFIRMATION_PENDING": "시장 상태가 약해 대기 중입니다.",
+        "LATE_CHASE": "후보는 강하지만 추격 위험이라 기다립니다.",
+        "LIVE_SIM_BLOCKED": "LIVE_SIM 주문 안전장치가 차단 중입니다.",
+        "RECONCILE_REQUIRED": "주문/잔고 재확인이 필요해 신규 매수를 중단합니다.",
+        "UNKNOWN_SUBMIT": "주문번호 확인이 필요해 신규 매수를 중단합니다.",
+        "ENTRY_PLAN_DIAGNOSTIC_ONLY": "지금은 관측 전용입니다. 주문은 나가지 않습니다.",
+        "NO_SIGNAL": "현재 매수 가능 후보가 없습니다.",
+    }.get(code, _operator_term(code)["description_ko"])
+
+
+def _role_label(role: Any) -> str:
+    return {
+        "LEADER": "대장",
+        "CO_LEADER": "공동대장",
+        "FOLLOWER": "후발",
+        "LATE_LAGGARD": "후발",
+        "WEAK_MEMBER": "제외",
+        "OVERHEATED": "제외",
+    }.get(_value(role).upper(), "확인중")
+
+
+def _entry_position_label(location: str, display: str = "") -> str:
+    if "CHASE" in display:
+        return "추격 위험"
+    return {
+        "GOOD_PULLBACK": "좋은 눌림",
+        "VWAP_RECLAIM": "VWAP 회복",
+        "PULLBACK_RECLAIM": "눌림 후 회복",
+        "SUPPORT_RECLAIM": "지지선 회복",
+        "FAILED_BREAKOUT": "판단 대기",
+        "DEEP_PULLBACK": "판단 대기",
+        "UNKNOWN": "판단 대기",
+    }.get(location, _operator_term(location)["label_ko"])
+
+
+def _order_permission_label(code: str) -> str:
+    if code == "READY":
+        return "가능"
+    if code == "LIVE_SIM_BLOCKED":
+        return "차단"
+    if code == "ENTRY_PLAN_DIAGNOSTIC_ONLY":
+        return "관측만"
+    return "관측만"
+
+
+def _theme_status_label(status: str) -> str:
+    return {
+        "LEADING": "주도",
+        "ACTIVE": "확산",
+        "WATCH": "관심",
+        "WEAK": "약함",
+    }.get(status, status or "확인중")
+
+
+def _theme_status_severity(status: str) -> str:
+    return {
+        "LEADING": "positive",
+        "ACTIVE": "positive",
+        "WATCH": "neutral",
+        "WEAK": "warning",
+    }.get(status, "muted")
+
+
+def _market_status_label(status: str) -> str:
+    text = status.upper()
+    if text in {"EXPANSION", "SELECTIVE", "HEALTHY"}:
+        return "정상"
+    if text in {"CHOPPY", "WEAK", "WAITING"}:
+        return "확인 필요"
+    if text in {"RISK_OFF", "BROKEN"}:
+        return "문제 있음"
+    return "확인중"
+
+
+def _market_session_code(status: str) -> str:
+    text = status.upper()
+    if text in {"CLOSED", "MARKET_CLOSED", "AFTER_MARKET", "POST_MARKET", "DONE"}:
+        return "NO_DATA"
+    if text in {"PREOPEN", "BEFORE_MARKET", "WAITING"}:
+        return "WAIT"
+    return "OK"
+
+
+def _market_session_label(status: str) -> str:
+    text = status.upper()
+    if text in {"CLOSED", "MARKET_CLOSED", "AFTER_MARKET", "POST_MARKET", "DONE"}:
+        return "장마감"
+    if text in {"PREOPEN", "BEFORE_MARKET", "WAITING"}:
+        return "장전"
+    return "장중"
+
+
+def _market_status_message(status: str) -> str:
+    label = _market_status_label(status)
+    return f"시장 상태는 {label}입니다."
+
+
+def _data_status_label(status: str) -> str:
+    text = status.upper()
+    if text == "OK":
+        return "정상"
+    if text in {"WARNING", "DEGRADED"}:
+        return "준비중"
+    if text == "BROKEN":
+        return "문제 있음"
+    return "확인중"
 
 
 _CONDITION_PURPOSE_LABELS = {

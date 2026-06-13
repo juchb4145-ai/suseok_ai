@@ -7013,6 +7013,7 @@ def _dashboard_slim_theme_lab_payload(payload: dict[str, Any]) -> dict[str, Any]
         "calculated_at": (payload or {}).get("calculated_at") or "",
         "last_updated_at": (payload or {}).get("last_updated_at") or "",
         "summary": dict((payload or {}).get("summary") or {}),
+        "operator_view": dict((payload or {}).get("operator_view") or {}),
         "data_quality": _dashboard_field_subset(
             data_quality,
             (
