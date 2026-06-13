@@ -1783,6 +1783,62 @@ function renderConservativeReasonPanel(payload = null) {
   renderConservativeReasonStockRows("themelab-conservative-reason-good-body", data.top_good_block_stocks || [], available, "좋은 차단 상위 종목이 없습니다.");
 }
 
+function renderShadowSmallEntryPromotionPanel(payload = null) {
+  const data = payload || (state.snapshot || {}).shadow_small_entry_promotion || {};
+  const summary = data.summary || {};
+  const available = Boolean(data.available);
+  const status = document.getElementById("themelab-shadow-small-entry-promotion-status");
+  if (status) {
+    status.textContent = data.status || (available ? "READY" : "NO_DATA");
+    status.className = `badge ${available ? "ready" : "observe"}`;
+  }
+  text("themelab-shadow-small-entry-promotion-mode", `${data.mode || summary.mode || "observe_only"} / order ${data.order_enabled ? "ON" : "OFF"}`);
+  text(
+    "themelab-shadow-small-entry-promotion-empty",
+    data.order_enabled
+      ? "조건 충족: 1차 leg만 LIVE_SIM 주문 가능합니다."
+      : "리포트 근거는 있으나 order_enabled=false라 주문하지 않습니다."
+  );
+  text("themelab-shadow-small-entry-promotion-updated", formatDateTime(data.last_updated_at));
+  text("themelab-shadow-small-entry-promotion-candidate-count", data.candidate_count ?? summary.candidate_count ?? 0);
+  text("themelab-shadow-small-entry-promotion-observe-count", data.observe_only_count ?? summary.observe_only_count ?? 0);
+  text("themelab-shadow-small-entry-promotion-promoted-count", data.promoted_count ?? summary.promoted_count ?? 0);
+  text("themelab-shadow-small-entry-promotion-blocked-count", data.blocked_count ?? summary.blocked_count ?? 0);
+  text("themelab-shadow-small-entry-promotion-used-count", data.used_promotions_today ?? summary.used_promotions_today ?? 0);
+  text("themelab-shadow-small-entry-promotion-day-limit", data.max_promotions_per_day ?? summary.max_promotions_per_day ?? 0);
+  renderShadowPromotionLines("themelab-shadow-small-entry-promotion-group-lines", data.top_reason_groups || summary.top_reason_groups || [], "아직 승격 reason group이 없습니다.");
+  renderShadowPromotionLines("themelab-shadow-small-entry-promotion-code-lines", data.top_reason_codes || summary.top_reason_codes || [], "아직 승격 reason code가 없습니다.");
+  renderShadowPromotionCandidates("themelab-shadow-small-entry-promotion-candidate-body", data.candidates || [], available);
+}
+
+function renderShadowPromotionLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = (rows || []).slice(0, 5);
+  node.innerHTML = items.length
+    ? items.map((item) => `<div>${reasonBadge(item.key || item.reason || "-")} <strong>${escapeHtml(item.count ?? 0)}</strong></div>`).join("")
+    : `<div class="muted">${escapeHtml(emptyText)}</div>`;
+}
+
+function renderShadowPromotionCandidates(id, rows, available) {
+  const body = document.getElementById(id);
+  if (!body) return;
+  if (!available) {
+    body.innerHTML = `<tr><td colspan="5" class="muted">소액 승격 trace는 PR 적용 이후 데이터부터 쌓입니다.</td></tr>`;
+    return;
+  }
+  const items = (rows || []).slice(0, 12);
+  body.innerHTML = items.length ? items.map((item) => `
+    <tr>
+      <td><strong>${escapeHtml(item.code || "-")}</strong><br><span>${escapeHtml(item.name || "")}</span></td>
+      <td>${reasonBadge(item.promotion_status || "-")}<br><span>${escapeHtml(item.final_status || "")}</span></td>
+      <td>${reasonBadge(item.reason_group || item.reason_code || "-")}<br><span>${escapeHtml(item.rejected_reason || "PASS")}</span></td>
+      <td>x${escapeHtml(optionalNumber(item.position_size_multiplier, 2))}</td>
+      <td>${escapeHtml(item.operator_message_ko || "-")}</td>
+    </tr>
+  `).join("") : `<tr><td colspan="5" class="muted">표시할 소액 승격 후보가 없습니다.</td></tr>`;
+}
+
 function renderConservativeReasonGroupRows(id, rows, available) {
   const body = document.getElementById(id);
   if (!body) return;
@@ -2178,6 +2234,7 @@ function render(snapshot) {
   renderLiveSimAuditPanel(currentSnapshot);
   state.conservativeReason.payload = currentSnapshot.conservative_reason_outcomes || state.conservativeReason.payload || {};
   renderConservativeReasonPanel(state.conservativeReason.payload);
+  renderShadowSmallEntryPromotionPanel(currentSnapshot.shadow_small_entry_promotion || {});
   renderShadowAb(currentSnapshot);
   renderThemes(currentSnapshot.ranked_themes || []);
   renderWatchset(currentSnapshot.watchset || []);

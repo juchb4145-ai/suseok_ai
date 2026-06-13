@@ -29,6 +29,13 @@ from trading.strategy.models import (
 from trading.strategy.pipeline import GatePipelineResult
 from trading.strategy.reason_codes import normalize_reason_codes, standardize_details
 from trading.strategy.runtime_settings import StrategyRuntimeSettings, legacy_strategy_runtime_settings
+from trading.strategy.shadow_small_entry_promotion import (
+    STATUS_BLOCKED as SHADOW_PROMOTION_BLOCKED,
+    STATUS_NO_EVIDENCE as SHADOW_PROMOTION_NO_EVIDENCE,
+    STATUS_OBSERVE_ONLY as SHADOW_PROMOTION_OBSERVE_ONLY,
+    STATUS_PROMOTED as SHADOW_PROMOTION_PROMOTED,
+    evaluate_shadow_small_entry_promotion,
+)
 from trading.strategy.support_readiness import (
     LATEST_TICK_MISSING,
     OBSERVE,
@@ -232,6 +239,7 @@ class ThemeLabDryRunLifecycleBridge:
         settings: StrategyRuntimeSettings | None = None,
         generation_config: CandidateGenerationConfig | None = None,
         shadow_ab_provider: Callable[[str], dict[str, Any]] | None = None,
+        shadow_small_entry_promotion_provider: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         self.db = db
         self.market_data = market_data
@@ -239,6 +247,7 @@ class ThemeLabDryRunLifecycleBridge:
         self.settings = settings or legacy_strategy_runtime_settings()
         self.generation_config = generation_config or CandidateGenerationConfig.from_env()
         self.shadow_ab_provider = shadow_ab_provider
+        self.shadow_small_entry_promotion_provider = shadow_small_entry_promotion_provider
 
     def build(
         self,
@@ -254,6 +263,7 @@ class ThemeLabDryRunLifecycleBridge:
         themes_by_id = {str(item.theme_id): item for item in result.themes}
         gate_results: list[GatePipelineResult] = []
         shadow_policy = self._shadow_small_entry_policy(trade_date)
+        promotion_evidence = self._shadow_small_entry_promotion_evidence(trade_date)
         shadow_promotions = 0
         shadow_max_promotions = int(shadow_policy.get("max_promotions_per_cycle") or 0)
 
@@ -290,6 +300,7 @@ class ThemeLabDryRunLifecycleBridge:
                 decision_cycle_id=decision_cycle_id,
                 shadow_policy=shadow_policy,
                 shadow_promotion_available=shadow_promotions < shadow_max_promotions,
+                shadow_promotion_evidence=promotion_evidence,
             )
             if gate_result.details.get("shadow_small_entry_dry_run_promoted"):
                 shadow_promotions += 1
@@ -312,6 +323,15 @@ class ThemeLabDryRunLifecycleBridge:
         except Exception as exc:
             return {"enabled": True, "active": False, "status": "AB_PROVIDER_ERROR", "error": str(exc), **config}
         return {**config, **_shadow_small_entry_policy_from_report(report, config)}
+
+    def _shadow_small_entry_promotion_evidence(self, trade_date: str) -> dict[str, Any]:
+        if self.shadow_small_entry_promotion_provider is None:
+            return {"available": False, "status": "NO_PROMOTION_PROVIDER"}
+        try:
+            evidence = self.shadow_small_entry_promotion_provider(trade_date)
+        except Exception as exc:
+            return {"available": False, "status": "PROMOTION_PROVIDER_ERROR", "error": str(exc)}
+        return dict(evidence or {})
 
     def _ensure_candidate(
         self,
@@ -483,6 +503,7 @@ class ThemeLabDryRunLifecycleBridge:
         decision_cycle_id: str,
         shadow_policy: dict[str, Any] | None = None,
         shadow_promotion_available: bool = True,
+        shadow_promotion_evidence: dict[str, Any] | None = None,
     ) -> GatePipelineResult:
         tick = self.market_data.latest_tick(candidate.code) if self.market_data is not None else None
         tick_metadata = dict(tick.metadata or {}) if tick is not None else {}
@@ -496,6 +517,7 @@ class ThemeLabDryRunLifecycleBridge:
             settings=self.settings,
             shadow_policy=shadow_policy,
             shadow_promotion_available=shadow_promotion_available,
+            shadow_promotion_evidence=shadow_promotion_evidence,
         )
         snapshot = self._indicator_snapshot(candidate, decision, watch, now)
         stock_details = _stock_pullback_details(candidate, decision, watch, snapshot, tick_metadata, mapping)
@@ -622,6 +644,7 @@ def _map_decision(
     settings: StrategyRuntimeSettings | None = None,
     shadow_policy: dict[str, Any] | None = None,
     shadow_promotion_available: bool = True,
+    shadow_promotion_evidence: dict[str, Any] | None = None,
 ) -> ThemeLabBridgeMapping:
     metadata = dict(tick_metadata or {})
     active_settings = settings or legacy_strategy_runtime_settings()
@@ -646,6 +669,21 @@ def _map_decision(
         settings=active_settings,
         now=now or datetime.now(),
     )
+    promotion_mapping = _shadow_small_entry_promotion_mapping(
+        decision,
+        watch,
+        theme,
+        metadata,
+        support,
+        latest,
+        data_quality,
+        active_settings,
+        shadow_promotion_evidence,
+        promotion_available=shadow_promotion_available,
+        recheck_after_sec=recheck_after_sec,
+    )
+    if promotion_mapping is not None:
+        return promotion_mapping
 
     if data_quality.bucket == BUCKET_BACKFILL_ONLY_OBSERVE:
         return ThemeLabBridgeMapping(
@@ -1040,6 +1078,190 @@ def _map_decision(
         shadow_small_entry_guard=shadow_guard,
         realtime_reliability_guard=reliability_guard,
     )
+
+
+def _shadow_small_entry_promotion_mapping(
+    decision: LabGateDecision,
+    watch: WatchSetSnapshot,
+    theme: ThemeConditionSnapshot | None,
+    metadata: dict[str, Any],
+    support: dict[str, Any],
+    latest,
+    data_quality: DataQualityClassification,
+    settings: StrategyRuntimeSettings,
+    evidence: dict[str, Any] | None,
+    *,
+    promotion_available: bool,
+    recheck_after_sec: int,
+) -> ThemeLabBridgeMapping | None:
+    if not isinstance(evidence, dict) or not evidence.get("available"):
+        return None
+    reason_codes = _reason_codes(decision, watch, theme)
+    trace = {
+        "status": decision.status.value,
+        "reason_codes": reason_codes + [data_quality.bucket, data_quality.action],
+        "stock_role": watch.stock_role.value,
+        "price_location_status": decision.price_location_status.value,
+        "price_location_readiness": watch.price_location_readiness.value,
+        "risk_level": decision.risk_level.value,
+        "current_price": metadata.get("current_price") or metadata.get("price") or getattr(watch, "current_price", 0),
+        "trade_value": metadata.get("trade_value") or getattr(watch, "trade_value", 0),
+        "latest_tick_ready": latest.ready,
+        "latest_tick_age_sec": latest.age_sec,
+        "support_ready": support.get("ready"),
+        "selected_support_source": support.get("source"),
+        "selected_support_price": support.get("price"),
+        "recent_support_ready": metadata.get("recent_support_ready"),
+        "vwap_ready": metadata.get("vwap_ready") or support.get("source") == "vwap",
+        "data_quality_bucket": data_quality.bucket,
+        "data_quality_action": data_quality.action,
+    }
+    evaluation = evaluate_shadow_small_entry_promotion(
+        gate_decision=decision,
+        watch=watch,
+        theme=theme,
+        trace=trace,
+        evidence=evidence,
+        settings=settings,
+        promotion_available=promotion_available,
+    ).to_dict()
+    status = str(evaluation.get("promotion_status") or "")
+    if status == SHADOW_PROMOTION_NO_EVIDENCE:
+        return None
+    if status == SHADOW_PROMOTION_PROMOTED:
+        return _shadow_promotion_ready_mapping(decision, support, latest, evaluation)
+    if status == SHADOW_PROMOTION_OBSERVE_ONLY:
+        return _shadow_promotion_observe_mapping(decision, support, latest, evaluation, recheck_after_sec)
+    if status == SHADOW_PROMOTION_BLOCKED and str(evaluation.get("rejected_reason") or "") in {
+        "SUPPORT_NOT_READY",
+        "VWAP_OR_SUPPORT_NOT_READY",
+        "LATEST_TICK_NOT_READY",
+        "CURRENT_PRICE_NOT_READY",
+        "TRADE_VALUE_NOT_READY",
+    }:
+        return _shadow_promotion_block_mapping(decision, support, latest, evaluation, recheck_after_sec)
+    return None
+
+
+def _shadow_promotion_ready_mapping(
+    decision: LabGateDecision,
+    support: dict[str, Any],
+    latest,
+    evaluation: dict[str, Any],
+) -> ThemeLabBridgeMapping:
+    reason_codes = _dedupe(list(evaluation.get("reason_codes") or []))
+    return ThemeLabBridgeMapping(
+        READY_SHADOW_SMALL_ENTRY,
+        "BUY_ELIGIBLE_SHADOW_SMALL_ENTRY_GUARDED",
+        True,
+        BlockType.NONE,
+        False,
+        0,
+        "B_SHADOW",
+        min(75.0, max(65.0, float(decision.price_location_score or 65.0))),
+        reason_codes,
+        ready_type=READY_SHADOW_SMALL_ENTRY,
+        selected_support_source=str(support.get("source") or ""),
+        selected_support_price=int(support.get("price") or 0),
+        selected_support_ready=True,
+        support_source_fallback_used=bool(support.get("fallback_used")),
+        latest_tick_ready=True,
+        latest_tick_age_sec=latest.age_sec,
+        position_size_multiplier=float(evaluation.get("position_size_multiplier") or 0.15),
+        shadow_small_entry_guard=_shadow_promotion_guard_payload(evaluation),
+    )
+
+
+def _shadow_promotion_observe_mapping(
+    decision: LabGateDecision,
+    support: dict[str, Any],
+    latest,
+    evaluation: dict[str, Any],
+    recheck_after_sec: int,
+) -> ThemeLabBridgeMapping:
+    reason_codes = _dedupe(list(evaluation.get("reason_codes") or []))
+    return ThemeLabBridgeMapping(
+        "WAIT_SHADOW_SMALL_ENTRY_CANDIDATE",
+        "NOT_ELIGIBLE_OBSERVE",
+        False,
+        BlockType.TEMPORARY,
+        True,
+        recheck_after_sec,
+        "B_SHADOW",
+        min(70.0, max(55.0, float(decision.price_location_score or 55.0))),
+        reason_codes,
+        ready_type="WAIT_SHADOW_SMALL_ENTRY_CANDIDATE",
+        selected_support_source=str(support.get("source") or ""),
+        selected_support_price=int(support.get("price") or 0),
+        selected_support_ready=bool(support.get("ready")),
+        support_source_fallback_used=bool(support.get("fallback_used")),
+        latest_tick_ready=bool(latest.ready),
+        latest_tick_age_sec=latest.age_sec,
+        position_size_multiplier=float(evaluation.get("position_size_multiplier") or 0.0),
+        shadow_small_entry_guard=_shadow_promotion_guard_payload(evaluation),
+        operator_message_ko=str(evaluation.get("operator_message_ko") or ""),
+    )
+
+
+def _shadow_promotion_block_mapping(
+    decision: LabGateDecision,
+    support: dict[str, Any],
+    latest,
+    evaluation: dict[str, Any],
+    recheck_after_sec: int,
+) -> ThemeLabBridgeMapping:
+    reason_codes = _dedupe(list(evaluation.get("reason_codes") or []))
+    return ThemeLabBridgeMapping(
+        "WAIT_SHADOW_SMALL_ENTRY_BLOCKED",
+        "NOT_ELIGIBLE_DATA",
+        False,
+        BlockType.TEMPORARY,
+        True,
+        recheck_after_sec,
+        "C",
+        max(0.0, float(decision.price_location_score or 0.0)),
+        reason_codes,
+        ready_type="WAIT_SHADOW_SMALL_ENTRY_BLOCKED",
+        selected_support_source=str(support.get("source") or ""),
+        selected_support_price=int(support.get("price") or 0),
+        selected_support_ready=bool(support.get("ready")),
+        latest_tick_ready=bool(latest.ready),
+        latest_tick_age_sec=latest.age_sec,
+        shadow_small_entry_guard=_shadow_promotion_guard_payload(evaluation),
+        operator_message_ko=str(evaluation.get("operator_message_ko") or ""),
+    )
+
+
+def _shadow_promotion_guard_payload(evaluation: dict[str, Any]) -> dict[str, Any]:
+    evidence = dict(evaluation.get("evidence") or {})
+    cancel = dict(evaluation.get("cancel_condition") or {})
+    return {
+        "enabled": True,
+        "candidate": True,
+        "promoted": bool(evaluation.get("promoted")),
+        "status": str(evaluation.get("promotion_status") or ""),
+        "reason": str(evaluation.get("rejected_reason") or "PASS"),
+        "promotion_status": str(evaluation.get("promotion_status") or ""),
+        "promotion_reason": str(evaluation.get("rejected_reason") or ""),
+        "promotion_reason_codes": list(evaluation.get("reason_codes") or []),
+        "source_report_id": str(evidence.get("source_report_id") or evidence.get("report_id") or ""),
+        "source_report_trade_date": str(evidence.get("source_report_trade_date") or evidence.get("trade_date") or ""),
+        "reason_group": str(evidence.get("reason_group") or ""),
+        "reason_code": str(evidence.get("reason_code") or ""),
+        "sample_count": evidence.get("sample_count"),
+        "missed_opportunity_rate": evidence.get("missed_opportunity_rate"),
+        "risk_avoided_rate": evidence.get("risk_avoided_rate"),
+        "good_block_rate": evidence.get("good_block_rate"),
+        "avg_mfe_15m_pct": evidence.get("avg_mfe_15m_pct"),
+        "avg_mae_15m_pct": evidence.get("avg_mae_15m_pct"),
+        "position_size_multiplier": evaluation.get("position_size_multiplier"),
+        "mode": cancel.get("shadow_small_entry_promotion_mode"),
+        "order_enabled": cancel.get("shadow_small_entry_promotion_order_enabled"),
+        "max_promotions_per_cycle": cancel.get("shadow_small_entry_max_promotions_per_cycle"),
+        "max_promotions_per_day": cancel.get("shadow_small_entry_max_promotions_per_day"),
+        "operator_message_ko": str(evaluation.get("operator_message_ko") or ""),
+        "evaluation": evaluation,
+    }
 
 
 def _entry_risk_mapping(
@@ -2007,6 +2229,31 @@ def _stock_pullback_details(
         "shadow_small_entry_win_rate_15m": shadow_guard.get("win_rate_15m"),
         "shadow_small_entry_risk_case_rate_15m": shadow_guard.get("risk_case_rate_15m"),
         "shadow_small_entry_labeled_count": shadow_guard.get("labeled_count"),
+        "shadow_small_entry_promotion_status": shadow_guard.get("promotion_status") or shadow_guard.get("status", ""),
+        "shadow_small_entry_promotion_reason": shadow_guard.get("promotion_reason") or shadow_guard.get("reason", ""),
+        "shadow_small_entry_promotion_reason_codes": list(shadow_guard.get("promotion_reason_codes") or []),
+        "shadow_small_entry_source_report_id": shadow_guard.get("source_report_id", ""),
+        "shadow_small_entry_source_report_trade_date": shadow_guard.get("source_report_trade_date", ""),
+        "shadow_small_entry_reason_group": shadow_guard.get("reason_group", ""),
+        "shadow_small_entry_reason_code": shadow_guard.get("reason_code", ""),
+        "shadow_small_entry_sample_count": shadow_guard.get("sample_count"),
+        "shadow_small_entry_missed_opportunity_rate": shadow_guard.get("missed_opportunity_rate"),
+        "shadow_small_entry_risk_avoided_rate": shadow_guard.get("risk_avoided_rate"),
+        "shadow_small_entry_good_block_rate": shadow_guard.get("good_block_rate"),
+        "shadow_small_entry_avg_mfe_15m_pct": shadow_guard.get("avg_mfe_15m_pct"),
+        "shadow_small_entry_avg_mae_15m_pct": shadow_guard.get("avg_mae_15m_pct"),
+        "shadow_small_entry_position_size_multiplier": shadow_guard.get("position_size_multiplier"),
+        "shadow_small_entry_promotion_mode": shadow_guard.get("mode", ""),
+        "shadow_small_entry_order_enabled": shadow_guard.get("order_enabled"),
+        "shadow_small_entry_max_promotions_per_cycle": shadow_guard.get("max_promotions_per_cycle"),
+        "shadow_small_entry_max_promotions_per_day": shadow_guard.get("max_promotions_per_day"),
+        "shadow_small_entry_max_promotions_per_code_per_day": shadow_guard.get("evaluation", {}).get("cancel_condition", {}).get("shadow_small_entry_max_promotions_per_code_per_day") if isinstance(shadow_guard.get("evaluation"), dict) else 1,
+        "shadow_small_entry_max_notional_per_day": shadow_guard.get("evaluation", {}).get("cancel_condition", {}).get("shadow_small_entry_max_notional_per_day") if isinstance(shadow_guard.get("evaluation"), dict) else 300000,
+        "shadow_small_entry_cancel_unfilled_after_sec": shadow_guard.get("evaluation", {}).get("cancel_condition", {}).get("shadow_small_entry_cancel_unfilled_after_sec") if isinstance(shadow_guard.get("evaluation"), dict) else 45,
+        "shadow_small_entry_stop_loss_pct": shadow_guard.get("evaluation", {}).get("cancel_condition", {}).get("shadow_small_entry_stop_loss_pct") if isinstance(shadow_guard.get("evaluation"), dict) else -1.2,
+        "shadow_small_entry_take_profit_pct": shadow_guard.get("evaluation", {}).get("cancel_condition", {}).get("shadow_small_entry_take_profit_pct") if isinstance(shadow_guard.get("evaluation"), dict) else 1.8,
+        "shadow_small_entry_max_hold_minutes": shadow_guard.get("evaluation", {}).get("cancel_condition", {}).get("shadow_small_entry_max_hold_minutes") if isinstance(shadow_guard.get("evaluation"), dict) else 20,
+        "shadow_small_entry_operator_message_ko": shadow_guard.get("operator_message_ko", ""),
         **market_fields,
         "position_size_multiplier": position_size_multiplier,
         "risk_off_entry": risk_off_details,
@@ -2136,6 +2383,31 @@ def _base_details(
         "shadow_small_entry_win_rate_15m": stock_details.get("shadow_small_entry_win_rate_15m"),
         "shadow_small_entry_risk_case_rate_15m": stock_details.get("shadow_small_entry_risk_case_rate_15m"),
         "shadow_small_entry_labeled_count": stock_details.get("shadow_small_entry_labeled_count"),
+        "shadow_small_entry_promotion_status": stock_details.get("shadow_small_entry_promotion_status", ""),
+        "shadow_small_entry_promotion_reason": stock_details.get("shadow_small_entry_promotion_reason", ""),
+        "shadow_small_entry_promotion_reason_codes": list(stock_details.get("shadow_small_entry_promotion_reason_codes") or []),
+        "shadow_small_entry_source_report_id": stock_details.get("shadow_small_entry_source_report_id", ""),
+        "shadow_small_entry_source_report_trade_date": stock_details.get("shadow_small_entry_source_report_trade_date", ""),
+        "shadow_small_entry_reason_group": stock_details.get("shadow_small_entry_reason_group", ""),
+        "shadow_small_entry_reason_code": stock_details.get("shadow_small_entry_reason_code", ""),
+        "shadow_small_entry_sample_count": stock_details.get("shadow_small_entry_sample_count"),
+        "shadow_small_entry_missed_opportunity_rate": stock_details.get("shadow_small_entry_missed_opportunity_rate"),
+        "shadow_small_entry_risk_avoided_rate": stock_details.get("shadow_small_entry_risk_avoided_rate"),
+        "shadow_small_entry_good_block_rate": stock_details.get("shadow_small_entry_good_block_rate"),
+        "shadow_small_entry_avg_mfe_15m_pct": stock_details.get("shadow_small_entry_avg_mfe_15m_pct"),
+        "shadow_small_entry_avg_mae_15m_pct": stock_details.get("shadow_small_entry_avg_mae_15m_pct"),
+        "shadow_small_entry_position_size_multiplier": stock_details.get("shadow_small_entry_position_size_multiplier"),
+        "shadow_small_entry_promotion_mode": stock_details.get("shadow_small_entry_promotion_mode", ""),
+        "shadow_small_entry_order_enabled": stock_details.get("shadow_small_entry_order_enabled"),
+        "shadow_small_entry_max_promotions_per_cycle": stock_details.get("shadow_small_entry_max_promotions_per_cycle"),
+        "shadow_small_entry_max_promotions_per_day": stock_details.get("shadow_small_entry_max_promotions_per_day"),
+        "shadow_small_entry_max_promotions_per_code_per_day": stock_details.get("shadow_small_entry_max_promotions_per_code_per_day"),
+        "shadow_small_entry_max_notional_per_day": stock_details.get("shadow_small_entry_max_notional_per_day"),
+        "shadow_small_entry_cancel_unfilled_after_sec": stock_details.get("shadow_small_entry_cancel_unfilled_after_sec"),
+        "shadow_small_entry_stop_loss_pct": stock_details.get("shadow_small_entry_stop_loss_pct"),
+        "shadow_small_entry_take_profit_pct": stock_details.get("shadow_small_entry_take_profit_pct"),
+        "shadow_small_entry_max_hold_minutes": stock_details.get("shadow_small_entry_max_hold_minutes"),
+        "shadow_small_entry_operator_message_ko": stock_details.get("shadow_small_entry_operator_message_ko", ""),
     }
     details = {
         "source": SOURCE,

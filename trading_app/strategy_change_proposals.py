@@ -10,6 +10,7 @@ from typing import Any, Iterable, Optional
 
 from storage.db import TradingDatabase
 from trading_app.conservative_reason_outcomes import ConservativeReasonOutcomeAnalyzer
+from trading_app.shadow_small_entry_promotion import ShadowSmallEntryPromotionAnalyzer
 from trading_app.strategy_replay import DEFAULT_REPLAY_DB_ROOT, scan_replay_reports
 from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
 
@@ -562,12 +563,92 @@ class StrategyChangeProposalGenerator:
         metrics["false_positive_increase_count"] = 0
         return metrics, report
 
+    def generate_from_shadow_small_entry_promotion(self, trade_date: str) -> list[StrategyChangeProposal]:
+        try:
+            report = ShadowSmallEntryPromotionAnalyzer(self.db).build_report(trade_date=trade_date or None, limit=50000)
+        except Exception:
+            return []
+        summary = dict(report.get("summary") or {})
+        evidence = dict(report.get("evidence") or {})
+        candidate_count = int(summary.get("candidate_count") or 0)
+        if candidate_count <= 0 and not bool(report.get("available")):
+            return []
+
+        source_id = str(evidence.get("report_id") or f"shadow_small_entry_promotion:{trade_date}")
+        top_reason_codes = {str(row.get("key") or "") for row in summary.get("top_reason_codes") or []}
+        top_reason_groups = {str(row.get("key") or "") for row in summary.get("top_reason_groups") or []}
+        observe_count = int(summary.get("observe_only_count") or 0)
+        promoted_count = int(summary.get("promoted_count") or 0)
+        blocked_count = int(summary.get("blocked_count") or 0)
+        sample_count = _shadow_promotion_sample_count(report)
+        confidence = _shadow_promotion_confidence(report, sample_count)
+        base_metrics = {
+            "sample_count": sample_count,
+            "shadow_small_entry_candidate_count": candidate_count,
+            "shadow_small_entry_observe_only_count": observe_count,
+            "shadow_small_entry_promoted_count": promoted_count,
+            "shadow_small_entry_blocked_count": blocked_count,
+            "shadow_small_entry_submitted_count": int(summary.get("submitted_count") or 0),
+            "shadow_small_entry_order_enabled": 1 if summary.get("order_enabled") else 0,
+            "shadow_small_entry_mode_live_sim_guarded": 1 if str(summary.get("mode") or "") == "live_sim_guarded" else 0,
+            "net_benefit_score": float(promoted_count or observe_count or candidate_count),
+            "confidence": confidence,
+            "false_positive_increase_count": 0,
+            "source_grade": "WATCH_CANDIDATE" if sample_count >= self.config.min_sample_count else "DATA_INSUFFICIENT",
+        }
+        candidate_specs: list[tuple[str, bool, dict[str, Any]]] = [
+            ("enable_shadow_small_entry_observe_only", candidate_count > 0, {}),
+            (
+                "enable_shadow_small_entry_live_sim_guarded",
+                bool(report.get("available")) and (observe_count > 0 or promoted_count > 0),
+                {"source_grade": "WATCH_CANDIDATE"},
+            ),
+            (
+                "reduce_shadow_small_entry_multiplier",
+                promoted_count > 0 or str(summary.get("sample_quality") or "").upper() in {"LOW", "MEDIUM"},
+                {"source_grade": "WATCH_CANDIDATE"},
+            ),
+            ("keep_shadow_small_entry_disabled", blocked_count > 0 or not bool(report.get("available")), {}),
+            (
+                "block_chase_small_entry",
+                bool(top_reason_codes & {"LATE_CHASE", "LATE_CHASE_TEMP_WAIT", "CHASE_HIGH", "CHASE_RISK", "VWAP_OVEREXTENDED"}),
+                {},
+            ),
+            (
+                "warmup_optional_shadow_small_entry",
+                bool(top_reason_codes & {"WARMUP_OPTIONAL", "WARMUP_OPTIONAL_ONLY", "WAIT_DATA_SUPPORT_NOT_READY"})
+                or "DATA_QUALITY_RISK" in top_reason_groups,
+                {},
+            ),
+        ]
+        proposals: list[StrategyChangeProposal] = []
+        for policy_key, enabled, extra_metrics in candidate_specs:
+            if not enabled or policy_key not in POLICY_PATCHES:
+                continue
+            proposals.append(
+                self._build_proposal(
+                    trade_date=trade_date,
+                    source_type="shadow_small_entry_promotion",
+                    source_ids=[source_id, f"shadow_small_entry_policy:{policy_key}"],
+                    policy_key=policy_key,
+                    evidence_metrics={**base_metrics, **extra_metrics},
+                    raw_source={
+                        "summary": summary,
+                        "evidence": evidence,
+                        "warnings": report.get("warnings") or [],
+                    },
+                )
+            )
+        return proposals
+
     def generate_combined_proposals(self, trade_date: str) -> list[StrategyChangeProposal]:
         proposals = []
         proposals.extend(self.generate_from_intraday_outcomes(trade_date))
         proposals.extend(self.generate_from_shadow_summary(trade_date))
         proposals.extend(self.generate_from_replay_reports(trade_date))
         proposals.extend(self.generate_from_threshold_ab(trade_date))
+        proposals.extend(self.generate_from_conservative_reason_outcomes(trade_date))
+        proposals.extend(self.generate_from_shadow_small_entry_promotion(trade_date))
         return _dedupe_proposals(proposals)
 
     def score_proposal(self, proposal: StrategyChangeProposal, evidence: Iterable[StrategyChangeEvidence]) -> StrategyChangeProposal:
@@ -623,6 +704,8 @@ class StrategyChangeProposalGenerator:
             proposals = self.generate_from_threshold_ab(trade_date)
         elif source_type == "conservative_reason_outcome":
             proposals = self.generate_from_conservative_reason_outcomes(trade_date)
+        elif source_type == "shadow_small_entry_promotion":
+            proposals = self.generate_from_shadow_small_entry_promotion(trade_date)
         else:
             proposals = self.generate_combined_proposals(trade_date)
         persisted = self.persist_proposals(proposals) if persist else {"proposal_count": len(proposals), "saved_count": 0, "evidence_count": 0}
@@ -785,6 +868,90 @@ POLICY_PATCHES: dict[str, dict[str, Any]] = {
         "patch": {
             "data_quality_gate.leader_observe_ready_enabled": True,
             "data_quality_gate.leader_observe_ready_order_enabled": False,
+        },
+    },
+    "enable_shadow_small_entry_observe_only": {
+        "title": "Shadow small-entry observe-only guard",
+        "summary_ko": "검증된 missed opportunity 근거를 shadow small-entry 관측 후보로만 보존하는 REVIEW_READY 제안입니다.",
+        "category": "order_guard",
+        "target_component": "shadow_small_entry_promotion",
+        "expected_effect_ko": "기본 주문 비활성 상태에서 후보, 차단 사유, multiplier 근거를 장중/장후에 추적합니다.",
+        "expected_risk_ko": "LIVE_SIM/LIVE_REAL 주문 경로를 켜지 않으므로 주문 리스크는 늘리지 않습니다.",
+        "patch": {
+            "shadow_small_entry_promotion.enabled": True,
+            "shadow_small_entry_promotion.mode": "observe_only",
+            "shadow_small_entry_promotion.order_enabled": False,
+        },
+    },
+    "enable_shadow_small_entry_live_sim_guarded": {
+        "title": "Shadow small-entry LIVE_SIM guarded rollout candidate",
+        "summary_ko": "운영자 승인 후에만 LIVE_SIM guarded 모드로 전환할 수 있는 small-entry 후보 제안입니다.",
+        "category": "order_guard",
+        "target_component": "shadow_small_entry_promotion",
+        "expected_effect_ko": "1차 leg, 0.1~0.25배, cycle/day/code 제한을 전제로 한 LIVE_SIM 전환 후보를 검토합니다.",
+        "expected_risk_ko": "이 제안은 order_enabled를 true로 바꾸지 않습니다. 실제 주문 활성화는 별도 승인과 설정 변경이 필요합니다.",
+        "patch": {
+            "shadow_small_entry_promotion.enabled": True,
+            "shadow_small_entry_promotion.mode": "live_sim_guarded",
+            "shadow_small_entry_promotion.order_enabled": False,
+            "shadow_small_entry_promotion.operator_approval_required_for_order_enabled": True,
+        },
+    },
+    "reduce_shadow_small_entry_multiplier": {
+        "title": "Shadow small-entry conservative sizing",
+        "summary_ko": "표본 또는 확신도가 낮은 small-entry 후보의 size multiplier를 더 보수적으로 낮추는 제안입니다.",
+        "category": "position_sizing",
+        "target_component": "shadow_small_entry_promotion",
+        "expected_effect_ko": "LIVE_SIM 전환 전에 얇은 표본 후보의 금액 노출을 더 작게 제한합니다.",
+        "expected_risk_ko": "진입 금액을 줄이는 제안이며 주문 활성화 상태를 바꾸지 않습니다.",
+        "patch": {
+            "shadow_small_entry_promotion.max_position_size_multiplier": 0.10,
+            "shadow_small_entry_promotion.max_position_size_multiplier_strong": 0.15,
+            "shadow_small_entry_promotion.thin_position_size_multiplier": 0.05,
+            "shadow_small_entry_promotion.order_enabled": False,
+        },
+    },
+    "keep_shadow_small_entry_disabled": {
+        "title": "Keep shadow small-entry order-disabled",
+        "summary_ko": "차단 또는 근거 부족이 우세해 shadow small-entry를 관측 전용으로 유지하는 제안입니다.",
+        "category": "order_guard",
+        "target_component": "shadow_small_entry_promotion",
+        "expected_effect_ko": "후보 관측은 유지하되 주문 활성화로 넘어가지 않도록 정책 근거를 남깁니다.",
+        "expected_risk_ko": "주문 가능 상태로 전환하지 않으므로 실거래 리스크는 늘어나지 않습니다.",
+        "patch": {
+            "shadow_small_entry_promotion.enabled": True,
+            "shadow_small_entry_promotion.mode": "observe_only",
+            "shadow_small_entry_promotion.order_enabled": False,
+        },
+    },
+    "block_chase_small_entry": {
+        "title": "Keep chase-risk shadow small-entry blocked",
+        "summary_ko": "추격/과열/VWAP 이격 reason은 shadow small-entry 승격 대상에서 계속 제외하는 제안입니다.",
+        "category": "risk",
+        "target_component": "shadow_small_entry_promotion",
+        "expected_effect_ko": "LATE_CHASE, CHASE_HIGH, VWAP_OVEREXTENDED 계열을 small-entry 완화 대상으로 섞지 않습니다.",
+        "expected_risk_ko": "차단 유지 제안이며 threshold 완화나 주문 활성화가 아닙니다.",
+        "patch": {
+            "shadow_small_entry_promotion.block_chase_small_entry": True,
+            "shadow_small_entry_promotion.order_enabled": False,
+        },
+    },
+    "warmup_optional_shadow_small_entry": {
+        "title": "WARMUP_OPTIONAL shadow small-entry candidate",
+        "summary_ko": "WARMUP_OPTIONAL 계열 missed opportunity를 shadow small-entry 후보로 관측하는 제안입니다.",
+        "category": "data_quality",
+        "target_component": "shadow_small_entry_promotion",
+        "expected_effect_ko": "DATA_INSUFFICIENT 전체 완화 없이 warmup optional 후보만 관측군으로 분리합니다.",
+        "expected_risk_ko": "order_enabled=false를 유지하므로 데이터 부족 상태에서 바로 주문하지 않습니다.",
+        "patch": {
+            "shadow_small_entry_promotion.allowed_reason_codes": [
+                "WARMUP_OPTIONAL",
+                "WARMUP_OPTIONAL_ONLY",
+                "WAIT_DATA_EARLY_SMALL_CANDIDATE",
+                "WAIT_DATA_SUPPORT_NOT_READY",
+            ],
+            "shadow_small_entry_promotion.mode": "observe_only",
+            "shadow_small_entry_promotion.order_enabled": False,
         },
     },
     "leader_only_theme_leader_small_entry_candidate": {
@@ -1057,6 +1224,33 @@ def _item_rate(items: Iterable[dict[str, Any]], field: str) -> float:
     if not labeled:
         return 0.0
     return round(sum(1 for item in labeled if item.get(field)) / len(labeled), 4)
+
+
+def _shadow_promotion_sample_count(report: dict[str, Any]) -> int:
+    candidates = list(report.get("candidates") or [])
+    rows = []
+    evidence = dict(report.get("evidence") or {})
+    rows.extend(list(evidence.get("reason_code_rows") or []))
+    rows.extend(list(evidence.get("group_rows") or []))
+    candidate_samples = [int(row.get("sample_count") or row.get("labeled_count") or row.get("event_count") or 0) for row in candidates]
+    evidence_samples = [int(row.get("sample_count") or row.get("labeled_count") or row.get("event_count") or 0) for row in rows]
+    return max([0, len(candidates), *candidate_samples, *evidence_samples])
+
+
+def _shadow_promotion_confidence(report: dict[str, Any], sample_count: int) -> float:
+    evidence = dict(report.get("evidence") or {})
+    candidates = list(report.get("candidates") or [])
+    values = []
+    for row in list(evidence.get("reason_code_rows") or []) + list(evidence.get("group_rows") or []):
+        if isinstance(row, dict) and row.get("confidence") is not None:
+            values.append(float(row.get("confidence") or 0))
+    for row in candidates:
+        nested = dict(row.get("evidence") or {})
+        if nested.get("confidence") is not None:
+            values.append(float(nested.get("confidence") or 0))
+    if values:
+        return round(max(values), 4)
+    return round(min(0.95, max(0, sample_count) / 30.0), 4) if sample_count else 0.0
 
 
 def _dedupe_proposals(proposals: list[StrategyChangeProposal]) -> list[StrategyChangeProposal]:

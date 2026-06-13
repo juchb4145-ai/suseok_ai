@@ -110,6 +110,7 @@ def build_core_strategy_runtime(
     theme_runtime_bridge = GatewayEventThemeRuntimeBridge(theme_runtime, warning_sink=warning_sink)
     order_sink = _build_order_sink(settings, gateway_state, warning_sink, runtime_settings=runtime_settings)
     theme_lab_shadow_ab_provider = _theme_lab_shadow_ab_provider(db, runtime_settings)
+    shadow_small_entry_promotion_provider = _shadow_small_entry_promotion_provider(db, runtime_settings)
     theme_lab_pipeline = None
     if config.theme_engine_mode == "themelab_flow":
         theme_backfill_service = ThemeBackfillService(
@@ -141,6 +142,7 @@ def build_core_strategy_runtime(
         order_sink=order_sink,
         theme_lab_pipeline=theme_lab_pipeline,
         theme_lab_shadow_ab_provider=theme_lab_shadow_ab_provider,
+        shadow_small_entry_promotion_provider=shadow_small_entry_promotion_provider,
     )
     readiness_report = build_readiness_report(
         db,
@@ -183,6 +185,25 @@ def _theme_lab_shadow_ab_provider(
         return ThemeLabGateReasonOutcomeAnalyzer(db).build_report(
             trade_date=report_trade_date,
             limit=10_000,
+        )
+
+    return provider
+
+
+def _shadow_small_entry_promotion_provider(
+    db: TradingDatabase,
+    runtime_settings: Any,
+) -> Callable[[str], dict[str, Any]] | None:
+    policy = dict(runtime_settings.value("shadow_small_entry_promotion", {}) or {})
+    if str(policy.get("enabled", True)).strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+
+    def provider(trade_date: str) -> dict[str, Any]:
+        from trading_app.shadow_small_entry_promotion import ShadowSmallEntryPromotionAnalyzer
+
+        return ShadowSmallEntryPromotionAnalyzer(db, settings=runtime_settings).load_evidence(
+            trade_date=str(trade_date or "").strip() or None,
+            limit=50_000,
         )
 
     return provider

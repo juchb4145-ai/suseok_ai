@@ -974,6 +974,24 @@ class TradingDatabase:
                 early_small_position_size_multiplier REAL,
                 early_small_rejected_reason TEXT NOT NULL DEFAULT '',
                 operator_message_ko TEXT NOT NULL DEFAULT '',
+                promotion_status TEXT NOT NULL DEFAULT '',
+                promotion_reason TEXT NOT NULL DEFAULT '',
+                promotion_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                source_report_id TEXT NOT NULL DEFAULT '',
+                source_report_trade_date TEXT NOT NULL DEFAULT '',
+                reason_group TEXT NOT NULL DEFAULT '',
+                reason_code TEXT NOT NULL DEFAULT '',
+                sample_count INTEGER,
+                missed_opportunity_rate REAL,
+                risk_avoided_rate REAL,
+                good_block_rate REAL,
+                avg_mfe_15m_pct REAL,
+                avg_mae_15m_pct REAL,
+                position_size_multiplier REAL,
+                max_promotions_per_cycle INTEGER,
+                max_promotions_per_day INTEGER,
+                order_enabled INTEGER,
+                mode TEXT NOT NULL DEFAULT '',
                 entry_plan_id INTEGER,
                 entry_plan_submittable INTEGER,
                 entry_plan_diagnostic_only INTEGER,
@@ -2570,6 +2588,12 @@ class TradingDatabase:
                 missing_optional_fields_json, early_small_candidate,
                 early_small_order_enabled, early_small_position_size_multiplier,
                 early_small_rejected_reason, operator_message_ko,
+                promotion_status, promotion_reason, promotion_reason_codes_json,
+                source_report_id, source_report_trade_date, reason_group, reason_code,
+                sample_count, missed_opportunity_rate, risk_avoided_rate,
+                good_block_rate, avg_mfe_15m_pct, avg_mae_15m_pct,
+                position_size_multiplier, max_promotions_per_cycle,
+                max_promotions_per_day, order_enabled, mode,
                 entry_plan_id, entry_plan_submittable,
                 entry_plan_diagnostic_only, dry_run_intent_id, dry_run_status,
                 dry_run_reason, live_sim_intent_id, live_sim_status,
@@ -2590,6 +2614,12 @@ class TradingDatabase:
                 :missing_optional_fields_json, :early_small_candidate,
                 :early_small_order_enabled, :early_small_position_size_multiplier,
                 :early_small_rejected_reason, :operator_message_ko,
+                :promotion_status, :promotion_reason, :promotion_reason_codes_json,
+                :source_report_id, :source_report_trade_date, :reason_group, :reason_code,
+                :sample_count, :missed_opportunity_rate, :risk_avoided_rate,
+                :good_block_rate, :avg_mfe_15m_pct, :avg_mae_15m_pct,
+                :position_size_multiplier, :max_promotions_per_cycle,
+                :max_promotions_per_day, :order_enabled, :mode,
                 :entry_plan_id, :entry_plan_submittable,
                 :entry_plan_diagnostic_only, :dry_run_intent_id, :dry_run_status,
                 :dry_run_reason, :live_sim_intent_id, :live_sim_status,
@@ -7781,6 +7811,24 @@ class TradingDatabase:
             "early_small_position_size_multiplier": "REAL",
             "early_small_rejected_reason": "TEXT NOT NULL DEFAULT ''",
             "operator_message_ko": "TEXT NOT NULL DEFAULT ''",
+            "promotion_status": "TEXT NOT NULL DEFAULT ''",
+            "promotion_reason": "TEXT NOT NULL DEFAULT ''",
+            "promotion_reason_codes_json": "TEXT NOT NULL DEFAULT '[]'",
+            "source_report_id": "TEXT NOT NULL DEFAULT ''",
+            "source_report_trade_date": "TEXT NOT NULL DEFAULT ''",
+            "reason_group": "TEXT NOT NULL DEFAULT ''",
+            "reason_code": "TEXT NOT NULL DEFAULT ''",
+            "sample_count": "INTEGER",
+            "missed_opportunity_rate": "REAL",
+            "risk_avoided_rate": "REAL",
+            "good_block_rate": "REAL",
+            "avg_mfe_15m_pct": "REAL",
+            "avg_mae_15m_pct": "REAL",
+            "position_size_multiplier": "REAL",
+            "max_promotions_per_cycle": "INTEGER",
+            "max_promotions_per_day": "INTEGER",
+            "order_enabled": "INTEGER",
+            "mode": "TEXT NOT NULL DEFAULT ''",
         }
         for name, definition in columns.items():
             self._ensure_column("buy_zero_rca_traces", name, definition)
@@ -8062,6 +8110,24 @@ def _buy_zero_trace_params(payload: dict) -> dict:
         "early_small_position_size_multiplier": _nullable_float(payload.get("early_small_position_size_multiplier")),
         "early_small_rejected_reason": str(payload.get("early_small_rejected_reason") or ""),
         "operator_message_ko": str(payload.get("operator_message_ko") or payload.get("data_quality_operator_message_ko") or ""),
+        "promotion_status": str(payload.get("promotion_status") or ""),
+        "promotion_reason": str(payload.get("promotion_reason") or payload.get("shadow_small_entry_promotion_reason") or ""),
+        "promotion_reason_codes_json": _json_list(payload.get("promotion_reason_codes_json", payload.get("promotion_reason_codes", []))),
+        "source_report_id": str(payload.get("source_report_id") or ""),
+        "source_report_trade_date": str(payload.get("source_report_trade_date") or ""),
+        "reason_group": str(payload.get("reason_group") or ""),
+        "reason_code": str(payload.get("reason_code") or ""),
+        "sample_count": _nullable_int(payload.get("sample_count")),
+        "missed_opportunity_rate": _nullable_float(payload.get("missed_opportunity_rate")),
+        "risk_avoided_rate": _nullable_float(payload.get("risk_avoided_rate")),
+        "good_block_rate": _nullable_float(payload.get("good_block_rate")),
+        "avg_mfe_15m_pct": _nullable_float(payload.get("avg_mfe_15m_pct")),
+        "avg_mae_15m_pct": _nullable_float(payload.get("avg_mae_15m_pct")),
+        "position_size_multiplier": _nullable_float(payload.get("position_size_multiplier")),
+        "max_promotions_per_cycle": _nullable_int(payload.get("max_promotions_per_cycle")),
+        "max_promotions_per_day": _nullable_int(payload.get("max_promotions_per_day")),
+        "order_enabled": _nullable_bool_int(payload.get("order_enabled")),
+        "mode": str(payload.get("mode") or ""),
         "entry_plan_id": _nullable_int(payload.get("entry_plan_id")),
         "entry_plan_submittable": _nullable_bool_int(payload.get("entry_plan_submittable")),
         "entry_plan_diagnostic_only": _nullable_bool_int(payload.get("entry_plan_diagnostic_only")),
@@ -8085,6 +8151,7 @@ def _row_to_buy_zero_trace(row: sqlite3.Row) -> dict:
     data["missing_core_fields"] = _safe_json_loads(data.get("missing_core_fields_json"), [])
     data["missing_entry_fields"] = _safe_json_loads(data.get("missing_entry_fields_json"), [])
     data["missing_optional_fields"] = _safe_json_loads(data.get("missing_optional_fields_json"), [])
+    data["promotion_reason_codes"] = _safe_json_loads(data.get("promotion_reason_codes_json"), [])
     for key in (
         "passed",
         "latest_tick_ready",
@@ -8096,6 +8163,7 @@ def _row_to_buy_zero_trace(row: sqlite3.Row) -> dict:
         "entry_plan_diagnostic_only",
         "early_small_candidate",
         "early_small_order_enabled",
+        "order_enabled",
     ):
         if data.get(key) is not None:
             data[key] = bool(data.get(key))
@@ -8213,6 +8281,26 @@ def _buy_zero_trace_events_from_strategy_decision_event(event: dict) -> list[dic
         if base.get("theme_id") or base.get("theme_name") or base.get("theme_score") is not None:
             add("THEME_ENGINE_EVALUATED", status=_first_string(gate_details.get("theme_status"), event.get("gate_status")), passed=True)
         add("THEMELAB_GATE_EVALUATED")
+        promotion_status = str(gate_details.get("shadow_small_entry_promotion_status") or "")
+        if promotion_status:
+            add("SHADOW_SMALL_ENTRY_EVIDENCE_LOADED", status=promotion_status, passed=True)
+            add("SHADOW_SMALL_ENTRY_CANDIDATE_EVALUATED", status=promotion_status, passed=promotion_status == "PROMOTED")
+            if promotion_status == "PROMOTED":
+                add("SHADOW_SMALL_ENTRY_PROMOTED", status=promotion_status, passed=True)
+            elif promotion_status == "OBSERVE_ONLY":
+                add(
+                    "SHADOW_SMALL_ENTRY_OBSERVE_ONLY",
+                    status=promotion_status,
+                    passed=False,
+                    reason=_first_string(gate_details.get("shadow_small_entry_promotion_reason"), "SHADOW_SMALL_ENTRY_PROMOTION_OBSERVE_ONLY"),
+                )
+            elif promotion_status == "BLOCKED":
+                add(
+                    "SHADOW_SMALL_ENTRY_BLOCKED",
+                    status=promotion_status,
+                    passed=False,
+                    reason=_first_string(gate_details.get("shadow_small_entry_promotion_reason"), "SHADOW_SMALL_ENTRY_PROMOTION_BLOCKED"),
+                )
         if _has_any_key(gate_details, ("hybrid_status", "hybrid_score", "hybrid_observe_only", "hybrid_gate_observe_only")):
             hybrid_status = _first_string(gate_details.get("hybrid_status"), event.get("gate_status"))
             hybrid_observe_only = bool(gate_details.get("hybrid_observe_only") or gate_details.get("hybrid_gate_observe_only"))
@@ -8259,8 +8347,12 @@ def _buy_zero_trace_events_from_strategy_decision_event(event: dict) -> list[dic
             add("LIVE_SIM_INTENT_CREATED", status=live_status, passed=bool(live_sim.get("intent_id")), reason=live_reason, extra={"live_sim": live_sim})
             if bool(live_sim.get("accepted")) or live_status in {"SUBMITTED", "ACCEPTED"}:
                 add("LIVE_SIM_COMMAND_QUEUED", status=live_status, passed=True, extra={"live_sim": live_sim})
+                if str(entry_cancel.get("ready_type") or gate_details.get("ready_type") or "") == "READY_SHADOW_SMALL_ENTRY":
+                    add("SHADOW_SMALL_ENTRY_ORDER_SUBMITTED", status=live_status, passed=True, extra={"live_sim": live_sim})
             else:
                 add("LIVE_SIM_BLOCKED", status=live_status or "BLOCKED", passed=False, reason=live_reason or "LIVE_SIM_NOT_SUBMITTED", extra={"live_sim": live_sim})
+                if str(entry_cancel.get("ready_type") or gate_details.get("ready_type") or "") == "READY_SHADOW_SMALL_ENTRY":
+                    add("SHADOW_SMALL_ENTRY_ORDER_BLOCKED", status=live_status or "BLOCKED", passed=False, reason=live_reason or "LIVE_SIM_NOT_SUBMITTED", extra={"live_sim": live_sim})
         return traces
 
     return traces
@@ -8348,11 +8440,60 @@ def _buy_zero_trace_base_from_decision(
             entry_cancel.get("early_small_rejected_reason"),
             order_metadata.get("early_small_rejected_reason"),
         ),
+        "promotion_status": _first_string(
+            gate_details.get("shadow_small_entry_promotion_status"),
+            entry_cancel.get("shadow_small_entry_promotion_status"),
+            order_metadata.get("shadow_small_entry_promotion_status"),
+        ),
+        "promotion_reason": _first_string(
+            gate_details.get("shadow_small_entry_promotion_reason"),
+            entry_cancel.get("shadow_small_entry_promotion_reason"),
+            order_metadata.get("shadow_small_entry_promotion_reason"),
+        ),
+        "promotion_reason_codes": _first_list(
+            gate_details.get("shadow_small_entry_promotion_reason_codes"),
+            entry_cancel.get("shadow_small_entry_promotion_reason_codes"),
+            order_metadata.get("shadow_small_entry_promotion_reason_codes"),
+        ),
+        "source_report_id": _first_string(
+            gate_details.get("shadow_small_entry_source_report_id"),
+            entry_cancel.get("shadow_small_entry_source_report_id"),
+            order_metadata.get("shadow_small_entry_source_report_id"),
+        ),
+        "source_report_trade_date": _first_string(
+            gate_details.get("shadow_small_entry_source_report_trade_date"),
+            entry_cancel.get("shadow_small_entry_source_report_trade_date"),
+            order_metadata.get("shadow_small_entry_source_report_trade_date"),
+        ),
+        "reason_group": _first_string(
+            gate_details.get("shadow_small_entry_reason_group"),
+            entry_cancel.get("shadow_small_entry_reason_group"),
+            order_metadata.get("shadow_small_entry_reason_group"),
+        ),
+        "reason_code": _first_string(
+            gate_details.get("shadow_small_entry_reason_code"),
+            entry_cancel.get("shadow_small_entry_reason_code"),
+            order_metadata.get("shadow_small_entry_reason_code"),
+        ),
+        "sample_count": _first_present(gate_details.get("shadow_small_entry_sample_count"), entry_cancel.get("shadow_small_entry_sample_count"), order_metadata.get("shadow_small_entry_sample_count")),
+        "missed_opportunity_rate": _first_present(gate_details.get("shadow_small_entry_missed_opportunity_rate"), entry_cancel.get("shadow_small_entry_missed_opportunity_rate"), order_metadata.get("shadow_small_entry_missed_opportunity_rate")),
+        "risk_avoided_rate": _first_present(gate_details.get("shadow_small_entry_risk_avoided_rate"), entry_cancel.get("shadow_small_entry_risk_avoided_rate"), order_metadata.get("shadow_small_entry_risk_avoided_rate")),
+        "good_block_rate": _first_present(gate_details.get("shadow_small_entry_good_block_rate"), entry_cancel.get("shadow_small_entry_good_block_rate"), order_metadata.get("shadow_small_entry_good_block_rate")),
+        "avg_mfe_15m_pct": _first_present(gate_details.get("shadow_small_entry_avg_mfe_15m_pct"), entry_cancel.get("shadow_small_entry_avg_mfe_15m_pct"), order_metadata.get("shadow_small_entry_avg_mfe_15m_pct")),
+        "avg_mae_15m_pct": _first_present(gate_details.get("shadow_small_entry_avg_mae_15m_pct"), entry_cancel.get("shadow_small_entry_avg_mae_15m_pct"), order_metadata.get("shadow_small_entry_avg_mae_15m_pct")),
+        "position_size_multiplier": _first_present(gate_details.get("shadow_small_entry_position_size_multiplier"), entry_cancel.get("shadow_small_entry_position_size_multiplier"), order_metadata.get("shadow_small_entry_position_size_multiplier")),
+        "max_promotions_per_cycle": _first_present(gate_details.get("shadow_small_entry_max_promotions_per_cycle"), entry_cancel.get("shadow_small_entry_max_promotions_per_cycle"), order_metadata.get("shadow_small_entry_max_promotions_per_cycle")),
+        "max_promotions_per_day": _first_present(gate_details.get("shadow_small_entry_max_promotions_per_day"), entry_cancel.get("shadow_small_entry_max_promotions_per_day"), order_metadata.get("shadow_small_entry_max_promotions_per_day")),
+        "order_enabled": _first_present(gate_details.get("shadow_small_entry_order_enabled"), entry_cancel.get("shadow_small_entry_promotion_order_enabled"), order_metadata.get("shadow_small_entry_promotion_order_enabled")),
+        "mode": _first_string(gate_details.get("shadow_small_entry_promotion_mode"), entry_cancel.get("shadow_small_entry_promotion_mode"), order_metadata.get("shadow_small_entry_promotion_mode")),
         "operator_message_ko": _first_string(
             gate_details.get("data_quality_operator_message_ko"),
+            gate_details.get("shadow_small_entry_operator_message_ko"),
             gate_details.get("operator_message_ko"),
             entry_cancel.get("data_quality_operator_message_ko"),
+            entry_cancel.get("shadow_small_entry_operator_message_ko"),
             order_metadata.get("data_quality_operator_message_ko"),
+            order_metadata.get("shadow_small_entry_operator_message_ko"),
         ),
         "entry_plan_id": _first_present(event.get("entry_plan_id"), entry_cancel.get("entry_plan_id")),
         "entry_plan_submittable": entry_cancel.get("submittable"),

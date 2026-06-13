@@ -289,6 +289,7 @@ class StrategyRuntime:
         order_sink=None,
         theme_lab_pipeline: Optional[ThemeLabRuntimePipeline] = None,
         theme_lab_shadow_ab_provider: Optional[Callable[[str], dict]] = None,
+        shadow_small_entry_promotion_provider: Optional[Callable[[str], dict]] = None,
     ) -> None:
         self.db = db
         self.candidate_collector = candidate_collector
@@ -307,6 +308,7 @@ class StrategyRuntime:
         self.order_sink = order_sink
         self.theme_lab_pipeline = theme_lab_pipeline
         self.theme_lab_shadow_ab_provider = theme_lab_shadow_ab_provider
+        self.shadow_small_entry_promotion_provider = shadow_small_entry_promotion_provider
         self._theme_lab_bridge_results: list[GatePipelineResult] = []
         self._theme_lab_outcome_tracking: dict[str, datetime] = {}
         self.started = False
@@ -1578,6 +1580,7 @@ class StrategyRuntime:
                 default_ttl_minutes=getattr(self.candidate_collector, "default_ttl_minutes", 30),
                 settings=getattr(self.entry_plan_builder, "settings", None),
                 shadow_ab_provider=self.theme_lab_shadow_ab_provider,
+                shadow_small_entry_promotion_provider=self.shadow_small_entry_promotion_provider,
             )
             built = bridge.build(
                 active_result,

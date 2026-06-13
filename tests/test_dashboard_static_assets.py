@@ -67,6 +67,16 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
         "conservative-reason-small-lines",
         "conservative-reason-missed-lines",
         "conservative-reason-good-lines",
+        "shadow-small-entry-promotion-card",
+        "shadow-small-entry-promotion-empty",
+        "shadow-small-entry-promotion-status",
+        "shadow-small-entry-promotion-mode",
+        "shadow-small-entry-promotion-candidate-count",
+        "shadow-small-entry-promotion-observe-count",
+        "shadow-small-entry-promotion-promoted-count",
+        "shadow-small-entry-promotion-blocked-count",
+        "shadow-small-entry-promotion-group-lines",
+        "shadow-small-entry-promotion-code-lines",
     ]:
         assert soup.select_one(f"#{node_id}") is not None
     assert soup.select_one("#transport-real-pilot-price-sample-rate") is not None
@@ -147,6 +157,8 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "function renderLiveSimAudit" in js
     assert "function renderConservativeReasonOutcomes" in js
     assert "function renderConservativeStockLines" in js
+    assert "function renderShadowSmallEntryPromotion" in js
+    assert "shadow_small_entry_promotion" in js
     assert "conservative_reason_outcomes" in js
     assert "live_sim_audit" in js
     assert "function renderBuyZeroDataQualityCounts" in js

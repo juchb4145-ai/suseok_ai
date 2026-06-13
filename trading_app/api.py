@@ -79,6 +79,11 @@ from trading_app.promotion_evidence import DEFAULT_PROMOTION_POLICY_ID, Promotio
 from trading_app.replay_tick_buffer import ReplayGradeTickBuffer, replay_tick_writer_config_from_settings
 from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
+from trading_app.shadow_small_entry_promotion import (
+    ShadowSmallEntryPromotionAnalyzer,
+    empty_payload as shadow_small_entry_empty_payload,
+    snapshot_payload as shadow_small_entry_snapshot_payload,
+)
 from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
 from trading_app.shadow_strategy import ShadowStrategyEvaluator, config_from_settings as shadow_config_from_settings
 from trading_app.strategy_change_proposals import (
@@ -611,6 +616,10 @@ def _theme_lab_gate_reason_outcome_analyzer(db: TradingDatabase) -> ThemeLabGate
 
 def _conservative_reason_outcome_analyzer(db: TradingDatabase) -> ConservativeReasonOutcomeAnalyzer:
     return ConservativeReasonOutcomeAnalyzer(db)
+
+
+def _shadow_small_entry_promotion_analyzer(db: TradingDatabase) -> ShadowSmallEntryPromotionAnalyzer:
+    return ShadowSmallEntryPromotionAnalyzer(db)
 
 
 def _buy_zero_rca_analyzer(db: TradingDatabase) -> BuyZeroRCAAnalyzer:
@@ -2240,7 +2249,7 @@ def runtime_change_proposal_detail(proposal_id: str) -> dict[str, Any]:
 @app.post("/api/runtime/change-proposals/generate")
 def generate_runtime_change_proposals(
     trade_date: str,
-    source_type: Optional[str] = Query("combined", pattern="^(intraday_outcome|shadow_strategy|replay|threshold_ab|conservative_reason_outcome|combined)$"),
+    source_type: Optional[str] = Query("combined", pattern="^(intraday_outcome|shadow_strategy|replay|threshold_ab|conservative_reason_outcome|shadow_small_entry_promotion|combined)$"),
     replay_id: Optional[str] = None,
     force: bool = False,
     persist: bool = True,
@@ -2570,6 +2579,109 @@ def generate_conservative_reason_outcomes(
             "trade_date": report.get("trade_date") or resolved_trade_date,
             "summary": report.get("summary") or {},
             "exports": analyzer.export_report(report, fmt=format) if export else {},
+            "disclaimer_ko": report.get("disclaimer_ko") or "",
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-promotion/summary")
+def shadow_small_entry_promotion_summary(
+    trade_date: Optional[str] = None,
+    limit: int = Query(50000, ge=1, le=100000),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        report = _shadow_small_entry_promotion_analyzer(db).build_report(
+            trade_date=resolved_trade_date,
+            limit=limit,
+            include_traces=True,
+        )
+        return shadow_small_entry_snapshot_payload(report)
+    except Exception as exc:
+        return shadow_small_entry_empty_payload(str(exc))
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-promotion/candidates")
+def shadow_small_entry_promotion_candidates(
+    trade_date: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=1000),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        items = _shadow_small_entry_promotion_analyzer(db).candidates(trade_date=resolved_trade_date, limit=limit)
+        return {
+            "trade_date": resolved_trade_date,
+            "total": len(items),
+            "items": items,
+            "filters": {"trade_date": resolved_trade_date, "limit": limit},
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-promotion/traces")
+def shadow_small_entry_promotion_traces(
+    trade_date: Optional[str] = None,
+    code: str = "",
+    candidate_instance_id: str = "",
+    limit: int = Query(200, ge=1, le=1000),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        items = _shadow_small_entry_promotion_analyzer(db).traces(
+            trade_date=resolved_trade_date,
+            code=code,
+            candidate_instance_id=candidate_instance_id,
+            limit=limit,
+        )
+        return {
+            "trade_date": resolved_trade_date,
+            "total": len(items),
+            "items": items,
+            "filters": {
+                "trade_date": resolved_trade_date,
+                "code": code,
+                "candidate_instance_id": candidate_instance_id,
+                "limit": limit,
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-promotion/generate")
+def generate_shadow_small_entry_promotion(
+    trade_date: Optional[str] = None,
+    export: bool = False,
+    format: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+    limit: int = Query(50000, ge=1, le=100000),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        analyzer = _shadow_small_entry_promotion_analyzer(db)
+        report = analyzer.build_report(trade_date=resolved_trade_date, limit=limit)
+        normalized = "md" if format == "markdown" else format
+        exports = {}
+        if export:
+            if normalized == "all":
+                exports = analyzer.export_all(report)
+            elif normalized == "csv":
+                exports = {"csv": str(analyzer.export_csv(report, analyzer.report_root / resolved_trade_date / f"shadow_small_entry_promotion_{resolved_trade_date}.csv"))}
+            elif normalized == "md":
+                exports = {"md": str(analyzer.export_markdown(report, analyzer.report_root / resolved_trade_date / f"shadow_small_entry_promotion_{resolved_trade_date}.md"))}
+            else:
+                exports = {"json": str(analyzer.export_json(report, analyzer.report_root / resolved_trade_date / f"shadow_small_entry_promotion_{resolved_trade_date}.json"))}
+        return {
+            "trade_date": resolved_trade_date,
+            "summary": report.get("summary") or {},
+            "exports": exports,
             "disclaimer_ko": report.get("disclaimer_ko") or "",
         }
     finally:
@@ -6728,6 +6840,15 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         conservative_reason_payload = conservative_reason_snapshot_payload(conservative_reason_report)
     except Exception as exc:
         conservative_reason_payload = conservative_reason_empty_payload(str(exc))
+    try:
+        shadow_small_entry_report = _shadow_small_entry_promotion_analyzer(db).build_report(
+            trade_date=today,
+            limit=10000,
+            include_traces=False,
+        )
+        shadow_small_entry_payload = shadow_small_entry_snapshot_payload(shadow_small_entry_report)
+    except Exception as exc:
+        shadow_small_entry_payload = shadow_small_entry_empty_payload(str(exc))
     shadow_summary_payload = db.shadow_strategy_summary(trade_date=today)
     replay_reports = scan_replay_reports(DEFAULT_REPLAY_DB_ROOT, limit=1)
     replay_runs = scan_replay_runs(DEFAULT_REPLAY_DB_ROOT, limit=5)
@@ -6799,6 +6920,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["buy_zero_rca"] = buy_zero_rca_payload
     runtime_payload["live_sim_audit"] = live_sim_audit_payload
     runtime_payload["conservative_reason_outcomes"] = conservative_reason_payload
+    runtime_payload["shadow_small_entry_promotion"] = shadow_small_entry_payload
     runtime_payload["shadow_strategies"] = shadow_summary_payload
     runtime_payload["strategy_replay"] = replay_payload
     runtime_payload["change_proposals"] = change_proposal_payload
@@ -6836,6 +6958,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "buy_zero_rca": buy_zero_rca_payload,
         "live_sim_audit": live_sim_audit_payload,
         "conservative_reason_outcomes": conservative_reason_payload,
+        "shadow_small_entry_promotion": shadow_small_entry_payload,
         "shadow_strategies": shadow_summary_payload,
         "strategy_replay": replay_payload,
         "change_proposals": change_proposal_payload,

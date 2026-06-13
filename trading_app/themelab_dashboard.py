@@ -13,6 +13,11 @@ from trading_app.conservative_reason_outcomes import (
     snapshot_payload as conservative_reason_snapshot_payload,
 )
 from trading_app.live_sim_audit import LiveSimLifecycleAuditor
+from trading_app.shadow_small_entry_promotion import (
+    ShadowSmallEntryPromotionAnalyzer,
+    empty_payload as shadow_small_entry_empty_payload,
+    snapshot_payload as shadow_small_entry_snapshot_payload,
+)
 from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
 
 
@@ -72,6 +77,7 @@ def build_theme_lab_dashboard_snapshot(
     gate_reason_outcomes = _theme_lab_gate_reason_outcomes(db, trade_date=trade_date)
     live_sim_audit = _live_sim_audit(db, gateway_state=gateway_state, trade_date=trade_date)
     conservative_reason_outcomes = _conservative_reason_outcomes(db, trade_date=trade_date)
+    shadow_small_entry_promotion = _shadow_small_entry_promotion(db, trade_date=trade_date)
 
     return {
         "available": True,
@@ -96,6 +102,7 @@ def build_theme_lab_dashboard_snapshot(
         "gate_reason_outcomes": gate_reason_outcomes,
         "live_sim_audit": live_sim_audit,
         "conservative_reason_outcomes": conservative_reason_outcomes,
+        "shadow_small_entry_promotion": shadow_small_entry_promotion,
         "shadow_small_entry": gate_reason_outcomes.get("shadow_small_entry") or _empty_shadow_small_entry(),
         "shadow_small_entry_ab": gate_reason_outcomes.get("shadow_small_entry_ab") or _empty_shadow_small_entry_ab(),
         "summary": summary,
@@ -165,6 +172,7 @@ def _empty_snapshot(
         "gate_reason_outcomes": _empty_gate_reason_outcomes(),
         "live_sim_audit": _live_sim_audit(db, gateway_state=gateway_state, trade_date=datetime.now().date().isoformat()) if db is not None else _live_sim_audit_empty(),
         "conservative_reason_outcomes": _conservative_reason_outcomes(db, trade_date=datetime.now().date().isoformat()) if db is not None else conservative_reason_empty_payload(),
+        "shadow_small_entry_promotion": _shadow_small_entry_promotion(db, trade_date=datetime.now().date().isoformat()) if db is not None else shadow_small_entry_empty_payload(),
         "shadow_small_entry": _empty_shadow_small_entry(),
         "shadow_small_entry_ab": _empty_shadow_small_entry_ab(),
         "summary": _empty_summary(runtime=runtime, freshness=freshness),
@@ -201,6 +209,18 @@ def _conservative_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") 
         return conservative_reason_snapshot_payload(report)
     except Exception as exc:
         return conservative_reason_empty_payload(str(exc))
+
+
+def _shadow_small_entry_promotion(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
+    try:
+        report = ShadowSmallEntryPromotionAnalyzer(db).build_report(
+            trade_date=trade_date or None,
+            limit=10000,
+            include_traces=False,
+        )
+        return shadow_small_entry_snapshot_payload(report)
+    except Exception as exc:
+        return shadow_small_entry_empty_payload(str(exc))
 
 
 def _theme_lab_gate_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:

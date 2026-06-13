@@ -93,6 +93,17 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#themelab-conservative-reason-data-body") is not None
     assert soup.select_one("#themelab-conservative-reason-missed-body") is not None
     assert soup.select_one("#themelab-conservative-reason-good-body") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-card") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-empty") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-status") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-mode") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-candidate-count") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-observe-count") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-promoted-count") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-blocked-count") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-group-lines") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-code-lines") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-candidate-body") is not None
     assert soup.select_one("#promotion-cockpit") is not None
     assert soup.select_one("#promotion-window-controls") is not None
     assert soup.select_one('[data-promotion-window="300"]') is not None
@@ -155,6 +166,8 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "gateway_unhealthy_display" in js
     assert "shadow_small_entry_ab" in js
     assert "renderShadowAb" in js
+    assert "renderShadowSmallEntryPromotionPanel" in js
+    assert "shadow_small_entry_promotion" in js
     assert "matchesFilters" in js
     assert "renderCockpit" in js
     assert "renderPromotionDecisionPanel" in js

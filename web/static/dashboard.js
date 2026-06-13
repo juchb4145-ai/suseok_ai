@@ -1186,6 +1186,47 @@ function renderConservativeReasonOutcomes(snapshot) {
   renderConservativeStockLines("conservative-reason-good-lines", payload.top_good_block_stocks || [], "좋은 차단 상위 종목이 없습니다.");
 }
 
+function renderShadowSmallEntryPromotion(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.shadow_small_entry_promotion || runtime.shadow_small_entry_promotion || {};
+  const summary = payload.summary || {};
+  const available = Boolean(payload.available);
+  const status = payload.status || (available ? "READY" : "NO_DATA");
+  text("shadow-small-entry-promotion-status", status);
+  cls("shadow-small-entry-promotion-status", `counter ${available ? "ok" : "muted"}`);
+  text("shadow-small-entry-promotion-mode", `${payload.mode || summary.mode || "observe_only"} / order ${payload.order_enabled ? "ON" : "OFF"}`);
+  cls("shadow-small-entry-promotion-mode", `counter ${payload.order_enabled ? "warn" : "muted"}`);
+  text(
+    "shadow-small-entry-promotion-empty",
+    payload.order_enabled
+      ? "조건 충족 후보는 1차 leg만 LIVE_SIM guarded 주문 가능합니다."
+      : "리포트 근거는 있으나 order_enabled=false라 주문하지 않습니다."
+  );
+  text("shadow-small-entry-promotion-updated", formatDateTime(payload.last_updated_at));
+  text("shadow-small-entry-promotion-candidate-count", payload.candidate_count ?? summary.candidate_count ?? 0);
+  text("shadow-small-entry-promotion-observe-count", payload.observe_only_count ?? summary.observe_only_count ?? 0);
+  text("shadow-small-entry-promotion-promoted-count", payload.promoted_count ?? summary.promoted_count ?? 0);
+  text("shadow-small-entry-promotion-blocked-count", payload.blocked_count ?? summary.blocked_count ?? 0);
+  text("shadow-small-entry-promotion-used-count", payload.used_promotions_today ?? summary.used_promotions_today ?? 0);
+  text("shadow-small-entry-promotion-day-limit", payload.max_promotions_per_day ?? summary.max_promotions_per_day ?? 0);
+  renderKeyCountLines("shadow-small-entry-promotion-group-lines", payload.top_reason_groups || summary.top_reason_groups || [], "아직 승격 reason group이 없습니다.");
+  renderKeyCountLines("shadow-small-entry-promotion-code-lines", payload.top_reason_codes || summary.top_reason_codes || [], "아직 승격 reason code가 없습니다.");
+}
+
+function renderKeyCountLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = firstItems(rows || [], 6);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item info">
+        <strong>${escapeHtml(item.key || item.reason || item.group || "-")}</strong>
+        <span>${escapeHtml(item.count ?? 0)}건</span>
+      </div>
+    `).join("")
+    : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
 function renderConservativeReasonLines(id, rows, emptyText) {
   const node = document.getElementById(id);
   if (!node) return;
@@ -1539,6 +1580,7 @@ function render(snapshot) {
   renderLiveSimAudit(snapshot);
   renderBuyZeroRca(snapshot);
   renderConservativeReasonOutcomes(snapshot);
+  renderShadowSmallEntryPromotion(snapshot);
 
   text("transport-mode", transport.mode || "rest_long_poll");
   text("transport-event-p95", formatMs(transport.event_latency_p95_ms));

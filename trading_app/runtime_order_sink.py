@@ -782,6 +782,64 @@ def _theme_lab_bridge_metadata(
             cancel.get("shadow_small_entry_labeled_count"),
             None,
         ),
+        "shadow_small_entry_promotion_status": details.get("shadow_small_entry_promotion_status")
+        or bridge.get("shadow_small_entry_promotion_status")
+        or cancel.get("shadow_small_entry_promotion_status")
+        or "",
+        "shadow_small_entry_promotion_reason": details.get("shadow_small_entry_promotion_reason")
+        or bridge.get("shadow_small_entry_promotion_reason")
+        or cancel.get("shadow_small_entry_promotion_reason")
+        or "",
+        "shadow_small_entry_promotion_reason_codes": list(
+            details.get("shadow_small_entry_promotion_reason_codes")
+            or bridge.get("shadow_small_entry_promotion_reason_codes")
+            or cancel.get("shadow_small_entry_promotion_reason_codes")
+            or []
+        ),
+        "shadow_small_entry_source_report_id": details.get("shadow_small_entry_source_report_id")
+        or bridge.get("shadow_small_entry_source_report_id")
+        or cancel.get("shadow_small_entry_source_report_id")
+        or "",
+        "shadow_small_entry_source_report_trade_date": details.get("shadow_small_entry_source_report_trade_date")
+        or bridge.get("shadow_small_entry_source_report_trade_date")
+        or cancel.get("shadow_small_entry_source_report_trade_date")
+        or "",
+        "shadow_small_entry_reason_group": details.get("shadow_small_entry_reason_group")
+        or bridge.get("shadow_small_entry_reason_group")
+        or cancel.get("shadow_small_entry_reason_group")
+        or "",
+        "shadow_small_entry_reason_code": details.get("shadow_small_entry_reason_code")
+        or bridge.get("shadow_small_entry_reason_code")
+        or cancel.get("shadow_small_entry_reason_code")
+        or "",
+        "shadow_small_entry_sample_count": _first_text(details.get("shadow_small_entry_sample_count"), bridge.get("shadow_small_entry_sample_count"), cancel.get("shadow_small_entry_sample_count"), None),
+        "shadow_small_entry_missed_opportunity_rate": _first_text(details.get("shadow_small_entry_missed_opportunity_rate"), bridge.get("shadow_small_entry_missed_opportunity_rate"), cancel.get("shadow_small_entry_missed_opportunity_rate"), None),
+        "shadow_small_entry_risk_avoided_rate": _first_text(details.get("shadow_small_entry_risk_avoided_rate"), bridge.get("shadow_small_entry_risk_avoided_rate"), cancel.get("shadow_small_entry_risk_avoided_rate"), None),
+        "shadow_small_entry_good_block_rate": _first_text(details.get("shadow_small_entry_good_block_rate"), bridge.get("shadow_small_entry_good_block_rate"), cancel.get("shadow_small_entry_good_block_rate"), None),
+        "shadow_small_entry_avg_mfe_15m_pct": _first_text(details.get("shadow_small_entry_avg_mfe_15m_pct"), bridge.get("shadow_small_entry_avg_mfe_15m_pct"), cancel.get("shadow_small_entry_avg_mfe_15m_pct"), None),
+        "shadow_small_entry_avg_mae_15m_pct": _first_text(details.get("shadow_small_entry_avg_mae_15m_pct"), bridge.get("shadow_small_entry_avg_mae_15m_pct"), cancel.get("shadow_small_entry_avg_mae_15m_pct"), None),
+        "shadow_small_entry_position_size_multiplier": _first_text(details.get("shadow_small_entry_position_size_multiplier"), bridge.get("shadow_small_entry_position_size_multiplier"), cancel.get("shadow_small_entry_position_size_multiplier"), None),
+        "shadow_small_entry_promotion_mode": details.get("shadow_small_entry_promotion_mode")
+        or bridge.get("shadow_small_entry_promotion_mode")
+        or cancel.get("shadow_small_entry_promotion_mode")
+        or "",
+        "shadow_small_entry_promotion_order_enabled": bool(
+            details.get("shadow_small_entry_order_enabled")
+            or bridge.get("shadow_small_entry_order_enabled")
+            or cancel.get("shadow_small_entry_promotion_order_enabled")
+        ),
+        "shadow_small_entry_max_promotions_per_cycle": _first_text(details.get("shadow_small_entry_max_promotions_per_cycle"), bridge.get("shadow_small_entry_max_promotions_per_cycle"), cancel.get("shadow_small_entry_max_promotions_per_cycle"), None),
+        "shadow_small_entry_max_promotions_per_day": _first_text(details.get("shadow_small_entry_max_promotions_per_day"), bridge.get("shadow_small_entry_max_promotions_per_day"), cancel.get("shadow_small_entry_max_promotions_per_day"), None),
+        "shadow_small_entry_max_promotions_per_code_per_day": _first_text(details.get("shadow_small_entry_max_promotions_per_code_per_day"), bridge.get("shadow_small_entry_max_promotions_per_code_per_day"), cancel.get("shadow_small_entry_max_promotions_per_code_per_day"), None),
+        "shadow_small_entry_max_notional_per_day": _first_text(details.get("shadow_small_entry_max_notional_per_day"), bridge.get("shadow_small_entry_max_notional_per_day"), cancel.get("shadow_small_entry_max_notional_per_day"), None),
+        "shadow_small_entry_cancel_unfilled_after_sec": _first_text(details.get("shadow_small_entry_cancel_unfilled_after_sec"), bridge.get("shadow_small_entry_cancel_unfilled_after_sec"), cancel.get("shadow_small_entry_cancel_unfilled_after_sec"), None),
+        "shadow_small_entry_stop_loss_pct": _first_text(details.get("shadow_small_entry_stop_loss_pct"), bridge.get("shadow_small_entry_stop_loss_pct"), cancel.get("shadow_small_entry_stop_loss_pct"), None),
+        "shadow_small_entry_take_profit_pct": _first_text(details.get("shadow_small_entry_take_profit_pct"), bridge.get("shadow_small_entry_take_profit_pct"), cancel.get("shadow_small_entry_take_profit_pct"), None),
+        "shadow_small_entry_max_hold_minutes": _first_text(details.get("shadow_small_entry_max_hold_minutes"), bridge.get("shadow_small_entry_max_hold_minutes"), cancel.get("shadow_small_entry_max_hold_minutes"), None),
+        "shadow_small_entry_operator_message_ko": details.get("shadow_small_entry_operator_message_ko")
+        or bridge.get("shadow_small_entry_operator_message_ko")
+        or cancel.get("shadow_small_entry_operator_message_ko")
+        or "",
         "risk_off_entry": dict(details.get("risk_off_entry") or bridge.get("risk_off_entry") or cancel.get("risk_off_entry") or {}),
         "risk_off_entry_enabled": bool(details.get("risk_off_entry_enabled") or bridge.get("risk_off_entry_enabled") or cancel.get("risk_off_entry_enabled")),
         "risk_off_entry_observe_only": bool(
