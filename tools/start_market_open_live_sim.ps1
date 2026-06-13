@@ -11,8 +11,10 @@ param(
     [ValidateSet("rest", "websocket-pilot", "websocket-experimental")]
     [string]$GatewayTransport = "websocket-pilot",
     [string]$GatewayCoreUrl = "",
+    [int]$RuntimeDryRunPositionAmount = 300000,
     [switch]$SkipGateway,
     [switch]$SkipRuntime,
+    [switch]$SkipShadowSmallEntryPreflight,
     [switch]$NoStopExisting,
     [switch]$DryRun
 )
@@ -35,9 +37,13 @@ if (-not $Token) {
     $Token = if ($env:TRADING_CORE_TOKEN) { $env:TRADING_CORE_TOKEN } else { "local-dev-token" }
 }
 
+$gatewayHost = if ($BindHost -in @("0.0.0.0", "::", "[::]")) { "127.0.0.1" } else { $BindHost }
 if (-not $GatewayCoreUrl) {
-    $gatewayHost = if ($BindHost -in @("0.0.0.0", "::", "[::]")) { "127.0.0.1" } else { $BindHost }
     $GatewayCoreUrl = "http://${gatewayHost}:$Port"
+}
+$GatewayWsUrl = ""
+if ($GatewayTransport -ne "rest") {
+    $GatewayWsUrl = "ws://${gatewayHost}:$Port/ws/gateway/transport"
 }
 
 $Python64 = Join-Path $ProjectRoot "venv_64\Scripts\python.exe"
@@ -49,11 +55,17 @@ $LogDir = Join-Path $ProjectRoot "logs"
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
 $env:TRADING_MODE = "OBSERVE"
+$env:TRADING_RUNTIME_ENABLED = "1"
+$env:TRADING_RUNTIME_AUTO_START = "0"
 $env:TRADING_RUNTIME_MODE = "DRY_RUN"
 $env:TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS = "1"
 $env:TRADING_RUNTIME_ALLOW_LIVE_ORDERS = "0"
+$env:TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT = [string]$RuntimeDryRunPositionAmount
 $env:TRADING_GATEWAY_TRANSPORT = $GatewayTransport
 $env:TRADING_KIWOOM_GATEWAY_CORE_URL = $GatewayCoreUrl
+if ($GatewayWsUrl) {
+    $env:TRADING_GATEWAY_WS_URL = $GatewayWsUrl
+}
 if ($GatewayTransport -eq "websocket-pilot") {
     $env:TRADING_GATEWAY_WEBSOCKET_REAL_PILOT = "1"
     $env:TRADING_GATEWAY_WEBSOCKET_ALLOW_REAL = "1"
@@ -61,6 +73,10 @@ if ($GatewayTransport -eq "websocket-pilot") {
     $env:TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS = "1"
     $env:TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS = "0"
 }
+$env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY = "1"
+$env:TRADING_SHADOW_STRATEGY_ALLOW_APPLY = "0"
+$env:TRADING_CHANGE_PROPOSAL_ALLOW_AUTO_APPLY = "0"
+$env:TRADING_THEME_BACKFILL_OBSERVE_ONLY = "1"
 $env:TRADING_CORE_TOKEN = $Token
 $env:TRADING_DB_PATH = $DbPath
 $env:PYTHONIOENCODING = "utf-8"
@@ -285,15 +301,92 @@ if (
     return $output | ConvertFrom-Json
 }
 
+function Get-ThemeLabStartupSummary {
+    try {
+        $snapshot = Invoke-CoreApi -Method GET -Path "/api/themelab/snapshot" -TimeoutSec 20
+        $summary = Get-ObjectPropertyValue $snapshot "summary"
+        $operatorView = Get-ObjectPropertyValue $snapshot "operator_view"
+        $mainAction = Get-ObjectPropertyValue $operatorView "main_action"
+        $themeBackfill = Get-ObjectPropertyValue $snapshot "theme_backfill_runtime"
+        [pscustomobject]@{
+            available = $true
+            operation_status = [string](Get-ObjectPropertyValue $summary "operation_status")
+            operation_message = [string](Get-ObjectPropertyValue $summary "operation_message")
+            ready_count = [int](Get-ObjectPropertyValue $summary "ready_count")
+            ready_small_entry_count = [int](Get-ObjectPropertyValue $summary "ready_small_entry_count")
+            order_candidate_count = [int](Get-ObjectPropertyValue $summary "order_candidate_count")
+            main_action = [pscustomobject]@{
+                status = [string](Get-ObjectPropertyValue $mainAction "status")
+                label_ko = [string](Get-ObjectPropertyValue $mainAction "label_ko")
+                message_ko = [string](Get-ObjectPropertyValue $mainAction "message_ko")
+            }
+            theme_backfill = [pscustomobject]@{
+                enabled = [bool](Get-ObjectPropertyValue $themeBackfill "enabled")
+                observe_only = [bool](Get-ObjectPropertyValue $themeBackfill "observe_only")
+                tr_backfill_caused_ready_count = [int](Get-ObjectPropertyValue $themeBackfill "tr_backfill_caused_ready_count")
+            }
+        }
+    } catch {
+        [pscustomobject]@{
+            available = $false
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Get-ShadowSmallEntryStartupStatus {
+    $statusPayload = $null
+    $preflightPayload = $null
+    try {
+        $statusPayload = Invoke-CoreApi -Method GET -Path "/api/shadow-small-entry-ops/status" -TimeoutSec 20
+        if (-not $SkipShadowSmallEntryPreflight) {
+            try {
+                $preflightPayload = Invoke-CoreApi -Method POST -Path "/api/shadow-small-entry-ops/preflight" -TimeoutSec 30
+            } catch {
+                $preflightPayload = [pscustomobject]@{
+                    status = "ERROR"
+                    blocking_reasons = @($_.Exception.Message)
+                }
+            }
+        }
+        [pscustomobject]@{
+            available = $true
+            status = [string](Get-ObjectPropertyValue $statusPayload "status")
+            mode = [string](Get-ObjectPropertyValue $statusPayload "mode")
+            order_enabled = [bool](Get-ObjectPropertyValue $statusPayload "order_enabled")
+            preflight_status = [string](Get-ObjectPropertyValue $statusPayload "preflight_status")
+            preflight_blocking_reasons = @(Get-ObjectPropertyValue $statusPayload "preflight_blocking_reasons")
+            operator_message_ko = [string](Get-ObjectPropertyValue $statusPayload "operator_message_ko")
+            daily_usage = Get-ObjectPropertyValue $statusPayload "today"
+            limits = Get-ObjectPropertyValue $statusPayload "limits"
+            audit = Get-ObjectPropertyValue $statusPayload "audit"
+            startup_preflight = $preflightPayload
+        }
+    } catch {
+        [pscustomobject]@{
+            available = $false
+            error = $_.Exception.Message
+        }
+    }
+}
+
 Push-Location $ProjectRoot
 try {
     Write-Step "Market open LIVE_SIM startup settings"
     Write-Step "Core TRADING_MODE=$env:TRADING_MODE"
+    Write-Step "Runtime TRADING_RUNTIME_ENABLED=$env:TRADING_RUNTIME_ENABLED auto_start=$env:TRADING_RUNTIME_AUTO_START"
     Write-Step "Runtime TRADING_RUNTIME_MODE=$env:TRADING_RUNTIME_MODE"
     Write-Step "Runtime TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS=$env:TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS"
     Write-Step "Runtime TRADING_RUNTIME_ALLOW_LIVE_ORDERS=$env:TRADING_RUNTIME_ALLOW_LIVE_ORDERS"
+    Write-Step "Runtime TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT=$env:TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT"
     Write-Step "Gateway transport=$env:TRADING_GATEWAY_TRANSPORT"
     Write-Step "Gateway core URL=$env:TRADING_KIWOOM_GATEWAY_CORE_URL"
+    if ($env:TRADING_GATEWAY_WS_URL) {
+        Write-Step "Gateway WebSocket URL=$env:TRADING_GATEWAY_WS_URL"
+    }
+    Write-Step "Shadow strategy observe_only=$env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY allow_apply=$env:TRADING_SHADOW_STRATEGY_ALLOW_APPLY"
+    Write-Step "Change proposal auto_apply=$env:TRADING_CHANGE_PROPOSAL_ALLOW_AUTO_APPLY"
+    Write-Step "Theme backfill observe_only=$env:TRADING_THEME_BACKFILL_OBSERVE_ONLY"
     if ($GatewayTransport -eq "websocket-pilot") {
         Write-Step "WebSocket pilot order commands allow=$env:TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS block=$env:TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS"
     }
@@ -308,14 +401,25 @@ try {
             db_path = $DbPath
             host = $BindHost
             port = $Port
+            dashboard_url = "http://${BindHost}:$Port/"
+            themelab_url = "http://${BindHost}:$Port/themelab"
             trading_mode = $env:TRADING_MODE
+            runtime_enabled = $env:TRADING_RUNTIME_ENABLED
+            runtime_auto_start = $env:TRADING_RUNTIME_AUTO_START
             runtime_mode = $env:TRADING_RUNTIME_MODE
             runtime_allow_dry_run_orders = $env:TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS
             runtime_allow_live_orders = $env:TRADING_RUNTIME_ALLOW_LIVE_ORDERS
+            runtime_dry_run_position_amount = $env:TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT
             gateway_transport = $env:TRADING_GATEWAY_TRANSPORT
             gateway_core_url = $env:TRADING_KIWOOM_GATEWAY_CORE_URL
+            gateway_ws_url = $env:TRADING_GATEWAY_WS_URL
             websocket_pilot_order_allow = $env:TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS
             websocket_pilot_order_block = $env:TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS
+            shadow_strategy_observe_only = $env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY
+            shadow_strategy_allow_apply = $env:TRADING_SHADOW_STRATEGY_ALLOW_APPLY
+            change_proposal_allow_auto_apply = $env:TRADING_CHANGE_PROPOSAL_ALLOW_AUTO_APPLY
+            theme_backfill_observe_only = $env:TRADING_THEME_BACKFILL_OBSERVE_ONLY
+            shadow_small_entry_preflight = if ($SkipShadowSmallEntryPreflight) { "skipped" } else { "enabled" }
             db_order_execution = $dbSettings
         } | ConvertTo-Json -Depth 6
         return
@@ -403,6 +507,19 @@ try {
         Write-Step "Runtime ready mode=$($runtimeStatus.mode) cycles=$($runtimeStatus.cycle_count)"
     }
 
+    $themeLabStatus = Get-ThemeLabStartupSummary
+    $shadowSmallEntryStatus = Get-ShadowSmallEntryStartupStatus
+    if ($themeLabStatus.available) {
+        Write-Step "ThemeLab status=$($themeLabStatus.operation_status) action=$($themeLabStatus.main_action.label_ko)"
+    } else {
+        Write-Step "ThemeLab status unavailable: $($themeLabStatus.error)"
+    }
+    if ($shadowSmallEntryStatus.available) {
+        Write-Step "Shadow Small Entry status=$($shadowSmallEntryStatus.status) mode=$($shadowSmallEntryStatus.mode) order_enabled=$($shadowSmallEntryStatus.order_enabled) preflight=$($shadowSmallEntryStatus.preflight_status)"
+    } else {
+        Write-Step "Shadow Small Entry status unavailable: $($shadowSmallEntryStatus.error)"
+    }
+
     [pscustomobject]@{
         started = $true
         core = @{
@@ -411,6 +528,10 @@ try {
             stdout = $coreOutLog
             stderr = $coreErrLog
             trading_mode = "OBSERVE"
+        }
+        ui = @{
+            dashboard_url = "http://${BindHost}:$Port/"
+            themelab_url = "http://${BindHost}:$Port/themelab"
         }
         runtime = if ($runtimeStatus) {
             @{
@@ -430,12 +551,16 @@ try {
                 kiwoom_logged_in = [bool]$gatewayStatus.kiwoom_logged_in
                 orderable = [bool]$gatewayStatus.orderable
                 transport = [string]$env:TRADING_GATEWAY_TRANSPORT
+                core_url = [string]$env:TRADING_KIWOOM_GATEWAY_CORE_URL
+                ws_url = [string]$env:TRADING_GATEWAY_WS_URL
                 broker_env = [string]$gatewayModes.broker_env
                 server_mode = [string]$gatewayModes.server_mode
                 account_mode = [string]$gatewayModes.account_mode
                 server_gubun = [string]$gatewayModes.server_gubun
             }
         } else { $null }
+        themelab = $themeLabStatus
+        shadow_small_entry_ops = $shadowSmallEntryStatus
         db_order_execution = $dbSettings
     } | ConvertTo-Json -Depth 8
 }
