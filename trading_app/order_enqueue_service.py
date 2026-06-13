@@ -706,6 +706,20 @@ class OrderEnqueueService:
                     if not due_reason:
                         continue
                     cancel_qty = _remaining_cancel_qty(order)
+                    db.append_live_sim_order_event(
+                        str(order.get("order_intent_id") or ""),
+                        "cancel_due",
+                        status_from=str(order.get("order_status") or ""),
+                        status_to=str(order.get("order_status") or ""),
+                        message=due_reason,
+                        payload={
+                            "cancel_due": True,
+                            "cancel_due_reason": due_reason,
+                            "cancel_qty": cancel_qty,
+                            "lifecycle": lifecycle,
+                        },
+                        created_at=now,
+                    )
                     result = self.enqueue_live_sim_cancel_order(
                         order,
                         cancel_qty=cancel_qty,
@@ -809,6 +823,15 @@ class OrderEnqueueService:
                 saved = db.save_live_sim_cancel_order(
                     {**base_record, "status": "RECONCILE_REQUIRED", "reason_codes": ["LIVE_SIM_CANCEL_RECONCILE_REQUIRED"], "details": {**base_record["details"], "order": updated}}
                 )
+                db.append_live_sim_order_event(
+                    original_order_id,
+                    "reconcile_required",
+                    status_from=str(order.get("order_status") or ""),
+                    status_to="RECONCILE_REQUIRED",
+                    message="LIVE_SIM_CANCEL_RECONCILE_REQUIRED",
+                    payload={"cancel": saved, "issue_type": "BROKER_ORDER_ID_MISSING", "operator_message_ko": "주문번호가 없어 재조회가 필요합니다."},
+                    created_at=now,
+                )
                 return OrderEnqueueResult(False, "LIVE_SIM", False, intent_id=cancel_intent_id, idempotency_key=idempotency_key, status="RECONCILE_REQUIRED", reason="LIVE_SIM_CANCEL_RECONCILE_REQUIRED", record=saved)
             duplicate = db.find_pending_live_sim_cancel(broker_order_id=broker_order_id)
             if duplicate is not None:
@@ -830,6 +853,15 @@ class OrderEnqueueService:
                 )
                 saved = db.save_live_sim_cancel_order(
                     {**base_record, "status": "RECONCILE_REQUIRED", "reason_codes": ["LIVE_SIM_CANCEL_MAX_ATTEMPTS_EXCEEDED", "LIVE_SIM_CANCEL_RECONCILE_REQUIRED"], "details": {**base_record["details"], "order": updated}}
+                )
+                db.append_live_sim_order_event(
+                    original_order_id,
+                    "reconcile_required",
+                    status_from=str(order.get("order_status") or ""),
+                    status_to="RECONCILE_REQUIRED",
+                    message="LIVE_SIM_CANCEL_MAX_ATTEMPTS_EXCEEDED",
+                    payload={"cancel": saved, "issue_type": "CANCEL_MAX_ATTEMPTS_EXCEEDED", "operator_message_ko": "취소 시도 횟수를 초과해 재조회가 필요합니다."},
+                    created_at=now,
                 )
                 return OrderEnqueueResult(False, "LIVE_SIM", False, intent_id=cancel_intent_id, idempotency_key=idempotency_key, status="RECONCILE_REQUIRED", reason="LIVE_SIM_CANCEL_MAX_ATTEMPTS_EXCEEDED", record=saved)
             guard_request = BrokerOrderRequest(
@@ -1060,6 +1092,15 @@ class OrderEnqueueService:
                                 "updated_at": now,
                                 "reason_codes": _merge_reason_codes(order, ["LIVE_SIM_RECONCILE_ORDER_CANCELLED_FROM_BROKER"]),
                             },
+                        )
+                        db.append_live_sim_order_event(
+                            str(order.get("order_intent_id") or ""),
+                            "cancelled",
+                            status_from=str(order.get("order_status") or ""),
+                            status_to="CANCELLED",
+                            message="LIVE_SIM_RECONCILE_ORDER_CANCELLED_FROM_BROKER",
+                            payload=broker_order,
+                            created_at=now,
                         )
                         orders_reconciled += 1
                         reason_codes.append("LIVE_SIM_RECONCILE_ORDER_CANCELLED_FROM_BROKER")
@@ -1488,8 +1529,11 @@ class OrderEnqueueService:
         min_amount = int(execution.get("min_order_amount_krw") or 0)
         max_amount = int(execution.get("max_order_amount_krw") or self.settings.max_order_amount)
         early_small_cap_applied = False
-        if broker_request.side == "buy" and _is_ready_early_small(request):
+        if broker_request.side == "buy" and (_is_ready_early_small(request) or _is_ready_shadow_small_entry(request)):
             multiplier = float(execution.get("early_small_max_order_amount_multiplier") or 0.5)
+            if _is_ready_shadow_small_entry(request):
+                metadata_multiplier = (request.metadata or {}).get("shadow_small_entry_position_size_multiplier")
+                multiplier = float(metadata_multiplier or execution.get("shadow_small_entry_max_order_amount_multiplier") or multiplier)
             multiplier = min(1.0, max(0.0, multiplier))
             max_amount = max(1, int(max_amount * multiplier))
             early_small_cap_applied = True
@@ -1509,6 +1553,9 @@ class OrderEnqueueService:
         if gate_reason:
             return gate_reason, [gate_reason], {"metadata": dict(request.metadata or {}), "gate_status": request.gate_status}
         if broker_request.side == "buy":
+            shadow_reason, shadow_codes, shadow_details = self._live_sim_shadow_small_entry_block(request, broker_request, trade_date=self._trade_date(request, str(self.clock())))
+            if shadow_reason:
+                return shadow_reason, shadow_codes, shadow_details
             lifecycle_reason, lifecycle_codes, lifecycle_details = self._live_sim_buy_lifecycle_block(
                 request,
                 broker_request,
@@ -1792,6 +1839,62 @@ class OrderEnqueueService:
         finally:
             db.close()
 
+    def _live_sim_shadow_small_entry_block(
+        self,
+        request: RuntimeOrderIntentRequest,
+        broker_request: BrokerOrderRequest,
+        *,
+        trade_date: str,
+    ) -> tuple[str, list[str], dict[str, Any]]:
+        if not _is_ready_shadow_small_entry(request):
+            return "", [], {}
+        metadata = dict(request.metadata or {})
+        if str(metadata.get("shadow_small_entry_promotion_mode") or "").lower() != "live_sim_guarded" or not bool(metadata.get("shadow_small_entry_promotion_order_enabled")):
+            return (
+                "SHADOW_SMALL_ENTRY_ORDER_NOT_ENABLED",
+                ["SHADOW_SMALL_ENTRY_ORDER_NOT_ENABLED"],
+                {"metadata": metadata},
+            )
+        try:
+            leg_index = int(request.leg_index or metadata.get("leg_index") or 1)
+        except (TypeError, ValueError):
+            leg_index = 1
+        if leg_index != 1:
+            return (
+                "SHADOW_SMALL_ENTRY_FIRST_LEG_ONLY",
+                ["SHADOW_SMALL_ENTRY_FIRST_LEG_ONLY"],
+                {"leg_index": leg_index},
+            )
+        amount = int(broker_request.quantity or 0) * max(0, int(broker_request.price or 0))
+        max_per_cycle = int(metadata.get("shadow_small_entry_max_promotions_per_cycle") or 1)
+        if max_per_cycle > 0 and int(metadata.get("shadow_small_entry_used_this_cycle") or 0) >= max_per_cycle:
+            return "SHADOW_SMALL_ENTRY_MAX_PER_CYCLE_EXCEEDED", ["SHADOW_SMALL_ENTRY_MAX_PER_CYCLE_EXCEEDED"], {"max_per_cycle": max_per_cycle}
+        max_day = int(metadata.get("shadow_small_entry_max_promotions_per_day") or 3)
+        max_code_day = int(metadata.get("shadow_small_entry_max_promotions_per_code_per_day") or 1)
+        max_notional_day = int(metadata.get("shadow_small_entry_max_notional_per_day") or 300000)
+        db = TradingDatabase(str(self.db_path))
+        try:
+            day_orders = [
+                order
+                for order in db.list_live_sim_orders(trade_date=trade_date, side="buy", limit=1000)
+                if _live_sim_order_is_shadow_small(order)
+            ]
+        finally:
+            db.close()
+        if max_day > 0 and len(day_orders) >= max_day:
+            return "SHADOW_SMALL_ENTRY_MAX_PER_DAY_EXCEEDED", ["SHADOW_SMALL_ENTRY_MAX_PER_DAY_EXCEEDED"], {"used": len(day_orders), "max_day": max_day}
+        code_orders = [order for order in day_orders if str(order.get("code") or "") == broker_request.code]
+        if max_code_day > 0 and len(code_orders) >= max_code_day:
+            return "SHADOW_SMALL_ENTRY_CODE_ALREADY_PROMOTED", ["SHADOW_SMALL_ENTRY_CODE_ALREADY_PROMOTED"], {"used": len(code_orders), "max_code_day": max_code_day}
+        notional = sum(int(order.get("submitted_qty") or order.get("requested_qty") or 0) * max(0, int(order.get("submitted_price") or order.get("requested_price") or 0)) for order in day_orders)
+        if max_notional_day > 0 and notional + amount > max_notional_day:
+            return (
+                "SHADOW_SMALL_ENTRY_NOTIONAL_LIMIT_EXCEEDED",
+                ["SHADOW_SMALL_ENTRY_NOTIONAL_LIMIT_EXCEEDED"],
+                {"used_notional": notional, "order_amount": amount, "max_notional_day": max_notional_day},
+            )
+        return "", [], {}
+
     def _save_live_sim_health(
         self,
         component: str,
@@ -2063,6 +2166,34 @@ def _is_ready_early_small(request: RuntimeOrderIntentRequest) -> bool:
     }
     values.update(str(item or "").upper() for item in list(metadata.get("reason_codes") or []))
     return "READY_EARLY_SMALL" in values
+
+
+def _is_ready_shadow_small_entry(request: RuntimeOrderIntentRequest) -> bool:
+    metadata = dict(request.metadata or {})
+    values = {
+        str(request.gate_reason or "").upper(),
+        str(metadata.get("ready_type") or "").upper(),
+        str(metadata.get("final_status") or "").upper(),
+        str(metadata.get("final_gate_status") or "").upper(),
+        str(metadata.get("order_eligibility") or "").upper(),
+        str(metadata.get("shadow_small_entry_promotion_status") or "").upper(),
+    }
+    values.update(str(item or "").upper() for item in list(metadata.get("reason_codes") or []))
+    return "READY_SHADOW_SMALL_ENTRY" in values or "BUY_ELIGIBLE_SHADOW_SMALL_ENTRY_GUARDED" in values or "PROMOTED" in values
+
+
+def _live_sim_order_is_shadow_small(order: dict[str, Any]) -> bool:
+    details = dict(order.get("details") or {})
+    request = dict(details.get("request") or {})
+    metadata = dict(request.get("metadata") or details.get("metadata") or {})
+    values = {
+        str(metadata.get("ready_type") or "").upper(),
+        str(metadata.get("final_gate_status") or "").upper(),
+        str(metadata.get("order_eligibility") or "").upper(),
+        str(metadata.get("shadow_small_entry_promotion_status") or "").upper(),
+    }
+    values.update(str(item or "").upper() for item in list(metadata.get("reason_codes") or []))
+    return "READY_SHADOW_SMALL_ENTRY" in values or "BUY_ELIGIBLE_SHADOW_SMALL_ENTRY_GUARDED" in values or "PROMOTED" in values
 
 
 def _order_price_type_allowed(request: BrokerOrderRequest, execution: dict[str, Any]) -> bool:

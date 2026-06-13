@@ -122,6 +122,206 @@
         </div>
       </section>
 
+      <section id="themelab-live-sim-audit-card" class="panel live-sim-audit-panel" aria-label="LIVE_SIM lifecycle audit">
+        <div class="panel-head">
+          <div>
+            <h2>LIVE_SIM 주문 lifecycle audit</h2>
+            <p id="themelab-live-sim-audit-empty">아직 LIVE_SIM 주문 audit 데이터가 없습니다.</p>
+          </div>
+          <div class="gate-status-strip">
+            <span id="themelab-live-sim-audit-status" class="badge observe">대기</span>
+            <span id="themelab-live-sim-audit-updated" class="counter">-</span>
+          </div>
+        </div>
+        <div class="buy-zero-summary-grid">
+          <article><span>열린 주문</span><strong id="themelab-live-sim-audit-open-orders">0</strong></article>
+          <article><span>UNKNOWN_SUBMIT</span><strong id="themelab-live-sim-audit-unknown-submit">0</strong></article>
+          <article><span>Reconcile 주문</span><strong id="themelab-live-sim-audit-reconcile-orders">0</strong></article>
+          <article><span>주문번호 누락</span><strong id="themelab-live-sim-audit-broker-missing">0</strong></article>
+          <article><span>취소 지연</span><strong id="themelab-live-sim-audit-cancel-stale">0</strong></article>
+          <article><span>포지션 불일치</span><strong id="themelab-live-sim-audit-position-mismatch">0</strong></article>
+        </div>
+        <div class="buy-zero-cause-grid">
+          <div>
+            <div class="operator-alert-subhead"><h3>운영 조치</h3><span class="counter">top</span></div>
+            <div id="themelab-live-sim-audit-top-actions" class="buy-zero-line-list"></div>
+          </div>
+          <div>
+            <div class="operator-alert-subhead"><h3>최근 이슈</h3><span class="counter">audit</span></div>
+            <div id="themelab-live-sim-audit-issues" class="buy-zero-line-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="themelab-shadow-small-entry-ops-card" class="panel conservative-reason-panel" aria-label="Shadow Small Entry 운영 제어">
+        <div class="panel-head">
+          <div>
+            <h2>Shadow Small Entry 운영 제어</h2>
+            <p id="themelab-shadow-small-entry-ops-message">현재는 관측 전용입니다. LIVE_SIM 활성화는 preflight와 2단계 확인이 필요합니다.</p>
+            <p class="row-meta">LIVE_REAL은 계속 차단되고, 이 패널은 shadow small entry의 관측/활성화/중단/롤백 상태만 제어합니다.</p>
+          </div>
+          <div class="gate-status-strip">
+            <button id="themelab-shadow-small-entry-ops-preflight" class="action-button" type="button">Preflight</button>
+            <button id="themelab-shadow-small-entry-ops-arm" class="action-button" type="button">Arm LIVE_SIM</button>
+            <button id="themelab-shadow-small-entry-ops-confirm" class="action-button" type="button">Confirm</button>
+            <button id="themelab-shadow-small-entry-ops-pause" class="action-button" type="button">Pause</button>
+            <button id="themelab-shadow-small-entry-ops-rollback" class="action-button" type="button">Rollback</button>
+            <button id="themelab-shadow-small-entry-ops-emergency-pause" class="action-button" type="button">Emergency Pause</button>
+            <span id="themelab-shadow-small-entry-ops-status" class="badge observe">OBSERVE_ONLY</span>
+          </div>
+        </div>
+        <div class="buy-zero-summary-grid conservative-reason-summary-grid">
+          <article><span>Mode / Order</span><strong id="themelab-shadow-small-entry-ops-mode">observe_only / OFF</strong></article>
+          <article><span>Order Enabled</span><strong id="themelab-shadow-small-entry-ops-order-enabled">OFF</strong></article>
+          <article><span>Preflight</span><strong id="themelab-shadow-small-entry-ops-preflight-status">NO_DATA</strong></article>
+          <article><span>Arm TTL</span><strong id="themelab-shadow-small-entry-ops-activation">-</strong></article>
+          <article><span>Promotions</span><strong id="themelab-shadow-small-entry-ops-promotion-count">0</strong></article>
+          <article><span>Submitted</span><strong id="themelab-shadow-small-entry-ops-submitted-count">0</strong></article>
+          <article><span>Filled</span><strong id="themelab-shadow-small-entry-ops-filled-count">0</strong></article>
+          <article><span>Open Positions</span><strong id="themelab-shadow-small-entry-ops-open-position-count">0</strong></article>
+          <article><span>Total Notional</span><strong id="themelab-shadow-small-entry-ops-notional">0</strong></article>
+          <article><span>Live Audit</span><strong id="themelab-shadow-small-entry-ops-audit-status">UNKNOWN</strong></article>
+          <article><span>Reconcile</span><strong id="themelab-shadow-small-entry-ops-reconcile-status">UNKNOWN</strong></article>
+          <article><span>Last Change</span><strong id="themelab-shadow-small-entry-ops-last-change">-</strong></article>
+        </div>
+        <div id="themelab-shadow-small-entry-ops-blocking-reasons" class="buy-zero-line-list"></div>
+        <div id="themelab-shadow-small-entry-ops-risk-lines" class="buy-zero-line-list"></div>
+      </section>
+
+      <section id="themelab-shadow-small-entry-pilot-card" class="panel conservative-reason-panel" aria-label="Shadow Small Entry Pilot 리포트">
+        <div class="panel-head">
+          <div>
+            <h2>Shadow Small Entry Pilot 리포트</h2>
+            <p id="themelab-shadow-small-entry-pilot-message">아직 Shadow Small Entry pilot run 데이터가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.</p>
+            <p class="row-meta">LIVE_REAL/guard/threshold를 바꾸지 않고, 1일 LIVE_SIM 파일럿 결과와 자동 중단 검증만 리뷰합니다.</p>
+          </div>
+          <div class="gate-status-strip">
+            <button id="themelab-shadow-small-entry-pilot-start" class="action-button" type="button">Start Pilot</button>
+            <button id="themelab-shadow-small-entry-pilot-complete" class="action-button" type="button">Complete</button>
+            <button id="themelab-shadow-small-entry-pilot-generate-report" class="action-button" type="button">Generate Report</button>
+            <span id="themelab-shadow-small-entry-pilot-status" class="badge observe">NO_DATA</span>
+          </div>
+        </div>
+        <div class="buy-zero-summary-grid conservative-reason-summary-grid">
+          <article><span>Pilot ID</span><strong id="themelab-shadow-small-entry-pilot-id">-</strong></article>
+          <article><span>Recommendation</span><strong id="themelab-shadow-small-entry-pilot-recommendation">-</strong></article>
+          <article><span>Candidates</span><strong id="themelab-shadow-small-entry-pilot-candidate-count">0</strong></article>
+          <article><span>Promoted</span><strong id="themelab-shadow-small-entry-pilot-promoted-count">0</strong></article>
+          <article><span>Submitted</span><strong id="themelab-shadow-small-entry-pilot-submitted-count">0</strong></article>
+          <article><span>Filled</span><strong id="themelab-shadow-small-entry-pilot-filled-count">0</strong></article>
+          <article><span>Open Positions</span><strong id="themelab-shadow-small-entry-pilot-open-position-count">0</strong></article>
+          <article><span>Total PnL</span><strong id="themelab-shadow-small-entry-pilot-total-pnl">0</strong></article>
+          <article><span>Win Rate</span><strong id="themelab-shadow-small-entry-pilot-win-rate">-</strong></article>
+          <article><span>Avg Return</span><strong id="themelab-shadow-small-entry-pilot-avg-return">-</strong></article>
+          <article><span>MFE / MAE</span><strong id="themelab-shadow-small-entry-pilot-mfe-mae">-</strong></article>
+          <article><span>Last Updated</span><strong id="themelab-shadow-small-entry-pilot-updated">-</strong></article>
+        </div>
+        <div id="themelab-shadow-small-entry-pilot-reasons" class="buy-zero-line-list"></div>
+        <div id="themelab-shadow-small-entry-pilot-safety-lines" class="buy-zero-line-list"></div>
+      </section>
+
+      <section id="themelab-shadow-small-entry-promotion-card" class="panel conservative-reason-panel" aria-label="Shadow 소액 승격 가드">
+        <div class="panel-head">
+          <div>
+            <h2>Shadow 소액 승격 가드</h2>
+            <p id="themelab-shadow-small-entry-promotion-empty">기본값은 observe_only/order_enabled=false입니다. 리포트 근거가 있어도 바로 주문하지 않습니다.</p>
+            <p class="row-meta">LIVE_REAL/guard/threshold는 변경하지 않고, 조건 충족 후보만 관측 또는 guarded LIVE_SIM 대상으로 분류합니다.</p>
+          </div>
+          <div class="gate-status-strip">
+            <span id="themelab-shadow-small-entry-promotion-status" class="badge observe">NO_DATA</span>
+            <span id="themelab-shadow-small-entry-promotion-mode" class="counter">observe_only</span>
+            <span id="themelab-shadow-small-entry-promotion-updated" class="counter">-</span>
+          </div>
+        </div>
+        <div class="buy-zero-summary-grid conservative-reason-summary-grid">
+          <article><span>후보</span><strong id="themelab-shadow-small-entry-promotion-candidate-count">0</strong></article>
+          <article><span>관측 후보</span><strong id="themelab-shadow-small-entry-promotion-observe-count">0</strong></article>
+          <article><span>승격 가능</span><strong id="themelab-shadow-small-entry-promotion-promoted-count">0</strong></article>
+          <article><span>차단</span><strong id="themelab-shadow-small-entry-promotion-blocked-count">0</strong></article>
+          <article><span>오늘 사용</span><strong id="themelab-shadow-small-entry-promotion-used-count">0</strong></article>
+          <article><span>일 한도</span><strong id="themelab-shadow-small-entry-promotion-day-limit">0</strong></article>
+        </div>
+        <div class="buy-zero-cause-grid">
+          <section>
+            <div class="operator-alert-subhead"><h3>상위 reason group</h3><span class="counter">group</span></div>
+            <div id="themelab-shadow-small-entry-promotion-group-lines" class="buy-zero-line-list"></div>
+          </section>
+          <section>
+            <div class="operator-alert-subhead"><h3>상위 reason code</h3><span class="counter">code</span></div>
+            <div id="themelab-shadow-small-entry-promotion-code-lines" class="buy-zero-line-list"></div>
+          </section>
+        </div>
+        <div class="table-wrap buy-zero-table-wrap">
+          <table>
+            <thead><tr><th>종목</th><th>상태</th><th>근거</th><th>배율</th><th>운영 메시지</th></tr></thead>
+            <tbody id="themelab-shadow-small-entry-promotion-candidate-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="themelab-conservative-reason-card" class="panel conservative-reason-panel" aria-label="보수적 차단 사유 검증">
+        <div class="panel-head">
+          <div>
+            <h2>보수적 차단 사유 검증</h2>
+            <p id="themelab-conservative-reason-empty">아직 outcome 관측 데이터가 부족합니다.</p>
+            <p class="row-meta">장중에는 5/15/30분 결과가 아직 확정되지 않을 수 있으며, 이 리포트는 주문 설정을 자동 변경하지 않습니다.</p>
+          </div>
+          <div class="gate-status-strip">
+            <button id="themelab-conservative-reason-refresh" class="action-button" type="button">새로고침</button>
+            <span id="themelab-conservative-reason-status" class="badge observe">NO_DATA</span>
+            <span id="themelab-conservative-reason-updated" class="counter">-</span>
+          </div>
+        </div>
+        <div class="buy-zero-summary-grid conservative-reason-summary-grid">
+          <article><span>관측 이벤트</span><strong id="themelab-conservative-reason-event-count">0</strong></article>
+          <article><span>기회손실률</span><strong id="themelab-conservative-reason-missed-rate">0.0%</strong></article>
+          <article><span>좋은 차단률</span><strong id="themelab-conservative-reason-good-rate">0.0%</strong></article>
+          <article><span>리스크 회피율</span><strong id="themelab-conservative-reason-risk-rate">0.0%</strong></article>
+          <article><span>False block 후보</span><strong id="themelab-conservative-reason-false-count">0</strong></article>
+          <article><span>소액 검토 후보</span><strong id="themelab-conservative-reason-small-count">0</strong></article>
+        </div>
+        <div class="buy-zero-cause-grid">
+          <section>
+            <div class="operator-alert-subhead"><h3>Group outcomes</h3><span class="counter">group</span></div>
+            <div class="table-wrap buy-zero-table-wrap">
+              <table>
+                <thead><tr><th>그룹</th><th>표본</th><th>기회손실</th><th>좋은 차단</th><th>리스크 회피</th><th>추천</th></tr></thead>
+                <tbody id="themelab-conservative-reason-group-body"></tbody>
+              </table>
+            </div>
+          </section>
+          <section>
+            <div class="operator-alert-subhead"><h3>Reason outcomes</h3><span class="counter">reason</span></div>
+            <div class="table-wrap buy-zero-table-wrap">
+              <table>
+                <thead><tr><th>사유</th><th>그룹</th><th>표본</th><th>MFE/MAE</th><th>추천</th></tr></thead>
+                <tbody id="themelab-conservative-reason-code-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+        <div class="buy-zero-cause-grid">
+          <section>
+            <div class="operator-alert-subhead"><h3>소액 진입 검토 후보</h3><span id="themelab-conservative-reason-small-status" class="counter">0</span></div>
+            <div id="themelab-conservative-reason-small-body" class="buy-zero-line-list"></div>
+          </section>
+          <section>
+            <div class="operator-alert-subhead"><h3>WARMUP_OPTIONAL 결과</h3><span class="counter">data</span></div>
+            <div id="themelab-conservative-reason-data-body" class="buy-zero-line-list"></div>
+          </section>
+        </div>
+        <div class="buy-zero-cause-grid">
+          <section>
+            <div class="operator-alert-subhead"><h3>놓친 기회 상위 종목</h3><span class="counter">MFE</span></div>
+            <div id="themelab-conservative-reason-missed-body" class="buy-zero-line-list"></div>
+          </section>
+          <section>
+            <div class="operator-alert-subhead"><h3>좋은 차단 상위 종목</h3><span class="counter">MAE</span></div>
+            <div id="themelab-conservative-reason-good-body" class="buy-zero-line-list"></div>
+          </section>
+        </div>
+      </section>
+
       <section id="promotion-cockpit" class="panel promotion-cockpit-panel" aria-label="Promotion Decision Cockpit">
         <div class="panel-head promotion-cockpit-head">
           <div>

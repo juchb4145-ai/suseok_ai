@@ -77,6 +77,77 @@
           </div>
         </section>
 
+        <section id="shadow-small-entry-ops-card" class="band">
+          <div class="section-head">
+            <div>
+              <h2>Shadow Small Entry 운영 제어</h2>
+              <p id="shadow-small-entry-ops-message" class="help-text">현재는 관측 전용입니다. LIVE_SIM 활성화는 preflight와 2단계 확인이 필요합니다.</p>
+            </div>
+            <div class="action-strip">
+              <button id="shadow-small-entry-ops-preflight" class="link-button" type="button">Preflight</button>
+              <button id="shadow-small-entry-ops-arm" class="link-button" type="button">Arm LIVE_SIM</button>
+              <button id="shadow-small-entry-ops-confirm" class="link-button" type="button">Confirm</button>
+              <button id="shadow-small-entry-ops-pause" class="link-button" type="button">Pause</button>
+              <button id="shadow-small-entry-ops-rollback" class="link-button" type="button">Rollback</button>
+              <button id="shadow-small-entry-ops-emergency-pause" class="link-button" type="button">Emergency Pause</button>
+              <span id="shadow-small-entry-ops-status" class="counter muted">OBSERVE_ONLY</span>
+            </div>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>Mode / Order</span><strong id="shadow-small-entry-ops-mode">observe_only / OFF</strong></div>
+            <div><span>Order Enabled</span><strong id="shadow-small-entry-ops-order-enabled">OFF</strong></div>
+            <div><span>Preflight</span><strong id="shadow-small-entry-ops-preflight-status">NO_DATA</strong></div>
+            <div><span>Arm TTL</span><strong id="shadow-small-entry-ops-activation">-</strong></div>
+            <div><span>Promotions</span><strong id="shadow-small-entry-ops-promotion-count">0</strong></div>
+            <div><span>Submitted</span><strong id="shadow-small-entry-ops-submitted-count">0</strong></div>
+            <div><span>Filled</span><strong id="shadow-small-entry-ops-filled-count">0</strong></div>
+            <div><span>Open Positions</span><strong id="shadow-small-entry-ops-open-position-count">0</strong></div>
+            <div><span>Total Notional</span><strong id="shadow-small-entry-ops-notional">0</strong></div>
+            <div><span>Live Audit</span><strong id="shadow-small-entry-ops-audit-status">UNKNOWN</strong></div>
+            <div><span>Reconcile</span><strong id="shadow-small-entry-ops-reconcile-status">UNKNOWN</strong></div>
+            <div><span>Last Change</span><strong id="shadow-small-entry-ops-last-change">-</strong></div>
+          </div>
+          <div id="shadow-small-entry-ops-blocking-reasons" class="inline-log"></div>
+          <div id="shadow-small-entry-ops-risk-lines" class="inline-log"></div>
+        </section>
+
+        <section id="shadow-small-entry-pilot-card" class="band">
+          <div class="section-head">
+            <div>
+              <h2>Shadow Small Entry Pilot 리포트</h2>
+              <p id="shadow-small-entry-pilot-message" class="help-text">아직 Shadow Small Entry pilot run 데이터가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.</p>
+            </div>
+            <div class="action-strip">
+              <button id="shadow-small-entry-pilot-start" class="link-button" type="button">Start Pilot</button>
+              <button id="shadow-small-entry-pilot-complete" class="link-button" type="button">Complete</button>
+              <button id="shadow-small-entry-pilot-generate-report" class="link-button" type="button">Generate Report</button>
+              <span id="shadow-small-entry-pilot-status" class="counter muted">NO_DATA</span>
+            </div>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>Pilot ID</span><strong id="shadow-small-entry-pilot-id">-</strong></div>
+            <div><span>Recommendation</span><strong id="shadow-small-entry-pilot-recommendation">-</strong></div>
+            <div><span>Candidates</span><strong id="shadow-small-entry-pilot-candidate-count">0</strong></div>
+            <div><span>Promoted</span><strong id="shadow-small-entry-pilot-promoted-count">0</strong></div>
+            <div><span>Submitted</span><strong id="shadow-small-entry-pilot-submitted-count">0</strong></div>
+            <div><span>Filled</span><strong id="shadow-small-entry-pilot-filled-count">0</strong></div>
+            <div><span>Open Positions</span><strong id="shadow-small-entry-pilot-open-position-count">0</strong></div>
+            <div><span>Total PnL</span><strong id="shadow-small-entry-pilot-total-pnl">0</strong></div>
+            <div><span>Win Rate</span><strong id="shadow-small-entry-pilot-win-rate">-</strong></div>
+            <div><span>Avg Return</span><strong id="shadow-small-entry-pilot-avg-return">-</strong></div>
+            <div><span>MFE / MAE</span><strong id="shadow-small-entry-pilot-mfe-mae">-</strong></div>
+            <div><span>Last Updated</span><strong id="shadow-small-entry-pilot-updated">-</strong></div>
+          </div>
+          <div id="shadow-small-entry-pilot-reasons" class="inline-log"></div>
+          <div id="shadow-small-entry-pilot-safety-lines" class="inline-log"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>종목</th><th>파일럿 상태</th><th>주문 상태</th><th>수량</th><th>PnL</th><th>추천</th></tr></thead>
+              <tbody id="shadow-small-entry-pilot-items"></tbody>
+            </table>
+          </div>
+        </section>
+
         <section class="band two-col">
           <div class="unframed-panel">
             <div class="section-head">
@@ -307,6 +378,39 @@
           <div id="runtime-warning-lines" class="inline-log"></div>
         </section>
 
+        <section id="live-sim-audit-card" class="band live-sim-audit-section">
+          <div class="section-head">
+            <div>
+              <h2>LIVE_SIM 주문 lifecycle audit</h2>
+              <p id="live-sim-audit-empty" class="help-text">아직 LIVE_SIM 주문 audit 데이터가 없습니다.</p>
+            </div>
+            <div class="action-strip">
+              <span id="live-sim-audit-status" class="counter muted">대기</span>
+              <span id="live-sim-audit-updated" class="counter muted">-</span>
+            </div>
+          </div>
+          <div class="mini-grid live-sim-audit-grid">
+            <div><span>열린 주문</span><strong id="live-sim-audit-open-orders">0</strong></div>
+            <div><span>UNKNOWN_SUBMIT</span><strong id="live-sim-audit-unknown-submit">0</strong></div>
+            <div><span>Reconcile 주문</span><strong id="live-sim-audit-reconcile-orders">0</strong></div>
+            <div><span>주문번호 누락</span><strong id="live-sim-audit-broker-missing">0</strong></div>
+            <div><span>취소 지연</span><strong id="live-sim-audit-cancel-stale">0</strong></div>
+            <div><span>Orphan 체결</span><strong id="live-sim-audit-orphan-exec">0</strong></div>
+            <div><span>포지션 불일치</span><strong id="live-sim-audit-position-mismatch">0</strong></div>
+            <div><span>중복 열린 포지션</span><strong id="live-sim-audit-duplicate-open-position">0</strong></div>
+          </div>
+          <div class="two-col live-sim-audit-detail-grid">
+            <div class="unframed-panel">
+              <h3>운영 조치</h3>
+              <div id="live-sim-audit-top-actions" class="inline-log"></div>
+            </div>
+            <div class="unframed-panel">
+              <h3>최근 이슈</h3>
+              <div id="live-sim-audit-issues" class="inline-log"></div>
+            </div>
+          </div>
+        </section>
+
         <section id="buy-zero-rca-card" class="band buy-zero-rca-section">
           <div class="section-head">
             <div>
@@ -341,6 +445,79 @@
             <div class="unframed-panel">
               <h3>데이터 품질 부족 사유</h3>
               <div id="buy-zero-rca-data-quality-blocks" class="inline-log"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="conservative-reason-card" class="band conservative-reason-section">
+          <div class="section-head">
+            <div>
+              <h2>보수적 차단 사유 검증</h2>
+              <p id="conservative-reason-empty" class="help-text">아직 outcome 관측 데이터가 부족합니다. 이 리포트는 주문 설정을 자동 변경하지 않습니다.</p>
+            </div>
+            <div class="action-strip">
+              <span id="conservative-reason-status" class="counter muted">NO_DATA</span>
+              <span id="conservative-reason-updated" class="counter muted">-</span>
+            </div>
+          </div>
+          <div class="mini-grid conservative-reason-grid">
+            <div><span>관측 이벤트</span><strong id="conservative-reason-event-count">0</strong></div>
+            <div><span>기회손실률</span><strong id="conservative-reason-missed-rate">0.0%</strong></div>
+            <div><span>좋은 차단률</span><strong id="conservative-reason-good-rate">0.0%</strong></div>
+            <div><span>리스크 회피율</span><strong id="conservative-reason-risk-rate">0.0%</strong></div>
+            <div><span>False block 후보</span><strong id="conservative-reason-false-count">0</strong></div>
+            <div><span>소액 검토 후보</span><strong id="conservative-reason-small-count">0</strong></div>
+          </div>
+          <div class="two-col conservative-reason-detail-grid">
+            <div class="unframed-panel">
+              <h3>Group outcomes</h3>
+              <div id="conservative-reason-group-lines" class="inline-log"></div>
+            </div>
+            <div class="unframed-panel">
+              <h3>소액 진입 검토 후보</h3>
+              <div id="conservative-reason-small-lines" class="inline-log"></div>
+            </div>
+          </div>
+          <div class="two-col conservative-reason-detail-grid">
+            <div class="unframed-panel">
+              <h3>놓친 기회 상위 종목</h3>
+              <div id="conservative-reason-missed-lines" class="inline-log"></div>
+            </div>
+            <div class="unframed-panel">
+              <h3>좋은 차단 상위 종목</h3>
+              <div id="conservative-reason-good-lines" class="inline-log"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="shadow-small-entry-promotion-card" class="band conservative-reason-section">
+          <div class="section-title-row">
+            <div>
+              <h2>Shadow 소액 승격 가드</h2>
+              <p id="shadow-small-entry-promotion-empty" class="help-text">기본값은 observe_only/order_enabled=false입니다. 리포트 근거가 있어도 바로 주문하지 않습니다.</p>
+            </div>
+            <div class="title-actions">
+              <span id="shadow-small-entry-promotion-status" class="counter muted">NO_DATA</span>
+              <span id="shadow-small-entry-promotion-mode" class="counter muted">observe_only</span>
+              <span id="shadow-small-entry-promotion-updated" class="counter muted">-</span>
+            </div>
+          </div>
+          <div class="mini-grid conservative-reason-grid">
+            <div><span>후보</span><strong id="shadow-small-entry-promotion-candidate-count">0</strong></div>
+            <div><span>관측 후보</span><strong id="shadow-small-entry-promotion-observe-count">0</strong></div>
+            <div><span>승격 가능</span><strong id="shadow-small-entry-promotion-promoted-count">0</strong></div>
+            <div><span>차단</span><strong id="shadow-small-entry-promotion-blocked-count">0</strong></div>
+            <div><span>오늘 사용</span><strong id="shadow-small-entry-promotion-used-count">0</strong></div>
+            <div><span>일 한도</span><strong id="shadow-small-entry-promotion-day-limit">0</strong></div>
+          </div>
+          <div class="two-col conservative-reason-detail-grid">
+            <div>
+              <h3>상위 reason group</h3>
+              <div id="shadow-small-entry-promotion-group-lines" class="inline-log"></div>
+            </div>
+            <div>
+              <h3>상위 reason code</h3>
+              <div id="shadow-small-entry-promotion-code-lines" class="inline-log"></div>
             </div>
           </div>
         </section>

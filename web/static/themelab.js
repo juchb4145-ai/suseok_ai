@@ -54,6 +54,15 @@
     lastFetchedAt: 0,
     tradeDate: "",
   },
+  conservativeReason: {
+    payload: {},
+    loading: false,
+    lastFetchedAt: 0,
+  },
+  shadowSmallEntryOps: {
+    activationToken: "",
+    activationTokenId: "",
+  },
   naverThemeSyncBusy: false,
   alertFilters: {
     category: "ALL",
@@ -177,6 +186,7 @@ const blockedOperatorActionTypes = [
 ];
 
 const BUY_ZERO_RCA_REFRESH_MS = 30000;
+const CONSERVATIVE_REASON_REFRESH_MS = 60000;
 const BUY_ZERO_RCA_CRITICAL_REASONS = new Set([
   "DATA_INSUFFICIENT",
   "LATE_CHASE_TEMP_WAIT",
@@ -208,6 +218,20 @@ const BUY_ZERO_RCA_STAGE_LABELS = {
   BROKER_ORDER_ACCEPTED: "브로커 접수",
   PARTIAL_FILLED: "부분체결",
   FILLED: "체결",
+};
+
+const SHADOW_SMALL_ENTRY_OPS_ENDPOINTS = {
+  preflight: "/api/shadow-small-entry-ops/preflight",
+  arm: "/api/shadow-small-entry-ops/arm",
+  confirm: "/api/shadow-small-entry-ops/confirm",
+  pause: "/api/shadow-small-entry-ops/pause",
+  rollback: "/api/shadow-small-entry-ops/rollback",
+  "emergency-pause": "/api/shadow-small-entry-ops/pause",
+};
+const SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS = {
+  start: "/api/shadow-small-entry-pilot/start",
+  complete: "/api/shadow-small-entry-pilot/complete",
+  "generate-report": "/api/shadow-small-entry-pilot/generate-report",
 };
 
 function escapeHtml(value) {
@@ -404,6 +428,19 @@ async function runWithLocalTokenRetry(requestFn) {
     throw new Error(result.payload.detail || result.payload.error || `${result.response.status} ${result.response.statusText}`);
   }
   return result.payload;
+}
+
+async function postJsonWithLocalToken(endpoint, token, body = {}) {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Local-Token": token,
+    },
+    body: JSON.stringify(body || {}),
+  });
+  const payload = await parseResponsePayload(response);
+  return { response, payload };
 }
 
 function money(value) {
@@ -1677,6 +1714,409 @@ function renderBuyZeroRcaPanel() {
   renderBuyZeroStageRows(state.buyZeroRca.stageRows, state.buyZeroRca.stage);
 }
 
+function renderLiveSimAuditPanel(snapshot = state.snapshot || {}) {
+  const payload = (snapshot || {}).live_sim_audit || {};
+  const summary = payload.summary || {};
+  const available = Boolean(payload.available);
+  const status = payload.status || (available ? "UNKNOWN" : "NO_DATA");
+  const tone = status === "OK" ? "ready" : status === "BROKEN" ? "critical" : /RECONCILE|WARN/.test(status) ? "warning" : "observe";
+  const message = ((payload.operator || {}).status_message_ko) || (available ? "LIVE_SIM audit 확인 중" : "아직 LIVE_SIM 주문 audit 데이터가 없습니다.");
+  const statusNode = document.getElementById("themelab-live-sim-audit-status");
+  if (statusNode) {
+    statusNode.textContent = `${status} · ${message}`;
+    statusNode.className = `badge ${tone}`;
+  }
+  text("themelab-live-sim-audit-updated", `audit ${formatDateTime(payload.last_updated_at)}`);
+  text("themelab-live-sim-audit-empty", available ? "send_order부터 체결/취소/포지션/reconcile까지 audit 원장을 표시합니다." : "아직 LIVE_SIM 주문 audit 데이터가 없습니다.");
+  text("themelab-live-sim-audit-open-orders", summary.open_live_sim_order_count ?? 0);
+  text("themelab-live-sim-audit-unknown-submit", summary.unknown_submit_count ?? 0);
+  text("themelab-live-sim-audit-reconcile-orders", summary.reconcile_required_order_count ?? 0);
+  text("themelab-live-sim-audit-broker-missing", summary.broker_order_id_missing_count ?? 0);
+  text("themelab-live-sim-audit-cancel-stale", summary.cancel_requested_stale_count ?? 0);
+  text("themelab-live-sim-audit-position-mismatch", summary.position_qty_mismatch_count ?? 0);
+  renderLiveSimAuditLines(
+    "themelab-live-sim-audit-top-actions",
+    ((payload.operator || {}).top_actions || []).map((item) => ({
+      label: item.issue_type || "-",
+      value: item.count ?? 0,
+      detail: item.operator_message_ko || item.suggested_action || "",
+    })),
+    "필요한 운영 조치가 없습니다."
+  );
+  renderLiveSimAuditLines(
+    "themelab-live-sim-audit-issues",
+    (payload.issues || []).slice(0, 6).map((item) => ({
+      label: item.issue_type || "-",
+      value: item.severity || "-",
+      detail: `${item.code || ""} ${item.operator_message_ko || ""}`.trim(),
+    })),
+    "최근 audit 이슈가 없습니다."
+  );
+}
+
+function renderLiveSimAuditLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = (rows || []).slice(0, 6);
+  node.innerHTML = items.length
+    ? items.map((item) => `<div>${reasonBadge(item.label || "-")} <strong>${escapeHtml(item.value ?? "")}</strong><span>${escapeHtml(item.detail || "")}</span></div>`).join("")
+    : `<div class="muted">${escapeHtml(emptyText)}</div>`;
+}
+
+async function fetchConservativeReasonOutcomes(options = {}) {
+  const force = Boolean(options.force);
+  if (state.conservativeReason.loading) return;
+  if (!force && Date.now() - state.conservativeReason.lastFetchedAt < CONSERVATIVE_REASON_REFRESH_MS) return;
+  state.conservativeReason.loading = true;
+  try {
+    const tradeDate = localTradeDate();
+    const response = await fetch(`/api/conservative-reason-outcomes/summary?trade_date=${encodeURIComponent(tradeDate)}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`conservative ${response.status}`);
+    state.conservativeReason.payload = await response.json();
+    state.conservativeReason.lastFetchedAt = Date.now();
+    renderConservativeReasonPanel(state.conservativeReason.payload);
+  } catch (error) {
+    const status = document.getElementById("themelab-conservative-reason-status");
+    if (status) {
+      status.textContent = `조회 실패: ${error.message || error}`;
+      status.className = "badge critical";
+    }
+  } finally {
+    state.conservativeReason.loading = false;
+  }
+}
+
+function renderConservativeReasonPanel(payload = null) {
+  const data = payload || state.conservativeReason.payload || (state.snapshot || {}).conservative_reason_outcomes || {};
+  const summary = data.summary || {};
+  const review = data.review_for_small_entry || {};
+  const reviewSummary = review.summary || {};
+  const available = Boolean(data.available);
+  const status = document.getElementById("themelab-conservative-reason-status");
+  if (status) {
+    status.textContent = available ? data.status || "READY" : "NO_DATA";
+    status.className = `badge ${available ? "ready" : "observe"}`;
+  }
+  text("themelab-conservative-reason-empty", available ? "보수적 차단 사유 outcome을 읽기 전용으로 검증합니다. 주문 설정은 자동 변경하지 않습니다." : "아직 outcome 관측 데이터가 부족합니다.");
+  text("themelab-conservative-reason-updated", formatDateTime(data.last_updated_at || data.generated_at));
+  text("themelab-conservative-reason-event-count", summary.event_count ?? 0);
+  text("themelab-conservative-reason-missed-rate", ratio(summary.missed_opportunity_rate ?? 0));
+  text("themelab-conservative-reason-good-rate", ratio(summary.good_block_rate ?? 0));
+  text("themelab-conservative-reason-risk-rate", ratio(summary.risk_avoided_rate ?? 0));
+  text("themelab-conservative-reason-false-count", summary.false_block_candidate_count ?? 0);
+  text("themelab-conservative-reason-small-count", reviewSummary.candidate_count ?? 0);
+  renderConservativeReasonGroupRows("themelab-conservative-reason-group-body", data.by_group || [], available);
+  renderConservativeReasonCodeRows("themelab-conservative-reason-code-body", data.by_reason_code || [], available);
+  renderConservativeReasonSmallRows("themelab-conservative-reason-small-body", review.by_reason_code || [], available);
+  text("themelab-conservative-reason-small-status", reviewSummary.candidate_count ?? 0);
+  renderConservativeReasonDataRows("themelab-conservative-reason-data-body", data.data_quality_bucket_summary || [], available);
+  renderConservativeReasonStockRows("themelab-conservative-reason-missed-body", data.top_missed_opportunity_stocks || [], available, "놓친 기회 상위 종목이 없습니다.");
+  renderConservativeReasonStockRows("themelab-conservative-reason-good-body", data.top_good_block_stocks || [], available, "좋은 차단 상위 종목이 없습니다.");
+}
+
+function renderShadowSmallEntryPromotionPanel(payload = null) {
+  const data = payload || (state.snapshot || {}).shadow_small_entry_promotion || {};
+  const summary = data.summary || {};
+  const available = Boolean(data.available);
+  const status = document.getElementById("themelab-shadow-small-entry-promotion-status");
+  if (status) {
+    status.textContent = data.status || (available ? "READY" : "NO_DATA");
+    status.className = `badge ${available ? "ready" : "observe"}`;
+  }
+  text("themelab-shadow-small-entry-promotion-mode", `${data.mode || summary.mode || "observe_only"} / order ${data.order_enabled ? "ON" : "OFF"}`);
+  text(
+    "themelab-shadow-small-entry-promotion-empty",
+    data.order_enabled
+      ? "조건 충족: 1차 leg만 LIVE_SIM 주문 가능합니다."
+      : "리포트 근거는 있으나 order_enabled=false라 주문하지 않습니다."
+  );
+  text("themelab-shadow-small-entry-promotion-updated", formatDateTime(data.last_updated_at));
+  text("themelab-shadow-small-entry-promotion-candidate-count", data.candidate_count ?? summary.candidate_count ?? 0);
+  text("themelab-shadow-small-entry-promotion-observe-count", data.observe_only_count ?? summary.observe_only_count ?? 0);
+  text("themelab-shadow-small-entry-promotion-promoted-count", data.promoted_count ?? summary.promoted_count ?? 0);
+  text("themelab-shadow-small-entry-promotion-blocked-count", data.blocked_count ?? summary.blocked_count ?? 0);
+  text("themelab-shadow-small-entry-promotion-used-count", data.used_promotions_today ?? summary.used_promotions_today ?? 0);
+  text("themelab-shadow-small-entry-promotion-day-limit", data.max_promotions_per_day ?? summary.max_promotions_per_day ?? 0);
+  renderShadowPromotionLines("themelab-shadow-small-entry-promotion-group-lines", data.top_reason_groups || summary.top_reason_groups || [], "아직 승격 reason group이 없습니다.");
+  renderShadowPromotionLines("themelab-shadow-small-entry-promotion-code-lines", data.top_reason_codes || summary.top_reason_codes || [], "아직 승격 reason code가 없습니다.");
+  renderShadowPromotionCandidates("themelab-shadow-small-entry-promotion-candidate-body", data.candidates || [], available);
+}
+
+function renderShadowSmallEntryOpsPanel(payload = null) {
+  const data = payload || (state.snapshot || {}).shadow_small_entry_ops || {};
+  const today = data.today || {};
+  const audit = data.audit || {};
+  const limits = data.limits || {};
+  const status = data.status || "OBSERVE_ONLY";
+  const orderEnabled = Boolean(data.order_enabled);
+  const statusNode = document.getElementById("themelab-shadow-small-entry-ops-status");
+  if (statusNode) {
+    statusNode.textContent = status;
+    statusNode.className = `badge ${status === "LIVE_SIM_ACTIVE" ? "warning" : status.startsWith("PAUSED") || status === "BROKEN" ? "blocked" : "observe"}`;
+  }
+  text("themelab-shadow-small-entry-ops-message", data.operator_message_ko || "현재는 관측 전용입니다. LIVE_SIM 활성화는 preflight와 2단계 확인이 필요합니다.");
+  text("themelab-shadow-small-entry-ops-mode", `${data.mode || "observe_only"} / ${orderEnabled ? "ON" : "OFF"}`);
+  text("themelab-shadow-small-entry-ops-order-enabled", orderEnabled ? "ON" : "OFF");
+  text("themelab-shadow-small-entry-ops-preflight-status", data.preflight_status || "NO_DATA");
+  text("themelab-shadow-small-entry-ops-activation", data.activation_armed ? `armed until ${formatDateTime(data.activation_expires_at)}` : "-");
+  text("themelab-shadow-small-entry-ops-promotion-count", today.promotion_count ?? 0);
+  text("themelab-shadow-small-entry-ops-submitted-count", today.submitted_count ?? 0);
+  text("themelab-shadow-small-entry-ops-filled-count", today.filled_count ?? 0);
+  text("themelab-shadow-small-entry-ops-open-position-count", today.open_position_count ?? 0);
+  text("themelab-shadow-small-entry-ops-notional", compactNumber(today.total_notional_krw ?? 0));
+  text("themelab-shadow-small-entry-ops-audit-status", audit.live_sim_audit_status || audit.status || "UNKNOWN");
+  text("themelab-shadow-small-entry-ops-reconcile-status", audit.reconcile_status || "UNKNOWN");
+  text("themelab-shadow-small-entry-ops-last-change", formatDateTime(data.last_status_change_at || data.last_updated_at));
+  renderShadowSmallEntryOpsReasonLines("themelab-shadow-small-entry-ops-blocking-reasons", data.preflight_blocking_reasons || [], "Preflight 차단 사유가 없습니다.");
+  renderShadowSmallEntryOpsUsageLines("themelab-shadow-small-entry-ops-risk-lines", today, limits, audit);
+}
+
+function renderShadowSmallEntryOpsReasonLines(id, reasons, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = (reasons || []).slice(0, 8);
+  node.innerHTML = items.length
+    ? items.map((reason) => reasonBadge(reason)).join(" ")
+    : `<div class="muted">${escapeHtml(emptyText)}</div>`;
+}
+
+function renderShadowSmallEntryOpsUsageLines(id, today, limits, audit) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const lines = [
+    `promotions ${today.promotion_count ?? 0}/${limits.max_promotions_per_day ?? "-"}`,
+    `submitted ${today.submitted_count ?? 0}/${limits.max_submitted_orders_per_day ?? "-"}`,
+    `notional ${compactNumber(today.total_notional_krw ?? 0)}/${compactNumber(limits.max_total_notional_krw ?? 0)}`,
+    `open ${today.open_position_count ?? 0}/${limits.max_open_positions ?? "-"}`,
+    `unknown ${today.unknown_submit_count ?? 0}`,
+    `reconcile ${today.reconcile_required_count ?? 0}`,
+    `heartbeat ${audit.gateway_heartbeat_ok ? "OK" : "BAD"}`,
+  ];
+  node.innerHTML = lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("");
+}
+
+function renderShadowSmallEntryPilotPanel(payload = null) {
+  const data = payload || (state.snapshot || {}).shadow_small_entry_pilot || {};
+  const summary = data.summary || {};
+  const status = data.status || "NO_DATA";
+  const statusNode = document.getElementById("themelab-shadow-small-entry-pilot-status");
+  if (statusNode) {
+    statusNode.textContent = status;
+    statusNode.className = `badge ${status === "REVIEW_READY" || status === "COMPLETED" ? "ready" : status === "NO_DATA" ? "observe" : "warning"}`;
+  }
+  text("themelab-shadow-small-entry-pilot-message", data.operator_message_ko || "아직 Shadow Small Entry pilot run 데이터가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.");
+  text("themelab-shadow-small-entry-pilot-id", compactPilotId(data.pilot_id || "-"));
+  text("themelab-shadow-small-entry-pilot-recommendation", data.recommendation || "-");
+  text("themelab-shadow-small-entry-pilot-candidate-count", summary.candidate_count ?? 0);
+  text("themelab-shadow-small-entry-pilot-promoted-count", summary.promoted_count ?? 0);
+  text("themelab-shadow-small-entry-pilot-submitted-count", summary.submitted_order_count ?? 0);
+  text("themelab-shadow-small-entry-pilot-filled-count", summary.filled_order_count ?? 0);
+  text("themelab-shadow-small-entry-pilot-open-position-count", summary.open_position_count ?? 0);
+  text("themelab-shadow-small-entry-pilot-total-pnl", compactNumber(summary.total_pnl_krw ?? 0));
+  text("themelab-shadow-small-entry-pilot-win-rate", summary.win_rate == null ? "-" : `${Math.round(Number(summary.win_rate || 0) * 100)}%`);
+  text("themelab-shadow-small-entry-pilot-avg-return", summary.avg_return_pct == null ? "-" : `${Number(summary.avg_return_pct || 0).toFixed(2)}%`);
+  text("themelab-shadow-small-entry-pilot-mfe-mae", `${summary.avg_mfe_pct == null ? "-" : Number(summary.avg_mfe_pct || 0).toFixed(2)} / ${summary.avg_mae_pct == null ? "-" : Number(summary.avg_mae_pct || 0).toFixed(2)}`);
+  text("themelab-shadow-small-entry-pilot-updated", formatDateTime(data.last_updated_at));
+  renderShadowSmallEntryPilotReasons(data.recommendation_reason_codes || []);
+  renderShadowSmallEntryPilotSafety(data.safety_checklist || []);
+}
+
+function renderShadowSmallEntryPilotReasons(reasons) {
+  const node = document.getElementById("themelab-shadow-small-entry-pilot-reasons");
+  if (!node) return;
+  const items = (reasons || []).slice(0, 8);
+  node.innerHTML = items.length
+    ? items.map((reason) => reasonBadge(reason)).join(" ")
+    : `<div class="muted">추천 reason code가 아직 없습니다.</div>`;
+}
+
+function renderShadowSmallEntryPilotSafety(checks) {
+  const node = document.getElementById("themelab-shadow-small-entry-pilot-safety-lines");
+  if (!node) return;
+  const items = (checks || []).slice(0, 8);
+  node.innerHTML = items.length
+    ? items.map((item) => `<div><strong>${escapeHtml(item.status || "-")}</strong> ${escapeHtml(item.check_id || "-")} · ${escapeHtml(item.operator_message_ko || "")}</div>`).join("")
+    : `<div class="muted">안전 체크리스트는 리포트 생성 후 표시됩니다.</div>`;
+}
+
+function compactPilotId(value) {
+  const textValue = String(value || "-");
+  return textValue.length > 28 ? `${textValue.slice(0, 18)}…${textValue.slice(-8)}` : textValue;
+}
+
+async function shadowSmallEntryOpsAction(action, button) {
+  const originalText = button?.textContent || "";
+  const body = { operator: "themelab", note: `themelab ${action}` };
+  if (action === "confirm") {
+    body.activation_token = state.shadowSmallEntryOps.activationToken || "";
+    body.note = "themelab confirm live_sim guarded";
+  }
+  if (action === "pause") body.reason = "SHADOW_SMALL_ENTRY_OPERATOR_PAUSE";
+  if (action === "emergency-pause") {
+    body.emergency = true;
+    body.reason = "SHADOW_SMALL_ENTRY_EMERGENCY_PAUSE";
+    body.note = "themelab emergency pause";
+  }
+  const endpoint = SHADOW_SMALL_ENTRY_OPS_ENDPOINTS[action] || SHADOW_SMALL_ENTRY_OPS_ENDPOINTS.preflight;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "running";
+  }
+  try {
+    const payload = await runWithLocalTokenRetry((token) => postJsonWithLocalToken(endpoint, token, body));
+    if (!payload) return;
+    if (payload.activation_token) {
+      state.shadowSmallEntryOps.activationToken = payload.activation_token;
+      state.shadowSmallEntryOps.activationTokenId = payload.activation_token_id || "";
+      updateOperatorSyncStatus(`Shadow Small Entry armed: ${payload.activation_token_id || ""}`);
+    } else if (action === "confirm") {
+      state.shadowSmallEntryOps.activationToken = "";
+      state.shadowSmallEntryOps.activationTokenId = "";
+    }
+    await fetchSnapshot();
+  } catch (error) {
+    updateOperatorSyncStatus(`Shadow Small Entry action failed: ${error.message || error}`);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+}
+
+async function shadowSmallEntryPilotAction(action, button) {
+  const originalText = button?.textContent || "";
+  const body = { operator: "themelab", note: `themelab ${action}` };
+  if (action === "generate-report") {
+    body.export = true;
+    body.format = "all";
+  }
+  const endpoint = SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS[action] || SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS["generate-report"];
+  if (button) {
+    button.disabled = true;
+    button.textContent = "running";
+  }
+  try {
+    const payload = await runWithLocalTokenRetry((token) => postJsonWithLocalToken(endpoint, token, body));
+    if (!payload) return;
+    updateOperatorSyncStatus(`Shadow Small Entry pilot ${action} 완료`);
+    await fetchSnapshot();
+  } catch (error) {
+    updateOperatorSyncStatus(`Shadow Small Entry pilot action failed: ${error.message || error}`);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+}
+
+function renderShadowPromotionLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = (rows || []).slice(0, 5);
+  node.innerHTML = items.length
+    ? items.map((item) => `<div>${reasonBadge(item.key || item.reason || "-")} <strong>${escapeHtml(item.count ?? 0)}</strong></div>`).join("")
+    : `<div class="muted">${escapeHtml(emptyText)}</div>`;
+}
+
+function renderShadowPromotionCandidates(id, rows, available) {
+  const body = document.getElementById(id);
+  if (!body) return;
+  if (!available) {
+    body.innerHTML = `<tr><td colspan="5" class="muted">소액 승격 trace는 PR 적용 이후 데이터부터 쌓입니다.</td></tr>`;
+    return;
+  }
+  const items = (rows || []).slice(0, 12);
+  body.innerHTML = items.length ? items.map((item) => `
+    <tr>
+      <td><strong>${escapeHtml(item.code || "-")}</strong><br><span>${escapeHtml(item.name || "")}</span></td>
+      <td>${reasonBadge(item.promotion_status || "-")}<br><span>${escapeHtml(item.final_status || "")}</span></td>
+      <td>${reasonBadge(item.reason_group || item.reason_code || "-")}<br><span>${escapeHtml(item.rejected_reason || "PASS")}</span></td>
+      <td>x${escapeHtml(optionalNumber(item.position_size_multiplier, 2))}</td>
+      <td>${escapeHtml(item.operator_message_ko || "-")}</td>
+    </tr>
+  `).join("") : `<tr><td colspan="5" class="muted">표시할 소액 승격 후보가 없습니다.</td></tr>`;
+}
+
+function renderConservativeReasonGroupRows(id, rows, available) {
+  const body = document.getElementById(id);
+  if (!body) return;
+  if (!available) {
+    body.innerHTML = `<tr><td colspan="6" class="muted">아직 outcome 관측 데이터가 부족합니다.</td></tr>`;
+    return;
+  }
+  const items = (rows || []).slice(0, 8);
+  body.innerHTML = items.length ? items.map((item) => `
+    <tr>
+      <td>${reasonBadge(item.group || "-")}</td>
+      <td>${escapeHtml(`${item.labeled_count ?? 0}/${item.event_count ?? 0}`)}</td>
+      <td>${ratio(item.missed_opportunity_rate)}</td>
+      <td>${ratio(item.good_block_rate)}</td>
+      <td>${ratio(item.risk_avoided_rate)}</td>
+      <td>${reasonBadge(item.recommendation || "-")}</td>
+    </tr>
+  `).join("") : `<tr><td colspan="6" class="muted">표시할 그룹 결과가 없습니다.</td></tr>`;
+}
+
+function renderConservativeReasonCodeRows(id, rows, available) {
+  const body = document.getElementById(id);
+  if (!body) return;
+  if (!available) {
+    body.innerHTML = `<tr><td colspan="5" class="muted">아직 outcome 관측 데이터가 부족합니다.</td></tr>`;
+    return;
+  }
+  const items = (rows || []).slice(0, 10);
+  body.innerHTML = items.length ? items.map((item) => `
+    <tr>
+      <td>${reasonBadge(item.reason_code || "-")}</td>
+      <td>${escapeHtml(item.group || "-")}</td>
+      <td>${escapeHtml(`${item.labeled_count ?? 0}/${item.event_count ?? 0}`)}</td>
+      <td>${pct(item.avg_mfe_15m_pct)} / ${pct(item.avg_mae_15m_pct)}</td>
+      <td>${reasonBadge(item.recommendation || "-")}</td>
+    </tr>
+  `).join("") : `<tr><td colspan="5" class="muted">표시할 reason 결과가 없습니다.</td></tr>`;
+}
+
+function renderConservativeReasonSmallRows(id, rows, available) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  if (!available) {
+    node.innerHTML = `<div class="muted">아직 outcome 관측 데이터가 부족합니다.</div>`;
+    return;
+  }
+  const items = (rows || []).slice(0, 6);
+  node.innerHTML = items.length ? items.map((item) => `
+    <div>${reasonBadge(item.reason_code || item.group || "-")} <strong>${escapeHtml(item.candidate_count ?? 0)}</strong><span>MFE ${pct(item.avg_mfe_15m_pct)} / MAE ${pct(item.avg_mae_15m_pct)} / x${escapeHtml(optionalNumber(item.suggested_position_size_multiplier, 2))}</span></div>
+  `).join("") : `<div class="muted">소액 진입 검토 후보가 없습니다.</div>`;
+}
+
+function renderConservativeReasonDataRows(id, rows, available) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  if (!available) {
+    node.innerHTML = `<div class="muted">장중에는 outcome 확정까지 시간이 필요합니다.</div>`;
+    return;
+  }
+  const items = (rows || []).slice(0, 6);
+  node.innerHTML = items.length ? items.map((item) => `
+    <div>${reasonBadge(item.data_quality_bucket || "-")} <strong>${escapeHtml(item.event_count ?? 0)}</strong><span>missed ${ratio(item.missed_opportunity_rate)} · ${escapeHtml(item.recommendation || "-")}</span></div>
+  `).join("") : `<div class="muted">데이터 품질 bucket 결과가 없습니다.</div>`;
+}
+
+function renderConservativeReasonStockRows(id, rows, available, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  if (!available) {
+    node.innerHTML = `<div class="muted">아직 outcome 관측 데이터가 부족합니다.</div>`;
+    return;
+  }
+  const items = (rows || []).slice(0, 8);
+  node.innerHTML = items.length ? items.map((item) => `
+    <div>${reasonBadge(item.primary_group || item.primary_reason || "-")} <strong>${escapeHtml(`${item.code || "-"} ${item.name || ""}`.trim())}</strong><span>MFE ${pct(item.mfe_15m_pct)} / MAE ${pct(item.mae_15m_pct)} · ${escapeHtml(item.recommendation || item.outcome_label || "-")}</span></div>
+  `).join("") : `<div class="muted">${escapeHtml(emptyText)}</div>`;
+}
+
 function renderBuyZeroInlineCounts(id, rows, key, emptyText) {
   const node = document.getElementById(id);
   if (!node) return;
@@ -1991,6 +2431,12 @@ function render(snapshot) {
   renderHeader(currentSnapshot);
   renderCockpit(currentSnapshot);
   renderBuyZeroRcaPanel();
+  renderLiveSimAuditPanel(currentSnapshot);
+  state.conservativeReason.payload = currentSnapshot.conservative_reason_outcomes || state.conservativeReason.payload || {};
+  renderConservativeReasonPanel(state.conservativeReason.payload);
+  renderShadowSmallEntryOpsPanel(currentSnapshot.shadow_small_entry_ops || {});
+  renderShadowSmallEntryPilotPanel(currentSnapshot.shadow_small_entry_pilot || {});
+  renderShadowSmallEntryPromotionPanel(currentSnapshot.shadow_small_entry_promotion || {});
   renderShadowAb(currentSnapshot);
   renderThemes(currentSnapshot.ranked_themes || []);
   renderWatchset(currentSnapshot.watchset || []);
@@ -3775,6 +4221,7 @@ async function fetchSnapshot() {
   if (!response.ok) throw new Error(`snapshot ${response.status}`);
   render(await response.json());
   fetchBuyZeroRca().catch(() => {});
+  fetchConservativeReasonOutcomes().catch(() => {});
   fetchPromotionDecision(state.snapshot || {}).catch(() => {});
 }
 
@@ -3785,6 +4232,39 @@ function initBuyZeroRcaPanel() {
     fetchBuyZeroRca({ force: true }).catch((error) => {
       setBuyZeroStatus(`조회 실패: ${error.message || error}`, "critical");
     });
+  });
+}
+
+function initConservativeReasonPanel() {
+  renderConservativeReasonPanel();
+  document.getElementById("themelab-conservative-reason-refresh")?.addEventListener("click", () => {
+    state.conservativeReason.lastFetchedAt = 0;
+    fetchConservativeReasonOutcomes({ force: true }).catch(() => {});
+  });
+}
+
+function initShadowSmallEntryOpsPanel() {
+  renderShadowSmallEntryOpsPanel();
+  [
+    ["themelab-shadow-small-entry-ops-preflight", "preflight"],
+    ["themelab-shadow-small-entry-ops-arm", "arm"],
+    ["themelab-shadow-small-entry-ops-confirm", "confirm"],
+    ["themelab-shadow-small-entry-ops-pause", "pause"],
+    ["themelab-shadow-small-entry-ops-rollback", "rollback"],
+    ["themelab-shadow-small-entry-ops-emergency-pause", "emergency-pause"],
+  ].forEach(([id, action]) => {
+    document.getElementById(id)?.addEventListener("click", (event) => shadowSmallEntryOpsAction(action, event.currentTarget).catch(() => {}));
+  });
+}
+
+function initShadowSmallEntryPilotPanel() {
+  renderShadowSmallEntryPilotPanel();
+  [
+    ["themelab-shadow-small-entry-pilot-start", "start"],
+    ["themelab-shadow-small-entry-pilot-complete", "complete"],
+    ["themelab-shadow-small-entry-pilot-generate-report", "generate-report"],
+  ].forEach(([id, action]) => {
+    document.getElementById(id)?.addEventListener("click", (event) => shadowSmallEntryPilotAction(action, event.currentTarget).catch(() => {}));
   });
 }
 
@@ -3813,6 +4293,9 @@ initOperatorActionCenter();
 initPostmarketReviewPanel();
 initPromotionCockpit();
 initBuyZeroRcaPanel();
+initConservativeReasonPanel();
+initShadowSmallEntryOpsPanel();
+initShadowSmallEntryPilotPanel();
 fetchSnapshot().catch(() => {});
 connectWs();
 setInterval(() => fetchSnapshot().catch(() => {}), 5000);

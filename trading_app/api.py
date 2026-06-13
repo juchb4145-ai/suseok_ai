@@ -59,6 +59,11 @@ from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSo
 from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThemeUniverseSource
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
 from trading_app.buy_zero_rca import BuyZeroRCAAnalyzer
+from trading_app.conservative_reason_outcomes import (
+    ConservativeReasonOutcomeAnalyzer,
+    empty_payload as conservative_reason_empty_payload,
+    snapshot_payload as conservative_reason_snapshot_payload,
+)
 from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, config_from_settings
 from trading_app.dry_run_threshold_ab import DryRunThresholdABAnalyzer, config_from_settings as threshold_ab_config_from_settings
 from trading_app.intraday_outcomes import (
@@ -67,12 +72,24 @@ from trading_app.intraday_outcomes import (
     config_from_settings as outcome_config_from_settings,
 )
 from trading_app.market_gate_review import MarketGateReviewAnalyzer
+from trading_app.live_sim_audit import LiveSimLifecycleAuditor
 from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.promotion_evidence import DEFAULT_PROMOTION_POLICY_ID, PromotionEvidenceAdapter
 from trading_app.replay_tick_buffer import ReplayGradeTickBuffer, replay_tick_writer_config_from_settings
 from trading_app.runtime_supervisor import RuntimeSupervisor
 from trading_app.schemas import GatewayCommandBatch, GatewayCommandIn, GatewayEventIn, HealthResponse, OrderEnqueueRequest
+from trading_app.shadow_small_entry_promotion import (
+    ShadowSmallEntryPromotionAnalyzer,
+    empty_payload as shadow_small_entry_empty_payload,
+    snapshot_payload as shadow_small_entry_snapshot_payload,
+)
+from trading_app.shadow_small_entry_ops import ShadowSmallEntryOpsService, snapshot_payload as shadow_small_entry_ops_snapshot_payload
+from trading_app.shadow_small_entry_pilot import (
+    ShadowSmallEntryPilotService,
+    empty_payload as shadow_small_entry_pilot_empty_payload,
+    snapshot_payload as shadow_small_entry_pilot_snapshot_payload,
+)
 from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
 from trading_app.shadow_strategy import ShadowStrategyEvaluator, config_from_settings as shadow_config_from_settings
 from trading_app.strategy_change_proposals import (
@@ -603,8 +620,28 @@ def _theme_lab_gate_reason_outcome_analyzer(db: TradingDatabase) -> ThemeLabGate
     return ThemeLabGateReasonOutcomeAnalyzer(db)
 
 
+def _conservative_reason_outcome_analyzer(db: TradingDatabase) -> ConservativeReasonOutcomeAnalyzer:
+    return ConservativeReasonOutcomeAnalyzer(db)
+
+
+def _shadow_small_entry_promotion_analyzer(db: TradingDatabase) -> ShadowSmallEntryPromotionAnalyzer:
+    return ShadowSmallEntryPromotionAnalyzer(db)
+
+
+def _shadow_small_entry_ops_service(db: TradingDatabase) -> ShadowSmallEntryOpsService:
+    return ShadowSmallEntryOpsService(db, gateway_state=gateway_state, core_settings=get_settings())
+
+
+def _shadow_small_entry_pilot_service(db: TradingDatabase) -> ShadowSmallEntryPilotService:
+    return ShadowSmallEntryPilotService(db, gateway_state=gateway_state)
+
+
 def _buy_zero_rca_analyzer(db: TradingDatabase) -> BuyZeroRCAAnalyzer:
     return BuyZeroRCAAnalyzer(db)
+
+
+def _live_sim_auditor(db: TradingDatabase) -> LiveSimLifecycleAuditor:
+    return LiveSimLifecycleAuditor(db, gateway_state=gateway_state)
 
 
 def _transport_config_from_settings() -> TransportLatencyConfig:
@@ -1601,6 +1638,23 @@ def runtime_buy_zero_missed_opportunities(
         close_database(db)
 
 
+@app.get("/api/runtime/live-sim/audit")
+def runtime_live_sim_lifecycle_audit(
+    trade_date: Optional[str] = None,
+    limit: int = Query(1000, ge=1, le=5000),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _live_sim_auditor(db).build_report(
+            trade_date=trade_date or datetime.now().date().isoformat(),
+            limit=limit,
+        )
+        report["filters"] = {"trade_date": trade_date or "", "limit": limit}
+        return report
+    finally:
+        close_database(db)
+
+
 @app.get("/api/runtime/outcomes/intraday")
 def runtime_intraday_outcomes(
     trade_date: Optional[str] = None,
@@ -2209,7 +2263,7 @@ def runtime_change_proposal_detail(proposal_id: str) -> dict[str, Any]:
 @app.post("/api/runtime/change-proposals/generate")
 def generate_runtime_change_proposals(
     trade_date: str,
-    source_type: Optional[str] = Query("combined", pattern="^(intraday_outcome|shadow_strategy|replay|threshold_ab|combined)$"),
+    source_type: Optional[str] = Query("combined", pattern="^(intraday_outcome|shadow_strategy|replay|threshold_ab|conservative_reason_outcome|shadow_small_entry_promotion|shadow_small_entry_pilot|combined)$"),
     replay_id: Optional[str] = None,
     force: bool = False,
     persist: bool = True,
@@ -2449,6 +2503,448 @@ def export_runtime_theme_lab_gate_reason_outcomes(
             "exports": analyzer.export_report(report, fmt=format),
             "notes": report.get("notes", []),
         }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/conservative-reason-outcomes")
+def conservative_reason_outcomes(
+    trade_date: Optional[str] = None,
+    limit: int = Query(10000, ge=1, le=50000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        return _conservative_reason_outcome_analyzer(db).build_report(trade_date=resolved_trade_date, limit=limit, offset=offset)
+    finally:
+        close_database(db)
+
+
+@app.get("/api/conservative-reason-outcomes/summary")
+def conservative_reason_outcomes_summary(
+    trade_date: Optional[str] = None,
+    limit: int = Query(10000, ge=1, le=50000),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        report = _conservative_reason_outcome_analyzer(db).build_report(trade_date=resolved_trade_date, limit=limit)
+        return conservative_reason_snapshot_payload(report)
+    finally:
+        close_database(db)
+
+
+@app.get("/api/conservative-reason-outcomes/items")
+def conservative_reason_outcomes_items(
+    trade_date: Optional[str] = None,
+    reason_group: str = "",
+    reason_code: str = "",
+    recommendation: str = "",
+    code: str = "",
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        analyzer = _conservative_reason_outcome_analyzer(db)
+        report = analyzer.build_report(trade_date=resolved_trade_date, limit=50000)
+        rows = analyzer.filter_items(
+            report,
+            reason_group=reason_group,
+            reason_code=reason_code,
+            recommendation=recommendation,
+            code=code,
+        )
+        start = max(0, int(offset or 0))
+        end = start + max(1, int(limit or 100))
+        return {
+            "trade_date": report.get("trade_date") or resolved_trade_date,
+            "generated_at": report.get("generated_at") or "",
+            "total": len(rows),
+            "items": rows[start:end],
+            "pagination": _pagination_payload(limit=limit, offset=offset, count=len(rows[start:end]), total=len(rows)),
+            "filters": {
+                "reason_group": reason_group,
+                "reason_code": reason_code,
+                "recommendation": recommendation,
+                "code": code,
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/conservative-reason-outcomes/generate")
+def generate_conservative_reason_outcomes(
+    trade_date: Optional[str] = None,
+    export: bool = False,
+    format: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+    limit: int = Query(50000, ge=1, le=100000),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        analyzer = _conservative_reason_outcome_analyzer(db)
+        report = analyzer.build_report(trade_date=resolved_trade_date, limit=limit)
+        return {
+            "report_id": report.get("report_id") or "",
+            "trade_date": report.get("trade_date") or resolved_trade_date,
+            "summary": report.get("summary") or {},
+            "exports": analyzer.export_report(report, fmt=format) if export else {},
+            "disclaimer_ko": report.get("disclaimer_ko") or "",
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-promotion/summary")
+def shadow_small_entry_promotion_summary(
+    trade_date: Optional[str] = None,
+    limit: int = Query(50000, ge=1, le=100000),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        report = _shadow_small_entry_promotion_analyzer(db).build_report(
+            trade_date=resolved_trade_date,
+            limit=limit,
+            include_traces=True,
+        )
+        return shadow_small_entry_snapshot_payload(report)
+    except Exception as exc:
+        return shadow_small_entry_empty_payload(str(exc))
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-promotion/candidates")
+def shadow_small_entry_promotion_candidates(
+    trade_date: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=1000),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        items = _shadow_small_entry_promotion_analyzer(db).candidates(trade_date=resolved_trade_date, limit=limit)
+        return {
+            "trade_date": resolved_trade_date,
+            "total": len(items),
+            "items": items,
+            "filters": {"trade_date": resolved_trade_date, "limit": limit},
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-promotion/traces")
+def shadow_small_entry_promotion_traces(
+    trade_date: Optional[str] = None,
+    code: str = "",
+    candidate_instance_id: str = "",
+    limit: int = Query(200, ge=1, le=1000),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        items = _shadow_small_entry_promotion_analyzer(db).traces(
+            trade_date=resolved_trade_date,
+            code=code,
+            candidate_instance_id=candidate_instance_id,
+            limit=limit,
+        )
+        return {
+            "trade_date": resolved_trade_date,
+            "total": len(items),
+            "items": items,
+            "filters": {
+                "trade_date": resolved_trade_date,
+                "code": code,
+                "candidate_instance_id": candidate_instance_id,
+                "limit": limit,
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-promotion/generate")
+def generate_shadow_small_entry_promotion(
+    trade_date: Optional[str] = None,
+    export: bool = False,
+    format: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+    limit: int = Query(50000, ge=1, le=100000),
+) -> dict[str, Any]:
+    resolved_trade_date = trade_date or datetime.now().date().isoformat()
+    db = open_database()
+    try:
+        analyzer = _shadow_small_entry_promotion_analyzer(db)
+        report = analyzer.build_report(trade_date=resolved_trade_date, limit=limit)
+        normalized = "md" if format == "markdown" else format
+        exports = {}
+        if export:
+            if normalized == "all":
+                exports = analyzer.export_all(report)
+            elif normalized == "csv":
+                exports = {"csv": str(analyzer.export_csv(report, analyzer.report_root / resolved_trade_date / f"shadow_small_entry_promotion_{resolved_trade_date}.csv"))}
+            elif normalized == "md":
+                exports = {"md": str(analyzer.export_markdown(report, analyzer.report_root / resolved_trade_date / f"shadow_small_entry_promotion_{resolved_trade_date}.md"))}
+            else:
+                exports = {"json": str(analyzer.export_json(report, analyzer.report_root / resolved_trade_date / f"shadow_small_entry_promotion_{resolved_trade_date}.json"))}
+        return {
+            "trade_date": resolved_trade_date,
+            "summary": report.get("summary") or {},
+            "exports": exports,
+            "disclaimer_ko": report.get("disclaimer_ko") or "",
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-ops/status")
+def shadow_small_entry_ops_status(trade_date: Optional[str] = None) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return shadow_small_entry_ops_snapshot_payload(
+            _shadow_small_entry_ops_service(db).status(trade_date=trade_date)
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/shadow-small-entry-ops/preflight")
+def shadow_small_entry_ops_preflight(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        return _shadow_small_entry_ops_service(db).preflight(trade_date=payload.get("trade_date"), persist=True)
+    finally:
+        close_database(db)
+
+
+@app.post("/api/shadow-small-entry-ops/arm")
+def shadow_small_entry_ops_arm(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        return _shadow_small_entry_ops_service(db).arm(
+            operator=str(payload.get("operator") or payload.get("changed_by") or "operator"),
+            note=str(payload.get("note") or payload.get("operator_note") or ""),
+            trade_date=payload.get("trade_date"),
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/shadow-small-entry-ops/confirm")
+def shadow_small_entry_ops_confirm(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        return _shadow_small_entry_ops_service(db).confirm(
+            activation_token=str(payload.get("activation_token") or payload.get("token") or ""),
+            operator=str(payload.get("operator") or payload.get("changed_by") or "operator"),
+            note=str(payload.get("note") or payload.get("operator_note") or ""),
+            trade_date=payload.get("trade_date"),
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/shadow-small-entry-ops/pause")
+def shadow_small_entry_ops_pause(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        emergency = bool(payload.get("emergency"))
+        return _shadow_small_entry_ops_service(db).pause(
+            operator=str(payload.get("operator") or payload.get("changed_by") or "operator"),
+            note=str(payload.get("note") or payload.get("operator_note") or ("emergency pause" if emergency else "")),
+            reason=str(payload.get("reason") or ("SHADOW_SMALL_ENTRY_EMERGENCY_PAUSE" if emergency else "SHADOW_SMALL_ENTRY_OPERATOR_PAUSE")),
+            status=str(payload.get("status") or "PAUSED_BY_OPERATOR"),
+            trade_date=payload.get("trade_date"),
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/shadow-small-entry-ops/rollback")
+def shadow_small_entry_ops_rollback(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        return _shadow_small_entry_ops_service(db).rollback(
+            operator=str(payload.get("operator") or payload.get("changed_by") or "operator"),
+            note=str(payload.get("note") or payload.get("operator_note") or ""),
+            trade_date=payload.get("trade_date"),
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/shadow-small-entry-ops/risk-check")
+def shadow_small_entry_ops_risk_check(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        return _shadow_small_entry_ops_service(db).risk_check(
+            trade_date=payload.get("trade_date"),
+            auto_pause=bool(payload.get("auto_pause", True)),
+        )
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-ops/audit-log")
+def shadow_small_entry_ops_audit_log(
+    trade_date: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = _shadow_small_entry_ops_service(db).audit_log(trade_date=trade_date, limit=limit)
+        return {"trade_date": trade_date or datetime.now().date().isoformat(), "total": len(items), "items": items}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-ops/report")
+def shadow_small_entry_ops_report(
+    trade_date: Optional[str] = None,
+    export: bool = False,
+    format: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        service = _shadow_small_entry_ops_service(db)
+        report = service.build_report(trade_date=trade_date, limit=500)
+        normalized = "md" if format == "markdown" else format
+        return {
+            **report,
+            "exports": service.export_report(report, fmt=normalized) if export else {},
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-pilot/status")
+def shadow_small_entry_pilot_status(trade_date: Optional[str] = None) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return shadow_small_entry_pilot_snapshot_payload(
+            _shadow_small_entry_pilot_service(db).status(trade_date=trade_date)
+        )
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-pilot/report")
+def shadow_small_entry_pilot_report(
+    trade_date: Optional[str] = None,
+    pilot_id: str = "",
+    export: bool = False,
+    format: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        service = _shadow_small_entry_pilot_service(db)
+        report = service.build_report(trade_date=trade_date, pilot_id=pilot_id, persist=False)
+        return {**report, "exports": service.export_report(report, fmt=format) if export else {}}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-pilot/items")
+def shadow_small_entry_pilot_items(
+    trade_date: Optional[str] = None,
+    pilot_id: str = "",
+    status: str = "",
+    recommendation: str = "",
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return _shadow_small_entry_pilot_service(db).items(
+            trade_date=trade_date,
+            pilot_id=pilot_id,
+            status=status,
+            recommendation=recommendation,
+            limit=limit,
+            offset=offset,
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/shadow-small-entry-pilot/start")
+def shadow_small_entry_pilot_start(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        return _shadow_small_entry_pilot_service(db).start(
+            trade_date=payload.get("trade_date"),
+            operator=str(payload.get("operator") or payload.get("changed_by") or "operator"),
+            operator_note=str(payload.get("note") or payload.get("operator_note") or ""),
+            source_report_trade_date=str(payload.get("source_report_trade_date") or ""),
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/shadow-small-entry-pilot/complete")
+def shadow_small_entry_pilot_complete(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        return _shadow_small_entry_pilot_service(db).complete(
+            trade_date=payload.get("trade_date"),
+            operator=str(payload.get("operator") or payload.get("changed_by") or "operator"),
+            operator_note=str(payload.get("note") or payload.get("operator_note") or ""),
+            export=bool(payload.get("export", False)),
+            fmt=str(payload.get("format") or "all"),
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/shadow-small-entry-pilot/generate-report")
+def shadow_small_entry_pilot_generate_report(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        service = _shadow_small_entry_pilot_service(db)
+        report = service.build_report(trade_date=payload.get("trade_date"), pilot_id=str(payload.get("pilot_id") or ""), persist=True)
+        exports = service.export_report(report, fmt=str(payload.get("format") or "all")) if bool(payload.get("export", True)) else {}
+        return {"ok": True, "report": report, "exports": exports}
     finally:
         close_database(db)
 
@@ -6591,14 +7087,51 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "items": db.list_runtime_order_intents(limit=12) if full_detail else [],
         "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=12) if full_detail else [],
     }
-    decision_summary_payload = db.strategy_decision_summary(trade_date=datetime.now().date().isoformat())
-    outcome_summary_payload = db.strategy_decision_outcome_summary(trade_date=datetime.now().date().isoformat())
+    today = datetime.now().date().isoformat()
+    decision_summary_payload = db.strategy_decision_summary(trade_date=today)
+    outcome_summary_payload = db.strategy_decision_outcome_summary(trade_date=today)
     buy_zero_rca_payload = _buy_zero_rca_analyzer(db).build_summary(
-        trade_date=datetime.now().date().isoformat(),
+        trade_date=today,
         limit=50000,
         include_missed_opportunities=False,
     )
-    shadow_summary_payload = db.shadow_strategy_summary(trade_date=datetime.now().date().isoformat())
+    live_sim_audit_payload = _live_sim_auditor(db).build_report(trade_date=today, limit=2000)
+    try:
+        conservative_reason_report = _conservative_reason_outcome_analyzer(db).build_report(trade_date=today, limit=10000)
+        conservative_reason_payload = conservative_reason_snapshot_payload(conservative_reason_report)
+    except Exception as exc:
+        conservative_reason_payload = conservative_reason_empty_payload(str(exc))
+    try:
+        shadow_small_entry_report = _shadow_small_entry_promotion_analyzer(db).build_report(
+            trade_date=today,
+            limit=10000,
+            include_traces=False,
+        )
+        shadow_small_entry_payload = shadow_small_entry_snapshot_payload(shadow_small_entry_report)
+    except Exception as exc:
+        shadow_small_entry_payload = shadow_small_entry_empty_payload(str(exc))
+    try:
+        shadow_small_entry_ops_payload = shadow_small_entry_ops_snapshot_payload(
+            _shadow_small_entry_ops_service(db).status(trade_date=today)
+        )
+    except Exception as exc:
+        shadow_small_entry_ops_payload = {
+            "available": False,
+            "status": "ERROR",
+            "mode": "observe_only",
+            "order_enabled": False,
+            "preflight_status": "ERROR",
+            "preflight_blocking_reasons": [str(exc)],
+            "operator_message_ko": "Shadow Small Entry 운영 상태를 불러오지 못했습니다.",
+            "last_updated_at": "",
+        }
+    try:
+        shadow_small_entry_pilot_payload = shadow_small_entry_pilot_snapshot_payload(
+            _shadow_small_entry_pilot_service(db).status(trade_date=today)
+        )
+    except Exception as exc:
+        shadow_small_entry_pilot_payload = shadow_small_entry_pilot_empty_payload(today, str(exc))
+    shadow_summary_payload = db.shadow_strategy_summary(trade_date=today)
     replay_reports = scan_replay_reports(DEFAULT_REPLAY_DB_ROOT, limit=1)
     replay_runs = scan_replay_runs(DEFAULT_REPLAY_DB_ROOT, limit=5)
     replay_payload = {
@@ -6610,7 +7143,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "data_quality": ((replay_reports[0].get("summary") or {}).get("warnings") if replay_reports else []) or [],
         "diff_summary": (replay_reports[0].get("diff_summary") if replay_reports else {}) or {},
     }
-    change_proposal_summary_payload = db.strategy_change_proposal_summary(trade_date=datetime.now().date().isoformat())
+    change_proposal_summary_payload = db.strategy_change_proposal_summary(trade_date=today)
     change_proposal_payload = {
         "summary": change_proposal_summary_payload,
         "top_recommendations": change_proposal_summary_payload.get("top_recommendations", []),
@@ -6667,6 +7200,11 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["intraday_decisions"] = decision_summary_payload
     runtime_payload["intraday_outcomes"] = outcome_summary_payload
     runtime_payload["buy_zero_rca"] = buy_zero_rca_payload
+    runtime_payload["live_sim_audit"] = live_sim_audit_payload
+    runtime_payload["conservative_reason_outcomes"] = conservative_reason_payload
+    runtime_payload["shadow_small_entry_promotion"] = shadow_small_entry_payload
+    runtime_payload["shadow_small_entry_ops"] = shadow_small_entry_ops_payload
+    runtime_payload["shadow_small_entry_pilot"] = shadow_small_entry_pilot_payload
     runtime_payload["shadow_strategies"] = shadow_summary_payload
     runtime_payload["strategy_replay"] = replay_payload
     runtime_payload["change_proposals"] = change_proposal_payload
@@ -6702,6 +7240,11 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "intraday_decisions": decision_summary_payload,
         "intraday_outcomes": outcome_summary_payload,
         "buy_zero_rca": buy_zero_rca_payload,
+        "live_sim_audit": live_sim_audit_payload,
+        "conservative_reason_outcomes": conservative_reason_payload,
+        "shadow_small_entry_promotion": shadow_small_entry_payload,
+        "shadow_small_entry_ops": shadow_small_entry_ops_payload,
+        "shadow_small_entry_pilot": shadow_small_entry_pilot_payload,
         "shadow_strategies": shadow_summary_payload,
         "strategy_replay": replay_payload,
         "change_proposals": change_proposal_payload,
@@ -7255,6 +7798,13 @@ def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
     elif event.type == "command_started":
         command_id = str(event.payload.get("command_id") or event.command_id or "")
         if command_id:
+            _append_live_sim_command_audit_event(
+                db,
+                command_id=command_id,
+                event_type="command_started",
+                status=str(event.payload.get("status") or CommandStatus.DISPATCHED.value),
+                payload=dict(event.payload or {}),
+            )
             gateway_state.ack_command(
                 command_id,
                 status=CommandStatus.DISPATCHED.value,
@@ -7347,6 +7897,14 @@ def _handle_command_ack(db: TradingDatabase, event: GatewayEvent) -> None:
             handled = gateway_state.fail_command(command_id, error, retryable=False)
         else:
             handled = gateway_state.ack_command(command_id, status=status, result_payload=payload, error=error)
+        _append_live_sim_command_audit_event(
+            db,
+            command_id=command_id,
+            event_type="command_rejected" if status in {CommandStatus.REJECTED.value, CommandStatus.FAILED.value} else "command_acked",
+            status=status,
+            payload=payload,
+            message=error or str(payload.get("message") or ""),
+        )
         trace = trace_from_payload(payload)
         if trace.get("transport_mode") == TRANSPORT_MODE_WEBSOCKET_REAL_PILOT:
             if existing_record is None and not handled:
@@ -7371,6 +7929,88 @@ def _handle_command_ack(db: TradingDatabase, event: GatewayEvent) -> None:
     order_result = payload.get("order_result")
     if command_type == "send_order" and isinstance(order_result, dict):
         db.save_order_result(BrokerOrderResult.from_dict(order_result))
+
+
+def _append_live_sim_command_audit_event(
+    db: TradingDatabase,
+    *,
+    command_id: str,
+    event_type: str,
+    status: str,
+    payload: dict[str, Any],
+    message: str = "",
+) -> None:
+    record = gateway_state.get_command(command_id)
+    record_payload: dict[str, Any] = {}
+    record_command_type = ""
+    if record is not None:
+        record_data = record.to_dict()
+        record_command = dict(record_data.get("command") or {})
+        record_payload = dict(record_command.get("payload") or {})
+        record_command_type = str(record_data.get("command_type") or record_command.get("type") or "")
+    command_type = str(payload.get("command_type") or record_command_type or "")
+    if command_type not in {"send_order", "cancel_order"}:
+        return
+    merged_payload = {**record_payload, **dict(payload or {})}
+    if str(merged_payload.get("order_mode") or "") != "LIVE_SIM" and str((record or {}).metadata.get("runtime") if record else "") != "LIVE_SIM":
+        return
+    order = None
+    if command_type == "send_order":
+        order = db.find_live_sim_order_by_command_id(command_id)
+    elif command_type == "cancel_order":
+        original_order_id = str(merged_payload.get("original_order_id") or "")
+        order = db.get_live_sim_order(original_order_id) if original_order_id else None
+    if order is None:
+        return
+    now = str(payload.get("timestamp") or payload.get("received_at") or "")
+    status_from = str(order.get("order_status") or "")
+    status_to = status_from
+    reason = message or str(payload.get("message") or status or event_type)
+    if command_type == "send_order" and status in {CommandStatus.REJECTED.value, CommandStatus.FAILED.value}:
+        status_to = "REJECTED" if status == CommandStatus.REJECTED.value else "FAILED"
+        codes = _append_reason_codes(order.get("reason_codes") or [], ["LIVE_SIM_COMMAND_REJECTED", status_to])
+        order = db.update_live_sim_order(
+            str(order.get("order_intent_id") or ""),
+            {
+                "order_status": status_to,
+                "rejected_at": now,
+                "updated_at": now,
+                "reason_codes": codes,
+                "details": {
+                    **dict(order.get("details") or {}),
+                    "command_audit": {
+                        "command_id": command_id,
+                        "command_type": command_type,
+                        "command_status": status,
+                        "message": reason,
+                        "payload": merged_payload,
+                    },
+                },
+            },
+        ) or order
+    db.append_live_sim_order_event(
+        str(order.get("order_intent_id") or ""),
+        event_type,
+        status_from=status_from,
+        status_to=status_to,
+        message=reason,
+        payload={
+            "command_id": command_id,
+            "command_type": command_type,
+            "command_status": status,
+            "command_payload": merged_payload,
+        },
+        created_at=now,
+    )
+
+
+def _append_reason_codes(existing: list[Any], additions: list[str]) -> list[str]:
+    merged: list[str] = []
+    for item in [*list(existing or []), *additions]:
+        text = str(item or "")
+        if text and text not in merged:
+            merged.append(text)
+    return merged
 
 
 def _runtime_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:

@@ -16,11 +16,34 @@ const state = {
     stage: "",
     error: "",
   },
+  shadowSmallEntryOps: {
+    activationToken: "",
+    activationTokenId: "",
+  },
+  shadowSmallEntryPilot: {
+    report: null,
+    inFlight: false,
+    lastFetchedAt: 0,
+  },
 };
 
 const SNAPSHOT_POLL_INTERVAL_MS = 30000;
 const SNAPSHOT_INITIAL_FALLBACK_MS = 7000;
 const SNAPSHOT_RECONNECT_MS = 3000;
+const SHADOW_SMALL_ENTRY_OPS_ENDPOINTS = {
+  preflight: "/api/shadow-small-entry-ops/preflight",
+  arm: "/api/shadow-small-entry-ops/arm",
+  confirm: "/api/shadow-small-entry-ops/confirm",
+  pause: "/api/shadow-small-entry-ops/pause",
+  rollback: "/api/shadow-small-entry-ops/rollback",
+  "emergency-pause": "/api/shadow-small-entry-ops/pause",
+};
+const SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS = {
+  start: "/api/shadow-small-entry-pilot/start",
+  complete: "/api/shadow-small-entry-pilot/complete",
+  "generate-report": "/api/shadow-small-entry-pilot/generate-report",
+  report: "/api/shadow-small-entry-pilot/report",
+};
 
 const tableConfigs = {
   transportLatency: {
@@ -1044,6 +1067,64 @@ function renderThemeLabSummary(themeLab) {
   text("themelab-order-candidates", summary.order_candidate_count || 0);
 }
 
+function renderLiveSimAudit(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.live_sim_audit || runtime.live_sim_audit || {};
+  const summary = payload.summary || {};
+  const available = Boolean(payload.available);
+  const status = payload.status || (available ? "UNKNOWN" : "NO_DATA");
+  const tone = status === "OK" ? "ok" : status === "BROKEN" ? "bad" : /RECONCILE|WARN/.test(status) ? "warn" : "muted";
+  const message = ((payload.operator || {}).status_message_ko) || (available ? "LIVE_SIM audit 확인 중" : "아직 LIVE_SIM 주문 audit 데이터가 없습니다.");
+
+  text("live-sim-audit-status", `${status} · ${message}`);
+  cls("live-sim-audit-status", `counter ${tone}`);
+  text("live-sim-audit-updated", formatDateTime(payload.last_updated_at));
+  text("live-sim-audit-empty", available ? "send_order부터 체결/취소/포지션/reconcile까지 audit 원장을 표시합니다." : "아직 LIVE_SIM 주문 audit 데이터가 없습니다.");
+  text("live-sim-audit-open-orders", summary.open_live_sim_order_count ?? 0);
+  text("live-sim-audit-unknown-submit", summary.unknown_submit_count ?? 0);
+  text("live-sim-audit-reconcile-orders", summary.reconcile_required_order_count ?? 0);
+  text("live-sim-audit-broker-missing", summary.broker_order_id_missing_count ?? 0);
+  text("live-sim-audit-cancel-stale", summary.cancel_requested_stale_count ?? 0);
+  text("live-sim-audit-orphan-exec", summary.orphan_execution_count ?? 0);
+  text("live-sim-audit-position-mismatch", summary.position_qty_mismatch_count ?? 0);
+  text("live-sim-audit-duplicate-open-position", summary.duplicate_open_position_count ?? 0);
+  renderLiveSimAuditLines(
+    "live-sim-audit-top-actions",
+    ((payload.operator || {}).top_actions || []).map((item) => ({
+      label: item.issue_type || "-",
+      value: item.count ?? 0,
+      detail: item.operator_message_ko || item.suggested_action || "",
+      tone: /BROKEN|MISMATCH|MISSING|UNKNOWN|RECONCILE/.test(String(item.issue_type || "")) ? "warn" : "muted",
+    })),
+    "필요한 운영 조치가 없습니다."
+  );
+  renderLiveSimAuditLines(
+    "live-sim-audit-issues",
+    (payload.issues || []).slice(0, 6).map((item) => ({
+      label: item.issue_type || "-",
+      value: item.severity || "-",
+      detail: `${item.code || ""} ${item.operator_message_ko || ""}`.trim(),
+      tone: item.severity === "BROKEN" ? "bad" : /RECONCILE|WARN/.test(String(item.severity || "")) ? "warn" : "muted",
+    })),
+    "최근 audit 이슈가 없습니다."
+  );
+}
+
+function renderLiveSimAuditLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = firstItems(rows || [], 6);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item ${escapeHtml(item.tone || "info")}">
+        <strong>${escapeHtml(item.label || "-")}</strong>
+        <span>${escapeHtml(item.detail || "")}</span>
+        <em>${escapeHtml(item.value ?? "")}</em>
+      </div>
+    `).join("")
+    : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
 function renderBuyZeroRca(snapshot) {
   const runtime = snapshot.runtime || {};
   const payload = snapshot.buy_zero_rca || runtime.buy_zero_rca || {};
@@ -1097,6 +1178,265 @@ function renderBuyZeroRca(snapshot) {
       cls("buy-zero-rca-ready-status", "counter bad");
     });
   }
+}
+
+function renderConservativeReasonOutcomes(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.conservative_reason_outcomes || runtime.conservative_reason_outcomes || {};
+  const summary = payload.summary || {};
+  const review = payload.review_for_small_entry || {};
+  const reviewSummary = review.summary || {};
+  const available = Boolean(payload.available);
+  const status = payload.status || (available ? "READY" : "NO_DATA");
+  text("conservative-reason-status", status);
+  cls("conservative-reason-status", `counter ${available ? "ok" : "muted"}`);
+  text(
+    "conservative-reason-empty",
+    available
+      ? "보수적 차단 사유 outcome을 읽기 전용으로 검증합니다. 주문 설정은 자동 변경하지 않습니다."
+      : "아직 outcome 관측 데이터가 부족합니다. 장중에는 5/15/30분 결과가 아직 확정되지 않을 수 있습니다."
+  );
+  text("conservative-reason-updated", formatDateTime(payload.last_updated_at || payload.generated_at));
+  text("conservative-reason-event-count", summary.event_count ?? 0);
+  text("conservative-reason-missed-rate", formatRate(summary.missed_opportunity_rate || 0));
+  text("conservative-reason-good-rate", formatRate(summary.good_block_rate || 0));
+  text("conservative-reason-risk-rate", formatRate(summary.risk_avoided_rate || 0));
+  text("conservative-reason-false-count", summary.false_block_candidate_count ?? 0);
+  text("conservative-reason-small-count", reviewSummary.candidate_count ?? 0);
+  renderConservativeReasonLines("conservative-reason-group-lines", payload.by_group || [], "아직 group outcome이 없습니다.");
+  renderConservativeSmallEntryLines("conservative-reason-small-lines", review.by_reason_code || [], "소액 진입 검토 후보가 없습니다.");
+  renderConservativeStockLines("conservative-reason-missed-lines", payload.top_missed_opportunity_stocks || [], "놓친 기회 상위 종목이 없습니다.");
+  renderConservativeStockLines("conservative-reason-good-lines", payload.top_good_block_stocks || [], "좋은 차단 상위 종목이 없습니다.");
+}
+
+function renderShadowSmallEntryPromotion(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.shadow_small_entry_promotion || runtime.shadow_small_entry_promotion || {};
+  const summary = payload.summary || {};
+  const available = Boolean(payload.available);
+  const status = payload.status || (available ? "READY" : "NO_DATA");
+  text("shadow-small-entry-promotion-status", status);
+  cls("shadow-small-entry-promotion-status", `counter ${available ? "ok" : "muted"}`);
+  text("shadow-small-entry-promotion-mode", `${payload.mode || summary.mode || "observe_only"} / order ${payload.order_enabled ? "ON" : "OFF"}`);
+  cls("shadow-small-entry-promotion-mode", `counter ${payload.order_enabled ? "warn" : "muted"}`);
+  text(
+    "shadow-small-entry-promotion-empty",
+    payload.order_enabled
+      ? "조건 충족 후보는 1차 leg만 LIVE_SIM guarded 주문 가능합니다."
+      : "리포트 근거는 있으나 order_enabled=false라 주문하지 않습니다."
+  );
+  text("shadow-small-entry-promotion-updated", formatDateTime(payload.last_updated_at));
+  text("shadow-small-entry-promotion-candidate-count", payload.candidate_count ?? summary.candidate_count ?? 0);
+  text("shadow-small-entry-promotion-observe-count", payload.observe_only_count ?? summary.observe_only_count ?? 0);
+  text("shadow-small-entry-promotion-promoted-count", payload.promoted_count ?? summary.promoted_count ?? 0);
+  text("shadow-small-entry-promotion-blocked-count", payload.blocked_count ?? summary.blocked_count ?? 0);
+  text("shadow-small-entry-promotion-used-count", payload.used_promotions_today ?? summary.used_promotions_today ?? 0);
+  text("shadow-small-entry-promotion-day-limit", payload.max_promotions_per_day ?? summary.max_promotions_per_day ?? 0);
+  renderKeyCountLines("shadow-small-entry-promotion-group-lines", payload.top_reason_groups || summary.top_reason_groups || [], "아직 승격 reason group이 없습니다.");
+  renderKeyCountLines("shadow-small-entry-promotion-code-lines", payload.top_reason_codes || summary.top_reason_codes || [], "아직 승격 reason code가 없습니다.");
+}
+
+function renderShadowSmallEntryOps(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.shadow_small_entry_ops || runtime.shadow_small_entry_ops || {};
+  const today = payload.today || {};
+  const audit = payload.audit || {};
+  const limits = payload.limits || {};
+  const status = payload.status || "OBSERVE_ONLY";
+  const orderEnabled = Boolean(payload.order_enabled);
+  const preflightStatus = payload.preflight_status || "NO_DATA";
+  const activationLabel = payload.activation_armed ? `armed until ${formatDateTime(payload.activation_expires_at)}` : "-";
+  text("shadow-small-entry-ops-status", status);
+  cls("shadow-small-entry-ops-status", `counter ${status === "LIVE_SIM_ACTIVE" ? "warn" : status.startsWith("PAUSED") || status === "BROKEN" ? "bad" : "muted"}`);
+  text("shadow-small-entry-ops-message", payload.operator_message_ko || "현재는 관측 전용입니다. LIVE_SIM 활성화는 preflight와 2단계 확인이 필요합니다.");
+  text("shadow-small-entry-ops-mode", `${payload.mode || "observe_only"} / ${orderEnabled ? "ON" : "OFF"}`);
+  text("shadow-small-entry-ops-order-enabled", orderEnabled ? "ON" : "OFF");
+  text("shadow-small-entry-ops-preflight-status", preflightStatus);
+  text("shadow-small-entry-ops-activation", activationLabel);
+  text("shadow-small-entry-ops-promotion-count", today.promotion_count ?? 0);
+  text("shadow-small-entry-ops-submitted-count", today.submitted_count ?? 0);
+  text("shadow-small-entry-ops-filled-count", today.filled_count ?? 0);
+  text("shadow-small-entry-ops-open-position-count", today.open_position_count ?? 0);
+  text("shadow-small-entry-ops-notional", fmtNumber(today.total_notional_krw ?? 0, 0));
+  text("shadow-small-entry-ops-audit-status", audit.live_sim_audit_status || audit.status || "UNKNOWN");
+  text("shadow-small-entry-ops-reconcile-status", audit.reconcile_status || "UNKNOWN");
+  text("shadow-small-entry-ops-last-change", formatDateTime(payload.last_status_change_at || payload.last_updated_at));
+  renderShadowSmallEntryOpsReasons("shadow-small-entry-ops-blocking-reasons", payload.preflight_blocking_reasons || [], "Preflight 차단 사유가 없습니다.");
+  renderShadowSmallEntryOpsRiskLines("shadow-small-entry-ops-risk-lines", today, limits, audit);
+}
+
+function renderShadowSmallEntryOpsReasons(id, reasons, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = firstItems(reasons || [], 8);
+  node.innerHTML = items.length
+    ? items.map((reason) => `<span class="badge warning">${escapeHtml(reason)}</span>`).join(" ")
+    : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
+function renderShadowSmallEntryOpsRiskLines(id, today, limits, audit) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const lines = [
+    `promotions ${today.promotion_count ?? 0}/${limits.max_promotions_per_day ?? "-"}`,
+    `submitted ${today.submitted_count ?? 0}/${limits.max_submitted_orders_per_day ?? "-"}`,
+    `notional ${fmtNumber(today.total_notional_krw ?? 0, 0)}/${fmtNumber(limits.max_total_notional_krw ?? 0, 0)}`,
+    `open ${today.open_position_count ?? 0}/${limits.max_open_positions ?? "-"}`,
+    `unknown ${today.unknown_submit_count ?? 0}`,
+    `reconcile ${today.reconcile_required_count ?? 0}`,
+    `heartbeat ${audit.gateway_heartbeat_ok ? "OK" : "BAD"}`,
+  ];
+  node.innerHTML = lines.map((line) => `<span class="counter muted">${escapeHtml(line)}</span>`).join(" ");
+}
+
+function renderShadowSmallEntryPilot(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.shadow_small_entry_pilot || runtime.shadow_small_entry_pilot || {};
+  const report = state.shadowSmallEntryPilot.report || {};
+  const summary = payload.summary || (report.summary || {});
+  const status = payload.status || "NO_DATA";
+  const recommendation = payload.recommendation || report.recommendation || "-";
+  const available = Boolean(payload.available || report.available);
+  text("shadow-small-entry-pilot-status", status);
+  cls("shadow-small-entry-pilot-status", `counter ${status === "REVIEW_READY" || status === "COMPLETED" ? "ok" : status === "NO_DATA" ? "muted" : "warn"}`);
+  text("shadow-small-entry-pilot-id", compactPlain(payload.pilot_id || report.pilot_id || "-"));
+  text("shadow-small-entry-pilot-recommendation", recommendation || "-");
+  text("shadow-small-entry-pilot-message", payload.operator_message_ko || report.operator_message_ko || "아직 Shadow Small Entry pilot run 데이터가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.");
+  text("shadow-small-entry-pilot-candidate-count", summary.candidate_count ?? 0);
+  text("shadow-small-entry-pilot-promoted-count", summary.promoted_count ?? 0);
+  text("shadow-small-entry-pilot-submitted-count", summary.submitted_order_count ?? 0);
+  text("shadow-small-entry-pilot-filled-count", summary.filled_order_count ?? 0);
+  text("shadow-small-entry-pilot-open-position-count", summary.open_position_count ?? 0);
+  text("shadow-small-entry-pilot-total-pnl", fmtNumber(summary.total_pnl_krw ?? 0, 0));
+  text("shadow-small-entry-pilot-win-rate", summary.win_rate == null ? "-" : formatRate(summary.win_rate));
+  text("shadow-small-entry-pilot-avg-return", summary.avg_return_pct == null ? "-" : `${fmtNumber(summary.avg_return_pct, 2)}%`);
+  text("shadow-small-entry-pilot-mfe-mae", `${summary.avg_mfe_pct == null ? "-" : fmtNumber(summary.avg_mfe_pct, 2)} / ${summary.avg_mae_pct == null ? "-" : fmtNumber(summary.avg_mae_pct, 2)}`);
+  text("shadow-small-entry-pilot-updated", formatDateTime(payload.last_updated_at || report.last_updated_at));
+  renderShadowSmallEntryPilotReasons(payload.recommendation_reason_codes || report.recommendation_reason_codes || []);
+  renderShadowSmallEntryPilotSafety(report.safety_checklist || []);
+  renderShadowSmallEntryPilotItems(report.items || [], available);
+  maybeFetchShadowSmallEntryPilotReport(payload);
+}
+
+function renderShadowSmallEntryPilotReasons(reasons) {
+  const node = document.getElementById("shadow-small-entry-pilot-reasons");
+  if (!node) return;
+  const items = firstItems(reasons || [], 8);
+  node.innerHTML = items.length
+    ? items.map((reason) => `<span class="badge ${/BROKEN|RECONCILE|UNKNOWN|LOSS|ERROR/.test(String(reason)) ? "warning" : "info"}">${escapeHtml(reason)}</span>`).join(" ")
+    : `<span class="empty">추천 reason code가 아직 없습니다.</span>`;
+}
+
+function renderShadowSmallEntryPilotSafety(checks) {
+  const node = document.getElementById("shadow-small-entry-pilot-safety-lines");
+  if (!node) return;
+  const items = firstItems(checks || [], 8);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item ${item.status === "PASS" ? "ok" : item.status === "FAIL" ? "bad" : item.status === "WARN" ? "warn" : "info"}">
+        <strong>${escapeHtml(item.check_id || "-")}</strong>
+        <span>${escapeHtml(item.status || "-")} · ${escapeHtml(item.operator_message_ko || "")}</span>
+      </div>
+    `).join("")
+    : `<span class="empty">안전 체크리스트는 리포트 생성 후 표시됩니다.</span>`;
+}
+
+function renderShadowSmallEntryPilotItems(items, available) {
+  const node = document.getElementById("shadow-small-entry-pilot-items");
+  if (!node) return;
+  const rows = firstItems(items || [], 20);
+  if (!rows.length) {
+    node.innerHTML = `<tr><td colspan="6" class="empty">${available ? "파일럿 후보 상세 rows가 아직 없습니다." : "아직 수집된 pilot trace가 없습니다."}</td></tr>`;
+    return;
+  }
+  node.innerHTML = rows.map((item) => `
+    <tr>
+      <td>${escapeHtml([item.code, item.name].filter(Boolean).join(" ") || "-")}</td>
+      <td>${badge(item.pilot_status || item.promotion_status || "-")}</td>
+      <td>${escapeHtml(item.order_status || "-")}</td>
+      <td>${escapeHtml(item.fill_qty ?? item.submitted_qty ?? 0)}</td>
+      <td>${escapeHtml(fmtNumber(item.realized_pnl_krw ?? item.unrealized_pnl_krw ?? 0, 0))}</td>
+      <td>${escapeHtml(item.recommendation || "-")}</td>
+    </tr>
+  `).join("");
+}
+
+function maybeFetchShadowSmallEntryPilotReport(payload) {
+  const now = Date.now();
+  if (state.shadowSmallEntryPilot.inFlight) return;
+  if (now - state.shadowSmallEntryPilot.lastFetchedAt < 60000) return;
+  state.shadowSmallEntryPilot.inFlight = true;
+  state.shadowSmallEntryPilot.lastFetchedAt = now;
+  const params = {};
+  if (payload.trade_date) params.trade_date = payload.trade_date;
+  apiGet(SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS.report, params)
+    .then((report) => {
+      state.shadowSmallEntryPilot.report = report;
+      renderShadowSmallEntryPilot(state.latestSnapshot || {});
+    })
+    .catch(() => {})
+    .finally(() => {
+      state.shadowSmallEntryPilot.inFlight = false;
+    });
+}
+
+function renderKeyCountLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = firstItems(rows || [], 6);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item info">
+        <strong>${escapeHtml(item.key || item.reason || item.group || "-")}</strong>
+        <span>${escapeHtml(item.count ?? 0)}건</span>
+      </div>
+    `).join("")
+    : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
+function renderConservativeReasonLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = firstItems(rows || [], 6);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item ${item.recommendation === "REVIEW_FOR_SMALL_ENTRY" ? "warn" : item.recommendation === "KEEP_BLOCK" ? "ok" : "info"}">
+        <strong>${escapeHtml(item.group || item.reason_code || "-")}</strong>
+        <span>missed ${formatRate(item.missed_opportunity_rate || 0)} · good ${formatRate(item.good_block_rate || 0)} · risk ${formatRate(item.risk_avoided_rate || 0)}</span>
+        <em>${escapeHtml(item.recommendation || "-")}</em>
+      </div>
+    `).join("")
+    : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
+function renderConservativeSmallEntryLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = firstItems(rows || [], 6);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item warn">
+        <strong>${escapeHtml(item.reason_code || item.group || "-")}</strong>
+        <span>${escapeHtml(item.candidate_count ?? 0)} 후보 · MFE ${formatPercentValue(item.avg_mfe_15m_pct)} / MAE ${formatPercentValue(item.avg_mae_15m_pct)}</span>
+        <em>x${escapeHtml(fmtNumber(item.suggested_position_size_multiplier, 2))}</em>
+      </div>
+    `).join("")
+    : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
+function renderConservativeStockLines(id, rows, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = firstItems(rows || [], 6);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item ${item.good_block ? "ok" : item.missed_opportunity ? "warn" : "info"}">
+        <strong>${escapeHtml(`${item.code || "-"} ${item.name || ""}`.trim())}</strong>
+        <span>${escapeHtml(item.primary_group || item.primary_reason || "-")} · MFE ${formatPercentValue(item.mfe_15m_pct)} / MAE ${formatPercentValue(item.mae_15m_pct)}</span>
+        <em>${escapeHtml(item.recommendation || item.outcome_label || "-")}</em>
+      </div>
+    `).join("")
+    : `<span class="empty">${escapeHtml(emptyText)}</span>`;
 }
 
 function renderBuyZeroInlineCounts(id, rows, key, emptyText) {
@@ -1404,7 +1744,12 @@ function render(snapshot) {
   cls("orderable-state", `pill ${gateway.orderable ? "ok" : "muted"}`);
   renderOpsAlerts(opsAlerts);
   renderThemeLabSummary(themeLab);
+  renderLiveSimAudit(snapshot);
   renderBuyZeroRca(snapshot);
+  renderConservativeReasonOutcomes(snapshot);
+  renderShadowSmallEntryPromotion(snapshot);
+  renderShadowSmallEntryOps(snapshot);
+  renderShadowSmallEntryPilot(snapshot);
 
   text("transport-mode", transport.mode || "rest_long_poll");
   text("transport-event-p95", formatMs(transport.event_latency_p95_ms));
@@ -1689,6 +2034,82 @@ async function pollSnapshot() {
   }
 }
 
+async function shadowSmallEntryOpsAction(action, button) {
+  const originalText = button?.textContent || "";
+  const body = { operator: "dashboard", note: `dashboard ${action}` };
+  if (action === "confirm") {
+    const token = state.shadowSmallEntryOps.activationToken || window.prompt("Shadow Small Entry activation token") || "";
+    body.activation_token = token;
+    body.note = window.prompt("operator note") || "dashboard confirm";
+  }
+  if (action === "pause") {
+    body.reason = "SHADOW_SMALL_ENTRY_OPERATOR_PAUSE";
+  }
+  if (action === "emergency-pause") {
+    body.emergency = true;
+    body.reason = "SHADOW_SMALL_ENTRY_EMERGENCY_PAUSE";
+    body.note = "dashboard emergency pause";
+  }
+  const endpoint = SHADOW_SMALL_ENTRY_OPS_ENDPOINTS[action] || SHADOW_SMALL_ENTRY_OPS_ENDPOINTS.preflight;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "running";
+  }
+  try {
+    const payload = await runWithLocalTokenRetry((token) => postWithLocalToken(endpoint, token, body));
+    if (!payload) return;
+    if (payload.activation_token) {
+      state.shadowSmallEntryOps.activationToken = payload.activation_token;
+      state.shadowSmallEntryOps.activationTokenId = payload.activation_token_id || "";
+      openDetailPanel("Shadow Small Entry arm token", {
+        activation_token: payload.activation_token,
+        activation_token_id: payload.activation_token_id,
+        activation_expires_at: payload.activation_expires_at,
+        note: "Confirm 전용 토큰입니다. 로컬 화면 세션에만 보관됩니다.",
+      });
+    } else if (action === "confirm") {
+      state.shadowSmallEntryOps.activationToken = "";
+      state.shadowSmallEntryOps.activationTokenId = "";
+    }
+    await pollSnapshot();
+  } catch (error) {
+    openDetailPanel("Shadow Small Entry 운영 제어 오류", { action, error: error.message });
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+}
+
+async function shadowSmallEntryPilotAction(action, button) {
+  const originalText = button?.textContent || "";
+  const endpoint = SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS[action] || SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS.report;
+  const body = { operator: "dashboard", note: `dashboard ${action}` };
+  if (action === "generate-report") {
+    body.export = true;
+    body.format = "all";
+  }
+  if (button) {
+    button.disabled = true;
+    button.textContent = "running";
+  }
+  try {
+    const payload = await runWithLocalTokenRetry((token) => postWithLocalToken(endpoint, token, body));
+    if (!payload) return;
+    state.shadowSmallEntryPilot.report = payload.report || payload;
+    state.shadowSmallEntryPilot.lastFetchedAt = Date.now();
+    await pollSnapshot();
+  } catch (error) {
+    openDetailPanel("Shadow Small Entry Pilot 오류", { action, error: error.message });
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+}
+
 async function runtimeCommand(action, button) {
   const originalText = button?.textContent || "";
   if (button) {
@@ -1787,6 +2208,23 @@ function initDashboard() {
   document.getElementById("runtime-start")?.addEventListener("click", (event) => runtimeCommand("start", event.currentTarget).catch(() => {}));
   document.getElementById("runtime-stop")?.addEventListener("click", (event) => runtimeCommand("stop", event.currentTarget).catch(() => {}));
   document.getElementById("runtime-cycle")?.addEventListener("click", (event) => runtimeCommand("cycle", event.currentTarget).catch(() => {}));
+  [
+    ["shadow-small-entry-ops-preflight", "preflight"],
+    ["shadow-small-entry-ops-arm", "arm"],
+    ["shadow-small-entry-ops-confirm", "confirm"],
+    ["shadow-small-entry-ops-pause", "pause"],
+    ["shadow-small-entry-ops-rollback", "rollback"],
+    ["shadow-small-entry-ops-emergency-pause", "emergency-pause"],
+  ].forEach(([id, action]) => {
+    document.getElementById(id)?.addEventListener("click", (event) => shadowSmallEntryOpsAction(action, event.currentTarget).catch(() => {}));
+  });
+  [
+    ["shadow-small-entry-pilot-start", "start"],
+    ["shadow-small-entry-pilot-complete", "complete"],
+    ["shadow-small-entry-pilot-generate-report", "generate-report"],
+  ].forEach(([id, action]) => {
+    document.getElementById(id)?.addEventListener("click", (event) => shadowSmallEntryPilotAction(action, event.currentTarget).catch(() => {}));
+  });
   document.getElementById("buy-zero-rca-refresh")?.addEventListener("click", () => {
     state.buyZeroRca.lastFetchedAt = 0;
     refreshBuyZeroRcaTables({ force: true }).catch((error) => {

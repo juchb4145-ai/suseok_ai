@@ -80,6 +80,30 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#themelab-buy-zero-rally-table-body") is not None
     assert soup.select_one("#themelab-buy-zero-rca-timeline") is not None
     assert soup.select_one("#themelab-buy-zero-rca-refresh") is not None
+    assert soup.select_one("#themelab-live-sim-audit-card") is not None
+    assert soup.select_one("#themelab-live-sim-audit-status") is not None
+    assert soup.select_one("#themelab-live-sim-audit-open-orders") is not None
+    assert soup.select_one("#themelab-live-sim-audit-top-actions") is not None
+    assert soup.select_one("#themelab-live-sim-audit-issues") is not None
+    assert soup.select_one("#themelab-conservative-reason-card") is not None
+    assert soup.select_one("#themelab-conservative-reason-status") is not None
+    assert soup.select_one("#themelab-conservative-reason-group-body") is not None
+    assert soup.select_one("#themelab-conservative-reason-code-body") is not None
+    assert soup.select_one("#themelab-conservative-reason-small-body") is not None
+    assert soup.select_one("#themelab-conservative-reason-data-body") is not None
+    assert soup.select_one("#themelab-conservative-reason-missed-body") is not None
+    assert soup.select_one("#themelab-conservative-reason-good-body") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-card") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-empty") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-status") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-mode") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-candidate-count") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-observe-count") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-promoted-count") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-blocked-count") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-group-lines") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-code-lines") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-promotion-candidate-body") is not None
     assert soup.select_one("#promotion-cockpit") is not None
     assert soup.select_one("#promotion-window-controls") is not None
     assert soup.select_one('[data-promotion-window="300"]') is not None
@@ -115,6 +139,23 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#gate-detail-sections") is not None
     assert soup.select_one("#watchset-body") is not None
     assert soup.select_one("#order-candidates") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-card") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-status") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-mode") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-preflight-status") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-blocking-reasons") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-risk-lines") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-arm") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-confirm") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-rollback") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-card") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-status") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-message") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-candidate-count") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-safety-lines") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-start") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-complete") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-generate-report") is not None
     assert soup.select_one('[data-filter-value="LIVE_GUARD_BLOCKED"]') is not None
     assert soup.select_one('[data-filter-value="MISSING_VWAP"]') is not None
     assert soup.select_one('[data-filter-value="ORDER_INTENT_CREATED"]') is not None
@@ -142,6 +183,18 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "gateway_unhealthy_display" in js
     assert "shadow_small_entry_ab" in js
     assert "renderShadowAb" in js
+    assert "renderShadowSmallEntryPromotionPanel" in js
+    assert "renderShadowSmallEntryOpsPanel" in js
+    assert "renderShadowSmallEntryPilotPanel" in js
+    assert "shadowSmallEntryPilotAction" in js
+    assert "shadow_small_entry_ops" in js
+    assert "shadow_small_entry_pilot" in js
+    assert "/api/shadow-small-entry-ops/arm" in js
+    assert "/api/shadow-small-entry-ops/confirm" in js
+    assert "/api/shadow-small-entry-ops/rollback" in js
+    assert "/api/shadow-small-entry-pilot/start" in js
+    assert "/api/shadow-small-entry-pilot/generate-report" in js
+    assert "shadow_small_entry_promotion" in js
     assert "matchesFilters" in js
     assert "renderCockpit" in js
     assert "renderPromotionDecisionPanel" in js
@@ -241,7 +294,12 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "/api/runtime/buy-zero/ready-not-ordered" in js
     assert "/api/runtime/buy-zero/missed-opportunities" in js
     assert "/api/runtime/buy-zero/traces" in js
+    assert "/api/conservative-reason-outcomes/summary" in js
     assert "function renderBuyZeroRcaPanel" in js
+    assert "function renderConservativeReasonPanel" in js
+    assert "function renderConservativeReasonStockRows" in js
+    assert "function renderLiveSimAuditPanel" in js
+    assert "live_sim_audit" in js
     assert "function renderBuyZeroDataQualityCounts" in js
     assert "function openBuyZeroTraceDetail" in js
     assert "BUY_ZERO_RCA_CRITICAL_REASONS" in js

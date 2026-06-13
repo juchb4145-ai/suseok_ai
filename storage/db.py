@@ -9,6 +9,7 @@ from typing import Iterable, Optional, Union
 from uuid import uuid4
 
 from trading.broker.models import BrokerExecutionEvent, BrokerOrderResult
+from trading.live_sim.lifecycle import validate_live_sim_transition
 from trading.models import BuyLeg, LegStatus, WatchItem
 from trading.strategy.models import (
     BlockType,
@@ -973,6 +974,41 @@ class TradingDatabase:
                 early_small_position_size_multiplier REAL,
                 early_small_rejected_reason TEXT NOT NULL DEFAULT '',
                 operator_message_ko TEXT NOT NULL DEFAULT '',
+                promotion_status TEXT NOT NULL DEFAULT '',
+                promotion_reason TEXT NOT NULL DEFAULT '',
+                promotion_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                source_report_id TEXT NOT NULL DEFAULT '',
+                source_report_trade_date TEXT NOT NULL DEFAULT '',
+                reason_group TEXT NOT NULL DEFAULT '',
+                reason_code TEXT NOT NULL DEFAULT '',
+                sample_count INTEGER,
+                missed_opportunity_rate REAL,
+                risk_avoided_rate REAL,
+                good_block_rate REAL,
+                avg_mfe_15m_pct REAL,
+                avg_mae_15m_pct REAL,
+                position_size_multiplier REAL,
+                max_promotions_per_cycle INTEGER,
+                max_promotions_per_day INTEGER,
+                order_enabled INTEGER,
+                mode TEXT NOT NULL DEFAULT '',
+                ops_status TEXT NOT NULL DEFAULT '',
+                previous_ops_status TEXT NOT NULL DEFAULT '',
+                next_ops_status TEXT NOT NULL DEFAULT '',
+                preflight_status TEXT NOT NULL DEFAULT '',
+                blocking_reasons_json TEXT NOT NULL DEFAULT '[]',
+                risk_check_status TEXT NOT NULL DEFAULT '',
+                risk_limit_breached INTEGER,
+                breached_metric TEXT NOT NULL DEFAULT '',
+                breached_value REAL,
+                breached_limit REAL,
+                operator_note TEXT NOT NULL DEFAULT '',
+                changed_by TEXT NOT NULL DEFAULT '',
+                activation_token_id TEXT NOT NULL DEFAULT '',
+                order_enabled_before INTEGER,
+                order_enabled_after INTEGER,
+                mode_before TEXT NOT NULL DEFAULT '',
+                mode_after TEXT NOT NULL DEFAULT '',
                 entry_plan_id INTEGER,
                 entry_plan_submittable INTEGER,
                 entry_plan_diagnostic_only INTEGER,
@@ -986,6 +1022,112 @@ class TradingDatabase:
                 broker_order_id TEXT NOT NULL DEFAULT '',
                 details_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS shadow_small_entry_ops_state (
+                state_key TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'OBSERVE_ONLY',
+                mode TEXT NOT NULL DEFAULT 'observe_only',
+                order_enabled INTEGER NOT NULL DEFAULT 0,
+                activation_token_id TEXT NOT NULL DEFAULT '',
+                activation_expires_at TEXT NOT NULL DEFAULT '',
+                last_status_change_at TEXT NOT NULL DEFAULT '',
+                last_status_change_reason TEXT NOT NULL DEFAULT '',
+                last_changed_by TEXT NOT NULL DEFAULT '',
+                last_operator_note TEXT NOT NULL DEFAULT '',
+                runtime_settings_hash TEXT NOT NULL DEFAULT '',
+                preflight_status TEXT NOT NULL DEFAULT '',
+                preflight_blocking_reasons_json TEXT NOT NULL DEFAULT '[]',
+                risk_check_status TEXT NOT NULL DEFAULT '',
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS shadow_small_entry_ops_tokens (
+                token_id TEXT PRIMARY KEY,
+                token_hash TEXT UNIQUE NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ARMED',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at TEXT NOT NULL DEFAULT '',
+                consumed_at TEXT NOT NULL DEFAULT '',
+                created_by TEXT NOT NULL DEFAULT '',
+                operator_note TEXT NOT NULL DEFAULT '',
+                preflight_json TEXT NOT NULL DEFAULT '{}',
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS shadow_small_entry_ops_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                audit_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL DEFAULT '',
+                previous_status TEXT NOT NULL DEFAULT '',
+                next_status TEXT NOT NULL DEFAULT '',
+                changed_by TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                operator_note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                runtime_settings_before_hash TEXT NOT NULL DEFAULT '',
+                runtime_settings_after_hash TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS shadow_small_entry_pilot_runs (
+                pilot_id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at TEXT NOT NULL DEFAULT '',
+                ended_at TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'PLANNED',
+                mode TEXT NOT NULL DEFAULT '',
+                order_enabled_at_start INTEGER NOT NULL DEFAULT 0,
+                operator TEXT NOT NULL DEFAULT '',
+                operator_note TEXT NOT NULL DEFAULT '',
+                activation_event_id TEXT NOT NULL DEFAULT '',
+                rollback_event_id TEXT NOT NULL DEFAULT '',
+                source_report_trade_date TEXT NOT NULL DEFAULT '',
+                conservative_reason_report_id TEXT NOT NULL DEFAULT '',
+                shadow_promotion_report_id TEXT NOT NULL DEFAULT '',
+                runtime_settings_hash TEXT NOT NULL DEFAULT '',
+                promotion_policy_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                ops_policy_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                risk_limit_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                preflight_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                recommendation TEXT NOT NULL DEFAULT '',
+                recommendation_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                operator_message_ko TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS shadow_small_entry_pilot_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT UNIQUE NOT NULL,
+                pilot_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL DEFAULT '',
+                event_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                reason_group TEXT NOT NULL DEFAULT '',
+                reason_code TEXT NOT NULL DEFAULT '',
+                gate_status TEXT NOT NULL DEFAULT '',
+                price_location_status TEXT NOT NULL DEFAULT '',
+                stock_role TEXT NOT NULL DEFAULT '',
+                order_intent_id TEXT NOT NULL DEFAULT '',
+                live_sim_order_intent_id TEXT NOT NULL DEFAULT '',
+                command_id TEXT NOT NULL DEFAULT '',
+                broker_order_id TEXT NOT NULL DEFAULT '',
+                position_id TEXT NOT NULL DEFAULT '',
+                quantity INTEGER NOT NULL DEFAULT 0,
+                price REAL,
+                notional_krw REAL,
+                realized_pnl_krw REAL,
+                unrealized_pnl_krw REAL,
+                return_pct REAL,
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                severity TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                operator_message_ko TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS shadow_strategy_evaluations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1523,6 +1665,20 @@ class TradingDatabase:
                 ON buy_zero_rca_traces(live_sim_intent_id);
             CREATE INDEX IF NOT EXISTS idx_buy_zero_rca_traces_command
                 ON buy_zero_rca_traces(command_id);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_ops_audit_trade_date
+                ON shadow_small_entry_ops_audit_log(trade_date, created_at);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_ops_audit_status
+                ON shadow_small_entry_ops_audit_log(next_status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_ops_tokens_status
+                ON shadow_small_entry_ops_tokens(status, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_pilot_runs_trade_date
+                ON shadow_small_entry_pilot_runs(trade_date, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_pilot_events_pilot
+                ON shadow_small_entry_pilot_events(pilot_id, event_at, id);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_pilot_events_code
+                ON shadow_small_entry_pilot_events(trade_date, code, event_at);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_pilot_events_type
+                ON shadow_small_entry_pilot_events(trade_date, event_type, severity);
             CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_trade_date
                 ON shadow_strategy_evaluations(trade_date, evaluated_at, id);
             CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_policy
@@ -1734,9 +1890,14 @@ class TradingDatabase:
 
     def _sync_live_sim_order_result(self, result: BrokerOrderResult) -> None:
         lookup = result.idempotency_key or result.request.idempotency_key
+        link_method = ""
         order = self.find_live_sim_order_by_idempotency(lookup) if lookup else None
+        if order is not None:
+            link_method = "idempotency_key"
         if order is None and result.command_id:
             order = self.find_live_sim_order_by_command_id(result.command_id)
+            if order is not None:
+                link_method = "command_id"
         if order is None:
             return
         now = str(result.raw.get("timestamp") or result.raw.get("received_at") or "")
@@ -1745,22 +1906,38 @@ class TradingDatabase:
 
             now = utc_timestamp()
         status_from = str(order.get("order_status") or "")
+        order_no = str(result.order_no or "")
+        broker_order_id_source = "order_result.order_no" if order_no else ("existing_live_sim_order" if order.get("broker_order_id") else "")
+        order_result_details = {
+            "order_result": result.to_dict(),
+            "order_result_received_at": now,
+            "order_result_ok": bool(result.ok),
+            "order_result_code": str(result.code),
+            "order_result_message": result.message,
+            "order_result_link_status": "LINKED",
+            "order_result_link_reason": link_method,
+            "broker_order_id_source": broker_order_id_source,
+        }
         if result.ok:
-            status_to = "ACCEPTED"
-            reason_codes = _merge_reason_codes(order, ["ORDER_RECONCILED_FROM_KIWOOM"])
+            status_to = "ACCEPTED" if order_no or order.get("broker_order_id") else "UNKNOWN_SUBMIT"
+            reason_codes = _merge_reason_codes(
+                order,
+                ["ORDER_RECONCILED_FROM_KIWOOM"]
+                if status_to == "ACCEPTED"
+                else ["ORDER_UNKNOWN_SUBMIT_REQUIRES_RECONCILE", "LIVE_SIM_ORDER_NO_MISSING"],
+            )
             updates = {
                 "command_id": result.command_id or order.get("command_id"),
-                "broker_order_id": result.order_no or order.get("broker_order_id"),
+                "broker_order_id": order_no or order.get("broker_order_id"),
                 "broker_response_code": str(result.code),
                 "broker_response_message": result.message,
                 "order_status": status_to,
-                "accepted_at": now,
+                "accepted_at": now if status_to == "ACCEPTED" else str(order.get("accepted_at") or ""),
                 "updated_at": now,
                 "reason_codes": reason_codes,
                 "details": {
                     **dict(order.get("details") or {}),
-                    "order_result": result.to_dict(),
-                    "order_result_ok": True,
+                    **order_result_details,
                 },
             }
         else:
@@ -1776,8 +1953,7 @@ class TradingDatabase:
                 "reason_codes": reason_codes,
                 "details": {
                     **dict(order.get("details") or {}),
-                    "order_result": result.to_dict(),
-                    "order_result_ok": False,
+                    **order_result_details,
                 },
             }
         saved = self.update_live_sim_order(str(order.get("order_intent_id") or ""), updates)
@@ -1822,6 +1998,35 @@ class TradingDatabase:
         fill_qty = max(0, cumulative_fill_qty - previous_cumulative_fill_qty)
         remaining_qty = max(0, int(event.remaining_quantity or 0))
         fill_price = max(0, int(event.price or 0))
+        audit_warnings: list[dict[str, object]] = []
+        if int(event.remaining_quantity or 0) < 0:
+            audit_warnings.append(
+                {
+                    "issue_type": "LIVE_SIM_REMAINING_QTY_NEGATIVE",
+                    "severity": "BROKEN",
+                    "operator_message_ko": "체결 이벤트의 미체결 수량이 음수입니다.",
+                }
+            )
+        if cumulative_fill_qty < previous_cumulative_fill_qty:
+            audit_warnings.append(
+                {
+                    "issue_type": "LIVE_SIM_CUMULATIVE_FILL_DECREASE",
+                    "severity": "RECONCILE_REQUIRED",
+                    "operator_message_ko": "누적 체결 수량이 이전 이벤트보다 감소했습니다.",
+                }
+            )
+        requested_qty = int(order.get("requested_qty") or event.quantity or 0)
+        if requested_qty > 0 and cumulative_fill_qty + remaining_qty != requested_qty:
+            audit_warnings.append(
+                {
+                    "issue_type": "LIVE_SIM_FILL_REMAINING_QTY_MISMATCH",
+                    "severity": "WARN",
+                    "operator_message_ko": "누적체결과 잔량 합계가 요청 수량과 다릅니다.",
+                    "requested_qty": requested_qty,
+                    "cumulative_fill_qty": cumulative_fill_qty,
+                    "remaining_qty": remaining_qty,
+                }
+            )
         raw_event = {
             **event.to_dict(),
             "reported_filled_quantity": int(event.filled_quantity or 0),
@@ -1830,6 +2035,7 @@ class TradingDatabase:
             "previous_cumulative_fill_qty": previous_cumulative_fill_qty,
             "fill_link_method": fill_link_method,
             "manual_intervention": False,
+            "audit_warnings": audit_warnings,
         }
         fill_id = event.execution_id or f"{event.order_no}:{event.filled_quantity}:{event.remaining_quantity}:{event.price}:{now}"
         fill_payload = {
@@ -1868,20 +2074,55 @@ class TradingDatabase:
                 reason = "LIVE_SIM_PARTIAL_FILL_TRACKED" if status_to == "PARTIAL_FILLED" else "ORDER_RECONCILED_FROM_KIWOOM"
         details = dict(order.get("details") or {})
         position = dict(details.get("position") or {})
+        position_pre_fill: dict | None = None
+        fill_side = str(fill.get("side") or order.get("side") or "").lower()
+        position_id_for_fill = (
+            f"LIVE_SIM:{order.get('account_id_masked') or fill.get('account_id_masked') or ''}:"
+            f"{order.get('code') or fill.get('code') or ''}:"
+            f"{order.get('candidate_instance_id') or 'no_ci'}"
+        )
         if fill_qty > 0:
+            position_pre_fill = self.get_live_sim_position(position_id_for_fill)
+            if fill_side == "sell":
+                current_position = position_pre_fill
+                open_qty = int((current_position or {}).get("current_qty") or 0)
+                if current_position is None:
+                    audit_warnings.append(
+                        {
+                            "issue_type": "LIVE_SIM_SELL_FILL_POSITION_MISSING",
+                            "severity": "RECONCILE_REQUIRED",
+                            "operator_message_ko": "매도 체결이 들어왔지만 연결된 열린 포지션이 없습니다.",
+                            "position_id": position_id_for_fill,
+                        }
+                    )
+                elif fill_qty > open_qty:
+                    audit_warnings.append(
+                        {
+                            "issue_type": "LIVE_SIM_SELL_FILL_EXCEEDS_POSITION",
+                            "severity": "RECONCILE_REQUIRED",
+                            "operator_message_ko": "매도 체결 수량이 DB 포지션 수량을 초과했습니다.",
+                            "position_id": position_id_for_fill,
+                            "fill_qty": fill_qty,
+                            "open_position_qty": open_qty,
+                        }
+                    )
             position = self.upsert_live_sim_position_from_fill(order, fill, exit_guard=dict(details.get("exit_guard") or {}))
+        if any(str(item.get("severity") or "") in {"BROKEN", "RECONCILE_REQUIRED"} for item in audit_warnings):
+            status_to = "RECONCILE_REQUIRED"
         updates = {
             "broker_order_id": broker_order_id,
             "order_status": status_to,
             "first_fill_at": order.get("first_fill_at") or (now if fill_qty > 0 else ""),
             "last_fill_at": now,
             "updated_at": now,
-            "reason_codes": _merge_reason_codes(order, [reason]),
+            "reason_codes": _merge_reason_codes(order, [reason, *[str(item.get("issue_type") or "") for item in audit_warnings]]),
             "details": {
                 **details,
                 "fill_link_method": fill_link_method,
                 "last_fill": fill,
                 "position": position,
+                "broker_order_id_source": details.get("broker_order_id_source") or ("execution.order_no" if event.order_no else ""),
+                "execution_audit_warnings": audit_warnings,
             },
         }
         saved = self.update_live_sim_order(str(order.get("order_intent_id") or ""), updates)
@@ -1891,9 +2132,30 @@ class TradingDatabase:
             status_from=status_from,
             status_to=str((saved or updates).get("order_status") or status_to),
             message=reason,
-            payload={"execution": event.to_dict(), "fill": fill, "position": position},
+            payload={"execution": event.to_dict(), "fill": fill, "position": position, "audit_warnings": audit_warnings},
             created_at=now,
         )
+        if fill_qty > 0 and position:
+            if fill_side == "buy" and (position_pre_fill is None or int(position_pre_fill.get("current_qty") or 0) <= 0):
+                self.append_live_sim_order_event(
+                    str(order.get("order_intent_id") or ""),
+                    "position_opened",
+                    status_from="",
+                    status_to=str(position.get("status") or "OPEN"),
+                    message="LIVE_SIM_POSITION_OPENED",
+                    payload={"fill": fill, "position": position},
+                    created_at=now,
+                )
+            elif fill_side == "sell" and str(position.get("status") or "") == "CLOSED":
+                self.append_live_sim_order_event(
+                    str(order.get("order_intent_id") or ""),
+                    "position_closed",
+                    status_from=str((position_pre_fill or {}).get("status") or ""),
+                    status_to="CLOSED",
+                    message="LIVE_SIM_POSITION_CLOSED",
+                    payload={"fill": fill, "position": position},
+                    created_at=now,
+                )
 
     def _sync_manual_live_sim_execution(self, event: BrokerExecutionEvent) -> None:
         now = str(event.timestamp or "")
@@ -2463,6 +2725,17 @@ class TradingDatabase:
                 missing_optional_fields_json, early_small_candidate,
                 early_small_order_enabled, early_small_position_size_multiplier,
                 early_small_rejected_reason, operator_message_ko,
+                promotion_status, promotion_reason, promotion_reason_codes_json,
+                source_report_id, source_report_trade_date, reason_group, reason_code,
+                sample_count, missed_opportunity_rate, risk_avoided_rate,
+                good_block_rate, avg_mfe_15m_pct, avg_mae_15m_pct,
+                position_size_multiplier, max_promotions_per_cycle,
+                max_promotions_per_day, order_enabled, mode,
+                ops_status, previous_ops_status, next_ops_status,
+                preflight_status, blocking_reasons_json, risk_check_status,
+                risk_limit_breached, breached_metric, breached_value, breached_limit,
+                operator_note, changed_by, activation_token_id,
+                order_enabled_before, order_enabled_after, mode_before, mode_after,
                 entry_plan_id, entry_plan_submittable,
                 entry_plan_diagnostic_only, dry_run_intent_id, dry_run_status,
                 dry_run_reason, live_sim_intent_id, live_sim_status,
@@ -2483,6 +2756,17 @@ class TradingDatabase:
                 :missing_optional_fields_json, :early_small_candidate,
                 :early_small_order_enabled, :early_small_position_size_multiplier,
                 :early_small_rejected_reason, :operator_message_ko,
+                :promotion_status, :promotion_reason, :promotion_reason_codes_json,
+                :source_report_id, :source_report_trade_date, :reason_group, :reason_code,
+                :sample_count, :missed_opportunity_rate, :risk_avoided_rate,
+                :good_block_rate, :avg_mfe_15m_pct, :avg_mae_15m_pct,
+                :position_size_multiplier, :max_promotions_per_cycle,
+                :max_promotions_per_day, :order_enabled, :mode,
+                :ops_status, :previous_ops_status, :next_ops_status,
+                :preflight_status, :blocking_reasons_json, :risk_check_status,
+                :risk_limit_breached, :breached_metric, :breached_value, :breached_limit,
+                :operator_note, :changed_by, :activation_token_id,
+                :order_enabled_before, :order_enabled_after, :mode_before, :mode_after,
                 :entry_plan_id, :entry_plan_submittable,
                 :entry_plan_diagnostic_only, :dry_run_intent_id, :dry_run_status,
                 :dry_run_reason, :live_sim_intent_id, :live_sim_status,
@@ -3786,7 +4070,7 @@ class TradingDatabase:
               AND lower(side) = lower(?)
               AND submitted_qty = ?
               AND submitted_price = ?
-              AND order_status IN ('SUBMITTED', 'ACCEPTED', 'PARTIAL_FILLED')
+              AND order_status IN ('SUBMITTED', 'UNKNOWN_SUBMIT', 'ACCEPTED', 'PARTIAL_FILLED')
             ORDER BY
               CASE
                 WHEN accepted_at != '' THEN accepted_at
@@ -3857,6 +4141,10 @@ class TradingDatabase:
             from trading.broker.models import utc_timestamp
 
             created_at = utc_timestamp()
+        payload_body = dict(payload or {})
+        transition = validate_live_sim_transition(status_from, status_to)
+        if not transition.get("ok"):
+            payload_body["transition_warning"] = transition
         self.conn.execute(
             """
             INSERT INTO live_sim_order_events(
@@ -3869,7 +4157,7 @@ class TradingDatabase:
                 status_from,
                 status_to,
                 message,
-                json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str),
+                json.dumps(payload_body, ensure_ascii=False, sort_keys=True, default=str),
                 created_at,
             ),
         )
@@ -3879,12 +4167,53 @@ class TradingDatabase:
             status_from=status_from,
             status_to=status_to,
             message=message,
-            payload=payload or {},
+            payload=payload_body,
             created_at=created_at,
         )
         if trace:
             self._save_buy_zero_trace_events_no_commit([trace])
         self.conn.commit()
+
+    def list_live_sim_order_events(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        order_intent_id: Optional[str] = None,
+        event_type: Optional[str] = None,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("(o.trade_date = ? OR substr(e.created_at, 1, 10) = ?)")
+            params.extend([trade_date, trade_date])
+        if order_intent_id:
+            clauses.append("e.order_intent_id = ?")
+            params.append(order_intent_id)
+        if event_type:
+            clauses.append("e.event_type = ?")
+            params.append(event_type)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                e.*,
+                o.trade_date AS order_trade_date,
+                o.code AS order_code,
+                o.side AS order_side,
+                o.command_id AS order_command_id,
+                o.broker_order_id AS order_broker_order_id,
+                o.candidate_instance_id AS order_candidate_instance_id
+            FROM live_sim_order_events e
+            LEFT JOIN live_sim_orders o ON o.order_intent_id = e.order_intent_id
+            {where}
+            ORDER BY e.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 500)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_live_sim_order_event(row) for row in rows]
 
     def save_live_sim_cancel_order(self, record: dict) -> dict:
         payload = _live_sim_cancel_params(record)
@@ -3978,6 +4307,7 @@ class TradingDatabase:
     def list_live_sim_cancel_orders(
         self,
         *,
+        trade_date: Optional[str] = None,
         status: Optional[str] = None,
         code: Optional[str] = None,
         limit: int = 100,
@@ -3985,6 +4315,9 @@ class TradingDatabase:
     ) -> list[dict]:
         clauses: list[str] = []
         params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(trade_date)
         if status:
             clauses.append("status = ?")
             params.append(status)
@@ -4028,6 +4361,49 @@ class TradingDatabase:
             (params["broker_order_id"], params["fill_id"]),
         ).fetchone()
         return inserted, (_row_to_live_sim_fill(row) if row else dict(payload or {}))
+
+    def list_live_sim_fill_events(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        order_intent_id: Optional[str] = None,
+        broker_order_id: Optional[str] = None,
+        code: Optional[str] = None,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("(o.trade_date = ? OR substr(f.received_at, 1, 10) = ? OR substr(f.event_time, 1, 10) = ?)")
+            params.extend([trade_date, trade_date, trade_date])
+        if order_intent_id is not None:
+            clauses.append("f.order_intent_id = ?")
+            params.append(order_intent_id)
+        if broker_order_id is not None:
+            clauses.append("f.broker_order_id = ?")
+            params.append(broker_order_id)
+        if code:
+            clauses.append("f.code = ?")
+            params.append(code)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                f.*,
+                o.trade_date AS order_trade_date,
+                o.candidate_instance_id AS order_candidate_instance_id,
+                o.requested_qty AS order_requested_qty,
+                o.order_status AS order_status
+            FROM live_sim_fill_events f
+            LEFT JOIN live_sim_orders o ON o.order_intent_id = f.order_intent_id
+            {where}
+            ORDER BY f.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 500)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_live_sim_fill(row) for row in rows]
 
     def upsert_live_sim_position_from_fill(self, order: dict, fill: dict, *, exit_guard: Optional[dict] = None) -> dict:
         side = str(fill.get("side") or order.get("side") or "").lower()
@@ -4265,6 +4641,17 @@ class TradingDatabase:
         ).fetchone()
         return _row_to_live_sim_health(row) if row else None
 
+    def list_live_sim_runtime_health(self, *, limit: int = 100) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM live_sim_runtime_health
+            ORDER BY updated_at DESC, component ASC
+            LIMIT ?
+            """,
+            (max(1, int(limit or 100)),),
+        ).fetchall()
+        return [_row_to_live_sim_health(row) for row in rows]
+
     def save_live_sim_reconcile_event(self, payload: dict) -> dict:
         params = _live_sim_reconcile_params(payload)
         with self.conn:
@@ -4291,6 +4678,34 @@ class TradingDatabase:
             (params["event_id"],),
         ).fetchone()
         return _row_to_live_sim_reconcile(row) if row else dict(payload or {})
+
+    def list_live_sim_reconcile_events(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("(substr(started_at, 1, 10) = ? OR substr(completed_at, 1, 10) = ?)")
+            params.extend([trade_date, trade_date])
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM live_sim_reconcile_events
+            {where}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_live_sim_reconcile(row) for row in rows]
 
     def live_sim_summary(self, *, trade_date: Optional[str] = None) -> dict:
         params: list[object] = []
@@ -6750,6 +7165,313 @@ class TradingDatabase:
             ).fetchone()
             return dict(row)
 
+    def load_shadow_small_entry_ops_state(self, state_key: str = "default") -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM shadow_small_entry_ops_state WHERE state_key = ?",
+            (state_key,),
+        ).fetchone()
+        return _row_to_shadow_small_entry_ops_state(row) if row else None
+
+    def save_shadow_small_entry_ops_state(self, payload: dict) -> dict:
+        state_key = str(payload.get("state_key") or "default")
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO shadow_small_entry_ops_state(
+                    state_key, status, mode, order_enabled, activation_token_id,
+                    activation_expires_at, last_status_change_at, last_status_change_reason,
+                    last_changed_by, last_operator_note, runtime_settings_hash,
+                    preflight_status, preflight_blocking_reasons_json, risk_check_status,
+                    warnings_json, details_json, updated_at
+                ) VALUES (
+                    :state_key, :status, :mode, :order_enabled, :activation_token_id,
+                    :activation_expires_at, :last_status_change_at, :last_status_change_reason,
+                    :last_changed_by, :last_operator_note, :runtime_settings_hash,
+                    :preflight_status, :preflight_blocking_reasons_json, :risk_check_status,
+                    :warnings_json, :details_json, :updated_at
+                )
+                ON CONFLICT(state_key) DO UPDATE SET
+                    status=excluded.status,
+                    mode=excluded.mode,
+                    order_enabled=excluded.order_enabled,
+                    activation_token_id=excluded.activation_token_id,
+                    activation_expires_at=excluded.activation_expires_at,
+                    last_status_change_at=excluded.last_status_change_at,
+                    last_status_change_reason=excluded.last_status_change_reason,
+                    last_changed_by=excluded.last_changed_by,
+                    last_operator_note=excluded.last_operator_note,
+                    runtime_settings_hash=excluded.runtime_settings_hash,
+                    preflight_status=excluded.preflight_status,
+                    preflight_blocking_reasons_json=excluded.preflight_blocking_reasons_json,
+                    risk_check_status=excluded.risk_check_status,
+                    warnings_json=excluded.warnings_json,
+                    details_json=excluded.details_json,
+                    updated_at=excluded.updated_at
+                """,
+                _shadow_small_entry_ops_state_params({**payload, "state_key": state_key}),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM shadow_small_entry_ops_state WHERE state_key = ?",
+                (state_key,),
+            ).fetchone()
+            return _row_to_shadow_small_entry_ops_state(row)
+
+    def save_shadow_small_entry_ops_token(self, payload: dict) -> dict:
+        params = _shadow_small_entry_ops_token_params(payload)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO shadow_small_entry_ops_tokens(
+                    token_id, token_hash, status, created_at, expires_at,
+                    consumed_at, created_by, operator_note, preflight_json, details_json
+                ) VALUES (
+                    :token_id, :token_hash, :status, :created_at, :expires_at,
+                    :consumed_at, :created_by, :operator_note, :preflight_json, :details_json
+                )
+                ON CONFLICT(token_id) DO UPDATE SET
+                    token_hash=excluded.token_hash,
+                    status=excluded.status,
+                    expires_at=excluded.expires_at,
+                    consumed_at=excluded.consumed_at,
+                    operator_note=excluded.operator_note,
+                    preflight_json=excluded.preflight_json,
+                    details_json=excluded.details_json
+                """,
+                params,
+            )
+            row = self.conn.execute(
+                "SELECT * FROM shadow_small_entry_ops_tokens WHERE token_id = ?",
+                (params["token_id"],),
+            ).fetchone()
+            return _row_to_shadow_small_entry_ops_token(row)
+
+    def get_shadow_small_entry_ops_token_by_hash(self, token_hash: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM shadow_small_entry_ops_tokens WHERE token_hash = ?",
+            (str(token_hash or ""),),
+        ).fetchone()
+        return _row_to_shadow_small_entry_ops_token(row) if row else None
+
+    def update_shadow_small_entry_ops_token(self, token_id: str, updates: dict) -> Optional[dict]:
+        allowed = {
+            "status": updates.get("status"),
+            "consumed_at": updates.get("consumed_at"),
+            "details_json": _json_payload(updates.get("details", updates.get("details_json", {}))),
+        }
+        assignments = [f"{key} = ?" for key, value in allowed.items() if value is not None]
+        values = [value for value in allowed.values() if value is not None]
+        if not assignments:
+            return None
+        values.append(str(token_id or ""))
+        with self.conn:
+            self.conn.execute(
+                f"UPDATE shadow_small_entry_ops_tokens SET {', '.join(assignments)} WHERE token_id = ?",
+                tuple(values),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM shadow_small_entry_ops_tokens WHERE token_id = ?",
+                (str(token_id or ""),),
+            ).fetchone()
+            return _row_to_shadow_small_entry_ops_token(row) if row else None
+
+    def append_shadow_small_entry_ops_audit_log(self, payload: dict) -> dict:
+        params = _shadow_small_entry_ops_audit_params(payload)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO shadow_small_entry_ops_audit_log(
+                    audit_id, trade_date, event_type, previous_status, next_status,
+                    changed_by, reason, reason_codes_json, operator_note, created_at,
+                    runtime_settings_before_hash, runtime_settings_after_hash, details_json
+                ) VALUES (
+                    :audit_id, :trade_date, :event_type, :previous_status, :next_status,
+                    :changed_by, :reason, :reason_codes_json, :operator_note, :created_at,
+                    :runtime_settings_before_hash, :runtime_settings_after_hash, :details_json
+                )
+                """,
+                params,
+            )
+            row = self.conn.execute(
+                "SELECT * FROM shadow_small_entry_ops_audit_log WHERE audit_id = ?",
+                (params["audit_id"],),
+            ).fetchone()
+            return _row_to_shadow_small_entry_ops_audit(row)
+
+    def list_shadow_small_entry_ops_audit_log(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM shadow_small_entry_ops_audit_log
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_shadow_small_entry_ops_audit(row) for row in rows]
+
+    def save_shadow_small_entry_pilot_run(self, payload: dict) -> dict:
+        params = _shadow_small_entry_pilot_run_params(payload)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO shadow_small_entry_pilot_runs(
+                    pilot_id, trade_date, created_at, started_at, ended_at,
+                    status, mode, order_enabled_at_start, operator, operator_note,
+                    activation_event_id, rollback_event_id, source_report_trade_date,
+                    conservative_reason_report_id, shadow_promotion_report_id,
+                    runtime_settings_hash, promotion_policy_snapshot_json,
+                    ops_policy_snapshot_json, risk_limit_snapshot_json,
+                    preflight_snapshot_json, summary_json, recommendation,
+                    recommendation_reason_codes_json, operator_message_ko, updated_at
+                ) VALUES (
+                    :pilot_id, :trade_date, :created_at, :started_at, :ended_at,
+                    :status, :mode, :order_enabled_at_start, :operator, :operator_note,
+                    :activation_event_id, :rollback_event_id, :source_report_trade_date,
+                    :conservative_reason_report_id, :shadow_promotion_report_id,
+                    :runtime_settings_hash, :promotion_policy_snapshot_json,
+                    :ops_policy_snapshot_json, :risk_limit_snapshot_json,
+                    :preflight_snapshot_json, :summary_json, :recommendation,
+                    :recommendation_reason_codes_json, :operator_message_ko, :updated_at
+                )
+                ON CONFLICT(pilot_id) DO UPDATE SET
+                    trade_date=excluded.trade_date,
+                    started_at=excluded.started_at,
+                    ended_at=excluded.ended_at,
+                    status=excluded.status,
+                    mode=excluded.mode,
+                    order_enabled_at_start=excluded.order_enabled_at_start,
+                    operator=excluded.operator,
+                    operator_note=excluded.operator_note,
+                    activation_event_id=excluded.activation_event_id,
+                    rollback_event_id=excluded.rollback_event_id,
+                    source_report_trade_date=excluded.source_report_trade_date,
+                    conservative_reason_report_id=excluded.conservative_reason_report_id,
+                    shadow_promotion_report_id=excluded.shadow_promotion_report_id,
+                    runtime_settings_hash=excluded.runtime_settings_hash,
+                    promotion_policy_snapshot_json=excluded.promotion_policy_snapshot_json,
+                    ops_policy_snapshot_json=excluded.ops_policy_snapshot_json,
+                    risk_limit_snapshot_json=excluded.risk_limit_snapshot_json,
+                    preflight_snapshot_json=excluded.preflight_snapshot_json,
+                    summary_json=excluded.summary_json,
+                    recommendation=excluded.recommendation,
+                    recommendation_reason_codes_json=excluded.recommendation_reason_codes_json,
+                    operator_message_ko=excluded.operator_message_ko,
+                    updated_at=excluded.updated_at
+                """,
+                params,
+            )
+            row = self.conn.execute(
+                "SELECT * FROM shadow_small_entry_pilot_runs WHERE pilot_id = ?",
+                (params["pilot_id"],),
+            ).fetchone()
+            return _row_to_shadow_small_entry_pilot_run(row)
+
+    def get_shadow_small_entry_pilot_run(self, pilot_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM shadow_small_entry_pilot_runs WHERE pilot_id = ?",
+            (str(pilot_id or ""),),
+        ).fetchone()
+        return _row_to_shadow_small_entry_pilot_run(row) if row else None
+
+    def latest_shadow_small_entry_pilot_run(self, *, trade_date: Optional[str] = None) -> Optional[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.conn.execute(
+            f"""
+            SELECT * FROM shadow_small_entry_pilot_runs
+            {where}
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            tuple(params),
+        ).fetchone()
+        return _row_to_shadow_small_entry_pilot_run(row) if row else None
+
+    def save_shadow_small_entry_pilot_events(self, events: Iterable[dict]) -> int:
+        rows = [_shadow_small_entry_pilot_event_params(item) for item in events]
+        if not rows:
+            return 0
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT OR IGNORE INTO shadow_small_entry_pilot_events(
+                    event_id, pilot_id, trade_date, event_type, event_at,
+                    code, name, candidate_instance_id, theme_name, reason_group,
+                    reason_code, gate_status, price_location_status, stock_role,
+                    order_intent_id, live_sim_order_intent_id, command_id,
+                    broker_order_id, position_id, quantity, price, notional_krw,
+                    realized_pnl_krw, unrealized_pnl_krw, return_pct,
+                    reason_codes_json, severity, details_json, operator_message_ko
+                ) VALUES (
+                    :event_id, :pilot_id, :trade_date, :event_type, :event_at,
+                    :code, :name, :candidate_instance_id, :theme_name, :reason_group,
+                    :reason_code, :gate_status, :price_location_status, :stock_role,
+                    :order_intent_id, :live_sim_order_intent_id, :command_id,
+                    :broker_order_id, :position_id, :quantity, :price, :notional_krw,
+                    :realized_pnl_krw, :unrealized_pnl_krw, :return_pct,
+                    :reason_codes_json, :severity, :details_json, :operator_message_ko
+                )
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def list_shadow_small_entry_pilot_events(
+        self,
+        *,
+        pilot_id: str = "",
+        trade_date: Optional[str] = None,
+        code: str = "",
+        recommendation: str = "",
+        status: str = "",
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if pilot_id:
+            clauses.append("pilot_id = ?")
+            params.append(str(pilot_id))
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if code:
+            clauses.append("code = ?")
+            params.append(str(code))
+        if recommendation:
+            clauses.append("json_extract(details_json, '$.recommendation') = ?")
+            params.append(str(recommendation))
+        if status:
+            clauses.append("(event_type = ? OR gate_status = ? OR severity = ?)")
+            params.extend([str(status), str(status), str(status)])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM shadow_small_entry_pilot_events
+            {where}
+            ORDER BY event_at ASC, id ASC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 1000)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_shadow_small_entry_pilot_event(row) for row in rows]
+
     def close(self) -> None:
         self.conn.close()
 
@@ -7543,6 +8265,41 @@ class TradingDatabase:
             "early_small_position_size_multiplier": "REAL",
             "early_small_rejected_reason": "TEXT NOT NULL DEFAULT ''",
             "operator_message_ko": "TEXT NOT NULL DEFAULT ''",
+            "promotion_status": "TEXT NOT NULL DEFAULT ''",
+            "promotion_reason": "TEXT NOT NULL DEFAULT ''",
+            "promotion_reason_codes_json": "TEXT NOT NULL DEFAULT '[]'",
+            "source_report_id": "TEXT NOT NULL DEFAULT ''",
+            "source_report_trade_date": "TEXT NOT NULL DEFAULT ''",
+            "reason_group": "TEXT NOT NULL DEFAULT ''",
+            "reason_code": "TEXT NOT NULL DEFAULT ''",
+            "sample_count": "INTEGER",
+            "missed_opportunity_rate": "REAL",
+            "risk_avoided_rate": "REAL",
+            "good_block_rate": "REAL",
+            "avg_mfe_15m_pct": "REAL",
+            "avg_mae_15m_pct": "REAL",
+            "position_size_multiplier": "REAL",
+            "max_promotions_per_cycle": "INTEGER",
+            "max_promotions_per_day": "INTEGER",
+            "order_enabled": "INTEGER",
+            "mode": "TEXT NOT NULL DEFAULT ''",
+            "ops_status": "TEXT NOT NULL DEFAULT ''",
+            "previous_ops_status": "TEXT NOT NULL DEFAULT ''",
+            "next_ops_status": "TEXT NOT NULL DEFAULT ''",
+            "preflight_status": "TEXT NOT NULL DEFAULT ''",
+            "blocking_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
+            "risk_check_status": "TEXT NOT NULL DEFAULT ''",
+            "risk_limit_breached": "INTEGER",
+            "breached_metric": "TEXT NOT NULL DEFAULT ''",
+            "breached_value": "REAL",
+            "breached_limit": "REAL",
+            "operator_note": "TEXT NOT NULL DEFAULT ''",
+            "changed_by": "TEXT NOT NULL DEFAULT ''",
+            "activation_token_id": "TEXT NOT NULL DEFAULT ''",
+            "order_enabled_before": "INTEGER",
+            "order_enabled_after": "INTEGER",
+            "mode_before": "TEXT NOT NULL DEFAULT ''",
+            "mode_after": "TEXT NOT NULL DEFAULT ''",
         }
         for name, definition in columns.items():
             self._ensure_column("buy_zero_rca_traces", name, definition)
@@ -7824,6 +8581,41 @@ def _buy_zero_trace_params(payload: dict) -> dict:
         "early_small_position_size_multiplier": _nullable_float(payload.get("early_small_position_size_multiplier")),
         "early_small_rejected_reason": str(payload.get("early_small_rejected_reason") or ""),
         "operator_message_ko": str(payload.get("operator_message_ko") or payload.get("data_quality_operator_message_ko") or ""),
+        "promotion_status": str(payload.get("promotion_status") or ""),
+        "promotion_reason": str(payload.get("promotion_reason") or payload.get("shadow_small_entry_promotion_reason") or ""),
+        "promotion_reason_codes_json": _json_list(payload.get("promotion_reason_codes_json", payload.get("promotion_reason_codes", []))),
+        "source_report_id": str(payload.get("source_report_id") or ""),
+        "source_report_trade_date": str(payload.get("source_report_trade_date") or ""),
+        "reason_group": str(payload.get("reason_group") or ""),
+        "reason_code": str(payload.get("reason_code") or ""),
+        "sample_count": _nullable_int(payload.get("sample_count")),
+        "missed_opportunity_rate": _nullable_float(payload.get("missed_opportunity_rate")),
+        "risk_avoided_rate": _nullable_float(payload.get("risk_avoided_rate")),
+        "good_block_rate": _nullable_float(payload.get("good_block_rate")),
+        "avg_mfe_15m_pct": _nullable_float(payload.get("avg_mfe_15m_pct")),
+        "avg_mae_15m_pct": _nullable_float(payload.get("avg_mae_15m_pct")),
+        "position_size_multiplier": _nullable_float(payload.get("position_size_multiplier")),
+        "max_promotions_per_cycle": _nullable_int(payload.get("max_promotions_per_cycle")),
+        "max_promotions_per_day": _nullable_int(payload.get("max_promotions_per_day")),
+        "order_enabled": _nullable_bool_int(payload.get("order_enabled")),
+        "mode": str(payload.get("mode") or ""),
+        "ops_status": str(payload.get("ops_status") or ""),
+        "previous_ops_status": str(payload.get("previous_ops_status") or ""),
+        "next_ops_status": str(payload.get("next_ops_status") or ""),
+        "preflight_status": str(payload.get("preflight_status") or ""),
+        "blocking_reasons_json": _json_list(payload.get("blocking_reasons_json", payload.get("blocking_reasons", []))),
+        "risk_check_status": str(payload.get("risk_check_status") or ""),
+        "risk_limit_breached": _nullable_bool_int(payload.get("risk_limit_breached")),
+        "breached_metric": str(payload.get("breached_metric") or ""),
+        "breached_value": _nullable_float(payload.get("breached_value")),
+        "breached_limit": _nullable_float(payload.get("breached_limit")),
+        "operator_note": str(payload.get("operator_note") or ""),
+        "changed_by": str(payload.get("changed_by") or ""),
+        "activation_token_id": str(payload.get("activation_token_id") or ""),
+        "order_enabled_before": _nullable_bool_int(payload.get("order_enabled_before")),
+        "order_enabled_after": _nullable_bool_int(payload.get("order_enabled_after")),
+        "mode_before": str(payload.get("mode_before") or ""),
+        "mode_after": str(payload.get("mode_after") or ""),
         "entry_plan_id": _nullable_int(payload.get("entry_plan_id")),
         "entry_plan_submittable": _nullable_bool_int(payload.get("entry_plan_submittable")),
         "entry_plan_diagnostic_only": _nullable_bool_int(payload.get("entry_plan_diagnostic_only")),
@@ -7847,6 +8639,8 @@ def _row_to_buy_zero_trace(row: sqlite3.Row) -> dict:
     data["missing_core_fields"] = _safe_json_loads(data.get("missing_core_fields_json"), [])
     data["missing_entry_fields"] = _safe_json_loads(data.get("missing_entry_fields_json"), [])
     data["missing_optional_fields"] = _safe_json_loads(data.get("missing_optional_fields_json"), [])
+    data["promotion_reason_codes"] = _safe_json_loads(data.get("promotion_reason_codes_json"), [])
+    data["blocking_reasons"] = _safe_json_loads(data.get("blocking_reasons_json"), [])
     for key in (
         "passed",
         "latest_tick_ready",
@@ -7858,10 +8652,190 @@ def _row_to_buy_zero_trace(row: sqlite3.Row) -> dict:
         "entry_plan_diagnostic_only",
         "early_small_candidate",
         "early_small_order_enabled",
+        "order_enabled",
+        "risk_limit_breached",
+        "order_enabled_before",
+        "order_enabled_after",
     ):
         if data.get(key) is not None:
             data[key] = bool(data.get(key))
     data["pass/fail"] = data.get("pass_fail")
+    return data
+
+
+def _shadow_small_entry_ops_state_params(payload: dict) -> dict:
+    now = str(payload.get("updated_at") or payload.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+    return {
+        "state_key": str(payload.get("state_key") or "default"),
+        "status": str(payload.get("status") or "OBSERVE_ONLY"),
+        "mode": str(payload.get("mode") or "observe_only"),
+        "order_enabled": 1 if bool(payload.get("order_enabled")) else 0,
+        "activation_token_id": str(payload.get("activation_token_id") or ""),
+        "activation_expires_at": str(payload.get("activation_expires_at") or ""),
+        "last_status_change_at": str(payload.get("last_status_change_at") or now),
+        "last_status_change_reason": str(payload.get("last_status_change_reason") or ""),
+        "last_changed_by": str(payload.get("last_changed_by") or payload.get("changed_by") or ""),
+        "last_operator_note": str(payload.get("last_operator_note") or payload.get("operator_note") or ""),
+        "runtime_settings_hash": str(payload.get("runtime_settings_hash") or ""),
+        "preflight_status": str(payload.get("preflight_status") or ""),
+        "preflight_blocking_reasons_json": _json_list(payload.get("preflight_blocking_reasons_json", payload.get("preflight_blocking_reasons", []))),
+        "risk_check_status": str(payload.get("risk_check_status") or ""),
+        "warnings_json": _json_list(payload.get("warnings_json", payload.get("warnings", []))),
+        "details_json": _json_payload(payload.get("details_json", payload.get("details", {}))),
+        "updated_at": now,
+    }
+
+
+def _row_to_shadow_small_entry_ops_state(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["order_enabled"] = bool(data.get("order_enabled"))
+    data["preflight_blocking_reasons"] = _safe_json_loads(data.get("preflight_blocking_reasons_json"), [])
+    data["warnings"] = _safe_json_loads(data.get("warnings_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    return data
+
+
+def _shadow_small_entry_ops_token_params(payload: dict) -> dict:
+    now = str(payload.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+    return {
+        "token_id": str(payload.get("token_id") or f"sse_ops_token_{uuid4().hex[:12]}"),
+        "token_hash": str(payload.get("token_hash") or ""),
+        "status": str(payload.get("status") or "ARMED"),
+        "created_at": now,
+        "expires_at": str(payload.get("expires_at") or ""),
+        "consumed_at": str(payload.get("consumed_at") or ""),
+        "created_by": str(payload.get("created_by") or payload.get("operator") or ""),
+        "operator_note": str(payload.get("operator_note") or ""),
+        "preflight_json": _json_payload(payload.get("preflight_json", payload.get("preflight", {}))),
+        "details_json": _json_payload(payload.get("details_json", payload.get("details", {}))),
+    }
+
+
+def _row_to_shadow_small_entry_ops_token(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["preflight"] = _safe_json_loads(data.get("preflight_json"), {})
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    return data
+
+
+def _shadow_small_entry_ops_audit_params(payload: dict) -> dict:
+    created_at = str(payload.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+    return {
+        "audit_id": str(payload.get("audit_id") or f"sse_ops_audit_{uuid4().hex[:16]}"),
+        "trade_date": str(payload.get("trade_date") or _trade_date_from_timestamp(created_at) or ""),
+        "event_type": str(payload.get("event_type") or ""),
+        "previous_status": str(payload.get("previous_status") or ""),
+        "next_status": str(payload.get("next_status") or ""),
+        "changed_by": str(payload.get("changed_by") or ""),
+        "reason": str(payload.get("reason") or ""),
+        "reason_codes_json": _json_list(payload.get("reason_codes_json", payload.get("reason_codes", []))),
+        "operator_note": str(payload.get("operator_note") or ""),
+        "created_at": created_at,
+        "runtime_settings_before_hash": str(payload.get("runtime_settings_before_hash") or ""),
+        "runtime_settings_after_hash": str(payload.get("runtime_settings_after_hash") or ""),
+        "details_json": _json_payload(payload.get("details_json", payload.get("details", {}))),
+    }
+
+
+def _row_to_shadow_small_entry_ops_audit(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["reason_codes"] = _safe_json_loads(data.get("reason_codes_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    return data
+
+
+def _shadow_small_entry_pilot_run_params(payload: dict) -> dict:
+    now = str(payload.get("updated_at") or payload.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+    created_at = str(payload.get("created_at") or now)
+    trade_date = str(payload.get("trade_date") or _trade_date_from_timestamp(created_at) or "")
+    return {
+        "pilot_id": str(payload.get("pilot_id") or f"shadow_small_entry_pilot:{trade_date or created_at[:10]}"),
+        "trade_date": trade_date,
+        "created_at": created_at,
+        "started_at": str(payload.get("started_at") or ""),
+        "ended_at": str(payload.get("ended_at") or ""),
+        "status": str(payload.get("status") or "PLANNED"),
+        "mode": str(payload.get("mode") or ""),
+        "order_enabled_at_start": 1 if bool(payload.get("order_enabled_at_start")) else 0,
+        "operator": str(payload.get("operator") or ""),
+        "operator_note": str(payload.get("operator_note") or ""),
+        "activation_event_id": str(payload.get("activation_event_id") or ""),
+        "rollback_event_id": str(payload.get("rollback_event_id") or ""),
+        "source_report_trade_date": str(payload.get("source_report_trade_date") or ""),
+        "conservative_reason_report_id": str(payload.get("conservative_reason_report_id") or ""),
+        "shadow_promotion_report_id": str(payload.get("shadow_promotion_report_id") or ""),
+        "runtime_settings_hash": str(payload.get("runtime_settings_hash") or ""),
+        "promotion_policy_snapshot_json": _json_payload(payload.get("promotion_policy_snapshot_json", payload.get("promotion_policy_snapshot", {}))),
+        "ops_policy_snapshot_json": _json_payload(payload.get("ops_policy_snapshot_json", payload.get("ops_policy_snapshot", {}))),
+        "risk_limit_snapshot_json": _json_payload(payload.get("risk_limit_snapshot_json", payload.get("risk_limit_snapshot", {}))),
+        "preflight_snapshot_json": _json_payload(payload.get("preflight_snapshot_json", payload.get("preflight_snapshot", {}))),
+        "summary_json": _json_payload(payload.get("summary_json", payload.get("summary", {}))),
+        "recommendation": str(payload.get("recommendation") or ""),
+        "recommendation_reason_codes_json": _json_list(payload.get("recommendation_reason_codes_json", payload.get("recommendation_reason_codes", []))),
+        "operator_message_ko": str(payload.get("operator_message_ko") or ""),
+        "updated_at": now,
+    }
+
+
+def _row_to_shadow_small_entry_pilot_run(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["order_enabled_at_start"] = bool(data.get("order_enabled_at_start"))
+    data["promotion_policy_snapshot"] = _safe_json_loads(data.get("promotion_policy_snapshot_json"), {})
+    data["ops_policy_snapshot"] = _safe_json_loads(data.get("ops_policy_snapshot_json"), {})
+    data["risk_limit_snapshot"] = _safe_json_loads(data.get("risk_limit_snapshot_json"), {})
+    data["preflight_snapshot"] = _safe_json_loads(data.get("preflight_snapshot_json"), {})
+    data["summary"] = _safe_json_loads(data.get("summary_json"), {})
+    data["recommendation_reason_codes"] = _safe_json_loads(data.get("recommendation_reason_codes_json"), [])
+    return data
+
+
+def _shadow_small_entry_pilot_event_params(payload: dict) -> dict:
+    event_at = str(payload.get("event_at") or payload.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+    trade_date = str(payload.get("trade_date") or _trade_date_from_timestamp(event_at) or "")
+    event_type = str(payload.get("event_type") or payload.get("stage") or "")
+    code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
+    candidate_instance_id = str(payload.get("candidate_instance_id") or "")
+    event_id = str(
+        payload.get("event_id")
+        or f"shadow_small_entry_pilot_event:{trade_date}:{event_type}:{code}:{candidate_instance_id}:{uuid4().hex[:12]}"
+    )
+    return {
+        "event_id": event_id,
+        "pilot_id": str(payload.get("pilot_id") or ""),
+        "trade_date": trade_date,
+        "event_type": event_type,
+        "event_at": event_at,
+        "code": code,
+        "name": str(payload.get("name") or ""),
+        "candidate_instance_id": candidate_instance_id,
+        "theme_name": str(payload.get("theme_name") or ""),
+        "reason_group": str(payload.get("reason_group") or payload.get("primary_group") or ""),
+        "reason_code": str(payload.get("reason_code") or payload.get("primary_reason") or payload.get("primary_block_reason") or ""),
+        "gate_status": str(payload.get("gate_status") or payload.get("stage_status") or payload.get("promotion_status") or ""),
+        "price_location_status": str(payload.get("price_location_status") or ""),
+        "stock_role": str(payload.get("stock_role") or ""),
+        "order_intent_id": str(payload.get("order_intent_id") or ""),
+        "live_sim_order_intent_id": str(payload.get("live_sim_order_intent_id") or payload.get("live_sim_intent_id") or ""),
+        "command_id": str(payload.get("command_id") or ""),
+        "broker_order_id": str(payload.get("broker_order_id") or ""),
+        "position_id": str(payload.get("position_id") or ""),
+        "quantity": int(payload.get("quantity") or payload.get("fill_qty") or payload.get("requested_qty") or 0),
+        "price": _nullable_float(payload.get("price", payload.get("fill_price", payload.get("submitted_price")))),
+        "notional_krw": _nullable_float(payload.get("notional_krw")),
+        "realized_pnl_krw": _nullable_float(payload.get("realized_pnl_krw")),
+        "unrealized_pnl_krw": _nullable_float(payload.get("unrealized_pnl_krw")),
+        "return_pct": _nullable_float(payload.get("return_pct")),
+        "reason_codes_json": _json_list(payload.get("reason_codes_json", payload.get("reason_codes", []))),
+        "severity": str(payload.get("severity") or ""),
+        "details_json": _json_payload(payload.get("details_json", payload.get("details", {}))),
+        "operator_message_ko": str(payload.get("operator_message_ko") or ""),
+    }
+
+
+def _row_to_shadow_small_entry_pilot_event(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["reason_codes"] = _safe_json_loads(data.get("reason_codes_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
     return data
 
 
@@ -7975,6 +8949,26 @@ def _buy_zero_trace_events_from_strategy_decision_event(event: dict) -> list[dic
         if base.get("theme_id") or base.get("theme_name") or base.get("theme_score") is not None:
             add("THEME_ENGINE_EVALUATED", status=_first_string(gate_details.get("theme_status"), event.get("gate_status")), passed=True)
         add("THEMELAB_GATE_EVALUATED")
+        promotion_status = str(gate_details.get("shadow_small_entry_promotion_status") or "")
+        if promotion_status:
+            add("SHADOW_SMALL_ENTRY_EVIDENCE_LOADED", status=promotion_status, passed=True)
+            add("SHADOW_SMALL_ENTRY_CANDIDATE_EVALUATED", status=promotion_status, passed=promotion_status == "PROMOTED")
+            if promotion_status == "PROMOTED":
+                add("SHADOW_SMALL_ENTRY_PROMOTED", status=promotion_status, passed=True)
+            elif promotion_status == "OBSERVE_ONLY":
+                add(
+                    "SHADOW_SMALL_ENTRY_OBSERVE_ONLY",
+                    status=promotion_status,
+                    passed=False,
+                    reason=_first_string(gate_details.get("shadow_small_entry_promotion_reason"), "SHADOW_SMALL_ENTRY_PROMOTION_OBSERVE_ONLY"),
+                )
+            elif promotion_status == "BLOCKED":
+                add(
+                    "SHADOW_SMALL_ENTRY_BLOCKED",
+                    status=promotion_status,
+                    passed=False,
+                    reason=_first_string(gate_details.get("shadow_small_entry_promotion_reason"), "SHADOW_SMALL_ENTRY_PROMOTION_BLOCKED"),
+                )
         if _has_any_key(gate_details, ("hybrid_status", "hybrid_score", "hybrid_observe_only", "hybrid_gate_observe_only")):
             hybrid_status = _first_string(gate_details.get("hybrid_status"), event.get("gate_status"))
             hybrid_observe_only = bool(gate_details.get("hybrid_observe_only") or gate_details.get("hybrid_gate_observe_only"))
@@ -8021,8 +9015,12 @@ def _buy_zero_trace_events_from_strategy_decision_event(event: dict) -> list[dic
             add("LIVE_SIM_INTENT_CREATED", status=live_status, passed=bool(live_sim.get("intent_id")), reason=live_reason, extra={"live_sim": live_sim})
             if bool(live_sim.get("accepted")) or live_status in {"SUBMITTED", "ACCEPTED"}:
                 add("LIVE_SIM_COMMAND_QUEUED", status=live_status, passed=True, extra={"live_sim": live_sim})
+                if str(entry_cancel.get("ready_type") or gate_details.get("ready_type") or "") == "READY_SHADOW_SMALL_ENTRY":
+                    add("SHADOW_SMALL_ENTRY_ORDER_SUBMITTED", status=live_status, passed=True, extra={"live_sim": live_sim})
             else:
                 add("LIVE_SIM_BLOCKED", status=live_status or "BLOCKED", passed=False, reason=live_reason or "LIVE_SIM_NOT_SUBMITTED", extra={"live_sim": live_sim})
+                if str(entry_cancel.get("ready_type") or gate_details.get("ready_type") or "") == "READY_SHADOW_SMALL_ENTRY":
+                    add("SHADOW_SMALL_ENTRY_ORDER_BLOCKED", status=live_status or "BLOCKED", passed=False, reason=live_reason or "LIVE_SIM_NOT_SUBMITTED", extra={"live_sim": live_sim})
         return traces
 
     return traces
@@ -8110,11 +9108,60 @@ def _buy_zero_trace_base_from_decision(
             entry_cancel.get("early_small_rejected_reason"),
             order_metadata.get("early_small_rejected_reason"),
         ),
+        "promotion_status": _first_string(
+            gate_details.get("shadow_small_entry_promotion_status"),
+            entry_cancel.get("shadow_small_entry_promotion_status"),
+            order_metadata.get("shadow_small_entry_promotion_status"),
+        ),
+        "promotion_reason": _first_string(
+            gate_details.get("shadow_small_entry_promotion_reason"),
+            entry_cancel.get("shadow_small_entry_promotion_reason"),
+            order_metadata.get("shadow_small_entry_promotion_reason"),
+        ),
+        "promotion_reason_codes": _first_list(
+            gate_details.get("shadow_small_entry_promotion_reason_codes"),
+            entry_cancel.get("shadow_small_entry_promotion_reason_codes"),
+            order_metadata.get("shadow_small_entry_promotion_reason_codes"),
+        ),
+        "source_report_id": _first_string(
+            gate_details.get("shadow_small_entry_source_report_id"),
+            entry_cancel.get("shadow_small_entry_source_report_id"),
+            order_metadata.get("shadow_small_entry_source_report_id"),
+        ),
+        "source_report_trade_date": _first_string(
+            gate_details.get("shadow_small_entry_source_report_trade_date"),
+            entry_cancel.get("shadow_small_entry_source_report_trade_date"),
+            order_metadata.get("shadow_small_entry_source_report_trade_date"),
+        ),
+        "reason_group": _first_string(
+            gate_details.get("shadow_small_entry_reason_group"),
+            entry_cancel.get("shadow_small_entry_reason_group"),
+            order_metadata.get("shadow_small_entry_reason_group"),
+        ),
+        "reason_code": _first_string(
+            gate_details.get("shadow_small_entry_reason_code"),
+            entry_cancel.get("shadow_small_entry_reason_code"),
+            order_metadata.get("shadow_small_entry_reason_code"),
+        ),
+        "sample_count": _first_present(gate_details.get("shadow_small_entry_sample_count"), entry_cancel.get("shadow_small_entry_sample_count"), order_metadata.get("shadow_small_entry_sample_count")),
+        "missed_opportunity_rate": _first_present(gate_details.get("shadow_small_entry_missed_opportunity_rate"), entry_cancel.get("shadow_small_entry_missed_opportunity_rate"), order_metadata.get("shadow_small_entry_missed_opportunity_rate")),
+        "risk_avoided_rate": _first_present(gate_details.get("shadow_small_entry_risk_avoided_rate"), entry_cancel.get("shadow_small_entry_risk_avoided_rate"), order_metadata.get("shadow_small_entry_risk_avoided_rate")),
+        "good_block_rate": _first_present(gate_details.get("shadow_small_entry_good_block_rate"), entry_cancel.get("shadow_small_entry_good_block_rate"), order_metadata.get("shadow_small_entry_good_block_rate")),
+        "avg_mfe_15m_pct": _first_present(gate_details.get("shadow_small_entry_avg_mfe_15m_pct"), entry_cancel.get("shadow_small_entry_avg_mfe_15m_pct"), order_metadata.get("shadow_small_entry_avg_mfe_15m_pct")),
+        "avg_mae_15m_pct": _first_present(gate_details.get("shadow_small_entry_avg_mae_15m_pct"), entry_cancel.get("shadow_small_entry_avg_mae_15m_pct"), order_metadata.get("shadow_small_entry_avg_mae_15m_pct")),
+        "position_size_multiplier": _first_present(gate_details.get("shadow_small_entry_position_size_multiplier"), entry_cancel.get("shadow_small_entry_position_size_multiplier"), order_metadata.get("shadow_small_entry_position_size_multiplier")),
+        "max_promotions_per_cycle": _first_present(gate_details.get("shadow_small_entry_max_promotions_per_cycle"), entry_cancel.get("shadow_small_entry_max_promotions_per_cycle"), order_metadata.get("shadow_small_entry_max_promotions_per_cycle")),
+        "max_promotions_per_day": _first_present(gate_details.get("shadow_small_entry_max_promotions_per_day"), entry_cancel.get("shadow_small_entry_max_promotions_per_day"), order_metadata.get("shadow_small_entry_max_promotions_per_day")),
+        "order_enabled": _first_present(gate_details.get("shadow_small_entry_order_enabled"), entry_cancel.get("shadow_small_entry_promotion_order_enabled"), order_metadata.get("shadow_small_entry_promotion_order_enabled")),
+        "mode": _first_string(gate_details.get("shadow_small_entry_promotion_mode"), entry_cancel.get("shadow_small_entry_promotion_mode"), order_metadata.get("shadow_small_entry_promotion_mode")),
         "operator_message_ko": _first_string(
             gate_details.get("data_quality_operator_message_ko"),
+            gate_details.get("shadow_small_entry_operator_message_ko"),
             gate_details.get("operator_message_ko"),
             entry_cancel.get("data_quality_operator_message_ko"),
+            entry_cancel.get("shadow_small_entry_operator_message_ko"),
             order_metadata.get("data_quality_operator_message_ko"),
+            order_metadata.get("shadow_small_entry_operator_message_ko"),
         ),
         "entry_plan_id": _first_present(event.get("entry_plan_id"), entry_cancel.get("entry_plan_id")),
         "entry_plan_submittable": entry_cancel.get("submittable"),
@@ -8143,25 +9190,91 @@ def _buy_zero_trace_from_live_sim_order_event(
 ) -> dict | None:
     if order is None:
         return None
-    stage_map = {
-        "submitted": "LIVE_SIM_COMMAND_QUEUED",
+    payload = dict(payload or {})
+    details = dict(order.get("details") or {})
+    request = dict(details.get("request") or {})
+    metadata = dict(request.get("metadata") or {})
+    side = str(order.get("side") or request.get("side") or "").lower()
+    order_phase = str(order.get("order_phase") or request.get("order_phase") or metadata.get("order_phase") or ("exit" if side == "sell" else "entry"))
+    fill = dict(payload.get("fill") or {})
+    position = dict(payload.get("position") or details.get("position") or {})
+    execution = dict(payload.get("execution") or {})
+    audit_warnings = list(payload.get("audit_warnings") or details.get("execution_audit_warnings") or [])
+    first_warning = dict(audit_warnings[0]) if audit_warnings and isinstance(audit_warnings[0], dict) else {}
+    if event_type == "submitted":
+        stage = "EXIT_ORDER_SUBMITTED" if order_phase == "exit" or side == "sell" else "LIVE_SIM_COMMAND_QUEUED"
+    elif event_type == "order_result":
+        if status_to == "ACCEPTED":
+            stage = "BROKER_ORDER_ACCEPTED"
+        elif status_to == "UNKNOWN_SUBMIT":
+            stage = "LIVE_SIM_UNKNOWN_SUBMIT"
+        else:
+            stage = "BROKER_ORDER_REJECTED"
+    elif event_type == "execution":
+        if status_to == "RECONCILE_REQUIRED":
+            stage = "RECONCILE_REQUIRED"
+        elif side == "sell" and status_to == "FILLED":
+            stage = "EXIT_FILLED"
+        elif status_to == "PARTIAL_FILLED":
+            stage = "PARTIAL_FILLED"
+        elif status_to == "FILLED":
+            stage = "FILLED"
+        else:
+            stage = "BROKER_ORDER_ACCEPTED"
+    elif event_type == "position_opened":
+        stage = "POSITION_OPENED"
+    elif event_type == "position_closed":
+        stage = "POSITION_CLOSED"
+    elif event_type == "cancel_due":
+        stage = "CANCEL_DUE"
+    elif event_type == "cancel_requested":
+        stage = "CANCEL_REQUESTED"
+    elif event_type == "cancelled":
+        stage = "CANCELLED"
+    elif event_type in {"command_dispatched", "command_started"}:
+        stage = "LIVE_SIM_COMMAND_DISPATCHED"
+    elif event_type == "command_acked":
+        stage = "LIVE_SIM_COMMAND_ACKED"
+    elif event_type == "command_rejected":
+        stage = "LIVE_SIM_COMMAND_REJECTED"
+    elif event_type in {"reconcile_open_order", "reconcile_required"}:
+        stage = "RECONCILE_REQUIRED"
+    else:
+        stage_map = {
         "duplicate_blocked": "LIVE_SIM_BLOCKED",
         "blocked": "LIVE_SIM_BLOCKED",
         "blocked_live_safety": "LIVE_SIM_BLOCKED",
         "enqueue_rejected": "LIVE_SIM_BLOCKED",
-        "order_result": "BROKER_ORDER_ACCEPTED" if status_to == "ACCEPTED" else "LIVE_SIM_BLOCKED",
-        "execution": "PARTIAL_FILLED" if status_to == "PARTIAL_FILLED" else ("FILLED" if status_to == "FILLED" else "BROKER_ORDER_ACCEPTED"),
-        "cancel_requested": "CANCEL_REQUESTED",
-        "reconcile_open_order": "RECONCILE_REQUIRED",
-    }
-    stage = stage_map.get(str(event_type))
+        }
+        stage = stage_map.get(str(event_type))
     if not stage:
         return None
-    passed = stage not in {"LIVE_SIM_BLOCKED", "RECONCILE_REQUIRED"}
+    passed = stage not in {"LIVE_SIM_BLOCKED", "RECONCILE_REQUIRED", "LIVE_SIM_UNKNOWN_SUBMIT", "BROKER_ORDER_REJECTED", "LIVE_SIM_COMMAND_REJECTED"}
     reason_codes = _dedupe([*[str(item) for item in order.get("reason_codes") or []], str(message or status_to or event_type)])
-    details = dict(order.get("details") or {})
-    request = dict(details.get("request") or {})
-    metadata = dict(request.get("metadata") or {})
+    operator_message_ko = _first_string(
+        first_warning.get("operator_message_ko"),
+        payload.get("operator_message_ko"),
+        "주문번호가 없어 재조회가 필요합니다." if stage == "LIVE_SIM_UNKNOWN_SUBMIT" else "",
+        "LIVE_SIM guard에서 차단되었습니다." if stage == "LIVE_SIM_BLOCKED" else "",
+    )
+    lifecycle_details = {
+        "event_type": event_type,
+        "status_from": status_from,
+        "status_to": status_to,
+        "order_status": status_to or str(order.get("order_status") or ""),
+        "fill_qty": fill.get("fill_qty"),
+        "cumulative_fill_qty": fill.get("cumulative_fill_qty"),
+        "remaining_qty": fill.get("remaining_qty"),
+        "position_id": position.get("position_id"),
+        "position_qty": position.get("current_qty"),
+        "cancel_intent_id": payload.get("cancel_intent_id") or payload.get("cancel", {}).get("cancel_intent_id") if isinstance(payload.get("cancel"), dict) else payload.get("cancel_intent_id"),
+        "reconcile_issue_type": first_warning.get("issue_type") or payload.get("issue_type") or "",
+        "operator_message_ko": operator_message_ko,
+        "broker_order_id_source": details.get("broker_order_id_source") or payload.get("broker_order_id_source") or "",
+        "order_result_link_status": details.get("order_result_link_status") or "",
+        "order_result_link_reason": details.get("order_result_link_reason") or "",
+        "audit_warnings": audit_warnings,
+    }
     return {
         "trace_id": f"live_sim_order:{order.get('order_intent_id') or ''}:{event_type}:{status_to}:{created_at}",
         "trade_date": str(order.get("trade_date") or _trade_date_from_timestamp(created_at) or ""),
@@ -8179,13 +9292,21 @@ def _buy_zero_trace_from_live_sim_order_event(
         "passed": passed,
         "primary_block_reason": "" if passed else str(message or status_to or event_type),
         "reason_codes": reason_codes,
+        "operator_message_ko": operator_message_ko,
         "entry_plan_id": order.get("entry_plan_id"),
         "live_sim_intent_id": str(order.get("order_intent_id") or ""),
         "live_sim_status": status_to or str(order.get("order_status") or ""),
         "live_sim_reason": str(message or ""),
         "command_id": str(order.get("command_id") or ""),
         "broker_order_id": str(order.get("broker_order_id") or ""),
-        "details": {"live_sim_order": order, "event_type": event_type, "status_from": status_from, "status_to": status_to, "payload": payload},
+        "details": {
+            "live_sim_order": order,
+            "event_type": event_type,
+            "status_from": status_from,
+            "status_to": status_to,
+            "payload": payload,
+            "live_sim_lifecycle": lifecycle_details,
+        },
         "created_at": created_at,
     }
 
@@ -9312,6 +10433,18 @@ def _row_to_live_sim_order(row: sqlite3.Row) -> dict:
     return data
 
 
+def _row_to_live_sim_order_event(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["payload"] = _safe_json_loads(data.get("payload_json"), {})
+    data["trade_date"] = str(data.get("order_trade_date") or _trade_date_from_timestamp(data.get("created_at")) or "")
+    data["code"] = str(data.get("order_code") or "")
+    data["side"] = str(data.get("order_side") or "")
+    data["command_id"] = str(data.get("order_command_id") or "")
+    data["broker_order_id"] = str(data.get("order_broker_order_id") or "")
+    data["candidate_instance_id"] = str(data.get("order_candidate_instance_id") or "")
+    return data
+
+
 def _live_sim_cancel_params(payload: dict) -> dict:
     details = payload.get("details") if "details" in payload else payload.get("details_json", {})
     reason_codes = payload.get("reason_codes") if "reason_codes" in payload else payload.get("reason_codes_json", [])
@@ -9396,6 +10529,8 @@ def _live_sim_fill_params(payload: dict) -> dict:
 def _row_to_live_sim_fill(row: sqlite3.Row) -> dict:
     data = dict(row)
     data["raw_event"] = _safe_json_loads(data.get("raw_event_json"), {})
+    data["trade_date"] = str(data.get("order_trade_date") or _trade_date_from_timestamp(data.get("received_at") or data.get("event_time")) or "")
+    data["candidate_instance_id"] = str(data.get("order_candidate_instance_id") or "")
     return data
 
 
