@@ -95,6 +95,10 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#cockpit-live-readiness") is not None
     assert soup.select_one("#themelab-buy-zero-rca-card") is not None
     assert soup.select_one('#themelab-buy-zero-rca-card[data-operator-tab="no-buy"]') is not None
+    assert soup.select_one("#themelab-buy-zero-rca-card h2").get_text(strip=True) == "매수 0건 원인 분석"
+    assert "주문 판단 추적 데이터" in html
+    assert "단계별 차단 후보" in html
+    assert "관측/차단 이후 급등 후보" in html
     assert soup.select_one("#themelab-buy-zero-rca-status") is not None
     assert soup.select_one("#themelab-buy-zero-stage-funnel") is not None
     assert soup.select_one("#themelab-buy-zero-ready-table-body") is not None
@@ -108,6 +112,10 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#themelab-live-sim-audit-top-actions") is not None
     assert soup.select_one("#themelab-live-sim-audit-issues") is not None
     assert soup.select_one("#themelab-conservative-reason-card") is not None
+    assert "과차단 후보" in html
+    assert "사유 그룹별 결과" in html
+    assert "사유 코드별 결과" in html
+    assert "최대유리/불리" in html
     assert soup.select_one("#themelab-conservative-reason-status") is not None
     assert soup.select_one("#themelab-conservative-reason-group-body") is not None
     assert soup.select_one("#themelab-conservative-reason-code-body") is not None
@@ -404,6 +412,19 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "function renderConservativeReasonStockRows" in js
     assert "function renderLiveSimAuditPanel" in js
     assert "live_sim_audit" in js
+    assert "BUY_ZERO_RCA_STATUS_LABELS" in js
+    assert "function buyZeroDisplayLabel" in js
+    assert "function buyZeroBadge" in js
+    assert "소액 운영 사전 점검" in js
+    assert "소액 후보 평가" in js
+    assert "모의주문 감사 문제" in js
+    assert "시장 폭 위험" in js
+    assert "가격 위치 대기" in js
+    assert "표본 더 필요" in js
+    assert "대기 유지" in js
+    assert "유효 호가 비율 낮음" in js
+    assert "주문 판단 상세" in js
+    assert "최대유리" in js
     assert "function renderBuyZeroDataQualityCounts" in js
     assert "function openBuyZeroTraceDetail" in js
     assert "BUY_ZERO_RCA_CRITICAL_REASONS" in js

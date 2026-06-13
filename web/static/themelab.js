@@ -257,17 +257,69 @@ const BUY_ZERO_RCA_CRITICAL_REASONS = new Set([
 const BUY_ZERO_RCA_STAGE_LABELS = {
   CANDIDATE_GENERATED: "후보 생성",
   THEME_ENGINE_EVALUATED: "테마 엔진",
-  THEMELAB_GATE_EVALUATED: "ThemeLab Gate",
-  HYBRID_GATE_EVALUATED: "Hybrid Gate",
-  RISK_GATE_EVALUATED: "Risk Gate",
-  LIFECYCLE_UPDATED: "Lifecycle",
-  ENTRY_PLAN_CREATED: "EntryPlan",
+  THEMELAB_GATE_EVALUATED: "테마랩 게이트",
+  HYBRID_GATE_EVALUATED: "통합 게이트",
+  RISK_GATE_EVALUATED: "리스크 게이트",
+  LIFECYCLE_UPDATED: "후보 상태 갱신",
+  ENTRY_PLAN_CREATED: "진입 계획",
   VIRTUAL_ORDER_SUBMITTED: "가상 주문",
-  DRY_RUN_INTENT_CREATED: "DRY_RUN 의도",
-  LIVE_SIM_COMMAND_QUEUED: "LIVE_SIM 큐",
+  DRY_RUN_INTENT_CREATED: "가상 주문 의도",
+  LIVE_SIM_COMMAND_QUEUED: "모의주문 대기열",
   BROKER_ORDER_ACCEPTED: "브로커 접수",
   PARTIAL_FILLED: "부분체결",
   FILLED: "체결",
+};
+
+const BUY_ZERO_RCA_STATUS_LABELS = {
+  READY: "매수 가능",
+  READY_SMALL: "소액 가능",
+  WAIT: "대기",
+  OBSERVE: "관측",
+  BLOCKED: "차단",
+  PASS: "통과",
+  FAIL: "차단",
+  FAILED: "실패",
+  SUCCESS: "성공",
+  UNKNOWN: "확인중",
+  NO_DATA: "데이터 없음",
+  DRY_RUN: "가상주문",
+  LIVE_SIM: "모의주문",
+  LIVE_SIM_BLOCKED: "모의주문 차단",
+  DIAGNOSTIC_ONLY: "진단 전용",
+  ORDER_SINK_NOOP: "주문 경로 비활성",
+  CORE_BLOCKING: "핵심 데이터 부족",
+  ENTRY_BLOCKING: "진입 데이터 부족",
+  WARMUP_OPTIONAL: "보조지표 준비중",
+  BACKFILL_ONLY_OBSERVE: "실시간 미확인",
+  GATE_RESULT_KEY_MISMATCH: "판단키 불일치",
+  CANDIDATE_STATE_MISMATCH: "후보 상태 불일치",
+  CHASE_RISK: "추격 위험",
+  LATE_CHASE_TEMP_WAIT: "추격 대기",
+  DATA_INSUFFICIENT: "데이터 부족",
+  DATA_INSUFFICIENT_MORE_SAMPLES: "표본 더 필요",
+  KEEP_WAIT: "대기 유지",
+  OBSERVE_MORE: "추가 관측",
+  PROMOTE_SMALL_ENTRY: "소액 검토",
+  BREADTH_RISK: "시장 폭 위험",
+  MARKET_RISK: "시장 위험",
+  PRICE_LOCATION_WAIT: "가격 위치 대기",
+  PRICE_LOCATION_WARMUP: "가격 위치 준비중",
+  PRICE_LOCATION_UNKNOWN: "가격 위치 미확인",
+  SIDE_BREADTH_VALID_QUOTE_RATIO_LOW: "유효 호가 비율 낮음",
+  SIDE_BREADTH_SOURCE_REALTIME_UNIVERSE: "실시간 표본 기준",
+  SIDE_BREADTH_SAMPLE_TOO_SMALL: "시장 폭 표본 부족",
+  SIDE_BREADTH_FALLBACK_INDEX_RETURN: "지수 등락률 대체",
+  SHADOW_SMALL_ENTRY_OPS_PREFLIGHT: "소액 운영 사전 점검",
+  SHADOW_SMALL_ENTRY_EVIDENCE_LOADED: "소액 근거 적재",
+  SHADOW_SMALL_ENTRY_CANDIDATE_EVALUATED: "소액 후보 평가",
+  SHADOW_SMALL_ENTRY_OBSERVE_ONLY: "소액 관측 전용",
+  SHADOW_SMALL_ENTRY_PROMOTED: "소액 승격",
+  SHADOW_SMALL_ENTRY_BLOCKED: "소액 차단",
+  SHADOW_SMALL_ENTRY_ORDER_SUBMITTED: "소액 주문 제출",
+  SHADOW_SMALL_ENTRY_ORDER_BLOCKED: "소액 주문 차단",
+  LIVE_SIM_AUDIT_BROKEN: "모의주문 감사 문제",
+  LIVE_SIM_AUDIT_WARN: "모의주문 감사 확인",
+  LIVE_SIM_AUDIT_OK: "모의주문 감사 정상",
 };
 
 const SHADOW_SMALL_ENTRY_OPS_ENDPOINTS = {
@@ -362,11 +414,28 @@ function operatorBadge(label, severity = "muted") {
   return `<span class="badge ${operatorToneClass(severity)}">${escapeHtml(label || "-")}</span>`;
 }
 
+function buyZeroDisplayLabel(value) {
+  const raw = String(value || "-").trim();
+  if (!raw || raw === "-") return "-";
+  const key = raw.toUpperCase();
+  if (BUY_ZERO_RCA_STATUS_LABELS[key]) return BUY_ZERO_RCA_STATUS_LABELS[key];
+  if (BUY_ZERO_RCA_STAGE_LABELS[key]) return BUY_ZERO_RCA_STAGE_LABELS[key];
+  const term = translateReasonCode(key);
+  if (operatorReasonTerms[key]) return term.label_ko;
+  return raw.replaceAll("_", " ");
+}
+
+function buyZeroBadge(value, tone = "") {
+  const raw = String(value || "-").trim();
+  const label = buyZeroDisplayLabel(raw);
+  return `<span class="badge ${tone || statusClass[String(raw).toUpperCase()] || "observe"}" title="${escapeHtml(raw)}">${escapeHtml(label)}</span>`;
+}
+
 function reasonBadge(reason) {
   const label = String(reason || "-");
   const upper = label.toUpperCase();
   const critical = BUY_ZERO_RCA_CRITICAL_REASONS.has(upper) || /DATA_INSUFFICIENT|CHASE|LIVE_SIM_BLOCKED|DIAGNOSTIC_ONLY|ORDER_SINK_NOOP|GATE_RESULT_KEY_MISMATCH|WAIT_MARKET_CONFIRMATION/i.test(upper);
-  return badge(label, critical ? "critical" : "");
+  return buyZeroBadge(label, critical ? "critical" : "");
 }
 
 function reasonBadges(reasons) {
@@ -1792,15 +1861,15 @@ function renderBuyZeroRcaPanel() {
   const empty = document.getElementById("themelab-buy-zero-rca-empty");
   if (empty) {
     empty.hidden = available;
-    empty.textContent = "아직 RCA trace가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.";
+    empty.textContent = "아직 주문 판단 추적 데이터가 없습니다. 기능 적용 이후 이벤트부터 쌓입니다.";
   }
-  text("themelab-buy-zero-rca-note", "trace는 PR 적용 이후 데이터만 표시하며, 과거 DB backfill은 하지 않습니다.");
+  text("themelab-buy-zero-rca-note", "주문 판단 추적은 기능 적용 이후 데이터만 표시하며, 과거 DB는 소급 보강하지 않습니다.");
   if (!available) {
     const traceDetail = document.getElementById("themelab-buy-zero-rca-trace-detail");
     if (traceDetail) traceDetail.hidden = true;
   }
-  setBuyZeroStatus(!available ? "TRACE 대기" : buyZero ? "오늘 LIVE_SIM 매수 0건" : "LIVE_SIM 주문 발생", !available ? "observe" : buyZero ? "warning" : "ready");
-  text("themelab-buy-zero-rca-updated", `trace ${formatDateTime(summary.last_updated_at || payload.last_updated_at)}`);
+  setBuyZeroStatus(!available ? "추적 대기" : buyZero ? "오늘 모의매수 0건" : "모의주문 발생", !available ? "observe" : buyZero ? "warning" : "ready");
+  text("themelab-buy-zero-rca-updated", `추적 ${formatDateTime(summary.last_updated_at || payload.last_updated_at)}`);
   text("themelab-buy-zero-total-candidates", summary.total_candidates ?? payload.total_candidates ?? 0);
   text("themelab-buy-zero-gate-evaluated", summary.gate_evaluated_count ?? payload.gate_evaluated_count ?? 0);
   text("themelab-buy-zero-ready-counts", `${summary.ready_exact_count ?? payload.ready_exact_count ?? summary.ready_count ?? payload.ready_count ?? 0} / ${summary.ready_small_count ?? payload.ready_small_count ?? 0}`);
@@ -1895,7 +1964,7 @@ function renderConservativeReasonPanel(payload = null) {
   const available = Boolean(data.available);
   const status = document.getElementById("themelab-conservative-reason-status");
   if (status) {
-    status.textContent = available ? data.status || "READY" : "NO_DATA";
+    status.textContent = available ? buyZeroDisplayLabel(data.status || "READY") : "데이터 없음";
     status.className = `badge ${available ? "ready" : "observe"}`;
   }
   text("themelab-conservative-reason-empty", available ? "보수적 차단 사유 outcome을 읽기 전용으로 검증합니다. 주문 설정은 자동 변경하지 않습니다." : "아직 outcome 관측 데이터가 부족합니다.");
@@ -2350,7 +2419,7 @@ function renderConservativeReasonCodeRows(id, rows, available) {
       <td>${pct(item.avg_mfe_15m_pct)} / ${pct(item.avg_mae_15m_pct)}</td>
       <td>${reasonBadge(item.recommendation || "-")}</td>
     </tr>
-  `).join("") : `<tr><td colspan="5" class="muted">표시할 reason 결과가 없습니다.</td></tr>`;
+  `).join("") : `<tr><td colspan="5" class="muted">표시할 사유 결과가 없습니다.</td></tr>`;
 }
 
 function renderConservativeReasonSmallRows(id, rows, available) {
@@ -2362,7 +2431,7 @@ function renderConservativeReasonSmallRows(id, rows, available) {
   }
   const items = (rows || []).slice(0, 6);
   node.innerHTML = items.length ? items.map((item) => `
-    <div>${reasonBadge(item.reason_code || item.group || "-")} <strong>${escapeHtml(item.candidate_count ?? 0)}</strong><span>MFE ${pct(item.avg_mfe_15m_pct)} / MAE ${pct(item.avg_mae_15m_pct)} / x${escapeHtml(optionalNumber(item.suggested_position_size_multiplier, 2))}</span></div>
+    <div>${reasonBadge(item.reason_code || item.group || "-")} <strong>${escapeHtml(item.candidate_count ?? 0)}</strong><span>최대유리 ${pct(item.avg_mfe_15m_pct)} / 최대불리 ${pct(item.avg_mae_15m_pct)} / x${escapeHtml(optionalNumber(item.suggested_position_size_multiplier, 2))}</span></div>
   `).join("") : `<div class="muted">소액 진입 검토 후보가 없습니다.</div>`;
 }
 
@@ -2375,7 +2444,7 @@ function renderConservativeReasonDataRows(id, rows, available) {
   }
   const items = (rows || []).slice(0, 6);
   node.innerHTML = items.length ? items.map((item) => `
-    <div>${reasonBadge(item.data_quality_bucket || "-")} <strong>${escapeHtml(item.event_count ?? 0)}</strong><span>missed ${ratio(item.missed_opportunity_rate)} · ${escapeHtml(item.recommendation || "-")}</span></div>
+    <div>${reasonBadge(item.data_quality_bucket || "-")} <strong>${escapeHtml(item.event_count ?? 0)}</strong><span>기회손실 ${ratio(item.missed_opportunity_rate)} · ${escapeHtml(buyZeroDisplayLabel(item.recommendation || "-"))}</span></div>
   `).join("") : `<div class="muted">데이터 품질 bucket 결과가 없습니다.</div>`;
 }
 
@@ -2388,7 +2457,7 @@ function renderConservativeReasonStockRows(id, rows, available, emptyText) {
   }
   const items = (rows || []).slice(0, 8);
   node.innerHTML = items.length ? items.map((item) => `
-    <div>${reasonBadge(item.primary_group || item.primary_reason || "-")} <strong>${escapeHtml(`${item.code || "-"} ${item.name || ""}`.trim())}</strong><span>MFE ${pct(item.mfe_15m_pct)} / MAE ${pct(item.mae_15m_pct)} · ${escapeHtml(item.recommendation || item.outcome_label || "-")}</span></div>
+    <div>${reasonBadge(item.primary_group || item.primary_reason || "-")} <strong>${escapeHtml(`${item.code || "-"} ${item.name || ""}`.trim())}</strong><span>최대유리 ${pct(item.mfe_15m_pct)} / 최대불리 ${pct(item.mae_15m_pct)} · ${escapeHtml(buyZeroDisplayLabel(item.recommendation || item.outcome_label || "-"))}</span></div>
   `).join("") : `<div class="muted">${escapeHtml(emptyText)}</div>`;
 }
 
@@ -2428,16 +2497,16 @@ function renderBuyZeroStageFunnel(rows) {
   if (!node) return;
   const items = rows && rows.length ? rows : Object.keys(BUY_ZERO_RCA_STAGE_LABELS).map((stage) => ({ stage, total: 0, passed: 0, failed: 0, top_reason: "" }));
   const eventCount = items.reduce((total, item) => total + Number(item.total || 0), 0);
-  text("themelab-buy-zero-stage-status", eventCount ? `${eventCount} events` : "stage 대기");
+  text("themelab-buy-zero-stage-status", eventCount ? `${eventCount}건 추적` : "단계 대기");
   node.innerHTML = items.map((item) => {
     const failed = Number(item.failed || 0);
     const tone = failed ? "warning" : Number(item.total || 0) ? "ready" : "observe";
     return `
       <button type="button" class="buy-zero-stage-step ${tone}" data-buy-zero-stage="${escapeHtml(item.stage || "")}">
-        <span>${escapeHtml(BUY_ZERO_RCA_STAGE_LABELS[item.stage] || item.stage || "-")}</span>
+        <span>${escapeHtml(buyZeroDisplayLabel(item.stage || "-"))}</span>
         <strong>${escapeHtml(item.total ?? 0)}</strong>
         <em>${escapeHtml(item.passed ?? 0)} 통과 / ${escapeHtml(failed)} 차단</em>
-        <small>${escapeHtml(item.top_reason || "차단 사유 없음")}</small>
+        <small>${escapeHtml(buyZeroDisplayLabel(item.top_reason || "차단 사유 없음"))}</small>
       </button>
     `;
   }).join("");
@@ -2451,7 +2520,7 @@ function renderBuyZeroStageFunnel(rows) {
 async function fetchBuyZeroStageCandidates(stage) {
   if (!stage) return;
   state.buyZeroRca.stage = stage;
-  text("themelab-buy-zero-stage-status", `${stage} 조회 중`);
+  text("themelab-buy-zero-stage-status", `${buyZeroDisplayLabel(stage)} 조회 중`);
   const params = new URLSearchParams({
     trade_date: state.buyZeroRca.tradeDate || localTradeDate(),
     stage,
@@ -2463,7 +2532,7 @@ async function fetchBuyZeroStageCandidates(stage) {
   const payload = await response.json();
   state.buyZeroRca.stageRows = payload.items || [];
   renderBuyZeroStageRows(state.buyZeroRca.stageRows, stage);
-  text("themelab-buy-zero-stage-status", `${stage} 차단 ${state.buyZeroRca.stageRows.length}`);
+  text("themelab-buy-zero-stage-status", `${buyZeroDisplayLabel(stage)} 차단 ${state.buyZeroRca.stageRows.length}건`);
 }
 
 function renderBuyZeroReadyRows(rows, traceAvailable) {
@@ -2471,21 +2540,21 @@ function renderBuyZeroReadyRows(rows, traceAvailable) {
   if (!body) return;
   text("themelab-buy-zero-ready-status", rows.length);
   if (!traceAvailable) {
-    body.innerHTML = `<tr><td colspan="6" class="muted">아직 수집된 RCA trace가 없습니다</td></tr>`;
+    body.innerHTML = `<tr><td colspan="6" class="muted">아직 수집된 주문 판단 추적 기록이 없습니다</td></tr>`;
     return;
   }
   if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="6" class="muted">READY였지만 주문 안 나간 종목이 없습니다</td></tr>`;
+    body.innerHTML = `<tr><td colspan="6" class="muted">매수 가능 상태였지만 주문 안 나간 종목이 없습니다</td></tr>`;
     return;
   }
   body.innerHTML = rows.slice(0, 50).map((item, index) => `
     <tr data-buy-zero-ready-row="${index}">
       <td>${escapeHtml(`${item.code || "-"} ${item.name || ""}`.trim())}<div class="row-meta">${escapeHtml(item.theme_name || "-")} · ${shortId(item.candidate_instance_id || "")}</div></td>
       <td>${reasonBadge(item.classification || "-")}</td>
-      <td>${badge(item.gate_status || "-")}</td>
+      <td>${buyZeroBadge(item.gate_status || "-")}</td>
       <td>${reasonBadges(item.reason_codes || [item.primary_block_reason].filter(Boolean))}</td>
-      <td>${badge(item.dry_run_status || "-")}<div class="row-meta">${escapeHtml(item.live_sim_status || "-")} ${escapeHtml(item.live_sim_reason || "")}</div></td>
-      <td>tick ${escapeHtml(optionalNumber(item.latest_tick_age_sec, 1))}s<div class="row-meta">support ${escapeHtml(yesNoUnknown(item.support_ready))}</div></td>
+      <td>${buyZeroBadge(item.dry_run_status || "-")}<div class="row-meta">모의 ${escapeHtml(buyZeroDisplayLabel(item.live_sim_status || "-"))} ${escapeHtml(buyZeroDisplayLabel(item.live_sim_reason || ""))}</div></td>
+      <td>틱 ${escapeHtml(optionalNumber(item.latest_tick_age_sec, 1))}초<div class="row-meta">지지선 ${escapeHtml(yesNoUnknown(item.support_ready))}</div></td>
     </tr>
   `).join("");
   body.querySelectorAll("[data-buy-zero-ready-row]").forEach((row) => {
@@ -2502,21 +2571,21 @@ function renderBuyZeroRallyRows(rows, traceAvailable) {
   if (!body) return;
   text("themelab-buy-zero-rally-status", rows.length);
   if (!traceAvailable) {
-    body.innerHTML = `<tr><td colspan="6" class="muted">아직 수집된 RCA trace가 없습니다</td></tr>`;
+    body.innerHTML = `<tr><td colspan="6" class="muted">아직 수집된 주문 판단 추적 기록이 없습니다</td></tr>`;
     return;
   }
   if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="6" class="muted">OBSERVE/BLOCKED 이후 급등 후보가 없습니다</td></tr>`;
+    body.innerHTML = `<tr><td colspan="6" class="muted">관측/차단 이후 급등 후보가 없습니다</td></tr>`;
     return;
   }
   body.innerHTML = rows.slice(0, 50).map((item, index) => `
     <tr data-buy-zero-rally-row="${index}">
       <td>${escapeHtml(`${item.code || "-"} ${item.name || ""}`.trim())}<div class="row-meta">${escapeHtml(item.theme_name || "-")}</div></td>
-      <td>${badge(item.status || "-")}</td>
+      <td>${buyZeroBadge(item.status || "-")}</td>
       <td>${reasonBadges(item.reason_codes || [item.primary_reason].filter(Boolean))}</td>
       <td>${pct(item.return_5m_pct)} / ${pct(item.return_15m_pct)} / ${pct(item.return_30m_pct)}</td>
       <td>${pct(item.mfe_15m_pct)} / ${pct(item.mae_15m_pct)}</td>
-      <td>${escapeHtml(item.price_location_status || "-")}<div class="row-meta">${item.missed_opportunity ? "기회손실" : "기회손실 아님"}</div></td>
+      <td>${escapeHtml(buyZeroDisplayLabel(item.price_location_status || "-"))}<div class="row-meta">${item.missed_opportunity ? "기회손실" : "기회손실 아님"}</div></td>
     </tr>
   `).join("");
   body.querySelectorAll("[data-buy-zero-rally-row]").forEach((row) => {
@@ -2531,19 +2600,19 @@ function renderBuyZeroRallyRows(rows, traceAvailable) {
 function renderBuyZeroStageRows(rows, stage) {
   const body = document.getElementById("themelab-buy-zero-stage-candidates-body");
   if (!body) return;
-  text("themelab-buy-zero-stage-title", stage ? `${stage} 차단 후보` : "Stage 차단 후보");
+  text("themelab-buy-zero-stage-title", stage ? `${buyZeroDisplayLabel(stage)} 차단 후보` : "단계별 차단 후보");
   if (!stage) {
     body.innerHTML = `<div class="muted">퍼널 단계를 클릭하면 해당 단계에서 막힌 종목을 표시합니다</div>`;
     return;
   }
   if (!rows.length) {
-    body.innerHTML = `<div class="muted">${escapeHtml(stage)} 단계에서 막힌 trace가 없습니다</div>`;
+    body.innerHTML = `<div class="muted">${escapeHtml(buyZeroDisplayLabel(stage))} 단계에서 막힌 주문 판단 기록이 없습니다</div>`;
     return;
   }
   body.innerHTML = rows.slice(0, 50).map((item, index) => `
     <button type="button" data-buy-zero-stage-row="${index}">
       <strong>${escapeHtml(`${item.code || "-"} ${item.name || ""}`.trim())}</strong>
-      <span>${badge(item.stage_status || item.pass_fail || "-")} ${reasonBadges(item.reason_codes || [item.primary_block_reason].filter(Boolean))}</span>
+      <span>${buyZeroBadge(item.stage_status || item.pass_fail || "-")} ${reasonBadges(item.reason_codes || [item.primary_block_reason].filter(Boolean))}</span>
     </button>
   `).join("");
   body.querySelectorAll("[data-buy-zero-stage-row]").forEach((row) => {
@@ -2559,7 +2628,7 @@ async function openBuyZeroTraceDetail(item) {
   if (!item) return;
   const detail = document.getElementById("themelab-buy-zero-rca-trace-detail");
   if (detail) detail.hidden = false;
-  text("themelab-buy-zero-trace-title", `Trace ${item.code || ""} ${item.name || ""}`.trim());
+  text("themelab-buy-zero-trace-title", `주문 판단 상세 ${item.code || ""} ${item.name || ""}`.trim());
   text("themelab-buy-zero-trace-status", "조회 중");
   const params = new URLSearchParams({
     trade_date: state.buyZeroRca.tradeDate || localTradeDate(),
@@ -2580,37 +2649,37 @@ function renderBuyZeroTraceDetail(selected, rows) {
   const summary = document.getElementById("themelab-buy-zero-trace-summary");
   const timeline = document.getElementById("themelab-buy-zero-rca-timeline");
   const ordered = [...rows].sort((left, right) => String(left.created_at || "").localeCompare(String(right.created_at || "")));
-  text("themelab-buy-zero-trace-status", `${ordered.length} events`);
+  text("themelab-buy-zero-trace-status", `${ordered.length}건`);
   if (summary) {
     summary.innerHTML = [
       `<div><span>종목</span><strong>${escapeHtml(`${selected.code || "-"} ${selected.name || ""}`.trim())}</strong></div>`,
-      `<div><span>Candidate</span><strong>${shortId(selected.candidate_instance_id || "-")}</strong></div>`,
-      `<div><span>분류</span><strong>${escapeHtml(selected.classification || selected.status || "-")}</strong></div>`,
+      `<div><span>후보 ID</span><strong>${shortId(selected.candidate_instance_id || "-")}</strong></div>`,
+      `<div><span>분류</span><strong>${escapeHtml(buyZeroDisplayLabel(selected.classification || selected.status || "-"))}</strong></div>`,
       `<div><span>테마</span><strong>${escapeHtml(selected.theme_name || "-")}</strong></div>`,
     ].join("");
   }
   if (!timeline) return;
   if (!ordered.length) {
-    timeline.innerHTML = `<div class="muted">해당 종목의 RCA trace가 없습니다</div>`;
+    timeline.innerHTML = `<div class="muted">해당 종목의 주문 판단 추적 기록이 없습니다</div>`;
     return;
   }
   timeline.innerHTML = ordered.map((item) => `
     <article class="buy-zero-trace-event ${String(item.pass_fail || "").toLowerCase()}">
-      <header><strong>${escapeHtml(item.stage || "-")}</strong>${badge(item.stage_status || item.pass_fail || "-")}<time>${escapeHtml(formatDateTime(item.created_at))}</time></header>
+      <header><strong>${escapeHtml(buyZeroDisplayLabel(item.stage || "-"))}</strong>${buyZeroBadge(item.stage_status || item.pass_fail || "-")}<time>${escapeHtml(formatDateTime(item.created_at))}</time></header>
       <p>${escapeHtml(buyZeroTraceMessage(item))}</p>
       <div class="buy-zero-trace-fields">
         <span>사유 ${reasonBadges(item.reason_codes || [item.primary_block_reason].filter(Boolean))}</span>
-        <span>Gate ${escapeHtml(item.gate_status || "-")} / score ${escapeHtml(optionalNumber(item.gate_score, 1))}</span>
-        <span>Data ${escapeHtml(item.data_quality_bucket || "-")} / ${escapeHtml(item.data_quality_action || "-")}</span>
-        <span>Missing ${reasonBadges([...(item.missing_core_fields || []), ...(item.missing_entry_fields || []), ...(item.missing_optional_fields || [])])}</span>
-        <span>Early-small ${escapeHtml(yesNoUnknown(item.early_small_candidate))} / order ${escapeHtml(yesNoUnknown(item.early_small_order_enabled))} / x${escapeHtml(optionalNumber(item.early_small_position_size_multiplier, 2))}</span>
-        <span>Tick ${escapeHtml(yesNoUnknown(item.latest_tick_ready))} / ${escapeHtml(optionalNumber(item.latest_tick_age_sec, 1))}s</span>
-        <span>Support ${escapeHtml(yesNoUnknown(item.support_ready))} / ${escapeHtml(item.selected_support_source || "-")}</span>
-        <span>DRY_RUN ${escapeHtml(item.dry_run_status || "-")} ${escapeHtml(item.dry_run_reason || "")}</span>
-        <span>LIVE_SIM ${escapeHtml(item.live_sim_status || "-")} ${escapeHtml(item.live_sim_reason || "")}</span>
-        <span>Early-small 거절 ${escapeHtml(item.early_small_rejected_reason || "-")}</span>
-        <span>Command ${shortId(item.command_id || "-")}</span>
-        <span>Broker ${shortId(item.broker_order_id || "-")}</span>
+        <span>게이트 ${escapeHtml(buyZeroDisplayLabel(item.gate_status || "-"))} / 점수 ${escapeHtml(optionalNumber(item.gate_score, 1))}</span>
+        <span>데이터 ${escapeHtml(buyZeroDisplayLabel(item.data_quality_bucket || "-"))} / ${escapeHtml(buyZeroDisplayLabel(item.data_quality_action || "-"))}</span>
+        <span>누락 ${reasonBadges([...(item.missing_core_fields || []), ...(item.missing_entry_fields || []), ...(item.missing_optional_fields || [])])}</span>
+        <span>장초반 소액 ${escapeHtml(yesNoUnknown(item.early_small_candidate))} / 주문 ${escapeHtml(yesNoUnknown(item.early_small_order_enabled))} / x${escapeHtml(optionalNumber(item.early_small_position_size_multiplier, 2))}</span>
+        <span>틱 ${escapeHtml(yesNoUnknown(item.latest_tick_ready))} / ${escapeHtml(optionalNumber(item.latest_tick_age_sec, 1))}초</span>
+        <span>지지선 ${escapeHtml(yesNoUnknown(item.support_ready))} / ${escapeHtml(buyZeroDisplayLabel(item.selected_support_source || "-"))}</span>
+        <span>가상주문 ${escapeHtml(buyZeroDisplayLabel(item.dry_run_status || "-"))} ${escapeHtml(buyZeroDisplayLabel(item.dry_run_reason || ""))}</span>
+        <span>모의주문 ${escapeHtml(buyZeroDisplayLabel(item.live_sim_status || "-"))} ${escapeHtml(buyZeroDisplayLabel(item.live_sim_reason || ""))}</span>
+        <span>장초반 소액 거절 ${escapeHtml(buyZeroDisplayLabel(item.early_small_rejected_reason || "-"))}</span>
+        <span>명령 ID ${shortId(item.command_id || "-")}</span>
+        <span>주문번호 ${shortId(item.broker_order_id || "-")}</span>
       </div>
     </article>
   `).join("");
@@ -2627,17 +2696,17 @@ function buyZeroTraceMessage(item) {
   ].join(" ").toUpperCase();
   if (item.operator_message_ko && item.data_quality_bucket) return item.operator_message_ko;
   if (/CORE_BLOCKING/.test(textValue)) return "핵심 실시간 데이터 부족으로 주문 금지";
-  if (/ENTRY_BLOCKING/.test(textValue)) return "진입 판단 데이터 부족으로 WAIT_DATA";
-  if (/WARMUP_OPTIONAL/.test(textValue)) return "보조 warmup 부족으로 early-small 후보 관찰";
-  if (/BACKFILL_ONLY_OBSERVE/.test(textValue)) return "TR backfill만 있어 실시간 확인 전까지 관찰";
+  if (/ENTRY_BLOCKING/.test(textValue)) return "진입 판단 데이터 부족으로 데이터 대기";
+  if (/WARMUP_OPTIONAL/.test(textValue)) return "보조지표 준비 부족으로 장초반 소액 후보를 관찰";
+  if (/BACKFILL_ONLY_OBSERVE/.test(textValue)) return "TR 보강 데이터만 있어 실시간 확인 전까지 관찰";
   if (/LATEST_TICK|TICK_.*OLD|REALTIME_RELIABILITY/.test(textValue)) return "실시간 틱이 오래되어 주문 보류";
   if (/SUPPORT_NOT_READY|SUPPORT/.test(textValue) && item.entry_plan_diagnostic_only) return "지지선 미확정으로 진단 전용";
-  if (/LIVE_SIM|ACCOUNT_GUARD|EXIT_GUARD|KILL_SWITCH/.test(textValue)) return "LIVE_SIM guard에서 차단";
-  if (/GATE_RESULT_KEY_MISMATCH|CANDIDATE_STATE/.test(textValue)) return "READY였지만 candidate state/gate_result_key 불일치";
+  if (/LIVE_SIM|ACCOUNT_GUARD|EXIT_GUARD|KILL_SWITCH/.test(textValue)) return "모의주문 안전장치에서 차단";
+  if (/GATE_RESULT_KEY_MISMATCH|CANDIDATE_STATE/.test(textValue)) return "매수 가능 상태였지만 후보 상태 또는 판단키가 맞지 않았습니다";
   if (/DUPLICATE/.test(textValue)) return "중복 주문 방지로 차단";
-  if (/CHASE|LATE_CHASE|VWAP_OVEREXTENDED/.test(textValue)) return "추격 위험으로 OBSERVE";
+  if (/CHASE|LATE_CHASE|VWAP_OVEREXTENDED/.test(textValue)) return "추격 위험으로 관측 전환";
   if (String(item.pass_fail || "").toUpperCase() === "PASS") return "이 단계는 통과";
-  return item.primary_block_reason || item.stage_status || "trace event";
+  return buyZeroDisplayLabel(item.primary_block_reason || item.stage_status || "주문 판단 이벤트");
 }
 
 function appendActionResultToEvents(result) {
@@ -2880,7 +2949,7 @@ function renderTabCandidates(view = {}) {
 function renderTabNoBuy(view = {}) {
   const node = document.querySelector("#tab-no-buy .operator-tab-intro");
   const reason = (view.no_buy_reasons || [])[0];
-  if (node) node.textContent = view.tabs?.no_buy?.summary_ko || (reason ? `안 산 이유: 가장 큰 이유는 ${reason.label_ko || translateReasonCode(reason.code).label_ko}입니다.` : "안 산 이유: Buy-Zero RCA와 보수적 차단 사유를 아래에서 확인합니다.");
+  if (node) node.textContent = view.tabs?.no_buy?.summary_ko || (reason ? `안 산 이유: 가장 큰 이유는 ${reason.label_ko || translateReasonCode(reason.code).label_ko}입니다.` : "안 산 이유: 매수 0건 원인 분석과 보수적 차단 사유를 아래에서 확인합니다.");
 }
 
 function renderTabOrdersRisk(view = {}) {

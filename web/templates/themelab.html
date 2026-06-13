@@ -87,10 +87,10 @@
         <div class="operator-tab-intro">테마 순위, 구성, 대장/공동대장/후발 흐름을 확인합니다.</div>
       </section>
       <section id="tab-candidates" class="operator-tab-panel" data-tab-panel="tab-candidates" aria-label="매수 후보" hidden>
-        <div class="operator-tab-intro">READY/WAIT/OBSERVE/BLOCKED 후보 테이블과 주문 후보를 확인합니다.</div>
+        <div class="operator-tab-intro">매수 가능/대기/관측/차단 후보 테이블과 주문 후보를 확인합니다.</div>
       </section>
       <section id="tab-no-buy" class="operator-tab-panel" data-tab-panel="tab-no-buy" aria-label="안 산 이유" hidden>
-        <div class="operator-tab-intro">Buy-Zero RCA, 데이터 부족, 보수적 차단 사유를 확인합니다.</div>
+        <div class="operator-tab-intro">매수 0건 원인 분석, 데이터 부족, 보수적 차단 사유를 확인합니다.</div>
       </section>
       <section id="tab-orders-risk" class="operator-tab-panel" data-tab-panel="tab-orders-risk" aria-label="주문/리스크" hidden>
         <div class="operator-tab-intro">LIVE_SIM audit, reconcile, 미체결, 주문 안전장치를 확인합니다.</div>
@@ -150,26 +150,26 @@
         </div>
       </section>
 
-      <section id="themelab-buy-zero-rca-card" class="panel buy-zero-rca-panel" data-operator-tab="no-buy" aria-label="매수 0건 RCA">
+      <section id="themelab-buy-zero-rca-card" class="panel buy-zero-rca-panel" data-operator-tab="no-buy" aria-label="매수 0건 원인 분석">
         <div class="panel-head buy-zero-head">
           <div>
-            <h2>매수 0건 RCA</h2>
-            <p id="themelab-buy-zero-rca-empty">아직 RCA trace가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.</p>
-            <p id="themelab-buy-zero-rca-note" class="row-meta">trace는 PR 적용 이후 데이터만 표시하며, 과거 DB backfill은 하지 않습니다.</p>
+            <h2>매수 0건 원인 분석</h2>
+            <p id="themelab-buy-zero-rca-empty">아직 주문 판단 추적 데이터가 없습니다. 기능 적용 이후 이벤트부터 쌓입니다.</p>
+            <p id="themelab-buy-zero-rca-note" class="row-meta">주문 판단 추적은 기능 적용 이후 데이터만 표시하며, 과거 DB는 소급 보강하지 않습니다.</p>
           </div>
           <div class="gate-status-strip">
             <button id="themelab-buy-zero-rca-refresh" class="action-button" type="button">새로고침</button>
-            <span id="themelab-buy-zero-rca-status" class="badge observe">TRACE 대기</span>
-            <span id="themelab-buy-zero-rca-updated" class="counter">trace -</span>
+            <span id="themelab-buy-zero-rca-status" class="badge observe">추적 대기</span>
+            <span id="themelab-buy-zero-rca-updated" class="counter">추적 -</span>
           </div>
         </div>
         <div class="buy-zero-summary-grid">
           <article><span>후보</span><strong id="themelab-buy-zero-total-candidates">0</strong></article>
-          <article><span>Gate 평가</span><strong id="themelab-buy-zero-gate-evaluated">0</strong></article>
-          <article><span>READY / SMALL</span><strong id="themelab-buy-zero-ready-counts">0 / 0</strong></article>
-          <article><span>WAIT / OBSERVE</span><strong id="themelab-buy-zero-wait-observe-counts">0 / 0</strong></article>
-          <article><span>BLOCKED</span><strong id="themelab-buy-zero-blocked-count">0</strong></article>
-          <article><span>LIVE_SIM 차단</span><strong id="themelab-buy-zero-live-blocked-count">0</strong></article>
+          <article><span>게이트 평가</span><strong id="themelab-buy-zero-gate-evaluated">0</strong></article>
+          <article><span>매수 가능 / 소액</span><strong id="themelab-buy-zero-ready-counts">0 / 0</strong></article>
+          <article><span>대기 / 관측</span><strong id="themelab-buy-zero-wait-observe-counts">0 / 0</strong></article>
+          <article><span>차단</span><strong id="themelab-buy-zero-blocked-count">0</strong></article>
+          <article><span>모의주문 차단</span><strong id="themelab-buy-zero-live-blocked-count">0</strong></article>
         </div>
         <div class="buy-zero-cause-grid">
           <div>
@@ -181,34 +181,34 @@
             <div id="themelab-buy-zero-data-quality-blocks" class="buy-zero-line-list"></div>
           </div>
         </div>
-        <div class="operator-alert-subhead"><h3>왜 주문이 안 나갔나</h3><span id="themelab-buy-zero-stage-status" class="counter">stage 대기</span></div>
-        <div id="themelab-buy-zero-stage-funnel" class="buy-zero-stage-funnel" aria-label="매수 0건 RCA stage funnel"></div>
+        <div class="operator-alert-subhead"><h3>왜 주문이 안 나갔나</h3><span id="themelab-buy-zero-stage-status" class="counter">단계 대기</span></div>
+        <div id="themelab-buy-zero-stage-funnel" class="buy-zero-stage-funnel" aria-label="매수 0건 단계별 차단 흐름"></div>
         <div class="buy-zero-drill-grid">
           <section>
             <div class="operator-alert-subhead"><h3>READY인데 주문 안 나간 종목</h3><span id="themelab-buy-zero-ready-status" class="counter">0</span></div>
             <div class="table-wrap buy-zero-table-wrap">
               <table>
-                <thead><tr><th>종목</th><th>분류</th><th>Gate</th><th>차단 사유</th><th>DRY/LIVE</th><th>데이터</th></tr></thead>
+                <thead><tr><th>종목</th><th>분류</th><th>게이트</th><th>차단 사유</th><th>가상/모의</th><th>데이터</th></tr></thead>
                 <tbody id="themelab-buy-zero-ready-table-body"></tbody>
               </table>
             </div>
           </section>
           <section>
-            <div class="operator-alert-subhead"><h3>OBSERVE/BLOCKED 이후 급등 후보</h3><span id="themelab-buy-zero-rally-status" class="counter">0</span></div>
+            <div class="operator-alert-subhead"><h3>관측/차단 이후 급등 후보</h3><span id="themelab-buy-zero-rally-status" class="counter">0</span></div>
             <div class="table-wrap buy-zero-table-wrap">
               <table>
-                <thead><tr><th>종목</th><th>상태</th><th>사유</th><th>5m/15m/30m</th><th>MFE/MAE</th><th>위치</th></tr></thead>
+                <thead><tr><th>종목</th><th>상태</th><th>사유</th><th>5/15/30분</th><th>최대유리/불리</th><th>위치</th></tr></thead>
                 <tbody id="themelab-buy-zero-rally-table-body"></tbody>
               </table>
             </div>
           </section>
         </div>
         <div id="themelab-buy-zero-stage-candidates-panel" class="buy-zero-stage-candidates">
-          <div class="operator-alert-subhead"><h3 id="themelab-buy-zero-stage-title">Stage 차단 후보</h3><span class="counter">click stage</span></div>
+          <div class="operator-alert-subhead"><h3 id="themelab-buy-zero-stage-title">단계별 차단 후보</h3><span class="counter">단계 선택</span></div>
           <div id="themelab-buy-zero-stage-candidates-body" class="buy-zero-compact-list"></div>
         </div>
         <div id="themelab-buy-zero-rca-trace-detail" class="buy-zero-trace-detail" hidden>
-          <div class="operator-alert-subhead"><h3 id="themelab-buy-zero-trace-title">Trace Drilldown</h3><span id="themelab-buy-zero-trace-status" class="counter">row click</span></div>
+          <div class="operator-alert-subhead"><h3 id="themelab-buy-zero-trace-title">주문 판단 상세</h3><span id="themelab-buy-zero-trace-status" class="counter">행 선택</span></div>
           <div id="themelab-buy-zero-trace-summary" class="buy-zero-trace-summary"></div>
           <div id="themelab-buy-zero-rca-timeline" class="buy-zero-trace-timeline"></div>
         </div>
@@ -360,7 +360,7 @@
           </div>
           <div class="gate-status-strip">
             <button id="themelab-conservative-reason-refresh" class="action-button" type="button">새로고침</button>
-            <span id="themelab-conservative-reason-status" class="badge observe">NO_DATA</span>
+            <span id="themelab-conservative-reason-status" class="badge observe">데이터 없음</span>
             <span id="themelab-conservative-reason-updated" class="counter">-</span>
           </div>
         </div>
@@ -369,12 +369,12 @@
           <article><span>기회손실률</span><strong id="themelab-conservative-reason-missed-rate">0.0%</strong></article>
           <article><span>좋은 차단률</span><strong id="themelab-conservative-reason-good-rate">0.0%</strong></article>
           <article><span>리스크 회피율</span><strong id="themelab-conservative-reason-risk-rate">0.0%</strong></article>
-          <article><span>False block 후보</span><strong id="themelab-conservative-reason-false-count">0</strong></article>
+          <article><span>과차단 후보</span><strong id="themelab-conservative-reason-false-count">0</strong></article>
           <article><span>소액 검토 후보</span><strong id="themelab-conservative-reason-small-count">0</strong></article>
         </div>
         <div class="buy-zero-cause-grid">
           <section>
-            <div class="operator-alert-subhead"><h3>Group outcomes</h3><span class="counter">group</span></div>
+            <div class="operator-alert-subhead"><h3>사유 그룹별 결과</h3><span class="counter">그룹</span></div>
             <div class="table-wrap buy-zero-table-wrap">
               <table>
                 <thead><tr><th>그룹</th><th>표본</th><th>기회손실</th><th>좋은 차단</th><th>리스크 회피</th><th>추천</th></tr></thead>
@@ -383,10 +383,10 @@
             </div>
           </section>
           <section>
-            <div class="operator-alert-subhead"><h3>Reason outcomes</h3><span class="counter">reason</span></div>
+            <div class="operator-alert-subhead"><h3>사유 코드별 결과</h3><span class="counter">사유</span></div>
             <div class="table-wrap buy-zero-table-wrap">
               <table>
-                <thead><tr><th>사유</th><th>그룹</th><th>표본</th><th>MFE/MAE</th><th>추천</th></tr></thead>
+                <thead><tr><th>사유</th><th>그룹</th><th>표본</th><th>최대유리/불리</th><th>추천</th></tr></thead>
                 <tbody id="themelab-conservative-reason-code-body"></tbody>
               </table>
             </div>
@@ -398,17 +398,17 @@
             <div id="themelab-conservative-reason-small-body" class="buy-zero-line-list"></div>
           </section>
           <section>
-            <div class="operator-alert-subhead"><h3>WARMUP_OPTIONAL 결과</h3><span class="counter">data</span></div>
+            <div class="operator-alert-subhead"><h3>보조지표 준비중 결과</h3><span class="counter">데이터</span></div>
             <div id="themelab-conservative-reason-data-body" class="buy-zero-line-list"></div>
           </section>
         </div>
         <div class="buy-zero-cause-grid">
           <section>
-            <div class="operator-alert-subhead"><h3>놓친 기회 상위 종목</h3><span class="counter">MFE</span></div>
+            <div class="operator-alert-subhead"><h3>놓친 기회 상위 종목</h3><span class="counter">최대유리</span></div>
             <div id="themelab-conservative-reason-missed-body" class="buy-zero-line-list"></div>
           </section>
           <section>
-            <div class="operator-alert-subhead"><h3>좋은 차단 상위 종목</h3><span class="counter">MAE</span></div>
+            <div class="operator-alert-subhead"><h3>좋은 차단 상위 종목</h3><span class="counter">최대불리</span></div>
             <div id="themelab-conservative-reason-good-body" class="buy-zero-line-list"></div>
           </section>
         </div>
