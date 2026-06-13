@@ -77,6 +77,18 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
         "shadow-small-entry-promotion-blocked-count",
         "shadow-small-entry-promotion-group-lines",
         "shadow-small-entry-promotion-code-lines",
+        "shadow-small-entry-pilot-card",
+        "shadow-small-entry-pilot-status",
+        "shadow-small-entry-pilot-message",
+        "shadow-small-entry-pilot-recommendation",
+        "shadow-small-entry-pilot-candidate-count",
+        "shadow-small-entry-pilot-submitted-count",
+        "shadow-small-entry-pilot-filled-count",
+        "shadow-small-entry-pilot-safety-lines",
+        "shadow-small-entry-pilot-items",
+        "shadow-small-entry-pilot-start",
+        "shadow-small-entry-pilot-complete",
+        "shadow-small-entry-pilot-generate-report",
     ]:
         assert soup.select_one(f"#{node_id}") is not None
     assert soup.select_one("#transport-real-pilot-price-sample-rate") is not None
@@ -159,10 +171,15 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "function renderConservativeStockLines" in js
     assert "function renderShadowSmallEntryPromotion" in js
     assert "function renderShadowSmallEntryOps" in js
+    assert "function renderShadowSmallEntryPilot" in js
+    assert "function shadowSmallEntryPilotAction" in js
     assert "shadow_small_entry_ops" in js
+    assert "shadow_small_entry_pilot" in js
     assert "/api/shadow-small-entry-ops/arm" in js
     assert "/api/shadow-small-entry-ops/confirm" in js
     assert "/api/shadow-small-entry-ops/rollback" in js
+    assert "/api/shadow-small-entry-pilot/start" in js
+    assert "/api/shadow-small-entry-pilot/generate-report" in js
     assert "shadow_small_entry_promotion" in js
     assert "conservative_reason_outcomes" in js
     assert "live_sim_audit" in js

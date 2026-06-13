@@ -1070,6 +1070,65 @@ class TradingDatabase:
                 runtime_settings_after_hash TEXT NOT NULL DEFAULT '',
                 details_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS shadow_small_entry_pilot_runs (
+                pilot_id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at TEXT NOT NULL DEFAULT '',
+                ended_at TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'PLANNED',
+                mode TEXT NOT NULL DEFAULT '',
+                order_enabled_at_start INTEGER NOT NULL DEFAULT 0,
+                operator TEXT NOT NULL DEFAULT '',
+                operator_note TEXT NOT NULL DEFAULT '',
+                activation_event_id TEXT NOT NULL DEFAULT '',
+                rollback_event_id TEXT NOT NULL DEFAULT '',
+                source_report_trade_date TEXT NOT NULL DEFAULT '',
+                conservative_reason_report_id TEXT NOT NULL DEFAULT '',
+                shadow_promotion_report_id TEXT NOT NULL DEFAULT '',
+                runtime_settings_hash TEXT NOT NULL DEFAULT '',
+                promotion_policy_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                ops_policy_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                risk_limit_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                preflight_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                recommendation TEXT NOT NULL DEFAULT '',
+                recommendation_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                operator_message_ko TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS shadow_small_entry_pilot_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT UNIQUE NOT NULL,
+                pilot_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL DEFAULT '',
+                event_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                reason_group TEXT NOT NULL DEFAULT '',
+                reason_code TEXT NOT NULL DEFAULT '',
+                gate_status TEXT NOT NULL DEFAULT '',
+                price_location_status TEXT NOT NULL DEFAULT '',
+                stock_role TEXT NOT NULL DEFAULT '',
+                order_intent_id TEXT NOT NULL DEFAULT '',
+                live_sim_order_intent_id TEXT NOT NULL DEFAULT '',
+                command_id TEXT NOT NULL DEFAULT '',
+                broker_order_id TEXT NOT NULL DEFAULT '',
+                position_id TEXT NOT NULL DEFAULT '',
+                quantity INTEGER NOT NULL DEFAULT 0,
+                price REAL,
+                notional_krw REAL,
+                realized_pnl_krw REAL,
+                unrealized_pnl_krw REAL,
+                return_pct REAL,
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                severity TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                operator_message_ko TEXT NOT NULL DEFAULT ''
+            );
             CREATE TABLE IF NOT EXISTS shadow_strategy_evaluations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 evaluation_id TEXT UNIQUE NOT NULL,
@@ -1612,6 +1671,14 @@ class TradingDatabase:
                 ON shadow_small_entry_ops_audit_log(next_status, created_at);
             CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_ops_tokens_status
                 ON shadow_small_entry_ops_tokens(status, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_pilot_runs_trade_date
+                ON shadow_small_entry_pilot_runs(trade_date, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_pilot_events_pilot
+                ON shadow_small_entry_pilot_events(pilot_id, event_at, id);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_pilot_events_code
+                ON shadow_small_entry_pilot_events(trade_date, code, event_at);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_pilot_events_type
+                ON shadow_small_entry_pilot_events(trade_date, event_type, severity);
             CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_trade_date
                 ON shadow_strategy_evaluations(trade_date, evaluated_at, id);
             CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_policy
@@ -7254,6 +7321,157 @@ class TradingDatabase:
         ).fetchall()
         return [_row_to_shadow_small_entry_ops_audit(row) for row in rows]
 
+    def save_shadow_small_entry_pilot_run(self, payload: dict) -> dict:
+        params = _shadow_small_entry_pilot_run_params(payload)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO shadow_small_entry_pilot_runs(
+                    pilot_id, trade_date, created_at, started_at, ended_at,
+                    status, mode, order_enabled_at_start, operator, operator_note,
+                    activation_event_id, rollback_event_id, source_report_trade_date,
+                    conservative_reason_report_id, shadow_promotion_report_id,
+                    runtime_settings_hash, promotion_policy_snapshot_json,
+                    ops_policy_snapshot_json, risk_limit_snapshot_json,
+                    preflight_snapshot_json, summary_json, recommendation,
+                    recommendation_reason_codes_json, operator_message_ko, updated_at
+                ) VALUES (
+                    :pilot_id, :trade_date, :created_at, :started_at, :ended_at,
+                    :status, :mode, :order_enabled_at_start, :operator, :operator_note,
+                    :activation_event_id, :rollback_event_id, :source_report_trade_date,
+                    :conservative_reason_report_id, :shadow_promotion_report_id,
+                    :runtime_settings_hash, :promotion_policy_snapshot_json,
+                    :ops_policy_snapshot_json, :risk_limit_snapshot_json,
+                    :preflight_snapshot_json, :summary_json, :recommendation,
+                    :recommendation_reason_codes_json, :operator_message_ko, :updated_at
+                )
+                ON CONFLICT(pilot_id) DO UPDATE SET
+                    trade_date=excluded.trade_date,
+                    started_at=excluded.started_at,
+                    ended_at=excluded.ended_at,
+                    status=excluded.status,
+                    mode=excluded.mode,
+                    order_enabled_at_start=excluded.order_enabled_at_start,
+                    operator=excluded.operator,
+                    operator_note=excluded.operator_note,
+                    activation_event_id=excluded.activation_event_id,
+                    rollback_event_id=excluded.rollback_event_id,
+                    source_report_trade_date=excluded.source_report_trade_date,
+                    conservative_reason_report_id=excluded.conservative_reason_report_id,
+                    shadow_promotion_report_id=excluded.shadow_promotion_report_id,
+                    runtime_settings_hash=excluded.runtime_settings_hash,
+                    promotion_policy_snapshot_json=excluded.promotion_policy_snapshot_json,
+                    ops_policy_snapshot_json=excluded.ops_policy_snapshot_json,
+                    risk_limit_snapshot_json=excluded.risk_limit_snapshot_json,
+                    preflight_snapshot_json=excluded.preflight_snapshot_json,
+                    summary_json=excluded.summary_json,
+                    recommendation=excluded.recommendation,
+                    recommendation_reason_codes_json=excluded.recommendation_reason_codes_json,
+                    operator_message_ko=excluded.operator_message_ko,
+                    updated_at=excluded.updated_at
+                """,
+                params,
+            )
+            row = self.conn.execute(
+                "SELECT * FROM shadow_small_entry_pilot_runs WHERE pilot_id = ?",
+                (params["pilot_id"],),
+            ).fetchone()
+            return _row_to_shadow_small_entry_pilot_run(row)
+
+    def get_shadow_small_entry_pilot_run(self, pilot_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM shadow_small_entry_pilot_runs WHERE pilot_id = ?",
+            (str(pilot_id or ""),),
+        ).fetchone()
+        return _row_to_shadow_small_entry_pilot_run(row) if row else None
+
+    def latest_shadow_small_entry_pilot_run(self, *, trade_date: Optional[str] = None) -> Optional[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.conn.execute(
+            f"""
+            SELECT * FROM shadow_small_entry_pilot_runs
+            {where}
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            tuple(params),
+        ).fetchone()
+        return _row_to_shadow_small_entry_pilot_run(row) if row else None
+
+    def save_shadow_small_entry_pilot_events(self, events: Iterable[dict]) -> int:
+        rows = [_shadow_small_entry_pilot_event_params(item) for item in events]
+        if not rows:
+            return 0
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT OR IGNORE INTO shadow_small_entry_pilot_events(
+                    event_id, pilot_id, trade_date, event_type, event_at,
+                    code, name, candidate_instance_id, theme_name, reason_group,
+                    reason_code, gate_status, price_location_status, stock_role,
+                    order_intent_id, live_sim_order_intent_id, command_id,
+                    broker_order_id, position_id, quantity, price, notional_krw,
+                    realized_pnl_krw, unrealized_pnl_krw, return_pct,
+                    reason_codes_json, severity, details_json, operator_message_ko
+                ) VALUES (
+                    :event_id, :pilot_id, :trade_date, :event_type, :event_at,
+                    :code, :name, :candidate_instance_id, :theme_name, :reason_group,
+                    :reason_code, :gate_status, :price_location_status, :stock_role,
+                    :order_intent_id, :live_sim_order_intent_id, :command_id,
+                    :broker_order_id, :position_id, :quantity, :price, :notional_krw,
+                    :realized_pnl_krw, :unrealized_pnl_krw, :return_pct,
+                    :reason_codes_json, :severity, :details_json, :operator_message_ko
+                )
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def list_shadow_small_entry_pilot_events(
+        self,
+        *,
+        pilot_id: str = "",
+        trade_date: Optional[str] = None,
+        code: str = "",
+        recommendation: str = "",
+        status: str = "",
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if pilot_id:
+            clauses.append("pilot_id = ?")
+            params.append(str(pilot_id))
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if code:
+            clauses.append("code = ?")
+            params.append(str(code))
+        if recommendation:
+            clauses.append("json_extract(details_json, '$.recommendation') = ?")
+            params.append(str(recommendation))
+        if status:
+            clauses.append("(event_type = ? OR gate_status = ? OR severity = ?)")
+            params.extend([str(status), str(status), str(status)])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM shadow_small_entry_pilot_events
+            {where}
+            ORDER BY event_at ASC, id ASC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 1000)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_shadow_small_entry_pilot_event(row) for row in rows]
+
     def close(self) -> None:
         self.conn.close()
 
@@ -8520,6 +8738,101 @@ def _shadow_small_entry_ops_audit_params(payload: dict) -> dict:
 
 
 def _row_to_shadow_small_entry_ops_audit(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["reason_codes"] = _safe_json_loads(data.get("reason_codes_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    return data
+
+
+def _shadow_small_entry_pilot_run_params(payload: dict) -> dict:
+    now = str(payload.get("updated_at") or payload.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+    created_at = str(payload.get("created_at") or now)
+    trade_date = str(payload.get("trade_date") or _trade_date_from_timestamp(created_at) or "")
+    return {
+        "pilot_id": str(payload.get("pilot_id") or f"shadow_small_entry_pilot:{trade_date or created_at[:10]}"),
+        "trade_date": trade_date,
+        "created_at": created_at,
+        "started_at": str(payload.get("started_at") or ""),
+        "ended_at": str(payload.get("ended_at") or ""),
+        "status": str(payload.get("status") or "PLANNED"),
+        "mode": str(payload.get("mode") or ""),
+        "order_enabled_at_start": 1 if bool(payload.get("order_enabled_at_start")) else 0,
+        "operator": str(payload.get("operator") or ""),
+        "operator_note": str(payload.get("operator_note") or ""),
+        "activation_event_id": str(payload.get("activation_event_id") or ""),
+        "rollback_event_id": str(payload.get("rollback_event_id") or ""),
+        "source_report_trade_date": str(payload.get("source_report_trade_date") or ""),
+        "conservative_reason_report_id": str(payload.get("conservative_reason_report_id") or ""),
+        "shadow_promotion_report_id": str(payload.get("shadow_promotion_report_id") or ""),
+        "runtime_settings_hash": str(payload.get("runtime_settings_hash") or ""),
+        "promotion_policy_snapshot_json": _json_payload(payload.get("promotion_policy_snapshot_json", payload.get("promotion_policy_snapshot", {}))),
+        "ops_policy_snapshot_json": _json_payload(payload.get("ops_policy_snapshot_json", payload.get("ops_policy_snapshot", {}))),
+        "risk_limit_snapshot_json": _json_payload(payload.get("risk_limit_snapshot_json", payload.get("risk_limit_snapshot", {}))),
+        "preflight_snapshot_json": _json_payload(payload.get("preflight_snapshot_json", payload.get("preflight_snapshot", {}))),
+        "summary_json": _json_payload(payload.get("summary_json", payload.get("summary", {}))),
+        "recommendation": str(payload.get("recommendation") or ""),
+        "recommendation_reason_codes_json": _json_list(payload.get("recommendation_reason_codes_json", payload.get("recommendation_reason_codes", []))),
+        "operator_message_ko": str(payload.get("operator_message_ko") or ""),
+        "updated_at": now,
+    }
+
+
+def _row_to_shadow_small_entry_pilot_run(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["order_enabled_at_start"] = bool(data.get("order_enabled_at_start"))
+    data["promotion_policy_snapshot"] = _safe_json_loads(data.get("promotion_policy_snapshot_json"), {})
+    data["ops_policy_snapshot"] = _safe_json_loads(data.get("ops_policy_snapshot_json"), {})
+    data["risk_limit_snapshot"] = _safe_json_loads(data.get("risk_limit_snapshot_json"), {})
+    data["preflight_snapshot"] = _safe_json_loads(data.get("preflight_snapshot_json"), {})
+    data["summary"] = _safe_json_loads(data.get("summary_json"), {})
+    data["recommendation_reason_codes"] = _safe_json_loads(data.get("recommendation_reason_codes_json"), [])
+    return data
+
+
+def _shadow_small_entry_pilot_event_params(payload: dict) -> dict:
+    event_at = str(payload.get("event_at") or payload.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+    trade_date = str(payload.get("trade_date") or _trade_date_from_timestamp(event_at) or "")
+    event_type = str(payload.get("event_type") or payload.get("stage") or "")
+    code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
+    candidate_instance_id = str(payload.get("candidate_instance_id") or "")
+    event_id = str(
+        payload.get("event_id")
+        or f"shadow_small_entry_pilot_event:{trade_date}:{event_type}:{code}:{candidate_instance_id}:{uuid4().hex[:12]}"
+    )
+    return {
+        "event_id": event_id,
+        "pilot_id": str(payload.get("pilot_id") or ""),
+        "trade_date": trade_date,
+        "event_type": event_type,
+        "event_at": event_at,
+        "code": code,
+        "name": str(payload.get("name") or ""),
+        "candidate_instance_id": candidate_instance_id,
+        "theme_name": str(payload.get("theme_name") or ""),
+        "reason_group": str(payload.get("reason_group") or payload.get("primary_group") or ""),
+        "reason_code": str(payload.get("reason_code") or payload.get("primary_reason") or payload.get("primary_block_reason") or ""),
+        "gate_status": str(payload.get("gate_status") or payload.get("stage_status") or payload.get("promotion_status") or ""),
+        "price_location_status": str(payload.get("price_location_status") or ""),
+        "stock_role": str(payload.get("stock_role") or ""),
+        "order_intent_id": str(payload.get("order_intent_id") or ""),
+        "live_sim_order_intent_id": str(payload.get("live_sim_order_intent_id") or payload.get("live_sim_intent_id") or ""),
+        "command_id": str(payload.get("command_id") or ""),
+        "broker_order_id": str(payload.get("broker_order_id") or ""),
+        "position_id": str(payload.get("position_id") or ""),
+        "quantity": int(payload.get("quantity") or payload.get("fill_qty") or payload.get("requested_qty") or 0),
+        "price": _nullable_float(payload.get("price", payload.get("fill_price", payload.get("submitted_price")))),
+        "notional_krw": _nullable_float(payload.get("notional_krw")),
+        "realized_pnl_krw": _nullable_float(payload.get("realized_pnl_krw")),
+        "unrealized_pnl_krw": _nullable_float(payload.get("unrealized_pnl_krw")),
+        "return_pct": _nullable_float(payload.get("return_pct")),
+        "reason_codes_json": _json_list(payload.get("reason_codes_json", payload.get("reason_codes", []))),
+        "severity": str(payload.get("severity") or ""),
+        "details_json": _json_payload(payload.get("details_json", payload.get("details", {}))),
+        "operator_message_ko": str(payload.get("operator_message_ko") or ""),
+    }
+
+
+def _row_to_shadow_small_entry_pilot_event(row: sqlite3.Row) -> dict:
     data = dict(row)
     data["reason_codes"] = _safe_json_loads(data.get("reason_codes_json"), [])
     data["details"] = _safe_json_loads(data.get("details_json"), {})

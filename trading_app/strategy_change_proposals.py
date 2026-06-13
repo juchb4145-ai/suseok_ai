@@ -10,6 +10,7 @@ from typing import Any, Iterable, Optional
 
 from storage.db import TradingDatabase
 from trading_app.conservative_reason_outcomes import ConservativeReasonOutcomeAnalyzer
+from trading_app.shadow_small_entry_pilot import ShadowSmallEntryPilotService
 from trading_app.shadow_small_entry_promotion import ShadowSmallEntryPromotionAnalyzer
 from trading_app.strategy_replay import DEFAULT_REPLAY_DB_ROOT, scan_replay_reports
 from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
@@ -641,6 +642,73 @@ class StrategyChangeProposalGenerator:
             )
         return proposals
 
+    def generate_from_shadow_small_entry_pilot(self, trade_date: str) -> list[StrategyChangeProposal]:
+        try:
+            report = ShadowSmallEntryPilotService(self.db).build_report(trade_date=trade_date or None, persist=False, limit=50000)
+        except Exception:
+            return []
+        summary = dict(report.get("summary") or {})
+        candidate_count = int(summary.get("candidate_count") or 0)
+        if candidate_count <= 0 and not bool(report.get("available")):
+            return []
+        recommendation = str(report.get("recommendation") or "")
+        source_id = str(report.get("pilot_id") or f"shadow_small_entry_pilot:{trade_date}")
+        filled_count = int(summary.get("filled_order_count") or 0)
+        issue_count = (
+            int(summary.get("reconcile_required_count") or 0)
+            + int(summary.get("audit_warning_count") or 0)
+            + int(summary.get("audit_broken_count") or 0)
+            + int(summary.get("unknown_submit_count") or 0)
+        )
+        confidence = min(0.85, max(0.25, (filled_count or candidate_count) / 10.0))
+        base_metrics = {
+            "sample_count": max(candidate_count, filled_count, int(summary.get("submitted_order_count") or 0)),
+            "shadow_small_entry_pilot_candidate_count": candidate_count,
+            "shadow_small_entry_pilot_submitted_order_count": int(summary.get("submitted_order_count") or 0),
+            "shadow_small_entry_pilot_filled_order_count": filled_count,
+            "shadow_small_entry_pilot_total_pnl_krw": float(summary.get("total_pnl_krw") or 0),
+            "shadow_small_entry_pilot_win_rate": float(summary.get("win_rate") or 0),
+            "shadow_small_entry_pilot_avg_mae_pct": float(summary.get("avg_mae_pct") or 0),
+            "shadow_small_entry_pilot_reconcile_required_count": int(summary.get("reconcile_required_count") or 0),
+            "shadow_small_entry_pilot_audit_broken_count": int(summary.get("audit_broken_count") or 0),
+            "shadow_small_entry_pilot_unknown_submit_count": int(summary.get("unknown_submit_count") or 0),
+            "shadow_small_entry_pilot_exit_guard_block_count": int(summary.get("exit_guard_block_count") or 0),
+            "false_positive_increase_count": 0,
+            "net_benefit_score": float(filled_count) - float(issue_count),
+            "confidence": confidence,
+            "source_grade": "WATCH_CANDIDATE" if filled_count >= 3 and issue_count == 0 else "DATA_INSUFFICIENT",
+        }
+        policy_by_recommendation = {
+            "CONTINUE_LIVE_SIM_GUARDED": "continue_shadow_small_entry_live_sim_guarded",
+            "REDUCE_SIZE": "reduce_shadow_small_entry_size",
+            "REDUCE_FREQUENCY": "reduce_shadow_small_entry_frequency",
+            "KEEP_DISABLED": "keep_shadow_small_entry_disabled",
+            "ROLLBACK_TO_OBSERVE_ONLY": "rollback_shadow_small_entry_observe_only",
+            "INVESTIGATE_ORDER_LIFECYCLE": "investigate_live_sim_lifecycle",
+            "INVESTIGATE_RECONCILE": "investigate_live_sim_lifecycle",
+            "INVESTIGATE_EXIT_LOGIC": "investigate_exit_logic",
+            "INVESTIGATE_DATA_QUALITY": "warmup_optional_shadow_small_entry",
+            "CONTINUE_OBSERVE_ONLY": "enable_shadow_small_entry_observe_only",
+        }
+        policy_key = policy_by_recommendation.get(recommendation, "enable_shadow_small_entry_observe_only")
+        if policy_key not in POLICY_PATCHES:
+            return []
+        return [
+            self._build_proposal(
+                trade_date=trade_date,
+                source_type="shadow_small_entry_pilot",
+                source_ids=[source_id, f"shadow_small_entry_pilot_policy:{policy_key}"],
+                policy_key=policy_key,
+                evidence_metrics=base_metrics,
+                raw_source={
+                    "summary": summary,
+                    "recommendation": recommendation,
+                    "recommendation_reason_codes": report.get("recommendation_reason_codes") or [],
+                    "safety_checklist": report.get("safety_checklist") or [],
+                },
+            )
+        ]
+
     def generate_combined_proposals(self, trade_date: str) -> list[StrategyChangeProposal]:
         proposals = []
         proposals.extend(self.generate_from_intraday_outcomes(trade_date))
@@ -649,6 +717,7 @@ class StrategyChangeProposalGenerator:
         proposals.extend(self.generate_from_threshold_ab(trade_date))
         proposals.extend(self.generate_from_conservative_reason_outcomes(trade_date))
         proposals.extend(self.generate_from_shadow_small_entry_promotion(trade_date))
+        proposals.extend(self.generate_from_shadow_small_entry_pilot(trade_date))
         return _dedupe_proposals(proposals)
 
     def score_proposal(self, proposal: StrategyChangeProposal, evidence: Iterable[StrategyChangeEvidence]) -> StrategyChangeProposal:
@@ -706,6 +775,8 @@ class StrategyChangeProposalGenerator:
             proposals = self.generate_from_conservative_reason_outcomes(trade_date)
         elif source_type == "shadow_small_entry_promotion":
             proposals = self.generate_from_shadow_small_entry_promotion(trade_date)
+        elif source_type == "shadow_small_entry_pilot":
+            proposals = self.generate_from_shadow_small_entry_pilot(trade_date)
         else:
             proposals = self.generate_combined_proposals(trade_date)
         persisted = self.persist_proposals(proposals) if persist else {"proposal_count": len(proposals), "saved_count": 0, "evidence_count": 0}
@@ -952,6 +1023,84 @@ POLICY_PATCHES: dict[str, dict[str, Any]] = {
             ],
             "shadow_small_entry_promotion.mode": "observe_only",
             "shadow_small_entry_promotion.order_enabled": False,
+        },
+    },
+    "continue_shadow_small_entry_live_sim_guarded": {
+        "title": "Continue Shadow Small Entry guarded pilot",
+        "summary_ko": "1일 파일럿에서 주문 lifecycle 문제가 없을 때 LIVE_SIM guarded 관측을 이어갈지 검토하는 REVIEW_READY 제안입니다.",
+        "category": "order_guard",
+        "target_component": "shadow_small_entry_promotion",
+        "expected_effect_ko": "guarded 모드 후보를 유지하되 order_enabled는 자동으로 켜지지 않습니다.",
+        "expected_risk_ko": "실제 주문 활성화는 별도 운영 승인과 ops preflight/confirm이 필요합니다.",
+        "patch": {
+            "shadow_small_entry_promotion.enabled": True,
+            "shadow_small_entry_promotion.mode": "live_sim_guarded",
+            "shadow_small_entry_promotion.order_enabled": False,
+            "shadow_small_entry_promotion.operator_approval_required_for_order_enabled": True,
+        },
+    },
+    "reduce_shadow_small_entry_size": {
+        "title": "Reduce Shadow Small Entry pilot size",
+        "summary_ko": "파일럿 손실 또는 MAE 확대 시 다음 검증 단위의 size를 줄이는 REVIEW_READY 제안입니다.",
+        "category": "position_sizing",
+        "target_component": "shadow_small_entry_promotion",
+        "expected_effect_ko": "추가 파일럿의 노출을 더 보수적으로 제한합니다.",
+        "expected_risk_ko": "order_enabled=false를 유지하므로 자동 주문 활성화 위험은 없습니다.",
+        "patch": {
+            "shadow_small_entry_promotion.max_position_size_multiplier": 0.05,
+            "shadow_small_entry_promotion.max_position_size_multiplier_strong": 0.10,
+            "shadow_small_entry_promotion.thin_position_size_multiplier": 0.03,
+            "shadow_small_entry_promotion.order_enabled": False,
+        },
+    },
+    "reduce_shadow_small_entry_frequency": {
+        "title": "Reduce Shadow Small Entry pilot frequency",
+        "summary_ko": "파일럿 빈도를 낮춰 하루 promotion/order 후보 수를 더 보수적으로 제한하는 REVIEW_READY 제안입니다.",
+        "category": "order_guard",
+        "target_component": "shadow_small_entry_ops",
+        "expected_effect_ko": "다음 파일럿의 후보/주문 빈도 한도를 낮춥니다.",
+        "expected_risk_ko": "order_enabled=false를 유지하며 guard 완화는 포함하지 않습니다.",
+        "patch": {
+            "shadow_small_entry_ops.daily_limits.max_promotions_per_day": 1,
+            "shadow_small_entry_ops.daily_limits.max_submitted_orders_per_day": 1,
+            "shadow_small_entry_promotion.order_enabled": False,
+        },
+    },
+    "rollback_shadow_small_entry_observe_only": {
+        "title": "Rollback Shadow Small Entry to observe-only",
+        "summary_ko": "파일럿 audit/reconcile 문제가 있을 때 observe_only로 되돌리는 REVIEW_READY 제안입니다.",
+        "category": "order_guard",
+        "target_component": "shadow_small_entry_ops",
+        "expected_effect_ko": "신규 small-entry 주문을 중단하고 관측/리뷰만 유지합니다.",
+        "expected_risk_ko": "LIVE_SIM guard를 완화하지 않으며 order_enabled=false를 명시합니다.",
+        "patch": {
+            "shadow_small_entry_ops.current_status": "ROLLED_BACK",
+            "shadow_small_entry_promotion.mode": "observe_only",
+            "shadow_small_entry_promotion.order_enabled": False,
+        },
+    },
+    "investigate_live_sim_lifecycle": {
+        "title": "Investigate LIVE_SIM lifecycle before next pilot",
+        "summary_ko": "UNKNOWN_SUBMIT/reconcile/order audit 이슈가 있어 다음 파일럿 전 주문 lifecycle 점검을 요구하는 REVIEW_READY 제안입니다.",
+        "category": "order_guard",
+        "target_component": "live_sim_audit",
+        "expected_effect_ko": "주문번호 누락, 취소 지연, 포지션 불일치 등 운영 리스크를 먼저 확인합니다.",
+        "expected_risk_ko": "설정 완화 없이 order_enabled=false를 유지합니다.",
+        "patch": {
+            "shadow_small_entry_promotion.order_enabled": False,
+            "shadow_small_entry_ops.require_preflight_pass": True,
+        },
+    },
+    "investigate_exit_logic": {
+        "title": "Investigate Shadow Small Entry exit logic",
+        "summary_ko": "파일럿 청산 guard/exit 연결 이슈가 있어 exit logic 확인을 요구하는 REVIEW_READY 제안입니다.",
+        "category": "exit",
+        "target_component": "exit_engine",
+        "expected_effect_ko": "손절/익절/max-hold가 기존 포지션과 끊기지 않았는지 재검증합니다.",
+        "expected_risk_ko": "exit threshold 완화나 주문 활성화는 포함하지 않습니다.",
+        "patch": {
+            "shadow_small_entry_promotion.order_enabled": False,
+            "shadow_small_entry_ops.risk_limits.pause_on_exit_guard_not_ready": True,
         },
     },
     "leader_only_theme_leader_small_entry_candidate": {

@@ -20,6 +20,11 @@ const state = {
     activationToken: "",
     activationTokenId: "",
   },
+  shadowSmallEntryPilot: {
+    report: null,
+    inFlight: false,
+    lastFetchedAt: 0,
+  },
 };
 
 const SNAPSHOT_POLL_INTERVAL_MS = 30000;
@@ -32,6 +37,12 @@ const SHADOW_SMALL_ENTRY_OPS_ENDPOINTS = {
   pause: "/api/shadow-small-entry-ops/pause",
   rollback: "/api/shadow-small-entry-ops/rollback",
   "emergency-pause": "/api/shadow-small-entry-ops/pause",
+};
+const SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS = {
+  start: "/api/shadow-small-entry-pilot/start",
+  complete: "/api/shadow-small-entry-pilot/complete",
+  "generate-report": "/api/shadow-small-entry-pilot/generate-report",
+  report: "/api/shadow-small-entry-pilot/report",
 };
 
 const tableConfigs = {
@@ -1278,6 +1289,97 @@ function renderShadowSmallEntryOpsRiskLines(id, today, limits, audit) {
   node.innerHTML = lines.map((line) => `<span class="counter muted">${escapeHtml(line)}</span>`).join(" ");
 }
 
+function renderShadowSmallEntryPilot(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.shadow_small_entry_pilot || runtime.shadow_small_entry_pilot || {};
+  const report = state.shadowSmallEntryPilot.report || {};
+  const summary = payload.summary || (report.summary || {});
+  const status = payload.status || "NO_DATA";
+  const recommendation = payload.recommendation || report.recommendation || "-";
+  const available = Boolean(payload.available || report.available);
+  text("shadow-small-entry-pilot-status", status);
+  cls("shadow-small-entry-pilot-status", `counter ${status === "REVIEW_READY" || status === "COMPLETED" ? "ok" : status === "NO_DATA" ? "muted" : "warn"}`);
+  text("shadow-small-entry-pilot-id", compactPlain(payload.pilot_id || report.pilot_id || "-"));
+  text("shadow-small-entry-pilot-recommendation", recommendation || "-");
+  text("shadow-small-entry-pilot-message", payload.operator_message_ko || report.operator_message_ko || "아직 Shadow Small Entry pilot run 데이터가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.");
+  text("shadow-small-entry-pilot-candidate-count", summary.candidate_count ?? 0);
+  text("shadow-small-entry-pilot-promoted-count", summary.promoted_count ?? 0);
+  text("shadow-small-entry-pilot-submitted-count", summary.submitted_order_count ?? 0);
+  text("shadow-small-entry-pilot-filled-count", summary.filled_order_count ?? 0);
+  text("shadow-small-entry-pilot-open-position-count", summary.open_position_count ?? 0);
+  text("shadow-small-entry-pilot-total-pnl", fmtNumber(summary.total_pnl_krw ?? 0, 0));
+  text("shadow-small-entry-pilot-win-rate", summary.win_rate == null ? "-" : formatRate(summary.win_rate));
+  text("shadow-small-entry-pilot-avg-return", summary.avg_return_pct == null ? "-" : `${fmtNumber(summary.avg_return_pct, 2)}%`);
+  text("shadow-small-entry-pilot-mfe-mae", `${summary.avg_mfe_pct == null ? "-" : fmtNumber(summary.avg_mfe_pct, 2)} / ${summary.avg_mae_pct == null ? "-" : fmtNumber(summary.avg_mae_pct, 2)}`);
+  text("shadow-small-entry-pilot-updated", formatDateTime(payload.last_updated_at || report.last_updated_at));
+  renderShadowSmallEntryPilotReasons(payload.recommendation_reason_codes || report.recommendation_reason_codes || []);
+  renderShadowSmallEntryPilotSafety(report.safety_checklist || []);
+  renderShadowSmallEntryPilotItems(report.items || [], available);
+  maybeFetchShadowSmallEntryPilotReport(payload);
+}
+
+function renderShadowSmallEntryPilotReasons(reasons) {
+  const node = document.getElementById("shadow-small-entry-pilot-reasons");
+  if (!node) return;
+  const items = firstItems(reasons || [], 8);
+  node.innerHTML = items.length
+    ? items.map((reason) => `<span class="badge ${/BROKEN|RECONCILE|UNKNOWN|LOSS|ERROR/.test(String(reason)) ? "warning" : "info"}">${escapeHtml(reason)}</span>`).join(" ")
+    : `<span class="empty">추천 reason code가 아직 없습니다.</span>`;
+}
+
+function renderShadowSmallEntryPilotSafety(checks) {
+  const node = document.getElementById("shadow-small-entry-pilot-safety-lines");
+  if (!node) return;
+  const items = firstItems(checks || [], 8);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item ${item.status === "PASS" ? "ok" : item.status === "FAIL" ? "bad" : item.status === "WARN" ? "warn" : "info"}">
+        <strong>${escapeHtml(item.check_id || "-")}</strong>
+        <span>${escapeHtml(item.status || "-")} · ${escapeHtml(item.operator_message_ko || "")}</span>
+      </div>
+    `).join("")
+    : `<span class="empty">안전 체크리스트는 리포트 생성 후 표시됩니다.</span>`;
+}
+
+function renderShadowSmallEntryPilotItems(items, available) {
+  const node = document.getElementById("shadow-small-entry-pilot-items");
+  if (!node) return;
+  const rows = firstItems(items || [], 20);
+  if (!rows.length) {
+    node.innerHTML = `<tr><td colspan="6" class="empty">${available ? "파일럿 후보 상세 rows가 아직 없습니다." : "아직 수집된 pilot trace가 없습니다."}</td></tr>`;
+    return;
+  }
+  node.innerHTML = rows.map((item) => `
+    <tr>
+      <td>${escapeHtml([item.code, item.name].filter(Boolean).join(" ") || "-")}</td>
+      <td>${badge(item.pilot_status || item.promotion_status || "-")}</td>
+      <td>${escapeHtml(item.order_status || "-")}</td>
+      <td>${escapeHtml(item.fill_qty ?? item.submitted_qty ?? 0)}</td>
+      <td>${escapeHtml(fmtNumber(item.realized_pnl_krw ?? item.unrealized_pnl_krw ?? 0, 0))}</td>
+      <td>${escapeHtml(item.recommendation || "-")}</td>
+    </tr>
+  `).join("");
+}
+
+function maybeFetchShadowSmallEntryPilotReport(payload) {
+  const now = Date.now();
+  if (state.shadowSmallEntryPilot.inFlight) return;
+  if (now - state.shadowSmallEntryPilot.lastFetchedAt < 60000) return;
+  state.shadowSmallEntryPilot.inFlight = true;
+  state.shadowSmallEntryPilot.lastFetchedAt = now;
+  const params = {};
+  if (payload.trade_date) params.trade_date = payload.trade_date;
+  apiGet(SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS.report, params)
+    .then((report) => {
+      state.shadowSmallEntryPilot.report = report;
+      renderShadowSmallEntryPilot(state.latestSnapshot || {});
+    })
+    .catch(() => {})
+    .finally(() => {
+      state.shadowSmallEntryPilot.inFlight = false;
+    });
+}
+
 function renderKeyCountLines(id, rows, emptyText) {
   const node = document.getElementById(id);
   if (!node) return;
@@ -1647,6 +1749,7 @@ function render(snapshot) {
   renderConservativeReasonOutcomes(snapshot);
   renderShadowSmallEntryPromotion(snapshot);
   renderShadowSmallEntryOps(snapshot);
+  renderShadowSmallEntryPilot(snapshot);
 
   text("transport-mode", transport.mode || "rest_long_poll");
   text("transport-event-p95", formatMs(transport.event_latency_p95_ms));
@@ -1979,6 +2082,34 @@ async function shadowSmallEntryOpsAction(action, button) {
   }
 }
 
+async function shadowSmallEntryPilotAction(action, button) {
+  const originalText = button?.textContent || "";
+  const endpoint = SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS[action] || SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS.report;
+  const body = { operator: "dashboard", note: `dashboard ${action}` };
+  if (action === "generate-report") {
+    body.export = true;
+    body.format = "all";
+  }
+  if (button) {
+    button.disabled = true;
+    button.textContent = "running";
+  }
+  try {
+    const payload = await runWithLocalTokenRetry((token) => postWithLocalToken(endpoint, token, body));
+    if (!payload) return;
+    state.shadowSmallEntryPilot.report = payload.report || payload;
+    state.shadowSmallEntryPilot.lastFetchedAt = Date.now();
+    await pollSnapshot();
+  } catch (error) {
+    openDetailPanel("Shadow Small Entry Pilot 오류", { action, error: error.message });
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+}
+
 async function runtimeCommand(action, button) {
   const originalText = button?.textContent || "";
   if (button) {
@@ -2086,6 +2217,13 @@ function initDashboard() {
     ["shadow-small-entry-ops-emergency-pause", "emergency-pause"],
   ].forEach(([id, action]) => {
     document.getElementById(id)?.addEventListener("click", (event) => shadowSmallEntryOpsAction(action, event.currentTarget).catch(() => {}));
+  });
+  [
+    ["shadow-small-entry-pilot-start", "start"],
+    ["shadow-small-entry-pilot-complete", "complete"],
+    ["shadow-small-entry-pilot-generate-report", "generate-report"],
+  ].forEach(([id, action]) => {
+    document.getElementById(id)?.addEventListener("click", (event) => shadowSmallEntryPilotAction(action, event.currentTarget).catch(() => {}));
   });
   document.getElementById("buy-zero-rca-refresh")?.addEventListener("click", () => {
     state.buyZeroRca.lastFetchedAt = 0;

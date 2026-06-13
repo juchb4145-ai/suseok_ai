@@ -22,6 +22,11 @@ from trading_app.shadow_small_entry_ops import (
     ShadowSmallEntryOpsService,
     snapshot_payload as shadow_small_entry_ops_snapshot_payload,
 )
+from trading_app.shadow_small_entry_pilot import (
+    ShadowSmallEntryPilotService,
+    empty_payload as shadow_small_entry_pilot_empty_payload,
+    snapshot_payload as shadow_small_entry_pilot_snapshot_payload,
+)
 from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
 
 
@@ -83,6 +88,7 @@ def build_theme_lab_dashboard_snapshot(
     conservative_reason_outcomes = _conservative_reason_outcomes(db, trade_date=trade_date)
     shadow_small_entry_promotion = _shadow_small_entry_promotion(db, trade_date=trade_date)
     shadow_small_entry_ops = _shadow_small_entry_ops(db, gateway_state=gateway_state, trade_date=trade_date)
+    shadow_small_entry_pilot = _shadow_small_entry_pilot(db, gateway_state=gateway_state, trade_date=trade_date)
 
     return {
         "available": True,
@@ -109,6 +115,7 @@ def build_theme_lab_dashboard_snapshot(
         "conservative_reason_outcomes": conservative_reason_outcomes,
         "shadow_small_entry_promotion": shadow_small_entry_promotion,
         "shadow_small_entry_ops": shadow_small_entry_ops,
+        "shadow_small_entry_pilot": shadow_small_entry_pilot,
         "shadow_small_entry": gate_reason_outcomes.get("shadow_small_entry") or _empty_shadow_small_entry(),
         "shadow_small_entry_ab": gate_reason_outcomes.get("shadow_small_entry_ab") or _empty_shadow_small_entry_ab(),
         "summary": summary,
@@ -180,6 +187,7 @@ def _empty_snapshot(
         "conservative_reason_outcomes": _conservative_reason_outcomes(db, trade_date=datetime.now().date().isoformat()) if db is not None else conservative_reason_empty_payload(),
         "shadow_small_entry_promotion": _shadow_small_entry_promotion(db, trade_date=datetime.now().date().isoformat()) if db is not None else shadow_small_entry_empty_payload(),
         "shadow_small_entry_ops": _shadow_small_entry_ops(db, gateway_state=gateway_state, trade_date=datetime.now().date().isoformat()) if db is not None else _shadow_small_entry_ops_empty(),
+        "shadow_small_entry_pilot": _shadow_small_entry_pilot(db, gateway_state=gateway_state, trade_date=datetime.now().date().isoformat()) if db is not None else shadow_small_entry_pilot_empty_payload(datetime.now().date().isoformat()),
         "shadow_small_entry": _empty_shadow_small_entry(),
         "shadow_small_entry_ab": _empty_shadow_small_entry_ab(),
         "summary": _empty_summary(runtime=runtime, freshness=freshness),
@@ -271,6 +279,15 @@ def _shadow_small_entry_ops_empty() -> dict[str, Any]:
         "operator_message_ko": "Shadow Small Entry 운영 trace가 아직 없습니다.",
         "last_updated_at": "",
     }
+
+
+def _shadow_small_entry_pilot(db: TradingDatabase, *, gateway_state: Any | None, trade_date: str = "") -> dict[str, Any]:
+    try:
+        return shadow_small_entry_pilot_snapshot_payload(
+            ShadowSmallEntryPilotService(db, gateway_state=gateway_state).status(trade_date=trade_date or None)
+        )
+    except Exception as exc:
+        return shadow_small_entry_pilot_empty_payload(trade_date or datetime.now().date().isoformat(), str(exc))
 
 
 def _theme_lab_gate_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:

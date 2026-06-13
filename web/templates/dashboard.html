@@ -111,6 +111,43 @@
           <div id="shadow-small-entry-ops-risk-lines" class="inline-log"></div>
         </section>
 
+        <section id="shadow-small-entry-pilot-card" class="band">
+          <div class="section-head">
+            <div>
+              <h2>Shadow Small Entry Pilot 리포트</h2>
+              <p id="shadow-small-entry-pilot-message" class="help-text">아직 Shadow Small Entry pilot run 데이터가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.</p>
+            </div>
+            <div class="action-strip">
+              <button id="shadow-small-entry-pilot-start" class="link-button" type="button">Start Pilot</button>
+              <button id="shadow-small-entry-pilot-complete" class="link-button" type="button">Complete</button>
+              <button id="shadow-small-entry-pilot-generate-report" class="link-button" type="button">Generate Report</button>
+              <span id="shadow-small-entry-pilot-status" class="counter muted">NO_DATA</span>
+            </div>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>Pilot ID</span><strong id="shadow-small-entry-pilot-id">-</strong></div>
+            <div><span>Recommendation</span><strong id="shadow-small-entry-pilot-recommendation">-</strong></div>
+            <div><span>Candidates</span><strong id="shadow-small-entry-pilot-candidate-count">0</strong></div>
+            <div><span>Promoted</span><strong id="shadow-small-entry-pilot-promoted-count">0</strong></div>
+            <div><span>Submitted</span><strong id="shadow-small-entry-pilot-submitted-count">0</strong></div>
+            <div><span>Filled</span><strong id="shadow-small-entry-pilot-filled-count">0</strong></div>
+            <div><span>Open Positions</span><strong id="shadow-small-entry-pilot-open-position-count">0</strong></div>
+            <div><span>Total PnL</span><strong id="shadow-small-entry-pilot-total-pnl">0</strong></div>
+            <div><span>Win Rate</span><strong id="shadow-small-entry-pilot-win-rate">-</strong></div>
+            <div><span>Avg Return</span><strong id="shadow-small-entry-pilot-avg-return">-</strong></div>
+            <div><span>MFE / MAE</span><strong id="shadow-small-entry-pilot-mfe-mae">-</strong></div>
+            <div><span>Last Updated</span><strong id="shadow-small-entry-pilot-updated">-</strong></div>
+          </div>
+          <div id="shadow-small-entry-pilot-reasons" class="inline-log"></div>
+          <div id="shadow-small-entry-pilot-safety-lines" class="inline-log"></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>종목</th><th>파일럿 상태</th><th>주문 상태</th><th>수량</th><th>PnL</th><th>추천</th></tr></thead>
+              <tbody id="shadow-small-entry-pilot-items"></tbody>
+            </table>
+          </div>
+        </section>
+
         <section class="band two-col">
           <div class="unframed-panel">
             <div class="section-head">

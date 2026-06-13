@@ -85,6 +85,11 @@ from trading_app.shadow_small_entry_promotion import (
     snapshot_payload as shadow_small_entry_snapshot_payload,
 )
 from trading_app.shadow_small_entry_ops import ShadowSmallEntryOpsService, snapshot_payload as shadow_small_entry_ops_snapshot_payload
+from trading_app.shadow_small_entry_pilot import (
+    ShadowSmallEntryPilotService,
+    empty_payload as shadow_small_entry_pilot_empty_payload,
+    snapshot_payload as shadow_small_entry_pilot_snapshot_payload,
+)
 from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
 from trading_app.shadow_strategy import ShadowStrategyEvaluator, config_from_settings as shadow_config_from_settings
 from trading_app.strategy_change_proposals import (
@@ -625,6 +630,10 @@ def _shadow_small_entry_promotion_analyzer(db: TradingDatabase) -> ShadowSmallEn
 
 def _shadow_small_entry_ops_service(db: TradingDatabase) -> ShadowSmallEntryOpsService:
     return ShadowSmallEntryOpsService(db, gateway_state=gateway_state, core_settings=get_settings())
+
+
+def _shadow_small_entry_pilot_service(db: TradingDatabase) -> ShadowSmallEntryPilotService:
+    return ShadowSmallEntryPilotService(db, gateway_state=gateway_state)
 
 
 def _buy_zero_rca_analyzer(db: TradingDatabase) -> BuyZeroRCAAnalyzer:
@@ -2254,7 +2263,7 @@ def runtime_change_proposal_detail(proposal_id: str) -> dict[str, Any]:
 @app.post("/api/runtime/change-proposals/generate")
 def generate_runtime_change_proposals(
     trade_date: str,
-    source_type: Optional[str] = Query("combined", pattern="^(intraday_outcome|shadow_strategy|replay|threshold_ab|conservative_reason_outcome|shadow_small_entry_promotion|combined)$"),
+    source_type: Optional[str] = Query("combined", pattern="^(intraday_outcome|shadow_strategy|replay|threshold_ab|conservative_reason_outcome|shadow_small_entry_promotion|shadow_small_entry_pilot|combined)$"),
     replay_id: Optional[str] = None,
     force: bool = False,
     persist: bool = True,
@@ -2833,6 +2842,109 @@ def shadow_small_entry_ops_report(
             **report,
             "exports": service.export_report(report, fmt=normalized) if export else {},
         }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-pilot/status")
+def shadow_small_entry_pilot_status(trade_date: Optional[str] = None) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return shadow_small_entry_pilot_snapshot_payload(
+            _shadow_small_entry_pilot_service(db).status(trade_date=trade_date)
+        )
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-pilot/report")
+def shadow_small_entry_pilot_report(
+    trade_date: Optional[str] = None,
+    pilot_id: str = "",
+    export: bool = False,
+    format: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        service = _shadow_small_entry_pilot_service(db)
+        report = service.build_report(trade_date=trade_date, pilot_id=pilot_id, persist=False)
+        return {**report, "exports": service.export_report(report, fmt=format) if export else {}}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/shadow-small-entry-pilot/items")
+def shadow_small_entry_pilot_items(
+    trade_date: Optional[str] = None,
+    pilot_id: str = "",
+    status: str = "",
+    recommendation: str = "",
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return _shadow_small_entry_pilot_service(db).items(
+            trade_date=trade_date,
+            pilot_id=pilot_id,
+            status=status,
+            recommendation=recommendation,
+            limit=limit,
+            offset=offset,
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/shadow-small-entry-pilot/start")
+def shadow_small_entry_pilot_start(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        return _shadow_small_entry_pilot_service(db).start(
+            trade_date=payload.get("trade_date"),
+            operator=str(payload.get("operator") or payload.get("changed_by") or "operator"),
+            operator_note=str(payload.get("note") or payload.get("operator_note") or ""),
+            source_report_trade_date=str(payload.get("source_report_trade_date") or ""),
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/shadow-small-entry-pilot/complete")
+def shadow_small_entry_pilot_complete(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        return _shadow_small_entry_pilot_service(db).complete(
+            trade_date=payload.get("trade_date"),
+            operator=str(payload.get("operator") or payload.get("changed_by") or "operator"),
+            operator_note=str(payload.get("note") or payload.get("operator_note") or ""),
+            export=bool(payload.get("export", False)),
+            fmt=str(payload.get("format") or "all"),
+        )
+    finally:
+        close_database(db)
+
+
+@app.post("/api/shadow-small-entry-pilot/generate-report")
+def shadow_small_entry_pilot_generate_report(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        service = _shadow_small_entry_pilot_service(db)
+        report = service.build_report(trade_date=payload.get("trade_date"), pilot_id=str(payload.get("pilot_id") or ""), persist=True)
+        exports = service.export_report(report, fmt=str(payload.get("format") or "all")) if bool(payload.get("export", True)) else {}
+        return {"ok": True, "report": report, "exports": exports}
     finally:
         close_database(db)
 
@@ -7013,6 +7125,12 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
             "operator_message_ko": "Shadow Small Entry 운영 상태를 불러오지 못했습니다.",
             "last_updated_at": "",
         }
+    try:
+        shadow_small_entry_pilot_payload = shadow_small_entry_pilot_snapshot_payload(
+            _shadow_small_entry_pilot_service(db).status(trade_date=today)
+        )
+    except Exception as exc:
+        shadow_small_entry_pilot_payload = shadow_small_entry_pilot_empty_payload(today, str(exc))
     shadow_summary_payload = db.shadow_strategy_summary(trade_date=today)
     replay_reports = scan_replay_reports(DEFAULT_REPLAY_DB_ROOT, limit=1)
     replay_runs = scan_replay_runs(DEFAULT_REPLAY_DB_ROOT, limit=5)
@@ -7086,6 +7204,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["conservative_reason_outcomes"] = conservative_reason_payload
     runtime_payload["shadow_small_entry_promotion"] = shadow_small_entry_payload
     runtime_payload["shadow_small_entry_ops"] = shadow_small_entry_ops_payload
+    runtime_payload["shadow_small_entry_pilot"] = shadow_small_entry_pilot_payload
     runtime_payload["shadow_strategies"] = shadow_summary_payload
     runtime_payload["strategy_replay"] = replay_payload
     runtime_payload["change_proposals"] = change_proposal_payload
@@ -7125,6 +7244,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "conservative_reason_outcomes": conservative_reason_payload,
         "shadow_small_entry_promotion": shadow_small_entry_payload,
         "shadow_small_entry_ops": shadow_small_entry_ops_payload,
+        "shadow_small_entry_pilot": shadow_small_entry_pilot_payload,
         "shadow_strategies": shadow_summary_payload,
         "strategy_replay": replay_payload,
         "change_proposals": change_proposal_payload,

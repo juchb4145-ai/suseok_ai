@@ -148,6 +148,14 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#themelab-shadow-small-entry-ops-arm") is not None
     assert soup.select_one("#themelab-shadow-small-entry-ops-confirm") is not None
     assert soup.select_one("#themelab-shadow-small-entry-ops-rollback") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-card") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-status") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-message") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-candidate-count") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-safety-lines") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-start") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-complete") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-pilot-generate-report") is not None
     assert soup.select_one('[data-filter-value="LIVE_GUARD_BLOCKED"]') is not None
     assert soup.select_one('[data-filter-value="MISSING_VWAP"]') is not None
     assert soup.select_one('[data-filter-value="ORDER_INTENT_CREATED"]') is not None
@@ -177,10 +185,15 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "renderShadowAb" in js
     assert "renderShadowSmallEntryPromotionPanel" in js
     assert "renderShadowSmallEntryOpsPanel" in js
+    assert "renderShadowSmallEntryPilotPanel" in js
+    assert "shadowSmallEntryPilotAction" in js
     assert "shadow_small_entry_ops" in js
+    assert "shadow_small_entry_pilot" in js
     assert "/api/shadow-small-entry-ops/arm" in js
     assert "/api/shadow-small-entry-ops/confirm" in js
     assert "/api/shadow-small-entry-ops/rollback" in js
+    assert "/api/shadow-small-entry-pilot/start" in js
+    assert "/api/shadow-small-entry-pilot/generate-report" in js
     assert "shadow_small_entry_promotion" in js
     assert "matchesFilters" in js
     assert "renderCockpit" in js

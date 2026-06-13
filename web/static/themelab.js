@@ -228,6 +228,11 @@ const SHADOW_SMALL_ENTRY_OPS_ENDPOINTS = {
   rollback: "/api/shadow-small-entry-ops/rollback",
   "emergency-pause": "/api/shadow-small-entry-ops/pause",
 };
+const SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS = {
+  start: "/api/shadow-small-entry-pilot/start",
+  complete: "/api/shadow-small-entry-pilot/complete",
+  "generate-report": "/api/shadow-small-entry-pilot/generate-report",
+};
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -1890,6 +1895,55 @@ function renderShadowSmallEntryOpsUsageLines(id, today, limits, audit) {
   node.innerHTML = lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("");
 }
 
+function renderShadowSmallEntryPilotPanel(payload = null) {
+  const data = payload || (state.snapshot || {}).shadow_small_entry_pilot || {};
+  const summary = data.summary || {};
+  const status = data.status || "NO_DATA";
+  const statusNode = document.getElementById("themelab-shadow-small-entry-pilot-status");
+  if (statusNode) {
+    statusNode.textContent = status;
+    statusNode.className = `badge ${status === "REVIEW_READY" || status === "COMPLETED" ? "ready" : status === "NO_DATA" ? "observe" : "warning"}`;
+  }
+  text("themelab-shadow-small-entry-pilot-message", data.operator_message_ko || "아직 Shadow Small Entry pilot run 데이터가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.");
+  text("themelab-shadow-small-entry-pilot-id", compactPilotId(data.pilot_id || "-"));
+  text("themelab-shadow-small-entry-pilot-recommendation", data.recommendation || "-");
+  text("themelab-shadow-small-entry-pilot-candidate-count", summary.candidate_count ?? 0);
+  text("themelab-shadow-small-entry-pilot-promoted-count", summary.promoted_count ?? 0);
+  text("themelab-shadow-small-entry-pilot-submitted-count", summary.submitted_order_count ?? 0);
+  text("themelab-shadow-small-entry-pilot-filled-count", summary.filled_order_count ?? 0);
+  text("themelab-shadow-small-entry-pilot-open-position-count", summary.open_position_count ?? 0);
+  text("themelab-shadow-small-entry-pilot-total-pnl", compactNumber(summary.total_pnl_krw ?? 0));
+  text("themelab-shadow-small-entry-pilot-win-rate", summary.win_rate == null ? "-" : `${Math.round(Number(summary.win_rate || 0) * 100)}%`);
+  text("themelab-shadow-small-entry-pilot-avg-return", summary.avg_return_pct == null ? "-" : `${Number(summary.avg_return_pct || 0).toFixed(2)}%`);
+  text("themelab-shadow-small-entry-pilot-mfe-mae", `${summary.avg_mfe_pct == null ? "-" : Number(summary.avg_mfe_pct || 0).toFixed(2)} / ${summary.avg_mae_pct == null ? "-" : Number(summary.avg_mae_pct || 0).toFixed(2)}`);
+  text("themelab-shadow-small-entry-pilot-updated", formatDateTime(data.last_updated_at));
+  renderShadowSmallEntryPilotReasons(data.recommendation_reason_codes || []);
+  renderShadowSmallEntryPilotSafety(data.safety_checklist || []);
+}
+
+function renderShadowSmallEntryPilotReasons(reasons) {
+  const node = document.getElementById("themelab-shadow-small-entry-pilot-reasons");
+  if (!node) return;
+  const items = (reasons || []).slice(0, 8);
+  node.innerHTML = items.length
+    ? items.map((reason) => reasonBadge(reason)).join(" ")
+    : `<div class="muted">추천 reason code가 아직 없습니다.</div>`;
+}
+
+function renderShadowSmallEntryPilotSafety(checks) {
+  const node = document.getElementById("themelab-shadow-small-entry-pilot-safety-lines");
+  if (!node) return;
+  const items = (checks || []).slice(0, 8);
+  node.innerHTML = items.length
+    ? items.map((item) => `<div><strong>${escapeHtml(item.status || "-")}</strong> ${escapeHtml(item.check_id || "-")} · ${escapeHtml(item.operator_message_ko || "")}</div>`).join("")
+    : `<div class="muted">안전 체크리스트는 리포트 생성 후 표시됩니다.</div>`;
+}
+
+function compactPilotId(value) {
+  const textValue = String(value || "-");
+  return textValue.length > 28 ? `${textValue.slice(0, 18)}…${textValue.slice(-8)}` : textValue;
+}
+
 async function shadowSmallEntryOpsAction(action, button) {
   const originalText = button?.textContent || "";
   const body = { operator: "themelab", note: `themelab ${action}` };
@@ -1922,6 +1976,33 @@ async function shadowSmallEntryOpsAction(action, button) {
     await fetchSnapshot();
   } catch (error) {
     updateOperatorSyncStatus(`Shadow Small Entry action failed: ${error.message || error}`);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+}
+
+async function shadowSmallEntryPilotAction(action, button) {
+  const originalText = button?.textContent || "";
+  const body = { operator: "themelab", note: `themelab ${action}` };
+  if (action === "generate-report") {
+    body.export = true;
+    body.format = "all";
+  }
+  const endpoint = SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS[action] || SHADOW_SMALL_ENTRY_PILOT_ENDPOINTS["generate-report"];
+  if (button) {
+    button.disabled = true;
+    button.textContent = "running";
+  }
+  try {
+    const payload = await runWithLocalTokenRetry((token) => postJsonWithLocalToken(endpoint, token, body));
+    if (!payload) return;
+    updateOperatorSyncStatus(`Shadow Small Entry pilot ${action} 완료`);
+    await fetchSnapshot();
+  } catch (error) {
+    updateOperatorSyncStatus(`Shadow Small Entry pilot action failed: ${error.message || error}`);
   } finally {
     if (button) {
       button.disabled = false;
@@ -2354,6 +2435,7 @@ function render(snapshot) {
   state.conservativeReason.payload = currentSnapshot.conservative_reason_outcomes || state.conservativeReason.payload || {};
   renderConservativeReasonPanel(state.conservativeReason.payload);
   renderShadowSmallEntryOpsPanel(currentSnapshot.shadow_small_entry_ops || {});
+  renderShadowSmallEntryPilotPanel(currentSnapshot.shadow_small_entry_pilot || {});
   renderShadowSmallEntryPromotionPanel(currentSnapshot.shadow_small_entry_promotion || {});
   renderShadowAb(currentSnapshot);
   renderThemes(currentSnapshot.ranked_themes || []);
@@ -4175,6 +4257,17 @@ function initShadowSmallEntryOpsPanel() {
   });
 }
 
+function initShadowSmallEntryPilotPanel() {
+  renderShadowSmallEntryPilotPanel();
+  [
+    ["themelab-shadow-small-entry-pilot-start", "start"],
+    ["themelab-shadow-small-entry-pilot-complete", "complete"],
+    ["themelab-shadow-small-entry-pilot-generate-report", "generate-report"],
+  ].forEach(([id, action]) => {
+    document.getElementById(id)?.addEventListener("click", (event) => shadowSmallEntryPilotAction(action, event.currentTarget).catch(() => {}));
+  });
+}
+
 function isFullThemeLabSnapshot(snapshot) {
   const payload = snapshot || {};
   const market = payload.market || {};
@@ -4202,6 +4295,7 @@ initPromotionCockpit();
 initBuyZeroRcaPanel();
 initConservativeReasonPanel();
 initShadowSmallEntryOpsPanel();
+initShadowSmallEntryPilotPanel();
 fetchSnapshot().catch(() => {});
 connectWs();
 setInterval(() => fetchSnapshot().catch(() => {}), 5000);
