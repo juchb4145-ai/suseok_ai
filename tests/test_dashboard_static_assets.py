@@ -158,6 +158,11 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "function renderConservativeReasonOutcomes" in js
     assert "function renderConservativeStockLines" in js
     assert "function renderShadowSmallEntryPromotion" in js
+    assert "function renderShadowSmallEntryOps" in js
+    assert "shadow_small_entry_ops" in js
+    assert "/api/shadow-small-entry-ops/arm" in js
+    assert "/api/shadow-small-entry-ops/confirm" in js
+    assert "/api/shadow-small-entry-ops/rollback" in js
     assert "shadow_small_entry_promotion" in js
     assert "conservative_reason_outcomes" in js
     assert "live_sim_audit" in js
@@ -173,5 +178,27 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert ".slice(0, 20)" not in js
     assert "/api/gateway/transport/latency" in js
     assert "/api/runtime/performance/dry-run/false-signals" in js
+
+
+def test_dashboard_shadow_small_entry_ops_dom_ids():
+    html = (ROOT / "web" / "templates" / "dashboard.html").read_text(encoding="utf-8")
+    js = (ROOT / "web" / "static" / "dashboard.js").read_text(encoding="utf-8")
+
+    for selector in [
+        'id="shadow-small-entry-ops-card"',
+        'id="shadow-small-entry-ops-status"',
+        'id="shadow-small-entry-ops-mode"',
+        'id="shadow-small-entry-ops-order-enabled"',
+        'id="shadow-small-entry-ops-preflight-status"',
+        'id="shadow-small-entry-ops-blocking-reasons"',
+        'id="shadow-small-entry-ops-risk-lines"',
+        'id="shadow-small-entry-ops-preflight"',
+        'id="shadow-small-entry-ops-arm"',
+        'id="shadow-small-entry-ops-confirm"',
+        'id="shadow-small-entry-ops-pause"',
+        'id="shadow-small-entry-ops-rollback"',
+        'id="shadow-small-entry-ops-emergency-pause"',
+    ]:
+        assert selector in html
     assert "표시할 데이터가 없습니다" in js
     assert "오래된 데이터" in js

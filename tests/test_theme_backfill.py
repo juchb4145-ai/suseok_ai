@@ -39,7 +39,7 @@ def test_theme_backfill_planner_enqueues_high_before_medium_and_limits_cycle():
     summary = service.plan_and_enqueue(result, NOW)
 
     assert summary["enqueued_count"] == 3
-    dispatched = state.dispatch_commands(limit=3)
+    dispatched = state.dispatch_commands(limit=3, now=NOW)
     codes = [command.payload["code"] for command in dispatched]
     assert codes == ["000001", "000003", "000004"]
     records = state.list_commands(limit=10, include_finished=True)
@@ -336,14 +336,15 @@ def _healthy_state() -> GatewayStateStore:
     return state
 
 
-def _enqueue_backfill(state: GatewayStateStore, code: str, *, ttl_sec: int = 90, now: datetime = NOW) -> GatewayCommand:
+def _enqueue_backfill(state: GatewayStateStore, code: str, *, ttl_sec: int = 90, now: datetime | None = None) -> GatewayCommand:
+    current = now or datetime.now(timezone.utc).replace(microsecond=0)
     command = GatewayCommand(
         type="tr_request",
         command_id=f"cmd-backfill-{code}",
         idempotency_key=f"theme_backfill:2026-06-05:{code}:opt10001:1",
         payload={"purpose": THEME_BACKFILL_PURPOSE, "code": code, "tr_code": "opt10001"},
     )
-    state.enqueue_command(command, priority=CommandPriority.LOW, ttl_sec=ttl_sec, max_attempts=1, now=now)
+    state.enqueue_command(command, priority=CommandPriority.LOW, ttl_sec=ttl_sec, max_attempts=1, now=current)
     return command
 
 

@@ -99,6 +99,7 @@ class ShadowSmallEntryPromotionConfig:
     exit_take_profit_pct: float = 1.8
     exit_max_hold_minutes: int = 20
     observe_only_reason_code: str = SHADOW_OBSERVE_ONLY_REASON
+    ops_status: str = "OBSERVE_ONLY"
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "ShadowSmallEntryPromotionConfig":
@@ -147,6 +148,7 @@ class ShadowSmallEntryPromotionConfig:
             exit_take_profit_pct=_float(data.get("exit_take_profit_pct"), 1.8),
             exit_max_hold_minutes=max(1, _int(data.get("exit_max_hold_minutes"), 20)),
             observe_only_reason_code=str(data.get("observe_only_reason_code") or SHADOW_OBSERVE_ONLY_REASON),
+            ops_status=str(data.get("ops_status") or data.get("current_status") or "OBSERVE_ONLY").upper(),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -176,11 +178,17 @@ class ShadowSmallEntryPromotionEvaluation:
 
 def config_from_settings(settings: Any | None) -> ShadowSmallEntryPromotionConfig:
     raw: Any = None
+    ops_raw: Any = {}
     if settings is not None and hasattr(settings, "value"):
         raw = settings.value("shadow_small_entry_promotion", {})
+        ops_raw = settings.value("shadow_small_entry_ops", {})
     elif isinstance(settings, Mapping):
         raw = settings.get("shadow_small_entry_promotion", settings)
-    return ShadowSmallEntryPromotionConfig.from_mapping(raw if isinstance(raw, Mapping) else {})
+        ops_raw = settings.get("shadow_small_entry_ops", {})
+    merged = dict(raw if isinstance(raw, Mapping) else {})
+    if isinstance(ops_raw, Mapping):
+        merged["ops_status"] = ops_raw.get("current_status") or ops_raw.get("status") or ops_raw.get("default_status") or merged.get("ops_status")
+    return ShadowSmallEntryPromotionConfig.from_mapping(merged)
 
 
 def evaluate_shadow_small_entry_promotion(
@@ -295,6 +303,19 @@ def evaluate_shadow_small_entry_promotion(
             cfg,
             {**matched, "sample_quality": sample_quality, "position_size_multiplier": multiplier},
             "리포트 근거는 있으나 order_enabled=false라 주문하지 않습니다.",
+            multiplier=multiplier,
+        )
+    ops_status = str(cfg.ops_status or "").upper()
+    if ops_status != "LIVE_SIM_ACTIVE":
+        reason = _ops_block_reason(ops_status)
+        return _evaluation(
+            candidate_payload,
+            STATUS_OBSERVE_ONLY,
+            reason,
+            base_codes + [reason, cfg.observe_only_reason_code],
+            cfg,
+            {**matched, "sample_quality": sample_quality, "position_size_multiplier": multiplier},
+            "운영 상태가 LIVE_SIM_ACTIVE가 아니어서 관측 전용으로 유지합니다.",
             multiplier=multiplier,
         )
 
@@ -527,6 +548,25 @@ def _sample_quality(sample_count: int, cfg: ShadowSmallEntryPromotionConfig) -> 
     if sample_count < cfg.strong_sample_count:
         return "MEDIUM"
     return "HIGH"
+
+
+def _ops_block_reason(status: str) -> str:
+    status = str(status or "").upper()
+    if status in {"", "OBSERVE_ONLY", "DISABLED"}:
+        return "SHADOW_SMALL_ENTRY_OPS_OBSERVE_ONLY"
+    if status == "LIVE_SIM_ARMED":
+        return "SHADOW_SMALL_ENTRY_OPS_NOT_ACTIVE"
+    if status == "PAUSED_BY_RISK":
+        return "SHADOW_SMALL_ENTRY_OPS_PAUSED_BY_RISK"
+    if status == "PAUSED_BY_AUDIT":
+        return "SHADOW_SMALL_ENTRY_OPS_PAUSED_BY_AUDIT"
+    if status == "PAUSED_BY_RECONCILE":
+        return "SHADOW_SMALL_ENTRY_OPS_RECONCILE_REQUIRED"
+    if status == "ROLLED_BACK":
+        return "SHADOW_SMALL_ENTRY_OPS_ROLLED_BACK"
+    if status == "BROKEN":
+        return "SHADOW_SMALL_ENTRY_OPS_PREFLIGHT_FAILED"
+    return "SHADOW_SMALL_ENTRY_OPS_NOT_ACTIVE"
 
 
 def _get(obj: Any, name: str, default: Any = "") -> Any:

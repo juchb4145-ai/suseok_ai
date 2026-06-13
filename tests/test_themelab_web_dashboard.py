@@ -139,6 +139,15 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#gate-detail-sections") is not None
     assert soup.select_one("#watchset-body") is not None
     assert soup.select_one("#order-candidates") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-card") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-status") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-mode") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-preflight-status") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-blocking-reasons") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-risk-lines") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-arm") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-confirm") is not None
+    assert soup.select_one("#themelab-shadow-small-entry-ops-rollback") is not None
     assert soup.select_one('[data-filter-value="LIVE_GUARD_BLOCKED"]') is not None
     assert soup.select_one('[data-filter-value="MISSING_VWAP"]') is not None
     assert soup.select_one('[data-filter-value="ORDER_INTENT_CREATED"]') is not None
@@ -167,6 +176,11 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "shadow_small_entry_ab" in js
     assert "renderShadowAb" in js
     assert "renderShadowSmallEntryPromotionPanel" in js
+    assert "renderShadowSmallEntryOpsPanel" in js
+    assert "shadow_small_entry_ops" in js
+    assert "/api/shadow-small-entry-ops/arm" in js
+    assert "/api/shadow-small-entry-ops/confirm" in js
+    assert "/api/shadow-small-entry-ops/rollback" in js
     assert "shadow_small_entry_promotion" in js
     assert "matchesFilters" in js
     assert "renderCockpit" in js

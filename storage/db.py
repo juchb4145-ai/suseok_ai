@@ -992,6 +992,23 @@ class TradingDatabase:
                 max_promotions_per_day INTEGER,
                 order_enabled INTEGER,
                 mode TEXT NOT NULL DEFAULT '',
+                ops_status TEXT NOT NULL DEFAULT '',
+                previous_ops_status TEXT NOT NULL DEFAULT '',
+                next_ops_status TEXT NOT NULL DEFAULT '',
+                preflight_status TEXT NOT NULL DEFAULT '',
+                blocking_reasons_json TEXT NOT NULL DEFAULT '[]',
+                risk_check_status TEXT NOT NULL DEFAULT '',
+                risk_limit_breached INTEGER,
+                breached_metric TEXT NOT NULL DEFAULT '',
+                breached_value REAL,
+                breached_limit REAL,
+                operator_note TEXT NOT NULL DEFAULT '',
+                changed_by TEXT NOT NULL DEFAULT '',
+                activation_token_id TEXT NOT NULL DEFAULT '',
+                order_enabled_before INTEGER,
+                order_enabled_after INTEGER,
+                mode_before TEXT NOT NULL DEFAULT '',
+                mode_after TEXT NOT NULL DEFAULT '',
                 entry_plan_id INTEGER,
                 entry_plan_submittable INTEGER,
                 entry_plan_diagnostic_only INTEGER,
@@ -1005,6 +1022,53 @@ class TradingDatabase:
                 broker_order_id TEXT NOT NULL DEFAULT '',
                 details_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS shadow_small_entry_ops_state (
+                state_key TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'OBSERVE_ONLY',
+                mode TEXT NOT NULL DEFAULT 'observe_only',
+                order_enabled INTEGER NOT NULL DEFAULT 0,
+                activation_token_id TEXT NOT NULL DEFAULT '',
+                activation_expires_at TEXT NOT NULL DEFAULT '',
+                last_status_change_at TEXT NOT NULL DEFAULT '',
+                last_status_change_reason TEXT NOT NULL DEFAULT '',
+                last_changed_by TEXT NOT NULL DEFAULT '',
+                last_operator_note TEXT NOT NULL DEFAULT '',
+                runtime_settings_hash TEXT NOT NULL DEFAULT '',
+                preflight_status TEXT NOT NULL DEFAULT '',
+                preflight_blocking_reasons_json TEXT NOT NULL DEFAULT '[]',
+                risk_check_status TEXT NOT NULL DEFAULT '',
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS shadow_small_entry_ops_tokens (
+                token_id TEXT PRIMARY KEY,
+                token_hash TEXT UNIQUE NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ARMED',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at TEXT NOT NULL DEFAULT '',
+                consumed_at TEXT NOT NULL DEFAULT '',
+                created_by TEXT NOT NULL DEFAULT '',
+                operator_note TEXT NOT NULL DEFAULT '',
+                preflight_json TEXT NOT NULL DEFAULT '{}',
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS shadow_small_entry_ops_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                audit_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL DEFAULT '',
+                previous_status TEXT NOT NULL DEFAULT '',
+                next_status TEXT NOT NULL DEFAULT '',
+                changed_by TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                operator_note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                runtime_settings_before_hash TEXT NOT NULL DEFAULT '',
+                runtime_settings_after_hash TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS shadow_strategy_evaluations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1542,6 +1606,12 @@ class TradingDatabase:
                 ON buy_zero_rca_traces(live_sim_intent_id);
             CREATE INDEX IF NOT EXISTS idx_buy_zero_rca_traces_command
                 ON buy_zero_rca_traces(command_id);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_ops_audit_trade_date
+                ON shadow_small_entry_ops_audit_log(trade_date, created_at);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_ops_audit_status
+                ON shadow_small_entry_ops_audit_log(next_status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_shadow_small_entry_ops_tokens_status
+                ON shadow_small_entry_ops_tokens(status, expires_at);
             CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_trade_date
                 ON shadow_strategy_evaluations(trade_date, evaluated_at, id);
             CREATE INDEX IF NOT EXISTS idx_shadow_strategy_evaluations_policy
@@ -2594,6 +2664,11 @@ class TradingDatabase:
                 good_block_rate, avg_mfe_15m_pct, avg_mae_15m_pct,
                 position_size_multiplier, max_promotions_per_cycle,
                 max_promotions_per_day, order_enabled, mode,
+                ops_status, previous_ops_status, next_ops_status,
+                preflight_status, blocking_reasons_json, risk_check_status,
+                risk_limit_breached, breached_metric, breached_value, breached_limit,
+                operator_note, changed_by, activation_token_id,
+                order_enabled_before, order_enabled_after, mode_before, mode_after,
                 entry_plan_id, entry_plan_submittable,
                 entry_plan_diagnostic_only, dry_run_intent_id, dry_run_status,
                 dry_run_reason, live_sim_intent_id, live_sim_status,
@@ -2620,6 +2695,11 @@ class TradingDatabase:
                 :good_block_rate, :avg_mfe_15m_pct, :avg_mae_15m_pct,
                 :position_size_multiplier, :max_promotions_per_cycle,
                 :max_promotions_per_day, :order_enabled, :mode,
+                :ops_status, :previous_ops_status, :next_ops_status,
+                :preflight_status, :blocking_reasons_json, :risk_check_status,
+                :risk_limit_breached, :breached_metric, :breached_value, :breached_limit,
+                :operator_note, :changed_by, :activation_token_id,
+                :order_enabled_before, :order_enabled_after, :mode_before, :mode_after,
                 :entry_plan_id, :entry_plan_submittable,
                 :entry_plan_diagnostic_only, :dry_run_intent_id, :dry_run_status,
                 :dry_run_reason, :live_sim_intent_id, :live_sim_status,
@@ -7018,6 +7098,162 @@ class TradingDatabase:
             ).fetchone()
             return dict(row)
 
+    def load_shadow_small_entry_ops_state(self, state_key: str = "default") -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM shadow_small_entry_ops_state WHERE state_key = ?",
+            (state_key,),
+        ).fetchone()
+        return _row_to_shadow_small_entry_ops_state(row) if row else None
+
+    def save_shadow_small_entry_ops_state(self, payload: dict) -> dict:
+        state_key = str(payload.get("state_key") or "default")
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO shadow_small_entry_ops_state(
+                    state_key, status, mode, order_enabled, activation_token_id,
+                    activation_expires_at, last_status_change_at, last_status_change_reason,
+                    last_changed_by, last_operator_note, runtime_settings_hash,
+                    preflight_status, preflight_blocking_reasons_json, risk_check_status,
+                    warnings_json, details_json, updated_at
+                ) VALUES (
+                    :state_key, :status, :mode, :order_enabled, :activation_token_id,
+                    :activation_expires_at, :last_status_change_at, :last_status_change_reason,
+                    :last_changed_by, :last_operator_note, :runtime_settings_hash,
+                    :preflight_status, :preflight_blocking_reasons_json, :risk_check_status,
+                    :warnings_json, :details_json, :updated_at
+                )
+                ON CONFLICT(state_key) DO UPDATE SET
+                    status=excluded.status,
+                    mode=excluded.mode,
+                    order_enabled=excluded.order_enabled,
+                    activation_token_id=excluded.activation_token_id,
+                    activation_expires_at=excluded.activation_expires_at,
+                    last_status_change_at=excluded.last_status_change_at,
+                    last_status_change_reason=excluded.last_status_change_reason,
+                    last_changed_by=excluded.last_changed_by,
+                    last_operator_note=excluded.last_operator_note,
+                    runtime_settings_hash=excluded.runtime_settings_hash,
+                    preflight_status=excluded.preflight_status,
+                    preflight_blocking_reasons_json=excluded.preflight_blocking_reasons_json,
+                    risk_check_status=excluded.risk_check_status,
+                    warnings_json=excluded.warnings_json,
+                    details_json=excluded.details_json,
+                    updated_at=excluded.updated_at
+                """,
+                _shadow_small_entry_ops_state_params({**payload, "state_key": state_key}),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM shadow_small_entry_ops_state WHERE state_key = ?",
+                (state_key,),
+            ).fetchone()
+            return _row_to_shadow_small_entry_ops_state(row)
+
+    def save_shadow_small_entry_ops_token(self, payload: dict) -> dict:
+        params = _shadow_small_entry_ops_token_params(payload)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO shadow_small_entry_ops_tokens(
+                    token_id, token_hash, status, created_at, expires_at,
+                    consumed_at, created_by, operator_note, preflight_json, details_json
+                ) VALUES (
+                    :token_id, :token_hash, :status, :created_at, :expires_at,
+                    :consumed_at, :created_by, :operator_note, :preflight_json, :details_json
+                )
+                ON CONFLICT(token_id) DO UPDATE SET
+                    token_hash=excluded.token_hash,
+                    status=excluded.status,
+                    expires_at=excluded.expires_at,
+                    consumed_at=excluded.consumed_at,
+                    operator_note=excluded.operator_note,
+                    preflight_json=excluded.preflight_json,
+                    details_json=excluded.details_json
+                """,
+                params,
+            )
+            row = self.conn.execute(
+                "SELECT * FROM shadow_small_entry_ops_tokens WHERE token_id = ?",
+                (params["token_id"],),
+            ).fetchone()
+            return _row_to_shadow_small_entry_ops_token(row)
+
+    def get_shadow_small_entry_ops_token_by_hash(self, token_hash: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM shadow_small_entry_ops_tokens WHERE token_hash = ?",
+            (str(token_hash or ""),),
+        ).fetchone()
+        return _row_to_shadow_small_entry_ops_token(row) if row else None
+
+    def update_shadow_small_entry_ops_token(self, token_id: str, updates: dict) -> Optional[dict]:
+        allowed = {
+            "status": updates.get("status"),
+            "consumed_at": updates.get("consumed_at"),
+            "details_json": _json_payload(updates.get("details", updates.get("details_json", {}))),
+        }
+        assignments = [f"{key} = ?" for key, value in allowed.items() if value is not None]
+        values = [value for value in allowed.values() if value is not None]
+        if not assignments:
+            return None
+        values.append(str(token_id or ""))
+        with self.conn:
+            self.conn.execute(
+                f"UPDATE shadow_small_entry_ops_tokens SET {', '.join(assignments)} WHERE token_id = ?",
+                tuple(values),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM shadow_small_entry_ops_tokens WHERE token_id = ?",
+                (str(token_id or ""),),
+            ).fetchone()
+            return _row_to_shadow_small_entry_ops_token(row) if row else None
+
+    def append_shadow_small_entry_ops_audit_log(self, payload: dict) -> dict:
+        params = _shadow_small_entry_ops_audit_params(payload)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO shadow_small_entry_ops_audit_log(
+                    audit_id, trade_date, event_type, previous_status, next_status,
+                    changed_by, reason, reason_codes_json, operator_note, created_at,
+                    runtime_settings_before_hash, runtime_settings_after_hash, details_json
+                ) VALUES (
+                    :audit_id, :trade_date, :event_type, :previous_status, :next_status,
+                    :changed_by, :reason, :reason_codes_json, :operator_note, :created_at,
+                    :runtime_settings_before_hash, :runtime_settings_after_hash, :details_json
+                )
+                """,
+                params,
+            )
+            row = self.conn.execute(
+                "SELECT * FROM shadow_small_entry_ops_audit_log WHERE audit_id = ?",
+                (params["audit_id"],),
+            ).fetchone()
+            return _row_to_shadow_small_entry_ops_audit(row)
+
+    def list_shadow_small_entry_ops_audit_log(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM shadow_small_entry_ops_audit_log
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_shadow_small_entry_ops_audit(row) for row in rows]
+
     def close(self) -> None:
         self.conn.close()
 
@@ -7829,6 +8065,23 @@ class TradingDatabase:
             "max_promotions_per_day": "INTEGER",
             "order_enabled": "INTEGER",
             "mode": "TEXT NOT NULL DEFAULT ''",
+            "ops_status": "TEXT NOT NULL DEFAULT ''",
+            "previous_ops_status": "TEXT NOT NULL DEFAULT ''",
+            "next_ops_status": "TEXT NOT NULL DEFAULT ''",
+            "preflight_status": "TEXT NOT NULL DEFAULT ''",
+            "blocking_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
+            "risk_check_status": "TEXT NOT NULL DEFAULT ''",
+            "risk_limit_breached": "INTEGER",
+            "breached_metric": "TEXT NOT NULL DEFAULT ''",
+            "breached_value": "REAL",
+            "breached_limit": "REAL",
+            "operator_note": "TEXT NOT NULL DEFAULT ''",
+            "changed_by": "TEXT NOT NULL DEFAULT ''",
+            "activation_token_id": "TEXT NOT NULL DEFAULT ''",
+            "order_enabled_before": "INTEGER",
+            "order_enabled_after": "INTEGER",
+            "mode_before": "TEXT NOT NULL DEFAULT ''",
+            "mode_after": "TEXT NOT NULL DEFAULT ''",
         }
         for name, definition in columns.items():
             self._ensure_column("buy_zero_rca_traces", name, definition)
@@ -8128,6 +8381,23 @@ def _buy_zero_trace_params(payload: dict) -> dict:
         "max_promotions_per_day": _nullable_int(payload.get("max_promotions_per_day")),
         "order_enabled": _nullable_bool_int(payload.get("order_enabled")),
         "mode": str(payload.get("mode") or ""),
+        "ops_status": str(payload.get("ops_status") or ""),
+        "previous_ops_status": str(payload.get("previous_ops_status") or ""),
+        "next_ops_status": str(payload.get("next_ops_status") or ""),
+        "preflight_status": str(payload.get("preflight_status") or ""),
+        "blocking_reasons_json": _json_list(payload.get("blocking_reasons_json", payload.get("blocking_reasons", []))),
+        "risk_check_status": str(payload.get("risk_check_status") or ""),
+        "risk_limit_breached": _nullable_bool_int(payload.get("risk_limit_breached")),
+        "breached_metric": str(payload.get("breached_metric") or ""),
+        "breached_value": _nullable_float(payload.get("breached_value")),
+        "breached_limit": _nullable_float(payload.get("breached_limit")),
+        "operator_note": str(payload.get("operator_note") or ""),
+        "changed_by": str(payload.get("changed_by") or ""),
+        "activation_token_id": str(payload.get("activation_token_id") or ""),
+        "order_enabled_before": _nullable_bool_int(payload.get("order_enabled_before")),
+        "order_enabled_after": _nullable_bool_int(payload.get("order_enabled_after")),
+        "mode_before": str(payload.get("mode_before") or ""),
+        "mode_after": str(payload.get("mode_after") or ""),
         "entry_plan_id": _nullable_int(payload.get("entry_plan_id")),
         "entry_plan_submittable": _nullable_bool_int(payload.get("entry_plan_submittable")),
         "entry_plan_diagnostic_only": _nullable_bool_int(payload.get("entry_plan_diagnostic_only")),
@@ -8152,6 +8422,7 @@ def _row_to_buy_zero_trace(row: sqlite3.Row) -> dict:
     data["missing_entry_fields"] = _safe_json_loads(data.get("missing_entry_fields_json"), [])
     data["missing_optional_fields"] = _safe_json_loads(data.get("missing_optional_fields_json"), [])
     data["promotion_reason_codes"] = _safe_json_loads(data.get("promotion_reason_codes_json"), [])
+    data["blocking_reasons"] = _safe_json_loads(data.get("blocking_reasons_json"), [])
     for key in (
         "passed",
         "latest_tick_ready",
@@ -8164,10 +8435,94 @@ def _row_to_buy_zero_trace(row: sqlite3.Row) -> dict:
         "early_small_candidate",
         "early_small_order_enabled",
         "order_enabled",
+        "risk_limit_breached",
+        "order_enabled_before",
+        "order_enabled_after",
     ):
         if data.get(key) is not None:
             data[key] = bool(data.get(key))
     data["pass/fail"] = data.get("pass_fail")
+    return data
+
+
+def _shadow_small_entry_ops_state_params(payload: dict) -> dict:
+    now = str(payload.get("updated_at") or payload.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+    return {
+        "state_key": str(payload.get("state_key") or "default"),
+        "status": str(payload.get("status") or "OBSERVE_ONLY"),
+        "mode": str(payload.get("mode") or "observe_only"),
+        "order_enabled": 1 if bool(payload.get("order_enabled")) else 0,
+        "activation_token_id": str(payload.get("activation_token_id") or ""),
+        "activation_expires_at": str(payload.get("activation_expires_at") or ""),
+        "last_status_change_at": str(payload.get("last_status_change_at") or now),
+        "last_status_change_reason": str(payload.get("last_status_change_reason") or ""),
+        "last_changed_by": str(payload.get("last_changed_by") or payload.get("changed_by") or ""),
+        "last_operator_note": str(payload.get("last_operator_note") or payload.get("operator_note") or ""),
+        "runtime_settings_hash": str(payload.get("runtime_settings_hash") or ""),
+        "preflight_status": str(payload.get("preflight_status") or ""),
+        "preflight_blocking_reasons_json": _json_list(payload.get("preflight_blocking_reasons_json", payload.get("preflight_blocking_reasons", []))),
+        "risk_check_status": str(payload.get("risk_check_status") or ""),
+        "warnings_json": _json_list(payload.get("warnings_json", payload.get("warnings", []))),
+        "details_json": _json_payload(payload.get("details_json", payload.get("details", {}))),
+        "updated_at": now,
+    }
+
+
+def _row_to_shadow_small_entry_ops_state(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["order_enabled"] = bool(data.get("order_enabled"))
+    data["preflight_blocking_reasons"] = _safe_json_loads(data.get("preflight_blocking_reasons_json"), [])
+    data["warnings"] = _safe_json_loads(data.get("warnings_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    return data
+
+
+def _shadow_small_entry_ops_token_params(payload: dict) -> dict:
+    now = str(payload.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+    return {
+        "token_id": str(payload.get("token_id") or f"sse_ops_token_{uuid4().hex[:12]}"),
+        "token_hash": str(payload.get("token_hash") or ""),
+        "status": str(payload.get("status") or "ARMED"),
+        "created_at": now,
+        "expires_at": str(payload.get("expires_at") or ""),
+        "consumed_at": str(payload.get("consumed_at") or ""),
+        "created_by": str(payload.get("created_by") or payload.get("operator") or ""),
+        "operator_note": str(payload.get("operator_note") or ""),
+        "preflight_json": _json_payload(payload.get("preflight_json", payload.get("preflight", {}))),
+        "details_json": _json_payload(payload.get("details_json", payload.get("details", {}))),
+    }
+
+
+def _row_to_shadow_small_entry_ops_token(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["preflight"] = _safe_json_loads(data.get("preflight_json"), {})
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    return data
+
+
+def _shadow_small_entry_ops_audit_params(payload: dict) -> dict:
+    created_at = str(payload.get("created_at") or datetime.now().isoformat(timespec="seconds"))
+    return {
+        "audit_id": str(payload.get("audit_id") or f"sse_ops_audit_{uuid4().hex[:16]}"),
+        "trade_date": str(payload.get("trade_date") or _trade_date_from_timestamp(created_at) or ""),
+        "event_type": str(payload.get("event_type") or ""),
+        "previous_status": str(payload.get("previous_status") or ""),
+        "next_status": str(payload.get("next_status") or ""),
+        "changed_by": str(payload.get("changed_by") or ""),
+        "reason": str(payload.get("reason") or ""),
+        "reason_codes_json": _json_list(payload.get("reason_codes_json", payload.get("reason_codes", []))),
+        "operator_note": str(payload.get("operator_note") or ""),
+        "created_at": created_at,
+        "runtime_settings_before_hash": str(payload.get("runtime_settings_before_hash") or ""),
+        "runtime_settings_after_hash": str(payload.get("runtime_settings_after_hash") or ""),
+        "details_json": _json_payload(payload.get("details_json", payload.get("details", {}))),
+    }
+
+
+def _row_to_shadow_small_entry_ops_audit(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["reason_codes"] = _safe_json_loads(data.get("reason_codes_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
     return data
 
 

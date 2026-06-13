@@ -59,6 +59,10 @@
     loading: false,
     lastFetchedAt: 0,
   },
+  shadowSmallEntryOps: {
+    activationToken: "",
+    activationTokenId: "",
+  },
   naverThemeSyncBusy: false,
   alertFilters: {
     category: "ALL",
@@ -214,6 +218,15 @@ const BUY_ZERO_RCA_STAGE_LABELS = {
   BROKER_ORDER_ACCEPTED: "브로커 접수",
   PARTIAL_FILLED: "부분체결",
   FILLED: "체결",
+};
+
+const SHADOW_SMALL_ENTRY_OPS_ENDPOINTS = {
+  preflight: "/api/shadow-small-entry-ops/preflight",
+  arm: "/api/shadow-small-entry-ops/arm",
+  confirm: "/api/shadow-small-entry-ops/confirm",
+  pause: "/api/shadow-small-entry-ops/pause",
+  rollback: "/api/shadow-small-entry-ops/rollback",
+  "emergency-pause": "/api/shadow-small-entry-ops/pause",
 };
 
 function escapeHtml(value) {
@@ -410,6 +423,19 @@ async function runWithLocalTokenRetry(requestFn) {
     throw new Error(result.payload.detail || result.payload.error || `${result.response.status} ${result.response.statusText}`);
   }
   return result.payload;
+}
+
+async function postJsonWithLocalToken(endpoint, token, body = {}) {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Local-Token": token,
+    },
+    body: JSON.stringify(body || {}),
+  });
+  const payload = await parseResponsePayload(response);
+  return { response, payload };
 }
 
 function money(value) {
@@ -1811,6 +1837,99 @@ function renderShadowSmallEntryPromotionPanel(payload = null) {
   renderShadowPromotionCandidates("themelab-shadow-small-entry-promotion-candidate-body", data.candidates || [], available);
 }
 
+function renderShadowSmallEntryOpsPanel(payload = null) {
+  const data = payload || (state.snapshot || {}).shadow_small_entry_ops || {};
+  const today = data.today || {};
+  const audit = data.audit || {};
+  const limits = data.limits || {};
+  const status = data.status || "OBSERVE_ONLY";
+  const orderEnabled = Boolean(data.order_enabled);
+  const statusNode = document.getElementById("themelab-shadow-small-entry-ops-status");
+  if (statusNode) {
+    statusNode.textContent = status;
+    statusNode.className = `badge ${status === "LIVE_SIM_ACTIVE" ? "warning" : status.startsWith("PAUSED") || status === "BROKEN" ? "blocked" : "observe"}`;
+  }
+  text("themelab-shadow-small-entry-ops-message", data.operator_message_ko || "현재는 관측 전용입니다. LIVE_SIM 활성화는 preflight와 2단계 확인이 필요합니다.");
+  text("themelab-shadow-small-entry-ops-mode", `${data.mode || "observe_only"} / ${orderEnabled ? "ON" : "OFF"}`);
+  text("themelab-shadow-small-entry-ops-order-enabled", orderEnabled ? "ON" : "OFF");
+  text("themelab-shadow-small-entry-ops-preflight-status", data.preflight_status || "NO_DATA");
+  text("themelab-shadow-small-entry-ops-activation", data.activation_armed ? `armed until ${formatDateTime(data.activation_expires_at)}` : "-");
+  text("themelab-shadow-small-entry-ops-promotion-count", today.promotion_count ?? 0);
+  text("themelab-shadow-small-entry-ops-submitted-count", today.submitted_count ?? 0);
+  text("themelab-shadow-small-entry-ops-filled-count", today.filled_count ?? 0);
+  text("themelab-shadow-small-entry-ops-open-position-count", today.open_position_count ?? 0);
+  text("themelab-shadow-small-entry-ops-notional", compactNumber(today.total_notional_krw ?? 0));
+  text("themelab-shadow-small-entry-ops-audit-status", audit.live_sim_audit_status || audit.status || "UNKNOWN");
+  text("themelab-shadow-small-entry-ops-reconcile-status", audit.reconcile_status || "UNKNOWN");
+  text("themelab-shadow-small-entry-ops-last-change", formatDateTime(data.last_status_change_at || data.last_updated_at));
+  renderShadowSmallEntryOpsReasonLines("themelab-shadow-small-entry-ops-blocking-reasons", data.preflight_blocking_reasons || [], "Preflight 차단 사유가 없습니다.");
+  renderShadowSmallEntryOpsUsageLines("themelab-shadow-small-entry-ops-risk-lines", today, limits, audit);
+}
+
+function renderShadowSmallEntryOpsReasonLines(id, reasons, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = (reasons || []).slice(0, 8);
+  node.innerHTML = items.length
+    ? items.map((reason) => reasonBadge(reason)).join(" ")
+    : `<div class="muted">${escapeHtml(emptyText)}</div>`;
+}
+
+function renderShadowSmallEntryOpsUsageLines(id, today, limits, audit) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const lines = [
+    `promotions ${today.promotion_count ?? 0}/${limits.max_promotions_per_day ?? "-"}`,
+    `submitted ${today.submitted_count ?? 0}/${limits.max_submitted_orders_per_day ?? "-"}`,
+    `notional ${compactNumber(today.total_notional_krw ?? 0)}/${compactNumber(limits.max_total_notional_krw ?? 0)}`,
+    `open ${today.open_position_count ?? 0}/${limits.max_open_positions ?? "-"}`,
+    `unknown ${today.unknown_submit_count ?? 0}`,
+    `reconcile ${today.reconcile_required_count ?? 0}`,
+    `heartbeat ${audit.gateway_heartbeat_ok ? "OK" : "BAD"}`,
+  ];
+  node.innerHTML = lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("");
+}
+
+async function shadowSmallEntryOpsAction(action, button) {
+  const originalText = button?.textContent || "";
+  const body = { operator: "themelab", note: `themelab ${action}` };
+  if (action === "confirm") {
+    body.activation_token = state.shadowSmallEntryOps.activationToken || "";
+    body.note = "themelab confirm live_sim guarded";
+  }
+  if (action === "pause") body.reason = "SHADOW_SMALL_ENTRY_OPERATOR_PAUSE";
+  if (action === "emergency-pause") {
+    body.emergency = true;
+    body.reason = "SHADOW_SMALL_ENTRY_EMERGENCY_PAUSE";
+    body.note = "themelab emergency pause";
+  }
+  const endpoint = SHADOW_SMALL_ENTRY_OPS_ENDPOINTS[action] || SHADOW_SMALL_ENTRY_OPS_ENDPOINTS.preflight;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "running";
+  }
+  try {
+    const payload = await runWithLocalTokenRetry((token) => postJsonWithLocalToken(endpoint, token, body));
+    if (!payload) return;
+    if (payload.activation_token) {
+      state.shadowSmallEntryOps.activationToken = payload.activation_token;
+      state.shadowSmallEntryOps.activationTokenId = payload.activation_token_id || "";
+      updateOperatorSyncStatus(`Shadow Small Entry armed: ${payload.activation_token_id || ""}`);
+    } else if (action === "confirm") {
+      state.shadowSmallEntryOps.activationToken = "";
+      state.shadowSmallEntryOps.activationTokenId = "";
+    }
+    await fetchSnapshot();
+  } catch (error) {
+    updateOperatorSyncStatus(`Shadow Small Entry action failed: ${error.message || error}`);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+}
+
 function renderShadowPromotionLines(id, rows, emptyText) {
   const node = document.getElementById(id);
   if (!node) return;
@@ -2234,6 +2353,7 @@ function render(snapshot) {
   renderLiveSimAuditPanel(currentSnapshot);
   state.conservativeReason.payload = currentSnapshot.conservative_reason_outcomes || state.conservativeReason.payload || {};
   renderConservativeReasonPanel(state.conservativeReason.payload);
+  renderShadowSmallEntryOpsPanel(currentSnapshot.shadow_small_entry_ops || {});
   renderShadowSmallEntryPromotionPanel(currentSnapshot.shadow_small_entry_promotion || {});
   renderShadowAb(currentSnapshot);
   renderThemes(currentSnapshot.ranked_themes || []);
@@ -4041,6 +4161,20 @@ function initConservativeReasonPanel() {
   });
 }
 
+function initShadowSmallEntryOpsPanel() {
+  renderShadowSmallEntryOpsPanel();
+  [
+    ["themelab-shadow-small-entry-ops-preflight", "preflight"],
+    ["themelab-shadow-small-entry-ops-arm", "arm"],
+    ["themelab-shadow-small-entry-ops-confirm", "confirm"],
+    ["themelab-shadow-small-entry-ops-pause", "pause"],
+    ["themelab-shadow-small-entry-ops-rollback", "rollback"],
+    ["themelab-shadow-small-entry-ops-emergency-pause", "emergency-pause"],
+  ].forEach(([id, action]) => {
+    document.getElementById(id)?.addEventListener("click", (event) => shadowSmallEntryOpsAction(action, event.currentTarget).catch(() => {}));
+  });
+}
+
 function isFullThemeLabSnapshot(snapshot) {
   const payload = snapshot || {};
   const market = payload.market || {};
@@ -4067,6 +4201,7 @@ initPostmarketReviewPanel();
 initPromotionCockpit();
 initBuyZeroRcaPanel();
 initConservativeReasonPanel();
+initShadowSmallEntryOpsPanel();
 fetchSnapshot().catch(() => {});
 connectWs();
 setInterval(() => fetchSnapshot().catch(() => {}), 5000);

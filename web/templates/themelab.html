@@ -153,6 +153,41 @@
         </div>
       </section>
 
+      <section id="themelab-shadow-small-entry-ops-card" class="panel conservative-reason-panel" aria-label="Shadow Small Entry 운영 제어">
+        <div class="panel-head">
+          <div>
+            <h2>Shadow Small Entry 운영 제어</h2>
+            <p id="themelab-shadow-small-entry-ops-message">현재는 관측 전용입니다. LIVE_SIM 활성화는 preflight와 2단계 확인이 필요합니다.</p>
+            <p class="row-meta">LIVE_REAL은 계속 차단되고, 이 패널은 shadow small entry의 관측/활성화/중단/롤백 상태만 제어합니다.</p>
+          </div>
+          <div class="gate-status-strip">
+            <button id="themelab-shadow-small-entry-ops-preflight" class="action-button" type="button">Preflight</button>
+            <button id="themelab-shadow-small-entry-ops-arm" class="action-button" type="button">Arm LIVE_SIM</button>
+            <button id="themelab-shadow-small-entry-ops-confirm" class="action-button" type="button">Confirm</button>
+            <button id="themelab-shadow-small-entry-ops-pause" class="action-button" type="button">Pause</button>
+            <button id="themelab-shadow-small-entry-ops-rollback" class="action-button" type="button">Rollback</button>
+            <button id="themelab-shadow-small-entry-ops-emergency-pause" class="action-button" type="button">Emergency Pause</button>
+            <span id="themelab-shadow-small-entry-ops-status" class="badge observe">OBSERVE_ONLY</span>
+          </div>
+        </div>
+        <div class="buy-zero-summary-grid conservative-reason-summary-grid">
+          <article><span>Mode / Order</span><strong id="themelab-shadow-small-entry-ops-mode">observe_only / OFF</strong></article>
+          <article><span>Order Enabled</span><strong id="themelab-shadow-small-entry-ops-order-enabled">OFF</strong></article>
+          <article><span>Preflight</span><strong id="themelab-shadow-small-entry-ops-preflight-status">NO_DATA</strong></article>
+          <article><span>Arm TTL</span><strong id="themelab-shadow-small-entry-ops-activation">-</strong></article>
+          <article><span>Promotions</span><strong id="themelab-shadow-small-entry-ops-promotion-count">0</strong></article>
+          <article><span>Submitted</span><strong id="themelab-shadow-small-entry-ops-submitted-count">0</strong></article>
+          <article><span>Filled</span><strong id="themelab-shadow-small-entry-ops-filled-count">0</strong></article>
+          <article><span>Open Positions</span><strong id="themelab-shadow-small-entry-ops-open-position-count">0</strong></article>
+          <article><span>Total Notional</span><strong id="themelab-shadow-small-entry-ops-notional">0</strong></article>
+          <article><span>Live Audit</span><strong id="themelab-shadow-small-entry-ops-audit-status">UNKNOWN</strong></article>
+          <article><span>Reconcile</span><strong id="themelab-shadow-small-entry-ops-reconcile-status">UNKNOWN</strong></article>
+          <article><span>Last Change</span><strong id="themelab-shadow-small-entry-ops-last-change">-</strong></article>
+        </div>
+        <div id="themelab-shadow-small-entry-ops-blocking-reasons" class="buy-zero-line-list"></div>
+        <div id="themelab-shadow-small-entry-ops-risk-lines" class="buy-zero-line-list"></div>
+      </section>
+
       <section id="themelab-shadow-small-entry-promotion-card" class="panel conservative-reason-panel" aria-label="Shadow 소액 승격 가드">
         <div class="panel-head">
           <div>

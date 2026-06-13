@@ -16,11 +16,23 @@ const state = {
     stage: "",
     error: "",
   },
+  shadowSmallEntryOps: {
+    activationToken: "",
+    activationTokenId: "",
+  },
 };
 
 const SNAPSHOT_POLL_INTERVAL_MS = 30000;
 const SNAPSHOT_INITIAL_FALLBACK_MS = 7000;
 const SNAPSHOT_RECONNECT_MS = 3000;
+const SHADOW_SMALL_ENTRY_OPS_ENDPOINTS = {
+  preflight: "/api/shadow-small-entry-ops/preflight",
+  arm: "/api/shadow-small-entry-ops/arm",
+  confirm: "/api/shadow-small-entry-ops/confirm",
+  pause: "/api/shadow-small-entry-ops/pause",
+  rollback: "/api/shadow-small-entry-ops/rollback",
+  "emergency-pause": "/api/shadow-small-entry-ops/pause",
+};
 
 const tableConfigs = {
   transportLatency: {
@@ -1213,6 +1225,59 @@ function renderShadowSmallEntryPromotion(snapshot) {
   renderKeyCountLines("shadow-small-entry-promotion-code-lines", payload.top_reason_codes || summary.top_reason_codes || [], "아직 승격 reason code가 없습니다.");
 }
 
+function renderShadowSmallEntryOps(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.shadow_small_entry_ops || runtime.shadow_small_entry_ops || {};
+  const today = payload.today || {};
+  const audit = payload.audit || {};
+  const limits = payload.limits || {};
+  const status = payload.status || "OBSERVE_ONLY";
+  const orderEnabled = Boolean(payload.order_enabled);
+  const preflightStatus = payload.preflight_status || "NO_DATA";
+  const activationLabel = payload.activation_armed ? `armed until ${formatDateTime(payload.activation_expires_at)}` : "-";
+  text("shadow-small-entry-ops-status", status);
+  cls("shadow-small-entry-ops-status", `counter ${status === "LIVE_SIM_ACTIVE" ? "warn" : status.startsWith("PAUSED") || status === "BROKEN" ? "bad" : "muted"}`);
+  text("shadow-small-entry-ops-message", payload.operator_message_ko || "현재는 관측 전용입니다. LIVE_SIM 활성화는 preflight와 2단계 확인이 필요합니다.");
+  text("shadow-small-entry-ops-mode", `${payload.mode || "observe_only"} / ${orderEnabled ? "ON" : "OFF"}`);
+  text("shadow-small-entry-ops-order-enabled", orderEnabled ? "ON" : "OFF");
+  text("shadow-small-entry-ops-preflight-status", preflightStatus);
+  text("shadow-small-entry-ops-activation", activationLabel);
+  text("shadow-small-entry-ops-promotion-count", today.promotion_count ?? 0);
+  text("shadow-small-entry-ops-submitted-count", today.submitted_count ?? 0);
+  text("shadow-small-entry-ops-filled-count", today.filled_count ?? 0);
+  text("shadow-small-entry-ops-open-position-count", today.open_position_count ?? 0);
+  text("shadow-small-entry-ops-notional", fmtNumber(today.total_notional_krw ?? 0, 0));
+  text("shadow-small-entry-ops-audit-status", audit.live_sim_audit_status || audit.status || "UNKNOWN");
+  text("shadow-small-entry-ops-reconcile-status", audit.reconcile_status || "UNKNOWN");
+  text("shadow-small-entry-ops-last-change", formatDateTime(payload.last_status_change_at || payload.last_updated_at));
+  renderShadowSmallEntryOpsReasons("shadow-small-entry-ops-blocking-reasons", payload.preflight_blocking_reasons || [], "Preflight 차단 사유가 없습니다.");
+  renderShadowSmallEntryOpsRiskLines("shadow-small-entry-ops-risk-lines", today, limits, audit);
+}
+
+function renderShadowSmallEntryOpsReasons(id, reasons, emptyText) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const items = firstItems(reasons || [], 8);
+  node.innerHTML = items.length
+    ? items.map((reason) => `<span class="badge warning">${escapeHtml(reason)}</span>`).join(" ")
+    : `<span class="empty">${escapeHtml(emptyText)}</span>`;
+}
+
+function renderShadowSmallEntryOpsRiskLines(id, today, limits, audit) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  const lines = [
+    `promotions ${today.promotion_count ?? 0}/${limits.max_promotions_per_day ?? "-"}`,
+    `submitted ${today.submitted_count ?? 0}/${limits.max_submitted_orders_per_day ?? "-"}`,
+    `notional ${fmtNumber(today.total_notional_krw ?? 0, 0)}/${fmtNumber(limits.max_total_notional_krw ?? 0, 0)}`,
+    `open ${today.open_position_count ?? 0}/${limits.max_open_positions ?? "-"}`,
+    `unknown ${today.unknown_submit_count ?? 0}`,
+    `reconcile ${today.reconcile_required_count ?? 0}`,
+    `heartbeat ${audit.gateway_heartbeat_ok ? "OK" : "BAD"}`,
+  ];
+  node.innerHTML = lines.map((line) => `<span class="counter muted">${escapeHtml(line)}</span>`).join(" ");
+}
+
 function renderKeyCountLines(id, rows, emptyText) {
   const node = document.getElementById(id);
   if (!node) return;
@@ -1581,6 +1646,7 @@ function render(snapshot) {
   renderBuyZeroRca(snapshot);
   renderConservativeReasonOutcomes(snapshot);
   renderShadowSmallEntryPromotion(snapshot);
+  renderShadowSmallEntryOps(snapshot);
 
   text("transport-mode", transport.mode || "rest_long_poll");
   text("transport-event-p95", formatMs(transport.event_latency_p95_ms));
@@ -1865,6 +1931,54 @@ async function pollSnapshot() {
   }
 }
 
+async function shadowSmallEntryOpsAction(action, button) {
+  const originalText = button?.textContent || "";
+  const body = { operator: "dashboard", note: `dashboard ${action}` };
+  if (action === "confirm") {
+    const token = state.shadowSmallEntryOps.activationToken || window.prompt("Shadow Small Entry activation token") || "";
+    body.activation_token = token;
+    body.note = window.prompt("operator note") || "dashboard confirm";
+  }
+  if (action === "pause") {
+    body.reason = "SHADOW_SMALL_ENTRY_OPERATOR_PAUSE";
+  }
+  if (action === "emergency-pause") {
+    body.emergency = true;
+    body.reason = "SHADOW_SMALL_ENTRY_EMERGENCY_PAUSE";
+    body.note = "dashboard emergency pause";
+  }
+  const endpoint = SHADOW_SMALL_ENTRY_OPS_ENDPOINTS[action] || SHADOW_SMALL_ENTRY_OPS_ENDPOINTS.preflight;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "running";
+  }
+  try {
+    const payload = await runWithLocalTokenRetry((token) => postWithLocalToken(endpoint, token, body));
+    if (!payload) return;
+    if (payload.activation_token) {
+      state.shadowSmallEntryOps.activationToken = payload.activation_token;
+      state.shadowSmallEntryOps.activationTokenId = payload.activation_token_id || "";
+      openDetailPanel("Shadow Small Entry arm token", {
+        activation_token: payload.activation_token,
+        activation_token_id: payload.activation_token_id,
+        activation_expires_at: payload.activation_expires_at,
+        note: "Confirm 전용 토큰입니다. 로컬 화면 세션에만 보관됩니다.",
+      });
+    } else if (action === "confirm") {
+      state.shadowSmallEntryOps.activationToken = "";
+      state.shadowSmallEntryOps.activationTokenId = "";
+    }
+    await pollSnapshot();
+  } catch (error) {
+    openDetailPanel("Shadow Small Entry 운영 제어 오류", { action, error: error.message });
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+}
+
 async function runtimeCommand(action, button) {
   const originalText = button?.textContent || "";
   if (button) {
@@ -1963,6 +2077,16 @@ function initDashboard() {
   document.getElementById("runtime-start")?.addEventListener("click", (event) => runtimeCommand("start", event.currentTarget).catch(() => {}));
   document.getElementById("runtime-stop")?.addEventListener("click", (event) => runtimeCommand("stop", event.currentTarget).catch(() => {}));
   document.getElementById("runtime-cycle")?.addEventListener("click", (event) => runtimeCommand("cycle", event.currentTarget).catch(() => {}));
+  [
+    ["shadow-small-entry-ops-preflight", "preflight"],
+    ["shadow-small-entry-ops-arm", "arm"],
+    ["shadow-small-entry-ops-confirm", "confirm"],
+    ["shadow-small-entry-ops-pause", "pause"],
+    ["shadow-small-entry-ops-rollback", "rollback"],
+    ["shadow-small-entry-ops-emergency-pause", "emergency-pause"],
+  ].forEach(([id, action]) => {
+    document.getElementById(id)?.addEventListener("click", (event) => shadowSmallEntryOpsAction(action, event.currentTarget).catch(() => {}));
+  });
   document.getElementById("buy-zero-rca-refresh")?.addEventListener("click", () => {
     state.buyZeroRca.lastFetchedAt = 0;
     refreshBuyZeroRcaTables({ force: true }).catch((error) => {

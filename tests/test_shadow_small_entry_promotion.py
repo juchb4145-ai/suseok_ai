@@ -69,6 +69,7 @@ def test_shadow_small_entry_live_sim_guarded_promotes_only_when_enabled():
         config=ShadowSmallEntryPromotionConfig(
             mode=MODE_LIVE_SIM_GUARDED,
             order_enabled=True,
+            ops_status="LIVE_SIM_ACTIVE",
             min_sample_count=10,
             strong_sample_count=30,
             min_confidence=0.55,
@@ -95,6 +96,7 @@ def test_shadow_small_entry_thin_sample_and_risk_blocks():
         config=ShadowSmallEntryPromotionConfig(
             mode=MODE_LIVE_SIM_GUARDED,
             order_enabled=True,
+            ops_status="LIVE_SIM_ACTIVE",
             min_sample_count=10,
             min_confidence=0.55,
         ),
@@ -105,6 +107,7 @@ def test_shadow_small_entry_thin_sample_and_risk_blocks():
         config=ShadowSmallEntryPromotionConfig(
             mode=MODE_LIVE_SIM_GUARDED,
             order_enabled=True,
+            ops_status="LIVE_SIM_ACTIVE",
             min_sample_count=10,
             min_confidence=0.55,
         ),

@@ -77,6 +77,40 @@
           </div>
         </section>
 
+        <section id="shadow-small-entry-ops-card" class="band">
+          <div class="section-head">
+            <div>
+              <h2>Shadow Small Entry 운영 제어</h2>
+              <p id="shadow-small-entry-ops-message" class="help-text">현재는 관측 전용입니다. LIVE_SIM 활성화는 preflight와 2단계 확인이 필요합니다.</p>
+            </div>
+            <div class="action-strip">
+              <button id="shadow-small-entry-ops-preflight" class="link-button" type="button">Preflight</button>
+              <button id="shadow-small-entry-ops-arm" class="link-button" type="button">Arm LIVE_SIM</button>
+              <button id="shadow-small-entry-ops-confirm" class="link-button" type="button">Confirm</button>
+              <button id="shadow-small-entry-ops-pause" class="link-button" type="button">Pause</button>
+              <button id="shadow-small-entry-ops-rollback" class="link-button" type="button">Rollback</button>
+              <button id="shadow-small-entry-ops-emergency-pause" class="link-button" type="button">Emergency Pause</button>
+              <span id="shadow-small-entry-ops-status" class="counter muted">OBSERVE_ONLY</span>
+            </div>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>Mode / Order</span><strong id="shadow-small-entry-ops-mode">observe_only / OFF</strong></div>
+            <div><span>Order Enabled</span><strong id="shadow-small-entry-ops-order-enabled">OFF</strong></div>
+            <div><span>Preflight</span><strong id="shadow-small-entry-ops-preflight-status">NO_DATA</strong></div>
+            <div><span>Arm TTL</span><strong id="shadow-small-entry-ops-activation">-</strong></div>
+            <div><span>Promotions</span><strong id="shadow-small-entry-ops-promotion-count">0</strong></div>
+            <div><span>Submitted</span><strong id="shadow-small-entry-ops-submitted-count">0</strong></div>
+            <div><span>Filled</span><strong id="shadow-small-entry-ops-filled-count">0</strong></div>
+            <div><span>Open Positions</span><strong id="shadow-small-entry-ops-open-position-count">0</strong></div>
+            <div><span>Total Notional</span><strong id="shadow-small-entry-ops-notional">0</strong></div>
+            <div><span>Live Audit</span><strong id="shadow-small-entry-ops-audit-status">UNKNOWN</strong></div>
+            <div><span>Reconcile</span><strong id="shadow-small-entry-ops-reconcile-status">UNKNOWN</strong></div>
+            <div><span>Last Change</span><strong id="shadow-small-entry-ops-last-change">-</strong></div>
+          </div>
+          <div id="shadow-small-entry-ops-blocking-reasons" class="inline-log"></div>
+          <div id="shadow-small-entry-ops-risk-lines" class="inline-log"></div>
+        </section>
+
         <section class="band two-col">
           <div class="unframed-panel">
             <div class="section-head">
