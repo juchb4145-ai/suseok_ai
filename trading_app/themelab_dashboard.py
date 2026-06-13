@@ -55,6 +55,20 @@ OPERATOR_TERM_DICTIONARY: dict[str, dict[str, str]] = {
         "severity": "neutral",
         "operator_action_ko": "분봉/VWAP/지지선 준비 상태를 확인하세요.",
     },
+    "READY_EARLY_SMALL": {
+        "label_ko": "장초반 소액 후보",
+        "short_label_ko": "초반소액",
+        "description_ko": "장초반 데이터가 완성되기 전 제한적으로 관찰하는 소액 후보입니다.",
+        "severity": "neutral",
+        "operator_action_ko": "분봉/VWAP/지지선 준비 상태를 확인하세요.",
+    },
+    "READY_SHADOW_SMALL_ENTRY": {
+        "label_ko": "검증 기반 소액 후보",
+        "short_label_ko": "검증소액",
+        "description_ko": "검증 리포트 근거가 있는 소액 진입 후보입니다.",
+        "severity": "positive",
+        "operator_action_ko": "소액 진입 실험 탭에서 한도와 가드 상태를 확인하세요.",
+    },
     "WAIT": {
         "label_ko": "대기",
         "short_label_ko": "대기",
@@ -111,6 +125,20 @@ OPERATOR_TERM_DICTIONARY: dict[str, dict[str, str]] = {
         "severity": "neutral",
         "operator_action_ko": "실시간 조건식/틱 수신 여부를 확인하세요.",
     },
+    "LATEST_TICK_STALE": {
+        "label_ko": "실시간 틱 지연",
+        "short_label_ko": "틱지연",
+        "description_ko": "최신 틱 수신이 지연되어 판단을 보수적으로 봅니다.",
+        "severity": "warning",
+        "operator_action_ko": "실시간 수신과 게이트웨이 heartbeat를 확인하세요.",
+    },
+    "VWAP_MISSING": {
+        "label_ko": "VWAP 미확인",
+        "short_label_ko": "VWAP없음",
+        "description_ko": "VWAP 계산 또는 수신이 아직 확인되지 않았습니다.",
+        "severity": "warning",
+        "operator_action_ko": "분봉 수집과 VWAP 계산 상태를 확인하세요.",
+    },
     "LATE_CHASE": {
         "label_ko": "뒤늦은 추격 위험",
         "short_label_ko": "추격위험",
@@ -152,6 +180,13 @@ OPERATOR_TERM_DICTIONARY: dict[str, dict[str, str]] = {
         "description_ko": "현재가가 VWAP 대비 과도하게 벌어져 있습니다.",
         "severity": "warning",
         "operator_action_ko": "VWAP 근처 재접근 또는 눌림을 기다리세요.",
+    },
+    "BREAKOUT_CONTINUATION": {
+        "label_ko": "돌파 연속 구간",
+        "short_label_ko": "돌파연속",
+        "description_ko": "돌파 이후 연속 상승 구간이라 추격 위험을 확인해야 합니다.",
+        "severity": "warning",
+        "operator_action_ko": "눌림 또는 지지선 회복 확인 후 접근하세요.",
     },
     "LOW_BREADTH": {
         "label_ko": "테마 확산 부족",
@@ -1357,11 +1392,12 @@ def _operator_view(snapshot: dict[str, Any]) -> dict[str, Any]:
     gateway = dict(snapshot.get("gateway") or {})
     ranked_themes = _as_list(snapshot.get("ranked_themes"))
     watchset = _as_list(snapshot.get("watchset"))
+    entry_statuses = {"READY", "READY_SMALL", "EARLY_SMALL", "READY_EARLY_SMALL", "READY_SHADOW_SMALL_ENTRY"}
     entry_candidates = [
         item
         for item in watchset
-        if str(item.get("gate_status") or item.get("display_status") or "") in {"READY", "READY_SMALL", "EARLY_SMALL"}
-        or str(item.get("display_status") or "") in {"READY", "READY_SMALL", "EARLY_SMALL"}
+        if str(item.get("gate_status") or item.get("display_status") or "") in entry_statuses
+        or str(item.get("display_status") or "") in entry_statuses
     ]
     no_buy_reasons = _operator_no_buy_reasons(summary, data_quality, watchset, snapshot)
     risk_status = _operator_risk_status(summary, data_quality, gateway, snapshot)
@@ -1375,6 +1411,8 @@ def _operator_view(snapshot: dict[str, Any]) -> dict[str, Any]:
         "no_buy_reasons": no_buy_reasons[:3],
         "risk_status": risk_status[:5],
         "panels": _operator_panels(snapshot),
+        "tabs": _operator_tabs(snapshot, no_buy_reasons=no_buy_reasons, risk_status=risk_status),
+        "developer": {"raw_available": True},
         "limits": {
             "top_themes": 5,
             "buy_candidates": 10,
@@ -1696,6 +1734,7 @@ def _operator_panels(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
     conservative = dict(snapshot.get("conservative_reason_outcomes") or {})
     shadow_ops = dict(snapshot.get("shadow_small_entry_ops") or {})
     shadow_pilot = dict(snapshot.get("shadow_small_entry_pilot") or {})
+    shadow_promotion = dict(snapshot.get("shadow_small_entry_promotion") or {})
     gate_outcomes = dict(snapshot.get("gate_reason_outcomes") or {})
     return {
         "buy_zero_rca": {
@@ -1711,10 +1750,22 @@ def _operator_panels(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "status": live_sim.get("status") or "NO_DATA",
         },
         "shadow_small_entry": {
-            "summary_ko": shadow_ops.get("operator_message_ko") or "Shadow Small Entry 운영 상태는 주문/리스크 또는 리포트 탭에서 확인합니다.",
+            "summary_ko": shadow_ops.get("operator_message_ko") or "소액 진입 실험은 관측/승격/파일럿 상태를 한 탭에서 확인합니다.",
             "visible_in_main": False,
-            "tab": "orders-risk",
+            "tab": "small-entry",
             "status": shadow_ops.get("status") or "NO_DATA",
+        },
+        "shadow_small_entry_promotion": {
+            "summary_ko": shadow_promotion.get("operator_message_ko") or "소액 승격 후보와 차단 근거는 소액 진입 실험 탭에서 확인합니다.",
+            "visible_in_main": False,
+            "tab": "small-entry",
+            "status": shadow_promotion.get("status") or "NO_DATA",
+        },
+        "shadow_small_entry_pilot": {
+            "summary_ko": shadow_pilot.get("operator_message_ko") or "파일럿 실행 상태와 안전 체크는 소액 진입 실험 탭에서 확인합니다.",
+            "visible_in_main": False,
+            "tab": "small-entry",
+            "status": shadow_pilot.get("status") or "NO_DATA",
         },
         "conservative_reason": {
             "summary_ko": "보수적 차단 사유 outcome은 안 산 이유 탭에서 확인합니다.",
@@ -1723,16 +1774,62 @@ def _operator_panels(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "status": conservative.get("status") or "NO_DATA",
         },
         "pilot_report": {
-            "summary_ko": shadow_pilot.get("operator_message_ko") or "파일럿 리포트는 리포트 탭에서 확인합니다.",
+            "summary_ko": shadow_pilot.get("operator_message_ko") or "파일럿 리포트 파일은 소액 진입 실험과 리포트 탭에서 확인합니다.",
+            "visible_in_main": False,
+            "tab": "small-entry",
+            "status": shadow_pilot.get("status") or "NO_DATA",
+        },
+        "reports": {
+            "summary_ko": "장후 outcome report, StrategyChangeProposal, CSV/Markdown export는 리포트 탭에서 확인합니다.",
             "visible_in_main": False,
             "tab": "reports",
-            "status": shadow_pilot.get("status") or "NO_DATA",
+            "status": conservative.get("status") or shadow_pilot.get("status") or "NO_DATA",
         },
         "developer_details": {
             "summary_ko": "raw JSON, trace, reason_code 원문은 개발자 상세 탭에서만 표시합니다.",
             "visible_in_main": False,
             "tab": "developer",
             "status": "HIDDEN",
+        },
+    }
+
+
+def _operator_tabs(
+    snapshot: dict[str, Any],
+    *,
+    no_buy_reasons: list[dict[str, Any]],
+    risk_status: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    shadow_ops = dict(snapshot.get("shadow_small_entry_ops") or {})
+    shadow_pilot = dict(snapshot.get("shadow_small_entry_pilot") or {})
+    shadow_promotion = dict(snapshot.get("shadow_small_entry_promotion") or {})
+    live_sim = dict(snapshot.get("live_sim_audit") or {})
+    conservative = dict(snapshot.get("conservative_reason_outcomes") or {})
+    buy_zero = dict(snapshot.get("gate_reason_outcomes") or {})
+    return {
+        "no_buy": {
+            "summary_ko": f"안 산 이유 상위 {min(3, len(no_buy_reasons))}개를 요약합니다.",
+            "count": len(no_buy_reasons),
+        },
+        "orders_risk": {
+            "summary_ko": "LIVE_SIM audit, reconcile, 미체결/취소, 주문 안전장치를 확인합니다.",
+            "count": len(risk_status),
+        },
+        "small_entry": {
+            "summary_ko": shadow_ops.get("operator_message_ko") or "소액 진입 실험은 현재 관측/승격/파일럿 상태를 확인합니다.",
+            "count": sum(
+                1
+                for item in (shadow_ops, shadow_pilot, shadow_promotion)
+                if item.get("available") or item.get("status") or item.get("candidate_count")
+            ),
+        },
+        "reports": {
+            "summary_ko": "장후 outcome report, 파일럿 export, 전략 변경 제안을 확인합니다.",
+            "count": sum(1 for item in (conservative, shadow_pilot, buy_zero) if item.get("available") or item.get("status")),
+        },
+        "developer": {
+            "summary_ko": "raw trace, reason_code, command_id, JSON, debug counter는 기본 숨김입니다.",
+            "count": 0,
         },
     }
 
@@ -1747,11 +1844,11 @@ def _normalize_operator_reason_code(reason: Any) -> str:
         "PRICE_LOCATION_WARMUP": "WARMUP_OPTIONAL",
         "PRICE_LOCATION_UNKNOWN": "ENTRY_BLOCKING",
         "WAIT_DATA_SUPPORT_NOT_READY": "SUPPORT_NOT_READY",
-        "MISSING_VWAP": "DATA_INSUFFICIENT",
+        "MISSING_VWAP": "VWAP_MISSING",
         "MISSING_CURRENT_PRICE": "DATA_INSUFFICIENT",
         "MISSING_SESSION_HIGH": "DATA_INSUFFICIENT",
         "MISSING_PREV_CLOSE": "DATA_INSUFFICIENT",
-        "STALE_TICK": "DATA_INSUFFICIENT",
+        "STALE_TICK": "LATEST_TICK_STALE",
         "CHASE_RISK_BLOCKED": "LATE_CHASE",
         "LATE_CHASE_TEMP_WAIT": "LATE_CHASE",
     }

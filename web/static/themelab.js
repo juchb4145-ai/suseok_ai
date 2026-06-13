@@ -159,6 +159,11 @@ const operatorReasonTerms = {
   ENTRY_BLOCKING: ["진입 판단 데이터 부족", "진입부족", "warning", "진입 위치 판단에 필요한 데이터가 부족합니다.", "가격 위치와 지지선/VWAP 준비 상태를 확인하세요."],
   WARMUP_OPTIONAL: ["보조지표 준비중", "준비중", "neutral", "보조지표가 장초반 또는 데이터 수집 과정에서 준비 중입니다.", "추가 분봉 수집을 기다리세요."],
   BACKFILL_ONLY_OBSERVE: ["실시간 미확인", "미확인", "neutral", "TR 보강 데이터만 있고 실시간 흐름 확인이 부족합니다.", "실시간 조건식/틱 수신 여부를 확인하세요."],
+  READY_EARLY_SMALL: ["장초반 소액 후보", "초반소액", "neutral", "장초반 데이터가 완성되기 전 제한적으로 관찰하는 소액 후보입니다.", "분봉/VWAP/지지선 준비 상태를 확인하세요."],
+  READY_SHADOW_SMALL_ENTRY: ["검증 기반 소액 후보", "검증소액", "positive", "검증 리포트 근거가 있는 소액 진입 후보입니다.", "소액 진입 실험 탭에서 한도와 가드 상태를 확인하세요."],
+  LATEST_TICK_STALE: ["실시간 틱 지연", "틱지연", "warning", "최신 틱 수신이 지연되어 판단을 보수적으로 봅니다.", "실시간 수신과 게이트웨이 heartbeat를 확인하세요."],
+  VWAP_MISSING: ["VWAP 미확인", "VWAP없음", "warning", "VWAP 계산 또는 수신이 아직 확인되지 않았습니다.", "분봉 수집과 VWAP 계산 상태를 확인하세요."],
+  BREAKOUT_CONTINUATION: ["돌파 연속 구간", "돌파연속", "warning", "돌파 이후 연속 상승 구간이라 추격 위험을 확인해야 합니다.", "눌림 또는 지지선 회복 확인 후 접근하세요."],
   LATE_CHASE: ["뒤늦은 추격 위험", "추격위험", "warning", "이미 오른 뒤 따라붙는 구간이라 진입을 기다립니다.", "눌림 또는 VWAP/지지선 회복을 기다리세요."],
   LATE_CHASE_TEMP_WAIT: ["뒤늦은 추격 위험", "추격대기", "warning", "늦은 추격 위험이 있어 잠시 뒤 재확인합니다.", "재확인 시간 이후 가격 위치를 다시 확인하세요."],
   CHASE_HIGH: ["고점 추격 위험", "고점추격", "warning", "고점 부근 추격 매수 위험이 큽니다.", "고점 이탈 여부와 눌림 전환을 확인하세요."],
@@ -2690,7 +2695,7 @@ function operatorView(snapshot = state.snapshot || {}) {
   const summary = snapshot.summary || {};
   const dataQuality = snapshot.data_quality || {};
   const market = snapshot.market || {};
-  const candidates = (snapshot.watchset || []).filter((item) => ["READY", "READY_SMALL", "EARLY_SMALL"].includes(item.gate_status || item.display_status));
+  const candidates = (snapshot.watchset || []).filter((item) => ["READY", "READY_SMALL", "EARLY_SMALL", "READY_EARLY_SMALL", "READY_SHADOW_SMALL_ENTRY"].includes(item.gate_status || item.display_status));
   const dataReason = translateReasonCode("DATA_INSUFFICIENT");
   const noBuyReasons = candidates.length ? [] : [{
     code: "NO_SIGNAL",
@@ -2745,6 +2750,7 @@ function operatorView(snapshot = state.snapshot || {}) {
     no_buy_reasons: noBuyReasons.slice(0, 3),
     risk_status: [],
     panels: {},
+    tabs: {},
   };
 }
 
@@ -2760,6 +2766,7 @@ function renderOperatorMain(snapshot = state.snapshot || {}) {
   renderTabCandidates(view);
   renderTabNoBuy(view);
   renderTabOrdersRisk(view);
+  renderTabSmallEntry(view);
   renderTabReports(view);
   renderDeveloperDetails(view);
 }
@@ -2824,7 +2831,7 @@ function renderBuyCandidates(items = []) {
       <div class="row-meta">${escapeHtml(item.theme_name || "-")} · ${escapeHtml(item.role_label_ko || "-")} · ${escapeHtml(item.entry_position_label_ko || "-")} · 주문 ${escapeHtml(item.order_permission_label_ko || "-")}</div>
       <p>${escapeHtml(item.operator_message_ko || "")}</p>
     </article>
-  `).join("") : `<div class="operator-empty">READY / READY_SMALL 후보가 없습니다.</div>`;
+  `).join("") : `<div class="operator-empty">READY / READY_SMALL / 소액 후보가 없습니다.</div>`;
 }
 
 function renderNoBuyReasons(items = []) {
@@ -2873,25 +2880,31 @@ function renderTabCandidates(view = {}) {
 function renderTabNoBuy(view = {}) {
   const node = document.querySelector("#tab-no-buy .operator-tab-intro");
   const reason = (view.no_buy_reasons || [])[0];
-  if (node) node.textContent = reason ? `안 산 이유: 가장 큰 이유는 ${reason.label_ko || translateReasonCode(reason.code).label_ko}입니다.` : "안 산 이유: Buy-Zero RCA와 보수적 차단 사유를 아래에서 확인합니다.";
+  if (node) node.textContent = view.tabs?.no_buy?.summary_ko || (reason ? `안 산 이유: 가장 큰 이유는 ${reason.label_ko || translateReasonCode(reason.code).label_ko}입니다.` : "안 산 이유: Buy-Zero RCA와 보수적 차단 사유를 아래에서 확인합니다.");
 }
 
 function renderTabOrdersRisk(view = {}) {
   const node = document.querySelector("#tab-orders-risk .operator-tab-intro");
   const danger = (view.risk_status || []).find((item) => item.severity === "danger");
-  if (node) node.textContent = danger ? `주문/리스크: ${danger.title_ko} 확인이 필요합니다.` : "주문/리스크: LIVE_SIM audit, reconcile, 미체결 상태를 아래에서 확인합니다.";
+  if (node) node.textContent = view.tabs?.orders_risk?.summary_ko || (danger ? `주문/리스크: ${danger.title_ko} 확인이 필요합니다.` : "주문/리스크: LIVE_SIM audit, reconcile, 미체결, 주문 안전장치를 아래에서 확인합니다.");
+}
+
+function renderTabSmallEntry(view = {}) {
+  const node = document.querySelector("#tab-small-entry .operator-tab-intro");
+  const panels = view.panels || {};
+  if (node) node.textContent = view.tabs?.small_entry?.summary_ko || panels.shadow_small_entry?.summary_ko || "소액 진입 실험: 승격 후보, 운영 제어, 파일럿 상태를 아래에서 확인합니다.";
 }
 
 function renderTabReports(view = {}) {
   const node = document.querySelector("#tab-reports .operator-tab-intro");
   const panels = view.panels || {};
-  if (node) node.textContent = panels.pilot_report?.summary_ko || "리포트: 파일럿, outcome, 승격 검토 결과를 아래에서 확인합니다.";
+  if (node) node.textContent = view.tabs?.reports?.summary_ko || panels.reports?.summary_ko || panels.pilot_report?.summary_ko || "리포트: 장후 outcome report, 전략 변경 제안, export 결과를 아래에서 확인합니다.";
 }
 
 function renderDeveloperDetails(view = {}) {
   const node = document.querySelector("#tab-developer .operator-tab-intro");
   const panels = view.panels || {};
-  if (node) node.textContent = panels.developer_details?.summary_ko || "raw trace, reason_code, JSON, debug counter는 이 탭에서만 확인합니다.";
+  if (node) node.textContent = view.tabs?.developer?.summary_ko || panels.developer_details?.summary_ko || "raw trace, reason_code, JSON, debug counter는 이 탭에서만 확인합니다.";
 }
 
 function render(snapshot) {

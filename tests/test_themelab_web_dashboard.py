@@ -27,6 +27,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     html = (ROOT / "web" / "templates" / "themelab.html").read_text(encoding="utf-8")
     css = (ROOT / "web" / "static" / "themelab.css").read_text(encoding="utf-8")
     js = (ROOT / "web" / "static" / "themelab.js").read_text(encoding="utf-8")
+    inventory = (ROOT / "docs" / "dashboard_panel_inventory.md").read_text(encoding="utf-8")
     soup = BeautifulSoup(html, "html.parser")
 
     assert soup.select_one(".terminal-shell") is not None
@@ -39,6 +40,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#tab-candidates") is not None
     assert soup.select_one("#tab-no-buy") is not None
     assert soup.select_one("#tab-orders-risk") is not None
+    assert soup.select_one("#tab-small-entry") is not None
     assert soup.select_one("#tab-reports") is not None
     assert soup.select_one("#tab-developer") is not None
     assert soup.select_one("#tab-developer").has_attr("hidden")
@@ -114,6 +116,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#themelab-conservative-reason-missed-body") is not None
     assert soup.select_one("#themelab-conservative-reason-good-body") is not None
     assert soup.select_one("#themelab-shadow-small-entry-promotion-card") is not None
+    assert soup.select_one('#themelab-shadow-small-entry-promotion-card[data-operator-tab="small-entry"]') is not None
     assert soup.select_one("#themelab-shadow-small-entry-promotion-empty") is not None
     assert soup.select_one("#themelab-shadow-small-entry-promotion-status") is not None
     assert soup.select_one("#themelab-shadow-small-entry-promotion-mode") is not None
@@ -160,7 +163,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#watchset-body") is not None
     assert soup.select_one("#order-candidates") is not None
     assert soup.select_one("#themelab-shadow-small-entry-ops-card") is not None
-    assert soup.select_one('#themelab-shadow-small-entry-ops-card[data-operator-tab="orders-risk"]') is not None
+    assert soup.select_one('#themelab-shadow-small-entry-ops-card[data-operator-tab="small-entry"]') is not None
     assert soup.select_one("#themelab-shadow-small-entry-ops-status") is not None
     assert soup.select_one("#themelab-shadow-small-entry-ops-status").get_text(strip=True) == "관측 전용"
     assert soup.select_one("#themelab-shadow-small-entry-ops-preflight").get_text(strip=True) == "사전 점검"
@@ -177,6 +180,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#themelab-shadow-small-entry-ops-confirm") is not None
     assert soup.select_one("#themelab-shadow-small-entry-ops-rollback") is not None
     assert soup.select_one("#themelab-shadow-small-entry-pilot-card") is not None
+    assert soup.select_one('#themelab-shadow-small-entry-pilot-card[data-operator-tab="small-entry"]') is not None
     assert soup.select_one("#themelab-shadow-small-entry-pilot-status") is not None
     assert soup.select_one("#themelab-shadow-small-entry-pilot-status").get_text(strip=True) == "데이터 없음"
     assert soup.select_one("#themelab-shadow-small-entry-pilot-message") is not None
@@ -215,6 +219,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "function renderTabCandidates" in js
     assert "function renderTabNoBuy" in js
     assert "function renderTabOrdersRisk" in js
+    assert "function renderTabSmallEntry" in js
     assert "function renderTabReports" in js
     assert "function renderDeveloperDetails" in js
     assert "function translateReasonCode" in js
@@ -229,6 +234,10 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "키움 미로그인" in js
     assert "키움 주문 불가" in js
     assert "승격 근거 부족" in js
+    assert "검증 기반 소액 후보" in js
+    assert "실시간 틱 지연" in js
+    assert "VWAP 미확인" in js
+    assert "돌파 연속 구간" in js
     assert "translateReasonCode(reason)" in js
     assert "themelab-tab-nav" in css
     assert "operator-main-grid" in css
@@ -237,8 +246,21 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "status-observe" in css
     assert "status-blocked" in css
     assert "status-danger" in css
+    assert "status-warning" in css
     assert "status-muted" in css
+    assert "card-main" in css
+    assert "card-summary" in css
+    assert "card-detail" in css
+    assert "tab-panel" in css
+    assert "is-collapsed" in css
+    assert "is-hidden" in css
     assert '[data-operator-tab]' in css
+    assert "Shadow Small Entry Ops" in inventory
+    assert "tab-small-entry" in inventory
+    assert "MAIN" in inventory
+    assert "DETAIL" in inventory
+    assert "REPORT" in inventory
+    assert "DEBUG" in inventory
     assert "isFullThemeLabSnapshot" in js
     assert "snapshot.theme_lab && isFullThemeLabSnapshot(snapshot.theme_lab)" in js
     assert "/api/gateway/kiwoom/start" in js
@@ -883,6 +905,12 @@ def test_theme_lab_snapshot_includes_operator_view_with_korean_reason_labels(tmp
     assert any(item["title_ko"] == "LIVE_SIM audit" for item in view["risk_status"])
     assert view["panels"]["buy_zero_rca"]["visible_in_main"] is False
     assert view["panels"]["live_sim_audit"]["tab"] == "orders-risk"
+    assert view["panels"]["shadow_small_entry"]["tab"] == "small-entry"
+    assert view["panels"]["shadow_small_entry_pilot"]["tab"] == "small-entry"
+    assert view["tabs"]["small_entry"]["summary_ko"]
+    assert view["tabs"]["orders_risk"]["summary_ko"]
+    assert view["tabs"]["reports"]["summary_ko"]
+    assert view["developer"]["raw_available"] is True
     assert view["panels"]["developer_details"]["visible_in_main"] is False
 
 

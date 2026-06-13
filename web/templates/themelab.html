@@ -34,6 +34,7 @@
         <button data-tab-target="tab-candidates" type="button" aria-controls="tab-candidates" aria-pressed="false">매수 후보</button>
         <button data-tab-target="tab-no-buy" type="button" aria-controls="tab-no-buy" aria-pressed="false">안 산 이유</button>
         <button data-tab-target="tab-orders-risk" type="button" aria-controls="tab-orders-risk" aria-pressed="false">주문/리스크</button>
+        <button data-tab-target="tab-small-entry" type="button" aria-controls="tab-small-entry" aria-pressed="false">소액 진입 실험</button>
         <button data-tab-target="tab-reports" type="button" aria-controls="tab-reports" aria-pressed="false">리포트</button>
         <button data-tab-target="tab-developer" type="button" aria-controls="tab-developer" aria-pressed="false">개발자 상세</button>
       </nav>
@@ -92,10 +93,13 @@
         <div class="operator-tab-intro">Buy-Zero RCA, 데이터 부족, 보수적 차단 사유를 확인합니다.</div>
       </section>
       <section id="tab-orders-risk" class="operator-tab-panel" data-tab-panel="tab-orders-risk" aria-label="주문/리스크" hidden>
-        <div class="operator-tab-intro">LIVE_SIM audit, reconcile, 미체결, Shadow Small Entry 운영 상태를 확인합니다.</div>
+        <div class="operator-tab-intro">LIVE_SIM audit, reconcile, 미체결, 주문 안전장치를 확인합니다.</div>
+      </section>
+      <section id="tab-small-entry" class="operator-tab-panel" data-tab-panel="tab-small-entry" aria-label="소액 진입 실험" hidden>
+        <div class="operator-tab-intro">Shadow Small Entry 승격, 운영 제어, 파일럿 상태를 한 곳에서 확인합니다.</div>
       </section>
       <section id="tab-reports" class="operator-tab-panel" data-tab-panel="tab-reports" aria-label="리포트" hidden>
-        <div class="operator-tab-intro">파일럿 리포트, outcome report, 승격 검토 리포트를 확인합니다.</div>
+        <div class="operator-tab-intro">장후 outcome report, 전략 변경 제안, export 결과를 확인합니다.</div>
       </section>
       <section id="tab-developer" class="operator-tab-panel" data-tab-panel="tab-developer" aria-label="개발자 상세" hidden>
         <details class="developer-disclosure">
@@ -241,7 +245,7 @@
         </div>
       </section>
 
-      <section id="themelab-shadow-small-entry-ops-card" class="panel conservative-reason-panel" data-operator-tab="orders-risk" aria-label="Shadow Small Entry 운영 제어">
+      <section id="themelab-shadow-small-entry-ops-card" class="panel conservative-reason-panel" data-operator-tab="small-entry" aria-label="Shadow Small Entry 운영 제어">
         <div class="panel-head">
           <div>
             <h2>Shadow Small Entry 운영 제어</h2>
@@ -276,7 +280,7 @@
         <div id="themelab-shadow-small-entry-ops-risk-lines" class="buy-zero-line-list"></div>
       </section>
 
-      <section id="themelab-shadow-small-entry-pilot-card" class="panel conservative-reason-panel" data-operator-tab="reports" aria-label="Shadow Small Entry 파일럿 리포트">
+      <section id="themelab-shadow-small-entry-pilot-card" class="panel conservative-reason-panel" data-operator-tab="small-entry" aria-label="Shadow Small Entry 파일럿 리포트">
         <div class="panel-head">
           <div>
             <h2>Shadow Small Entry 파일럿 리포트</h2>
@@ -308,7 +312,7 @@
         <div id="themelab-shadow-small-entry-pilot-safety-lines" class="buy-zero-line-list"></div>
       </section>
 
-      <section id="themelab-shadow-small-entry-promotion-card" class="panel conservative-reason-panel" data-operator-tab="reports" aria-label="Shadow 소액 승격 가드">
+      <section id="themelab-shadow-small-entry-promotion-card" class="panel conservative-reason-panel" data-operator-tab="small-entry" aria-label="Shadow 소액 승격 가드">
         <div class="panel-head">
           <div>
             <h2>Shadow 소액 승격 가드</h2>
