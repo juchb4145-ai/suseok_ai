@@ -7,6 +7,7 @@ SCRIPT = Path("tools/start_market_open_live_sim.ps1")
 def test_market_open_live_sim_script_declares_runtime_safety_envs():
     text = SCRIPT.read_text(encoding="utf-8")
 
+    assert "[int]$RuntimeDryRunPositionAmount = 30000000" in text
     assert "$env:TRADING_MODE = \"OBSERVE\"" in text
     assert "$env:TRADING_RUNTIME_ENABLED = \"1\"" in text
     assert "$env:TRADING_RUNTIME_AUTO_START = \"0\"" in text

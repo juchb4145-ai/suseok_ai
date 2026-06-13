@@ -11,7 +11,7 @@ param(
     [ValidateSet("rest", "websocket-pilot", "websocket-experimental")]
     [string]$GatewayTransport = "websocket-pilot",
     [string]$GatewayCoreUrl = "",
-    [int]$RuntimeDryRunPositionAmount = 300000,
+    [int]$RuntimeDryRunPositionAmount = 30000000,
     [switch]$SkipGateway,
     [switch]$SkipRuntime,
     [switch]$SkipShadowSmallEntryPreflight,
