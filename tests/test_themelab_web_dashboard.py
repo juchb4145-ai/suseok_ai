@@ -152,6 +152,9 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#focus-summary") is not None
     assert soup.select_one("#decision-checklist") is not None
     assert soup.select_one("#price-map") is not None
+    assert soup.select_one('section[aria-label="가격 위치 지도"]') is not None
+    assert "가격 위치 지도" in html
+    assert "분봉 차트" in html
     assert soup.select_one("#chart-timeframe") is not None
     assert soup.select_one('[data-chart-interval="1m"]') is not None
     assert soup.select_one('[data-chart-interval="3m"]') is not None
@@ -448,12 +451,19 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "chartFromWatchItem" in js
     assert "renderDecisionChecklist" in js
     assert "renderPriceMap" in js
+    assert "priceReferenceDefinitions" in js
+    assert "groupPriceReferences" in js
+    assert "현재가 위치" in js
+    assert "상한가까지" in js
     assert "renderFocusPanel(item, selectedChart)" in js
     assert "renderChart(selectedChart)" in js
     assert "minuteChartSvg" in js
     assert "RUNTIME_INACTIVE" in js
     assert "snapshot_age_label" in js
     assert ".chart-ref.vwap" in css
+    assert ".price-map-summary" in css
+    assert ".price-marker.is-cluster" in css
+    assert ".chart-ref-label-link" in css
     assert "operator-alert-panel" in css
     assert "session-review-card" in css
     assert "operator-event-journal-list" in css

@@ -3971,41 +3971,135 @@ function decisionTone(value) {
   return "observe";
 }
 
+const priceReferenceDefinitions = [
+  { key: "support_price", label: "지지선", short: "지지", kind: "support" },
+  { key: "recent_support_price", label: "최근 지지", short: "최근", kind: "support" },
+  { key: "vwap", label: "VWAP", short: "VWAP", kind: "vwap" },
+  { key: "breakout_level", label: "돌파 기준", short: "돌파", kind: "breakout" },
+  { key: "current_price", label: "현재가", short: "현재", kind: "last" },
+  { key: "upper_limit_price", label: "상한가", short: "상한", kind: "upper" },
+];
+
+function priceReferencePoints(source) {
+  return priceReferenceDefinitions
+    .map((definition) => ({ ...definition, value: numberOrNull(source[definition.key]) }))
+    .filter((point) => point.value !== null && Number.isFinite(point.value));
+}
+
+function mergedPriceKind(items) {
+  if (items.some((item) => item.kind === "last")) return "last";
+  if (items.some((item) => item.kind === "upper")) return "upper";
+  if (items.some((item) => item.kind === "vwap")) return "vwap";
+  if (items.some((item) => item.kind === "breakout")) return "breakout";
+  return "support";
+}
+
+function orderedPriceReferenceItems(items) {
+  const priority = {
+    current_price: 0,
+    breakout_level: 1,
+    recent_support_price: 2,
+    support_price: 3,
+    vwap: 4,
+    upper_limit_price: 5,
+  };
+  return [...items].sort((a, b) => (priority[a.key] ?? 9) - (priority[b.key] ?? 9));
+}
+
+function groupPriceReferences(points) {
+  const groups = [];
+  [...points].sort((a, b) => a.value - b.value).forEach((point) => {
+    const existing = groups.find((group) => Math.abs(group.value - point.value) <= Math.max(1, Math.abs(point.value) * 0.00002));
+    if (existing) {
+      existing.items.push(point);
+      existing.keys.push(point.key);
+      const orderedItems = orderedPriceReferenceItems(existing.items);
+      existing.label = orderedItems.map((item) => item.label).join(" · ");
+      existing.short = orderedItems.map((item) => item.short).join(" · ");
+      existing.kind = mergedPriceKind(existing.items);
+      existing.isCluster = true;
+      return;
+    }
+    groups.push({
+      ...point,
+      items: [point],
+      keys: [point.key],
+      isCluster: false,
+    });
+  });
+  return groups;
+}
+
+function priceGapPct(baseValue, referenceValue) {
+  if (!Number.isFinite(baseValue) || !Number.isFinite(referenceValue) || referenceValue <= 0) return null;
+  return ((baseValue - referenceValue) / referenceValue) * 100;
+}
+
+function formatGapPct(value) {
+  if (!Number.isFinite(value)) return "-";
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${value.toFixed(2)}%`;
+}
+
+function priceMapSummary(points) {
+  const current = points.find((point) => point.key === "current_price");
+  if (!current) return "현재가 수신 대기";
+  const vwap = points.find((point) => point.key === "vwap");
+  const support = points.find((point) => point.key === "recent_support_price") || points.find((point) => point.key === "support_price");
+  const upper = points.find((point) => point.key === "upper_limit_price");
+  const parts = [];
+  if (vwap) parts.push(`VWAP 대비 ${formatGapPct(priceGapPct(current.value, vwap.value))}`);
+  if (support) parts.push(`${support.label} 대비 ${formatGapPct(priceGapPct(current.value, support.value))}`);
+  if (upper) parts.push(`상한가까지 ${formatGapPct(priceGapPct(upper.value, current.value))}`);
+  return parts.length ? parts.join(" · ") : "비교 기준 수신 대기";
+}
+
+function priceMetricHint(point, current) {
+  if (!current) return "비교 대기";
+  if (point.key === "current_price") return "비교 기준";
+  if (point.key === "upper_limit_price") return `현재가에서 ${formatGapPct(priceGapPct(point.value, current.value))}`;
+  return `현재가 ${formatGapPct(priceGapPct(current.value, point.value))}`;
+}
+
 function renderPriceMap(itemOrChart) {
-  const definitions = [
-    ["support_price", "Support"],
-    ["recent_support_price", "Recent"],
-    ["vwap", "VWAP"],
-    ["breakout_level", "Breakout"],
-    ["current_price", "Last"],
-    ["upper_limit_price", "Upper"],
-  ];
-  const points = definitions.map(([key, label]) => ({ key, label, value: numberOrNull(itemOrChart[key]) }))
-    .filter((point) => point.value !== null);
-  text("focus-price-state", points.length ? `${points.length}개 기준` : "데이터 대기");
+  const points = priceReferencePoints(itemOrChart);
+  const groupedPoints = groupPriceReferences(points);
+  const current = points.find((point) => point.key === "current_price");
+  text("focus-price-state", current ? `현재가 ${formatPrice(current.value)}` : (points.length ? `${points.length}개 기준` : "데이터 대기"));
   if (!points.length) {
     return `<div class="price-map-empty">데이터 대기</div>`;
   }
-  const values = points.map((point) => point.value);
+  const values = groupedPoints.map((point) => point.value);
   const minValue = Math.min(...values);
   const maxValue = Math.max(...values);
   const span = Math.max(1, maxValue - minValue);
-  const markers = points.map((point) => {
+  const markers = groupedPoints.map((point) => {
     const left = minValue === maxValue ? 50 : ((point.value - minValue) / span) * 100;
+    const clusterClass = point.isCluster ? " is-cluster" : "";
     return `
-      <span class="price-marker ${point.key}" style="left: ${left.toFixed(2)}%">
-        <i></i><b>${escapeHtml(point.label)}</b>
+      <span class="price-marker ${point.kind}${clusterClass}" style="left: ${left.toFixed(2)}%" title="${escapeHtml(point.label)} ${escapeHtml(formatPrice(point.value))}">
+        <i></i><b>${escapeHtml(point.short)}</b>
       </span>
     `;
   }).join("");
   const metrics = points.map((point) => `
-    <div class="price-metric ${point.key}">
+    <div class="price-metric ${point.kind}">
       <span>${escapeHtml(point.label)}</span>
       <strong>${escapeHtml(formatPrice(point.value))}</strong>
+      <em>${escapeHtml(priceMetricHint(point, current))}</em>
     </div>
   `).join("");
   return `
-    <div class="price-track" aria-hidden="true">${markers}</div>
+    <div class="price-map-summary">
+      <strong>현재가 위치</strong>
+      <span>${escapeHtml(priceMapSummary(points))}</span>
+    </div>
+    <div class="price-track" aria-hidden="true">
+      <span class="price-zone-label left">지지/눌림</span>
+      <span class="price-zone-label center">평균/돌파</span>
+      <span class="price-zone-label right">상단/상한</span>
+      ${markers}
+    </div>
     <div class="price-metrics">${metrics}</div>
   `;
 }
@@ -4121,11 +4215,23 @@ function minuteChartSvg(chart, candles) {
       <rect class="chart-candle ${tone}${completeClass}" x="${(x - candleWidth / 2).toFixed(2)}" y="${bodyY.toFixed(2)}" width="${candleWidth.toFixed(2)}" height="${bodyHeight.toFixed(2)}"></rect>
     `;
   }).join("");
-  const overlays = refs.map((item) => {
-    const yy = y(item.value);
+  const overlayItems = refs.map((item) => ({ ...item, y: y(item.value) }))
+    .sort((a, b) => a.y - b.y);
+  let lastLabelY = -Infinity;
+  const overlays = overlayItems.map((item) => {
+    const yy = item.y;
+    let labelY = yy - 6;
+    if (labelY - lastLabelY < 16) labelY = lastLabelY + 16;
+    labelY = Math.max(14, Math.min(height - 18, labelY));
+    lastLabelY = labelY;
+    const connector = Math.abs(labelY - (yy - 6)) > 3
+      ? `<line class="chart-ref-label-link ${item.kind}" x1="${margin.left + 4}" y1="${yy.toFixed(2)}" x2="${margin.left + 4}" y2="${labelY.toFixed(2)}"></line>`
+      : "";
+    const clusterClass = item.isCluster ? " is-cluster" : "";
     return `
       <line class="chart-ref ${item.kind}" x1="${margin.left}" y1="${yy.toFixed(2)}" x2="${width - margin.right}" y2="${yy.toFixed(2)}"></line>
-      <text class="chart-ref-label ${item.kind}" x="${margin.left + 8}" y="${(yy - 5).toFixed(2)}">${escapeHtml(item.label)} ${escapeHtml(formatPrice(item.value))}</text>
+      ${connector}
+      <text class="chart-ref-label ${item.kind}${clusterClass}" x="${margin.left + 8}" y="${labelY.toFixed(2)}">${escapeHtml(item.label)} ${escapeHtml(formatPrice(item.value))}</text>
     `;
   }).join("");
   const footer = [
@@ -4145,15 +4251,7 @@ function minuteChartSvg(chart, candles) {
 }
 
 function chartReferenceLines(chart) {
-  return [
-    { key: "vwap", label: "VWAP", kind: "vwap" },
-    { key: "support_price", label: "SUPPORT", kind: "support" },
-    { key: "recent_support_price", label: "SUPPORT", kind: "support" },
-    { key: "breakout_level", label: "BREAKOUT", kind: "breakout" },
-    { key: "upper_limit_price", label: "UPPER", kind: "upper" },
-    { key: "current_price", label: "LAST", kind: "last" },
-  ].map((item) => ({ ...item, value: numberOrNull(chart[item.key]) }))
-    .filter((item) => item.value !== null && Number.isFinite(item.value));
+  return groupPriceReferences(priceReferencePoints(chart));
 }
 
 function numberOrNull(value) {
