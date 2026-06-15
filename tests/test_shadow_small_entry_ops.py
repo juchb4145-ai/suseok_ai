@@ -76,6 +76,33 @@ def test_shadow_small_entry_ops_defaults_to_observe_only(tmp_path):
         db.close()
 
 
+def test_shadow_small_entry_ops_status_uses_bounded_promotion_evidence(tmp_path, monkeypatch):
+    calls = []
+
+    class FakePromotionAnalyzer:
+        def __init__(self, db):
+            self.db = db
+
+        def load_evidence(self, *, trade_date=None, limit=50000):
+            calls.append(limit)
+            return {"available": False, "status": "NO_DATA", "source_report_trade_date": trade_date}
+
+    monkeypatch.setattr("trading_app.shadow_small_entry_ops.ShadowSmallEntryPromotionAnalyzer", FakePromotionAnalyzer)
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        service = ShadowSmallEntryOpsService(
+            db,
+            gateway_state=None,
+            core_settings=_core_settings(tmp_path),
+            promotion_evidence_limit=123,
+        )
+        service.status(trade_date=TODAY)
+
+        assert calls == [123]
+    finally:
+        db.close()
+
+
 def test_shadow_small_entry_ops_preflight_fail_blocks_arm(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     try:

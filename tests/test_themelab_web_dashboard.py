@@ -829,6 +829,39 @@ def test_theme_lab_snapshot_caches_expensive_reports(tmp_path, monkeypatch):
     assert calls == {"gate": 1, "conservative": 1, "promotion": 1, "ops": 1}
 
 
+def test_theme_lab_snapshot_light_mode_skips_expensive_reports(tmp_path, monkeypatch):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("extended report builder should not run in light mode")
+
+    monkeypatch.setattr(themelab_dashboard, "_theme_lab_gate_reason_source_report", _fail_if_called)
+    monkeypatch.setattr(themelab_dashboard, "_conservative_reason_report", _fail_if_called)
+    monkeypatch.setattr(themelab_dashboard, "_shadow_small_entry_promotion_report", _fail_if_called)
+    monkeypatch.setattr(themelab_dashboard, "_shadow_small_entry_ops", _fail_if_called)
+    try:
+        db.save_theme_lab_flow_result(
+            "2026-06-04T09:01:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [_watch("000001", "READY", role="LEADER")],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db, include_extended=False)
+    finally:
+        db.close()
+
+    assert payload["available"] is True
+    assert payload["summary"]["watchset_size"] == 1
+    assert payload["operator_view"]["developer"]["raw_available"] is True
+    assert payload["gate_reason_outcomes"]["status"] == "NO_DATA"
+    assert payload["shadow_small_entry_ops"]["status"] == "NO_DATA"
+
+
 def test_theme_lab_snapshot_includes_shadow_small_entry_ab_outcomes(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     at = datetime(2026, 6, 4, 9, 1, 0)

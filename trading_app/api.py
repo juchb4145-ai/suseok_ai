@@ -126,6 +126,7 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        _shutdown_dashboard_snapshot_refresh_executor()
         _shutdown_theme_lab_dashboard_snapshot_refresh_executor()
         await _stop_core_ws_event_worker()
         await _stop_gateway_condition_event_worker()
@@ -565,6 +566,8 @@ _dashboard_snapshot_cache_monotonic = 0.0
 _dashboard_snapshot_cache_build_ms = 0.0
 _dashboard_snapshot_cache_hit_count = 0
 _dashboard_snapshot_cache_miss_count = 0
+_dashboard_snapshot_cache_refreshing: set[str] = set()
+_dashboard_snapshot_refresh_executor: ThreadPoolExecutor | None = None
 _dashboard_fragment_cache: dict[tuple[str, str], tuple[float, Any]] = {}
 _theme_lab_dashboard_snapshot_cache_lock = RLock()
 _theme_lab_dashboard_snapshot_cache: dict[tuple[str, str], tuple[float, Any]] = {}
@@ -6107,9 +6110,10 @@ def _cached_dashboard_fragment(
         cached = _dashboard_fragment_cache.get(cache_key)
         if cached is not None and now - cached[0] <= ttl:
             return cached[1]
-        value = builder()
+    value = builder()
+    with _dashboard_snapshot_cache_lock:
         _dashboard_fragment_cache[cache_key] = (time.monotonic(), value)
-        return value
+    return value
 
 
 def _cached_theme_lab_dashboard_snapshot(
@@ -6192,13 +6196,14 @@ def _shutdown_theme_lab_dashboard_snapshot_refresh_executor() -> None:
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-def _build_theme_lab_dashboard_snapshot_with_fresh_db() -> dict[str, Any]:
+def _build_theme_lab_dashboard_snapshot_with_fresh_db(*, include_extended: bool = True) -> dict[str, Any]:
     db = open_database()
     try:
         return build_theme_lab_dashboard_snapshot(
             db,
             runtime_status=runtime_supervisor.status(),
             gateway_state=gateway_state,
+            include_extended=include_extended,
         )
     finally:
         close_database(db)
@@ -6225,8 +6230,15 @@ def _build_dashboard_snapshot_payload(*, force: bool = False, detail: str = DASH
     if ttl <= 0.0:
         return _build_dashboard_snapshot_payload_uncached(detail=resolved_detail)
     now = time.monotonic()
+    should_refresh = False
     with _dashboard_snapshot_cache_lock:
-        if (
+        if force and _dashboard_snapshot_cache_payload is not None and _dashboard_snapshot_cache_db_path == db_path:
+            _dashboard_snapshot_cache_hit_count += 1
+            should_refresh = db_path not in _dashboard_snapshot_cache_refreshing
+            if should_refresh:
+                _dashboard_snapshot_cache_refreshing.add(db_path)
+            stale_payload = _dashboard_snapshot_cache_payload
+        elif (
             not force
             and _dashboard_snapshot_cache_payload is not None
             and _dashboard_snapshot_cache_db_path == db_path
@@ -6234,14 +6246,79 @@ def _build_dashboard_snapshot_payload(*, force: bool = False, detail: str = DASH
         ):
             _dashboard_snapshot_cache_hit_count += 1
             return _dashboard_snapshot_cache_payload
+        elif (
+            not force
+            and _dashboard_snapshot_cache_payload is not None
+            and _dashboard_snapshot_cache_db_path == db_path
+        ):
+            _dashboard_snapshot_cache_hit_count += 1
+            should_refresh = db_path not in _dashboard_snapshot_cache_refreshing
+            if should_refresh:
+                _dashboard_snapshot_cache_refreshing.add(db_path)
+            stale_payload = _dashboard_snapshot_cache_payload
+        else:
+            stale_payload = None
         _dashboard_snapshot_cache_miss_count += 1
-        started = time.perf_counter()
-        payload = _build_dashboard_snapshot_payload_uncached(detail=resolved_detail)
-        _dashboard_snapshot_cache_build_ms = (time.perf_counter() - started) * 1000.0
+    if stale_payload is not None:
+        if should_refresh:
+            _submit_dashboard_snapshot_refresh(db_path, resolved_detail)
+        return stale_payload
+    started = time.perf_counter()
+    payload = _build_dashboard_snapshot_payload_uncached(detail=resolved_detail)
+    build_ms = (time.perf_counter() - started) * 1000.0
+    with _dashboard_snapshot_cache_lock:
+        _dashboard_snapshot_cache_build_ms = build_ms
         _dashboard_snapshot_cache_payload = payload
         _dashboard_snapshot_cache_db_path = db_path
         _dashboard_snapshot_cache_monotonic = time.monotonic()
-        return payload
+    return payload
+
+
+def _dashboard_snapshot_refresh_executor_instance() -> ThreadPoolExecutor:
+    global _dashboard_snapshot_refresh_executor
+    if _dashboard_snapshot_refresh_executor is None:
+        _dashboard_snapshot_refresh_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="dashboard-snapshot-refresh",
+        )
+    return _dashboard_snapshot_refresh_executor
+
+
+def _submit_dashboard_snapshot_refresh(db_path: str, detail: str) -> None:
+    try:
+        _dashboard_snapshot_refresh_executor_instance().submit(_refresh_dashboard_snapshot_cache, db_path, detail)
+    except Exception:
+        with _dashboard_snapshot_cache_lock:
+            _dashboard_snapshot_cache_refreshing.discard(db_path)
+
+
+def _refresh_dashboard_snapshot_cache(db_path: str, detail: str) -> None:
+    global _dashboard_snapshot_cache_payload
+    global _dashboard_snapshot_cache_db_path
+    global _dashboard_snapshot_cache_monotonic
+    global _dashboard_snapshot_cache_build_ms
+    try:
+        started = time.perf_counter()
+        payload = _build_dashboard_snapshot_payload_uncached(detail=detail)
+        build_ms = (time.perf_counter() - started) * 1000.0
+        with _dashboard_snapshot_cache_lock:
+            _dashboard_snapshot_cache_payload = payload
+            _dashboard_snapshot_cache_db_path = db_path
+            _dashboard_snapshot_cache_monotonic = time.monotonic()
+            _dashboard_snapshot_cache_build_ms = build_ms
+    finally:
+        with _dashboard_snapshot_cache_lock:
+            _dashboard_snapshot_cache_refreshing.discard(db_path)
+
+
+def _shutdown_dashboard_snapshot_refresh_executor() -> None:
+    global _dashboard_snapshot_refresh_executor
+    executor = _dashboard_snapshot_refresh_executor
+    _dashboard_snapshot_refresh_executor = None
+    with _dashboard_snapshot_cache_lock:
+        _dashboard_snapshot_cache_refreshing.clear()
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _dashboard_snapshot_for_client_count(payload: dict[str, Any], client_count: int) -> dict[str, Any]:
@@ -7330,9 +7407,375 @@ def _dashboard_slim_logs_payload(payload: dict[str, Any], *, item_limit: int = 4
     }
 
 
+def _dashboard_slim_intraday_decisions_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    data = dict(payload or {})
+    result = _dashboard_field_subset(
+        data,
+        ("trade_date", "window_sec", "event_count", "funnel", "major_reason_distribution", "readiness"),
+    )
+    for key in ("top_block_reasons", "top_wait_reasons", "top_data_quality_issues"):
+        result[key] = list(data.get(key) or [])[:10]
+    return result
+
+
+def _dashboard_slim_shadow_strategies_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    data = dict(payload or {})
+    result = _dashboard_field_subset(
+        data,
+        (
+            "trade_date",
+            "window_sec",
+            "horizon_sec",
+            "policy_id",
+            "total_evaluations",
+            "changed_decision_count",
+            "by_policy",
+            "by_change_type",
+            "by_shadow_gate_status",
+            "by_outcome_label",
+            "baseline_ready_count",
+            "shadow_ready_count",
+            "ready_delta",
+            "estimated_opportunity_loss_reduced_count",
+            "estimated_false_positive_increase_count",
+            "estimated_risk_block_effective_count",
+            "estimated_exit_too_late_reduced_count",
+        ),
+    )
+    result["policy_ranking"] = [
+        _dashboard_field_subset(
+            dict(item or {}),
+            (
+                "policy_id",
+                "policy_name",
+                "label_ko",
+                "total_count",
+                "changed_decision_count",
+                "ready_delta",
+                "estimated_net_benefit_score",
+                "confidence",
+                "recommendation_grade",
+            ),
+        )
+        for item in list(data.get("policy_ranking") or [])[:5]
+    ]
+    result["data_quality_issues"] = list(data.get("data_quality_issues") or [])[:10]
+    return result
+
+
+def _dashboard_slim_threshold_ab_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    data = dict(payload or {})
+    return {
+        "generated_at": data.get("generated_at", ""),
+        "trade_date": data.get("trade_date", ""),
+        "report_id": data.get("report_id", ""),
+        "summary": dict(data.get("summary") or {}),
+        "recommendations": [
+            _dashboard_field_subset(
+                dict(item or {}),
+                ("metric", "category", "recommendation", "label_ko", "message_ko", "candidate_count"),
+            )
+            for item in list(data.get("recommendations") or [])[:3]
+        ],
+        "candidates": [
+            _dashboard_field_subset(
+                dict(item or {}),
+                ("candidate_id", "code", "name", "category", "metric", "recommendation", "score"),
+            )
+            for item in list(data.get("candidates") or [])[:3]
+        ],
+        "disclaimer_ko": data.get("disclaimer_ko", ""),
+    }
+
+
+def _dashboard_slim_report_list_payload(
+    payload: dict[str, Any],
+    *,
+    item_limit: int = 10,
+) -> dict[str, Any]:
+    data = dict(payload or {})
+    result = dict(data)
+    for key in (
+        "items",
+        "candidates",
+        "traces",
+        "recent",
+        "ready_not_ordered_items",
+        "observe_blocked_after_rally_items",
+        "missed_opportunity_items",
+        "early_small_candidates",
+    ):
+        if key in result and isinstance(result[key], list):
+            result[key] = list(result[key])[:item_limit]
+    for key in ("ready_not_ordered_report", "observe_blocked_after_rally", "live_sim_blocked"):
+        section = result.get(key)
+        if isinstance(section, dict):
+            section_copy = dict(section)
+            if isinstance(section_copy.get("items"), list):
+                section_copy["items"] = list(section_copy["items"])[:item_limit]
+            result[key] = section_copy
+    return result
+
+
+def _dashboard_slim_buy_zero_rca_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return _dashboard_slim_report_list_payload(payload, item_limit=10)
+
+
+def _dashboard_slim_conservative_reason_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return _dashboard_slim_report_list_payload(payload, item_limit=10)
+
+
+def _dashboard_slim_shadow_small_entry_promotion_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return _dashboard_slim_report_list_payload(payload, item_limit=10)
+
+
+def _dashboard_slim_strategy_replay_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    data = dict(payload or {})
+    latest = dict(data.get("latest") or {})
+    latest_summary = dict(latest.get("summary") or {})
+    return {
+        "latest": _dashboard_field_subset(
+            latest,
+            (
+                "report_id",
+                "trade_date",
+                "generated_at",
+                "status",
+                "mode",
+                "source_db_path",
+                "replay_db_path",
+            ),
+        ),
+        "recent_runs": [
+            _dashboard_field_subset(
+                dict(item or {}),
+                ("replay_id", "trade_date", "status", "created_at", "started_at", "finished_at", "replay_db_path"),
+            )
+            for item in list(data.get("recent_runs") or [])[:5]
+        ],
+        "summary": _dashboard_field_subset(
+            dict(data.get("summary") or {}),
+            (
+                "total_count",
+                "candidate_count",
+                "baseline_ready_count",
+                "shadow_ready_count",
+                "changed_decision_count",
+                "opportunity_loss_count",
+                "false_positive_count",
+                "warning_count",
+            ),
+        ),
+        "funnel": dict(data.get("funnel") or {}),
+        "shadow_ranking": [
+            _dashboard_field_subset(
+                dict(item or {}),
+                ("policy_id", "policy_name", "recommendation_grade", "score", "confidence", "message_ko"),
+            )
+            for item in list(data.get("shadow_ranking") or [])[:5]
+        ],
+        "data_quality": list(data.get("data_quality") or latest_summary.get("warnings") or [])[:10],
+        "diff_summary": dict(data.get("diff_summary") or {}),
+    }
+
+
+def _dashboard_slim_runtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    runtime = dict(payload or {})
+    if "dry_run_orders" in runtime:
+        runtime["dry_run_orders"] = {"summary": dict((runtime.get("dry_run_orders") or {}).get("summary") or {})}
+    if "intraday_decisions" in runtime:
+        runtime["intraday_decisions"] = _dashboard_field_subset(
+            dict(runtime.get("intraday_decisions") or {}),
+            ("trade_date", "window_sec", "event_count", "funnel", "readiness"),
+        )
+    if "intraday_outcomes" in runtime:
+        runtime["intraday_outcomes"] = _dashboard_field_subset(
+            dict(runtime.get("intraday_outcomes") or {}),
+            (
+                "trade_date",
+                "window_sec",
+                "horizon_sec",
+                "total_decisions",
+                "outcome_count",
+                "labeled_count",
+                "insufficient_count",
+                "by_label",
+                "ready_count",
+            ),
+        )
+    if "buy_zero_rca" in runtime:
+        data = dict(runtime.get("buy_zero_rca") or {})
+        runtime["buy_zero_rca"] = _dashboard_field_subset(
+            data,
+            (
+                "available",
+                "status",
+                "trade_date",
+                "generated_at",
+                "summary",
+            ),
+        )
+    if "live_sim_audit" in runtime:
+        data = dict(runtime.get("live_sim_audit") or {})
+        runtime["live_sim_audit"] = _dashboard_field_subset(
+            data,
+            (
+                "available",
+                "status",
+                "trade_date",
+                "generated_at",
+                "summary",
+                "exit_guard_ready",
+            ),
+        )
+    if "conservative_reason_outcomes" in runtime:
+        data = dict(runtime.get("conservative_reason_outcomes") or {})
+        runtime["conservative_reason_outcomes"] = _dashboard_field_subset(
+            data,
+            ("available", "status", "trade_date", "generated_at", "summary", "warnings"),
+        )
+    if "shadow_small_entry_promotion" in runtime:
+        data = dict(runtime.get("shadow_small_entry_promotion") or {})
+        runtime["shadow_small_entry_promotion"] = _dashboard_field_subset(
+            data,
+            (
+                "available",
+                "enabled",
+                "mode",
+                "order_enabled",
+                "status",
+                "source_report_trade_date",
+                "candidate_count",
+                "observe_only_count",
+                "promoted_count",
+                "blocked_count",
+                "submitted_count",
+                "summary",
+                "warnings",
+                "last_updated_at",
+            ),
+        )
+    if "shadow_small_entry_ops" in runtime:
+        data = dict(runtime.get("shadow_small_entry_ops") or {})
+        runtime["shadow_small_entry_ops"] = _dashboard_field_subset(
+            data,
+            (
+                "available",
+                "status",
+                "mode",
+                "order_enabled",
+                "preflight_status",
+                "preflight_blocking_reasons",
+                "activation_armed",
+                "activation_expires_at",
+                "last_status_change_at",
+                "today",
+                "limits",
+                "audit",
+                "warnings",
+                "operator_message_ko",
+                "last_updated_at",
+            ),
+        )
+    if "shadow_small_entry_pilot" in runtime:
+        data = dict(runtime.get("shadow_small_entry_pilot") or {})
+        runtime["shadow_small_entry_pilot"] = _dashboard_field_subset(
+            data,
+            (
+                "available",
+                "status",
+                "mode",
+                "order_enabled",
+                "preflight_status",
+                "preflight_blocking_reasons",
+                "today",
+                "audit",
+                "warnings",
+                "operator_message_ko",
+                "last_updated_at",
+            ),
+        )
+    if "shadow_strategies" in runtime:
+        runtime["shadow_strategies"] = _dashboard_field_subset(
+            dict(runtime.get("shadow_strategies") or {}),
+            (
+                "trade_date",
+                "window_sec",
+                "horizon_sec",
+                "total_evaluations",
+                "changed_decision_count",
+                "baseline_ready_count",
+                "shadow_ready_count",
+                "ready_delta",
+                "by_policy",
+                "by_change_type",
+            ),
+        )
+    if "strategy_replay" in runtime:
+        runtime["strategy_replay"] = _dashboard_field_subset(
+            dict(runtime.get("strategy_replay") or {}),
+            ("latest", "summary", "funnel", "data_quality", "diff_summary"),
+        )
+    if "change_proposals" in runtime:
+        data = dict(runtime.get("change_proposals") or {})
+        runtime["change_proposals"] = {
+            "summary": dict(data.get("summary") or {}),
+            "top_recommendations": list(data.get("top_recommendations") or [])[:3],
+        }
+    if "dry_run_performance" in runtime:
+        data = dict(runtime.get("dry_run_performance") or {})
+        runtime["dry_run_performance"] = _dashboard_field_subset(
+            data,
+            (
+                "generated_at",
+                "trade_date",
+                "total_lifecycle_count",
+                "completed_lifecycle_count",
+                "win_rate",
+                "avg_realized_return_pct",
+                "false_positive_count",
+                "false_negative_count",
+                "opportunity_loss_count",
+                "live_would_pass_win_rate",
+                "live_would_reject_but_rallied_count",
+            ),
+        )
+    if "threshold_ab" in runtime:
+        data = dict(runtime.get("threshold_ab") or {})
+        runtime["threshold_ab"] = {
+            "generated_at": data.get("generated_at", ""),
+            "trade_date": data.get("trade_date", ""),
+            "report_id": data.get("report_id", ""),
+            "summary": dict(data.get("summary") or {}),
+            "recommendations": list(data.get("recommendations") or [])[:1],
+        }
+    return runtime
+
+
+def _dashboard_dry_run_performance_trade_date(db: TradingDatabase) -> str:
+    try:
+        row = db.conn.execute(
+            """
+            SELECT MAX(trade_date) AS trade_date
+            FROM (
+                SELECT trade_date FROM runtime_order_intents WHERE COALESCE(trade_date, '') != ''
+                UNION ALL
+                SELECT trade_date FROM trade_reviews WHERE COALESCE(trade_date, '') != ''
+            )
+            """
+        ).fetchone()
+        return str(row["trade_date"] or "") if row else ""
+    except Exception:
+        return ""
+
+
 def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNAPSHOT_DETAIL_SLIM) -> dict[str, Any]:
     resolved_detail = _dashboard_snapshot_detail(detail)
     full_detail = resolved_detail == DASHBOARD_SNAPSHOT_DETAIL_FULL
+    buy_zero_limit = 50000 if full_detail else 250
+    live_sim_audit_limit = 2000 if full_detail else 250
+    heavy_report_limit = 10000 if full_detail else 100
+    performance_limit = 500 if full_detail else 120
     status_payload = api_status()
     commands_payload = dict(status_payload["commands"])
     commands_payload["recent"] = gateway_state.list_commands(limit=12 if full_detail else 5, include_finished=True)
@@ -7369,31 +7812,72 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=12) if full_detail else [],
     }
     today = datetime.now().date().isoformat()
-    decision_summary_payload = db.strategy_decision_summary(trade_date=today)
-    outcome_summary_payload = db.strategy_decision_outcome_summary(trade_date=today)
-    buy_zero_rca_payload = _buy_zero_rca_analyzer(db).build_summary(
-        trade_date=today,
-        limit=50000,
-        include_missed_opportunities=False,
+    decision_summary_payload = _cached_dashboard_fragment(
+        db,
+        f"intraday_decisions:v2:{today}",
+        lambda: db.strategy_decision_summary(trade_date=today),
     )
-    live_sim_audit_payload = _live_sim_auditor(db).build_report(trade_date=today, limit=2000)
+    outcome_summary_payload = _cached_dashboard_fragment(
+        db,
+        f"intraday_outcomes:v2:{today}",
+        lambda: db.strategy_decision_outcome_summary(trade_date=today),
+    )
+    buy_zero_rca_payload = _cached_dashboard_fragment(
+        db,
+        f"buy_zero_rca:v2:{today}:{buy_zero_limit}",
+        lambda: _buy_zero_rca_analyzer(db).build_summary(
+            trade_date=today,
+            limit=buy_zero_limit,
+            include_missed_opportunities=False,
+        ),
+    )
+    live_sim_audit_payload = _cached_dashboard_fragment(
+        db,
+        f"live_sim_audit:v2:{today}:{live_sim_audit_limit}",
+        lambda: _live_sim_auditor(db).build_report(trade_date=today, limit=live_sim_audit_limit),
+    )
+    conservative_reason_report: dict[str, Any] | None = None
     try:
-        conservative_reason_report = _conservative_reason_outcome_analyzer(db).build_report(trade_date=today, limit=10000)
-        conservative_reason_payload = conservative_reason_snapshot_payload(conservative_reason_report)
+        if db.strategy_decision_outcome_count(trade_date=today) <= 0:
+            conservative_reason_payload = conservative_reason_empty_payload()
+        else:
+            conservative_reason_report = _cached_dashboard_fragment(
+                db,
+                f"conservative_reason:v2:{today}:{heavy_report_limit}",
+                lambda: _conservative_reason_outcome_analyzer(db).build_report(trade_date=today, limit=heavy_report_limit),
+            )
+            conservative_reason_payload = conservative_reason_snapshot_payload(conservative_reason_report)
     except Exception as exc:
         conservative_reason_payload = conservative_reason_empty_payload(str(exc))
+    shadow_small_entry_report: dict[str, Any] | None = None
     try:
-        shadow_small_entry_report = _shadow_small_entry_promotion_analyzer(db).build_report(
-            trade_date=today,
-            limit=10000,
-            include_traces=False,
-        )
-        shadow_small_entry_payload = shadow_small_entry_snapshot_payload(shadow_small_entry_report)
+        if not bool(conservative_reason_payload.get("available")):
+            shadow_small_entry_payload = shadow_small_entry_empty_payload()
+        else:
+            shadow_small_entry_report = _cached_dashboard_fragment(
+                db,
+                f"shadow_small_entry_promotion:v2:{today}:{heavy_report_limit}",
+                lambda: _shadow_small_entry_promotion_analyzer(db).build_report(
+                    trade_date=today,
+                    limit=heavy_report_limit,
+                    include_traces=False,
+                    conservative_report=conservative_reason_report,
+                ),
+            )
+            shadow_small_entry_payload = shadow_small_entry_snapshot_payload(shadow_small_entry_report)
     except Exception as exc:
         shadow_small_entry_payload = shadow_small_entry_empty_payload(str(exc))
     try:
         shadow_small_entry_ops_payload = shadow_small_entry_ops_snapshot_payload(
-            _shadow_small_entry_ops_service(db).status(trade_date=today)
+            ShadowSmallEntryOpsService(
+                db,
+                gateway_state=gateway_state,
+                core_settings=get_settings(),
+                promotion_evidence=(
+                    dict(shadow_small_entry_report.get("evidence") or {}) if shadow_small_entry_report is not None else None
+                ),
+                live_audit_report=live_sim_audit_payload,
+            ).status(trade_date=today)
         )
     except Exception as exc:
         shadow_small_entry_ops_payload = {
@@ -7412,7 +7896,14 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         )
     except Exception as exc:
         shadow_small_entry_pilot_payload = shadow_small_entry_pilot_empty_payload(today, str(exc))
-    shadow_summary_payload = db.shadow_strategy_summary(trade_date=today)
+    shadow_summary_payload = _cached_dashboard_fragment(
+        db,
+        f"shadow_strategies:v2:{today}",
+        lambda: db.shadow_strategy_summary(trade_date=today),
+    )
+    if not full_detail:
+        decision_summary_payload = _dashboard_slim_intraday_decisions_payload(decision_summary_payload)
+        shadow_summary_payload = _dashboard_slim_shadow_strategies_payload(shadow_summary_payload)
     replay_reports = scan_replay_reports(DEFAULT_REPLAY_DB_ROOT, limit=1)
     replay_runs = scan_replay_runs(DEFAULT_REPLAY_DB_ROOT, limit=5)
     replay_payload = {
@@ -7430,10 +7921,14 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "top_recommendations": change_proposal_summary_payload.get("top_recommendations", []),
         "disclaimer_ko": "자동 적용 아님: 승인 상태만 저장하며 runtime config는 변경하지 않습니다.",
     }
+    dry_run_performance_trade_date = _dashboard_dry_run_performance_trade_date(db)
     dry_run_performance_report = _cached_dashboard_fragment(
         db,
-        "dry_run_performance:v1:500",
-        lambda: _performance_analyzer(db).build_report(limit=500),
+        f"dry_run_performance:v3:{dry_run_performance_trade_date or 'all'}:{performance_limit}",
+        lambda: _performance_analyzer(db).build_report(
+            trade_date=dry_run_performance_trade_date or None,
+            limit=performance_limit,
+        ),
     )
     threshold_ab_report = _threshold_ab_analyzer().build_report(dry_run_performance_report, limit=10, offset=0)
     dry_run_performance_payload = {
@@ -7477,6 +7972,12 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "candidates": list(threshold_ab_report.get("candidates") or [])[:5],
         "disclaimer_ko": threshold_ab_report.get("disclaimer_ko", ""),
     }
+    if not full_detail:
+        buy_zero_rca_payload = _dashboard_slim_buy_zero_rca_payload(buy_zero_rca_payload)
+        conservative_reason_payload = _dashboard_slim_conservative_reason_payload(conservative_reason_payload)
+        shadow_small_entry_payload = _dashboard_slim_shadow_small_entry_promotion_payload(shadow_small_entry_payload)
+        replay_payload = _dashboard_slim_strategy_replay_payload(replay_payload)
+        threshold_ab_payload = _dashboard_slim_threshold_ab_payload(threshold_ab_payload)
     runtime_payload["dry_run_orders"] = dry_run_orders_payload
     runtime_payload["intraday_decisions"] = decision_summary_payload
     runtime_payload["intraday_outcomes"] = outcome_summary_payload
@@ -7501,11 +8002,17 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         dry_run_performance=dry_run_performance_payload,
         logs=logs_payload,
     )
+    runtime_snapshot_payload = runtime_payload if full_detail else _dashboard_slim_runtime_payload(runtime_payload)
     theme_lab_payload = _cached_theme_lab_dashboard_snapshot(
         db,
-        "theme_lab:v2:shared",
-        lambda: build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_status, gateway_state=gateway_state),
-        refresh_builder=_build_theme_lab_dashboard_snapshot_with_fresh_db,
+        "theme_lab:v3:full" if full_detail else "theme_lab:v3:slim",
+        lambda: build_theme_lab_dashboard_snapshot(
+            db,
+            runtime_status=runtime_status,
+            gateway_state=gateway_state,
+            include_extended=full_detail,
+        ),
+        refresh_builder=lambda: _build_theme_lab_dashboard_snapshot_with_fresh_db(include_extended=full_detail),
     )
     if not full_detail:
         theme_lab_payload = _dashboard_slim_theme_lab_payload(theme_lab_payload)
@@ -7517,7 +8024,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "commands": commands_payload,
         "transport": transport_payload,
         "transport_experiment": transport_experiment_payload,
-        "runtime": runtime_payload,
+        "runtime": runtime_snapshot_payload,
         "dry_run_orders": dry_run_orders_payload,
         "intraday_decisions": decision_summary_payload,
         "intraday_outcomes": outcome_summary_payload,
@@ -8378,8 +8885,11 @@ def _transport_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
         "websocket_recommendation_reason": reason,
         "latest_report_id": status.get("latest_report_id", ""),
         "warning_flags": summary.get("warning_flags", []),
-        "recent_errors": status.get("recent_errors", [])[:10],
-        "real_gateway_websocket_pilot": real_pilot,
+        "recent_errors": [
+            _transport_dashboard_error_payload(dict(item or {}))
+            for item in list(status.get("recent_errors") or [])[:5]
+        ],
+        "real_gateway_websocket_pilot": _transport_dashboard_real_pilot_payload(real_pilot),
         "real_pilot_enabled": real_pilot.get("enabled", False),
         "real_pilot_connected": real_pilot.get("connected", False),
         "real_pilot_state": real_pilot.get("state", "DISCONNECTED"),
@@ -8397,6 +8907,75 @@ def _transport_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
         "real_pilot_last_ws_event_at": real_pilot.get("last_ws_event_at", ""),
         "real_pilot_last_ws_ack_at": real_pilot.get("last_ws_ack_at", ""),
     }
+
+
+def _transport_dashboard_error_payload(error: dict[str, Any]) -> dict[str, Any]:
+    return _dashboard_field_subset(
+        error,
+        (
+            "id",
+            "sample_id",
+            "trace_id",
+            "trade_date",
+            "created_at",
+            "direction",
+            "message_type",
+            "event_id",
+            "command_id",
+            "request_id",
+            "source",
+            "success",
+            "error",
+            "transport_mode",
+            "latency_ms",
+            "total_latency_ms",
+            "event_latency_ms",
+            "command_latency_ms",
+            "ack_latency_ms",
+            "long_poll_wait_ms",
+            "gateway_execute_ms",
+            "rate_limit_wait_ms",
+            "ws_receive_ms",
+            "ws_send_ms",
+            "ws_session_id",
+            "ws_connection_id",
+            "connection_id",
+        ),
+    )
+
+
+def _transport_dashboard_real_pilot_payload(real_pilot: dict[str, Any]) -> dict[str, Any]:
+    return _dashboard_field_subset(
+        real_pilot,
+        (
+            "enabled",
+            "connected",
+            "state",
+            "ws_session_id",
+            "ws_connection_id",
+            "reconnect_count",
+            "fallback_state",
+            "fallback_reason",
+            "fallback_detail",
+            "fallback_at",
+            "last_error",
+            "last_error_type",
+            "last_error_stage",
+            "last_error_at",
+            "last_close_code",
+            "last_close_reason",
+            "blocked_order_command_count",
+            "session_loss_count",
+            "duplicate_ack_count",
+            "unknown_ack_count",
+            "price_tick_sample_rate",
+            "price_tick_sampled_count",
+            "price_tick_fallback_count",
+            "event_fallback_count",
+            "last_ws_event_at",
+            "last_ws_ack_at",
+        ),
+    )
 
 
 def _transport_experiment_dashboard_payload(db: TradingDatabase) -> dict[str, Any]:

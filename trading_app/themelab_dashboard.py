@@ -577,11 +577,18 @@ def build_theme_lab_dashboard_snapshot(
     runtime_status: dict[str, Any] | None = None,
     gateway_state: Any | None = None,
     now: datetime | None = None,
+    include_extended: bool = True,
 ) -> dict[str, Any]:
     raw = db.latest_theme_lab_flow_result()
     theme_source_sync = _theme_source_sync_status(db)
     if not raw:
-        return _empty_snapshot(runtime_status=runtime_status, theme_source_sync=theme_source_sync, db=db, gateway_state=gateway_state)
+        return _empty_snapshot(
+            runtime_status=runtime_status,
+            theme_source_sync=theme_source_sync,
+            db=db,
+            gateway_state=gateway_state,
+            include_extended=include_extended,
+        )
 
     themes = _as_list(raw.get("theme_rankings") or raw.get("theme_condition_snapshots"))
     gate_decisions = _as_list(raw.get("gate_decisions"))
@@ -606,30 +613,38 @@ def build_theme_lab_dashboard_snapshot(
     data_quality = _apply_market_session_data_quality_display(data_quality, market, runtime)
     summary = _summary(ranked_themes, watchset, entry_candidates, data_quality, runtime=runtime, freshness=freshness)
     trade_date = _snapshot_trade_date(raw)
-    gate_reason_report = _theme_lab_gate_reason_source_report(db, trade_date=trade_date)
-    gate_reason_outcomes = _theme_lab_gate_reason_outcomes_payload(gate_reason_report)
-    live_sim_audit = _live_sim_audit(db, gateway_state=gateway_state, trade_date=trade_date)
-    conservative_reason_report = _conservative_reason_report(
-        db,
-        trade_date=trade_date,
-        source_report=gate_reason_report,
-    )
-    conservative_reason_outcomes = _conservative_reason_outcomes_payload(conservative_reason_report)
-    shadow_small_entry_promotion_report = _shadow_small_entry_promotion_report(
-        db,
-        trade_date=trade_date,
-        conservative_report=conservative_reason_report,
-        themelab_report=gate_reason_report,
-    )
-    shadow_small_entry_promotion = _shadow_small_entry_promotion_payload(shadow_small_entry_promotion_report)
-    shadow_small_entry_ops = _shadow_small_entry_ops(
-        db,
-        gateway_state=gateway_state,
-        trade_date=trade_date,
-        promotion_evidence=dict(shadow_small_entry_promotion_report.get("evidence") or {}),
-        live_audit_report=live_sim_audit,
-    )
-    shadow_small_entry_pilot = _shadow_small_entry_pilot(db, gateway_state=gateway_state, trade_date=trade_date)
+    if include_extended:
+        gate_reason_report = _theme_lab_gate_reason_source_report(db, trade_date=trade_date)
+        gate_reason_outcomes = _theme_lab_gate_reason_outcomes_payload(gate_reason_report)
+        live_sim_audit = _live_sim_audit(db, gateway_state=gateway_state, trade_date=trade_date)
+        conservative_reason_report = _conservative_reason_report(
+            db,
+            trade_date=trade_date,
+            source_report=gate_reason_report,
+        )
+        conservative_reason_outcomes = _conservative_reason_outcomes_payload(conservative_reason_report)
+        shadow_small_entry_promotion_report = _shadow_small_entry_promotion_report(
+            db,
+            trade_date=trade_date,
+            conservative_report=conservative_reason_report,
+            themelab_report=gate_reason_report,
+        )
+        shadow_small_entry_promotion = _shadow_small_entry_promotion_payload(shadow_small_entry_promotion_report)
+        shadow_small_entry_ops = _shadow_small_entry_ops(
+            db,
+            gateway_state=gateway_state,
+            trade_date=trade_date,
+            promotion_evidence=dict(shadow_small_entry_promotion_report.get("evidence") or {}),
+            live_audit_report=live_sim_audit,
+        )
+        shadow_small_entry_pilot = _shadow_small_entry_pilot(db, gateway_state=gateway_state, trade_date=trade_date)
+    else:
+        gate_reason_outcomes = _empty_gate_reason_outcomes()
+        live_sim_audit = _live_sim_audit_empty()
+        conservative_reason_outcomes = conservative_reason_empty_payload()
+        shadow_small_entry_promotion = shadow_small_entry_empty_payload()
+        shadow_small_entry_ops = _shadow_small_entry_ops_empty()
+        shadow_small_entry_pilot = shadow_small_entry_pilot_empty_payload(trade_date)
 
     payload = {
         "available": True,
@@ -671,9 +686,11 @@ def _empty_snapshot(
     theme_source_sync: dict[str, Any] | None = None,
     db: TradingDatabase | None = None,
     gateway_state: Any | None = None,
+    include_extended: bool = True,
 ) -> dict[str, Any]:
     runtime = _runtime_context(runtime_status)
     freshness = _empty_freshness()
+    trade_date = datetime.now().date().isoformat()
     payload = {
         "available": False,
         "source": "theme_lab_flow_snapshots",
@@ -726,11 +743,11 @@ def _empty_snapshot(
         "selected_chart": {"symbol": "KOSDAQ", "name": "KOSDAQ", "type": "index", "chart_data_status": "NO_CANDLE_DATA"},
         "gate_detail": {"gate_status": "OBSERVE", "summary_message": "선택된 WatchSet 종목이 없습니다."},
         "gate_reason_outcomes": _empty_gate_reason_outcomes(),
-        "live_sim_audit": _live_sim_audit(db, gateway_state=gateway_state, trade_date=datetime.now().date().isoformat()) if db is not None else _live_sim_audit_empty(),
-        "conservative_reason_outcomes": _conservative_reason_outcomes(db, trade_date=datetime.now().date().isoformat()) if db is not None else conservative_reason_empty_payload(),
-        "shadow_small_entry_promotion": _shadow_small_entry_promotion(db, trade_date=datetime.now().date().isoformat()) if db is not None else shadow_small_entry_empty_payload(),
-        "shadow_small_entry_ops": _shadow_small_entry_ops(db, gateway_state=gateway_state, trade_date=datetime.now().date().isoformat()) if db is not None else _shadow_small_entry_ops_empty(),
-        "shadow_small_entry_pilot": _shadow_small_entry_pilot(db, gateway_state=gateway_state, trade_date=datetime.now().date().isoformat()) if db is not None else shadow_small_entry_pilot_empty_payload(datetime.now().date().isoformat()),
+        "live_sim_audit": _live_sim_audit(db, gateway_state=gateway_state, trade_date=trade_date) if db is not None and include_extended else _live_sim_audit_empty(),
+        "conservative_reason_outcomes": _conservative_reason_outcomes(db, trade_date=trade_date) if db is not None and include_extended else conservative_reason_empty_payload(),
+        "shadow_small_entry_promotion": _shadow_small_entry_promotion(db, trade_date=trade_date) if db is not None and include_extended else shadow_small_entry_empty_payload(),
+        "shadow_small_entry_ops": _shadow_small_entry_ops(db, gateway_state=gateway_state, trade_date=trade_date) if db is not None and include_extended else _shadow_small_entry_ops_empty(),
+        "shadow_small_entry_pilot": _shadow_small_entry_pilot(db, gateway_state=gateway_state, trade_date=trade_date) if db is not None and include_extended else shadow_small_entry_pilot_empty_payload(trade_date),
         "shadow_small_entry": _empty_shadow_small_entry(),
         "shadow_small_entry_ab": _empty_shadow_small_entry_ab(),
         "summary": _empty_summary(runtime=runtime, freshness=freshness),

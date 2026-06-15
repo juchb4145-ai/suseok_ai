@@ -136,6 +136,7 @@ class ShadowSmallEntryOpsService:
         report_root: Path | None = None,
         promotion_evidence: Mapping[str, Any] | None = None,
         live_audit_report: Mapping[str, Any] | None = None,
+        promotion_evidence_limit: int = 100,
     ) -> None:
         self.db = db
         self.gateway_state = gateway_state
@@ -144,6 +145,7 @@ class ShadowSmallEntryOpsService:
         self.report_root = Path(report_root) if report_root is not None else REPORT_ROOT
         self._promotion_evidence_override = dict(promotion_evidence or {}) if promotion_evidence is not None else None
         self._live_audit_report_override = dict(live_audit_report or {}) if live_audit_report is not None else None
+        self.promotion_evidence_limit = max(100, int(promotion_evidence_limit or 100))
 
     def status(self, *, trade_date: str | None = None) -> dict[str, Any]:
         settings = self._settings()
@@ -634,7 +636,10 @@ class ShadowSmallEntryOpsService:
         if self._promotion_evidence_override is not None:
             return dict(self._promotion_evidence_override)
         try:
-            return ShadowSmallEntryPromotionAnalyzer(self.db).load_evidence(trade_date=trade_date, limit=50000)
+            return ShadowSmallEntryPromotionAnalyzer(self.db).load_evidence(
+                trade_date=trade_date,
+                limit=self.promotion_evidence_limit,
+            )
         except Exception as exc:
             return {"available": False, "status": "ERROR", "warnings": [str(exc)]}
 

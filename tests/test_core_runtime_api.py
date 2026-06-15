@@ -331,7 +331,9 @@ def test_dashboard_snapshot_payload_uses_shared_cache(tmp_path, monkeypatch):
         calls.append(time.monotonic())
         return {"snapshot_detail": detail, "gateway": {}, "runtime": {"call_count": len(calls)}}
 
+    refreshes = []
     monkeypatch.setattr(api, "build_dashboard_snapshot", fake_snapshot)
+    monkeypatch.setattr(api, "_submit_dashboard_snapshot_refresh", lambda db_path, detail: refreshes.append((db_path, detail)))
     monkeypatch.setattr(api, "DASHBOARD_SNAPSHOT_CACHE_TTL_SEC", 60.0)
     api._dashboard_snapshot_cache_payload = None
     api._dashboard_snapshot_cache_db_path = ""
@@ -342,9 +344,306 @@ def test_dashboard_snapshot_payload_uses_shared_cache(tmp_path, monkeypatch):
     forced = api._build_dashboard_snapshot_payload(force=True)
 
     assert first is second
-    assert len(calls) == 2
+    assert forced is first
+    assert len(calls) == 1
+    assert len(refreshes) == 1
     assert first["runtime"]["call_count"] == 1
-    assert forced["runtime"]["call_count"] == 2
+
+
+def test_dashboard_snapshot_cache_returns_stale_and_schedules_refresh(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    submitted = []
+
+    class FakeExecutor:
+        def submit(self, fn, *args):
+            submitted.append((fn, args))
+            return None
+
+    stale_payload = {"snapshot_detail": "slim", "value": "stale"}
+    cache_key = f"{api._dashboard_database_cache_key()}:{api.DASHBOARD_SNAPSHOT_DETAIL_SLIM}"
+    monkeypatch.setattr(api, "_dashboard_snapshot_refresh_executor_instance", lambda: FakeExecutor())
+    monkeypatch.setattr(
+        api,
+        "_build_dashboard_snapshot_payload_uncached",
+        lambda *, detail="slim": {"snapshot_detail": detail, "value": "fresh"},
+    )
+    monkeypatch.setattr(api, "DASHBOARD_SNAPSHOT_CACHE_TTL_SEC", 0.001)
+    with api._dashboard_snapshot_cache_lock:
+        api._dashboard_snapshot_cache_payload = stale_payload
+        api._dashboard_snapshot_cache_db_path = cache_key
+        api._dashboard_snapshot_cache_monotonic = time.monotonic() - 10.0
+        api._dashboard_snapshot_cache_refreshing.clear()
+
+    first = api._build_dashboard_snapshot_payload()
+    second = api._build_dashboard_snapshot_payload()
+    fn, args = submitted[0]
+    fn(*args)
+
+    with api._dashboard_snapshot_cache_lock:
+        refreshed = api._dashboard_snapshot_cache_payload
+        refreshing = set(api._dashboard_snapshot_cache_refreshing)
+
+    assert first is stale_payload
+    assert second is stale_payload
+    assert len(submitted) == 1
+    assert refreshed == {"snapshot_detail": "slim", "value": "fresh"}
+    assert refreshing == set()
+
+
+def test_dashboard_slim_strategy_replay_payload_drops_heavy_report_detail():
+    import trading_app.api as api
+
+    payload = {
+        "latest": {
+            "report_id": "replay-1",
+            "trade_date": "2026-06-15",
+            "generated_at": "2026-06-15T09:00:00+09:00",
+            "status": "OK",
+            "summary": {"total_count": 100, "warnings": ["late"]},
+            "recommendations": [{"policy_id": f"p{i}", "raw": "x" * 1000} for i in range(20)],
+            "items": [{"raw": "x" * 1000}],
+        },
+        "recent_runs": [{"replay_id": f"run-{i}", "raw": "x" * 1000} for i in range(8)],
+        "summary": {"total_count": 100, "candidate_count": 20, "raw": "x" * 1000},
+        "shadow_ranking": [{"policy_id": f"p{i}", "raw": "x" * 1000} for i in range(20)],
+        "data_quality": ["late"] * 20,
+        "diff_summary": {"changed": 3},
+    }
+
+    slim = api._dashboard_slim_strategy_replay_payload(payload)
+
+    assert slim["latest"] == {
+        "report_id": "replay-1",
+        "trade_date": "2026-06-15",
+        "generated_at": "2026-06-15T09:00:00+09:00",
+        "status": "OK",
+    }
+    assert len(slim["recent_runs"]) == 5
+    assert len(slim["shadow_ranking"]) == 5
+    assert len(slim["data_quality"]) == 10
+    assert "recommendations" not in slim["latest"]
+    assert "items" not in slim["latest"]
+    assert "raw" not in slim["summary"]
+    assert "raw" not in slim["shadow_ranking"][0]
+
+
+def test_dashboard_slim_buy_zero_rca_payload_preserves_operator_keys_and_trims_items():
+    import trading_app.api as api
+
+    payload = {
+        "available": True,
+        "summary": {"total": 12},
+        "stage_funnel": {"READY": 12},
+        "ready_not_ordered_report": {"items": [{"id": i} for i in range(20)], "count": 20},
+        "observe_blocked_after_rally": {"items": [{"id": i} for i in range(20)], "count": 20},
+        "live_sim_blocked": {"items": [{"id": i} for i in range(20)], "count": 20},
+        "data_quality_blocks": {"reasons": [{"reason": "DATA"}]},
+        "data_quality_taxonomy": {"warmup_optional_count": 1},
+        "early_small_candidates": [{"id": i} for i in range(20)],
+        "ready_not_ordered_items": [{"classification": "READY_BUT_LIVE_SIM_BLOCKED", "id": i} for i in range(20)],
+    }
+
+    slim = api._dashboard_slim_buy_zero_rca_payload(payload)
+
+    for key in (
+        "available",
+        "summary",
+        "stage_funnel",
+        "ready_not_ordered_report",
+        "observe_blocked_after_rally",
+        "live_sim_blocked",
+        "data_quality_blocks",
+        "data_quality_taxonomy",
+    ):
+        assert key in slim
+    assert len(slim["ready_not_ordered_items"]) == 10
+    assert len(slim["early_small_candidates"]) == 10
+    assert len(slim["ready_not_ordered_report"]["items"]) == 10
+    assert slim["ready_not_ordered_items"][0]["classification"] == "READY_BUT_LIVE_SIM_BLOCKED"
+
+
+def test_transport_dashboard_payload_trims_heavy_error_and_pilot_detail():
+    import trading_app.api as api
+
+    error_items = [
+        {
+            "id": i,
+            "sample_id": f"sample-{i}",
+            "trace_id": f"trace-{i}",
+            "created_at": "2026-06-15T09:00:00+09:00",
+            "trade_date": "2026-06-15",
+            "direction": "gateway_to_core",
+            "message_type": "condition_event",
+            "event_id": f"event-{i}",
+            "source": "kiwoom_gateway",
+            "success": False,
+            "error": "STALE_CONDITION_INCLUDE_QUEUE_WAIT",
+            "transport_mode": "websocket_real_pilot",
+            "metadata": {"raw": "x" * 5000},
+            "metadata_json": "x" * 5000,
+            "stage_ms": {"raw": "x" * 500},
+            "stage_ms_json": "x" * 500,
+        }
+        for i in range(8)
+    ]
+    payload = {
+        "transport_mode": "websocket_real_pilot",
+        "metrics_enabled": True,
+        "latest_summary": {
+            "count": 8,
+            "live_window_sec": 30,
+            "historical_sample_count": 100,
+            "event_latency_p95_ms": 10,
+            "command_latency_p95_ms": 20,
+            "ack_latency_p95_ms": 30,
+            "warning_flags": ["SLOW"],
+        },
+        "websocket_recommendation": {
+            "should_switch": True,
+            "recommendation": "SWITCH_TO_WEBSOCKET",
+            "reasons": ["command latency improved"],
+        },
+        "gateway": {"reconnect_count": 2},
+        "latest_report_id": "report-1",
+        "recent_errors": error_items,
+        "real_gateway_websocket_pilot": {
+            "enabled": True,
+            "connected": True,
+            "state": "CONNECTED",
+            "ws_session_id": "session-1",
+            "reconnect_count": 3,
+            "fallback_reason": "",
+            "blocked_order_command_count": 1,
+            "session_loss_count": 0,
+            "duplicate_ack_count": 2,
+            "unknown_ack_count": 4,
+            "price_tick_sample_rate": 0.1,
+            "price_tick_sampled_count": 5,
+            "price_tick_fallback_count": 6,
+            "event_fallback_count": 7,
+            "last_ws_event_at": "2026-06-15T09:01:00+09:00",
+            "last_ws_ack_at": "2026-06-15T09:01:01+09:00",
+            "core_ws_event_control_queue_sizes": [1, 2, 3],
+            "core_condition_event_queue_sizes_by_worker": [4, 5, 6],
+        },
+    }
+
+    dashboard = api._transport_dashboard_payload(payload)
+
+    assert len(dashboard["recent_errors"]) == 5
+    assert dashboard["recent_errors"][0]["sample_id"] == "sample-0"
+    assert dashboard["recent_errors"][0]["error"] == "STALE_CONDITION_INCLUDE_QUEUE_WAIT"
+    assert "metadata" not in dashboard["recent_errors"][0]
+    assert "metadata_json" not in dashboard["recent_errors"][0]
+    assert "stage_ms" not in dashboard["recent_errors"][0]
+    assert dashboard["real_gateway_websocket_pilot"]["ws_session_id"] == "session-1"
+    assert dashboard["real_gateway_websocket_pilot"]["duplicate_ack_count"] == 2
+    assert "core_ws_event_control_queue_sizes" not in dashboard["real_gateway_websocket_pilot"]
+    assert dashboard["real_pilot_duplicate_ack_count"] == 2
+
+
+def test_dashboard_slim_runtime_payload_reduces_duplicate_sections_but_keeps_summaries():
+    import trading_app.api as api
+
+    runtime = {
+        "enabled": True,
+        "running": True,
+        "mode": "DRY_RUN",
+        "last_cycle_at": "2026-06-15T09:00:00+09:00",
+        "live_sim_audit": {
+            "available": True,
+            "status": "WARN",
+            "summary": {"unknown_submit_count": 1},
+            "open_orders": [{"raw": "x" * 1000}],
+            "reconcile_issues": [{"raw": "x" * 1000}],
+            "operator": {"status_message_ko": "check"},
+        },
+        "buy_zero_rca": {
+            "available": True,
+            "summary": {"ready_not_ordered_count": 3},
+            "stage_funnel": {"READY": 3},
+            "ready_not_ordered_items": [{"raw": "x" * 1000}],
+        },
+        "shadow_small_entry_promotion": {
+            "available": True,
+            "status": "READY",
+            "summary": {"candidate_count": 10},
+            "candidate_count": 10,
+            "candidates": [{"raw": "x" * 1000}],
+            "evidence": {"raw": "x" * 1000},
+        },
+        "dry_run_orders": {"summary": {"total": 2}, "items": [{"raw": "x" * 1000}]},
+        "strategy_replay": {
+            "latest": {"report_id": "r1"},
+            "summary": {"total_count": 5},
+            "funnel": {"READY": 1},
+            "shadow_ranking": [{"raw": "x" * 1000}],
+        },
+        "threshold_ab": {
+            "summary": {"candidate_count": 4},
+            "recommendations": [{"metric": "a"}, {"metric": "b"}],
+            "candidates": [{"raw": "x" * 1000}],
+        },
+    }
+
+    slim = api._dashboard_slim_runtime_payload(runtime)
+
+    assert slim["running"] is True
+    assert slim["live_sim_audit"]["summary"]["unknown_submit_count"] == 1
+    assert "open_orders" not in slim["live_sim_audit"]
+    assert "reconcile_issues" not in slim["live_sim_audit"]
+    assert slim["buy_zero_rca"]["summary"]["ready_not_ordered_count"] == 3
+    assert "ready_not_ordered_items" not in slim["buy_zero_rca"]
+    assert slim["shadow_small_entry_promotion"]["candidate_count"] == 10
+    assert "candidates" not in slim["shadow_small_entry_promotion"]
+    assert "evidence" not in slim["shadow_small_entry_promotion"]
+    assert slim["dry_run_orders"] == {"summary": {"total": 2}}
+    assert "shadow_ranking" not in slim["strategy_replay"]
+    assert len(slim["threshold_ab"]["recommendations"]) == 1
+
+
+def test_dashboard_dry_run_performance_trade_date_uses_latest_activity(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        for trade_date, intent_id in (("2026-06-10", "older"), ("2026-06-15", "latest")):
+            db.save_runtime_order_intent(
+                {
+                    "intent_id": intent_id,
+                    "trade_date": trade_date,
+                    "source": "strategy_runtime",
+                    "mode": "DRY_RUN",
+                    "dry_run": True,
+                    "status": "DRY_RUN_ACCEPTED",
+                    "reason": "",
+                    "code": "005930",
+                    "side": "buy",
+                    "quantity": 1,
+                    "price": 10000,
+                    "order_amount": 10000,
+                    "order_type": 1,
+                    "hoga": "00",
+                    "tag": "runtime",
+                    "strategy_name": "KOSDAQ_THEME_PROFILE",
+                    "order_phase": "entry",
+                    "idempotency_key": intent_id,
+                    "dedupe_key": f"dedupe:{intent_id}",
+                    "created_at": f"{trade_date}T09:00:00",
+                    "updated_at": f"{trade_date}T09:00:00",
+                }
+            )
+
+        assert api._dashboard_dry_run_performance_trade_date(db) == "2026-06-15"
+    finally:
+        db.close()
 
 
 def test_theme_lab_snapshot_cache_returns_stale_and_schedules_refresh(tmp_path, monkeypatch):
