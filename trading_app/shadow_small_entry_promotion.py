@@ -100,7 +100,14 @@ class ShadowSmallEntryPromotionAnalyzer:
         self.config = config or config_from_settings(self.settings)
         self.report_root = Path(report_root) if report_root is not None else REPORT_ROOT
 
-    def load_evidence(self, *, trade_date: Optional[str] = None, limit: int = 50000) -> dict[str, Any]:
+    def load_evidence(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        limit: int = 50000,
+        conservative_report: Optional[dict[str, Any]] = None,
+        themelab_report: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         cfg = self.config
         if not cfg.enabled:
             return ShadowSmallEntryPromotionEvidence(
@@ -118,16 +125,22 @@ class ShadowSmallEntryPromotionAnalyzer:
                 warnings=[],
             ).to_dict()
         warnings: list[str] = []
-        try:
-            conservative = ConservativeReasonOutcomeAnalyzer(self.db).build_report(trade_date=trade_date, limit=limit)
-        except Exception as exc:
-            conservative = {}
-            warnings.append(f"CONSERVATIVE_REASON_REPORT_ERROR:{exc}")
-        try:
-            themelab = ThemeLabGateReasonOutcomeAnalyzer(self.db).build_report(trade_date=trade_date, limit=limit)
-        except Exception as exc:
-            themelab = {}
-            warnings.append(f"THEMELAB_OUTCOME_REPORT_ERROR:{exc}")
+        if conservative_report is not None:
+            conservative = conservative_report
+        else:
+            try:
+                conservative = ConservativeReasonOutcomeAnalyzer(self.db).build_report(trade_date=trade_date, limit=limit)
+            except Exception as exc:
+                conservative = {}
+                warnings.append(f"CONSERVATIVE_REASON_REPORT_ERROR:{exc}")
+        if themelab_report is not None:
+            themelab = themelab_report
+        else:
+            try:
+                themelab = ThemeLabGateReasonOutcomeAnalyzer(self.db).build_report(trade_date=trade_date, limit=limit)
+            except Exception as exc:
+                themelab = {}
+                warnings.append(f"THEMELAB_OUTCOME_REPORT_ERROR:{exc}")
 
         source_trade_date = str(conservative.get("trade_date") or themelab.get("trade_date") or trade_date or "")
         age_days = _report_age_days(source_trade_date)
@@ -174,9 +187,21 @@ class ShadowSmallEntryPromotionAnalyzer:
         trade_date: Optional[str] = None,
         limit: int = 50000,
         include_traces: bool = True,
+        conservative_report: Optional[dict[str, Any]] = None,
+        themelab_report: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        evidence = self.load_evidence(trade_date=trade_date, limit=limit)
-        candidates = self._candidate_evaluations(trade_date=trade_date, evidence=evidence, limit=limit)
+        evidence = self.load_evidence(
+            trade_date=trade_date,
+            limit=limit,
+            conservative_report=conservative_report,
+            themelab_report=themelab_report,
+        )
+        candidates = self._candidate_evaluations(
+            trade_date=trade_date,
+            evidence=evidence,
+            limit=limit,
+            conservative_report=conservative_report,
+        )
         traces = self.traces(trade_date=trade_date, limit=500, include_existing=include_traces, generated_candidates=candidates)
         summary = _summary(candidates, evidence, self.config, traces)
         generated_at = datetime.now().isoformat(timespec="seconds")
@@ -281,8 +306,15 @@ class ShadowSmallEntryPromotionAnalyzer:
             "md": str(self.export_markdown(report, target / f"{stem}.md")),
         }
 
-    def _candidate_evaluations(self, *, trade_date: Optional[str], evidence: dict[str, Any], limit: int) -> list[dict[str, Any]]:
-        items = self._source_candidate_items(trade_date=trade_date, limit=limit)
+    def _candidate_evaluations(
+        self,
+        *,
+        trade_date: Optional[str],
+        evidence: dict[str, Any],
+        limit: int,
+        conservative_report: Optional[dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
+        items = self._source_candidate_items(trade_date=trade_date, limit=limit, conservative_report=conservative_report)
         rows: list[dict[str, Any]] = []
         for item in items:
             evaluation = evaluate_shadow_small_entry_promotion(
@@ -321,11 +353,20 @@ class ShadowSmallEntryPromotionAnalyzer:
         rows.sort(key=lambda row: _status_sort(row.get("promotion_status")), reverse=True)
         return rows
 
-    def _source_candidate_items(self, *, trade_date: Optional[str], limit: int) -> list[dict[str, Any]]:
-        try:
-            report = ConservativeReasonOutcomeAnalyzer(self.db).build_report(trade_date=trade_date, limit=limit)
-        except Exception:
-            return []
+    def _source_candidate_items(
+        self,
+        *,
+        trade_date: Optional[str],
+        limit: int,
+        conservative_report: Optional[dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
+        if conservative_report is not None:
+            report = conservative_report
+        else:
+            try:
+                report = ConservativeReasonOutcomeAnalyzer(self.db).build_report(trade_date=trade_date, limit=limit)
+            except Exception:
+                return []
         review = report.get("review_for_small_entry") or {}
         candidates = list(review.get("candidates") or [])
         if candidates:

@@ -134,12 +134,16 @@ class ShadowSmallEntryOpsService:
         core_settings: CoreSettings | None = None,
         now_provider: Any | None = None,
         report_root: Path | None = None,
+        promotion_evidence: Mapping[str, Any] | None = None,
+        live_audit_report: Mapping[str, Any] | None = None,
     ) -> None:
         self.db = db
         self.gateway_state = gateway_state
         self.core_settings = core_settings or get_settings()
         self.now_provider = now_provider or (lambda: datetime.now().replace(microsecond=0))
         self.report_root = Path(report_root) if report_root is not None else REPORT_ROOT
+        self._promotion_evidence_override = dict(promotion_evidence or {}) if promotion_evidence is not None else None
+        self._live_audit_report_override = dict(live_audit_report or {}) if live_audit_report is not None else None
 
     def status(self, *, trade_date: str | None = None) -> dict[str, Any]:
         settings = self._settings()
@@ -619,12 +623,16 @@ class ShadowSmallEntryOpsService:
             return {"connected": False, "heartbeat_ok": False, "kiwoom_logged_in": False, "orderable": False}
 
     def _live_audit(self, trade_date: str) -> dict[str, Any]:
+        if self._live_audit_report_override is not None:
+            return dict(self._live_audit_report_override)
         try:
             return LiveSimLifecycleAuditor(self.db, self.gateway_state).build_report(trade_date=trade_date, limit=1000)
         except Exception as exc:
             return {"available": False, "status": "WARN", "summary": {}, "error": str(exc)}
 
     def _promotion_evidence(self, trade_date: str) -> dict[str, Any]:
+        if self._promotion_evidence_override is not None:
+            return dict(self._promotion_evidence_override)
         try:
             return ShadowSmallEntryPromotionAnalyzer(self.db).load_evidence(trade_date=trade_date, limit=50000)
         except Exception as exc:

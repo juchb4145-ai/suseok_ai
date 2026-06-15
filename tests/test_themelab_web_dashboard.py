@@ -589,7 +589,7 @@ def test_theme_lab_snapshot_caches_expensive_reports(tmp_path, monkeypatch):
         themelab_dashboard._theme_lab_dashboard_report_cache.clear()
     monkeypatch.setattr(
         themelab_dashboard,
-        "_build_theme_lab_gate_reason_outcomes",
+        "_build_theme_lab_gate_reason_source_report",
         _counted(
             "gate",
             {
@@ -606,13 +606,36 @@ def test_theme_lab_snapshot_caches_expensive_reports(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         themelab_dashboard,
-        "_build_conservative_reason_outcomes",
-        _counted("conservative", {"available": True, "status": "READY", "summary": {}}),
+        "_build_conservative_reason_report",
+        _counted(
+            "conservative",
+            {
+                "available": True,
+                "status": "READY",
+                "report_id": "cached-conservative",
+                "trade_date": "2026-06-04",
+                "generated_at": "",
+                "summary": {},
+                "review_for_small_entry": {},
+            },
+        ),
     )
     monkeypatch.setattr(
         themelab_dashboard,
-        "_build_shadow_small_entry_promotion",
-        _counted("promotion", {"available": True, "status": "READY", "candidate_count": 0}),
+        "_build_shadow_small_entry_promotion_report",
+        _counted(
+            "promotion",
+            {
+                "available": True,
+                "status": "READY",
+                "trade_date": "2026-06-04",
+                "generated_at": "",
+                "evidence": {"available": True, "status": "READY", "source_report_trade_date": "2026-06-04"},
+                "summary": {"candidate_count": 0},
+                "candidates": [],
+                "traces": [],
+            },
+        ),
     )
     monkeypatch.setattr(
         themelab_dashboard,

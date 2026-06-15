@@ -197,8 +197,9 @@ class ConservativeReasonOutcomeAnalyzer:
         trade_date: Optional[str] = None,
         limit: int = 10000,
         offset: int = 0,
+        source_report: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        source = self.base_analyzer.build_report(trade_date=trade_date, limit=limit, offset=offset)
+        source = source_report if source_report is not None else self.base_analyzer.build_report(trade_date=trade_date, limit=limit, offset=offset)
         items = [self._item_from_theme_lab(item) for item in source.get("items") or []]
         group_summary = self._group_summary(items)
         reason_summary = self._reason_code_summary(items, group_summary=group_summary)

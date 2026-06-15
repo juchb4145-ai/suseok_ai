@@ -595,11 +595,29 @@ def build_theme_lab_dashboard_snapshot(
     ranked_themes = _ranked_theme_rows(themes, condition_counts, backfill_status_by_theme=backfill_status_by_theme)
     summary = _summary(ranked_themes, watchset, entry_candidates, data_quality, runtime=runtime, freshness=freshness)
     trade_date = _snapshot_trade_date(raw)
-    gate_reason_outcomes = _theme_lab_gate_reason_outcomes(db, trade_date=trade_date)
+    gate_reason_report = _theme_lab_gate_reason_source_report(db, trade_date=trade_date)
+    gate_reason_outcomes = _theme_lab_gate_reason_outcomes_payload(gate_reason_report)
     live_sim_audit = _live_sim_audit(db, gateway_state=gateway_state, trade_date=trade_date)
-    conservative_reason_outcomes = _conservative_reason_outcomes(db, trade_date=trade_date)
-    shadow_small_entry_promotion = _shadow_small_entry_promotion(db, trade_date=trade_date)
-    shadow_small_entry_ops = _shadow_small_entry_ops(db, gateway_state=gateway_state, trade_date=trade_date)
+    conservative_reason_report = _conservative_reason_report(
+        db,
+        trade_date=trade_date,
+        source_report=gate_reason_report,
+    )
+    conservative_reason_outcomes = _conservative_reason_outcomes_payload(conservative_reason_report)
+    shadow_small_entry_promotion_report = _shadow_small_entry_promotion_report(
+        db,
+        trade_date=trade_date,
+        conservative_report=conservative_reason_report,
+        themelab_report=gate_reason_report,
+    )
+    shadow_small_entry_promotion = _shadow_small_entry_promotion_payload(shadow_small_entry_promotion_report)
+    shadow_small_entry_ops = _shadow_small_entry_ops(
+        db,
+        gateway_state=gateway_state,
+        trade_date=trade_date,
+        promotion_evidence=dict(shadow_small_entry_promotion_report.get("evidence") or {}),
+        live_audit_report=live_sim_audit,
+    )
     shadow_small_entry_pilot = _shadow_small_entry_pilot(db, gateway_state=gateway_state, trade_date=trade_date)
 
     payload = {
@@ -734,58 +752,196 @@ def _live_sim_audit_empty() -> dict[str, Any]:
     }
 
 
-def _conservative_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
+def _report_cache_extra_key(*reports: dict[str, Any] | None) -> str:
+    values = []
+    for report in reports:
+        if not report:
+            values.append("")
+            continue
+        values.append(str(report.get("report_id") or report.get("generated_at") or ""))
+    return "|".join(values)
+
+
+def _conservative_reason_report(
+    db: TradingDatabase,
+    *,
+    trade_date: str = "",
+    source_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return _cached_theme_lab_dashboard_report(
         db,
-        "conservative_reason_outcomes",
+        "conservative_reason_report",
         trade_date=trade_date,
-        builder=lambda: _build_conservative_reason_outcomes(db, trade_date=trade_date),
+        extra_key=_report_cache_extra_key(source_report),
+        builder=lambda: _build_conservative_reason_report(db, trade_date=trade_date, source_report=source_report),
     )
 
 
-def _build_conservative_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
+def _build_conservative_reason_report(
+    db: TradingDatabase,
+    *,
+    trade_date: str = "",
+    source_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return ConservativeReasonOutcomeAnalyzer(db).build_report(
+        trade_date=trade_date or None,
+        limit=10000,
+        source_report=source_report,
+    )
+
+
+def _conservative_reason_outcomes(
+    db: TradingDatabase,
+    *,
+    trade_date: str = "",
+    source_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     try:
-        report = ConservativeReasonOutcomeAnalyzer(db).build_report(trade_date=trade_date or None, limit=10000)
-        return conservative_reason_snapshot_payload(report)
+        return _conservative_reason_outcomes_payload(
+            _conservative_reason_report(db, trade_date=trade_date, source_report=source_report)
+        )
     except Exception as exc:
         return conservative_reason_empty_payload(str(exc))
 
 
-def _shadow_small_entry_promotion(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
-    return _cached_theme_lab_dashboard_report(
-        db,
-        "shadow_small_entry_promotion",
-        trade_date=trade_date,
-        builder=lambda: _build_shadow_small_entry_promotion(db, trade_date=trade_date),
-    )
+def _conservative_reason_outcomes_payload(report: dict[str, Any]) -> dict[str, Any]:
+    return conservative_reason_snapshot_payload(report)
 
 
-def _build_shadow_small_entry_promotion(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
+def _shadow_small_entry_promotion(
+    db: TradingDatabase,
+    *,
+    trade_date: str = "",
+    conservative_report: dict[str, Any] | None = None,
+    themelab_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     try:
-        report = ShadowSmallEntryPromotionAnalyzer(db).build_report(
-            trade_date=trade_date or None,
-            limit=10000,
-            include_traces=False,
+        return _shadow_small_entry_promotion_payload(
+            _shadow_small_entry_promotion_report(
+                db,
+                trade_date=trade_date,
+                conservative_report=conservative_report,
+                themelab_report=themelab_report,
+            )
         )
-        return shadow_small_entry_snapshot_payload(report)
     except Exception as exc:
         return shadow_small_entry_empty_payload(str(exc))
 
 
-def _shadow_small_entry_ops(db: TradingDatabase, *, gateway_state: Any | None, trade_date: str = "") -> dict[str, Any]:
+def _shadow_small_entry_promotion_report(
+    db: TradingDatabase,
+    *,
+    trade_date: str = "",
+    conservative_report: dict[str, Any] | None = None,
+    themelab_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return _cached_theme_lab_dashboard_report(
+        db,
+        "shadow_small_entry_promotion_report",
+        trade_date=trade_date,
+        extra_key=_report_cache_extra_key(conservative_report, themelab_report),
+        builder=lambda: _build_shadow_small_entry_promotion_report(
+            db,
+            trade_date=trade_date,
+            conservative_report=conservative_report,
+            themelab_report=themelab_report,
+        ),
+    )
+
+
+def _build_shadow_small_entry_promotion_report(
+    db: TradingDatabase,
+    *,
+    trade_date: str = "",
+    conservative_report: dict[str, Any] | None = None,
+    themelab_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return ShadowSmallEntryPromotionAnalyzer(db).build_report(
+        trade_date=trade_date or None,
+        limit=10000,
+        include_traces=False,
+        conservative_report=conservative_report,
+        themelab_report=themelab_report,
+    )
+
+
+def _build_shadow_small_entry_promotion(
+    db: TradingDatabase,
+    *,
+    trade_date: str = "",
+    conservative_report: dict[str, Any] | None = None,
+    themelab_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        return _shadow_small_entry_promotion_payload(
+            _build_shadow_small_entry_promotion_report(
+                db,
+                trade_date=trade_date,
+                conservative_report=conservative_report,
+                themelab_report=themelab_report,
+            )
+        )
+    except Exception as exc:
+        return shadow_small_entry_empty_payload(str(exc))
+
+
+def _shadow_small_entry_promotion_payload(report: dict[str, Any]) -> dict[str, Any]:
+    return shadow_small_entry_snapshot_payload(report)
+
+
+def _ops_report_cache_extra_key(
+    gateway_state: Any | None,
+    promotion_evidence: dict[str, Any] | None,
+    live_audit_report: dict[str, Any] | None,
+) -> str:
+    return "|".join(
+        (
+            _gateway_report_cache_key(gateway_state),
+            str((promotion_evidence or {}).get("report_id") or (promotion_evidence or {}).get("source_report_trade_date") or ""),
+            str((live_audit_report or {}).get("last_updated_at") or (live_audit_report or {}).get("generated_at") or ""),
+        )
+    )
+
+
+def _shadow_small_entry_ops(
+    db: TradingDatabase,
+    *,
+    gateway_state: Any | None,
+    trade_date: str = "",
+    promotion_evidence: dict[str, Any] | None = None,
+    live_audit_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return _cached_theme_lab_dashboard_report(
         db,
         "shadow_small_entry_ops",
         trade_date=trade_date,
-        extra_key=_gateway_report_cache_key(gateway_state),
-        builder=lambda: _build_shadow_small_entry_ops(db, gateway_state=gateway_state, trade_date=trade_date),
+        extra_key=_ops_report_cache_extra_key(gateway_state, promotion_evidence, live_audit_report),
+        builder=lambda: _build_shadow_small_entry_ops(
+            db,
+            gateway_state=gateway_state,
+            trade_date=trade_date,
+            promotion_evidence=promotion_evidence,
+            live_audit_report=live_audit_report,
+        ),
     )
 
 
-def _build_shadow_small_entry_ops(db: TradingDatabase, *, gateway_state: Any | None, trade_date: str = "") -> dict[str, Any]:
+def _build_shadow_small_entry_ops(
+    db: TradingDatabase,
+    *,
+    gateway_state: Any | None,
+    trade_date: str = "",
+    promotion_evidence: dict[str, Any] | None = None,
+    live_audit_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     try:
         return shadow_small_entry_ops_snapshot_payload(
-            ShadowSmallEntryOpsService(db, gateway_state=gateway_state).status(trade_date=trade_date or None)
+            ShadowSmallEntryOpsService(
+                db,
+                gateway_state=gateway_state,
+                promotion_evidence=promotion_evidence,
+                live_audit_report=live_audit_report,
+            ).status(trade_date=trade_date or None)
         )
     except Exception as exc:
         empty = _shadow_small_entry_ops_empty()
@@ -844,11 +1000,29 @@ def _theme_lab_gate_reason_outcomes(db: TradingDatabase, *, trade_date: str = ""
 
 
 def _build_theme_lab_gate_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
+    return _theme_lab_gate_reason_outcomes_payload(_theme_lab_gate_reason_source_report(db, trade_date=trade_date))
+
+
+def _theme_lab_gate_reason_source_report(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
+    return _cached_theme_lab_dashboard_report(
+        db,
+        "theme_lab_gate_reason_source_report",
+        trade_date=trade_date,
+        builder=lambda: _build_theme_lab_gate_reason_source_report(db, trade_date=trade_date),
+    )
+
+
+def _build_theme_lab_gate_reason_source_report(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
     try:
-        report = ThemeLabGateReasonOutcomeAnalyzer(db).build_report(trade_date=trade_date or None, limit=10000)
+        return ThemeLabGateReasonOutcomeAnalyzer(db).build_report(trade_date=trade_date or None, limit=10000)
     except Exception as exc:
+        return {"status": "ERROR", "error": str(exc)}
+
+
+def _theme_lab_gate_reason_outcomes_payload(report: dict[str, Any]) -> dict[str, Any]:
+    if str(report.get("status") or "").upper() == "ERROR":
         empty = _empty_gate_reason_outcomes()
-        empty.update({"status": "ERROR", "error": str(exc)})
+        empty.update({"status": "ERROR", "error": str(report.get("error") or "")})
         return empty
     return {
         "status": report.get("status") or "READY",
