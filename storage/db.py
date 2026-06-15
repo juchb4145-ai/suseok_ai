@@ -1507,6 +1507,14 @@ class TradingDatabase:
                 ON candidates(trade_date, code);
             CREATE INDEX IF NOT EXISTS idx_candidate_events_candidate_id_created_at
                 ON candidate_events(candidate_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_virtual_orders_candidate_status
+                ON virtual_orders(candidate_id, status);
+            CREATE INDEX IF NOT EXISTS idx_virtual_orders_status_candidate
+                ON virtual_orders(status, candidate_id);
+            CREATE INDEX IF NOT EXISTS idx_virtual_positions_candidate_closed
+                ON virtual_positions(candidate_id, closed_at);
+            CREATE INDEX IF NOT EXISTS idx_virtual_positions_order
+                ON virtual_positions(virtual_order_id);
             CREATE INDEX IF NOT EXISTS idx_canonical_themes_status
                 ON canonical_themes(status);
             CREATE INDEX IF NOT EXISTS idx_canonical_themes_trade_eligible

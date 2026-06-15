@@ -806,13 +806,20 @@ class StrategyRuntime:
                 results_by_candidate.setdefault(result.candidate_id, []).append(result)
 
         changed: dict[int, GatePipelineResult] = {}
+        open_activity_candidate_ids = self._open_virtual_activity_candidate_ids()
         for candidate in candidates:
             if candidate.id is None:
                 continue
-            current = self.db.load_candidate_by_id(candidate.id) or candidate
+            current = candidate
             results = results_by_candidate.get(candidate.id, [])
             try:
-                changed_result = self._apply_candidate_lifecycle(current, results, now, snapshot)
+                changed_result = self._apply_candidate_lifecycle(
+                    current,
+                    results,
+                    now,
+                    snapshot,
+                    has_open_activity=self._candidate_has_open_virtual_activity(current, open_activity_candidate_ids),
+                )
                 if changed_result is not None:
                     changed[candidate.id] = changed_result
             except Exception as exc:
@@ -825,10 +832,14 @@ class StrategyRuntime:
         results: list[GatePipelineResult],
         now: datetime,
         snapshot: StrategyRuntimeSnapshot,
+        *,
+        has_open_activity: Optional[bool] = None,
     ) -> Optional[GatePipelineResult]:
         previous_signature = _lifecycle_signature(candidate)
         previous_persist_signature = _candidate_persist_signature(candidate)
-        recheck_due = _blocked_recheck_due(candidate, now, self._has_open_virtual_activity(candidate))
+        if has_open_activity is None:
+            has_open_activity = self._has_open_virtual_activity(candidate)
+        recheck_due = _blocked_recheck_due(candidate, now, has_open_activity)
         previous_reasons = _candidate_reason_codes(candidate)
         metadata = dict(candidate.metadata)
         metadata["quality_status"] = self._candidate_quality_status(candidate)
@@ -1150,7 +1161,8 @@ class StrategyRuntime:
         snapshot: StrategyRuntimeSnapshot,
     ) -> None:
         rolled = 0
-        for candidate in self.db.list_candidates():
+        unfinished_candidate_ids = self._unfinished_virtual_activity_candidate_ids()
+        for candidate in self._rollover_candidate_candidates(current_trade_date):
             if not candidate.trade_date or candidate.trade_date >= current_trade_date:
                 continue
             if candidate.state not in ACTIVE_RUNTIME_STATES and not (
@@ -1159,7 +1171,7 @@ class StrategyRuntime:
                 and candidate.can_recover
             ):
                 continue
-            if self._has_unfinished_virtual_activity(candidate):
+            if self._candidate_has_unfinished_virtual_activity(candidate, unfinished_candidate_ids):
                 continue
             previous_state = candidate.state
             metadata = dict(candidate.metadata or {})
@@ -1198,6 +1210,36 @@ class StrategyRuntime:
             snapshot.candidate_save_count += rolled
             snapshot.db_write_count_per_cycle += rolled
             snapshot.warnings.append(f"SESSION_ROLLOVER_EXPIRED_CANDIDATES={rolled}")
+
+    def _rollover_candidate_candidates(self, current_trade_date: str) -> list[Candidate]:
+        conn = getattr(self.db, "conn", None)
+        row_to_candidate = getattr(self.db, "_row_to_candidate", None)
+        if conn is None or row_to_candidate is None:
+            return self.db.list_candidates()
+        try:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM candidates
+                WHERE trade_date < ?
+                  AND (
+                    state IN (?, ?, ?)
+                    OR (state = ? AND block_type = ? AND can_recover = 1)
+                  )
+                ORDER BY trade_date, code
+                """,
+                (
+                    current_trade_date,
+                    CandidateState.DETECTED.value,
+                    CandidateState.WATCHING.value,
+                    CandidateState.READY.value,
+                    CandidateState.BLOCKED.value,
+                    BlockType.TEMPORARY.value,
+                ),
+            ).fetchall()
+        except Exception:
+            return self.db.list_candidates()
+        return [row_to_candidate(row) for row in rows]
 
     def _evaluate_virtual_orders(
         self,
@@ -2188,6 +2230,53 @@ class StrategyRuntime:
             if order.status == VirtualOrderStatus.FILLED and not self._virtual_order_has_position(candidate, order):
                 return True
         return False
+
+    def _candidate_has_unfinished_virtual_activity(
+        self,
+        candidate: Candidate,
+        unfinished_candidate_ids: Optional[set[int]],
+    ) -> bool:
+        if candidate.id is None:
+            return False
+        if unfinished_candidate_ids is None:
+            return self._has_unfinished_virtual_activity(candidate)
+        return int(candidate.id) in unfinished_candidate_ids
+
+    def _unfinished_virtual_activity_candidate_ids(self) -> Optional[set[int]]:
+        conn = getattr(self.db, "conn", None)
+        if conn is None:
+            return None
+        try:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT candidate_id
+                FROM virtual_positions
+                WHERE candidate_id IS NOT NULL AND closed_at = ''
+                UNION
+                SELECT DISTINCT candidate_id
+                FROM virtual_orders
+                WHERE candidate_id IS NOT NULL AND status = ?
+                UNION
+                SELECT DISTINCT o.candidate_id
+                FROM virtual_orders o
+                WHERE o.candidate_id IS NOT NULL
+                  AND o.status = ?
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM virtual_positions p
+                    WHERE p.virtual_order_id = o.id
+                  )
+                """,
+                (VirtualOrderStatus.SUBMITTED.value, VirtualOrderStatus.FILLED.value),
+            ).fetchall()
+        except Exception:
+            return None
+        result: set[int] = set()
+        for row in rows:
+            candidate_id = row["candidate_id"] if hasattr(row, "keys") else row[0]
+            if candidate_id is not None:
+                result.add(int(candidate_id))
+        return result
 
     def _virtual_order_has_position(self, candidate: Candidate, order: VirtualOrder) -> bool:
         if order.id is None:

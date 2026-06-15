@@ -11,6 +11,7 @@ from trading.strategy.market_data import StrategyTick
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import IndexTick, MarketIndexStore
 from trading.strategy.models import Candidate, CandidateState, OrderMode
+from trading.strategy.pipeline import GatePipelineResult
 from trading.strategy.readiness import ReadinessReport
 from trading.strategy.runtime import (
     THEME_LAB_BOOTSTRAP_SOURCE,
@@ -250,6 +251,62 @@ def test_readiness_reuse_step_preserves_current_cycle_fields(tmp_path):
     assert snapshot.candidate_subscription_selected_count == 5
     assert timings["readiness_snapshot_final_reused"] == 0.0
     assert "READINESS_SNAPSHOT_REUSED:readiness_snapshot_final" in snapshot.warnings
+    db.close()
+
+
+def test_apply_lifecycle_uses_bulk_virtual_activity_lookup(monkeypatch, tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    runtime = build_observe_runtime(MockKiwoomClient(), db)
+    candidate = db.save_candidate(
+        Candidate(
+            trade_date="2026-06-01",
+            code="000001",
+            state=CandidateState.WATCHING,
+            metadata={"quality_status": "actionable"},
+        )
+    )
+    result = GatePipelineResult(
+        candidate_id=candidate.id,
+        code=candidate.code,
+        theme_id="theme-a",
+        final_grade="A",
+        final_score=91.0,
+        strategy_eligible=True,
+    )
+    snapshot = StrategyRuntimeSnapshot(cycle_at="2026-06-01T09:01:00")
+
+    monkeypatch.setattr(db, "load_candidate_by_id", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("candidate should already be loaded")))
+    monkeypatch.setattr(db, "load_open_virtual_position", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("open activity should be bulk loaded")))
+    monkeypatch.setattr(db, "list_virtual_orders", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("open activity should be bulk loaded")))
+
+    changed = runtime._apply_lifecycle([candidate], [result], snapshot, datetime(2026, 6, 1, 9, 1, 0))
+
+    assert changed == {candidate.id: result}
+    assert snapshot.candidate_save_count == 1
+    assert db.load_candidate("2026-06-01", "000001").state == CandidateState.READY
+    db.close()
+
+
+def test_rollover_candidates_uses_filtered_bulk_lookup(monkeypatch, tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    runtime = build_observe_runtime(MockKiwoomClient(), db)
+    old_active = db.save_candidate(Candidate(trade_date="2026-05-31", code="000001", state=CandidateState.WATCHING))
+    old_removed = db.save_candidate(Candidate(trade_date="2026-05-31", code="000002", state=CandidateState.REMOVED))
+    current = db.save_candidate(Candidate(trade_date="2026-06-01", code="000003", state=CandidateState.WATCHING))
+    snapshot = StrategyRuntimeSnapshot(cycle_at="2026-06-01T09:01:00")
+
+    monkeypatch.setattr(db, "list_candidates", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("rollover should use filtered SQL")))
+    monkeypatch.setattr(db, "load_open_virtual_position", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unfinished activity should be bulk loaded")))
+    monkeypatch.setattr(db, "list_virtual_orders", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unfinished activity should be bulk loaded")))
+
+    runtime._rollover_previous_trade_date_candidates("2026-06-01", datetime(2026, 6, 1, 9, 1, 0), snapshot)
+
+    assert db.load_candidate("2026-05-31", "000001").state == CandidateState.EXPIRED
+    assert db.load_candidate("2026-05-31", "000002").state == CandidateState.REMOVED
+    assert db.load_candidate("2026-06-01", "000003").state == CandidateState.WATCHING
+    assert snapshot.expired_count == 1
+    assert snapshot.candidate_save_count == 1
+    assert old_active.id != old_removed.id != current.id
     db.close()
 
 
