@@ -1523,8 +1523,12 @@ class TradingDatabase:
                 ON theme_membership_current(stock_code);
             CREATE INDEX IF NOT EXISTS idx_theme_membership_current_theme
                 ON theme_membership_current(theme_id);
+            CREATE INDEX IF NOT EXISTS idx_theme_membership_current_active_score_theme_stock
+                ON theme_membership_current(active, membership_score, theme_id, stock_code);
             CREATE INDEX IF NOT EXISTS idx_theme_activity_snapshots_created_rank
                 ON theme_activity_snapshots(created_at, rank);
+            CREATE INDEX IF NOT EXISTS idx_theme_activity_snapshots_theme_id_id
+                ON theme_activity_snapshots(theme_id, id);
             CREATE INDEX IF NOT EXISTS idx_theme_lab_flow_snapshots_calculated
                 ON theme_lab_flow_snapshots(calculated_at);
             CREATE INDEX IF NOT EXISTS idx_dynamic_theme_clusters_status
@@ -5687,6 +5691,26 @@ class TradingDatabase:
         ).fetchone()
         return self._row_to_candidate(row) if row else None
 
+    def load_candidates_by_codes(self, trade_date: str, codes: Iterable[str]) -> list[Candidate]:
+        clean_codes = sorted({str(code or "").strip() for code in codes if str(code or "").strip()})
+        if not clean_codes:
+            return []
+        result: list[Candidate] = []
+        for start in range(0, len(clean_codes), 500):
+            chunk = clean_codes[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"""
+                SELECT *
+                FROM candidates
+                WHERE trade_date = ? AND code IN ({placeholders})
+                ORDER BY trade_date, code
+                """,
+                (trade_date, *chunk),
+            ).fetchall()
+            result.extend(self._row_to_candidate(row) for row in rows)
+        return result
+
     def load_candidate_by_id(self, candidate_id: int) -> Optional[Candidate]:
         row = self.conn.execute("SELECT * FROM candidates WHERE id = ?", (candidate_id,)).fetchone()
         return self._row_to_candidate(row) if row else None
@@ -5710,6 +5734,25 @@ class TradingDatabase:
         query += " ORDER BY trade_date, code"
         rows = self.conn.execute(query, params).fetchall()
         return [self._row_to_candidate(row) for row in rows]
+
+    def count_candidates(
+        self,
+        trade_date: Optional[str] = None,
+        state: Optional[Union[CandidateState, str]] = None,
+    ) -> int:
+        query = "SELECT COUNT(*) AS count FROM candidates"
+        clauses = []
+        params = []
+        if trade_date is not None:
+            clauses.append("trade_date = ?")
+            params.append(trade_date)
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state.value if isinstance(state, CandidateState) else str(state))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        row = self.conn.execute(query, params).fetchone()
+        return int(row["count"] if row else 0)
 
     def save_candidate_event(self, event: CandidateEvent) -> CandidateEvent:
         with self.conn:

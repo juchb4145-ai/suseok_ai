@@ -11,6 +11,7 @@ from typing import Any, Mapping, Optional
 
 from storage.db import TradingDatabase
 from trading.strategy.runtime_settings import StrategyRuntimeSettings, StrategyRuntimeSettingsRepository
+from trading_app.cash_risk_limits import resolve_live_sim_cash_limits
 from trading_app.dependencies import CoreSettings, get_settings
 from trading_app.live_sim_audit import LiveSimLifecycleAuditor
 from trading_app.shadow_small_entry_promotion import ShadowSmallEntryPromotionAnalyzer
@@ -147,6 +148,7 @@ class ShadowSmallEntryOpsService:
         state = self._state(settings=settings, cfg=cfg)
         preflight = self.preflight(trade_date=today, persist=False)
         risk = self._risk_snapshot(trade_date=today)
+        limits = self._effective_daily_limits(settings=settings, cfg=cfg)
         audit_rows = self.db.list_shadow_small_entry_ops_audit_log(trade_date=today, limit=20)
         payload = {
             "available": True,
@@ -161,7 +163,7 @@ class ShadowSmallEntryOpsService:
             "last_status_change_at": state.get("last_status_change_at") or "",
             "last_status_change_reason": state.get("last_status_change_reason") or "",
             "today": risk["today"],
-            "limits": cfg.daily_limits | {
+            "limits": limits | {
                 "max_daily_realized_loss_krw": cfg.risk_limits.get("max_daily_realized_loss_krw"),
                 "max_daily_unrealized_loss_krw": cfg.risk_limits.get("max_daily_unrealized_loss_krw"),
             },
@@ -194,6 +196,7 @@ class ShadowSmallEntryOpsService:
         core = self.core_settings
         gateway = self._gateway_snapshot()
         heartbeat = dict(gateway.get("last_heartbeat_payload") or {})
+        daily_limits = self._effective_daily_limits(settings=settings, cfg=cfg, gateway=gateway)
         live_audit = self._live_audit(today)
         live_summary = dict(live_audit.get("summary") or {})
         usage = self._usage(today)
@@ -235,15 +238,15 @@ class ShadowSmallEntryOpsService:
         evidence = self._promotion_evidence(today)
         if not bool(evidence.get("available")):
             blocking.append("SHADOW_PROMOTION_EVIDENCE_NOT_READY")
-        if usage["promotion_count"] >= int(cfg.daily_limits.get("max_promotions_per_day") or 0):
+        if usage["promotion_count"] >= int(daily_limits.get("max_promotions_per_day") or 0):
             blocking.append("SHADOW_SMALL_ENTRY_DAILY_PROMOTION_LIMIT")
-        if usage["submitted_count"] >= int(cfg.daily_limits.get("max_submitted_orders_per_day") or 0):
+        if usage["submitted_count"] >= int(daily_limits.get("max_submitted_orders_per_day") or 0):
             blocking.append("SHADOW_SMALL_ENTRY_DAILY_SUBMIT_LIMIT")
-        if usage["filled_count"] >= int(cfg.daily_limits.get("max_filled_orders_per_day") or 0):
+        if usage["filled_count"] >= int(daily_limits.get("max_filled_orders_per_day") or 0):
             blocking.append("SHADOW_SMALL_ENTRY_DAILY_FILL_LIMIT")
-        if usage["total_notional_krw"] >= int(cfg.daily_limits.get("max_total_notional_krw") or 0):
+        if usage["total_notional_krw"] >= int(daily_limits.get("max_total_notional_krw") or 0):
             blocking.append("SHADOW_SMALL_ENTRY_NOTIONAL_LIMIT")
-        if usage["open_position_count"] > int(cfg.daily_limits.get("max_open_positions") or 1):
+        if usage["open_position_count"] > int(daily_limits.get("max_open_positions") or 1):
             blocking.append("SHADOW_SMALL_ENTRY_OPEN_POSITION_LIMIT")
 
         status = "PASS" if not blocking else "FAIL"
@@ -259,6 +262,7 @@ class ShadowSmallEntryOpsService:
                 "server_mode": server_mode,
                 "live_sim_audit": live_audit,
                 "usage": usage,
+                "limits": daily_limits,
                 "evidence_status": evidence.get("status"),
                 "source_report_trade_date": evidence.get("source_report_trade_date"),
             },
@@ -583,6 +587,26 @@ class ShadowSmallEntryOpsService:
             "details": dict((saved or {}).get("details") or {}),
         }
 
+    def _effective_daily_limits(
+        self,
+        *,
+        settings: StrategyRuntimeSettings,
+        cfg: ShadowSmallEntryOpsConfig,
+        gateway: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        limits = dict(cfg.daily_limits or {})
+        execution = dict(settings.value("order_execution", {}) or {})
+        cash_limits = resolve_live_sim_cash_limits(execution, gateway or self._gateway_snapshot())
+        if cash_limits.get("enabled") and int(cash_limits.get("daily_turnover_amount_krw") or 0) > 0:
+            limits["max_total_notional_krw"] = int(cash_limits.get("daily_turnover_amount_krw") or 0)
+            limits["cash_based_limits_enabled"] = True
+            limits["available_cash_krw"] = int(cash_limits.get("available_cash_krw") or 0)
+            limits["cash_source"] = str(cash_limits.get("cash_source") or "")
+            limits["daily_turnover_limit_pct"] = float(cash_limits.get("daily_turnover_limit_pct") or 0.0)
+        else:
+            limits["cash_based_limits_enabled"] = False
+        return limits
+
     def _settings(self) -> StrategyRuntimeSettings:
         return StrategyRuntimeSettingsRepository(self.db).load()
 
@@ -632,7 +656,7 @@ class ShadowSmallEntryOpsService:
             if value > limit:
                 breaches.append({"metric": metric, "value": value, "limit": limit, "reason": reason, "pause_status": pause_status})
 
-        daily = cfg.daily_limits
+        daily = self._effective_daily_limits(settings=settings, cfg=cfg, gateway=gateway)
         risk = cfg.risk_limits
         add("promotion_count", usage["promotion_count"], int(daily.get("max_promotions_per_day") or 3), "SHADOW_SMALL_ENTRY_MAX_PROMOTIONS_EXCEEDED", STATUS_PAUSED_BY_RISK)
         add("submitted_count", usage["submitted_count"], int(daily.get("max_submitted_orders_per_day") or 3), "SHADOW_SMALL_ENTRY_MAX_SUBMITTED_EXCEEDED", STATUS_PAUSED_BY_RISK)

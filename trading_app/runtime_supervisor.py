@@ -61,6 +61,10 @@ class RuntimeSupervisor:
         self._cycle_lock = asyncio.Lock()
         self._state_lock = RLock()
         self._event_lock = RLock()
+        self._cycle_future: asyncio.Future | None = None
+        self._cycle_future_started_at = ""
+        self._cycle_future_started_perf = 0.0
+        self._cycle_future_reason = ""
         self._pending_price_ticks: dict[str, GatewayEvent] = {}
         self._dropped_price_tick_count = 0
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strategy-runtime")
@@ -175,21 +179,31 @@ class RuntimeSupervisor:
         if not self.running:
             self._warn("RUNTIME_CYCLE_REJECTED_NOT_RUNNING")
             return self.status()
+        if self._cycle_worker_pending():
+            self._skip_cycle(f"cycle worker still running: {reason}")
+            return self.status()
         if self._cycle_lock.locked():
-            with self._state_lock:
-                self.skipped_cycle_count += 1
-            self._log_runtime_event("cycle_skipped", "skipped", f"cycle already running: {reason}")
+            self._skip_cycle(f"cycle already running: {reason}")
             return self.status()
         async with self._cycle_lock:
+            if self._cycle_worker_pending():
+                self._skip_cycle(f"cycle worker still running: {reason}")
+                return self.status()
             if reason == "manual":
                 with self._state_lock:
                     self.manual_cycle_count += 1
             started_at = _utc_now()
             started = perf_counter()
             loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(self._executor, self._cycle_in_worker)
+            with self._state_lock:
+                self._cycle_future = future
+                self._cycle_future_started_at = started_at
+                self._cycle_future_started_perf = started
+                self._cycle_future_reason = reason
             try:
                 snapshot = await asyncio.wait_for(
-                    loop.run_in_executor(self._executor, self._cycle_in_worker),
+                    asyncio.shield(future),
                     timeout=max(1, int(self.settings.runtime_cycle_timeout_sec)),
                 )
             except Exception as exc:
@@ -203,6 +217,16 @@ class RuntimeSupervisor:
                     self.next_cycle_at = _after_seconds(_utc_now(), self._interval_sec()) if self.running else ""
                 self._log_runtime_cycle(started_at, _utc_now(), duration_ms, "failed", {}, error)
                 self._log_runtime_event("cycle_failed", "failed", error)
+                if not future.done():
+                    future.add_done_callback(
+                        lambda done_future, cycle_started_at=started_at, cycle_started=started: self._consume_late_cycle_future(
+                            done_future,
+                            cycle_started_at,
+                            cycle_started,
+                        )
+                    )
+                else:
+                    self._clear_cycle_future(future)
                 return self.status()
             duration_ms = int(round((perf_counter() - started) * 1000))
             snapshot["cycle_duration_ms"] = snapshot.get("cycle_duration_ms") or duration_ms
@@ -216,6 +240,11 @@ class RuntimeSupervisor:
                 self.last_snapshot = snapshot
                 self.last_error = ""
                 self.next_cycle_at = _after_seconds(_utc_now(), self._interval_sec()) if self.running else ""
+                if self._cycle_future is future:
+                    self._cycle_future = None
+                    self._cycle_future_started_at = ""
+                    self._cycle_future_started_perf = 0.0
+                    self._cycle_future_reason = ""
             self._log_runtime_cycle(
                 started_at,
                 _utc_now(),
@@ -241,13 +270,22 @@ class RuntimeSupervisor:
             self._log_runtime_event("loop_failed", "failed", error)
 
     def status(self) -> dict[str, Any]:
+        cycle_worker_pending_before_db = self._cycle_worker_pending()
         gateway = self.gateway_state.snapshot().to_dict()
         command_summary = self.gateway_state.command_snapshot()
-        dry_run_order_summary = _dry_run_order_summary(self.settings.db_path)
+        dry_run_order_summary = (
+            {"status": "SKIPPED", "reason": "CYCLE_WORKER_PENDING"}
+            if cycle_worker_pending_before_db
+            else _dry_run_order_summary(self.settings.db_path)
+        )
         realtime_data_quality = self._realtime_data_quality_snapshot()
         with self._state_lock:
             snapshot = dict(self.last_snapshot or {})
             warnings = list(self.warnings[-50:])
+            cycle_worker_pending = self._cycle_future is not None and not self._cycle_future.done()
+            cycle_worker_elapsed_ms = 0
+            if cycle_worker_pending and self._cycle_future_started_perf:
+                cycle_worker_elapsed_ms = int(round((perf_counter() - self._cycle_future_started_perf) * 1000))
             return {
                 "enabled": self.enabled,
                 "auto_start": self.auto_start,
@@ -265,6 +303,10 @@ class RuntimeSupervisor:
                 "manual_cycle_count": self.manual_cycle_count,
                 "last_error": self.last_error,
                 "worker_stage": self.worker_stage,
+                "cycle_worker_pending": cycle_worker_pending,
+                "cycle_worker_started_at": self._cycle_future_started_at if cycle_worker_pending else "",
+                "cycle_worker_elapsed_ms": cycle_worker_elapsed_ms,
+                "cycle_worker_reason": self._cycle_future_reason if cycle_worker_pending else "",
                 "post_cycle_diagnostics": self._post_cycle_diagnostics_status_locked(),
                 "last_cycle_timings": dict(self.last_cycle_timings),
                 "warnings": warnings,
@@ -669,6 +711,43 @@ class RuntimeSupervisor:
     def _set_worker_stage(self, stage: str) -> None:
         with self._state_lock:
             self.worker_stage = str(stage or "idle")
+
+    def _cycle_worker_pending(self) -> bool:
+        with self._state_lock:
+            return self._cycle_future is not None and not self._cycle_future.done()
+
+    def _skip_cycle(self, message: str) -> None:
+        with self._state_lock:
+            self.skipped_cycle_count += 1
+            self.next_cycle_at = _after_seconds(_utc_now(), self._interval_sec()) if self.running else ""
+        self._log_runtime_event("cycle_skipped", "skipped", message)
+
+    def _clear_cycle_future(self, future: asyncio.Future) -> None:
+        with self._state_lock:
+            if self._cycle_future is future:
+                self._cycle_future = None
+                self._cycle_future_started_at = ""
+                self._cycle_future_started_perf = 0.0
+                self._cycle_future_reason = ""
+
+    def _consume_late_cycle_future(self, future: asyncio.Future, started_at: str, started: float) -> None:
+        duration_ms = int(round((perf_counter() - started) * 1000))
+        try:
+            snapshot = _jsonable(future.result())
+            if isinstance(snapshot, dict):
+                snapshot["cycle_duration_ms"] = snapshot.get("cycle_duration_ms") or duration_ms
+            self._log_runtime_event(
+                "cycle_late_completed",
+                "late",
+                f"cycle completed after timeout in {duration_ms}ms",
+                snapshot if isinstance(snapshot, dict) else {},
+            )
+        except asyncio.CancelledError:
+            self._log_runtime_event("cycle_late_cancelled", "cancelled", "cycle worker future cancelled")
+        except Exception as exc:
+            self._log_runtime_event("cycle_late_failed", "failed", _exception_message(exc))
+        finally:
+            self._clear_cycle_future(future)
 
     def _set_post_cycle_diagnostics_stage(self, stage: str) -> None:
         with self._state_lock:

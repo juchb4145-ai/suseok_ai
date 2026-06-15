@@ -99,6 +99,8 @@ THEME_LAB_OUTCOME_TRACKING_REASON_PREFIXES = (
     "DATA_WARMUP",
     "MISSING_",
 )
+FINAL_READINESS_SOFT_BUDGET_DEFAULT_SEC = 60
+READINESS_SOFT_BUDGET_DEFAULT_SEC = 30
 
 
 @dataclass
@@ -310,6 +312,7 @@ class StrategyRuntime:
         self.theme_lab_shadow_ab_provider = theme_lab_shadow_ab_provider
         self.shadow_small_entry_promotion_provider = shadow_small_entry_promotion_provider
         self._theme_lab_bridge_results: list[GatePipelineResult] = []
+        self._theme_lab_pipeline_timings: dict[str, float] = {}
         self._theme_lab_outcome_tracking: dict[str, datetime] = {}
         self.started = False
         self._warnings: list[str] = []
@@ -363,7 +366,7 @@ class StrategyRuntime:
                 if order.id is not None and self.db.load_virtual_position_by_order(order.id) is None
             ]
             open_items = self.db.list_open_virtual_positions()
-            snapshot.candidate_count = len(self.db.list_candidates(trade_date))
+            snapshot.candidate_count = self._candidate_count(trade_date)
             snapshot.active_candidate_count = len(active)
             snapshot.recovered_candidate_count = len(active)
             snapshot.virtual_order_count = len(submitted_orders)
@@ -430,13 +433,21 @@ class StrategyRuntime:
             trade_date = timed("trade_date", self.candidate_collector._trade_date)
             timed("prune_position_context_history", lambda: self._prune_position_context_history(snapshot, current))
             timed("theme_lab_flow", lambda: self._run_theme_lab_flow(snapshot, current))
+            self._emit_theme_lab_pipeline_timings(timing_callback)
             timed("flow_diagnostics_empty", lambda: self._apply_flow_diagnostics(snapshot, current, trade_date, []))
             if snapshot.gate_skip_reason == GATE_SKIP_MARKET_SESSION_CLOSED:
-                snapshot.candidate_count = timed("candidate_count", lambda: len(self.db.list_candidates(trade_date)))
+                snapshot.candidate_count = timed("candidate_count", lambda: self._candidate_count(trade_date))
                 snapshot.active_candidate_count = timed("active_candidates_closed", lambda: len(self._active_candidates(trade_date, current)))
                 timed("condition_adapter_stop_closed", lambda: self._stop_condition_adapter_for_market_closed(snapshot))
                 timed("reconcile_subscriptions_closed", lambda: self._reconcile_subscriptions([], snapshot))
-                timed("readiness_snapshot_closed", lambda: self._refresh_readiness_snapshot(snapshot, current, trade_date))
+                self._refresh_readiness_snapshot_step(
+                    "readiness_snapshot_closed",
+                    snapshot,
+                    current,
+                    trade_date,
+                    started,
+                    timing_callback,
+                )
                 snapshot.warnings = timed("dedupe_warnings", lambda: dedupe_warnings(snapshot.warnings))
                 return snapshot
 
@@ -448,15 +459,35 @@ class StrategyRuntime:
             snapshot.db_write_count_per_cycle += len(expired)
             timed("quality_controls", lambda: self._apply_quality_controls(trade_date, current, snapshot))
             subscription_candidates = timed("subscription_candidates", lambda: self._subscription_candidates(trade_date, snapshot))
-            snapshot.candidate_count = timed("candidate_count", lambda: len(self.db.list_candidates(trade_date)))
+            snapshot.candidate_count = timed("candidate_count", lambda: self._candidate_count(trade_date))
             timed("reconcile_subscriptions", lambda: self._reconcile_subscriptions(subscription_candidates, snapshot))
-            timed("readiness_snapshot", lambda: self._refresh_readiness_snapshot(snapshot, current, trade_date))
+            readiness_candidate_save_count = snapshot.candidate_save_count
+            readiness_available = self._refresh_readiness_snapshot_step(
+                "readiness_snapshot",
+                snapshot,
+                current,
+                trade_date,
+                started,
+                timing_callback,
+            )
             candidates = timed("active_candidates", lambda: self._active_candidates(trade_date, current))
             snapshot.active_candidate_count = len(candidates)
             timed("flow_diagnostics_candidates", lambda: self._apply_flow_diagnostics(snapshot, current, trade_date, candidates))
             if snapshot.gate_skip_reason == GATE_SKIP_DATA_WARMUP:
                 snapshot.evaluated_candidate_count = 0
-                timed("readiness_snapshot_warmup", lambda: self._refresh_readiness_snapshot(snapshot, current, trade_date))
+                if not (
+                    readiness_available
+                    and snapshot.candidate_save_count == readiness_candidate_save_count
+                    and self._reuse_readiness_snapshot_step("readiness_snapshot_warmup", snapshot, timing_callback)
+                ):
+                    self._refresh_readiness_snapshot_step(
+                        "readiness_snapshot_warmup",
+                        snapshot,
+                        current,
+                        trade_date,
+                        started,
+                        timing_callback,
+                    )
                 snapshot.warnings = timed("dedupe_warnings", lambda: dedupe_warnings(snapshot.warnings))
                 return snapshot
             snapshot.evaluated_candidate_count = timed(
@@ -533,7 +564,22 @@ class StrategyRuntime:
                 ),
             )
             timed("save_reviews", lambda: self._save_reviews(context_by_candidate, expired, snapshot, current))
-            timed("readiness_snapshot_final", lambda: self._refresh_readiness_snapshot(snapshot, current, trade_date))
+            if (
+                readiness_available
+                and snapshot.candidate_save_count == readiness_candidate_save_count
+                and self._reuse_readiness_snapshot_step("readiness_snapshot_final", snapshot, timing_callback)
+            ):
+                pass
+            else:
+                defer_final, elapsed_ms, budget_sec = self._final_readiness_defer_decision(started)
+                if defer_final:
+                    snapshot.warnings.append(
+                        f"READINESS_SNAPSHOT_FINAL_DEFERRED:elapsed_ms={elapsed_ms}:budget_sec={budget_sec}"
+                    )
+                    if timing_callback is not None:
+                        timing_callback("readiness_snapshot_final_deferred", 0.0)
+                else:
+                    timed("readiness_snapshot_final", lambda: self._refresh_readiness_snapshot(snapshot, current, trade_date))
             snapshot.warnings = timed("dedupe_warnings", lambda: dedupe_warnings(snapshot.warnings))
             return snapshot
         finally:
@@ -1545,6 +1591,7 @@ class StrategyRuntime:
 
     def _run_theme_lab_flow(self, snapshot: StrategyRuntimeSnapshot, now: datetime) -> None:
         self._theme_lab_bridge_results = []
+        self._theme_lab_pipeline_timings = {}
         if not self._theme_lab_flow_active():
             return
         if self.theme_lab_pipeline is None:
@@ -1560,6 +1607,8 @@ class StrategyRuntime:
         active_result = bridge_result or result
         if active_result is None:
             return
+        if result is not None:
+            self._remember_theme_lab_pipeline_timings(result)
         snapshot.gate_result_count = len(active_result.gate_decisions)
         if not active_result.watchset:
             snapshot.warnings.append("THEME_LAB_WATCHSET_EMPTY")
@@ -1587,12 +1636,114 @@ class StrategyRuntime:
                 trade_date=self.candidate_collector._trade_date(),
                 now=now,
             )
+            self._remember_theme_lab_bridge_timings(built)
             self._theme_lab_bridge_results = built.gate_results
             snapshot.candidate_save_count += built.candidate_save_count
             snapshot.db_write_count_per_cycle += built.candidate_save_count
             snapshot.warnings.extend(built.warnings or [])
         except Exception as exc:
             snapshot.warnings.append(f"THEME_LAB_BRIDGE_FAILED:{exc}")
+
+    def _remember_theme_lab_pipeline_timings(self, result: Any) -> None:
+        self._theme_lab_pipeline_timings = {}
+        data_quality = getattr(result, "data_quality", {}) or {}
+        raw_timings = data_quality.get("runtime_pipeline_timings") if isinstance(data_quality, dict) else None
+        if not isinstance(raw_timings, dict):
+            return
+        timings: dict[str, float] = {}
+        for label, seconds in raw_timings.items():
+            try:
+                timings[str(label)] = round(float(seconds or 0.0), 6)
+            except (TypeError, ValueError):
+                continue
+        self._theme_lab_pipeline_timings = timings
+
+    def _remember_theme_lab_bridge_timings(self, result: Any) -> None:
+        raw_timings = getattr(result, "timings", {}) or {}
+        if not isinstance(raw_timings, dict):
+            return
+        for label, seconds in raw_timings.items():
+            try:
+                self._theme_lab_pipeline_timings[f"bridge.{label}"] = round(float(seconds or 0.0), 6)
+            except (TypeError, ValueError):
+                continue
+
+    def _emit_theme_lab_pipeline_timings(self, timing_callback: Optional[Callable[[str, float], None]]) -> None:
+        if timing_callback is None:
+            return
+        for label, seconds in self._theme_lab_pipeline_timings.items():
+            timing_callback(f"theme_lab_flow:{label}", seconds)
+
+    def _final_readiness_defer_decision(
+        self,
+        cycle_started: float,
+        *,
+        now_perf: Optional[float] = None,
+    ) -> tuple[bool, int, int]:
+        budget_sec = _env_int(
+            "TRADING_RUNTIME_FINAL_READINESS_SOFT_BUDGET_SEC",
+            FINAL_READINESS_SOFT_BUDGET_DEFAULT_SEC,
+        )
+        current_perf = perf_counter() if now_perf is None else float(now_perf)
+        elapsed_ms = max(0, int(round((current_perf - cycle_started) * 1000)))
+        if budget_sec <= 0:
+            return False, elapsed_ms, budget_sec
+        return elapsed_ms >= budget_sec * 1000, elapsed_ms, budget_sec
+
+    def _readiness_defer_decision(
+        self,
+        cycle_started: float,
+        *,
+        now_perf: Optional[float] = None,
+    ) -> tuple[bool, int, int]:
+        budget_sec = _env_int(
+            "TRADING_RUNTIME_READINESS_SOFT_BUDGET_SEC",
+            READINESS_SOFT_BUDGET_DEFAULT_SEC,
+        )
+        current_perf = perf_counter() if now_perf is None else float(now_perf)
+        elapsed_ms = max(0, int(round((current_perf - cycle_started) * 1000)))
+        if budget_sec <= 0:
+            return False, elapsed_ms, budget_sec
+        return elapsed_ms >= budget_sec * 1000, elapsed_ms, budget_sec
+
+    def _refresh_readiness_snapshot_step(
+        self,
+        label: str,
+        snapshot: StrategyRuntimeSnapshot,
+        current: datetime,
+        trade_date: str,
+        cycle_started: float,
+        timing_callback: Optional[Callable[[str, float], None]],
+    ) -> bool:
+        if timing_callback is not None:
+            timing_callback(f"{label}:start", 0.0)
+        defer, elapsed_ms, budget_sec = self._readiness_defer_decision(cycle_started)
+        if defer and self._apply_cached_readiness_snapshot(snapshot):
+            snapshot.warnings.append(
+                f"READINESS_SNAPSHOT_DEFERRED:{label}:elapsed_ms={elapsed_ms}:budget_sec={budget_sec}"
+            )
+            if timing_callback is not None:
+                timing_callback(f"{label}_deferred", 0.0)
+            return True
+        started = perf_counter()
+        try:
+            return self._refresh_readiness_snapshot(snapshot, current, trade_date)
+        finally:
+            if timing_callback is not None:
+                timing_callback(label, perf_counter() - started)
+
+    def _reuse_readiness_snapshot_step(
+        self,
+        label: str,
+        snapshot: StrategyRuntimeSnapshot,
+        timing_callback: Optional[Callable[[str, float], None]],
+    ) -> bool:
+        if not self._apply_cached_readiness_snapshot(snapshot):
+            return False
+        snapshot.warnings.append(f"READINESS_SNAPSHOT_REUSED:{label}")
+        if timing_callback is not None:
+            timing_callback(f"{label}_reused", 0.0)
+        return True
 
     def _fresh_theme_lab_result(self, now: datetime):
         if self.theme_lab_pipeline is None:
@@ -1861,8 +2012,9 @@ class StrategyRuntime:
         result: list[tuple[Candidate, str]] = []
         candidates = self.db.list_candidates(trade_date=trade_date)
         self._theme_presence_cache = _active_theme_presence_by_code(self.db, candidates, default_when_not_ready=True)
+        open_activity_candidate_ids = self._open_virtual_activity_candidate_ids()
         for candidate in candidates:
-            has_open_activity = self._has_open_virtual_activity(candidate)
+            has_open_activity = self._candidate_has_open_virtual_activity(candidate, open_activity_candidate_ids)
             quality_status = self._candidate_quality_status(candidate)
             if quality_status == QUALITY_DISCOVERY_ONLY:
                 if snapshot is not None:
@@ -1896,8 +2048,13 @@ class StrategyRuntime:
         result: list[Candidate] = []
         candidates = self.db.list_candidates(trade_date=trade_date)
         self._theme_presence_cache = _active_theme_presence_by_code(self.db, candidates, default_when_not_ready=True)
+        open_activity_candidate_ids = self._open_virtual_activity_candidate_ids()
         for candidate in candidates:
-            if not self._has_open_virtual_activity(candidate) and self._candidate_quality_status(candidate) in {QUALITY_INVALID_CODE, QUALITY_UNMAPPED}:
+            has_open_activity = self._candidate_has_open_virtual_activity(candidate, open_activity_candidate_ids)
+            if not has_open_activity and self._candidate_quality_status(candidate) in {
+                QUALITY_INVALID_CODE,
+                QUALITY_UNMAPPED,
+            }:
                 continue
             if candidate.state in ACTIVE_RUNTIME_STATES:
                 result.append(candidate)
@@ -1905,13 +2062,20 @@ class StrategyRuntime:
                 candidate.state == CandidateState.BLOCKED
                 and candidate.block_type == BlockType.TEMPORARY
                 and candidate.can_recover
-                and (now is None or _blocked_recheck_due(candidate, now, self._has_open_virtual_activity(candidate)))
+                and (now is None or _blocked_recheck_due(candidate, now, has_open_activity))
             ):
                 result.append(candidate)
         return result
 
+    def _candidate_count(self, trade_date: str) -> int:
+        count_candidates = getattr(self.db, "count_candidates", None)
+        if count_candidates is not None:
+            return int(count_candidates(trade_date=trade_date))
+        return len(self.db.list_candidates(trade_date=trade_date))
+
     def _runtime_candidates(self, trade_date: str) -> list[Candidate]:
         result: list[Candidate] = []
+        open_activity_candidate_ids = self._open_virtual_activity_candidate_ids()
         for candidate in self.db.list_candidates(trade_date=trade_date):
             if candidate.state in ACTIVE_RUNTIME_STATES:
                 result.append(candidate)
@@ -1921,7 +2085,7 @@ class StrategyRuntime:
                 and candidate.can_recover
             ):
                 result.append(candidate)
-            elif self._has_open_virtual_activity(candidate):
+            elif self._candidate_has_open_virtual_activity(candidate, open_activity_candidate_ids):
                 result.append(candidate)
         return result
 
@@ -1975,6 +2139,43 @@ class StrategyRuntime:
             order.status == VirtualOrderStatus.SUBMITTED
             for order in self.db.list_virtual_orders(candidate.id)
         )
+
+    def _candidate_has_open_virtual_activity(
+        self,
+        candidate: Candidate,
+        open_activity_candidate_ids: Optional[set[int]],
+    ) -> bool:
+        if candidate.id is None:
+            return False
+        if open_activity_candidate_ids is None:
+            return self._has_open_virtual_activity(candidate)
+        return int(candidate.id) in open_activity_candidate_ids
+
+    def _open_virtual_activity_candidate_ids(self) -> Optional[set[int]]:
+        conn = getattr(self.db, "conn", None)
+        if conn is None:
+            return None
+        try:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT candidate_id
+                FROM virtual_positions
+                WHERE candidate_id IS NOT NULL AND closed_at = ''
+                UNION
+                SELECT DISTINCT candidate_id
+                FROM virtual_orders
+                WHERE candidate_id IS NOT NULL AND status = ?
+                """,
+                (VirtualOrderStatus.SUBMITTED.value,),
+            ).fetchall()
+        except Exception:
+            return None
+        result: set[int] = set()
+        for row in rows:
+            candidate_id = row["candidate_id"] if hasattr(row, "keys") else row[0]
+            if candidate_id is not None:
+                result.add(int(candidate_id))
+        return result
 
     def _has_unfinished_virtual_activity(self, candidate: Candidate) -> bool:
         if candidate.id is None:
@@ -2690,7 +2891,7 @@ class StrategyRuntime:
         snapshot: StrategyRuntimeSnapshot,
         current: datetime,
         trade_date: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         try:
             report = build_readiness_report(
                 self.db,
@@ -2708,7 +2909,32 @@ class StrategyRuntime:
             )
         except Exception as exc:
             snapshot.warnings.append(f"READINESS_REPORT_FAILED:{exc}")
-            return
+            return False
+        self._apply_readiness_report(snapshot, report)
+        return True
+
+    def _apply_cached_readiness_snapshot(self, snapshot: StrategyRuntimeSnapshot) -> bool:
+        report = self.readiness_report
+        if report is None:
+            return False
+        market_session_status = snapshot.market_session_status
+        data_warmup_status = snapshot.data_warmup_status
+        gate_skip_reason = snapshot.gate_skip_reason
+        selected_count = snapshot.candidate_subscription_selected_count
+        skipped_discovery_count = snapshot.candidate_subscription_skipped_discovery_count
+        skipped_unmapped_count = snapshot.candidate_subscription_skipped_unmapped_count
+        self._apply_readiness_report(snapshot, report)
+        snapshot.market_session_status = market_session_status
+        snapshot.data_warmup_status = data_warmup_status
+        snapshot.gate_skip_reason = gate_skip_reason
+        snapshot.candidate_subscription_selected_count = selected_count
+        snapshot.candidate_subscription_skipped_discovery_count = skipped_discovery_count
+        snapshot.candidate_subscription_skipped_unmapped_count = skipped_unmapped_count
+        if gate_skip_reason:
+            snapshot.warnings = dedupe_warnings(list(snapshot.warnings) + [gate_skip_reason])
+        return True
+
+    def _apply_readiness_report(self, snapshot: StrategyRuntimeSnapshot, report: ReadinessReport) -> None:
         self.readiness_report = report
         if report.unresolved_condition_profiles_count <= 0:
             snapshot.warnings = _without_resolved_condition_warnings(snapshot.warnings)

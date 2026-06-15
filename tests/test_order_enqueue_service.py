@@ -70,6 +70,94 @@ def test_api_dry_run_order_creates_intent_without_gateway_command(tmp_path, monk
     assert snapshot["dry_run_orders"]["summary"]["total"] == 1
 
 
+def test_api_dry_run_order_sizes_down_instead_of_rejecting_amount_limit(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+
+    response = client.post(
+        "/api/orders/enqueue",
+        json=_order_payload(idempotency_key="sized-down", code="096770", quantity=53, price=113000),
+        headers=HEADERS,
+    )
+    payload = response.json()
+
+    assert payload["accepted"] is True
+    assert payload["status"] == "DRY_RUN_ACCEPTED"
+    assert payload["request"]["quantity"] == 26
+    assert payload["request"]["price"] == 113000
+
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        row = db.get_runtime_order_intent(payload["intent_id"])
+    finally:
+        db.close()
+    assert row["status"] == "DRY_RUN_ACCEPTED"
+    assert row["quantity"] == 26
+    assert row["order_amount"] == 2_938_000
+    assert row["safety"]["ok"] is True
+    assert row["metadata"]["dry_run_quantity_adjusted_by_order_amount_limit"] is True
+    assert row["metadata"]["dry_run_original_quantity"] == 53
+    assert row["metadata"]["dry_run_original_order_amount"] == 5_989_000
+    assert row["metadata"]["dry_run_adjusted_quantity"] == 26
+    assert row["metadata"]["dry_run_adjusted_order_amount"] == 2_938_000
+    validation = row["metadata"]["strategy_validation"]
+    assert validation["execution_decision"] == "SIZED_DOWN"
+    assert validation["hypothetical_qty"] == 53
+    assert validation["actual_qty"] == 26
+
+
+def test_api_dry_run_sized_order_can_retry_prior_amount_limit_rejection(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path, monkeypatch)
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        db.save_runtime_order_intent(
+            {
+                "intent_id": "old-rejected",
+                "trade_date": "2026-06-15",
+                "source": "themelab_flow",
+                "mode": "DRY_RUN",
+                "dry_run": True,
+                "status": "DRY_RUN_REJECTED",
+                "reason": "ORDER_AMOUNT_LIMIT",
+                "account": "dryrun-account",
+                "code": "096770",
+                "side": "buy",
+                "quantity": 53,
+                "price": 113000,
+                "order_amount": 5_989_000,
+                "order_type": 1,
+                "hoga": "00",
+                "tag": "DRY",
+                "order_phase": "entry",
+                "idempotency_key": "retry-sized",
+                "dedupe_key": "old-original-quantity-dedupe",
+                "safety": {"ok": False, "reason": "ORDER_AMOUNT_LIMIT"},
+                "created_at": "2026-06-15T01:10:06+00:00",
+                "updated_at": "2026-06-15T01:10:06+00:00",
+            }
+        )
+    finally:
+        db.close()
+
+    payload = client.post(
+        "/api/orders/enqueue",
+        json=_order_payload(idempotency_key="retry-sized", code="096770", quantity=53, price=113000),
+        headers=HEADERS,
+    ).json()
+
+    assert payload["accepted"] is True
+    assert payload["status"] == "DRY_RUN_ACCEPTED"
+    assert payload["duplicate_of"] == ""
+    assert payload["intent_id"] != "old-rejected"
+
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        row = db.get_runtime_order_intent(payload["intent_id"])
+    finally:
+        db.close()
+    assert row["quantity"] == 26
+    assert row["metadata"]["dry_run_quantity_adjusted_by_order_amount_limit"] is True
+
+
 def test_api_dry_run_order_duplicate_survives_core_reload(tmp_path, monkeypatch):
     client, api = _client(tmp_path, monkeypatch)
 

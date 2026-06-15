@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, Callable
 
 from storage.db import TradingDatabase
@@ -177,7 +178,7 @@ def _theme_lab_shadow_ab_provider(
     if str(policy.get("enabled") or "").strip().lower() not in {"1", "true", "yes", "on"}:
         return None
 
-    def provider(trade_date: str) -> dict[str, Any]:
+    def load_report(trade_date: str) -> dict[str, Any]:
         from trading_app.theme_lab_gate_reason_outcomes import ThemeLabGateReasonOutcomeAnalyzer
 
         configured_date = str(policy.get("report_trade_date") or "").strip()
@@ -187,7 +188,7 @@ def _theme_lab_shadow_ab_provider(
             limit=10_000,
         )
 
-    return provider
+    return _cached_report_provider(load_report, ttl_sec=_provider_cache_ttl_sec(policy, default=300))
 
 
 def _shadow_small_entry_promotion_provider(
@@ -198,7 +199,7 @@ def _shadow_small_entry_promotion_provider(
     if str(policy.get("enabled", True)).strip().lower() not in {"1", "true", "yes", "on"}:
         return None
 
-    def provider(trade_date: str) -> dict[str, Any]:
+    def load_report(trade_date: str) -> dict[str, Any]:
         from trading_app.shadow_small_entry_promotion import ShadowSmallEntryPromotionAnalyzer
 
         return ShadowSmallEntryPromotionAnalyzer(db, settings=runtime_settings).load_evidence(
@@ -206,7 +207,37 @@ def _shadow_small_entry_promotion_provider(
             limit=50_000,
         )
 
+    return _cached_report_provider(load_report, ttl_sec=_provider_cache_ttl_sec(policy, default=300))
+
+
+def _cached_report_provider(
+    loader: Callable[[str], dict[str, Any]],
+    *,
+    ttl_sec: int,
+) -> Callable[[str], dict[str, Any]]:
+    cache: dict[str, tuple[float, dict[str, Any]]] = {}
+    ttl = max(0, int(ttl_sec or 0))
+
+    def provider(trade_date: str) -> dict[str, Any]:
+        key = str(trade_date or "")
+        now = perf_counter()
+        cached = cache.get(key)
+        if ttl > 0 and cached is not None and now - cached[0] <= ttl:
+            return dict(cached[1])
+        payload = dict(loader(trade_date) or {})
+        if ttl > 0:
+            cache[key] = (perf_counter(), payload)
+        return dict(payload)
+
     return provider
+
+
+def _provider_cache_ttl_sec(policy: dict[str, Any], *, default: int) -> int:
+    raw = policy.get("cache_ttl_sec", policy.get("report_cache_ttl_sec", policy.get("evidence_cache_ttl_sec", default)))
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _build_order_sink(

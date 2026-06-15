@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from time import perf_counter
 from typing import Any, Callable, Iterable, Optional
 
 from trading.strategy.candidates import CandidateLifecycle, is_valid_stock_code, normalize_code
@@ -190,6 +191,8 @@ class ThemeLabBridgeBuildResult:
     gate_results: list[GatePipelineResult]
     candidate_save_count: int = 0
     warnings: list[str] | None = None
+    timings: dict[str, float] = field(default_factory=dict)
+    counters: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -256,61 +259,113 @@ class ThemeLabDryRunLifecycleBridge:
         trade_date: str,
         now: datetime,
     ) -> ThemeLabBridgeBuildResult:
+        total_started = perf_counter()
+        timings: dict[str, float] = {}
+        counters: dict[str, int] = {}
+
+        def timed(label: str, callback):
+            started = perf_counter()
+            try:
+                return callback()
+            finally:
+                timings[label] = round(timings.get(label, 0.0) + (perf_counter() - started), 6)
+
         warnings: list[str] = []
         candidate_saves = 0
         decision_cycle_id = f"{SOURCE}:{trade_date}:{now.replace(microsecond=0).isoformat()}"
-        watch_by_code = {normalize_code(item.symbol): item for item in result.watchset}
-        themes_by_id = {str(item.theme_id): item for item in result.themes}
+        watch_by_code = timed("index_watchset", lambda: {normalize_code(item.symbol): item for item in result.watchset})
+        themes_by_id = timed("index_themes", lambda: {str(item.theme_id): item for item in result.themes})
         gate_results: list[GatePipelineResult] = []
-        shadow_policy = self._shadow_small_entry_policy(trade_date)
-        promotion_evidence = self._shadow_small_entry_promotion_evidence(trade_date)
+        shadow_policy = timed("shadow_small_entry_policy", lambda: self._shadow_small_entry_policy(trade_date))
+        promotion_evidence = timed("shadow_small_entry_promotion_evidence", lambda: self._shadow_small_entry_promotion_evidence(trade_date))
         shadow_promotions = 0
         shadow_max_promotions = int(shadow_policy.get("max_promotions_per_cycle") or 0)
+        candidate_codes = _bridge_candidate_codes(result.gate_decisions, watch_by_code)
+        existing_by_code = timed("prefetch_candidates", lambda: self._load_existing_candidates(trade_date, candidate_codes))
+        counters["decision_count"] = len(result.gate_decisions)
+        counters["watchset_count"] = len(result.watchset)
+        counters["prefetch_candidate_count"] = len(existing_by_code)
 
         for decision in result.gate_decisions:
             code = normalize_code(decision.symbol)
             if not is_valid_stock_code(code):
                 warnings.append(f"THEME_LAB_BRIDGE_INVALID_CODE:{decision.symbol}")
+                counters["invalid_code_count"] = counters.get("invalid_code_count", 0) + 1
                 continue
             watch = watch_by_code.get(code)
             if watch is None:
                 warnings.append(f"THEME_LAB_BRIDGE_WATCHSET_MISSING:{code}")
+                counters["watchset_missing_count"] = counters.get("watchset_missing_count", 0) + 1
                 continue
             theme_id = str(watch.primary_theme or (watch.themes[0] if watch.themes else ""))
             theme = themes_by_id.get(theme_id)
-            candidate, saved = self._ensure_candidate(
-                code,
-                watch,
-                theme,
-                trade_date=trade_date,
-                now=now,
-                decision_cycle_id=decision_cycle_id,
+            candidate, saved = timed(
+                "ensure_candidate",
+                lambda code=code, watch=watch, theme=theme: self._ensure_candidate(
+                    code,
+                    watch,
+                    theme,
+                    trade_date=trade_date,
+                    now=now,
+                    decision_cycle_id=decision_cycle_id,
+                    existing_candidate=existing_by_code.get(code),
+                    existing_loaded=True,
+                ),
             )
+            existing_by_code[code] = candidate
             if saved:
                 candidate_saves += 1
             if candidate.id is None:
                 warnings.append(f"THEME_LAB_BRIDGE_CANDIDATE_ID_MISSING:{code}")
+                counters["candidate_id_missing_count"] = counters.get("candidate_id_missing_count", 0) + 1
                 continue
-            gate_result = self._gate_result(
-                candidate,
-                decision,
-                watch,
-                theme,
-                now,
-                decision_cycle_id=decision_cycle_id,
-                shadow_policy=shadow_policy,
-                shadow_promotion_available=shadow_promotions < shadow_max_promotions,
-                shadow_promotion_evidence=promotion_evidence,
+            gate_result = timed(
+                "gate_result",
+                lambda candidate=candidate, decision=decision, watch=watch, theme=theme: self._gate_result(
+                    candidate,
+                    decision,
+                    watch,
+                    theme,
+                    now,
+                    decision_cycle_id=decision_cycle_id,
+                    shadow_policy=shadow_policy,
+                    shadow_promotion_available=shadow_promotions < shadow_max_promotions,
+                    shadow_promotion_evidence=promotion_evidence,
+                ),
             )
             if gate_result.details.get("shadow_small_entry_dry_run_promoted"):
                 shadow_promotions += 1
             gate_results.append(gate_result)
 
+        counters["candidate_save_count"] = candidate_saves
+        counters["gate_result_count"] = len(gate_results)
+        counters["shadow_promotion_count"] = shadow_promotions
+        timings["total"] = round(perf_counter() - total_started, 6)
         return ThemeLabBridgeBuildResult(
             gate_results=gate_results,
             candidate_save_count=candidate_saves,
             warnings=warnings,
+            timings=timings,
+            counters=counters,
         )
+
+    def _load_existing_candidates(self, trade_date: str, codes: Iterable[str]) -> dict[str, Candidate]:
+        clean_codes = sorted({normalize_code(code) for code in codes if normalize_code(code)})
+        if not clean_codes:
+            return {}
+        loader = getattr(self.db, "load_candidates_by_codes", None)
+        if callable(loader):
+            return {
+                normalize_code(candidate.code): candidate
+                for candidate in loader(trade_date, clean_codes)
+                if normalize_code(candidate.code)
+            }
+        result: dict[str, Candidate] = {}
+        for code in clean_codes:
+            candidate = self.db.load_candidate(trade_date, code)
+            if candidate is not None:
+                result[code] = candidate
+        return result
 
     def _shadow_small_entry_policy(self, trade_date: str) -> dict[str, Any]:
         config = _shadow_small_entry_settings(self.settings)
@@ -342,10 +397,12 @@ class ThemeLabDryRunLifecycleBridge:
         trade_date: str,
         now: datetime,
         decision_cycle_id: str,
+        existing_candidate: Candidate | None = None,
+        existing_loaded: bool = False,
     ) -> tuple[Candidate, bool]:
         now_text = now.replace(microsecond=0).isoformat()
         expires_at = (now.replace(microsecond=0) + timedelta(minutes=self.default_ttl_minutes)).isoformat()
-        existing = self.db.load_candidate(trade_date, code)
+        existing = existing_candidate if existing_loaded else self.db.load_candidate(trade_date, code)
         strategy_profile = _strategy_profile_from_watch(watch, self._latest_tick_metadata(code))
         candidate_market = _candidate_market_for_candidate(watch)
         theme_id = str(watch.primary_theme or (watch.themes[0] if watch.themes else ""))
@@ -631,6 +688,18 @@ class ThemeLabDryRunLifecycleBridge:
     def _latest_tick_metadata(self, code: str) -> dict[str, Any]:
         tick = self.market_data.latest_tick(code) if self.market_data is not None else None
         return dict(tick.metadata or {}) if tick is not None else {}
+
+
+def _bridge_candidate_codes(
+    decisions: Iterable[LabGateDecision],
+    watch_by_code: dict[str, WatchSetSnapshot],
+) -> list[str]:
+    result: list[str] = []
+    for decision in decisions:
+        code = normalize_code(decision.symbol)
+        if is_valid_stock_code(code) and code in watch_by_code and code not in result:
+            result.append(code)
+    return result
 
 
 def _map_decision(

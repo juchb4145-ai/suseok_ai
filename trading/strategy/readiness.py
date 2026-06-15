@@ -12,7 +12,13 @@ from trading.strategy.candidates import (
     candidate_is_discovery_only,
     candidate_quality_status,
 )
-from trading.strategy.models import BlockType, Candidate, CandidateState, StrategyProfile
+from trading.strategy.models import (
+    BlockType,
+    Candidate,
+    CandidateState,
+    StrategyProfile,
+    VirtualOrderStatus,
+)
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
 from trading.theme_engine.models import ThemeStatus
 from trading.theme_engine.repository import ThemeEngineRepository
@@ -145,7 +151,7 @@ def build_readiness_report(
         active_theme_count=len(active_themes),
         watch_theme_count=len(watch_themes),
         candidate_theme_count=len(candidate_themes),
-        theme_active_stock_count=len(theme_universe.build_active_universe()),
+        theme_active_stock_count=_theme_active_stock_count(theme_universe),
         theme_last_sync_at=last_sync.finished_at if last_sync else "",
         top_theme_name=top_theme.theme_name if top_theme else "",
         top_theme_score=top_theme.theme_score if top_theme else 0.0,
@@ -182,6 +188,9 @@ def dedupe_warnings(values) -> list[str]:
 
 
 def _active_candidates(db: "TradingDatabase", trade_date: Optional[str]) -> list[Candidate]:
+    fast_candidates = _active_candidates_from_sql(db, trade_date)
+    if fast_candidates is not None:
+        return fast_candidates
     candidates = db.list_candidates(trade_date=trade_date) if trade_date else db.list_candidates()
     result: list[Candidate] = []
     for candidate in candidates:
@@ -196,6 +205,45 @@ def _active_candidates(db: "TradingDatabase", trade_date: Optional[str]) -> list
         elif _has_open_virtual_activity(db, candidate):
             result.append(candidate)
     return result
+
+
+def _active_candidates_from_sql(db: "TradingDatabase", trade_date: Optional[str]) -> Optional[list[Candidate]]:
+    conn = getattr(db, "conn", None)
+    row_to_candidate = getattr(db, "_row_to_candidate", None)
+    if conn is None or row_to_candidate is None:
+        return None
+    clauses = [
+        """
+        (
+            state IN (?, ?, ?)
+            OR (state = ? AND block_type = ? AND can_recover = 1)
+            OR id IN (
+                SELECT DISTINCT candidate_id
+                FROM virtual_positions
+                WHERE candidate_id IS NOT NULL AND closed_at = ''
+            )
+            OR id IN (
+                SELECT DISTINCT candidate_id
+                FROM virtual_orders
+                WHERE candidate_id IS NOT NULL AND status = ?
+            )
+        )
+        """
+    ]
+    params: list[str] = [
+        CandidateState.DETECTED.value,
+        CandidateState.WATCHING.value,
+        CandidateState.READY.value,
+        CandidateState.BLOCKED.value,
+        BlockType.TEMPORARY.value,
+        VirtualOrderStatus.SUBMITTED.value,
+    ]
+    if trade_date is not None:
+        clauses.insert(0, "trade_date = ?")
+        params.insert(0, trade_date)
+    query = f"SELECT * FROM candidates WHERE {' AND '.join(clauses)} ORDER BY trade_date, code"
+    rows = conn.execute(query, params).fetchall()
+    return [row_to_candidate(row) for row in rows]
 
 
 def _active_theme_presence_by_code(
@@ -232,6 +280,46 @@ def _active_theme_presence_by_code(
         for row in rows:
             result[str(row["stock_code"])] = True
     return result
+
+
+def _theme_active_stock_count(theme_universe: ThemeUniverseBuilder) -> int:
+    fast_count = _theme_active_stock_count_from_sql(theme_universe)
+    if fast_count is not None:
+        return fast_count
+    return len(theme_universe.build_active_universe())
+
+
+def _theme_active_stock_count_from_sql(theme_universe: ThemeUniverseBuilder) -> Optional[int]:
+    repository = getattr(theme_universe, "repository", None)
+    conn = getattr(repository, "conn", None)
+    config = getattr(theme_universe, "config", None)
+    if conn is None or config is None:
+        return None
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM (
+                SELECT m.stock_code
+                FROM theme_membership_current m
+                JOIN canonical_themes c ON c.theme_id = m.theme_id
+                WHERE m.active = 1
+                  AND m.membership_score >= ?
+                  AND c.status IN (?, ?)
+                GROUP BY m.stock_code
+                LIMIT ?
+            )
+            """,
+            (
+                float(config.min_membership_score),
+                ThemeStatus.ACTIVE.value,
+                ThemeStatus.WATCH.value,
+                int(config.max_size),
+            ),
+        ).fetchone()
+    except Exception:
+        return None
+    return int(row["count"] if row else 0)
 
 
 def _has_open_virtual_activity(db: "TradingDatabase", candidate: Candidate) -> bool:

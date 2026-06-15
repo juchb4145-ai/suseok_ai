@@ -4,6 +4,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, time, timedelta
+from time import perf_counter
 from typing import Any, Optional
 
 from trading.strategy.candidates import normalize_code
@@ -274,6 +275,7 @@ class ThemeLabRuntimePipeline:
         self._market_confirmation_metrics: dict[str, Any] = _empty_market_confirmation_metrics()
         self.backfill_service = backfill_service
         self.last_backfill_runtime: dict[str, Any] = {}
+        self.last_pipeline_timings: dict[str, float] = {}
 
     def run_if_due(self, now: datetime) -> Optional[ThemeLabFlowResult]:
         current = now.replace(microsecond=0)
@@ -284,9 +286,19 @@ class ThemeLabRuntimePipeline:
 
     def run(self, now: datetime) -> ThemeLabFlowResult:
         self._warnings = []
-        repository = ThemeEngineRepository(self.db)
-        theme_inputs = self._theme_inputs(repository)
-        snapshots = self._snapshots(theme_inputs)
+        timings: dict[str, float] = {}
+        total_started = perf_counter()
+
+        def timed(label: str, callback):
+            started = perf_counter()
+            try:
+                return callback()
+            finally:
+                timings[label] = round(perf_counter() - started, 6)
+
+        repository = timed("repository", lambda: ThemeEngineRepository(self.db))
+        theme_inputs = timed("theme_inputs", lambda: self._theme_inputs(repository))
+        snapshots = timed("snapshots", lambda: self._snapshots(theme_inputs))
         if not theme_inputs:
             self._warnings.append("THEME_LAB_MAPPING_EMPTY")
         if not snapshots:
@@ -294,23 +306,39 @@ class ThemeLabRuntimePipeline:
         missing_prev_close = [code for code, snapshot in snapshots.items() if not _prev_close(snapshot)]
         if missing_prev_close:
             self._warnings.append("THEME_LAB_PREV_CLOSE_MISSING")
-        metadata_by_symbol = self._metadata_by_symbol(theme_inputs)
-        session = self._market_session_context(now)
+        metadata_by_symbol = timed("metadata_by_symbol", lambda: self._metadata_by_symbol(theme_inputs))
+        session = timed("market_session_context", lambda: self._market_session_context(now))
         self._market_confirmation_metrics = _empty_market_confirmation_metrics()
-        self._restore_confirmation_state_once(now, session=session)
-        result = self.engine.run_pipeline(
-            theme_inputs=theme_inputs,
-            snapshots=snapshots,
-            metadata_by_symbol=metadata_by_symbol,
-            kospi_return_pct=self.market_index_store.state("KOSPI").change_rate,
-            kosdaq_return_pct=self.market_index_store.state("KOSDAQ").change_rate,
-            calculated_at=now.isoformat(),
+        timed("restore_confirmation_state", lambda: self._restore_confirmation_state_once(now, session=session))
+        result = timed(
+            "engine_run_pipeline",
+            lambda: self.engine.run_pipeline(
+                theme_inputs=theme_inputs,
+                snapshots=snapshots,
+                metadata_by_symbol=metadata_by_symbol,
+                kospi_return_pct=self.market_index_store.state("KOSPI").change_rate,
+                kosdaq_return_pct=self.market_index_store.state("KOSDAQ").change_rate,
+                calculated_at=now.isoformat(),
+            ),
         )
-        result = self._persist_confirmation_state(result, now, session=session)
-        result = _annotate_market_session(result, session, self._market_confirmation_metrics)
+        result = timed("persist_confirmation_state", lambda: self._persist_confirmation_state(result, now, session=session))
+        result = timed(
+            "annotate_market_session",
+            lambda: _annotate_market_session(result, session, self._market_confirmation_metrics),
+        )
+        self.last_backfill_runtime = timed("backfill", lambda: self._run_backfill(result, now))
+        result = _annotate_runtime_pipeline_timings(
+            result,
+            timings,
+            total_started,
+            theme_input_count=len(theme_inputs),
+            snapshot_count=len(snapshots),
+            metadata_count=len(metadata_by_symbol),
+        )
         self.last_result = result
-        self.last_backfill_runtime = self._run_backfill(result, now)
-        self._save_result(result, now)
+        timed("save_result", lambda: self._save_result(result, now))
+        timings["total"] = round(perf_counter() - total_started, 6)
+        self.last_pipeline_timings = dict(timings)
         return result
 
     def _session_id(self, now: datetime) -> str:
@@ -960,6 +988,27 @@ def _annotate_market_session(
         gate_decisions=decisions,
         data_quality=data_quality,
     )
+
+
+def _annotate_runtime_pipeline_timings(
+    result: ThemeLabFlowResult,
+    timings: dict[str, float],
+    total_started: float,
+    *,
+    theme_input_count: int,
+    snapshot_count: int,
+    metadata_count: int,
+) -> ThemeLabFlowResult:
+    data_quality = dict(result.data_quality or {})
+    data_quality["runtime_pipeline_timings"] = {
+        str(label): round(float(seconds or 0.0), 6)
+        for label, seconds in timings.items()
+    }
+    data_quality["runtime_pipeline_total_sec"] = round(perf_counter() - total_started, 6)
+    data_quality["runtime_pipeline_theme_input_count"] = int(theme_input_count)
+    data_quality["runtime_pipeline_snapshot_count"] = int(snapshot_count)
+    data_quality["runtime_pipeline_metadata_count"] = int(metadata_count)
+    return replace(result, data_quality=data_quality)
 
 
 def _market_session_fields(session: MarketSessionContext, metrics: dict[str, Any]) -> dict[str, Any]:

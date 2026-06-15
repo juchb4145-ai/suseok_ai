@@ -10,6 +10,7 @@ from trading.broker.command_queue import CommandPriority
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import BrokerExecutionEvent, BrokerOrderRequest, GatewayCommand, new_message_id, utc_timestamp
 from trading.risk.safety_guard import OrderCommandSafetyGuard, OrderSafetyConfig, dedupe_key_for_order_request
+from trading_app.cash_risk_limits import resolve_live_sim_cash_limits
 from trading_app.dependencies import CoreSettings
 from trading_app.schemas import OrderEnqueueRequest
 
@@ -228,6 +229,7 @@ class OrderEnqueueService:
 
     def enqueue_dry_run_order(self, request: RuntimeOrderIntentRequest) -> OrderEnqueueResult:
         broker_request = self._broker_request_from_runtime(request)
+        broker_request, dry_run_sizing = self._apply_dry_run_sizing_cap(request, broker_request)
         idempotency_key = broker_request.idempotency_key or self._runtime_idempotency_key(request, broker_request)
         broker_request = BrokerOrderRequest(
             **{**broker_request.to_dict(), "idempotency_key": idempotency_key}
@@ -238,8 +240,13 @@ class OrderEnqueueService:
 
         db = TradingDatabase(str(self.db_path))
         try:
-            duplicate = db.find_runtime_order_intent_by_idempotency(idempotency_key) or db.find_runtime_order_intent_by_dedupe(dedupe_key)
-            response_request = {**broker_request.to_dict(), **request.to_dict()}
+            idempotency_duplicate = db.find_runtime_order_intent_by_idempotency(idempotency_key)
+            dedupe_duplicate = db.find_runtime_order_intent_by_dedupe(dedupe_key)
+            if _dry_run_amount_limit_duplicate_replayable(idempotency_duplicate, dry_run_sizing):
+                duplicate = dedupe_duplicate
+            else:
+                duplicate = idempotency_duplicate or dedupe_duplicate
+            response_request = {**request.to_dict(), **broker_request.to_dict()}
             if duplicate is not None:
                 db.append_runtime_order_intent_event(
                     str(duplicate.get("intent_id") or ""),
@@ -285,12 +292,13 @@ class OrderEnqueueService:
             reason = "DRY_RUN_ORDER_INTENT_RECORDED" if decision_safety.ok else _dry_run_reject_reason(request, decision_safety.reason)
             intent_id = new_message_id("intent")
             metadata = {
-                **dict(request.metadata or {}),
+                **dict(broker_request.metadata or {}),
                 "runtime_cycle_at": request.runtime_cycle_at,
                 "gate_score": request.gate_score,
                 "hybrid_score": request.hybrid_score,
                 "theme_name": request.theme_name,
                 "theme_score": request.theme_score,
+                **({"dry_run_sizing": dry_run_sizing} if dry_run_sizing else {}),
             }
             record = {
                 "intent_id": intent_id,
@@ -400,6 +408,12 @@ class OrderEnqueueService:
         trade_date = self._trade_date(request, now)
         gateway_status = self.gateway_state.snapshot().to_dict()
         broker_request = self._broker_request_from_runtime_live_sim(request, gateway_status=gateway_status)
+        broker_request, cash_sizing = self._apply_live_sim_cash_sizing(
+            request,
+            broker_request,
+            execution=execution,
+            gateway_status=gateway_status,
+        )
         (
             request,
             broker_request,
@@ -426,6 +440,7 @@ class OrderEnqueueService:
             dedupe_key=dedupe_key,
             reason_codes=[],
             details={
+                **({"cash_sizing": cash_sizing} if cash_sizing else {}),
                 "account_guard": account_guard,
                 "execution_config": _public_execution_config(execution),
                 "exit_guard": exit_guard,
@@ -528,7 +543,15 @@ class OrderEnqueueService:
                 )
 
             duplicate_command = self.gateway_state.has_duplicate(dedupe_key)
-            live_safety = self._live_sim_guard(execution).validate(
+            live_safety = self._live_sim_guard(
+                execution,
+                max_order_amount=self._live_sim_safety_max_order_amount(
+                    request,
+                    broker_request,
+                    execution=execution,
+                    gateway_status=gateway_status,
+                ),
+            ).validate(
                 broker_request,
                 gateway_status=gateway_status,
                 existing_order_command_count=self._order_command_count(
@@ -1365,6 +1388,69 @@ class OrderEnqueueService:
             },
         )
 
+    def _apply_dry_run_sizing_cap(
+        self,
+        request: RuntimeOrderIntentRequest,
+        broker_request: BrokerOrderRequest,
+    ) -> tuple[BrokerOrderRequest, dict[str, Any]]:
+        if str(broker_request.side or "").lower() != "buy":
+            return broker_request, {}
+        quantity = int(broker_request.quantity or 0)
+        price = max(0, int(broker_request.price or 0))
+        max_amount = int(self.settings.max_order_amount or 0)
+        if quantity <= 0 or price <= 0 or max_amount <= 0:
+            return broker_request, {}
+        original_amount = quantity * price
+        if original_amount <= max_amount:
+            return broker_request, {}
+
+        adjusted_quantity = max_amount // price
+        if adjusted_quantity <= 0 or adjusted_quantity >= quantity:
+            return broker_request, {}
+
+        adjusted_amount = adjusted_quantity * price
+        sizing = {
+            "quantity_adjusted": True,
+            "source": "dry_run_order_amount_sizing_cap",
+            "max_order_amount_krw": max_amount,
+            "original_quantity": quantity,
+            "original_order_amount": original_amount,
+            "adjusted_quantity": adjusted_quantity,
+            "adjusted_order_amount": adjusted_amount,
+            "price": price,
+        }
+        metadata = {
+            **dict(broker_request.metadata or {}),
+            "dry_run_quantity_adjusted_by_order_amount_limit": True,
+            "dry_run_original_quantity": quantity,
+            "dry_run_original_order_amount": original_amount,
+            "dry_run_adjusted_quantity": adjusted_quantity,
+            "dry_run_adjusted_order_amount": adjusted_amount,
+            "dry_run_order_amount_limit_krw": max_amount,
+            "strategy_validation": _strategy_validation_payload(
+                request,
+                BrokerOrderRequest(
+                    **{
+                        **broker_request.to_dict(),
+                        "quantity": adjusted_quantity,
+                    }
+                ),
+                execution_decision="SIZED_DOWN",
+                block_reason="",
+                details=sizing,
+            ),
+        }
+        return (
+            BrokerOrderRequest(
+                **{
+                    **broker_request.to_dict(),
+                    "quantity": adjusted_quantity,
+                    "metadata": metadata,
+                }
+            ),
+            sizing,
+        )
+
     def _broker_request_from_runtime_live_sim(
         self,
         request: RuntimeOrderIntentRequest,
@@ -1474,12 +1560,12 @@ class OrderEnqueueService:
             )
         )
 
-    def _live_sim_guard(self, execution: dict[str, Any]) -> OrderCommandSafetyGuard:
+    def _live_sim_guard(self, execution: dict[str, Any], *, max_order_amount: int | None = None) -> OrderCommandSafetyGuard:
         return OrderCommandSafetyGuard(
             OrderSafetyConfig(
                 mode="LIVE",
                 live_order_enabled=True,
-                max_order_amount=int(execution.get("max_order_amount_krw") or self.settings.max_order_amount),
+                max_order_amount=int(max_order_amount or execution.get("max_order_amount_krw") or self.settings.max_order_amount),
                 max_daily_orders_per_code=int(execution.get("max_orders_per_day") or self.settings.max_daily_orders_per_code),
                 allow_zero_price=False,
                 limit_sell_amount=False,
@@ -1527,33 +1613,58 @@ class OrderEnqueueService:
             return "PRICE_INVALID_OR_MARKET_ORDER_UNSUPPORTED", ["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD"], {"hoga": broker_request.hoga, "price": broker_request.price}
         amount = int(broker_request.quantity or 0) * max(0, int(broker_request.price or 0))
         min_amount = int(execution.get("min_order_amount_krw") or 0)
-        max_amount = int(execution.get("max_order_amount_krw") or self.settings.max_order_amount)
-        early_small_cap_applied = False
-        if broker_request.side == "buy" and (_is_ready_early_small(request) or _is_ready_shadow_small_entry(request)):
-            multiplier = float(execution.get("early_small_max_order_amount_multiplier") or 0.5)
-            if _is_ready_shadow_small_entry(request):
-                metadata_multiplier = (request.metadata or {}).get("shadow_small_entry_position_size_multiplier")
-                multiplier = float(metadata_multiplier or execution.get("shadow_small_entry_max_order_amount_multiplier") or multiplier)
-            multiplier = min(1.0, max(0.0, multiplier))
-            max_amount = max(1, int(max_amount * multiplier))
-            early_small_cap_applied = True
+        amount_limit = self._live_sim_order_amount_limit(
+            request,
+            broker_request,
+            execution=execution,
+            gateway_status=gateway_status,
+        )
+        max_amount = int(amount_limit["max_order_amount_krw"] or 0)
         if broker_request.side == "buy" and min_amount > 0 and amount < min_amount:
             return "ORDER_AMOUNT_BELOW_MIN", ["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD"], {"amount": amount, "min_order_amount_krw": min_amount}
         if broker_request.side == "buy" and amount > max_amount:
-            return (
-                "ORDER_AMOUNT_LIMIT",
-                ["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD"],
-                {
-                    "amount": amount,
-                    "max_order_amount_krw": max_amount,
-                    "early_small_cap_applied": early_small_cap_applied,
-                },
-            )
+            if self._live_sim_min_lot_exception_applies(broker_request, amount_limit):
+                broker_request.metadata.setdefault("live_sim_min_lot_exception_applied", True)
+                broker_request.metadata.setdefault("live_sim_cash_risk_limits", amount_limit)
+            else:
+                validation = _strategy_validation_payload(
+                    request,
+                    broker_request,
+                    execution_decision="BLOCKED",
+                    block_reason="ORDER_AMOUNT_LIMIT",
+                    details={"amount": amount, "max_order_amount_krw": max_amount, "amount_limit": amount_limit},
+                )
+                broker_request.metadata.setdefault("strategy_validation", validation)
+                return (
+                    "ORDER_AMOUNT_LIMIT",
+                    ["LIVE_SIM_ORDER_BLOCKED_ACCOUNT_GUARD"],
+                    {
+                        "amount": amount,
+                        "max_order_amount_krw": max_amount,
+                        "early_small_cap_applied": bool(amount_limit.get("early_small_cap_applied")),
+                        "amount_limit": amount_limit,
+                        "strategy_validation": validation,
+                    },
+                )
         gate_reason = _runtime_gate_block_reason(request)
         if gate_reason:
             return gate_reason, [gate_reason], {"metadata": dict(request.metadata or {}), "gate_status": request.gate_status}
         if broker_request.side == "buy":
-            shadow_reason, shadow_codes, shadow_details = self._live_sim_shadow_small_entry_block(request, broker_request, trade_date=self._trade_date(request, str(self.clock())))
+            exposure_reason, exposure_codes, exposure_details = self._live_sim_cash_exposure_block(
+                request,
+                broker_request,
+                execution=execution,
+                gateway_status=gateway_status,
+            )
+            if exposure_reason:
+                return exposure_reason, exposure_codes, exposure_details
+            shadow_reason, shadow_codes, shadow_details = self._live_sim_shadow_small_entry_block(
+                request,
+                broker_request,
+                trade_date=self._trade_date(request, str(self.clock())),
+                execution=execution,
+                gateway_status=gateway_status,
+            )
             if shadow_reason:
                 return shadow_reason, shadow_codes, shadow_details
             lifecycle_reason, lifecycle_codes, lifecycle_details = self._live_sim_buy_lifecycle_block(
@@ -1582,6 +1693,250 @@ class OrderEnqueueService:
             return db.live_sim_summary(trade_date=_kst_trade_date(str(self.clock())))
         finally:
             db.close()
+
+    def _live_sim_order_amount_limit(
+        self,
+        request: RuntimeOrderIntentRequest,
+        broker_request: BrokerOrderRequest,
+        *,
+        execution: dict[str, Any],
+        gateway_status: dict[str, Any],
+    ) -> dict[str, Any]:
+        cash_limits = resolve_live_sim_cash_limits(execution, gateway_status)
+        if cash_limits.get("enabled") and int(cash_limits.get("per_order_amount_krw") or 0) > 0:
+            max_amount = int(cash_limits.get("per_order_amount_krw") or 0)
+            source = "cash_based_per_order_limit"
+        else:
+            max_amount = int(execution.get("max_order_amount_krw") or self.settings.max_order_amount)
+            source = "fixed_max_order_amount"
+
+        early_small_cap_applied = False
+        multiplier = 1.0
+        if broker_request.side == "buy" and (_is_ready_early_small(request) or _is_ready_shadow_small_entry(request)):
+            multiplier = float(execution.get("early_small_max_order_amount_multiplier") or 0.5)
+            if _is_ready_shadow_small_entry(request):
+                metadata_multiplier = (request.metadata or {}).get("shadow_small_entry_position_size_multiplier")
+                multiplier = float(metadata_multiplier or execution.get("shadow_small_entry_max_order_amount_multiplier") or multiplier)
+            multiplier = min(1.0, max(0.0, multiplier))
+            max_amount = max(1, int(max_amount * multiplier))
+            early_small_cap_applied = True
+
+        return {
+            "max_order_amount_krw": max_amount,
+            "source": source,
+            "early_small_cap_applied": early_small_cap_applied,
+            "position_size_multiplier": multiplier,
+            "cash_limits": cash_limits,
+        }
+
+    def _apply_live_sim_cash_sizing(
+        self,
+        request: RuntimeOrderIntentRequest,
+        broker_request: BrokerOrderRequest,
+        *,
+        execution: dict[str, Any],
+        gateway_status: dict[str, Any],
+    ) -> tuple[BrokerOrderRequest, dict[str, Any]]:
+        if str(broker_request.side or "").lower() != "buy":
+            return broker_request, {}
+        amount_limit = self._live_sim_order_amount_limit(
+            request,
+            broker_request,
+            execution=execution,
+            gateway_status=gateway_status,
+        )
+        cash_limits = dict(amount_limit.get("cash_limits") or {})
+        if not cash_limits.get("enabled") or not _boolish(execution.get("cash_based_auto_size_enabled"), True):
+            return broker_request, amount_limit if cash_limits.get("enabled") else {}
+
+        quantity = int(broker_request.quantity or 0)
+        price = max(0, int(broker_request.price or 0))
+        if quantity <= 0 or price <= 0:
+            return broker_request, amount_limit
+
+        original_amount = quantity * price
+        max_amount = int(amount_limit.get("max_order_amount_krw") or 0)
+        target_quantity = max_amount // price if max_amount > 0 else 0
+        exception_applied = False
+        if target_quantity < 1 and self._live_sim_min_lot_exception_allowed(price, amount_limit):
+            target_quantity = 1
+            exception_applied = True
+
+        metadata = {
+            **dict(broker_request.metadata or {}),
+            "live_sim_cash_risk_limits": amount_limit,
+            "live_sim_original_quantity": quantity,
+            "live_sim_original_order_amount": original_amount,
+        }
+        if target_quantity <= 0 or target_quantity >= quantity:
+            return BrokerOrderRequest(**{**broker_request.to_dict(), "metadata": metadata}), amount_limit
+
+        adjusted_amount = target_quantity * price
+        metadata.update(
+            {
+                "live_sim_quantity_adjusted_by_cash_limit": True,
+                "live_sim_adjusted_quantity": target_quantity,
+                "live_sim_adjusted_order_amount": adjusted_amount,
+                "live_sim_min_lot_exception_applied": exception_applied,
+            }
+        )
+        adjusted = BrokerOrderRequest(
+            **{
+                **broker_request.to_dict(),
+                "quantity": target_quantity,
+                "metadata": metadata,
+            }
+        )
+        adjusted.metadata["strategy_validation"] = _strategy_validation_payload(
+            request,
+            adjusted,
+            execution_decision="SIZED_DOWN",
+            block_reason="",
+            details={
+                "original_quantity": quantity,
+                "original_order_amount": original_amount,
+                "adjusted_quantity": target_quantity,
+                "adjusted_order_amount": adjusted_amount,
+                "amount_limit": amount_limit,
+            },
+        )
+        return adjusted, {**amount_limit, "quantity_adjusted": True, "adjusted_quantity": target_quantity}
+
+    def _live_sim_safety_max_order_amount(
+        self,
+        request: RuntimeOrderIntentRequest,
+        broker_request: BrokerOrderRequest,
+        *,
+        execution: dict[str, Any],
+        gateway_status: dict[str, Any],
+    ) -> int:
+        amount_limit = self._live_sim_order_amount_limit(
+            request,
+            broker_request,
+            execution=execution,
+            gateway_status=gateway_status,
+        )
+        max_amount = int(amount_limit.get("max_order_amount_krw") or 0)
+        amount = int(broker_request.quantity or 0) * max(0, int(broker_request.price or 0))
+        if amount > max_amount and self._live_sim_min_lot_exception_applies(broker_request, amount_limit):
+            return amount
+        return max_amount
+
+    @staticmethod
+    def _live_sim_min_lot_exception_allowed(price: int, amount_limit: dict[str, Any]) -> bool:
+        cash_limits = dict(amount_limit.get("cash_limits") or {})
+        return (
+            bool(cash_limits.get("enabled"))
+            and bool(cash_limits.get("min_lot_exception_enabled"))
+            and int(price or 0) > 0
+            and int(price or 0) <= int(cash_limits.get("min_lot_exception_amount_krw") or 0)
+        )
+
+    def _live_sim_min_lot_exception_applies(
+        self,
+        broker_request: BrokerOrderRequest,
+        amount_limit: dict[str, Any],
+    ) -> bool:
+        return (
+            str(broker_request.side or "").lower() == "buy"
+            and int(broker_request.quantity or 0) == 1
+            and self._live_sim_min_lot_exception_allowed(int(broker_request.price or 0), amount_limit)
+        )
+
+    def _live_sim_cash_exposure_block(
+        self,
+        request: RuntimeOrderIntentRequest,
+        broker_request: BrokerOrderRequest,
+        *,
+        execution: dict[str, Any],
+        gateway_status: dict[str, Any],
+    ) -> tuple[str, list[str], dict[str, Any]]:
+        cash_limits = resolve_live_sim_cash_limits(execution, gateway_status)
+        if not cash_limits.get("enabled"):
+            return "", [], {}
+        order_amount = int(broker_request.quantity or 0) * max(0, int(broker_request.price or 0))
+        if order_amount <= 0:
+            return "", [], {}
+
+        account_id_masked = _mask_account(str(broker_request.account or ""))
+        open_statuses = {"OPEN", "PARTIAL", "EXIT_ORDERED", "EXIT_SUBMITTING", "RECONCILE_REQUIRED"}
+        db = TradingDatabase(str(self.db_path))
+        try:
+            positions = [
+                position
+                for position in db.list_live_sim_positions(limit=1000)
+                if str(position.get("status") or "") in open_statuses
+                and (not account_id_masked or str(position.get("account_id_masked") or "") == account_id_masked)
+            ]
+        finally:
+            db.close()
+
+        total_exposure = sum(_live_sim_position_notional(position) for position in positions)
+        symbol_exposure = sum(
+            _live_sim_position_notional(position)
+            for position in positions
+            if str(position.get("code") or "") == broker_request.code
+        )
+        total_limit = int(cash_limits.get("total_exposure_amount_krw") or 0)
+        symbol_limit = int(cash_limits.get("per_symbol_exposure_amount_krw") or 0)
+
+        if total_limit > 0 and total_exposure + order_amount > total_limit:
+            validation = _strategy_validation_payload(
+                request,
+                broker_request,
+                execution_decision="BLOCKED",
+                block_reason="LIVE_SIM_TOTAL_EXPOSURE_LIMIT",
+                details={
+                    "existing_total_exposure_krw": total_exposure,
+                    "order_amount_krw": order_amount,
+                    "projected_total_exposure_krw": total_exposure + order_amount,
+                    "total_exposure_limit_krw": total_limit,
+                    "cash_limits": cash_limits,
+                },
+            )
+            broker_request.metadata.setdefault("strategy_validation", validation)
+            return (
+                "LIVE_SIM_TOTAL_EXPOSURE_LIMIT",
+                ["LIVE_SIM_TOTAL_EXPOSURE_LIMIT"],
+                {
+                    "existing_total_exposure_krw": total_exposure,
+                    "order_amount_krw": order_amount,
+                    "projected_total_exposure_krw": total_exposure + order_amount,
+                    "total_exposure_limit_krw": total_limit,
+                    "cash_limits": cash_limits,
+                    "strategy_validation": validation,
+                },
+            )
+
+        if symbol_limit > 0 and symbol_exposure + order_amount > symbol_limit:
+            validation = _strategy_validation_payload(
+                request,
+                broker_request,
+                execution_decision="BLOCKED",
+                block_reason="LIVE_SIM_SYMBOL_EXPOSURE_LIMIT",
+                details={
+                    "existing_symbol_exposure_krw": symbol_exposure,
+                    "order_amount_krw": order_amount,
+                    "projected_symbol_exposure_krw": symbol_exposure + order_amount,
+                    "symbol_exposure_limit_krw": symbol_limit,
+                    "cash_limits": cash_limits,
+                },
+            )
+            broker_request.metadata.setdefault("strategy_validation", validation)
+            return (
+                "LIVE_SIM_SYMBOL_EXPOSURE_LIMIT",
+                ["LIVE_SIM_SYMBOL_EXPOSURE_LIMIT"],
+                {
+                    "existing_symbol_exposure_krw": symbol_exposure,
+                    "order_amount_krw": order_amount,
+                    "projected_symbol_exposure_krw": symbol_exposure + order_amount,
+                    "symbol_exposure_limit_krw": symbol_limit,
+                    "cash_limits": cash_limits,
+                    "strategy_validation": validation,
+                },
+            )
+
+        return "", [], {}
 
     def _apply_live_sim_exit_position_quantity(
         self,
@@ -1845,6 +2200,8 @@ class OrderEnqueueService:
         broker_request: BrokerOrderRequest,
         *,
         trade_date: str,
+        execution: dict[str, Any],
+        gateway_status: dict[str, Any],
     ) -> tuple[str, list[str], dict[str, Any]]:
         if not _is_ready_shadow_small_entry(request):
             return "", [], {}
@@ -1871,7 +2228,12 @@ class OrderEnqueueService:
             return "SHADOW_SMALL_ENTRY_MAX_PER_CYCLE_EXCEEDED", ["SHADOW_SMALL_ENTRY_MAX_PER_CYCLE_EXCEEDED"], {"max_per_cycle": max_per_cycle}
         max_day = int(metadata.get("shadow_small_entry_max_promotions_per_day") or 3)
         max_code_day = int(metadata.get("shadow_small_entry_max_promotions_per_code_per_day") or 1)
-        max_notional_day = int(metadata.get("shadow_small_entry_max_notional_per_day") or 300000)
+        cash_limits = resolve_live_sim_cash_limits(execution, gateway_status)
+        max_notional_day = (
+            int(cash_limits.get("daily_turnover_amount_krw") or 0)
+            if cash_limits.get("enabled")
+            else int(metadata.get("shadow_small_entry_max_notional_per_day") or 300000)
+        )
         db = TradingDatabase(str(self.db_path))
         try:
             day_orders = [
@@ -1888,10 +2250,28 @@ class OrderEnqueueService:
             return "SHADOW_SMALL_ENTRY_CODE_ALREADY_PROMOTED", ["SHADOW_SMALL_ENTRY_CODE_ALREADY_PROMOTED"], {"used": len(code_orders), "max_code_day": max_code_day}
         notional = sum(int(order.get("submitted_qty") or order.get("requested_qty") or 0) * max(0, int(order.get("submitted_price") or order.get("requested_price") or 0)) for order in day_orders)
         if max_notional_day > 0 and notional + amount > max_notional_day:
+            validation = _strategy_validation_payload(
+                request,
+                broker_request,
+                execution_decision="BLOCKED",
+                block_reason="SHADOW_SMALL_ENTRY_NOTIONAL_LIMIT_EXCEEDED",
+                details={
+                    "used_notional": notional,
+                    "order_amount": amount,
+                    "max_notional_day": max_notional_day,
+                    "cash_limits": cash_limits,
+                },
+            )
             return (
                 "SHADOW_SMALL_ENTRY_NOTIONAL_LIMIT_EXCEEDED",
                 ["SHADOW_SMALL_ENTRY_NOTIONAL_LIMIT_EXCEEDED"],
-                {"used_notional": notional, "order_amount": amount, "max_notional_day": max_notional_day},
+                {
+                    "used_notional": notional,
+                    "order_amount": amount,
+                    "max_notional_day": max_notional_day,
+                    "cash_limits": cash_limits,
+                    "strategy_validation": validation,
+                },
             )
         return "", [], {}
 
@@ -1975,6 +2355,18 @@ def _dry_run_reject_reason(request: RuntimeOrderIntentRequest, fallback: str) ->
     if fallback == "QUANTITY_INVALID" and quantity_reason in {"QUANTITY_ZERO", "QUANTITY_BELOW_MIN"}:
         return quantity_reason
     return fallback
+
+
+def _dry_run_amount_limit_duplicate_replayable(
+    duplicate: dict[str, Any] | None,
+    dry_run_sizing: dict[str, Any],
+) -> bool:
+    if not duplicate or not dry_run_sizing.get("quantity_adjusted"):
+        return False
+    return (
+        str(duplicate.get("status") or "") == DRY_RUN_REJECTED
+        and str(duplicate.get("reason") or "") == "ORDER_AMOUNT_LIMIT"
+    )
 
 
 def _live_sim_account_guard(
@@ -2082,6 +2474,53 @@ def _normalize_broker_env(value: Any) -> str:
     if "실전" in str(value) or "실계좌" in str(value):
         return "REAL"
     return "UNKNOWN"
+
+
+def _live_sim_position_notional(position: dict[str, Any]) -> int:
+    quantity = max(0, int(position.get("current_qty") or 0))
+    price = max(0, int(position.get("entry_avg_price") or 0))
+    return quantity * price
+
+
+def _strategy_validation_payload(
+    request: RuntimeOrderIntentRequest,
+    broker_request: BrokerOrderRequest,
+    *,
+    execution_decision: str,
+    block_reason: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    amount = int(broker_request.quantity or 0) * max(0, int(broker_request.price or 0))
+    original_quantity = int((request.metadata or {}).get("live_sim_original_quantity") or request.quantity or broker_request.quantity or 0)
+    original_amount = original_quantity * max(0, int(request.price or broker_request.price or 0))
+    return {
+        "signal_decision": "PASS" if str(request.gate_status or "").upper() in {"READY", "PASS", "PROMOTED"} else str(request.gate_status or "UNKNOWN"),
+        "execution_decision": execution_decision,
+        "block_reason": block_reason,
+        "counterfactual_tracking_required": execution_decision in {"BLOCKED", "SIZED_DOWN"},
+        "hypothetical_qty": original_quantity,
+        "hypothetical_entry_price": int(request.price or broker_request.price or 0),
+        "hypothetical_order_amount": original_amount,
+        "actual_qty": int(broker_request.quantity or 0),
+        "actual_order_amount": amount,
+        "candidate_id": request.candidate_id,
+        "virtual_order_id": request.virtual_order_id,
+        "candidate_instance_id": str((request.metadata or {}).get("candidate_instance_id") or ""),
+        "details": dict(details or {}),
+    }
+
+
+def _boolish(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
 
 
 def _runtime_gate_block_reason(request: RuntimeOrderIntentRequest) -> str:

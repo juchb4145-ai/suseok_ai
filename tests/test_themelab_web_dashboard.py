@@ -195,6 +195,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#themelab-shadow-small-entry-pilot-status") is not None
     assert soup.select_one("#themelab-shadow-small-entry-pilot-status").get_text(strip=True) == "데이터 없음"
     assert soup.select_one("#themelab-shadow-small-entry-pilot-message") is not None
+    assert "아직 파일럿을 시작한 기록이 없습니다" in soup.select_one("#themelab-shadow-small-entry-pilot-message").get_text(strip=True)
     assert soup.select_one("#themelab-shadow-small-entry-pilot-candidate-count") is not None
     assert soup.select_one("#themelab-shadow-small-entry-pilot-safety-lines") is not None
     assert soup.select_one("#themelab-shadow-small-entry-pilot-start") is not None
@@ -288,6 +289,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "renderShadowSmallEntryPromotionPanel" in js
     assert "renderShadowSmallEntryOpsPanel" in js
     assert "renderShadowSmallEntryPilotPanel" in js
+    assert "파일럿 시작 후 후보, 주문, 체결, 손익 데이터" in js
     assert "shadowSmallEntryPilotAction" in js
     assert "function shadowSmallEntryPilotStatusLabel" in js
     assert "function shadowSmallEntryPilotRecommendationLabel" in js

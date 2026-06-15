@@ -11,6 +11,7 @@ from trading.strategy.market_data import StrategyTick
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import IndexTick, MarketIndexStore
 from trading.strategy.models import Candidate, CandidateState, OrderMode
+from trading.strategy.readiness import ReadinessReport
 from trading.strategy.runtime import (
     THEME_LAB_BOOTSTRAP_SOURCE,
     THEME_LAB_WATCHSET_SOURCE,
@@ -144,16 +145,111 @@ def test_theme_lab_runtime_tick_runs_pipeline_saves_result_and_syncs_watchset(tm
     market_data.update_tick(_tick("000003", 100, 0.0, now))
 
     runtime.start(now)
-    snapshot = runtime.cycle(now + timedelta(seconds=3))
+    cycle_timings: dict[str, float] = {}
+    snapshot = runtime.cycle(now + timedelta(seconds=3), timing_callback=cycle_timings.__setitem__)
 
     rows = db.conn.execute("SELECT * FROM theme_lab_flow_snapshots").fetchall()
     assert rows
     payload = json.loads(rows[-1]["payload_json"])
+    pipeline_timings = payload["data_quality"]["runtime_pipeline_timings"]
+    assert pipeline_timings["theme_inputs"] >= 0
+    assert pipeline_timings["engine_run_pipeline"] >= 0
+    assert payload["data_quality"]["runtime_pipeline_total_sec"] >= pipeline_timings["engine_run_pipeline"]
+    assert payload["data_quality"]["runtime_pipeline_theme_input_count"] == 1
+    assert "theme_lab_flow:engine_run_pipeline" in cycle_timings
+    assert "theme_lab_flow:bridge.total" in cycle_timings
     assert payload["gate_decisions"]
     assert {item["symbol"] for item in payload["watchset_snapshots"]} == {"000001", "000002"}
     assert {"000001", "000002"} <= set(client.registered_codes)
     assert "000003" not in set(client.registered_codes)
     assert snapshot.gate_result_count == len(payload["gate_decisions"])
+    db.close()
+
+
+def test_final_readiness_soft_budget_can_defer_or_disable(monkeypatch, tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    runtime = build_observe_runtime(MockKiwoomClient(), db)
+
+    monkeypatch.setenv("TRADING_RUNTIME_FINAL_READINESS_SOFT_BUDGET_SEC", "60")
+    defer, elapsed_ms, budget_sec = runtime._final_readiness_defer_decision(100.0, now_perf=160.0)
+    assert defer is True
+    assert elapsed_ms == 60000
+    assert budget_sec == 60
+
+    monkeypatch.setenv("TRADING_RUNTIME_FINAL_READINESS_SOFT_BUDGET_SEC", "0")
+    defer, elapsed_ms, budget_sec = runtime._final_readiness_defer_decision(100.0, now_perf=999.0)
+    assert defer is False
+    assert elapsed_ms == 899000
+    assert budget_sec == 0
+    db.close()
+
+
+def test_readiness_soft_budget_reuses_cached_report(monkeypatch, tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    runtime = build_observe_runtime(MockKiwoomClient(), db)
+    runtime.readiness_report = ReadinessReport(active_theme_count=7, top_theme_name="cached-theme")
+    snapshot = StrategyRuntimeSnapshot(
+        cycle_at="2026-06-01T09:01:00",
+        data_warmup_status="waiting_index",
+        gate_skip_reason="DATA_WARMUP",
+        candidate_subscription_selected_count=5,
+    )
+    timings: dict[str, float] = {}
+
+    monkeypatch.setattr(runtime, "_readiness_defer_decision", lambda *args, **kwargs: (True, 61000, 60))
+    monkeypatch.setattr(
+        runtime,
+        "_refresh_readiness_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("readiness rebuild should be deferred")),
+    )
+
+    assert runtime._refresh_readiness_snapshot_step(
+        "readiness_snapshot",
+        snapshot,
+        datetime(2026, 6, 1, 9, 1, 0),
+        "2026-06-01",
+        100.0,
+        timings.__setitem__,
+    ) is True
+
+    assert snapshot.active_theme_count == 7
+    assert snapshot.top_theme_name == "cached-theme"
+    assert snapshot.data_warmup_status == "waiting_index"
+    assert snapshot.gate_skip_reason == "DATA_WARMUP"
+    assert snapshot.candidate_subscription_selected_count == 5
+    assert timings["readiness_snapshot_deferred"] == 0.0
+    assert any(item.startswith("READINESS_SNAPSHOT_DEFERRED:readiness_snapshot") for item in snapshot.warnings)
+    db.close()
+
+
+def test_readiness_reuse_step_preserves_current_cycle_fields(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    runtime = build_observe_runtime(MockKiwoomClient(), db)
+    runtime.readiness_report = ReadinessReport(
+        active_theme_count=9,
+        top_theme_name="cached-theme",
+        market_session_status="open",
+        data_warmup_status="ready",
+        gate_skip_reason="",
+        candidate_subscription_selected_count=99,
+    )
+    snapshot = StrategyRuntimeSnapshot(
+        cycle_at="2026-06-01T09:01:00",
+        data_warmup_status="waiting_index",
+        gate_skip_reason="DATA_WARMUP",
+        candidate_subscription_selected_count=5,
+    )
+    timings: dict[str, float] = {}
+
+    assert runtime._reuse_readiness_snapshot_step("readiness_snapshot_final", snapshot, timings.__setitem__) is True
+
+    assert snapshot.active_theme_count == 9
+    assert snapshot.top_theme_name == "cached-theme"
+    assert snapshot.data_warmup_status == "waiting_index"
+    assert snapshot.gate_skip_reason == "DATA_WARMUP"
+    assert snapshot.candidate_subscription_selected_count == 5
+    assert timings["readiness_snapshot_final_reused"] == 0.0
+    assert "READINESS_SNAPSHOT_REUSED:readiness_snapshot_final" in snapshot.warnings
     db.close()
 
 

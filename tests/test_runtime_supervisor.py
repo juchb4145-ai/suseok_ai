@@ -68,14 +68,21 @@ class _FakeDb:
         pass
 
 
-def _settings(tmp_path, *, enabled=True, intraday_outcome_enabled=False, shadow_strategy_enabled=False):
+def _settings(
+    tmp_path,
+    *,
+    enabled=True,
+    intraday_outcome_enabled=False,
+    shadow_strategy_enabled=False,
+    runtime_cycle_timeout_sec=5,
+):
     return CoreSettings(
         db_path=Path(tmp_path) / "runtime.sqlite3",
         local_token="test-token",
         runtime_enabled=enabled,
         runtime_auto_start=False,
         runtime_evaluation_interval_sec=60,
-        runtime_cycle_timeout_sec=5,
+        runtime_cycle_timeout_sec=runtime_cycle_timeout_sec,
         intraday_outcome_enabled=intraday_outcome_enabled,
         shadow_strategy_enabled=shadow_strategy_enabled,
     )
@@ -204,6 +211,30 @@ def test_blank_cycle_exception_uses_type_name(tmp_path):
 
     assert status["failed_cycle_count"] == 1
     assert status["last_error"] == "TimeoutError"
+
+
+def test_timed_out_cycle_does_not_queue_overlapping_worker(tmp_path):
+    runtime = _FakeRuntime(sleep_cycle=1.35)
+    supervisor, _ = _supervisor(tmp_path, runtime, runtime_cycle_timeout_sec=1)
+
+    async def scenario():
+        await supervisor.start()
+        timed_out = await supervisor.run_once()
+        skipped = await supervisor.run_once()
+        while supervisor.status()["cycle_worker_pending"]:
+            await asyncio.sleep(0.05)
+        completed = supervisor.status()
+        await supervisor.shutdown()
+        return timed_out, skipped, completed
+
+    timed_out, skipped, completed = asyncio.run(scenario())
+
+    assert timed_out["failed_cycle_count"] == 1
+    assert timed_out["cycle_worker_pending"] is True
+    assert timed_out["dry_run_orders"]["reason"] == "CYCLE_WORKER_PENDING"
+    assert skipped["skipped_cycle_count"] == 1
+    assert runtime.cycle_calls == 1
+    assert completed["cycle_worker_pending"] is False
 
 
 def test_gateway_event_is_forwarded_to_runtime_bridge(tmp_path):

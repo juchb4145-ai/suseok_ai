@@ -33,7 +33,14 @@ TODAY = date.today().isoformat()
 
 
 class _FakeGateway:
-    def __init__(self, *, heartbeat_ok: bool = True, orderable: bool = True) -> None:
+    def __init__(self, *, heartbeat_ok: bool = True, orderable: bool = True, available_cash_krw: int = 0) -> None:
+        heartbeat = {
+            "kiwoom_logged_in": True,
+            "orderable": orderable,
+            "server_mode": "SIMULATION",
+        }
+        if available_cash_krw:
+            heartbeat["available_cash_krw"] = available_cash_krw
         self._snapshot = GatewayStatusSnapshot(
             connection_state="CONNECTED",
             connected=True,
@@ -41,11 +48,7 @@ class _FakeGateway:
             orderable=orderable,
             mode="DRY_RUN",
             heartbeat_ok=heartbeat_ok,
-            last_heartbeat_payload={
-                "kiwoom_logged_in": True,
-                "orderable": orderable,
-                "server_mode": "SIMULATION",
-            },
+            last_heartbeat_payload=heartbeat,
         )
 
     def snapshot(self) -> GatewayStatusSnapshot:
@@ -91,7 +94,7 @@ def test_shadow_small_entry_ops_preflight_fail_blocks_arm(tmp_path):
 def test_shadow_small_entry_ops_arm_confirm_sets_live_sim_active(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     try:
-        now = datetime(2026, 6, 13, 9, 30)
+        now = datetime.fromisoformat(f"{TODAY}T09:30:00")
         service = _passing_service(db, tmp_path, now=now)
         preflight = service.preflight(trade_date=TODAY)
         armed = service.arm(operator="tester", note="morning pilot", trade_date=TODAY)
@@ -119,10 +122,33 @@ def test_shadow_small_entry_ops_arm_confirm_sets_live_sim_active(tmp_path):
         db.close()
 
 
+def test_shadow_small_entry_ops_uses_cash_based_daily_notional_limit(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        service = ShadowSmallEntryOpsService(
+            db,
+            gateway_state=_FakeGateway(available_cash_krw=46_000_000),
+            core_settings=_core_settings(tmp_path),
+            now_provider=lambda: datetime.fromisoformat(f"{TODAY}T09:30:00"),
+            report_root=tmp_path / "reports",
+        )
+        service._promotion_evidence = lambda trade_date: {"available": True, "status": "READY", "source_report_trade_date": trade_date}  # type: ignore[method-assign]
+
+        status = service.status(trade_date=TODAY)
+        preflight = service.preflight(trade_date=TODAY, persist=False)
+
+        assert status["limits"]["max_total_notional_krw"] == 23_000_000
+        assert status["limits"]["cash_based_limits_enabled"] is True
+        assert preflight["details"]["limits"]["max_total_notional_krw"] == 23_000_000
+        assert preflight["status"] == "PASS"
+    finally:
+        db.close()
+
+
 def test_shadow_small_entry_ops_confirm_requires_token_note_and_ttl(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     try:
-        now = datetime(2026, 6, 13, 9, 30)
+        now = datetime.fromisoformat(f"{TODAY}T09:30:00")
         service = _passing_service(db, tmp_path, now=now)
         armed = service.arm(operator="tester", note="morning pilot", trade_date=TODAY)
         missing_note = service.confirm(activation_token=armed["activation_token"], operator="tester", note="", trade_date=TODAY)
@@ -296,7 +322,7 @@ def _passing_service(db: TradingDatabase, tmp_path: Path, *, now: datetime) -> S
 
 
 def _activated_service(db: TradingDatabase, tmp_path: Path) -> ShadowSmallEntryOpsService:
-    service = _passing_service(db, tmp_path, now=datetime(2026, 6, 13, 9, 30))
+    service = _passing_service(db, tmp_path, now=datetime.fromisoformat(f"{TODAY}T09:30:00"))
     armed = service.arm(operator="tester", note="morning pilot", trade_date=TODAY)
     service.confirm(
         activation_token=armed["activation_token"],

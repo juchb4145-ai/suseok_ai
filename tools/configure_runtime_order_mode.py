@@ -49,6 +49,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-order-amount-krw", type=int, default=300_000)
     parser.add_argument("--max-position-amount-krw", type=int, default=300_000)
     parser.add_argument("--max-total-exposure-krw", type=int, default=1_000_000)
+    parser.add_argument("--available-cash-krw", type=int, default=0)
+    parser.add_argument("--daily-turnover-limit-pct", type=float, default=0.50)
+    parser.add_argument("--per-order-limit-pct", type=float, default=0.05)
+    parser.add_argument("--total-exposure-limit-pct", type=float, default=0.25)
+    parser.add_argument("--per-symbol-exposure-limit-pct", type=float, default=0.07)
+    parser.add_argument("--min-lot-exception-pct", type=float, default=0.06)
+    parser.add_argument("--per-trade-risk-limit-pct", type=float, default=0.0025)
+    parser.add_argument(
+        "--disable-cash-based-limits",
+        action="store_true",
+        help="Keep legacy fixed KRW limits even when available cash is configured.",
+    )
     parser.add_argument(
         "--kill-switch-active",
         action="store_true",
@@ -135,6 +147,16 @@ def _apply_live_sim(payload: dict[str, Any], args: argparse.Namespace) -> None:
             "max_order_amount_krw": int(args.max_order_amount_krw),
             "max_position_amount_krw": int(args.max_position_amount_krw),
             "max_total_exposure_krw": int(args.max_total_exposure_krw),
+            "cash_based_limits_enabled": not bool(args.disable_cash_based_limits),
+            "available_cash_krw": int(args.available_cash_krw),
+            "daily_turnover_limit_pct": float(args.daily_turnover_limit_pct),
+            "per_order_limit_pct": float(args.per_order_limit_pct),
+            "total_exposure_limit_pct": float(args.total_exposure_limit_pct),
+            "per_symbol_exposure_limit_pct": float(args.per_symbol_exposure_limit_pct),
+            "min_lot_exception_enabled": True,
+            "min_lot_exception_pct": float(args.min_lot_exception_pct),
+            "cash_based_auto_size_enabled": True,
+            "per_trade_risk_limit_pct": float(args.per_trade_risk_limit_pct),
             "allow_market_order": False,
             "kill_switch_enabled": True,
             "kill_switch_active": bool(args.kill_switch_active),
@@ -189,6 +211,14 @@ def _summary(db_path: Path, settings: StrategyRuntimeSettings) -> dict[str, Any]
         "max_order_amount_krw": execution.get("max_order_amount_krw"),
         "max_position_amount_krw": execution.get("max_position_amount_krw"),
         "max_total_exposure_krw": execution.get("max_total_exposure_krw"),
+        "cash_based_limits_enabled": bool(execution.get("cash_based_limits_enabled")),
+        "available_cash_krw": execution.get("available_cash_krw"),
+        "daily_turnover_limit_pct": execution.get("daily_turnover_limit_pct"),
+        "per_order_limit_pct": execution.get("per_order_limit_pct"),
+        "total_exposure_limit_pct": execution.get("total_exposure_limit_pct"),
+        "per_symbol_exposure_limit_pct": execution.get("per_symbol_exposure_limit_pct"),
+        "min_lot_exception_pct": execution.get("min_lot_exception_pct"),
+        "per_trade_risk_limit_pct": execution.get("per_trade_risk_limit_pct"),
         "kill_switch_active": bool(execution.get("kill_switch_active")),
     }
 

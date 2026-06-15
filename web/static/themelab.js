@@ -2102,7 +2102,7 @@ function renderShadowSmallEntryPilotPanel(payload = null) {
     statusNode.textContent = shadowSmallEntryPilotStatusLabel(status);
     statusNode.className = `badge ${shadowSmallEntryPilotStatusTone(status)}`;
   }
-  text("themelab-shadow-small-entry-pilot-message", data.operator_message_ko || "아직 Shadow Small Entry 파일럿 실행 데이터가 없습니다. PR 적용 이후 이벤트부터 쌓입니다.");
+  text("themelab-shadow-small-entry-pilot-message", data.operator_message_ko || "아직 파일럿을 시작한 기록이 없습니다. 파일럿 시작 후 후보, 주문, 체결, 손익 데이터가 이곳에 쌓입니다.");
   text("themelab-shadow-small-entry-pilot-id", compactPilotId(data.pilot_id || "-"));
   text("themelab-shadow-small-entry-pilot-recommendation", shadowSmallEntryPilotRecommendationLabel(data.recommendation));
   text("themelab-shadow-small-entry-pilot-candidate-count", summary.candidate_count ?? 0);

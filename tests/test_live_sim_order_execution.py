@@ -63,20 +63,23 @@ def _exit_guard(**overrides):
     return payload
 
 
-def _state(*, account="1234567890", broker_env="SIMULATION") -> GatewayStateStore:
+def _state(*, account="1234567890", broker_env="SIMULATION", available_cash_krw=0) -> GatewayStateStore:
+    payload = {
+        "kiwoom_logged_in": True,
+        "orderable": True,
+        "account": account,
+        "broker_env": broker_env,
+        "server_mode": broker_env,
+        "mode": broker_env,
+    }
+    if available_cash_krw:
+        payload["available_cash_krw"] = available_cash_krw
     state = GatewayStateStore()
     state.record_event(
         GatewayEvent(
             type="heartbeat",
             timestamp=utc_timestamp(),
-            payload={
-                "kiwoom_logged_in": True,
-                "orderable": True,
-                "account": account,
-                "broker_env": broker_env,
-                "server_mode": broker_env,
-                "mode": broker_env,
-            },
+            payload=payload,
         )
     )
     return state
@@ -1091,6 +1094,183 @@ def test_live_sim_data_quality_blocks_entry_unless_ready_early_small_cap_passes(
     assert early_capped.safety["details"]["early_small_cap_applied"] is True
     assert early_allowed.accepted is True
     assert state.command_snapshot()["queued_count"] == 1
+
+
+def test_live_sim_cash_based_limits_resize_high_price_shadow_entry_to_one_share(tmp_path):
+    service, _, state = _service(tmp_path, state=_state(available_cash_krw=46_000_000))
+    metadata = {
+        "candidate_instance_id": "ci-hynix",
+        "support_ready": True,
+        "latest_tick_ready": True,
+        "reason_codes": ["READY_EARLY_SMALL"],
+        "shadow_small_entry_dry_run_promoted": True,
+        "shadow_small_entry_promotion_mode": "live_sim_guarded",
+        "shadow_small_entry_promotion_order_enabled": True,
+        "shadow_small_entry_position_size_multiplier": 0.1,
+    }
+
+    result = service.enqueue_live_sim_order(
+        _request(code="000660", quantity=13, price=2_150_000, gate_reason="READY_EARLY_SMALL", metadata=metadata),
+        execution_config=_live_sim_execution(
+            cash_based_limits_enabled=True,
+            available_cash_krw=46_000_000,
+            daily_turnover_limit_pct=0.50,
+            per_order_limit_pct=0.05,
+            min_lot_exception_pct=0.06,
+            max_order_amount_krw=300_000,
+        ),
+        exit_guard_config=_exit_guard(),
+        lifecycle_config=_lifecycle(),
+        reconcile_config=_reconcile(),
+    )
+
+    assert result.accepted is True
+    assert result.command["payload"]["quantity"] == 1
+    assert result.command["payload"]["live_sim_quantity_adjusted_by_cash_limit"] is True
+    assert result.command["payload"]["live_sim_original_quantity"] == 13
+    assert result.command["payload"]["live_sim_min_lot_exception_applied"] is True
+    assert result.record["requested_qty"] == 1
+    assert result.record["details"]["cash_sizing"]["quantity_adjusted"] is True
+    assert state.command_snapshot()["queued_count"] == 1
+
+
+def test_live_sim_cash_based_amount_block_preserves_strategy_validation_metadata(tmp_path):
+    service, _, state = _service(tmp_path, state=_state(available_cash_krw=46_000_000))
+    metadata = {
+        "candidate_instance_id": "ci-expensive",
+        "support_ready": True,
+        "latest_tick_ready": True,
+        "reason_codes": ["READY_EARLY_SMALL"],
+        "shadow_small_entry_dry_run_promoted": True,
+        "shadow_small_entry_promotion_mode": "live_sim_guarded",
+        "shadow_small_entry_promotion_order_enabled": True,
+        "shadow_small_entry_position_size_multiplier": 0.1,
+    }
+
+    result = service.enqueue_live_sim_order(
+        _request(code="999999", quantity=2, price=3_000_000, gate_reason="READY_EARLY_SMALL", metadata=metadata),
+        execution_config=_live_sim_execution(
+            cash_based_limits_enabled=True,
+            available_cash_krw=46_000_000,
+            daily_turnover_limit_pct=0.50,
+            per_order_limit_pct=0.05,
+            min_lot_exception_pct=0.06,
+            max_order_amount_krw=300_000,
+        ),
+        exit_guard_config=_exit_guard(),
+        lifecycle_config=_lifecycle(),
+        reconcile_config=_reconcile(),
+    )
+
+    assert result.accepted is False
+    assert result.reason == "ORDER_AMOUNT_LIMIT"
+    validation = result.record["details"]["strategy_validation"]
+    assert validation["signal_decision"] == "PASS"
+    assert validation["execution_decision"] == "BLOCKED"
+    assert validation["counterfactual_tracking_required"] is True
+    assert validation["hypothetical_qty"] == 2
+    assert validation["hypothetical_order_amount"] == 6_000_000
+    assert state.command_snapshot()["queued_count"] == 0
+
+
+def test_live_sim_cash_based_total_exposure_blocks_order_and_preserves_validation(tmp_path):
+    service, settings, state = _service(tmp_path, state=_state(available_cash_krw=46_000_000))
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        db.save_live_sim_position(
+            {
+                "position_id": "LIVE_SIM:12******90:005930:ci-total",
+                "candidate_instance_id": "ci-total",
+                "code": "005930",
+                "account_id_masked": "12******90",
+                "opened_at": "2026-05-30T09:00:00",
+                "entry_qty": 150,
+                "entry_avg_price": 70_000,
+                "current_qty": 150,
+                "status": "OPEN",
+                "updated_at": "2026-05-30T09:00:00",
+            }
+        )
+    finally:
+        db.close()
+
+    result = service.enqueue_live_sim_order(
+        _request(
+            code="000660",
+            quantity=20,
+            price=70_000,
+            metadata={"candidate_instance_id": "ci-new", "support_ready": True, "latest_tick_ready": True, "reason_codes": ["READY_PULLBACK"]},
+        ),
+        execution_config=_live_sim_execution(
+            cash_based_limits_enabled=True,
+            available_cash_krw=46_000_000,
+            per_order_limit_pct=0.05,
+            total_exposure_limit_pct=0.25,
+            per_symbol_exposure_limit_pct=0.07,
+        ),
+        exit_guard_config=_exit_guard(),
+        lifecycle_config=_lifecycle(),
+        reconcile_config=_reconcile(),
+    )
+
+    assert result.accepted is False
+    assert result.reason == "LIVE_SIM_TOTAL_EXPOSURE_LIMIT"
+    assert result.record["details"]["projected_total_exposure_krw"] == 11_900_000
+    validation = result.record["details"]["strategy_validation"]
+    assert validation["execution_decision"] == "BLOCKED"
+    assert validation["block_reason"] == "LIVE_SIM_TOTAL_EXPOSURE_LIMIT"
+    assert validation["hypothetical_order_amount"] == 1_400_000
+    assert state.command_snapshot()["queued_count"] == 0
+
+
+def test_live_sim_cash_based_symbol_exposure_blocks_order_and_preserves_validation(tmp_path):
+    service, settings, state = _service(tmp_path, state=_state(available_cash_krw=46_000_000))
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        db.save_live_sim_position(
+            {
+                "position_id": "LIVE_SIM:12******90:005930:ci-symbol",
+                "candidate_instance_id": "ci-symbol",
+                "code": "005930",
+                "account_id_masked": "12******90",
+                "opened_at": "2026-05-30T09:00:00",
+                "entry_qty": 40,
+                "entry_avg_price": 70_000,
+                "current_qty": 40,
+                "status": "OPEN",
+                "updated_at": "2026-05-30T09:00:00",
+            }
+        )
+    finally:
+        db.close()
+
+    result = service.enqueue_live_sim_order(
+        _request(
+            code="005930",
+            quantity=10,
+            price=70_000,
+            metadata={"candidate_instance_id": "ci-same-symbol", "support_ready": True, "latest_tick_ready": True, "reason_codes": ["READY_PULLBACK"]},
+        ),
+        execution_config=_live_sim_execution(
+            cash_based_limits_enabled=True,
+            available_cash_krw=46_000_000,
+            per_order_limit_pct=0.05,
+            total_exposure_limit_pct=0.25,
+            per_symbol_exposure_limit_pct=0.07,
+        ),
+        exit_guard_config=_exit_guard(),
+        lifecycle_config=_lifecycle(),
+        reconcile_config=_reconcile(),
+    )
+
+    assert result.accepted is False
+    assert result.reason == "LIVE_SIM_SYMBOL_EXPOSURE_LIMIT"
+    assert result.record["details"]["projected_symbol_exposure_krw"] == 3_500_000
+    validation = result.record["details"]["strategy_validation"]
+    assert validation["execution_decision"] == "BLOCKED"
+    assert validation["block_reason"] == "LIVE_SIM_SYMBOL_EXPOSURE_LIMIT"
+    assert validation["hypothetical_order_amount"] == 700_000
+    assert state.command_snapshot()["queued_count"] == 0
 
 
 def test_repair_live_sim_positions_corrects_cumulative_delta_overcount(tmp_path):
