@@ -8,6 +8,7 @@ def test_market_open_live_sim_script_declares_runtime_safety_envs():
     text = SCRIPT.read_text(encoding="utf-8")
 
     assert "[int]$RuntimeDryRunPositionAmount = 30000000" in text
+    assert "[switch]$RequireGatewayOrderable" in text
     assert "$env:TRADING_MODE = \"OBSERVE\"" in text
     assert "$env:TRADING_RUNTIME_ENABLED = \"1\"" in text
     assert "$env:TRADING_RUNTIME_AUTO_START = \"0\"" in text
@@ -44,6 +45,17 @@ def test_market_open_live_sim_script_reports_new_operator_surfaces():
     assert "dashboard_url" in text
     assert "shadow_small_entry_ops" in text
     assert "theme_backfill" in text
+
+
+def test_market_open_live_sim_script_decouples_gateway_orderability_from_runtime_start():
+    text = SCRIPT.read_text(encoding="utf-8")
+
+    assert "Kiwoom gateway heartbeat readiness" in text
+    assert "Kiwoom gateway orderable readiness" in text
+    assert "Gateway heartbeat ready but order readiness pending" in text
+    assert "ready_for_orders" in text
+    assert "require_orderable" in text
+    assert "Get-GatewayStartupDiagnostics" in text
 
 
 def test_market_open_live_sim_script_configures_websocket_pilot_url():

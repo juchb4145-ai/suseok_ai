@@ -7,11 +7,13 @@ param(
     [string]$Token = "",
     [int]$CoreStartupTimeoutSec = 45,
     [int]$GatewayStartupTimeoutSec = 90,
+    [int]$GatewayDiagnosticsTailLines = 20,
     [int]$RuntimeStartupTimeoutSec = 120,
     [ValidateSet("rest", "websocket-pilot", "websocket-experimental")]
     [string]$GatewayTransport = "websocket-pilot",
     [string]$GatewayCoreUrl = "",
     [int]$RuntimeDryRunPositionAmount = 30000000,
+    [switch]$RequireGatewayOrderable,
     [switch]$SkipGateway,
     [switch]$SkipRuntime,
     [switch]$SkipShadowSmallEntryPreflight,
@@ -167,6 +169,17 @@ function Wait-Until([scriptblock]$Condition, [int]$TimeoutSec, [string]$Label) {
     throw "Timed out waiting for $Label after ${TimeoutSec}s"
 }
 
+function Get-FileTailLines([string]$Path, [int]$LineCount) {
+    if (-not (Test-Path $Path)) {
+        return @()
+    }
+    try {
+        return @(Get-Content -Path $Path -Tail ([Math]::Max(1, $LineCount)) -ErrorAction Stop)
+    } catch {
+        return @("TAIL_READ_FAILED: $($_.Exception.Message)")
+    }
+}
+
 function Get-ObjectPropertyValue([object]$Object, [string]$Name) {
     if ($null -eq $Object) {
         return $null
@@ -226,6 +239,65 @@ function Assert-GatewayNotRealMode([object]$Status) {
     }
 }
 
+function Get-GatewayProcessSnapshot {
+    $rows = @(Get-CimInstance Win32_Process | Where-Object {
+        ($_.Name -match "python|pythonw") -and ($_.CommandLine -match "apps[\\/]kiwoom_gateway.py|kiwoom_gateway.py")
+    })
+    return @($rows | ForEach-Object {
+        [pscustomobject]@{
+            pid = [int]$_.ProcessId
+            name = [string]$_.Name
+            command_line = [string]$_.CommandLine
+        }
+    })
+}
+
+function Get-GatewayStartupDiagnostics {
+    $status = $null
+    try {
+        $status = Invoke-CoreApi -Method GET -Path "/api/gateway/status" -TimeoutSec 5
+    } catch {
+        $status = [pscustomobject]@{
+            error = $_.Exception.Message
+        }
+    }
+    $stdoutPath = Join-Path $LogDir "kiwoom_gateway_dashboard.out.log"
+    $stderrPath = Join-Path $LogDir "kiwoom_gateway_dashboard.err.log"
+    [pscustomobject]@{
+        status = $status
+        processes = @(Get-GatewayProcessSnapshot)
+        stdout_path = $stdoutPath
+        stderr_path = $stderrPath
+        stdout_tail = @(Get-FileTailLines -Path $stdoutPath -LineCount $GatewayDiagnosticsTailLines)
+        stderr_tail = @(Get-FileTailLines -Path $stderrPath -LineCount $GatewayDiagnosticsTailLines)
+    }
+}
+
+function Write-GatewayStartupDiagnostics([object]$Diagnostics) {
+    $status = Get-ObjectPropertyValue $Diagnostics "status"
+    if ($status) {
+        Write-Step ("Gateway diagnostic status state={0} connected={1} heartbeat_ok={2} login={3} orderable={4} heartbeat_age={5} last_error={6}" -f `
+            (Get-ObjectPropertyValue $status "connection_state"), `
+            (Get-ObjectPropertyValue $status "connected"), `
+            (Get-ObjectPropertyValue $status "heartbeat_ok"), `
+            (Get-ObjectPropertyValue $status "kiwoom_logged_in"), `
+            (Get-ObjectPropertyValue $status "orderable"), `
+            (Get-ObjectPropertyValue $status "heartbeat_age_sec"), `
+            (Get-ObjectPropertyValue $status "last_error"))
+    }
+    $processes = @(Get-ObjectPropertyValue $Diagnostics "processes")
+    $pids = (($processes | ForEach-Object { [string](Get-ObjectPropertyValue $_ "pid") }) -join ",")
+    Write-Step "Gateway diagnostic processes count=$($processes.Count) pids=$pids"
+    $stderrTail = @(Get-ObjectPropertyValue $Diagnostics "stderr_tail")
+    if ($stderrTail.Count -gt 0) {
+        Write-Step "Gateway stderr tail: $($stderrTail -join ' | ')"
+    }
+    $stdoutTail = @(Get-ObjectPropertyValue $Diagnostics "stdout_tail")
+    if ($stdoutTail.Count -gt 0) {
+        Write-Step "Gateway stdout tail: $($stdoutTail -join ' | ')"
+    }
+}
+
 function Get-DescendantProcessIds([int]$RootProcessId) {
     $children = Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $RootProcessId }
     foreach ($child in $children) {
@@ -256,7 +328,7 @@ function Stop-ExistingTradingStack {
         $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$listenerProcessId" -ErrorAction SilentlyContinue
         if ($proc -and $proc.ParentProcessId) {
             $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.ParentProcessId)" -ErrorAction SilentlyContinue
-            if ($parent -and ($parent.CommandLine -like "*trading_app.api*" -or $parent.CommandLine -like "*apps.core_api*")) {
+            if ($parent -and ($parent.CommandLine -match "trading_app\.api|apps[\\/]core_api\.py|core_api\.py")) {
                 [void]$processIds.Add([int]$parent.ProcessId)
                 foreach ($childProcessId in Get-DescendantProcessIds -RootProcessId ([int]$parent.ProcessId)) {
                     [void]$processIds.Add([int]$childProcessId)
@@ -265,9 +337,7 @@ function Stop-ExistingTradingStack {
         }
     }
 
-    $gatewayProcesses = Get-CimInstance Win32_Process | Where-Object {
-        ($_.Name -match "python|pythonw") -and ($_.CommandLine -match "apps[\\/]kiwoom_gateway.py|kiwoom_gateway.py")
-    }
+    $gatewayProcesses = Get-GatewayProcessSnapshot
     foreach ($gateway in $gatewayProcesses) {
         [void]$processIds.Add([int]$gateway.ProcessId)
     }
@@ -440,6 +510,7 @@ try {
     Write-Step "Runtime TRADING_RUNTIME_ALLOW_LIVE_ORDERS=$env:TRADING_RUNTIME_ALLOW_LIVE_ORDERS"
     Write-Step "Runtime TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT=$env:TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT"
     Write-Step "Gateway transport=$env:TRADING_GATEWAY_TRANSPORT"
+    Write-Step "Gateway readiness require_orderable=$([bool]$RequireGatewayOrderable)"
     Write-Step "Gateway core URL=$env:TRADING_KIWOOM_GATEWAY_CORE_URL"
     if ($env:TRADING_GATEWAY_WS_URL) {
         Write-Step "Gateway WebSocket URL=$env:TRADING_GATEWAY_WS_URL"
@@ -476,6 +547,7 @@ try {
             gateway_transport = $env:TRADING_GATEWAY_TRANSPORT
             gateway_core_url = $env:TRADING_KIWOOM_GATEWAY_CORE_URL
             gateway_ws_url = $env:TRADING_GATEWAY_WS_URL
+            gateway_require_orderable = [bool]$RequireGatewayOrderable
             websocket_pilot_order_allow = $env:TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS
             websocket_pilot_order_block = $env:TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS
             shadow_strategy_observe_only = $env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY
@@ -547,23 +619,38 @@ try {
             $remainingCount = @($gatewayStart.stale_recovery.remaining_processes).Count
             Write-Step "Gateway stale recovery stopped=$stoppedCount remaining=$remainingCount state=$($gatewayStart.gateway.connection_state) heartbeat_age=$($gatewayStart.gateway.heartbeat_age_sec)"
         }
-        $gatewayStatus = Wait-Until -TimeoutSec $GatewayStartupTimeoutSec -Label "Kiwoom gateway readiness" -Condition {
-            $status = $null
-            try {
-                $status = Invoke-CoreApi -Method GET -Path "/api/gateway/status" -TimeoutSec 5
-            } catch {
-                return $null
-            }
-            if ($status.connected -and $status.heartbeat_ok -and $status.kiwoom_logged_in -and $status.orderable) {
-                Assert-GatewayNotRealMode $status
-                if (Test-GatewaySimulationMode $status) {
+        $gatewayWaitLabel = if ($RequireGatewayOrderable) { "Kiwoom gateway orderable readiness" } else { "Kiwoom gateway heartbeat readiness" }
+        try {
+            $gatewayStatus = Wait-Until -TimeoutSec $GatewayStartupTimeoutSec -Label $gatewayWaitLabel -Condition {
+                $status = $null
+                try {
+                    $status = Invoke-CoreApi -Method GET -Path "/api/gateway/status" -TimeoutSec 5
+                } catch {
+                    return $null
+                }
+                if ($status.connected -and $status.heartbeat_ok) {
+                    Assert-GatewayNotRealMode $status
+                    if ($RequireGatewayOrderable) {
+                        if ($status.kiwoom_logged_in -and $status.orderable -and (Test-GatewaySimulationMode $status)) {
+                            return $status
+                        }
+                        return $null
+                    }
                     return $status
                 }
+                return $null
             }
-            return $null
+        } catch {
+            $diagnostics = Get-GatewayStartupDiagnostics
+            Write-GatewayStartupDiagnostics $diagnostics
+            throw
         }
         $gatewayModes = Get-GatewayBrokerModeSummary $gatewayStatus
-        Write-Step "Gateway ready connected=$($gatewayStatus.connected) orderable=$($gatewayStatus.orderable) broker_env=$($gatewayModes.broker_env) account_mode=$($gatewayModes.account_mode)"
+        $gatewayReadyForOrders = [bool]($gatewayStatus.kiwoom_logged_in -and $gatewayStatus.orderable -and (Test-GatewaySimulationMode $gatewayStatus))
+        if (-not $gatewayReadyForOrders -and -not $RequireGatewayOrderable) {
+            Write-Step "Gateway heartbeat ready but order readiness pending; runtime will start in guarded DRY_RUN mode login=$($gatewayStatus.kiwoom_logged_in) orderable=$($gatewayStatus.orderable) broker_env=$($gatewayModes.broker_env) account_mode=$($gatewayModes.account_mode)"
+        }
+        Write-Step "Gateway ready connected=$($gatewayStatus.connected) heartbeat_ok=$($gatewayStatus.heartbeat_ok) orderable=$($gatewayStatus.orderable) broker_env=$($gatewayModes.broker_env) account_mode=$($gatewayModes.account_mode)"
     }
 
     $runtimeStatus = $null
@@ -641,6 +728,9 @@ try {
                 transport = [string]$env:TRADING_GATEWAY_TRANSPORT
                 core_url = [string]$env:TRADING_KIWOOM_GATEWAY_CORE_URL
                 ws_url = [string]$env:TRADING_GATEWAY_WS_URL
+                readiness_mode = if ($RequireGatewayOrderable) { "orderable" } else { "heartbeat" }
+                ready_for_orders = [bool]($gatewayStatus.kiwoom_logged_in -and $gatewayStatus.orderable -and (Test-GatewaySimulationMode $gatewayStatus))
+                require_orderable = [bool]$RequireGatewayOrderable
                 broker_env = [string]$gatewayModes.broker_env
                 server_mode = [string]$gatewayModes.server_mode
                 account_mode = [string]$gatewayModes.account_mode
