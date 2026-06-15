@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 from itertools import count
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Timer
 from typing import Any, Optional
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
@@ -126,6 +126,7 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        _shutdown_theme_lab_dashboard_snapshot_refresh_executor()
         await _stop_core_ws_event_worker()
         await _stop_gateway_condition_event_worker()
         replay_tick_buffer.stop()
@@ -567,6 +568,8 @@ _dashboard_snapshot_cache_miss_count = 0
 _dashboard_fragment_cache: dict[tuple[str, str], tuple[float, Any]] = {}
 _theme_lab_dashboard_snapshot_cache_lock = RLock()
 _theme_lab_dashboard_snapshot_cache: dict[tuple[str, str], tuple[float, Any]] = {}
+_theme_lab_dashboard_snapshot_refreshing: set[tuple[str, str]] = set()
+_theme_lab_dashboard_snapshot_refresh_executor: ThreadPoolExecutor | None = None
 
 
 def _build_runtime_supervisor() -> RuntimeSupervisor:
@@ -912,27 +915,52 @@ def start_kiwoom_gateway(_: None = Depends(verify_gateway_token)) -> dict[str, A
 
 def _start_kiwoom_gateway_response() -> dict[str, Any]:
     snapshot = gateway_state.snapshot().to_dict()
+    gateway_status = _gateway_start_status(snapshot)
     if snapshot.get("connected") and snapshot.get("heartbeat_ok"):
         return {
             "started": False,
             "reason": "ALREADY_CONNECTED",
-            "gateway": _gateway_start_status(snapshot),
+            "gateway": gateway_status,
             "processes": [],
         }
     processes = _find_kiwoom_gateway_processes()
+    stale_for_start = bool(gateway_status.get("stale_for_start"))
+    stopped_processes: list[dict[str, Any]] = []
+    if stale_for_start and processes:
+        stopped_processes = _stop_kiwoom_gateway_processes(processes)
+        time.sleep(0.5)
+        processes = _find_kiwoom_gateway_processes()
+        if processes:
+            return {
+                "started": False,
+                "reason": "STALE_RESTART_BLOCKED",
+                "gateway": gateway_status,
+                "processes": processes,
+                "stale_recovery": {
+                    "stale": True,
+                    "stopped_processes": stopped_processes,
+                    "remaining_processes": processes,
+                },
+            }
     if processes:
         return {
             "started": False,
             "reason": "ALREADY_RUNNING",
-            "gateway": _gateway_start_status(snapshot),
+            "gateway": gateway_status,
             "processes": processes,
         }
     started = _start_kiwoom_gateway_process()
+    reason = "RESTARTED_STALE" if stopped_processes else ("STARTED_STALE_STATE" if stale_for_start else "STARTED")
     return {
         "started": True,
-        "reason": "STARTED",
-        "gateway": _gateway_start_status(snapshot),
+        "reason": reason,
+        "gateway": gateway_status,
         "processes": [started],
+        "stale_recovery": {
+            "stale": stale_for_start,
+            "stopped_processes": stopped_processes,
+            "remaining_processes": [],
+        },
         "logs": {
             "stdout": str(PROJECT_ROOT / "logs" / "kiwoom_gateway_dashboard.out.log"),
             "stderr": str(PROJECT_ROOT / "logs" / "kiwoom_gateway_dashboard.err.log"),
@@ -941,13 +969,35 @@ def _start_kiwoom_gateway_response() -> dict[str, Any]:
 
 
 def _gateway_start_status(snapshot: dict[str, Any]) -> dict[str, Any]:
+    stale_for_start = _gateway_snapshot_stale_for_start(snapshot)
     return {
         "connected": bool(snapshot.get("connected")),
         "heartbeat_ok": bool(snapshot.get("heartbeat_ok")),
+        "heartbeat_age_sec": snapshot.get("heartbeat_age_sec"),
+        "heartbeat_timeout_sec": snapshot.get("heartbeat_timeout_sec"),
         "kiwoom_logged_in": bool(snapshot.get("kiwoom_logged_in")),
         "orderable": bool(snapshot.get("orderable")),
         "connection_state": str(snapshot.get("connection_state") or "UNKNOWN"),
+        "stale_for_start": stale_for_start,
     }
+
+
+def _gateway_snapshot_stale_for_start(snapshot: dict[str, Any]) -> bool:
+    if bool(snapshot.get("heartbeat_ok")):
+        return False
+    connection_state = str(snapshot.get("connection_state") or "").upper()
+    if connection_state == "STALE":
+        return True
+    if not bool(snapshot.get("connected")):
+        return False
+    heartbeat_age = snapshot.get("heartbeat_age_sec")
+    timeout = snapshot.get("heartbeat_timeout_sec")
+    if heartbeat_age is None:
+        return True
+    try:
+        return float(heartbeat_age) > float(timeout or 0)
+    except (TypeError, ValueError):
+        return True
 
 
 def _find_kiwoom_gateway_processes() -> list[dict[str, Any]]:
@@ -985,6 +1035,28 @@ def _find_kiwoom_gateway_processes() -> list[dict[str, Any]]:
         for row in rows
         if isinstance(row, dict) and int(row.get("ProcessId") or 0) > 0
     ]
+
+
+def _stop_kiwoom_gateway_processes(processes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if os.name != "nt":
+        return []
+    pids = sorted({int(process.get("pid") or 0) for process in processes if int(process.get("pid") or 0) > 0})
+    if not pids:
+        return []
+    script = "$ErrorActionPreference = 'SilentlyContinue'; " + "; ".join(
+        f"Stop-Process -Id {pid} -Force" for pid in pids
+    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return []
+    return [process for process in processes if int(process.get("pid") or 0) in set(pids)]
 
 
 def _start_kiwoom_gateway_process() -> dict[str, Any]:
@@ -3229,9 +3301,13 @@ def theme_lab_snapshot(refresh: bool = Query(False)) -> dict[str, Any]:
             runtime_status=runtime_supervisor.status(),
             gateway_state=gateway_state,
         )
-        if refresh:
-            return builder()
-        return _cached_theme_lab_dashboard_snapshot(db, "theme_lab:v2:shared", builder)
+        return _cached_theme_lab_dashboard_snapshot(
+            db,
+            "theme_lab:v2:shared",
+            builder,
+            force=refresh,
+            refresh_builder=_build_theme_lab_dashboard_snapshot_with_fresh_db,
+        )
     finally:
         close_database(db)
 
@@ -6042,6 +6118,7 @@ def _cached_theme_lab_dashboard_snapshot(
     builder,
     *,
     force: bool = False,
+    refresh_builder=None,
     ttl_sec: float | None = None,
 ):
     ttl = _dashboard_snapshot_cache_ttl_sec() if ttl_sec is None else max(0.0, float(ttl_sec))
@@ -6054,10 +6131,77 @@ def _cached_theme_lab_dashboard_snapshot(
             cached = _theme_lab_dashboard_snapshot_cache.get(cache_key)
             if cached is not None and now - cached[0] <= ttl:
                 return cached[1]
+            if cached is not None and refresh_builder is not None:
+                _schedule_theme_lab_dashboard_snapshot_refresh_locked(cache_key, refresh_builder)
+                return cached[1]
     value = builder()
     with _theme_lab_dashboard_snapshot_cache_lock:
         _theme_lab_dashboard_snapshot_cache[cache_key] = (time.monotonic(), value)
     return value
+
+
+def _theme_lab_dashboard_snapshot_refresh_executor_instance() -> ThreadPoolExecutor:
+    global _theme_lab_dashboard_snapshot_refresh_executor
+    if _theme_lab_dashboard_snapshot_refresh_executor is None:
+        _theme_lab_dashboard_snapshot_refresh_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="theme-lab-snapshot-refresh",
+        )
+    return _theme_lab_dashboard_snapshot_refresh_executor
+
+
+def _schedule_theme_lab_dashboard_snapshot_refresh_locked(cache_key: tuple[str, str], refresh_builder) -> None:
+    if cache_key in _theme_lab_dashboard_snapshot_refreshing:
+        return
+    _theme_lab_dashboard_snapshot_refreshing.add(cache_key)
+    _defer_theme_lab_dashboard_snapshot_refresh(cache_key, refresh_builder)
+
+
+def _defer_theme_lab_dashboard_snapshot_refresh(cache_key: tuple[str, str], refresh_builder) -> None:
+    timer = Timer(0.25, _submit_theme_lab_dashboard_snapshot_refresh, args=(cache_key, refresh_builder))
+    timer.daemon = True
+    timer.start()
+
+
+def _submit_theme_lab_dashboard_snapshot_refresh(cache_key: tuple[str, str], refresh_builder) -> None:
+    try:
+        executor = _theme_lab_dashboard_snapshot_refresh_executor_instance()
+        executor.submit(_refresh_theme_lab_dashboard_snapshot_cache, cache_key, refresh_builder)
+    except Exception:
+        with _theme_lab_dashboard_snapshot_cache_lock:
+            _theme_lab_dashboard_snapshot_refreshing.discard(cache_key)
+
+
+def _refresh_theme_lab_dashboard_snapshot_cache(cache_key: tuple[str, str], refresh_builder) -> None:
+    try:
+        payload = refresh_builder()
+        with _theme_lab_dashboard_snapshot_cache_lock:
+            _theme_lab_dashboard_snapshot_cache[cache_key] = (time.monotonic(), payload)
+    finally:
+        with _theme_lab_dashboard_snapshot_cache_lock:
+            _theme_lab_dashboard_snapshot_refreshing.discard(cache_key)
+
+
+def _shutdown_theme_lab_dashboard_snapshot_refresh_executor() -> None:
+    global _theme_lab_dashboard_snapshot_refresh_executor
+    executor = _theme_lab_dashboard_snapshot_refresh_executor
+    _theme_lab_dashboard_snapshot_refresh_executor = None
+    with _theme_lab_dashboard_snapshot_cache_lock:
+        _theme_lab_dashboard_snapshot_refreshing.clear()
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _build_theme_lab_dashboard_snapshot_with_fresh_db() -> dict[str, Any]:
+    db = open_database()
+    try:
+        return build_theme_lab_dashboard_snapshot(
+            db,
+            runtime_status=runtime_supervisor.status(),
+            gateway_state=gateway_state,
+        )
+    finally:
+        close_database(db)
 
 
 def _build_dashboard_snapshot_payload_uncached(*, detail: str = DASHBOARD_SNAPSHOT_DETAIL_SLIM) -> dict[str, Any]:
@@ -7150,7 +7294,11 @@ def _dashboard_slim_theme_lab_payload(payload: dict[str, Any]) -> dict[str, Any]
             data_quality,
             (
                 "status",
+                "raw_status",
+                "display_status",
                 "message",
+                "raw_message",
+                "display_message",
                 "watchset_size",
                 "stale",
                 "age_sec",
@@ -7357,6 +7505,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         db,
         "theme_lab:v2:shared",
         lambda: build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_status, gateway_state=gateway_state),
+        refresh_builder=_build_theme_lab_dashboard_snapshot_with_fresh_db,
     )
     if not full_detail:
         theme_lab_payload = _dashboard_slim_theme_lab_payload(theme_lab_payload)

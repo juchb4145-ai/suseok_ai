@@ -422,6 +422,13 @@ OPERATOR_TERM_DICTIONARY: dict[str, dict[str, str]] = {
         "severity": "warning",
         "operator_action_ko": "상세 탭에서 원인을 확인하세요.",
     },
+    "DIAGNOSTIC": {
+        "label_ko": "진단 전용",
+        "short_label_ko": "진단",
+        "description_ko": "운영 장애가 아니라 진단/리포트용으로 확인할 상태입니다.",
+        "severity": "neutral",
+        "operator_action_ko": "장중 재개 전까지 참고 지표로만 확인하세요.",
+    },
     "ERROR": {
         "label_ko": "문제 있음",
         "short_label_ko": "문제",
@@ -580,19 +587,23 @@ def build_theme_lab_dashboard_snapshot(
     gate_decisions = _as_list(raw.get("gate_decisions"))
     watchset = _sorted_watchset(_merge_watchset_gate_decisions(_as_list(raw.get("watchset_snapshots")), gate_decisions))
     condition_counts = _condition_theme_counts(db, raw)
-    data_quality = _data_quality(raw, watchset)
     runtime = _runtime_context(runtime_status)
     freshness = _snapshot_freshness(raw, now=now)
+    backfill_runtime = _theme_backfill_runtime(raw, gateway_state)
+    data_quality = _data_quality(raw, watchset)
+    data_quality = _apply_backfill_data_quality(data_quality, backfill_runtime)
     data_quality = {**data_quality, **_freshness_quality_fields(freshness)}
     entry_candidates = [item for item in watchset if item.get("gate_status") in {"READY", "READY_SMALL"}]
     chart_universe = _chart_universe(themes, watchset, entry_candidates)
     selected = _select_chart(chart_universe, watchset)
     selected_watch = next((item for item in watchset if item.get("symbol") == selected.get("symbol")), {})
 
-    backfill_runtime = _theme_backfill_runtime(raw, gateway_state)
     gateway = _gateway_context(gateway_state)
     backfill_status_by_theme = _theme_backfill_status_by_theme(gateway_state)
     ranked_themes = _ranked_theme_rows(themes, condition_counts, backfill_status_by_theme=backfill_status_by_theme)
+    data_quality = _apply_ranked_theme_data_quality(data_quality, ranked_themes)
+    market = _market(raw.get("market_status") or {}, runtime=runtime)
+    data_quality = _apply_market_session_data_quality_display(data_quality, market, runtime)
     summary = _summary(ranked_themes, watchset, entry_candidates, data_quality, runtime=runtime, freshness=freshness)
     trade_date = _snapshot_trade_date(raw)
     gate_reason_report = _theme_lab_gate_reason_source_report(db, trade_date=trade_date)
@@ -631,7 +642,7 @@ def build_theme_lab_dashboard_snapshot(
         "theme_backfill_runtime": backfill_runtime,
         "theme_source_sync": theme_source_sync,
         **_freshness_quality_fields(freshness),
-        "market": _market(raw.get("market_status") or {}),
+        "market": market,
         "condition_statuses": _condition_statuses(db, gateway_state),
         "data_quality": data_quality,
         "ranked_themes": ranked_themes[:30],
@@ -1228,8 +1239,8 @@ def _gateway_context(gateway_state: Any | None) -> dict[str, Any]:
     }
 
 
-def _market(raw: dict[str, Any]) -> dict[str, Any]:
-    return {
+def _market(raw: dict[str, Any], *, runtime: dict[str, Any] | None = None) -> dict[str, Any]:
+    market = {
         "market_status": _value(raw.get("market_status") or raw.get("status") or "UNKNOWN"),
         "kospi_return_pct": raw.get("kospi_return_pct"),
         "kosdaq_return_pct": raw.get("kosdaq_return_pct"),
@@ -1240,6 +1251,31 @@ def _market(raw: dict[str, Any]) -> dict[str, Any]:
         "data_quality_flags": list(raw.get("data_quality_flags") or []),
         "sides": [_market_side(raw, "KOSPI"), _market_side(raw, "KOSDAQ")],
     }
+    return _apply_runtime_market_session(market, runtime)
+
+
+def _apply_runtime_market_session(market: dict[str, Any], runtime: dict[str, Any] | None) -> dict[str, Any]:
+    runtime = runtime or {}
+    session = str(runtime.get("market_session_status") or "").strip().lower()
+    gate_skip = str(runtime.get("gate_skip_reason") or "").strip().upper()
+    if session != "closed" and gate_skip != "MARKET_SESSION_CLOSED":
+        return market
+    result = dict(market)
+    result["market_status"] = "CLOSED"
+    result["market_session_status"] = "closed"
+    result["gate_skip_reason"] = "MARKET_SESSION_CLOSED"
+    flags = list(dict.fromkeys(list(result.get("data_quality_flags") or []) + ["MARKET_SESSION_CLOSED"]))
+    result["data_quality_flags"] = flags
+    sides = []
+    for side in _as_list(result.get("sides")):
+        row = dict(side)
+        row["status"] = "CLOSED"
+        row["breadth_ready"] = False
+        row["breadth_gate_usable"] = False
+        row["reason_codes"] = list(dict.fromkeys(list(row.get("reason_codes") or []) + ["MARKET_SESSION_CLOSED"]))
+        sides.append(row)
+    result["sides"] = sides
+    return result
 
 
 def _market_side(raw: dict[str, Any], side: str) -> dict[str, Any]:
@@ -1499,9 +1535,14 @@ def _runtime_context(runtime_status: dict[str, Any] | None) -> dict[str, Any]:
             "realtime_data_quality": {},
             "realtime_reliability_score": 0.0,
             "realtime_reliability_bucket": "NO_DATA",
+            "market_session_status": "",
+            "data_warmup_status": "",
+            "gate_skip_reason": "",
         }
     running = bool(runtime_status.get("running"))
     realtime_quality = dict(runtime_status.get("realtime_data_quality") or {})
+    latest_snapshot = dict(runtime_status.get("latest_snapshot") or {})
+    readiness = dict(runtime_status.get("readiness") or {})
     return {
         "known": True,
         "enabled": bool(runtime_status.get("enabled")),
@@ -1515,6 +1556,11 @@ def _runtime_context(runtime_status: dict[str, Any] | None) -> dict[str, Any]:
         "realtime_data_quality": realtime_quality,
         "realtime_reliability_score": float(realtime_quality.get("realtime_reliability_score") or 0.0),
         "realtime_reliability_bucket": str(realtime_quality.get("realtime_reliability_bucket") or "NO_DATA"),
+        "market_session_status": str(
+            latest_snapshot.get("market_session_status") or readiness.get("market_session_status") or ""
+        ),
+        "data_warmup_status": str(latest_snapshot.get("data_warmup_status") or readiness.get("data_warmup_status") or ""),
+        "gate_skip_reason": str(latest_snapshot.get("gate_skip_reason") or readiness.get("gate_skip_reason") or ""),
     }
 
 
@@ -1666,6 +1712,8 @@ def _operation_status_message(
     if runtime.get("known") and freshness.get("snapshot_stale"):
         age_label = str(freshness.get("snapshot_age_label") or "오래")
         return "SNAPSHOT_STALE", f"ThemeLab 스냅샷이 {age_label} 전 계산되어 최신 운용 상태가 아닙니다."
+    if str(runtime.get("market_session_status") or "").lower() == "closed" or str(runtime.get("gate_skip_reason") or "").upper() == "MARKET_SESSION_CLOSED":
+        return "OBSERVE_ONLY", "장 마감 상태입니다. 실시간 데이터 품질은 진단/리포트용으로만 확인합니다."
     if watchset_size == 0:
         if theme_count <= 0 or data_status == "BROKEN":
             return "SNAPSHOT_UNAVAILABLE", "ThemeLabFlow 결과 대기 중입니다."
@@ -2344,6 +2392,8 @@ def _data_status_label(status: str) -> str:
     text = status.upper()
     if text == "OK":
         return "정상"
+    if text == "DIAGNOSTIC":
+        return "진단 전용"
     if text in {"WARNING", "DEGRADED"}:
         return "준비중"
     if text == "BROKEN":
@@ -2628,6 +2678,160 @@ def _data_quality(raw: dict[str, Any], watchset: list[dict[str, Any]]) -> dict[s
         "reasons": reasons,
         "message": _data_quality_message(status, reasons),
     }
+
+
+def _apply_backfill_data_quality(data_quality: dict[str, Any], backfill_runtime: dict[str, Any]) -> dict[str, Any]:
+    result = dict(data_quality)
+    if not str(backfill_runtime.get("last_success_at") or "").strip():
+        return result
+
+    current_after = _optional_int(backfill_runtime.get("missing_price_count_after"))
+    prev_after = _optional_int(backfill_runtime.get("missing_prev_close_count_after"))
+    adjusted = False
+    if current_after is not None:
+        current_missing = int(result.get("current_price_missing_count") or 0)
+        result["current_price_missing_count"] = min(current_missing, current_after)
+        adjusted = adjusted or result["current_price_missing_count"] != current_missing
+    if prev_after is not None:
+        prev_missing = int(result.get("prev_close_missing_count") or 0)
+        result["prev_close_missing_count"] = min(prev_missing, prev_after)
+        adjusted = adjusted or result["prev_close_missing_count"] != prev_missing
+    if not adjusted:
+        return result
+
+    result["backfill_adjusted"] = True
+    status = str(result.get("status") or "OK")
+    if status != "BROKEN":
+        candle_missing = int(result.get("candle_missing_count") or 0)
+        quote_stale = int(result.get("quote_stale_count") or 0)
+        missing_current_price = int(result.get("current_price_missing_count") or 0)
+        missing_prev_close = int(result.get("prev_close_missing_count") or 0)
+        missing_vwap = int(result.get("vwap_missing_count") or 0)
+        missing_session_high = int(result.get("session_high_missing_count") or 0)
+        if candle_missing or quote_stale >= 5:
+            status = "DEGRADED"
+        elif any([missing_current_price, missing_vwap, missing_session_high, missing_prev_close, quote_stale]):
+            status = "WARNING"
+        else:
+            status = "OK"
+        result["status"] = status
+        reasons = _data_quality_reasons(
+            candle_missing=candle_missing,
+            quote_stale=quote_stale,
+            missing_current_price=missing_current_price,
+            missing_prev_close=missing_prev_close,
+            missing_vwap=missing_vwap,
+            missing_session_high=missing_session_high,
+        )
+        result["reasons"] = reasons
+        result["message"] = _data_quality_message(status, reasons)
+    return result
+
+
+def _apply_ranked_theme_data_quality(data_quality: dict[str, Any], ranked_themes: list[dict[str, Any]]) -> dict[str, Any]:
+    result = dict(data_quality)
+    if not ranked_themes:
+        return result
+
+    status_counts = Counter(str(row.get("theme_quality_status") or "UNKNOWN").upper() for row in ranked_themes)
+    blocking_count = int(status_counts.get("BROKEN", 0) + status_counts.get("DEGRADED", 0))
+    warning_count = int(status_counts.get("WARNING", 0))
+    zero_price_count = sum(
+        1
+        for row in ranked_themes
+        if int(row.get("eligible_total_members") or 0) > 0
+        and float(row.get("member_price_coverage_ratio") or 0.0) <= 0.0
+    )
+    coverage_values = [
+        float(row.get("member_price_coverage_ratio") or 0.0)
+        for row in ranked_themes
+        if int(row.get("eligible_total_members") or 0) > 0
+    ]
+    min_price_coverage = min(coverage_values) if coverage_values else None
+
+    result["theme_rank_quality_status_counts"] = dict(status_counts)
+    result["theme_rank_degraded_count"] = blocking_count
+    result["theme_rank_warning_count"] = warning_count
+    result["theme_rank_zero_price_coverage_count"] = zero_price_count
+    result["theme_rank_min_price_coverage_ratio"] = min_price_coverage
+
+    reasons = list(result.get("reasons") or [])
+    if blocking_count:
+        reasons.append(
+            f"Theme Rank 가격 품질 낮음: DEGRADED/BROKEN {blocking_count}개, 가격 0% {zero_price_count}개"
+        )
+        if str(result.get("status") or "OK").upper() != "BROKEN":
+            result["status"] = "DEGRADED"
+    elif warning_count and str(result.get("status") or "OK").upper() == "OK":
+        reasons.append(f"Theme Rank 가격 품질 확인 필요: WARNING {warning_count}개")
+        result["status"] = "WARNING"
+    result["reasons"] = list(dict.fromkeys(reasons))
+    result["message"] = _data_quality_message(str(result.get("status") or "OK"), result["reasons"])
+    return result
+
+
+def _apply_market_session_data_quality_display(
+    data_quality: dict[str, Any],
+    market: dict[str, Any],
+    runtime: dict[str, Any],
+) -> dict[str, Any]:
+    result = dict(data_quality)
+    raw_status = str(result.get("status") or "OK").upper()
+    result["raw_status"] = raw_status
+    result["raw_message"] = result.get("message") or ""
+    result.setdefault("display_status", raw_status)
+    result.setdefault("display_message", result.get("message") or "")
+    result.setdefault("operator_severity", _operator_term(raw_status)["severity"])
+    if raw_status == "BROKEN" or not _is_market_session_closed(market, runtime):
+        return result
+
+    display_message = "장 마감: 실시간 현재가/틱 공백은 운영 장애가 아니라 진단용으로 표시합니다."
+    result["status"] = "DIAGNOSTIC"
+    result["message"] = display_message
+    result["display_status"] = "DIAGNOSTIC"
+    result["display_message"] = display_message
+    result["operator_severity"] = "neutral"
+    result["session_adjusted"] = True
+    result["diagnostic_only"] = True
+    result["display_reasons"] = list(
+        dict.fromkeys(["MARKET_SESSION_CLOSED", *[str(reason) for reason in result.get("reasons") or []]])
+    )
+    return result
+
+
+def _is_market_session_closed(market: dict[str, Any], runtime: dict[str, Any]) -> bool:
+    market_status = str(market.get("market_status") or "").upper()
+    runtime_session = str(runtime.get("market_session_status") or "").lower()
+    gate_skip = str(runtime.get("gate_skip_reason") or "").upper()
+    return (
+        market_status in {"CLOSED", "MARKET_CLOSED", "AFTER_MARKET", "POST_MARKET", "DONE"}
+        or runtime_session == "closed"
+        or gate_skip == "MARKET_SESSION_CLOSED"
+    )
+
+
+def _data_quality_display_status(data_quality: dict[str, Any]) -> str:
+    return str(data_quality.get("display_status") or data_quality.get("status") or "UNKNOWN")
+
+
+def _data_quality_display_message(data_quality: dict[str, Any]) -> str:
+    return str(data_quality.get("display_message") or data_quality.get("message") or "?곗씠???곹깭 ?뺤씤 以묒엯?덈떎.")
+
+
+def _data_quality_blocks_operator_attention(data_quality: dict[str, Any]) -> bool:
+    display_status = _data_quality_display_status(data_quality).upper()
+    if display_status == "DIAGNOSTIC":
+        return False
+    return str(data_quality.get("status") or "").upper() in {"BROKEN", "DEGRADED"}
+
+
+def _optional_int(value) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _watchset_candle_missing_count(watchset: list[dict[str, Any]]) -> int:

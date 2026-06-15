@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from trading.broker.command_persistence import SQLiteCommandStore
 from trading.broker.command_queue import CommandPriority, CommandStatus
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import GatewayCommand
@@ -69,6 +70,146 @@ def test_theme_backfill_planner_respects_ready_order_low_and_duplicate_bucket():
     high = _result([_theme("high", 1, [_hit("000001", ("MISSING_CURRENT_PRICE",))])])
     assert service.plan_and_enqueue(high, NOW)["enqueued_count"] == 1
     assert service.plan_and_enqueue(high, NOW)["duplicated_bucket_count"] == 1
+
+
+def test_theme_backfill_candidate_scope_limits_themes_and_hits_per_theme():
+    result = _result(
+        [
+            _theme(
+                "top",
+                1,
+                [
+                    _hit("000005", ("MISSING_PREV_CLOSE",)),
+                    _hit("000001", ("MISSING_PREV_CLOSE",), leader=True, return_pct=7.0, turnover_krw=3000000),
+                    _hit("000002", ("MISSING_PREV_CLOSE",), strong=True, return_pct=4.0, turnover_krw=2000000),
+                    _hit("000003", ("MISSING_CURRENT_PRICE",)),
+                ],
+            ),
+            _theme(
+                "second",
+                2,
+                [
+                    _hit("000101", ("MISSING_PREV_CLOSE",)),
+                    _hit("000102", ("MISSING_PREV_CLOSE",)),
+                    _hit("000103", ("MISSING_PREV_CLOSE",)),
+                ],
+            ),
+            _theme("third", 3, [_hit("000201", ("MISSING_PREV_CLOSE",))]),
+        ]
+    )
+    cfg = ThemeBackfillConfig(enabled=True, max_themes=2, max_hits_per_theme=2)
+
+    candidates = build_backfill_candidates(result, cfg=cfg, now=NOW)
+
+    assert [item.code for item in candidates] == ["000001", "000002", "000101", "000102"]
+    assert all(item.primary_theme_id != "third" for item in candidates)
+    assert candidates[0].hit_rank == 1
+    assert candidates[1].hit_rank == 2
+
+
+def test_theme_backfill_hydrates_recent_acked_cache_after_state_recreation(tmp_path):
+    db_path = tmp_path / "commands.sqlite3"
+    first = GatewayStateStore(command_store=SQLiteCommandStore(db_path, dedupe_retention_sec=86400, history_retention_sec=86400))
+    first.status.connected = True
+    first.status.kiwoom_logged_in = True
+    first.status.last_heartbeat_at = NOW.isoformat()
+    first.enqueue_command(
+        GatewayCommand(
+            type="tr_request",
+            command_id="cmd-cache",
+            payload={
+                "purpose": THEME_BACKFILL_PURPOSE,
+                "code": "000001",
+                "trade_date": NOW.date().isoformat(),
+                "tr_code": "opt10001",
+            },
+        ),
+        priority=CommandPriority.LOW,
+        ttl_sec=60,
+        max_attempts=1,
+        now=NOW,
+    )
+    first.dispatch_commands(limit=1, now=NOW)
+    first.ack_command(
+        "cmd-cache",
+        status=CommandStatus.ACKED.value,
+        result_payload={
+            "purpose": THEME_BACKFILL_PURPOSE,
+            "code": "000001",
+            "trade_date": NOW.date().isoformat(),
+            "parsed_backfill": {
+                "code": "000001",
+                "current_price": 1234,
+                "prev_close": 1200,
+                "stock_name": "캐시",
+            },
+        },
+    )
+
+    restarted = GatewayStateStore(command_store=SQLiteCommandStore(db_path, dedupe_retention_sec=86400, history_retention_sec=86400))
+    market_data = MarketDataStore()
+    service = ThemeBackfillService(restarted, config=ThemeBackfillConfig(enabled=True, cache_enabled=True, cache_ttl_sec=86400))
+
+    summary = service.hydrate_cache(market_data, NOW + timedelta(minutes=1))
+
+    tick = market_data.latest_tick("000001")
+    assert summary["backfill_cache_record_count"] == 1
+    assert summary["backfill_cache_applied_count"] == 1
+    assert tick is not None
+    assert tick.price == 1234
+    assert tick.metadata["prev_close"] == 1200
+    assert tick.metadata["price_source"] == "TR_BACKFILL"
+    assert tick.metadata["gate_usable"] is False
+
+
+def test_theme_backfill_cache_skips_other_trade_date():
+    state = _healthy_state()
+    _enqueue_backfill(state, "000001", now=NOW)
+    state.dispatch_commands(limit=1, now=NOW)
+    state.ack_command(
+        "cmd-backfill-000001",
+        status=CommandStatus.ACKED.value,
+        result_payload={
+            "purpose": THEME_BACKFILL_PURPOSE,
+            "code": "000001",
+            "trade_date": "1999-01-01",
+            "parsed_backfill": {"code": "000001", "current_price": 1234, "prev_close": 1200},
+        },
+    )
+    service = ThemeBackfillService(state, config=ThemeBackfillConfig(enabled=True, cache_enabled=True, cache_ttl_sec=86400))
+    market_data = MarketDataStore()
+
+    summary = service.hydrate_cache(market_data, NOW)
+
+    assert summary["backfill_cache_record_count"] == 1
+    assert summary["backfill_cache_stale_count"] == 1
+    assert summary["backfill_cache_applied_count"] == 0
+    assert market_data.latest_tick("000001") is None
+
+
+def test_theme_backfill_cache_keeps_same_trade_date_even_when_record_clock_is_old():
+    state = _healthy_state()
+    old = NOW - timedelta(days=2)
+    _enqueue_backfill(state, "000001", now=old)
+    state.dispatch_commands(limit=1, now=old)
+    state.ack_command(
+        "cmd-backfill-000001",
+        status=CommandStatus.ACKED.value,
+        result_payload={
+            "purpose": THEME_BACKFILL_PURPOSE,
+            "code": "000001",
+            "trade_date": NOW.date().isoformat(),
+            "parsed_backfill": {"code": "000001", "current_price": 1234, "prev_close": 1200},
+        },
+    )
+    service = ThemeBackfillService(state, config=ThemeBackfillConfig(enabled=True, cache_enabled=True, cache_ttl_sec=1))
+    market_data = MarketDataStore()
+
+    summary = service.hydrate_cache(market_data, NOW)
+
+    assert summary["backfill_cache_applied_count"] == 1
+    assert summary["backfill_cache_stale_count"] == 0
+    assert market_data.latest_tick("000001").price == 1234
 
 
 def test_theme_backfill_observe_pilot_blocks_non_observe_mode():
@@ -363,13 +504,16 @@ def _theme(theme_id: str, rank: int, hits):
     )
 
 
-def _hit(symbol: str, flags):
+def _hit(symbol: str, flags, *, leader=False, strong=False, alive=False, return_pct=0.0, turnover_krw=0.0):
     return SimpleNamespace(
         symbol=symbol,
         name=f"종목{symbol}",
         excluded=False,
         current_price=0,
-        return_pct=0,
-        turnover_krw=0,
+        return_pct=return_pct,
+        turnover_krw=turnover_krw,
+        alive_hit=alive or strong or leader,
+        strong_hit=strong or leader,
+        leader_hit=leader,
         data_quality_flags=tuple(flags),
     )

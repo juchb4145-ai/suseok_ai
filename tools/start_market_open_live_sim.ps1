@@ -15,6 +15,17 @@ param(
     [switch]$SkipGateway,
     [switch]$SkipRuntime,
     [switch]$SkipShadowSmallEntryPreflight,
+    [switch]$WaitThemeLabStartupSnapshot,
+    [switch]$DisableThemeBackfillWarmup,
+    [int]$ThemeBackfillMaxPerCycle = 6,
+    [int]$ThemeBackfillMaxPending = 10,
+    [int]$ThemeBackfillTtlSec = 60,
+    [int]$ThemeBackfillOpt10001BucketSec = 60,
+    [int]$ThemeBackfillOpt10081BucketSec = 1800,
+    [int]$ThemeBackfillMaxThemes = 8,
+    [int]$ThemeBackfillMaxHitsPerTheme = 8,
+    [int]$ThemeBackfillCacheTtlSec = 21600,
+    [int]$ThemeBackfillCacheLimit = 500,
     [switch]$NoStopExisting,
     [switch]$DryRun
 )
@@ -36,6 +47,16 @@ $DbPath = [string](Resolve-Path $DbPath)
 if (-not $Token) {
     $Token = if ($env:TRADING_CORE_TOKEN) { $env:TRADING_CORE_TOKEN } else { "local-dev-token" }
 }
+
+$ThemeBackfillMaxPerCycle = [Math]::Max(1, $ThemeBackfillMaxPerCycle)
+$ThemeBackfillMaxPending = [Math]::Max($ThemeBackfillMaxPerCycle, $ThemeBackfillMaxPending)
+$ThemeBackfillTtlSec = [Math]::Max(10, $ThemeBackfillTtlSec)
+$ThemeBackfillOpt10001BucketSec = [Math]::Max(30, $ThemeBackfillOpt10001BucketSec)
+$ThemeBackfillOpt10081BucketSec = [Math]::Max(300, $ThemeBackfillOpt10081BucketSec)
+$ThemeBackfillMaxThemes = [Math]::Max(0, $ThemeBackfillMaxThemes)
+$ThemeBackfillMaxHitsPerTheme = [Math]::Max(0, $ThemeBackfillMaxHitsPerTheme)
+$ThemeBackfillCacheTtlSec = [Math]::Max(0, $ThemeBackfillCacheTtlSec)
+$ThemeBackfillCacheLimit = [Math]::Max(0, $ThemeBackfillCacheLimit)
 
 $gatewayHost = if ($BindHost -in @("0.0.0.0", "::", "[::]")) { "127.0.0.1" } else { $BindHost }
 if (-not $GatewayCoreUrl) {
@@ -76,7 +97,20 @@ if ($GatewayTransport -eq "websocket-pilot") {
 $env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY = "1"
 $env:TRADING_SHADOW_STRATEGY_ALLOW_APPLY = "0"
 $env:TRADING_CHANGE_PROPOSAL_ALLOW_AUTO_APPLY = "0"
+$env:TRADING_THEME_BACKFILL_ENABLED = if ($DisableThemeBackfillWarmup) { "0" } else { "1" }
 $env:TRADING_THEME_BACKFILL_OBSERVE_ONLY = "1"
+$env:TRADING_THEME_BACKFILL_MAX_PER_CYCLE = [string]$ThemeBackfillMaxPerCycle
+$env:TRADING_THEME_BACKFILL_MAX_PENDING = [string]$ThemeBackfillMaxPending
+$env:TRADING_THEME_BACKFILL_TTL_SEC = [string]$ThemeBackfillTtlSec
+$env:TRADING_THEME_BACKFILL_OPT10001_BUCKET_SEC = [string]$ThemeBackfillOpt10001BucketSec
+$env:TRADING_THEME_BACKFILL_OPT10081_BUCKET_SEC = [string]$ThemeBackfillOpt10081BucketSec
+$env:TRADING_THEME_BACKFILL_ALLOW_OPT10081 = "0"
+$env:TRADING_THEME_BACKFILL_ALLOW_REGULAR_SESSION = "1"
+$env:TRADING_THEME_BACKFILL_MAX_THEMES = [string]$ThemeBackfillMaxThemes
+$env:TRADING_THEME_BACKFILL_MAX_HITS_PER_THEME = [string]$ThemeBackfillMaxHitsPerTheme
+$env:TRADING_THEME_BACKFILL_CACHE_ENABLED = "1"
+$env:TRADING_THEME_BACKFILL_CACHE_TTL_SEC = [string]$ThemeBackfillCacheTtlSec
+$env:TRADING_THEME_BACKFILL_CACHE_LIMIT = [string]$ThemeBackfillCacheLimit
 $env:TRADING_CORE_TOKEN = $Token
 $env:TRADING_DB_PATH = $DbPath
 $env:PYTHONIOENCODING = "utf-8"
@@ -334,6 +368,32 @@ function Get-ThemeLabStartupSummary {
     }
 }
 
+function Get-ThemeLabStartupSummarySkipped {
+    [pscustomobject]@{
+        available = $false
+        skipped = $true
+        reason = "STARTUP_SNAPSHOT_DECOUPLED"
+        operation_status = "SKIPPED"
+        operation_message = "ThemeLab startup snapshot is decoupled from LIVE_SIM readiness. Use -WaitThemeLabStartupSnapshot to wait for it."
+        theme_backfill = [pscustomobject]@{
+            enabled = [string]$env:TRADING_THEME_BACKFILL_ENABLED -eq "1"
+            observe_only = [string]$env:TRADING_THEME_BACKFILL_OBSERVE_ONLY -eq "1"
+            max_per_cycle = [int]$env:TRADING_THEME_BACKFILL_MAX_PER_CYCLE
+            max_pending = [int]$env:TRADING_THEME_BACKFILL_MAX_PENDING
+            ttl_sec = [int]$env:TRADING_THEME_BACKFILL_TTL_SEC
+            opt10001_bucket_sec = [int]$env:TRADING_THEME_BACKFILL_OPT10001_BUCKET_SEC
+            opt10081_bucket_sec = [int]$env:TRADING_THEME_BACKFILL_OPT10081_BUCKET_SEC
+            allow_opt10081 = [string]$env:TRADING_THEME_BACKFILL_ALLOW_OPT10081 -eq "1"
+            allow_regular_session = [string]$env:TRADING_THEME_BACKFILL_ALLOW_REGULAR_SESSION -eq "1"
+            max_themes = [int]$env:TRADING_THEME_BACKFILL_MAX_THEMES
+            max_hits_per_theme = [int]$env:TRADING_THEME_BACKFILL_MAX_HITS_PER_THEME
+            cache_enabled = [string]$env:TRADING_THEME_BACKFILL_CACHE_ENABLED -eq "1"
+            cache_ttl_sec = [int]$env:TRADING_THEME_BACKFILL_CACHE_TTL_SEC
+            cache_limit = [int]$env:TRADING_THEME_BACKFILL_CACHE_LIMIT
+        }
+    }
+}
+
 function Get-ShadowSmallEntryStartupStatus {
     $statusPayload = $null
     $preflightPayload = $null
@@ -386,7 +446,10 @@ try {
     }
     Write-Step "Shadow strategy observe_only=$env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY allow_apply=$env:TRADING_SHADOW_STRATEGY_ALLOW_APPLY"
     Write-Step "Change proposal auto_apply=$env:TRADING_CHANGE_PROPOSAL_ALLOW_AUTO_APPLY"
-    Write-Step "Theme backfill observe_only=$env:TRADING_THEME_BACKFILL_OBSERVE_ONLY"
+    Write-Step "Theme backfill enabled=$env:TRADING_THEME_BACKFILL_ENABLED observe_only=$env:TRADING_THEME_BACKFILL_OBSERVE_ONLY max_per_cycle=$env:TRADING_THEME_BACKFILL_MAX_PER_CYCLE max_pending=$env:TRADING_THEME_BACKFILL_MAX_PENDING ttl=$env:TRADING_THEME_BACKFILL_TTL_SEC opt10001_bucket=$env:TRADING_THEME_BACKFILL_OPT10001_BUCKET_SEC max_themes=$env:TRADING_THEME_BACKFILL_MAX_THEMES max_hits_per_theme=$env:TRADING_THEME_BACKFILL_MAX_HITS_PER_THEME cache_ttl=$env:TRADING_THEME_BACKFILL_CACHE_TTL_SEC"
+    if (-not $WaitThemeLabStartupSnapshot) {
+        Write-Step "ThemeLab startup snapshot wait=disabled; LIVE_SIM readiness will not wait for ThemeLab dashboard backfill diagnostics"
+    }
     if ($GatewayTransport -eq "websocket-pilot") {
         Write-Step "WebSocket pilot order commands allow=$env:TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS block=$env:TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS"
     }
@@ -418,7 +481,20 @@ try {
             shadow_strategy_observe_only = $env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY
             shadow_strategy_allow_apply = $env:TRADING_SHADOW_STRATEGY_ALLOW_APPLY
             change_proposal_allow_auto_apply = $env:TRADING_CHANGE_PROPOSAL_ALLOW_AUTO_APPLY
+            theme_backfill_enabled = $env:TRADING_THEME_BACKFILL_ENABLED
             theme_backfill_observe_only = $env:TRADING_THEME_BACKFILL_OBSERVE_ONLY
+            theme_backfill_max_per_cycle = $env:TRADING_THEME_BACKFILL_MAX_PER_CYCLE
+            theme_backfill_max_pending = $env:TRADING_THEME_BACKFILL_MAX_PENDING
+            theme_backfill_ttl_sec = $env:TRADING_THEME_BACKFILL_TTL_SEC
+            theme_backfill_opt10001_bucket_sec = $env:TRADING_THEME_BACKFILL_OPT10001_BUCKET_SEC
+            theme_backfill_opt10081_bucket_sec = $env:TRADING_THEME_BACKFILL_OPT10081_BUCKET_SEC
+            theme_backfill_allow_opt10081 = $env:TRADING_THEME_BACKFILL_ALLOW_OPT10081
+            theme_backfill_max_themes = $env:TRADING_THEME_BACKFILL_MAX_THEMES
+            theme_backfill_max_hits_per_theme = $env:TRADING_THEME_BACKFILL_MAX_HITS_PER_THEME
+            theme_backfill_cache_enabled = $env:TRADING_THEME_BACKFILL_CACHE_ENABLED
+            theme_backfill_cache_ttl_sec = $env:TRADING_THEME_BACKFILL_CACHE_TTL_SEC
+            theme_backfill_cache_limit = $env:TRADING_THEME_BACKFILL_CACHE_LIMIT
+            themelab_startup_snapshot = if ($WaitThemeLabStartupSnapshot) { "wait" } else { "decoupled" }
             shadow_small_entry_preflight = if ($SkipShadowSmallEntryPreflight) { "skipped" } else { "enabled" }
             db_order_execution = $dbSettings
         } | ConvertTo-Json -Depth 6
@@ -466,6 +542,11 @@ try {
     if (-not $SkipGateway) {
         $gatewayStart = Invoke-CoreApi -Method POST -Path "/api/gateway/kiwoom/start" -TimeoutSec 20
         Write-Step "Gateway start reason=$($gatewayStart.reason)"
+        if ($gatewayStart.stale_recovery -and $gatewayStart.stale_recovery.stale) {
+            $stoppedCount = @($gatewayStart.stale_recovery.stopped_processes).Count
+            $remainingCount = @($gatewayStart.stale_recovery.remaining_processes).Count
+            Write-Step "Gateway stale recovery stopped=$stoppedCount remaining=$remainingCount state=$($gatewayStart.gateway.connection_state) heartbeat_age=$($gatewayStart.gateway.heartbeat_age_sec)"
+        }
         $gatewayStatus = Wait-Until -TimeoutSec $GatewayStartupTimeoutSec -Label "Kiwoom gateway readiness" -Condition {
             $status = $null
             try {
@@ -507,10 +588,17 @@ try {
         Write-Step "Runtime ready mode=$($runtimeStatus.mode) cycles=$($runtimeStatus.cycle_count)"
     }
 
-    $themeLabStatus = Get-ThemeLabStartupSummary
+    if (-not $SkipRuntime) {
+        Write-Step "LIVE_SIM readiness reached; ThemeLab backfill may continue in background"
+    } else {
+        Write-Step "Runtime startup skipped; ThemeLab backfill will not run until runtime starts"
+    }
+    $themeLabStatus = if ($WaitThemeLabStartupSnapshot) { Get-ThemeLabStartupSummary } else { Get-ThemeLabStartupSummarySkipped }
     $shadowSmallEntryStatus = Get-ShadowSmallEntryStartupStatus
     if ($themeLabStatus.available) {
         Write-Step "ThemeLab status=$($themeLabStatus.operation_status) action=$($themeLabStatus.main_action.label_ko)"
+    } elseif ($themeLabStatus.skipped) {
+        Write-Step "ThemeLab startup snapshot skipped: $($themeLabStatus.reason)"
     } else {
         Write-Step "ThemeLab status unavailable: $($themeLabStatus.error)"
     }

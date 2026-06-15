@@ -114,6 +114,7 @@ const statusClass = {
   DEGRADED: "blocked",
   BROKEN: "blocked",
   WARNING: "warning",
+  DIAGNOSTIC: "observe",
   OK: "ready",
   PROMOTE: "ready",
   HOLD: "wait",

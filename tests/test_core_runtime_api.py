@@ -61,6 +61,60 @@ def test_start_kiwoom_gateway_launches_process_when_disconnected(tmp_path, monke
     assert response["processes"][0]["pid"] == 1234
 
 
+def test_start_kiwoom_gateway_starts_when_connected_state_is_stale(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch, enabled="0") as client:
+        import trading_app.api as api
+
+        api.gateway_state.record_event(
+            GatewayEvent(
+                type="heartbeat",
+                event_id="evt-gateway-stale",
+                timestamp="2000-01-01T00:00:00+00:00",
+                payload={"kiwoom_logged_in": True},
+            )
+        )
+        monkeypatch.setattr(api, "_find_kiwoom_gateway_processes", lambda: [])
+        monkeypatch.setattr(
+            api,
+            "_start_kiwoom_gateway_process",
+            lambda: {"pid": 2345, "name": "python.exe", "command_line": "python apps/kiwoom_gateway.py"},
+        )
+        response = client.post("/api/gateway/kiwoom/start", headers={"X-Local-Token": "test-token"}).json()
+
+    assert response["started"] is True
+    assert response["reason"] == "STARTED_STALE_STATE"
+    assert response["gateway"]["stale_for_start"] is True
+    assert response["stale_recovery"]["stale"] is True
+    assert response["processes"][0]["pid"] == 2345
+
+
+def test_start_kiwoom_gateway_restarts_stale_running_process(tmp_path, monkeypatch):
+    stale_process = {"pid": 3456, "name": "python.exe", "command_line": "python apps/kiwoom_gateway.py"}
+    launched_process = {"pid": 4567, "name": "python.exe", "command_line": "python apps/kiwoom_gateway.py"}
+
+    with _client(tmp_path, monkeypatch, enabled="0") as client:
+        import trading_app.api as api
+
+        api.gateway_state.record_event(
+            GatewayEvent(
+                type="heartbeat",
+                event_id="evt-gateway-stale-running",
+                timestamp="2000-01-01T00:00:00+00:00",
+                payload={"kiwoom_logged_in": True},
+            )
+        )
+        process_checks = [[stale_process], []]
+        monkeypatch.setattr(api, "_find_kiwoom_gateway_processes", lambda: process_checks.pop(0))
+        monkeypatch.setattr(api, "_stop_kiwoom_gateway_processes", lambda processes: list(processes))
+        monkeypatch.setattr(api, "_start_kiwoom_gateway_process", lambda: launched_process)
+        response = client.post("/api/gateway/kiwoom/start", headers={"X-Local-Token": "test-token"}).json()
+
+    assert response["started"] is True
+    assert response["reason"] == "RESTARTED_STALE"
+    assert response["stale_recovery"]["stopped_processes"][0]["pid"] == 3456
+    assert response["processes"][0]["pid"] == 4567
+
+
 def test_kiwoom_gateway_defaults_to_single_base_python(monkeypatch):
     import trading_app.api as api
 
@@ -291,6 +345,75 @@ def test_dashboard_snapshot_payload_uses_shared_cache(tmp_path, monkeypatch):
     assert len(calls) == 2
     assert first["runtime"]["call_count"] == 1
     assert forced["runtime"]["call_count"] == 2
+
+
+def test_theme_lab_snapshot_cache_returns_stale_and_schedules_refresh(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    submitted = []
+
+    class FakeExecutor:
+        def submit(self, fn, *args):
+            submitted.append((fn, args))
+            return None
+
+    calls = {"builder": 0, "refresh": 0}
+
+    def builder():
+        calls["builder"] += 1
+        return {"value": "sync"}
+
+    def refresh_builder():
+        calls["refresh"] += 1
+        return {"value": "fresh"}
+
+    try:
+        cache_key = (api._dashboard_database_cache_key(db), "theme_lab:test")
+        with api._theme_lab_dashboard_snapshot_cache_lock:
+            api._theme_lab_dashboard_snapshot_cache.clear()
+            api._theme_lab_dashboard_snapshot_refreshing.clear()
+            api._theme_lab_dashboard_snapshot_cache[cache_key] = (time.monotonic() - 10.0, {"value": "stale"})
+        monkeypatch.setattr(api, "_theme_lab_dashboard_snapshot_refresh_executor_instance", lambda: FakeExecutor())
+        monkeypatch.setattr(
+            api,
+            "_defer_theme_lab_dashboard_snapshot_refresh",
+            lambda cache_key, refresh_builder: api._submit_theme_lab_dashboard_snapshot_refresh(cache_key, refresh_builder),
+        )
+
+        first = api._cached_theme_lab_dashboard_snapshot(
+            db,
+            "theme_lab:test",
+            builder,
+            refresh_builder=refresh_builder,
+            ttl_sec=0.001,
+        )
+        second = api._cached_theme_lab_dashboard_snapshot(
+            db,
+            "theme_lab:test",
+            builder,
+            refresh_builder=refresh_builder,
+            ttl_sec=0.001,
+        )
+
+        fn, args = submitted[0]
+        fn(*args)
+        with api._theme_lab_dashboard_snapshot_cache_lock:
+            refreshed = api._theme_lab_dashboard_snapshot_cache[cache_key][1]
+    finally:
+        db.close()
+        with api._theme_lab_dashboard_snapshot_cache_lock:
+            api._theme_lab_dashboard_snapshot_cache.clear()
+            api._theme_lab_dashboard_snapshot_refreshing.clear()
+
+    assert first == {"value": "stale"}
+    assert second == {"value": "stale"}
+    assert calls == {"builder": 0, "refresh": 1}
+    assert len(submitted) == 1
+    assert refreshed == {"value": "fresh"}
 
 
 def test_dashboard_snapshot_defaults_to_slim_detail(tmp_path, monkeypatch):

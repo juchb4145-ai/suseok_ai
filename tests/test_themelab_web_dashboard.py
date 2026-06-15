@@ -568,6 +568,159 @@ def test_theme_lab_snapshot_sorts_watchset_and_filters_entry_candidates(tmp_path
     assert payload["data_quality"]["vi_status_supported"] is False
 
 
+def test_theme_lab_snapshot_applies_backfill_data_quality_overlay(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    theme = _theme()
+    theme["eligible_total_members"] = 2
+    try:
+        db.save_theme_lab_flow_result(
+            "09:01:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [theme],
+                "watchset_snapshots": [_watch("000001", "WAIT")],
+                "gate_decisions": [],
+                "data_quality": {
+                    "current_price_missing_count": 2,
+                    "prev_close_missing_count": 2,
+                    "candle_missing_count": 0,
+                    "status": "WARNING",
+                },
+                "theme_backfill_runtime": {
+                    "last_success_at": "2026-06-15T06:56:22+00:00",
+                    "missing_price_count_before": 2,
+                    "missing_price_count_after": 0,
+                    "missing_prev_close_count_before": 2,
+                    "missing_prev_close_count_after": 0,
+                },
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    assert payload["data_quality"]["status"] == "OK"
+    assert payload["data_quality"]["current_price_missing_count"] == 0
+    assert payload["data_quality"]["prev_close_missing_count"] == 0
+    assert payload["data_quality"]["backfill_adjusted"] is True
+    assert payload["data_quality"]["reasons"] == []
+
+
+def test_theme_lab_snapshot_global_quality_reflects_degraded_theme_rank(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    degraded_theme = _theme()
+    degraded_theme.update(
+        {
+            "eligible_total_members": 2,
+            "alive_count": 0,
+            "strong_count": 0,
+            "leader_count": 0,
+            "theme_turnover_krw": 0,
+            "data_quality_flags": ["MISSING_CURRENT_PRICE", "MISSING_PREV_CLOSE"],
+            "member_hits": [
+                {
+                    "symbol": "000001",
+                    "name": "A",
+                    "return_pct": None,
+                    "turnover_krw": 0,
+                    "alive_hit": False,
+                    "strong_hit": False,
+                    "leader_hit": False,
+                    "excluded": False,
+                    "data_quality_flags": ["MISSING_CURRENT_PRICE", "MISSING_PREV_CLOSE"],
+                },
+                {
+                    "symbol": "000002",
+                    "name": "B",
+                    "return_pct": None,
+                    "turnover_krw": 0,
+                    "alive_hit": False,
+                    "strong_hit": False,
+                    "leader_hit": False,
+                    "excluded": False,
+                    "data_quality_flags": ["MISSING_CURRENT_PRICE", "MISSING_PREV_CLOSE"],
+                },
+            ],
+        }
+    )
+    try:
+        db.save_theme_lab_flow_result(
+            "09:01:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [degraded_theme],
+                "watchset_snapshots": [],
+                "gate_decisions": [],
+                "data_quality": {
+                    "current_price_missing_count": 2,
+                    "prev_close_missing_count": 2,
+                    "candle_missing_count": 0,
+                    "status": "WARNING",
+                },
+                "theme_backfill_runtime": {
+                    "last_success_at": "2026-06-15T06:56:22+00:00",
+                    "missing_price_count_after": 0,
+                    "missing_prev_close_count_after": 0,
+                },
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    assert payload["ranked_themes"][0]["theme_quality_status"] in {"BROKEN", "DEGRADED"}
+    assert payload["data_quality"]["status"] == "DEGRADED"
+    assert payload["data_quality"]["current_price_missing_count"] == 0
+    assert payload["data_quality"]["theme_rank_degraded_count"] == 1
+    assert payload["data_quality"]["theme_rank_zero_price_coverage_count"] == 1
+    assert "Theme Rank" in payload["data_quality"]["message"]
+
+
+def test_theme_lab_snapshot_marks_market_closed_from_runtime_status(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        db.save_theme_lab_flow_result(
+            "09:01:00",
+            {
+                "market_status": {"market_status": "CHOPPY", "kospi_return_pct": 0.0, "kosdaq_return_pct": 0.0},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [_watch("000001", "WAIT")],
+                "gate_decisions": [],
+                "data_quality": {
+                    "status": "WARNING",
+                    "current_price_missing_count": 1,
+                    "prev_close_missing_count": 1,
+                },
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(
+            db,
+            runtime_status={
+                "running": True,
+                "latest_snapshot": {
+                    "market_session_status": "closed",
+                    "data_warmup_status": "closed",
+                    "gate_skip_reason": "MARKET_SESSION_CLOSED",
+                },
+            },
+        )
+    finally:
+        db.close()
+
+    assert payload["runtime"]["market_session_status"] == "closed"
+    assert payload["market"]["market_status"] == "CLOSED"
+    assert {side["status"] for side in payload["market"]["sides"]} == {"CLOSED"}
+    assert payload["data_quality"]["raw_status"] in {"WARNING", "DEGRADED"}
+    assert payload["data_quality"]["status"] == "DIAGNOSTIC"
+    assert payload["data_quality"]["session_adjusted"] is True
+    data_status = next(item for item in payload["operator_view"]["operating_status"] if item["key"] == "data")
+    assert data_status["status"] == "DIAGNOSTIC"
+    assert data_status["severity"] == "neutral"
+
+
 def test_theme_lab_snapshot_caches_expensive_reports(tmp_path, monkeypatch):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     calls = {

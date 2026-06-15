@@ -32,6 +32,33 @@ TRADING_THEME_BACKFILL_ALLOW_REGULAR_SESSION=1
 
 `MAX_PER_CYCLE=2` is acceptable after confirming gateway command latency is stable.
 
+## Market-Open LIVE_SIM Warmup Preset
+
+`tools/start_market_open_live_sim.ps1` is an OBSERVE/DRY_RUN startup path, so it enables a bounded ThemeLab warmup profile by default:
+
+```powershell
+TRADING_THEME_BACKFILL_ENABLED=1
+TRADING_THEME_BACKFILL_OBSERVE_ONLY=1
+TRADING_THEME_BACKFILL_MAX_PER_CYCLE=6
+TRADING_THEME_BACKFILL_MAX_PENDING=10
+TRADING_THEME_BACKFILL_TTL_SEC=60
+TRADING_THEME_BACKFILL_OPT10001_BUCKET_SEC=60
+TRADING_THEME_BACKFILL_OPT10081_BUCKET_SEC=1800
+TRADING_THEME_BACKFILL_ALLOW_OPT10081=0
+TRADING_THEME_BACKFILL_ALLOW_REGULAR_SESSION=1
+TRADING_THEME_BACKFILL_MAX_THEMES=8
+TRADING_THEME_BACKFILL_MAX_HITS_PER_THEME=8
+TRADING_THEME_BACKFILL_CACHE_ENABLED=1
+TRADING_THEME_BACKFILL_CACHE_TTL_SEC=21600
+TRADING_THEME_BACKFILL_CACHE_LIMIT=500
+```
+
+The script does not wait for `/api/themelab/snapshot` by default. Use `-WaitThemeLabStartupSnapshot` only when startup diagnostics should include the fresh ThemeLab dashboard snapshot, and `-DisableThemeBackfillWarmup` when TR backfill traffic should remain fully off.
+
+The warmup scope is intentionally bounded. It backfills the highest ranked degraded themes first, and within each theme prefers leader/strong/alive members before lower-signal members. This keeps startup TR traffic focused on the symbols most likely to affect WatchSet and operator judgment.
+
+On restart, the runtime hydrates same-trade-date ACKed ThemeLab backfill results from the gateway command history before building ThemeLab snapshots. Cached TR_BACKFILL ticks remain `gate_usable=false`; they improve coverage and operator visibility, but they must not create READY/READY_SMALL by themselves.
+
 ## Watch During Pilot
 
 Check `/api/themelab/snapshot` and the dashboard for:
@@ -47,6 +74,8 @@ Check `/api/themelab/snapshot` and the dashboard for:
 - `theme_backfill_runtime.missing_price_count_before`
 - `theme_backfill_runtime.missing_prev_close_count_before`
 - `theme_backfill_runtime.tr_backfill_caused_ready_count`
+- `theme_backfill_runtime.backfill_cache_applied_count`
+- `theme_backfill_runtime.backfill_cache_stale_count`
 - gateway queue depth and command latency
 
 Current dashboard aggregation is based on the recent 500 gateway commands. It is not a durable long-term event store.

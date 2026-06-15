@@ -38,6 +38,11 @@ class ThemeBackfillConfig:
     opt10081_bucket_sec: int = 1800
     allow_opt10081: bool = False
     allow_regular_session: bool = True
+    max_themes: int = 0
+    max_hits_per_theme: int = 0
+    cache_enabled: bool = True
+    cache_ttl_sec: int = 21600
+    cache_limit: int = 500
 
     @classmethod
     def from_env(cls, *, trading_mode: str | None = None) -> "ThemeBackfillConfig":
@@ -52,6 +57,11 @@ class ThemeBackfillConfig:
             opt10081_bucket_sec=_int_env("TRADING_THEME_BACKFILL_OPT10081_BUCKET_SEC", 1800),
             allow_opt10081=_bool_env("TRADING_THEME_BACKFILL_ALLOW_OPT10081", False),
             allow_regular_session=_bool_env("TRADING_THEME_BACKFILL_ALLOW_REGULAR_SESSION", True),
+            max_themes=max(0, _int_env("TRADING_THEME_BACKFILL_MAX_THEMES", 0)),
+            max_hits_per_theme=max(0, _int_env("TRADING_THEME_BACKFILL_MAX_HITS_PER_THEME", 0)),
+            cache_enabled=_bool_env("TRADING_THEME_BACKFILL_CACHE_ENABLED", True),
+            cache_ttl_sec=max(0, _int_env("TRADING_THEME_BACKFILL_CACHE_TTL_SEC", 21600)),
+            cache_limit=max(0, _int_env("TRADING_THEME_BACKFILL_CACHE_LIMIT", 500)),
         )
 
 
@@ -64,6 +74,7 @@ class BackfillCandidate:
     missing_fields: list[str] = field(default_factory=list)
     priority: str = "MEDIUM"
     rank: int = 999999
+    hit_rank: int = 999999
 
 
 class ThemeBackfillService:
@@ -76,10 +87,54 @@ class ThemeBackfillService:
         self.gateway_state = gateway_state
         self.config = config or ThemeBackfillConfig.from_env()
         self.last_summary = _empty_summary(self.config)
+        self.last_cache_summary = _empty_cache_summary(self.config)
+
+    def hydrate_cache(self, market_data: Any, now: datetime) -> dict[str, Any]:
+        summary = _empty_cache_summary(self.config)
+        if not self.config.cache_enabled or self.config.cache_limit <= 0:
+            self.last_cache_summary = summary
+            return summary
+        seen_codes: set[str] = set()
+        trade_date = _trade_date(now)
+        for record in self.gateway_state.list_commands(
+            status=CommandStatus.ACKED.value,
+            limit=self.config.cache_limit,
+            include_finished=True,
+            command_type="tr_request",
+        ):
+            payload = _payload(record)
+            if str(payload.get("purpose") or "") != THEME_BACKFILL_PURPOSE:
+                continue
+            summary["backfill_cache_record_count"] += 1
+            record_trade_date = _record_trade_date(record)
+            if record_trade_date and record_trade_date != trade_date:
+                summary["backfill_cache_stale_count"] += 1
+                continue
+            if not record_trade_date and _record_age_sec(record, now) > self.config.cache_ttl_sec:
+                summary["backfill_cache_stale_count"] += 1
+                continue
+            result_payload = _result_payload(record)
+            parsed = _parsed_backfill_payload(result_payload)
+            code = _normalize_code(result_payload.get("code") or payload.get("code") or parsed.get("code") or "")
+            if not code or code in seen_codes or not parsed:
+                summary["backfill_cache_skip_count"] += 1
+                continue
+            seen_codes.add(code)
+            try:
+                applied = bool(market_data.apply_theme_backfill(code, parsed, now=_as_utc(now).replace(tzinfo=None)))
+            except Exception:
+                applied = False
+            if applied:
+                summary["backfill_cache_applied_count"] += 1
+            else:
+                summary["backfill_cache_skip_count"] += 1
+        self.last_cache_summary = summary
+        return summary
 
     def plan_and_enqueue(self, result: Any, now: datetime) -> dict[str, Any]:
         cfg = self.config
         summary = _empty_summary(cfg)
+        summary.update(self.last_cache_summary)
         summary.update(_result_quality_metrics(result, prefix="before"))
         candidates = build_backfill_candidates(result, cfg=cfg, now=now)
         summary["candidate_count"] = len(candidates)
@@ -137,20 +192,23 @@ class ThemeBackfillService:
 
 def build_backfill_candidates(result: Any, *, cfg: ThemeBackfillConfig, now: datetime) -> list[BackfillCandidate]:
     aggregate: dict[tuple[str, str], BackfillCandidate] = {}
+    selected_theme_count = 0
     for rank, theme in enumerate(list(getattr(result, "themes", ()) or ()), start=1):
         priority = _theme_backfill_priority(theme)
         if priority not in {"HIGH", "MEDIUM"}:
             continue
+        hits = _scoped_backfill_hits(theme, cfg=cfg)
+        if not hits:
+            continue
+        if cfg.max_themes > 0 and selected_theme_count >= cfg.max_themes:
+            continue
+        selected_theme_count += 1
         theme_id = str(getattr(theme, "theme_id", "") or "")
-        for hit in getattr(theme, "member_hits", ()) or ():
-            if bool(getattr(hit, "excluded", False)):
-                continue
+        for hit_rank, hit in enumerate(hits, start=1):
             code = _normalize_code(getattr(hit, "symbol", ""))
             if not code:
                 continue
             missing = _missing_fields(hit)
-            if not missing:
-                continue
             _merge_candidate(
                 aggregate,
                 BackfillCandidate(
@@ -161,6 +219,7 @@ def build_backfill_candidates(result: Any, *, cfg: ThemeBackfillConfig, now: dat
                     missing_fields=missing,
                     priority=priority,
                     rank=rank,
+                    hit_rank=hit_rank,
                 ),
             )
             if cfg.allow_opt10081 and "prev_close" in missing:
@@ -174,11 +233,12 @@ def build_backfill_candidates(result: Any, *, cfg: ThemeBackfillConfig, now: dat
                         missing_fields=["prev_close"],
                         priority=priority,
                         rank=rank,
+                        hit_rank=hit_rank,
                     ),
                 )
     return sorted(
         aggregate.values(),
-        key=lambda item: (0 if item.priority == "HIGH" else 1, item.rank, item.code, 0 if item.tr_code == TR_OPT10001 else 1),
+        key=_candidate_sort_key,
     )
 
 
@@ -212,6 +272,8 @@ def command_for_candidate(candidate: BackfillCandidate, *, cfg: ThemeBackfillCon
             "trade_date": _trade_date(now),
             "bucket": bucket,
             "backfill_priority": candidate.priority,
+            "backfill_theme_rank": candidate.rank,
+            "backfill_hit_rank": candidate.hit_rank,
         },
     )
 
@@ -427,6 +489,54 @@ def _missing_fields(hit: Any) -> list[str]:
     return list(dict.fromkeys(fields))
 
 
+def _scoped_backfill_hits(theme: Any, *, cfg: ThemeBackfillConfig) -> list[Any]:
+    hits = []
+    for hit in getattr(theme, "member_hits", ()) or ():
+        if bool(getattr(hit, "excluded", False)):
+            continue
+        if not _normalize_code(getattr(hit, "symbol", "")):
+            continue
+        if not _missing_fields(hit):
+            continue
+        hits.append(hit)
+    hits = sorted(hits, key=_backfill_hit_sort_key)
+    if cfg.max_hits_per_theme > 0:
+        return hits[: cfg.max_hits_per_theme]
+    return hits
+
+
+def _backfill_hit_sort_key(hit: Any) -> tuple[Any, ...]:
+    if bool(getattr(hit, "leader_hit", False)):
+        condition_level = 3
+    elif bool(getattr(hit, "strong_hit", False)):
+        condition_level = 2
+    elif bool(getattr(hit, "alive_hit", False)):
+        condition_level = 1
+    else:
+        condition_level = 0
+    flags = set(getattr(hit, "data_quality_flags", ()) or ())
+    missing_current = "MISSING_CURRENT_PRICE" in flags
+    missing_prev = "MISSING_PREV_CLOSE" in flags
+    return (
+        -condition_level,
+        0 if missing_current else 1,
+        0 if missing_prev else 1,
+        -abs(float(getattr(hit, "return_pct", 0.0) or 0.0)),
+        -float(getattr(hit, "turnover_krw", 0.0) or 0.0),
+        _normalize_code(getattr(hit, "symbol", "")),
+    )
+
+
+def _candidate_sort_key(item: BackfillCandidate) -> tuple[Any, ...]:
+    return (
+        0 if item.priority == "HIGH" else 1,
+        item.rank,
+        item.hit_rank,
+        item.code,
+        0 if item.tr_code == TR_OPT10001 else 1,
+    )
+
+
 def _merge_candidate(target: dict[tuple[str, str], BackfillCandidate], candidate: BackfillCandidate) -> None:
     key = (candidate.code, candidate.tr_code)
     existing = target.get(key)
@@ -435,10 +545,11 @@ def _merge_candidate(target: dict[tuple[str, str], BackfillCandidate], candidate
         return
     existing.related_theme_ids = list(dict.fromkeys(existing.related_theme_ids + candidate.related_theme_ids))
     existing.missing_fields = list(dict.fromkeys(existing.missing_fields + candidate.missing_fields))
-    if existing.priority != "HIGH" and candidate.priority == "HIGH":
-        existing.priority = "HIGH"
+    if _candidate_sort_key(candidate) < _candidate_sort_key(existing):
+        existing.priority = candidate.priority
         existing.primary_theme_id = candidate.primary_theme_id
-        existing.rank = min(existing.rank, candidate.rank)
+        existing.rank = candidate.rank
+        existing.hit_rank = candidate.hit_rank
 
 
 def _active_records(gateway_state: GatewayStateStore) -> list[dict[str, Any]]:
@@ -471,6 +582,21 @@ def _payload(record: dict[str, Any]) -> dict[str, Any]:
         return payload
     payload = record.get("payload")
     return dict(payload or {}) if isinstance(payload, dict) else {}
+
+
+def _result_payload(record: dict[str, Any]) -> dict[str, Any]:
+    payload = record.get("result_payload")
+    return dict(payload or {}) if isinstance(payload, dict) else {}
+
+
+def _parsed_backfill_payload(result_payload: dict[str, Any]) -> dict[str, Any]:
+    parsed = result_payload.get("parsed_backfill")
+    if isinstance(parsed, dict):
+        return dict(parsed)
+    raw = result_payload.get("raw")
+    if isinstance(raw, dict) and isinstance(raw.get("parsed_backfill"), dict):
+        return dict(raw.get("parsed_backfill") or {})
+    return {}
 
 
 def _command_type(record: dict[str, Any]) -> str:
@@ -512,6 +638,28 @@ def _record_time(record: dict[str, Any], key: str) -> datetime | None:
         return None
 
 
+def _record_trade_date(record: dict[str, Any]) -> str:
+    payload = _payload(record)
+    result_payload = _result_payload(record)
+    for value in (
+        payload.get("trade_date"),
+        result_payload.get("trade_date"),
+        record.get("trade_date"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text[:10]
+    created = _record_time(record, "created_at")
+    return created.date().isoformat() if created else ""
+
+
+def _record_age_sec(record: dict[str, Any], now: datetime) -> int:
+    base = _record_time(record, "acked_at") or _record_time(record, "finished_at") or _record_time(record, "updated_at") or _record_time(record, "created_at")
+    if base is None:
+        return 0
+    return max(0, int((_as_utc(now) - _as_utc(base)).total_seconds()))
+
+
 def _result_quality_metrics(result: Any, *, prefix: str) -> dict[str, Any]:
     total = 0
     missing_price = 0
@@ -550,6 +698,19 @@ def _empty_summary(cfg: ThemeBackfillConfig) -> dict[str, Any]:
         "enabled": cfg.enabled,
         "observe_only": cfg.observe_only,
         "trading_mode": cfg.trading_mode,
+        "max_per_cycle": cfg.max_per_cycle,
+        "max_pending": cfg.max_pending,
+        "ttl_sec": cfg.ttl_sec,
+        "opt10001_bucket_sec": cfg.opt10001_bucket_sec,
+        "opt10081_bucket_sec": cfg.opt10081_bucket_sec,
+        "allow_opt10081": cfg.allow_opt10081,
+        "allow_regular_session": cfg.allow_regular_session,
+        "max_themes": cfg.max_themes,
+        "max_hits_per_theme": cfg.max_hits_per_theme,
+        "cache_enabled": cfg.cache_enabled,
+        "cache_ttl_sec": cfg.cache_ttl_sec,
+        "cache_limit": cfg.cache_limit,
+        **_empty_cache_summary(cfg),
         "observe_pilot_active": bool(cfg.enabled and (not cfg.observe_only or str(cfg.trading_mode or "").upper() == "OBSERVE")),
         "history_window": "recent_500_commands",
         "paused_reason": "",
@@ -588,6 +749,18 @@ def _empty_summary(cfg: ThemeBackfillConfig) -> dict[str, Any]:
         "backfill_paused_by_order_count": 0,
         "backfill_paused_by_gateway_unhealthy_count": 0,
         "tr_backfill_caused_ready_count": 0,
+    }
+
+
+def _empty_cache_summary(cfg: ThemeBackfillConfig) -> dict[str, Any]:
+    return {
+        "backfill_cache_enabled": cfg.cache_enabled,
+        "backfill_cache_ttl_sec": cfg.cache_ttl_sec,
+        "backfill_cache_limit": cfg.cache_limit,
+        "backfill_cache_record_count": 0,
+        "backfill_cache_applied_count": 0,
+        "backfill_cache_skip_count": 0,
+        "backfill_cache_stale_count": 0,
     }
 
 

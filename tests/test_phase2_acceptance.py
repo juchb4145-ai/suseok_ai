@@ -30,6 +30,7 @@ from trading.strategy.export import REVIEW_EXPORT_COLUMNS, ReviewExporter
 from trading.strategy.holding import StaticHoldingProvider
 from trading.strategy.models import (
     BlockType,
+    Candidate,
     CandidateState,
     FillPolicy,
     GateDecision,
@@ -42,7 +43,7 @@ from trading.strategy.pipeline import GatePipelineResult
 from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.replay import TickReplayRunner
 from trading.strategy.review import TradeReviewService
-from trading.strategy.runtime import StrategyRuntime, StrategyRuntimeConfig
+from trading.strategy.runtime import StrategyRuntime, StrategyRuntimeConfig, _candidate_generation_summary
 from trading.strategy.virtual_orders import VirtualOrderService
 
 
@@ -260,6 +261,129 @@ def review_keys(db, candidate_id: int):
 
 def assert_unique(values: set, expected_count: int) -> None:
     assert len(values) == expected_count
+
+
+def test_candidate_generation_summary_snapshot_reuses_recent_cache(tmp_path, monkeypatch):
+    runtime, db, _client, _clock = build_acceptance_runtime(tmp_path)
+    monkeypatch.setenv("TRADING_RUNTIME_CANDIDATE_GENERATION_SUMMARY_TTL_SEC", "30")
+    candidates = [
+        Candidate(
+            trade_date="2026-05-29",
+            code=CODE,
+            metadata={"candidate_generation_seq": 1, "candidate_generation_reason": "stale_re_detected"},
+        ),
+        Candidate(
+            trade_date="2026-05-29",
+            code=CODE,
+            metadata={"candidate_generation_seq": 2, "candidate_generation_reason": "theme_changed"},
+        ),
+    ]
+    list_calls = 0
+
+    def fake_list_candidates(trade_date=None, *args, **kwargs):
+        nonlocal list_calls
+        assert trade_date == "2026-05-29"
+        list_calls += 1
+        return list(candidates)
+
+    def fake_count_candidates(trade_date=None, *args, **kwargs):
+        assert trade_date == "2026-05-29"
+        return len(candidates)
+
+    monkeypatch.setattr(db, "list_candidates", fake_list_candidates)
+    monkeypatch.setattr(db, "count_candidates", fake_count_candidates)
+    monkeypatch.setattr(runtime, "_candidate_generation_summary_from_sql", lambda trade_date: None)
+
+    first = runtime._snapshot(NOW)
+    second = runtime._snapshot(NOW + timedelta(seconds=1))
+
+    assert list_calls == 1
+    assert second.candidate_generation_summary == first.candidate_generation_summary
+    assert second.candidate_generation_summary["multi_generation_code_count"] == 1
+    assert second.candidate_generation_summary["theme_change_generation_count"] == 1
+
+    candidates.append(
+        Candidate(
+            trade_date="2026-05-29",
+            code="222222",
+            metadata={"candidate_generation_seq": 1, "candidate_generation_reason": "source_changed"},
+        )
+    )
+    third = runtime._snapshot(NOW + timedelta(seconds=2))
+
+    assert list_calls == 2
+    assert third.candidate_generation_summary["source_change_generation_count"] == 1
+
+
+def test_candidate_generation_summary_sql_matches_python_summary(tmp_path):
+    runtime, db, _client, _clock = build_acceptance_runtime(tmp_path)
+    db.save_candidate(
+        Candidate(
+            trade_date="2026-05-29",
+            code=CODE,
+            metadata={"candidate_generation_seq": 1, "candidate_generation_reason": "stale_re_detected"},
+        )
+    )
+    db.save_candidate(
+        Candidate(
+            trade_date="2026-05-29",
+            code="222222",
+            metadata={"candidate_generation_seq": 3, "generation_reason": "theme_changed"},
+        )
+    )
+    db.save_candidate(
+        Candidate(
+            trade_date="2026-05-29",
+            code="333333",
+            metadata={
+                "candidate_generation_seq": 0,
+                "candidate_generation_reason": "same_generation_min_gap_guardrail",
+                "excessive_generation_blocked": True,
+            },
+        )
+    )
+
+    expected = _candidate_generation_summary(db.list_candidates("2026-05-29"))
+
+    assert runtime._candidate_generation_summary_from_sql("2026-05-29") == expected
+
+
+def test_active_candidate_count_uses_fast_sql_for_simple_states(tmp_path, monkeypatch):
+    runtime, db, _client, _clock = build_acceptance_runtime(tmp_path)
+    db.save_candidate(Candidate(trade_date="2026-05-29", code=CODE, state=CandidateState.WATCHING))
+    db.save_candidate(Candidate(trade_date="2026-05-29", code="BAD", state=CandidateState.WATCHING))
+    db.save_candidate(Candidate(trade_date="2026-05-29", code="222222", state=CandidateState.EXPIRED))
+
+    def fail_active_candidates(*args, **kwargs):
+        raise AssertionError("simple active count should use SQL")
+
+    monkeypatch.setattr(runtime, "_active_candidates", fail_active_candidates)
+
+    assert runtime._active_candidate_count("2026-05-29", NOW) == 1
+
+
+def test_active_candidate_count_falls_back_for_recoverable_blocked(tmp_path, monkeypatch):
+    runtime, db, _client, _clock = build_acceptance_runtime(tmp_path)
+    db.save_candidate(
+        Candidate(
+            trade_date="2026-05-29",
+            code=CODE,
+            state=CandidateState.BLOCKED,
+            block_type=BlockType.TEMPORARY,
+            can_recover=True,
+        )
+    )
+    calls = 0
+
+    def fake_active_candidates(trade_date, now=None):
+        nonlocal calls
+        calls += 1
+        return [object(), object()]
+
+    monkeypatch.setattr(runtime, "_active_candidates", fake_active_candidates)
+
+    assert runtime._active_candidate_count("2026-05-29", NOW) == 2
+    assert calls == 1
 
 
 def test_phase2_eligible_filled_path_acceptance_and_idempotency(tmp_path, monkeypatch):

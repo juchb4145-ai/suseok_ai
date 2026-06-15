@@ -298,6 +298,7 @@ class ThemeLabRuntimePipeline:
 
         repository = timed("repository", lambda: ThemeEngineRepository(self.db))
         theme_inputs = timed("theme_inputs", lambda: self._theme_inputs(repository))
+        backfill_cache_summary = timed("backfill_cache", lambda: self._hydrate_backfill_cache(now))
         snapshots = timed("snapshots", lambda: self._snapshots(theme_inputs))
         if not theme_inputs:
             self._warnings.append("THEME_LAB_MAPPING_EMPTY")
@@ -326,7 +327,7 @@ class ThemeLabRuntimePipeline:
             "annotate_market_session",
             lambda: _annotate_market_session(result, session, self._market_confirmation_metrics),
         )
-        self.last_backfill_runtime = timed("backfill", lambda: self._run_backfill(result, now))
+        self.last_backfill_runtime = timed("backfill", lambda: self._run_backfill(result, now, cache_summary=backfill_cache_summary))
         result = _annotate_runtime_pipeline_timings(
             result,
             timings,
@@ -910,14 +911,28 @@ class ThemeLabRuntimePipeline:
         if callable(save):
             save(now.isoformat(), payload)
 
-    def _run_backfill(self, result: ThemeLabFlowResult, now: datetime) -> dict[str, Any]:
+    def _run_backfill(self, result: ThemeLabFlowResult, now: datetime, *, cache_summary: dict[str, Any] | None = None) -> dict[str, Any]:
+        if self.backfill_service is None:
+            return dict(cache_summary or {})
+        try:
+            summary = self.backfill_service.plan_and_enqueue(result, now)
+            if cache_summary:
+                summary.update(cache_summary)
+            return summary
+        except Exception as exc:
+            self._warnings.append(f"THEME_BACKFILL_FAILED:{exc}")
+            return {"enabled": True, "paused_reason": f"ERROR:{exc}", **dict(cache_summary or {})}
+
+    def _hydrate_backfill_cache(self, now: datetime) -> dict[str, Any]:
         if self.backfill_service is None:
             return {}
         try:
-            return self.backfill_service.plan_and_enqueue(result, now)
+            hydrator = getattr(self.backfill_service, "hydrate_cache", None)
+            if callable(hydrator):
+                return dict(hydrator(self.market_data, now) or {})
         except Exception as exc:
-            self._warnings.append(f"THEME_BACKFILL_FAILED:{exc}")
-            return {"enabled": True, "paused_reason": f"ERROR:{exc}"}
+            self._warnings.append(f"THEME_BACKFILL_CACHE_FAILED:{exc}")
+        return {}
 
 
 def _annotate_market_confirmation_persistence(

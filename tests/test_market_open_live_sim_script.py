@@ -18,13 +18,26 @@ def test_market_open_live_sim_script_declares_runtime_safety_envs():
     assert "$env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY = \"1\"" in text
     assert "$env:TRADING_SHADOW_STRATEGY_ALLOW_APPLY = \"0\"" in text
     assert "$env:TRADING_CHANGE_PROPOSAL_ALLOW_AUTO_APPLY = \"0\"" in text
+    assert "$env:TRADING_THEME_BACKFILL_ENABLED = if ($DisableThemeBackfillWarmup) { \"0\" } else { \"1\" }" in text
     assert "$env:TRADING_THEME_BACKFILL_OBSERVE_ONLY = \"1\"" in text
+    assert "$env:TRADING_THEME_BACKFILL_MAX_PER_CYCLE = [string]$ThemeBackfillMaxPerCycle" in text
+    assert "$env:TRADING_THEME_BACKFILL_MAX_PENDING = [string]$ThemeBackfillMaxPending" in text
+    assert "$env:TRADING_THEME_BACKFILL_TTL_SEC = [string]$ThemeBackfillTtlSec" in text
+    assert "$env:TRADING_THEME_BACKFILL_OPT10001_BUCKET_SEC = [string]$ThemeBackfillOpt10001BucketSec" in text
+    assert "$env:TRADING_THEME_BACKFILL_ALLOW_OPT10081 = \"0\"" in text
+    assert "$env:TRADING_THEME_BACKFILL_MAX_THEMES = [string]$ThemeBackfillMaxThemes" in text
+    assert "$env:TRADING_THEME_BACKFILL_MAX_HITS_PER_THEME = [string]$ThemeBackfillMaxHitsPerTheme" in text
+    assert "$env:TRADING_THEME_BACKFILL_CACHE_ENABLED = \"1\"" in text
+    assert "$env:TRADING_THEME_BACKFILL_CACHE_TTL_SEC = [string]$ThemeBackfillCacheTtlSec" in text
+    assert "$env:TRADING_THEME_BACKFILL_CACHE_LIMIT = [string]$ThemeBackfillCacheLimit" in text
 
 
 def test_market_open_live_sim_script_reports_new_operator_surfaces():
     text = SCRIPT.read_text(encoding="utf-8")
 
     assert "/api/themelab/snapshot" in text
+    assert "[switch]$WaitThemeLabStartupSnapshot" in text
+    assert "STARTUP_SNAPSHOT_DECOUPLED" in text
     assert "/api/shadow-small-entry-ops/status" in text
     assert "/api/shadow-small-entry-ops/preflight" in text
     assert "themelab_url" in text

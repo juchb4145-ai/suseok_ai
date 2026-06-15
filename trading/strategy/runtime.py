@@ -319,6 +319,10 @@ class StrategyRuntime:
         self.startup_warnings: list[str] = []
         self.readiness_report: Optional[ReadinessReport] = None
         self._theme_presence_cache: dict[str, bool] = {}
+        self._candidate_generation_summary_cache: dict[str, Any] = {}
+        self._candidate_generation_summary_cache_trade_date = ""
+        self._candidate_generation_summary_cache_count: Optional[int] = None
+        self._candidate_generation_summary_cache_expires_at = 0.0
         self._last_runtime_time = _clean_time(self.clock())
         if hasattr(self.candidate_collector, "set_condition_event_allowed"):
             self.candidate_collector.set_condition_event_allowed(self._condition_events_allowed)
@@ -437,7 +441,10 @@ class StrategyRuntime:
             timed("flow_diagnostics_empty", lambda: self._apply_flow_diagnostics(snapshot, current, trade_date, []))
             if snapshot.gate_skip_reason == GATE_SKIP_MARKET_SESSION_CLOSED:
                 snapshot.candidate_count = timed("candidate_count", lambda: self._candidate_count(trade_date))
-                snapshot.active_candidate_count = timed("active_candidates_closed", lambda: len(self._active_candidates(trade_date, current)))
+                snapshot.active_candidate_count = timed(
+                    "active_candidates_closed",
+                    lambda: self._active_candidate_count(trade_date, current),
+                )
                 timed("condition_adapter_stop_closed", lambda: self._stop_condition_adapter_for_market_closed(snapshot))
                 timed("reconcile_subscriptions_closed", lambda: self._reconcile_subscriptions([], snapshot))
                 self._refresh_readiness_snapshot_step(
@@ -2109,6 +2116,96 @@ class StrategyRuntime:
                 result.append(candidate)
         return result
 
+    def _active_candidate_count(self, trade_date: str, now: Optional[datetime] = None) -> int:
+        fast_count = self._active_candidate_count_from_sql(trade_date)
+        if fast_count is not None:
+            return fast_count
+        return len(self._active_candidates(trade_date, now))
+
+    def _active_candidate_count_from_sql(self, trade_date: str) -> Optional[int]:
+        conn = getattr(self.db, "conn", None)
+        if conn is None:
+            return None
+        try:
+            blocked_row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM candidates
+                WHERE trade_date = ?
+                  AND state = ?
+                  AND block_type = ?
+                  AND can_recover = 1
+                """,
+                (trade_date, CandidateState.BLOCKED.value, BlockType.TEMPORARY.value),
+            ).fetchone()
+            if int(blocked_row["count"] if blocked_row else 0):
+                return None
+
+            theme_ready_row = conn.execute("SELECT COUNT(*) AS count FROM theme_membership_current").fetchone()
+            theme_ready = int(theme_ready_row["count"] if theme_ready_row else 0) > 0
+            active_theme_clause = (
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM theme_membership_current m
+                    JOIN canonical_themes t ON t.theme_id = m.theme_id
+                    WHERE m.active = 1
+                      AND t.status IN ('ACTIVE', 'WATCH')
+                      AND m.stock_code = c.code
+                )
+                """
+                if theme_ready
+                else "1 = 1"
+            )
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM candidates c
+                WHERE c.trade_date = ?
+                  AND (
+                    c.state IN (?, ?, ?)
+                    OR c.id IN (
+                        SELECT DISTINCT candidate_id
+                        FROM virtual_positions
+                        WHERE candidate_id IS NOT NULL AND closed_at = ''
+                    )
+                    OR c.id IN (
+                        SELECT DISTINCT candidate_id
+                        FROM virtual_orders
+                        WHERE candidate_id IS NOT NULL AND status = ?
+                    )
+                  )
+                  AND (
+                    c.id IN (
+                        SELECT DISTINCT candidate_id
+                        FROM virtual_positions
+                        WHERE candidate_id IS NOT NULL AND closed_at = ''
+                    )
+                    OR c.id IN (
+                        SELECT DISTINCT candidate_id
+                        FROM virtual_orders
+                        WHERE candidate_id IS NOT NULL AND status = ?
+                    )
+                    OR (
+                        LENGTH(c.code) = 6
+                        AND c.code GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'
+                        AND {active_theme_clause}
+                    )
+                  )
+                """,
+                (
+                    trade_date,
+                    CandidateState.DETECTED.value,
+                    CandidateState.WATCHING.value,
+                    CandidateState.READY.value,
+                    VirtualOrderStatus.SUBMITTED.value,
+                    VirtualOrderStatus.SUBMITTED.value,
+                ),
+            ).fetchone()
+        except Exception:
+            return None
+        return int(row["count"] if row else 0)
+
     def _candidate_count(self, trade_date: str) -> int:
         count_candidates = getattr(self.db, "count_candidates", None)
         if count_candidates is not None:
@@ -2610,10 +2707,108 @@ class StrategyRuntime:
     def _apply_candidate_generation_summary(self, snapshot: StrategyRuntimeSnapshot) -> None:
         try:
             trade_date = self.candidate_collector._trade_date()
-            candidates = self.db.list_candidates(trade_date)
-            snapshot.candidate_generation_summary = _candidate_generation_summary(candidates)
+            current_count = self._candidate_generation_summary_count(trade_date)
+            now_perf = perf_counter()
+            ttl_sec = max(0.0, _env_float("TRADING_RUNTIME_CANDIDATE_GENERATION_SUMMARY_TTL_SEC", 30.0))
+            if (
+                ttl_sec > 0
+                and self._candidate_generation_summary_cache
+                and self._candidate_generation_summary_cache_trade_date == trade_date
+                and now_perf < self._candidate_generation_summary_cache_expires_at
+                and (
+                    current_count is None
+                    or self._candidate_generation_summary_cache_count is None
+                    or current_count == self._candidate_generation_summary_cache_count
+                )
+            ):
+                snapshot.candidate_generation_summary = dict(self._candidate_generation_summary_cache)
+                return
+            summary = self._candidate_generation_summary_from_sql(trade_date)
+            if summary is None:
+                candidates = self.db.list_candidates(trade_date)
+                summary = _candidate_generation_summary(candidates)
+                current_count = current_count if current_count is not None else len(candidates)
+            snapshot.candidate_generation_summary = summary
+            if ttl_sec > 0:
+                self._candidate_generation_summary_cache = dict(summary)
+                self._candidate_generation_summary_cache_trade_date = trade_date
+                self._candidate_generation_summary_cache_count = current_count
+                self._candidate_generation_summary_cache_expires_at = now_perf + ttl_sec
         except Exception as exc:
             snapshot.candidate_generation_summary = {"error": f"CANDIDATE_GENERATION_SUMMARY_FAILED:{exc}"}
+
+    def _candidate_generation_summary_count(self, trade_date: str) -> Optional[int]:
+        count_candidates = getattr(self.db, "count_candidates", None)
+        if count_candidates is None:
+            return None
+        try:
+            return int(count_candidates(trade_date=trade_date))
+        except Exception:
+            return None
+
+    def _candidate_generation_summary_from_sql(self, trade_date: str) -> Optional[dict]:
+        conn = getattr(self.db, "conn", None)
+        if conn is None:
+            return None
+        try:
+            row = conn.execute(
+                """
+                WITH candidate_rows AS (
+                    SELECT
+                        trade_date || ':' || code AS candidate_key,
+                        CAST(COALESCE(json_extract(metadata_json, '$.candidate_generation_seq'), 0) AS INTEGER) AS generation_seq,
+                        COALESCE(
+                            NULLIF(CAST(json_extract(metadata_json, '$.generation_reason') AS TEXT), ''),
+                            NULLIF(CAST(json_extract(metadata_json, '$.candidate_generation_reason') AS TEXT), ''),
+                            ''
+                        ) AS reason,
+                        json_extract(metadata_json, '$.excessive_generation_blocked') AS excessive_generation_blocked
+                    FROM candidates
+                    WHERE trade_date = ?
+                ),
+                generation_counts AS (
+                    SELECT candidate_key, COUNT(DISTINCT generation_seq) AS generation_count
+                    FROM candidate_rows
+                    WHERE generation_seq <> 0
+                    GROUP BY candidate_key
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM generation_counts WHERE generation_count > 1) AS multi_generation_code_count,
+                    (SELECT AVG(generation_count) FROM generation_counts) AS avg_generation_per_code,
+                    COALESCE((SELECT MAX(generation_count) FROM generation_counts), 0) AS max_generation_per_code,
+                    SUM(CASE WHEN reason = 'stale_re_detected' THEN 1 ELSE 0 END) AS stale_re_detect_count,
+                    SUM(CASE WHEN reason = 'theme_changed' THEN 1 ELSE 0 END) AS theme_change_generation_count,
+                    SUM(CASE WHEN reason = 'source_changed' THEN 1 ELSE 0 END) AS source_change_generation_count,
+                    SUM(CASE WHEN reason = 'strategy_changed' THEN 1 ELSE 0 END) AS strategy_change_generation_count,
+                    SUM(CASE WHEN reason = 'previous_lifecycle_closed' THEN 1 ELSE 0 END) AS previous_lifecycle_closed_generation_count,
+                    SUM(
+                        CASE
+                            WHEN reason IN ('same_generation_min_gap_guardrail', 'same_generation_max_generation_guardrail') THEN 1
+                            WHEN excessive_generation_blocked IS NOT NULL
+                              AND CAST(excessive_generation_blocked AS TEXT) NOT IN ('', '0', 'false', 'False', 'FALSE') THEN 1
+                            ELSE 0
+                        END
+                    ) AS excessive_generation_count
+                FROM candidate_rows
+                """,
+                (trade_date,),
+            ).fetchone()
+        except Exception:
+            return None
+        if row is None:
+            return None
+        avg_value = row["avg_generation_per_code"]
+        return {
+            "multi_generation_code_count": int(row["multi_generation_code_count"] or 0),
+            "avg_generation_per_code": round(float(avg_value), 4) if avg_value is not None else None,
+            "max_generation_per_code": int(row["max_generation_per_code"] or 0),
+            "stale_re_detect_count": int(row["stale_re_detect_count"] or 0),
+            "theme_change_generation_count": int(row["theme_change_generation_count"] or 0),
+            "source_change_generation_count": int(row["source_change_generation_count"] or 0),
+            "strategy_change_generation_count": int(row["strategy_change_generation_count"] or 0),
+            "previous_lifecycle_closed_generation_count": int(row["previous_lifecycle_closed_generation_count"] or 0),
+            "excessive_generation_count": int(row["excessive_generation_count"] or 0),
+        }
 
     def _emit_entry_order_intent(
         self,
@@ -3514,6 +3709,13 @@ def _status_text(value) -> str:
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
 
