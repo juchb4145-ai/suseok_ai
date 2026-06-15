@@ -7,6 +7,7 @@ param(
     [string]$Token = "",
     [int]$CoreStartupTimeoutSec = 45,
     [int]$GatewayStartupTimeoutSec = 90,
+    [int]$GatewayStartupRetryCount = 1,
     [int]$GatewayDiagnosticsTailLines = 20,
     [int]$RuntimeStartupTimeoutSec = 120,
     [ValidateSet("rest", "websocket-pilot", "websocket-experimental")]
@@ -511,6 +512,7 @@ try {
     Write-Step "Runtime TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT=$env:TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT"
     Write-Step "Gateway transport=$env:TRADING_GATEWAY_TRANSPORT"
     Write-Step "Gateway readiness require_orderable=$([bool]$RequireGatewayOrderable)"
+    Write-Step "Gateway startup retries=$GatewayStartupRetryCount"
     Write-Step "Gateway core URL=$env:TRADING_KIWOOM_GATEWAY_CORE_URL"
     if ($env:TRADING_GATEWAY_WS_URL) {
         Write-Step "Gateway WebSocket URL=$env:TRADING_GATEWAY_WS_URL"
@@ -548,6 +550,7 @@ try {
             gateway_core_url = $env:TRADING_KIWOOM_GATEWAY_CORE_URL
             gateway_ws_url = $env:TRADING_GATEWAY_WS_URL
             gateway_require_orderable = [bool]$RequireGatewayOrderable
+            gateway_startup_retry_count = $GatewayStartupRetryCount
             websocket_pilot_order_allow = $env:TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS
             websocket_pilot_order_block = $env:TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS
             shadow_strategy_observe_only = $env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY
@@ -612,38 +615,45 @@ try {
     $gatewayStatus = $null
     $gatewayModes = $null
     if (-not $SkipGateway) {
-        $gatewayStart = Invoke-CoreApi -Method POST -Path "/api/gateway/kiwoom/start" -TimeoutSec 20
-        Write-Step "Gateway start reason=$($gatewayStart.reason)"
-        if ($gatewayStart.stale_recovery -and $gatewayStart.stale_recovery.stale) {
-            $stoppedCount = @($gatewayStart.stale_recovery.stopped_processes).Count
-            $remainingCount = @($gatewayStart.stale_recovery.remaining_processes).Count
-            Write-Step "Gateway stale recovery stopped=$stoppedCount remaining=$remainingCount state=$($gatewayStart.gateway.connection_state) heartbeat_age=$($gatewayStart.gateway.heartbeat_age_sec)"
-        }
         $gatewayWaitLabel = if ($RequireGatewayOrderable) { "Kiwoom gateway orderable readiness" } else { "Kiwoom gateway heartbeat readiness" }
-        try {
-            $gatewayStatus = Wait-Until -TimeoutSec $GatewayStartupTimeoutSec -Label $gatewayWaitLabel -Condition {
-                $status = $null
-                try {
-                    $status = Invoke-CoreApi -Method GET -Path "/api/gateway/status" -TimeoutSec 5
-                } catch {
-                    return $null
-                }
-                if ($status.connected -and $status.heartbeat_ok) {
-                    Assert-GatewayNotRealMode $status
-                    if ($RequireGatewayOrderable) {
-                        if ($status.kiwoom_logged_in -and $status.orderable -and (Test-GatewaySimulationMode $status)) {
-                            return $status
-                        }
+        $maxGatewayAttempts = 1 + [Math]::Max(0, $GatewayStartupRetryCount)
+        for ($gatewayAttempt = 1; $gatewayAttempt -le $maxGatewayAttempts; $gatewayAttempt++) {
+            $gatewayStart = Invoke-CoreApi -Method POST -Path "/api/gateway/kiwoom/start" -TimeoutSec 20
+            Write-Step "Gateway start attempt=$gatewayAttempt/$maxGatewayAttempts reason=$($gatewayStart.reason)"
+            if ($gatewayStart.stale_recovery -and ($gatewayStart.stale_recovery.stale -or $gatewayStart.stale_recovery.orphan)) {
+                $stoppedCount = @($gatewayStart.stale_recovery.stopped_processes).Count
+                $remainingCount = @($gatewayStart.stale_recovery.remaining_processes).Count
+                Write-Step "Gateway stale recovery stopped=$stoppedCount remaining=$remainingCount stale=$($gatewayStart.stale_recovery.stale) orphan=$($gatewayStart.stale_recovery.orphan) state=$($gatewayStart.gateway.connection_state) heartbeat_age=$($gatewayStart.gateway.heartbeat_age_sec)"
+            }
+            try {
+                $gatewayStatus = Wait-Until -TimeoutSec $GatewayStartupTimeoutSec -Label $gatewayWaitLabel -Condition {
+                    $status = $null
+                    try {
+                        $status = Invoke-CoreApi -Method GET -Path "/api/gateway/status" -TimeoutSec 5
+                    } catch {
                         return $null
                     }
-                    return $status
+                    if ($status.connected -and $status.heartbeat_ok) {
+                        Assert-GatewayNotRealMode $status
+                        if ($RequireGatewayOrderable) {
+                            if ($status.kiwoom_logged_in -and $status.orderable -and (Test-GatewaySimulationMode $status)) {
+                                return $status
+                            }
+                            return $null
+                        }
+                        return $status
+                    }
+                    return $null
                 }
-                return $null
+                break
+            } catch {
+                $diagnostics = Get-GatewayStartupDiagnostics
+                Write-GatewayStartupDiagnostics $diagnostics
+                if ($gatewayAttempt -ge $maxGatewayAttempts) {
+                    throw
+                }
+                Write-Step "Gateway readiness retrying after timeout; requesting gateway restart"
             }
-        } catch {
-            $diagnostics = Get-GatewayStartupDiagnostics
-            Write-GatewayStartupDiagnostics $diagnostics
-            throw
         }
         $gatewayModes = Get-GatewayBrokerModeSummary $gatewayStatus
         $gatewayReadyForOrders = [bool]($gatewayStatus.kiwoom_logged_in -and $gatewayStatus.orderable -and (Test-GatewaySimulationMode $gatewayStatus))

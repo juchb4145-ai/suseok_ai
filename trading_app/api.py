@@ -928,19 +928,21 @@ def _start_kiwoom_gateway_response() -> dict[str, Any]:
         }
     processes = _find_kiwoom_gateway_processes()
     stale_for_start = bool(gateway_status.get("stale_for_start"))
+    orphan_for_start = bool(processes and _gateway_snapshot_orphan_process_for_start(snapshot))
     stopped_processes: list[dict[str, Any]] = []
-    if stale_for_start and processes:
+    if (stale_for_start or orphan_for_start) and processes:
         stopped_processes = _stop_kiwoom_gateway_processes(processes)
         time.sleep(0.5)
         processes = _find_kiwoom_gateway_processes()
         if processes:
             return {
                 "started": False,
-                "reason": "STALE_RESTART_BLOCKED",
+                "reason": "ORPHAN_RESTART_BLOCKED" if orphan_for_start else "STALE_RESTART_BLOCKED",
                 "gateway": gateway_status,
                 "processes": processes,
                 "stale_recovery": {
                     "stale": True,
+                    "orphan": orphan_for_start,
                     "stopped_processes": stopped_processes,
                     "remaining_processes": processes,
                 },
@@ -953,7 +955,15 @@ def _start_kiwoom_gateway_response() -> dict[str, Any]:
             "processes": processes,
         }
     started = _start_kiwoom_gateway_process()
-    reason = "RESTARTED_STALE" if stopped_processes else ("STARTED_STALE_STATE" if stale_for_start else "STARTED")
+    reason = (
+        "RESTARTED_ORPHAN"
+        if orphan_for_start and stopped_processes
+        else "RESTARTED_STALE"
+        if stopped_processes
+        else "STARTED_STALE_STATE"
+        if stale_for_start
+        else "STARTED"
+    )
     return {
         "started": True,
         "reason": reason,
@@ -961,6 +971,7 @@ def _start_kiwoom_gateway_response() -> dict[str, Any]:
         "processes": [started],
         "stale_recovery": {
             "stale": stale_for_start,
+            "orphan": orphan_for_start,
             "stopped_processes": stopped_processes,
             "remaining_processes": [],
         },
@@ -1001,6 +1012,18 @@ def _gateway_snapshot_stale_for_start(snapshot: dict[str, Any]) -> bool:
         return float(heartbeat_age) > float(timeout or 0)
     except (TypeError, ValueError):
         return True
+
+
+def _gateway_snapshot_orphan_process_for_start(snapshot: dict[str, Any]) -> bool:
+    if bool(snapshot.get("connected")) or bool(snapshot.get("heartbeat_ok")):
+        return False
+    last_heartbeat_at = str(snapshot.get("last_heartbeat_at") or "").strip()
+    last_event_at = str(snapshot.get("last_event_at") or "").strip()
+    try:
+        received_event_count = int(snapshot.get("received_event_count") or 0)
+    except (TypeError, ValueError):
+        received_event_count = 0
+    return not last_heartbeat_at and not last_event_at and received_event_count <= 0
 
 
 def _find_kiwoom_gateway_processes() -> list[dict[str, Any]]:
@@ -7395,16 +7418,61 @@ def _dashboard_slim_theme_lab_payload(payload: dict[str, Any]) -> dict[str, Any]
 
 
 def _dashboard_slim_logs_payload(payload: dict[str, Any], *, item_limit: int = 40) -> dict[str, Any]:
+    gateway_limit = max(10, item_limit // 4)
     return {
         "core": list((payload or {}).get("core") or [])[:item_limit],
-        "gateway": list((payload or {}).get("gateway") or [])[: max(10, item_limit // 4)],
-        "items": list((payload or {}).get("items") or [])[:item_limit],
+        "gateway": [
+            _dashboard_slim_gateway_log_event(dict(item or {}))
+            for item in list((payload or {}).get("gateway") or [])[:gateway_limit]
+        ],
+        "items": [
+            _dashboard_slim_log_item(dict(item or {}))
+            for item in list((payload or {}).get("items") or [])[:item_limit]
+        ],
         "warnings": list((payload or {}).get("warnings") or [])[:10],
         "timezone": (payload or {}).get("timezone") or "Asia/Seoul",
         "live_window_sec": (payload or {}).get("live_window_sec") or LOG_LIVE_WINDOW_SEC,
         "stale_core_log_count": (payload or {}).get("stale_core_log_count") or 0,
         "hidden_gateway_event_counts": dict((payload or {}).get("hidden_gateway_event_counts") or {}),
     }
+
+
+def _dashboard_slim_log_item(item: dict[str, Any]) -> dict[str, Any]:
+    slim = _dashboard_field_subset(
+        item,
+        ("source", "timestamp", "timestamp_utc", "type", "line"),
+    )
+    event = dict(item.get("event") or {})
+    if event:
+        slim["event"] = _dashboard_slim_gateway_log_event(event)
+    return slim
+
+
+def _dashboard_slim_gateway_log_event(event: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(event.get("payload") or {})
+    slim = _dashboard_field_subset(
+        event,
+        ("type", "event_id", "request_id", "timestamp", "source", "command_id", "idempotency_key"),
+    )
+    payload_summary = _dashboard_field_subset(
+        payload,
+        (
+            "command_type",
+            "status",
+            "result_code",
+            "error",
+            "message",
+            "code",
+            "screen_no",
+            "condition_name",
+            "order_no",
+            "broker_order_id",
+            "transport_mode",
+        ),
+    )
+    if payload_summary:
+        slim["payload"] = payload_summary
+    return slim
 
 
 def _dashboard_slim_intraday_decisions_payload(payload: dict[str, Any]) -> dict[str, Any]:

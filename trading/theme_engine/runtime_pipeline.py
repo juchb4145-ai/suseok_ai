@@ -255,6 +255,7 @@ class ThemeLabRuntimePipeline:
         persistence_config: MarketSideConfirmationPersistenceConfig | None = None,
         session_config: MarketSessionConfig | None = None,
         backfill_service: ThemeBackfillService | None = None,
+        theme_input_cache_ttl_sec: int | None = None,
     ) -> None:
         self.db = db
         self.market_data = market_data
@@ -276,6 +277,12 @@ class ThemeLabRuntimePipeline:
         self.backfill_service = backfill_service
         self.last_backfill_runtime: dict[str, Any] = {}
         self.last_pipeline_timings: dict[str, float] = {}
+        if theme_input_cache_ttl_sec is None:
+            theme_input_cache_ttl_sec = _env_int("TRADING_THEME_LAB_INPUT_CACHE_TTL_SEC", 60, minimum=0)
+        self.theme_input_cache_ttl_sec = max(0, int(theme_input_cache_ttl_sec))
+        self._theme_inputs_cache: list[tuple[str, str, list[ThemeMembership]]] | None = None
+        self._theme_inputs_cache_signature: tuple[int, int, str, str] | None = None
+        self._theme_inputs_cache_loaded_at: datetime | None = None
 
     def run_if_due(self, now: datetime) -> Optional[ThemeLabFlowResult]:
         current = now.replace(microsecond=0)
@@ -867,11 +874,52 @@ class ThemeLabRuntimePipeline:
         return warnings
 
     def _theme_inputs(self, repository: ThemeEngineRepository) -> list[tuple[str, str, list[ThemeMembership]]]:
+        signature = self._theme_input_signature(repository)
+        if self._can_reuse_theme_inputs_cache(signature):
+            return list(self._theme_inputs_cache or [])
+        inputs = self._load_theme_inputs(repository)
+        self._theme_inputs_cache = inputs
+        self._theme_inputs_cache_signature = signature
+        self._theme_inputs_cache_loaded_at = datetime.now()
+        return list(inputs)
+
+    def _theme_input_signature(self, repository: ThemeEngineRepository) -> tuple[int, int, str, str] | None:
+        signature_fn = getattr(repository, "theme_input_signature", None)
+        if not callable(signature_fn):
+            return None
+        try:
+            return signature_fn(
+                statuses=(ThemeStatus.ACTIVE.value, ThemeStatus.WATCH.value, ThemeStatus.CANDIDATE.value),
+                active=True,
+            )
+        except Exception as exc:
+            self._warnings.append(f"THEME_LAB_INPUT_SIGNATURE_FAILED:{exc}")
+            return None
+
+    def _can_reuse_theme_inputs_cache(self, signature: tuple[int, int, str, str] | None) -> bool:
+        if self.theme_input_cache_ttl_sec <= 0:
+            return False
+        if self._theme_inputs_cache is None or self._theme_inputs_cache_loaded_at is None:
+            return False
+        if signature is None or signature != self._theme_inputs_cache_signature:
+            return False
+        age_sec = (datetime.now() - self._theme_inputs_cache_loaded_at).total_seconds()
+        return age_sec <= self.theme_input_cache_ttl_sec
+
+    def _load_theme_inputs(self, repository: ThemeEngineRepository) -> list[tuple[str, str, list[ThemeMembership]]]:
         themes = [
             theme
             for theme in repository.list_canonical_themes()
             if _enum_value(theme.status) in {ThemeStatus.ACTIVE.value, ThemeStatus.WATCH.value, ThemeStatus.CANDIDATE.value}
         ]
+        member_loader = getattr(repository, "list_members_by_theme_ids", None)
+        if callable(member_loader):
+            members_by_theme = member_loader([theme.theme_id for theme in themes], active=True)
+            return [
+                (theme.theme_id, theme.display_name or theme.canonical_name, list(members_by_theme.get(theme.theme_id) or []))
+                for theme in themes
+                if members_by_theme.get(theme.theme_id)
+            ]
         inputs: list[tuple[str, str, list[ThemeMembership]]] = []
         for theme in themes:
             members = repository.get_members_by_theme(theme.theme_id, active=True)
@@ -1317,6 +1365,13 @@ def _dedupe_tuple(values: tuple[str, ...]) -> tuple[str, ...]:
         if text and text not in result:
             result.append(text)
     return tuple(result)
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return max(minimum, int(default))
 
 
 def _bool(value, default: bool) -> bool:

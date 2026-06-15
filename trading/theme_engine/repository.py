@@ -320,6 +320,83 @@ class ThemeEngineRepository:
         rows = self.conn.execute(query, params).fetchall()
         return [_row_to_membership(row) for row in rows]
 
+    def list_members_by_theme_ids(
+        self,
+        theme_ids: list[str] | tuple[str, ...],
+        *,
+        active: bool = True,
+    ) -> dict[str, list[ThemeMembership]]:
+        ids = [str(theme_id or "").strip() for theme_id in theme_ids if str(theme_id or "").strip()]
+        if not ids:
+            return {}
+        seen: set[str] = set()
+        ordered_ids = []
+        for theme_id in ids:
+            if theme_id in seen:
+                continue
+            seen.add(theme_id)
+            ordered_ids.append(theme_id)
+        placeholders = ",".join("?" for _ in ordered_ids)
+        query = f"SELECT * FROM theme_membership_current WHERE theme_id IN ({placeholders})"
+        params: list[object] = list(ordered_ids)
+        if active:
+            query += " AND active = 1"
+        query += " ORDER BY theme_id, membership_score DESC, stock_code"
+        rows = self.conn.execute(query, params).fetchall()
+        grouped: dict[str, list[ThemeMembership]] = {theme_id: [] for theme_id in ordered_ids}
+        for row in rows:
+            membership = _row_to_membership(row)
+            grouped.setdefault(membership.theme_id, []).append(membership)
+        return grouped
+
+    def theme_input_signature(
+        self,
+        *,
+        statuses: list[str] | tuple[str, ...] | set[str] | None = None,
+        active: bool = True,
+    ) -> tuple[int, int, str, str]:
+        status_values = [_enum_value(status) for status in (statuses or []) if _enum_value(status)]
+        theme_where = ""
+        theme_params: list[object] = []
+        if status_values:
+            placeholders = ",".join("?" for _ in status_values)
+            theme_where = f"WHERE status IN ({placeholders})"
+            theme_params.extend(status_values)
+        theme_row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS theme_count,
+                   COALESCE(MAX(updated_at), '') AS max_theme_updated_at
+            FROM canonical_themes
+            {theme_where}
+            """,
+            theme_params,
+        ).fetchone()
+        member_where = []
+        member_params: list[object] = []
+        if active:
+            member_where.append("m.active = 1")
+        if status_values:
+            placeholders = ",".join("?" for _ in status_values)
+            member_where.append(f"t.status IN ({placeholders})")
+            member_params.extend(status_values)
+        member_clause = "WHERE " + " AND ".join(member_where) if member_where else ""
+        member_row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS member_count,
+                   COALESCE(MAX(m.updated_at), '') AS max_member_updated_at
+            FROM theme_membership_current m
+            JOIN canonical_themes t ON t.theme_id = m.theme_id
+            {member_clause}
+            """,
+            member_params,
+        ).fetchone()
+        return (
+            int(theme_row["theme_count"] or 0) if theme_row else 0,
+            int(member_row["member_count"] or 0) if member_row else 0,
+            str(theme_row["max_theme_updated_at"] or "") if theme_row else "",
+            str(member_row["max_member_updated_at"] or "") if member_row else "",
+        )
+
     def get_themes_by_stock(self, stock_code: str, active: bool = True) -> list[ThemeMembership]:
         query = "SELECT * FROM theme_membership_current WHERE stock_code = ?"
         params: list[object] = [normalize_stock_code(stock_code)]

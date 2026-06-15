@@ -167,6 +167,58 @@ def test_theme_lab_runtime_tick_runs_pipeline_saves_result_and_syncs_watchset(tm
     db.close()
 
 
+def test_theme_lab_runtime_reuses_theme_inputs_cache_until_mapping_changes(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        _seed_theme(db)
+        now = datetime(2026, 6, 1, 9, 1, 0)
+        market_data = MarketDataStore()
+        for code in ("000001", "000002", "000003", "000004"):
+            market_data.update_tick(_tick(code, 105, 5.0, now))
+        market_index_store = MarketIndexStore()
+        pipeline = ThemeLabRuntimePipeline(
+            db=db,
+            market_data=market_data,
+            market_index_store=market_index_store,
+            theme_input_cache_ttl_sec=60,
+        )
+        load_count = 0
+        original_load = pipeline._load_theme_inputs
+
+        def counted_load(repository):
+            nonlocal load_count
+            load_count += 1
+            return original_load(repository)
+
+        pipeline._load_theme_inputs = counted_load
+
+        pipeline.run(now)
+        pipeline.run(now + timedelta(seconds=3))
+
+        assert load_count == 1
+
+        ThemeEngineRepository(db).upsert_current_membership(
+            ThemeMembership(
+                theme_id="ai",
+                stock_code="000004",
+                stock_name="stock-000004",
+                membership_score=0.9,
+                active=True,
+                trade_eligible=True,
+            )
+        )
+        pipeline.run(now + timedelta(seconds=6))
+
+        assert load_count == 2
+        assert any(
+            member.stock_code == "000004"
+            for _, _, members in (pipeline._theme_inputs_cache or [])
+            for member in members
+        )
+    finally:
+        db.close()
+
+
 def test_final_readiness_soft_budget_can_defer_or_disable(monkeypatch, tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     runtime = build_observe_runtime(MockKiwoomClient(), db)

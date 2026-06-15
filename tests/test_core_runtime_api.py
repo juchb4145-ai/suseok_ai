@@ -115,6 +115,26 @@ def test_start_kiwoom_gateway_restarts_stale_running_process(tmp_path, monkeypat
     assert response["processes"][0]["pid"] == 4567
 
 
+def test_start_kiwoom_gateway_restarts_orphan_running_process_without_heartbeat(tmp_path, monkeypatch):
+    orphan_process = {"pid": 5678, "name": "python.exe", "command_line": "python apps/kiwoom_gateway.py"}
+    launched_process = {"pid": 6789, "name": "python.exe", "command_line": "python apps/kiwoom_gateway.py"}
+
+    with _client(tmp_path, monkeypatch, enabled="0") as client:
+        import trading_app.api as api
+
+        process_checks = [[orphan_process], []]
+        monkeypatch.setattr(api, "_find_kiwoom_gateway_processes", lambda: process_checks.pop(0))
+        monkeypatch.setattr(api, "_stop_kiwoom_gateway_processes", lambda processes: list(processes))
+        monkeypatch.setattr(api, "_start_kiwoom_gateway_process", lambda: launched_process)
+        response = client.post("/api/gateway/kiwoom/start", headers={"X-Local-Token": "test-token"}).json()
+
+    assert response["started"] is True
+    assert response["reason"] == "RESTARTED_ORPHAN"
+    assert response["stale_recovery"]["orphan"] is True
+    assert response["stale_recovery"]["stopped_processes"][0]["pid"] == 5678
+    assert response["processes"][0]["pid"] == 6789
+
+
 def test_kiwoom_gateway_defaults_to_single_base_python(monkeypatch):
     import trading_app.api as api
 
@@ -877,6 +897,50 @@ def test_dashboard_logs_hide_price_tick_noise(tmp_path, monkeypatch):
     assert logs["gateway"][0]["type"] == "command_ack"
     assert [item["type"] for item in logs["items"]] == ["command_ack"]
     assert logs["hidden_gateway_event_counts"] == {"price_tick": 1}
+
+
+def test_dashboard_slim_logs_payload_strips_gateway_event_raw_payload():
+    import trading_app.api as api
+
+    raw_event = {
+        "type": "command_ack",
+        "timestamp": "2026-05-31T09:41:38+00:00",
+        "event_id": "evt-ack",
+        "source": "kiwoom_gateway",
+        "payload": {
+            "command_type": "register_realtime",
+            "status": "ACKED",
+            "transport_mode": "websocket_real_pilot",
+            "transport_trace": {"raw": "x" * 10000},
+            "raw_blob": "y" * 10000,
+        },
+    }
+    payload = {
+        "core": ["2026-05-31 18:41:37 KST [gateway][rate_limited] register_realtime"],
+        "gateway": [raw_event],
+        "items": [
+            {
+                "source": "gateway",
+                "timestamp": "2026-05-31 18:41:38 KST",
+                "timestamp_utc": "2026-05-31T09:41:38+00:00",
+                "type": "command_ack",
+                "line": "2026-05-31 18:41:38 KST [gateway_event] command_ack",
+                "event": raw_event,
+            }
+        ],
+        "warnings": [],
+    }
+
+    slim = api._dashboard_slim_logs_payload(payload)
+
+    assert slim["items"][0]["line"] == "2026-05-31 18:41:38 KST [gateway_event] command_ack"
+    assert slim["gateway"][0]["payload"] == {
+        "command_type": "register_realtime",
+        "status": "ACKED",
+        "transport_mode": "websocket_real_pilot",
+    }
+    assert "transport_trace" not in slim["gateway"][0]["payload"]
+    assert "raw_blob" not in slim["items"][0]["event"]["payload"]
 
 
 def test_runtime_start_requires_token(tmp_path, monkeypatch):
