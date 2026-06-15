@@ -183,3 +183,21 @@ def test_gateway_state_dedupes_events_and_commands():
     assert snapshot.kiwoom_logged_in is True
     assert snapshot.deduped_event_count == 1
     assert [item.command_id for item in state.pop_commands()] == ["cmd-1"]
+
+
+def test_gateway_state_heartbeat_hint_does_not_dedupe_event():
+    state = GatewayStateStore()
+    event = GatewayEvent(
+        type="heartbeat",
+        event_id="evt-heartbeat-hint",
+        payload={"kiwoom_logged_in": True, "orderable": True, "account": "1234567890"},
+    )
+
+    state.record_heartbeat_hint(event)
+    hinted = state.snapshot()
+    accepted = state.record_event(event)
+
+    assert hinted.heartbeat_ok is True
+    assert hinted.kiwoom_logged_in is True
+    assert accepted is True
+    assert state.snapshot().received_event_count == 1

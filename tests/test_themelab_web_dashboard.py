@@ -17,6 +17,7 @@ from trading.strategy.models import StrategyProfile
 from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE
 from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeSourceSyncResult, ThemeStatus
 from trading.theme_engine.repository import ThemeEngineRepository
+import trading_app.themelab_dashboard as themelab_dashboard
 from trading_app.themelab_dashboard import build_theme_lab_dashboard_snapshot
 
 
@@ -565,6 +566,91 @@ def test_theme_lab_snapshot_sorts_watchset_and_filters_entry_candidates(tmp_path
     assert {"KOSPI", "KOSDAQ", "000001", "000002"}.issubset(universe)
     assert "000004" not in universe
     assert payload["data_quality"]["vi_status_supported"] is False
+
+
+def test_theme_lab_snapshot_caches_expensive_reports(tmp_path, monkeypatch):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    calls = {
+        "gate": 0,
+        "conservative": 0,
+        "promotion": 0,
+        "ops": 0,
+    }
+
+    def _counted(name: str, payload: dict):
+        def _builder(*args, **kwargs):
+            calls[name] += 1
+            return dict(payload)
+
+        return _builder
+
+    monkeypatch.setenv("TRADING_THEMELAB_DASHBOARD_REPORT_CACHE_TTL_SEC", "30")
+    with themelab_dashboard._theme_lab_dashboard_report_cache_lock:
+        themelab_dashboard._theme_lab_dashboard_report_cache.clear()
+    monkeypatch.setattr(
+        themelab_dashboard,
+        "_build_theme_lab_gate_reason_outcomes",
+        _counted(
+            "gate",
+            {
+                "status": "READY",
+                "report_id": "cached-gate",
+                "trade_date": "2026-06-04",
+                "generated_at": "",
+                "summary": {"event_count": 0},
+                "top_missed_opportunity_reasons": [],
+                "shadow_small_entry": {},
+                "shadow_small_entry_ab": {},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        themelab_dashboard,
+        "_build_conservative_reason_outcomes",
+        _counted("conservative", {"available": True, "status": "READY", "summary": {}}),
+    )
+    monkeypatch.setattr(
+        themelab_dashboard,
+        "_build_shadow_small_entry_promotion",
+        _counted("promotion", {"available": True, "status": "READY", "candidate_count": 0}),
+    )
+    monkeypatch.setattr(
+        themelab_dashboard,
+        "_build_shadow_small_entry_ops",
+        _counted(
+            "ops",
+            {
+                "available": True,
+                "status": "OBSERVE_ONLY",
+                "preflight_status": "PASS",
+                "preflight_blocking_reasons": [],
+                "operator_message_ko": "",
+            },
+        ),
+    )
+
+    try:
+        db.save_theme_lab_flow_result(
+            "2026-06-04T09:01:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [_watch("000001", "READY", role="LEADER")],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        first = build_theme_lab_dashboard_snapshot(db)
+        second = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+        with themelab_dashboard._theme_lab_dashboard_report_cache_lock:
+            themelab_dashboard._theme_lab_dashboard_report_cache.clear()
+
+    assert first["gate_reason_outcomes"]["report_id"] == "cached-gate"
+    assert second["gate_reason_outcomes"]["report_id"] == "cached-gate"
+    assert calls == {"gate": 1, "conservative": 1, "promotion": 1, "ops": 1}
 
 
 def test_theme_lab_snapshot_includes_shadow_small_entry_ab_outcomes(tmp_path):

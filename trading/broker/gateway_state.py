@@ -81,16 +81,7 @@ class GatewayStateStore:
             self.status.gateway_client_id = event.source or self.status.gateway_client_id
 
             if event.type == "heartbeat":
-                self.status.last_heartbeat_at = event.timestamp or utc_timestamp()
-                self.status.last_heartbeat_payload = dict(event.payload or {})
-                self.status.last_error = str(event.payload.get("last_error") or "")
-                self.status.kiwoom_logged_in = bool(event.payload.get("kiwoom_logged_in", self.status.kiwoom_logged_in))
-                self.status.orderable = bool(event.payload.get("orderable", self.status.orderable))
-                self.status.account = str(event.payload.get("account") or self.status.account)
-                self.status.mode = str(event.payload.get("mode") or self.status.mode or "OBSERVE")
-                reconnect_count = event.payload.get("reconnect_count")
-                if reconnect_count is not None:
-                    self.status.reconnect_count = int(reconnect_count or 0)
+                self._apply_heartbeat_status_locked(event)
             elif event.type == "login_status":
                 self.status.kiwoom_logged_in = bool(event.payload.get("logged_in"))
                 self.status.last_error = str(event.payload.get("message") or "")
@@ -118,6 +109,28 @@ class GatewayStateStore:
             if len(self._recent_events) > self.max_recent_events:
                 self._recent_events = self._recent_events[-self.max_recent_events :]
             return True
+
+    def record_heartbeat_hint(self, event: GatewayEvent) -> None:
+        if event.type != "heartbeat":
+            return
+        with self._lock:
+            self.status.connected = True
+            self.status.connection_state = "CONNECTED"
+            self.status.last_event_at = event.timestamp or utc_timestamp()
+            self.status.gateway_client_id = event.source or self.status.gateway_client_id
+            self._apply_heartbeat_status_locked(event)
+
+    def _apply_heartbeat_status_locked(self, event: GatewayEvent) -> None:
+        self.status.last_heartbeat_at = event.timestamp or utc_timestamp()
+        self.status.last_heartbeat_payload = dict(event.payload or {})
+        self.status.last_error = str(event.payload.get("last_error") or "")
+        self.status.kiwoom_logged_in = bool(event.payload.get("kiwoom_logged_in", self.status.kiwoom_logged_in))
+        self.status.orderable = bool(event.payload.get("orderable", self.status.orderable))
+        self.status.account = str(event.payload.get("account") or self.status.account)
+        self.status.mode = str(event.payload.get("mode") or self.status.mode or "OBSERVE")
+        reconnect_count = event.payload.get("reconnect_count")
+        if reconnect_count is not None:
+            self.status.reconnect_count = int(reconnect_count or 0)
 
     def enqueue_command(
         self,

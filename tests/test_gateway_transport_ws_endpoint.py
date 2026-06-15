@@ -303,6 +303,53 @@ def test_gateway_transport_ws_send_completed_diagnostic_updates_latency_sample(t
     assert sample["metadata"]["gateway_ws_send_completed_at_utc"] == "2026-06-08T00:00:00.030+00:00"
 
 
+def test_gateway_transport_ws_unsampled_send_completed_skips_queue(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "trader.sqlite3"
+    monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    monkeypatch.setenv("TRADING_TRANSPORT_METRICS_SAMPLE_HEARTBEAT_RATE", "0")
+    monkeypatch.setenv("TRADING_CORE_WS_EVENT_WORKER_SPLIT_ENABLED", "1")
+
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    with TestClient(api.app) as client:
+        with client.websocket_connect("/ws/gateway/transport?token=test-token") as ws:
+            hello = ws.receive_json()
+            session_id = hello["payload"]["websocket_session_id"]
+            ws.send_json(
+                GatewayWsMessage(
+                    type="transport_send_completed",
+                    trace_id="trace-unsampled-send-complete",
+                    source="kiwoom_gateway",
+                    event_id="evt-unsampled-heartbeat",
+                    payload={
+                        "original_message_id": "ws-unsampled-heartbeat",
+                        "original_trace_id": "trace-unsampled-send-complete",
+                        "original_type": "heartbeat",
+                        "sample_message_type": "heartbeat",
+                        "original_event_id": "evt-unsampled-heartbeat",
+                        "original_sequence": 10,
+                        "gateway_ws_send_started_at_utc": "2026-06-08T00:00:00.010+00:00",
+                        "gateway_ws_send_completed_at_utc": "2026-06-08T00:00:00.030+00:00",
+                        "gateway_ws_send_duration_ms": 20.0,
+                        "ws_session_id": session_id,
+                        "transport_mode": "websocket_real_pilot",
+                    },
+                    metadata={"transport_mode": "websocket_real_pilot", "ws_session_id": session_id},
+                    sequence=11,
+                ).to_dict()
+            )
+            ack = _recv_until(ws, "event_ack")
+            status = client.get("/api/gateway/transport/status").json()["real_gateway_websocket_pilot"]
+
+    assert ack["payload"]["accepted"] is True
+    assert ack["payload"]["queued"] is False
+    assert ack["payload"]["skipped"] is True
+    assert ack["payload"]["reason"] == "UNSAMPLED_SEND_COMPLETED"
+    assert status["gateway_ws_send_completed_skipped_count"] >= 1
+
+
 def test_gateway_transport_ws_event_ack_does_not_wait_for_event_processing(tmp_path, monkeypatch):
     db_path = Path(tmp_path) / "trader.sqlite3"
     monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
@@ -331,7 +378,13 @@ def test_gateway_transport_ws_event_ack_does_not_wait_for_event_processing(tmp_p
                 GatewayWsMessage(
                     type="heartbeat",
                     event_id="evt-slow-heartbeat",
-                    payload={"transport_mode": "websocket_real_pilot"},
+                    payload={
+                        "transport_mode": "websocket_real_pilot",
+                        "kiwoom_logged_in": True,
+                        "orderable": True,
+                        "account": "1234567890",
+                        "mode": "DRY_RUN",
+                    },
                     metadata={"transport_mode": "websocket_real_pilot"},
                     sequence=1,
                 ).to_dict()
@@ -341,9 +394,70 @@ def test_gateway_transport_ws_event_ack_does_not_wait_for_event_processing(tmp_p
             assert ack["payload"]["accepted"] is True
             assert ack["payload"]["queued"] is True
             assert elapsed_ms < 250
+            gateway_status = client.get("/api/gateway/status").json()
+            assert gateway_status["heartbeat_ok"] is True
+            assert gateway_status["kiwoom_logged_in"] is True
+            assert gateway_status["orderable"] is True
+            assert gateway_status["account"] == "1234567890"
 
             ws.send_json(GatewayWsMessage(type="ping", sequence=2).to_dict())
             assert _recv_until(ws, "pong")["type"] == "pong"
+
+
+def test_gateway_transport_ws_unsampled_unchanged_heartbeat_skips_queue(tmp_path, monkeypatch):
+    db_path = Path(tmp_path) / "trader.sqlite3"
+    monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
+    monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    monkeypatch.setenv("TRADING_TRANSPORT_METRICS_SAMPLE_HEARTBEAT_RATE", "0")
+    monkeypatch.setenv("TRADING_CORE_WS_EVENT_WORKER_SPLIT_ENABLED", "1")
+
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    payload = {
+        "transport_mode": "websocket_real_pilot",
+        "kiwoom_logged_in": True,
+        "orderable": True,
+        "account": "1234567890",
+        "mode": "DRY_RUN",
+        "reconnect_count": 0,
+        "broker_env": "SIMULATION",
+        "server_mode": "SIMULATION",
+        "account_mode": "SIMULATION",
+    }
+    with TestClient(api.app) as client:
+        with client.websocket_connect("/ws/gateway/transport?token=test-token") as ws:
+            ws.receive_json()
+            ws.send_json(
+                GatewayWsMessage(
+                    type="heartbeat",
+                    event_id="evt-heartbeat-state-baseline",
+                    payload=payload,
+                    metadata={"transport_mode": "websocket_real_pilot"},
+                    sequence=1,
+                ).to_dict()
+            )
+            first_ack = _recv_until(ws, "event_ack")
+            ws.send_json(
+                GatewayWsMessage(
+                    type="heartbeat",
+                    event_id="evt-heartbeat-state-unchanged",
+                    payload=payload,
+                    metadata={"transport_mode": "websocket_real_pilot"},
+                    sequence=2,
+                ).to_dict()
+            )
+            second_ack = _recv_until(ws, "event_ack")
+            gateway_status = client.get("/api/gateway/status").json()
+            transport_status = client.get("/api/gateway/transport/status").json()["real_gateway_websocket_pilot"]
+
+    assert first_ack["payload"]["queued"] is True
+    assert second_ack["payload"]["accepted"] is True
+    assert second_ack["payload"]["queued"] is False
+    assert second_ack["payload"]["reason"] == "FAST_STATUS_ONLY"
+    assert gateway_status["heartbeat_ok"] is True
+    assert gateway_status["kiwoom_logged_in"] is True
+    assert transport_status["core_ws_heartbeat_fast_skipped_count"] >= 1
 
 
 def test_gateway_transport_ws_core_event_worker_coalesces_price_ticks_by_code(tmp_path, monkeypatch):
@@ -1207,6 +1321,7 @@ def test_transport_heartbeat_does_not_override_kiwoom_login(tmp_path, monkeypatc
         )
         ack = _recv_until(ws, "event_ack")
         assert ack["payload"]["transport_only"] is True
+        assert ack["payload"]["queued"] is False
 
     status = client.get("/api/gateway/status").json()
     assert status["kiwoom_logged_in"] is True

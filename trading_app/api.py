@@ -391,6 +391,7 @@ gateway_ws_transport_state: dict[str, Any] = {
     "gateway_ws_send_completed_count": 0,
     "gateway_ws_send_completed_update_count": 0,
     "gateway_ws_send_completed_miss_count": 0,
+    "gateway_ws_send_completed_skipped_count": 0,
     "gateway_ws_last_send_completed_duration_ms": 0.0,
     "gateway_ws_last_send_completed_to_core_receive_ms": 0.0,
     "gateway_ws_last_send_completed_message_type": "",
@@ -485,6 +486,9 @@ gateway_core_ws_event_worker_state: dict[str, Any] = {
     "price_tick_processed_count": 0,
     "price_tick_dropped_count": 0,
     "price_tick_last_key": "",
+    "heartbeat_fast_skipped_count": 0,
+    "last_heartbeat_queue_key": "",
+    "last_heartbeat_queue_key_at": "",
     "last_message_type": "",
     "last_event_id": "",
     "last_queue_wait_ms": 0.0,
@@ -561,6 +565,8 @@ _dashboard_snapshot_cache_build_ms = 0.0
 _dashboard_snapshot_cache_hit_count = 0
 _dashboard_snapshot_cache_miss_count = 0
 _dashboard_fragment_cache: dict[tuple[str, str], tuple[float, Any]] = {}
+_theme_lab_dashboard_snapshot_cache_lock = RLock()
+_theme_lab_dashboard_snapshot_cache: dict[tuple[str, str], tuple[float, Any]] = {}
 
 
 def _build_runtime_supervisor() -> RuntimeSupervisor:
@@ -3215,10 +3221,17 @@ def snapshot(refresh: bool = Query(False), detail: str = Query(DASHBOARD_SNAPSHO
 
 
 @app.get("/api/themelab/snapshot")
-def theme_lab_snapshot() -> dict[str, Any]:
+def theme_lab_snapshot(refresh: bool = Query(False)) -> dict[str, Any]:
     db = open_database()
     try:
-        return build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_supervisor.status(), gateway_state=gateway_state)
+        builder = lambda: build_theme_lab_dashboard_snapshot(
+            db,
+            runtime_status=runtime_supervisor.status(),
+            gateway_state=gateway_state,
+        )
+        if refresh:
+            return builder()
+        return _cached_theme_lab_dashboard_snapshot(db, "theme_lab:v2:shared", builder)
     finally:
         close_database(db)
 
@@ -5618,6 +5631,67 @@ def _update_gateway_core_ws_event_worker_state(patch: dict[str, Any]) -> None:
     gateway_core_ws_event_worker_state.update({key: value for key, value in patch.items() if value is not None})
 
 
+def _record_core_ws_fast_status_hint(event: GatewayEvent, metadata: dict[str, Any]) -> None:
+    if event.type not in {"heartbeat", "transport_heartbeat"}:
+        return
+    _record_ws_message_side_effects(event, metadata)
+    if event.type == "heartbeat":
+        gateway_state.record_heartbeat_hint(event)
+    _update_gateway_core_ws_event_worker_state(
+        {
+            "last_fast_status_hint_type": event.type,
+            "last_fast_status_hint_event_id": event.event_id,
+            "last_fast_status_hint_at": utc_now_ms(),
+        }
+    )
+
+
+def _core_ws_heartbeat_queue_required(event: GatewayEvent) -> bool:
+    if event.type != "heartbeat":
+        return True
+    payload = dict(event.payload or {})
+    if _ws_pilot_diagnostic_signature(payload):
+        return True
+    settings = get_settings()
+    sample_key = event.event_id or event.command_id or event.request_id
+    if settings.transport_metrics_enabled and should_sample_transport_message(
+        message_type=event.type,
+        sample_key=sample_key,
+        price_tick_rate=settings.transport_metrics_sample_price_tick_rate,
+        heartbeat_rate=settings.transport_metrics_sample_heartbeat_rate,
+    ):
+        return True
+    state_key_payload = {
+        "kiwoom_logged_in": bool(payload.get("kiwoom_logged_in", False)),
+        "orderable": bool(payload.get("orderable", False)),
+        "account": str(payload.get("account") or ""),
+        "mode": str(payload.get("mode") or ""),
+        "reconnect_count": str(payload.get("reconnect_count") if payload.get("reconnect_count") is not None else ""),
+        "broker_env": str(payload.get("broker_env") or ""),
+        "server_mode": str(payload.get("server_mode") or ""),
+        "account_mode": str(payload.get("account_mode") or ""),
+        "last_error": str(payload.get("last_error") or ""),
+    }
+    state_key = json.dumps(state_key_payload, ensure_ascii=False, sort_keys=True, default=str)
+    if state_key != str(gateway_core_ws_event_worker_state.get("last_heartbeat_queue_key") or ""):
+        _update_gateway_core_ws_event_worker_state(
+            {
+                "last_heartbeat_queue_key": state_key,
+                "last_heartbeat_queue_key_at": utc_now_ms(),
+            }
+        )
+        return True
+    _update_gateway_core_ws_event_worker_state(
+        {
+            "heartbeat_fast_skipped_count": int(gateway_core_ws_event_worker_state.get("heartbeat_fast_skipped_count") or 0) + 1,
+            "last_fast_status_hint_type": event.type,
+            "last_fast_status_hint_event_id": event.event_id,
+            "last_fast_status_hint_at": utc_now_ms(),
+        }
+    )
+    return False
+
+
 def _process_condition_event_in_worker(event: GatewayEvent) -> dict[str, Any]:
     result = _process_condition_event_batch_in_worker([event])
     results = list(result.get("results") or [])
@@ -5960,6 +6034,30 @@ def _cached_dashboard_fragment(
         value = builder()
         _dashboard_fragment_cache[cache_key] = (time.monotonic(), value)
         return value
+
+
+def _cached_theme_lab_dashboard_snapshot(
+    db: TradingDatabase,
+    key: str,
+    builder,
+    *,
+    force: bool = False,
+    ttl_sec: float | None = None,
+):
+    ttl = _dashboard_snapshot_cache_ttl_sec() if ttl_sec is None else max(0.0, float(ttl_sec))
+    if ttl <= 0.0:
+        return builder()
+    cache_key = (_dashboard_database_cache_key(db), key)
+    now = time.monotonic()
+    if not force:
+        with _theme_lab_dashboard_snapshot_cache_lock:
+            cached = _theme_lab_dashboard_snapshot_cache.get(cache_key)
+            if cached is not None and now - cached[0] <= ttl:
+                return cached[1]
+    value = builder()
+    with _theme_lab_dashboard_snapshot_cache_lock:
+        _theme_lab_dashboard_snapshot_cache[cache_key] = (time.monotonic(), value)
+    return value
 
 
 def _build_dashboard_snapshot_payload_uncached(*, detail: str = DASHBOARD_SNAPSHOT_DETAIL_SLIM) -> dict[str, Any]:
@@ -6643,11 +6741,21 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                 )
             elif message.type == "transport_heartbeat":
                 event = _gateway_event_from_ws_message(message, metadata=metadata)
-                queue_result = _enqueue_core_ws_event_work(
-                    kind="transport_heartbeat",
-                    event=event,
-                    metadata=metadata,
-                )
+                _record_core_ws_fast_status_hint(event, metadata)
+                if _ws_pilot_diagnostic_signature(dict(event.payload or {})):
+                    queue_result = _enqueue_core_ws_event_work(
+                        kind="transport_heartbeat",
+                        event=event,
+                        metadata=metadata,
+                    )
+                else:
+                    queue_result = {
+                        "accepted": True,
+                        "queued": False,
+                        "reason": "FAST_STATUS_ONLY",
+                        "queue_size": _core_ws_event_total_queue_size(),
+                        "queue_max_size": _core_ws_event_queue_max_size(),
+                    }
                 _queue_core_ws_outbound(
                     outbound_queue,
                     GatewayWsMessage(
@@ -6672,16 +6780,28 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                     connection_id=connection_id,
                 )
             elif message.type == "transport_send_completed":
-                queue_result = _enqueue_core_ws_event_work(
-                    kind="send_completed",
-                    message=message,
-                    metadata=metadata,
-                )
+                if _gateway_ws_send_completed_sample_expected(message, metadata):
+                    queue_result = _enqueue_core_ws_event_work(
+                        kind="send_completed",
+                        message=message,
+                        metadata=metadata,
+                    )
+                else:
+                    record_result = _record_gateway_ws_send_completed(message, metadata)
+                    queue_result = {
+                        "accepted": True,
+                        "queued": False,
+                        "reason": str(record_result.get("reason") or "UNSAMPLED_SEND_COMPLETED"),
+                        "queue_size": _core_ws_event_total_queue_size(),
+                        "queue_max_size": _core_ws_event_queue_max_size(),
+                        **record_result,
+                    }
                 result = {
                     "accepted": bool(queue_result.get("accepted")),
                     "type": "transport_send_completed",
                     "queued": bool(queue_result.get("queued")),
                     "updated": False,
+                    "skipped": bool(queue_result.get("skipped")),
                     "queue_size": int(queue_result.get("queue_size") or 0),
                     "queue_max_size": int(queue_result.get("queue_max_size") or 0),
                     "reason": str(queue_result.get("reason") or ""),
@@ -6754,7 +6874,19 @@ async def gateway_transport_ws(websocket: WebSocket) -> None:
                 )
             elif message.type in {"gateway_event", "heartbeat", "command_started", "command_ack", "command_failed", "rate_limited"}:
                 event = _gateway_event_from_ws_message(message, metadata=metadata)
-                if event.type == "condition_event" and _gateway_condition_event_async_enabled():
+                _record_core_ws_fast_status_hint(event, metadata)
+                if event.type == "heartbeat" and not _core_ws_heartbeat_queue_required(event):
+                    result = {
+                        "accepted": True,
+                        "event_id": event.event_id,
+                        "type": event.type,
+                        "queued": False,
+                        "coalesced": False,
+                        "queue_size": _core_ws_event_total_queue_size(),
+                        "queue_max_size": _core_ws_event_queue_max_size(),
+                        "reason": "FAST_STATUS_ONLY",
+                    }
+                elif event.type == "condition_event" and _gateway_condition_event_async_enabled():
                     queue_result = _enqueue_gateway_condition_events([event], metadata)
                     result = {
                         "accepted": bool(queue_result.get("accepted")),
@@ -7221,9 +7353,9 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         dry_run_performance=dry_run_performance_payload,
         logs=logs_payload,
     )
-    theme_lab_payload = _cached_dashboard_fragment(
+    theme_lab_payload = _cached_theme_lab_dashboard_snapshot(
         db,
-        "theme_lab:v2:full" if full_detail else "theme_lab:v2:summary",
+        "theme_lab:v2:shared",
         lambda: build_theme_lab_dashboard_snapshot(db, runtime_status=runtime_status, gateway_state=gateway_state),
     )
     if not full_detail:
@@ -8190,6 +8322,37 @@ def _active_command_count(summary: dict[str, Any]) -> int:
     return count
 
 
+def _gateway_ws_send_completed_sample_expected(message: GatewayWsMessage, metadata: dict[str, Any]) -> bool:
+    settings = get_settings()
+    if not settings.transport_metrics_enabled:
+        return False
+    payload = dict(message.payload or {})
+    sample_message_type = str(payload.get("sample_message_type") or metadata.get("sample_message_type") or payload.get("original_type") or "")
+    if not sample_message_type:
+        return False
+    if (
+        sample_message_type == "price_tick"
+        and str(payload.get("transport_mode") or metadata.get("transport_mode") or "") == TRANSPORT_MODE_WEBSOCKET_REAL_PILOT
+        and not settings.transport_metrics_persist_ws_price_ticks
+    ):
+        return False
+    sample_key = str(
+        payload.get("original_event_id")
+        or message.event_id
+        or payload.get("original_command_id")
+        or message.command_id
+        or payload.get("original_trace_id")
+        or payload.get("original_message_id")
+        or ""
+    )
+    return should_sample_transport_message(
+        message_type=sample_message_type,
+        sample_key=sample_key,
+        price_tick_rate=settings.transport_metrics_sample_price_tick_rate,
+        heartbeat_rate=settings.transport_metrics_sample_heartbeat_rate,
+    )
+
+
 def _record_gateway_ws_send_completed(message: GatewayWsMessage, metadata: dict[str, Any]) -> dict[str, Any]:
     payload = dict(message.payload or {})
     original_sequence = int(payload.get("original_sequence") or metadata.get("original_sequence") or 0)
@@ -8216,39 +8379,44 @@ def _record_gateway_ws_send_completed(message: GatewayWsMessage, metadata: dict[
     updated = False
     sample_id = ""
     complete_to_core_receive_ms: float | None = None
-    db = open_database()
-    try:
-        sample = db.find_gateway_transport_latency_sample_by_ws_message(
-            ws_session_id=ws_session_id,
-            ws_message_sequence=original_sequence,
-            message_type=sample_message_type,
-            event_id=str(payload.get("original_event_id") or message.event_id or ""),
-            command_id=str(payload.get("original_command_id") or message.command_id or ""),
-        )
-        if sample is None:
+    skipped = not _gateway_ws_send_completed_sample_expected(message, metadata)
+    if not skipped:
+        db = open_database()
+        try:
             sample = db.find_gateway_transport_latency_sample_by_ws_message(
                 ws_session_id=ws_session_id,
                 ws_message_sequence=original_sequence,
                 message_type=sample_message_type,
+                event_id=str(payload.get("original_event_id") or message.event_id or ""),
+                command_id=str(payload.get("original_command_id") or message.command_id or ""),
             )
-        if sample is not None:
-            sample_id = str(sample.get("sample_id") or "")
-            core_received_at = str((sample.get("metadata") or {}).get("core_ws_received_at_utc") or "")
-            complete_to_core_receive_ms = wall_ms(send_completed_at, core_received_at)
-            stage_updates["gateway_ws_send_complete_to_core_receive_ms"] = complete_to_core_receive_ms
-            db.update_gateway_transport_latency_sample_stage(
-                sample_id,
-                stage_updates=stage_updates,
-                metadata_updates=metadata_updates,
-            )
-            updated = True
-    finally:
-        close_database(db)
+            if sample is None:
+                sample = db.find_gateway_transport_latency_sample_by_ws_message(
+                    ws_session_id=ws_session_id,
+                    ws_message_sequence=original_sequence,
+                    message_type=sample_message_type,
+                )
+            if sample is not None:
+                sample_id = str(sample.get("sample_id") or "")
+                core_received_at = str((sample.get("metadata") or {}).get("core_ws_received_at_utc") or "")
+                complete_to_core_receive_ms = wall_ms(send_completed_at, core_received_at)
+                stage_updates["gateway_ws_send_complete_to_core_receive_ms"] = complete_to_core_receive_ms
+                db.update_gateway_transport_latency_sample_stage(
+                    sample_id,
+                    stage_updates=stage_updates,
+                    metadata_updates=metadata_updates,
+                )
+                updated = True
+        finally:
+            close_database(db)
     _update_gateway_ws_transport_state(
         {
             "gateway_ws_send_completed_count": int(gateway_ws_transport_state.get("gateway_ws_send_completed_count") or 0) + 1,
             "gateway_ws_send_completed_update_count": int(gateway_ws_transport_state.get("gateway_ws_send_completed_update_count") or 0) + (1 if updated else 0),
-            "gateway_ws_send_completed_miss_count": int(gateway_ws_transport_state.get("gateway_ws_send_completed_miss_count") or 0) + (0 if updated else 1),
+            "gateway_ws_send_completed_miss_count": int(gateway_ws_transport_state.get("gateway_ws_send_completed_miss_count") or 0)
+            + (0 if skipped or updated else 1),
+            "gateway_ws_send_completed_skipped_count": int(gateway_ws_transport_state.get("gateway_ws_send_completed_skipped_count") or 0)
+            + (1 if skipped else 0),
             "gateway_ws_last_send_completed_duration_ms": send_duration_ms,
             "gateway_ws_last_send_completed_to_core_receive_ms": complete_to_core_receive_ms,
             "gateway_ws_last_send_completed_message_type": sample_message_type,
@@ -8259,6 +8427,8 @@ def _record_gateway_ws_send_completed(message: GatewayWsMessage, metadata: dict[
         "accepted": True,
         "type": "transport_send_completed",
         "updated": updated,
+        "skipped": skipped,
+        "reason": "UNSAMPLED_SEND_COMPLETED" if skipped else "",
         "sample_id": sample_id,
         "message_type": sample_message_type,
         "original_sequence": original_sequence,
@@ -8541,6 +8711,7 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         "gateway_ws_send_completed_count": int(state.get("gateway_ws_send_completed_count") or 0),
         "gateway_ws_send_completed_update_count": int(state.get("gateway_ws_send_completed_update_count") or 0),
         "gateway_ws_send_completed_miss_count": int(state.get("gateway_ws_send_completed_miss_count") or 0),
+        "gateway_ws_send_completed_skipped_count": int(state.get("gateway_ws_send_completed_skipped_count") or 0),
         "gateway_ws_last_send_completed_duration_ms": float(
             heartbeat.get("ws_last_send_completed_duration_ms")
             or state.get("gateway_ws_last_send_completed_duration_ms")
@@ -8615,8 +8786,12 @@ def _real_gateway_websocket_pilot_status(heartbeat_payload: dict[str, Any] | Non
         "core_ws_price_tick_processed_count": int(core_event_worker.get("price_tick_processed_count") or 0),
         "core_ws_price_tick_dropped_count": int(core_event_worker.get("price_tick_dropped_count") or 0),
         "core_ws_price_tick_last_key": core_event_worker.get("price_tick_last_key") or "",
+        "core_ws_heartbeat_fast_skipped_count": int(core_event_worker.get("heartbeat_fast_skipped_count") or 0),
         "core_ws_event_last_message_type": core_event_worker.get("last_message_type") or "",
         "core_ws_event_last_event_id": core_event_worker.get("last_event_id") or "",
+        "core_ws_event_last_fast_status_hint_type": core_event_worker.get("last_fast_status_hint_type") or "",
+        "core_ws_event_last_fast_status_hint_event_id": core_event_worker.get("last_fast_status_hint_event_id") or "",
+        "core_ws_event_last_fast_status_hint_at": core_event_worker.get("last_fast_status_hint_at") or "",
         "core_ws_event_last_queue_wait_ms": float(core_event_worker.get("last_queue_wait_ms") or 0.0),
         "core_ws_event_last_duration_ms": float(core_event_worker.get("last_duration_ms") or 0.0),
         "core_ws_event_last_queued_at": core_event_worker.get("last_queued_at") or "",

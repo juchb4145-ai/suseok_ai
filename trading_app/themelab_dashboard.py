@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
+import time
 from collections import Counter, defaultdict
 from datetime import datetime
-from typing import Any
+from threading import RLock
+from typing import Any, Callable
 
 from storage.db import TradingDatabase
 from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE
@@ -451,6 +454,114 @@ DISPLAY_WAIT_ORDER = {
     "WAIT_DATA_LATEST_TICK_STALE": 2,
 }
 NAVER_THEME_SYNC_SOURCE = "naver_theme_universe"
+THEME_LAB_DASHBOARD_REPORT_CACHE_TTL_SEC = 120.0
+THEME_LAB_DASHBOARD_REPORT_STALE_TTL_SEC = 600.0
+THEME_LAB_DASHBOARD_REPORT_CACHE_MAX_ITEMS = 64
+_theme_lab_dashboard_report_cache: dict[tuple[str, str, str, str], tuple[float, dict[str, Any]]] = {}
+_theme_lab_dashboard_report_cache_lock = RLock()
+
+
+def _theme_lab_dashboard_float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, value)
+
+
+def _theme_lab_dashboard_report_cache_ttl_sec() -> float:
+    return _theme_lab_dashboard_float_env(
+        "TRADING_THEMELAB_DASHBOARD_REPORT_CACHE_TTL_SEC",
+        THEME_LAB_DASHBOARD_REPORT_CACHE_TTL_SEC,
+    )
+
+
+def _theme_lab_dashboard_report_stale_ttl_sec() -> float:
+    return _theme_lab_dashboard_float_env(
+        "TRADING_THEMELAB_DASHBOARD_REPORT_STALE_TTL_SEC",
+        THEME_LAB_DASHBOARD_REPORT_STALE_TTL_SEC,
+    )
+
+
+def _theme_lab_dashboard_database_cache_key(db: TradingDatabase) -> str:
+    try:
+        return str(db.path.resolve())
+    except Exception:
+        return str(getattr(db, "path", "") or "")
+
+
+def _prune_theme_lab_dashboard_report_cache(now: float, ttl: float) -> None:
+    expired_keys = [
+        key for key, (cached_at, _) in _theme_lab_dashboard_report_cache.items() if now - cached_at > ttl
+    ]
+    for key in expired_keys:
+        _theme_lab_dashboard_report_cache.pop(key, None)
+    overflow = len(_theme_lab_dashboard_report_cache) - THEME_LAB_DASHBOARD_REPORT_CACHE_MAX_ITEMS
+    if overflow > 0:
+        oldest_keys = sorted(
+            _theme_lab_dashboard_report_cache,
+            key=lambda key: _theme_lab_dashboard_report_cache[key][0],
+        )[:overflow]
+        for key in oldest_keys:
+            _theme_lab_dashboard_report_cache.pop(key, None)
+
+
+def _cached_theme_lab_dashboard_report(
+    db: TradingDatabase,
+    report_name: str,
+    *,
+    trade_date: str = "",
+    extra_key: str = "",
+    builder: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    ttl = _theme_lab_dashboard_report_cache_ttl_sec()
+    if ttl <= 0.0:
+        return builder()
+    stale_ttl = max(ttl, _theme_lab_dashboard_report_stale_ttl_sec())
+    cache_key = (
+        _theme_lab_dashboard_database_cache_key(db),
+        report_name,
+        str(trade_date or ""),
+        str(extra_key or ""),
+    )
+    now = time.monotonic()
+    with _theme_lab_dashboard_report_cache_lock:
+        cached = _theme_lab_dashboard_report_cache.get(cache_key)
+        if cached is not None and now - cached[0] <= ttl:
+            return cached[1]
+        if cached is not None and now - cached[0] <= stale_ttl:
+            return cached[1]
+    value = builder()
+    stored_at = time.monotonic()
+    with _theme_lab_dashboard_report_cache_lock:
+        _prune_theme_lab_dashboard_report_cache(stored_at, ttl)
+        _theme_lab_dashboard_report_cache[cache_key] = (stored_at, value)
+    return value
+
+
+def _gateway_report_cache_key(gateway_state: Any | None) -> str:
+    if gateway_state is None:
+        return "gateway:none"
+    try:
+        gateway = gateway_state.snapshot().to_dict()
+    except Exception:
+        return "gateway:unavailable"
+    heartbeat = dict(gateway.get("last_heartbeat_payload") or {})
+    fields = (
+        gateway.get("connected"),
+        gateway.get("heartbeat_ok"),
+        gateway.get("kiwoom_logged_in"),
+        gateway.get("orderable"),
+        gateway.get("connection_state"),
+        gateway.get("mode"),
+        gateway.get("account"),
+        gateway.get("broker_env") or heartbeat.get("broker_env"),
+        heartbeat.get("server_mode"),
+        heartbeat.get("kiwoom_logged_in"),
+        heartbeat.get("orderable"),
+        heartbeat.get("kill_switch_active"),
+    )
+    return "|".join(str(value) for value in fields)
 
 
 def build_theme_lab_dashboard_snapshot(
@@ -624,6 +735,15 @@ def _live_sim_audit_empty() -> dict[str, Any]:
 
 
 def _conservative_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
+    return _cached_theme_lab_dashboard_report(
+        db,
+        "conservative_reason_outcomes",
+        trade_date=trade_date,
+        builder=lambda: _build_conservative_reason_outcomes(db, trade_date=trade_date),
+    )
+
+
+def _build_conservative_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
     try:
         report = ConservativeReasonOutcomeAnalyzer(db).build_report(trade_date=trade_date or None, limit=10000)
         return conservative_reason_snapshot_payload(report)
@@ -632,6 +752,15 @@ def _conservative_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") 
 
 
 def _shadow_small_entry_promotion(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
+    return _cached_theme_lab_dashboard_report(
+        db,
+        "shadow_small_entry_promotion",
+        trade_date=trade_date,
+        builder=lambda: _build_shadow_small_entry_promotion(db, trade_date=trade_date),
+    )
+
+
+def _build_shadow_small_entry_promotion(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
     try:
         report = ShadowSmallEntryPromotionAnalyzer(db).build_report(
             trade_date=trade_date or None,
@@ -644,6 +773,16 @@ def _shadow_small_entry_promotion(db: TradingDatabase, *, trade_date: str = "") 
 
 
 def _shadow_small_entry_ops(db: TradingDatabase, *, gateway_state: Any | None, trade_date: str = "") -> dict[str, Any]:
+    return _cached_theme_lab_dashboard_report(
+        db,
+        "shadow_small_entry_ops",
+        trade_date=trade_date,
+        extra_key=_gateway_report_cache_key(gateway_state),
+        builder=lambda: _build_shadow_small_entry_ops(db, gateway_state=gateway_state, trade_date=trade_date),
+    )
+
+
+def _build_shadow_small_entry_ops(db: TradingDatabase, *, gateway_state: Any | None, trade_date: str = "") -> dict[str, Any]:
     try:
         return shadow_small_entry_ops_snapshot_payload(
             ShadowSmallEntryOpsService(db, gateway_state=gateway_state).status(trade_date=trade_date or None)
@@ -696,6 +835,15 @@ def _shadow_small_entry_pilot(db: TradingDatabase, *, gateway_state: Any | None,
 
 
 def _theme_lab_gate_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
+    return _cached_theme_lab_dashboard_report(
+        db,
+        "theme_lab_gate_reason_outcomes",
+        trade_date=trade_date,
+        builder=lambda: _build_theme_lab_gate_reason_outcomes(db, trade_date=trade_date),
+    )
+
+
+def _build_theme_lab_gate_reason_outcomes(db: TradingDatabase, *, trade_date: str = "") -> dict[str, Any]:
     try:
         report = ThemeLabGateReasonOutcomeAnalyzer(db).build_report(trade_date=trade_date or None, limit=10000)
     except Exception as exc:
