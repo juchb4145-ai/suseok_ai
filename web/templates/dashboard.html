@@ -522,6 +522,72 @@
           <div id="live-sim-canary-performance-recommendations" class="inline-log"></div>
         </section>
 
+        <section id="exit-policy-validation-card" class="band exit-policy-validation-section">
+          <div class="section-head">
+            <div>
+              <h2>Exit 정책 검증</h2>
+              <p id="exit-policy-validation-empty" class="help-text">분석 전용 / 실제 적용 아님. Shadow exit와 실제 LIVE_SIM 청산 품질을 비교합니다.</p>
+            </div>
+            <div class="action-strip">
+              <span id="exit-policy-validation-status" class="counter muted">대기</span>
+              <span id="exit-policy-validation-updated" class="counter muted">-</span>
+            </div>
+          </div>
+          <div class="mini-grid live-sim-canary-performance-grid">
+            <div><span>대상 lifecycle</span><strong id="exit-policy-validation-lifecycle">0</strong></div>
+            <div><span>실제 평균 Net</span><strong id="exit-policy-validation-actual-net">-</strong></div>
+            <div><span>최고 Shadow</span><strong id="exit-policy-validation-best">-</strong></div>
+            <div><span>최고 기대값</span><strong id="exit-policy-validation-best-exp">-</strong></div>
+            <div><span>손절 hit</span><strong id="exit-policy-validation-stoploss">0</strong></div>
+            <div><span>익절 capture</span><strong id="exit-policy-validation-takeprofit">0</strong></div>
+            <div><span>약한 시간청산</span><strong id="exit-policy-validation-timeweak">0</strong></div>
+            <div><span>Trailing 개선</span><strong id="exit-policy-validation-trailing">0</strong></div>
+            <div><span>큰 giveback</span><strong id="exit-policy-validation-giveback">0</strong></div>
+            <div><span>데이터 부족</span><strong id="exit-policy-validation-insufficient">0</strong></div>
+          </div>
+          <div class="table-wrap compact-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>Scenario</th>
+                  <th>표본</th>
+                  <th>승률</th>
+                  <th>기대값</th>
+                  <th>평균 Net</th>
+                  <th>평균 MAE</th>
+                  <th>보유분</th>
+                  <th>개선</th>
+                  <th>악화</th>
+                  <th>판정</th>
+                </tr>
+              </thead>
+              <tbody id="exit-policy-validation-scenarios">
+                <tr><td colspan="10">표시할 Exit 정책 검증 scenario가 없습니다.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-wrap compact-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>종목</th>
+                  <th>Scenario</th>
+                  <th>Actual</th>
+                  <th>Shadow</th>
+                  <th>Delta</th>
+                  <th>비교</th>
+                  <th>이슈</th>
+                  <th>상세</th>
+                </tr>
+              </thead>
+              <tbody id="exit-policy-validation-cases">
+                <tr><td colspan="8">표시할 Exit 정책 검증 case가 없습니다.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div id="exit-policy-validation-recommendations" class="inline-log"></div>
+        </section>
+
         <section id="buy-zero-rca-card" class="band buy-zero-rca-section">
           <div class="section-head">
             <div>

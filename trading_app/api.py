@@ -68,6 +68,11 @@ from trading_app.conservative_reason_outcomes import (
 )
 from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, config_from_settings
 from trading_app.dry_run_threshold_ab import DryRunThresholdABAnalyzer, config_from_settings as threshold_ab_config_from_settings
+from trading_app.exit_policy_validation import (
+    ExitPolicyValidationAnalyzer,
+    ExitPolicyValidationConfig,
+    config_from_dry_run_config as exit_policy_config_from_dry_run_config,
+)
 from trading_app.intraday_outcomes import (
     IntradayOutcomeLabeler,
     ThemeLabFlowPricePathProvider,
@@ -683,6 +688,34 @@ def _live_sim_canary_performance_analyzer(db: TradingDatabase) -> LiveSimCanaryP
         config=config,
         gateway_state=gateway_state,
         dry_run_analyzer=_performance_analyzer(db),
+    )
+
+
+def _exit_policy_validation_analyzer(db: TradingDatabase) -> ExitPolicyValidationAnalyzer:
+    dry_config = config_from_settings(get_settings())
+    config = exit_policy_config_from_dry_run_config(dry_config)
+    try:
+        runtime_settings = StrategyRuntimeSettingsRepository(db).load()
+        exit_guard = dict(runtime_settings.value("live_sim_exit_guard", {}) or {})
+    except Exception:
+        exit_guard = {}
+    config = ExitPolicyValidationConfig(
+        baseline_stop_loss_pct=float(exit_guard.get("stop_loss_pct", config.baseline_stop_loss_pct)),
+        baseline_take_profit_pct=float(exit_guard.get("take_profit_pct", config.baseline_take_profit_pct)),
+        baseline_max_hold_minutes=int(exit_guard.get("max_hold_minutes", config.baseline_max_hold_minutes)),
+        commission_bp_per_side=config.commission_bp_per_side,
+        sell_tax_bp=config.sell_tax_bp,
+        primary_slippage_bp=config.primary_slippage_bp,
+        comparison_tolerance_pct=config.comparison_tolerance_pct,
+        min_candidate_samples=config.min_candidate_samples,
+        large_giveback_pct=config.large_giveback_pct,
+        stale_tick_gap_sec=config.stale_tick_gap_sec,
+        market_close_hhmm=config.market_close_hhmm,
+    )
+    return ExitPolicyValidationAnalyzer(
+        db,
+        config=config,
+        canary_analyzer=_live_sim_canary_performance_analyzer(db),
     )
 
 
@@ -2157,6 +2190,208 @@ def runtime_live_sim_canary_performance_case_detail(case_id: str) -> dict[str, A
         if item is None:
             raise HTTPException(status_code=404, detail="LIVE_SIM Canary performance case not found")
         return item
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/exit-policy/validation")
+def runtime_exit_policy_validation(
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    scenario_id: Optional[str] = None,
+    comparison_label: Optional[str] = None,
+    exit_trigger_type: Optional[str] = None,
+    segment: Optional[str] = None,
+    recommendation_grade: Optional[str] = None,
+    issue_type: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _exit_policy_validation_analyzer(db).build_report(
+            trade_date=trade_date,
+            code=code,
+            scenario_id=scenario_id,
+            comparison_label=comparison_label,
+            exit_trigger_type=exit_trigger_type,
+            segment=segment,
+            recommendation_grade=recommendation_grade,
+            issue_type=issue_type,
+            limit=limit,
+            offset=offset,
+        )
+        total = int(report.get("total_items") or len(report.get("items") or []))
+        report["pagination"] = _pagination_payload(
+            limit=limit,
+            offset=offset,
+            count=len(report.get("items") or []),
+            total=total,
+        )
+        return report
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/exit-policy/validation/rebuild")
+def rebuild_runtime_exit_policy_validation(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    trade_date: Optional[str] = None,
+    persist: bool = True,
+    export: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        resolved_trade_date = str(payload.get("trade_date") or trade_date or "")
+        resolved_persist = bool(payload.get("persist", persist))
+        resolved_export = str(payload.get("export") or export or "json")
+        analyzer = _exit_policy_validation_analyzer(db)
+        report = analyzer.build_report(trade_date=resolved_trade_date or None, limit=10000)
+        persisted = analyzer.persist_report(report) if resolved_persist else None
+        exports = analyzer.export_report(report, fmt=resolved_export) if resolved_export else {}
+        return {
+            "report_id": report["report_id"],
+            "persisted": persisted is not None,
+            "persisted_report": persisted or {},
+            "exported": exports,
+            "safety_scope": report.get("safety_scope", {}),
+            "analysis_only": True,
+            "gateway_command_created": False,
+            "settings_changed": False,
+            "report": report,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/exit-policy/validation/reports")
+def runtime_exit_policy_validation_reports(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = _exit_policy_validation_analyzer(db).list_reports(limit=limit + 1, offset=offset)
+        items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {"items": items, "pagination": pagination, "filters": {"limit": limit, "offset": offset}}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/exit-policy/validation/reports/{report_id}")
+def runtime_exit_policy_validation_report_detail(report_id: str) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _exit_policy_validation_analyzer(db).get_report(report_id)
+        if report is None:
+            return {"report_id": report_id, "found": False}
+        report["found"] = True
+        return report
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/exit-policy/validation/scenarios")
+def runtime_exit_policy_validation_scenarios(
+    trade_date: Optional[str] = None,
+    scenario_id: Optional[str] = None,
+    recommendation_grade: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _exit_policy_validation_analyzer(db).build_report(
+            trade_date=trade_date,
+            scenario_id=scenario_id,
+            recommendation_grade=recommendation_grade,
+            limit=10000,
+        )
+        items = list(report.get("scenario_summary") or [])
+        if scenario_id:
+            items = [item for item in items if item.get("scenario_id") == scenario_id]
+        if recommendation_grade:
+            items = [item for item in items if item.get("recommendation_grade") == recommendation_grade]
+        page, pagination = _trim_page(items[offset : offset + limit + 1], limit=limit, offset=offset)
+        return {
+            "items": page,
+            "pagination": pagination,
+            "filters": {
+                "trade_date": trade_date or "",
+                "scenario_id": scenario_id or "",
+                "recommendation_grade": recommendation_grade or "",
+                "limit": limit,
+                "offset": offset,
+            },
+            "analysis_only": True,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/exit-policy/validation/cases")
+def runtime_exit_policy_validation_cases(
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    scenario_id: Optional[str] = None,
+    comparison_label: Optional[str] = None,
+    exit_trigger_type: Optional[str] = None,
+    segment: Optional[str] = None,
+    recommendation_grade: Optional[str] = None,
+    issue_type: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _exit_policy_validation_analyzer(db).build_report(
+            trade_date=trade_date,
+            code=code,
+            scenario_id=scenario_id,
+            comparison_label=comparison_label,
+            exit_trigger_type=exit_trigger_type,
+            segment=segment,
+            recommendation_grade=recommendation_grade,
+            issue_type=issue_type,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "items": report.get("items", []),
+            "pagination": _pagination_payload(
+                limit=limit,
+                offset=offset,
+                count=len(report.get("items") or []),
+                total=int(report.get("total_items") or 0),
+            ),
+            "filters": report.get("filters", {}),
+            "analysis_only": True,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/exit-policy/validation/cases/{case_id}")
+def runtime_exit_policy_validation_case_detail(case_id: str, trade_date: Optional[str] = None) -> dict[str, Any]:
+    db = open_database()
+    try:
+        analyzer = _exit_policy_validation_analyzer(db)
+        for meta in analyzer.list_reports(limit=500, offset=0):
+            report = analyzer.get_report(str(meta.get("report_id") or ""))
+            if not report:
+                continue
+            for item in report.get("items") or []:
+                if item.get("case_id") == case_id:
+                    item["found"] = True
+                    return item
+        report = analyzer.build_report(trade_date=trade_date, limit=10000)
+        for item in report.get("items") or []:
+            if item.get("case_id") == case_id:
+                item["found"] = True
+                return item
+        raise HTTPException(status_code=404, detail="Exit policy validation case not found")
     finally:
         close_database(db)
 
@@ -8201,6 +8436,24 @@ def _dashboard_slim_runtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "disclaimer_ko",
             ),
         )
+    if "exit_policy_validation" in runtime:
+        data = dict(runtime.get("exit_policy_validation") or {})
+        runtime["exit_policy_validation"] = _dashboard_field_subset(
+            data,
+            (
+                "available",
+                "status",
+                "generated_at",
+                "trade_date",
+                "summary",
+                "actual_exit_quality",
+                "scenario_summary",
+                "cases",
+                "recommendations",
+                "disclaimer_ko",
+                "analysis_only",
+            ),
+        )
     if "live_sim_preflight" in runtime:
         data = dict(runtime.get("live_sim_preflight") or {})
         runtime["live_sim_preflight"] = _dashboard_field_subset(
@@ -8453,6 +8706,24 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "cases": list(live_sim_canary_performance_report.get("items") or [])[: 10 if full_detail else 5],
         "disclaimer_ko": live_sim_canary_performance_report.get("disclaimer_ko", ""),
     }
+    exit_policy_validation_report = _cached_dashboard_fragment(
+        db,
+        f"exit_policy_validation:v1:{today}:{performance_limit}",
+        lambda: _exit_policy_validation_analyzer(db).build_report(trade_date=today, limit=performance_limit),
+    )
+    exit_policy_validation_payload = {
+        "available": bool(exit_policy_validation_report.get("summary", {}).get("shadow_case_count")),
+        "status": exit_policy_validation_report.get("status", "READY"),
+        "generated_at": exit_policy_validation_report.get("generated_at", ""),
+        "trade_date": exit_policy_validation_report.get("trade_date", today),
+        "summary": exit_policy_validation_report.get("summary", {}),
+        "actual_exit_quality": exit_policy_validation_report.get("actual_exit_quality", {}),
+        "scenario_summary": list(exit_policy_validation_report.get("scenario_summary") or [])[: 12 if full_detail else 6],
+        "cases": list(exit_policy_validation_report.get("items") or [])[: 10 if full_detail else 5],
+        "recommendations": list(exit_policy_validation_report.get("recommendations") or [])[:5],
+        "disclaimer_ko": exit_policy_validation_report.get("disclaimer_ko", ""),
+        "analysis_only": True,
+    }
     conservative_reason_report: dict[str, Any] | None = None
     try:
         conservative_reason_report = _cached_dashboard_fragment(
@@ -8646,6 +8917,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["live_sim_preflight"] = live_sim_preflight_payload
     runtime_payload["live_sim_canary"] = live_sim_canary_payload
     runtime_payload["live_sim_canary_performance"] = live_sim_canary_performance_payload
+    runtime_payload["exit_policy_validation"] = exit_policy_validation_payload
     runtime_payload["conservative_reason_outcomes"] = conservative_reason_payload
     runtime_payload["shadow_small_entry_promotion"] = shadow_small_entry_payload
     runtime_payload["shadow_small_entry_ops"] = shadow_small_entry_ops_payload
@@ -8683,6 +8955,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "live_sim_preflight": live_sim_preflight_payload,
         "live_sim_canary": live_sim_canary_payload,
         "live_sim_canary_performance": live_sim_canary_performance_payload,
+        "exit_policy_validation": exit_policy_validation_payload,
         "conservative_reason_outcomes": conservative_reason_payload,
         "shadow_small_entry_promotion": shadow_small_entry_payload,
         "shadow_small_entry_ops": shadow_small_entry_ops_payload,

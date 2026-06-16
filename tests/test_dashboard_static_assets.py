@@ -66,6 +66,15 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
         "live-sim-preflight-backfill",
         "live-sim-preflight-blocking",
         "live-sim-preflight-action",
+        "exit-policy-validation-card",
+        "exit-policy-validation-status",
+        "exit-policy-validation-empty",
+        "exit-policy-validation-lifecycle",
+        "exit-policy-validation-actual-net",
+        "exit-policy-validation-best",
+        "exit-policy-validation-scenarios",
+        "exit-policy-validation-cases",
+        "exit-policy-validation-recommendations",
         "buy-zero-rca-card",
         "buy-zero-rca-empty",
         "buy-zero-rca-market-session",
@@ -120,6 +129,7 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
     assert "LIVE 자동주문" in html
     assert "ThemeLab 운용 요약" in html
     assert "매수 0건 RCA" in html
+    assert "Exit 정책 검증" in html
     assert "보수적 차단 사유 검증" in html
     assert "READY인데 주문 안 나간 종목" in html
     assert "OBSERVE/BLOCKED 이후 급등 후보" in html
@@ -183,6 +193,8 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "function renderBuyZeroRca" in js
     assert "function renderLiveSimAudit" in js
     assert "function renderLiveSimPreflight" in js
+    assert "function renderExitPolicyValidation" in js
+    assert "exit_policy_validation" in js
     assert "live_sim_preflight" in js
     assert "LIVE_SIM 사전 점검" in js
     assert "function renderConservativeReasonOutcomes" in js

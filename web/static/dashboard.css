@@ -214,22 +214,26 @@ button:disabled {
   word-break: break-word;
 }
 
-.live-sim-canary-performance-section .canary-decision {
+.live-sim-canary-performance-section .canary-decision,
+.exit-policy-validation-section .canary-decision {
   border-bottom: 0;
   padding: 0;
 }
 
-.live-sim-canary-performance-section .canary-decision summary {
+.live-sim-canary-performance-section .canary-decision summary,
+.exit-policy-validation-section .canary-decision summary {
   grid-template-columns: 1fr;
   min-height: 28px;
 }
 
-.live-sim-canary-performance-section .canary-decision pre {
+.live-sim-canary-performance-section .canary-decision pre,
+.exit-policy-validation-section .canary-decision pre {
   max-height: 360px;
   min-width: 360px;
 }
 
-.live-sim-canary-performance-section table {
+.live-sim-canary-performance-section table,
+.exit-policy-validation-section table {
   min-width: 1120px;
 }
 

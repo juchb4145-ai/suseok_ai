@@ -370,6 +370,7 @@ Invoke-RestMethod http://127.0.0.1:8000/api/runtime/live-sim/canary/performance/
 저장 위치:
 
 - LIVE_SIM Canary 사후 분석: `reports/live_sim_canary/<거래일>/`
+- Exit 정책 검증: `reports/exit_policy_validation/<거래일>/`
 
 운영자 조치:
 
@@ -377,6 +378,28 @@ Invoke-RestMethod http://127.0.0.1:8000/api/runtime/live-sim/canary/performance/
 - `PARTIAL_FILL`: 잔량 취소/리컨실 여부와 부분체결 대기 시간을 확인합니다.
 - `RECONCILE_REQUIRED`: 신규 설정 변경 검토보다 먼저 broker snapshot과 `live_sim_positions` 원장을 맞춥니다.
 - `ORPHAN_EXECUTION` 또는 `ORPHAN_ORDER_RESULT`: `gateway_command_id`, `order_intent_id`, `broker_order_id`, `candidate_instance_id` 순서로 연결 누락을 확인합니다.
+
+## 장후 Exit 정책 검증
+
+LIVE_SIM Canary 청산 결과가 쌓인 날에는 `Exit 정책 검증` 리포트를 실행합니다. 이 리포트는 손절/익절/트레일링/최대보유/context risk exit를 사후 shadow 시뮬레이션하고 실제 LIVE_SIM exit와 비교합니다.
+
+```powershell
+$headers = @{ "X-Local-Token" = "local-dev-token" }
+Invoke-RestMethod `
+  -Method Post `
+  "http://127.0.0.1:8000/api/runtime/exit-policy/validation/rebuild" `
+  -Headers $headers `
+  -ContentType "application/json" `
+  -Body '{"persist":true,"export":"all"}'
+Invoke-RestMethod http://127.0.0.1:8000/api/runtime/exit-policy/validation/scenarios
+```
+
+주의:
+
+- 분석 전용이며 실제 청산 주문을 만들지 않습니다.
+- `strategy_runtime_settings`와 exit threshold를 자동 변경하지 않습니다.
+- 가격 경로가 부족한 case는 `INSUFFICIENT_DATA`로 분류하고 0수익으로 처리하지 않습니다.
+- 대시보드에서는 `Exit 정책 검증` 패널에서 scenario별 기대값과 case별 actual/shadow 차이를 확인합니다.
 
 ## DRY_RUN으로 되돌리기
 

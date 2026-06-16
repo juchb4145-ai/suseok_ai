@@ -1383,6 +1383,115 @@ function renderLiveSimCanaryPerformanceRecommendations(rows) {
     : `<span class="empty">검토 전용 권고가 아직 없습니다.</span>`;
 }
 
+function renderExitPolicyValidation(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.exit_policy_validation || runtime.exit_policy_validation || {};
+  const summary = payload.summary || {};
+  const scenarios = payload.scenario_summary || [];
+  const cases = payload.cases || payload.items || [];
+  const available = Boolean(payload.available) || Number(summary.shadow_case_count || 0) > 0;
+  const bestScenario = summary.best_shadow_scenario || "-";
+
+  text("exit-policy-validation-status", available ? (payload.status || "READY") : "NO_DATA");
+  cls("exit-policy-validation-status", `counter ${available ? "ok" : "muted"}`);
+  text("exit-policy-validation-updated", formatDateTime(payload.generated_at));
+  text(
+    "exit-policy-validation-empty",
+    available
+      ? "분석 전용 / 실제 적용 아님. Shadow exit와 실제 LIVE_SIM 청산 품질을 비교합니다."
+      : "Exit 정책 검증 표본을 기다리는 중입니다. 가격 경로가 없으면 데이터 부족으로 표시됩니다."
+  );
+  text("exit-policy-validation-lifecycle", summary.analysis_lifecycle_count ?? 0);
+  text("exit-policy-validation-actual-net", formatPercentValue(summary.actual_live_sim_avg_net_return_pct));
+  text("exit-policy-validation-best", bestScenario);
+  text("exit-policy-validation-best-exp", formatPercentValue(summary.best_shadow_expectancy_pct));
+  text("exit-policy-validation-stoploss", summary.stop_loss_hit_count ?? 0);
+  text("exit-policy-validation-takeprofit", summary.take_profit_capture_count ?? 0);
+  text("exit-policy-validation-timeweak", summary.time_exit_weak_count ?? 0);
+  text("exit-policy-validation-trailing", summary.trailing_would_improve_count ?? 0);
+  text("exit-policy-validation-giveback", summary.giveback_large_count ?? 0);
+  text("exit-policy-validation-insufficient", summary.insufficient_data_count ?? 0);
+  renderExitPolicyValidationScenarioRows(scenarios);
+  renderExitPolicyValidationCaseRows(cases);
+  renderExitPolicyValidationRecommendations(payload.recommendations || []);
+}
+
+function renderExitPolicyValidationScenarioRows(rows) {
+  const body = document.getElementById("exit-policy-validation-scenarios");
+  if (!body) return;
+  const items = firstItems(rows || [], 10);
+  if (!items.length) {
+    body.innerHTML = `<tr><td class="empty" colspan="10">표시할 Exit 정책 검증 scenario가 없습니다.</td></tr>`;
+    return;
+  }
+  body.innerHTML = items.map((item) => `
+    <tr>
+      <td>${escapeHtml(item.scenario_id || "-")}</td>
+      <td>${escapeHtml(item.sample_count ?? 0)}</td>
+      <td>${escapeHtml(formatRate(item.win_rate))}</td>
+      <td>${escapeHtml(formatPercentValue(item.expectancy_pct))}</td>
+      <td>${escapeHtml(formatPercentValue(item.avg_net_return_pct))}</td>
+      <td>${escapeHtml(formatPercentValue(item.avg_mae_pct))}</td>
+      <td>${escapeHtml(fmtOptionalNumber(item.avg_hold_minutes, 1))}</td>
+      <td>${escapeHtml(item.better_than_actual_count ?? 0)}</td>
+      <td>${escapeHtml(item.worse_than_actual_count ?? 0)}</td>
+      <td>${badge(item.recommendation_grade || "INSUFFICIENT_SAMPLE")}</td>
+    </tr>
+  `).join("");
+}
+
+function renderExitPolicyValidationCaseRows(rows) {
+  const body = document.getElementById("exit-policy-validation-cases");
+  if (!body) return;
+  const items = firstItems(rows || [], 10);
+  if (!items.length) {
+    body.innerHTML = `<tr><td class="empty" colspan="8">표시할 Exit 정책 검증 case가 없습니다.</td></tr>`;
+    return;
+  }
+  body.innerHTML = items.map((item) => {
+    const detail = {
+      price_path_summary: item.price_path_summary || {},
+      actual: item.actual || {},
+      shadow_result: item.shadow_result || {},
+      segments: item.segments || {},
+      context_risk_signals: item.context_risk_signals || {},
+      raw_details_json: item.raw_details_json || {},
+    };
+    return `
+      <tr>
+        <td>${escapeHtml([item.code, item.name].filter(Boolean).join(" ") || "-")}</td>
+        <td>${escapeHtml(item.scenario_id || "-")}</td>
+        <td>${escapeHtml(item.actual_exit_type || "-")} / ${escapeHtml(formatPercentValue(item.actual_net_return_pct))}</td>
+        <td>${escapeHtml(item.shadow_exit_type || "-")} / ${escapeHtml(formatPercentValue(item.shadow_net_return_pct))}</td>
+        <td>${escapeHtml(formatPercentValue(item.net_return_delta_pct))}</td>
+        <td>${badge(item.comparison_label || "INCOMPARABLE")}</td>
+        <td>${escapeHtml(item.issue_type || "-")}</td>
+        <td>
+          <details class="canary-decision">
+            <summary>${escapeHtml(item.operator_message_ko || "상세")}</summary>
+            <pre>${escapeHtml(JSON.stringify(detail, null, 2))}</pre>
+          </details>
+        </td>
+      </tr>
+    `;
+  }).join("");
+}
+
+function renderExitPolicyValidationRecommendations(rows) {
+  const node = document.getElementById("exit-policy-validation-recommendations");
+  if (!node) return;
+  const items = firstItems(rows || [], 5);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item info">
+        <strong>${escapeHtml(item.scenario_id || "검토 전용")}</strong>
+        <span>${escapeHtml(item.recommendation_reason_ko || "")}</span>
+        <em>${escapeHtml(item.recommendation_grade || "WATCH")}</em>
+      </div>
+    `).join("")
+    : `<span class="empty">Exit 정책 권고는 표본 누적 후 표시됩니다.</span>`;
+}
+
 function renderBuyZeroRca(snapshot) {
   const runtime = snapshot.runtime || {};
   const payload = snapshot.buy_zero_rca || runtime.buy_zero_rca || {};
@@ -2006,6 +2115,7 @@ function render(snapshot) {
   renderThemeLabSummary(themeLab);
   renderLiveSimAudit(snapshot);
   renderLiveSimCanaryPerformance(snapshot);
+  renderExitPolicyValidation(snapshot);
   renderBuyZeroRca(snapshot);
   renderConservativeReasonOutcomes(snapshot);
   renderShadowSmallEntryPromotion(snapshot);

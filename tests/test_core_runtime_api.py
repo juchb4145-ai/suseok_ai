@@ -608,6 +608,13 @@ def test_dashboard_slim_runtime_payload_reduces_duplicate_sections_but_keeps_sum
             "recommendations": [{"metric": "a"}, {"metric": "b"}],
             "candidates": [{"raw": "x" * 1000}],
         },
+        "exit_policy_validation": {
+            "available": True,
+            "summary": {"analysis_lifecycle_count": 1},
+            "scenario_summary": [{"scenario_id": "balanced_intraday"}],
+            "cases": [{"case_id": "large"}],
+            "segment_analysis": {"raw": "x" * 1000},
+        },
     }
 
     slim = api._dashboard_slim_runtime_payload(runtime)
@@ -624,6 +631,8 @@ def test_dashboard_slim_runtime_payload_reduces_duplicate_sections_but_keeps_sum
     assert slim["dry_run_orders"] == {"summary": {"total": 2}}
     assert "shadow_ranking" not in slim["strategy_replay"]
     assert len(slim["threshold_ab"]["recommendations"]) == 1
+    assert slim["exit_policy_validation"]["summary"]["analysis_lifecycle_count"] == 1
+    assert "segment_analysis" not in slim["exit_policy_validation"]
 
 
 def test_dashboard_dry_run_performance_trade_date_uses_latest_activity(tmp_path, monkeypatch):

@@ -117,6 +117,28 @@ Reports are written under:
 reports/live_sim_canary/<trade_date>/
 ```
 
+## Exit Policy Validation Flow
+
+After LIVE_SIM Canary post-trade linkage is clean enough, run the review-only Exit Policy Validation report to compare actual exits with shadow stop-loss, take-profit, trailing, time-exit, and context-risk exits.
+
+```powershell
+$headers = @{ "X-Local-Token" = "local-dev-token" }
+Invoke-RestMethod `
+  -Method Post `
+  "http://127.0.0.1:8000/api/runtime/exit-policy/validation/rebuild" `
+  -Headers $headers `
+  -ContentType "application/json" `
+  -Body '{"trade_date":"2026-06-17","persist":true,"export":"all"}'
+```
+
+Reports are written under:
+
+```text
+reports/exit_policy_validation/<trade_date>/
+```
+
+This follow-up report is analysis-only. It must not create sell/cancel/modify commands or write `strategy_runtime_settings`.
+
 ## Operator Review Guidance
 
 Recommendations are review prompts only. Examples:
