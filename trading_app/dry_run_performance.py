@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import median
 from typing import Any, Iterable, Optional
@@ -25,6 +25,20 @@ class DryRunPerformanceConfig:
     good_trade_threshold_pct: float = 2.0
     min_hold_minutes_for_final: int = 20
     pending_grace_minutes: int = 30
+    commission_bp_per_side: float = 1.5
+    sell_tax_bp: float = 15.0
+    slippage_scenarios_bp: tuple[float, ...] = (0.0, 10.0, 20.0, 30.0)
+    entry_delay_scenarios_sec: tuple[int, ...] = (0, 1, 3, 5)
+    primary_slippage_bp: float = 10.0
+    primary_entry_delay_sec: int = 0
+    min_go_trade_days: int = 5
+    min_go_accepted_entry_lifecycles: int = 30
+    max_go_bad_ready_rate: float = 0.25
+    max_go_opportunity_loss_rate: float = 0.25
+    max_go_stale_tick_rate: float = 0.2
+    max_go_latency_distortion_rate: float = 0.2
+    stale_tick_age_sec: float = 3.0
+    gateway_latency_warn_ms: float = 1000.0
 
 
 @dataclass
@@ -49,6 +63,14 @@ class DryRunTradeLifecycle:
     reason_family: str = ""
     gate_score: Optional[float] = None
     hybrid_score: Optional[float] = None
+    hybrid_status: str = ""
+    hybrid_position_tier: str = ""
+    hybrid_reason_codes: list[str] = field(default_factory=list)
+    reason_codes: list[str] = field(default_factory=list)
+    membership_score: Optional[float] = None
+    theme_score_bucket: str = ""
+    membership_score_bucket: str = ""
+    stock_role: str = ""
     session_bucket: str = ""
     entry_intent_id: str = ""
     entry_intent_status: str = ""
@@ -72,6 +94,13 @@ class DryRunTradeLifecycle:
     exit_quantity_total: int = 0
     exit_amount_total: int = 0
     realized_return_pct: Optional[float] = None
+    net_return_pct: Optional[float] = None
+    net_expectancy_component: Optional[float] = None
+    net_opportunity_return_pct: Optional[float] = None
+    cost_adjusted_classification: str = ""
+    net_bad_ready_type: str = ""
+    net_opportunity_type: str = ""
+    cost_scenarios: list[dict[str, Any]] = field(default_factory=list)
     max_return_5m: Optional[float] = None
     max_return_10m: Optional[float] = None
     max_return_20m: Optional[float] = None
@@ -96,6 +125,13 @@ class DryRunTradeLifecycle:
     data_quality_issue_reasons: dict[str, str] = field(default_factory=dict)
     review_false_positive_mismatch: bool = False
     review_false_negative_mismatch: bool = False
+    limit_price_hit: Optional[bool] = None
+    partial_fill_risk: str = ""
+    spread_risk: str = ""
+    liquidity_bucket: str = ""
+    entry_tick_age_sec: Optional[float] = None
+    gateway_command_latency_ms: Optional[float] = None
+    execution_realism: dict[str, Any] = field(default_factory=dict)
     details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -275,6 +311,13 @@ class DryRunPerformanceAnalyzer:
         return {
             "report_id": report_id,
             "status": "READY",
+            "review_only": True,
+            "safety_scope": {
+                "live_real_order_activation": False,
+                "gateway_send_order_created": False,
+                "strategy_settings_auto_change": False,
+            },
+            "disclaimer_ko": "분석 전용 리포트입니다. 추천/진단은 자동 적용하지 않으며 LIVE_REAL 주문, Gateway send_order, 전략 설정 변경을 생성하지 않습니다.",
             "generated_at": generated_at,
             "trade_date": trade_date or "",
             "filters": filters,
@@ -327,6 +370,18 @@ class DryRunPerformanceAnalyzer:
         for decision in self.db.list_exit_decisions_for_analysis():
             if decision.virtual_position_id is not None:
                 decisions_by_position.setdefault(decision.virtual_position_id, []).append(decision)
+        hybrid_events_by_code_date = _hybrid_events_by_code_date(
+            self.db,
+            trade_date=trade_date,
+            code=code,
+            limit=20000,
+        )
+        ticks_by_code_date = _gateway_price_ticks_by_code_date(
+            self.db,
+            trade_date=trade_date,
+            code=code,
+            limit=50000,
+        )
         context_history_by_position: dict[int, list[Any]] = {}
         if hasattr(self.db, "list_position_context_history_for_analysis"):
             histories = self.db.list_position_context_history_for_analysis(
@@ -372,6 +427,8 @@ class DryRunPerformanceAnalyzer:
                 position_by_order,
                 positions_by_candidate,
                 decisions_by_position,
+                hybrid_events_by_code_date,
+                ticks_by_code_date,
                 context_history_by_position,
                 candidates,
                 list(group.get("links") or []),
@@ -395,6 +452,8 @@ class DryRunPerformanceAnalyzer:
         position_by_order: dict[int, Any],
         positions_by_candidate: dict[int, list[Any]],
         decisions_by_position: dict[int, list[Any]],
+        hybrid_events_by_code_date: dict[str, list[dict[str, Any]]],
+        ticks_by_code_date: dict[str, list[dict[str, Any]]],
         context_history_by_position: dict[int, list[Any]],
         candidates: dict[int, Any],
         attribution_links: list[AttributionLink],
@@ -499,6 +558,13 @@ class DryRunPerformanceAnalyzer:
             )
             or ""
         )
+        code_date_key = _code_date_key(trade_date, code)
+        hybrid_event = _match_hybrid_event(
+            hybrid_events_by_code_date.get(code_date_key, []),
+            candidate_instance_id=candidate_instance_id,
+            reference_at=str(entry.get("created_at") if entry else review.created_at if review else ""),
+        )
+        hybrid_details = dict((hybrid_event or {}).get("details") or {})
         gate_reason = str(_first_not_none(entry.get("gate_reason") if entry else None, review_details.get("primary_reason_code"), review_details.get("gate_reason")) or "")
         taxonomy_codes = [
             gate_reason,
@@ -507,6 +573,58 @@ class DryRunPerformanceAnalyzer:
             *[str(value) for value in (review_details.get("blocking_reason_codes") or [])],
             *[str(value) for value in (review_details.get("secondary_reason_codes") or [])],
         ]
+        hybrid_reason_codes = _unique(
+            [
+                *((hybrid_event or {}).get("hybrid_reason_codes") or []),
+                (hybrid_event or {}).get("hybrid_primary_reason"),
+                *taxonomy_codes,
+            ]
+        )
+        theme_score_value = _optional_float(
+            _first_not_none(
+                (hybrid_event or {}).get("theme_score"),
+                hybrid_details.get("theme_score"),
+                entry_request.get("theme_score"),
+                entry_metadata.get("theme_score"),
+                review_details.get("theme_score"),
+            )
+        )
+        hybrid_score_value = _optional_float(
+            _first_not_none(
+                (hybrid_event or {}).get("hybrid_score"),
+                entry_request.get("hybrid_score"),
+                entry_metadata.get("hybrid_score"),
+                review_details.get("hybrid_score"),
+            )
+        )
+        membership_score_value = _optional_float(
+            _first_not_none(
+                (hybrid_event or {}).get("membership_score"),
+                hybrid_details.get("membership_score"),
+                entry_request.get("membership_score"),
+                entry_metadata.get("membership_score"),
+                review_details.get("membership_score"),
+            )
+        )
+        stock_role = _first_text(
+            (hybrid_event or {}).get("leader_type"),
+            (hybrid_event or {}).get("relation_type"),
+            entry_metadata.get("stock_role"),
+            entry_request.get("stock_role"),
+            review_details.get("stock_role"),
+        )
+        hybrid_status = _first_text(
+            entry_metadata.get("hybrid_status"),
+            entry_request.get("hybrid_status"),
+            review_details.get("hybrid_status"),
+            (hybrid_event or {}).get("hybrid_status"),
+        )
+        hybrid_position_tier = _first_text(
+            entry_metadata.get("hybrid_position_tier"),
+            entry_request.get("hybrid_position_tier"),
+            review_details.get("hybrid_position_tier"),
+            (hybrid_event or {}).get("hybrid_position_tier"),
+        )
         reason_status = normalize_reason_status(
             reason_codes=taxonomy_codes,
             display_state=str(_first_not_none(entry.get("gate_status") if entry else None, review_details.get("gate_status")) or ""),
@@ -526,13 +644,21 @@ class DryRunPerformanceAnalyzer:
             attribution_confidence=_attribution_confidence(best_link),
             legacy_low_confidence_sample=_legacy_low_confidence_sample(candidate_instance_id, best_link),
             theme_name=str(_first_not_none(entry_request.get("theme_name"), review.theme_name if review else None, entry_metadata.get("theme_name")) or ""),
-            theme_score=_optional_float(_first_not_none(entry_request.get("theme_score"), entry_metadata.get("theme_score"), review_details.get("theme_score"))),
+            theme_score=theme_score_value,
             gate_status=str(_first_not_none(entry.get("gate_status") if entry else None, review_details.get("gate_status")) or ""),
             gate_reason=gate_reason,
             reason_status=reason_status,
             reason_family=reason_status_family(reason_status),
             gate_score=_optional_float(_first_not_none(entry_request.get("gate_score"), entry_metadata.get("gate_score"), review_details.get("gate_score"))),
-            hybrid_score=_optional_float(_first_not_none(entry_request.get("hybrid_score"), entry_metadata.get("hybrid_score"), review_details.get("hybrid_score"))),
+            hybrid_score=hybrid_score_value,
+            hybrid_status=hybrid_status,
+            hybrid_position_tier=hybrid_position_tier,
+            hybrid_reason_codes=hybrid_reason_codes,
+            reason_codes=hybrid_reason_codes,
+            membership_score=membership_score_value,
+            theme_score_bucket=_score_bucket(theme_score_value),
+            membership_score_bucket=_membership_score_bucket(membership_score_value),
+            stock_role=stock_role,
             session_bucket=str(_first_not_none(review_details.get("session_bucket"), entry_metadata.get("session_bucket")) or ""),
             entry_intent_id=str(entry.get("intent_id") or "") if entry else "",
             entry_intent_status=str(entry.get("status") or "") if entry else "",
@@ -569,7 +695,7 @@ class DryRunPerformanceAnalyzer:
             blocked_but_later_rallied=bool(review.blocked_but_later_rallied) if review else False,
             expired_but_later_rallied=bool(review.expired_but_later_rallied) if review else False,
             hold_minutes=_hold_minutes(position.opened_at, position.closed_at) if position else None,
-            score_bucket=_score_bucket(_optional_float(_first_not_none(entry_request.get("hybrid_score"), entry_request.get("gate_score"), review_details.get("hybrid_score")))),
+            score_bucket=_score_bucket(_optional_float(_first_not_none(hybrid_score_value, entry_request.get("gate_score"), review_details.get("hybrid_score")))),
             details={
                 "entry_intent_count": len(entry_intents),
                 "exit_intent_count": len(exit_intents),
@@ -628,8 +754,28 @@ class DryRunPerformanceAnalyzer:
                 "position_context_has_holding": "HOLDING_EVAL" in context_capture_reasons,
                 "position_context_has_exit": "EXIT_EVAL" in context_capture_reasons,
                 "context_risk_exit_details": context_risk_exit_details,
+                "hybrid_validation_event_id": (hybrid_event or {}).get("id"),
+                "hybrid_validation_event_created_at": (hybrid_event or {}).get("created_at", ""),
             },
         )
+        tick_rows = ticks_by_code_date.get(code_date_key, [])
+        lifecycle.execution_realism = _execution_realism(lifecycle, entry, tick_rows, self.config)
+        lifecycle.limit_price_hit = lifecycle.execution_realism.get("limit_price_hit")
+        lifecycle.partial_fill_risk = str(lifecycle.execution_realism.get("partial_fill_risk") or "")
+        lifecycle.spread_risk = str(lifecycle.execution_realism.get("spread_risk") or "")
+        lifecycle.liquidity_bucket = str(lifecycle.execution_realism.get("liquidity_bucket") or "")
+        lifecycle.entry_tick_age_sec = _optional_float(lifecycle.execution_realism.get("entry_tick_age_sec"))
+        lifecycle.gateway_command_latency_ms = _optional_float(lifecycle.execution_realism.get("gateway_command_latency_ms"))
+        cost_payload = _cost_adjusted_payload(lifecycle, entry, tick_rows, self.config)
+        lifecycle.cost_scenarios = list(cost_payload.get("cost_scenarios") or [])
+        lifecycle.net_return_pct = _optional_float(cost_payload.get("net_return_pct"))
+        lifecycle.net_expectancy_component = lifecycle.net_return_pct
+        lifecycle.net_opportunity_return_pct = _optional_float(cost_payload.get("net_opportunity_return_pct"))
+        lifecycle.cost_adjusted_classification = str(cost_payload.get("cost_adjusted_classification") or "")
+        lifecycle.net_bad_ready_type = str(cost_payload.get("net_bad_ready_type") or "")
+        lifecycle.net_opportunity_type = str(cost_payload.get("net_opportunity_type") or "")
+        lifecycle.details["cost_assumptions"] = cost_payload.get("cost_assumptions", {})
+        lifecycle.details["execution_realism"] = dict(lifecycle.execution_realism)
         lifecycle.data_quality_issue_reasons = _data_quality_issue_reasons(
             lifecycle,
             entry,
@@ -651,10 +797,22 @@ class DryRunPerformanceAnalyzer:
         live_pass_items = [item for item in items if bool(item.get("entry_live_would_pass"))]
         live_pass_completed = [item for item in live_pass_items if _is_completed(item)]
         live_pass_wins = [item for item in live_pass_completed if (_optional_float(item.get("realized_return_pct")) or 0.0) > 0.0]
+        accepted_completed = [
+            item
+            for item in completed
+            if item.get("entry_intent_status") in {"DRY_RUN_ACCEPTED", "ACCEPTED"}
+        ]
+        net_values = [_optional_float(item.get("net_return_pct")) for item in accepted_completed]
+        net_values = [value for value in net_values if value is not None]
+        net_wins = [value for value in net_values if value > 0.0]
         generation_summary = _generation_summary(items)
         position_context_summary = _position_context_history_summary(items)
+        execution_realism = _execution_realism_summary(items, self.config)
+        cost_adjusted = _cost_adjusted_summary(items)
+        go_no_go = _go_no_go_summary(items, self.config, net_values, cost_adjusted, execution_realism)
         return {
             "total_lifecycle_count": len(items),
+            "trade_day_count": len({str(item.get("trade_date") or "") for item in items if item.get("trade_date")}),
             "entry_intent_count": sum(1 for item in items if item.get("entry_intent_id")),
             "exit_intent_count": sum(len(item.get("exit_intent_ids") or []) for item in items),
             "completed_lifecycle_count": len(completed),
@@ -677,6 +835,17 @@ class DryRunPerformanceAnalyzer:
             "median_realized_return_pct": median(realized_values) if realized_values else None,
             "win_rate": _ratio(len(wins), len(completed)),
             "loss_rate": _ratio(len(losses), len(completed)),
+            "accepted_completed_lifecycle_count": len(accepted_completed),
+            "net_expectancy": _avg(net_values),
+            "avg_net_return_pct": _avg(net_values),
+            "median_net_return_pct": median(net_values) if net_values else None,
+            "net_win_rate": _ratio(len(net_wins), len(net_values)),
+            "net_loss_rate": _ratio(len(net_values) - len(net_wins), len(net_values)),
+            "primary_cost_assumption": _primary_cost_assumption(self.config),
+            "cost_scenario_expectancy": _aggregate_cost_scenarios(items),
+            "cost_adjusted": cost_adjusted,
+            "execution_realism": execution_realism,
+            "go_no_go": go_no_go,
             "avg_max_return_5m": _avg([item.get("max_return_5m") for item in items]),
             "avg_max_return_10m": _avg([item.get("max_return_10m") for item in items]),
             "avg_max_return_20m": _avg([item.get("max_return_20m") for item in items]),
@@ -703,6 +872,10 @@ class DryRunPerformanceAnalyzer:
             "false_positive_rate": _ratio(sum(1 for item in items if item.get("dry_run_false_positive_type")), len(items)),
             "false_negative_rate": _ratio(sum(1 for item in items if item.get("dry_run_false_negative_type")), len(items)),
             "opportunity_loss_count": sum(1 for item in items if item.get("opportunity_loss_type")),
+            "cost_adjusted_bad_ready_count": cost_adjusted.get("bad_ready_count", 0),
+            "cost_adjusted_bad_ready_rate": cost_adjusted.get("bad_ready_rate"),
+            "cost_adjusted_opportunity_loss_count": cost_adjusted.get("opportunity_loss_count", 0),
+            "cost_adjusted_opportunity_loss_rate": cost_adjusted.get("opportunity_loss_rate"),
         }
 
     def aggregate_false_signals(self, items: list[dict]) -> dict[str, Any]:
@@ -733,11 +906,17 @@ class DryRunPerformanceAnalyzer:
             "by_reason_status": _group_stats(items, "reason_status"),
             "by_reason_family": _group_stats(items, "reason_family"),
             "by_gate_status": _group_stats(items, "gate_status"),
+            "by_hybrid_status": _group_stats(items, "hybrid_status"),
+            "by_hybrid_position_tier": _group_stats(items, "hybrid_position_tier"),
             "by_session_bucket": _group_stats(items, "session_bucket"),
             "by_code": _group_stats(items, "code"),
             "by_live_reject_reason": _group_stats(items, "entry_live_reject_reason"),
             "by_decision_safety_reason": _group_stats(items, "entry_decision_safety_reason"),
             "by_score_bucket": _group_stats(items, "score_bucket"),
+            "by_theme_score_bucket": _group_stats(items, "theme_score_bucket"),
+            "by_membership_score_bucket": _group_stats(items, "membership_score_bucket"),
+            "by_stock_role": _group_stats(items, "stock_role"),
+            "by_reason_code": _multi_group_stats(items, "reason_codes", "reason_code"),
             "by_exit_decision_type": _multi_group_stats(items, "exit_decision_types", "decision_type"),
             "reason_summary": reason_summary(items),
         }
@@ -845,6 +1024,11 @@ class DryRunPerformanceAnalyzer:
             "exit_decision_types",
             "final_status",
             "realized_return_pct",
+            "net_return_pct",
+            "cost_adjusted_classification",
+            "net_bad_ready_type",
+            "net_opportunity_type",
+            "net_opportunity_return_pct",
             "max_return_5m",
             "max_return_10m",
             "max_return_20m",
@@ -857,8 +1041,21 @@ class DryRunPerformanceAnalyzer:
             "gate_reason",
             "reason_status",
             "reason_family",
+            "reason_codes",
             "hybrid_score",
+            "hybrid_status",
+            "hybrid_position_tier",
             "theme_score",
+            "theme_score_bucket",
+            "membership_score",
+            "membership_score_bucket",
+            "stock_role",
+            "limit_price_hit",
+            "partial_fill_risk",
+            "spread_risk",
+            "liquidity_bucket",
+            "entry_tick_age_sec",
+            "gateway_command_latency_ms",
         ]
         with path.open("w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.DictWriter(handle, fieldnames=columns)
@@ -867,6 +1064,7 @@ class DryRunPerformanceAnalyzer:
                 row = dict(item)
                 row["exit_intent_ids"] = ",".join(str(value) for value in row.get("exit_intent_ids") or [])
                 row["exit_decision_types"] = ",".join(str(value) for value in row.get("exit_decision_types") or [])
+                row["reason_codes"] = ",".join(str(value) for value in row.get("reason_codes") or [])
                 writer.writerow({column: row.get(column, "") for column in columns})
         return path
 
@@ -884,6 +1082,20 @@ class DryRunPerformanceAnalyzer:
             f"- Completed lifecycles: {summary.get('completed_lifecycle_count', 0)}",
             f"- Win rate: {_pct(summary.get('win_rate'))}",
             f"- Avg realized return: {_num(summary.get('avg_realized_return_pct'))}",
+            f"- Net expectancy: {_num(summary.get('net_expectancy'))}",
+            f"- Net win rate: {_pct(summary.get('net_win_rate'))}",
+            f"- Review-only: {bool(report.get('review_only', True))}",
+            "",
+            "## Go/No-Go",
+            *_markdown_go_no_go_lines(summary.get("go_no_go", {})),
+            "",
+            "## Cost And Slippage",
+            *_markdown_cost_assumption_lines(summary.get("primary_cost_assumption", {})),
+            "### Scenario Expectancy",
+            *_markdown_cost_scenario_lines(summary.get("cost_scenario_expectancy", [])),
+            "",
+            "## Execution Realism",
+            *_markdown_execution_realism_lines(summary.get("execution_realism", {})),
             "",
             "## DRY_RUN Intent Summary",
             f"- Entry intents: {summary.get('entry_intent_count', 0)}",
@@ -931,6 +1143,8 @@ class DryRunPerformanceAnalyzer:
             f"- False positives: {summary.get('false_positive_count', 0)}",
             f"- False negatives: {summary.get('false_negative_count', 0)}",
             f"- Opportunity loss: {summary.get('opportunity_loss_count', 0)}",
+            f"- Cost-adjusted bad-ready: {summary.get('cost_adjusted_bad_ready_count', 0)}",
+            f"- Cost-adjusted opportunity loss: {summary.get('cost_adjusted_opportunity_loss_count', 0)}",
             "",
             "### Top False Positive Types",
             *_markdown_count_lines(false_summary.get("top_false_positive_types", []), "type"),
@@ -949,6 +1163,24 @@ class DryRunPerformanceAnalyzer:
             "",
             "## Session Bucket Performance",
             *_markdown_group_lines(grouped.get("by_session_bucket", [])[:10]),
+            "",
+            "## Hybrid Status Performance",
+            *_markdown_group_lines(grouped.get("by_hybrid_status", [])[:10]),
+            "",
+            "## Hybrid Position Tier Performance",
+            *_markdown_group_lines(grouped.get("by_hybrid_position_tier", [])[:10]),
+            "",
+            "## Reason Code Performance",
+            *_markdown_group_lines(grouped.get("by_reason_code", [])[:10]),
+            "",
+            "## Theme Score Bucket Performance",
+            *_markdown_group_lines(grouped.get("by_theme_score_bucket", [])[:10]),
+            "",
+            "## Membership Score Bucket Performance",
+            *_markdown_group_lines(grouped.get("by_membership_score_bucket", [])[:10]),
+            "",
+            "## Stock Role Performance",
+            *_markdown_group_lines(grouped.get("by_stock_role", [])[:10]),
             "",
             "## Exit Decision Type Performance",
             *_markdown_group_lines(grouped.get("by_exit_decision_type", [])[:10]),
@@ -989,6 +1221,20 @@ def config_from_settings(settings: Any) -> DryRunPerformanceConfig:
         good_trade_threshold_pct=float(getattr(settings, "dry_run_good_trade_threshold_pct", 2.0)),
         min_hold_minutes_for_final=int(getattr(settings, "dry_run_min_hold_minutes_for_final", 20)),
         pending_grace_minutes=int(getattr(settings, "dry_run_pending_grace_minutes", 30)),
+        commission_bp_per_side=float(getattr(settings, "dry_run_commission_bp_per_side", 1.5)),
+        sell_tax_bp=float(getattr(settings, "dry_run_sell_tax_bp", 15.0)),
+        slippage_scenarios_bp=_float_tuple(getattr(settings, "dry_run_slippage_scenarios_bp", "0,10,20,30"), (0.0, 10.0, 20.0, 30.0)),
+        entry_delay_scenarios_sec=_int_tuple(getattr(settings, "dry_run_entry_delay_scenarios_sec", "0,1,3,5"), (0, 1, 3, 5)),
+        primary_slippage_bp=float(getattr(settings, "dry_run_primary_slippage_bp", 10.0)),
+        primary_entry_delay_sec=int(getattr(settings, "dry_run_primary_entry_delay_sec", 0)),
+        min_go_trade_days=int(getattr(settings, "dry_run_go_min_trade_days", 5)),
+        min_go_accepted_entry_lifecycles=int(getattr(settings, "dry_run_go_min_accepted_entry_lifecycles", 30)),
+        max_go_bad_ready_rate=float(getattr(settings, "dry_run_go_max_bad_ready_rate", 0.25)),
+        max_go_opportunity_loss_rate=float(getattr(settings, "dry_run_go_max_opportunity_loss_rate", 0.25)),
+        max_go_stale_tick_rate=float(getattr(settings, "dry_run_go_max_stale_tick_rate", 0.2)),
+        max_go_latency_distortion_rate=float(getattr(settings, "dry_run_go_max_latency_distortion_rate", 0.2)),
+        stale_tick_age_sec=float(getattr(settings, "dry_run_stale_tick_age_sec", 3.0)),
+        gateway_latency_warn_ms=float(getattr(settings, "dry_run_gateway_latency_warn_ms", 1000.0)),
     )
 
 
@@ -1240,18 +1486,30 @@ def _multi_group_stats(items: list[dict], field: str, key_name: str) -> list[dic
 def _stats_for_group(key: str, values: list[dict]) -> dict[str, Any]:
     completed = [item for item in values if _is_completed(item)]
     wins = [item for item in completed if (_optional_float(item.get("realized_return_pct")) or 0.0) > 0.0]
+    accepted_completed = [
+        item
+        for item in completed
+        if item.get("entry_intent_status") in {"DRY_RUN_ACCEPTED", "ACCEPTED"}
+    ]
+    net_values = [_optional_float(item.get("net_return_pct")) for item in accepted_completed]
+    net_values = [value for value in net_values if value is not None]
     return {
         "key": key,
         "count": len(values),
         "completed": len(completed),
         "win_rate": _ratio(len(wins), len(completed)),
         "avg_realized_return_pct": _avg([item.get("realized_return_pct") for item in completed]),
+        "net_expectancy": _avg(net_values),
+        "avg_net_return_pct": _avg(net_values),
+        "net_win_rate": _ratio(sum(1 for value in net_values if value > 0.0), len(net_values)),
         "avg_max_return_20m": _avg([item.get("max_return_20m") for item in values]),
         "avg_max_drawdown_20m": _avg([item.get("max_drawdown_20m") for item in values]),
         "false_positive_count": sum(1 for item in values if item.get("dry_run_false_positive_type")),
         "false_positive_rate": _ratio(sum(1 for item in values if item.get("dry_run_false_positive_type")), len(values)),
         "false_negative_count": sum(1 for item in values if item.get("dry_run_false_negative_type")),
         "opportunity_loss_count": sum(1 for item in values if item.get("opportunity_loss_type")),
+        "cost_adjusted_bad_ready_count": sum(1 for item in values if item.get("net_bad_ready_type")),
+        "cost_adjusted_opportunity_loss_count": sum(1 for item in values if item.get("net_opportunity_type")),
         "live_would_pass_count": sum(1 for item in values if item.get("entry_live_would_pass")),
         "live_would_reject_count": sum(1 for item in values if item.get("entry_intent_id") and not item.get("entry_live_would_pass")),
     }
@@ -1353,6 +1611,630 @@ def _support_source_distribution(rows: list[dict]) -> list[dict[str, Any]]:
         for source in row.get("support_source_present") or []:
             counts[str(source)] = counts.get(str(source), 0) + 1
     return [{"source": source, "count": count} for source, count in sorted(counts.items(), key=lambda pair: pair[1], reverse=True)]
+
+
+def _hybrid_events_by_code_date(
+    db: TradingDatabase,
+    *,
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    limit: int = 20000,
+) -> dict[str, list[dict[str, Any]]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if trade_date:
+        clauses.append("trade_date = ?")
+        params.append(str(trade_date))
+    if code:
+        clauses.append("stock_code = ?")
+        params.append(str(code))
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = db.conn.execute(
+        f"""
+        SELECT *
+        FROM hybrid_gate_validation_events
+        {where}
+        ORDER BY trade_date ASC, stock_code ASC, created_at ASC, id ASC
+        LIMIT ?
+        """,
+        tuple(params + [max(1, int(limit or 20000))]),
+    ).fetchall()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        data = dict(row)
+        data["hybrid_reason_codes"] = _safe_json(data.get("hybrid_reason_codes_json"), [])
+        data["details"] = _safe_json(data.get("details_json"), {})
+        grouped.setdefault(_code_date_key(str(data.get("trade_date") or ""), str(data.get("stock_code") or "")), []).append(data)
+    return grouped
+
+
+def _gateway_price_ticks_by_code_date(
+    db: TradingDatabase,
+    *,
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    limit: int = 50000,
+) -> dict[str, list[dict[str, Any]]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if trade_date:
+        clauses.append("trade_date = ?")
+        params.append(str(trade_date))
+    if code:
+        clauses.append("code = ?")
+        params.append(str(code))
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = db.conn.execute(
+        f"""
+        SELECT id, event_id, trade_date, timestamp, received_at, code, name, price,
+               trade_value, execution_strength, best_bid, best_ask, spread_ticks,
+               source, transport_mode, raw_payload_json, metadata_json, created_at
+        FROM gateway_price_ticks
+        {where}
+        ORDER BY trade_date ASC, code ASC, timestamp ASC, id ASC
+        LIMIT ?
+        """,
+        tuple(params + [max(1, int(limit or 50000))]),
+    ).fetchall()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        data = dict(row)
+        data["raw_payload"] = _safe_json(data.get("raw_payload_json"), {})
+        data["metadata"] = _safe_json(data.get("metadata_json"), {})
+        grouped.setdefault(_code_date_key(str(data.get("trade_date") or ""), str(data.get("code") or "")), []).append(data)
+    return grouped
+
+
+def _match_hybrid_event(
+    events: list[dict[str, Any]],
+    *,
+    candidate_instance_id: str = "",
+    reference_at: str = "",
+) -> dict[str, Any]:
+    if not events:
+        return {}
+    if candidate_instance_id:
+        for event in reversed(events):
+            if _payload_contains_value(event, candidate_instance_id):
+                return event
+    reference = _parse_time(reference_at)
+    if reference is None:
+        return events[-1]
+    before_or_equal = [
+        event
+        for event in events
+        if (_parse_time(str(event.get("created_at") or "")) is not None)
+        and _time_delta_seconds(event.get("created_at"), reference_at) is not None
+        and (_time_delta_seconds(event.get("created_at"), reference_at) or 0.0) >= 0.0
+    ]
+    if before_or_equal:
+        return before_or_equal[-1]
+    return events[0]
+
+
+def _payload_contains_value(payload: Any, needle: str) -> bool:
+    if not needle:
+        return False
+    if isinstance(payload, dict):
+        return any(_payload_contains_value(value, needle) for value in payload.values())
+    if isinstance(payload, list):
+        return any(_payload_contains_value(value, needle) for value in payload)
+    return str(payload or "") == str(needle)
+
+
+def _execution_realism(
+    lifecycle: DryRunTradeLifecycle,
+    entry: Optional[dict],
+    ticks: list[dict[str, Any]],
+    config: DryRunPerformanceConfig,
+) -> dict[str, Any]:
+    if entry is None:
+        return {
+            "limit_price_hit": None,
+            "partial_fill_risk": "UNKNOWN",
+            "spread_risk": "UNKNOWN",
+            "liquidity_bucket": "UNKNOWN",
+            "data_status": "NO_ENTRY_INTENT",
+        }
+    entry_time = _first_text(entry.get("created_at"), entry.get("updated_at"), lifecycle.opened_at)
+    limit_price = _first_float(lifecycle.entry_price, entry.get("price"))
+    tick_at_entry = _first_tick_at_or_after(ticks, entry_time)
+    previous_tick = _latest_tick_at_or_before(ticks, entry_time)
+    observed_tick = tick_at_entry or previous_tick or {}
+    sources = _analysis_sources(entry, observed_tick, lifecycle.details)
+    trade_value = _first_float(_recursive_first(sources, "trade_value"), observed_tick.get("trade_value"))
+    spread_ticks = _first_int(_recursive_first(sources, "spread_ticks"), observed_tick.get("spread_ticks"))
+    best_bid = _first_float(_recursive_first(sources, "best_bid"), observed_tick.get("best_bid"))
+    best_ask = _first_float(_recursive_first(sources, "best_ask"), observed_tick.get("best_ask"))
+    observed_price = _first_float(observed_tick.get("price"), _recursive_first(sources, "price"))
+    entry_tick_age_sec = _first_float(
+        _recursive_first(sources, "entry_tick_age_sec"),
+        _recursive_first(sources, "latest_tick_age_sec"),
+        _recursive_first(sources, "tick_age_sec"),
+    )
+    if entry_tick_age_sec is None and previous_tick:
+        entry_tick_age_sec = _time_delta_seconds(previous_tick.get("timestamp") or previous_tick.get("received_at"), entry_time)
+    latency_ms = _first_float(
+        _recursive_first(sources, "gateway_command_latency_ms"),
+        _recursive_first(sources, "command_latency_ms"),
+        _recursive_first(sources, "total_wall_ms"),
+        _recursive_first(sources, "ack_round_trip_ms"),
+        _recursive_first(sources, "core_dispatch_wait_ms"),
+    )
+    explicit_hit = _recursive_first(sources, "limit_price_hit")
+    limit_price_hit = _bool_or_none(explicit_hit)
+    if limit_price_hit is None:
+        limit_price_hit = _limit_price_hit(str(entry.get("side") or "buy"), limit_price, observed_price, best_bid, best_ask)
+    liquidity_bucket = _liquidity_bucket(trade_value)
+    spread_risk = _spread_risk(spread_ticks)
+    partial_fill_risk = _partial_fill_risk(
+        order_amount=_first_float(lifecycle.entry_amount, entry.get("order_amount")),
+        trade_value=trade_value,
+        limit_price_hit=limit_price_hit,
+    )
+    stale_tick = entry_tick_age_sec is not None and entry_tick_age_sec > config.stale_tick_age_sec
+    high_latency = latency_ms is not None and latency_ms > config.gateway_latency_warn_ms
+    return {
+        "limit_price_hit": limit_price_hit,
+        "partial_fill_risk": partial_fill_risk,
+        "spread_risk": spread_risk,
+        "liquidity_bucket": liquidity_bucket,
+        "trade_value": trade_value,
+        "order_amount": _first_float(lifecycle.entry_amount, entry.get("order_amount")),
+        "entry_tick_age_sec": entry_tick_age_sec,
+        "gateway_command_latency_ms": latency_ms,
+        "spread_ticks": spread_ticks,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "observed_price": observed_price,
+        "observed_tick_id": observed_tick.get("event_id") or observed_tick.get("id"),
+        "tick_data_available": bool(observed_tick),
+        "stale_tick": stale_tick,
+        "high_gateway_latency": high_latency,
+        "data_status": "OK" if observed_tick else "TICK_MISSING",
+    }
+
+
+def _cost_adjusted_payload(
+    lifecycle: DryRunTradeLifecycle,
+    entry: Optional[dict],
+    ticks: list[dict[str, Any]],
+    config: DryRunPerformanceConfig,
+) -> dict[str, Any]:
+    cost_scenarios: list[dict[str, Any]] = []
+    primary_net: Optional[float] = None
+    primary_cost_pct = _round_trip_cost_pct(config, config.primary_slippage_bp)
+    baseline_gross = _gross_return_pct(lifecycle)
+    for slippage_bp in config.slippage_scenarios_bp:
+        cost_pct = _round_trip_cost_pct(config, slippage_bp)
+        for delay_sec in config.entry_delay_scenarios_sec:
+            delayed_price = _delayed_entry_price(entry, ticks, delay_sec)
+            gross = _gross_return_pct(lifecycle, entry_price_override=delayed_price)
+            if delay_sec == 0 and gross is None:
+                gross = baseline_gross
+            net = round(gross - cost_pct, 4) if gross is not None else None
+            row = {
+                "slippage_bp": float(slippage_bp),
+                "entry_delay_sec": int(delay_sec),
+                "round_trip_cost_pct": round(cost_pct, 4),
+                "gross_return_pct": round(gross, 4) if gross is not None else None,
+                "net_return_pct": net,
+                "entry_price": delayed_price,
+                "tick_data_available": delayed_price is not None if delay_sec else bool(delayed_price or lifecycle.entry_price),
+            }
+            if float(slippage_bp) == float(config.primary_slippage_bp) and int(delay_sec) == int(config.primary_entry_delay_sec):
+                primary_net = net
+            cost_scenarios.append(row)
+    if primary_net is None and baseline_gross is not None:
+        primary_net = round(baseline_gross - primary_cost_pct, 4)
+    net_opportunity = None
+    max_return = _first_float(lifecycle.max_return_20m, lifecycle.max_return_10m, lifecycle.max_return_5m)
+    if max_return is not None:
+        net_opportunity = round(max_return - primary_cost_pct, 4)
+    classification, bad_ready_type, opportunity_type = _cost_adjusted_classification(
+        lifecycle,
+        net_return_pct=primary_net,
+        net_opportunity_return_pct=net_opportunity,
+        config=config,
+    )
+    return {
+        "cost_assumptions": _primary_cost_assumption(config),
+        "cost_scenarios": cost_scenarios,
+        "net_return_pct": primary_net,
+        "net_opportunity_return_pct": net_opportunity,
+        "cost_adjusted_classification": classification,
+        "net_bad_ready_type": bad_ready_type,
+        "net_opportunity_type": opportunity_type,
+    }
+
+
+def _cost_adjusted_classification(
+    lifecycle: DryRunTradeLifecycle,
+    *,
+    net_return_pct: Optional[float],
+    net_opportunity_return_pct: Optional[float],
+    config: DryRunPerformanceConfig,
+) -> tuple[str, str, str]:
+    status = str(lifecycle.hybrid_status or lifecycle.gate_status or "").upper()
+    entry_accepted = lifecycle.entry_intent_status in {"DRY_RUN_ACCEPTED", "ACCEPTED"}
+    bad_ready_type = ""
+    opportunity_type = ""
+    if status in {"READY", "READY_SMALL", "READY_SHADOW_SMALL_ENTRY"} and entry_accepted and net_return_pct is not None:
+        if net_return_pct < 0.0:
+            bad_ready_type = "NET_BAD_READY"
+            return "bad_ready", bad_ready_type, opportunity_type
+        return "good_ready_after_cost" if net_return_pct >= config.good_trade_threshold_pct else "weak_ready_after_cost", "", ""
+    if status in {"WAIT", "BLOCKED", "OBSERVE"} or not entry_accepted:
+        max_return = _first_float(lifecycle.max_return_20m, lifecycle.max_return_10m, lifecycle.max_return_5m)
+        if (
+            net_opportunity_return_pct is not None
+            and net_opportunity_return_pct > 0.0
+            and (max_return is None or max_return >= config.fn_rally_threshold_pct or lifecycle.opportunity_loss_type)
+        ):
+            if status == "WAIT":
+                opportunity_type = "NET_MISSED_WAIT"
+            elif status == "BLOCKED":
+                opportunity_type = "NET_BLOCKED_OPPORTUNITY"
+            else:
+                opportunity_type = "NET_MISSED_OPPORTUNITY"
+            return "missed_opportunity_after_cost", "", opportunity_type
+    if net_return_pct is not None and entry_accepted:
+        return "accepted_after_cost", "", ""
+    return "neutral_after_cost", "", ""
+
+
+def _gross_return_pct(lifecycle: DryRunTradeLifecycle, *, entry_price_override: Optional[float] = None) -> Optional[float]:
+    entry_price = _first_float(entry_price_override, lifecycle.position_entry_price, lifecycle.entry_price)
+    exit_price = _first_float(lifecycle.exit_price)
+    if entry_price and exit_price:
+        return round(((exit_price / entry_price) - 1.0) * 100.0, 4)
+    return _optional_float(lifecycle.realized_return_pct)
+
+
+def _round_trip_cost_pct(config: DryRunPerformanceConfig, slippage_bp: float) -> float:
+    total_bp = (float(config.commission_bp_per_side) * 2.0) + float(config.sell_tax_bp) + (float(slippage_bp) * 2.0)
+    return total_bp / 100.0
+
+
+def _primary_cost_assumption(config: DryRunPerformanceConfig) -> dict[str, Any]:
+    return {
+        "commission_bp_per_side": float(config.commission_bp_per_side),
+        "sell_tax_bp": float(config.sell_tax_bp),
+        "primary_slippage_bp": float(config.primary_slippage_bp),
+        "primary_entry_delay_sec": int(config.primary_entry_delay_sec),
+        "primary_round_trip_cost_pct": round(_round_trip_cost_pct(config, config.primary_slippage_bp), 4),
+        "slippage_scenarios_bp": [float(value) for value in config.slippage_scenarios_bp],
+        "entry_delay_scenarios_sec": [int(value) for value in config.entry_delay_scenarios_sec],
+    }
+
+
+def _delayed_entry_price(entry: Optional[dict], ticks: list[dict[str, Any]], delay_sec: int) -> Optional[float]:
+    if entry is None:
+        return None
+    if int(delay_sec) <= 0:
+        return _first_float(entry.get("price"))
+    entry_time = _parse_time(_first_text(entry.get("created_at"), entry.get("updated_at")))
+    if entry_time is None:
+        return None
+    target = entry_time + timedelta(seconds=int(delay_sec))
+    tick = _first_tick_at_or_after(ticks, target.isoformat())
+    return _first_float((tick or {}).get("price"))
+
+
+def _first_tick_at_or_after(ticks: list[dict[str, Any]], timestamp: str) -> dict[str, Any]:
+    target = _parse_time(timestamp)
+    if target is None:
+        return {}
+    for tick in ticks:
+        tick_time = _parse_time(str(tick.get("timestamp") or tick.get("received_at") or tick.get("created_at") or ""))
+        if tick_time is None:
+            continue
+        delta = _datetime_delta_seconds(target, tick_time)
+        if delta is not None and delta >= 0:
+            return tick
+    return {}
+
+
+def _latest_tick_at_or_before(ticks: list[dict[str, Any]], timestamp: str) -> dict[str, Any]:
+    target = _parse_time(timestamp)
+    if target is None:
+        return {}
+    selected: dict[str, Any] = {}
+    for tick in ticks:
+        tick_time = _parse_time(str(tick.get("timestamp") or tick.get("received_at") or tick.get("created_at") or ""))
+        if tick_time is None:
+            continue
+        delta = _datetime_delta_seconds(tick_time, target)
+        if delta is not None and delta >= 0:
+            selected = tick
+    return selected
+
+
+def _limit_price_hit(side: str, limit_price: Optional[float], observed_price: Optional[float], best_bid: Optional[float], best_ask: Optional[float]) -> Optional[bool]:
+    if not limit_price or limit_price <= 0:
+        return None
+    normalized = str(side or "").lower()
+    if normalized == "sell":
+        reference = _first_float(best_bid, observed_price)
+        return None if reference is None else reference >= limit_price
+    reference = _first_float(best_ask, observed_price)
+    return None if reference is None else reference <= limit_price
+
+
+def _liquidity_bucket(trade_value: Optional[float]) -> str:
+    if trade_value is None:
+        return "UNKNOWN"
+    if trade_value < 10_000_000:
+        return "LOW_LT_10M"
+    if trade_value < 100_000_000:
+        return "MEDIUM_10M_100M"
+    if trade_value < 1_000_000_000:
+        return "HIGH_100M_1B"
+    return "VERY_HIGH_GE_1B"
+
+
+def _partial_fill_risk(order_amount: Optional[float], trade_value: Optional[float], limit_price_hit: Optional[bool]) -> str:
+    if limit_price_hit is False:
+        return "HIGH"
+    if not order_amount or not trade_value or trade_value <= 0:
+        return "UNKNOWN"
+    ratio = float(order_amount) / float(trade_value)
+    if ratio >= 0.1:
+        return "VERY_HIGH"
+    if ratio >= 0.03:
+        return "HIGH"
+    if ratio >= 0.01:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _spread_risk(spread_ticks: Optional[int]) -> str:
+    if spread_ticks is None:
+        return "UNKNOWN"
+    if spread_ticks <= 1:
+        return "LOW"
+    if spread_ticks <= 3:
+        return "MEDIUM"
+    return "HIGH"
+
+
+def _cost_adjusted_summary(items: list[dict]) -> dict[str, Any]:
+    ready_samples = [
+        item
+        for item in items
+        if str(item.get("hybrid_status") or item.get("gate_status") or "").upper() in {"READY", "READY_SMALL", "READY_SHADOW_SMALL_ENTRY"}
+        and item.get("entry_intent_status") in {"DRY_RUN_ACCEPTED", "ACCEPTED"}
+    ]
+    bad_ready = [item for item in ready_samples if item.get("net_bad_ready_type")]
+    opportunity = [item for item in items if item.get("net_opportunity_type")]
+    return {
+        "bad_ready_count": len(bad_ready),
+        "bad_ready_rate": _ratio(len(bad_ready), len(ready_samples)),
+        "ready_sample_count": len(ready_samples),
+        "opportunity_loss_count": len(opportunity),
+        "opportunity_loss_rate": _ratio(len(opportunity), len(items)),
+        "top_bad_ready_types": _top_counts((item.get("net_bad_ready_type") for item in bad_ready), key="type"),
+        "top_opportunity_types": _top_counts((item.get("net_opportunity_type") for item in opportunity), key="type"),
+    }
+
+
+def _execution_realism_summary(items: list[dict], config: DryRunPerformanceConfig) -> dict[str, Any]:
+    limit_samples = [item for item in items if item.get("limit_price_hit") is not None]
+    limit_hits = [item for item in limit_samples if item.get("limit_price_hit") is True]
+    high_partial = [item for item in items if str(item.get("partial_fill_risk") or "") in {"HIGH", "VERY_HIGH"}]
+    high_spread = [item for item in items if str(item.get("spread_risk") or "") == "HIGH"]
+    stale = [
+        item
+        for item in items
+        if _optional_float(item.get("entry_tick_age_sec")) is not None
+        and (_optional_float(item.get("entry_tick_age_sec")) or 0.0) > config.stale_tick_age_sec
+    ]
+    high_latency = [
+        item
+        for item in items
+        if _optional_float(item.get("gateway_command_latency_ms")) is not None
+        and (_optional_float(item.get("gateway_command_latency_ms")) or 0.0) > config.gateway_latency_warn_ms
+    ]
+    return {
+        "limit_price_hit_sample_count": len(limit_samples),
+        "limit_price_hit_count": len(limit_hits),
+        "limit_price_hit_rate": _ratio(len(limit_hits), len(limit_samples)),
+        "partial_fill_high_risk_count": len(high_partial),
+        "partial_fill_high_risk_rate": _ratio(len(high_partial), len(items)),
+        "spread_high_risk_count": len(high_spread),
+        "spread_high_risk_rate": _ratio(len(high_spread), len(items)),
+        "stale_tick_count": len(stale),
+        "stale_tick_rate": _ratio(len(stale), len(items)),
+        "gateway_latency_high_count": len(high_latency),
+        "gateway_latency_high_rate": _ratio(len(high_latency), len(items)),
+        "avg_entry_tick_age_sec": _avg([item.get("entry_tick_age_sec") for item in items]),
+        "avg_gateway_command_latency_ms": _avg([item.get("gateway_command_latency_ms") for item in items]),
+        "by_liquidity_bucket": _top_counts((item.get("liquidity_bucket") for item in items), key="bucket"),
+        "by_partial_fill_risk": _top_counts((item.get("partial_fill_risk") for item in items), key="risk"),
+        "by_spread_risk": _top_counts((item.get("spread_risk") for item in items), key="risk"),
+    }
+
+
+def _aggregate_cost_scenarios(items: list[dict]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[float, int], list[dict[str, Any]]] = {}
+    for item in items:
+        if item.get("entry_intent_status") not in {"DRY_RUN_ACCEPTED", "ACCEPTED"} or not _is_completed(item):
+            continue
+        for scenario in item.get("cost_scenarios") or []:
+            if not isinstance(scenario, dict):
+                continue
+            key = (float(scenario.get("slippage_bp") or 0.0), int(scenario.get("entry_delay_sec") or 0))
+            grouped.setdefault(key, []).append(scenario)
+    rows: list[dict[str, Any]] = []
+    for (slippage_bp, delay_sec), values in sorted(grouped.items()):
+        net_values = [_optional_float(row.get("net_return_pct")) for row in values]
+        net_values = [value for value in net_values if value is not None]
+        rows.append(
+            {
+                "slippage_bp": slippage_bp,
+                "entry_delay_sec": delay_sec,
+                "sample_count": len(net_values),
+                "net_expectancy": _avg(net_values),
+                "net_win_rate": _ratio(sum(1 for value in net_values if value > 0.0), len(net_values)),
+                "avg_gross_return_pct": _avg([row.get("gross_return_pct") for row in values]),
+                "tick_data_available_count": sum(1 for row in values if row.get("tick_data_available")),
+            }
+        )
+    return rows
+
+
+def _go_no_go_summary(
+    items: list[dict],
+    config: DryRunPerformanceConfig,
+    net_values: list[float],
+    cost_adjusted: dict[str, Any],
+    execution_realism: dict[str, Any],
+) -> dict[str, Any]:
+    trade_day_count = len({str(item.get("trade_date") or "") for item in items if item.get("trade_date")})
+    accepted_entry_count = sum(1 for item in items if item.get("entry_intent_status") in {"DRY_RUN_ACCEPTED", "ACCEPTED"})
+    net_expectancy = _avg(net_values)
+    criteria = [
+        _criterion("MIN_5_TRADE_DAYS", trade_day_count >= config.min_go_trade_days, trade_day_count, f">={config.min_go_trade_days}"),
+        _criterion(
+            "MIN_30_ACCEPTED_ENTRY_LIFECYCLES",
+            accepted_entry_count >= config.min_go_accepted_entry_lifecycles,
+            accepted_entry_count,
+            f">={config.min_go_accepted_entry_lifecycles}",
+        ),
+        _criterion("POSITIVE_NET_EXPECTANCY", net_expectancy is not None and net_expectancy > 0.0, net_expectancy, ">0"),
+        _criterion(
+            "BAD_READY_RATE_WITHIN_LIMIT",
+            (cost_adjusted.get("bad_ready_rate") is not None and float(cost_adjusted.get("bad_ready_rate") or 0.0) <= config.max_go_bad_ready_rate),
+            cost_adjusted.get("bad_ready_rate"),
+            f"<={config.max_go_bad_ready_rate}",
+        ),
+        _criterion(
+            "OPPORTUNITY_LOSS_WITHIN_LIMIT",
+            (cost_adjusted.get("opportunity_loss_rate") is not None and float(cost_adjusted.get("opportunity_loss_rate") or 0.0) <= config.max_go_opportunity_loss_rate),
+            cost_adjusted.get("opportunity_loss_rate"),
+            f"<={config.max_go_opportunity_loss_rate}",
+        ),
+        _criterion(
+            "STALE_TICK_DISTORTION_WITHIN_LIMIT",
+            (execution_realism.get("stale_tick_rate") is not None and float(execution_realism.get("stale_tick_rate") or 0.0) <= config.max_go_stale_tick_rate),
+            execution_realism.get("stale_tick_rate"),
+            f"<={config.max_go_stale_tick_rate}",
+        ),
+        _criterion(
+            "LATENCY_DISTORTION_WITHIN_LIMIT",
+            (
+                execution_realism.get("gateway_latency_high_rate") is None
+                or float(execution_realism.get("gateway_latency_high_rate") or 0.0) <= config.max_go_latency_distortion_rate
+            ),
+            execution_realism.get("gateway_latency_high_rate"),
+            f"<={config.max_go_latency_distortion_rate}",
+        ),
+    ]
+    passed = all(item["passed"] for item in criteria)
+    insufficient = trade_day_count < config.min_go_trade_days or accepted_entry_count < config.min_go_accepted_entry_lifecycles
+    return {
+        "decision": "GO" if passed else "NO_GO",
+        "readiness": "INSUFFICIENT_DATA" if insufficient else "EVALUATED",
+        "review_only": True,
+        "criteria": criteria,
+        "blocked_by": [item["code"] for item in criteria if not item["passed"]],
+    }
+
+
+def _criterion(code: str, passed: bool, value: Any, threshold: str) -> dict[str, Any]:
+    return {"code": code, "passed": bool(passed), "value": value, "threshold": threshold}
+
+
+def _analysis_sources(*payloads: Any) -> list[Any]:
+    sources: list[Any] = []
+    for payload in payloads:
+        if isinstance(payload, dict):
+            sources.append(payload)
+            for key in ("metadata", "request", "response", "details", "safety", "live_safety", "raw_payload"):
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    sources.append(value)
+    return sources
+
+
+def _recursive_first(sources: list[Any], key: str) -> Any:
+    for source in sources:
+        value = _recursive_find(source, key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _recursive_find(payload: Any, key: str) -> Any:
+    if isinstance(payload, dict):
+        if key in payload and payload.get(key) not in (None, ""):
+            return payload.get(key)
+        for value in payload.values():
+            found = _recursive_find(value, key)
+            if found not in (None, ""):
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _recursive_find(value, key)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def _bool_or_none(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "hit", "pass"}:
+        return True
+    if text in {"0", "false", "no", "n", "miss", "fail"}:
+        return False
+    return None
+
+
+def _time_delta_seconds(start: Any, end: Any) -> Optional[float]:
+    start_dt = _parse_time(str(start or ""))
+    end_dt = _parse_time(str(end or ""))
+    if start_dt is None or end_dt is None:
+        return None
+    return _datetime_delta_seconds(start_dt, end_dt)
+
+
+def _datetime_delta_seconds(start: datetime, end: datetime) -> Optional[float]:
+    try:
+        if start.tzinfo is not None and end.tzinfo is None:
+            start = start.replace(tzinfo=None)
+        if end.tzinfo is not None and start.tzinfo is None:
+            end = end.replace(tzinfo=None)
+        return (end - start).total_seconds()
+    except Exception:
+        return None
+
+
+def _safe_json(value: Any, default: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        parsed = json.loads(str(value or ""))
+    except Exception:
+        return default
+    return parsed if parsed is not None else default
+
+
+def _membership_score_bucket(value: Optional[float]) -> str:
+    if value is None:
+        return "UNKNOWN"
+    for label, low, high in [
+        ("0_0_55", 0.0, 0.55),
+        ("0_55_0_65", 0.55, 0.65),
+        ("0_65_0_80", 0.65, 0.80),
+        ("0_80_1_00", 0.80, 1.0001),
+    ]:
+        if low <= float(value) < high:
+            return label
+    return "UNKNOWN"
 
 
 def _candidate_instances_by_code_date(
@@ -1776,6 +2658,34 @@ def _last_int(values: Iterable[Any]) -> int:
     return parsed
 
 
+def _float_tuple(value: Any, default: tuple[float, ...]) -> tuple[float, ...]:
+    if isinstance(value, (list, tuple)):
+        raw_values = value
+    else:
+        raw_values = str(value or "").split(",")
+    parsed: list[float] = []
+    for item in raw_values:
+        try:
+            parsed.append(float(item))
+        except (TypeError, ValueError):
+            continue
+    return tuple(parsed) if parsed else default
+
+
+def _int_tuple(value: Any, default: tuple[int, ...]) -> tuple[int, ...]:
+    if isinstance(value, (list, tuple)):
+        raw_values = value
+    else:
+        raw_values = str(value or "").split(",")
+    parsed: list[int] = []
+    for item in raw_values:
+        try:
+            parsed.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return tuple(parsed) if parsed else default
+
+
 def _optional_float(value: Any) -> Optional[float]:
     if value is None or value == "":
         return None
@@ -1849,13 +2759,68 @@ def _markdown_group_lines(rows: list[dict]) -> list[str]:
         return ["- none"]
     output = []
     for row in rows:
-        key = row.get("key", row.get("decision_type", "UNKNOWN"))
+        key = row.get("key", row.get("decision_type", row.get("reason_code", "UNKNOWN")))
         output.append(
             f"- {key}: count={row.get('count', 0)}, win_rate={_pct(row.get('win_rate'))}, "
-            f"avg_return={_num(row.get('avg_realized_return_pct'))}, FP={row.get('false_positive_count', 0)}, "
+            f"avg_return={_num(row.get('avg_realized_return_pct'))}, net={_num(row.get('net_expectancy'))}, FP={row.get('false_positive_count', 0)}, "
             f"FN={row.get('false_negative_count', 0)}"
         )
     return output
+
+
+def _markdown_go_no_go_lines(go_no_go: dict) -> list[str]:
+    if not go_no_go:
+        return ["- decision: NO_GO", "- reason: no go/no-go data"]
+    lines = [
+        f"- decision: {go_no_go.get('decision', 'NO_GO')}",
+        f"- readiness: {go_no_go.get('readiness', 'INSUFFICIENT_DATA')}",
+        f"- review_only: {bool(go_no_go.get('review_only', True))}",
+    ]
+    for item in go_no_go.get("criteria") or []:
+        status = "PASS" if item.get("passed") else "FAIL"
+        lines.append(f"- {item.get('code')}: {status} (value={item.get('value')}, threshold={item.get('threshold')})")
+    return lines
+
+
+def _markdown_cost_assumption_lines(assumption: dict) -> list[str]:
+    if not assumption:
+        return ["- no cost assumption"]
+    return [
+        f"- commission_bp_per_side: {assumption.get('commission_bp_per_side')}",
+        f"- sell_tax_bp: {assumption.get('sell_tax_bp')}",
+        f"- primary_slippage_bp: {assumption.get('primary_slippage_bp')}",
+        f"- primary_entry_delay_sec: {assumption.get('primary_entry_delay_sec')}",
+        f"- primary_round_trip_cost_pct: {_num(assumption.get('primary_round_trip_cost_pct'))}",
+    ]
+
+
+def _markdown_cost_scenario_lines(rows: list[dict]) -> list[str]:
+    if not rows:
+        return ["- none"]
+    return [
+        "- slip={slip}bp delay={delay}s samples={samples} net={net} win={win}".format(
+            slip=row.get("slippage_bp"),
+            delay=row.get("entry_delay_sec"),
+            samples=row.get("sample_count", 0),
+            net=_num(row.get("net_expectancy")),
+            win=_pct(row.get("net_win_rate")),
+        )
+        for row in rows[:20]
+    ]
+
+
+def _markdown_execution_realism_lines(realism: dict) -> list[str]:
+    if not realism:
+        return ["- no execution realism data"]
+    return [
+        f"- limit_price_hit_rate: {_pct(realism.get('limit_price_hit_rate'))}",
+        f"- partial_fill_high_risk: {realism.get('partial_fill_high_risk_count', 0)} ({_pct(realism.get('partial_fill_high_risk_rate'))})",
+        f"- spread_high_risk: {realism.get('spread_high_risk_count', 0)} ({_pct(realism.get('spread_high_risk_rate'))})",
+        f"- stale_tick: {realism.get('stale_tick_count', 0)} ({_pct(realism.get('stale_tick_rate'))})",
+        f"- high_gateway_latency: {realism.get('gateway_latency_high_count', 0)} ({_pct(realism.get('gateway_latency_high_rate'))})",
+        f"- avg_entry_tick_age_sec: {realism.get('avg_entry_tick_age_sec')}",
+        f"- avg_gateway_command_latency_ms: {realism.get('avg_gateway_command_latency_ms')}",
+    ]
 
 
 def _markdown_quality_lines(data_quality: dict) -> list[str]:

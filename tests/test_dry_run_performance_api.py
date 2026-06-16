@@ -115,4 +115,6 @@ def test_performance_api_report_false_signals_rebuild_and_export(tmp_path, monke
     snapshot = client.get("/api/snapshot").json()
     assert "dry_run_performance" in snapshot
     assert snapshot["dry_run_performance"]["false_negative_count"] == 1
-
+    assert "net_expectancy" in snapshot["dry_run_performance"]
+    assert "execution_realism" in snapshot["dry_run_performance"]
+    assert "go_no_go" in snapshot["dry_run_performance"]

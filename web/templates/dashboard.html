@@ -911,11 +911,22 @@
             <div><span>완료</span><strong id="dryrun-perf-completed">0</strong></div>
             <div><span>승률</span><strong id="dryrun-perf-win-rate">-</strong></div>
             <div><span>평균 수익률</span><strong id="dryrun-perf-avg-return">-</strong></div>
+            <div><span>Net expectancy</span><strong id="dryrun-perf-net-expectancy">-</strong></div>
+            <div><span>Net win rate</span><strong id="dryrun-perf-net-win-rate">-</strong></div>
             <div><span>오탐</span><strong id="dryrun-perf-fp">0</strong></div>
             <div><span>미탐</span><strong id="dryrun-perf-fn">0</strong></div>
             <div><span>기회손실</span><strong id="dryrun-perf-opp">0</strong></div>
+            <div><span>Bad-ready net</span><strong id="dryrun-perf-net-bad-ready">0</strong></div>
+            <div><span>Opportunity net</span><strong id="dryrun-perf-net-opp">0</strong></div>
+            <div><span>Go/No-Go</span><strong id="dryrun-perf-go-nogo">NO_GO</strong></div>
+            <div><span>Limit hit</span><strong id="dryrun-perf-limit-hit">-</strong></div>
+            <div><span>Stale tick</span><strong id="dryrun-perf-stale-tick">-</strong></div>
+            <div><span>Latency risk</span><strong id="dryrun-perf-latency-risk">-</strong></div>
             <div><span>LIVE 통과 승률</span><strong id="dryrun-perf-live-pass-win">-</strong></div>
           </div>
+          <div id="dryrun-perf-go-nogo-lines" class="inline-log"></div>
+          <div id="dryrun-perf-cost-lines" class="inline-log"></div>
+          <div id="dryrun-perf-realism-lines" class="inline-log"></div>
           <div id="dryrun-perf-fp-lines" class="inline-log"></div>
           <div id="dryrun-perf-fn-lines" class="inline-log"></div>
           <div id="dryrun-perf-reject-rally-lines" class="inline-log"></div>
@@ -958,7 +969,7 @@
           <div class="table-toolbar" data-table-toolbar="dryRunPerformance"></div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>종목</th><th>전략</th><th>테마</th><th>품질</th><th>오탐</th><th>미탐/기회</th><th>수익률</th><th>20분 최고</th><th>낙폭</th><th>게이트</th></tr></thead>
+              <thead><tr><th>종목</th><th>전략</th><th>테마</th><th>품질</th><th>오탐</th><th>미탐/기회</th><th>수익률</th><th>Net</th><th>현실성</th><th>Hybrid</th><th>20분 최고</th><th>낙폭</th><th>게이트</th></tr></thead>
               <tbody id="dryRunPerformance-body"></tbody>
             </table>
           </div>

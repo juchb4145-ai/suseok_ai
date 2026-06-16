@@ -15,6 +15,7 @@ The analyzer links `runtime_order_intents` into a trade lifecycle using this pri
 5. Otherwise `orphan_entry` or `orphan_exit`
 
 Each lifecycle can contain one or more entry/buy intents, multiple exit/sell intents, one virtual position, exit decisions, and one latest trade review.
+The analyzer also joins matching `hybrid_gate_validation_events` by trade date/code and candidate instance metadata when available, so grouped performance can be reviewed by `hybrid_status`, `hybrid_position_tier`, reason codes, theme score bucket, membership score bucket, session bucket, and stock role.
 
 ## Joined Data
 
@@ -24,8 +25,48 @@ The report reads:
 - `trade_reviews`: final status, max return/drawdown windows, existing false-positive/false-negative flags
 - `virtual_positions`: realized return, hold time, max return/drawdown
 - `exit_decisions`: TAKE_PROFIT, SUPPORT_LOSS, TIME_EXIT, TRAILING_STOP context
+- `hybrid_gate_validation_events`: hybrid status, position tier, reason codes, theme/membership scores, stock role
+- `gateway_price_ticks`: delayed entry price, limit-hit, spread, and liquidity diagnostics when tick data is available
 
 The existing `trade_reviews` flags are preserved. DRY_RUN false signal fields are reported separately because an intent-level diagnosis can differ from a review-level diagnosis.
+
+## Cost, Slippage, And Delay
+
+The report is still review-only, but it now computes cost-adjusted return fields:
+
+- `net_return_pct`: primary scenario net return after buy/sell commission, sell tax, and entry/exit slippage
+- `net_expectancy`: average primary net return for completed accepted entry lifecycles
+- `cost_scenario_expectancy`: matrix for slippage `0,10,20,30` bp and entry delay `0,1,3,5` seconds by default
+- `net_bad_ready_type`: READY lifecycle that becomes a bad-ready case after costs
+- `net_opportunity_type`: WAIT/BLOCKED/OBSERVE or rejected lifecycle that still has positive net opportunity after costs
+
+Delayed entry uses the first stored `gateway_price_ticks` row at or after `entry_created_at + delay_sec`. If tick data is missing, the delayed scenario is marked with no sample rather than inferred.
+
+## Execution Realism
+
+Each lifecycle includes:
+
+- `limit_price_hit`
+- `partial_fill_risk`
+- `spread_risk`
+- `liquidity_bucket`
+- `entry_tick_age_sec`
+- `gateway_command_latency_ms`
+
+The summary reports hit rate, high partial-fill/spread risk rates, stale tick rate, latency risk rate, and liquidity buckets. Missing ticks are kept visible as data-quality limitations.
+
+## Go/No-Go
+
+The `summary.go_no_go` block is review-only and uses these criteria:
+
+- at least 5 trade days
+- at least 30 accepted entry lifecycles
+- cost/slippage adjusted `net_expectancy > 0`
+- `bad_ready_rate` within the configured limit
+- cost-adjusted opportunity loss within the configured limit
+- stale tick and gateway latency distortion within configured limits
+
+Failing any criterion yields `NO_GO`; insufficient trade days or accepted entries also marks readiness as `INSUFFICIENT_DATA`.
 
 ## False Positive
 

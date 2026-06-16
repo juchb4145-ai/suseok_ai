@@ -215,6 +215,13 @@ const tableConfigs = {
       (item) => textCell(item.dry_run_false_positive_type || "-"),
       (item) => textCell(item.dry_run_false_negative_type || item.opportunity_loss_type || "-"),
       (item) => textCell(formatPercentValue(item.realized_return_pct)),
+      (item) => textCell(formatPercentValue(item.net_return_pct)),
+      (item) => textCell([
+        item.limit_price_hit === true ? "limit hit" : item.limit_price_hit === false ? "limit miss" : "limit ?",
+        item.partial_fill_risk || "fill ?",
+        item.spread_risk || "spread ?",
+      ].join(" / ")),
+      (item) => textCell([item.hybrid_status || item.gate_status || "-", item.hybrid_position_tier || item.stock_role || ""].filter(Boolean).join(" / ")),
       (item) => textCell(formatPercentValue(item.max_return_20m)),
       (item) => textCell(formatPercentValue(item.max_drawdown_20m)),
       (item) => textCell(item.gate_reason || "-"),
@@ -1887,10 +1894,46 @@ function render(snapshot) {
   text("dryrun-perf-completed", dryRunPerformance.completed_lifecycle_count || 0);
   text("dryrun-perf-win-rate", formatRate(dryRunPerformance.win_rate));
   text("dryrun-perf-avg-return", formatPercentValue(dryRunPerformance.avg_realized_return_pct));
+  text("dryrun-perf-net-expectancy", formatPercentValue(dryRunPerformance.net_expectancy));
+  text("dryrun-perf-net-win-rate", formatRate(dryRunPerformance.net_win_rate));
   text("dryrun-perf-fp", dryRunPerformance.false_positive_count || 0);
   text("dryrun-perf-fn", dryRunPerformance.false_negative_count || 0);
   text("dryrun-perf-opp", dryRunPerformance.opportunity_loss_count || 0);
+  text("dryrun-perf-net-bad-ready", `${dryRunPerformance.cost_adjusted_bad_ready_count || 0} / ${formatRate(dryRunPerformance.cost_adjusted_bad_ready_rate)}`);
+  text("dryrun-perf-net-opp", `${dryRunPerformance.cost_adjusted_opportunity_loss_count || 0} / ${formatRate(dryRunPerformance.cost_adjusted_opportunity_loss_rate)}`);
+  const goNoGo = dryRunPerformance.go_no_go || {};
+  const realism = dryRunPerformance.execution_realism || {};
+  text("dryrun-perf-go-nogo", goNoGo.decision || "NO_GO");
+  text("dryrun-perf-limit-hit", formatRate(realism.limit_price_hit_rate));
+  text("dryrun-perf-stale-tick", `${realism.stale_tick_count || 0} / ${formatRate(realism.stale_tick_rate)}`);
+  text("dryrun-perf-latency-risk", `${realism.gateway_latency_high_count || 0} / ${formatRate(realism.gateway_latency_high_rate)}`);
   text("dryrun-perf-live-pass-win", formatRate(dryRunPerformance.live_would_pass_win_rate));
+  renderInlineCounts(
+    "dryrun-perf-go-nogo-lines",
+    (goNoGo.criteria || []).map((item) => ({ reason: `${item.passed ? "PASS" : "FAIL"} ${item.code} (${item.value ?? "-"} / ${item.threshold || "-"})`, count: "" })),
+    "reason",
+    "Go/No-Go 기준 데이터가 없습니다"
+  );
+  renderInlineCounts(
+    "dryrun-perf-cost-lines",
+    (dryRunPerformance.cost_scenario_expectancy || []).slice(0, 8).map((item) => ({
+      reason: `${item.slippage_bp}bp ${item.entry_delay_sec}s net ${formatPercentValue(item.net_expectancy)} win ${formatRate(item.net_win_rate)}`,
+      count: item.sample_count || 0,
+    })),
+    "reason",
+    "비용/지연 시나리오 표본이 없습니다"
+  );
+  renderInlineCounts(
+    "dryrun-perf-realism-lines",
+    [
+      { reason: "partial_fill_high", count: realism.partial_fill_high_risk_count || 0 },
+      { reason: "spread_high", count: realism.spread_high_risk_count || 0 },
+      { reason: "stale_tick", count: realism.stale_tick_count || 0 },
+      { reason: "latency_high", count: realism.gateway_latency_high_count || 0 },
+    ],
+    "reason",
+    "체결 현실성 경고가 없습니다"
+  );
   renderInlineCounts("dryrun-perf-fp-lines", dryRunPerformance.top_false_positive_types || [], "type", "오탐 유형이 없습니다");
   renderInlineCounts("dryrun-perf-fn-lines", dryRunPerformance.top_false_negative_types || [], "type", "미탐 유형이 없습니다");
   renderInlineCounts("dryrun-perf-reject-rally-lines", dryRunPerformance.top_reject_reasons_with_rally || [], "reason", "상승을 놓친 거부 사유가 없습니다");

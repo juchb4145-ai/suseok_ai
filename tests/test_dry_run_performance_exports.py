@@ -81,9 +81,15 @@ def test_report_persistence_and_exports(tmp_path):
         assert set(exports) == {"json", "csv", "md"}
         for path in exports.values():
             assert Path(path).exists()
-        assert "lifecycle_id" in Path(exports["csv"]).read_text(encoding="utf-8-sig")
+        csv_text = Path(exports["csv"]).read_text(encoding="utf-8-sig")
+        assert "lifecycle_id" in csv_text
+        assert "net_return_pct" in csv_text
+        assert "partial_fill_risk" in csv_text
         markdown = Path(exports["md"]).read_text(encoding="utf-8")
         assert "DRY_RUN Performance Report" in markdown
+        assert "Cost And Slippage" in markdown
+        assert "Execution Realism" in markdown
+        assert "Go/No-Go" in markdown
         assert "Data Quality Issues" in markdown or "no major data quality issue" in markdown
     finally:
         db.close()

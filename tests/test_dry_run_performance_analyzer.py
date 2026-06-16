@@ -1,8 +1,9 @@
 from pathlib import Path
 
 from storage.db import TradingDatabase
+from trading.strategy.hybrid_validation import HybridValidationEvent, HybridValidationRepository
 from trading.strategy.models import ExitDecision, FillPolicy, PositionContextSnapshot, ReviewFinalStatus, TradeReview, VirtualPosition
-from trading_app.dry_run_performance import DryRunPerformanceAnalyzer
+from trading_app.dry_run_performance import DryRunPerformanceAnalyzer, DryRunPerformanceConfig
 
 
 def _db(tmp_path) -> TradingDatabase:
@@ -221,6 +222,181 @@ def test_take_profit_accepted_entry_is_true_positive(tmp_path):
     item = report["items"][0]
     assert item["signal_classification"] == "true_positive"
     assert report["summary"]["true_positive_count"] == 1
+
+
+def test_cost_slippage_and_entry_delay_scenarios_are_reported(tmp_path):
+    db = _db(tmp_path)
+    try:
+        position = db.save_virtual_position(
+            VirtualPosition(
+                candidate_id=1,
+                virtual_order_id=20,
+                entry_price=10000,
+                quantity=10,
+                opened_at="2026-05-30T09:01:00",
+                closed_at="2026-05-30T09:20:00",
+                close_price=10300,
+                close_reason="TAKE_PROFIT",
+                realized_return_pct=3.0,
+            )
+        )
+        db.save_runtime_order_intent(
+            _intent(
+                "entry-cost",
+                virtual_position_id=position.id,
+                metadata={"session_bucket": "OPEN", "latest_tick_age_sec": 1.0, "gateway_command_latency_ms": 200},
+            )
+        )
+        db.save_trade_review(
+            _review(
+                virtual_position_id=position.id,
+                final_status=ReviewFinalStatus.VIRTUAL_CLOSED_TAKE_PROFIT.value,
+                exit_price=10300,
+                max_return_20m=3.5,
+                max_drawdown_20m=-0.5,
+            )
+        )
+        db.save_gateway_price_ticks_batch(
+            [
+                {
+                    "event_id": "tick-entry",
+                    "trade_date": "2026-05-30",
+                    "timestamp": "2026-05-30T09:01:00",
+                    "code": "005930",
+                    "price": 10000,
+                    "trade_value": 20_000_000,
+                    "best_bid": 9990,
+                    "best_ask": 10000,
+                    "spread_ticks": 1,
+                },
+                {
+                    "event_id": "tick-delay-3",
+                    "trade_date": "2026-05-30",
+                    "timestamp": "2026-05-30T09:01:03",
+                    "code": "005930",
+                    "price": 10100,
+                    "trade_value": 20_000_000,
+                    "best_bid": 10090,
+                    "best_ask": 10100,
+                    "spread_ticks": 1,
+                },
+            ]
+        )
+        config = DryRunPerformanceConfig(
+            commission_bp_per_side=0.0,
+            sell_tax_bp=0.0,
+            slippage_scenarios_bp=(0.0, 10.0),
+            entry_delay_scenarios_sec=(0, 3),
+            primary_slippage_bp=10.0,
+        )
+        report = DryRunPerformanceAnalyzer(db, config=config).build_report(trade_date="2026-05-30")
+    finally:
+        db.close()
+
+    item = report["items"][0]
+    assert item["net_return_pct"] == 2.8
+    delayed = {
+        (row["slippage_bp"], row["entry_delay_sec"]): row
+        for row in item["cost_scenarios"]
+    }
+    assert delayed[(10.0, 3)]["entry_price"] == 10100.0
+    assert delayed[(10.0, 3)]["net_return_pct"] == 1.7802
+    assert report["summary"]["net_expectancy"] == 2.8
+    assert report["summary"]["execution_realism"]["limit_price_hit_rate"] == 1.0
+    assert item["partial_fill_risk"] == "LOW"
+
+
+def test_hybrid_validation_event_join_and_bucket_grouping(tmp_path):
+    db = _db(tmp_path)
+    try:
+        db.save_runtime_order_intent(
+            _intent(
+                "entry-hybrid",
+                metadata={"candidate_instance_id": "ci-hybrid", "candidate_generation_seq": 1, "stock_role": "LEADER"},
+                request={"theme_name": "AI", "theme_score": 72.0, "hybrid_score": 82.0, "membership_score": 0.72},
+            )
+        )
+        db.save_trade_review(
+            _review(
+                details={"candidate_instance_id": "ci-hybrid", "candidate_generation_seq": 1, "session_bucket": "OPEN"},
+                final_status=ReviewFinalStatus.VIRTUAL_CLOSED_TAKE_PROFIT.value,
+                exit_price=10300,
+            )
+        )
+        repo = HybridValidationRepository(db)
+        repo.save_event(
+            HybridValidationEvent(
+                ts="2026-05-30T09:00:59",
+                trade_date="2026-05-30",
+                stock_code="005930",
+                stock_name="Samsung",
+                hybrid_status="READY",
+                hybrid_score=84.0,
+                hybrid_position_tier="core",
+                hybrid_primary_reason="STRONG_ACTIVE_THEME",
+                hybrid_reason_codes=["STRONG_ACTIVE_THEME", "GOOD_PULLBACK"],
+                theme_name="AI",
+                theme_score=72.0,
+                membership_score=0.72,
+                leader_type="LEADER",
+                details_json={"candidate_instance_id": "ci-other"},
+            )
+        )
+        repo.save_event(
+            HybridValidationEvent(
+                ts="2026-05-30T09:01:00",
+                trade_date="2026-05-30",
+                stock_code="005930",
+                stock_name="Samsung",
+                hybrid_status="READY",
+                hybrid_score=86.0,
+                hybrid_position_tier="starter",
+                hybrid_primary_reason="STRONG_ACTIVE_THEME",
+                hybrid_reason_codes=["STRONG_ACTIVE_THEME", "VWAP_RECLAIM"],
+                theme_name="AI",
+                theme_score=76.0,
+                membership_score=0.81,
+                leader_type="CO_LEADER",
+                details_json={"candidate_instance_id": "ci-hybrid"},
+            )
+        )
+        report = DryRunPerformanceAnalyzer(db).build_report(trade_date="2026-05-30")
+    finally:
+        db.close()
+
+    assert report["summary"]["total_lifecycle_count"] == 1
+    item = report["items"][0]
+    assert item["hybrid_status"] == "READY"
+    assert item["hybrid_position_tier"] == "starter"
+    assert item["membership_score_bucket"] == "0_80_1_00"
+    assert item["stock_role"] == "CO_LEADER"
+    assert "VWAP_RECLAIM" in item["reason_codes"]
+    grouped = report["grouped"]
+    assert grouped["by_hybrid_status"][0]["key"] == "READY"
+    assert grouped["by_hybrid_position_tier"][0]["key"] == "starter"
+    assert grouped["by_theme_score_bucket"][0]["key"] == "60-80"
+    assert grouped["by_membership_score_bucket"][0]["key"] == "0_80_1_00"
+    assert grouped["by_stock_role"][0]["key"] == "CO_LEADER"
+    assert grouped["by_reason_code"][0]["reason_code"] in {"STRONG_ACTIVE_THEME", "VWAP_RECLAIM"}
+
+
+def test_report_build_is_review_only_and_does_not_create_live_or_gateway_commands(tmp_path):
+    db = _db(tmp_path)
+    try:
+        db.save_runtime_order_intent(_intent("entry-safe"))
+        before_commands = db.conn.execute("SELECT COUNT(*) AS count FROM gateway_commands").fetchone()["count"]
+        before_live_sim = db.conn.execute("SELECT COUNT(*) AS count FROM live_sim_orders").fetchone()["count"]
+        report = DryRunPerformanceAnalyzer(db).build_report(trade_date="2026-05-30")
+        after_commands = db.conn.execute("SELECT COUNT(*) AS count FROM gateway_commands").fetchone()["count"]
+        after_live_sim = db.conn.execute("SELECT COUNT(*) AS count FROM live_sim_orders").fetchone()["count"]
+    finally:
+        db.close()
+
+    assert report["review_only"] is True
+    assert report["safety_scope"]["live_real_order_activation"] is False
+    assert report["safety_scope"]["gateway_send_order_created"] is False
+    assert before_commands == after_commands == 0
+    assert before_live_sim == after_live_sim == 0
 
 
 def test_orphan_exit_and_missing_review_are_reported_as_data_quality(tmp_path):

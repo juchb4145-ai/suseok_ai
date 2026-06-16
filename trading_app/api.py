@@ -3065,11 +3065,11 @@ def runtime_dry_run_false_signals(
         report = _performance_analyzer(db).build_report(trade_date=trade_date, limit=10000)
         items = list(report.get("items") or [])
         if type == "false_positive":
-            items = [item for item in items if item.get("dry_run_false_positive_type")]
+            items = [item for item in items if item.get("dry_run_false_positive_type") or item.get("net_bad_ready_type")]
         elif type == "false_negative":
-            items = [item for item in items if item.get("dry_run_false_negative_type")]
+            items = [item for item in items if item.get("dry_run_false_negative_type") or item.get("net_opportunity_type")]
         elif type == "opportunity_loss":
-            items = [item for item in items if item.get("opportunity_loss_type")]
+            items = [item for item in items if item.get("opportunity_loss_type") or item.get("net_opportunity_type")]
         start = max(0, int(offset or 0))
         end = start + max(1, int(limit or 100))
         page_items = items[start:end]
@@ -7801,11 +7801,21 @@ def _dashboard_slim_runtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "completed_lifecycle_count",
                 "win_rate",
                 "avg_realized_return_pct",
+                "net_expectancy",
+                "net_win_rate",
                 "false_positive_count",
                 "false_negative_count",
                 "opportunity_loss_count",
+                "cost_adjusted_bad_ready_count",
+                "cost_adjusted_bad_ready_rate",
+                "cost_adjusted_opportunity_loss_count",
+                "cost_adjusted_opportunity_loss_rate",
                 "live_would_pass_win_rate",
                 "live_would_reject_but_rallied_count",
+                "primary_cost_assumption",
+                "cost_scenario_expectancy",
+                "execution_realism",
+                "go_no_go",
             ),
         )
     if "threshold_ab" in runtime:
@@ -7992,7 +8002,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     dry_run_performance_trade_date = _dashboard_dry_run_performance_trade_date(db)
     dry_run_performance_report = _cached_dashboard_fragment(
         db,
-        f"dry_run_performance:v3:{dry_run_performance_trade_date or 'all'}:{performance_limit}",
+        f"dry_run_performance:v4:{dry_run_performance_trade_date or 'all'}:{performance_limit}",
         lambda: _performance_analyzer(db).build_report(
             trade_date=dry_run_performance_trade_date or None,
             limit=performance_limit,
@@ -8009,13 +8019,23 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
                 "completed_lifecycle_count",
                 "win_rate",
                 "avg_realized_return_pct",
+                "net_expectancy",
+                "net_win_rate",
                 "false_positive_count",
                 "false_negative_count",
                 "opportunity_loss_count",
+                "cost_adjusted_bad_ready_count",
+                "cost_adjusted_bad_ready_rate",
+                "cost_adjusted_opportunity_loss_count",
+                "cost_adjusted_opportunity_loss_rate",
                 "live_would_pass_win_rate",
                 "live_would_reject_but_rallied_count",
             ]
         },
+        "primary_cost_assumption": dry_run_performance_report.get("summary", {}).get("primary_cost_assumption", {}),
+        "cost_scenario_expectancy": list(dry_run_performance_report.get("summary", {}).get("cost_scenario_expectancy", []) or [])[:16],
+        "execution_realism": dry_run_performance_report.get("summary", {}).get("execution_realism", {}),
+        "go_no_go": dry_run_performance_report.get("summary", {}).get("go_no_go", {}),
         "top_false_positive_types": dry_run_performance_report.get("false_signal_summary", {}).get("top_false_positive_types", []),
         "top_false_negative_types": dry_run_performance_report.get("false_signal_summary", {}).get("top_false_negative_types", []),
         "support_vwap_coverage": dry_run_performance_report.get("summary", {}).get("data_quality", {}).get("support_vwap_coverage", {}),
