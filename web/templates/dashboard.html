@@ -470,6 +470,58 @@
           </div>
         </section>
 
+        <section id="live-sim-canary-performance-card" class="band live-sim-canary-performance-section">
+          <div class="section-head">
+            <div>
+              <h2>LIVE_SIM Canary 체결/성과</h2>
+              <p id="live-sim-canary-performance-empty" class="help-text">Canary 주문의 체결 품질과 DRY_RUN 대비 차이를 기다리는 중입니다.</p>
+            </div>
+            <div class="action-strip">
+              <span id="live-sim-canary-performance-status" class="counter muted">대기</span>
+              <span id="live-sim-canary-performance-updated" class="counter muted">-</span>
+            </div>
+          </div>
+          <div class="mini-grid live-sim-canary-performance-grid">
+            <div><span>오늘 주문</span><strong id="live-sim-canary-performance-total">0</strong></div>
+            <div><span>제출/접수</span><strong id="live-sim-canary-performance-submit-ack">0 / 0</strong></div>
+            <div><span>부분/완전체결</span><strong id="live-sim-canary-performance-partial-full">0 / 0</strong></div>
+            <div><span>미체결/취소</span><strong id="live-sim-canary-performance-nofill-cancel">0 / 0</strong></div>
+            <div><span>청산/리컨실</span><strong id="live-sim-canary-performance-closed-reconcile">0 / 0</strong></div>
+            <div><span>평균 fill</span><strong id="live-sim-canary-performance-fill-ratio">-</strong></div>
+            <div><span>진입 slippage</span><strong id="live-sim-canary-performance-slippage">-</strong></div>
+            <div><span>평균 수익</span><strong id="live-sim-canary-performance-net">-</strong></div>
+            <div><span>DRY 대비 차이</span><strong id="live-sim-canary-performance-gap">-</strong></div>
+            <div><span>LIVE_WORSE</span><strong id="live-sim-canary-performance-worse">-</strong></div>
+            <div><span>NO_FILL</span><strong id="live-sim-canary-performance-nofill-rate">-</strong></div>
+            <div><span>Orphan</span><strong id="live-sim-canary-performance-orphan">0</strong></div>
+          </div>
+          <div class="table-wrap compact-table">
+            <table id="live-sim-canary-performance-table">
+              <thead>
+                <tr>
+                  <th>종목</th>
+                  <th>테마</th>
+                  <th>Hybrid</th>
+                  <th>요청/체결</th>
+                  <th>Fill</th>
+                  <th>Slippage</th>
+                  <th>청산</th>
+                  <th>Net</th>
+                  <th>DRY Net</th>
+                  <th>차이</th>
+                  <th>결과</th>
+                  <th>상태</th>
+                  <th>이슈</th>
+                </tr>
+              </thead>
+              <tbody id="live-sim-canary-performance-rows">
+                <tr><td colspan="13">표시할 LIVE_SIM Canary 성과 케이스가 없습니다.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div id="live-sim-canary-performance-recommendations" class="inline-log"></div>
+        </section>
+
         <section id="buy-zero-rca-card" class="band buy-zero-rca-section">
           <div class="section-head">
             <div>

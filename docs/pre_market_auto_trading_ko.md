@@ -338,6 +338,46 @@ Invoke-RestMethod -Method Post "http://127.0.0.1:8000/api/gateway/transport/late
 - DRY_RUN 성과: `reports/dry_run_performance/<거래일>/`
 - 전송 지연: `reports/gateway_transport_latency/<거래일>/`
 
+## LIVE_SIM Canary 체결/성과 확인
+
+장중 LIVE_SIM Canary 주문이 발생한 뒤에는 대시보드의 `LIVE_SIM Canary 체결/성과` 패널을 확인합니다.
+
+확인 항목:
+
+- 오늘 Canary 주문 수
+- 제출/접수/부분체결/완전체결/미체결/취소/청산/리컨실 필요 수
+- 평균 `fill_ratio`
+- 평균 `entry_slippage_bp`
+- 평균 `net_return_pct`
+- DRY_RUN 대비 LIVE_SIM 평균 차이
+- `LIVE_WORSE`, `NO_FILL`, `PARTIAL_FILL`, `RECONCILE_REQUIRED`, orphan case 비율과 건수
+
+행 상세에서는 order/fill/exit timeline, DRY_RUN vs LIVE_SIM 비교, raw metadata, linked IDs를 확인합니다. 이 패널에는 주문 실행 버튼이나 설정 변경 버튼이 없어야 합니다.
+
+장후에는 LIVE_SIM Canary post-trade 리포트를 재생성하고 export합니다.
+
+```powershell
+$headers = @{ "X-Local-Token" = "local-dev-token" }
+Invoke-RestMethod `
+  -Method Post `
+  "http://127.0.0.1:8000/api/runtime/live-sim/canary/performance/rebuild" `
+  -Headers $headers `
+  -ContentType "application/json" `
+  -Body '{"persist":true,"export":"all"}'
+Invoke-RestMethod http://127.0.0.1:8000/api/runtime/live-sim/canary/performance/reports
+```
+
+저장 위치:
+
+- LIVE_SIM Canary 사후 분석: `reports/live_sim_canary/<거래일>/`
+
+운영자 조치:
+
+- `NO_FILL`: 주문번호와 미체결 원장을 확인하고, 반복되면 limit price policy 검토 후보로만 기록합니다.
+- `PARTIAL_FILL`: 잔량 취소/리컨실 여부와 부분체결 대기 시간을 확인합니다.
+- `RECONCILE_REQUIRED`: 신규 설정 변경 검토보다 먼저 broker snapshot과 `live_sim_positions` 원장을 맞춥니다.
+- `ORPHAN_EXECUTION` 또는 `ORPHAN_ORDER_RESULT`: `gateway_command_id`, `order_intent_id`, `broker_order_id`, `candidate_instance_id` 순서로 연결 누락을 확인합니다.
+
 ## DRY_RUN으로 되돌리기
 
 LIVE_SIM을 쓴 뒤에는 다음 날 실수 방지를 위해 DRY_RUN으로 되돌립니다. Core가 실행 중이면 저장 후 재시작합니다.

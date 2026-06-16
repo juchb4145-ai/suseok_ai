@@ -214,6 +214,25 @@ button:disabled {
   word-break: break-word;
 }
 
+.live-sim-canary-performance-section .canary-decision {
+  border-bottom: 0;
+  padding: 0;
+}
+
+.live-sim-canary-performance-section .canary-decision summary {
+  grid-template-columns: 1fr;
+  min-height: 28px;
+}
+
+.live-sim-canary-performance-section .canary-decision pre {
+  max-height: 360px;
+  min-width: 360px;
+}
+
+.live-sim-canary-performance-section table {
+  min-width: 1120px;
+}
+
 .section-head {
   display: flex;
   align-items: flex-start;

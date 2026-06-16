@@ -76,6 +76,10 @@ from trading_app.intraday_outcomes import (
 from trading_app.market_gate_review import MarketGateReviewAnalyzer
 from trading_app.live_sim_audit import LiveSimLifecycleAuditor
 from trading_app.live_sim_canary import canary_config_from_settings, evaluate_live_sim_canary
+from trading_app.live_sim_canary_performance import (
+    LiveSimCanaryPerformanceAnalyzer,
+    LiveSimCanaryPerformanceConfig,
+)
 from trading_app.live_sim_preflight import LiveSimPreflightService, compact_preflight_snapshot
 from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
@@ -658,6 +662,28 @@ def _buy_zero_rca_analyzer(db: TradingDatabase) -> BuyZeroRCAAnalyzer:
 
 def _live_sim_auditor(db: TradingDatabase) -> LiveSimLifecycleAuditor:
     return LiveSimLifecycleAuditor(db, gateway_state=gateway_state)
+
+
+def _live_sim_canary_performance_analyzer(db: TradingDatabase) -> LiveSimCanaryPerformanceAnalyzer:
+    settings = get_settings()
+    config = LiveSimCanaryPerformanceConfig(
+        good_entry_slippage_bp=float(getattr(settings, "live_sim_canary_good_entry_slippage_bp", 10.0)),
+        acceptable_entry_slippage_bp=float(getattr(settings, "live_sim_canary_acceptable_entry_slippage_bp", 30.0)),
+        bad_entry_slippage_bp=float(getattr(settings, "live_sim_canary_bad_entry_slippage_bp", 50.0)),
+        good_exit_slippage_bp=float(getattr(settings, "live_sim_canary_good_exit_slippage_bp", -10.0)),
+        acceptable_exit_slippage_bp=float(getattr(settings, "live_sim_canary_acceptable_exit_slippage_bp", -30.0)),
+        high_latency_ms=float(getattr(settings, "live_sim_canary_high_latency_ms", 1000.0)),
+        stale_tick_age_sec=float(getattr(settings, "live_sim_canary_stale_tick_age_sec", 3.0)),
+        match_tolerance_pct=float(getattr(settings, "live_sim_canary_match_tolerance_pct", 0.05)),
+        commission_bp_per_side=float(getattr(settings, "dry_run_commission_bp_per_side", 1.5)),
+        sell_tax_bp=float(getattr(settings, "dry_run_sell_tax_bp", 15.0)),
+    )
+    return LiveSimCanaryPerformanceAnalyzer(
+        db,
+        config=config,
+        gateway_state=gateway_state,
+        dry_run_analyzer=_performance_analyzer(db),
+    )
 
 
 def _live_sim_preflight_service(db: TradingDatabase) -> LiveSimPreflightService:
@@ -1967,6 +1993,170 @@ def rebuild_runtime_live_sim_canary(
             "gateway_command_created": False,
             "items": saved[:20],
         }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/live-sim/canary/performance")
+def runtime_live_sim_canary_performance(
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    final_status: Optional[str] = None,
+    fill_quality_grade: Optional[str] = None,
+    exit_quality_grade: Optional[str] = None,
+    outcome_match: Optional[str] = None,
+    issue_type: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = _live_sim_canary_performance_analyzer(db).build_report(
+            trade_date=trade_date,
+            code=code,
+            final_status=final_status,
+            fill_quality_grade=fill_quality_grade,
+            exit_quality_grade=exit_quality_grade,
+            outcome_match=outcome_match,
+            issue_type=issue_type,
+            limit=limit,
+            offset=offset,
+        )
+        total = int(report.get("total_items") or len(report.get("items") or []))
+        report["pagination"] = _pagination_payload(
+            limit=limit,
+            offset=offset,
+            count=len(report.get("items") or []),
+            total=total,
+        )
+        return report
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/live-sim/canary/performance/rebuild")
+def rebuild_runtime_live_sim_canary_performance(
+    body: Optional[dict[str, Any]] = Body(default=None),
+    trade_date: Optional[str] = None,
+    persist: bool = True,
+    export: str = Query("json", pattern="^(json|csv|md|markdown|all)$"),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        resolved_trade_date = str(payload.get("trade_date") or trade_date or datetime.now().date().isoformat())
+        resolved_persist = bool(payload.get("persist", persist))
+        resolved_export = str(payload.get("export") or export or "json")
+        analyzer = _live_sim_canary_performance_analyzer(db)
+        report = analyzer.build_report(trade_date=resolved_trade_date, limit=10000)
+        persisted = analyzer.persist_report(report) if resolved_persist else None
+        exports = analyzer.export_report(report, fmt=resolved_export) if resolved_export else {}
+        return {
+            "report_id": report["report_id"],
+            "persisted": persisted is not None,
+            "exported": exports,
+            "safety_scope": report.get("safety_scope", {}),
+            "analysis_only": True,
+            "report": report,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/live-sim/canary/performance/reports")
+def runtime_live_sim_canary_performance_reports(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_live_sim_canary_performance_reports(limit=limit + 1, offset=offset)
+        items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {"items": items, "pagination": pagination, "filters": {"limit": limit, "offset": offset}}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/live-sim/canary/performance/reports/{report_id}")
+def runtime_live_sim_canary_performance_report_detail(report_id: str) -> dict[str, Any]:
+    db = open_database()
+    try:
+        report = db.get_live_sim_canary_performance_report(report_id)
+        if report is None:
+            return {"report_id": report_id, "found": False}
+        report["found"] = True
+        return report
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/live-sim/canary/performance/cases")
+def runtime_live_sim_canary_performance_cases(
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    final_status: Optional[str] = None,
+    fill_quality_grade: Optional[str] = None,
+    exit_quality_grade: Optional[str] = None,
+    outcome_match: Optional[str] = None,
+    issue_type: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_live_sim_canary_performance_cases(
+            trade_date=trade_date,
+            code=code,
+            final_status=final_status,
+            fill_quality_grade=fill_quality_grade,
+            exit_quality_grade=exit_quality_grade,
+            outcome_match=outcome_match,
+            issue_type=issue_type,
+            limit=limit + 1,
+            offset=offset,
+        )
+        if not items and offset == 0:
+            report = _live_sim_canary_performance_analyzer(db).build_report(
+                trade_date=trade_date,
+                code=code,
+                final_status=final_status,
+                fill_quality_grade=fill_quality_grade,
+                exit_quality_grade=exit_quality_grade,
+                outcome_match=outcome_match,
+                issue_type=issue_type,
+                limit=limit + 1,
+                offset=0,
+            )
+            items = list(report.get("items") or [])
+        items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {
+            "items": items,
+            "pagination": pagination,
+            "filters": {
+                "trade_date": trade_date or "",
+                "code": code or "",
+                "final_status": final_status or "",
+                "fill_quality_grade": fill_quality_grade or "",
+                "exit_quality_grade": exit_quality_grade or "",
+                "outcome_match": outcome_match or "",
+                "issue_type": issue_type or "",
+                "limit": limit,
+                "offset": offset,
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/live-sim/canary/performance/cases/{case_id}")
+def runtime_live_sim_canary_performance_case_detail(case_id: str) -> dict[str, Any]:
+    db = open_database()
+    try:
+        item = db.get_live_sim_canary_performance_case(case_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="LIVE_SIM Canary performance case not found")
+        return item
     finally:
         close_database(db)
 
@@ -7996,6 +8186,21 @@ def _dashboard_slim_runtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "exit_guard_ready",
             ),
         )
+    if "live_sim_canary_performance" in runtime:
+        data = dict(runtime.get("live_sim_canary_performance") or {})
+        runtime["live_sim_canary_performance"] = _dashboard_field_subset(
+            data,
+            (
+                "available",
+                "status",
+                "generated_at",
+                "trade_date",
+                "summary",
+                "recommendations",
+                "cases",
+                "disclaimer_ko",
+            ),
+        )
     if "live_sim_preflight" in runtime:
         data = dict(runtime.get("live_sim_preflight") or {})
         runtime["live_sim_preflight"] = _dashboard_field_subset(
@@ -8233,6 +8438,21 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         f"live_sim_audit:v2:{today}:{live_sim_audit_limit}",
         lambda: _live_sim_auditor(db).build_report(trade_date=today, limit=live_sim_audit_limit),
     )
+    live_sim_canary_performance_report = _cached_dashboard_fragment(
+        db,
+        f"live_sim_canary_performance:v1:{today}:{performance_limit}",
+        lambda: _live_sim_canary_performance_analyzer(db).build_report(trade_date=today, limit=performance_limit),
+    )
+    live_sim_canary_performance_payload = {
+        "available": bool(live_sim_canary_performance_report.get("summary", {}).get("total_lifecycle_count")),
+        "status": live_sim_canary_performance_report.get("status", "READY"),
+        "generated_at": live_sim_canary_performance_report.get("generated_at", ""),
+        "trade_date": live_sim_canary_performance_report.get("trade_date", today),
+        "summary": live_sim_canary_performance_report.get("summary", {}),
+        "recommendations": list(live_sim_canary_performance_report.get("recommendations") or [])[:5],
+        "cases": list(live_sim_canary_performance_report.get("items") or [])[: 10 if full_detail else 5],
+        "disclaimer_ko": live_sim_canary_performance_report.get("disclaimer_ko", ""),
+    }
     conservative_reason_report: dict[str, Any] | None = None
     try:
         conservative_reason_report = _cached_dashboard_fragment(
@@ -8425,6 +8645,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["live_sim_audit"] = live_sim_audit_payload
     runtime_payload["live_sim_preflight"] = live_sim_preflight_payload
     runtime_payload["live_sim_canary"] = live_sim_canary_payload
+    runtime_payload["live_sim_canary_performance"] = live_sim_canary_performance_payload
     runtime_payload["conservative_reason_outcomes"] = conservative_reason_payload
     runtime_payload["shadow_small_entry_promotion"] = shadow_small_entry_payload
     runtime_payload["shadow_small_entry_ops"] = shadow_small_entry_ops_payload
@@ -8461,6 +8682,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "live_sim_audit": live_sim_audit_payload,
         "live_sim_preflight": live_sim_preflight_payload,
         "live_sim_canary": live_sim_canary_payload,
+        "live_sim_canary_performance": live_sim_canary_performance_payload,
         "conservative_reason_outcomes": conservative_reason_payload,
         "shadow_small_entry_promotion": shadow_small_entry_payload,
         "shadow_small_entry_ops": shadow_small_entry_ops_payload,

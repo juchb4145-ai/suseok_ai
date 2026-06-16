@@ -1430,6 +1430,18 @@ class TradingDatabase:
                 generated_at TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS live_sim_canary_performance_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                grouped_json TEXT NOT NULL DEFAULT '{}',
+                recommendation_json TEXT NOT NULL DEFAULT '[]',
+                filters_json TEXT NOT NULL DEFAULT '{}',
+                generated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS live_sim_preflight_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 snapshot_id TEXT UNIQUE NOT NULL,
@@ -1495,6 +1507,25 @@ class TradingDatabase:
                 quality_bucket TEXT NOT NULL DEFAULT '',
                 item_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS live_sim_canary_performance_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id TEXT NOT NULL,
+                case_id TEXT NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                order_intent_id TEXT NOT NULL DEFAULT '',
+                gateway_command_id TEXT NOT NULL DEFAULT '',
+                broker_order_id TEXT NOT NULL DEFAULT '',
+                final_status TEXT NOT NULL DEFAULT '',
+                fill_quality_grade TEXT NOT NULL DEFAULT '',
+                exit_quality_grade TEXT NOT NULL DEFAULT '',
+                outcome_match TEXT NOT NULL DEFAULT '',
+                issue_types_json TEXT NOT NULL DEFAULT '[]',
+                case_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(report_id, case_id)
             );
             CREATE TABLE IF NOT EXISTS dry_run_threshold_ab_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1799,6 +1830,18 @@ class TradingDatabase:
                 ON live_sim_reconcile_events(status, started_at);
             CREATE INDEX IF NOT EXISTS idx_dry_run_performance_reports_trade_date
                 ON dry_run_performance_reports(trade_date, generated_at);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_canary_performance_reports_trade_date
+                ON live_sim_canary_performance_reports(trade_date, generated_at);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_canary_performance_cases_report_id
+                ON live_sim_canary_performance_cases(report_id, id);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_canary_performance_cases_trade_date
+                ON live_sim_canary_performance_cases(trade_date, id);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_canary_performance_cases_code
+                ON live_sim_canary_performance_cases(code, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_canary_performance_cases_status
+                ON live_sim_canary_performance_cases(final_status, fill_quality_grade, exit_quality_grade);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_canary_performance_cases_outcome
+                ON live_sim_canary_performance_cases(outcome_match);
             CREATE INDEX IF NOT EXISTS idx_live_sim_preflight_snapshots_checked
                 ON live_sim_preflight_snapshots(checked_at);
             CREATE INDEX IF NOT EXISTS idx_live_sim_preflight_snapshots_status
@@ -5274,6 +5317,168 @@ class TradingDatabase:
             (report_id, max(1, int(limit or 1000)), max(0, int(offset or 0))),
         ).fetchall()
         return [_row_to_dry_run_performance_item(row) for row in rows]
+
+    def save_live_sim_canary_performance_report(self, report: dict) -> dict:
+        report_id = str(report.get("report_id") or "")
+        if not report_id:
+            raise ValueError("report_id is required")
+        summary = dict(report.get("summary") or {})
+        grouped = dict(report.get("grouped") or {})
+        recommendations = list(report.get("recommendations") or [])
+        filters = dict(report.get("filters") or {})
+        items = list(report.get("items") or [])
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO live_sim_canary_performance_reports(
+                    report_id, trade_date, status, summary_json, grouped_json,
+                    recommendation_json, filters_json, generated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_id) DO UPDATE SET
+                    trade_date=excluded.trade_date,
+                    status=excluded.status,
+                    summary_json=excluded.summary_json,
+                    grouped_json=excluded.grouped_json,
+                    recommendation_json=excluded.recommendation_json,
+                    filters_json=excluded.filters_json,
+                    generated_at=excluded.generated_at
+                """,
+                (
+                    report_id,
+                    str(report.get("trade_date") or filters.get("trade_date") or ""),
+                    str(report.get("status") or "READY"),
+                    json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(grouped, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(recommendations, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(filters, ensure_ascii=False, sort_keys=True, default=str),
+                    str(report.get("generated_at") or ""),
+                ),
+            )
+            self.conn.execute("DELETE FROM live_sim_canary_performance_cases WHERE report_id = ?", (report_id,))
+            for item in items:
+                issue_types = [
+                    str(issue.get("issue_type") or "")
+                    for issue in list(item.get("issues") or [])
+                    if str(issue.get("issue_type") or "")
+                ]
+                self.conn.execute(
+                    """
+                    INSERT INTO live_sim_canary_performance_cases(
+                        report_id, case_id, trade_date, code, candidate_instance_id,
+                        order_intent_id, gateway_command_id, broker_order_id,
+                        final_status, fill_quality_grade, exit_quality_grade,
+                        outcome_match, issue_types_json, case_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        report_id,
+                        str(item.get("case_id") or item.get("lifecycle_id") or ""),
+                        str(item.get("trade_date") or ""),
+                        str(item.get("code") or ""),
+                        str(item.get("candidate_instance_id") or ""),
+                        str(item.get("order_intent_id") or ""),
+                        str(item.get("gateway_command_id") or ""),
+                        str(item.get("broker_order_id") or ""),
+                        str(item.get("final_status") or ""),
+                        str(item.get("fill_quality_grade") or ""),
+                        str(item.get("exit_quality_grade") or ""),
+                        str(item.get("outcome_match") or ""),
+                        json.dumps(issue_types, ensure_ascii=False, sort_keys=True, default=str),
+                        json.dumps(item, ensure_ascii=False, sort_keys=True, default=str),
+                    ),
+                )
+        return self.get_live_sim_canary_performance_report(report_id) or {"report_id": report_id}
+
+    def list_live_sim_canary_performance_reports(self, *, limit: int = 50, offset: int = 0) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT id, report_id, trade_date, status, summary_json,
+                   recommendation_json, filters_json, generated_at, created_at
+            FROM live_sim_canary_performance_reports
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (max(1, int(limit or 50)), max(0, int(offset or 0))),
+        ).fetchall()
+        return [_row_to_live_sim_canary_performance_report(row, include_grouped=False, include_items=False) for row in rows]
+
+    def get_live_sim_canary_performance_report(self, report_id: str, *, include_items: bool = True) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM live_sim_canary_performance_reports WHERE report_id = ?",
+            (str(report_id or ""),),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = _row_to_live_sim_canary_performance_report(row, include_grouped=True, include_items=False)
+        if include_items:
+            payload["items"] = self.list_live_sim_canary_performance_cases(report_id=report_id, limit=10000)
+        return payload
+
+    def list_live_sim_canary_performance_cases(
+        self,
+        *,
+        report_id: Optional[str] = None,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        final_status: Optional[str] = None,
+        fill_quality_grade: Optional[str] = None,
+        exit_quality_grade: Optional[str] = None,
+        outcome_match: Optional[str] = None,
+        issue_type: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if report_id:
+            clauses.append("report_id = ?")
+            params.append(str(report_id))
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if code:
+            clauses.append("code = ?")
+            params.append(str(code))
+        if final_status:
+            clauses.append("final_status = ?")
+            params.append(str(final_status))
+        if fill_quality_grade:
+            clauses.append("fill_quality_grade = ?")
+            params.append(str(fill_quality_grade))
+        if exit_quality_grade:
+            clauses.append("exit_quality_grade = ?")
+            params.append(str(exit_quality_grade))
+        if outcome_match:
+            clauses.append("outcome_match = ?")
+            params.append(str(outcome_match))
+        if issue_type:
+            clauses.append("issue_types_json LIKE ?")
+            params.append(f"%{str(issue_type)}%")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM live_sim_canary_performance_cases
+            {where}
+            ORDER BY id ASC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_live_sim_canary_performance_case(row) for row in rows]
+
+    def get_live_sim_canary_performance_case(self, case_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM live_sim_canary_performance_cases
+            WHERE case_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (str(case_id or ""),),
+        ).fetchone()
+        return _row_to_live_sim_canary_performance_case(row) if row else None
 
     def save_live_sim_preflight_snapshot(self, snapshot: dict) -> dict:
         snapshot_id = str(snapshot.get("snapshot_id") or "")
@@ -10962,6 +11167,52 @@ def _row_to_dry_run_performance_report(
     if include_items:
         payload["items"] = []
     return payload
+
+
+def _row_to_live_sim_canary_performance_report(
+    row: sqlite3.Row,
+    *,
+    include_grouped: bool,
+    include_items: bool,
+) -> dict:
+    payload = {
+        "id": int(row["id"]),
+        "report_id": row["report_id"],
+        "trade_date": row["trade_date"],
+        "status": row["status"],
+        "summary": _safe_json_loads(row["summary_json"], {}),
+        "recommendations": _safe_json_loads(row["recommendation_json"], []),
+        "filters": _safe_json_loads(row["filters_json"], {}),
+        "generated_at": row["generated_at"],
+        "created_at": row["created_at"],
+    }
+    if include_grouped and "grouped_json" in row.keys():
+        payload["grouped"] = _safe_json_loads(row["grouped_json"], {})
+    if include_items:
+        payload["items"] = []
+    return payload
+
+
+def _row_to_live_sim_canary_performance_case(row: sqlite3.Row) -> dict:
+    item = _safe_json_loads(row["case_json"], {})
+    if not isinstance(item, dict):
+        item = {}
+    item.setdefault("id", int(row["id"]))
+    item.setdefault("report_id", row["report_id"])
+    item.setdefault("case_id", row["case_id"])
+    item.setdefault("trade_date", row["trade_date"])
+    item.setdefault("code", row["code"])
+    item.setdefault("candidate_instance_id", row["candidate_instance_id"])
+    item.setdefault("order_intent_id", row["order_intent_id"])
+    item.setdefault("gateway_command_id", row["gateway_command_id"])
+    item.setdefault("broker_order_id", row["broker_order_id"])
+    item.setdefault("final_status", row["final_status"])
+    item.setdefault("fill_quality_grade", row["fill_quality_grade"])
+    item.setdefault("exit_quality_grade", row["exit_quality_grade"])
+    item.setdefault("outcome_match", row["outcome_match"])
+    item.setdefault("issue_types", _safe_json_loads(row["issue_types_json"], []))
+    item.setdefault("created_at", row["created_at"])
+    return item
 
 
 def _live_sim_canary_decision_params(payload: dict) -> dict:

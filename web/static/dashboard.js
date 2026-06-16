@@ -494,6 +494,11 @@ function fmtOptionalNumber(value, digits = 1) {
   return number.toFixed(digits);
 }
 
+function formatBp(value, digits = 1) {
+  const formatted = fmtOptionalNumber(value, digits);
+  return formatted === "-" ? "-" : `${formatted}bp`;
+}
+
 function formatMs(value) {
   if (value == null || value === "") return "-";
   const number = Number(value);
@@ -1277,6 +1282,107 @@ function renderLiveSimAuditLines(id, rows, emptyText) {
     : `<span class="empty">${escapeHtml(emptyText)}</span>`;
 }
 
+function renderLiveSimCanaryPerformance(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.live_sim_canary_performance || runtime.live_sim_canary_performance || {};
+  const summary = payload.summary || {};
+  const cases = payload.cases || payload.items || [];
+  const available = Boolean(payload.available) || Number(summary.total_lifecycle_count || 0) > 0;
+  const status = available ? (payload.status || "READY") : "NO_DATA";
+  const tone = /RECONCILE|BAD|CRITICAL/.test(JSON.stringify(summary.issue_counts || {})) ? "warn" : available ? "ok" : "muted";
+
+  text("live-sim-canary-performance-status", status);
+  cls("live-sim-canary-performance-status", `counter ${tone}`);
+  text("live-sim-canary-performance-updated", formatDateTime(payload.generated_at));
+  text(
+    "live-sim-canary-performance-empty",
+    available
+      ? "LIVE_SIM Canary 주문의 실제 체결/청산과 DRY_RUN 대비 차이를 표시합니다."
+      : "Canary 주문의 체결 품질과 DRY_RUN 대비 차이를 기다리는 중입니다."
+  );
+  text("live-sim-canary-performance-total", summary.today_canary_order_count ?? summary.total_lifecycle_count ?? 0);
+  text("live-sim-canary-performance-submit-ack", `${summary.submitted_count ?? 0} / ${summary.broker_accepted_count ?? 0}`);
+  text("live-sim-canary-performance-partial-full", `${summary.partial_fill_count ?? 0} / ${summary.full_fill_count ?? 0}`);
+  text("live-sim-canary-performance-nofill-cancel", `${summary.no_fill_count ?? 0} / ${summary.cancelled_count ?? 0}`);
+  text("live-sim-canary-performance-closed-reconcile", `${summary.closed_count ?? 0} / ${summary.reconcile_required_count ?? 0}`);
+  text("live-sim-canary-performance-fill-ratio", formatRate(summary.avg_fill_ratio));
+  text("live-sim-canary-performance-slippage", formatBp(summary.avg_entry_slippage_bp, 1));
+  text("live-sim-canary-performance-net", formatPercentValue(summary.avg_net_return_pct));
+  text("live-sim-canary-performance-gap", formatPercentValue(summary.avg_live_vs_dry_run_net_diff_pct));
+  text("live-sim-canary-performance-worse", formatRate(summary.live_worse_rate));
+  text("live-sim-canary-performance-nofill-rate", formatRate(summary.no_fill_rate));
+  text("live-sim-canary-performance-orphan", summary.orphan_case_count ?? 0);
+  renderLiveSimCanaryPerformanceRows(cases);
+  renderLiveSimCanaryPerformanceRecommendations(payload.recommendations || []);
+}
+
+function renderLiveSimCanaryPerformanceRows(rows) {
+  const body = document.getElementById("live-sim-canary-performance-rows");
+  if (!body) return;
+  const items = firstItems(rows || [], 10);
+  if (!items.length) {
+    body.innerHTML = `<tr><td class="empty" colspan="13">표시할 LIVE_SIM Canary 성과 케이스가 없습니다.</td></tr>`;
+    return;
+  }
+  body.innerHTML = items.map((item) => {
+    const issues = (item.issue_types || (item.issues || []).map((issue) => issue.issue_type)).filter(Boolean);
+    const detail = {
+      linked_ids: item.linked_ids || {},
+      order_timeline: item.order_timeline || [],
+      fill_timeline: item.fill_timeline || [],
+      exit_timeline: item.exit_timeline || [],
+      dry_run_vs_live_sim: {
+        dry_run_expected_entry_price: item.dry_run_expected_entry_price,
+        live_sim_avg_entry_price: item.live_sim_avg_entry_price,
+        dry_run_net_return_pct: item.dry_run_net_return_pct,
+        live_sim_net_return_pct: item.live_sim_net_return_pct,
+        net_return_diff_pct: item.net_return_diff_pct,
+        dry_run_exit_reason: item.dry_run_exit_reason,
+        live_sim_exit_reason: item.live_sim_exit_reason,
+        outcome_match: item.outcome_match,
+      },
+      raw_metadata: item.raw_metadata || {},
+    };
+    return `
+      <tr>
+        <td>${escapeHtml([item.code, item.name].filter(Boolean).join(" ") || "-")}</td>
+        <td>${escapeHtml(item.theme || "-")}</td>
+        <td>${escapeHtml(fmtOptionalNumber(item.hybrid_score, 1))}</td>
+        <td>${escapeHtml(fmtOptionalNumber(item.requested_price, 0))} / ${escapeHtml(fmtOptionalNumber(item.avg_fill_price, 0))}</td>
+        <td>${escapeHtml(formatRate(item.fill_ratio))}</td>
+        <td>${escapeHtml(formatBp(item.entry_slippage_bp, 1))}</td>
+        <td>${escapeHtml(item.exit_reason || "-")}</td>
+        <td>${escapeHtml(formatPercentValue(item.net_return_pct))}</td>
+        <td>${escapeHtml(formatPercentValue(item.dry_run_net_return_pct))}</td>
+        <td>${escapeHtml(formatPercentValue(item.net_return_diff_pct))}</td>
+        <td>${badge(item.outcome_match || "INCOMPARABLE")}</td>
+        <td>${badge(item.final_status || "UNKNOWN")}</td>
+        <td>
+          <details class="canary-decision">
+            <summary>${escapeHtml(issues.slice(0, 2).join(", ") || item.fill_quality_grade || "-")}</summary>
+            <pre>${escapeHtml(JSON.stringify(detail, null, 2))}</pre>
+          </details>
+        </td>
+      </tr>
+    `;
+  }).join("");
+}
+
+function renderLiveSimCanaryPerformanceRecommendations(rows) {
+  const node = document.getElementById("live-sim-canary-performance-recommendations");
+  if (!node) return;
+  const items = firstItems(rows || [], 5);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item info">
+        <strong>검토 전용</strong>
+        <span>${escapeHtml(item)}</span>
+        <em>자동 적용 없음</em>
+      </div>
+    `).join("")
+    : `<span class="empty">검토 전용 권고가 아직 없습니다.</span>`;
+}
+
 function renderBuyZeroRca(snapshot) {
   const runtime = snapshot.runtime || {};
   const payload = snapshot.buy_zero_rca || runtime.buy_zero_rca || {};
@@ -1899,6 +2005,7 @@ function render(snapshot) {
   renderLiveSimCanary(snapshot);
   renderThemeLabSummary(themeLab);
   renderLiveSimAudit(snapshot);
+  renderLiveSimCanaryPerformance(snapshot);
   renderBuyZeroRca(snapshot);
   renderConservativeReasonOutcomes(snapshot);
   renderShadowSmallEntryPromotion(snapshot);
