@@ -35,6 +35,8 @@ class CoreSettings:
     runtime_cycle_timeout_sec: int = 30
     runtime_allow_dry_run_orders: bool = False
     runtime_allow_live_orders: bool = False
+    runtime_live_sim_require_preflight_go_for_order_sink: bool = False
+    runtime_live_sim_allow_preflight_warnings_for_order_sink: bool = False
     runtime_require_gateway_heartbeat: bool = True
     runtime_require_kiwoom_login: bool = True
     runtime_require_orderable_for_order: bool = True
@@ -163,6 +165,14 @@ def get_settings() -> CoreSettings:
         runtime_cycle_timeout_sec=_int_env("TRADING_RUNTIME_CYCLE_TIMEOUT_SEC", 30),
         runtime_allow_dry_run_orders=_bool_env("TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS", False),
         runtime_allow_live_orders=_bool_env("TRADING_RUNTIME_ALLOW_LIVE_ORDERS", False),
+        runtime_live_sim_require_preflight_go_for_order_sink=_bool_env(
+            "TRADING_RUNTIME_LIVE_SIM_REQUIRE_PREFLIGHT_GO_FOR_ORDER_SINK",
+            False,
+        ),
+        runtime_live_sim_allow_preflight_warnings_for_order_sink=_bool_env(
+            "TRADING_RUNTIME_LIVE_SIM_ALLOW_PREFLIGHT_WARNINGS_FOR_ORDER_SINK",
+            False,
+        ),
         runtime_require_gateway_heartbeat=_bool_env("TRADING_RUNTIME_REQUIRE_GATEWAY_HEARTBEAT", True),
         runtime_require_kiwoom_login=_bool_env("TRADING_RUNTIME_REQUIRE_KIWOOM_LOGIN", True),
         runtime_require_orderable_for_order=_bool_env("TRADING_RUNTIME_REQUIRE_ORDERABLE_FOR_ORDER", True),

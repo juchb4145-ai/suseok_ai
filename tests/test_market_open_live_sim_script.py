@@ -17,6 +17,8 @@ def test_market_open_live_sim_script_declares_runtime_safety_envs():
     assert "$env:TRADING_RUNTIME_MODE = \"DRY_RUN\"" in text
     assert "$env:TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS = \"1\"" in text
     assert "$env:TRADING_RUNTIME_ALLOW_LIVE_ORDERS = \"0\"" in text
+    assert "$env:TRADING_RUNTIME_LIVE_SIM_REQUIRE_PREFLIGHT_GO_FOR_ORDER_SINK = \"1\"" in text
+    assert "$env:TRADING_RUNTIME_LIVE_SIM_ALLOW_PREFLIGHT_WARNINGS_FOR_ORDER_SINK" in text
     assert "$env:TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT" in text
     assert "$env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY = \"1\"" in text
     assert "$env:TRADING_SHADOW_STRATEGY_ALLOW_APPLY = \"0\"" in text
@@ -62,9 +64,17 @@ def test_market_open_live_sim_script_reports_new_operator_surfaces():
 def test_market_open_live_sim_script_decouples_gateway_orderability_from_runtime_start():
     text = SCRIPT.read_text(encoding="utf-8")
 
+    assert "[int]$GatewayPreflightReadyTimeoutSec = 180" in text
     assert "Kiwoom gateway heartbeat readiness" in text
     assert "Kiwoom gateway orderable readiness" in text
+    assert "function Wait-GatewayLiveSimPreflightReady" in text
     assert "Gateway heartbeat ready but order readiness pending" in text
+    assert "waiting for LIVE_SIM preflight readiness" in text
+    assert "Gateway preflight readiness pending" in text
+    assert "Gateway LIVE_SIM preflight readiness reached" in text
+    assert "DRY_RUN collection-only mode" in text
+    assert "runtime first DRY_RUN collection cycle" in text
+    assert "live_sim_startup_policy" in text
     assert "ready_for_orders" in text
     assert "require_orderable" in text
     assert "Get-GatewayStartupDiagnostics" in text

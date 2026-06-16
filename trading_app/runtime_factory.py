@@ -267,6 +267,8 @@ def _build_order_sink(
                 gateway_state=gateway_state,
                 db_path=settings.db_path,
             )
+            if _live_sim_order_sink_blocked_by_preflight(settings, warning_sink):
+                return DryRunRuntimeOrderSink(settings=settings, service=service, warning_sink=warning_sink)
             return LiveSimRuntimeOrderSink(settings=settings, service=service, warning_sink=warning_sink, runtime_settings=runtime_settings)
         if warning_sink is not None:
             warning_sink("LIVE_SIM_REQUIRES_DRY_RUN_RUNTIME")
@@ -285,3 +287,32 @@ def _build_order_sink(
         if settings.runtime_mode == "DRY_RUN"
         else "OBSERVE_VIRTUAL_ONLY"
     )
+
+
+def _live_sim_order_sink_blocked_by_preflight(
+    settings: CoreSettings,
+    warning_sink: Callable[[str], None] | None,
+) -> bool:
+    if not bool(getattr(settings, "runtime_live_sim_require_preflight_go_for_order_sink", False)):
+        return False
+    status = _latest_live_sim_preflight_status(settings)
+    allowed = {"GO"}
+    if bool(getattr(settings, "runtime_live_sim_allow_preflight_warnings_for_order_sink", False)):
+        allowed.add("GO_WITH_WARNINGS")
+    if status in allowed:
+        return False
+    if warning_sink is not None:
+        warning_sink(f"LIVE_SIM_ORDER_SINK_PREFLIGHT_NOT_GO:{status or 'MISSING'}")
+    return True
+
+
+def _latest_live_sim_preflight_status(settings: CoreSettings) -> str:
+    try:
+        db = TradingDatabase(str(settings.db_path))
+        try:
+            snapshot = db.latest_live_sim_preflight_snapshot() or {}
+        finally:
+            db.close()
+    except Exception:
+        return "ERROR"
+    return str(snapshot.get("status") or "").strip().upper()

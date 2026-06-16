@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$ProjectRoot = "",
     [string]$DbPath = "",
@@ -7,6 +7,7 @@ param(
     [string]$Token = "",
     [int]$CoreStartupTimeoutSec = 45,
     [int]$GatewayStartupTimeoutSec = 90,
+    [int]$GatewayPreflightReadyTimeoutSec = 180,
     [int]$GatewayStartupRetryCount = 1,
     [int]$GatewayDiagnosticsTailLines = 20,
     [int]$RuntimeStartupTimeoutSec = 120,
@@ -44,6 +45,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$Utf8Encoding = New-Object System.Text.UTF8Encoding -ArgumentList $false
+[Console]::OutputEncoding = $Utf8Encoding
+$OutputEncoding = $Utf8Encoding
 
 if (-not $ProjectRoot) {
     $ProjectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
@@ -70,6 +74,7 @@ $ThemeBackfillMaxThemes = [Math]::Max(0, $ThemeBackfillMaxThemes)
 $ThemeBackfillMaxHitsPerTheme = [Math]::Max(0, $ThemeBackfillMaxHitsPerTheme)
 $ThemeBackfillCacheTtlSec = [Math]::Max(0, $ThemeBackfillCacheTtlSec)
 $ThemeBackfillCacheLimit = [Math]::Max(0, $ThemeBackfillCacheLimit)
+$GatewayPreflightReadyTimeoutSec = [Math]::Max(0, $GatewayPreflightReadyTimeoutSec)
 $PreOpenWarmupTimeoutSec = [Math]::Max(0, $PreOpenWarmupTimeoutSec)
 $PreOpenWarmupPollSec = [Math]::Max(1, $PreOpenWarmupPollSec)
 $PreOpenWarmupMinBackfillSuccessCount = [Math]::Max(0, $PreOpenWarmupMinBackfillSuccessCount)
@@ -111,6 +116,8 @@ $env:TRADING_RUNTIME_AUTO_START = "0"
 $env:TRADING_RUNTIME_MODE = "DRY_RUN"
 $env:TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS = "1"
 $env:TRADING_RUNTIME_ALLOW_LIVE_ORDERS = "0"
+$env:TRADING_RUNTIME_LIVE_SIM_REQUIRE_PREFLIGHT_GO_FOR_ORDER_SINK = "1"
+$env:TRADING_RUNTIME_LIVE_SIM_ALLOW_PREFLIGHT_WARNINGS_FOR_ORDER_SINK = if ($AllowLiveSimWithWarnings) { "1" } else { "0" }
 $env:TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT = [string]$RuntimeDryRunPositionAmount
 $env:TRADING_GATEWAY_TRANSPORT = $GatewayTransport
 $env:TRADING_KIWOOM_GATEWAY_CORE_URL = $GatewayCoreUrl
@@ -265,6 +272,54 @@ function Assert-GatewayNotRealMode([object]$Status) {
     if ($modes.broker_env -eq "REAL" -or $modes.server_mode -eq "REAL" -or $modes.account_mode -eq "REAL") {
         throw "Gateway reported REAL account/server mode; LIVE_SIM startup aborted."
     }
+}
+
+function Wait-GatewayLiveSimPreflightReady([int]$TimeoutSec) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $lastStatus = $null
+    $lastError = ""
+    $lastLogAt = (Get-Date).AddSeconds(-60)
+    do {
+        try {
+            $lastStatus = Invoke-CoreApi -Method GET -Path "/api/gateway/status" -TimeoutSec 5
+            $lastError = ""
+        } catch {
+            $lastStatus = $null
+            $lastError = $_.Exception.Message
+        }
+
+        if ($lastStatus) {
+            Assert-GatewayNotRealMode $lastStatus
+            $modes = Get-GatewayBrokerModeSummary $lastStatus
+            $ready = [bool](
+                $lastStatus.connected -and
+                $lastStatus.heartbeat_ok -and
+                $lastStatus.kiwoom_logged_in -and
+                $lastStatus.orderable -and
+                (Test-GatewaySimulationMode $lastStatus)
+            )
+            if ($ready) {
+                return $lastStatus
+            }
+            if (((Get-Date) - $lastLogAt).TotalSeconds -ge 10) {
+                Write-Step ("Gateway preflight readiness pending login={0} orderable={1} broker_env={2} account_mode={3} heartbeat_ok={4}" -f `
+                    $lastStatus.kiwoom_logged_in, $lastStatus.orderable, $modes.broker_env, $modes.account_mode, $lastStatus.heartbeat_ok)
+                $lastLogAt = Get-Date
+            }
+        } elseif (((Get-Date) - $lastLogAt).TotalSeconds -ge 10) {
+            Write-Step "Gateway preflight readiness pending: status unavailable last_error=$lastError"
+            $lastLogAt = Get-Date
+        }
+
+        Start-Sleep -Seconds 1
+    } while ((Get-Date) -lt $deadline)
+
+    if ($lastStatus) {
+        $modes = Get-GatewayBrokerModeSummary $lastStatus
+        throw ("Timed out waiting for Kiwoom LIVE_SIM preflight readiness after {0}s. last login={1} orderable={2} broker_env={3} account_mode={4} heartbeat_ok={5}" -f `
+            $TimeoutSec, $lastStatus.kiwoom_logged_in, $lastStatus.orderable, $modes.broker_env, $modes.account_mode, $lastStatus.heartbeat_ok)
+    }
+    throw "Timed out waiting for Kiwoom LIVE_SIM preflight readiness after ${TimeoutSec}s. gateway status unavailable last_error=$lastError"
 }
 
 function Get-GatewayProcessSnapshot {
@@ -530,14 +585,18 @@ function Assert-LiveSimPreflightAllowsStartup([object]$Preflight) {
         throw "LIVE_SIM preflight fail-closed: REAL/UNKNOWN/LIVE_REAL/account mismatch 위험은 -AllowLiveSimWithWarnings로 우회할 수 없습니다. reasons=$reasonText"
     }
     if ($status -eq "GO") {
-        return
+        return "LIVE_SIM"
     }
     if ($status -eq "GO_WITH_WARNINGS") {
         if ($AllowLiveSimWithWarnings) {
             Write-Step "LIVE_SIM preflight GO_WITH_WARNINGS accepted by explicit -AllowLiveSimWithWarnings"
-            return
+            return "LIVE_SIM"
         }
         throw "LIVE_SIM preflight returned GO_WITH_WARNINGS. 경고 상태로 진행하려면 -AllowLiveSimWithWarnings를 명시해야 합니다. warnings=$warningText"
+    }
+    if ($status -eq "INSUFFICIENT_DATA") {
+        Write-Step "LIVE_SIM preflight has insufficient DRY_RUN performance data; runtime will start in DRY_RUN collection-only mode and LIVE_SIM order sink will remain disabled. reasons=$reasonText"
+        return "DRY_RUN_COLLECT_ONLY"
     }
     throw "LIVE_SIM preflight blocked runtime startup. status=$status reasons=$reasonText"
 }
@@ -798,6 +857,7 @@ try {
     Write-Step "Gateway transport=$env:TRADING_GATEWAY_TRANSPORT"
     Write-Step "Gateway readiness require_orderable=$([bool]$RequireGatewayOrderable)"
     Write-Step "Gateway startup retries=$GatewayStartupRetryCount"
+    Write-Step "Gateway preflight readiness timeout=$GatewayPreflightReadyTimeoutSec"
     Write-Step "Gateway core URL=$env:TRADING_KIWOOM_GATEWAY_CORE_URL"
     Write-Step "LIVE_SIM preflight allow_warnings=$([bool]$AllowLiveSimWithWarnings)"
     if ($env:TRADING_GATEWAY_WS_URL) {
@@ -838,6 +898,7 @@ try {
             gateway_ws_url = $env:TRADING_GATEWAY_WS_URL
             gateway_require_orderable = [bool]$RequireGatewayOrderable
             gateway_startup_retry_count = $GatewayStartupRetryCount
+            gateway_preflight_ready_timeout_sec = $GatewayPreflightReadyTimeoutSec
             live_sim_preflight = @{
                 enabled = $true
                 dry_run_note = "Core/Gateway startup was not executed, so API preflight rebuild was not called."
@@ -963,17 +1024,31 @@ try {
         $gatewayModes = Get-GatewayBrokerModeSummary $gatewayStatus
         $gatewayReadyForOrders = [bool]($gatewayStatus.kiwoom_logged_in -and $gatewayStatus.orderable -and (Test-GatewaySimulationMode $gatewayStatus))
         if (-not $gatewayReadyForOrders -and -not $RequireGatewayOrderable) {
-            Write-Step "Gateway heartbeat ready but order readiness pending; runtime will start in guarded DRY_RUN mode login=$($gatewayStatus.kiwoom_logged_in) orderable=$($gatewayStatus.orderable) broker_env=$($gatewayModes.broker_env) account_mode=$($gatewayModes.account_mode)"
+            Write-Step "Gateway heartbeat ready but order readiness pending; waiting for LIVE_SIM preflight readiness login=$($gatewayStatus.kiwoom_logged_in) orderable=$($gatewayStatus.orderable) broker_env=$($gatewayModes.broker_env) account_mode=$($gatewayModes.account_mode)"
+            try {
+                $gatewayStatus = Wait-GatewayLiveSimPreflightReady -TimeoutSec $GatewayPreflightReadyTimeoutSec
+            } catch {
+                Write-GatewayStartupDiagnostics (Get-GatewayStartupDiagnostics)
+                throw
+            }
+            $gatewayModes = Get-GatewayBrokerModeSummary $gatewayStatus
+            $gatewayReadyForOrders = [bool]($gatewayStatus.kiwoom_logged_in -and $gatewayStatus.orderable -and (Test-GatewaySimulationMode $gatewayStatus))
+            Write-Step "Gateway LIVE_SIM preflight readiness reached login=$($gatewayStatus.kiwoom_logged_in) orderable=$($gatewayStatus.orderable) broker_env=$($gatewayModes.broker_env) account_mode=$($gatewayModes.account_mode)"
         }
         Write-Step "Gateway ready connected=$($gatewayStatus.connected) heartbeat_ok=$($gatewayStatus.heartbeat_ok) orderable=$($gatewayStatus.orderable) broker_env=$($gatewayModes.broker_env) account_mode=$($gatewayModes.account_mode)"
     }
 
     $liveSimPreflightSummary = $null
+    $liveSimStartupPolicy = "SKIPPED"
     if (-not $SkipRuntime) {
         $liveSimPreflight = Get-LiveSimPreflightStatus
         $liveSimPreflightSummary = Write-LiveSimPreflightSummary $liveSimPreflight
-        Assert-LiveSimPreflightAllowsStartup $liveSimPreflight
-        Write-Step "LIVE_SIM preflight passed; runtime startup may proceed"
+        $liveSimStartupPolicy = Assert-LiveSimPreflightAllowsStartup $liveSimPreflight
+        if ($liveSimStartupPolicy -eq "DRY_RUN_COLLECT_ONLY") {
+            Write-Step "LIVE_SIM preflight did not permit simulated orders; runtime startup may proceed for DRY_RUN data collection only"
+        } else {
+            Write-Step "LIVE_SIM preflight passed; runtime startup may proceed"
+        }
     } else {
         Write-Step "LIVE_SIM preflight skipped because runtime startup is skipped"
     }
@@ -985,12 +1060,15 @@ try {
         $startCycle = [int]($beforeRuntime.cycle_count)
         $runtimeStart = Invoke-CoreApi -Method POST -Path "/api/runtime/start" -TimeoutSec 20
         Write-Step "Runtime start running=$($runtimeStart.running) mode=$($runtimeStart.mode)"
-        $runtimeStatus = Wait-Until -TimeoutSec $RuntimeStartupTimeoutSec -Label "runtime first LIVE_SIM-ready cycle" -Condition {
+        $runtimeWaitLabel = if ($liveSimStartupPolicy -eq "DRY_RUN_COLLECT_ONLY") { "runtime first DRY_RUN collection cycle" } else { "runtime first LIVE_SIM-ready cycle" }
+        $runtimeStatus = Wait-Until -TimeoutSec $RuntimeStartupTimeoutSec -Label $runtimeWaitLabel -Condition {
             try {
                 $status = Invoke-CoreApi -Method GET -Path "/api/runtime/status" -TimeoutSec 8
                 $snapshot = $status.latest_snapshot
                 $liveSimReady = [bool]($snapshot.live_sim_order_sink_enabled) -or [string]($snapshot.live_sim_order_policy) -eq "LIVE_SIM_FIRST_LEG_GUARDED"
-                if ($status.running -and [string]$status.mode -eq "DRY_RUN" -and [int]$status.cycle_count -gt $startCycle -and $liveSimReady) {
+                $dryRunCollectionReady = [bool]($snapshot.dry_run_order_sink_enabled) -and [string]($snapshot.dry_run_order_policy) -eq "DRY_RUN_INTENT_ONLY"
+                $orderSinkReady = if ($liveSimStartupPolicy -eq "DRY_RUN_COLLECT_ONLY") { $dryRunCollectionReady } else { $liveSimReady }
+                if ($status.running -and [string]$status.mode -eq "DRY_RUN" -and [int]$status.cycle_count -gt $startCycle -and $orderSinkReady) {
                     return $status
                 }
             } catch {
@@ -998,7 +1076,7 @@ try {
             }
             return $null
         }
-        Write-Step "Runtime ready mode=$($runtimeStatus.mode) cycles=$($runtimeStatus.cycle_count)"
+        Write-Step "Runtime ready mode=$($runtimeStatus.mode) cycles=$($runtimeStatus.cycle_count) startup_policy=$liveSimStartupPolicy"
     }
 
     if (-not $SkipRuntime) {
@@ -1008,7 +1086,11 @@ try {
         } elseif ($preOpenDataWarmupStatus.skipped) {
             Write-Step "Pre-open data warmup skipped: $($preOpenDataWarmupStatus.reason)"
         }
-        Write-Step "LIVE_SIM readiness reached; ThemeLab backfill warmed or bounded by startup policy"
+        if ($liveSimStartupPolicy -eq "DRY_RUN_COLLECT_ONLY") {
+            Write-Step "DRY_RUN collection readiness reached; ThemeLab backfill warmed or bounded by startup policy"
+        } else {
+            Write-Step "LIVE_SIM readiness reached; ThemeLab backfill warmed or bounded by startup policy"
+        }
     } else {
         $preOpenDataWarmupStatus = [pscustomobject]@{
             enabled = [bool]$PreOpenDataWarmupEnabled
@@ -1069,6 +1151,7 @@ try {
                 readiness_mode = if ($RequireGatewayOrderable) { "orderable" } else { "heartbeat" }
                 ready_for_orders = [bool]($gatewayStatus.kiwoom_logged_in -and $gatewayStatus.orderable -and (Test-GatewaySimulationMode $gatewayStatus))
                 require_orderable = [bool]$RequireGatewayOrderable
+                preflight_readiness_timeout_sec = $GatewayPreflightReadyTimeoutSec
                 broker_env = [string]$gatewayModes.broker_env
                 server_mode = [string]$gatewayModes.server_mode
                 account_mode = [string]$gatewayModes.account_mode
@@ -1077,6 +1160,7 @@ try {
         } else { $null }
         themelab = $themeLabStatus
         pre_open_data_warmup = $preOpenDataWarmupStatus
+        live_sim_startup_policy = $liveSimStartupPolicy
         live_sim_preflight = $liveSimPreflightSummary
         live_sim_hybrid_ready_canary = Get-ObjectPropertyValue $dbSettings "live_sim_hybrid_ready_canary"
         shadow_small_entry_ops = $shadowSmallEntryStatus

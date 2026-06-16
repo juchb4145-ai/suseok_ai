@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -193,6 +194,36 @@ def test_factory_live_sim_requires_explicit_runtime_setting(tmp_path):
     sink = _build_order_sink(settings, _state(), None, runtime_settings=runtime_settings)
 
     assert isinstance(sink, LiveSimRuntimeOrderSink)
+
+
+def test_factory_live_sim_preflight_not_go_uses_dry_run_collection_sink(tmp_path):
+    settings = replace(
+        _settings(tmp_path),
+        runtime_live_sim_require_preflight_go_for_order_sink=True,
+    )
+    db = TradingDatabase(str(settings.db_path))
+    try:
+        db.save_live_sim_preflight_snapshot(
+            {
+                "snapshot_id": "preflight-insufficient",
+                "checked_at": "2026-05-30T09:00:00+09:00",
+                "status": "INSUFFICIENT_DATA",
+                "blocking_reasons": ["MIN_5_TRADE_DAYS"],
+                "warning_reasons": [],
+            }
+        )
+    finally:
+        db.close()
+    runtime_settings = StrategyRuntimeSettings.from_settings_json(
+        {"order_execution": _live_sim_execution(), "live_sim_exit_guard": _exit_guard()}
+    )
+    warnings: list[str] = []
+
+    sink = _build_order_sink(settings, _state(), warnings.append, runtime_settings=runtime_settings)
+
+    assert isinstance(sink, DryRunRuntimeOrderSink)
+    assert not isinstance(sink, LiveSimRuntimeOrderSink)
+    assert "LIVE_SIM_ORDER_SINK_PREFLIGHT_NOT_GO:INSUFFICIENT_DATA" in warnings
 
 
 def test_strategy_runtime_snapshot_includes_live_sim_order_sink_fields(tmp_path):
