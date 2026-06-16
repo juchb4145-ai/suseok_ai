@@ -73,6 +73,7 @@ from trading_app.intraday_outcomes import (
 )
 from trading_app.market_gate_review import MarketGateReviewAnalyzer
 from trading_app.live_sim_audit import LiveSimLifecycleAuditor
+from trading_app.live_sim_preflight import LiveSimPreflightService, compact_preflight_snapshot
 from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.promotion_evidence import DEFAULT_PROMOTION_POLICY_ID, PromotionEvidenceAdapter
@@ -654,6 +655,25 @@ def _buy_zero_rca_analyzer(db: TradingDatabase) -> BuyZeroRCAAnalyzer:
 
 def _live_sim_auditor(db: TradingDatabase) -> LiveSimLifecycleAuditor:
     return LiveSimLifecycleAuditor(db, gateway_state=gateway_state)
+
+
+def _live_sim_preflight_service(db: TradingDatabase) -> LiveSimPreflightService:
+    return LiveSimPreflightService(db, gateway_state, settings=get_settings())
+
+
+def _live_sim_preflight_theme_lab_snapshot(db: TradingDatabase) -> dict[str, Any]:
+    try:
+        return build_theme_lab_dashboard_snapshot(
+            db,
+            runtime_status=runtime_supervisor.status(),
+            gateway_state=gateway_state,
+            include_extended=False,
+        )
+    except Exception:
+        try:
+            return db.latest_theme_lab_flow_result()
+        except Exception:
+            return {}
 
 
 def _transport_config_from_settings() -> TransportLatencyConfig:
@@ -1755,6 +1775,56 @@ def runtime_live_sim_lifecycle_audit(
         )
         report["filters"] = {"trade_date": trade_date or "", "limit": limit}
         return report
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/live-sim/preflight")
+def runtime_live_sim_preflight(include_details: bool = True) -> dict[str, Any]:
+    db = open_database()
+    try:
+        transport_status = _transport_status_payload(db)
+        snapshot = _live_sim_preflight_service(db).build_snapshot(
+            runtime_status=runtime_supervisor.status(),
+            transport_status=transport_status,
+            theme_lab_snapshot=_live_sim_preflight_theme_lab_snapshot(db),
+            include_details=include_details,
+        )
+        return snapshot
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/live-sim/preflight/rebuild")
+def rebuild_runtime_live_sim_preflight(
+    include_details: bool = True,
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        transport_status = _transport_status_payload(db)
+        snapshot = _live_sim_preflight_service(db).build_snapshot(
+            runtime_status=runtime_supervisor.status(),
+            transport_status=transport_status,
+            theme_lab_snapshot=_live_sim_preflight_theme_lab_snapshot(db),
+            persist=True,
+            include_details=True,
+        )
+        return snapshot if include_details else compact_preflight_snapshot(snapshot)
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/live-sim/preflight/history")
+def runtime_live_sim_preflight_history(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_live_sim_preflight_snapshots(limit=limit + 1, offset=offset)
+        items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {"items": items, "pagination": pagination, "filters": {"limit": limit, "offset": offset}}
     finally:
         close_database(db)
 
@@ -7382,6 +7452,7 @@ def _dashboard_slim_reviews_payload(payload: dict[str, Any], *, item_limit: int 
 
 def _dashboard_slim_theme_lab_payload(payload: dict[str, Any]) -> dict[str, Any]:
     data_quality = dict((payload or {}).get("data_quality") or {})
+    backfill_runtime = dict((payload or {}).get("theme_backfill_runtime") or {})
     return {
         "available": bool((payload or {}).get("available")),
         "source": (payload or {}).get("source") or "",
@@ -7410,6 +7481,23 @@ def _dashboard_slim_theme_lab_payload(payload: dict[str, Any]) -> dict[str, Any]
             ),
         ),
         "runtime": _dashboard_field_subset(dict((payload or {}).get("runtime") or {}), ("enabled", "running", "mode")),
+        "theme_backfill_runtime": _dashboard_field_subset(
+            backfill_runtime,
+            (
+                "enabled",
+                "observe_only",
+                "paused_reason",
+                "queued_count",
+                "dispatched_count",
+                "parser_miss_ratio",
+                "tr_backfill_caused_ready_count",
+                "gateway_command_queue_depth",
+                "load_guard",
+                "load_guard_status",
+                "paused_backfill",
+                "pause_reason_codes",
+            ),
+        ),
         "gateway": _dashboard_field_subset(
             dict((payload or {}).get("gateway") or {}),
             ("connected", "heartbeat_ok", "kiwoom_logged_in", "orderable", "connection_state"),
@@ -7694,6 +7782,25 @@ def _dashboard_slim_runtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "generated_at",
                 "summary",
                 "exit_guard_ready",
+            ),
+        )
+    if "live_sim_preflight" in runtime:
+        data = dict(runtime.get("live_sim_preflight") or {})
+        runtime["live_sim_preflight"] = _dashboard_field_subset(
+            data,
+            (
+                "snapshot_id",
+                "status",
+                "blocking_reasons",
+                "warning_reasons",
+                "operator_message_ko",
+                "recommended_action_ko",
+                "checked_at",
+                "account_mode_summary",
+                "performance_summary",
+                "gateway_load_summary",
+                "backfill_summary",
+                "safety_summary",
             ),
         )
     if "conservative_reason_outcomes" in runtime:
@@ -8060,17 +8167,53 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "candidates": list(threshold_ab_report.get("candidates") or [])[:5],
         "disclaimer_ko": threshold_ab_report.get("disclaimer_ko", ""),
     }
+    theme_lab_preflight_payload = _cached_theme_lab_dashboard_snapshot(
+        db,
+        "theme_lab:v3:full" if full_detail else "theme_lab:v3:slim",
+        lambda: build_theme_lab_dashboard_snapshot(
+            db,
+            runtime_status=runtime_status,
+            gateway_state=gateway_state,
+            include_extended=full_detail,
+        ),
+        refresh_builder=lambda: _build_theme_lab_dashboard_snapshot_with_fresh_db(include_extended=full_detail),
+    )
+    theme_lab_payload = theme_lab_preflight_payload
+    try:
+        live_sim_preflight_payload = _live_sim_preflight_service(db).build_snapshot(
+            runtime_status=runtime_status,
+            performance_report=dry_run_performance_report,
+            transport_status=transport_payload,
+            theme_lab_snapshot=theme_lab_preflight_payload,
+            include_details=full_detail,
+        )
+    except Exception as exc:
+        live_sim_preflight_payload = {
+            "status": "FAIL_CLOSED",
+            "blocking_reasons": ["PREFLIGHT_EXCEPTION"],
+            "warning_reasons": [],
+            "operator_message_ko": f"LIVE_SIM 사전 점검 중 오류가 발생해 fail-closed 처리합니다: {exc}",
+            "recommended_action_ko": "자동주문을 시작하지 말고 로그와 설정을 점검한 뒤 preflight rebuild를 다시 실행하세요.",
+            "checked_at": utc_timestamp(),
+            "account_mode_summary": {},
+            "performance_summary": {},
+            "gateway_load_summary": {},
+            "backfill_summary": {},
+            "safety_summary": {},
+        }
     if not full_detail:
         buy_zero_rca_payload = _dashboard_slim_buy_zero_rca_payload(buy_zero_rca_payload)
         conservative_reason_payload = _dashboard_slim_conservative_reason_payload(conservative_reason_payload)
         shadow_small_entry_payload = _dashboard_slim_shadow_small_entry_promotion_payload(shadow_small_entry_payload)
         replay_payload = _dashboard_slim_strategy_replay_payload(replay_payload)
         threshold_ab_payload = _dashboard_slim_threshold_ab_payload(threshold_ab_payload)
+        theme_lab_payload = _dashboard_slim_theme_lab_payload(theme_lab_payload)
     runtime_payload["dry_run_orders"] = dry_run_orders_payload
     runtime_payload["intraday_decisions"] = decision_summary_payload
     runtime_payload["intraday_outcomes"] = outcome_summary_payload
     runtime_payload["buy_zero_rca"] = buy_zero_rca_payload
     runtime_payload["live_sim_audit"] = live_sim_audit_payload
+    runtime_payload["live_sim_preflight"] = live_sim_preflight_payload
     runtime_payload["conservative_reason_outcomes"] = conservative_reason_payload
     runtime_payload["shadow_small_entry_promotion"] = shadow_small_entry_payload
     runtime_payload["shadow_small_entry_ops"] = shadow_small_entry_ops_payload
@@ -8091,19 +8234,6 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         logs=logs_payload,
     )
     runtime_snapshot_payload = runtime_payload if full_detail else _dashboard_slim_runtime_payload(runtime_payload)
-    theme_lab_payload = _cached_theme_lab_dashboard_snapshot(
-        db,
-        "theme_lab:v3:full" if full_detail else "theme_lab:v3:slim",
-        lambda: build_theme_lab_dashboard_snapshot(
-            db,
-            runtime_status=runtime_status,
-            gateway_state=gateway_state,
-            include_extended=full_detail,
-        ),
-        refresh_builder=lambda: _build_theme_lab_dashboard_snapshot_with_fresh_db(include_extended=full_detail),
-    )
-    if not full_detail:
-        theme_lab_payload = _dashboard_slim_theme_lab_payload(theme_lab_payload)
     return {
         "snapshot_detail": resolved_detail,
         "timestamp": utc_timestamp(),
@@ -8118,6 +8248,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "intraday_outcomes": outcome_summary_payload,
         "buy_zero_rca": buy_zero_rca_payload,
         "live_sim_audit": live_sim_audit_payload,
+        "live_sim_preflight": live_sim_preflight_payload,
         "conservative_reason_outcomes": conservative_reason_payload,
         "shadow_small_entry_promotion": shadow_small_entry_payload,
         "shadow_small_entry_ops": shadow_small_entry_ops_payload,

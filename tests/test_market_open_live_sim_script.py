@@ -9,6 +9,7 @@ def test_market_open_live_sim_script_declares_runtime_safety_envs():
 
     assert "[int]$RuntimeDryRunPositionAmount = 30000000" in text
     assert "[switch]$RequireGatewayOrderable" in text
+    assert "[switch]$AllowLiveSimWithWarnings" in text
     assert "[int]$GatewayStartupRetryCount = 1" in text
     assert "$env:TRADING_MODE = \"OBSERVE\"" in text
     assert "$env:TRADING_RUNTIME_ENABLED = \"1\"" in text
@@ -35,6 +36,13 @@ def test_market_open_live_sim_script_declares_runtime_safety_envs():
     assert "$env:TRADING_THEME_BACKFILL_CACHE_LIMIT = [string]$ThemeBackfillCacheLimit" in text
     assert "[switch]$SkipPreOpenDataWarmup" in text
     assert "$PreOpenDataWarmupEnabled" in text
+    assert "Get-LiveSimPreflightStatus" in text
+    assert "/api/runtime/live-sim/preflight/rebuild?include_details=true" in text
+    assert "Assert-LiveSimPreflightAllowsStartup" in text
+    assert "GO_WITH_WARNINGS" in text
+    assert "FAIL_CLOSED" in text
+    assert "REAL/UNKNOWN/LIVE_REAL" in text
+    assert "live_sim_preflight" in text
 
 
 def test_market_open_live_sim_script_reports_new_operator_surfaces():

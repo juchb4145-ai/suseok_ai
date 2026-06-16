@@ -41,6 +41,7 @@ from trading_app.runtime_adapters import (
 )
 from trading_app.order_enqueue_service import OrderEnqueueService
 from trading_app.runtime_order_sink import DryRunRuntimeOrderSink, LiveSimRuntimeOrderSink, NoopRuntimeOrderSink
+from trading_app.runtime_load_guard import runtime_load_guard_from_theme_result
 
 
 @dataclass
@@ -117,6 +118,11 @@ def build_core_strategy_runtime(
         theme_backfill_service = ThemeBackfillService(
             gateway_state,
             config=ThemeBackfillConfig.from_env(trading_mode=settings.mode),
+            load_guard_provider=lambda gateway, result, summary: runtime_load_guard_from_theme_result(
+                gateway,
+                result,
+                backfill_summary=summary,
+            ),
         )
         theme_lab_pipeline = ThemeLabRuntimePipeline(
             db=db,

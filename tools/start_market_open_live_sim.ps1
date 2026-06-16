@@ -38,6 +38,7 @@ param(
     [int]$PreOpenWarmupMaxPending = 10,
     [int]$PreOpenWarmupMaxThemes = 8,
     [int]$PreOpenWarmupMaxHitsPerTheme = 90,
+    [switch]$AllowLiveSimWithWarnings,
     [switch]$NoStopExisting,
     [switch]$DryRun
 )
@@ -432,6 +433,89 @@ if (
     return $output | ConvertFrom-Json
 }
 
+function Get-ReasonCodeText([object]$Value) {
+    $items = @($Value)
+    if ($items.Count -eq 0) {
+        return ""
+    }
+    return (($items | ForEach-Object { [string]$_ } | Where-Object { $_ }) -join ",")
+}
+
+function Get-LiveSimPreflightStatus {
+    return Invoke-CoreApi -Method POST -Path "/api/runtime/live-sim/preflight/rebuild?include_details=true" -TimeoutSec 90
+}
+
+function Convert-LiveSimPreflightSummary([object]$Preflight) {
+    $account = Get-ObjectPropertyValue $Preflight "account_mode_summary"
+    $modes = Get-ObjectPropertyValue $account "normalized_modes"
+    $performance = Get-ObjectPropertyValue $Preflight "performance_summary"
+    $gatewayLoad = Get-ObjectPropertyValue $Preflight "gateway_load_summary"
+    $backfill = Get-ObjectPropertyValue $Preflight "backfill_summary"
+    $loadGuard = Get-ObjectPropertyValue $backfill "load_guard"
+    $safety = Get-ObjectPropertyValue $Preflight "safety_summary"
+    [pscustomobject]@{
+        status = [string](Get-ObjectPropertyValue $Preflight "status")
+        checked_at = [string](Get-ObjectPropertyValue $Preflight "checked_at")
+        account_masked = [string](Get-ObjectPropertyValue $account "account_masked")
+        simulation_confirmed = [bool](Get-ObjectPropertyValue $account "simulation_confirmed")
+        real_detected = [bool](Get-ObjectPropertyValue $account "real_detected")
+        broker_env = [string](Get-ObjectPropertyValue $modes "broker_env")
+        account_mode = [string](Get-ObjectPropertyValue $modes "account_mode")
+        live_real_enabled = [bool](Get-ObjectPropertyValue $safety "live_real_enabled")
+        kill_switch_active = [bool](Get-ObjectPropertyValue $safety "kill_switch_active")
+        net_expectancy = Get-ObjectPropertyValue $performance "net_expectancy"
+        accepted_completed_lifecycle_count = [int](Get-ObjectPropertyValue $performance "accepted_completed_lifecycle_count")
+        bad_ready_rate = Get-ObjectPropertyValue $performance "bad_ready_rate"
+        gateway_queue_depth = [int](Get-ObjectPropertyValue $gatewayLoad "gateway_queue_depth")
+        order_command_pending_count = [int](Get-ObjectPropertyValue $gatewayLoad "order_command_pending_count")
+        backfill_pending_count = [int](Get-ObjectPropertyValue $gatewayLoad "backfill_pending_count")
+        load_guard_status = [string](Get-ObjectPropertyValue $loadGuard "load_guard_status")
+        tr_backfill_caused_ready_count = [int](Get-ObjectPropertyValue $backfill "tr_backfill_caused_ready_count")
+        blocking_reasons = Get-ReasonCodeText (Get-ObjectPropertyValue $Preflight "blocking_reasons")
+        warning_reasons = Get-ReasonCodeText (Get-ObjectPropertyValue $Preflight "warning_reasons")
+        operator_message_ko = [string](Get-ObjectPropertyValue $Preflight "operator_message_ko")
+        recommended_action_ko = [string](Get-ObjectPropertyValue $Preflight "recommended_action_ko")
+    }
+}
+
+function Write-LiveSimPreflightSummary([object]$Preflight) {
+    $summary = Convert-LiveSimPreflightSummary $Preflight
+    Write-Step ("LIVE_SIM preflight status={0} account={1} sim={2} broker_env={3} account_mode={4} live_real={5} kill_switch={6}" -f `
+        $summary.status, $summary.account_masked, $summary.simulation_confirmed, $summary.broker_env, $summary.account_mode, $summary.live_real_enabled, $summary.kill_switch_active)
+    Write-Step ("LIVE_SIM preflight performance net={0} accepted={1} bad_ready={2} queue={3} order_pending={4} backfill_pending={5} load_guard={6}" -f `
+        $summary.net_expectancy, $summary.accepted_completed_lifecycle_count, $summary.bad_ready_rate, $summary.gateway_queue_depth, $summary.order_command_pending_count, $summary.backfill_pending_count, $summary.load_guard_status)
+    if ($summary.blocking_reasons) {
+        Write-Step "LIVE_SIM preflight blocking=$($summary.blocking_reasons)"
+    }
+    if ($summary.warning_reasons) {
+        Write-Step "LIVE_SIM preflight warnings=$($summary.warning_reasons)"
+    }
+    Write-Step "LIVE_SIM preflight message=$($summary.operator_message_ko)"
+    Write-Step "LIVE_SIM preflight action=$($summary.recommended_action_ko)"
+    return $summary
+}
+
+function Assert-LiveSimPreflightAllowsStartup([object]$Preflight) {
+    $status = ([string](Get-ObjectPropertyValue $Preflight "status")).Trim().ToUpperInvariant()
+    $blockingText = Get-ReasonCodeText (Get-ObjectPropertyValue $Preflight "blocking_reasons")
+    $warningText = Get-ReasonCodeText (Get-ObjectPropertyValue $Preflight "warning_reasons")
+    $reasonText = "$blockingText,$warningText"
+    if ($status -eq "FAIL_CLOSED" -or $reasonText -match "REAL|UNKNOWN_FAIL_CLOSED|LIVE_REAL|ALLOWED_ACCOUNT_MISMATCH") {
+        throw "LIVE_SIM preflight fail-closed: REAL/UNKNOWN/LIVE_REAL/account mismatch 위험은 -AllowLiveSimWithWarnings로 우회할 수 없습니다. reasons=$reasonText"
+    }
+    if ($status -eq "GO") {
+        return
+    }
+    if ($status -eq "GO_WITH_WARNINGS") {
+        if ($AllowLiveSimWithWarnings) {
+            Write-Step "LIVE_SIM preflight GO_WITH_WARNINGS accepted by explicit -AllowLiveSimWithWarnings"
+            return
+        }
+        throw "LIVE_SIM preflight returned GO_WITH_WARNINGS. 경고 상태로 진행하려면 -AllowLiveSimWithWarnings를 명시해야 합니다. warnings=$warningText"
+    }
+    throw "LIVE_SIM preflight blocked runtime startup. status=$status reasons=$reasonText"
+}
+
 function Get-ThemeLabStartupSummary {
     try {
         $snapshot = Invoke-CoreApi -Method GET -Path "/api/themelab/snapshot" -TimeoutSec 20
@@ -689,6 +773,7 @@ try {
     Write-Step "Gateway readiness require_orderable=$([bool]$RequireGatewayOrderable)"
     Write-Step "Gateway startup retries=$GatewayStartupRetryCount"
     Write-Step "Gateway core URL=$env:TRADING_KIWOOM_GATEWAY_CORE_URL"
+    Write-Step "LIVE_SIM preflight allow_warnings=$([bool]$AllowLiveSimWithWarnings)"
     if ($env:TRADING_GATEWAY_WS_URL) {
         Write-Step "Gateway WebSocket URL=$env:TRADING_GATEWAY_WS_URL"
     }
@@ -727,6 +812,11 @@ try {
             gateway_ws_url = $env:TRADING_GATEWAY_WS_URL
             gateway_require_orderable = [bool]$RequireGatewayOrderable
             gateway_startup_retry_count = $GatewayStartupRetryCount
+            live_sim_preflight = @{
+                enabled = $true
+                dry_run_note = "Core/Gateway startup was not executed, so API preflight rebuild was not called."
+                allow_warnings = [bool]$AllowLiveSimWithWarnings
+            }
             websocket_pilot_order_allow = $env:TRADING_GATEWAY_WEBSOCKET_PILOT_ALLOW_ORDER_COMMANDS
             websocket_pilot_order_block = $env:TRADING_GATEWAY_WEBSOCKET_PILOT_BLOCK_ORDER_COMMANDS
             shadow_strategy_observe_only = $env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY
@@ -852,6 +942,16 @@ try {
         Write-Step "Gateway ready connected=$($gatewayStatus.connected) heartbeat_ok=$($gatewayStatus.heartbeat_ok) orderable=$($gatewayStatus.orderable) broker_env=$($gatewayModes.broker_env) account_mode=$($gatewayModes.account_mode)"
     }
 
+    $liveSimPreflightSummary = $null
+    if (-not $SkipRuntime) {
+        $liveSimPreflight = Get-LiveSimPreflightStatus
+        $liveSimPreflightSummary = Write-LiveSimPreflightSummary $liveSimPreflight
+        Assert-LiveSimPreflightAllowsStartup $liveSimPreflight
+        Write-Step "LIVE_SIM preflight passed; runtime startup may proceed"
+    } else {
+        Write-Step "LIVE_SIM preflight skipped because runtime startup is skipped"
+    }
+
     $runtimeStatus = $null
     if (-not $SkipRuntime) {
         $beforeRuntime = Invoke-CoreApi -Method GET -Path "/api/runtime/status" -TimeoutSec 10
@@ -950,6 +1050,7 @@ try {
         } else { $null }
         themelab = $themeLabStatus
         pre_open_data_warmup = $preOpenDataWarmupStatus
+        live_sim_preflight = $liveSimPreflightSummary
         shadow_small_entry_ops = $shadowSmallEntryStatus
         db_order_execution = $dbSettings
     } | ConvertTo-Json -Depth 8

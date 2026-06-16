@@ -56,6 +56,30 @@
           <div id="ops-alert-lines" class="alert-list"></div>
         </section>
 
+        <section id="live-sim-preflight-card" class="band">
+          <div class="section-head">
+            <div>
+              <h2>LIVE_SIM 실행 전 점검</h2>
+              <p id="live-sim-preflight-message" class="help-text">사전 점검 결과를 기다리는 중입니다.</p>
+            </div>
+            <span id="live-sim-preflight-status" class="counter muted">NO_DATA</span>
+          </div>
+          <div class="mini-grid command-grid">
+            <div><span>계좌 모드</span><strong id="live-sim-preflight-account">UNKNOWN</strong></div>
+            <div><span>Gateway</span><strong id="live-sim-preflight-gateway">-</strong></div>
+            <div><span>LIVE_REAL</span><strong id="live-sim-preflight-live-real">OFF</strong></div>
+            <div><span>Kill Switch</span><strong id="live-sim-preflight-kill-switch">OFF</strong></div>
+            <div><span>Net Expectancy</span><strong id="live-sim-preflight-net">-</strong></div>
+            <div><span>Accepted</span><strong id="live-sim-preflight-accepted">0</strong></div>
+            <div><span>Bad READY</span><strong id="live-sim-preflight-bad-ready">-</strong></div>
+            <div><span>Stale / Latency</span><strong id="live-sim-preflight-stale">-</strong></div>
+            <div><span>Queue</span><strong id="live-sim-preflight-queue">0</strong></div>
+            <div><span>Backfill Guard</span><strong id="live-sim-preflight-backfill">-</strong></div>
+          </div>
+          <div id="live-sim-preflight-blocking" class="inline-log"></div>
+          <div id="live-sim-preflight-action" class="inline-log"></div>
+        </section>
+
         <section class="band">
           <div class="section-head">
             <div>

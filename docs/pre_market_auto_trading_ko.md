@@ -168,6 +168,30 @@ py -3.9-32 apps\kiwoom_gateway.py --mock --once --core-url http://127.0.0.1:8000
 - 주문 한도는 작게 시작한다.
 - 실계좌 번호 전체를 문서나 Git에 남기지 않는다.
 
+LIVE_SIM 전용 Go/No-Go 점검은 Core가 켜진 뒤 다음 API로 확인합니다.
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8000/api/runtime/live-sim/preflight?include_details=true"
+```
+
+운영 이력에 snapshot을 남기려면 local token으로 rebuild를 실행합니다. 이 API는 읽기/저장 전용이며 주문을 만들거나 설정을 바꾸지 않습니다.
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Headers @{ "X-Local-Token" = $env:TRADING_CORE_TOKEN } `
+  "http://127.0.0.1:8000/api/runtime/live-sim/preflight/rebuild?include_details=true"
+```
+
+판정 기준:
+
+- `GO`: 시작 가능
+- `GO_WITH_WARNINGS`: `tools/start_market_open_live_sim.ps1 -AllowLiveSimWithWarnings`를 명시했을 때만 진행
+- `INSUFFICIENT_DATA`, `NO_GO`: 진행하지 않음
+- `FAIL_CLOSED`: 어떤 플래그로도 우회하지 않음
+
+대시보드 Overview의 `LIVE_SIM 실행 전 점검` 카드는 같은 preflight 결과를 보여줍니다. 이 카드는 상태 표시 전용이며 주문 실행 버튼이나 LIVE_SIM 활성화 버튼을 제공하지 않습니다.
+
 ### 1. LIVE_SIM 설정 저장
 
 Core를 켜기 전에 실행합니다. 이미 Core가 실행 중이면 설정 저장 후 Core를 재시작합니다.
@@ -192,7 +216,25 @@ cd C:\Users\juchn\주식2
 .\venv_64\Scripts\python.exe tools\configure_runtime_order_mode.py --mode LIVE_SIM --kill-switch-active
 ```
 
-### 2. Core/API 실행
+### 2. 권장 통합 실행 스크립트
+
+설정 저장 후에는 통합 스크립트를 우선 사용합니다. 이 스크립트는 Core/Gateway를 준비하고, Runtime 시작 전에 LIVE_SIM preflight rebuild를 실행합니다.
+
+```powershell
+.\tools\start_market_open_live_sim.ps1
+```
+
+`GO_WITH_WARNINGS` 상태에서만 운영자가 명시적으로 계속 진행하려면 다음처럼 실행합니다.
+
+```powershell
+.\tools\start_market_open_live_sim.ps1 -AllowLiveSimWithWarnings
+```
+
+`FAIL_CLOSED`, REAL/UNKNOWN 계좌, `LIVE_REAL`, 허용 계좌 불일치, TR backfill READY 근거는 이 플래그로도 우회되지 않습니다.
+
+아래 Core/Gateway 수동 실행 절차는 장애 대응이나 분리 점검용입니다.
+
+### 3. Core/API 실행
 
 LIVE_SIM도 Core의 실주문 스위치는 닫아 둡니다. 여기서 `TRADING_MODE=LIVE`를 쓰지 않습니다.
 
@@ -214,7 +256,7 @@ $env:TRADING_RUNTIME_DRY_RUN_POSITION_AMOUNT = "300000"
 - DB 설정의 `order_execution.mode=LIVE_SIM`이 들어가면 DRY_RUN 기록 대신 모의투자 주문 싱크가 선택되고, 조건을 통과한 주문은 Gateway `send_order`로 큐잉됩니다.
 - `LIVE_REAL`은 별도로 막혀 있습니다.
 
-### 3. Gateway 실행 및 모의투자 로그인
+### 4. Gateway 실행 및 모의투자 로그인
 
 PowerShell 창 2에서 실행합니다.
 
@@ -225,7 +267,7 @@ py -3.9-32 apps\kiwoom_gateway.py --core-url http://127.0.0.1:8000 --token local
 
 키움 로그인 창에서 모의투자 서버/모의투자 계좌로 로그인합니다. 실계좌 또는 알 수 없는 계좌 환경이면 `LIVE_SIM` 주문은 fail-closed로 막혀야 합니다.
 
-### 4. LIVE_SIM 점검
+### 5. LIVE_SIM 점검
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/api/gateway/status

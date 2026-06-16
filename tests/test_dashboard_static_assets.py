@@ -51,6 +51,21 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
         "live-sim-audit-broker-missing",
         "live-sim-audit-top-actions",
         "live-sim-audit-issues",
+        "live-sim-preflight-card",
+        "live-sim-preflight-status",
+        "live-sim-preflight-message",
+        "live-sim-preflight-account",
+        "live-sim-preflight-gateway",
+        "live-sim-preflight-live-real",
+        "live-sim-preflight-kill-switch",
+        "live-sim-preflight-net",
+        "live-sim-preflight-accepted",
+        "live-sim-preflight-bad-ready",
+        "live-sim-preflight-stale",
+        "live-sim-preflight-queue",
+        "live-sim-preflight-backfill",
+        "live-sim-preflight-blocking",
+        "live-sim-preflight-action",
         "buy-zero-rca-card",
         "buy-zero-rca-empty",
         "buy-zero-rca-market-session",
@@ -167,6 +182,9 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "shadowRiskCandidates" in js
     assert "function renderBuyZeroRca" in js
     assert "function renderLiveSimAudit" in js
+    assert "function renderLiveSimPreflight" in js
+    assert "live_sim_preflight" in js
+    assert "LIVE_SIM 사전 점검" in js
     assert "function renderConservativeReasonOutcomes" in js
     assert "function renderConservativeStockLines" in js
     assert "function renderShadowSmallEntryPromotion" in js

@@ -1074,6 +1074,72 @@ function renderThemeLabSummary(themeLab) {
   text("themelab-order-candidates", summary.order_candidate_count || 0);
 }
 
+function renderLiveSimPreflight(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.live_sim_preflight || runtime.live_sim_preflight || {};
+  const status = payload.status || "NO_DATA";
+  const tone = status === "GO" ? "ok" : status === "GO_WITH_WARNINGS" ? "warn" : /FAIL_CLOSED|NO_GO/.test(status) ? "bad" : "muted";
+  const account = payload.account_mode_summary || {};
+  const modes = account.normalized_modes || {};
+  const performance = payload.performance_summary || {};
+  const gatewayLoad = payload.gateway_load_summary || {};
+  const backfill = payload.backfill_summary || {};
+  const safety = payload.safety_summary || {};
+  const loadGuard = backfill.load_guard || {};
+  const blocking = payload.blocking_reasons || [];
+  const warnings = payload.warning_reasons || [];
+
+  text("live-sim-preflight-status", status);
+  cls("live-sim-preflight-status", `counter ${tone}`);
+  text("live-sim-preflight-message", payload.operator_message_ko || "LIVE_SIM 사전 점검 결과가 아직 없습니다.");
+  text(
+    "live-sim-preflight-account",
+    [
+      account.simulation_confirmed ? "SIMULATION" : account.real_detected ? "REAL" : "UNKNOWN",
+      account.account_masked || "",
+      modes.broker_env ? `broker=${modes.broker_env}` : "",
+    ].filter(Boolean).join(" / ")
+  );
+  text(
+    "live-sim-preflight-gateway",
+    [
+      gatewayLoad.heartbeat_ok ? "heartbeat OK" : "heartbeat 확인 필요",
+      `queue ${gatewayLoad.gateway_queue_depth || 0}`,
+      `order ${gatewayLoad.order_command_pending_count || 0}`,
+    ].join(" / ")
+  );
+  text("live-sim-preflight-live-real", safety.live_real_enabled ? "ON" : "OFF");
+  text("live-sim-preflight-kill-switch", safety.kill_switch_active ? "ON" : "OFF");
+  text("live-sim-preflight-net", formatPercentValue(performance.net_expectancy));
+  text("live-sim-preflight-accepted", performance.accepted_completed_lifecycle_count || performance.dry_run_accepted_count || 0);
+  text("live-sim-preflight-bad-ready", formatRate(performance.bad_ready_rate));
+  text(
+    "live-sim-preflight-stale",
+    `${formatRate(performance.stale_tick_rate)} / ${formatRate(performance.latency_distortion_rate)}`
+  );
+  text(
+    "live-sim-preflight-queue",
+    `${gatewayLoad.gateway_queue_depth || 0} total / ${gatewayLoad.backfill_pending_count || 0} backfill`
+  );
+  text(
+    "live-sim-preflight-backfill",
+    [
+      loadGuard.load_guard_status || backfill.load_guard_status || "-",
+      backfill.tr_backfill_caused_ready_count ? `READY evidence ${backfill.tr_backfill_caused_ready_count}` : "",
+    ].filter(Boolean).join(" / ")
+  );
+  renderInlineCounts(
+    "live-sim-preflight-blocking",
+    [
+      ...blocking.map((reason) => ({ reason, count: "BLOCK" })),
+      ...warnings.map((reason) => ({ reason, count: "WARN" })),
+    ],
+    "reason",
+    "차단 또는 경고 사유가 없습니다"
+  );
+  text("live-sim-preflight-action", payload.recommended_action_ko || "-");
+}
+
 function renderLiveSimAudit(snapshot) {
   const runtime = snapshot.runtime || {};
   const payload = snapshot.live_sim_audit || runtime.live_sim_audit || {};
@@ -1750,6 +1816,7 @@ function render(snapshot) {
   cls("gateway-state", `pill ${gateway.heartbeat_ok ? "ok" : gateway.connected ? "warn" : "bad"}`);
   cls("orderable-state", `pill ${gateway.orderable ? "ok" : "muted"}`);
   renderOpsAlerts(opsAlerts);
+  renderLiveSimPreflight(snapshot);
   renderThemeLabSummary(themeLab);
   renderLiveSimAudit(snapshot);
   renderBuyZeroRca(snapshot);

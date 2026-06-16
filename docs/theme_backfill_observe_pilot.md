@@ -76,9 +76,39 @@ Check `/api/themelab/snapshot` and the dashboard for:
 - `theme_backfill_runtime.tr_backfill_caused_ready_count`
 - `theme_backfill_runtime.backfill_cache_applied_count`
 - `theme_backfill_runtime.backfill_cache_stale_count`
+- `theme_backfill_runtime.load_guard_status`
+- `theme_backfill_runtime.paused_backfill`
+- `theme_backfill_runtime.pause_reason_codes`
+- `theme_backfill_runtime.load_guard.gateway_queue_depth`
+- `theme_backfill_runtime.load_guard.order_command_pending_count`
+- `theme_backfill_runtime.load_guard.backfill_pending_count`
 - gateway queue depth and command latency
 
 Current dashboard aggregation is based on the recent 500 gateway commands. It is not a durable long-term event store.
+
+## Runtime Load Guard
+
+Runtime Load Guard is evaluated before new ThemeLab backfill commands are enqueued. It protects order flow and Kiwoom TR capacity by pausing non-order backfill traffic when the runtime is already under pressure.
+
+Guard statuses:
+
+- `OK`: backfill may enqueue.
+- `DEGRADED`: backfill is not hard-paused, but operator review is needed.
+- `PAUSED`: new backfill dispatch is stopped.
+- `FAIL_CLOSED`: hard safety violation; new backfill dispatch is stopped.
+
+Primary pause reasons:
+
+- `READY_OR_READY_SMALL_PRESENT`
+- `ORDER_COMMAND_PENDING`
+- `GATEWAY_HEARTBEAT_STALE`
+- `COMMAND_LATENCY_HIGH`
+- `RATE_LIMITED_RECENT`
+- `TR_FAILURE_RECENT`
+- `PARSER_MISS_RATIO_HIGH`
+- `TR_BACKFILL_CAUSED_READY`
+
+`TR_BACKFILL_CAUSED_READY` must be treated as a safety incident. Backfill data is display/coverage data only and must never be accepted as READY/READY_SMALL evidence.
 
 ## Stop Criteria
 

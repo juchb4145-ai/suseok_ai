@@ -1430,6 +1430,17 @@ class TradingDatabase:
                 generated_at TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS live_sim_preflight_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                checked_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                blocking_reasons_json TEXT NOT NULL DEFAULT '[]',
+                warning_reasons_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS dry_run_performance_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 report_id TEXT NOT NULL,
@@ -1755,6 +1766,10 @@ class TradingDatabase:
                 ON live_sim_reconcile_events(status, started_at);
             CREATE INDEX IF NOT EXISTS idx_dry_run_performance_reports_trade_date
                 ON dry_run_performance_reports(trade_date, generated_at);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_preflight_snapshots_checked
+                ON live_sim_preflight_snapshots(checked_at);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_preflight_snapshots_status
+                ON live_sim_preflight_snapshots(status, checked_at);
             CREATE INDEX IF NOT EXISTS idx_dry_run_performance_items_report_id
                 ON dry_run_performance_items(report_id);
             CREATE INDEX IF NOT EXISTS idx_dry_run_performance_items_code
@@ -5218,6 +5233,70 @@ class TradingDatabase:
             (report_id, max(1, int(limit or 1000)), max(0, int(offset or 0))),
         ).fetchall()
         return [_row_to_dry_run_performance_item(row) for row in rows]
+
+    def save_live_sim_preflight_snapshot(self, snapshot: dict) -> dict:
+        snapshot_id = str(snapshot.get("snapshot_id") or "")
+        if not snapshot_id:
+            raise ValueError("snapshot_id is required")
+        checked_at = str(snapshot.get("checked_at") or datetime.now().isoformat(timespec="seconds"))
+        trade_date = str(snapshot.get("trade_date") or checked_at[:10])
+        blocking = list(snapshot.get("blocking_reasons") or [])
+        warnings = list(snapshot.get("warning_reasons") or [])
+        payload_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, default=str)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO live_sim_preflight_snapshots(
+                    snapshot_id, trade_date, checked_at, status,
+                    blocking_reasons_json, warning_reasons_json, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(snapshot_id) DO UPDATE SET
+                    trade_date=excluded.trade_date,
+                    checked_at=excluded.checked_at,
+                    status=excluded.status,
+                    blocking_reasons_json=excluded.blocking_reasons_json,
+                    warning_reasons_json=excluded.warning_reasons_json,
+                    payload_json=excluded.payload_json
+                """,
+                (
+                    snapshot_id,
+                    trade_date,
+                    checked_at,
+                    str(snapshot.get("status") or ""),
+                    json.dumps(blocking, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(warnings, ensure_ascii=False, sort_keys=True, default=str),
+                    payload_json,
+                ),
+            )
+        return self.get_live_sim_preflight_snapshot(snapshot_id) or dict(snapshot)
+
+    def list_live_sim_preflight_snapshots(self, *, limit: int = 50, offset: int = 0) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM live_sim_preflight_snapshots
+            ORDER BY checked_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (max(1, int(limit or 50)), max(0, int(offset or 0))),
+        ).fetchall()
+        return [_row_to_live_sim_preflight_snapshot(row) for row in rows]
+
+    def get_live_sim_preflight_snapshot(self, snapshot_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM live_sim_preflight_snapshots WHERE snapshot_id = ?",
+            (str(snapshot_id or ""),),
+        ).fetchone()
+        return _row_to_live_sim_preflight_snapshot(row) if row else None
+
+    def latest_live_sim_preflight_snapshot(self) -> Optional[dict]:
+        row = self.conn.execute(
+            """
+            SELECT * FROM live_sim_preflight_snapshots
+            ORDER BY checked_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return _row_to_live_sim_preflight_snapshot(row) if row else None
 
     def save_dry_run_threshold_ab_report(self, report: dict) -> dict:
         report_id = str(report.get("report_id") or "")
@@ -10713,6 +10792,21 @@ def _row_to_dry_run_performance_report(
         payload["grouped"] = _safe_json_loads(row["grouped_json"], {})
     if include_items:
         payload["items"] = []
+    return payload
+
+
+def _row_to_live_sim_preflight_snapshot(row: sqlite3.Row) -> dict:
+    payload = _safe_json_loads(row["payload_json"], {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("id", int(row["id"]))
+    payload.setdefault("snapshot_id", row["snapshot_id"])
+    payload.setdefault("trade_date", row["trade_date"])
+    payload.setdefault("checked_at", row["checked_at"])
+    payload.setdefault("status", row["status"])
+    payload.setdefault("blocking_reasons", _safe_json_loads(row["blocking_reasons_json"], []))
+    payload.setdefault("warning_reasons", _safe_json_loads(row["warning_reasons_json"], []))
+    payload.setdefault("created_at", row["created_at"])
     return payload
 
 

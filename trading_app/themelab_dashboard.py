@@ -16,6 +16,7 @@ from trading_app.conservative_reason_outcomes import (
     snapshot_payload as conservative_reason_snapshot_payload,
 )
 from trading_app.live_sim_audit import LiveSimLifecycleAuditor
+from trading_app.runtime_load_guard import build_runtime_load_guard_snapshot
 from trading_app.shadow_small_entry_promotion import (
     ShadowSmallEntryPromotionAnalyzer,
     empty_payload as shadow_small_entry_empty_payload,
@@ -3036,6 +3037,19 @@ def _theme_backfill_runtime(raw: dict[str, Any], gateway_state: Any | None) -> d
     base.setdefault("tr_backfill_caused_ready_count", 0)
     base.setdefault("gateway_unhealthy_detail", "")
     base.setdefault("gateway_unhealthy_display", "")
+    base.setdefault(
+        "load_guard",
+        {
+            "load_guard_status": "FAIL_CLOSED",
+            "paused_backfill": True,
+            "pause_reason_codes": ["GATEWAY_STATE_UNAVAILABLE"],
+            "operator_message_ko": "Gateway 상태를 확인할 수 없어 backfill을 중단합니다.",
+            "affected_services": ["theme_backfill", "non_order_tr"],
+        },
+    )
+    base.setdefault("load_guard_status", dict(base.get("load_guard") or {}).get("load_guard_status", "FAIL_CLOSED"))
+    base.setdefault("paused_backfill", bool(dict(base.get("load_guard") or {}).get("paused_backfill", True)))
+    base.setdefault("pause_reason_codes", list(dict(base.get("load_guard") or {}).get("pause_reason_codes") or []))
     if gateway_state is None:
         _annotate_backfill_gateway_detail(base, None)
         return base
@@ -3103,6 +3117,24 @@ def _theme_backfill_runtime(raw: dict[str, Any], gateway_state: Any | None) -> d
             if parser_status != "OK":
                 base["parser_miss_count"] = int(base.get("parser_miss_count") or 0) + 1
     base["parser_miss_ratio"] = None if parsed_records <= 0 else round(int(base.get("parser_miss_count") or 0) / parsed_records, 4)
+    try:
+        load_guard = build_runtime_load_guard_snapshot(
+            gateway_state,
+            raw_theme_lab=raw,
+            backfill_summary=base,
+        )
+    except Exception as exc:
+        load_guard = {
+            "load_guard_status": "FAIL_CLOSED",
+            "paused_backfill": True,
+            "pause_reason_codes": ["LOAD_GUARD_EXCEPTION"],
+            "operator_message_ko": f"Runtime Load Guard 확인 중 오류가 발생했습니다: {exc}",
+            "affected_services": ["theme_backfill", "non_order_tr"],
+        }
+    base["load_guard"] = load_guard
+    base["load_guard_status"] = str(load_guard.get("load_guard_status") or "")
+    base["paused_backfill"] = bool(load_guard.get("paused_backfill"))
+    base["pause_reason_codes"] = list(load_guard.get("pause_reason_codes") or [])
     return base
 
 

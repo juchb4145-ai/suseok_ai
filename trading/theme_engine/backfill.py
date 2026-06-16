@@ -3,7 +3,7 @@
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from trading.broker.command_queue import CommandPriority, CommandStatus, ORDER_COMMAND_TYPES
 from trading.broker.gateway_state import GatewayStateStore
@@ -84,9 +84,11 @@ class ThemeBackfillService:
         gateway_state: GatewayStateStore,
         *,
         config: ThemeBackfillConfig | None = None,
+        load_guard_provider: Callable[[GatewayStateStore, Any, dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.gateway_state = gateway_state
         self.config = config or ThemeBackfillConfig.from_env()
+        self.load_guard_provider = load_guard_provider
         self.last_summary = _empty_summary(self.config)
         self.last_cache_summary = _empty_cache_summary(self.config)
 
@@ -155,6 +157,17 @@ class ThemeBackfillService:
             summary["backfill_paused_by_regular_session_count"] += 1
             self.last_summary = summary
             return summary
+        load_guard = self._runtime_load_guard(result, summary)
+        if load_guard:
+            summary["load_guard"] = load_guard
+            summary["load_guard_status"] = str(load_guard.get("load_guard_status") or "")
+            summary["paused_backfill"] = bool(load_guard.get("paused_backfill"))
+            summary["pause_reason_codes"] = list(load_guard.get("pause_reason_codes") or [])
+            if bool(load_guard.get("paused_backfill")):
+                summary["paused_reason"] = summary["pause_reason_codes"][0] if summary["pause_reason_codes"] else "LOAD_GUARD_PAUSED"
+                _increment_pause(summary, summary["paused_reason"])
+                self.last_summary = summary
+                return summary
         pause_reason = enqueue_pause_reason(self.gateway_state, result)
         if pause_reason:
             summary["paused_reason"] = pause_reason
@@ -194,6 +207,20 @@ class ThemeBackfillService:
         summary["queued_count"] += enqueued
         self.last_summary = summary
         return summary
+
+    def _runtime_load_guard(self, result: Any, summary: dict[str, Any]) -> dict[str, Any]:
+        if self.load_guard_provider is None:
+            return {}
+        try:
+            return dict(self.load_guard_provider(self.gateway_state, result, summary) or {})
+        except Exception as exc:
+            return {
+                "load_guard_status": "FAIL_CLOSED",
+                "paused_backfill": True,
+                "pause_reason_codes": ["LOAD_GUARD_EXCEPTION"],
+                "operator_message_ko": f"Runtime Load Guard 확인 중 오류가 발생해 backfill을 중단합니다: {exc}",
+                "affected_services": ["theme_backfill", "non_order_tr"],
+            }
 
 
 def build_backfill_candidates(result: Any, *, cfg: ThemeBackfillConfig, now: datetime) -> list[BackfillCandidate]:
