@@ -27,11 +27,14 @@ def test_market_open_live_sim_script_declares_runtime_safety_envs():
     assert "$env:TRADING_THEME_BACKFILL_TTL_SEC = [string]$ThemeBackfillTtlSec" in text
     assert "$env:TRADING_THEME_BACKFILL_OPT10001_BUCKET_SEC = [string]$ThemeBackfillOpt10001BucketSec" in text
     assert "$env:TRADING_THEME_BACKFILL_ALLOW_OPT10081 = \"0\"" in text
+    assert "$env:TRADING_THEME_BACKFILL_ALLOW_REGULAR_SESSION = if ($PreOpenDataWarmupEnabled) { \"0\" } else { \"1\" }" in text
     assert "$env:TRADING_THEME_BACKFILL_MAX_THEMES = [string]$ThemeBackfillMaxThemes" in text
     assert "$env:TRADING_THEME_BACKFILL_MAX_HITS_PER_THEME = [string]$ThemeBackfillMaxHitsPerTheme" in text
     assert "$env:TRADING_THEME_BACKFILL_CACHE_ENABLED = \"1\"" in text
     assert "$env:TRADING_THEME_BACKFILL_CACHE_TTL_SEC = [string]$ThemeBackfillCacheTtlSec" in text
     assert "$env:TRADING_THEME_BACKFILL_CACHE_LIMIT = [string]$ThemeBackfillCacheLimit" in text
+    assert "[switch]$SkipPreOpenDataWarmup" in text
+    assert "$PreOpenDataWarmupEnabled" in text
 
 
 def test_market_open_live_sim_script_reports_new_operator_surfaces():
@@ -67,3 +70,13 @@ def test_market_open_live_sim_script_configures_websocket_pilot_url():
     assert "$GatewayWsUrl = \"ws://${gatewayHost}:$Port/ws/gateway/transport\"" in text
     assert "$env:TRADING_GATEWAY_WS_URL = $GatewayWsUrl" in text
     assert "gateway_ws_url" in text
+
+
+def test_market_open_live_sim_script_waits_for_pre_open_data_warmup():
+    text = SCRIPT.read_text(encoding="utf-8")
+
+    assert "function Wait-PreOpenDataWarmup" in text
+    assert "Pre-open ThemeLab data warmup wait started" in text
+    assert "/api/themelab/snapshot?refresh=true" in text
+    assert "Pre-open data warmup completed=" in text
+    assert "pre_open_data_warmup" in text

@@ -20,6 +20,7 @@ param(
     [switch]$SkipShadowSmallEntryPreflight,
     [switch]$WaitThemeLabStartupSnapshot,
     [switch]$DisableThemeBackfillWarmup,
+    [switch]$SkipPreOpenDataWarmup,
     [int]$ThemeBackfillMaxPerCycle = 6,
     [int]$ThemeBackfillMaxPending = 10,
     [int]$ThemeBackfillTtlSec = 60,
@@ -29,6 +30,14 @@ param(
     [int]$ThemeBackfillMaxHitsPerTheme = 8,
     [int]$ThemeBackfillCacheTtlSec = 21600,
     [int]$ThemeBackfillCacheLimit = 500,
+    [int]$PreOpenWarmupTimeoutSec = 900,
+    [int]$PreOpenWarmupPollSec = 5,
+    [int]$PreOpenWarmupMinBackfillSuccessCount = 80,
+    [double]$PreOpenWarmupTargetPriceCoveragePct = 60.0,
+    [int]$PreOpenWarmupMaxPerCycle = 6,
+    [int]$PreOpenWarmupMaxPending = 10,
+    [int]$PreOpenWarmupMaxThemes = 8,
+    [int]$PreOpenWarmupMaxHitsPerTheme = 90,
     [switch]$NoStopExisting,
     [switch]$DryRun
 )
@@ -60,6 +69,23 @@ $ThemeBackfillMaxThemes = [Math]::Max(0, $ThemeBackfillMaxThemes)
 $ThemeBackfillMaxHitsPerTheme = [Math]::Max(0, $ThemeBackfillMaxHitsPerTheme)
 $ThemeBackfillCacheTtlSec = [Math]::Max(0, $ThemeBackfillCacheTtlSec)
 $ThemeBackfillCacheLimit = [Math]::Max(0, $ThemeBackfillCacheLimit)
+$PreOpenWarmupTimeoutSec = [Math]::Max(0, $PreOpenWarmupTimeoutSec)
+$PreOpenWarmupPollSec = [Math]::Max(1, $PreOpenWarmupPollSec)
+$PreOpenWarmupMinBackfillSuccessCount = [Math]::Max(0, $PreOpenWarmupMinBackfillSuccessCount)
+$PreOpenWarmupTargetPriceCoveragePct = [Math]::Min(100.0, [Math]::Max(0.0, $PreOpenWarmupTargetPriceCoveragePct))
+$PreOpenWarmupMaxPerCycle = [Math]::Max(1, $PreOpenWarmupMaxPerCycle)
+$PreOpenWarmupMaxPending = [Math]::Max($PreOpenWarmupMaxPerCycle, $PreOpenWarmupMaxPending)
+$PreOpenWarmupMaxThemes = [Math]::Max(0, $PreOpenWarmupMaxThemes)
+$PreOpenWarmupMaxHitsPerTheme = [Math]::Max(0, $PreOpenWarmupMaxHitsPerTheme)
+
+$regularOpenAt = (Get-Date).Date.AddHours(9)
+$PreOpenDataWarmupEnabled = (-not [bool]$SkipPreOpenDataWarmup) -and (-not [bool]$DisableThemeBackfillWarmup) -and ((Get-Date) -lt $regularOpenAt)
+if ($PreOpenDataWarmupEnabled) {
+    $ThemeBackfillMaxPerCycle = [Math]::Max($ThemeBackfillMaxPerCycle, $PreOpenWarmupMaxPerCycle)
+    $ThemeBackfillMaxPending = [Math]::Max($ThemeBackfillMaxPending, $PreOpenWarmupMaxPending)
+    $ThemeBackfillMaxThemes = [Math]::Max($ThemeBackfillMaxThemes, $PreOpenWarmupMaxThemes)
+    $ThemeBackfillMaxHitsPerTheme = [Math]::Max($ThemeBackfillMaxHitsPerTheme, $PreOpenWarmupMaxHitsPerTheme)
+}
 
 $gatewayHost = if ($BindHost -in @("0.0.0.0", "::", "[::]")) { "127.0.0.1" } else { $BindHost }
 if (-not $GatewayCoreUrl) {
@@ -108,7 +134,7 @@ $env:TRADING_THEME_BACKFILL_TTL_SEC = [string]$ThemeBackfillTtlSec
 $env:TRADING_THEME_BACKFILL_OPT10001_BUCKET_SEC = [string]$ThemeBackfillOpt10001BucketSec
 $env:TRADING_THEME_BACKFILL_OPT10081_BUCKET_SEC = [string]$ThemeBackfillOpt10081BucketSec
 $env:TRADING_THEME_BACKFILL_ALLOW_OPT10081 = "0"
-$env:TRADING_THEME_BACKFILL_ALLOW_REGULAR_SESSION = "1"
+$env:TRADING_THEME_BACKFILL_ALLOW_REGULAR_SESSION = if ($PreOpenDataWarmupEnabled) { "0" } else { "1" }
 $env:TRADING_THEME_BACKFILL_MAX_THEMES = [string]$ThemeBackfillMaxThemes
 $env:TRADING_THEME_BACKFILL_MAX_HITS_PER_THEME = [string]$ThemeBackfillMaxHitsPerTheme
 $env:TRADING_THEME_BACKFILL_CACHE_ENABLED = "1"
@@ -501,6 +527,155 @@ function Get-ShadowSmallEntryStartupStatus {
     }
 }
 
+function Convert-ToIntOrZero([object]$Value) {
+    if ($null -eq $Value) {
+        return 0
+    }
+    $text = ([string]$Value).Trim()
+    if (-not $text) {
+        return 0
+    }
+    try {
+        return [int]([double]$text)
+    } catch {
+        return 0
+    }
+}
+
+function Convert-ToNullableDouble([object]$Value) {
+    if ($null -eq $Value) {
+        return $null
+    }
+    $text = ([string]$Value).Trim()
+    if (-not $text) {
+        return $null
+    }
+    try {
+        return [double]$text
+    } catch {
+        return $null
+    }
+}
+
+function Get-RegularOpenAt {
+    return (Get-Date).Date.AddHours(9)
+}
+
+function Test-BeforeRegularOpen {
+    return (Get-Date) -lt (Get-RegularOpenAt)
+}
+
+function Get-PreOpenDataWarmupSummary {
+    try {
+        $snapshot = Invoke-CoreApi -Method GET -Path "/api/themelab/snapshot?refresh=true" -TimeoutSec 30
+        $summary = Get-ObjectPropertyValue $snapshot "summary"
+        $dataQuality = Get-ObjectPropertyValue $snapshot "data_quality"
+        $backfill = Get-ObjectPropertyValue $snapshot "theme_backfill_runtime"
+        $coverageRatio = Convert-ToNullableDouble (Get-ObjectPropertyValue $dataQuality "theme_rank_min_price_coverage_ratio")
+        $coveragePct = $null
+        if ($null -ne $coverageRatio) {
+            $coveragePct = [Math]::Round($coverageRatio * 100.0, 2)
+        }
+        $successCount = [Math]::Max(
+            (Convert-ToIntOrZero (Get-ObjectPropertyValue $backfill "success_count")),
+            (Convert-ToIntOrZero (Get-ObjectPropertyValue $backfill "theme_backfill_success_count"))
+        )
+        $queuedCount = Convert-ToIntOrZero (Get-ObjectPropertyValue $backfill "queued_count")
+        $dispatchedCount = Convert-ToIntOrZero (Get-ObjectPropertyValue $backfill "dispatched_count")
+        $activeCount = $queuedCount + $dispatchedCount
+        $candidateCount = [Math]::Max(
+            (Convert-ToIntOrZero (Get-ObjectPropertyValue $backfill "candidate_count")),
+            (Convert-ToIntOrZero (Get-ObjectPropertyValue $backfill "theme_backfill_candidate_count"))
+        )
+        $status = [string](Get-ObjectPropertyValue $dataQuality "status")
+        $coverageReady = $false
+        if ($null -ne $coveragePct) {
+            $coverageReady = $coveragePct -ge $PreOpenWarmupTargetPriceCoveragePct
+        }
+        $successReady = $successCount -ge $PreOpenWarmupMinBackfillSuccessCount
+        $noBackfillNeeded = $candidateCount -eq 0 -and $activeCount -eq 0 -and $status.ToUpperInvariant() -notin @("BROKEN", "DEGRADED")
+        [pscustomobject]@{
+            available = $true
+            completed = [bool](($coverageReady -or $successReady -or $noBackfillNeeded) -and $activeCount -eq 0)
+            status = $status
+            operation_status = [string](Get-ObjectPropertyValue $summary "operation_status")
+            ready_count = Convert-ToIntOrZero (Get-ObjectPropertyValue $summary "ready_count")
+            order_candidate_count = Convert-ToIntOrZero (Get-ObjectPropertyValue $summary "order_candidate_count")
+            price_coverage_pct = $coveragePct
+            target_price_coverage_pct = $PreOpenWarmupTargetPriceCoveragePct
+            backfill_success_count = $successCount
+            min_backfill_success_count = $PreOpenWarmupMinBackfillSuccessCount
+            backfill_candidate_count = $candidateCount
+            backfill_queued_count = $queuedCount
+            backfill_dispatched_count = $dispatchedCount
+            backfill_active_count = $activeCount
+            paused_reason = [string](Get-ObjectPropertyValue $backfill "paused_reason")
+            message = [string](Get-ObjectPropertyValue $dataQuality "message")
+            coverage_ready = [bool]$coverageReady
+            success_ready = [bool]$successReady
+            no_backfill_needed = [bool]$noBackfillNeeded
+        }
+    } catch {
+        [pscustomobject]@{
+            available = $false
+            completed = $false
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Wait-PreOpenDataWarmup {
+    if (-not $PreOpenDataWarmupEnabled) {
+        return [pscustomobject]@{
+            enabled = $false
+            skipped = $true
+            reason = if ([bool]$SkipPreOpenDataWarmup) { "SKIP_PRE_OPEN_DATA_WARMUP" } elseif ([bool]$DisableThemeBackfillWarmup) { "THEME_BACKFILL_DISABLED" } else { "NOT_BEFORE_REGULAR_OPEN" }
+            completed = $false
+        }
+    }
+    if ($PreOpenWarmupTimeoutSec -le 0) {
+        return [pscustomobject]@{
+            enabled = $true
+            skipped = $true
+            reason = "TIMEOUT_DISABLED"
+            completed = $false
+        }
+    }
+
+    $deadline = (Get-Date).AddSeconds($PreOpenWarmupTimeoutSec)
+    $last = $null
+    Write-Step "Pre-open ThemeLab data warmup wait started timeout=${PreOpenWarmupTimeoutSec}s target_price_coverage=${PreOpenWarmupTargetPriceCoveragePct}% min_backfill_success=$PreOpenWarmupMinBackfillSuccessCount"
+    while ((Get-Date) -lt $deadline -and (Test-BeforeRegularOpen)) {
+        $last = Get-PreOpenDataWarmupSummary
+        if ($last.available) {
+            Write-Step ("Pre-open warmup status={0} coverage={1}% success={2}/{3} active={4} candidates={5} paused={6}" -f `
+                $last.status, `
+                $(if ($null -ne $last.price_coverage_pct) { $last.price_coverage_pct } else { "n/a" }), `
+                $last.backfill_success_count, `
+                $last.min_backfill_success_count, `
+                $last.backfill_active_count, `
+                $last.backfill_candidate_count, `
+                $last.paused_reason)
+            if ($last.completed) {
+                $last | Add-Member -NotePropertyName enabled -NotePropertyValue $true -Force
+                $last | Add-Member -NotePropertyName stop_reason -NotePropertyValue "TARGET_REACHED" -Force
+                return $last
+            }
+        } else {
+            Write-Step "Pre-open warmup snapshot unavailable: $($last.error)"
+        }
+        Start-Sleep -Seconds $PreOpenWarmupPollSec
+    }
+
+    if ($null -eq $last) {
+        $last = Get-PreOpenDataWarmupSummary
+    }
+    $stopReason = if (-not (Test-BeforeRegularOpen)) { "REGULAR_OPEN_REACHED" } else { "TIMEOUT" }
+    $last | Add-Member -NotePropertyName enabled -NotePropertyValue $true -Force
+    $last | Add-Member -NotePropertyName stop_reason -NotePropertyValue $stopReason -Force
+    return $last
+}
+
 Push-Location $ProjectRoot
 try {
     Write-Step "Market open LIVE_SIM startup settings"
@@ -520,6 +695,7 @@ try {
     Write-Step "Shadow strategy observe_only=$env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY allow_apply=$env:TRADING_SHADOW_STRATEGY_ALLOW_APPLY"
     Write-Step "Change proposal auto_apply=$env:TRADING_CHANGE_PROPOSAL_ALLOW_AUTO_APPLY"
     Write-Step "Theme backfill enabled=$env:TRADING_THEME_BACKFILL_ENABLED observe_only=$env:TRADING_THEME_BACKFILL_OBSERVE_ONLY max_per_cycle=$env:TRADING_THEME_BACKFILL_MAX_PER_CYCLE max_pending=$env:TRADING_THEME_BACKFILL_MAX_PENDING ttl=$env:TRADING_THEME_BACKFILL_TTL_SEC opt10001_bucket=$env:TRADING_THEME_BACKFILL_OPT10001_BUCKET_SEC max_themes=$env:TRADING_THEME_BACKFILL_MAX_THEMES max_hits_per_theme=$env:TRADING_THEME_BACKFILL_MAX_HITS_PER_THEME cache_ttl=$env:TRADING_THEME_BACKFILL_CACHE_TTL_SEC"
+    Write-Step "Pre-open data warmup enabled=$PreOpenDataWarmupEnabled skip=$([bool]$SkipPreOpenDataWarmup) timeout=$PreOpenWarmupTimeoutSec poll=$PreOpenWarmupPollSec target_coverage_pct=$PreOpenWarmupTargetPriceCoveragePct min_success=$PreOpenWarmupMinBackfillSuccessCount allow_regular_session=$env:TRADING_THEME_BACKFILL_ALLOW_REGULAR_SESSION"
     if (-not $WaitThemeLabStartupSnapshot) {
         Write-Step "ThemeLab startup snapshot wait=disabled; LIVE_SIM readiness will not wait for ThemeLab dashboard backfill diagnostics"
     }
@@ -564,11 +740,24 @@ try {
             theme_backfill_opt10001_bucket_sec = $env:TRADING_THEME_BACKFILL_OPT10001_BUCKET_SEC
             theme_backfill_opt10081_bucket_sec = $env:TRADING_THEME_BACKFILL_OPT10081_BUCKET_SEC
             theme_backfill_allow_opt10081 = $env:TRADING_THEME_BACKFILL_ALLOW_OPT10081
+            theme_backfill_allow_regular_session = $env:TRADING_THEME_BACKFILL_ALLOW_REGULAR_SESSION
             theme_backfill_max_themes = $env:TRADING_THEME_BACKFILL_MAX_THEMES
             theme_backfill_max_hits_per_theme = $env:TRADING_THEME_BACKFILL_MAX_HITS_PER_THEME
             theme_backfill_cache_enabled = $env:TRADING_THEME_BACKFILL_CACHE_ENABLED
             theme_backfill_cache_ttl_sec = $env:TRADING_THEME_BACKFILL_CACHE_TTL_SEC
             theme_backfill_cache_limit = $env:TRADING_THEME_BACKFILL_CACHE_LIMIT
+            pre_open_data_warmup = @{
+                enabled = [bool]$PreOpenDataWarmupEnabled
+                skip = [bool]$SkipPreOpenDataWarmup
+                timeout_sec = $PreOpenWarmupTimeoutSec
+                poll_sec = $PreOpenWarmupPollSec
+                min_backfill_success_count = $PreOpenWarmupMinBackfillSuccessCount
+                target_price_coverage_pct = $PreOpenWarmupTargetPriceCoveragePct
+                max_per_cycle = $PreOpenWarmupMaxPerCycle
+                max_pending = $PreOpenWarmupMaxPending
+                max_themes = $PreOpenWarmupMaxThemes
+                max_hits_per_theme = $PreOpenWarmupMaxHitsPerTheme
+            }
             themelab_startup_snapshot = if ($WaitThemeLabStartupSnapshot) { "wait" } else { "decoupled" }
             shadow_small_entry_preflight = if ($SkipShadowSmallEntryPreflight) { "skipped" } else { "enabled" }
             db_order_execution = $dbSettings
@@ -686,8 +875,20 @@ try {
     }
 
     if (-not $SkipRuntime) {
-        Write-Step "LIVE_SIM readiness reached; ThemeLab backfill may continue in background"
+        $preOpenDataWarmupStatus = Wait-PreOpenDataWarmup
+        if ($preOpenDataWarmupStatus.enabled -and -not $preOpenDataWarmupStatus.skipped) {
+            Write-Step "Pre-open data warmup completed=$($preOpenDataWarmupStatus.completed) stop_reason=$($preOpenDataWarmupStatus.stop_reason) coverage=$($preOpenDataWarmupStatus.price_coverage_pct)% success=$($preOpenDataWarmupStatus.backfill_success_count) active=$($preOpenDataWarmupStatus.backfill_active_count)"
+        } elseif ($preOpenDataWarmupStatus.skipped) {
+            Write-Step "Pre-open data warmup skipped: $($preOpenDataWarmupStatus.reason)"
+        }
+        Write-Step "LIVE_SIM readiness reached; ThemeLab backfill warmed or bounded by startup policy"
     } else {
+        $preOpenDataWarmupStatus = [pscustomobject]@{
+            enabled = [bool]$PreOpenDataWarmupEnabled
+            skipped = $true
+            reason = "RUNTIME_SKIPPED"
+            completed = $false
+        }
         Write-Step "Runtime startup skipped; ThemeLab backfill will not run until runtime starts"
     }
     $themeLabStatus = if ($WaitThemeLabStartupSnapshot) { Get-ThemeLabStartupSummary } else { Get-ThemeLabStartupSummarySkipped }
@@ -748,6 +949,7 @@ try {
             }
         } else { $null }
         themelab = $themeLabStatus
+        pre_open_data_warmup = $preOpenDataWarmupStatus
         shadow_small_entry_ops = $shadowSmallEntryStatus
         db_order_execution = $dbSettings
     } | ConvertTo-Json -Depth 8

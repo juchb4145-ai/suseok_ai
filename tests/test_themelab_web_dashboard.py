@@ -1260,6 +1260,31 @@ def test_theme_lab_snapshot_operation_status_for_ready_live_blocked_and_data_qua
         payload = build_theme_lab_dashboard_snapshot(db)
         assert payload["summary"]["operation_status"] == "READY_BUT_LIVE_BLOCKED"
         assert payload["summary"]["operation_message_ko"] == "READY 후보는 있으나 LIVE Guard 통과 후보가 없습니다."
+        assert payload["operator_view"]["main_action"]["status"] == "READY_BUT_LIVE_BLOCKED"
+
+        diagnostic_ready = _watch("000203", "READY")
+        diagnostic_ready.update(
+            {
+                "diagnostic_only": True,
+                "submittable": False,
+                "live_order_enabled": True,
+                "live_order_guard_passed": True,
+            }
+        )
+        db.save_theme_lab_flow_result(
+            "2026-06-03T09:08:30",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [diagnostic_ready],
+                "gate_decisions": [],
+                "data_quality": {"status": "OK", "candle_missing_count": 0},
+            },
+        )
+        payload = build_theme_lab_dashboard_snapshot(db)
+        assert payload["summary"]["operation_status"] == "ENTRY_PLAN_DIAGNOSTIC_ONLY"
+        assert payload["operator_view"]["main_action"]["status"] == "ENTRY_PLAN_DIAGNOSTIC_ONLY"
+        assert payload["operator_view"]["buy_candidates"][0]["order_permission_label_ko"] == "관측만"
 
         data_wait = _watch("000202", "WAIT")
         data_wait.update({"support_ready_reason": "WAIT_DATA_SUPPORT_NOT_READY", "diagnostic_only": True})

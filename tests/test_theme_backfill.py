@@ -221,6 +221,21 @@ def test_theme_backfill_observe_pilot_blocks_non_observe_mode():
     assert state.list_commands(limit=10, include_finished=True) == []
 
 
+def test_theme_backfill_can_pause_during_regular_session():
+    state = _healthy_state()
+    service = ThemeBackfillService(state, config=ThemeBackfillConfig(enabled=True, allow_regular_session=False))
+    regular_at = datetime(2026, 6, 5, 9, 10, 0)
+
+    summary = service.plan_and_enqueue(
+        _result([_theme("high", 1, [_hit("000001", ("MISSING_CURRENT_PRICE",))])]),
+        regular_at,
+    )
+
+    assert summary["paused_reason"] == "REGULAR_SESSION_DISABLED"
+    assert summary["backfill_paused_by_regular_session_count"] == 1
+    assert state.list_commands(limit=10, include_finished=True) == []
+
+
 def test_theme_backfill_dispatch_guard_skips_queued_backfill_after_ready_or_non_backfill():
     state = _healthy_state()
     _enqueue_backfill(state, "000001")
@@ -270,6 +285,20 @@ def test_theme_backfill_dispatch_guard_skips_non_observe_mode():
         config=ThemeBackfillConfig(enabled=True, trading_mode="LIVE", observe_only=True),
     )
     assert state.list_commands(include_finished=True)[0]["status"] == CommandStatus.SKIPPED_NOT_OBSERVE_MODE.value
+
+
+def test_theme_backfill_dispatch_guard_skips_regular_session_when_disabled(monkeypatch):
+    monkeypatch.setattr("trading.theme_engine.backfill._is_regular_session", lambda now: True)
+    state = _healthy_state()
+    _enqueue_backfill(state, "000001")
+
+    apply_dispatch_guard(
+        state,
+        {"watchset_snapshots": []},
+        config=ThemeBackfillConfig(enabled=True, allow_regular_session=False),
+    )
+
+    assert state.list_commands(include_finished=True)[0]["status"] == CommandStatus.SKIPPED_REGULAR_SESSION.value
 
 
 def test_theme_backfill_parsers_normalize_prices_and_prev_close():

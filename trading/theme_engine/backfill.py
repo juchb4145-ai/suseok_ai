@@ -24,6 +24,7 @@ PAUSE_NON_BACKFILL_PENDING = "NON_BACKFILL_PENDING"
 PAUSE_GATEWAY_UNHEALTHY = "GATEWAY_UNHEALTHY"
 PAUSE_PENDING_LIMIT = "PENDING_LIMIT"
 PAUSE_OPT10081_DISABLED = "OPT10081_DISABLED"
+PAUSE_REGULAR_SESSION_DISABLED = "REGULAR_SESSION_DISABLED"
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,11 @@ class ThemeBackfillService:
             return summary
         if cfg.observe_only and str(cfg.trading_mode or "").upper() != "OBSERVE":
             summary["paused_reason"] = PAUSE_NOT_OBSERVE_MODE
+            self.last_summary = summary
+            return summary
+        if not cfg.allow_regular_session and _is_regular_session(now):
+            summary["paused_reason"] = PAUSE_REGULAR_SESSION_DISABLED
+            summary["backfill_paused_by_regular_session_count"] += 1
             self.last_summary = summary
             return summary
         pause_reason = enqueue_pause_reason(self.gateway_state, result)
@@ -362,6 +368,8 @@ def dispatch_pause_reason(
     cfg = config or ThemeBackfillConfig.from_env()
     if cfg.observe_only and str(cfg.trading_mode or "").upper() != "OBSERVE":
         return CommandStatus.SKIPPED_NOT_OBSERVE_MODE.value
+    if not cfg.allow_regular_session and _is_regular_session(datetime.now(timezone.utc)):
+        return CommandStatus.SKIPPED_REGULAR_SESSION.value
     if _raw_has_ready_like(raw_theme_lab):
         return CommandStatus.SKIPPED_READY.value
     active = active_records if active_records is not None else _active_records(gateway_state)
@@ -748,6 +756,7 @@ def _empty_summary(cfg: ThemeBackfillConfig) -> dict[str, Any]:
         "backfill_paused_by_ready_count": 0,
         "backfill_paused_by_order_count": 0,
         "backfill_paused_by_gateway_unhealthy_count": 0,
+        "backfill_paused_by_regular_session_count": 0,
         "tr_backfill_caused_ready_count": 0,
     }
 
@@ -771,6 +780,8 @@ def _increment_pause(summary: dict[str, Any], reason: str) -> None:
         summary["backfill_paused_by_order_count"] += 1
     elif reason in {PAUSE_GATEWAY_UNHEALTHY, CommandStatus.SKIPPED_GATEWAY_UNHEALTHY.value}:
         summary["backfill_paused_by_gateway_unhealthy_count"] += 1
+    elif reason in {PAUSE_REGULAR_SESSION_DISABLED, CommandStatus.SKIPPED_REGULAR_SESSION.value}:
+        summary["backfill_paused_by_regular_session_count"] += 1
 
 
 def _trade_date(now: datetime) -> str:
@@ -781,6 +792,13 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def _is_regular_session(value: datetime) -> bool:
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone(timedelta(hours=9))).replace(tzinfo=None)
+    minutes = value.hour * 60 + value.minute
+    return (9 * 60) <= minutes <= (15 * 60 + 30)
 
 
 def _normalize_code(value: Any) -> str:

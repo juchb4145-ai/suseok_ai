@@ -1367,9 +1367,10 @@ def _summary(
     leader_count = sum(1 for item in watchset if item.get("stock_role") == "LEADER")
     co_leader_count = sum(1 for item in watchset if item.get("stock_role") == "CO_LEADER")
     late_laggard_count = sum(1 for item in watchset if item.get("stock_role") == "LATE_LAGGARD")
-    live_guard_passed = sum(1 for item in watchset if item.get("live_order_guard_passed"))
     ready_like = [item for item in watchset if item.get("gate_status") in {"READY", "READY_SMALL"}]
-    live_guard_blocked = sum(1 for item in ready_like if not item.get("live_order_guard_passed"))
+    live_guard_passed = sum(1 for item in ready_like if _candidate_submittable(item) and item.get("live_order_guard_passed"))
+    submittable_ready_count = sum(1 for item in ready_like if _candidate_submittable(item))
+    live_guard_blocked = sum(1 for item in ready_like if _candidate_submittable(item) and not item.get("live_order_guard_passed"))
     risk_off_small_entries = [item for item in watchset if _is_risk_off_small_entry(item)]
     risk_off_reject_reasons = Counter(
         str(item.get("risk_off_entry_rejected_reason") or "UNKNOWN")
@@ -1411,6 +1412,7 @@ def _summary(
         live_guard_passed_count=live_guard_passed,
         live_guard_blocked_count=live_guard_blocked,
         order_candidate_count=len(entry_candidates),
+        submittable_ready_count=submittable_ready_count,
         data_quality_status=str(data_quality.get("status") or "UNKNOWN"),
         watchset_size=len(watchset),
         runtime=runtime,
@@ -1487,6 +1489,7 @@ def _empty_summary(
         live_guard_passed_count=0,
         live_guard_blocked_count=0,
         order_candidate_count=0,
+        submittable_ready_count=0,
         data_quality_status="BROKEN",
         watchset_size=0,
         runtime=runtime,
@@ -1717,6 +1720,7 @@ def _operation_status_message(
     order_candidate_count: int,
     data_quality_status: str,
     watchset_size: int,
+    submittable_ready_count: int = 0,
     runtime: dict[str, Any] | None = None,
     freshness: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
@@ -1739,6 +1743,8 @@ def _operation_status_message(
         return "OBSERVE_ONLY", "ThemeLabFlow 결과는 있으나 WatchSet 조건을 통과한 종목이 없습니다."
     if ready_count > 0 and live_guard_passed_count > 0 and data_status not in {"DEGRADED", "BROKEN"}:
         return "READY_TO_TRADE", "READY 후보가 있고 데이터 품질이 정상입니다."
+    if ready_like > 0 and submittable_ready_count <= 0:
+        return "ENTRY_PLAN_DIAGNOSTIC_ONLY", "READY 후보는 있으나 진입 계획이 관측/진단 전용입니다."
     if ready_like > 0 and live_guard_passed_count == 0 and live_guard_blocked_count > 0:
         return "READY_BUT_LIVE_BLOCKED", "READY 후보는 있으나 LIVE Guard 통과 후보가 없습니다."
     if data_status in {"DEGRADED", "BROKEN"} or data_not_ready_count >= max(1, ready_like + market_pending_count):
@@ -1819,6 +1825,11 @@ def _operator_main_action(
 ) -> dict[str, Any]:
     market_status = _value(market.get("market_status")).upper()
     critical_risk = next((item for item in risk_status if item.get("severity") == "danger"), None)
+    actionable_candidates = [item for item in entry_candidates if _candidate_order_permission_code(item) == "READY"]
+    blocked_candidates = [item for item in entry_candidates if _candidate_order_permission_code(item) == "LIVE_SIM_BLOCKED"]
+    diagnostic_candidates = [
+        item for item in entry_candidates if _candidate_order_permission_code(item) == "ENTRY_PLAN_DIAGNOSTIC_ONLY"
+    ]
     if market_status in {"CLOSED", "MARKET_CLOSED", "AFTER_MARKET", "POST_MARKET", "DONE"}:
         status = "OBSERVE_ONLY"
         message = "정규장이 종료되었습니다. 리포트 탭에서 장후 리뷰를 확인하세요."
@@ -1828,9 +1839,15 @@ def _operator_main_action(
     elif str(data_quality.get("status") or "").upper() in {"BROKEN", "DEGRADED"}:
         status = "WAIT_DATA_QUALITY"
         message = "실시간 데이터가 준비 중입니다. 분봉/VWAP/지지선 수집을 기다립니다."
-    elif entry_candidates:
+    elif actionable_candidates:
         status = "READY_TO_TRADE"
         message = "지금 매수 가능 후보가 있습니다. 후보 목록을 확인하세요."
+    elif blocked_candidates:
+        status = "READY_BUT_LIVE_BLOCKED"
+        message = "매수 후보는 있지만 주문 안전장치가 차단 중입니다. 주문/리스크 상태를 확인하세요."
+    elif diagnostic_candidates:
+        status = "ENTRY_PLAN_DIAGNOSTIC_ONLY"
+        message = "매수 후보는 있지만 진입 계획이 관측/진단 전용이라 주문은 나가지 않았습니다."
     elif no_buy_reasons:
         status = "NO_SIGNAL"
         message = f"현재 매수 가능 후보가 없습니다. 가장 큰 이유는 {no_buy_reasons[0]['label_ko']}입니다."
@@ -2295,11 +2312,15 @@ def _candidate_operator_message(item: dict[str, Any], location: str, order_code:
 def _candidate_order_permission_code(item: dict[str, Any]) -> str:
     if item.get("submittable") and item.get("live_order_guard_passed"):
         return "READY"
+    if item.get("diagnostic_only") or (str(item.get("gate_status") or "") in {"READY", "READY_SMALL"} and not _candidate_submittable(item)):
+        return "ENTRY_PLAN_DIAGNOSTIC_ONLY"
     if str(item.get("gate_status") or "") in {"READY", "READY_SMALL"} and not item.get("live_order_guard_passed"):
         return "LIVE_SIM_BLOCKED"
-    if item.get("diagnostic_only"):
-        return "ENTRY_PLAN_DIAGNOSTIC_ONLY"
     return "OBSERVE"
+
+
+def _candidate_submittable(item: dict[str, Any]) -> bool:
+    return bool(item.get("submittable", str(item.get("gate_status") or "") in {"READY", "READY_SMALL"}))
 
 
 def _no_buy_message(code: str) -> str:
@@ -3008,6 +3029,7 @@ def _theme_backfill_runtime(raw: dict[str, Any], gateway_state: Any | None) -> d
     base.setdefault("backfill_paused_by_ready_count", 0)
     base.setdefault("backfill_paused_by_order_count", 0)
     base.setdefault("backfill_paused_by_gateway_unhealthy_count", 0)
+    base.setdefault("backfill_paused_by_regular_session_count", 0)
     base.setdefault("last_success_at", "")
     base.setdefault("last_failure_at", "")
     base.setdefault("last_failure_reason", "")
@@ -3033,6 +3055,7 @@ def _theme_backfill_runtime(raw: dict[str, Any], gateway_state: Any | None) -> d
         "backfill_paused_by_ready_count",
         "backfill_paused_by_order_count",
         "backfill_paused_by_gateway_unhealthy_count",
+        "backfill_paused_by_regular_session_count",
     ):
         base[key] = 0
     records = _theme_backfill_records(gateway_state)
@@ -3067,6 +3090,8 @@ def _theme_backfill_runtime(raw: dict[str, Any], gateway_state: Any | None) -> d
                 base["backfill_paused_by_order_count"] = int(base.get("backfill_paused_by_order_count") or 0) + 1
             elif status == "SKIPPED_GATEWAY_UNHEALTHY":
                 base["backfill_paused_by_gateway_unhealthy_count"] = int(base.get("backfill_paused_by_gateway_unhealthy_count") or 0) + 1
+            elif status == "SKIPPED_REGULAR_SESSION":
+                base["backfill_paused_by_regular_session_count"] = int(base.get("backfill_paused_by_regular_session_count") or 0) + 1
         elif status.startswith("EXPIRED"):
             base["expired_count"] = int(base.get("expired_count") or 0) + 1
             if status == "EXPIRED_BEFORE_DISPATCH":
