@@ -187,6 +187,33 @@ button:disabled {
   min-width: 0;
 }
 
+.canary-decision {
+  border-bottom: 1px solid var(--line);
+  padding: 8px 0;
+}
+
+.canary-decision summary {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto minmax(140px, 2fr);
+  gap: 8px;
+  align-items: center;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.canary-decision pre {
+  max-height: 280px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .section-head {
   display: flex;
   align-items: flex-start;

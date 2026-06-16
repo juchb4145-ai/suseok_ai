@@ -51,8 +51,10 @@ from trading.broker.transport_metrics import (
 )
 from trading.broker.ws_messages import GatewayWsMessage
 from trading.strategy.candidates import CandidateCollector
+from trading.strategy.hybrid_validation import HybridValidationRepository
 from trading.strategy.models import BlockType, CandidateState
 from trading.strategy.reason_taxonomy import normalize_reason_status, reason_status_family, reason_summary
+from trading.strategy.runtime_settings import StrategyRuntimeSettingsRepository
 from trading.theme_engine.backfill import ThemeBackfillConfig, apply_dispatch_guard
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSourceSyncService
@@ -73,6 +75,7 @@ from trading_app.intraday_outcomes import (
 )
 from trading_app.market_gate_review import MarketGateReviewAnalyzer
 from trading_app.live_sim_audit import LiveSimLifecycleAuditor
+from trading_app.live_sim_canary import canary_config_from_settings, evaluate_live_sim_canary
 from trading_app.live_sim_preflight import LiveSimPreflightService, compact_preflight_snapshot
 from trading_app.ops_alerts import build_ops_alerts
 from trading_app.order_enqueue_service import OrderEnqueueService
@@ -1827,6 +1830,215 @@ def runtime_live_sim_preflight_history(
         return {"items": items, "pagination": pagination, "filters": {"limit": limit, "offset": offset}}
     finally:
         close_database(db)
+
+
+@app.get("/api/runtime/live-sim/canary/summary")
+def runtime_live_sim_canary_summary(trade_date: Optional[str] = None) -> dict[str, Any]:
+    db = open_database()
+    try:
+        date = trade_date or datetime.now().date().isoformat()
+        summary = db.live_sim_canary_summary(trade_date=date)
+        runtime_settings = StrategyRuntimeSettingsRepository(db).load()
+        config = canary_config_from_settings(runtime_settings)
+        latest_preflight = db.latest_live_sim_preflight_snapshot() or {}
+        performance = dict(latest_preflight.get("performance_summary") or {})
+        go_no_go = dict(performance.get("go_no_go") or {})
+        config_status = "disabled"
+        if bool(config.get("enabled")) and bool(config.get("order_enabled")):
+            config_status = "order-enabled"
+        elif bool(config.get("enabled")):
+            config_status = "observe-only"
+        summary.update(
+            {
+                "config_status": config_status,
+                "canary_config": {
+                    "enabled": bool(config.get("enabled")),
+                    "order_enabled": bool(config.get("order_enabled")),
+                    "max_orders_per_day": config.get("max_orders_per_day"),
+                    "max_position_amount_krw": config.get("max_position_amount_krw"),
+                    "position_size_multiplier": config.get("position_size_multiplier"),
+                },
+                "preflight_status": summary.get("preflight_status") or latest_preflight.get("status", ""),
+                "load_guard_status": summary.get("load_guard_status") or dict(latest_preflight.get("backfill_summary") or {}).get("load_guard", {}).get("load_guard_status", ""),
+                "dry_run_go_no_go_status": summary.get("dry_run_go_no_go_status")
+                or str(go_no_go.get("decision") or go_no_go.get("readiness") or ""),
+                "net_expectancy_pass": _live_sim_canary_net_expectancy_pass(performance, config),
+                "watch_provisional_notice_ko": "WATCH/PROVISIONAL은 아직 LIVE_SIM Canary 주문 대상이 아닙니다.",
+            }
+        )
+        return summary
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/live-sim/canary/decisions")
+def runtime_live_sim_canary_decisions(
+    trade_date: Optional[str] = None,
+    code: Optional[str] = None,
+    status: Optional[str] = None,
+    eligible: Optional[bool] = None,
+    reason_code: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        items = db.list_live_sim_canary_decisions(
+            trade_date=trade_date,
+            code=code,
+            status=status,
+            eligible=eligible,
+            reason_code=reason_code,
+            limit=limit + 1,
+            offset=offset,
+        )
+        items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {
+            "items": items,
+            "pagination": pagination,
+            "filters": {
+                "trade_date": trade_date or "",
+                "code": code or "",
+                "status": status or "",
+                "eligible": eligible,
+                "reason_code": reason_code or "",
+                "limit": limit,
+                "offset": offset,
+            },
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/live-sim/canary/decisions/{decision_id}")
+def runtime_live_sim_canary_decision_detail(decision_id: str) -> dict[str, Any]:
+    db = open_database()
+    try:
+        item = db.get_live_sim_canary_decision(decision_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Canary decision not found")
+        return item
+    finally:
+        close_database(db)
+
+
+@app.post("/api/runtime/live-sim/canary/rebuild")
+def rebuild_runtime_live_sim_canary(
+    body: dict[str, Any] = Body(default_factory=dict),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        payload = dict(body or {})
+        trade_date = str(payload.get("trade_date") or datetime.now().date().isoformat())
+        limit = max(1, min(5000, int(payload.get("limit") or 500)))
+        runtime_settings = StrategyRuntimeSettingsRepository(db).load()
+        config = canary_config_from_settings(runtime_settings)
+        analysis_config = {**config, "order_enabled": False}
+        latest_preflight = db.latest_live_sim_preflight_snapshot() or {}
+        events = HybridValidationRepository(db).list_events(trade_date=trade_date)
+        saved: list[dict[str, Any]] = []
+        for event in events[:limit]:
+            metadata = _live_sim_canary_metadata_from_hybrid_event(event)
+            decision = evaluate_live_sim_canary(
+                runtime_settings=runtime_settings,
+                canary_config=analysis_config,
+                preflight_snapshot=latest_preflight,
+                metadata={
+                    **metadata,
+                    "rebuild_analysis_only": True,
+                    "reason_codes": list(metadata.get("reason_codes") or []) + ["CANARY_REBUILD_ANALYSIS_ONLY"],
+                },
+                counters={
+                    "orders_per_day": 0,
+                    "orders_per_cycle": 0,
+                    "new_positions_per_day": 0,
+                    "has_open_order_for_code": False,
+                    "has_position_for_code": False,
+                },
+            )
+            saved.append(db.save_live_sim_canary_decision(decision.to_dict()))
+        return {
+            "status": "REBUILT_ANALYSIS_ONLY",
+            "trade_date": trade_date,
+            "source_event_count": len(events[:limit]),
+            "saved_count": len(saved),
+            "order_created": False,
+            "gateway_command_created": False,
+            "items": saved[:20],
+        }
+    finally:
+        close_database(db)
+
+
+def _live_sim_canary_net_expectancy_pass(performance: dict[str, Any], config: dict[str, Any]) -> bool:
+    if not performance:
+        return False
+    value = performance.get("net_expectancy_pct", performance.get("net_expectancy"))
+    try:
+        expectancy = float(value)
+    except (TypeError, ValueError):
+        return False
+    try:
+        minimum = float(config.get("min_net_expectancy_pct") or 0.0)
+    except (TypeError, ValueError):
+        minimum = 0.0
+    return expectancy >= minimum
+
+
+def _live_sim_canary_metadata_from_hybrid_event(event: Any) -> dict[str, Any]:
+    details = dict(getattr(event, "details_json", {}) or {})
+    pipeline = dict(details.get("pipeline_details") or details.get("pipeline_summary") or {})
+    return {
+        "trade_date": str(getattr(event, "trade_date", "") or ""),
+        "code": str(getattr(event, "stock_code", "") or ""),
+        "hybrid_status": str(getattr(event, "hybrid_status", "") or ""),
+        "hybrid_score": getattr(event, "hybrid_score", None),
+        "hybrid_position_tier": str(getattr(event, "hybrid_position_tier", "") or ""),
+        "dynamic_theme_status": str(getattr(event, "theme_status", "") or ""),
+        "theme_name": str(getattr(event, "theme_name", "") or ""),
+        "theme_score": getattr(event, "theme_score", None),
+        "stock_role": str(getattr(event, "leader_type", "") or ""),
+        "price_location_status": str(details.get("price_location_status") or pipeline.get("price_location_status") or ""),
+        "price_location_readiness": str(details.get("price_location_readiness") or pipeline.get("price_location_readiness") or ""),
+        "risk_level": str(details.get("risk_level") or pipeline.get("risk_level") or ""),
+        "latest_tick_ready": bool(details.get("latest_tick_ready", False)),
+        "support_ready": bool(details.get("support_ready", False)),
+        "vwap_or_recent_support_ready": bool(details.get("vwap_or_recent_support_ready", False)),
+        "gate_usable": bool(details.get("gate_usable", False)),
+        "limit_price": int(details.get("limit_price") or details.get("base_price") or 0),
+        "current_price": int(details.get("current_price") or details.get("base_price") or 0),
+        "reason_codes": list(getattr(event, "hybrid_reason_codes", []) or []),
+        "hybrid_validation_event_id": getattr(event, "id", None),
+        "hybrid_validation_details": details,
+    }
+
+
+def _live_sim_canary_snapshot_payload(db: TradingDatabase, *, trade_date: str) -> dict[str, Any]:
+    runtime_settings = StrategyRuntimeSettingsRepository(db).load()
+    config = canary_config_from_settings(runtime_settings)
+    summary = db.live_sim_canary_summary(trade_date=trade_date)
+    recent = db.list_live_sim_canary_decisions(trade_date=trade_date, limit=8)
+    config_status = "disabled"
+    if bool(config.get("enabled")) and bool(config.get("order_enabled")):
+        config_status = "order-enabled"
+    elif bool(config.get("enabled")):
+        config_status = "observe-only"
+    return {
+        "available": bool(summary.get("total_count") or config.get("enabled")),
+        "status": config_status.upper().replace("-", "_"),
+        "config_status": config_status,
+        "enabled": bool(config.get("enabled")),
+        "order_enabled": bool(config.get("order_enabled")),
+        "trade_date": trade_date,
+        "summary": summary,
+        "recent_decisions": recent,
+        "max_orders_per_day": config.get("max_orders_per_day"),
+        "max_position_amount_krw": config.get("max_position_amount_krw"),
+        "position_size_multiplier": config.get("position_size_multiplier"),
+        "watch_provisional_notice_ko": "WATCH/PROVISIONAL은 아직 LIVE_SIM Canary 주문 대상이 아닙니다.",
+        "last_updated_at": recent[0].get("created_at") if recent else "",
+    }
 
 
 @app.get("/api/runtime/outcomes/intraday")
@@ -8023,15 +8235,12 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     )
     conservative_reason_report: dict[str, Any] | None = None
     try:
-        if db.strategy_decision_outcome_count(trade_date=today) <= 0:
-            conservative_reason_payload = conservative_reason_empty_payload()
-        else:
-            conservative_reason_report = _cached_dashboard_fragment(
-                db,
-                f"conservative_reason:v2:{today}:{heavy_report_limit}",
-                lambda: _conservative_reason_outcome_analyzer(db).build_report(trade_date=today, limit=heavy_report_limit),
-            )
-            conservative_reason_payload = conservative_reason_snapshot_payload(conservative_reason_report)
+        conservative_reason_report = _cached_dashboard_fragment(
+            db,
+            f"conservative_reason:v2:{today}:{heavy_report_limit}",
+            lambda: _conservative_reason_outcome_analyzer(db).build_report(trade_date=today, limit=heavy_report_limit),
+        )
+        conservative_reason_payload = conservative_reason_snapshot_payload(conservative_reason_report)
     except Exception as exc:
         conservative_reason_payload = conservative_reason_empty_payload(str(exc))
     shadow_small_entry_report: dict[str, Any] | None = None
@@ -8201,6 +8410,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
             "backfill_summary": {},
             "safety_summary": {},
         }
+    live_sim_canary_payload = _live_sim_canary_snapshot_payload(db, trade_date=today)
     if not full_detail:
         buy_zero_rca_payload = _dashboard_slim_buy_zero_rca_payload(buy_zero_rca_payload)
         conservative_reason_payload = _dashboard_slim_conservative_reason_payload(conservative_reason_payload)
@@ -8214,6 +8424,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["buy_zero_rca"] = buy_zero_rca_payload
     runtime_payload["live_sim_audit"] = live_sim_audit_payload
     runtime_payload["live_sim_preflight"] = live_sim_preflight_payload
+    runtime_payload["live_sim_canary"] = live_sim_canary_payload
     runtime_payload["conservative_reason_outcomes"] = conservative_reason_payload
     runtime_payload["shadow_small_entry_promotion"] = shadow_small_entry_payload
     runtime_payload["shadow_small_entry_ops"] = shadow_small_entry_ops_payload
@@ -8249,6 +8460,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "buy_zero_rca": buy_zero_rca_payload,
         "live_sim_audit": live_sim_audit_payload,
         "live_sim_preflight": live_sim_preflight_payload,
+        "live_sim_canary": live_sim_canary_payload,
         "conservative_reason_outcomes": conservative_reason_payload,
         "shadow_small_entry_promotion": shadow_small_entry_payload,
         "shadow_small_entry_ops": shadow_small_entry_ops_payload,

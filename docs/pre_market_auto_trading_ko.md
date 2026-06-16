@@ -192,6 +192,19 @@ Invoke-RestMethod `
 
 대시보드 Overview의 `LIVE_SIM 실행 전 점검` 카드는 같은 preflight 결과를 보여줍니다. 이 카드는 상태 표시 전용이며 주문 실행 버튼이나 LIVE_SIM 활성화 버튼을 제공하지 않습니다.
 
+### LIVE_SIM Canary 상태 확인
+
+Preflight가 `GO`인 뒤에도 Hybrid READY Canary는 별도로 확인합니다.
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8000/api/runtime/live-sim/canary/summary"
+Invoke-RestMethod "http://127.0.0.1:8000/api/runtime/live-sim/canary/decisions?limit=20"
+```
+
+처음에는 반드시 `live_sim_hybrid_ready_canary.order_enabled=false`로 두고 판단만 관찰합니다. 이 상태에서는 READY가 나오더라도 Canary decision만 남고 LIVE_SIM 주문은 생성되지 않습니다.
+
+`order_enabled=true`는 충분한 DRY_RUN 성과 검증과 LIVE_SIM 운영 검증 이후에만 켭니다. 이 Canary는 `WATCH`, `PROVISIONAL`, `small_first_entry`를 주문 대상으로 삼지 않으며, `LIVE_REAL` 설정과도 무관합니다.
+
 ### 1. LIVE_SIM 설정 저장
 
 Core를 켜기 전에 실행합니다. 이미 Core가 실행 중이면 설정 저장 후 Core를 재시작합니다.

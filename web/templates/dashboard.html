@@ -80,6 +80,41 @@
           <div id="live-sim-preflight-action" class="inline-log"></div>
         </section>
 
+        <section id="live-sim-canary-card" class="band live-sim-canary-section">
+          <div class="section-head">
+            <div>
+              <h2>LIVE_SIM Canary</h2>
+              <p id="live-sim-canary-message" class="help-text">WATCH/PROVISIONAL은 아직 LIVE_SIM Canary 주문 대상이 아닙니다.</p>
+            </div>
+            <div class="action-strip">
+              <span id="live-sim-canary-status" class="counter muted">DISABLED</span>
+              <span id="live-sim-canary-updated" class="counter muted">-</span>
+            </div>
+          </div>
+          <div class="mini-grid live-sim-canary-grid">
+            <div><span>설정</span><strong id="live-sim-canary-config">disabled</strong></div>
+            <div><span>Preflight</span><strong id="live-sim-canary-preflight">NO_DATA</strong></div>
+            <div><span>Load Guard</span><strong id="live-sim-canary-loadguard">NO_DATA</strong></div>
+            <div><span>DRY_RUN</span><strong id="live-sim-canary-dryrun">NO_DATA</strong></div>
+            <div><span>Eligible</span><strong id="live-sim-canary-eligible">0</strong></div>
+            <div><span>Blocked</span><strong id="live-sim-canary-blocked">0</strong></div>
+            <div><span>Submitted</span><strong id="live-sim-canary-submitted">0</strong></div>
+            <div><span>Filled</span><strong id="live-sim-canary-filled">0</strong></div>
+            <div><span>일일 한도</span><strong id="live-sim-canary-day-limit">0</strong></div>
+            <div><span>최대 금액</span><strong id="live-sim-canary-max-amount">0</strong></div>
+          </div>
+          <div class="two-col live-sim-canary-detail-grid">
+            <div class="unframed-panel">
+              <h3>차단 사유 Top 10</h3>
+              <div id="live-sim-canary-reasons" class="inline-log"></div>
+            </div>
+            <div class="unframed-panel">
+              <h3>최근 판단</h3>
+              <div id="live-sim-canary-decisions" class="inline-log"></div>
+            </div>
+          </div>
+        </section>
+
         <section class="band">
           <div class="section-head">
             <div>

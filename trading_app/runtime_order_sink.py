@@ -4,11 +4,18 @@ import math
 from dataclasses import dataclass, field, fields
 from typing import Any, Callable
 
+from storage.db import TradingDatabase
 from trading.strategy.exit import FINAL_EXIT_TYPES
 from trading.strategy.models import Candidate, EntryPlan, ExitDecision, VirtualOrder, VirtualPosition
 from trading.strategy.pipeline import GatePipelineResult
 from trading.strategy.themelab_adapter import ORDER_PHASE_ENTRY, SOURCE as THEMELAB_SOURCE, themelab_entry_idempotency_key
 from trading_app.dependencies import CoreSettings
+from trading_app.live_sim_canary import (
+    LIVE_SIM_CANARY_SOURCE,
+    canary_config_from_settings,
+    decision_record_from_result,
+    evaluate_live_sim_canary,
+)
 from trading_app.order_enqueue_service import OrderEnqueueService, RuntimeOrderIntentRequest
 
 
@@ -514,6 +521,13 @@ class LiveSimRuntimeOrderSink(DryRunRuntimeOrderSink):
             }
         try:
             dry_request = _runtime_request_from_dry_payload(dry_payload)
+            canary_config = self._canary_config()
+            if phase == "entry" and self._canary_limited_mode(canary_config):
+                return self._submit_live_sim_canary_from_dry_payload(
+                    dry_payload,
+                    dry_request,
+                    canary_config=canary_config,
+                )
             request = _replace_runtime_request(
                 dry_request,
                 dry_run=False,
@@ -540,6 +554,140 @@ class LiveSimRuntimeOrderSink(DryRunRuntimeOrderSink):
             return {"accepted": False, "mode": "LIVE_SIM", "status": "ERROR", "reason": str(exc)}
         self._record_live_sim_result(result, phase=phase)
         return result.to_dict()
+
+    def _submit_live_sim_canary_from_dry_payload(
+        self,
+        dry_payload: dict[str, Any],
+        dry_request: RuntimeOrderIntentRequest,
+        *,
+        canary_config: dict[str, Any],
+    ) -> dict[str, Any]:
+        db = TradingDatabase(str(self.service.db_path))
+        try:
+            metadata = dict(dry_request.metadata or {})
+            preflight = dict(metadata.get("live_sim_preflight") or metadata.get("preflight_snapshot") or db.latest_live_sim_preflight_snapshot() or {})
+            counters = self._canary_counters(db, dry_request, metadata)
+            decision = evaluate_live_sim_canary(
+                runtime_settings=self.runtime_settings,
+                canary_config=canary_config,
+                preflight_snapshot=preflight,
+                metadata={
+                    **metadata,
+                    "code": dry_request.code,
+                    "candidate_id": dry_request.candidate_id,
+                    "limit_price": dry_request.price,
+                    "leg_index": dry_request.leg_index,
+                    "hybrid_score": dry_request.hybrid_score,
+                    "theme_name": dry_request.theme_name,
+                    "theme_score": dry_request.theme_score,
+                    "trade_date": _first_text(metadata.get("trade_date"), dry_payload.get("record", {}).get("trade_date")),
+                },
+                counters=counters,
+                limit_price=int(dry_request.price or 0),
+                current_price=int(metadata.get("current_price") or metadata.get("price") or dry_request.price or 0),
+                created_at=str(dry_payload.get("response", {}).get("created_at") or dry_request.runtime_cycle_at or ""),
+            )
+            db.save_live_sim_canary_decision(decision.to_dict())
+            if not decision.eligible:
+                self.live_sim_total_count += 1
+                self.live_sim_blocked_count += 1
+                self.last_live_sim_reject_reason = decision.reason_codes[-1] if decision.reason_codes else decision.status
+                self.last_live_sim_order_intent_at = decision.created_at
+                return {
+                    "accepted": False,
+                    "mode": "LIVE_SIM",
+                    "status": decision.status,
+                    "reason": decision.reason_codes[-1] if decision.reason_codes else decision.status,
+                    "canary_decision_id": decision.decision_id,
+                    "canary": decision.to_dict(),
+                }
+            request = _replace_runtime_request(
+                dry_request,
+                source=LIVE_SIM_CANARY_SOURCE,
+                dry_run=False,
+                quantity=decision.quantity,
+                price=decision.limit_price,
+                idempotency_key=self._canary_idempotency_key(decision, dry_request),
+                reason=str(canary_config.get("reason_code") or "LIVE_SIM_HYBRID_READY_CANARY"),
+                gate_status="READY",
+                order_phase="entry",
+                metadata={
+                    **metadata,
+                    "source": LIVE_SIM_CANARY_SOURCE,
+                    "canary_decision_id": decision.decision_id,
+                    "canary_reason_codes": list(decision.reason_codes),
+                    "canary_blocking_reasons": list(decision.blocking_reasons),
+                    "canary_warning_reasons": list(decision.warning_reasons),
+                    "dry_run_intent_id": dry_payload.get("intent_id"),
+                    "dry_run_status": dry_payload.get("status"),
+                    "dry_run_reason": dry_payload.get("reason"),
+                    "candidate_instance_id": decision.candidate_instance_id,
+                    "candidate_generation_seq": decision.candidate_generation_seq,
+                    "submit_first_leg_only": bool(canary_config.get("submit_first_leg_only", True)),
+                    "order_ttl_sec": decision.order_ttl_sec,
+                },
+            )
+            result = self.service.enqueue_live_sim_order(
+                request,
+                execution_config={
+                    **self._execution_config(),
+                    "max_position_amount_krw": decision.max_position_amount_krw,
+                    "max_order_amount_krw": decision.max_position_amount_krw,
+                    "command_ttl_sec": decision.order_ttl_sec or self.settings.command_ttl_sec,
+                    "allow_market_order": False,
+                    "submit_first_leg_only": True,
+                },
+                exit_guard_config=self._exit_guard_config(),
+                lifecycle_config=self._lifecycle_config(),
+                reconcile_config=self._reconcile_config(),
+            )
+            self._record_live_sim_result(result, phase="entry")
+            saved = db.save_live_sim_canary_decision(decision_record_from_result(decision, order_result=result))
+            payload = result.to_dict()
+            payload["canary_decision_id"] = decision.decision_id
+            payload["canary"] = saved
+            return payload
+        finally:
+            db.close()
+
+    def _canary_config(self) -> dict[str, Any]:
+        if self.runtime_settings is None:
+            return {}
+        return canary_config_from_settings(self.runtime_settings)
+
+    def _canary_limited_mode(self, canary_config: dict[str, Any]) -> bool:
+        return bool(canary_config.get("enabled") or canary_config.get("order_enabled"))
+
+    def _canary_counters(
+        self,
+        db: TradingDatabase,
+        request: RuntimeOrderIntentRequest,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        trade_date = _first_text(metadata.get("trade_date"), request.runtime_cycle_at[:10])
+        submitted_statuses = {"SUBMITTED", "ACCEPTED", "PARTIAL_FILLED", "FILLED", "UNKNOWN_SUBMIT"}
+        active_statuses = {"CREATED", "SUBMITTING", "SUBMITTED", "ACCEPTED", "PARTIAL_FILLED", "UNKNOWN_SUBMIT", "CANCEL_REQUESTED"}
+        orders = db.list_live_sim_orders(trade_date=trade_date, side="buy", limit=10000) if trade_date else []
+        code_orders = db.list_live_sim_orders(code=request.code, side="buy", limit=200)
+        positions = db.list_live_sim_positions(code=request.code, limit=200)
+        open_positions_today = [
+            item
+            for item in db.list_live_sim_positions(limit=10000)
+            if str(item.get("opened_at") or "").startswith(trade_date) and str(item.get("status") or "") == "OPEN"
+        ] if trade_date else []
+        return {
+            "orders_per_day": sum(1 for item in orders if str(item.get("order_status") or "") in submitted_statuses),
+            "orders_per_cycle": 0,
+            "new_positions_per_day": len(open_positions_today),
+            "has_open_order_for_code": any(str(item.get("order_status") or "") in active_statuses for item in code_orders),
+            "has_position_for_code": any(str(item.get("status") or "") == "OPEN" and int(item.get("current_qty") or 0) > 0 for item in positions),
+        }
+
+    def _canary_idempotency_key(self, decision, request: RuntimeOrderIntentRequest) -> str:
+        return (
+            f"runtime:livesim:canary:{decision.trade_date}:{request.code}:{request.candidate_id or ''}:"
+            f"{decision.candidate_instance_id}:{decision.candidate_generation_seq}:entry:first"
+        )
 
     def _execution_config(self) -> dict[str, Any]:
         if self.runtime_settings is None:

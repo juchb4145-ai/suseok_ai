@@ -395,6 +395,7 @@ db = TradingDatabase(str(db_path))
 try:
     settings = StrategyRuntimeSettingsRepository(db).load()
     execution = dict(settings.value("order_execution", {}) or {})
+    canary = dict(settings.value("live_sim_hybrid_ready_canary", {}) or {})
     result = {
         "db_path": str(db_path),
         "mode": str(execution.get("mode") or ""),
@@ -406,6 +407,13 @@ try:
         "block_real_account": bool(execution.get("block_real_account")),
         "fail_closed_on_account_unknown": bool(execution.get("fail_closed_on_account_unknown")),
         "allowed_account_numbers_count": len(list(execution.get("allowed_account_numbers") or [])),
+        "live_sim_hybrid_ready_canary": {
+            "enabled": bool(canary.get("enabled")),
+            "order_enabled": bool(canary.get("order_enabled")),
+            "max_orders_per_day": int(canary.get("max_orders_per_day") or 0),
+            "max_position_amount_krw": int(canary.get("max_position_amount_krw") or 0),
+            "position_size_multiplier": float(canary.get("position_size_multiplier") or 0.0),
+        },
     }
 finally:
     db.close()
@@ -493,6 +501,24 @@ function Write-LiveSimPreflightSummary([object]$Preflight) {
     Write-Step "LIVE_SIM preflight message=$($summary.operator_message_ko)"
     Write-Step "LIVE_SIM preflight action=$($summary.recommended_action_ko)"
     return $summary
+}
+
+function Write-LiveSimCanaryStartupSummary([object]$DbSettings, [object]$PreflightSummary) {
+    $canary = Get-ObjectPropertyValue $DbSettings "live_sim_hybrid_ready_canary"
+    $preflightStatus = if ($PreflightSummary) { [string](Get-ObjectPropertyValue $PreflightSummary "status") } else { "SKIPPED" }
+    $enabled = [bool](Get-ObjectPropertyValue $canary "enabled")
+    $orderEnabled = [bool](Get-ObjectPropertyValue $canary "order_enabled")
+    $maxOrdersPerDay = [int](Get-ObjectPropertyValue $canary "max_orders_per_day")
+    $maxPositionAmount = [int](Get-ObjectPropertyValue $canary "max_position_amount_krw")
+    $multiplier = [double](Get-ObjectPropertyValue $canary "position_size_multiplier")
+    Write-Step ("LIVE_SIM Canary enabled={0} order_enabled={1} max_orders_per_day={2} max_position_amount_krw={3} position_size_multiplier={4} preflight={5}" -f `
+        $enabled, $orderEnabled, $maxOrdersPerDay, $maxPositionAmount, $multiplier, $preflightStatus)
+    if ($preflightStatus.Trim().ToUpperInvariant() -ne "GO") {
+        Write-Step "LIVE_SIM Canary orders unavailable: Preflight status is not GO."
+    }
+    if (-not $orderEnabled) {
+        Write-Step "LIVE_SIM Canary order_enabled=false; 판단만 기록하고 주문은 생성하지 않습니다."
+    }
 }
 
 function Assert-LiveSimPreflightAllowsStartup([object]$Preflight) {
@@ -951,6 +977,7 @@ try {
     } else {
         Write-Step "LIVE_SIM preflight skipped because runtime startup is skipped"
     }
+    Write-LiveSimCanaryStartupSummary $dbSettings $liveSimPreflightSummary
 
     $runtimeStatus = $null
     if (-not $SkipRuntime) {
@@ -1051,6 +1078,7 @@ try {
         themelab = $themeLabStatus
         pre_open_data_warmup = $preOpenDataWarmupStatus
         live_sim_preflight = $liveSimPreflightSummary
+        live_sim_hybrid_ready_canary = Get-ObjectPropertyValue $dbSettings "live_sim_hybrid_ready_canary"
         shadow_small_entry_ops = $shadowSmallEntryStatus
         db_order_execution = $dbSettings
     } | ConvertTo-Json -Depth 8

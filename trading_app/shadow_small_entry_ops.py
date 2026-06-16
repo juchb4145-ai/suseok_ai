@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import secrets
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -636,7 +637,9 @@ class ShadowSmallEntryOpsService:
         if self._promotion_evidence_override is not None:
             return dict(self._promotion_evidence_override)
         try:
-            return ShadowSmallEntryPromotionAnalyzer(self.db).load_evidence(
+            module = sys.modules.get(__name__)
+            analyzer_cls = getattr(module, "ShadowSmallEntryPromotionAnalyzer", ShadowSmallEntryPromotionAnalyzer)
+            return analyzer_cls(self.db).load_evidence(
                 trade_date=trade_date,
                 limit=self.promotion_evidence_limit,
             )

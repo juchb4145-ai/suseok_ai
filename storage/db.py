@@ -1441,6 +1441,39 @@ class TradingDatabase:
                 payload_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS live_sim_canary_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_id TEXT UNIQUE NOT NULL,
+                trade_date TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                candidate_generation_seq INTEGER NOT NULL DEFAULT 0,
+                hybrid_status TEXT NOT NULL DEFAULT '',
+                hybrid_position_tier TEXT NOT NULL DEFAULT '',
+                hybrid_score REAL,
+                theme_name TEXT NOT NULL DEFAULT '',
+                theme_score REAL,
+                stock_role TEXT NOT NULL DEFAULT '',
+                price_location_status TEXT NOT NULL DEFAULT '',
+                price_location_readiness TEXT NOT NULL DEFAULT '',
+                eligible INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                blocking_reasons_json TEXT NOT NULL DEFAULT '[]',
+                warning_reasons_json TEXT NOT NULL DEFAULT '[]',
+                preflight_status TEXT NOT NULL DEFAULT '',
+                dry_run_go_no_go_status TEXT NOT NULL DEFAULT '',
+                load_guard_status TEXT NOT NULL DEFAULT '',
+                limit_price INTEGER NOT NULL DEFAULT 0,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                max_position_amount_krw INTEGER NOT NULL DEFAULT 0,
+                position_size_multiplier REAL NOT NULL DEFAULT 0,
+                order_intent_id TEXT NOT NULL DEFAULT '',
+                gateway_command_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
             CREATE TABLE IF NOT EXISTS dry_run_performance_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 report_id TEXT NOT NULL,
@@ -1770,6 +1803,14 @@ class TradingDatabase:
                 ON live_sim_preflight_snapshots(checked_at);
             CREATE INDEX IF NOT EXISTS idx_live_sim_preflight_snapshots_status
                 ON live_sim_preflight_snapshots(status, checked_at);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_canary_decisions_trade_date
+                ON live_sim_canary_decisions(trade_date, created_at);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_canary_decisions_code
+                ON live_sim_canary_decisions(code, created_at);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_canary_decisions_status
+                ON live_sim_canary_decisions(status, eligible, created_at);
+            CREATE INDEX IF NOT EXISTS idx_live_sim_canary_decisions_order_intent
+                ON live_sim_canary_decisions(order_intent_id);
             CREATE INDEX IF NOT EXISTS idx_dry_run_performance_items_report_id
                 ON dry_run_performance_items(report_id);
             CREATE INDEX IF NOT EXISTS idx_dry_run_performance_items_code
@@ -5297,6 +5338,134 @@ class TradingDatabase:
             """
         ).fetchone()
         return _row_to_live_sim_preflight_snapshot(row) if row else None
+
+    def save_live_sim_canary_decision(self, decision: dict) -> dict:
+        payload = _live_sim_canary_decision_params(decision)
+        if not payload["decision_id"]:
+            raise ValueError("decision_id is required")
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO live_sim_canary_decisions(
+                    decision_id, trade_date, code, candidate_id, candidate_instance_id,
+                    candidate_generation_seq, hybrid_status, hybrid_position_tier,
+                    hybrid_score, theme_name, theme_score, stock_role,
+                    price_location_status, price_location_readiness, eligible, status,
+                    reason_codes_json, blocking_reasons_json, warning_reasons_json,
+                    preflight_status, dry_run_go_no_go_status, load_guard_status,
+                    limit_price, quantity, max_position_amount_krw,
+                    position_size_multiplier, order_intent_id, gateway_command_id,
+                    created_at, details_json
+                ) VALUES (
+                    :decision_id, :trade_date, :code, :candidate_id, :candidate_instance_id,
+                    :candidate_generation_seq, :hybrid_status, :hybrid_position_tier,
+                    :hybrid_score, :theme_name, :theme_score, :stock_role,
+                    :price_location_status, :price_location_readiness, :eligible, :status,
+                    :reason_codes_json, :blocking_reasons_json, :warning_reasons_json,
+                    :preflight_status, :dry_run_go_no_go_status, :load_guard_status,
+                    :limit_price, :quantity, :max_position_amount_krw,
+                    :position_size_multiplier, :order_intent_id, :gateway_command_id,
+                    :created_at, :details_json
+                )
+                ON CONFLICT(decision_id) DO UPDATE SET
+                    order_intent_id=excluded.order_intent_id,
+                    gateway_command_id=excluded.gateway_command_id,
+                    eligible=excluded.eligible,
+                    status=excluded.status,
+                    reason_codes_json=excluded.reason_codes_json,
+                    blocking_reasons_json=excluded.blocking_reasons_json,
+                    warning_reasons_json=excluded.warning_reasons_json,
+                    limit_price=excluded.limit_price,
+                    quantity=excluded.quantity,
+                    details_json=excluded.details_json
+                """,
+                payload,
+            )
+        return self.get_live_sim_canary_decision(str(payload.get("decision_id") or "")) or dict(decision or {})
+
+    def get_live_sim_canary_decision(self, decision_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM live_sim_canary_decisions WHERE decision_id = ?",
+            (str(decision_id or ""),),
+        ).fetchone()
+        return _row_to_live_sim_canary_decision(row) if row else None
+
+    def list_live_sim_canary_decisions(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        status: Optional[str] = None,
+        eligible: Optional[bool] = None,
+        reason_code: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if code:
+            clauses.append("code = ?")
+            params.append(str(code))
+        if status:
+            clauses.append("status = ?")
+            params.append(str(status))
+        if eligible is not None:
+            clauses.append("eligible = ?")
+            params.append(int(bool(eligible)))
+        if reason_code:
+            clauses.append("reason_codes_json LIKE ?")
+            params.append(f"%{str(reason_code)}%")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM live_sim_canary_decisions
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [max(1, int(limit or 100)), max(0, int(offset or 0))]),
+        ).fetchall()
+        return [_row_to_live_sim_canary_decision(row) for row in rows]
+
+    def live_sim_canary_summary(self, *, trade_date: Optional[str] = None, limit: int = 5000) -> dict:
+        date = str(trade_date or datetime.now().date().isoformat())
+        rows = self.list_live_sim_canary_decisions(trade_date=date, limit=limit)
+        status_counts = Counter(str(row.get("status") or "") for row in rows)
+        blocked_reasons: Counter[str] = Counter()
+        submitted_count = 0
+        filled_count = 0
+        for row in rows:
+            for reason in list(row.get("blocking_reasons") or []):
+                blocked_reasons[str(reason)] += 1
+            order_intent_id = str(row.get("order_intent_id") or "")
+            if order_intent_id:
+                submitted_count += 1
+                order = self.get_live_sim_order(order_intent_id)
+                if order and str(order.get("order_status") or "") in {"FILLED", "PARTIAL_FILLED"}:
+                    filled_count += 1
+        latest = rows[0] if rows else {}
+        return {
+            "trade_date": date,
+            "total_count": len(rows),
+            "eligible_count": sum(1 for row in rows if bool(row.get("eligible"))),
+            "blocked_count": int(status_counts.get("BLOCKED", 0)),
+            "observe_only_count": int(status_counts.get("OBSERVE_ONLY", 0)),
+            "config_disabled_count": int(status_counts.get("CONFIG_DISABLED", 0)),
+            "submitted_count": submitted_count,
+            "filled_count": filled_count,
+            "status_counts": dict(status_counts),
+            "blocked_reason_top": [
+                {"reason": reason, "count": count}
+                for reason, count in blocked_reasons.most_common(10)
+            ],
+            "preflight_status": str(latest.get("preflight_status") or ""),
+            "load_guard_status": str(latest.get("load_guard_status") or ""),
+            "dry_run_go_no_go_status": str(latest.get("dry_run_go_no_go_status") or ""),
+        }
 
     def save_dry_run_threshold_ab_report(self, report: dict) -> dict:
         report_id = str(report.get("report_id") or "")
@@ -10793,6 +10962,64 @@ def _row_to_dry_run_performance_report(
     if include_items:
         payload["items"] = []
     return payload
+
+
+def _live_sim_canary_decision_params(payload: dict) -> dict:
+    reason_codes = payload.get("reason_codes_json", payload.get("reason_codes", []))
+    blocking = payload.get("blocking_reasons_json", payload.get("blocking_reasons", []))
+    warnings = payload.get("warning_reasons_json", payload.get("warning_reasons", []))
+    details = payload.get("details_json", payload.get("metadata", payload.get("details", {})))
+    return {
+        "decision_id": str(payload.get("decision_id") or ""),
+        "trade_date": str(payload.get("trade_date") or ""),
+        "code": str(payload.get("code") or ""),
+        "candidate_id": payload.get("candidate_id"),
+        "candidate_instance_id": str(payload.get("candidate_instance_id") or ""),
+        "candidate_generation_seq": int(payload.get("candidate_generation_seq") or 0),
+        "hybrid_status": str(payload.get("hybrid_status") or ""),
+        "hybrid_position_tier": str(payload.get("hybrid_position_tier") or ""),
+        "hybrid_score": _nullable_float(payload.get("hybrid_score")),
+        "theme_name": str(payload.get("theme_name") or ""),
+        "theme_score": _nullable_float(payload.get("theme_score")),
+        "stock_role": str(payload.get("stock_role") or ""),
+        "price_location_status": str(payload.get("price_location_status") or ""),
+        "price_location_readiness": str(payload.get("price_location_readiness") or ""),
+        "eligible": int(bool(payload.get("eligible"))),
+        "status": str(payload.get("status") or ""),
+        "reason_codes_json": reason_codes
+        if isinstance(reason_codes, str)
+        else json.dumps(list(reason_codes or []), ensure_ascii=False, sort_keys=True, default=str),
+        "blocking_reasons_json": blocking
+        if isinstance(blocking, str)
+        else json.dumps(list(blocking or []), ensure_ascii=False, sort_keys=True, default=str),
+        "warning_reasons_json": warnings
+        if isinstance(warnings, str)
+        else json.dumps(list(warnings or []), ensure_ascii=False, sort_keys=True, default=str),
+        "preflight_status": str(payload.get("preflight_status") or ""),
+        "dry_run_go_no_go_status": str(payload.get("dry_run_go_no_go_status") or ""),
+        "load_guard_status": str(payload.get("load_guard_status") or ""),
+        "limit_price": int(payload.get("limit_price") or 0),
+        "quantity": int(payload.get("quantity") or 0),
+        "max_position_amount_krw": int(payload.get("max_position_amount_krw") or 0),
+        "position_size_multiplier": float(payload.get("position_size_multiplier") or 0.0),
+        "order_intent_id": str(payload.get("order_intent_id") or ""),
+        "gateway_command_id": str(payload.get("gateway_command_id") or ""),
+        "created_at": str(payload.get("created_at") or datetime.now().isoformat(timespec="seconds")),
+        "details_json": details
+        if isinstance(details, str)
+        else json.dumps(dict(details or {}), ensure_ascii=False, sort_keys=True, default=str),
+    }
+
+
+def _row_to_live_sim_canary_decision(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["eligible"] = bool(data.get("eligible"))
+    data["reason_codes"] = _safe_json_loads(data.get("reason_codes_json"), [])
+    data["blocking_reasons"] = _safe_json_loads(data.get("blocking_reasons_json"), [])
+    data["warning_reasons"] = _safe_json_loads(data.get("warning_reasons_json"), [])
+    data["details"] = _safe_json_loads(data.get("details_json"), {})
+    data["metadata"] = data["details"]
+    return data
 
 
 def _row_to_live_sim_preflight_snapshot(row: sqlite3.Row) -> dict:

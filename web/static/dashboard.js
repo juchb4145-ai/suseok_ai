@@ -1140,6 +1140,85 @@ function renderLiveSimPreflight(snapshot) {
   text("live-sim-preflight-action", payload.recommended_action_ko || "-");
 }
 
+function renderLiveSimCanary(snapshot) {
+  const runtime = snapshot.runtime || {};
+  const payload = snapshot.live_sim_canary || runtime.live_sim_canary || {};
+  const summary = payload.summary || {};
+  const configStatus = payload.config_status || "disabled";
+  const status = payload.status || configStatus.toUpperCase().replace("-", "_");
+  const tone = configStatus === "order-enabled" ? "warn" : configStatus === "observe-only" ? "ok" : "muted";
+
+  text("live-sim-canary-status", status || "DISABLED");
+  cls("live-sim-canary-status", `counter ${tone}`);
+  text("live-sim-canary-updated", formatDateTime(payload.last_updated_at));
+  text("live-sim-canary-message", payload.watch_provisional_notice_ko || "WATCH/PROVISIONAL은 아직 LIVE_SIM Canary 주문 대상이 아닙니다.");
+  text("live-sim-canary-config", `${configStatus} / order ${payload.order_enabled ? "ON" : "OFF"}`);
+  text("live-sim-canary-preflight", summary.preflight_status || payload.preflight_status || "NO_DATA");
+  text("live-sim-canary-loadguard", summary.load_guard_status || payload.load_guard_status || "NO_DATA");
+  text("live-sim-canary-dryrun", summary.dry_run_go_no_go_status || payload.dry_run_go_no_go_status || "NO_DATA");
+  text("live-sim-canary-eligible", summary.eligible_count ?? 0);
+  text("live-sim-canary-blocked", summary.blocked_count ?? 0);
+  text("live-sim-canary-submitted", summary.submitted_count ?? 0);
+  text("live-sim-canary-filled", summary.filled_count ?? 0);
+  text("live-sim-canary-day-limit", payload.max_orders_per_day ?? 0);
+  text("live-sim-canary-max-amount", fmtNumber(payload.max_position_amount_krw ?? 0, 0));
+  renderLiveSimCanaryReasons(summary.blocked_reason_top || []);
+  renderLiveSimCanaryDecisions(payload.recent_decisions || []);
+}
+
+function renderLiveSimCanaryReasons(rows) {
+  const node = document.getElementById("live-sim-canary-reasons");
+  if (!node) return;
+  const items = firstItems(rows || [], 10);
+  node.innerHTML = items.length
+    ? items.map((item) => `
+      <div class="alert-item warn">
+        <strong>${escapeHtml(item.reason || item.key || "-")}</strong>
+        <span>blocked</span>
+        <em>${escapeHtml(item.count ?? 0)}</em>
+      </div>
+    `).join("")
+    : `<span class="empty">차단 사유가 아직 없습니다.</span>`;
+}
+
+function renderLiveSimCanaryDecisions(rows) {
+  const node = document.getElementById("live-sim-canary-decisions");
+  if (!node) return;
+  const items = firstItems(rows || [], 8);
+  node.innerHTML = items.length
+    ? items.map((item) => {
+      const reasons = (item.blocking_reasons || item.reason_codes || []).slice(0, 4).join(", ") || "-";
+      const detail = {
+        decision_id: item.decision_id,
+        code: item.code,
+        theme_name: item.theme_name,
+        hybrid_status: item.hybrid_status,
+        hybrid_score: item.hybrid_score,
+        hybrid_position_tier: item.hybrid_position_tier,
+        stock_role: item.stock_role,
+        price_location_status: item.price_location_status,
+        price_location_readiness: item.price_location_readiness,
+        blocking_reasons: item.blocking_reasons || [],
+        limit_price: item.limit_price,
+        quantity: item.quantity,
+        order_intent_id: item.order_intent_id,
+        gateway_command_id: item.gateway_command_id,
+        metadata: item.metadata || item.details || {},
+      };
+      return `
+        <details class="canary-decision">
+          <summary>
+            <span>${escapeHtml(item.code || "-")} ${escapeHtml(item.theme_name || "")}</span>
+            ${badge(item.status || "-", item.eligible ? "ok" : "warn")}
+            <em>${escapeHtml(reasons)}</em>
+          </summary>
+          <pre>${escapeHtml(JSON.stringify(detail, null, 2))}</pre>
+        </details>
+      `;
+    }).join("")
+    : `<span class="empty">최근 Canary 판단이 없습니다.</span>`;
+}
+
 function renderLiveSimAudit(snapshot) {
   const runtime = snapshot.runtime || {};
   const payload = snapshot.live_sim_audit || runtime.live_sim_audit || {};
@@ -1817,6 +1896,7 @@ function render(snapshot) {
   cls("orderable-state", `pill ${gateway.orderable ? "ok" : "muted"}`);
   renderOpsAlerts(opsAlerts);
   renderLiveSimPreflight(snapshot);
+  renderLiveSimCanary(snapshot);
   renderThemeLabSummary(themeLab);
   renderLiveSimAudit(snapshot);
   renderBuyZeroRca(snapshot);
