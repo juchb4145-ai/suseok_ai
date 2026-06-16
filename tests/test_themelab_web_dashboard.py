@@ -31,6 +31,9 @@ def test_themelab_page_is_standalone_dark_terminal():
     inventory = (ROOT / "docs" / "dashboard_panel_inventory.md").read_text(encoding="utf-8")
     soup = BeautifulSoup(html, "html.parser")
 
+    assert soup.title.get_text(strip=True) == "ThemeLab 자동매매 운영 대시보드"
+    assert soup.select_one("h1").get_text(strip=True) == "ThemeLab 자동매매 운영 대시보드"
+    assert "ThemeLabFlow Trading Terminal" not in html
     assert soup.select_one(".terminal-shell") is not None
     assert soup.select_one("#operator-main-action") is not None
     assert soup.select_one("#operator-main-action-message") is not None
@@ -43,20 +46,30 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#tab-orders-risk") is not None
     assert soup.select_one("#tab-small-entry") is not None
     assert soup.select_one("#tab-reports") is not None
+    assert soup.select_one("#tab-system") is not None
+    assert soup.select_one("#tab-system").has_attr("hidden")
     assert soup.select_one("#tab-developer") is not None
     assert soup.select_one("#tab-developer").has_attr("hidden")
+    assert soup.select_one('[data-tab-target="tab-system"]').get_text(strip=True) == "시스템 상태"
     assert soup.select_one("#operator-operating-status") is not None
     assert soup.select_one("#operator-top-themes") is not None
     assert soup.select_one("#operator-buy-candidates") is not None
     assert soup.select_one("#operator-no-buy-reasons") is not None
     assert soup.select_one("#operator-risk-status") is not None
+    assert "오늘 운영 상태" in html
+    assert "지금 주도테마" in html
+    assert "지금 매수 후보" in html
+    assert "왜 안 사고 있나" in html
+    assert "주문/리스크 안전" in html
     assert soup.select_one('[data-tab-target="tab-main"].active') is not None
     assert soup.select_one("#operating-cockpit") is not None
+    assert soup.select_one('#operating-cockpit[data-operator-tab="system"]') is not None
     assert soup.select_one("#operation-status") is not None
     assert soup.select_one("#naver-theme-sync") is not None
     assert soup.select_one("#naver-theme-sync-status") is not None
     assert soup.select_one("#kiwoom-gateway-start") is not None
     assert soup.select_one("#operator-alert-panel") is not None
+    assert soup.select_one('#operator-alert-panel[data-operator-tab="system"]') is not None
     assert soup.select_one("#operator-alert-count") is not None
     assert soup.select_one("#operator-alert-filters") is not None
     assert soup.select_one("#operator-alert-list") is not None
@@ -78,6 +91,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#operator-runbook-panel") is not None
     assert soup.select_one("#operator-runbook-title") is not None
     assert soup.select_one("#operator-runbook-body") is not None
+    assert soup.select_one('.quality-grid[data-operator-tab="system"]') is not None
     assert soup.select_one("#postmarket-review-panel") is not None
     assert soup.select_one(".postmarket-review-toolbar") is not None
     assert soup.select_one("#postmarket-review-summary") is not None
@@ -217,8 +231,15 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one('[data-filter-value="WAIT_PRICE_LOCATION_PROVISIONAL"]') is not None
     assert soup.select_one('[data-filter-value="WAIT_PRICE_LOCATION_UNKNOWN"]') is not None
     assert "/static/themelab.css" in html
+    assert "/static/dashboard.css" not in html
     assert "/static/themelab.js" in html
+    assert "color-scheme: dark" in css
     assert "--app-bg: #0b0f14" in css
+    assert "--panel:" in css
+    assert "--text:" in css
+    assert "--ready:" in css
+    assert "--blocked:" in css
+    assert "Malgun Gothic" in css
     assert "cockpit-grid" in css
     assert "/ws/dashboard" in js
     assert "/api/themelab/snapshot" in js
@@ -234,7 +255,11 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "function renderTabOrdersRisk" in js
     assert "function renderTabSmallEntry" in js
     assert "function renderTabReports" in js
+    assert "function renderTabSystem" in js
     assert "function renderDeveloperDetails" in js
+    assert "Runtime(전략 실행 루프)" in js
+    assert "Heartbeat(연결 생존 신호)" in js
+    assert "DRY_RUN(모의 판단/가상 주문)" in js
     assert "function translateReasonCode" in js
     assert "function operatorMessageForReason" in js
     assert "function shadowSmallEntryOpsStatusLabel" in js
@@ -254,6 +279,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "translateReasonCode(reason)" in js
     assert "themelab-tab-nav" in css
     assert "operator-main-grid" in css
+    assert 'body[data-active-tab="tab-system"] [data-operator-tab="system"]' in css
     assert "status-ready" in css
     assert "status-wait" in css
     assert "status-observe" in css
@@ -1827,11 +1853,28 @@ def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, 
         db.close()
 
     with TestClient(api.app) as client:
+        root_page = client.get("/")
         page = client.get("/themelab")
         direct = client.get("/api/themelab/snapshot").json()
         snapshot = client.get("/api/snapshot").json()
 
+    root_soup = BeautifulSoup(root_page.text, "html.parser")
+    theme_soup = BeautifulSoup(page.text, "html.parser")
+    assert root_page.status_code == 200
+    assert root_soup.select_one(".terminal-shell") is not None
+    assert root_soup.select_one("#tab-main") is not None
+    assert root_soup.select_one("#tab-system") is not None
+    assert "오늘 운영 상태" in root_page.text
+    assert "지금 주도테마" in root_page.text
+    assert "지금 매수 후보" in root_page.text
+    assert "왜 안 사고 있나" in root_page.text
+    assert "주문/리스크 안전" in root_page.text
+    assert "/static/themelab.css" in root_page.text
+    assert "/static/dashboard.css" not in root_page.text
+    assert "Overview" not in root_page.text
     assert page.status_code == 200
+    assert theme_soup.select_one(".terminal-shell") is not None
+    assert theme_soup.select_one("#tab-system") is not None
     assert direct["summary"]["ready_count"] == 1
     assert direct["operator_view"]["main_action"]["message_ko"]
     assert direct["operator_view"]["buy_candidates"][0]["status_label_ko"] == "매수 가능"

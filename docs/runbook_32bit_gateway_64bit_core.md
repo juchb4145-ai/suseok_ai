@@ -26,6 +26,8 @@ Dashboard:
 http://127.0.0.1:8000/
 ```
 
+The intraday operator URL is the single ThemeLab operator dashboard at `/`. `/themelab` remains a compatibility alias for older bookmarks. Core/Gateway/Runtime details are folded into the `시스템 상태` and `개발자 상세` tabs.
+
 Health check:
 
 ```powershell

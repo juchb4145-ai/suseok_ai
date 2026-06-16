@@ -2232,8 +2232,12 @@ def _operator_tabs(
             "summary_ko": "장후 outcome report, 파일럿 export, 전략 변경 제안을 확인합니다.",
             "count": sum(1 for item in (conservative, shadow_pilot, buy_zero) if item.get("available") or item.get("status")),
         },
+        "system": {
+            "summary_ko": "Core 상태, Gateway 연결, Kiwoom 로그인, Heartbeat(연결 생존 신호), Runtime(전략 실행 루프), DRY_RUN(모의 판단/가상 주문)을 확인합니다.",
+            "count": len(risk_status),
+        },
         "developer": {
-            "summary_ko": "raw trace, reason_code, command_id, JSON, debug counter는 기본 숨김입니다.",
+            "summary_ko": "원본 JSON, command id, trace timeline, transport latency 원본, replay/debug 표, 상세 로그는 기본 숨김입니다.",
             "count": 0,
         },
     }

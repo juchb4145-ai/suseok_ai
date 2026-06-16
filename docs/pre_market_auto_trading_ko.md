@@ -105,13 +105,16 @@ py -3.9-32 apps\kiwoom_gateway.py --core-url http://127.0.0.1:8000 --token local
 http://127.0.0.1:8000/
 ```
 
+장중 운영자가 보는 화면은 `/` 하나로 정리되어 있습니다. `/themelab`은 기존 북마크 호환용 alias이며 같은 ThemeLab 운영 대시보드를 엽니다.
+
 대시보드에서 먼저 볼 곳:
 
-- 상단 요약 카드의 Core/Gateway/Runtime 상태
-- `운영 점검 알림`
-- `Runtime/DRY_RUN` 탭
-- 최근 DRY_RUN 주문 의도
-- Gateway 명령 이력
+- `오늘 운영 상태`
+- `지금 주도테마`
+- `지금 매수 후보`
+- `왜 안 사고 있나`
+- `주문/리스크 안전`
+- Core/Gateway/Runtime 상세는 `시스템 상태` 또는 `개발자 상세` 탭
 
 ### 5. 운영 점검 명령
 
@@ -236,6 +239,8 @@ cd C:\Users\juchn\주식2
 ```powershell
 .\tools\start_market_open_live_sim.ps1
 ```
+
+실행 후 브라우저 확인 화면은 `http://127.0.0.1:8000/` 기준입니다.
 
 `GO_WITH_WARNINGS` 상태에서만 운영자가 명시적으로 계속 진행하려면 다음처럼 실행합니다.
 

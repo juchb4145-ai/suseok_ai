@@ -70,6 +70,8 @@ python -m uvicorn trading_app.api:app --host 127.0.0.1 --port 8000 --reload
 http://127.0.0.1:8000/
 ```
 
+장중 운영자는 위 `/` 화면 하나를 기준으로 본다. `/themelab`은 기존 북마크와 문서 호환을 위한 같은 ThemeLab 운영 대시보드 alias다. 기존 Core/Gateway/Runtime 상세, Heartbeat, DRY_RUN, transport, 로그성 원문은 통합 화면의 `시스템 상태` 또는 `개발자 상세` 탭에서 확인한다.
+
 빠른 운영 점검:
 
 ```powershell

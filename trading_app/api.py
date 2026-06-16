@@ -901,7 +901,7 @@ def _transport_status_payload(db: TradingDatabase) -> dict[str, Any]:
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
-    return templates.TemplateResponse(request, "dashboard.html", {})
+    return templates.TemplateResponse(request, "themelab.html", {})
 
 
 @app.get("/themelab", response_class=HTMLResponse)

@@ -2838,6 +2838,7 @@ function renderOperatorMain(snapshot = state.snapshot || {}) {
   renderTabOrdersRisk(view);
   renderTabSmallEntry(view);
   renderTabReports(view);
+  renderTabSystem(view);
   renderDeveloperDetails(view);
 }
 
@@ -2971,10 +2972,15 @@ function renderTabReports(view = {}) {
   if (node) node.textContent = view.tabs?.reports?.summary_ko || panels.reports?.summary_ko || panels.pilot_report?.summary_ko || "리포트: 장후 outcome report, 전략 변경 제안, export 결과를 아래에서 확인합니다.";
 }
 
+function renderTabSystem(view = {}) {
+  const node = document.querySelector("#tab-system .operator-tab-intro");
+  if (node) node.textContent = view.tabs?.system?.summary_ko || "시스템 상태: Core 상태, Gateway 연결, Kiwoom 로그인, Heartbeat(연결 생존 신호), Runtime(전략 실행 루프), DRY_RUN(모의 판단/가상 주문)을 확인합니다.";
+}
+
 function renderDeveloperDetails(view = {}) {
   const node = document.querySelector("#tab-developer .operator-tab-intro");
   const panels = view.panels || {};
-  if (node) node.textContent = view.tabs?.developer?.summary_ko || panels.developer_details?.summary_ko || "raw trace, reason_code, JSON, debug counter는 이 탭에서만 확인합니다.";
+  if (node) node.textContent = view.tabs?.developer?.summary_ko || panels.developer_details?.summary_ko || "원본 JSON, command id, trace timeline, transport latency 원본, replay/debug 표, 상세 로그는 이 탭에서만 확인합니다.";
 }
 
 function render(snapshot) {
@@ -3025,7 +3031,7 @@ function renderHeader(snapshot) {
   const dataQuality = snapshot.data_quality || {};
   const backfill = snapshot.theme_backfill_runtime || {};
   const snapshotAge = summary.snapshot_age_label ? ` / age ${summary.snapshot_age_label}` : "";
-  text("flow-updated", snapshot.available ? `계산 ${snapshot.calculated_at || "-"} / 갱신 ${snapshot.last_updated_at || "-"}${snapshotAge}` : "ThemeLabFlow 결과 대기 중");
+  text("flow-updated", snapshot.available ? `계산 ${snapshot.calculated_at || "-"} / 갱신 ${snapshot.last_updated_at || "-"}${snapshotAge}` : "ThemeLab 자동매매 운영 결과 대기 중");
   document.getElementById("market-strip").innerHTML = [
     badge(market.market_status || "WAITING"),
     `<span class="counter">KOSPI ${pct(market.kospi_return_pct)}</span>`,
@@ -3044,7 +3050,7 @@ function renderCockpit(snapshot) {
   const backfill = snapshot.theme_backfill_runtime || {};
   const gateway = snapshot.gateway || {};
   setBadge("operation-status", summary.operation_status || "SNAPSHOT_UNAVAILABLE");
-  text("operation-message", summary.operation_message_ko || "ThemeLabFlow 결과 대기 중");
+  text("operation-message", summary.operation_message_ko || "ThemeLab 자동매매 운영 결과 대기 중");
   const snapshotState = summary.snapshot_stale ? "STALE" : "FRESH";
   const snapshotAge = summary.snapshot_age_label ? `age ${summary.snapshot_age_label}` : `갱신 ${snapshot.last_updated_at || "-"}`;
   text("cockpit-snapshot-state", snapshot.available ? `${snapshotState} / ${snapshotAge}` : "대기");
@@ -3062,11 +3068,11 @@ function renderCockpit(snapshot) {
 
   const themeCounts = summary.theme_status_counts || {};
   document.getElementById("cockpit-theme-status").innerHTML = [
-    countLine("LEADING", themeCounts.LEADING),
-    countLine("ACTIVE", themeCounts.ACTIVE),
-    countLine("WATCH", themeCounts.WATCH),
-    countLine("WEAK", themeCounts.WEAK),
-    `<div class="cockpit-line"><strong>TOP</strong><span>${escapeHtml(summary.top_theme_name || "-")} ${summary.top_theme_score ? `· ${score(summary.top_theme_score, 0)}점` : ""}</span></div>`,
+    countLine("주도", themeCounts.LEADING),
+    countLine("활성", themeCounts.ACTIVE),
+    countLine("관찰", themeCounts.WATCH),
+    countLine("약함", themeCounts.WEAK),
+    `<div class="cockpit-line"><strong>최상위</strong><span>${escapeHtml(summary.top_theme_name || "-")} ${summary.top_theme_score ? `· ${score(summary.top_theme_score, 0)}점` : ""}</span></div>`,
   ].join("");
 
   document.getElementById("cockpit-candidate-status").innerHTML = [
@@ -3095,16 +3101,24 @@ function renderCockpit(snapshot) {
   ].join("");
 
   document.getElementById("cockpit-live-readiness").innerHTML = [
-    `<div class="cockpit-line"><strong>Runtime</strong>${badge(summary.runtime_status || "UNKNOWN")}<span>${summary.runtime_running ? "running" : "inactive"} ${escapeHtml(summary.runtime_mode || "")}</span></div>`,
-    `<div class="cockpit-line"><strong>Kiwoom</strong>${boolBadge(gateway.kiwoom_logged_in, "\ub85c\uadf8\uc778", "\ubbf8\ub85c\uadf8\uc778")}<span>${gateway.heartbeat_ok ? "heartbeat OK" : "heartbeat wait"} · ${gateway.connected ? "connected" : "disconnected"}</span></div>`,
-    `<div class="cockpit-line"><strong>Snapshot</strong>${badge(summary.snapshot_stale ? "SNAPSHOT_STALE" : "OK")}<span>${escapeHtml(summary.snapshot_age_label || "-")}</span></div>`,
-    `<div class="cockpit-line"><strong>TR_BACKFILL</strong>${boolBadge(backfill.enabled, "ON", "OFF")}<span>${escapeHtml(backfillStatusText(backfill))} · parser miss ${ratio(backfill.parser_miss_ratio)} · ${escapeHtml(backfill.history_window || "recent_500_commands")}</span></div>`,
-    `<div class="cockpit-line"><strong>LIVE</strong>${boolBadge(summary.live_order_enabled, "활성", "비활성")}</div>`,
+    `<div class="cockpit-line"><strong>Runtime(전략 실행 루프)</strong>${badge(summary.runtime_status || "UNKNOWN")}<span>${summary.runtime_running ? "실행 중" : "중지"} ${escapeHtml(runtimeModeLabel(summary.runtime_mode))}</span></div>`,
+    `<div class="cockpit-line"><strong>Kiwoom</strong>${boolBadge(gateway.kiwoom_logged_in, "\ub85c\uadf8\uc778", "\ubbf8\ub85c\uadf8\uc778")}<span>Heartbeat(연결 생존 신호) ${gateway.heartbeat_ok ? "정상" : "대기"} · ${gateway.connected ? "연결됨" : "끊김"}</span></div>`,
+    `<div class="cockpit-line"><strong>스냅샷</strong>${badge(summary.snapshot_stale ? "SNAPSHOT_STALE" : "OK")}<span>${escapeHtml(summary.snapshot_age_label || "-")}</span></div>`,
+    `<div class="cockpit-line"><strong>TR 보강</strong>${boolBadge(backfill.enabled, "ON", "OFF")}<span>${escapeHtml(backfillStatusText(backfill))} · 파서 미스 ${ratio(backfill.parser_miss_ratio)} · ${escapeHtml(backfill.history_window || "recent_500_commands")}</span></div>`,
+    `<div class="cockpit-line"><strong>실전 주문</strong>${boolBadge(summary.live_order_enabled, "활성", "비활성")}</div>`,
     countLine("Guard 통과", summary.live_guard_passed_count),
     countLine("Guard 차단", summary.live_guard_blocked_count),
     countLine("추격 대기", summary.late_chase_wait_count),
     countLine("추격 차단", summary.chase_risk_blocked_count),
   ].join("");
+}
+
+function runtimeModeLabel(value) {
+  const textValue = String(value || "").toUpperCase();
+  if (textValue === "DRY_RUN") return "DRY_RUN(모의 판단/가상 주문)";
+  if (textValue === "LIVE_SIM") return "LIVE_SIM(모의투자 주문)";
+  if (textValue === "LIVE_REAL") return "LIVE_REAL(실전 주문)";
+  return value || "";
 }
 
 function renderPromotionDecisionPanel() {

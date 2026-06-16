@@ -192,6 +192,7 @@ body[data-active-tab="tab-no-buy"] [data-operator-tab="no-buy"],
 body[data-active-tab="tab-orders-risk"] [data-operator-tab="orders-risk"],
 body[data-active-tab="tab-small-entry"] [data-operator-tab="small-entry"],
 body[data-active-tab="tab-reports"] [data-operator-tab="reports"],
+body[data-active-tab="tab-system"] [data-operator-tab="system"],
 body[data-active-tab="tab-developer"] [data-operator-tab="developer"] {
   display: grid !important;
 }
