@@ -185,6 +185,12 @@ class _Event:
     data_quality_action: str = ""
     early_small_candidate: bool = False
     early_small_order_enabled: bool = False
+    trade_setup_type: str = ""
+    trade_setup_action: str = ""
+    trade_setup_confidence_score: Optional[float] = None
+    trade_setup_position_size_multiplier: Optional[float] = None
+    trade_setup_reason_codes: list[str] = field(default_factory=list)
+    trade_setup_operator_message_ko: str = ""
     source_snapshot_id: int = 0
 
 
@@ -428,6 +434,12 @@ class ThemeLabGateReasonOutcomeAnalyzer:
             "data_quality_action": event.data_quality_action,
             "early_small_candidate": event.early_small_candidate,
             "early_small_order_enabled": event.early_small_order_enabled,
+            "trade_setup_type": event.trade_setup_type,
+            "trade_setup_action": event.trade_setup_action,
+            "trade_setup_confidence_score": event.trade_setup_confidence_score,
+            "trade_setup_position_size_multiplier": event.trade_setup_position_size_multiplier,
+            "trade_setup_reason_codes": list(event.trade_setup_reason_codes),
+            "trade_setup_operator_message_ko": event.trade_setup_operator_message_ko,
             "source_snapshot_id": event.source_snapshot_id,
         }
         if event.base_price <= 0:
@@ -614,6 +626,7 @@ class ThemeLabGateReasonOutcomeAnalyzer:
 def _event_from_details(snapshot: dict[str, Any], snapshot_at: datetime, code: str, details: dict[str, Any]) -> _Event:
     reasons = _reason_codes(details)
     status = _status(details)
+    trade_setup_reason_codes = _list_upper(details.get("trade_setup_reason_codes") or [])
     return _Event(
         observed_at=snapshot_at,
         trade_date=str(details.get("market_trade_date") or snapshot_at.date().isoformat()),
@@ -646,11 +659,19 @@ def _event_from_details(snapshot: dict[str, Any], snapshot_at: datetime, code: s
         data_quality_action=str(details.get("data_quality_action") or ""),
         early_small_candidate=bool(details.get("early_small_candidate")),
         early_small_order_enabled=bool(details.get("early_small_order_enabled")),
+        trade_setup_type=str(details.get("trade_setup_type") or "").strip().upper(),
+        trade_setup_action=str(details.get("trade_setup_action") or "").strip().upper(),
+        trade_setup_confidence_score=_float_or_none(details.get("trade_setup_confidence_score")),
+        trade_setup_position_size_multiplier=_float_or_none(details.get("trade_setup_position_size_multiplier")),
+        trade_setup_reason_codes=trade_setup_reason_codes,
+        trade_setup_operator_message_ko=str(details.get("trade_setup_operator_message_ko") or ""),
         source_snapshot_id=int(snapshot.get("id") or 0),
     )
 
 
 def _should_track_event(event: _Event) -> bool:
+    if event.trade_setup_type and event.trade_setup_type != "UNKNOWN":
+        return True
     if event.status.upper() in TRACKED_STATUSES:
         return True
     reasons = {reason.upper() for reason in event.reason_codes}
@@ -674,6 +695,7 @@ def _reason_codes(details: dict[str, Any]) -> list[str]:
         "market_side_reason_codes",
         "market_session_reason_codes",
         "risk_reason_codes",
+        "trade_setup_reason_codes",
         "price_location_data_quality_flags",
         "missing_core_fields",
         "missing_entry_fields",
@@ -691,6 +713,24 @@ def _reason_codes(details: dict[str, Any]) -> list[str]:
         token = f"PRICE_LOCATION_{readiness}"
         if token not in result:
             result.append(token)
+    return result
+
+
+def _list_upper(values: Any) -> list[str]:
+    if isinstance(values, str):
+        values = [part.strip() for part in values.split(",")]
+    elif isinstance(values, dict):
+        values = values.values()
+    else:
+        try:
+            values = list(values or [])
+        except TypeError:
+            values = [values]
+    result: list[str] = []
+    for value in values or []:
+        text = str(value or "").strip().upper()
+        if text and text not in result:
+            result.append(text)
     return result
 
 
