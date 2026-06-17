@@ -38,6 +38,100 @@
           <div class="metric"><span>Heartbeat</span><strong id="heartbeat-age">-</strong></div>
         </section>
 
+        <section id="dashboard-v2-root" class="band dashboard-v2-console" hidden>
+          <div class="section-head">
+            <div>
+              <h2>Reboot V2 운영 콘솔</h2>
+              <p id="dashboard-v2-message" class="help-text">시장, 테마, 후보, 보유 리스크, 주문 안전 상태를 요약합니다.</p>
+            </div>
+            <div class="action-strip">
+              <span id="dashboard-v2-status-label" class="counter muted">관찰전용</span>
+              <a class="link-button" href="/legacy">Legacy</a>
+              <a class="link-button" href="/debug">개발자 상세</a>
+            </div>
+          </div>
+          <div id="dashboard-v2-banners" class="alert-list"></div>
+          <div class="mini-grid dashboard-v2-status-grid">
+            <div><span>시장국면</span><strong id="dashboard-v2-market-status">-</strong></div>
+            <div><span>주문안전</span><strong id="dashboard-v2-order-safety">-</strong></div>
+            <div><span>브로커 / 계좌</span><strong id="dashboard-v2-broker-account">-</strong></div>
+            <div><span>킬스위치</span><strong id="dashboard-v2-kill-switch">NORMAL</strong></div>
+            <div><span>데이터</span><strong id="dashboard-v2-data-freshness">-</strong></div>
+            <div><span>최근 Runtime</span><strong id="dashboard-v2-runtime-cycle">-</strong></div>
+          </div>
+          <section class="dashboard-v2-main-grid">
+            <article class="dashboard-v2-panel">
+              <div class="section-head"><h3>시장국면</h3><span id="dashboard-v2-market-pill" class="counter muted">UNKNOWN</span></div>
+              <p id="dashboard-v2-market-message" class="help-text">시장 데이터 대기</p>
+              <div class="mini-grid compact">
+                <div><span>KOSPI</span><strong id="dashboard-v2-kospi">-</strong></div>
+                <div><span>KOSDAQ</span><strong id="dashboard-v2-kosdaq">-</strong></div>
+                <div><span>차단</span><strong id="dashboard-v2-market-blocks">0</strong></div>
+                <div><span>시장대기</span><strong id="dashboard-v2-market-waits">0</strong></div>
+              </div>
+            </article>
+            <article class="dashboard-v2-panel">
+              <div class="section-head"><h3>주문안전</h3><span id="dashboard-v2-order-pill" class="counter muted">OBSERVE</span></div>
+              <div class="mini-grid compact">
+                <div><span>LIVE_SIM</span><strong id="dashboard-v2-live-sim">OFF</strong></div>
+                <div><span>Open Orders</span><strong id="dashboard-v2-open-orders">0</strong></div>
+                <div><span>거부</span><strong id="dashboard-v2-rejected-orders">0</strong></div>
+                <div><span>취소대기</span><strong id="dashboard-v2-pending-cancel">0</strong></div>
+              </div>
+              <p id="dashboard-v2-last-reject" class="help-text">최근 주문 거부 없음</p>
+            </article>
+            <article class="dashboard-v2-panel">
+              <div class="section-head"><h3>포트폴리오 리스크</h3><span id="dashboard-v2-risk-pill" class="counter muted">NORMAL</span></div>
+              <div class="mini-grid compact">
+                <div><span>보유</span><strong id="dashboard-v2-open-positions">0</strong></div>
+                <div><span>미실현</span><strong id="dashboard-v2-unrealized">-</strong></div>
+                <div><span>EXIT NOW</span><strong id="dashboard-v2-exit-now">0</strong></div>
+                <div><span>SCALE OUT</span><strong id="dashboard-v2-scale-out">0</strong></div>
+              </div>
+              <p id="dashboard-v2-risk-message" class="help-text">보유 리스크 관찰</p>
+            </article>
+          </section>
+          <section class="dashboard-v2-main-grid dashboard-v2-two">
+            <article class="dashboard-v2-panel">
+              <div class="section-head"><h3>주도테마 TOP5</h3><span id="dashboard-v2-theme-count" class="counter">0</span></div>
+              <div id="dashboard-v2-themes" class="operator-list"></div>
+            </article>
+            <article class="dashboard-v2-panel">
+              <div class="section-head"><h3>차단/대기/주문거부 TOP</h3><span id="dashboard-v2-reason-count" class="counter">0</span></div>
+              <div id="dashboard-v2-reasons" class="operator-list"></div>
+            </article>
+          </section>
+          <section class="dashboard-v2-main-grid dashboard-v2-two">
+            <article class="dashboard-v2-panel">
+              <div class="section-head"><h3>진입 준비 관찰 후보</h3><span id="dashboard-v2-entry-count" class="counter">0</span></div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>종목</th><th>테마</th><th>상태</th><th>가격</th><th>왜?</th></tr></thead>
+                  <tbody id="dashboard-v2-entry-rows"></tbody>
+                </table>
+              </div>
+            </article>
+            <article class="dashboard-v2-panel">
+              <div class="section-head"><h3>보유 포지션 / 청산 판단</h3><span id="dashboard-v2-position-count" class="counter">0</span></div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>종목</th><th>수익률</th><th>청산</th><th>보유</th><th>리스크</th></tr></thead>
+                  <tbody id="dashboard-v2-position-rows"></tbody>
+                </table>
+              </div>
+            </article>
+          </section>
+          <details class="dashboard-v2-debug">
+            <summary>시스템 상태</summary>
+            <div class="mini-grid compact">
+              <div><span>Gateway</span><strong id="dashboard-v2-health-gateway">-</strong></div>
+              <div><span>Command Queue</span><strong id="dashboard-v2-health-queue">0</strong></div>
+              <div><span>Transport</span><strong id="dashboard-v2-health-transport">-</strong></div>
+              <div><span>Last Exception</span><strong id="dashboard-v2-health-exception">-</strong></div>
+            </div>
+          </details>
+        </section>
+
         <section class="band">
           <div class="section-head">
             <div>

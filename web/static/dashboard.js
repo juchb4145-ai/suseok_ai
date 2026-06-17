@@ -1055,6 +1055,164 @@ function renderOpsAlerts(payload) {
     .join("");
 }
 
+function renderDashboardV2(snapshot) {
+  const payload = (snapshot || {}).dashboard_v2 || {};
+  const root = document.getElementById("dashboard-v2-root");
+  if (!root) return;
+  if (!payload.schema_version) {
+    root.hidden = true;
+    return;
+  }
+  root.hidden = false;
+  const status = payload.v2_status || {};
+  const market = payload.market_overview || {};
+  const themes = payload.leading_themes || { items: [] };
+  const entry = payload.entry_candidates || { items: [] };
+  const positionRisk = payload.position_risk || { positions: [] };
+  const orderManager = payload.order_manager || {};
+  const reasons = payload.wait_block_reasons || { items: [] };
+  const health = payload.system_health || {};
+
+  text("dashboard-v2-message", status.operator_message_ko || "Reboot V2 운영 상태를 요약합니다.");
+  text("dashboard-v2-status-label", status.status_label || "관찰전용");
+  cls("dashboard-v2-status-label", `counter ${statusTone(status.status_label)}`);
+  renderDashboardV2Banners(payload.safety_banners || []);
+
+  text("dashboard-v2-market-status", `${market.global_status || "-"} / ${market.kospi_status || "-"} / ${market.kosdaq_status || "-"}`);
+  text("dashboard-v2-order-safety", orderManager.live_sim_orders_allowed ? "LIVE_SIM 허용" : "관찰/차단");
+  text("dashboard-v2-broker-account", `${status.broker_env || "UNKNOWN"} / ${status.account || "-"}`);
+  text("dashboard-v2-kill-switch", status.kill_switch_state || "NORMAL");
+  text("dashboard-v2-data-freshness", status.data_freshness_status || "-");
+  text("dashboard-v2-runtime-cycle", formatDateTime(status.last_runtime_cycle_at));
+
+  text("dashboard-v2-market-pill", market.global_status || "UNKNOWN");
+  cls("dashboard-v2-market-pill", `counter ${market.risk_off_detected ? "bad" : market.weak_market_detected ? "warn" : "ok"}`);
+  text("dashboard-v2-market-message", market.market_operator_message_ko || "시장 데이터 대기");
+  text("dashboard-v2-kospi", `${formatPercentValue(market.kospi_return_pct)} / ${formatPercentValue(Number(market.kospi_breadth_pct || 0) * 100)}`);
+  text("dashboard-v2-kosdaq", `${formatPercentValue(market.kosdaq_return_pct)} / ${formatPercentValue(Number(market.kosdaq_breadth_pct || 0) * 100)}`);
+  text("dashboard-v2-market-blocks", market.block_new_entry_count || 0);
+  text("dashboard-v2-market-waits", market.wait_market_count || 0);
+
+  text("dashboard-v2-order-pill", orderManager.mode || "OBSERVE");
+  cls("dashboard-v2-order-pill", `counter ${orderManager.real_broker_blocked ? "bad" : orderManager.live_sim_orders_allowed ? "ok" : "muted"}`);
+  text("dashboard-v2-live-sim", orderManager.live_sim_orders_allowed ? "ON" : "OFF");
+  text("dashboard-v2-open-orders", orderManager.open_order_count || 0);
+  text("dashboard-v2-rejected-orders", orderManager.rejected_order_count || 0);
+  text("dashboard-v2-pending-cancel", orderManager.pending_cancel_count || 0);
+  text("dashboard-v2-last-reject", orderManager.last_reject_reason ? `최근 거부: ${orderManager.last_reject_reason}` : "최근 주문 거부 없음");
+
+  text("dashboard-v2-risk-pill", positionRisk.portfolio_risk_level || "NORMAL");
+  cls("dashboard-v2-risk-pill", `counter ${/KILL|REDUCE|STOP|RISK/i.test(positionRisk.portfolio_risk_level || "") ? "bad" : positionRisk.stop_new_entry_recommended ? "warn" : "ok"}`);
+  text("dashboard-v2-open-positions", positionRisk.open_position_count || 0);
+  text("dashboard-v2-unrealized", formatPercentValue(positionRisk.unrealized_pnl_pct));
+  text("dashboard-v2-exit-now", positionRisk.exit_now_count || 0);
+  text("dashboard-v2-scale-out", positionRisk.scale_out_count || 0);
+  text("dashboard-v2-risk-message", positionRisk.kill_switch_recommended ? "킬스위치 권고: 신규 매수 차단 확인" : positionRisk.stop_new_entry_recommended ? "신규진입 중지 권고" : "보유 리스크 관찰");
+
+  text("dashboard-v2-theme-count", themes.top5_count || (themes.items || []).length || 0);
+  renderDashboardV2Themes(themes.items || []);
+  text("dashboard-v2-reason-count", (reasons.items || []).length || 0);
+  renderDashboardV2Reasons(reasons.items || []);
+  text("dashboard-v2-entry-count", (entry.items || []).length || 0);
+  renderDashboardV2EntryRows(entry.items || []);
+  text("dashboard-v2-position-count", (positionRisk.positions || []).length || 0);
+  renderDashboardV2PositionRows(positionRisk.positions || []);
+
+  text("dashboard-v2-health-gateway", (health.gateway_heartbeat || {}).ok ? "정상" : "점검");
+  text("dashboard-v2-health-queue", health.command_queue_depth || 0);
+  text("dashboard-v2-health-transport", health.transport_status || "-");
+  text("dashboard-v2-health-exception", health.last_exception || "-");
+}
+
+function renderDashboardV2Banners(rows) {
+  const node = document.getElementById("dashboard-v2-banners");
+  if (!node) return;
+  if (!rows.length) {
+    node.innerHTML = '<div class="alert-item ok"><strong>정상</strong><span>주요 안전 경고가 없습니다.</span></div>';
+    return;
+  }
+  node.innerHTML = rows.map((item) => `
+    <div class="alert-item ${item.severity === "critical" ? "bad" : item.severity === "warning" ? "warn" : "ok"}">
+      <strong>${escapeHtml(item.message_ko || item.reason_code || "-")}</strong>
+      <span>${escapeHtml(item.reason_code || "")}</span>
+    </div>
+  `).join("");
+}
+
+function renderDashboardV2Themes(rows) {
+  const node = document.getElementById("dashboard-v2-themes");
+  if (!node) return;
+  if (!rows.length) {
+    node.innerHTML = '<span class="empty">주도테마 후보 데이터가 없습니다</span>';
+    return;
+  }
+  node.innerHTML = rows.slice(0, 5).map((item) => `
+    <div class="dashboard-v2-list-item">
+      <div><strong>${escapeHtml(item.rank || "-")}. ${escapeHtml(item.theme_name || "-")}</strong><span>${escapeHtml(item.leader_name || item.leader_symbol || "-")}</span></div>
+      <div>${badge(item.theme_status_label || item.theme_status || "관찰")}<span>${escapeHtml(fmtOptionalNumber(item.theme_score, 1))}</span></div>
+      <p>${escapeHtml(item.reason_summary_ko || "-")}</p>
+    </div>
+  `).join("");
+}
+
+function renderDashboardV2Reasons(rows) {
+  const node = document.getElementById("dashboard-v2-reasons");
+  if (!node) return;
+  if (!rows.length) {
+    node.innerHTML = '<span class="empty">집계된 대기/차단 사유가 없습니다</span>';
+    return;
+  }
+  node.innerHTML = rows.slice(0, 8).map((item) => `
+    <div class="dashboard-v2-list-item">
+      <div><strong>${escapeHtml(item.reason_ko || item.reason_code || "-")}</strong>${badge(item.severity || "normal")}</div>
+      <p>${escapeHtml(item.reason_code || "-")} · ${escapeHtml(item.count ?? 0)}건 · ${escapeHtml(item.suggested_action_ko || "")}</p>
+    </div>
+  `).join("");
+}
+
+function renderDashboardV2EntryRows(rows) {
+  const node = document.getElementById("dashboard-v2-entry-rows");
+  if (!node) return;
+  if (!rows.length) {
+    node.innerHTML = '<tr><td colspan="5" class="empty">진입 준비 관찰 후보가 없습니다</td></tr>';
+    return;
+  }
+  node.innerHTML = rows.slice(0, 12).map((item) => `
+    <tr>
+      <td>${textCell(`${item.code || "-"} ${item.name || ""}`.trim())}</td>
+      <td>${textCell(item.theme_name || "-")}</td>
+      <td>${badge(item.display_bucket_label || item.display_bucket || "-")}</td>
+      <td>${textCell(item.current_price || "-")}</td>
+      <td>${textCell(item.reason_summary_ko || item.operator_message_ko || "-")}</td>
+    </tr>
+  `).join("");
+}
+
+function renderDashboardV2PositionRows(rows) {
+  const node = document.getElementById("dashboard-v2-position-rows");
+  if (!node) return;
+  if (!rows.length) {
+    node.innerHTML = '<tr><td colspan="5" class="empty">보유 포지션이 없습니다</td></tr>';
+    return;
+  }
+  node.innerHTML = rows.slice(0, 12).map((item) => `
+    <tr>
+      <td>${textCell(`${item.code || "-"} ${item.name || ""}`.trim())}</td>
+      <td>${textCell(formatPercentValue(item.current_return_pct))}</td>
+      <td>${badge(item.exit_status || "HOLD")}</td>
+      <td>${textCell(`${item.holding_minutes || 0}분`)}</td>
+      <td>${textCell(item.risk_message_ko || "-")}</td>
+    </tr>
+  `).join("");
+}
+
+function statusTone(value) {
+  const textValue = String(value || "");
+  if (/위험|주문차단/.test(textValue)) return "bad";
+  if (/대기|관찰|제한/.test(textValue)) return "warn";
+  return "ok";
+}
+
 function renderThemeLabSummary(themeLab) {
   const payload = themeLab || {};
   const summary = payload.summary || {};
@@ -2097,6 +2255,7 @@ function render(snapshot) {
   const opsAlerts = snapshot.ops_alerts || { summary: {}, alerts: [] };
   const themeLab = snapshot.theme_lab || {};
 
+  renderDashboardV2(snapshot);
   text("snapshot-time", snapshot.timestamp || "대기 중");
   text("core-mode", core.mode || "OBSERVE");
   cls("core-mode", `pill ${core.mode === "LIVE" ? "warn" : core.mode === "DRY_RUN" ? "ok" : "muted"}`);

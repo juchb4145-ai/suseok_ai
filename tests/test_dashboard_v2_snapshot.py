@@ -1,0 +1,122 @@
+from trading_app.dashboard_labels import reason_label_ko
+from trading_app.dashboard_v2 import build_dashboard_v2_snapshot
+
+
+def test_dashboard_v2_empty_sections_return_stable_schema(monkeypatch):
+    monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
+
+    payload = build_dashboard_v2_snapshot({}, detail="slim")
+
+    assert payload["schema_version"] == "dashboard_v2.reboot_ops.v1"
+    assert payload["enabled"] is True
+    assert set(payload) >= {
+        "v2_status",
+        "market_overview",
+        "leading_themes",
+        "entry_candidates",
+        "position_risk",
+        "exit_watch",
+        "order_manager",
+        "wait_block_reasons",
+        "system_health",
+        "legacy_debug_link",
+    }
+    assert payload["leading_themes"]["items"] == []
+    assert payload["entry_candidates"]["items"] == []
+
+
+def test_dashboard_v2_limits_theme_board_to_top5(monkeypatch):
+    monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
+    snapshot = {
+        "theme_board": {
+            "status": "OK",
+            "top_themes": [
+                {"theme_rank": idx, "theme_name": f"테마{idx}", "theme_status": "LEADING_THEME", "theme_score": 100 - idx}
+                for idx in range(1, 8)
+            ],
+        }
+    }
+
+    payload = build_dashboard_v2_snapshot(snapshot)
+
+    assert payload["leading_themes"]["top5_count"] == 5
+    assert [item["theme_name"] for item in payload["leading_themes"]["items"]] == ["테마1", "테마2", "테마3", "테마4", "테마5"]
+    assert payload["leading_themes"]["items"][0]["theme_status_label"] == "주도테마"
+
+
+def test_dashboard_v2_entry_decisions_map_to_operator_buckets(monkeypatch):
+    monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
+    snapshot = {
+        "entry_engine": {
+            "status": "OK",
+            "decisions": [
+                {"code": "000001", "name": "READY", "entry_status": "OBSERVE_READY", "reason_codes": []},
+                {"code": "000002", "name": "PRICE", "entry_status": "PRICE_WAIT", "reason_codes": ["CHASE_HIGH"]},
+                {"code": "000003", "name": "WAIT", "entry_status": "DATA_WAIT", "reason_codes": ["LATEST_TICK_MISSING"]},
+                {"code": "000004", "name": "BLOCK", "entry_status": "HARD_BLOCK", "reason_codes": ["MARKET_RISK_OFF_BLOCK"]},
+            ],
+        },
+        "order_manager": {
+            "managed_orders": [{"code": "000001", "status": "QUEUED_TO_GATEWAY"}],
+        },
+    }
+
+    payload = build_dashboard_v2_snapshot(snapshot)
+
+    buckets = {item["code"]: item["display_bucket"] for item in payload["entry_candidates"]["items"]}
+    assert buckets["000001"] == "ORDER_PENDING"
+    assert buckets["000002"] == "SETUP_READY"
+    assert buckets["000003"] == "WAIT"
+    assert buckets["000004"] == "BLOCK"
+
+
+def test_dashboard_v2_risk_off_and_real_broker_create_safety_banners(monkeypatch):
+    monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
+    snapshot = {
+        "gateway": {
+            "heartbeat_ok": True,
+            "account": "12345678",
+            "last_heartbeat_payload": {"server_gubun": "0"},
+        },
+        "market_regime": {
+            "global_status": "RISK_OFF",
+            "risk_off_detected": True,
+            "block_new_entry_count": 3,
+        },
+        "order_manager": {
+            "enabled": True,
+            "mode": "LIVE_SIM",
+            "broker_env": "REAL",
+            "account": "12345678",
+            "account_whitelisted": False,
+            "live_sim_orders_allowed": False,
+            "kill_switch_state": "KILL_SWITCH_ACTIVE",
+        },
+    }
+
+    payload = build_dashboard_v2_snapshot(snapshot)
+
+    messages = [item["message_ko"] for item in payload["safety_banners"]]
+    assert "실계좌 환경 감지: 모든 자동주문 차단" in messages
+    assert "RISK_OFF: 신규진입 차단, 보유 리스크 축소 우선" in messages
+    assert "킬스위치 활성: 신규 매수 차단" in messages
+
+
+def test_dashboard_v2_wait_block_reasons_aggregate_and_unknown_reason_fallback(monkeypatch):
+    monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
+    snapshot = {
+        "entry_engine": {
+            "top_wait_reasons": [{"reason": "LATEST_TICK_MISSING", "count": 2}],
+            "top_block_reasons": [{"reason": "UNKNOWN_NEW_REASON", "count": 1}],
+        },
+        "order_manager": {
+            "top_wait_or_block_reasons": [{"reason": "ACCOUNT_NOT_WHITELISTED", "count": 1}],
+        },
+    }
+
+    payload = build_dashboard_v2_snapshot(snapshot)
+
+    reasons = {item["reason_code"]: item for item in payload["wait_block_reasons"]["items"]}
+    assert reasons["LATEST_TICK_MISSING"]["reason_ko"] == "실시간 tick 대기"
+    assert reasons["UNKNOWN_NEW_REASON"]["reason_ko"] == "UNKNOWN_NEW_REASON"
+    assert reason_label_ko("UNKNOWN_NEW_REASON") == "UNKNOWN_NEW_REASON"

@@ -69,6 +69,7 @@ from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSo
 from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThemeUniverseSource
 from trading.theme_engine.theme_board import theme_board_dashboard_section
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
+from trading_app.dashboard_v2 import build_dashboard_v2_snapshot, dashboard_v2_auto_route_enabled, dashboard_v2_enabled
 from trading_app.buy_zero_rca import BuyZeroRCAAnalyzer
 from trading_app.conservative_reason_outcomes import (
     ConservativeReasonOutcomeAnalyzer,
@@ -910,12 +911,24 @@ def _transport_status_payload(db: TradingDatabase) -> dict[str, Any]:
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
+    if dashboard_v2_auto_route_enabled():
+        return templates.TemplateResponse(request, "dashboard.html", {"dashboard_v2_enabled": True})
     return templates.TemplateResponse(request, "themelab.html", {})
 
 
 @app.get("/themelab", response_class=HTMLResponse)
 def theme_lab_dashboard(request: Request):
     return templates.TemplateResponse(request, "themelab.html", {})
+
+
+@app.get("/legacy", response_class=HTMLResponse)
+def legacy_dashboard(request: Request):
+    return templates.TemplateResponse(request, "themelab.html", {})
+
+
+@app.get("/debug", response_class=HTMLResponse)
+def debug_dashboard(request: Request):
+    return templates.TemplateResponse(request, "dashboard.html", {"dashboard_v2_enabled": dashboard_v2_enabled()})
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -4030,8 +4043,21 @@ def reviews(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
 
 
 @app.get("/api/snapshot")
-def snapshot(refresh: bool = Query(False), detail: str = Query(DASHBOARD_SNAPSHOT_DETAIL_SLIM)) -> dict[str, Any]:
-    return _build_dashboard_snapshot_payload(force=refresh, detail=detail)
+def snapshot(
+    refresh: bool = Query(False),
+    detail: str = Query(DASHBOARD_SNAPSHOT_DETAIL_SLIM),
+    view: str = Query(""),
+) -> dict[str, Any]:
+    payload = _build_dashboard_snapshot_payload(force=refresh, detail=detail)
+    if str(view or "").strip().lower() == "v2":
+        return build_dashboard_v2_snapshot(payload, detail=detail)
+    return payload
+
+
+@app.get("/api/dashboard-v2/snapshot")
+def dashboard_v2_snapshot(refresh: bool = Query(False), detail: str = Query(DASHBOARD_SNAPSHOT_DETAIL_SLIM)) -> dict[str, Any]:
+    payload = _build_dashboard_snapshot_payload(force=refresh, detail=detail)
+    return build_dashboard_v2_snapshot(payload, detail=detail)
 
 
 @app.get("/api/themelab/snapshot")
@@ -6966,7 +6992,10 @@ def _build_theme_lab_dashboard_snapshot_with_fresh_db(*, include_extended: bool 
 def _build_dashboard_snapshot_payload_uncached(*, detail: str = DASHBOARD_SNAPSHOT_DETAIL_SLIM) -> dict[str, Any]:
     db = open_database()
     try:
-        return build_dashboard_snapshot(db, detail=detail)
+        payload = build_dashboard_snapshot(db, detail=detail)
+        if dashboard_v2_enabled():
+            payload["dashboard_v2"] = build_dashboard_v2_snapshot(payload, detail=detail)
+        return payload
     finally:
         close_database(db)
 

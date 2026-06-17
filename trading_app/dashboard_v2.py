@@ -1,0 +1,670 @@
+from __future__ import annotations
+
+import os
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+from typing import Any, Iterable
+
+from trading_app.dashboard_labels import (
+    entry_bucket_label_ko,
+    reason_label_ko,
+    reason_severity,
+    suggested_action_ko,
+    theme_status_label_ko,
+)
+
+
+def dashboard_v2_enabled() -> bool:
+    return _env_bool("TRADING_DASHBOARD_V2_ENABLED", _env_bool("STRATEGY_REBOOT_V2_DASHBOARD", False))
+
+
+def dashboard_v2_auto_route_enabled() -> bool:
+    return _env_bool("TRADING_DASHBOARD_V2_AUTO_ROUTE", False)
+
+
+def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str = "slim") -> dict[str, Any]:
+    base = dict(snapshot or {})
+    full = str(detail or "slim").lower() in {"full", "debug", "verbose"}
+    runtime = dict(base.get("runtime") or {})
+    gateway = dict(base.get("gateway") or {})
+    commands = dict(base.get("commands") or {})
+    market = dict(base.get("market_regime") or runtime.get("market_regime") or {})
+    themes = dict(base.get("theme_board") or runtime.get("theme_board") or {})
+    entry = dict(base.get("entry_engine") or runtime.get("entry_engine") or {})
+    exit_engine = dict(base.get("exit_engine") or runtime.get("exit_engine") or {})
+    pos_risk = dict(base.get("position_risk") or runtime.get("position_risk") or {})
+    order_manager = dict(base.get("order_manager") or runtime.get("order_manager") or {})
+    candidates = dict(base.get("candidates") or {})
+
+    payload = {
+        "schema_version": "dashboard_v2.reboot_ops.v1",
+        "generated_at": base.get("timestamp") or _now(),
+        "enabled": dashboard_v2_enabled(),
+        "v2_status": _v2_status(base, runtime, gateway, market, order_manager, pos_risk),
+        "market_overview": _market_overview(market),
+        "leading_themes": _leading_themes(themes),
+        "entry_candidates": _entry_candidates(entry, candidates, order_manager),
+        "position_risk": _position_risk(pos_risk, exit_engine),
+        "exit_watch": _exit_watch(exit_engine),
+        "order_manager": _order_manager(order_manager, gateway, commands),
+        "wait_block_reasons": _wait_block_reasons(base, runtime),
+        "system_health": _system_health(base, runtime, gateway, commands),
+        "legacy_debug_link": {
+            "label": "개발자 상세",
+            "href": "/themelab",
+            "debug_href": "/api/snapshot?detail=full",
+        },
+        "ui_policy": {
+            "main_view_raw_json": False,
+            "main_view_legacy_panels": False,
+            "live_real_enable_ui_allowed": False,
+            "order_enable_ui_allowed": False,
+            "kill_switch_reset_ui_allowed": False,
+        },
+    }
+    payload["safety_banners"] = _safety_banners(payload)
+    if full:
+        payload["debug"] = {
+            "market_regime": market,
+            "theme_board": themes,
+            "entry_engine": entry,
+            "exit_engine": exit_engine,
+            "position_risk": pos_risk,
+            "order_manager": order_manager,
+        }
+    return payload
+
+
+def _v2_status(
+    base: dict[str, Any],
+    runtime: dict[str, Any],
+    gateway: dict[str, Any],
+    market: dict[str, Any],
+    order_manager: dict[str, Any],
+    position_risk: dict[str, Any],
+) -> dict[str, Any]:
+    core = dict(base.get("core") or {})
+    broker_env = str(order_manager.get("broker_env") or _broker_env_from_gateway(gateway))
+    kill = str(order_manager.get("kill_switch_state") or "NORMAL")
+    market_status = str(market.get("global_status") or "")
+    live_sim_allowed = bool(order_manager.get("live_sim_orders_allowed"))
+    observe_only = bool("ORDER_MANAGER_OBSERVE_ONLY" in set(order_manager.get("warnings") or [])) or not live_sim_allowed
+    label = "정상"
+    if kill in {"KILL_SWITCH_ACTIVE", "REDUCE_ONLY", "STOP_NEW_BUY"}:
+        label = "위험"
+    elif broker_env == "REAL":
+        label = "주문차단"
+    elif market_status == "RISK_OFF":
+        label = "위험"
+    elif not live_sim_allowed:
+        label = "관찰전용"
+    if market_status == "DATA_WAIT" or bool(market.get("data_wait_count")):
+        label = "데이터대기"
+    return {
+        "reboot_v2_enabled": True,
+        "dashboard_v2_enabled": dashboard_v2_enabled(),
+        "trading_mode": core.get("mode") or runtime.get("mode") or "OBSERVE",
+        "order_manager_mode": order_manager.get("mode", "OBSERVE"),
+        "observe_only": observe_only,
+        "dry_run_enabled": bool(runtime.get("dry_run_order_sink_enabled") or runtime.get("mode") == "DRY_RUN"),
+        "live_sim_enabled": live_sim_allowed,
+        "real_broker_blocked": broker_env == "REAL" or "REAL_BROKER_BLOCKED" in set(order_manager.get("warnings") or []),
+        "broker_env": broker_env,
+        "account_mode": _account_mode(gateway, order_manager),
+        "account": order_manager.get("account") or gateway.get("account") or "",
+        "account_whitelisted": bool(order_manager.get("account_whitelisted")),
+        "market_session_status": market.get("market_session_status") or runtime.get("market_session_status") or "",
+        "last_runtime_cycle_at": runtime.get("last_cycle_at") or runtime.get("cycle_at") or "",
+        "last_gateway_heartbeat_at": gateway.get("last_heartbeat_at") or "",
+        "data_freshness_status": _data_freshness_status(gateway, market, runtime),
+        "kill_switch_state": kill,
+        "status_label": label,
+        "operator_message_ko": _status_message(label, market_status, broker_env, kill, live_sim_allowed),
+    }
+
+
+def _market_overview(market: dict[str, Any]) -> dict[str, Any]:
+    global_status = str(market.get("global_status") or market.get("status") or "UNKNOWN")
+    return {
+        "status": market.get("status", "EMPTY"),
+        "global_status": global_status,
+        "kospi_status": market.get("kospi_status", "UNKNOWN"),
+        "kosdaq_status": market.get("kosdaq_status", "UNKNOWN"),
+        "kospi_return_pct": _num(market.get("kospi_return_pct")),
+        "kosdaq_return_pct": _num(market.get("kosdaq_return_pct")),
+        "kospi_breadth_pct": _num(market.get("kospi_breadth_pct")),
+        "kosdaq_breadth_pct": _num(market.get("kosdaq_breadth_pct")),
+        "risk_off_detected": bool(market.get("risk_off_detected") or global_status == "RISK_OFF"),
+        "weak_market_detected": bool(market.get("weak_market_detected") or global_status == "WEAK"),
+        "block_new_entry_count": int(market.get("block_new_entry_count") or 0),
+        "wait_market_count": int(market.get("wait_market_count") or 0),
+        "market_operator_message_ko": _market_message(global_status, market),
+        "top_reasons": [_reason_item(item) for item in list(market.get("top_reasons") or [])[:5]],
+    }
+
+
+def _leading_themes(theme_board: dict[str, Any]) -> dict[str, Any]:
+    rows = []
+    for index, theme in enumerate(list(theme_board.get("top_themes") or [])[:5], start=1):
+        item = dict(theme or {})
+        status = str(item.get("theme_status") or "")
+        reasons = list(item.get("reason_codes") or [])
+        rows.append(
+            {
+                "rank": int(item.get("theme_rank") or index),
+                "theme_name": item.get("theme_name") or item.get("name") or "-",
+                "theme_status": status,
+                "theme_status_label": theme_status_label_ko(status),
+                "theme_score": _num(item.get("theme_score")),
+                "leader_symbol": item.get("leader_symbol", ""),
+                "leader_name": item.get("leader_name", ""),
+                "co_leader_symbols": list(item.get("co_leader_symbols") or [])[:5],
+                "strong_count": int(item.get("strong_count") or 0),
+                "leader_count": int(item.get("leader_count") or 0),
+                "theme_turnover_krw": _num(item.get("theme_turnover_krw")),
+                "market_overlay": {
+                    "dominant_market_side": item.get("dominant_market_side", ""),
+                    "market_risk_flag": bool(item.get("market_risk_flag")),
+                },
+                "data_quality_status": _data_quality_status(item),
+                "reason_summary_ko": _reason_summary_ko(reasons) or theme_status_label_ko(status),
+                "reason_codes": reasons,
+            }
+        )
+    return {
+        "status": theme_board.get("status", "EMPTY"),
+        "calculated_at": theme_board.get("calculated_at", ""),
+        "items": rows,
+        "top5_count": len(rows),
+        "hidden_total_hint": "전체 테마 표는 개발자 상세에서 확인",
+    }
+
+
+def _entry_candidates(entry: dict[str, Any], candidates: dict[str, Any], order_manager: dict[str, Any]) -> dict[str, Any]:
+    source_rows = []
+    source_rows.extend(list(entry.get("top_ready_candidates") or []))
+    source_rows.extend(list(entry.get("decisions") or []))
+    if not source_rows:
+        source_rows.extend(list(candidates.get("items") or []))
+    seen: set[str] = set()
+    rows = []
+    pending_codes = {
+        str(item.get("code") or "")
+        for item in list(order_manager.get("managed_orders") or [])
+        if str(item.get("status") or "") in {"QUEUED_TO_GATEWAY", "ACKED_BY_GATEWAY", "PARTIALLY_FILLED", "CANCEL_PENDING"}
+    }
+    for raw in source_rows:
+        item = dict(raw or {})
+        code = str(item.get("code") or "")
+        key = f"{code}:{item.get('entry_status') or item.get('display_state') or item.get('id') or len(rows)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        entry_status = str(item.get("entry_status") or item.get("display_state") or "")
+        bucket = _entry_bucket(item, pending_codes)
+        reasons = _entry_reasons(item)
+        rows.append(
+            {
+                "code": code,
+                "name": item.get("name", ""),
+                "theme_name": item.get("theme_name") or item.get("theme_board_theme_name") or "",
+                "theme_status": item.get("theme_status") or item.get("theme_board_theme_status") or "",
+                "stock_role": item.get("stock_role") or item.get("theme_board_stock_role") or "",
+                "market_status": item.get("market_status") or item.get("market_regime_status") or "",
+                "market_action": item.get("market_action") or "",
+                "entry_status": entry_status or "UNKNOWN",
+                "display_bucket": bucket,
+                "display_bucket_label": entry_bucket_label_ko(bucket),
+                "setup_status": "SETUP_READY" if bucket in {"SETUP_READY", "TIMING_READY", "ORDER_PENDING"} else bucket,
+                "price_location": item.get("price_location") or item.get("entry_price_location") or "",
+                "current_price": int(_num(item.get("current_price"))),
+                "change_rate_pct": _num(item.get("change_rate_pct") or item.get("change_rate")),
+                "vwap_gap_pct": _num(item.get("vwap_gap_pct")),
+                "pullback_from_high_pct": _num(item.get("pullback_from_high_pct")),
+                "limit_price_hint": int(_num(item.get("limit_price_hint"))),
+                "position_size_multiplier_hint": _num(item.get("position_size_multiplier_hint")),
+                "dry_run_intent_allowed": bool(item.get("dry_run_intent_allowed") or item.get("entry_dry_run_intent_allowed")),
+                "live_order_allowed": bool(item.get("live_order_allowed") or item.get("entry_live_order_allowed")),
+                "reason_summary_ko": _reason_summary_ko(reasons),
+                "operator_message_ko": item.get("operator_message_ko") or item.get("entry_operator_message_ko") or _entry_message(bucket),
+                "reason_codes": reasons,
+            }
+        )
+    priority = {"ORDER_PENDING": 0, "TIMING_READY": 1, "SETUP_READY": 2, "WAIT": 3, "BLOCK": 4}
+    rows = sorted(rows, key=lambda row: (priority.get(row["display_bucket"], 9), row["code"]))[:15]
+    bucket_counts = Counter(row["display_bucket"] for row in rows)
+    return {
+        "status": entry.get("status", "EMPTY"),
+        "calculated_at": entry.get("calculated_at", ""),
+        "observe_ready_count": int(entry.get("observe_ready_count") or sum(1 for row in rows if row["display_bucket"] in {"TIMING_READY", "ORDER_PENDING"})),
+        "items": rows,
+        "bucket_counts": dict(bucket_counts),
+    }
+
+
+def _position_risk(position_risk: dict[str, Any], exit_engine: dict[str, Any]) -> dict[str, Any]:
+    exit_by_position = {str(item.get("position_id") or ""): dict(item or {}) for item in list(exit_engine.get("ready_exit_decisions") or [])}
+    rows = []
+    for raw in list(position_risk.get("positions") or [])[:20]:
+        item = dict(raw or {})
+        exit_decision = exit_by_position.get(str(item.get("position_id") or ""), {})
+        reasons = list(item.get("reason_codes") or []) + list(exit_decision.get("reason_codes") or [])
+        rows.append(
+            {
+                "code": item.get("code", ""),
+                "name": item.get("name", ""),
+                "entry_price": int(_num(item.get("entry_price") or item.get("avg_entry_price"))),
+                "current_price": int(_num(item.get("current_price"))),
+                "current_return_pct": _num(item.get("current_return_pct")),
+                "max_return_pct": _num(item.get("max_return_pct")),
+                "max_drawdown_pct": _num(item.get("max_drawdown_pct")),
+                "holding_minutes": int(_num(item.get("holding_minutes"))),
+                "theme_status": dict(item.get("details") or {}).get("theme_status", ""),
+                "market_status": dict(item.get("details") or {}).get("market_status", ""),
+                "exit_status": exit_decision.get("exit_status", ""),
+                "exit_reason": exit_decision.get("exit_reason", ""),
+                "stop_loss_price": int(_num(item.get("stop_loss_price"))),
+                "trailing_stop_price": int(_num(item.get("trailing_stop_price"))),
+                "take_profit_price": int(_num(item.get("take_profit_price"))),
+                "risk_message_ko": _reason_summary_ko(reasons) or "보유 리스크 관찰",
+                "reason_codes": reasons,
+            }
+        )
+    return {
+        "status": position_risk.get("status", "EMPTY"),
+        "portfolio_risk_level": position_risk.get("portfolio_risk_level", "NORMAL"),
+        "open_position_count": int(position_risk.get("open_position_count") or 0),
+        "total_exposure": int(_num(position_risk.get("total_exposure"))),
+        "theme_exposure_top": _top_mapping(position_risk.get("theme_exposure") or {}, limit=5),
+        "market_side_exposure": dict(position_risk.get("market_side_exposure") or {}),
+        "unrealized_pnl_pct": _num(position_risk.get("unrealized_pnl_pct")),
+        "daily_realized_pnl_pct": _num(position_risk.get("daily_realized_pnl_pct")),
+        "stop_new_entry_recommended": bool(position_risk.get("stop_new_entry_recommended")),
+        "kill_switch_recommended": bool(position_risk.get("kill_switch_recommended")),
+        "top_position_risks": [_reason_item(item) for item in list(position_risk.get("top_position_risks") or [])[:10]],
+        "exit_now_count": int(exit_engine.get("exit_now_count") or 0),
+        "scale_out_count": int(exit_engine.get("scale_out_count") or 0),
+        "wait_confirmation_count": int(exit_engine.get("wait_confirmation_count") or 0),
+        "positions": rows,
+    }
+
+
+def _exit_watch(exit_engine: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": exit_engine.get("status", "EMPTY"),
+        "exit_now_count": int(exit_engine.get("exit_now_count") or 0),
+        "scale_out_count": int(exit_engine.get("scale_out_count") or 0),
+        "wait_confirmation_count": int(exit_engine.get("wait_confirmation_count") or 0),
+        "data_wait_count": int(exit_engine.get("data_wait_count") or 0),
+        "top_exit_reasons": [_reason_item(item) for item in list(exit_engine.get("top_exit_reasons") or [])[:10]],
+        "ready_exit_decisions": list(exit_engine.get("ready_exit_decisions") or [])[:10],
+    }
+
+
+def _order_manager(order_manager: dict[str, Any], gateway: dict[str, Any], commands: dict[str, Any]) -> dict[str, Any]:
+    rows = []
+    for raw in list(order_manager.get("managed_orders") or [])[:12]:
+        item = dict(raw or {})
+        sent_at = str(item.get("sent_at") or item.get("created_at") or "")
+        cancel_sec = int(item.get("cancel_after_sec") or 0)
+        rows.append(
+            {
+                "code": item.get("code", ""),
+                "side": item.get("side", ""),
+                "quantity": int(item.get("quantity") or 0),
+                "price": int(item.get("price") or 0),
+                "filled_quantity": int(item.get("filled_quantity") or 0),
+                "remaining_quantity": int(item.get("remaining_quantity") or 0),
+                "status": item.get("status", ""),
+                "order_no": item.get("order_no", ""),
+                "sent_at": sent_at,
+                "cancel_after_sec": cancel_sec,
+                "cancel_due_at": _plus_seconds(sent_at, cancel_sec) if sent_at and cancel_sec else "",
+                "reason_summary_ko": _order_reason_summary(item),
+            }
+        )
+    return {
+        "status": order_manager.get("status", "DISABLED"),
+        "order_manager_enabled": bool(order_manager.get("enabled")),
+        "mode": order_manager.get("mode", "OBSERVE"),
+        "live_sim_orders_allowed": bool(order_manager.get("live_sim_orders_allowed")),
+        "broker_env": order_manager.get("broker_env") or _broker_env_from_gateway(gateway),
+        "account_mode": _account_mode(gateway, order_manager),
+        "account": order_manager.get("account") or gateway.get("account") or "",
+        "account_whitelisted": bool(order_manager.get("account_whitelisted")),
+        "real_broker_blocked": (order_manager.get("broker_env") or _broker_env_from_gateway(gateway)) == "REAL",
+        "kill_switch_state": order_manager.get("kill_switch_state", "NORMAL"),
+        "today_buy_order_count": int(order_manager.get("today_buy_order_count") or 0),
+        "today_sell_order_count": int(order_manager.get("today_sell_order_count") or 0),
+        "open_order_count": int(order_manager.get("open_order_count") or 0),
+        "pending_cancel_count": int(order_manager.get("pending_cancel_count") or 0),
+        "rejected_order_count": int(order_manager.get("rejected_order_count") or 0),
+        "last_order_at": order_manager.get("last_order_at", ""),
+        "last_reject_reason": order_manager.get("last_reject_reason", ""),
+        "next_cancel_due_count": sum(1 for row in rows if row["remaining_quantity"] > 0 and row["cancel_due_at"]),
+        "command_queue_health": _command_queue_health(commands, gateway),
+        "orders": rows,
+        "warnings": list(order_manager.get("warnings") or []),
+    }
+
+
+def _wait_block_reasons(base: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    reason_sources = [
+        base.get("candidate_ingestion"),
+        base.get("theme_board") or runtime.get("theme_board"),
+        base.get("market_regime") or runtime.get("market_regime"),
+        base.get("entry_engine") or runtime.get("entry_engine"),
+        base.get("exit_engine") or runtime.get("exit_engine"),
+        base.get("position_risk") or runtime.get("position_risk"),
+        base.get("order_manager") or runtime.get("order_manager"),
+    ]
+    counts: Counter[str] = Counter()
+    samples: defaultdict[str, list[str]] = defaultdict(list)
+    for source in reason_sources:
+        _collect_reasons(source, counts, samples)
+    rows = []
+    for reason, count in counts.most_common(12):
+        rows.append(
+            {
+                "reason_code": reason,
+                "reason_ko": reason_label_ko(reason),
+                "count": int(count),
+                "severity": reason_severity(reason),
+                "affected_codes_sample": samples.get(reason, [])[:5],
+                "suggested_action_ko": suggested_action_ko(reason),
+            }
+        )
+    return {"items": rows, "total_reason_count": sum(counts.values())}
+
+
+def _system_health(base: dict[str, Any], runtime: dict[str, Any], gateway: dict[str, Any], commands: dict[str, Any]) -> dict[str, Any]:
+    transport = dict(base.get("transport") or {})
+    return {
+        "summary_status": "정상" if bool(gateway.get("heartbeat_ok")) and not runtime.get("last_error") else "점검",
+        "gateway_heartbeat": {
+            "ok": bool(gateway.get("heartbeat_ok")),
+            "age_sec": gateway.get("heartbeat_age_sec"),
+            "last_heartbeat_at": gateway.get("last_heartbeat_at", ""),
+        },
+        "kiwoom_logged_in": bool(gateway.get("kiwoom_logged_in")),
+        "command_queue_depth": int(commands.get("queued_count") or gateway.get("pending_command_count") or 0),
+        "command_ack_latency": transport.get("ack_latency_p95_ms"),
+        "event_latency": transport.get("event_latency_p95_ms"),
+        "transport_status": transport.get("mode") or transport.get("transport_mode") or "",
+        "sqlite_health": "OK",
+        "runtime_cycle_duration": runtime.get("last_cycle_duration_ms"),
+        "last_exception": runtime.get("last_error", ""),
+        "data_freshness": _data_freshness_status(gateway, dict(base.get("market_regime") or {}), runtime),
+        "latest_tick_age_percentile": transport.get("price_tick_age_p95_sec"),
+        "latest_theme_board_at": (base.get("theme_board") or runtime.get("theme_board") or {}).get("calculated_at", ""),
+        "latest_market_regime_at": (base.get("market_regime") or runtime.get("market_regime") or {}).get("calculated_at", ""),
+        "latest_entry_engine_at": (base.get("entry_engine") or runtime.get("entry_engine") or {}).get("calculated_at", ""),
+        "latest_exit_engine_at": (base.get("exit_engine") or runtime.get("exit_engine") or {}).get("calculated_at", ""),
+        "collapsed_by_default": True,
+    }
+
+
+def _safety_banners(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    status = dict(payload.get("v2_status") or {})
+    market = dict(payload.get("market_overview") or {})
+    order = dict(payload.get("order_manager") or {})
+    banners: list[dict[str, Any]] = []
+    if status.get("broker_env") == "REAL" or order.get("real_broker_blocked"):
+        banners.append({"severity": "critical", "message_ko": "실계좌 환경 감지: 모든 자동주문 차단", "reason_code": "REAL_BROKER_BLOCKED"})
+    if not order.get("live_sim_orders_allowed"):
+        banners.append({"severity": "info", "message_ko": "모의주문 비활성: 관찰 전용", "reason_code": "LIVE_SIM_FLAG_DISABLED"})
+    if order.get("account") and not order.get("account_whitelisted"):
+        banners.append({"severity": "warning", "message_ko": "계좌 whitelist 대기", "reason_code": "ACCOUNT_NOT_WHITELISTED"})
+    if status.get("kill_switch_state") in {"KILL_SWITCH_ACTIVE", "STOP_NEW_BUY", "REDUCE_ONLY"}:
+        banners.append({"severity": "critical", "message_ko": "킬스위치 활성: 신규 매수 차단", "reason_code": "KILL_SWITCH_BLOCKS_BUY"})
+    if market.get("risk_off_detected"):
+        banners.append({"severity": "critical", "message_ko": "RISK_OFF: 신규진입 차단, 보유 리스크 축소 우선", "reason_code": "MARKET_RISK_OFF_BLOCK"})
+    if status.get("data_freshness_status") == "STALE":
+        banners.append({"severity": "warning", "message_ko": "Gateway heartbeat 지연: 데이터 신선도 점검", "reason_code": "GATEWAY_HEARTBEAT_STALE"})
+    if not order.get("order_manager_enabled"):
+        banners.append({"severity": "info", "message_ko": "OrderManager 비활성: 관찰 전용", "reason_code": "ORDER_MANAGER_DISABLED"})
+    return banners
+
+
+def _collect_reasons(source: Any, counts: Counter[str], samples: defaultdict[str, list[str]]) -> None:
+    if isinstance(source, list):
+        for item in source:
+            _collect_reasons(item, counts, samples)
+        return
+    if not isinstance(source, dict):
+        return
+    for key in ("reason_codes", "warnings"):
+        for reason in list(source.get(key) or []):
+            _add_reason(counts, samples, reason, source.get("code"))
+    for key in (
+        "top_reasons",
+        "top_wait_reasons",
+        "top_block_reasons",
+        "top_position_risks",
+        "top_exit_reasons",
+        "top_wait_or_block_reasons",
+    ):
+        for item in list(source.get(key) or []):
+            if isinstance(item, dict):
+                reason = item.get("reason") or item.get("reason_code")
+                count = int(item.get("count") or 1)
+                if reason:
+                    counts[str(reason)] += count
+                    code = item.get("code")
+                    if code:
+                        samples[str(reason)].append(str(code))
+    for key in ("items", "top_ready_candidates", "positions", "managed_orders", "orders", "ready_exit_decisions"):
+        for item in list(source.get(key) or []):
+            _collect_reasons(item, counts, samples)
+
+
+def _add_reason(counts: Counter[str], samples: defaultdict[str, list[str]], reason: Any, code: Any = None) -> None:
+    text = str(reason or "").strip()
+    if not text:
+        return
+    counts[text] += 1
+    if code:
+        sample = str(code)
+        if sample not in samples[text]:
+            samples[text].append(sample)
+
+
+def _reason_item(item: Any) -> dict[str, Any]:
+    data = dict(item or {}) if isinstance(item, dict) else {"reason": item, "count": 1}
+    reason = str(data.get("reason") or data.get("reason_code") or "")
+    return {
+        "reason_code": reason,
+        "reason_ko": reason_label_ko(reason),
+        "count": int(data.get("count") or 1),
+        "severity": reason_severity(reason),
+        "suggested_action_ko": suggested_action_ko(reason),
+    }
+
+
+def _entry_bucket(item: dict[str, Any], pending_codes: set[str]) -> str:
+    code = str(item.get("code") or "")
+    if code and code in pending_codes:
+        return "ORDER_PENDING"
+    status = str(item.get("entry_status") or item.get("display_state") or "").upper()
+    if status == "OBSERVE_READY":
+        return "TIMING_READY"
+    if status in {"PRICE_WAIT"}:
+        return "SETUP_READY"
+    if status in {"WAIT", "DATA_WAIT", "MARKET_WAIT", "THEME_WAIT"}:
+        return "WAIT"
+    if status in {"HARD_BLOCK", "BLOCKED"}:
+        return "BLOCK"
+    if bool(item.get("entry_ready_allowed")):
+        return "TIMING_READY"
+    return "WAIT"
+
+
+def _entry_reasons(item: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in ("reason_codes", "entry_reason_codes", "market_reason_codes"):
+        values.extend(str(reason) for reason in list(item.get(key) or []) if reason)
+    return _dedupe(values)
+
+
+def _entry_message(bucket: str) -> str:
+    if bucket == "TIMING_READY":
+        return "진입 준비 관찰 상태입니다."
+    if bucket == "SETUP_READY":
+        return "기본 조건은 통과했지만 가격 타이밍을 기다립니다."
+    if bucket == "ORDER_PENDING":
+        return "OrderManager가 LIVE_SIM 주문 상태를 관리 중입니다."
+    if bucket == "BLOCK":
+        return "리스크 또는 정책 조건으로 차단 중입니다."
+    return "시장, 테마, 가격 또는 데이터 조건을 기다립니다."
+
+
+def _reason_summary_ko(reasons: Iterable[Any]) -> str:
+    labels = [reason_label_ko(reason) for reason in _dedupe([str(item) for item in reasons if item])]
+    return ", ".join(labels[:3])
+
+
+def _order_reason_summary(item: dict[str, Any]) -> str:
+    details = dict(item.get("details") or {})
+    risk = dict(details.get("risk") or {})
+    reasons = list(risk.get("reason_codes") or item.get("reason_codes") or [])
+    if reasons:
+        return _reason_summary_ko(reasons)
+    status = str(item.get("status") or "")
+    if status == "FILLED":
+        return "체결 완료"
+    if status == "PARTIALLY_FILLED":
+        return "부분 체결, 잔량 관리"
+    if status == "CANCEL_PENDING":
+        return "미체결 취소 요청 중"
+    if "REJECT" in status:
+        return "주문 거부 확인 필요"
+    return status or "-"
+
+
+def _market_message(status: str, market: dict[str, Any]) -> str:
+    if status == "RISK_OFF":
+        return "시장국면: RISK_OFF - 신규진입 차단, 보유 리스크 축소 우선"
+    if status == "SELECTIVE":
+        return "시장국면: SELECTIVE - 대장주 중심 축소 진입만 관찰"
+    if status == "EXPANSION":
+        return "시장국면: EXPANSION - 주도테마 확산 여부 관찰"
+    if status == "WEAK":
+        return "시장국면: WEAK - 신규진입 대기, 보유 리스크 우선"
+    if status == "DATA_WAIT" or int(market.get("data_wait_count") or 0) > 0:
+        return "시장 데이터 대기 - 지수 tick 또는 breadth 부족"
+    return f"시장국면: {status or 'UNKNOWN'}"
+
+
+def _status_message(label: str, market_status: str, broker_env: str, kill: str, live_sim_allowed: bool) -> str:
+    if broker_env == "REAL":
+        return "실계좌 환경 감지: 모든 자동주문 차단"
+    if kill in {"KILL_SWITCH_ACTIVE", "REDUCE_ONLY", "STOP_NEW_BUY"}:
+        return "킬스위치 활성: 신규 매수 차단"
+    if market_status == "RISK_OFF":
+        return "RISK_OFF: 신규진입 차단, 보유 리스크 축소 우선"
+    if not live_sim_allowed:
+        return "관찰 전용 또는 모의주문 비활성 상태입니다."
+    return f"Dashboard V2 상태: {label}"
+
+
+def _data_freshness_status(gateway: dict[str, Any], market: dict[str, Any], runtime: dict[str, Any]) -> str:
+    if not bool(gateway.get("heartbeat_ok")):
+        return "STALE"
+    if market.get("global_status") == "DATA_WAIT" or runtime.get("data_warmup_status") not in {"", None, "ready"}:
+        return "WAIT_DATA"
+    return "FRESH"
+
+
+def _broker_env_from_gateway(gateway: dict[str, Any]) -> str:
+    payload = dict(gateway.get("last_heartbeat_payload") or {})
+    values = [
+        gateway.get("broker_env"),
+        gateway.get("account_mode"),
+        gateway.get("server_mode"),
+        gateway.get("server_gubun"),
+        gateway.get("mode"),
+        payload.get("broker_env"),
+        payload.get("account_mode"),
+        payload.get("server_mode"),
+        payload.get("server_gubun"),
+        payload.get("mode"),
+    ]
+    normalized = {str(value or "").strip().upper() for value in values if str(value or "").strip()}
+    if normalized & {"REAL", "PROD", "PRODUCTION", "LIVE", "LIVE_REAL", "0"}:
+        return "REAL"
+    if normalized & {"SIM", "SIMULATION", "MOCK", "PAPER", "DEMO", "LIVE_SIM", "1"}:
+        return "SIMULATION"
+    return "UNKNOWN"
+
+
+def _account_mode(gateway: dict[str, Any], order_manager: dict[str, Any]) -> str:
+    payload = dict(gateway.get("last_heartbeat_payload") or {})
+    return str(
+        order_manager.get("account_mode")
+        or gateway.get("account_mode")
+        or payload.get("account_mode")
+        or payload.get("server_mode")
+        or payload.get("server_gubun")
+        or ""
+    )
+
+
+def _command_queue_health(commands: dict[str, Any], gateway: dict[str, Any]) -> str:
+    queued = int(commands.get("queued_count") or gateway.get("pending_command_count") or 0)
+    if queued >= 1000:
+        return "위험"
+    if queued >= 50:
+        return "주의"
+    return "정상"
+
+
+def _top_mapping(value: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
+    rows = [{"key": str(key), "value": item} for key, item in dict(value or {}).items()]
+    return rows[:limit]
+
+
+def _data_quality_status(item: dict[str, Any]) -> str:
+    flags = list(item.get("data_quality_flags") or [])
+    if flags:
+        return "데이터대기"
+    ratio = _num(item.get("realtime_valid_ratio"))
+    if ratio and ratio < 0.7:
+        return "데이터대기"
+    return "정상"
+
+
+def _plus_seconds(value: str, seconds: int) -> str:
+    try:
+        base = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return (base + timedelta(seconds=max(0, int(seconds)))).isoformat()
+
+
+def _num(value: Any) -> float:
+    if value in {None, ""}:
+        return 0.0
+    try:
+        return float(str(value).replace(",", "").replace("%", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _dedupe(values: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _now() -> str:
+    return datetime.now().replace(microsecond=0).isoformat()

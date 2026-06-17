@@ -490,3 +490,48 @@ python -m pytest tests/test_chejan_reconcile.py -q
 python -m pytest tests/test_core_runtime_api.py -q
 python -m pytest -q
 ```
+
+## Phase 10 Dashboard V2 체크포인트
+
+목표는 Reboot V2 운영 흐름을 한 화면으로 요약하되 주문 실행 UI는 만들지 않는 것이다.
+
+구현 범위:
+
+- `trading_app/dashboard_v2.py`: 기존 snapshot에서 Reboot V2 운영 필드만 추출하는 aggregator
+- `trading_app/dashboard_labels.py`: reason code 한글 label, severity, suggested action dictionary
+- `GET /api/dashboard-v2/snapshot`
+- `GET /api/snapshot?view=v2`
+- `TRADING_DASHBOARD_V2_ENABLED=true`일 때 기존 `/api/snapshot`과 `/ws/dashboard`에 additive `dashboard_v2` 포함
+- `TRADING_DASHBOARD_V2_AUTO_ROUTE=true`일 때 `/`를 Core dashboard V2 summary 화면으로 라우팅
+- `/legacy`, `/debug` 호환 route 추가
+- `web/templates/dashboard.html`, `web/static/dashboard.js`, `web/static/dashboard.css`에 V2 summary console 추가
+- `docs/dashboard_v2_runbook.md` 추가
+
+첫 화면 우선순위:
+
+- 시장국면
+- 주도테마 TOP5
+- 진입 준비 관찰 후보
+- 보유 리스크 / 청산 판단
+- 차단/대기/주문거부 사유 TOP
+
+금지:
+
+- 주문 enable/disable 버튼
+- LIVE/REAL 주문 활성화 UI
+- Gateway send_order/cancel_order 직접 호출 UI
+- kill switch reset 버튼
+- hybrid/final grade/threshold/shadow/promotion을 메인 판단으로 표시
+- “매수 추천”, “매수 확정”, “수익 보장” 표현
+
+검증 명령:
+
+```text
+python -m pytest tests/test_dashboard_v2_snapshot.py -q
+python -m pytest tests/test_themelab_web_dashboard.py -q
+python -m pytest tests/test_core_runtime_api.py -q
+python -m pytest tests/test_order_manager_live_sim.py -q
+python -m pytest tests/test_entry_engine.py -q
+python -m pytest tests/test_exit_engine_reboot.py -q
+python -m pytest -q
+```
