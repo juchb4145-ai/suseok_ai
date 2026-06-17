@@ -369,4 +369,64 @@ order_intent_allowed = False
 - 조건검색 booster 유입 수
 
 READY/주문 버튼처럼 보이는 표현은 넣지 않는다.
+## OBSERVE Runtime Wiring
 
+This PR wires the first vertical runtime slice into the existing OBSERVE path.
+
+Implemented components:
+
+- `trading/theme_engine/opening_runtime.py`
+  - `OpeningBurstScheduler` reads `TRADING_OPENING_BURST_*` settings.
+  - At `09:03`, `09:06`, `09:09`, `09:12`, and `09:15`, it enqueues a `tr_request` command for `opt10032`.
+  - The command uses `purpose=opening_turnover_seed`, `response_mode=capture`, `rq_name=OpeningTurnoverSeed_opt10032`, and screen `8720`.
+  - Idempotency key format is `opening_burst:seed:{trade_date}:{HHMM}`.
+  - The runtime hard-pauses when disabled, outside OBSERVE mode, or outside regular session.
+
+- `storage/db.py`
+  - Persists `opening_turnover_seed_batches`.
+  - Persists `opening_turnover_seed_rows`.
+  - Persists `opening_theme_burst_results`.
+  - Raw `opt10032` rows are retained even when parser fields are missing.
+
+- Runtime integration
+  - Gateway `command_ack` events with `purpose=opening_turnover_seed` are parsed and saved as seed batches.
+  - Parsed seed batches are unioned/deduped through `OpeningTurnoverSeedCollector`.
+  - Eligible seed symbols are registered through `register_realtime`, capped by `TRADING_OPENING_BURST_MAX_REALTIME_REGISTER`.
+  - `OpeningThemeBurstEngine` consumes seed batches, realtime snapshots, and active theme membership.
+
+- Dashboard/API snapshot
+  - ThemeLab snapshot includes `opening_theme_burst`.
+  - Slim dashboard payload keeps the same section with the key OBSERVE fields.
+
+Runtime safety invariants:
+
+- `output_mode=OBSERVE`
+- `ready_allowed=false`
+- `order_intent_allowed=false`
+- No Candidate `READY` transition is created by this path.
+- No DRY_RUN buy intent is created by this path.
+- No LIVE order command is created by this path.
+- `register_realtime` is the only Gateway command type created after seed parsing.
+
+Current environment defaults:
+
+```text
+TRADING_OPENING_BURST_ENABLED=false
+TRADING_OPENING_BURST_OBSERVE_ONLY=true
+TRADING_OPENING_BURST_SEED_TIMES=09:03,09:06,09:09,09:12,09:15
+TRADING_OPENING_BURST_TOP_N_PER_CALL=100
+TRADING_OPENING_BURST_MAX_UNION_SIZE=300
+TRADING_OPENING_BURST_MAX_REALTIME_REGISTER=100
+```
+
+Added runtime wiring tests:
+
+- Scheduler fires only on configured seed times.
+- Duplicate seed cycles are blocked by idempotency key.
+- `opt10032` parser supports field-name fallback.
+- Missing parser fields preserve raw rows and do not crash the runtime.
+- Runtime computes OBSERVE results without condition profiles.
+- `ready_allowed` and `order_intent_allowed` remain false.
+- Realtime registration obeys the configured max limit.
+- `LEADER_ONLY_THEME` does not select follower, late-laggard, or overheated symbols.
+- Dashboard snapshot includes `opening_theme_burst`.

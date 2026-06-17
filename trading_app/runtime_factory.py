@@ -28,6 +28,7 @@ from trading.strategy.runtime_settings import StrategyRuntimeSettingsRepository
 from trading.strategy.virtual_orders import VirtualOrderService
 from trading.theme_engine.backfill import ThemeBackfillConfig, ThemeBackfillService
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
+from trading.theme_engine.opening_runtime import OpeningBurstRuntimeConfig, OpeningThemeBurstRuntimePipeline
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime import RealTimeThemeRuntime
 from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline, theme_lab_config_from_settings
@@ -132,6 +133,13 @@ def build_core_strategy_runtime(
             engine=ThemeLabFlowEngine(theme_lab_config_from_settings(runtime_settings)),
             backfill_service=theme_backfill_service,
         )
+    opening_burst_pipeline = OpeningThemeBurstRuntimePipeline(
+        db=db,
+        gateway_state=gateway_state,
+        market_data=market_data,
+        repository=theme_repository,
+        config=OpeningBurstRuntimeConfig.from_env(trading_mode=settings.mode),
+    )
     runtime = StrategyRuntime(
         db=db,
         candidate_collector=candidate_collector,
@@ -148,6 +156,7 @@ def build_core_strategy_runtime(
         holding_provider=StaticHoldingProvider(set(config.holding_watch_codes)),
         order_sink=order_sink,
         theme_lab_pipeline=theme_lab_pipeline,
+        opening_burst_pipeline=opening_burst_pipeline,
         theme_lab_shadow_ab_provider=theme_lab_shadow_ab_provider,
         shadow_small_entry_promotion_provider=shadow_small_entry_promotion_provider,
     )

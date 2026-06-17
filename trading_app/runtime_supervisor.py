@@ -354,7 +354,10 @@ class RuntimeSupervisor:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
             return
-        if event.type == "command_ack" and str((event.payload or {}).get("purpose") or "") == "theme_data_backfill":
+        if event.type == "command_ack" and str((event.payload or {}).get("purpose") or "") in {
+            "theme_data_backfill",
+            "opening_turnover_seed",
+        }:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
             return
@@ -565,6 +568,11 @@ class RuntimeSupervisor:
         condition_adapter = getattr(self._bundle.runtime, "condition_adapter", None)
         if condition_adapter is not None:
             handler = getattr(condition_adapter, "handle_event", None)
+            if callable(handler) and handler(event):
+                return
+        opening_burst_pipeline = getattr(self._bundle.runtime, "opening_burst_pipeline", None)
+        if opening_burst_pipeline is not None:
+            handler = getattr(opening_burst_pipeline, "handle_event", None)
             if callable(handler) and handler(event):
                 return
         self._bundle.market_data_bridge.handle_event(event)

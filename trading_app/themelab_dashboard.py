@@ -9,6 +9,10 @@ from typing import Any, Callable
 
 from storage.db import TradingDatabase
 from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE
+from trading.theme_engine.opening_runtime import (
+    empty_opening_theme_burst_section,
+    opening_theme_burst_dashboard_section,
+)
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading_app.conservative_reason_outcomes import (
     ConservativeReasonOutcomeAnalyzer,
@@ -620,6 +624,7 @@ def build_theme_lab_dashboard_snapshot(
     summary = _summary(ranked_themes, watchset, entry_candidates, data_quality, runtime=runtime, freshness=freshness)
     trade_setup_summary = _trade_setup_summary(watchset)
     trade_date = _snapshot_trade_date(raw)
+    opening_theme_burst = opening_theme_burst_dashboard_section(db, trade_date=trade_date)
     if include_extended:
         gate_reason_report = _theme_lab_gate_reason_source_report(db, trade_date=trade_date)
         gate_reason_outcomes = _theme_lab_gate_reason_outcomes_payload(gate_reason_report)
@@ -669,6 +674,7 @@ def build_theme_lab_dashboard_snapshot(
         "runtime": runtime,
         "gateway": gateway,
         "theme_backfill_runtime": backfill_runtime,
+        "opening_theme_burst": opening_theme_burst,
         "theme_source_sync": theme_source_sync,
         **_freshness_quality_fields(freshness),
         "market": market,
@@ -707,6 +713,11 @@ def _empty_snapshot(
     runtime = _runtime_context(runtime_status)
     freshness = _empty_freshness()
     trade_date = datetime.now().date().isoformat()
+    opening_theme_burst = (
+        opening_theme_burst_dashboard_section(db, trade_date=trade_date)
+        if db is not None
+        else empty_opening_theme_burst_section()
+    )
     payload = {
         "available": False,
         "source": "theme_lab_flow_snapshots",
@@ -716,6 +727,7 @@ def _empty_snapshot(
         "runtime": runtime,
         "gateway": _gateway_context(None),
         "theme_source_sync": theme_source_sync or _empty_theme_source_sync_status(),
+        "opening_theme_burst": opening_theme_burst,
         "theme_backfill_runtime": {
             "enabled": False,
             "paused_reason": "SNAPSHOT_UNAVAILABLE",

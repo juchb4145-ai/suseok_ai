@@ -8090,6 +8090,7 @@ def _dashboard_slim_reviews_payload(payload: dict[str, Any], *, item_limit: int 
 def _dashboard_slim_theme_lab_payload(payload: dict[str, Any]) -> dict[str, Any]:
     data_quality = dict((payload or {}).get("data_quality") or {})
     backfill_runtime = dict((payload or {}).get("theme_backfill_runtime") or {})
+    opening_theme_burst = dict((payload or {}).get("opening_theme_burst") or {})
     return {
         "available": bool((payload or {}).get("available")),
         "source": (payload or {}).get("source") or "",
@@ -8133,6 +8134,27 @@ def _dashboard_slim_theme_lab_payload(payload: dict[str, Any]) -> dict[str, Any]
                 "load_guard_status",
                 "paused_backfill",
                 "pause_reason_codes",
+            ),
+        ),
+        "opening_theme_burst": _dashboard_field_subset(
+            opening_theme_burst,
+            (
+                "status",
+                "trade_date",
+                "calculated_at",
+                "last_seed_batch_at",
+                "seed_batch_count",
+                "seed_symbol_count",
+                "realtime_registered_count",
+                "top_themes",
+                "selected_symbols",
+                "excluded_late_laggard_count",
+                "excluded_overheated_count",
+                "parser_status",
+                "warnings",
+                "ready_allowed",
+                "order_intent_allowed",
+                "output_mode",
             ),
         ),
         "gateway": _dashboard_field_subset(

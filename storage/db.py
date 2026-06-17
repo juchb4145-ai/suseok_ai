@@ -269,6 +269,50 @@ class TradingDatabase:
                 data_quality_json TEXT NOT NULL DEFAULT '{}',
                 payload_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS opening_turnover_seed_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                batch_time TEXT NOT NULL,
+                command_id TEXT NOT NULL DEFAULT '',
+                row_count INTEGER NOT NULL DEFAULT 0,
+                parsed_count INTEGER NOT NULL DEFAULT 0,
+                parser_status TEXT NOT NULL DEFAULT '',
+                parser_missing_fields_json TEXT NOT NULL DEFAULT '[]',
+                raw_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS opening_turnover_seed_rows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                batch_id INTEGER NOT NULL,
+                trade_date TEXT NOT NULL,
+                batch_time TEXT NOT NULL,
+                stock_code TEXT NOT NULL DEFAULT '',
+                stock_name TEXT NOT NULL DEFAULT '',
+                rank INTEGER NOT NULL DEFAULT 0,
+                turnover_krw REAL NOT NULL DEFAULT 0,
+                change_rate_pct REAL NOT NULL DEFAULT 0,
+                current_price REAL NOT NULL DEFAULT 0,
+                volume INTEGER NOT NULL DEFAULT 0,
+                parser_status TEXT NOT NULL DEFAULT '',
+                parser_missing_fields_json TEXT NOT NULL DEFAULT '[]',
+                raw_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS opening_theme_burst_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                output_mode TEXT NOT NULL DEFAULT 'OBSERVE',
+                ready_allowed INTEGER NOT NULL DEFAULT 0,
+                order_intent_allowed INTEGER NOT NULL DEFAULT 0,
+                seed_batch_count INTEGER NOT NULL DEFAULT 0,
+                seed_symbol_count INTEGER NOT NULL DEFAULT 0,
+                realtime_registered_count INTEGER NOT NULL DEFAULT 0,
+                selected_symbols_json TEXT NOT NULL DEFAULT '[]',
+                top_themes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
             CREATE TABLE IF NOT EXISTS theme_lab_outcome_observations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1614,6 +1658,17 @@ class TradingDatabase:
                 ON theme_activity_snapshots(theme_id, id);
             CREATE INDEX IF NOT EXISTS idx_theme_lab_flow_snapshots_calculated
                 ON theme_lab_flow_snapshots(calculated_at);
+            CREATE INDEX IF NOT EXISTS idx_opening_turnover_seed_batches_trade_date
+                ON opening_turnover_seed_batches(trade_date, batch_time, id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_opening_turnover_seed_batches_command
+                ON opening_turnover_seed_batches(command_id)
+                WHERE command_id != '';
+            CREATE INDEX IF NOT EXISTS idx_opening_turnover_seed_rows_batch
+                ON opening_turnover_seed_rows(batch_id, rank, stock_code);
+            CREATE INDEX IF NOT EXISTS idx_opening_turnover_seed_rows_trade_date
+                ON opening_turnover_seed_rows(trade_date, stock_code);
+            CREATE INDEX IF NOT EXISTS idx_opening_theme_burst_results_trade_date
+                ON opening_theme_burst_results(trade_date, calculated_at);
             CREATE INDEX IF NOT EXISTS idx_dynamic_theme_clusters_status
                 ON dynamic_theme_clusters(status);
             CREATE INDEX IF NOT EXISTS idx_theme_source_sync_runs_source_started
@@ -6353,6 +6408,212 @@ class TradingDatabase:
         payload["calculated_at"] = row["calculated_at"]
         return payload
 
+    def save_opening_turnover_seed_batch(self, batch: dict) -> dict:
+        trade_date = str(batch.get("trade_date") or "")
+        batch_time = str(batch.get("batch_time") or "")
+        command_id = str(batch.get("command_id") or "")
+        rows = list(batch.get("rows") or [])
+        missing = batch.get("parser_missing_fields") or []
+        raw = batch.get("raw") or {}
+        with self.conn:
+            existing = None
+            if command_id:
+                existing = self.conn.execute(
+                    "SELECT id FROM opening_turnover_seed_batches WHERE command_id = ?",
+                    (command_id,),
+                ).fetchone()
+            if existing is None:
+                cursor = self.conn.execute(
+                    """
+                    INSERT INTO opening_turnover_seed_batches(
+                        trade_date, batch_time, command_id, row_count, parsed_count,
+                        parser_status, parser_missing_fields_json, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade_date,
+                        batch_time,
+                        command_id,
+                        int(batch.get("row_count") or len(rows) or 0),
+                        int(batch.get("parsed_count") or 0),
+                        str(batch.get("parser_status") or ""),
+                        json.dumps(list(missing or []), ensure_ascii=False, sort_keys=True, default=str),
+                        json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str),
+                    ),
+                )
+                batch_id = int(cursor.lastrowid)
+            else:
+                batch_id = int(existing["id"])
+                self.conn.execute(
+                    """
+                    UPDATE opening_turnover_seed_batches
+                    SET trade_date = ?, batch_time = ?, row_count = ?, parsed_count = ?,
+                        parser_status = ?, parser_missing_fields_json = ?, raw_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        trade_date,
+                        batch_time,
+                        int(batch.get("row_count") or len(rows) or 0),
+                        int(batch.get("parsed_count") or 0),
+                        str(batch.get("parser_status") or ""),
+                        json.dumps(list(missing or []), ensure_ascii=False, sort_keys=True, default=str),
+                        json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str),
+                        batch_id,
+                    ),
+                )
+                self.conn.execute("DELETE FROM opening_turnover_seed_rows WHERE batch_id = ?", (batch_id,))
+            cleaned_rows = []
+            for row in rows:
+                row_missing = row.get("parser_missing_fields") or []
+                cleaned_rows.append(
+                    (
+                        batch_id,
+                        trade_date,
+                        batch_time,
+                        _clean_stock_code(row.get("stock_code")),
+                        str(row.get("stock_name") or ""),
+                        int(row.get("rank") or 0),
+                        _float_value(row.get("turnover_krw")),
+                        _float_value(row.get("change_rate_pct")),
+                        _float_value(row.get("current_price")),
+                        int(_float_value(row.get("volume"))),
+                        str(row.get("parser_status") or ""),
+                        json.dumps(list(row_missing or []), ensure_ascii=False, sort_keys=True, default=str),
+                        json.dumps(row.get("raw") or {}, ensure_ascii=False, sort_keys=True, default=str),
+                    )
+                )
+            self.conn.executemany(
+                """
+                INSERT INTO opening_turnover_seed_rows(
+                    batch_id, trade_date, batch_time, stock_code, stock_name,
+                    rank, turnover_krw, change_rate_pct, current_price, volume,
+                    parser_status, parser_missing_fields_json, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                cleaned_rows,
+            )
+        return self.get_opening_turnover_seed_batch(batch_id) or dict(batch)
+
+    def get_opening_turnover_seed_batch(self, batch_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM opening_turnover_seed_batches WHERE id = ?",
+            (int(batch_id),),
+        ).fetchone()
+        return self._opening_seed_batch_row(row) if row else None
+
+    def list_opening_turnover_seed_batches(
+        self,
+        *,
+        trade_date: str | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        params: list[object] = []
+        where = ""
+        if trade_date:
+            where = "WHERE trade_date = ?"
+            params.append(str(trade_date))
+        params.append(max(1, int(limit or 20)))
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM (
+                SELECT *
+                FROM opening_turnover_seed_batches
+                {where}
+                ORDER BY batch_time DESC, id DESC
+                LIMIT ?
+            )
+            ORDER BY batch_time ASC, id ASC
+            """,
+            params,
+        ).fetchall()
+        return [self._opening_seed_batch_row(row) for row in rows]
+
+    def list_opening_turnover_seed_rows(
+        self,
+        *,
+        batch_id: int | None = None,
+        trade_date: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if batch_id is not None:
+            clauses.append("batch_id = ?")
+            params.append(int(batch_id))
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, int(limit or 1000)))
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM opening_turnover_seed_rows
+            {where}
+            ORDER BY batch_time ASC, rank ASC, id ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [self._opening_seed_row(row) for row in rows]
+
+    def save_opening_theme_burst_result(self, result: dict) -> dict:
+        payload = dict(result.get("payload") or result)
+        selected_symbols = list(result.get("selected_symbols") or payload.get("selected_symbols") or [])
+        top_themes = list(result.get("top_themes") or payload.get("top_themes") or [])
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO opening_theme_burst_results(
+                    trade_date, calculated_at, output_mode, ready_allowed,
+                    order_intent_allowed, seed_batch_count, seed_symbol_count,
+                    realtime_registered_count, selected_symbols_json,
+                    top_themes_json, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(result.get("trade_date") or payload.get("trade_date") or ""),
+                    str(result.get("calculated_at") or payload.get("calculated_at") or ""),
+                    str(result.get("output_mode") or payload.get("output_mode") or "OBSERVE"),
+                    int(bool(result.get("ready_allowed") or payload.get("ready_allowed"))),
+                    int(bool(result.get("order_intent_allowed") or payload.get("order_intent_allowed"))),
+                    int(result.get("seed_batch_count") or 0),
+                    int(result.get("seed_symbol_count") or 0),
+                    int(result.get("realtime_registered_count") or 0),
+                    json.dumps(selected_symbols, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(top_themes, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+                ),
+            )
+        return self.get_opening_theme_burst_result(int(cursor.lastrowid)) or dict(result)
+
+    def get_opening_theme_burst_result(self, result_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM opening_theme_burst_results WHERE id = ?",
+            (int(result_id),),
+        ).fetchone()
+        return self._opening_theme_burst_result_row(row) if row else None
+
+    def latest_opening_theme_burst_result(self, *, trade_date: str | None = None) -> dict:
+        params: list[object] = []
+        where = ""
+        if trade_date:
+            where = "WHERE trade_date = ?"
+            params.append(str(trade_date))
+        row = self.conn.execute(
+            f"""
+            SELECT *
+            FROM opening_theme_burst_results
+            {where}
+            ORDER BY calculated_at DESC, id DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        return self._opening_theme_burst_result_row(row) if row else {}
+
     def list_theme_lab_flow_results(
         self,
         *,
@@ -6483,6 +6744,59 @@ class TradingDatabase:
         payload["created_at"] = row["created_at"]
         payload["calculated_at"] = row["calculated_at"]
         return payload
+
+    def _opening_seed_batch_row(self, row) -> dict:
+        return {
+            "id": int(row["id"]),
+            "created_at": row["created_at"],
+            "trade_date": row["trade_date"],
+            "batch_time": row["batch_time"],
+            "command_id": row["command_id"],
+            "row_count": int(row["row_count"] or 0),
+            "parsed_count": int(row["parsed_count"] or 0),
+            "parser_status": row["parser_status"],
+            "parser_missing_fields": _safe_json_loads(row["parser_missing_fields_json"], []),
+            "raw": _safe_json_loads(row["raw_json"], {}),
+        }
+
+    def _opening_seed_row(self, row) -> dict:
+        return {
+            "id": int(row["id"]),
+            "created_at": row["created_at"],
+            "batch_id": int(row["batch_id"]),
+            "trade_date": row["trade_date"],
+            "batch_time": row["batch_time"],
+            "stock_code": row["stock_code"],
+            "stock_name": row["stock_name"],
+            "rank": int(row["rank"] or 0),
+            "turnover_krw": float(row["turnover_krw"] or 0.0),
+            "change_rate_pct": float(row["change_rate_pct"] or 0.0),
+            "current_price": float(row["current_price"] or 0.0),
+            "volume": int(row["volume"] or 0),
+            "parser_status": row["parser_status"],
+            "parser_missing_fields": _safe_json_loads(row["parser_missing_fields_json"], []),
+            "raw": _safe_json_loads(row["raw_json"], {}),
+        }
+
+    def _opening_theme_burst_result_row(self, row) -> dict:
+        payload = _safe_json_loads(row["payload_json"], {})
+        if not isinstance(payload, dict):
+            payload = {}
+        return {
+            "id": int(row["id"]),
+            "created_at": row["created_at"],
+            "trade_date": row["trade_date"],
+            "calculated_at": row["calculated_at"],
+            "output_mode": row["output_mode"],
+            "ready_allowed": bool(row["ready_allowed"]),
+            "order_intent_allowed": bool(row["order_intent_allowed"]),
+            "seed_batch_count": int(row["seed_batch_count"] or 0),
+            "seed_symbol_count": int(row["seed_symbol_count"] or 0),
+            "realtime_registered_count": int(row["realtime_registered_count"] or 0),
+            "selected_symbols": _safe_json_loads(row["selected_symbols_json"], []),
+            "top_themes": _safe_json_loads(row["top_themes_json"], []),
+            "payload": payload,
+        }
 
     def save_operator_event(self, event: dict) -> bool:
         normalized = _normalize_operator_event(event)
