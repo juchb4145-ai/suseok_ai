@@ -20,6 +20,7 @@ from trading.strategy.indicators import IndicatorCalculator
 from trading.strategy.intraday import IntradayStateTracker
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import MarketIndexStore
+from trading.strategy.market_regime import MarketRegimeConfig, MarketRegimeRuntimePipeline
 from trading.strategy.models import OrderMode
 from trading.strategy.pipeline import GatePipeline
 from trading.strategy.readiness import build_readiness_report, dedupe_warnings
@@ -59,6 +60,7 @@ class CoreRuntimeBundle:
     candidate_ingestion_service: Any = None
     candidate_hydrator: Any = None
     theme_board_pipeline: Any = None
+    market_regime_pipeline: Any = None
 
 
 def build_core_strategy_runtime(
@@ -129,6 +131,13 @@ def build_core_strategy_runtime(
         candle_builder=candle_builder,
         config=ThemeBoardConfig.from_env(),
     )
+    market_regime_pipeline = MarketRegimeRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=market_index_store,
+        candle_builder=candle_builder,
+        config=MarketRegimeConfig.from_env(),
+    )
     theme_lab_pipeline = None
     if config.theme_engine_mode == "themelab_flow":
         theme_backfill_service = ThemeBackfillService(
@@ -175,12 +184,14 @@ def build_core_strategy_runtime(
         theme_lab_pipeline=theme_lab_pipeline,
         opening_burst_pipeline=opening_burst_pipeline,
         theme_board_pipeline=theme_board_pipeline,
+        market_regime_pipeline=market_regime_pipeline,
         theme_lab_shadow_ab_provider=theme_lab_shadow_ab_provider,
         shadow_small_entry_promotion_provider=shadow_small_entry_promotion_provider,
     )
     runtime.candidate_ingestion_service = candidate_ingestion_service
     runtime.candidate_hydrator = candidate_hydrator
     runtime.theme_board_pipeline = theme_board_pipeline
+    runtime.market_regime_pipeline = market_regime_pipeline
     readiness_report = build_readiness_report(
         db,
         subscription_manager=runtime.subscription_manager,
@@ -206,6 +217,7 @@ def build_core_strategy_runtime(
         candidate_ingestion_service=candidate_ingestion_service,
         candidate_hydrator=candidate_hydrator,
         theme_board_pipeline=theme_board_pipeline,
+        market_regime_pipeline=market_regime_pipeline,
     )
 
 

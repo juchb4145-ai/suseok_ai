@@ -652,6 +652,62 @@ class TradingDatabase:
                 ON theme_board_stock_snapshots(board_snapshot_id, theme_id, stock_score);
             CREATE INDEX IF NOT EXISTS idx_theme_board_stock_snapshots_trade_code
                 ON theme_board_stock_snapshots(trade_date, code, id);
+            CREATE TABLE IF NOT EXISTS market_regime_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                global_status TEXT NOT NULL DEFAULT '',
+                kospi_status TEXT NOT NULL DEFAULT '',
+                kosdaq_status TEXT NOT NULL DEFAULT '',
+                market_session_status TEXT NOT NULL DEFAULT '',
+                risk_off_detected INTEGER NOT NULL DEFAULT 0,
+                weak_market_detected INTEGER NOT NULL DEFAULT 0,
+                data_wait_count INTEGER NOT NULL DEFAULT 0,
+                policy_summary_json TEXT NOT NULL DEFAULT '{}',
+                data_quality_flags_json TEXT NOT NULL DEFAULT '[]',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_market_regime_snapshots_trade_calc
+                ON market_regime_snapshots(trade_date, calculated_at, id);
+            CREATE TABLE IF NOT EXISTS market_side_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                regime_snapshot_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                side TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '',
+                index_code TEXT NOT NULL DEFAULT '',
+                index_return_pct REAL NOT NULL DEFAULT 0,
+                breadth_pct REAL NOT NULL DEFAULT 0,
+                risk_score REAL NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_market_side_snapshots_regime_side
+                ON market_side_snapshots(regime_snapshot_id, side, id);
+            CREATE INDEX IF NOT EXISTS idx_market_side_snapshots_trade_side
+                ON market_side_snapshots(trade_date, side, calculated_at, id);
+            CREATE TABLE IF NOT EXISTS candidate_market_policies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                regime_snapshot_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                code TEXT NOT NULL,
+                market_side TEXT NOT NULL DEFAULT '',
+                market_status TEXT NOT NULL DEFAULT '',
+                global_market_status TEXT NOT NULL DEFAULT '',
+                market_action TEXT NOT NULL DEFAULT '',
+                block_new_entry INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(trade_date, calculated_at, code)
+            );
+            CREATE INDEX IF NOT EXISTS idx_candidate_market_policies_trade_action
+                ON candidate_market_policies(trade_date, market_action, id);
+            CREATE INDEX IF NOT EXISTS idx_candidate_market_policies_code
+                ON candidate_market_policies(code, id);
             CREATE TABLE IF NOT EXISTS indicator_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 candidate_id INTEGER,
@@ -6725,6 +6781,148 @@ class TradingDatabase:
             ).fetchone()
         return _row_to_theme_board_snapshot(row) if row else {}
 
+    def save_market_regime_snapshot(self, snapshot: dict) -> dict:
+        payload = dict(snapshot or {})
+        trade_date = str(payload.get("trade_date") or "")
+        calculated_at = str(payload.get("calculated_at") or "")
+        kospi_snapshot = dict(payload.get("kospi_snapshot") or {})
+        kosdaq_snapshot = dict(payload.get("kosdaq_snapshot") or {})
+        policies = dict(payload.get("candidate_policy_by_code") or {})
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO market_regime_snapshots(
+                    trade_date, calculated_at, global_status, kospi_status, kosdaq_status,
+                    market_session_status, risk_off_detected, weak_market_detected,
+                    data_wait_count, policy_summary_json, data_quality_flags_json,
+                    reason_codes_json, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_date,
+                    calculated_at,
+                    str(payload.get("global_status") or ""),
+                    str(payload.get("kospi_status") or ""),
+                    str(payload.get("kosdaq_status") or ""),
+                    str(payload.get("market_session_status") or ""),
+                    int(bool(payload.get("risk_off_detected"))),
+                    int(bool(payload.get("weak_market_detected"))),
+                    _safe_int(payload.get("data_wait_count"), 0),
+                    _json_payload(payload.get("policy_summary") or {}),
+                    _json_list(payload.get("data_quality_flags") or []),
+                    _json_list(payload.get("reason_codes") or []),
+                    _json_payload(payload),
+                ),
+            )
+            snapshot_id = int(cursor.lastrowid)
+            for side_snapshot in (kospi_snapshot, kosdaq_snapshot):
+                if not side_snapshot:
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO market_side_snapshots(
+                        regime_snapshot_id, trade_date, calculated_at, side, status,
+                        index_code, index_return_pct, breadth_pct, risk_score, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        trade_date,
+                        calculated_at,
+                        str(side_snapshot.get("side") or ""),
+                        str(side_snapshot.get("status") or ""),
+                        str(side_snapshot.get("index_code") or ""),
+                        _float_value(side_snapshot.get("index_return_pct")),
+                        _float_value(side_snapshot.get("breadth_pct")),
+                        _float_value(side_snapshot.get("risk_score")),
+                        _json_payload(side_snapshot),
+                    ),
+                )
+            for code, policy in policies.items():
+                item = dict(policy or {})
+                clean_code = _clean_stock_code(item.get("code")) or _clean_stock_code(code) or str(item.get("code") or code or "")
+                self.conn.execute(
+                    """
+                    INSERT INTO candidate_market_policies(
+                        regime_snapshot_id, trade_date, calculated_at, code, market_side,
+                        market_status, global_market_status, market_action, block_new_entry,
+                        payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(trade_date, calculated_at, code) DO UPDATE SET
+                        regime_snapshot_id=excluded.regime_snapshot_id,
+                        market_side=excluded.market_side,
+                        market_status=excluded.market_status,
+                        global_market_status=excluded.global_market_status,
+                        market_action=excluded.market_action,
+                        block_new_entry=excluded.block_new_entry,
+                        payload_json=excluded.payload_json
+                    """,
+                    (
+                        snapshot_id,
+                        trade_date,
+                        calculated_at,
+                        clean_code,
+                        str(item.get("market_side") or ""),
+                        str(item.get("market_status") or ""),
+                        str(item.get("global_market_status") or ""),
+                        str(item.get("market_action") or ""),
+                        int(bool(item.get("block_new_entry"))),
+                        _json_payload(item),
+                    ),
+                )
+        return self.get_market_regime_snapshot(snapshot_id) or {}
+
+    def get_market_regime_snapshot(self, snapshot_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM market_regime_snapshots WHERE id = ?",
+            (int(snapshot_id),),
+        ).fetchone()
+        return _row_to_market_regime_snapshot(row) if row else None
+
+    def latest_market_regime_snapshot(self, *, trade_date: Optional[str] = None) -> dict:
+        if trade_date:
+            row = self.conn.execute(
+                """
+                SELECT * FROM market_regime_snapshots
+                WHERE trade_date = ?
+                ORDER BY calculated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (str(trade_date),),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                """
+                SELECT * FROM market_regime_snapshots
+                ORDER BY calculated_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return _row_to_market_regime_snapshot(row) if row else {}
+
+    def list_candidate_market_policies(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        query = "SELECT * FROM candidate_market_policies"
+        clauses = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, int(limit or 100)))
+        rows = self.conn.execute(query, params).fetchall()
+        return [_row_to_candidate_market_policy(row) for row in rows]
+
     def save_indicator_snapshot(self, snapshot: IndicatorSnapshot) -> IndicatorSnapshot:
         with self.conn:
             return self._save_indicator_snapshot_no_commit(snapshot)
@@ -12163,6 +12361,50 @@ def _row_to_theme_board_snapshot(row: sqlite3.Row) -> dict:
     payload.setdefault("source_counts", _safe_json_loads(data.pop("source_counts_json", "{}"), {}))
     payload.setdefault("data_quality_flags", _safe_json_loads(data.pop("data_quality_flags_json", "[]"), []))
     payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    return payload
+
+
+def _row_to_market_regime_snapshot(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("id", data.get("id"))
+    payload.setdefault("created_at", data.get("created_at", ""))
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("calculated_at", data.get("calculated_at", ""))
+    payload.setdefault("global_status", data.get("global_status", ""))
+    payload.setdefault("kospi_status", data.get("kospi_status", ""))
+    payload.setdefault("kosdaq_status", data.get("kosdaq_status", ""))
+    payload.setdefault("market_session_status", data.get("market_session_status", ""))
+    payload.setdefault("risk_off_detected", bool(data.get("risk_off_detected")))
+    payload.setdefault("weak_market_detected", bool(data.get("weak_market_detected")))
+    payload.setdefault("data_wait_count", int(data.get("data_wait_count") or 0))
+    payload.setdefault("policy_summary", _safe_json_loads(data.pop("policy_summary_json", "{}"), {}))
+    payload.setdefault("data_quality_flags", _safe_json_loads(data.pop("data_quality_flags_json", "[]"), []))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    payload.setdefault("output_mode", "OBSERVE")
+    payload.setdefault("ready_allowed", False)
+    payload.setdefault("order_intent_allowed", False)
+    return payload
+
+
+def _row_to_candidate_market_policy(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("id", data.get("id"))
+    payload.setdefault("regime_snapshot_id", data.get("regime_snapshot_id"))
+    payload.setdefault("created_at", data.get("created_at", ""))
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("calculated_at", data.get("calculated_at", ""))
+    payload.setdefault("code", data.get("code", ""))
+    payload.setdefault("market_side", data.get("market_side", ""))
+    payload.setdefault("market_status", data.get("market_status", ""))
+    payload.setdefault("global_market_status", data.get("global_market_status", ""))
+    payload.setdefault("market_action", data.get("market_action", ""))
+    payload.setdefault("block_new_entry", bool(data.get("block_new_entry")))
     return payload
 
 

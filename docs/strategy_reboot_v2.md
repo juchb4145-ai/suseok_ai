@@ -733,6 +733,178 @@ ready_allowed=false
 order_intent_allowed=false
 ```
 
+## PR 4: MarketRegimeEngine Runtime Integration
+
+MarketRegimeEngine은 지수 tick, 후보 universe breadth, ThemeBoard overlay를 이용해 KOSPI/KOSDAQ 시장국면을 분리 계산하는 관찰/정책 계층이다. 매수 타이밍 엔진이 아니며 `READY`, `SETUP_READY`, `TIMING_READY`, `ORDER_PENDING`, `EntryPlan`, DRY_RUN buy intent, LIVE order command를 만들지 않는다.
+
+### Runtime 계약
+
+- 기본 feature flag는 `TRADING_MARKET_REGIME_ENABLED=false`다.
+- `TRADING_MARKET_REGIME_OBSERVE_ONLY=true`가 기본이며 산출물의 `output_mode=OBSERVE`, `ready_allowed=false`, `order_intent_allowed=false`를 고정한다.
+- Runtime cycle에서는 Opening Burst, ThemeBoard 이후 MarketRegime을 실행한다.
+- 데이터 부족은 `DATA_WAIT`/`WAIT_DATA`로 남기며 `HARD_BLOCK` 또는 후보 삭제로 승격하지 않는다.
+- `REMOVED`/`EXPIRED` 후보는 정책 계산과 metadata merge 대상에서 제외한다.
+
+### 설정값
+
+```text
+TRADING_MARKET_REGIME_ENABLED=false
+TRADING_MARKET_REGIME_OBSERVE_ONLY=true
+TRADING_MARKET_REGIME_INTERVAL_SEC=5
+TRADING_MARKET_REGIME_KOSPI_CODE=001
+TRADING_MARKET_REGIME_KOSDAQ_CODE=101
+TRADING_MARKET_REGIME_WEAK_KOSPI_PCT=-0.8
+TRADING_MARKET_REGIME_WEAK_KOSDAQ_PCT=-1.0
+TRADING_MARKET_REGIME_RISK_OFF_KOSPI_PCT=-2.0
+TRADING_MARKET_REGIME_RISK_OFF_KOSDAQ_PCT=-2.5
+TRADING_MARKET_REGIME_BREADTH_EXPANSION_PCT=0.58
+TRADING_MARKET_REGIME_BREADTH_WEAK_PCT=0.38
+TRADING_MARKET_REGIME_BREADTH_RISK_OFF_PCT=0.28
+TRADING_MARKET_REGIME_MIN_BREADTH_SAMPLE_KOSPI=80
+TRADING_MARKET_REGIME_MIN_BREADTH_SAMPLE_KOSDAQ=120
+TRADING_MARKET_REGIME_MAX_QUOTE_AGE_SEC=60
+```
+
+### 모델 계약
+
+- `MarketRegimeStatus`: `EXPANSION`, `SELECTIVE`, `CHOPPY`, `WEAK`, `RISK_OFF`, `DATA_WAIT`, `MARKET_CLOSED`
+- `MarketSide`: `KOSPI`, `KOSDAQ`, `UNKNOWN`
+- `CandidateMarketAction`: `ALLOW_NORMAL`, `ALLOW_REDUCED`, `WAIT_MARKET`, `BLOCK_NEW_ENTRY`, `DATA_WAIT`, `MARKET_CLOSED`
+- Models: `MarketRegimeConfig`, `MarketSideSnapshot`, `MarketBreadthSnapshot`, `MarketRegimeSnapshot`, `CandidateMarketPolicy`, `MarketRegimeResult`
+
+`MarketSideSnapshot` 필드:
+
+```text
+side
+status
+index_code
+index_name
+index_price
+index_return_pct
+index_slope_1m_pct
+index_slope_3m_pct
+index_slope_5m_pct
+index_slope_20m_pct
+position_vs_vwap
+position_vs_day_mid
+low_break_recent
+high_break_recent
+breadth_pct
+advancing_count
+declining_count
+flat_count
+strong_count
+weak_count
+valid_quote_count
+valid_quote_ratio
+turnover_weighted_return_pct
+risk_score
+data_quality_flags
+reason_codes
+```
+
+`MarketRegimeSnapshot` 필드:
+
+```text
+trade_date
+calculated_at
+global_status
+kospi_status
+kosdaq_status
+kospi_snapshot
+kosdaq_snapshot
+candidate_policy_by_code
+market_session_status
+market_open
+market_closed
+risk_off_detected
+weak_market_detected
+data_wait_count
+policy_summary
+data_quality_flags
+reason_codes
+output_mode=OBSERVE
+ready_allowed=false
+order_intent_allowed=false
+```
+
+`CandidateMarketPolicy` 필드:
+
+```text
+code
+market_side
+market_side_source
+market_status
+global_market_status
+market_action
+position_size_multiplier_hint
+block_new_entry
+wait_reason
+recheck_after_sec
+reason_codes
+```
+
+### 정책 매핑
+
+- `EXPANSION`: `ALLOW_NORMAL`, size multiplier `1.0`
+- `SELECTIVE`: `ALLOW_REDUCED`, size multiplier `0.5~0.7`
+- `CHOPPY`: `WAIT_MARKET` 또는 reduced 관찰, 기본 multiplier `0.25~0.5`
+- `WEAK`: `WAIT_MARKET`, `block_new_entry=true`
+- `RISK_OFF`: `BLOCK_NEW_ENTRY`, `block_new_entry=true`
+- `DATA_WAIT`: `DATA_WAIT`
+- `MARKET_CLOSED`: `MARKET_CLOSED`
+
+`RISK_OFF`는 후보를 삭제하지 않는다. 신규 매수만 금지하고, 후속 RiskManager/OrderManager 단계에서 buy-side 미체결 취소와 보유 포지션 축소를 별도 intent로 다룬다.
+
+### Candidate Metadata Merge
+
+```text
+market_side
+market_side_source
+market_regime_status
+global_market_regime_status
+market_action
+market_position_size_multiplier_hint
+market_block_new_entry
+market_reason_codes
+updated_by_market_regime_at
+```
+
+허용 영향은 `WATCHING` 유지, `WAIT_DATA` 유지, 시장 reason 추가뿐이다. `REMOVED`/`EXPIRED`는 제외한다. 금지 영향은 `READY` 계열 전이, `EntryPlan`, DRY_RUN buy intent, LIVE order command, hybrid/final grade 또는 threshold/promotion 자동 변경, RISK_OFF 후보 삭제다.
+
+### Storage와 Dashboard
+
+SQLite 테이블:
+
+- `market_regime_snapshots`
+- `market_side_snapshots`
+- `candidate_market_policies`
+
+Dashboard `market_regime` section:
+
+```text
+calculated_at
+global_status
+kospi_status
+kosdaq_status
+kospi_return_pct
+kosdaq_return_pct
+kospi_breadth_pct
+kosdaq_breadth_pct
+expansion/selective/choppy/weak/risk_off reason
+candidate_policy_summary
+block_new_entry_count
+wait_market_count
+data_wait_count
+warnings
+```
+
+Candidate table은 가능한 경우 `market_side`, `market_status`, `market_action`, `market_reason_codes`를 표시한다. 최종 Dashboard V2 방향은 시장국면, 주도테마 TOP5, READY 후보, 보유 리스크, 차단/대기 사유 TOP만 보는 단순 화면이다.
+
+### ThemeBoard Overlay
+
+MarketRegime은 최신 ThemeBoard snapshot에 `market_side_distribution`, `market_status_distribution`, `dominant_market_side`, `market_risk_flag`를 overlay할 수 있다. Overlay는 ThemeBoard의 `LEADING_THEME`, `SPREADING_THEME`, `LEADER_ONLY_THEME`, `WATCH_THEME`, `WEAK_THEME` 자체를 강제로 바꾸지 않는다.
+
 `ThemeBoardThemeSnapshot`은 테마 단위 압축 결과다.
 
 ```text
