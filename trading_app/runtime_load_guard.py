@@ -47,7 +47,7 @@ def build_runtime_load_guard_snapshot(
     fail_codes: list[str] = []
 
     if _theme_lab_has_ready_like(raw_theme_lab) or _result_has_ready_like(theme_lab_result):
-        pause_codes.append("READY_OR_READY_SMALL_PRESENT")
+        degrade_codes.append("READY_OR_READY_SMALL_PRESENT")
     if order_pending:
         pause_codes.append("ORDER_COMMAND_PENDING")
     heartbeat_age = _float_or_none(gateway.get("heartbeat_age_sec"))

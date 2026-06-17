@@ -507,6 +507,7 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "renderDecisionChecklist" in js
     assert "renderPriceMap" in js
     assert "priceReferenceDefinitions" in js
+    assert 'priceReferencePoints(chart, { includeUpper: false })' in js
     assert "groupPriceReferences" in js
     assert "현재가 위치" in js
     assert "상한가까지" in js
@@ -600,6 +601,77 @@ def test_theme_lab_snapshot_sorts_watchset_and_filters_entry_candidates(tmp_path
     assert {"KOSPI", "KOSDAQ", "000001", "000002"}.issubset(universe)
     assert "000004" not in universe
     assert payload["data_quality"]["vi_status_supported"] is False
+
+
+def test_theme_lab_snapshot_groups_trade_setup_summary(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        core = _watch("000001", "READY", role="LEADER")
+        core.update(
+            {
+                "trade_setup_type": "CORE_PULLBACK",
+                "trade_setup_action": "NORMAL_READY",
+                "trade_setup_confidence_score": 0.9,
+                "trade_setup_reason_codes": ["CORE_PULLBACK"],
+            }
+        )
+        probe = _watch("000002", "WAIT", role="LEADER")
+        probe.update(
+            {
+                "price_location_status": "VWAP_RECLAIM",
+                "trade_setup_type": "LEADER_PROBE",
+                "trade_setup_action": "SMALL_OBSERVE",
+                "trade_setup_confidence_score": 0.8,
+                "trade_setup_position_size_multiplier": 0.1,
+                "trade_setup_reason_codes": ["LEADER_PROBE", "OBSERVE_ONLY"],
+            }
+        )
+        relative = _watch("000003", "WAIT", role="CO_LEADER")
+        relative.update(
+            {
+                "candidate_market_status": "WEAK",
+                "trade_setup_type": "RELATIVE_STRENGTH",
+                "trade_setup_action": "SMALL_OBSERVE",
+                "trade_setup_confidence_score": 0.82,
+                "trade_setup_position_size_multiplier": 0.1,
+                "trade_setup_reason_codes": ["RELATIVE_STRENGTH", "OBSERVE_ONLY"],
+            }
+        )
+        avoid = _watch("000004", "BLOCKED", role="LATE_LAGGARD")
+        avoid.update(
+            {
+                "trade_setup_type": "AVOID",
+                "trade_setup_action": "BLOCK",
+                "trade_setup_reason_codes": ["LATE_LAGGARD"],
+            }
+        )
+        db.save_theme_lab_flow_result(
+            "09:01:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [_theme()],
+                "watchset_snapshots": [core, probe, relative, avoid],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db)
+    finally:
+        db.close()
+
+    setup = payload["trade_setup_summary"]
+    assert setup["candidate_count_by_type"]["CORE_PULLBACK"] == 1
+    assert setup["status_counts_by_type"]["LEADER_PROBE"]["WAIT"] == 1
+    assert setup["buy_capable_count_by_type"]["CORE_PULLBACK"] == 1
+    assert setup["leader_probe_observe_count"] == 1
+    assert setup["relative_strength_observe_count"] == 1
+    assert {item["trade_setup_type"] for item in setup["observed_small_candidates"]} == {
+        "LEADER_PROBE",
+        "RELATIVE_STRENGTH",
+    }
+    assert setup["block_reason_top_by_type"]["AVOID"][0]["reason_code"] == "LATE_LAGGARD"
+    assert payload["summary"]["trade_setup_observed_small_candidate_count"] == 2
 
 
 def test_theme_lab_snapshot_applies_backfill_data_quality_overlay(tmp_path):
@@ -1563,6 +1635,79 @@ def test_theme_lab_snapshot_adds_theme_backfill_command_status(tmp_path):
     assert payload["theme_backfill_runtime"]["history_window"] == "recent_500_commands"
     assert payload["theme_backfill_runtime"]["parser_miss_ratio"] is None
     assert payload["theme_backfill_runtime"]["tr_backfill_caused_ready_count"] == 0
+
+
+def test_theme_lab_snapshot_marks_backfill_partial_when_missing_symbols_remain(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    state = GatewayStateStore()
+    try:
+        theme = _theme()
+        theme.update(
+            {
+                "data_quality_flags": ["MISSING_CURRENT_PRICE", "MISSING_PREV_CLOSE"],
+                "member_hits": [
+                    {
+                        "symbol": "000001",
+                        "name": "priced",
+                        "current_price": 1000,
+                        "return_pct": 3.0,
+                        "turnover_krw": 1_000_000,
+                        "alive_hit": True,
+                        "strong_hit": True,
+                        "excluded": False,
+                        "data_quality_flags": [],
+                    },
+                    {
+                        "symbol": "000002",
+                        "name": "missing",
+                        "excluded": False,
+                        "data_quality_flags": ["MISSING_CURRENT_PRICE", "MISSING_PREV_CLOSE"],
+                    },
+                ],
+            }
+        )
+        db.save_theme_lab_flow_result(
+            "09:04:30",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [theme],
+                "watchset_snapshots": [],
+                "gate_decisions": [],
+                "data_quality": {},
+                "theme_backfill_runtime": {"enabled": True, "tr_backfill_caused_ready_count": 0},
+            },
+        )
+        state.enqueue_command(
+            GatewayCommand(
+                type="tr_request",
+                command_id="cmd-backfill-partial",
+                payload={
+                    "purpose": THEME_BACKFILL_PURPOSE,
+                    "primary_theme_id": "power",
+                    "related_theme_ids": ["power"],
+                    "code": "000001",
+                    "tr_code": "opt10001",
+                },
+            ),
+            priority=CommandPriority.LOW,
+            ttl_sec=90,
+            max_attempts=1,
+        )
+        state.ack_command(
+            "cmd-backfill-partial",
+            status="ACKED",
+            result_payload={"purpose": THEME_BACKFILL_PURPOSE, "parser_status": "OK"},
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db, gateway_state=state)
+    finally:
+        db.close()
+
+    row = payload["ranked_themes"][0]
+    assert row["theme_backfill_status"] == "부분완료"
+    assert row["theme_backfill_raw_status"] == "ACKED"
+    assert row["theme_backfill_effective_status"] == "PARTIAL_ACKED"
+    assert row["theme_backfill_symbols"] == ["missing[000002]"]
 
 
 def test_theme_lab_snapshot_counts_backfill_parser_miss_ratio(tmp_path):

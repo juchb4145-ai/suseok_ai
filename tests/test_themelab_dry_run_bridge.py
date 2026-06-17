@@ -61,9 +61,12 @@ def test_ready_good_pullback_creates_dry_run_intent_without_gateway_command(tmp_
     snapshot = runtime.cycle(NOW + timedelta(seconds=3))
 
     candidate = db.load_candidate("2026-06-01", "000001")
+    details = candidate.metadata["gate_results_by_theme"]["ai"]
     intents = db.list_runtime_order_intents(candidate_id=candidate.id)
 
     assert candidate.state == CandidateState.READY
+    assert details["trade_setup_type"] == "CORE_PULLBACK"
+    assert details["trade_setup_action"] == "NORMAL_READY"
     assert len(db.list_entry_plans(candidate.id)) == 1
     assert len(db.list_virtual_orders(candidate.id)) == 1
     assert len(intents) == 1

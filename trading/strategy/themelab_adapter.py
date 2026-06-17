@@ -37,6 +37,7 @@ from trading.strategy.shadow_small_entry_promotion import (
     STATUS_PROMOTED as SHADOW_PROMOTION_PROMOTED,
     evaluate_shadow_small_entry_promotion,
 )
+from trading.strategy.trade_setup_classifier import attach_trade_setup_details
 from trading.strategy.support_readiness import (
     LATEST_TICK_MISSING,
     OBSERVE,
@@ -2690,7 +2691,7 @@ def _base_details(
             "risk_off_exit_hint": dict(stock_details.get("risk_off_exit_hint") or {}),
         },
     }
-    return standardize_details(
+    details = standardize_details(
         details,
         mapping.reason_codes,
         passed=mapping.strategy_eligible,
@@ -2701,6 +2702,7 @@ def _base_details(
         legacy_score=0.0,
         new_score=mapping.final_score,
     )
+    return attach_trade_setup_details(details)
 
 
 def _observability_status_fields(

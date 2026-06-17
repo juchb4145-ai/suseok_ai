@@ -4188,8 +4188,10 @@ const priceReferenceDefinitions = [
   { key: "upper_limit_price", label: "상한가", short: "상한", kind: "upper" },
 ];
 
-function priceReferencePoints(source) {
+function priceReferencePoints(source, options = {}) {
+  const includeUpper = options.includeUpper !== false;
   return priceReferenceDefinitions
+    .filter((definition) => includeUpper || definition.key !== "upper_limit_price")
     .map((definition) => ({ ...definition, value: numberOrNull(source[definition.key]) }))
     .filter((point) => point.value !== null && Number.isFinite(point.value));
 }
@@ -4459,7 +4461,7 @@ function minuteChartSvg(chart, candles) {
 }
 
 function chartReferenceLines(chart) {
-  return groupPriceReferences(priceReferencePoints(chart));
+  return groupPriceReferences(priceReferencePoints(chart, { includeUpper: false }));
 }
 
 function numberOrNull(value) {

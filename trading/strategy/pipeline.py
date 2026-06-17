@@ -34,6 +34,7 @@ from trading.strategy.runtime_settings import (
     attach_settings_details,
     legacy_strategy_runtime_settings,
 )
+from trading.strategy.trade_setup_classifier import attach_trade_setup_details
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
 from trading.theme_engine.models import StockLeadershipResult, ThemeContext, ThemeStrengthResult
 
@@ -286,6 +287,7 @@ class GatePipeline:
             legacy_score=legacy_final_score,
             new_score=final_score,
         )
+        details = attach_trade_setup_details(details)
         if self.hybrid_validation_repository is not None and self.hybrid_validation_config.enabled:
             try:
                 event_ts = snapshot.created_at if snapshot else ""

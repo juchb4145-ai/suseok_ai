@@ -4129,6 +4129,18 @@ def _realtime_reliability_record_fields(result: GatePipelineResult) -> dict[str,
     }
 
 
+def _trade_setup_record_fields(result: GatePipelineResult) -> dict[str, Any]:
+    details = dict(result.details or {})
+    return {
+        "trade_setup_type": details.get("trade_setup_type", ""),
+        "trade_setup_confidence_score": details.get("trade_setup_confidence_score"),
+        "trade_setup_action": details.get("trade_setup_action", ""),
+        "trade_setup_position_size_multiplier": details.get("trade_setup_position_size_multiplier"),
+        "trade_setup_reason_codes": list(details.get("trade_setup_reason_codes") or []),
+        "trade_setup_operator_message_ko": details.get("trade_setup_operator_message_ko", ""),
+    }
+
+
 def _gate_result_record(result: GatePipelineResult, evaluated_at: str) -> dict:
     return {
         "theme_id": result.theme_id,
@@ -4314,6 +4326,7 @@ def _gate_result_record(result: GatePipelineResult, evaluated_at: str) -> dict:
         "dynamic_theme_score": result.details.get("dynamic_theme_score", 0.0),
         "membership_score": result.details.get("membership_score", 0.0),
         "hybrid_score": result.details.get("hybrid_score", result.final_score),
+        **_trade_setup_record_fields(result),
         "score": result.final_score,
         "evaluated_at": evaluated_at,
     }
@@ -4491,6 +4504,7 @@ def _block_record(result: GatePipelineResult) -> dict:
         "dynamic_theme_score": result.details.get("dynamic_theme_score", 0.0),
         "membership_score": result.details.get("membership_score", 0.0),
         "hybrid_score": result.details.get("hybrid_score", result.final_score),
+        **_trade_setup_record_fields(result),
     }
 
 

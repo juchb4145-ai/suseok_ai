@@ -613,6 +613,7 @@ def build_theme_lab_dashboard_snapshot(
     market = _market(raw.get("market_status") or {}, runtime=runtime)
     data_quality = _apply_market_session_data_quality_display(data_quality, market, runtime)
     summary = _summary(ranked_themes, watchset, entry_candidates, data_quality, runtime=runtime, freshness=freshness)
+    trade_setup_summary = _trade_setup_summary(watchset)
     trade_date = _snapshot_trade_date(raw)
     if include_extended:
         gate_reason_report = _theme_lab_gate_reason_source_report(db, trade_date=trade_date)
@@ -676,6 +677,7 @@ def build_theme_lab_dashboard_snapshot(
         "shadow_small_entry": gate_reason_outcomes.get("shadow_small_entry") or _empty_shadow_small_entry(),
         "shadow_small_entry_ab": gate_reason_outcomes.get("shadow_small_entry_ab") or _empty_shadow_small_entry_ab(),
         "summary": summary,
+        "trade_setup_summary": trade_setup_summary,
     }
     payload["operator_view"] = _operator_view(payload)
     return payload
@@ -752,6 +754,7 @@ def _empty_snapshot(
         "shadow_small_entry": _empty_shadow_small_entry(),
         "shadow_small_entry_ab": _empty_shadow_small_entry_ab(),
         "summary": _empty_summary(runtime=runtime, freshness=freshness),
+        "trade_setup_summary": _empty_trade_setup_summary(),
     }
     payload["operator_view"] = _operator_view(payload)
     return payload
@@ -1194,6 +1197,12 @@ def _merge_watchset_gate_decisions(watchset: list[dict[str, Any]], decisions: li
         "candidate_market_recovery_pending",
         "market_side_reason_codes",
         "market_side_data_quality_flags",
+        "trade_setup_type",
+        "trade_setup_confidence_score",
+        "trade_setup_action",
+        "trade_setup_position_size_multiplier",
+        "trade_setup_reason_codes",
+        "trade_setup_operator_message_ko",
     )
     merged: list[dict[str, Any]] = []
     for item in watchset:
@@ -1378,6 +1387,7 @@ def _summary(
         for item in watchset
         if item.get("risk_off_entry_enabled") and not item.get("risk_off_entry_allowed")
     )
+    trade_setup = _trade_setup_summary(watchset)
     market_pending_count = sum(1 for item in watchset if _is_market_pending(item))
     market_confirmation_pending_count = sum(
         1
@@ -1456,6 +1466,9 @@ def _summary(
         "order_candidate_count": len(entry_candidates),
         "theme_status_counts": dict(theme_statuses),
         "display_status_counts": dict(displays),
+        "trade_setup_type_counts": dict(trade_setup.get("candidate_count_by_type") or {}),
+        "trade_setup_buy_capable_counts": dict(trade_setup.get("buy_capable_count_by_type") or {}),
+        "trade_setup_observed_small_candidate_count": len(trade_setup.get("observed_small_candidates") or []),
         "top_theme_name": top_theme.get("theme_name", ""),
         "top_theme_status": top_theme.get("theme_status", ""),
         "top_theme_score": top_theme.get("condition_score", 0),
@@ -1529,6 +1542,9 @@ def _empty_summary(
         "order_candidate_count": 0,
         "theme_status_counts": {},
         "display_status_counts": {},
+        "trade_setup_type_counts": {},
+        "trade_setup_buy_capable_counts": {},
+        "trade_setup_observed_small_candidate_count": 0,
         "top_theme_name": "",
         "top_theme_status": "",
         "top_theme_score": 0,
@@ -1538,6 +1554,120 @@ def _empty_summary(
         **_summary_runtime_fields(runtime, freshness),
         "operation_status": status,
         "operation_message_ko": message,
+    }
+
+
+def _trade_setup_summary(watchset: list[dict[str, Any]]) -> dict[str, Any]:
+    type_counts: Counter[str] = Counter()
+    status_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    buy_counts: Counter[str] = Counter()
+    blockers: dict[str, Counter[str]] = defaultdict(Counter)
+    observed_small: list[dict[str, Any]] = []
+
+    for item in watchset:
+        setup_type = str(item.get("trade_setup_type") or "UNKNOWN").upper()
+        type_counts[setup_type] += 1
+        status_bucket = _trade_setup_status_bucket(item)
+        status_counts[setup_type][status_bucket] += 1
+        buy_capable = _trade_setup_buy_capable(item)
+        if buy_capable:
+            buy_counts[setup_type] += 1
+        else:
+            for reason in _trade_setup_block_reasons(item):
+                blockers[setup_type][reason] += 1
+        if setup_type in {"LEADER_PROBE", "RELATIVE_STRENGTH"} and str(item.get("trade_setup_action") or "") == "SMALL_OBSERVE":
+            observed_small.append(_trade_setup_candidate_row(item))
+
+    all_types = [
+        "CORE_PULLBACK",
+        "LEADER_PROBE",
+        "RELATIVE_STRENGTH",
+        "MOMENTUM_CONTINUATION",
+        "ROTATION_FOLLOWER",
+        "AVOID",
+        "UNKNOWN",
+    ]
+    return {
+        "candidate_count_by_type": {setup: int(type_counts.get(setup, 0)) for setup in all_types if type_counts.get(setup, 0)},
+        "status_counts_by_type": {
+            setup: {status: int(counter.get(status, 0)) for status in ("READY", "WAIT", "BLOCK", "OBSERVE") if counter.get(status, 0)}
+            for setup, counter in status_counts.items()
+        },
+        "buy_capable_count_by_type": {setup: int(buy_counts.get(setup, 0)) for setup in all_types if buy_counts.get(setup, 0)},
+        "block_reason_top_by_type": {
+            setup: [{"reason_code": reason, "count": int(count)} for reason, count in counter.most_common(5)]
+            for setup, counter in blockers.items()
+            if counter
+        },
+        "observed_small_candidates": observed_small[:20],
+        "leader_probe_observe_count": sum(1 for item in observed_small if item.get("trade_setup_type") == "LEADER_PROBE"),
+        "relative_strength_observe_count": sum(1 for item in observed_small if item.get("trade_setup_type") == "RELATIVE_STRENGTH"),
+    }
+
+
+def _empty_trade_setup_summary() -> dict[str, Any]:
+    return {
+        "candidate_count_by_type": {},
+        "status_counts_by_type": {},
+        "buy_capable_count_by_type": {},
+        "block_reason_top_by_type": {},
+        "observed_small_candidates": [],
+        "leader_probe_observe_count": 0,
+        "relative_strength_observe_count": 0,
+    }
+
+
+def _trade_setup_status_bucket(item: dict[str, Any]) -> str:
+    status = str(item.get("gate_status") or item.get("display_status") or item.get("final_gate_status") or "OBSERVE").upper()
+    if status.startswith("READY"):
+        return "READY"
+    if status.startswith("WAIT"):
+        return "WAIT"
+    if status.startswith("BLOCK") or status in {"ENTRY_RISK_FINAL_BLOCK", "CHASE_RISK_BLOCKED"}:
+        return "BLOCK"
+    return "OBSERVE"
+
+
+def _trade_setup_buy_capable(item: dict[str, Any]) -> bool:
+    return _trade_setup_status_bucket(item) == "READY" and _candidate_submittable(item) and not bool(item.get("diagnostic_only"))
+
+
+def _trade_setup_block_reasons(item: dict[str, Any]) -> list[str]:
+    values: list[Any] = []
+    for key in (
+        "blocked_reason_codes",
+        "reason_codes",
+        "risk_reason_codes",
+        "price_location_reason_codes",
+        "price_location_readiness_reason_codes",
+        "market_side_reason_codes",
+    ):
+        values.extend(item.get(key) or [])
+    values.extend(item.get("trade_setup_reason_codes") or [])
+    result = [str(value).upper() for value in values if str(value or "").strip()]
+    if not result:
+        status = str(item.get("display_status") or item.get("gate_status") or "").upper()
+        if status:
+            result.append(status)
+    return list(dict.fromkeys(result))
+
+
+def _trade_setup_candidate_row(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "symbol": item.get("symbol") or item.get("code") or "",
+        "code": item.get("code") or item.get("symbol") or "",
+        "stock_name": item.get("stock_name") or item.get("name") or "",
+        "theme_name": item.get("theme_name") or item.get("primary_theme") or "",
+        "gate_status": item.get("gate_status") or "",
+        "display_status": item.get("display_status") or item.get("gate_status") or "",
+        "trade_setup_type": str(item.get("trade_setup_type") or "UNKNOWN"),
+        "trade_setup_confidence_score": item.get("trade_setup_confidence_score"),
+        "trade_setup_action": item.get("trade_setup_action") or "",
+        "trade_setup_position_size_multiplier": item.get("trade_setup_position_size_multiplier"),
+        "trade_setup_reason_codes": list(item.get("trade_setup_reason_codes") or []),
+        "price_location_status": item.get("price_location_status") or "",
+        "stock_role": item.get("stock_role") or "",
+        "operator_message_ko": item.get("trade_setup_operator_message_ko") or "",
     }
 
 
@@ -2993,6 +3123,7 @@ def _theme_row(
     row["has_live_price_signal"] = _theme_has_live_price_signal(row)
     row.update(_theme_quality_profile(row))
     row.update((backfill_status_by_theme or {}).get(str(row["theme_id"]), {}))
+    row.update(_theme_backfill_effective_status(row))
     return row
 
 
@@ -3277,6 +3408,25 @@ def _theme_backfill_status_by_theme(gateway_state: Any | None) -> dict[str, dict
             if current is None or priority.get(status, 99) < priority.get(str(current.get("theme_backfill_raw_status") or ""), 99):
                 status_by_theme[theme_id] = item
     return status_by_theme
+
+
+def _theme_backfill_effective_status(row: dict[str, Any]) -> dict[str, Any]:
+    priority = str(row.get("theme_backfill_priority") or "NONE").upper()
+    raw_status = str(row.get("theme_backfill_raw_status") or "").upper()
+    symbols = [str(item or "").strip() for item in row.get("theme_backfill_symbols") or [] if str(item or "").strip()]
+    if priority == "NONE":
+        return {"theme_backfill_effective_status": raw_status}
+    if raw_status == "ACKED" and symbols:
+        return {
+            "theme_backfill_status": "부분완료",
+            "theme_backfill_effective_status": "PARTIAL_ACKED",
+        }
+    if not raw_status and symbols:
+        return {
+            "theme_backfill_status": "보강대기",
+            "theme_backfill_effective_status": "NEEDS_BACKFILL",
+        }
+    return {"theme_backfill_effective_status": raw_status}
 
 
 def _theme_backfill_records(gateway_state: Any) -> list[dict[str, Any]]:
@@ -3782,6 +3932,12 @@ def _watch_row(item: dict[str, Any]) -> dict[str, Any]:
         "price_location_provisional": bool(item.get("price_location_provisional")),
         "price_location_block_reason": item.get("price_location_block_reason", ""),
         "risk_level": _value(item.get("risk_level") or "UNKNOWN"),
+        "trade_setup_type": str(item.get("trade_setup_type") or "UNKNOWN"),
+        "trade_setup_confidence_score": item.get("trade_setup_confidence_score"),
+        "trade_setup_action": str(item.get("trade_setup_action") or ""),
+        "trade_setup_position_size_multiplier": item.get("trade_setup_position_size_multiplier"),
+        "trade_setup_reason_codes": list(item.get("trade_setup_reason_codes") or []),
+        "trade_setup_operator_message_ko": str(item.get("trade_setup_operator_message_ko") or ""),
         "chase_risk": bool(item.get("chase_risk")),
         "chase_risk_reason": item.get("chase_risk_reason", ""),
         "late_chase_level": item.get("late_chase_level", ""),
@@ -3931,6 +4087,9 @@ def _entry_row(item: dict[str, Any], priority: int) -> dict[str, Any]:
         "candidate_instance_id": item.get("candidate_instance_id", ""),
         "diagnostic_only": bool(item.get("diagnostic_only")),
         "submittable": bool(item.get("submittable")),
+        "trade_setup_type": item.get("trade_setup_type") or "UNKNOWN",
+        "trade_setup_action": item.get("trade_setup_action") or "",
+        "trade_setup_confidence_score": item.get("trade_setup_confidence_score"),
         "reason": item.get("summary_reason") or "",
     }
 

@@ -81,6 +81,20 @@ def test_runtime_load_guard_pauses_for_recent_rate_limit_event():
     assert "RATE_LIMITED_RECENT" in snapshot["pause_reason_codes"]
 
 
+def test_runtime_load_guard_degrades_but_allows_backfill_for_ready_only():
+    state = _healthy_state()
+
+    snapshot = build_runtime_load_guard_snapshot(
+        state,
+        raw_theme_lab={"watchset_snapshots": [{"gate_status": "READY"}]},
+        backfill_summary={"parser_miss_ratio": 0.0, "tr_backfill_caused_ready_count": 0},
+    )
+
+    assert snapshot["load_guard_status"] == "DEGRADED"
+    assert snapshot["paused_backfill"] is False
+    assert "READY_OR_READY_SMALL_PRESENT" in snapshot["pause_reason_codes"]
+
+
 def test_runtime_load_guard_pauses_for_ready_and_order_pending():
     state = _healthy_state()
     state.enqueue_command(GatewayCommand(type="send_order", command_id="cmd-order"), priority=CommandPriority.HIGH)
