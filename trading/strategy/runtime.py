@@ -29,6 +29,7 @@ from trading.strategy.exit import (
     VirtualPositionService,
 )
 from trading.strategy.entry_engine import EntryEngineRuntimePipeline, entry_engine_dashboard_section
+from trading.strategy.exit_engine_reboot import ExitEngineRuntimePipeline, exit_engine_dashboard_section
 from trading.strategy.holding import HoldingProvider, StaticHoldingProvider
 from trading.strategy.models import (
     BlockType,
@@ -59,6 +60,7 @@ from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline
 from trading.theme_engine.theme_board import ThemeBoardRuntimePipeline, theme_board_dashboard_section
 from trading.strategy.market_regime import MarketRegimeRuntimePipeline, market_regime_dashboard_section
+from trading.strategy.position_risk import PositionRiskRuntimePipeline, position_risk_dashboard_section
 from trading.theme_engine.universe import ThemeUniverseBuilder
 
 
@@ -268,6 +270,8 @@ class StrategyRuntimeSnapshot:
     theme_board: dict = field(default_factory=dict)
     market_regime: dict = field(default_factory=dict)
     entry_engine: dict = field(default_factory=dict)
+    exit_engine: dict = field(default_factory=dict)
+    position_risk: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -302,6 +306,8 @@ class StrategyRuntime:
         theme_board_pipeline: Optional[ThemeBoardRuntimePipeline] = None,
         market_regime_pipeline: Optional[MarketRegimeRuntimePipeline] = None,
         entry_engine_pipeline: Optional[EntryEngineRuntimePipeline] = None,
+        exit_engine_reboot_pipeline: Optional[ExitEngineRuntimePipeline] = None,
+        position_risk_pipeline: Optional[PositionRiskRuntimePipeline] = None,
         theme_lab_shadow_ab_provider: Optional[Callable[[str], dict]] = None,
         shadow_small_entry_promotion_provider: Optional[Callable[[str], dict]] = None,
     ) -> None:
@@ -325,6 +331,8 @@ class StrategyRuntime:
         self.theme_board_pipeline = theme_board_pipeline
         self.market_regime_pipeline = market_regime_pipeline
         self.entry_engine_pipeline = entry_engine_pipeline
+        self.exit_engine_reboot_pipeline = exit_engine_reboot_pipeline
+        self.position_risk_pipeline = position_risk_pipeline
         self.theme_lab_shadow_ab_provider = theme_lab_shadow_ab_provider
         self.shadow_small_entry_promotion_provider = shadow_small_entry_promotion_provider
         self._theme_lab_bridge_results: list[GatePipelineResult] = []
@@ -378,6 +386,8 @@ class StrategyRuntime:
             self._run_theme_board(snapshot, current)
             self._run_market_regime(snapshot, current)
             self._run_entry_engine(snapshot, current)
+            self._run_exit_engine_reboot(snapshot, current)
+            self._run_position_risk(snapshot, current)
             self._apply_flow_diagnostics(snapshot, current, trade_date, [])
             if snapshot.gate_skip_reason != GATE_SKIP_MARKET_SESSION_CLOSED:
                 self._rollover_previous_trade_date_candidates(trade_date, current, snapshot)
@@ -461,6 +471,8 @@ class StrategyRuntime:
             timed("theme_board", lambda: self._run_theme_board(snapshot, current))
             timed("market_regime", lambda: self._run_market_regime(snapshot, current))
             timed("entry_engine", lambda: self._run_entry_engine(snapshot, current))
+            timed("exit_engine_reboot", lambda: self._run_exit_engine_reboot(snapshot, current))
+            timed("position_risk", lambda: self._run_position_risk(snapshot, current))
             self._emit_theme_lab_pipeline_timings(timing_callback)
             timed("flow_diagnostics_empty", lambda: self._apply_flow_diagnostics(snapshot, current, trade_date, []))
             if snapshot.gate_skip_reason == GATE_SKIP_MARKET_SESSION_CLOSED:
@@ -1787,6 +1799,40 @@ class StrategyRuntime:
             }
             snapshot.warnings.append(f"ENTRY_ENGINE_FAILED:{exc}")
 
+    def _run_exit_engine_reboot(self, snapshot: StrategyRuntimeSnapshot, now: datetime) -> None:
+        if self.exit_engine_reboot_pipeline is None:
+            self._apply_exit_engine_reboot_snapshot(snapshot)
+            return
+        try:
+            summary = self.exit_engine_reboot_pipeline.run_if_due(now)
+            snapshot.exit_engine = dict(summary or {})
+            snapshot.warnings.extend(str(warning) for warning in list(summary.get("warnings") or []) if warning)
+        except Exception as exc:
+            snapshot.exit_engine = {
+                "status": "ERROR",
+                "error": str(exc),
+                "output_mode": "OBSERVE",
+                "live_order_allowed": False,
+            }
+            snapshot.warnings.append(f"EXIT_ENGINE_REBOOT_FAILED:{exc}")
+
+    def _run_position_risk(self, snapshot: StrategyRuntimeSnapshot, now: datetime) -> None:
+        if self.position_risk_pipeline is None:
+            self._apply_position_risk_snapshot(snapshot)
+            return
+        try:
+            summary = self.position_risk_pipeline.run_if_due(now)
+            snapshot.position_risk = dict(summary or {})
+            snapshot.warnings.extend(str(warning) for warning in list(summary.get("warnings") or []) if warning)
+        except Exception as exc:
+            snapshot.position_risk = {
+                "status": "ERROR",
+                "error": str(exc),
+                "output_mode": "OBSERVE",
+                "live_order_allowed": False,
+            }
+            snapshot.warnings.append(f"POSITION_RISK_FAILED:{exc}")
+
     def _remember_theme_lab_pipeline_timings(self, result: Any) -> None:
         self._theme_lab_pipeline_timings = {}
         data_quality = getattr(result, "data_quality", {}) or {}
@@ -2768,6 +2814,8 @@ class StrategyRuntime:
         self._apply_theme_board_snapshot(snapshot)
         self._apply_market_regime_snapshot(snapshot)
         self._apply_entry_engine_snapshot(snapshot)
+        self._apply_exit_engine_reboot_snapshot(snapshot)
+        self._apply_position_risk_snapshot(snapshot)
         self._apply_candidate_generation_summary(snapshot)
         self._apply_context_history_prune_snapshot(snapshot)
         return snapshot
@@ -2833,6 +2881,40 @@ class StrategyRuntime:
             snapshot.entry_engine = {
                 "status": "ERROR",
                 "error": f"ENTRY_ENGINE_SNAPSHOT_FAILED:{exc}",
+                "output_mode": "OBSERVE",
+                "live_order_allowed": False,
+            }
+
+    def _apply_exit_engine_reboot_snapshot(self, snapshot: StrategyRuntimeSnapshot) -> None:
+        if snapshot.exit_engine:
+            return
+        if self.exit_engine_reboot_pipeline is not None:
+            snapshot.exit_engine = dict(getattr(self.exit_engine_reboot_pipeline, "last_summary", {}) or {})
+            if snapshot.exit_engine:
+                return
+        try:
+            snapshot.exit_engine = exit_engine_dashboard_section(self.db)
+        except Exception as exc:
+            snapshot.exit_engine = {
+                "status": "ERROR",
+                "error": f"EXIT_ENGINE_REBOOT_SNAPSHOT_FAILED:{exc}",
+                "output_mode": "OBSERVE",
+                "live_order_allowed": False,
+            }
+
+    def _apply_position_risk_snapshot(self, snapshot: StrategyRuntimeSnapshot) -> None:
+        if snapshot.position_risk:
+            return
+        if self.position_risk_pipeline is not None:
+            snapshot.position_risk = dict(getattr(self.position_risk_pipeline, "last_summary", {}) or {})
+            if snapshot.position_risk:
+                return
+        try:
+            snapshot.position_risk = position_risk_dashboard_section(self.db)
+        except Exception as exc:
+            snapshot.position_risk = {
+                "status": "ERROR",
+                "error": f"POSITION_RISK_SNAPSHOT_FAILED:{exc}",
                 "output_mode": "OBSERVE",
                 "live_order_allowed": False,
             }

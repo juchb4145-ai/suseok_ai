@@ -762,6 +762,150 @@ class TradingDatabase:
                 ON entry_decision_checks(entry_decision_id, id);
             CREATE INDEX IF NOT EXISTS idx_entry_decision_checks_trade_status
                 ON entry_decision_checks(trade_date, check_name, check_status, id);
+            CREATE TABLE IF NOT EXISTS position_runtime_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                position_id TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                theme_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL DEFAULT '',
+                entry_price INTEGER NOT NULL DEFAULT 0,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                remaining_quantity INTEGER NOT NULL DEFAULT 0,
+                avg_entry_price REAL NOT NULL DEFAULT 0,
+                opened_at TEXT NOT NULL DEFAULT '',
+                holding_minutes INTEGER NOT NULL DEFAULT 0,
+                current_price INTEGER NOT NULL DEFAULT 0,
+                current_return_pct REAL NOT NULL DEFAULT 0,
+                max_return_pct REAL NOT NULL DEFAULT 0,
+                max_drawdown_pct REAL NOT NULL DEFAULT 0,
+                highest_price_since_entry INTEGER NOT NULL DEFAULT 0,
+                lowest_price_since_entry INTEGER NOT NULL DEFAULT 0,
+                realized_return_pct REAL NOT NULL DEFAULT 0,
+                unrealized_return_pct REAL NOT NULL DEFAULT 0,
+                stop_loss_price INTEGER NOT NULL DEFAULT 0,
+                take_profit_price INTEGER NOT NULL DEFAULT 0,
+                trailing_stop_price INTEGER NOT NULL DEFAULT 0,
+                trailing_active INTEGER NOT NULL DEFAULT 0,
+                first_profit_taken INTEGER NOT NULL DEFAULT 0,
+                last_tick_at TEXT NOT NULL DEFAULT '',
+                risk_status TEXT NOT NULL DEFAULT '',
+                data_quality_flags_json TEXT NOT NULL DEFAULT '[]',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(trade_date, calculated_at, position_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_position_runtime_trade_calc
+                ON position_runtime_snapshots(trade_date, calculated_at, id);
+            CREATE INDEX IF NOT EXISTS idx_position_runtime_code
+                ON position_runtime_snapshots(code, id);
+            CREATE TABLE IF NOT EXISTS exit_decisions_reboot (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                position_id TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                exit_status TEXT NOT NULL DEFAULT '',
+                exit_reason TEXT NOT NULL DEFAULT '',
+                quantity INTEGER NOT NULL DEFAULT 0,
+                price_hint INTEGER NOT NULL DEFAULT 0,
+                hoga_hint TEXT NOT NULL DEFAULT '',
+                current_price INTEGER NOT NULL DEFAULT 0,
+                current_return_pct REAL NOT NULL DEFAULT 0,
+                data_quality_flags_json TEXT NOT NULL DEFAULT '[]',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                operator_message_ko TEXT NOT NULL DEFAULT '',
+                dry_run_sell_intent_allowed INTEGER NOT NULL DEFAULT 0,
+                live_order_allowed INTEGER NOT NULL DEFAULT 0,
+                gateway_command_created INTEGER NOT NULL DEFAULT 0,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(trade_date, calculated_at, position_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_exit_decisions_reboot_trade_status
+                ON exit_decisions_reboot(trade_date, exit_status, id);
+            CREATE INDEX IF NOT EXISTS idx_exit_decisions_reboot_reason
+                ON exit_decisions_reboot(trade_date, exit_reason, id);
+            CREATE TABLE IF NOT EXISTS dry_run_sell_intents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                position_id TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                side TEXT NOT NULL DEFAULT 'sell',
+                quantity INTEGER NOT NULL DEFAULT 0,
+                price_hint INTEGER NOT NULL DEFAULT 0,
+                exit_reason TEXT NOT NULL DEFAULT '',
+                exit_status TEXT NOT NULL DEFAULT '',
+                hoga_hint TEXT NOT NULL DEFAULT '',
+                idempotency_key TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                live_order_allowed INTEGER NOT NULL DEFAULT 0,
+                gateway_command_created INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'CREATED',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(idempotency_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_dry_run_sell_intents_trade
+                ON dry_run_sell_intents(trade_date, calculated_at, id);
+            CREATE INDEX IF NOT EXISTS idx_dry_run_sell_intents_position
+                ON dry_run_sell_intents(position_id, id);
+            CREATE TABLE IF NOT EXISTS position_risk_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                position_id TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                risk_status TEXT NOT NULL DEFAULT '',
+                risk_level TEXT NOT NULL DEFAULT '',
+                stop_loss_distance_pct REAL NOT NULL DEFAULT 0,
+                take_profit_distance_pct REAL NOT NULL DEFAULT 0,
+                trailing_distance_pct REAL NOT NULL DEFAULT 0,
+                theme_risk_level TEXT NOT NULL DEFAULT '',
+                market_risk_level TEXT NOT NULL DEFAULT '',
+                data_risk_level TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(trade_date, calculated_at, position_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_position_risk_trade_level
+                ON position_risk_snapshots(trade_date, risk_level, id);
+            CREATE TABLE IF NOT EXISTS portfolio_risk_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                open_position_count INTEGER NOT NULL DEFAULT 0,
+                total_exposure INTEGER NOT NULL DEFAULT 0,
+                theme_exposure_json TEXT NOT NULL DEFAULT '{}',
+                market_side_exposure_json TEXT NOT NULL DEFAULT '{}',
+                unrealized_pnl_pct REAL NOT NULL DEFAULT 0,
+                max_drawdown_pct REAL NOT NULL DEFAULT 0,
+                daily_realized_pnl_pct REAL NOT NULL DEFAULT 0,
+                risk_level TEXT NOT NULL DEFAULT '',
+                stop_new_entry_recommended INTEGER NOT NULL DEFAULT 0,
+                kill_switch_recommended INTEGER NOT NULL DEFAULT 0,
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(trade_date, calculated_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_portfolio_risk_trade_level
+                ON portfolio_risk_snapshots(trade_date, risk_level, id);
             CREATE TABLE IF NOT EXISTS indicator_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 candidate_id INTEGER,
@@ -7125,6 +7269,413 @@ class TradingDatabase:
         ).fetchall()
         return [_row_to_entry_decision_check(row) for row in rows]
 
+    def save_position_runtime_snapshots(self, snapshots: Iterable[dict]) -> int:
+        rows = [dict(item or {}) for item in snapshots or []]
+        if not rows:
+            return 0
+        with self.conn:
+            for payload in rows:
+                self.conn.execute(
+                    """
+                    INSERT INTO position_runtime_snapshots(
+                        trade_date, calculated_at, position_id, candidate_id, code,
+                        name, theme_id, theme_name, source_type, entry_price,
+                        quantity, remaining_quantity, avg_entry_price, opened_at,
+                        holding_minutes, current_price, current_return_pct,
+                        max_return_pct, max_drawdown_pct, highest_price_since_entry,
+                        lowest_price_since_entry, realized_return_pct,
+                        unrealized_return_pct, stop_loss_price, take_profit_price,
+                        trailing_stop_price, trailing_active, first_profit_taken,
+                        last_tick_at, risk_status, data_quality_flags_json,
+                        details_json, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(trade_date, calculated_at, position_id) DO UPDATE SET
+                        candidate_id=excluded.candidate_id,
+                        code=excluded.code,
+                        name=excluded.name,
+                        theme_id=excluded.theme_id,
+                        theme_name=excluded.theme_name,
+                        source_type=excluded.source_type,
+                        entry_price=excluded.entry_price,
+                        quantity=excluded.quantity,
+                        remaining_quantity=excluded.remaining_quantity,
+                        avg_entry_price=excluded.avg_entry_price,
+                        opened_at=excluded.opened_at,
+                        holding_minutes=excluded.holding_minutes,
+                        current_price=excluded.current_price,
+                        current_return_pct=excluded.current_return_pct,
+                        max_return_pct=excluded.max_return_pct,
+                        max_drawdown_pct=excluded.max_drawdown_pct,
+                        highest_price_since_entry=excluded.highest_price_since_entry,
+                        lowest_price_since_entry=excluded.lowest_price_since_entry,
+                        realized_return_pct=excluded.realized_return_pct,
+                        unrealized_return_pct=excluded.unrealized_return_pct,
+                        stop_loss_price=excluded.stop_loss_price,
+                        take_profit_price=excluded.take_profit_price,
+                        trailing_stop_price=excluded.trailing_stop_price,
+                        trailing_active=excluded.trailing_active,
+                        first_profit_taken=excluded.first_profit_taken,
+                        last_tick_at=excluded.last_tick_at,
+                        risk_status=excluded.risk_status,
+                        data_quality_flags_json=excluded.data_quality_flags_json,
+                        details_json=excluded.details_json,
+                        payload_json=excluded.payload_json
+                    """,
+                    (
+                        str(payload.get("trade_date") or ""),
+                        str(payload.get("calculated_at") or ""),
+                        str(payload.get("position_id") or ""),
+                        payload.get("candidate_id"),
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("name") or ""),
+                        str(payload.get("theme_id") or ""),
+                        str(payload.get("theme_name") or ""),
+                        str(payload.get("source_type") or ""),
+                        _safe_int(payload.get("entry_price"), 0),
+                        _safe_int(payload.get("quantity"), 0),
+                        _safe_int(payload.get("remaining_quantity"), 0),
+                        _float_value(payload.get("avg_entry_price")),
+                        str(payload.get("opened_at") or ""),
+                        _safe_int(payload.get("holding_minutes"), 0),
+                        _safe_int(payload.get("current_price"), 0),
+                        _float_value(payload.get("current_return_pct")),
+                        _float_value(payload.get("max_return_pct")),
+                        _float_value(payload.get("max_drawdown_pct")),
+                        _safe_int(payload.get("highest_price_since_entry"), 0),
+                        _safe_int(payload.get("lowest_price_since_entry"), 0),
+                        _float_value(payload.get("realized_return_pct")),
+                        _float_value(payload.get("unrealized_return_pct")),
+                        _safe_int(payload.get("stop_loss_price"), 0),
+                        _safe_int(payload.get("take_profit_price"), 0),
+                        _safe_int(payload.get("trailing_stop_price"), 0),
+                        int(bool(payload.get("trailing_active"))),
+                        int(bool(payload.get("first_profit_taken"))),
+                        str(payload.get("last_tick_at") or ""),
+                        str(payload.get("risk_status") or ""),
+                        _json_list(payload.get("data_quality_flags") or []),
+                        _json_payload(payload.get("details") or {}),
+                        _json_payload(payload),
+                    ),
+                )
+        return len(rows)
+
+    def latest_position_runtime_snapshots(self, *, trade_date: Optional[str] = None) -> list[dict]:
+        return self._latest_reboot_batch(
+            "position_runtime_snapshots",
+            _row_to_position_runtime_snapshot,
+            trade_date=trade_date,
+            order_by="position_id ASC, id ASC",
+        )
+
+    def save_exit_decisions_reboot(self, decisions: Iterable[dict]) -> int:
+        rows = [dict(item or {}) for item in decisions or []]
+        if not rows:
+            return 0
+        with self.conn:
+            for payload in rows:
+                self.conn.execute(
+                    """
+                    INSERT INTO exit_decisions_reboot(
+                        trade_date, calculated_at, position_id, candidate_id, code,
+                        name, exit_status, exit_reason, quantity, price_hint,
+                        hoga_hint, current_price, current_return_pct,
+                        data_quality_flags_json, reason_codes_json,
+                        operator_message_ko, dry_run_sell_intent_allowed,
+                        live_order_allowed, gateway_command_created,
+                        details_json, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(trade_date, calculated_at, position_id) DO UPDATE SET
+                        candidate_id=excluded.candidate_id,
+                        code=excluded.code,
+                        name=excluded.name,
+                        exit_status=excluded.exit_status,
+                        exit_reason=excluded.exit_reason,
+                        quantity=excluded.quantity,
+                        price_hint=excluded.price_hint,
+                        hoga_hint=excluded.hoga_hint,
+                        current_price=excluded.current_price,
+                        current_return_pct=excluded.current_return_pct,
+                        data_quality_flags_json=excluded.data_quality_flags_json,
+                        reason_codes_json=excluded.reason_codes_json,
+                        operator_message_ko=excluded.operator_message_ko,
+                        dry_run_sell_intent_allowed=excluded.dry_run_sell_intent_allowed,
+                        live_order_allowed=excluded.live_order_allowed,
+                        gateway_command_created=excluded.gateway_command_created,
+                        details_json=excluded.details_json,
+                        payload_json=excluded.payload_json
+                    """,
+                    (
+                        str(payload.get("trade_date") or ""),
+                        str(payload.get("calculated_at") or ""),
+                        str(payload.get("position_id") or ""),
+                        payload.get("candidate_id"),
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("name") or ""),
+                        str(payload.get("exit_status") or ""),
+                        str(payload.get("exit_reason") or ""),
+                        _safe_int(payload.get("quantity"), 0),
+                        _safe_int(payload.get("price_hint"), 0),
+                        str(payload.get("hoga_hint") or ""),
+                        _safe_int(payload.get("current_price"), 0),
+                        _float_value(payload.get("current_return_pct")),
+                        _json_list(payload.get("data_quality_flags") or []),
+                        _json_list(payload.get("reason_codes") or []),
+                        str(payload.get("operator_message_ko") or ""),
+                        int(bool(payload.get("dry_run_sell_intent_allowed"))),
+                        int(bool(payload.get("live_order_allowed"))),
+                        int(bool(payload.get("gateway_command_created"))),
+                        _json_payload(payload.get("details") or {}),
+                        _json_payload(payload),
+                    ),
+                )
+        return len(rows)
+
+    def latest_exit_decisions_reboot(self, *, trade_date: Optional[str] = None) -> list[dict]:
+        return self._latest_reboot_batch(
+            "exit_decisions_reboot",
+            _row_to_exit_decision_reboot,
+            trade_date=trade_date,
+            order_by="id ASC",
+        )
+
+    def save_dry_run_sell_intents(self, intents: Iterable[dict]) -> int:
+        rows = [dict(item or {}) for item in intents or []]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        with self.conn:
+            for payload in rows:
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO dry_run_sell_intents(
+                        trade_date, calculated_at, position_id, candidate_id, code,
+                        side, quantity, price_hint, exit_reason, exit_status,
+                        hoga_hint, idempotency_key, source, live_order_allowed,
+                        gateway_command_created, status, details_json, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(payload.get("trade_date") or ""),
+                        str(payload.get("calculated_at") or ""),
+                        str(payload.get("position_id") or ""),
+                        payload.get("candidate_id"),
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("side") or "sell"),
+                        _safe_int(payload.get("quantity"), 0),
+                        _safe_int(payload.get("price_hint"), 0),
+                        str(payload.get("exit_reason") or ""),
+                        str(payload.get("exit_status") or ""),
+                        str(payload.get("hoga_hint") or ""),
+                        str(payload.get("idempotency_key") or ""),
+                        str(payload.get("source") or ""),
+                        int(bool(payload.get("live_order_allowed"))),
+                        int(bool(payload.get("gateway_command_created"))),
+                        str(payload.get("status") or "CREATED"),
+                        _json_payload(payload.get("details") or {}),
+                        _json_payload(payload),
+                    ),
+                )
+        return max(0, self.conn.total_changes - before)
+
+    def find_dry_run_sell_intent_by_idempotency(self, idempotency_key: str) -> Optional[dict]:
+        if not idempotency_key:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM dry_run_sell_intents WHERE idempotency_key = ? ORDER BY id ASC LIMIT 1",
+            (str(idempotency_key),),
+        ).fetchone()
+        return _row_to_dry_run_sell_intent(row) if row else None
+
+    def latest_dry_run_sell_intents(self, *, trade_date: Optional[str] = None) -> list[dict]:
+        params: list[object] = []
+        where = ""
+        if trade_date:
+            where = "WHERE trade_date = ?"
+            params.append(str(trade_date))
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM dry_run_sell_intents
+            {where}
+            ORDER BY calculated_at DESC, id DESC
+            LIMIT 100
+            """,
+            tuple(params),
+        ).fetchall()
+        return [_row_to_dry_run_sell_intent(row) for row in rows]
+
+    def save_position_risk_snapshots(self, snapshots: Iterable[dict]) -> int:
+        rows = [dict(item or {}) for item in snapshots or []]
+        if not rows:
+            return 0
+        with self.conn:
+            for payload in rows:
+                self.conn.execute(
+                    """
+                    INSERT INTO position_risk_snapshots(
+                        trade_date, calculated_at, position_id, candidate_id, code,
+                        risk_status, risk_level, stop_loss_distance_pct,
+                        take_profit_distance_pct, trailing_distance_pct,
+                        theme_risk_level, market_risk_level, data_risk_level,
+                        reason_codes_json, details_json, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(trade_date, calculated_at, position_id) DO UPDATE SET
+                        candidate_id=excluded.candidate_id,
+                        code=excluded.code,
+                        risk_status=excluded.risk_status,
+                        risk_level=excluded.risk_level,
+                        stop_loss_distance_pct=excluded.stop_loss_distance_pct,
+                        take_profit_distance_pct=excluded.take_profit_distance_pct,
+                        trailing_distance_pct=excluded.trailing_distance_pct,
+                        theme_risk_level=excluded.theme_risk_level,
+                        market_risk_level=excluded.market_risk_level,
+                        data_risk_level=excluded.data_risk_level,
+                        reason_codes_json=excluded.reason_codes_json,
+                        details_json=excluded.details_json,
+                        payload_json=excluded.payload_json
+                    """,
+                    (
+                        str(payload.get("trade_date") or ""),
+                        str(payload.get("calculated_at") or ""),
+                        str(payload.get("position_id") or ""),
+                        payload.get("candidate_id"),
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("risk_status") or ""),
+                        str(payload.get("risk_level") or ""),
+                        _float_value(payload.get("stop_loss_distance_pct")),
+                        _float_value(payload.get("take_profit_distance_pct")),
+                        _float_value(payload.get("trailing_distance_pct")),
+                        str(payload.get("theme_risk_level") or ""),
+                        str(payload.get("market_risk_level") or ""),
+                        str(payload.get("data_risk_level") or ""),
+                        _json_list(payload.get("reason_codes") or []),
+                        _json_payload(payload.get("details") or {}),
+                        _json_payload(payload),
+                    ),
+                )
+        return len(rows)
+
+    def latest_position_risk_snapshots(self, *, trade_date: Optional[str] = None) -> list[dict]:
+        return self._latest_reboot_batch(
+            "position_risk_snapshots",
+            _row_to_position_risk_snapshot,
+            trade_date=trade_date,
+            order_by="risk_level DESC, id ASC",
+        )
+
+    def save_portfolio_risk_snapshot(self, snapshot: dict) -> dict:
+        payload = dict(snapshot or {})
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO portfolio_risk_snapshots(
+                    trade_date, calculated_at, open_position_count, total_exposure,
+                    theme_exposure_json, market_side_exposure_json,
+                    unrealized_pnl_pct, max_drawdown_pct, daily_realized_pnl_pct,
+                    risk_level, stop_new_entry_recommended, kill_switch_recommended,
+                    reason_codes_json, details_json, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_date, calculated_at) DO UPDATE SET
+                    open_position_count=excluded.open_position_count,
+                    total_exposure=excluded.total_exposure,
+                    theme_exposure_json=excluded.theme_exposure_json,
+                    market_side_exposure_json=excluded.market_side_exposure_json,
+                    unrealized_pnl_pct=excluded.unrealized_pnl_pct,
+                    max_drawdown_pct=excluded.max_drawdown_pct,
+                    daily_realized_pnl_pct=excluded.daily_realized_pnl_pct,
+                    risk_level=excluded.risk_level,
+                    stop_new_entry_recommended=excluded.stop_new_entry_recommended,
+                    kill_switch_recommended=excluded.kill_switch_recommended,
+                    reason_codes_json=excluded.reason_codes_json,
+                    details_json=excluded.details_json,
+                    payload_json=excluded.payload_json
+                """,
+                (
+                    str(payload.get("trade_date") or ""),
+                    str(payload.get("calculated_at") or ""),
+                    _safe_int(payload.get("open_position_count"), 0),
+                    _safe_int(payload.get("total_exposure"), 0),
+                    _json_payload(payload.get("theme_exposure_by_theme") or payload.get("theme_exposure") or {}),
+                    _json_payload(payload.get("market_side_exposure") or {}),
+                    _float_value(payload.get("unrealized_pnl_pct")),
+                    _float_value(payload.get("max_drawdown_pct")),
+                    _float_value(payload.get("daily_realized_pnl_pct")),
+                    str(payload.get("risk_level") or ""),
+                    int(bool(payload.get("stop_new_entry_recommended"))),
+                    int(bool(payload.get("kill_switch_recommended"))),
+                    _json_list(payload.get("reason_codes") or []),
+                    _json_payload(payload.get("details") or {}),
+                    _json_payload(payload),
+                ),
+            )
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM portfolio_risk_snapshots
+            WHERE trade_date = ? AND calculated_at = ?
+            """,
+            (str(payload.get("trade_date") or ""), str(payload.get("calculated_at") or "")),
+        ).fetchone()
+        return _row_to_portfolio_risk_snapshot(row) if row else payload
+
+    def latest_portfolio_risk_snapshot(self, *, trade_date: Optional[str] = None) -> dict:
+        params: list[object] = []
+        where = ""
+        if trade_date:
+            where = "WHERE trade_date = ?"
+            params.append(str(trade_date))
+        row = self.conn.execute(
+            f"""
+            SELECT *
+            FROM portfolio_risk_snapshots
+            {where}
+            ORDER BY calculated_at DESC, id DESC
+            LIMIT 1
+            """,
+            tuple(params),
+        ).fetchone()
+        return _row_to_portfolio_risk_snapshot(row) if row else {}
+
+    def _latest_reboot_batch(
+        self,
+        table_name: str,
+        row_mapper,
+        *,
+        trade_date: Optional[str] = None,
+        order_by: str = "id ASC",
+    ) -> list[dict]:
+        if table_name not in {
+            "position_runtime_snapshots",
+            "exit_decisions_reboot",
+            "position_risk_snapshots",
+        }:
+            return []
+        params: list[object] = []
+        where = ""
+        if trade_date:
+            where = "WHERE trade_date = ?"
+            params.append(str(trade_date))
+        latest = self.conn.execute(
+            f"""
+            SELECT calculated_at
+            FROM {table_name}
+            {where}
+            ORDER BY calculated_at DESC, id DESC
+            LIMIT 1
+            """,
+            tuple(params),
+        ).fetchone()
+        if latest is None:
+            return []
+        query = f"SELECT * FROM {table_name} WHERE calculated_at = ?"
+        query_params: list[object] = [str(latest["calculated_at"] or "")]
+        if trade_date:
+            query += " AND trade_date = ?"
+            query_params.append(str(trade_date))
+        query += f" ORDER BY {order_by}"
+        rows = self.conn.execute(query, tuple(query_params)).fetchall()
+        return [row_mapper(row) for row in rows]
+
     def save_indicator_snapshot(self, snapshot: IndicatorSnapshot) -> IndicatorSnapshot:
         with self.conn:
             return self._save_indicator_snapshot_no_commit(snapshot)
@@ -12658,6 +13209,167 @@ def _row_to_entry_decision_check(row: sqlite3.Row) -> dict:
     payload.setdefault("code", data.get("code", ""))
     payload.setdefault("check_name", data.get("check_name", ""))
     payload.setdefault("status", data.get("check_status", ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    payload.setdefault("details", _safe_json_loads(data.pop("details_json", "{}"), {}))
+    return payload
+
+
+def _row_to_position_runtime_snapshot(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in (
+        "id",
+        "created_at",
+        "trade_date",
+        "calculated_at",
+        "position_id",
+        "candidate_id",
+        "code",
+        "name",
+        "theme_id",
+        "theme_name",
+        "source_type",
+        "opened_at",
+        "last_tick_at",
+        "risk_status",
+    ):
+        payload.setdefault(key, data.get(key, ""))
+    for key in (
+        "entry_price",
+        "quantity",
+        "remaining_quantity",
+        "holding_minutes",
+        "current_price",
+        "highest_price_since_entry",
+        "lowest_price_since_entry",
+        "stop_loss_price",
+        "take_profit_price",
+        "trailing_stop_price",
+    ):
+        payload.setdefault(key, int(data.get(key) or 0))
+    for key in (
+        "avg_entry_price",
+        "current_return_pct",
+        "max_return_pct",
+        "max_drawdown_pct",
+        "realized_return_pct",
+        "unrealized_return_pct",
+    ):
+        payload.setdefault(key, float(data.get(key) or 0.0))
+    payload.setdefault("trailing_active", bool(data.get("trailing_active")))
+    payload.setdefault("first_profit_taken", bool(data.get("first_profit_taken")))
+    payload.setdefault("data_quality_flags", _safe_json_loads(data.pop("data_quality_flags_json", "[]"), []))
+    payload.setdefault("details", _safe_json_loads(data.pop("details_json", "{}"), {}))
+    return payload
+
+
+def _row_to_exit_decision_reboot(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in (
+        "id",
+        "created_at",
+        "trade_date",
+        "calculated_at",
+        "position_id",
+        "candidate_id",
+        "code",
+        "name",
+        "exit_status",
+        "exit_reason",
+        "hoga_hint",
+        "operator_message_ko",
+    ):
+        payload.setdefault(key, data.get(key, ""))
+    for key in ("quantity", "price_hint", "current_price"):
+        payload.setdefault(key, int(data.get(key) or 0))
+    payload.setdefault("current_return_pct", float(data.get("current_return_pct") or 0.0))
+    payload.setdefault("data_quality_flags", _safe_json_loads(data.pop("data_quality_flags_json", "[]"), []))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    payload.setdefault("dry_run_sell_intent_allowed", bool(data.get("dry_run_sell_intent_allowed")))
+    payload.setdefault("live_order_allowed", bool(data.get("live_order_allowed")))
+    payload.setdefault("gateway_command_created", bool(data.get("gateway_command_created")))
+    payload.setdefault("details", _safe_json_loads(data.pop("details_json", "{}"), {}))
+    return payload
+
+
+def _row_to_dry_run_sell_intent(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in (
+        "id",
+        "created_at",
+        "trade_date",
+        "calculated_at",
+        "position_id",
+        "candidate_id",
+        "code",
+        "side",
+        "exit_reason",
+        "exit_status",
+        "hoga_hint",
+        "idempotency_key",
+        "source",
+        "status",
+    ):
+        payload.setdefault(key, data.get(key, ""))
+    for key in ("quantity", "price_hint"):
+        payload.setdefault(key, int(data.get(key) or 0))
+    payload.setdefault("live_order_allowed", bool(data.get("live_order_allowed")))
+    payload.setdefault("gateway_command_created", bool(data.get("gateway_command_created")))
+    payload.setdefault("details", _safe_json_loads(data.pop("details_json", "{}"), {}))
+    return payload
+
+
+def _row_to_position_risk_snapshot(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in (
+        "id",
+        "created_at",
+        "trade_date",
+        "calculated_at",
+        "position_id",
+        "candidate_id",
+        "code",
+        "risk_status",
+        "risk_level",
+        "theme_risk_level",
+        "market_risk_level",
+        "data_risk_level",
+    ):
+        payload.setdefault(key, data.get(key, ""))
+    for key in ("stop_loss_distance_pct", "take_profit_distance_pct", "trailing_distance_pct"):
+        payload.setdefault(key, float(data.get(key) or 0.0))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    payload.setdefault("details", _safe_json_loads(data.pop("details_json", "{}"), {}))
+    return payload
+
+
+def _row_to_portfolio_risk_snapshot(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in ("id", "created_at", "trade_date", "calculated_at", "risk_level"):
+        payload.setdefault(key, data.get(key, ""))
+    payload.setdefault("open_position_count", int(data.get("open_position_count") or 0))
+    payload.setdefault("total_exposure", int(data.get("total_exposure") or 0))
+    payload.setdefault("theme_exposure_by_theme", _safe_json_loads(data.pop("theme_exposure_json", "{}"), {}))
+    payload.setdefault("market_side_exposure", _safe_json_loads(data.pop("market_side_exposure_json", "{}"), {}))
+    payload.setdefault("unrealized_pnl_pct", float(data.get("unrealized_pnl_pct") or 0.0))
+    payload.setdefault("max_drawdown_pct", float(data.get("max_drawdown_pct") or 0.0))
+    payload.setdefault("daily_realized_pnl_pct", float(data.get("daily_realized_pnl_pct") or 0.0))
+    payload.setdefault("stop_new_entry_recommended", bool(data.get("stop_new_entry_recommended")))
+    payload.setdefault("kill_switch_recommended", bool(data.get("kill_switch_recommended")))
     payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
     payload.setdefault("details", _safe_json_loads(data.pop("details_json", "{}"), {}))
     return payload

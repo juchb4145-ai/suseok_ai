@@ -400,6 +400,41 @@ EntryEngine Reboot V2 Runtime Integration은 `WATCHING` 후보를 5단계로 평
 - `TRADING_ENTRY_ALLOW_DRY_RUN_INTENTS=false`에서 dry-run intent가 생성되지 않음
 - LIVE order command가 생성되지 않음
 
+## PR 6 구현 체크포인트
+
+ExitEngine + PositionRiskManager Reboot V2는 open position을 관찰 snapshot으로 정규화하고, observe-only exit decision과 포지션/포트폴리오 risk snapshot을 저장하는 PR이다.
+
+범위:
+
+- `trading/strategy/exit_engine_reboot.py`에 ExitEngine 모델, 판단 우선순위, DRY_RUN sell intent 산출, 런타임 파이프라인을 추가한다.
+- `trading/strategy/position_risk.py`에 PositionRuntimeService, PositionRiskManager, portfolio risk 요약, 런타임 파이프라인을 추가한다.
+- `position_runtime_snapshots`, `exit_decisions_reboot`, `dry_run_sell_intents`, `position_risk_snapshots`, `portfolio_risk_snapshots` SQLite 테이블을 추가한다.
+- Runtime cycle은 EntryEngine 이후 ExitEngine, PositionRiskManager 순서로 실행한다.
+- Dashboard에는 `exit_engine`, `position_risk` section을 추가한다.
+- Candidate metadata에는 exit/risk 표시 필드만 병합하고 매수 lifecycle state는 변경하지 않는다.
+
+금지:
+
+- LIVE order command, Gateway `send_order`, `cancel_order`, `modify_order` command 생성
+- 기존 hybrid gate/final grade/promotion/threshold 로직 연결
+- stale/invalid price 기반 sell intent 생성
+- open position 없는 sell intent 생성
+- DRY_RUN sell intent를 실제 주문 queue로 전달
+- PostgreSQL 연동
+
+검증:
+
+- virtual filled buy/open virtual position에서 runtime open position snapshot이 생성된다.
+- 동일 candidate/code 중복 open position snapshot은 하나로 정규화된다.
+- stop loss, fast stop loss, take profit, trailing stop, time exit 판단이 priority에 맞게 생성된다.
+- theme weak, leader collapse, market RISK_OFF/WEAK 판단이 생성된다.
+- stale/invalid data는 `DATA_WAIT` 또는 `STALE_DATA_RISK`가 되고 sell intent를 만들지 않는다.
+- `TRADING_EXIT_ALLOW_DRY_RUN_SELL_INTENTS=false`에서는 sell intent가 생성되지 않는다.
+- flag true에서는 idempotency key 기준으로 DRY_RUN sell intent가 중복 생성되지 않는다.
+- position risk manager가 portfolio risk level, stop_new_entry recommendation, kill_switch recommendation을 계산한다.
+- dashboard snapshot에 `exit_engine`, `position_risk` section이 포함된다.
+- LIVE/Gateway order command는 생성되지 않는다.
+
 ## Rollback
 
 v2는 feature flag로 분리되므로 rollback은 다음과 같다.

@@ -54,9 +54,11 @@ from trading.strategy.candidates import CandidateCollector
 from trading.strategy.candidate_hydrator import CandidateHydrator
 from trading.strategy.candidate_ingestion import CandidateIngestionService, build_candidate_ingestion_snapshot
 from trading.strategy.entry_engine import entry_engine_dashboard_section
+from trading.strategy.exit_engine_reboot import exit_engine_dashboard_section
 from trading.strategy.hybrid_validation import HybridValidationRepository
 from trading.strategy.market_regime import market_regime_dashboard_section
 from trading.strategy.models import BlockType, CandidateState
+from trading.strategy.position_risk import position_risk_dashboard_section
 from trading.strategy.reason_taxonomy import normalize_reason_status, reason_status_family, reason_summary
 from trading.strategy.runtime_settings import StrategyRuntimeSettingsRepository
 from trading.theme_engine.backfill import ThemeBackfillConfig, apply_dispatch_guard
@@ -8646,6 +8648,45 @@ def _dashboard_slim_runtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "summary": dict(data.get("summary") or {}),
             "recommendations": list(data.get("recommendations") or [])[:1],
         }
+    if "exit_engine" in runtime:
+        runtime["exit_engine"] = _dashboard_field_subset(
+            dict(runtime.get("exit_engine") or {}),
+            (
+                "status",
+                "calculated_at",
+                "trade_date",
+                "open_position_count",
+                "hold_count",
+                "scale_out_count",
+                "exit_now_count",
+                "wait_confirmation_count",
+                "data_wait_count",
+                "dry_run_sell_intent_count",
+                "top_exit_reasons",
+                "output_mode",
+                "live_order_allowed",
+            ),
+        )
+    if "position_risk" in runtime:
+        runtime["position_risk"] = _dashboard_field_subset(
+            dict(runtime.get("position_risk") or {}),
+            (
+                "status",
+                "calculated_at",
+                "trade_date",
+                "portfolio_risk_level",
+                "open_position_count",
+                "theme_exposure",
+                "market_side_exposure",
+                "unrealized_pnl_pct",
+                "daily_realized_pnl_pct",
+                "stop_new_entry_recommended",
+                "kill_switch_recommended",
+                "top_position_risks",
+                "output_mode",
+                "live_order_allowed",
+            ),
+        )
     return runtime
 
 
@@ -8713,6 +8754,8 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     theme_board_payload = theme_board_dashboard_section(db, trade_date=today)
     market_regime_payload = market_regime_dashboard_section(db, trade_date=today)
     entry_engine_payload = entry_engine_dashboard_section(db, trade_date=today)
+    exit_engine_payload = exit_engine_dashboard_section(db, trade_date=today)
+    position_risk_payload = position_risk_dashboard_section(db, trade_date=today)
     decision_summary_payload = _cached_dashboard_fragment(
         db,
         f"intraday_decisions:v2:{today}",
@@ -8977,6 +9020,8 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["theme_board"] = theme_board_payload
     runtime_payload["market_regime"] = market_regime_payload
     runtime_payload["entry_engine"] = entry_engine_payload
+    runtime_payload["exit_engine"] = exit_engine_payload
+    runtime_payload["position_risk"] = position_risk_payload
     gateway_payload = dict(status_payload["gateway"]) if full_detail else _dashboard_slim_gateway_payload(status_payload["gateway"])
     ops_alerts_payload = build_ops_alerts(
         core=status_payload["core"],
@@ -9021,6 +9066,8 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "theme_board": theme_board_payload,
         "market_regime": market_regime_payload,
         "entry_engine": entry_engine_payload,
+        "exit_engine": exit_engine_payload,
+        "position_risk": position_risk_payload,
         "candidates": candidates_payload,
         "themes": themes_payload,
         "orders": orders_payload,
@@ -9112,6 +9159,18 @@ def build_candidates_snapshot(
                 "entry_live_order_allowed": bool(metadata.get("entry_live_order_allowed", False)),
                 "entry_reason_codes": list(metadata.get("entry_reason_codes") or []),
                 "entry_operator_message_ko": metadata.get("entry_operator_message_ko", ""),
+                "exit_status": metadata.get("exit_status", ""),
+                "exit_reason": metadata.get("exit_reason", ""),
+                "exit_reason_codes": list(metadata.get("exit_reason_codes") or []),
+                "exit_live_order_allowed": bool(metadata.get("exit_live_order_allowed", False)),
+                "exit_gateway_command_created": bool(metadata.get("exit_gateway_command_created", False)),
+                "position_risk_level": metadata.get("position_risk_level", ""),
+                "current_return_pct": _number(metadata.get("current_return_pct")),
+                "max_return_pct": _number(metadata.get("max_return_pct")),
+                "max_drawdown_pct": _number(metadata.get("max_drawdown_pct")),
+                "stop_loss_price": _number(metadata.get("stop_loss_price")),
+                "take_profit_price": _number(metadata.get("take_profit_price")),
+                "trailing_stop_price": _number(metadata.get("trailing_stop_price")),
                 "reason_codes": reason_codes,
                 "detected_at": candidate.detected_at,
                 "last_seen_at": candidate.last_seen_at,

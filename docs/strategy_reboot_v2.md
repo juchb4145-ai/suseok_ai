@@ -1226,3 +1226,320 @@ order_intent_allowed=false
 ```
 
 대시보드 표현은 “주도 테마”, “관찰 종목”, “대장주/공동대장”, “후발/과열 제외”로 제한한다. “매수 추천”, “매수 확정”, “자동매수 대상”은 금지한다.
+## PR 6: ExitEngine + PositionRiskManager Reboot V2
+
+PR 6은 진입 이후의 관찰 포지션을 추적하고, 실시간 가격/캔들/ThemeBoard/MarketRegime을 기반으로 매도 판단과 포지션 리스크 요약을 산출한다.
+
+범위는 observe decision과 DRY_RUN sell intent 저장까지다. LIVE 주문, Gateway `send_order`, `cancel_order`, `modify_order` command는 생성하지 않는다. LIVE_SIM 실제 매도 주문과 broker reconciliation은 PR 7 OrderManager 범위다.
+
+### Runtime 순서
+
+```text
+gateway events / realtime tick
+-> candidate ingestion / hydration
+-> Opening Burst
+-> ThemeBoard
+-> MarketRegime
+-> EntryEngine
+-> PositionRuntimeService
+-> ExitEngine
+-> PositionRiskManager
+-> dashboard snapshot
+```
+
+기본 feature flag:
+
+```text
+TRADING_EXIT_ENGINE_ENABLED=false
+TRADING_EXIT_ENGINE_OBSERVE_ONLY=true
+TRADING_EXIT_ENGINE_INTERVAL_SEC=5
+TRADING_EXIT_ALLOW_DRY_RUN_SELL_INTENTS=false
+TRADING_POSITION_RISK_ENABLED=false
+TRADING_POSITION_RISK_INTERVAL_SEC=5
+```
+
+### PositionRuntimeSnapshot
+
+PositionRuntimeService는 기존 `virtual_positions`와 `live_sim_positions`의 open position을 읽어 Reboot V2 runtime snapshot으로 정규화한다.
+
+중복 방지 기준:
+
+- 같은 `candidate_id + code`의 open position은 한 번만 snapshot으로 생성한다.
+- `source_type`은 `DRY_RUN`, `VIRTUAL`, `LIVE_SIM_OBSERVED`, `MANUAL` 중 하나로 명시한다.
+- 실제 broker 잔고 reconcile은 하지 않는다.
+
+주요 필드:
+
+```text
+trade_date
+calculated_at
+position_id
+candidate_id
+code
+name
+theme_id
+theme_name
+source_type
+entry_price
+quantity
+remaining_quantity
+avg_entry_price
+opened_at
+holding_minutes
+current_price
+current_return_pct
+max_return_pct
+max_drawdown_pct
+highest_price_since_entry
+lowest_price_since_entry
+realized_return_pct
+unrealized_return_pct
+stop_loss_price
+take_profit_price
+trailing_stop_price
+trailing_active
+first_profit_taken
+last_tick_at
+data_quality_flags
+risk_status
+details
+```
+
+`risk_status`:
+
+```text
+OPEN
+SCALE_OUT_PENDING
+EXIT_PENDING
+CLOSED
+DATA_WAIT
+STALE_DATA_RISK
+```
+
+데이터 부족 정책:
+
+- latest tick 없음: `DATA_WAIT`
+- tick age 초과: `STALE_DATA_RISK`
+- current_price <= 0: `DATA_WAIT`
+- candle 부족: support/VWAP 기반 exit는 보류한다.
+- stale/invalid price로는 DRY_RUN sell intent를 생성하지 않는다.
+
+### ExitDecision
+
+`ExitDecisionStatus`:
+
+```text
+HOLD
+SCALE_OUT
+EXIT_NOW
+WAIT_CONFIRMATION
+DATA_WAIT
+ALREADY_CLOSED
+```
+
+`ExitReason`:
+
+```text
+TAKE_PROFIT
+STOP_LOSS
+STOP_LOSS_FAST
+SUPPORT_LOSS
+VWAP_LOSS
+TRAILING_STOP
+TIME_EXIT
+THEME_WEAK_EXIT
+LEADER_COLLAPSE_EXIT
+MARKET_WEAK_EXIT
+MARKET_RISK_OFF_EXIT
+BREADTH_COLLAPSE_EXIT
+STALE_DATA_EXIT_GUARD
+MANUAL_PROTECT
+```
+
+판단 우선순위:
+
+1. Data integrity guard: stale/invalid price면 sell intent 금지
+2. `STOP_LOSS` / `STOP_LOSS_FAST`
+3. `MARKET_RISK_OFF_EXIT`
+4. `SUPPORT_LOSS` / `VWAP_LOSS`
+5. `TRAILING_STOP`
+6. `THEME_WEAK_EXIT` / `LEADER_COLLAPSE_EXIT`
+7. `TAKE_PROFIT`
+8. `TIME_EXIT`
+9. `HOLD`
+
+stop과 take-profit이 같은 candle에서 동시에 가능하면 보수적으로 stop을 우선하고 `details.ambiguous_bar=true`를 남긴다.
+
+### Exit Config
+
+```text
+TRADING_EXIT_STOP_LOSS_PCT=-2.0
+TRADING_EXIT_FAST_STOP_LOSS_PCT=-1.2
+TRADING_EXIT_FAST_STOP_LOSS_MINUTES=5
+TRADING_EXIT_SUPPORT_BREAK_CONFIRM_CANDLES=2
+TRADING_EXIT_VWAP_BREAK_CONFIRM_CANDLES=2
+TRADING_EXIT_TAKE_PROFIT_1_PCT=5.0
+TRADING_EXIT_TAKE_PROFIT_1_RATIO=0.5
+TRADING_EXIT_TRAILING_ACTIVATE_PCT=3.0
+TRADING_EXIT_TRAILING_GAP_PCT=1.2
+TRADING_EXIT_MAX_HOLD_MINUTES=30
+TRADING_EXIT_MIN_RETURN_AFTER_HOLD_PCT=0.0
+TRADING_EXIT_FORCE_EXIT_BEFORE_CLOSE_MIN=10
+TRADING_THEME_WEAK_CONFIRMATION_CYCLES=2
+TRADING_LEADER_COLLAPSE_CONFIRMATION_CYCLES=1
+```
+
+### DRY_RUN Sell Intent
+
+기본값은 disabled다.
+
+```text
+TRADING_EXIT_ALLOW_DRY_RUN_SELL_INTENTS=false
+```
+
+생성 조건:
+
+- `ExitDecisionStatus`가 `SCALE_OUT` 또는 `EXIT_NOW`
+- position source가 `DRY_RUN`, `VIRTUAL`, `LIVE_SIM_OBSERVED`
+- `remaining_quantity > 0`
+- data quality가 sell intent 가능한 상태
+- 같은 idempotency key가 없음
+- LIVE order가 아님
+
+idempotency key:
+
+```text
+reboot_exit_dry_run:{trade_date}:{position_id}:{exit_reason}:{exit_bucket}
+```
+
+intent 필드:
+
+```text
+trade_date
+position_id
+candidate_id
+code
+side=sell
+quantity
+price_hint
+exit_reason
+exit_status
+hoga_hint
+idempotency_key
+source=exit_engine_reboot_v2
+live_order_allowed=false
+gateway_command_created=false
+details
+```
+
+### PositionRiskManager
+
+PositionRiskManager는 포지션 단위와 포트폴리오 단위 위험을 요약한다.
+
+포지션 단위:
+
+```text
+stop_loss_distance_pct
+take_profit_distance_pct
+trailing_distance_pct
+theme_risk_level
+market_risk_level
+data_risk_level
+risk_level
+reason_codes
+```
+
+포트폴리오 단위:
+
+```text
+open_position_count
+total_exposure
+theme_exposure_by_theme
+market_side_exposure
+unrealized_pnl_pct
+max_drawdown_pct
+daily_realized_pnl_pct
+risk_level
+stop_new_entry_recommended
+kill_switch_recommended
+```
+
+`risk_level`:
+
+```text
+NORMAL
+CAUTION
+REDUCE
+STOP_NEW_ENTRY
+KILL_SWITCH_RECOMMENDED
+```
+
+이번 PR의 kill switch는 recommendation만 저장한다. 실제 OrderManager 차단 강제 연결은 PR 7에서 처리한다.
+
+### SQLite 저장소
+
+추가 테이블:
+
+```text
+position_runtime_snapshots
+exit_decisions_reboot
+dry_run_sell_intents
+position_risk_snapshots
+portfolio_risk_snapshots
+```
+
+저장 기준:
+
+- `position_runtime_snapshots`: `trade_date + calculated_at + position_id`
+- `exit_decisions_reboot`: `trade_date + calculated_at + position_id`
+- `dry_run_sell_intents`: `idempotency_key`
+- `position_risk_snapshots`: `trade_date + calculated_at + position_id`
+- `portfolio_risk_snapshots`: `trade_date + calculated_at`
+
+### Dashboard
+
+`exit_engine` section:
+
+```text
+calculated_at
+open_position_count
+hold_count
+scale_out_count
+exit_now_count
+wait_confirmation_count
+data_wait_count
+dry_run_sell_intent_count
+top_exit_reasons
+warnings
+live_order_allowed=false
+```
+
+`position_risk` section:
+
+```text
+portfolio_risk_level
+open_position_count
+theme_exposure
+market_side_exposure
+unrealized_pnl_pct
+daily_realized_pnl_pct
+stop_new_entry_recommended
+kill_switch_recommended
+top_position_risks
+live_order_allowed=false
+```
+
+대시보드 표현은 "관찰상 매도 판단", "포지션 리스크 축소 필요", "손절/익절/시간청산 관찰", "테마 약화", "시장 위험"으로 제한한다. "실제 매도 주문 완료", "자동매매 확정", "LIVE 매도" 표현은 금지한다.
+
+### 금지 사항
+
+- LIVE order command 생성 금지
+- Gateway `send_order` command 생성 금지
+- `cancel_order`/`modify_order` command 생성 금지
+- hybrid gate/final grade 연결 금지
+- promotion 로직 연결 금지
+- threshold 자동 변경 금지
+- PostgreSQL 연동 금지
+- stale/invalid price로 sell intent 생성 금지
+- open position 없는 sell intent 생성 금지
+- DRY_RUN sell intent를 실제 주문 queue로 넣는 행위 금지

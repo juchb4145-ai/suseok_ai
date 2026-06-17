@@ -15,6 +15,7 @@ from trading.strategy.config import StrategyRuntimeConfigRepository
 from trading.strategy.entry import EntryPlanBuilder
 from trading.strategy.entry_engine import EntryEngineConfig, EntryEngineRuntimePipeline
 from trading.strategy.exit import ExitDecisionEngine, VirtualPositionService
+from trading.strategy.exit_engine_reboot import ExitEngineConfig, ExitEngineRuntimePipeline
 from trading.strategy.holding import StaticHoldingProvider
 from trading.strategy.hybrid_validation import HybridValidationRepository
 from trading.strategy.indicators import IndicatorCalculator
@@ -24,6 +25,7 @@ from trading.strategy.market_index import MarketIndexStore
 from trading.strategy.market_regime import MarketRegimeConfig, MarketRegimeRuntimePipeline
 from trading.strategy.models import OrderMode
 from trading.strategy.pipeline import GatePipeline
+from trading.strategy.position_risk import PositionRiskConfig, PositionRiskRuntimePipeline
 from trading.strategy.readiness import build_readiness_report, dedupe_warnings
 from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.review import TradeReviewService
@@ -63,6 +65,8 @@ class CoreRuntimeBundle:
     theme_board_pipeline: Any = None
     market_regime_pipeline: Any = None
     entry_engine_pipeline: Any = None
+    exit_engine_reboot_pipeline: Any = None
+    position_risk_pipeline: Any = None
 
 
 def build_core_strategy_runtime(
@@ -146,6 +150,18 @@ def build_core_strategy_runtime(
         candle_builder=candle_builder,
         config=EntryEngineConfig.from_env(),
     )
+    exit_engine_reboot_pipeline = ExitEngineRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        candle_builder=candle_builder,
+        config=ExitEngineConfig.from_env(),
+    )
+    position_risk_pipeline = PositionRiskRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        candle_builder=candle_builder,
+        config=PositionRiskConfig.from_env(),
+    )
     theme_lab_pipeline = None
     if config.theme_engine_mode == "themelab_flow":
         theme_backfill_service = ThemeBackfillService(
@@ -194,6 +210,8 @@ def build_core_strategy_runtime(
         theme_board_pipeline=theme_board_pipeline,
         market_regime_pipeline=market_regime_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
+        exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
+        position_risk_pipeline=position_risk_pipeline,
         theme_lab_shadow_ab_provider=theme_lab_shadow_ab_provider,
         shadow_small_entry_promotion_provider=shadow_small_entry_promotion_provider,
     )
@@ -202,6 +220,8 @@ def build_core_strategy_runtime(
     runtime.theme_board_pipeline = theme_board_pipeline
     runtime.market_regime_pipeline = market_regime_pipeline
     runtime.entry_engine_pipeline = entry_engine_pipeline
+    runtime.exit_engine_reboot_pipeline = exit_engine_reboot_pipeline
+    runtime.position_risk_pipeline = position_risk_pipeline
     readiness_report = build_readiness_report(
         db,
         subscription_manager=runtime.subscription_manager,
@@ -229,6 +249,8 @@ def build_core_strategy_runtime(
         theme_board_pipeline=theme_board_pipeline,
         market_regime_pipeline=market_regime_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
+        exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
+        position_risk_pipeline=position_risk_pipeline,
     )
 
 
