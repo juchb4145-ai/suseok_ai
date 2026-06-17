@@ -53,6 +53,7 @@ from trading.broker.ws_messages import GatewayWsMessage
 from trading.strategy.candidates import CandidateCollector
 from trading.strategy.candidate_hydrator import CandidateHydrator
 from trading.strategy.candidate_ingestion import CandidateIngestionService, build_candidate_ingestion_snapshot
+from trading.strategy.entry_engine import entry_engine_dashboard_section
 from trading.strategy.hybrid_validation import HybridValidationRepository
 from trading.strategy.market_regime import market_regime_dashboard_section
 from trading.strategy.models import BlockType, CandidateState
@@ -8711,6 +8712,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     candidate_ingestion_payload = build_candidate_ingestion_snapshot(db, trade_date=today)
     theme_board_payload = theme_board_dashboard_section(db, trade_date=today)
     market_regime_payload = market_regime_dashboard_section(db, trade_date=today)
+    entry_engine_payload = entry_engine_dashboard_section(db, trade_date=today)
     decision_summary_payload = _cached_dashboard_fragment(
         db,
         f"intraday_decisions:v2:{today}",
@@ -8974,6 +8976,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["candidate_ingestion"] = candidate_ingestion_payload
     runtime_payload["theme_board"] = theme_board_payload
     runtime_payload["market_regime"] = market_regime_payload
+    runtime_payload["entry_engine"] = entry_engine_payload
     gateway_payload = dict(status_payload["gateway"]) if full_detail else _dashboard_slim_gateway_payload(status_payload["gateway"])
     ops_alerts_payload = build_ops_alerts(
         core=status_payload["core"],
@@ -9017,6 +9020,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "candidate_ingestion": candidate_ingestion_payload,
         "theme_board": theme_board_payload,
         "market_regime": market_regime_payload,
+        "entry_engine": entry_engine_payload,
         "candidates": candidates_payload,
         "themes": themes_payload,
         "orders": orders_payload,
@@ -9101,6 +9105,13 @@ def build_candidates_snapshot(
                 "market_block_new_entry": bool(metadata.get("market_block_new_entry", False)),
                 "market_position_size_multiplier_hint": _number(metadata.get("market_position_size_multiplier_hint")),
                 "market_reason_codes": list(metadata.get("market_reason_codes") or []),
+                "entry_status": metadata.get("entry_status", ""),
+                "price_location": metadata.get("entry_price_location", ""),
+                "entry_ready_allowed": bool(metadata.get("entry_ready_allowed", False)),
+                "entry_dry_run_intent_allowed": bool(metadata.get("entry_dry_run_intent_allowed", False)),
+                "entry_live_order_allowed": bool(metadata.get("entry_live_order_allowed", False)),
+                "entry_reason_codes": list(metadata.get("entry_reason_codes") or []),
+                "entry_operator_message_ko": metadata.get("entry_operator_message_ko", ""),
                 "reason_codes": reason_codes,
                 "detected_at": candidate.detected_at,
                 "last_seen_at": candidate.last_seen_at,

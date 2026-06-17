@@ -905,6 +905,195 @@ Candidate table은 가능한 경우 `market_side`, `market_status`, `market_acti
 
 MarketRegime은 최신 ThemeBoard snapshot에 `market_side_distribution`, `market_status_distribution`, `dominant_market_side`, `market_risk_flag`를 overlay할 수 있다. Overlay는 ThemeBoard의 `LEADING_THEME`, `SPREADING_THEME`, `LEADER_ONLY_THEME`, `WATCH_THEME`, `WEAK_THEME` 자체를 강제로 바꾸지 않는다.
 
+## PR 5: EntryEngine Reboot V2 Runtime Integration
+
+EntryEngine은 `WATCHING` 후보에 대해 Reboot V2의 5단계 진입 판단을 observe-only로 산출한다. 기존 hybrid gate, final grade, EntryPlanBuilder, promotion, threshold A/B와 직접 연결하지 않는다. 조건검색 include, Opening Burst selected, TR hydration 가격만으로는 `OBSERVE_READY`가 될 수 없다.
+
+### Runtime 계약
+
+- 기본 feature flag는 `TRADING_ENTRY_ENGINE_ENABLED=false`다.
+- `TRADING_ENTRY_ENGINE_OBSERVE_ONLY=true`가 기본이며 LIVE order command는 항상 금지한다.
+- `TRADING_ENTRY_ALLOW_DRY_RUN_INTENTS=false`가 기본이다.
+- Runtime cycle 순서는 `Opening Burst -> ThemeBoard -> MarketRegime -> EntryEngine`이다.
+- Candidate state는 기본적으로 `WATCHING`을 유지하고, readiness는 `entry_decisions` 테이블과 candidate metadata에만 기록한다.
+
+### 5단계 판단
+
+```text
+1. Data Ready
+2. Theme Ready
+3. Market Allowed
+4. Stock Role Allowed
+5. Price Timing Ready
+```
+
+최종 `EntryDecisionStatus`:
+
+- `OBSERVE_READY`
+- `WAIT`
+- `HARD_BLOCK`
+- `DATA_WAIT`
+- `MARKET_WAIT`
+- `THEME_WAIT`
+- `PRICE_WAIT`
+
+Check status:
+
+- `PASS`
+- `WAIT`
+- `BLOCK`
+- `DATA_WAIT`
+
+### 설정값
+
+```text
+TRADING_ENTRY_ENGINE_ENABLED=false
+TRADING_ENTRY_ENGINE_OBSERVE_ONLY=true
+TRADING_ENTRY_ENGINE_INTERVAL_SEC=5
+TRADING_ENTRY_ALLOW_DRY_RUN_INTENTS=false
+TRADING_ENTRY_MAX_TICK_AGE_SEC=10
+TRADING_ENTRY_MIN_1M_CANDLES=3
+TRADING_ENTRY_REQUIRE_REALTIME_TICK=true
+TRADING_ENTRY_REQUIRE_VWAP=false
+TRADING_ENTRY_REQUIRE_TURNOVER=true
+TRADING_ENTRY_GOOD_PULLBACK_MIN_PCT=0.7
+TRADING_ENTRY_GOOD_PULLBACK_MAX_PCT=3.5
+TRADING_ENTRY_MAX_VWAP_GAP_LEADER_PCT=5.0
+TRADING_ENTRY_MAX_VWAP_GAP_CO_LEADER_PCT=4.0
+TRADING_ENTRY_MAX_VWAP_GAP_FOLLOWER_PCT=3.0
+TRADING_ENTRY_CHASE_HIGH_PULLBACK_MIN_PCT=0.3
+TRADING_ENTRY_MAX_SPREAD_TICKS=3
+TRADING_ENTRY_VI_COOLDOWN_SEC=180
+TRADING_ENTRY_UPPER_LIMIT_MIN_GAP_PCT=3.0
+```
+
+### EntryDecision 필드
+
+```text
+trade_date
+calculated_at
+candidate_id
+code
+name
+theme_id
+theme_name
+theme_status
+stock_role
+market_side
+market_status
+market_action
+price_location
+entry_status
+data_ready_status
+theme_ready_status
+market_ready_status
+role_ready_status
+price_timing_status
+current_price
+reference_price
+vwap
+support_price
+breakout_level
+limit_price_hint
+stop_loss_price_hint
+take_profit_price_hint
+position_size_multiplier_hint
+ready_allowed
+dry_run_intent_allowed
+live_order_allowed=false
+reason_codes
+operator_message_ko
+details
+```
+
+### 단계별 정책
+
+Data Ready:
+
+- recent realtime tick이 필수다.
+- TR backfill 가격만 있으면 `DATA_WAIT`다.
+- tick age 초과, current price 누락, 1m candle warmup 부족은 `DATA_WAIT`다.
+- turnover/cum volume 누락은 `WAIT` 계열 reason으로 남긴다.
+
+Theme Ready:
+
+- `LEADING_THEME`, `SPREADING_THEME`은 통과 가능하다.
+- `LEADER_ONLY_THEME`은 `LEADER`/`CO_LEADER`만 통과 가능하다.
+- `WATCH_THEME`은 `THEME_WAIT`, `WEAK_THEME`은 `HARD_BLOCK`, `DATA_WAIT`은 `DATA_WAIT`이다.
+
+Market Allowed:
+
+- `ALLOW_NORMAL`은 통과한다.
+- `ALLOW_REDUCED`는 통과하되 position size multiplier를 축소한다.
+- `WAIT_MARKET`은 `MARKET_WAIT`이다.
+- `BLOCK_NEW_ENTRY`는 `HARD_BLOCK`이다.
+- `DATA_WAIT`은 `DATA_WAIT`, `MARKET_CLOSED`는 차단한다.
+
+Stock Role Allowed:
+
+- `LEADER`, `CO_LEADER`는 통과 가능하다.
+- `FOLLOWER`는 `EXPANSION` 시장과 `LEADING_THEME`/`SPREADING_THEME`에서만 observe-ready 가능하다.
+- `LATE_LAGGARD`, `WEAK_MEMBER`, `OVERHEATED`는 차단한다.
+
+Price Timing:
+
+- 정상 ready 위치는 `GOOD_PULLBACK`, `PULLBACK_RECLAIM`, `VWAP_RECLAIM`이다.
+- `BREAKOUT_CONTINUATION`은 `EXPANSION + LEADER`에서만 observe-ready 가능하다.
+- `CHASE_HIGH`, `VWAP_OVEREXTENDED`, `FAILED_BREAKOUT`, `DEEP_PULLBACK`, `UNKNOWN`, `DATA_WAIT`은 ready가 아니다.
+- VI active, 상한가 근접, spread 과대는 진입을 차단하거나 대기시킨다.
+
+### 저장소와 Dashboard
+
+SQLite 테이블:
+
+- `entry_decisions`
+- `entry_decision_checks`
+
+Candidate metadata merge:
+
+```text
+entry_status
+entry_price_location
+entry_reason_codes
+entry_operator_message_ko
+entry_ready_allowed
+entry_dry_run_intent_allowed
+entry_live_order_allowed=false
+entry_limit_price_hint
+entry_stop_loss_price_hint
+entry_take_profit_price_hint
+updated_by_entry_engine_at
+```
+
+Dashboard `entry_engine` section:
+
+```text
+calculated_at
+evaluated_count
+observe_ready_count
+wait_count
+hard_block_count
+data_wait_count
+market_wait_count
+theme_wait_count
+price_wait_count
+dry_run_intent_allowed_count
+top_ready_candidates
+top_wait_reasons
+top_block_reasons
+warnings
+```
+
+금지:
+
+- LIVE order command 생성
+- Gateway `send_order` command 생성
+- hybrid gate/final grade 연결
+- promotion/threshold 자동 변경
+- RISK_OFF 후보 삭제
+- condition include만으로 `OBSERVE_READY` 생성
+- TR 가격만으로 price timing ready 생성
+
 `ThemeBoardThemeSnapshot`은 테마 단위 압축 결과다.
 
 ```text

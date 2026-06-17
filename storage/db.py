@@ -708,6 +708,60 @@ class TradingDatabase:
                 ON candidate_market_policies(trade_date, market_action, id);
             CREATE INDEX IF NOT EXISTS idx_candidate_market_policies_code
                 ON candidate_market_policies(code, id);
+            CREATE TABLE IF NOT EXISTS entry_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                theme_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                theme_status TEXT NOT NULL DEFAULT '',
+                stock_role TEXT NOT NULL DEFAULT '',
+                market_side TEXT NOT NULL DEFAULT '',
+                market_status TEXT NOT NULL DEFAULT '',
+                market_action TEXT NOT NULL DEFAULT '',
+                price_location TEXT NOT NULL DEFAULT '',
+                entry_status TEXT NOT NULL DEFAULT '',
+                current_price INTEGER NOT NULL DEFAULT 0,
+                limit_price_hint INTEGER NOT NULL DEFAULT 0,
+                stop_loss_price_hint INTEGER NOT NULL DEFAULT 0,
+                take_profit_price_hint INTEGER NOT NULL DEFAULT 0,
+                ready_allowed INTEGER NOT NULL DEFAULT 0,
+                dry_run_intent_allowed INTEGER NOT NULL DEFAULT 0,
+                live_order_allowed INTEGER NOT NULL DEFAULT 0,
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                operator_message_ko TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(trade_date, candidate_id, calculated_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_entry_decisions_trade_calc
+                ON entry_decisions(trade_date, calculated_at, id);
+            CREATE INDEX IF NOT EXISTS idx_entry_decisions_status
+                ON entry_decisions(trade_date, entry_status, id);
+            CREATE INDEX IF NOT EXISTS idx_entry_decisions_code
+                ON entry_decisions(code, id);
+            CREATE TABLE IF NOT EXISTS entry_decision_checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_decision_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                check_name TEXT NOT NULL DEFAULT '',
+                check_status TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_entry_decision_checks_decision
+                ON entry_decision_checks(entry_decision_id, id);
+            CREATE INDEX IF NOT EXISTS idx_entry_decision_checks_trade_status
+                ON entry_decision_checks(trade_date, check_name, check_status, id);
             CREATE TABLE IF NOT EXISTS indicator_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 candidate_id INTEGER,
@@ -6923,6 +6977,154 @@ class TradingDatabase:
         rows = self.conn.execute(query, params).fetchall()
         return [_row_to_candidate_market_policy(row) for row in rows]
 
+    def save_entry_decisions(self, decisions: Iterable[dict]) -> int:
+        cleaned = [dict(decision or {}) for decision in decisions or []]
+        if not cleaned:
+            return 0
+        saved_count = 0
+        with self.conn:
+            for payload in cleaned:
+                trade_date = str(payload.get("trade_date") or "")
+                calculated_at = str(payload.get("calculated_at") or "")
+                code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
+                candidate_id = payload.get("candidate_id")
+                self.conn.execute(
+                    """
+                    INSERT INTO entry_decisions(
+                        trade_date, calculated_at, candidate_id, code, name,
+                        theme_id, theme_name, theme_status, stock_role,
+                        market_side, market_status, market_action, price_location,
+                        entry_status, current_price, limit_price_hint,
+                        stop_loss_price_hint, take_profit_price_hint,
+                        ready_allowed, dry_run_intent_allowed, live_order_allowed,
+                        reason_codes_json, operator_message_ko, details_json,
+                        payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(trade_date, candidate_id, calculated_at) DO UPDATE SET
+                        code=excluded.code,
+                        name=excluded.name,
+                        theme_id=excluded.theme_id,
+                        theme_name=excluded.theme_name,
+                        theme_status=excluded.theme_status,
+                        stock_role=excluded.stock_role,
+                        market_side=excluded.market_side,
+                        market_status=excluded.market_status,
+                        market_action=excluded.market_action,
+                        price_location=excluded.price_location,
+                        entry_status=excluded.entry_status,
+                        current_price=excluded.current_price,
+                        limit_price_hint=excluded.limit_price_hint,
+                        stop_loss_price_hint=excluded.stop_loss_price_hint,
+                        take_profit_price_hint=excluded.take_profit_price_hint,
+                        ready_allowed=excluded.ready_allowed,
+                        dry_run_intent_allowed=excluded.dry_run_intent_allowed,
+                        live_order_allowed=excluded.live_order_allowed,
+                        reason_codes_json=excluded.reason_codes_json,
+                        operator_message_ko=excluded.operator_message_ko,
+                        details_json=excluded.details_json,
+                        payload_json=excluded.payload_json
+                    """,
+                    (
+                        trade_date,
+                        calculated_at,
+                        candidate_id,
+                        code,
+                        str(payload.get("name") or ""),
+                        str(payload.get("theme_id") or ""),
+                        str(payload.get("theme_name") or ""),
+                        str(payload.get("theme_status") or ""),
+                        str(payload.get("stock_role") or ""),
+                        str(payload.get("market_side") or ""),
+                        str(payload.get("market_status") or ""),
+                        str(payload.get("market_action") or ""),
+                        str(payload.get("price_location") or ""),
+                        str(payload.get("entry_status") or ""),
+                        _safe_int(payload.get("current_price"), 0),
+                        _safe_int(payload.get("limit_price_hint"), 0),
+                        _safe_int(payload.get("stop_loss_price_hint"), 0),
+                        _safe_int(payload.get("take_profit_price_hint"), 0),
+                        int(bool(payload.get("ready_allowed"))),
+                        int(bool(payload.get("dry_run_intent_allowed"))),
+                        int(bool(payload.get("live_order_allowed"))),
+                        _json_list(payload.get("reason_codes") or []),
+                        str(payload.get("operator_message_ko") or ""),
+                        _json_payload(payload.get("details") or {}),
+                        _json_payload(payload),
+                    ),
+                )
+                row = self.conn.execute(
+                    """
+                    SELECT id FROM entry_decisions
+                    WHERE trade_date = ? AND candidate_id IS ? AND calculated_at = ?
+                    """,
+                    (trade_date, candidate_id, calculated_at),
+                ).fetchone()
+                if row is None:
+                    continue
+                decision_id = int(row["id"])
+                self.conn.execute("DELETE FROM entry_decision_checks WHERE entry_decision_id = ?", (decision_id,))
+                details = dict(payload.get("details") or {})
+                checks = list(details.get("checks") or [])
+                for check in checks:
+                    item = dict(check or {})
+                    self.conn.execute(
+                        """
+                        INSERT INTO entry_decision_checks(
+                            entry_decision_id, trade_date, calculated_at, candidate_id,
+                            code, check_name, check_status, reason_codes_json,
+                            details_json, payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            decision_id,
+                            trade_date,
+                            calculated_at,
+                            candidate_id,
+                            code,
+                            str(item.get("check_name") or ""),
+                            str(item.get("status") or ""),
+                            _json_list(item.get("reason_codes") or []),
+                            _json_payload(item.get("details") or {}),
+                            _json_payload(item),
+                        ),
+                    )
+                saved_count += 1
+        return saved_count
+
+    def latest_entry_decisions(self, *, trade_date: Optional[str] = None) -> list[dict]:
+        params: list[object] = []
+        where = ""
+        if trade_date:
+            where = "WHERE trade_date = ?"
+            params.append(str(trade_date))
+        latest = self.conn.execute(
+            f"""
+            SELECT calculated_at
+            FROM entry_decisions
+            {where}
+            ORDER BY calculated_at DESC, id DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if latest is None:
+            return []
+        query = "SELECT * FROM entry_decisions WHERE calculated_at = ?"
+        query_params: list[object] = [str(latest["calculated_at"] or "")]
+        if trade_date:
+            query += " AND trade_date = ?"
+            query_params.append(str(trade_date))
+        query += " ORDER BY ready_allowed DESC, entry_status ASC, id ASC"
+        rows = self.conn.execute(query, query_params).fetchall()
+        return [_row_to_entry_decision(row) for row in rows]
+
+    def list_entry_decision_checks(self, entry_decision_id: int) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM entry_decision_checks WHERE entry_decision_id = ? ORDER BY id ASC",
+            (int(entry_decision_id),),
+        ).fetchall()
+        return [_row_to_entry_decision_check(row) for row in rows]
+
     def save_indicator_snapshot(self, snapshot: IndicatorSnapshot) -> IndicatorSnapshot:
         with self.conn:
             return self._save_indicator_snapshot_no_commit(snapshot)
@@ -12405,6 +12607,59 @@ def _row_to_candidate_market_policy(row: sqlite3.Row) -> dict:
     payload.setdefault("global_market_status", data.get("global_market_status", ""))
     payload.setdefault("market_action", data.get("market_action", ""))
     payload.setdefault("block_new_entry", bool(data.get("block_new_entry")))
+    return payload
+
+
+def _row_to_entry_decision(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("id", data.get("id"))
+    payload.setdefault("created_at", data.get("created_at", ""))
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("calculated_at", data.get("calculated_at", ""))
+    payload.setdefault("candidate_id", data.get("candidate_id"))
+    payload.setdefault("code", data.get("code", ""))
+    payload.setdefault("name", data.get("name", ""))
+    payload.setdefault("theme_id", data.get("theme_id", ""))
+    payload.setdefault("theme_name", data.get("theme_name", ""))
+    payload.setdefault("theme_status", data.get("theme_status", ""))
+    payload.setdefault("stock_role", data.get("stock_role", ""))
+    payload.setdefault("market_side", data.get("market_side", ""))
+    payload.setdefault("market_status", data.get("market_status", ""))
+    payload.setdefault("market_action", data.get("market_action", ""))
+    payload.setdefault("price_location", data.get("price_location", ""))
+    payload.setdefault("entry_status", data.get("entry_status", ""))
+    payload.setdefault("current_price", int(data.get("current_price") or 0))
+    payload.setdefault("limit_price_hint", int(data.get("limit_price_hint") or 0))
+    payload.setdefault("stop_loss_price_hint", int(data.get("stop_loss_price_hint") or 0))
+    payload.setdefault("take_profit_price_hint", int(data.get("take_profit_price_hint") or 0))
+    payload.setdefault("ready_allowed", bool(data.get("ready_allowed")))
+    payload.setdefault("dry_run_intent_allowed", bool(data.get("dry_run_intent_allowed")))
+    payload.setdefault("live_order_allowed", bool(data.get("live_order_allowed")))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    payload.setdefault("operator_message_ko", data.get("operator_message_ko", ""))
+    payload.setdefault("details", _safe_json_loads(data.pop("details_json", "{}"), {}))
+    return payload
+
+
+def _row_to_entry_decision_check(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("id", data.get("id"))
+    payload.setdefault("entry_decision_id", data.get("entry_decision_id"))
+    payload.setdefault("created_at", data.get("created_at", ""))
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("calculated_at", data.get("calculated_at", ""))
+    payload.setdefault("candidate_id", data.get("candidate_id"))
+    payload.setdefault("code", data.get("code", ""))
+    payload.setdefault("check_name", data.get("check_name", ""))
+    payload.setdefault("status", data.get("check_status", ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    payload.setdefault("details", _safe_json_loads(data.pop("details_json", "{}"), {}))
     return payload
 
 

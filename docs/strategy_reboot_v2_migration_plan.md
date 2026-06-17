@@ -365,6 +365,41 @@ MarketRegimeEngine Runtime Integration은 Phase 6의 시장국면 계산을 obse
 - `candidate_market_policies`는 `trade_date + calculated_at + code` 기준 idempotent
 - dashboard `market_regime` section과 candidate market fields 노출
 
+## PR 5 구현 체크포인트
+
+EntryEngine Reboot V2 Runtime Integration은 `WATCHING` 후보를 5단계로 평가해 observe-only entry decision을 저장하는 PR이다.
+
+범위:
+
+- `trading/strategy/entry_engine.py`에 EntryEngine 모델과 런타임 파이프라인을 추가한다.
+- 판단 단계는 Data Ready, Theme Ready, Market Allowed, Stock Role Allowed, Price Timing Ready로 고정한다.
+- 최종 status는 `OBSERVE_READY`, `WAIT`, `HARD_BLOCK`, `DATA_WAIT`, `MARKET_WAIT`, `THEME_WAIT`, `PRICE_WAIT`로 제한한다.
+- `entry_decisions`, `entry_decision_checks` SQLite 테이블을 추가한다.
+- Runtime cycle은 MarketRegime 이후 EntryEngine을 실행한다.
+- Dashboard에는 `entry_engine` section과 candidate row의 `entry_status`, `price_location`, `entry_reason_codes`, `entry_operator_message_ko`를 추가한다.
+- Candidate state는 기본적으로 `WATCHING`을 유지하고 entry 결과는 metadata와 decision table에만 기록한다.
+
+금지:
+
+- LIVE order command, Gateway `send_order` command 생성
+- 기존 hybrid gate/final grade/EntryPlanBuilder 직접 연결
+- promotion/threshold 자동 변경
+- RISK_OFF 후보 삭제
+- condition include 또는 Opening Burst selected만으로 `OBSERVE_READY` 생성
+- TR backfill 가격만으로 price timing ready 생성
+
+검증:
+
+- realtime tick 누락 또는 TR-only 가격은 `DATA_WAIT`
+- `LEADING_THEME + LEADER + ALLOW_NORMAL + VWAP_RECLAIM`은 `OBSERVE_READY`
+- `LEADER_ONLY_THEME + FOLLOWER`는 ready가 아님
+- `RISK_OFF`는 `HARD_BLOCK` 또는 시장 대기
+- `SELECTIVE + FOLLOWER`는 통과하지 않음
+- `EXPANSION + FOLLOWER`는 조건부 observe-ready 가능
+- `CHASE_HIGH`, `VWAP_OVEREXTENDED`, VI active, `OVERHEATED`는 ready가 아님
+- `TRADING_ENTRY_ALLOW_DRY_RUN_INTENTS=false`에서 dry-run intent가 생성되지 않음
+- LIVE order command가 생성되지 않음
+
 ## Rollback
 
 v2는 feature flag로 분리되므로 rollback은 다음과 같다.

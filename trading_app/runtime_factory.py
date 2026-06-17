@@ -13,6 +13,7 @@ from trading.strategy.candidate_ingestion import CandidateIngestionService
 from trading.strategy.conditions import ConditionProfileRepository, ensure_default_condition_profiles, ensure_theme_lab_condition_profiles
 from trading.strategy.config import StrategyRuntimeConfigRepository
 from trading.strategy.entry import EntryPlanBuilder
+from trading.strategy.entry_engine import EntryEngineConfig, EntryEngineRuntimePipeline
 from trading.strategy.exit import ExitDecisionEngine, VirtualPositionService
 from trading.strategy.holding import StaticHoldingProvider
 from trading.strategy.hybrid_validation import HybridValidationRepository
@@ -61,6 +62,7 @@ class CoreRuntimeBundle:
     candidate_hydrator: Any = None
     theme_board_pipeline: Any = None
     market_regime_pipeline: Any = None
+    entry_engine_pipeline: Any = None
 
 
 def build_core_strategy_runtime(
@@ -138,6 +140,12 @@ def build_core_strategy_runtime(
         candle_builder=candle_builder,
         config=MarketRegimeConfig.from_env(),
     )
+    entry_engine_pipeline = EntryEngineRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        candle_builder=candle_builder,
+        config=EntryEngineConfig.from_env(),
+    )
     theme_lab_pipeline = None
     if config.theme_engine_mode == "themelab_flow":
         theme_backfill_service = ThemeBackfillService(
@@ -185,6 +193,7 @@ def build_core_strategy_runtime(
         opening_burst_pipeline=opening_burst_pipeline,
         theme_board_pipeline=theme_board_pipeline,
         market_regime_pipeline=market_regime_pipeline,
+        entry_engine_pipeline=entry_engine_pipeline,
         theme_lab_shadow_ab_provider=theme_lab_shadow_ab_provider,
         shadow_small_entry_promotion_provider=shadow_small_entry_promotion_provider,
     )
@@ -192,6 +201,7 @@ def build_core_strategy_runtime(
     runtime.candidate_hydrator = candidate_hydrator
     runtime.theme_board_pipeline = theme_board_pipeline
     runtime.market_regime_pipeline = market_regime_pipeline
+    runtime.entry_engine_pipeline = entry_engine_pipeline
     readiness_report = build_readiness_report(
         db,
         subscription_manager=runtime.subscription_manager,
@@ -218,6 +228,7 @@ def build_core_strategy_runtime(
         candidate_hydrator=candidate_hydrator,
         theme_board_pipeline=theme_board_pipeline,
         market_regime_pipeline=market_regime_pipeline,
+        entry_engine_pipeline=entry_engine_pipeline,
     )
 
 

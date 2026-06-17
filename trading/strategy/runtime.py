@@ -28,6 +28,7 @@ from trading.strategy.exit import (
     ExitDecisionEngine,
     VirtualPositionService,
 )
+from trading.strategy.entry_engine import EntryEngineRuntimePipeline, entry_engine_dashboard_section
 from trading.strategy.holding import HoldingProvider, StaticHoldingProvider
 from trading.strategy.models import (
     BlockType,
@@ -266,6 +267,7 @@ class StrategyRuntimeSnapshot:
     opening_theme_burst: dict = field(default_factory=dict)
     theme_board: dict = field(default_factory=dict)
     market_regime: dict = field(default_factory=dict)
+    entry_engine: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -299,6 +301,7 @@ class StrategyRuntime:
         opening_burst_pipeline: Optional[OpeningThemeBurstRuntimePipeline] = None,
         theme_board_pipeline: Optional[ThemeBoardRuntimePipeline] = None,
         market_regime_pipeline: Optional[MarketRegimeRuntimePipeline] = None,
+        entry_engine_pipeline: Optional[EntryEngineRuntimePipeline] = None,
         theme_lab_shadow_ab_provider: Optional[Callable[[str], dict]] = None,
         shadow_small_entry_promotion_provider: Optional[Callable[[str], dict]] = None,
     ) -> None:
@@ -321,6 +324,7 @@ class StrategyRuntime:
         self.opening_burst_pipeline = opening_burst_pipeline
         self.theme_board_pipeline = theme_board_pipeline
         self.market_regime_pipeline = market_regime_pipeline
+        self.entry_engine_pipeline = entry_engine_pipeline
         self.theme_lab_shadow_ab_provider = theme_lab_shadow_ab_provider
         self.shadow_small_entry_promotion_provider = shadow_small_entry_promotion_provider
         self._theme_lab_bridge_results: list[GatePipelineResult] = []
@@ -373,6 +377,7 @@ class StrategyRuntime:
             self._run_opening_theme_burst(snapshot, current)
             self._run_theme_board(snapshot, current)
             self._run_market_regime(snapshot, current)
+            self._run_entry_engine(snapshot, current)
             self._apply_flow_diagnostics(snapshot, current, trade_date, [])
             if snapshot.gate_skip_reason != GATE_SKIP_MARKET_SESSION_CLOSED:
                 self._rollover_previous_trade_date_candidates(trade_date, current, snapshot)
@@ -455,6 +460,7 @@ class StrategyRuntime:
             timed("opening_theme_burst", lambda: self._run_opening_theme_burst(snapshot, current))
             timed("theme_board", lambda: self._run_theme_board(snapshot, current))
             timed("market_regime", lambda: self._run_market_regime(snapshot, current))
+            timed("entry_engine", lambda: self._run_entry_engine(snapshot, current))
             self._emit_theme_lab_pipeline_timings(timing_callback)
             timed("flow_diagnostics_empty", lambda: self._apply_flow_diagnostics(snapshot, current, trade_date, []))
             if snapshot.gate_skip_reason == GATE_SKIP_MARKET_SESSION_CLOSED:
@@ -1764,6 +1770,23 @@ class StrategyRuntime:
             }
             snapshot.warnings.append(f"MARKET_REGIME_FAILED:{exc}")
 
+    def _run_entry_engine(self, snapshot: StrategyRuntimeSnapshot, now: datetime) -> None:
+        if self.entry_engine_pipeline is None:
+            self._apply_entry_engine_snapshot(snapshot)
+            return
+        try:
+            summary = self.entry_engine_pipeline.run_if_due(now)
+            snapshot.entry_engine = dict(summary or {})
+            snapshot.warnings.extend(str(warning) for warning in list(summary.get("warnings") or []) if warning)
+        except Exception as exc:
+            snapshot.entry_engine = {
+                "status": "ERROR",
+                "error": str(exc),
+                "output_mode": "OBSERVE",
+                "live_order_allowed": False,
+            }
+            snapshot.warnings.append(f"ENTRY_ENGINE_FAILED:{exc}")
+
     def _remember_theme_lab_pipeline_timings(self, result: Any) -> None:
         self._theme_lab_pipeline_timings = {}
         data_quality = getattr(result, "data_quality", {}) or {}
@@ -2744,6 +2767,7 @@ class StrategyRuntime:
         self._apply_opening_theme_burst_snapshot(snapshot)
         self._apply_theme_board_snapshot(snapshot)
         self._apply_market_regime_snapshot(snapshot)
+        self._apply_entry_engine_snapshot(snapshot)
         self._apply_candidate_generation_summary(snapshot)
         self._apply_context_history_prune_snapshot(snapshot)
         return snapshot
@@ -2794,6 +2818,23 @@ class StrategyRuntime:
                 "output_mode": "OBSERVE",
                 "ready_allowed": False,
                 "order_intent_allowed": False,
+            }
+
+    def _apply_entry_engine_snapshot(self, snapshot: StrategyRuntimeSnapshot) -> None:
+        if snapshot.entry_engine:
+            return
+        if self.entry_engine_pipeline is not None:
+            snapshot.entry_engine = dict(getattr(self.entry_engine_pipeline, "last_summary", {}) or {})
+            if snapshot.entry_engine:
+                return
+        try:
+            snapshot.entry_engine = entry_engine_dashboard_section(self.db)
+        except Exception as exc:
+            snapshot.entry_engine = {
+                "status": "ERROR",
+                "error": f"ENTRY_ENGINE_SNAPSHOT_FAILED:{exc}",
+                "output_mode": "OBSERVE",
+                "live_order_allowed": False,
             }
 
     def _prune_position_context_history(self, snapshot: StrategyRuntimeSnapshot, current: datetime) -> None:
