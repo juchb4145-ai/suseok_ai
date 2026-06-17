@@ -9,7 +9,9 @@ from trading.strategy.reason_codes import normalize_reason_codes, standardize_de
 
 class CandidateState(str, Enum):
     DETECTED = "DETECTED"
+    HYDRATING = "HYDRATING"
     WATCHING = "WATCHING"
+    WAIT_DATA = "WAIT_DATA"
     READY = "READY"
     ORDER_DECIDED = "ORDER_DECIDED"
     ORDER_SENT = "ORDER_SENT"
@@ -22,8 +24,12 @@ class CandidateState(str, Enum):
 
 class CandidateSourceType(str, Enum):
     CONDITION = "condition"
+    CONDITION_SEARCH = "condition_search"
+    OPENING_BURST = "opening_burst"
     THEME_WATCH = "theme_watch"
+    THEME_BOARD = "theme_board"
     LEADING_STOCK = "leading_stock"
+    MANUAL_WATCH = "manual_watch"
     MANUAL_DEBUG = "manual_debug"
 
 

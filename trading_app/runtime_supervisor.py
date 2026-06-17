@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from storage.db import TradingDatabase
 from trading.broker.gateway_state import GatewayStateStore
-from trading.broker.models import GatewayEvent
+from trading.broker.models import BrokerConditionEvent, GatewayEvent
 from trading.strategy.readiness import build_readiness_report
 from trading.strategy.runtime import StrategyRuntime
 from trading_app.dependencies import CoreSettings
@@ -354,9 +354,14 @@ class RuntimeSupervisor:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
             return
+        if event.type == "condition_event":
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
+            return
         if event.type == "command_ack" and str((event.payload or {}).get("purpose") or "") in {
             "theme_data_backfill",
             "opening_turnover_seed",
+            "candidate_hydration",
         }:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
@@ -565,6 +570,19 @@ class RuntimeSupervisor:
     def _handle_gateway_event_in_worker(self, event: GatewayEvent) -> None:
         if self._bundle is None:
             return
+        candidate_hydrator = getattr(self._bundle, "candidate_hydrator", None)
+        if candidate_hydrator is not None:
+            handler = getattr(candidate_hydrator, "handle_event", None)
+            if callable(handler) and handler(event):
+                return
+        if event.type == "condition_event":
+            candidate_ingestion = getattr(self._bundle, "candidate_ingestion_service", None)
+            if candidate_ingestion is not None:
+                condition_event = BrokerConditionEvent.from_dict(event.payload)
+                result = candidate_ingestion.handle_condition_event(condition_event)
+                if condition_event.event_type != "remove" and getattr(result, "candidate", None) is not None and candidate_hydrator is not None:
+                    candidate_hydrator.enqueue_candidate(result.candidate)
+                return
         condition_adapter = getattr(self._bundle.runtime, "condition_adapter", None)
         if condition_adapter is not None:
             handler = getattr(condition_adapter, "handle_event", None)

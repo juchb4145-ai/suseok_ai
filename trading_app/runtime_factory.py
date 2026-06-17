@@ -8,6 +8,8 @@ from storage.db import TradingDatabase
 from trading.broker.gateway_state import GatewayStateStore
 from trading.strategy.candidates import CandidateCollector
 from trading.strategy.candles import CandleBuilder
+from trading.strategy.candidate_hydrator import CandidateHydrator
+from trading.strategy.candidate_ingestion import CandidateIngestionService
 from trading.strategy.conditions import ConditionProfileRepository, ensure_default_condition_profiles, ensure_theme_lab_condition_profiles
 from trading.strategy.config import StrategyRuntimeConfigRepository
 from trading.strategy.entry import EntryPlanBuilder
@@ -53,6 +55,8 @@ class CoreRuntimeBundle:
     theme_runtime: Any = None
     theme_runtime_bridge: Any = None
     order_sink: Any = None
+    candidate_ingestion_service: Any = None
+    candidate_hydrator: Any = None
 
 
 def build_core_strategy_runtime(
@@ -114,6 +118,8 @@ def build_core_strategy_runtime(
     order_sink = _build_order_sink(settings, gateway_state, warning_sink, runtime_settings=runtime_settings)
     theme_lab_shadow_ab_provider = _theme_lab_shadow_ab_provider(db, runtime_settings)
     shadow_small_entry_promotion_provider = _shadow_small_entry_promotion_provider(db, runtime_settings)
+    candidate_ingestion_service = CandidateIngestionService(db)
+    candidate_hydrator = CandidateHydrator(db, gateway_state, market_data=market_data)
     theme_lab_pipeline = None
     if config.theme_engine_mode == "themelab_flow":
         theme_backfill_service = ThemeBackfillService(
@@ -139,6 +145,8 @@ def build_core_strategy_runtime(
         market_data=market_data,
         repository=theme_repository,
         config=OpeningBurstRuntimeConfig.from_env(trading_mode=settings.mode),
+        candidate_ingestion_service=candidate_ingestion_service,
+        candidate_hydrator=candidate_hydrator,
     )
     runtime = StrategyRuntime(
         db=db,
@@ -160,6 +168,8 @@ def build_core_strategy_runtime(
         theme_lab_shadow_ab_provider=theme_lab_shadow_ab_provider,
         shadow_small_entry_promotion_provider=shadow_small_entry_promotion_provider,
     )
+    runtime.candidate_ingestion_service = candidate_ingestion_service
+    runtime.candidate_hydrator = candidate_hydrator
     readiness_report = build_readiness_report(
         db,
         subscription_manager=runtime.subscription_manager,
@@ -182,6 +192,8 @@ def build_core_strategy_runtime(
         theme_runtime_bridge=theme_runtime_bridge,
         db=db,
         order_sink=order_sink,
+        candidate_ingestion_service=candidate_ingestion_service,
+        candidate_hydrator=candidate_hydrator,
     )
 
 

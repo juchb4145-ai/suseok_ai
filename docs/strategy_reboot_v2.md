@@ -564,3 +564,131 @@ tick/candle/TR/테마 데이터 부족은 Candidate `WAIT` 상태와 `WAIT_DATA`
 - 실전 주문 promotion
 
 1단계의 완료 기준은 새 전략 흐름, 상태, 모델, hydration/idempotency, risk-off, dashboard 축소 방향이 문서로 고정되고, 필요한 경우 최소 skeleton이 추가되는 것이다.
+
+## PR 2: Candidate Ingestion + CandidateHydrator 고정 사항
+
+이 PR은 조건검색과 Opening Burst를 공통 후보 유입 모델로 묶고, 후보 보강 TR을 idempotent command로 큐잉하는 범위까지만 구현한다. `READY`, `SETUP_READY`, `TIMING_READY`, `ORDER_PENDING`, `EntryPlan`, DRY_RUN buy intent, LIVE order command는 이 PR의 산출물이 아니다.
+
+### CandidateSourceEvent
+
+모든 후보 유입은 `CandidateSourceEvent`로 정규화한다.
+
+```text
+trade_date: str
+code: str
+name: str
+source_type: condition_search | opening_burst | manual_watch | theme_board
+source_id: str
+source_rank: int
+source_score: float
+theme_id: str
+theme_name: str
+stock_role: str
+reason_codes: list[str]
+raw_payload: dict
+detected_at: str
+```
+
+정규화 규칙:
+
+- 조건검색 include는 `condition_search` source event를 만들고 Candidate를 `DETECTED`로 생성 또는 merge한다.
+- 조건검색 remove는 해당 source만 비활성화한다. 활성 source가 모두 사라진 관찰 후보만 `REMOVED`가 될 수 있다.
+- Opening Burst는 `selected` 종목만 `opening_burst` source event를 만든다. 제외/관찰 종목은 Candidate를 만들지 않는다.
+- 수동 watch와 ThemeBoard 후보는 같은 모델을 쓰되, 별도 entry 판단을 직접 만들 수 없다.
+
+Candidate merge key는 `trade_date + code`다. 같은 종목이 조건검색과 Opening Burst에 동시에 잡히면 하나의 active Candidate로 합쳐지고, source별 정보는 `metadata.candidate_ingestion.source_map`에 남긴다. 운영상 대표 source는 우선순위와 score/rank로 선택한다.
+
+### PR 2 Candidate 상태
+
+이 PR에서 활성화되는 상태는 다음으로 제한한다.
+
+- `DETECTED`
+- `HYDRATING`
+- `WATCHING`
+- `WAIT_DATA`
+- `REMOVED`
+- `EXPIRED`
+
+데이터 부족은 `WAIT_DATA` 상태와 reason code로 표현한다. `WAIT_DATA`는 회복 가능한 대기이며 `HARD_BLOCK`이 아니다. 테마 미매핑은 `theme_unmapped` reason만 추가하고, 가격/변동률/source 최소 데이터가 충분하면 `WATCHING`으로 갈 수 있다.
+
+### CandidateHydrator
+
+Hydrator는 `DETECTED` 또는 보강이 필요한 `WAIT_DATA` 후보에 대해 P1 기본 보강 TR command를 생성한다.
+
+기본값:
+
+```text
+tr_code=opt10001
+rq_name=CandidateHydration_opt10001
+bucket=basic
+purpose=candidate_hydration
+response_mode=capture
+idempotency_key=candidate_hydration:{trade_date}:{code}:{tr_code}:{bucket}
+max_per_cycle=5
+max_pending=10
+ttl_sec=90
+```
+
+환경 변수:
+
+```text
+TRADING_CANDIDATE_HYDRATION_MAX_PER_CYCLE
+TRADING_CANDIDATE_HYDRATION_MAX_PENDING
+TRADING_CANDIDATE_HYDRATION_TTL_SEC
+```
+
+보강 필드는 다음을 기본으로 한다. 영문 alias와 키움 한글 필드 alias는 모두 허용한다.
+
+```text
+stock_name
+current_price
+change_rate
+volume
+trade_value
+open_price
+day_high
+day_low
+prev_close
+```
+
+우선순위:
+
+- `HIGH`: `opening_burst` + `LEADER`/`CO_LEADER`
+- `MEDIUM`: `condition_search` + `theme_id` 있음
+- `LOW`: 미매핑 source 또는 약한 source
+
+CommandQueue에 같은 idempotency key가 active 상태로 존재하면 새 command를 만들지 않는다. 중복 요청은 hydration request record에는 `DUPLICATE`로 남기되, 후보는 보강 대기 상태를 유지한다.
+
+### TR ack merge
+
+`purpose=candidate_hydration` ack는 CandidateHydrator가 처리한다.
+
+- parsed payload를 `Candidate.metadata.candidate_hydration.parsed`에 저장한다.
+- `candidate_hydration_requests` 상태를 `ACKED`로 갱신하고 `candidate_hydration_results`에 raw/parsed payload를 남긴다.
+- `MarketDataStore.apply_theme_backfill`로 TR backfill tick을 병합한다.
+- TR-only 가격은 `price_source=TR_BACKFILL`로 표시하고 `gate_usable_for_entry=false`를 유지한다.
+- 실시간 tick이 들어오면 실시간 가격이 entry timing source가 되며, TR 가격은 후보 보강 context로만 남는다.
+- 최소 데이터가 충분하면 `WATCHING`, 부족하면 `WAIT_DATA`와 `WAIT_DATA_*` reason으로 남긴다.
+
+### 저장소와 대시보드
+
+최소 SQLite 테이블:
+
+- `candidate_source_events`
+- `candidate_hydration_requests`
+- `candidate_hydration_results`
+
+Dashboard snapshot에는 `candidate_ingestion` 섹션을 추가한다.
+
+```text
+detected_count
+hydrating_count
+watching_count
+wait_data_count
+source_counts
+hydration_pending_count
+hydration_error_count
+top_wait_data_reasons
+```
+
+이 섹션은 최종 Dashboard V2의 전 단계다. 최종 화면은 시장국면, 주도테마 TOP5, READY 후보, 보유 리스크, 차단/대기 사유 TOP만 보는 방향을 유지한다.

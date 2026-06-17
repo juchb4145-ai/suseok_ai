@@ -196,6 +196,8 @@ class OpeningThemeBurstRuntimePipeline:
         repository: ThemeEngineRepository,
         config: OpeningBurstRuntimeConfig | None = None,
         engine: OpeningThemeBurstEngine | None = None,
+        candidate_ingestion_service: Any = None,
+        candidate_hydrator: Any = None,
     ) -> None:
         self.db = db
         self.gateway_state = gateway_state
@@ -205,6 +207,8 @@ class OpeningThemeBurstRuntimePipeline:
         self.scheduler = OpeningBurstScheduler(gateway_state, config=self.config)
         self.engine = engine or OpeningThemeBurstEngine(self.config.engine_config())
         self.seed_collector = OpeningTurnoverSeedCollector(self.config.engine_config())
+        self.candidate_ingestion_service = candidate_ingestion_service
+        self.candidate_hydrator = candidate_hydrator
         self.last_summary = empty_opening_theme_burst_section(enabled=self.config.enabled, observe_only=self.config.observe_only)
         self.last_result: OpeningThemeBurstResult | None = None
         self.warnings: list[str] = []
@@ -466,6 +470,38 @@ class OpeningThemeBurstRuntimePipeline:
                 "payload": payload,
             }
         )
+        self._ingest_selected_candidates(result, trade_date=trade_date, summary=summary)
+
+    def _ingest_selected_candidates(
+        self,
+        result: OpeningThemeBurstResult,
+        *,
+        trade_date: str,
+        summary: dict[str, Any],
+    ) -> None:
+        service = self.candidate_ingestion_service
+        if service is None:
+            return
+        try:
+            ingestion_results = list(service.ingest_opening_burst_result(result, trade_date=trade_date) or [])
+            summary["candidate_ingestion"] = {
+                "source": "opening_burst",
+                "selected_count": len(result.selected_symbols),
+                "ingested_count": sum(1 for item in ingestion_results if getattr(item, "candidate", None) is not None),
+                "created_count": sum(1 for item in ingestion_results if bool(getattr(item, "created", False))),
+                "merged_count": sum(1 for item in ingestion_results if bool(getattr(item, "merged", False))),
+            }
+            hydrator = self.candidate_hydrator
+            if hydrator is not None:
+                hydration_results = list(hydrator.enqueue_due_candidates(trade_date=trade_date) or [])
+                summary["candidate_ingestion"]["hydration_enqueued_count"] = sum(
+                    1 for item in hydration_results if bool(getattr(item, "enqueued", False))
+                )
+                summary["candidate_ingestion"]["hydration_duplicate_count"] = sum(
+                    1 for item in hydration_results if bool(getattr(item, "duplicate", False))
+                )
+        except Exception as exc:
+            self.warnings.append(f"OPENING_BURST_CANDIDATE_INGESTION_FAILED:{exc}")
 
 
 def opening_seed_tr_command(cfg: OpeningBurstRuntimeConfig, *, trade_date: str, seed_time: str) -> GatewayCommand:

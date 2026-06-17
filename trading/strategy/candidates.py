@@ -54,26 +54,47 @@ class CandidateLifecycle:
             return
         allowed = {
             CandidateState.DETECTED: {
+                CandidateState.HYDRATING,
                 CandidateState.WATCHING,
+                CandidateState.WAIT_DATA,
+                CandidateState.BLOCKED,
+                CandidateState.REMOVED,
+                CandidateState.EXPIRED,
+            },
+            CandidateState.HYDRATING: {
+                CandidateState.WATCHING,
+                CandidateState.WAIT_DATA,
                 CandidateState.BLOCKED,
                 CandidateState.REMOVED,
                 CandidateState.EXPIRED,
             },
             CandidateState.WATCHING: {
                 CandidateState.DETECTED,
+                CandidateState.HYDRATING,
+                CandidateState.WAIT_DATA,
                 CandidateState.READY,
+                CandidateState.BLOCKED,
+                CandidateState.REMOVED,
+                CandidateState.EXPIRED,
+            },
+            CandidateState.WAIT_DATA: {
+                CandidateState.HYDRATING,
+                CandidateState.WATCHING,
                 CandidateState.BLOCKED,
                 CandidateState.REMOVED,
                 CandidateState.EXPIRED,
             },
             CandidateState.READY: {
                 CandidateState.WATCHING,
+                CandidateState.WAIT_DATA,
                 CandidateState.BLOCKED,
                 CandidateState.REMOVED,
                 CandidateState.EXPIRED,
             },
             CandidateState.BLOCKED: {
+                CandidateState.HYDRATING,
                 CandidateState.WATCHING,
+                CandidateState.WAIT_DATA,
                 CandidateState.READY,
                 CandidateState.REMOVED,
                 CandidateState.EXPIRED,

@@ -539,6 +539,65 @@ class TradingDatabase:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 payload_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS candidate_source_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL,
+                source_id TEXT NOT NULL DEFAULT '',
+                source_rank INTEGER NOT NULL DEFAULT 0,
+                source_score REAL NOT NULL DEFAULT 0,
+                theme_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                stock_role TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                raw_payload_json TEXT NOT NULL DEFAULT '{}',
+                detected_at TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_candidate_source_events_trade_code
+                ON candidate_source_events(trade_date, code, id);
+            CREATE INDEX IF NOT EXISTS idx_candidate_source_events_candidate
+                ON candidate_source_events(candidate_id, id);
+            CREATE TABLE IF NOT EXISTS candidate_hydration_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                command_id TEXT NOT NULL UNIQUE DEFAULT '',
+                idempotency_key TEXT NOT NULL DEFAULT '',
+                tr_code TEXT NOT NULL DEFAULT '',
+                rq_name TEXT NOT NULL DEFAULT '',
+                bucket TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                result_status TEXT NOT NULL DEFAULT '',
+                duplicate_of TEXT NOT NULL DEFAULT '',
+                request_payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_candidate_hydration_requests_trade_status
+                ON candidate_hydration_requests(trade_date, status, id);
+            CREATE TABLE IF NOT EXISTS candidate_hydration_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                command_id TEXT NOT NULL DEFAULT '',
+                idempotency_key TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                parsed_payload_json TEXT NOT NULL DEFAULT '{}',
+                raw_payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_candidate_hydration_results_trade_code
+                ON candidate_hydration_results(trade_date, code, id);
             CREATE TABLE IF NOT EXISTS indicator_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 candidate_id INTEGER,
@@ -6296,6 +6355,216 @@ class TradingDatabase:
     def transition_candidate_with_events(self, candidate: Candidate, events: Iterable[CandidateEvent]) -> Candidate:
         return self.save_candidate_with_events(candidate, events)
 
+    def save_candidate_source_event(self, event: dict) -> dict:
+        payload = dict(event or {})
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO candidate_source_events(
+                    trade_date, candidate_id, code, name, source_type, source_id,
+                    source_rank, source_score, theme_id, theme_name, stock_role,
+                    reason_codes_json, raw_payload_json, detected_at, status, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(payload.get("trade_date") or ""),
+                    payload.get("candidate_id"),
+                    _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                    str(payload.get("name") or ""),
+                    str(payload.get("source_type") or ""),
+                    str(payload.get("source_id") or ""),
+                    _safe_int(payload.get("source_rank"), 0),
+                    _float_value(payload.get("source_score")),
+                    str(payload.get("theme_id") or ""),
+                    str(payload.get("theme_name") or ""),
+                    str(payload.get("stock_role") or ""),
+                    _json_list(payload.get("reason_codes_json", payload.get("reason_codes", []))),
+                    _json_payload(payload.get("raw_payload_json", payload.get("raw_payload", {}))),
+                    str(payload.get("detected_at") or ""),
+                    str(payload.get("status") or ""),
+                    str(payload.get("reason") or ""),
+                ),
+            )
+        return self.get_candidate_source_event(int(cursor.lastrowid)) or {}
+
+    def get_candidate_source_event(self, event_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM candidate_source_events WHERE id = ?",
+            (int(event_id),),
+        ).fetchone()
+        return _row_to_candidate_source_event(row) if row else None
+
+    def list_candidate_source_events(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        candidate_id: Optional[int] = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        query = "SELECT * FROM candidate_source_events"
+        clauses = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if candidate_id is not None:
+            clauses.append("candidate_id = ?")
+            params.append(int(candidate_id))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, int(limit or 100)))
+        rows = self.conn.execute(query, params).fetchall()
+        return [_row_to_candidate_source_event(row) for row in rows]
+
+    def save_candidate_hydration_request(self, request: dict) -> dict:
+        payload = dict(request or {})
+        command_id = str(payload.get("command_id") or "")
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO candidate_hydration_requests(
+                    trade_date, candidate_id, code, command_id, idempotency_key,
+                    tr_code, rq_name, bucket, priority, status, result_status,
+                    duplicate_of, request_payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(command_id) DO UPDATE SET
+                    status=excluded.status,
+                    result_status=excluded.result_status,
+                    duplicate_of=excluded.duplicate_of,
+                    request_payload_json=excluded.request_payload_json,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    str(payload.get("trade_date") or ""),
+                    payload.get("candidate_id"),
+                    _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                    command_id,
+                    str(payload.get("idempotency_key") or ""),
+                    str(payload.get("tr_code") or ""),
+                    str(payload.get("rq_name") or ""),
+                    str(payload.get("bucket") or ""),
+                    str(payload.get("priority") or ""),
+                    str(payload.get("status") or ""),
+                    str(payload.get("result_status") or ""),
+                    str(payload.get("duplicate_of") or ""),
+                    _json_payload(payload.get("request_payload_json", payload.get("request_payload", {}))),
+                ),
+            )
+        return self.get_candidate_hydration_request(command_id=command_id) or {}
+
+    def get_candidate_hydration_request(self, *, command_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM candidate_hydration_requests WHERE command_id = ?",
+            (str(command_id or ""),),
+        ).fetchone()
+        return _row_to_candidate_hydration_request(row) if row else None
+
+    def update_candidate_hydration_request_status(
+        self,
+        *,
+        command_id: str,
+        status: str,
+        result_status: str = "",
+    ) -> bool:
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                UPDATE candidate_hydration_requests
+                SET status = ?, result_status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE command_id = ?
+                """,
+                (str(status or ""), str(result_status or ""), str(command_id or "")),
+            )
+        return bool(cursor.rowcount)
+
+    def list_candidate_hydration_requests(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        query = "SELECT * FROM candidate_hydration_requests"
+        clauses = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if status:
+            clauses.append("status = ?")
+            params.append(str(status))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, int(limit or 100)))
+        rows = self.conn.execute(query, params).fetchall()
+        return [_row_to_candidate_hydration_request(row) for row in rows]
+
+    def save_candidate_hydration_result(self, result: dict) -> dict:
+        payload = dict(result or {})
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO candidate_hydration_results(
+                    trade_date, candidate_id, code, command_id, idempotency_key,
+                    status, reason, parsed_payload_json, raw_payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(payload.get("trade_date") or ""),
+                    payload.get("candidate_id"),
+                    _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                    str(payload.get("command_id") or ""),
+                    str(payload.get("idempotency_key") or ""),
+                    str(payload.get("status") or ""),
+                    str(payload.get("reason") or ""),
+                    _json_payload(payload.get("parsed_payload_json", payload.get("parsed_payload", {}))),
+                    _json_payload(payload.get("raw_payload_json", payload.get("raw_payload", {}))),
+                ),
+            )
+        row = self.conn.execute(
+            "SELECT * FROM candidate_hydration_results WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        return _row_to_candidate_hydration_result(row) if row else {}
+
+    def candidate_hydration_summary(self, *, trade_date: Optional[str] = None) -> dict:
+        clauses = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        request_rows = self.conn.execute(
+            f"""
+            SELECT status, COUNT(*) AS count
+            FROM candidate_hydration_requests
+            {where}
+            GROUP BY status
+            """,
+            params,
+        ).fetchall()
+        result_rows = self.conn.execute(
+            f"""
+            SELECT status, COUNT(*) AS count
+            FROM candidate_hydration_results
+            {where}
+            GROUP BY status
+            """,
+            params,
+        ).fetchall()
+        request_counts = {str(row["status"] or ""): int(row["count"] or 0) for row in request_rows}
+        result_counts = {str(row["status"] or ""): int(row["count"] or 0) for row in result_rows}
+        pending_count = sum(request_counts.get(status, 0) for status in {"QUEUED", "DISPATCHED", "DUPLICATE"})
+        error_count = sum(result_counts.get(status, 0) for status in {"ERROR", "ORPHAN_ACK"}) + request_counts.get("REJECTED", 0)
+        return {
+            "request_counts": request_counts,
+            "result_counts": result_counts,
+            "pending_count": pending_count,
+            "error_count": error_count,
+        }
+
     def save_indicator_snapshot(self, snapshot: IndicatorSnapshot) -> IndicatorSnapshot:
         with self.conn:
             return self._save_indicator_snapshot_no_commit(snapshot)
@@ -11695,6 +11964,26 @@ def _row_to_gateway_transport_latency_report(row: sqlite3.Row) -> dict:
     }
 
 
+def _row_to_candidate_source_event(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["reason_codes"] = _safe_json_loads(data.pop("reason_codes_json", "[]"), [])
+    data["raw_payload"] = _safe_json_loads(data.pop("raw_payload_json", "{}"), {})
+    return data
+
+
+def _row_to_candidate_hydration_request(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["request_payload"] = _safe_json_loads(data.pop("request_payload_json", "{}"), {})
+    return data
+
+
+def _row_to_candidate_hydration_result(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["parsed_payload"] = _safe_json_loads(data.pop("parsed_payload_json", "{}"), {})
+    data["raw_payload"] = _safe_json_loads(data.pop("raw_payload_json", "{}"), {})
+    return data
+
+
 def _normalize_operator_event(event: dict) -> dict:
     if not isinstance(event, dict):
         raise ValueError("operator event must be a dict")
@@ -11949,6 +12238,13 @@ def _float_value(value: object) -> float:
         return float(str(value).strip().replace(",", ""))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(float(str(value).strip().replace(",", "")))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _clean_stock_code(value: object) -> str:

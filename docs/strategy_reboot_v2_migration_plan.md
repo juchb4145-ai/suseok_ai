@@ -303,6 +303,33 @@ Legacy 이동:
 - legacy dashboard panel은 debug/legacy namespace로 이동
 - 기존 테스트는 유지하되 새 v2 테스트와 의미를 분리
 
+## PR 2 구현 체크포인트
+
+Phase 3-4의 첫 구현 단위는 Candidate Ingestion과 CandidateHydrator다. 이 단계는 observe 전용 병렬 경로이며 기존 order path를 변경하지 않는다.
+
+완료된 계약:
+
+- `CandidateSourceEvent`로 조건검색 include/remove, Opening Burst selected, 향후 manual watch, 향후 ThemeBoard 후보를 같은 형태로 표현한다.
+- Candidate merge key는 `trade_date + code`이며, 같은 종목의 여러 source는 하나의 active Candidate에 병합한다.
+- PR 2에서 사용하는 상태는 `DETECTED`, `HYDRATING`, `WATCHING`, `WAIT_DATA`, `REMOVED`, `EXPIRED`로 제한한다.
+- 조건검색 include는 Candidate 생성과 hydration enqueue만 수행한다. `READY`, `EntryPlan`, DRY_RUN buy intent, LIVE order command를 만들지 않는다.
+- Opening Burst는 selected 종목만 후보로 유입한다. excluded/observed 종목은 Candidate를 만들지 않는다.
+- CandidateHydrator는 `purpose=candidate_hydration`, `response_mode=capture`, `tr_code=opt10001` command를 Gateway queue에 넣는다.
+- P1 hydration idempotency key는 `candidate_hydration:{trade_date}:{code}:{tr_code}:{bucket}`다.
+- 기본 throttle은 `max_per_cycle=5`, `max_pending=10`, `ttl_sec=90`이며 환경 변수로 조정한다.
+- TR ack는 Candidate metadata와 MarketDataStore backfill만 갱신한다. TR-only 가격은 `gate_usable_for_entry=false`로 남긴다.
+- 데이터 부족은 `WAIT_DATA`와 `WAIT_DATA_*` reason으로 기록한다. `theme_id` 부재는 `theme_unmapped` reason만 추가하며 단독 hard block이 아니다.
+- SQLite에는 `candidate_source_events`, `candidate_hydration_requests`, `candidate_hydration_results`만 추가한다. PostgreSQL 의존성은 만들지 않는다.
+- Dashboard snapshot은 `candidate_ingestion` 요약만 추가한다.
+
+검증:
+
+- condition include 후 order intent count가 증가하지 않는다.
+- condition include 후 Candidate가 `DETECTED` 또는 `HYDRATING`에 있다.
+- 같은 idempotency key의 hydration command는 중복 생성되지 않는다.
+- hydration ack 데이터가 부족하면 `WAIT_DATA`가 된다.
+- hydration ack TR backfill 가격만으로 entry gate를 통과하지 않는다.
+
 ## Rollback
 
 v2는 feature flag로 분리되므로 rollback은 다음과 같다.

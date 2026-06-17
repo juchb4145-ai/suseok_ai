@@ -51,6 +51,8 @@ from trading.broker.transport_metrics import (
 )
 from trading.broker.ws_messages import GatewayWsMessage
 from trading.strategy.candidates import CandidateCollector
+from trading.strategy.candidate_hydrator import CandidateHydrator
+from trading.strategy.candidate_ingestion import CandidateIngestionService, build_candidate_ingestion_snapshot
 from trading.strategy.hybrid_validation import HybridValidationRepository
 from trading.strategy.models import BlockType, CandidateState
 from trading.strategy.reason_taxonomy import normalize_reason_status, reason_status_family, reason_summary
@@ -6782,6 +6784,21 @@ def _persist_condition_event_with_collector(db: TradingDatabase, collector: Cand
         collector.handle_condition_remove(condition_event)
     else:
         collector.handle_condition_include(condition_event)
+    _ingest_condition_event_v2(db, condition_event)
+
+
+def _ingest_condition_event_v2(db: TradingDatabase, condition_event: BrokerConditionEvent) -> None:
+    service = CandidateIngestionService(db)
+    result = service.handle_condition_event(condition_event)
+    if condition_event.event_type == "remove":
+        return
+    candidate = getattr(result, "candidate", None)
+    if candidate is None:
+        return
+    try:
+        CandidateHydrator(db, gateway_state).enqueue_candidate(candidate)
+    except Exception as exc:
+        db.save_log(f"[candidate_ingestion][WARN] hydration enqueue failed: {candidate.code} {exc}")
 
 
 def _update_gateway_condition_event_worker_state(patch: dict[str, Any]) -> None:
@@ -8689,6 +8706,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "recent_sell": db.list_runtime_order_intents(side="sell", order_phase="exit", limit=12) if full_detail else [],
     }
     today = datetime.now().date().isoformat()
+    candidate_ingestion_payload = build_candidate_ingestion_snapshot(db, trade_date=today)
     decision_summary_payload = _cached_dashboard_fragment(
         db,
         f"intraday_decisions:v2:{today}",
@@ -8949,6 +8967,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["change_proposals"] = change_proposal_payload
     runtime_payload["dry_run_performance"] = dry_run_performance_payload
     runtime_payload["threshold_ab"] = threshold_ab_payload
+    runtime_payload["candidate_ingestion"] = candidate_ingestion_payload
     gateway_payload = dict(status_payload["gateway"]) if full_detail else _dashboard_slim_gateway_payload(status_payload["gateway"])
     ops_alerts_payload = build_ops_alerts(
         core=status_payload["core"],
@@ -8989,6 +9008,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "threshold_ab": threshold_ab_payload,
         "ops_alerts": ops_alerts_payload,
         "safety": status_payload["safety"],
+        "candidate_ingestion": candidate_ingestion_payload,
         "candidates": candidates_payload,
         "themes": themes_payload,
         "orders": orders_payload,
@@ -9528,6 +9548,7 @@ def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
             collector.handle_condition_remove(condition_event)
         else:
             collector.handle_condition_include(condition_event)
+        _ingest_condition_event_v2(db, condition_event)
     elif event.type == "execution_event":
         db.save_execution(BrokerExecutionEvent.from_dict(event.payload))
     elif event.type == "order_result":
