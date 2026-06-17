@@ -598,6 +598,60 @@ class TradingDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_candidate_hydration_results_trade_code
                 ON candidate_hydration_results(trade_date, code, id);
+            CREATE TABLE IF NOT EXISTS theme_board_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                board_status TEXT NOT NULL DEFAULT '',
+                theme_count INTEGER NOT NULL DEFAULT 0,
+                active_theme_count INTEGER NOT NULL DEFAULT 0,
+                watch_theme_count INTEGER NOT NULL DEFAULT 0,
+                data_wait_theme_count INTEGER NOT NULL DEFAULT 0,
+                top_themes_json TEXT NOT NULL DEFAULT '[]',
+                stocks_json TEXT NOT NULL DEFAULT '[]',
+                source_counts_json TEXT NOT NULL DEFAULT '{}',
+                data_quality_flags_json TEXT NOT NULL DEFAULT '[]',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_theme_board_snapshots_trade_calc
+                ON theme_board_snapshots(trade_date, calculated_at, id);
+            CREATE TABLE IF NOT EXISTS theme_board_theme_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                board_snapshot_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                theme_id TEXT NOT NULL,
+                theme_name TEXT NOT NULL DEFAULT '',
+                theme_rank INTEGER NOT NULL DEFAULT 0,
+                theme_status TEXT NOT NULL DEFAULT '',
+                theme_score REAL NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_theme_board_theme_snapshots_board
+                ON theme_board_theme_snapshots(board_snapshot_id, theme_rank, id);
+            CREATE INDEX IF NOT EXISTS idx_theme_board_theme_snapshots_trade_theme
+                ON theme_board_theme_snapshots(trade_date, theme_id, id);
+            CREATE TABLE IF NOT EXISTS theme_board_stock_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                board_snapshot_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                theme_id TEXT NOT NULL DEFAULT '',
+                stock_role TEXT NOT NULL DEFAULT '',
+                stock_score REAL NOT NULL DEFAULT 0,
+                entry_usable INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_theme_board_stock_snapshots_board
+                ON theme_board_stock_snapshots(board_snapshot_id, theme_id, stock_score);
+            CREATE INDEX IF NOT EXISTS idx_theme_board_stock_snapshots_trade_code
+                ON theme_board_stock_snapshots(trade_date, code, id);
             CREATE TABLE IF NOT EXISTS indicator_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 candidate_id INTEGER,
@@ -6565,6 +6619,112 @@ class TradingDatabase:
             "error_count": error_count,
         }
 
+    def save_theme_board_snapshot(self, snapshot: dict) -> dict:
+        payload = dict(snapshot or {})
+        trade_date = str(payload.get("trade_date") or "")
+        calculated_at = str(payload.get("calculated_at") or "")
+        top_themes = list(payload.get("top_themes") or [])
+        stocks = list(payload.get("stocks") or [])
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO theme_board_snapshots(
+                    trade_date, calculated_at, board_status, theme_count,
+                    active_theme_count, watch_theme_count, data_wait_theme_count,
+                    top_themes_json, stocks_json, source_counts_json,
+                    data_quality_flags_json, reason_codes_json, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_date,
+                    calculated_at,
+                    str(payload.get("board_status") or ""),
+                    _safe_int(payload.get("theme_count"), 0),
+                    _safe_int(payload.get("active_theme_count"), 0),
+                    _safe_int(payload.get("watch_theme_count"), 0),
+                    _safe_int(payload.get("data_wait_theme_count"), 0),
+                    _json_payload(top_themes),
+                    _json_payload(stocks),
+                    _json_payload(payload.get("source_counts") or {}),
+                    _json_list(payload.get("data_quality_flags") or []),
+                    _json_list(payload.get("reason_codes") or []),
+                    _json_payload(payload),
+                ),
+            )
+            snapshot_id = int(cursor.lastrowid)
+            for theme in top_themes:
+                item = dict(theme or {})
+                self.conn.execute(
+                    """
+                    INSERT INTO theme_board_theme_snapshots(
+                        board_snapshot_id, trade_date, calculated_at, theme_id,
+                        theme_name, theme_rank, theme_status, theme_score, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        trade_date,
+                        calculated_at,
+                        str(item.get("theme_id") or ""),
+                        str(item.get("theme_name") or ""),
+                        _safe_int(item.get("theme_rank"), 0),
+                        str(item.get("theme_status") or ""),
+                        _float_value(item.get("theme_score")),
+                        _json_payload(item),
+                    ),
+                )
+            for stock in stocks:
+                item = dict(stock or {})
+                self.conn.execute(
+                    """
+                    INSERT INTO theme_board_stock_snapshots(
+                        board_snapshot_id, trade_date, calculated_at, code, name,
+                        theme_id, stock_role, stock_score, entry_usable, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        trade_date,
+                        calculated_at,
+                        _clean_stock_code(item.get("code")) or str(item.get("code") or ""),
+                        str(item.get("name") or ""),
+                        str(item.get("theme_id") or ""),
+                        str(item.get("stock_role") or ""),
+                        _float_value(item.get("stock_score")),
+                        int(bool(item.get("entry_usable"))),
+                        _json_payload(item),
+                    ),
+                )
+        return self.get_theme_board_snapshot(snapshot_id) or {}
+
+    def get_theme_board_snapshot(self, snapshot_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM theme_board_snapshots WHERE id = ?",
+            (int(snapshot_id),),
+        ).fetchone()
+        return _row_to_theme_board_snapshot(row) if row else None
+
+    def latest_theme_board_snapshot(self, *, trade_date: Optional[str] = None) -> dict:
+        if trade_date:
+            row = self.conn.execute(
+                """
+                SELECT * FROM theme_board_snapshots
+                WHERE trade_date = ?
+                ORDER BY calculated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (str(trade_date),),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                """
+                SELECT * FROM theme_board_snapshots
+                ORDER BY calculated_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return _row_to_theme_board_snapshot(row) if row else {}
+
     def save_indicator_snapshot(self, snapshot: IndicatorSnapshot) -> IndicatorSnapshot:
         with self.conn:
             return self._save_indicator_snapshot_no_commit(snapshot)
@@ -11982,6 +12142,28 @@ def _row_to_candidate_hydration_result(row: sqlite3.Row) -> dict:
     data["parsed_payload"] = _safe_json_loads(data.pop("parsed_payload_json", "{}"), {})
     data["raw_payload"] = _safe_json_loads(data.pop("raw_payload_json", "{}"), {})
     return data
+
+
+def _row_to_theme_board_snapshot(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("id", data.get("id"))
+    payload.setdefault("created_at", data.get("created_at", ""))
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("calculated_at", data.get("calculated_at", ""))
+    payload.setdefault("board_status", data.get("board_status", ""))
+    payload.setdefault("theme_count", int(data.get("theme_count") or 0))
+    payload.setdefault("active_theme_count", int(data.get("active_theme_count") or 0))
+    payload.setdefault("watch_theme_count", int(data.get("watch_theme_count") or 0))
+    payload.setdefault("data_wait_theme_count", int(data.get("data_wait_theme_count") or 0))
+    payload.setdefault("top_themes", _safe_json_loads(data.pop("top_themes_json", "[]"), []))
+    payload.setdefault("stocks", _safe_json_loads(data.pop("stocks_json", "[]"), []))
+    payload.setdefault("source_counts", _safe_json_loads(data.pop("source_counts_json", "{}"), {}))
+    payload.setdefault("data_quality_flags", _safe_json_loads(data.pop("data_quality_flags_json", "[]"), []))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    return payload
 
 
 def _normalize_operator_event(event: dict) -> dict:

@@ -61,6 +61,7 @@ from trading.theme_engine.backfill import ThemeBackfillConfig, apply_dispatch_gu
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSourceSyncService
 from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThemeUniverseSource
+from trading.theme_engine.theme_board import theme_board_dashboard_section
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
 from trading_app.buy_zero_rca import BuyZeroRCAAnalyzer
 from trading_app.conservative_reason_outcomes import (
@@ -8707,6 +8708,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     }
     today = datetime.now().date().isoformat()
     candidate_ingestion_payload = build_candidate_ingestion_snapshot(db, trade_date=today)
+    theme_board_payload = theme_board_dashboard_section(db, trade_date=today)
     decision_summary_payload = _cached_dashboard_fragment(
         db,
         f"intraday_decisions:v2:{today}",
@@ -8968,6 +8970,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["dry_run_performance"] = dry_run_performance_payload
     runtime_payload["threshold_ab"] = threshold_ab_payload
     runtime_payload["candidate_ingestion"] = candidate_ingestion_payload
+    runtime_payload["theme_board"] = theme_board_payload
     gateway_payload = dict(status_payload["gateway"]) if full_detail else _dashboard_slim_gateway_payload(status_payload["gateway"])
     ops_alerts_payload = build_ops_alerts(
         core=status_payload["core"],
@@ -9009,6 +9012,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "ops_alerts": ops_alerts_payload,
         "safety": status_payload["safety"],
         "candidate_ingestion": candidate_ingestion_payload,
+        "theme_board": theme_board_payload,
         "candidates": candidates_payload,
         "themes": themes_payload,
         "orders": orders_payload,

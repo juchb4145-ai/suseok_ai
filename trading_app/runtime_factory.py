@@ -35,6 +35,7 @@ from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime import RealTimeThemeRuntime
 from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline, theme_lab_config_from_settings
 from trading.theme_engine.lab import ThemeLabFlowEngine
+from trading.theme_engine.theme_board import ThemeBoardConfig, ThemeBoardRuntimePipeline
 from trading_app.dependencies import CoreSettings
 from trading_app.runtime_adapters import (
     GatewayCommandConditionAdapter,
@@ -57,6 +58,7 @@ class CoreRuntimeBundle:
     order_sink: Any = None
     candidate_ingestion_service: Any = None
     candidate_hydrator: Any = None
+    theme_board_pipeline: Any = None
 
 
 def build_core_strategy_runtime(
@@ -120,6 +122,13 @@ def build_core_strategy_runtime(
     shadow_small_entry_promotion_provider = _shadow_small_entry_promotion_provider(db, runtime_settings)
     candidate_ingestion_service = CandidateIngestionService(db)
     candidate_hydrator = CandidateHydrator(db, gateway_state, market_data=market_data)
+    theme_board_pipeline = ThemeBoardRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        repository=theme_repository,
+        candle_builder=candle_builder,
+        config=ThemeBoardConfig.from_env(),
+    )
     theme_lab_pipeline = None
     if config.theme_engine_mode == "themelab_flow":
         theme_backfill_service = ThemeBackfillService(
@@ -165,11 +174,13 @@ def build_core_strategy_runtime(
         order_sink=order_sink,
         theme_lab_pipeline=theme_lab_pipeline,
         opening_burst_pipeline=opening_burst_pipeline,
+        theme_board_pipeline=theme_board_pipeline,
         theme_lab_shadow_ab_provider=theme_lab_shadow_ab_provider,
         shadow_small_entry_promotion_provider=shadow_small_entry_promotion_provider,
     )
     runtime.candidate_ingestion_service = candidate_ingestion_service
     runtime.candidate_hydrator = candidate_hydrator
+    runtime.theme_board_pipeline = theme_board_pipeline
     readiness_report = build_readiness_report(
         db,
         subscription_manager=runtime.subscription_manager,
@@ -194,6 +205,7 @@ def build_core_strategy_runtime(
         order_sink=order_sink,
         candidate_ingestion_service=candidate_ingestion_service,
         candidate_hydrator=candidate_hydrator,
+        theme_board_pipeline=theme_board_pipeline,
     )
 
 

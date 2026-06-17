@@ -56,6 +56,7 @@ from trading.strategy.virtual_orders import VirtualOrderService
 from trading.theme_engine.opening_runtime import OpeningThemeBurstRuntimePipeline, opening_theme_burst_dashboard_section
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline
+from trading.theme_engine.theme_board import ThemeBoardRuntimePipeline, theme_board_dashboard_section
 from trading.theme_engine.universe import ThemeUniverseBuilder
 
 
@@ -262,6 +263,7 @@ class StrategyRuntimeSnapshot:
     candidate_generation_summary: dict = field(default_factory=dict)
     context_history_prune_summary: dict = field(default_factory=dict)
     opening_theme_burst: dict = field(default_factory=dict)
+    theme_board: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -293,6 +295,7 @@ class StrategyRuntime:
         order_sink=None,
         theme_lab_pipeline: Optional[ThemeLabRuntimePipeline] = None,
         opening_burst_pipeline: Optional[OpeningThemeBurstRuntimePipeline] = None,
+        theme_board_pipeline: Optional[ThemeBoardRuntimePipeline] = None,
         theme_lab_shadow_ab_provider: Optional[Callable[[str], dict]] = None,
         shadow_small_entry_promotion_provider: Optional[Callable[[str], dict]] = None,
     ) -> None:
@@ -313,6 +316,7 @@ class StrategyRuntime:
         self.order_sink = order_sink
         self.theme_lab_pipeline = theme_lab_pipeline
         self.opening_burst_pipeline = opening_burst_pipeline
+        self.theme_board_pipeline = theme_board_pipeline
         self.theme_lab_shadow_ab_provider = theme_lab_shadow_ab_provider
         self.shadow_small_entry_promotion_provider = shadow_small_entry_promotion_provider
         self._theme_lab_bridge_results: list[GatePipelineResult] = []
@@ -363,6 +367,7 @@ class StrategyRuntime:
             trade_date = current.date().isoformat()
             self._run_theme_lab_flow(snapshot, current)
             self._run_opening_theme_burst(snapshot, current)
+            self._run_theme_board(snapshot, current)
             self._apply_flow_diagnostics(snapshot, current, trade_date, [])
             if snapshot.gate_skip_reason != GATE_SKIP_MARKET_SESSION_CLOSED:
                 self._rollover_previous_trade_date_candidates(trade_date, current, snapshot)
@@ -443,6 +448,7 @@ class StrategyRuntime:
             timed("prune_position_context_history", lambda: self._prune_position_context_history(snapshot, current))
             timed("theme_lab_flow", lambda: self._run_theme_lab_flow(snapshot, current))
             timed("opening_theme_burst", lambda: self._run_opening_theme_burst(snapshot, current))
+            timed("theme_board", lambda: self._run_theme_board(snapshot, current))
             self._emit_theme_lab_pipeline_timings(timing_callback)
             timed("flow_diagnostics_empty", lambda: self._apply_flow_diagnostics(snapshot, current, trade_date, []))
             if snapshot.gate_skip_reason == GATE_SKIP_MARKET_SESSION_CLOSED:
@@ -1716,6 +1722,24 @@ class StrategyRuntime:
             }
             snapshot.warnings.append(f"OPENING_THEME_BURST_FAILED:{exc}")
 
+    def _run_theme_board(self, snapshot: StrategyRuntimeSnapshot, now: datetime) -> None:
+        if self.theme_board_pipeline is None:
+            self._apply_theme_board_snapshot(snapshot)
+            return
+        try:
+            summary = self.theme_board_pipeline.run_if_due(now)
+            snapshot.theme_board = dict(summary or {})
+            snapshot.warnings.extend(str(warning) for warning in list(summary.get("warnings") or []) if warning)
+        except Exception as exc:
+            snapshot.theme_board = {
+                "status": "ERROR",
+                "error": str(exc),
+                "output_mode": "OBSERVE",
+                "ready_allowed": False,
+                "order_intent_allowed": False,
+            }
+            snapshot.warnings.append(f"THEME_BOARD_FAILED:{exc}")
+
     def _remember_theme_lab_pipeline_timings(self, result: Any) -> None:
         self._theme_lab_pipeline_timings = {}
         data_quality = getattr(result, "data_quality", {}) or {}
@@ -2694,6 +2718,7 @@ class StrategyRuntime:
         )
         self._apply_order_sink_snapshot(snapshot)
         self._apply_opening_theme_burst_snapshot(snapshot)
+        self._apply_theme_board_snapshot(snapshot)
         self._apply_candidate_generation_summary(snapshot)
         self._apply_context_history_prune_snapshot(snapshot)
         return snapshot
@@ -2709,6 +2734,24 @@ class StrategyRuntime:
             snapshot.opening_theme_burst = opening_theme_burst_dashboard_section(self.db)
         except Exception as exc:
             snapshot.opening_theme_burst = {"status": "ERROR", "error": f"OPENING_THEME_BURST_SNAPSHOT_FAILED:{exc}"}
+
+    def _apply_theme_board_snapshot(self, snapshot: StrategyRuntimeSnapshot) -> None:
+        if snapshot.theme_board:
+            return
+        if self.theme_board_pipeline is not None:
+            snapshot.theme_board = dict(getattr(self.theme_board_pipeline, "last_summary", {}) or {})
+            if snapshot.theme_board:
+                return
+        try:
+            snapshot.theme_board = theme_board_dashboard_section(self.db)
+        except Exception as exc:
+            snapshot.theme_board = {
+                "status": "ERROR",
+                "error": f"THEME_BOARD_SNAPSHOT_FAILED:{exc}",
+                "output_mode": "OBSERVE",
+                "ready_allowed": False,
+                "order_intent_allowed": False,
+            }
 
     def _prune_position_context_history(self, snapshot: StrategyRuntimeSnapshot, current: datetime) -> None:
         if not _env_bool("TRADING_CONTEXT_HISTORY_PRUNE_ENABLED", True):

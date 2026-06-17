@@ -692,3 +692,176 @@ top_wait_data_reasons
 ```
 
 이 섹션은 최종 Dashboard V2의 전 단계다. 최종 화면은 시장국면, 주도테마 TOP5, READY 후보, 보유 리스크, 차단/대기 사유 TOP만 보는 방향을 유지한다.
+
+## PR 3: ThemeBoard Runtime Unification
+
+ThemeBoard는 `WATCHING`/`WAIT_DATA` 후보, 실시간 tick, TR backfill metadata, theme membership, Opening Burst source를 테마 단위로 압축하는 관찰/분류 계층이다. 매수 판단 엔진이 아니며 `READY`, `SETUP_READY`, `TIMING_READY`, `EntryPlan`, DRY_RUN buy intent, LIVE order command를 만들지 않는다.
+
+위치:
+
+- `trading/theme_engine/theme_board.py`
+- runtime cycle hook: Opening Burst 반영 후 ThemeBoard 실행
+- dashboard section: `theme_board`
+
+기본 runtime flag:
+
+```text
+TRADING_THEME_BOARD_ENABLED=false
+TRADING_THEME_BOARD_OBSERVE_ONLY=true
+TRADING_THEME_BOARD_INTERVAL_SEC=5
+```
+
+### ThemeBoardSnapshot 계약
+
+`ThemeBoardSnapshot`은 Runtime/API/Dashboard가 공유하는 단일 payload다.
+
+```text
+trade_date
+calculated_at
+board_status
+theme_count
+active_theme_count
+watch_theme_count
+data_wait_theme_count
+top_themes
+stocks
+source_counts
+data_quality_flags
+reason_codes
+output_mode=OBSERVE
+ready_allowed=false
+order_intent_allowed=false
+```
+
+`ThemeBoardThemeSnapshot`은 테마 단위 압축 결과다.
+
+```text
+theme_id
+theme_name
+theme_rank
+theme_status
+theme_score
+active_candidate_count
+watching_candidate_count
+data_wait_count
+alive_count
+strong_count
+leader_count
+alive_ratio
+strong_ratio
+leader_ratio
+breadth_ratio
+weighted_return_pct
+theme_turnover_krw
+leader_concentration
+leader_symbol
+leader_name
+co_leader_symbols
+opening_burst_score
+condition_boost_count
+realtime_valid_count
+realtime_valid_ratio
+hydration_coverage_ratio
+data_quality_flags
+reason_codes
+```
+
+`ThemeBoardStockSnapshot`은 종목 단위 관찰 결과다.
+
+```text
+code
+name
+theme_id
+theme_name
+stock_role
+stock_score
+source_types
+source_score
+opening_burst_score
+condition_boost
+current_price
+change_rate_pct
+turnover_krw
+execution_strength
+momentum_1m
+momentum_3m
+momentum_5m
+vwap
+pullback_from_high_pct
+spread_ticks
+vi_active
+upper_limit_gap_pct
+entry_usable=false
+data_quality_flags
+reason_codes
+```
+
+### 상태와 역할 분류
+
+Theme status:
+
+- `DATA_WAIT`: active 후보가 없거나 realtime coverage가 낮음. 데이터 부족을 `WEAK_THEME`로 강등하지 않는다.
+- `LEADING_THEME`: 점수, strong count, leader count, breadth가 충분하고 단일 leader 집중이 과도하지 않음.
+- `SPREADING_THEME`: leader가 있고 여러 종목 동조가 확인되지만 `LEADING_THEME` 기준에는 아직 미달.
+- `LEADER_ONLY_THEME`: 대장주는 강하지만 breadth가 낮거나 leader concentration이 높음. 단일 급등주는 이 상태로 남긴다.
+- `WATCH_THEME`: 관심은 있으나 확산/강도가 부족한 관찰 상태.
+- `WEAK_THEME`: 데이터는 충분하지만 점수와 후속 흐름이 낮음.
+
+Stock role:
+
+- `LEADER`: 상승률 최고가 아니라 leader score 1위. 거래대금, 체결강도, 모멘텀, source score를 함께 본다.
+- `CO_LEADER`: leader score 2위 또는 공동대장 조건 충족.
+- `FOLLOWER`: 테마 동조는 있으나 대장주 대비 약함.
+- `LATE_LAGGARD`: 테마 확산 후 늦게 따라오며 거래대금/모멘텀이 약함.
+- `OVERHEATED`: VI active, 상한가 근접, VWAP 과열, 고가 근접 과열. 항상 `entry_usable=false`.
+- `WEAK_MEMBER`: 나머지 약한 구성원.
+
+### 데이터 사용 원칙
+
+- 조건검색 source는 `condition_boost` 또는 discovery source로만 반영한다.
+- Opening Burst selected 후보는 `opening_burst_score`와 source type으로 반영한다.
+- CandidateHydrator metadata는 이름, 전일가, 현재가, 거래대금, data quality 보강에만 쓴다.
+- TR-only 가격은 ThemeBoard에 포함할 수 있지만 `TR_BACKFILL_PRICE_ONLY` flag와 `entry_usable=false`를 남긴다.
+- REMOVED/EXPIRED 후보는 계산에서 제외한다.
+- Candidate metadata에는 `theme_board_*` 필드만 병합하고 state는 READY 계열로 바꾸지 않는다.
+
+Candidate metadata 병합 필드:
+
+```text
+theme_board_theme_id
+theme_board_theme_name
+theme_board_theme_rank
+theme_board_theme_status
+theme_board_theme_score
+theme_board_stock_role
+theme_board_stock_score
+theme_board_reason_codes
+entry_usable=false
+updated_by_theme_board_at
+```
+
+### 저장과 Dashboard
+
+SQLite 저장 테이블:
+
+- `theme_board_snapshots`
+- `theme_board_theme_snapshots`
+- `theme_board_stock_snapshots`
+
+Dashboard `theme_board` section:
+
+```text
+calculated_at
+top_themes
+theme_status_counts
+top_leaders
+data_wait_count
+weak_theme_count
+leader_only_count
+source_counts
+warnings
+ready_allowed=false
+order_intent_allowed=false
+```
+
+대시보드 표현은 “주도 테마”, “관찰 종목”, “대장주/공동대장”, “후발/과열 제외”로 제한한다. “매수 추천”, “매수 확정”, “자동매수 대상”은 금지한다.
