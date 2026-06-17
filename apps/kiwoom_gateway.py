@@ -896,7 +896,12 @@ def _execute_command(client, command: GatewayCommand, *, tr_runner=None) -> dict
         return _result_payload(result_code=result_code, message="login requested")
     elif command.type == "load_conditions":
         result_code = int(client.load_conditions() or 0)
-        return _result_payload(result_code=result_code, message="condition load requested", success_code=1)
+        return _result_payload(
+            result_code=result_code,
+            message="condition load requested",
+            success_code=1,
+            failure_message="condition load request failed",
+        )
     elif command.type == "send_condition":
         result_code = int(client.send_condition(
             str(payload.get("screen_no") or "7600"),
@@ -905,7 +910,12 @@ def _execute_command(client, command: GatewayCommand, *, tr_runner=None) -> dict
             realtime=bool(payload.get("realtime", True)),
             search_type=payload.get("search_type"),
         ) or 0)
-        return _result_payload(result_code=result_code, message="condition sent", success_code=1)
+        return _result_payload(
+            result_code=result_code,
+            message="condition sent",
+            success_code=1,
+            failure_message="condition send failed",
+        )
     elif command.type == "register_realtime":
         client.register_realtime(list(payload.get("codes") or []), screen_no=payload.get("screen_no"))
         return _result_payload(result_code=0, message="realtime registered")
@@ -1263,12 +1273,19 @@ def _command_event_payload(command: GatewayCommand, trace_updates: dict[str, Any
     }
 
 
-def _result_payload(*, result_code: int, message: str, success_code: int = 0, raw: dict[str, Any] | None = None) -> dict[str, Any]:
+def _result_payload(
+    *,
+    result_code: int,
+    message: str,
+    success_code: int = 0,
+    raw: dict[str, Any] | None = None,
+    failure_message: str | None = None,
+) -> dict[str, Any]:
     ok = int(result_code) == int(success_code)
     return {
         "status": "ACKED" if ok else "FAILED",
         "result_code": int(result_code),
-        "message": message,
+        "message": message if ok else f"{failure_message or message}: result_code={int(result_code)} expected={int(success_code)}",
         "raw": dict(raw or {}),
     }
 

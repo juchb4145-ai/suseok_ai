@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import importlib
+from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 from storage.db import TradingDatabase
@@ -35,6 +36,32 @@ def test_live_sim_preflight_go_masks_account_and_checks_core_guards(tmp_path):
     assert snapshot["account_mode_summary"]["simulation_confirmed"] is True
     assert snapshot["safety_summary"]["live_real_enabled"] is False
     assert "1234567890" not in json.dumps(snapshot, ensure_ascii=False)
+    db.close()
+
+
+def test_live_sim_preflight_ignores_old_cumulative_rate_limit_count(tmp_path):
+    db = _db(tmp_path)
+    _save_settings(db)
+    state = _gateway()
+    state.record_event(
+        GatewayEvent(
+            type="rate_limited",
+            event_id="evt-preflight-old-rate-limit",
+            timestamp=(datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds"),
+            payload={"command_type": "tr_request", "wait_time_sec": 0.25},
+        )
+    )
+
+    snapshot = _service(db, state, tmp_path).build_snapshot(
+        performance_report=_go_report(),
+        transport_status=_transport(),
+        theme_lab_snapshot=_theme_lab(),
+    )
+
+    assert snapshot["status"] == PREFLIGHT_STATUS_GO
+    assert "GATEWAY_RATE_LIMIT_RECENT" not in snapshot["warning_reasons"]
+    assert snapshot["gateway_load_summary"]["recent_rate_limit_count"] == 0
+    assert snapshot["gateway_load_summary"]["total_rate_limited_count"] == 1
     db.close()
 
 

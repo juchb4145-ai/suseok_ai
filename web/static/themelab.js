@@ -8,6 +8,7 @@
     data: "ALL",
     order: "ALL",
   },
+  selectedThemeId: "",
   selectedSymbol: "",
   chartInterval: "1m",
   operatorEvents: [],
@@ -657,6 +658,21 @@ function selectedWatchItem(snapshot) {
   const selected = watchset.find((item) => item.symbol === state.selectedSymbol);
   if (selected) return selected;
   return watchset[0] || (snapshot || {}).gate_detail || {};
+}
+
+function selectedTheme(snapshot) {
+  const themes = (snapshot || {}).ranked_themes || [];
+  if (!themes.length) return {};
+  const selected = themes.find((item) => String(item.theme_id || "") === state.selectedThemeId);
+  return selected || themes[0] || {};
+}
+
+function selectTheme(themeId) {
+  const snapshot = state.snapshot || {};
+  const targetThemeId = String(themeId || "");
+  if (targetThemeId) state.selectedThemeId = targetThemeId;
+  renderThemes(snapshot.ranked_themes || []);
+  renderThemeDetail(snapshot.ranked_themes || [], snapshot);
 }
 
 function selectedChartForSymbol(snapshot, symbol) {
@@ -3008,6 +3024,7 @@ function render(snapshot) {
   renderShadowSmallEntryPromotionPanel(currentSnapshot.shadow_small_entry_promotion || {});
   renderShadowAb(currentSnapshot);
   renderThemes(currentSnapshot.ranked_themes || []);
+  renderThemeDetail(currentSnapshot.ranked_themes || [], currentSnapshot);
   renderWatchset(currentSnapshot.watchset || []);
   renderOrders(currentSnapshot.entry_candidates || []);
   renderFocusPanel(selected, selectedChart);
@@ -3764,12 +3781,15 @@ function shadowMetric(label, value, formatter = compactNumber) {
 
 function renderThemes(themes) {
   const node = document.getElementById("theme-rank-list");
+  text("theme-count", themes.length);
   if (!themes.length) {
     node.innerHTML = `<div class="theme-row muted">강한 테마가 형성되면 여기에 표시됩니다.</div>`;
     return;
   }
+  const activeTheme = selectedTheme({ ranked_themes: themes });
+  if (activeTheme.theme_id && String(activeTheme.theme_id) !== state.selectedThemeId) state.selectedThemeId = String(activeTheme.theme_id);
   node.innerHTML = themes.map((item) => `
-    <article class="theme-row" data-theme="${escapeHtml(item.theme_id)}" data-symbol="${escapeHtml(item.top_leader_symbol)}">
+    <article class="theme-row ${String(item.theme_id || "") === state.selectedThemeId ? "selected" : ""}" data-theme="${escapeHtml(item.theme_id)}" data-symbol="${escapeHtml(item.top_leader_symbol)}">
       <div class="row-top">
         <span class="row-title">${item.rank}. ${escapeHtml(item.theme_name)}</span>
         ${badge(item.theme_status)}
@@ -3782,6 +3802,110 @@ function renderThemes(themes) {
       ${themeQualityLine(item)}
     </article>
   `).join("");
+}
+
+function renderThemeDetail(themes = [], snapshot = state.snapshot || {}) {
+  const panel = document.getElementById("theme-detail-panel");
+  if (!panel) return;
+  if (!themes.length) {
+    text("theme-detail-title", "테마 선택 대기");
+    text("theme-detail-subtitle", "테마 랭킹 데이터가 들어오면 구성 종목을 표시합니다.");
+    setBadge("theme-detail-status", "NO_DATA");
+    text("theme-detail-member-count", "0종목");
+    document.getElementById("theme-summary-grid").innerHTML = "";
+    document.getElementById("theme-member-body").innerHTML = `<tr><td colspan="9" class="muted">테마 구성 종목 데이터가 없습니다.</td></tr>`;
+    return;
+  }
+  let theme = selectedTheme({ ranked_themes: themes });
+  if (!theme.theme_id) theme = themes[0] || {};
+  if (theme.theme_id && String(theme.theme_id) !== state.selectedThemeId) state.selectedThemeId = String(theme.theme_id);
+  const members = themeMemberRows(theme, snapshot);
+  text("theme-detail-title", theme.theme_name || theme.theme_id || "테마 상세");
+  text("theme-detail-subtitle", `${theme.theme_id || "-"} · ${themeBreadthLine(theme)}`);
+  setBadge("theme-detail-status", theme.theme_status || "UNKNOWN");
+  text("theme-detail-member-count", `${members.length}/${theme.eligible_total_members || members.length || 0}종목`);
+  document.getElementById("theme-summary-grid").innerHTML = [
+    themeMetric("점수", score(theme.condition_score, 0), "조건식/가격 통합"),
+    themeMetric("생존", `${theme.alive_count || 0}/${theme.eligible_total_members || 0}`, ratio(theme.alive_ratio)),
+    themeMetric("강세", `${theme.strong_count || 0}/${theme.eligible_total_members || 0}`, ratio(theme.strong_ratio)),
+    themeMetric("주도", `${theme.leader_count || 0}/${theme.eligible_total_members || 0}`, ratio(theme.leader_ratio)),
+    themeMetric("대장 후보", theme.top_leader_name || theme.top_leader_symbol || "-", pct(theme.top_leader_return_pct)),
+    themeMetric("거래대금", money(theme.theme_turnover_krw), theme.member_data_coverage_label || "커버리지 확인 중"),
+  ].join("");
+  const body = document.getElementById("theme-member-body");
+  body.innerHTML = members.length ? members.map(themeMemberRow).join("") : `<tr><td colspan="9" class="muted">이 테마에 표시할 구성 종목이 없습니다.</td></tr>`;
+}
+
+function themeMetric(label, value, detail = "") {
+  return `
+    <article class="theme-metric">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+      <em>${escapeHtml(detail || "-")}</em>
+    </article>
+  `;
+}
+
+function themeMemberRows(theme, snapshot) {
+  const watchBySymbol = watchsetBySymbol(snapshot);
+  return (theme.members || theme.member_hits || []).map((member) => {
+    const symbol = String(member.symbol || member.stock_code || member.code || "");
+    const watch = watchBySymbol.get(symbol) || {};
+    return { ...member, ...watch, symbol, theme_member: member, in_watchset: Boolean(watch.symbol) };
+  }).sort(themeMemberSort);
+}
+
+function themeMemberSort(left, right) {
+  const leftLevel = Number(left.condition_level ?? signalLevel(left));
+  const rightLevel = Number(right.condition_level ?? signalLevel(right));
+  return (
+    Number(Boolean(left.excluded)) - Number(Boolean(right.excluded))
+    || rightLevel - leftLevel
+    || Number(right.return_pct || 0) - Number(left.return_pct || 0)
+    || Number(right.turnover_krw || 0) - Number(left.turnover_krw || 0)
+    || String(left.symbol || "").localeCompare(String(right.symbol || ""))
+  );
+}
+
+function signalLevel(item) {
+  if (item.leader_hit) return 3;
+  if (item.strong_hit) return 2;
+  if (item.alive_hit) return 1;
+  return 0;
+}
+
+function themeMemberRow(item) {
+  const name = item.stock_name || item.name || item.symbol || "-";
+  const signal = item.condition_label || (item.excluded ? "EXCLUDED" : signalLevelLabel(signalLevel(item)));
+  const gate = item.in_watchset ? statusCell(item) : badge("WATCH", "observe");
+  const flags = [...(item.data_quality_flags || []), ...(item.price_location_data_quality_flags || [])].filter(Boolean);
+  return `
+    <tr class="theme-member-row ${item.in_watchset ? "is-watchset" : ""}" data-symbol="${escapeHtml(item.symbol || "")}" data-watchset="${item.in_watchset ? "true" : "false"}">
+      <td><strong>${escapeHtml(name)}</strong><br><span class="muted">${escapeHtml(item.symbol || "-")}</span></td>
+      <td>${badge(signal, signalTone(signal))}</td>
+      <td>${item.in_watchset ? badge(item.stock_role || "-", decisionTone(item.stock_role || "")) : `<span class="muted">-</span>`}</td>
+      <td>${gate}</td>
+      <td class="num ${Number(item.return_pct || 0) >= 0 ? "positive" : "negative"}">${pct(item.return_pct)}</td>
+      <td class="num">${money(item.turnover_krw)}</td>
+      <td>${item.current_price ? escapeHtml(formatPrice(item.current_price)) : "<span class=\"muted\">-</span>"}</td>
+      <td>${item.in_watchset ? escapeHtml(item.price_location_status || "-") : "<span class=\"muted\">-</span>"}</td>
+      <td>${flags.length ? reasonBadges(flags.slice(0, 3)) : `<span class="muted">${escapeHtml(item.excluded_reason || "-")}</span>`}</td>
+    </tr>
+  `;
+}
+
+function signalLevelLabel(level) {
+  return level >= 3 ? "LEADER" : level >= 2 ? "STRONG" : level >= 1 ? "ALIVE" : "WATCH";
+}
+
+function signalTone(signal) {
+  return {
+    LEADER: "ready",
+    STRONG: "ready-small",
+    ALIVE: "wait",
+    WATCH: "observe",
+    EXCLUDED: "blocked",
+  }[String(signal || "").toUpperCase()] || "observe";
 }
 
 function themeBreadthLine(item) {
@@ -4730,6 +4854,17 @@ function renderDataQuality(item) {
 }
 
 function initFilters() {
+  document.getElementById("theme-rank-list")?.addEventListener("click", (event) => {
+    const row = event.target.closest("[data-theme]");
+    if (!row || !state.snapshot) return;
+    selectTheme(row.dataset.theme || "");
+  });
+  document.getElementById("theme-member-body")?.addEventListener("click", (event) => {
+    const row = event.target.closest("tr[data-symbol]");
+    if (!row || row.dataset.watchset !== "true" || !state.snapshot) return;
+    selectSymbol(row.dataset.symbol, { source: "theme-member" });
+    activateOperatorTab("tab-candidates");
+  });
   document.getElementById("watch-filters").addEventListener("click", (event) => {
     const button = event.target.closest("button[data-filter-kind]");
     if (!button) return;
@@ -4891,29 +5026,32 @@ function initFilters() {
   });
 }
 
+function activateOperatorTab(target = "tab-main") {
+  const nav = document.getElementById("themelab-tab-nav");
+  if (!nav) return;
+  const resolved = target || "tab-main";
+  document.body.dataset.activeTab = resolved;
+  nav.querySelectorAll("button[data-tab-target]").forEach((button) => {
+    const active = button.dataset.tabTarget === resolved;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  document.querySelectorAll("[data-tab-panel]").forEach((panel) => {
+    const active = panel.dataset.tabPanel === resolved;
+    panel.classList.toggle("active", active);
+    panel.hidden = !active;
+  });
+}
+
 function initTabs() {
   const nav = document.getElementById("themelab-tab-nav");
   if (!nav) return;
-  const activate = (target) => {
-    const resolved = target || "tab-main";
-    document.body.dataset.activeTab = resolved;
-    nav.querySelectorAll("button[data-tab-target]").forEach((button) => {
-      const active = button.dataset.tabTarget === resolved;
-      button.classList.toggle("active", active);
-      button.setAttribute("aria-pressed", active ? "true" : "false");
-    });
-    document.querySelectorAll("[data-tab-panel]").forEach((panel) => {
-      const active = panel.dataset.tabPanel === resolved;
-      panel.classList.toggle("active", active);
-      panel.hidden = !active;
-    });
-  };
   nav.addEventListener("click", (event) => {
     const button = event.target.closest("button[data-tab-target]");
     if (!button) return;
-    activate(button.dataset.tabTarget || "tab-main");
+    activateOperatorTab(button.dataset.tabTarget || "tab-main");
   });
-  activate(document.body.dataset.activeTab || "tab-main");
+  activateOperatorTab(document.body.dataset.activeTab || "tab-main");
 }
 
 async function fetchSnapshot() {

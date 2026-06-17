@@ -1448,9 +1448,24 @@ body[data-active-tab="tab-developer"] [data-operator-tab="developer"] {
 
 .flow-grid {
   display: grid;
-  grid-template-columns: minmax(270px, 0.85fr) minmax(480px, 1.45fr) minmax(300px, 0.9fr);
+  grid-template-columns: minmax(300px, 0.72fr) minmax(720px, 1.28fr);
   gap: 12px;
   min-height: 420px;
+}
+
+body[data-active-tab="tab-themes"] #candidate-focus-panel,
+body[data-active-tab="tab-themes"] .gate-panel {
+  display: none;
+}
+
+body[data-active-tab="tab-candidates"] .flow-grid[data-operator-tab="themes"] {
+  display: grid !important;
+  grid-template-columns: minmax(650px, 1.25fr) minmax(320px, 0.75fr);
+}
+
+body[data-active-tab="tab-candidates"] .flow-grid .theme-panel,
+body[data-active-tab="tab-candidates"] .flow-grid .theme-detail-panel {
+  display: none;
 }
 
 .bottom-grid {
@@ -1547,6 +1562,80 @@ body[data-active-tab="tab-developer"] [data-operator-tab="developer"] {
 .theme-row:hover {
   border-color: var(--border-active);
   background: var(--panel-hover);
+}
+
+.theme-row.selected {
+  border-color: rgba(56, 189, 248, 0.75);
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.theme-detail-panel {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.theme-detail-panel .panel-head p {
+  max-width: 760px;
+}
+
+.theme-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.theme-metric {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  padding: 9px 10px;
+}
+
+.theme-metric span,
+.theme-metric em {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.theme-metric span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.theme-metric strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.theme-metric em {
+  margin-top: 4px;
+  color: var(--sub);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.theme-member-table-wrap {
+  max-height: 560px;
+}
+
+.theme-member-table {
+  min-width: 920px;
+}
+
+.theme-member-row.is-watchset {
+  box-shadow: inset 3px 0 0 var(--ready-small);
 }
 
 .row-top {
@@ -2163,6 +2252,7 @@ tbody tr.selected {
   .buy-zero-trace-fields,
   .postmarket-summary-grid,
   .postmarket-review-grid,
+  .theme-summary-grid,
   .flow-grid,
   .bottom-grid,
   .quality-grid,

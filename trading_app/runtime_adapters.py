@@ -398,6 +398,19 @@ class GatewayCommandConditionAdapter:
                     self._remember_registered_condition(profile, condition_index, screen_no, current)
                     continue
                 status = CommandStatus.EXPIRED.value
+                command_id = str(record.get("command_id") or "")
+                if command_id:
+                    self.gateway_state.ack_command(
+                        command_id,
+                        status=CommandStatus.EXPIRED.value,
+                        result_payload={
+                            "recovery_reason": "STALE_SEND_CONDITION_ACK_SESSION",
+                            "condition_name": profile.condition_name,
+                            "condition_index": condition_index,
+                            "screen_no": screen_no,
+                        },
+                        error="STALE_SEND_CONDITION_ACK_SESSION",
+                    )
                 record["status"] = status
                 record["last_error"] = "STALE_SEND_CONDITION_ACK_SESSION"
                 self._warn(f"CONDITION_SEND_ACK_STALE_SESSION:{profile.condition_name}:{record.get('command_id') or ''}")
@@ -616,7 +629,7 @@ def _record_matches_session(record: dict[str, Any], current_session: set[str]) -
         return True
     record_session = _gateway_session_tokens(record.get("result_payload") or {})
     if not record_session:
-        return True
+        return False
     return not record_session.isdisjoint(current_session)
 
 

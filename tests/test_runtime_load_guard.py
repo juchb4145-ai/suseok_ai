@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from trading.broker.command_queue import CommandPriority
@@ -31,6 +31,54 @@ def test_runtime_load_guard_ok_when_gateway_and_theme_flow_are_quiet():
     assert snapshot["load_guard_status"] == LOAD_GUARD_OK
     assert snapshot["paused_backfill"] is False
     assert snapshot["pause_reason_codes"] == []
+
+
+def test_runtime_load_guard_ignores_cumulative_old_rate_limit_count():
+    state = _healthy_state()
+    state.record_event(
+        GatewayEvent(
+            type="rate_limited",
+            event_id="evt-old-rate-limit",
+            timestamp=(datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds"),
+            payload={"command_type": "tr_request", "wait_time_sec": 0.25},
+        )
+    )
+
+    snapshot = build_runtime_load_guard_snapshot(
+        state,
+        raw_theme_lab={"watchset_snapshots": []},
+        backfill_summary={"parser_miss_ratio": 0.0, "tr_backfill_caused_ready_count": 0},
+    )
+
+    assert snapshot["load_guard_status"] == LOAD_GUARD_OK
+    assert snapshot["paused_backfill"] is False
+    assert snapshot["recent_rate_limit_count"] == 0
+    assert snapshot["total_rate_limited_count"] == 1
+    assert "RATE_LIMITED_RECENT" not in snapshot["pause_reason_codes"]
+
+
+def test_runtime_load_guard_pauses_for_recent_rate_limit_event():
+    state = _healthy_state()
+    state.record_event(
+        GatewayEvent(
+            type="rate_limited",
+            event_id="evt-recent-rate-limit",
+            timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            payload={"command_type": "tr_request", "wait_time_sec": 0.25},
+        )
+    )
+
+    snapshot = build_runtime_load_guard_snapshot(
+        state,
+        raw_theme_lab={"watchset_snapshots": []},
+        backfill_summary={"parser_miss_ratio": 0.0, "tr_backfill_caused_ready_count": 0},
+    )
+
+    assert snapshot["load_guard_status"] == LOAD_GUARD_PAUSED
+    assert snapshot["paused_backfill"] is True
+    assert snapshot["recent_rate_limit_count"] == 1
+    assert snapshot["total_rate_limited_count"] == 1
+    assert "RATE_LIMITED_RECENT" in snapshot["pause_reason_codes"]
 
 
 def test_runtime_load_guard_pauses_for_ready_and_order_pending():

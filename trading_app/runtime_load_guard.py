@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from trading.broker.command_queue import ORDER_COMMAND_TYPES
@@ -19,6 +19,7 @@ LOAD_GUARD_FAIL_CLOSED = "FAIL_CLOSED"
 class RuntimeLoadGuardConfig:
     heartbeat_stale_sec: float = 15.0
     command_latency_pause_ms: float = 1500.0
+    rate_limit_pause_window_sec: float = 60.0
     parser_miss_degrade_ratio: float = 0.20
     parser_miss_pause_ratio: float = 0.50
 
@@ -56,7 +57,8 @@ def build_runtime_load_guard_snapshot(
     command_p95 = _command_latency_p95(transport_status or {})
     if command_p95 is not None and command_p95 > cfg.command_latency_pause_ms:
         pause_codes.append("COMMAND_LATENCY_HIGH")
-    recent_rate_limit_count = int(command_summary.get("rate_limited_count") or 0)
+    total_rate_limited_count = int(command_summary.get("rate_limited_count") or 0)
+    recent_rate_limit_count = _recent_rate_limit_count(gateway_state, cfg.rate_limit_pause_window_sec)
     recent_tr_failure_count = _recent_tr_failure_count(records)
     if recent_rate_limit_count > 0:
         pause_codes.append("RATE_LIMITED_RECENT")
@@ -93,6 +95,7 @@ def build_runtime_load_guard_snapshot(
         "order_command_pending_count": len(order_pending),
         "backfill_pending_count": len(backfill_pending),
         "recent_rate_limit_count": recent_rate_limit_count,
+        "total_rate_limited_count": total_rate_limited_count,
         "recent_tr_failure_count": recent_tr_failure_count,
         "heartbeat_age_sec": heartbeat_age,
         "command_latency_p95_ms": command_p95,
@@ -155,6 +158,36 @@ def _recent_tr_failure_count(records: list[dict[str, Any]]) -> int:
         if any(token in text for token in ("RATE_LIMITED", "TR_TIMEOUT", "TR_REQUEST_FAILED")) or str(record.get("status") or "") in {"FAILED", "REJECTED"}:
             count += 1
     return count
+
+
+def _recent_rate_limit_count(gateway_state: GatewayStateStore, window_sec: float) -> int:
+    try:
+        events = gateway_state.recent_events(limit=200)
+    except Exception:
+        return 0
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=max(0.0, float(window_sec or 0.0)))
+    count = 0
+    for event in events:
+        if str(getattr(event, "type", "") or "") != "rate_limited":
+            continue
+        event_time = _parse_event_time(getattr(event, "timestamp", ""))
+        if event_time is None or event_time >= cutoff:
+            count += 1
+    return count
+
+
+def _parse_event_time(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _affected_services(status: str, reason_codes: list[str]) -> list[str]:

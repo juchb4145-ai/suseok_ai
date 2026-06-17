@@ -1,5 +1,5 @@
-from apps.kiwoom_gateway import GatewayRuntime, _kiwoom_heartbeat_payload, _wire_kiwoom_signals
-from trading.broker.models import BrokerPriceTick, ConditionInfo, Signal
+from apps.kiwoom_gateway import GatewayRuntime, _execute_command, _kiwoom_heartbeat_payload, _wire_kiwoom_signals
+from trading.broker.models import BrokerPriceTick, ConditionInfo, GatewayCommand, Signal
 
 
 class FakeCoreClient:
@@ -145,6 +145,50 @@ def test_kiwoom_heartbeat_payload_keeps_unknown_environment_fail_closed():
     assert payload["broker_env"] == "UNKNOWN"
     assert payload["server_mode"] == "UNKNOWN"
     assert payload["account_mode"] == "UNKNOWN"
+
+
+def test_gateway_send_condition_failure_message_includes_result_code():
+    class Client:
+        def send_condition(self, screen_no, condition_name, condition_index, realtime=True, search_type=None):
+            return 0
+
+    result = _execute_command(
+        Client(),
+        GatewayCommand(
+            type="send_condition",
+            command_id="cmd-cond-fail",
+            payload={
+                "screen_no": "7602",
+                "condition_name": "테마랩_주도_5",
+                "condition_index": 85,
+                "realtime": True,
+                "search_type": 1,
+            },
+        ),
+    )
+
+    assert result["status"] == "FAILED"
+    assert result["result_code"] == 0
+    assert result["message"] == "condition send failed: result_code=0 expected=1"
+
+
+def test_gateway_send_condition_success_keeps_operator_message():
+    class Client:
+        def send_condition(self, screen_no, condition_name, condition_index, realtime=True, search_type=None):
+            return 1
+
+    result = _execute_command(
+        Client(),
+        GatewayCommand(
+            type="send_condition",
+            command_id="cmd-cond-ok",
+            payload={"condition_name": "테마랩_주도_5", "condition_index": 85},
+        ),
+    )
+
+    assert result["status"] == "ACKED"
+    assert result["result_code"] == 1
+    assert result["message"] == "condition sent"
 
 
 def test_gateway_runtime_emits_condition_load_events():

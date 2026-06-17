@@ -171,6 +171,9 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one("#shadow-ab-summary") is not None
     assert soup.select_one("#shadow-ab-body") is not None
     assert soup.select_one("#theme-rank-list") is not None
+    assert soup.select_one("#theme-detail-panel") is not None
+    assert soup.select_one("#theme-summary-grid") is not None
+    assert soup.select_one("#theme-member-body") is not None
     assert soup.select_one("#candidate-focus-panel") is not None
     assert soup.select_one("#focus-summary") is not None
     assert soup.select_one("#decision-checklist") is not None
@@ -249,6 +252,8 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "function renderBuyCandidates" in js
     assert "function renderNoBuyReasons" in js
     assert "function renderRiskStatus" in js
+    assert "function renderThemeDetail" in js
+    assert "function selectTheme" in js
     assert "function renderTabThemes" in js
     assert "function renderTabCandidates" in js
     assert "function renderTabNoBuy" in js
@@ -544,6 +549,9 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert "confidence-low" in css
     assert "review-table" in css
     assert "review-detail-panel" in css
+    assert "theme-detail-panel" in css
+    assert "theme-summary-grid" in css
+    assert "theme-member-table" in css
     assert "return-positive" in css
     assert "return-negative" in css
     assert "return-neutral" in css
@@ -1933,6 +1941,9 @@ def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, 
     assert theme_soup.select_one(".terminal-shell") is not None
     assert theme_soup.select_one("#tab-system") is not None
     assert direct["summary"]["ready_count"] == 1
+    assert direct["ranked_themes"][0]["members"][0]["symbol"] == "000002"
+    assert direct["ranked_themes"][0]["members"][0]["condition_label"] == "LEADER"
+    assert direct["ranked_themes"][0]["members"][1]["symbol"] == "000001"
     assert direct["operator_view"]["main_action"]["message_ko"]
     assert direct["operator_view"]["buy_candidates"][0]["status_label_ko"] == "매수 가능"
     assert snapshot["theme_lab"]["summary"]["ready_count"] == 1

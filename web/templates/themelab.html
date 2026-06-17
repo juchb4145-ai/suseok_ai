@@ -675,6 +675,27 @@
           <div id="theme-rank-list" class="rank-list"></div>
         </aside>
 
+        <section id="theme-detail-panel" class="panel theme-detail-panel">
+          <div class="panel-head">
+            <div>
+              <h2>테마 구성 종목</h2>
+              <p id="theme-detail-title">테마 선택 대기</p>
+              <p id="theme-detail-subtitle">테마 순위 데이터가 들어오면 구성 종목을 표시합니다.</p>
+            </div>
+            <div class="gate-status-strip">
+              <span id="theme-detail-status" class="badge observe">NO_DATA</span>
+              <span id="theme-detail-member-count" class="counter">0종목</span>
+            </div>
+          </div>
+          <div id="theme-summary-grid" class="theme-summary-grid"></div>
+          <div class="table-wrap theme-member-table-wrap">
+            <table class="theme-member-table">
+              <thead><tr><th>종목</th><th>신호</th><th>역할</th><th>WatchSet</th><th>등락률</th><th>거래대금</th><th>현재가</th><th>가격 위치</th><th>데이터</th></tr></thead>
+              <tbody id="theme-member-body"></tbody>
+            </table>
+          </div>
+        </section>
+
         <section id="candidate-focus-panel" class="panel chart-panel candidate-focus-panel">
           <div class="panel-head chart-head">
             <div>

@@ -2988,11 +2988,74 @@ def _theme_row(
         "top_leader_return_pct": leader["return_pct"],
         "top_leader_source": leader["source"],
         "data_quality_flags": list(item.get("data_quality_flags") or []),
+        "members": _theme_member_rows(member_hits),
     }
     row["has_live_price_signal"] = _theme_has_live_price_signal(row)
     row.update(_theme_quality_profile(row))
     row.update((backfill_status_by_theme or {}).get(str(row["theme_id"]), {}))
     return row
+
+
+def _theme_member_rows(member_hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for hit in member_hits:
+        symbol = str(hit.get("symbol") or hit.get("stock_code") or hit.get("code") or "")
+        if not symbol:
+            continue
+        alive = bool(hit.get("alive_hit"))
+        strong = bool(hit.get("strong_hit"))
+        leader = bool(hit.get("leader_hit"))
+        condition_level = 3 if leader else 2 if strong else 1 if alive else 0
+        rows.append(
+            {
+                "symbol": symbol,
+                "name": hit.get("name") or hit.get("stock_name") or symbol,
+                "current_price": _theme_member_number(hit.get("current_price")),
+                "return_pct": _theme_member_number(hit.get("return_pct")),
+                "turnover_krw": _theme_member_number(hit.get("turnover_krw")),
+                "alive_hit": alive,
+                "strong_hit": strong,
+                "leader_hit": leader,
+                "condition_level": condition_level,
+                "condition_label": _theme_member_condition_label(condition_level, bool(hit.get("excluded"))),
+                "excluded": bool(hit.get("excluded")),
+                "excluded_reason": str(hit.get("excluded_reason") or ""),
+                "data_quality_flags": list(hit.get("data_quality_flags") or []),
+            }
+        )
+    return sorted(rows, key=_theme_member_sort_key)
+
+
+def _theme_member_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None
+
+
+def _theme_member_condition_label(condition_level: int, excluded: bool) -> str:
+    if excluded:
+        return "EXCLUDED"
+    if condition_level >= 3:
+        return "LEADER"
+    if condition_level >= 2:
+        return "STRONG"
+    if condition_level >= 1:
+        return "ALIVE"
+    return "WATCH"
+
+
+def _theme_member_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return_pct = row.get("return_pct")
+    return_number = float(return_pct) if return_pct is not None else -9999.0
+    return (
+        1 if row.get("excluded") else 0,
+        -int(row.get("condition_level") or 0),
+        -return_number,
+        -float(row.get("turnover_krw") or 0),
+        str(row.get("symbol") or ""),
+    )
 
 
 def _ranked_theme_rows(

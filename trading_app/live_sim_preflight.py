@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from storage.db import TradingDatabase
@@ -31,6 +31,7 @@ class LiveSimPreflightConfig:
     gateway_queue_block_threshold: int = 100
     reconnect_warn_threshold: int = 3
     recent_error_warn_threshold: int = 1
+    rate_limit_recent_window_sec: float = 60.0
     parser_miss_warn_ratio: float = 0.20
     parser_miss_block_ratio: float = 0.50
 
@@ -236,7 +237,8 @@ class LiveSimPreflightService:
             "heartbeat_ok": bool(gateway_snapshot.get("heartbeat_ok")),
             "reconnect_count": int(gateway_snapshot.get("reconnect_count") or 0),
             "recent_gateway_errors": _recent_gateway_errors(self.gateway_state),
-            "recent_rate_limit_count": int(command_summary.get("rate_limited_count") or 0),
+            "recent_rate_limit_count": _recent_rate_limit_count(self.gateway_state, self.config.rate_limit_recent_window_sec),
+            "total_rate_limited_count": int(command_summary.get("rate_limited_count") or 0),
             "recent_tr_failure_count": tr_failures,
             "command_latency_p95_ms": summary.get("command_latency_p95_ms"),
             "command_latency_p99_ms": summary.get("command_latency_p99_ms"),
@@ -361,6 +363,19 @@ def _recent_gateway_errors(gateway_state: GatewayStateStore) -> list[str]:
     return errors[-10:]
 
 
+def _recent_rate_limit_count(gateway_state: GatewayStateStore, window_sec: float) -> int:
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=max(0.0, float(window_sec or 0.0)))
+    count = 0
+    for event in gateway_state.recent_events(limit=200):
+        if event.type != "rate_limited":
+            continue
+        event_time = _parse_event_time(event.timestamp)
+        if event_time is None or event_time >= cutoff:
+            count += 1
+    return count
+
+
 def _recent_tr_failure_count(records: list[dict[str, Any]]) -> int:
     count = 0
     for record in records[:200]:
@@ -377,6 +392,19 @@ def _recent_tr_failure_count(records: list[dict[str, Any]]) -> int:
         if any(token in text for token in _RECENT_TR_FAILURE_ERRORS) or str(record.get("status") or "") in {"FAILED", "REJECTED"}:
             count += 1
     return count
+
+
+def _parse_event_time(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _normalize_broker_mode(value: Any) -> str:
