@@ -1543,3 +1543,75 @@ live_order_allowed=false
 - stale/invalid price로 sell intent 생성 금지
 - open position 없는 sell intent 생성 금지
 - DRY_RUN sell intent를 실제 주문 queue로 넣는 행위 금지
+
+## PR 7 LIVE_SIM OrderManager Checkpoint
+
+PR 7은 Reboot V2 EntryEngine/ExitEngine 결과를 제한적 `LIVE_SIM` 주문 command로 변환하는 첫 단계다. REAL broker/account 주문은 계속 금지하며, 기본 설정은 전부 disabled/observe-only다.
+
+추가 모듈:
+
+- `trading/strategy/order_models.py`: OrderManager config, side/source/status, managed order model, risk decision, cancel/reconcile snapshot
+- `trading/strategy/order_risk.py`: broker guard, 계좌 whitelist, mode flag, daily/code/theme/position/price/spread risk check
+- `trading/strategy/kill_switch.py`: daily loss, PositionRisk recommendation, consecutive loss 기반 kill switch state
+- `trading/strategy/order_manager.py`: EntryEngine BUY intent, ExitEngine SELL intent, local persistence, Gateway command enqueue
+- `trading/strategy/unfilled_cancel.py`: ACK/PARTIAL 미체결 자동 cancel command
+- `trading/strategy/order_reconcile.py`: command ack와 Chejan execution_event reconcile
+
+추가 SQLite 테이블:
+
+```text
+managed_order_intents
+managed_orders
+managed_order_events
+order_risk_decisions
+order_kill_switch_state
+```
+
+고정된 안전 순서:
+
+```text
+EntryEngine/ExitEngine decision
+-> ManagedOrderIntent 저장
+-> OrderRiskDecision 저장
+-> risk PASS일 때만 ManagedOrder 저장
+-> GatewayCommand(send_order/cancel_order) 생성
+-> command queue enqueue
+-> command_ack는 ACK/REJECT만 반영
+-> Chejan execution_event만 fill/position source of truth
+```
+
+LIVE_SIM BUY 조건:
+
+- `entry_status=OBSERVE_READY`
+- `dry_run_intent_allowed=true` 또는 live-sim intent 허용
+- `TRADING_ORDER_MANAGER_MODE=LIVE_SIM`
+- `TRADING_ALLOW_LIVE_SIM_ORDERS=true`
+- `TRADING_ORDER_MANAGER_OBSERVE_ONLY=false`
+- simulation broker guard 통과
+- `market_action in {ALLOW_NORMAL, ALLOW_REDUCED}`
+- `stock_role in {LEADER, CO_LEADER}`
+- `price_location in {GOOD_PULLBACK, PULLBACK_RECLAIM, VWAP_RECLAIM}`
+- `OVERHEATED` 아님
+- PositionRisk stop-new-entry/kill-switch 미권고
+- daily/code/theme/position/order amount/quantity limit 통과
+
+LIVE_SIM SELL 조건:
+
+- `exit_status in {SCALE_OUT, EXIT_NOW}`
+- remaining quantity > 0
+- stale/invalid price 아님
+- duplicate sell intent 없음
+- broker simulation guard 통과
+- kill switch는 SELL/CANCEL을 위험 축소 경로로 허용
+
+명시적 금지:
+
+- REAL broker/account 주문 활성화
+- `TRADING_ALLOW_REAL_LIVE_ORDERS` 같은 real 주문 플래그 추가
+- hybrid gate, final grade, shadow/promotion, threshold A/B 결과를 OrderManager 입력으로 사용
+- command_ack만으로 fill/position 처리
+- PostgreSQL 의존성 추가
+
+운영 runbook:
+
+- `docs/live_sim_order_manager_runbook.md`

@@ -58,6 +58,8 @@ from trading.strategy.exit_engine_reboot import exit_engine_dashboard_section
 from trading.strategy.hybrid_validation import HybridValidationRepository
 from trading.strategy.market_regime import market_regime_dashboard_section
 from trading.strategy.models import BlockType, CandidateState
+from trading.strategy.order_manager import order_manager_dashboard_section
+from trading.strategy.order_reconcile import ManagedOrderReconciler
 from trading.strategy.position_risk import position_risk_dashboard_section
 from trading.strategy.reason_taxonomy import normalize_reason_status, reason_status_family, reason_summary
 from trading.strategy.runtime_settings import StrategyRuntimeSettingsRepository
@@ -8687,6 +8689,29 @@ def _dashboard_slim_runtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "live_order_allowed",
             ),
         )
+    if "order_manager" in runtime:
+        runtime["order_manager"] = _dashboard_field_subset(
+            dict(runtime.get("order_manager") or {}),
+            (
+                "status",
+                "mode",
+                "enabled",
+                "live_sim_orders_allowed",
+                "broker_env",
+                "account_whitelisted",
+                "risk_state",
+                "kill_switch_state",
+                "today_buy_order_count",
+                "today_sell_order_count",
+                "open_order_count",
+                "pending_cancel_count",
+                "rejected_order_count",
+                "last_order_at",
+                "last_reject_reason",
+                "top_wait_or_block_reasons",
+                "warnings",
+            ),
+        )
     return runtime
 
 
@@ -8756,6 +8781,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     entry_engine_payload = entry_engine_dashboard_section(db, trade_date=today)
     exit_engine_payload = exit_engine_dashboard_section(db, trade_date=today)
     position_risk_payload = position_risk_dashboard_section(db, trade_date=today)
+    order_manager_payload = order_manager_dashboard_section(db, gateway_state=gateway_state, trade_date=today)
     decision_summary_payload = _cached_dashboard_fragment(
         db,
         f"intraday_decisions:v2:{today}",
@@ -9022,6 +9048,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
     runtime_payload["entry_engine"] = entry_engine_payload
     runtime_payload["exit_engine"] = exit_engine_payload
     runtime_payload["position_risk"] = position_risk_payload
+    runtime_payload["order_manager"] = order_manager_payload
     gateway_payload = dict(status_payload["gateway"]) if full_detail else _dashboard_slim_gateway_payload(status_payload["gateway"])
     ops_alerts_payload = build_ops_alerts(
         core=status_payload["core"],
@@ -9068,6 +9095,7 @@ def build_dashboard_snapshot(db: TradingDatabase, *, detail: str = DASHBOARD_SNA
         "entry_engine": entry_engine_payload,
         "exit_engine": exit_engine_payload,
         "position_risk": position_risk_payload,
+        "order_manager": order_manager_payload,
         "candidates": candidates_payload,
         "themes": themes_payload,
         "orders": orders_payload,
@@ -9635,7 +9663,9 @@ def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
             collector.handle_condition_include(condition_event)
         _ingest_condition_event_v2(db, condition_event)
     elif event.type == "execution_event":
-        db.save_execution(BrokerExecutionEvent.from_dict(event.payload))
+        execution = BrokerExecutionEvent.from_dict(event.payload)
+        db.save_execution(execution)
+        ManagedOrderReconciler(db).handle_execution(execution)
     elif event.type == "order_result":
         db.save_order_result(BrokerOrderResult.from_dict(event.payload))
     elif event.type == "command_started":
@@ -9668,6 +9698,7 @@ def _persist_gateway_event(db: TradingDatabase, event: GatewayEvent) -> None:
             retryable = False
         if command_id:
             gateway_state.fail_command(command_id, str(event.payload.get("error") or ""), retryable=retryable)
+            ManagedOrderReconciler(db).handle_command_ack({**dict(event.payload or {}), "command_id": command_id, "status": CommandStatus.FAILED.value})
     elif event.type == "rate_limited":
         trace = trace_from_payload(event.payload)
         wait_time = event.payload.get("wait_time_sec", trace.get("wait_time_sec", ""))
@@ -9772,6 +9803,7 @@ def _handle_command_ack(db: TradingDatabase, event: GatewayEvent) -> None:
     order_result = payload.get("order_result")
     if command_type == "send_order" and isinstance(order_result, dict):
         db.save_order_result(BrokerOrderResult.from_dict(order_result))
+    ManagedOrderReconciler(db).handle_command_ack(payload)
 
 
 def _append_live_sim_command_audit_event(

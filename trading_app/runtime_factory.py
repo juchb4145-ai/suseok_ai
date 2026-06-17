@@ -24,6 +24,7 @@ from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import MarketIndexStore
 from trading.strategy.market_regime import MarketRegimeConfig, MarketRegimeRuntimePipeline
 from trading.strategy.models import OrderMode
+from trading.strategy.order_manager import OrderManagerConfig, OrderManagerRuntimePipeline
 from trading.strategy.pipeline import GatePipeline
 from trading.strategy.position_risk import PositionRiskConfig, PositionRiskRuntimePipeline
 from trading.strategy.readiness import build_readiness_report, dedupe_warnings
@@ -67,6 +68,7 @@ class CoreRuntimeBundle:
     entry_engine_pipeline: Any = None
     exit_engine_reboot_pipeline: Any = None
     position_risk_pipeline: Any = None
+    order_manager_pipeline: Any = None
 
 
 def build_core_strategy_runtime(
@@ -162,6 +164,12 @@ def build_core_strategy_runtime(
         candle_builder=candle_builder,
         config=PositionRiskConfig.from_env(),
     )
+    order_manager_pipeline = OrderManagerRuntimePipeline(
+        db=db,
+        gateway_state=gateway_state,
+        market_data=market_data,
+        config=OrderManagerConfig.from_env(),
+    )
     theme_lab_pipeline = None
     if config.theme_engine_mode == "themelab_flow":
         theme_backfill_service = ThemeBackfillService(
@@ -212,6 +220,7 @@ def build_core_strategy_runtime(
         entry_engine_pipeline=entry_engine_pipeline,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
         position_risk_pipeline=position_risk_pipeline,
+        order_manager_pipeline=order_manager_pipeline,
         theme_lab_shadow_ab_provider=theme_lab_shadow_ab_provider,
         shadow_small_entry_promotion_provider=shadow_small_entry_promotion_provider,
     )
@@ -222,6 +231,7 @@ def build_core_strategy_runtime(
     runtime.entry_engine_pipeline = entry_engine_pipeline
     runtime.exit_engine_reboot_pipeline = exit_engine_reboot_pipeline
     runtime.position_risk_pipeline = position_risk_pipeline
+    runtime.order_manager_pipeline = order_manager_pipeline
     readiness_report = build_readiness_report(
         db,
         subscription_manager=runtime.subscription_manager,
@@ -251,6 +261,7 @@ def build_core_strategy_runtime(
         entry_engine_pipeline=entry_engine_pipeline,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
         position_risk_pipeline=position_risk_pipeline,
+        order_manager_pipeline=order_manager_pipeline,
     )
 
 

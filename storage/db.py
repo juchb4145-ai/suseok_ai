@@ -906,6 +906,121 @@ class TradingDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_portfolio_risk_trade_level
                 ON portfolio_risk_snapshots(trade_date, risk_level, id);
+            CREATE TABLE IF NOT EXISTS managed_order_intents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                account_id_masked TEXT NOT NULL DEFAULT '',
+                quantity INTEGER NOT NULL DEFAULT 0,
+                price INTEGER NOT NULL DEFAULT 0,
+                hoga TEXT NOT NULL DEFAULT '00',
+                idempotency_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'CREATED',
+                candidate_id INTEGER,
+                position_id TEXT NOT NULL DEFAULT '',
+                decision_id INTEGER,
+                theme_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(idempotency_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_managed_order_intents_trade_status
+                ON managed_order_intents(trade_date, status, id);
+            CREATE INDEX IF NOT EXISTS idx_managed_order_intents_code
+                ON managed_order_intents(code, id);
+            CREATE TABLE IF NOT EXISTS managed_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                intent_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                account_id_masked TEXT NOT NULL DEFAULT '',
+                quantity INTEGER NOT NULL DEFAULT 0,
+                price INTEGER NOT NULL DEFAULT 0,
+                hoga TEXT NOT NULL DEFAULT '00',
+                status TEXT NOT NULL DEFAULT 'PENDING_LOCAL',
+                candidate_id INTEGER,
+                position_id TEXT NOT NULL DEFAULT '',
+                command_id TEXT NOT NULL DEFAULT '',
+                order_no TEXT NOT NULL DEFAULT '',
+                original_order_no TEXT NOT NULL DEFAULT '',
+                filled_quantity INTEGER NOT NULL DEFAULT 0,
+                remaining_quantity INTEGER NOT NULL DEFAULT 0,
+                avg_fill_price REAL NOT NULL DEFAULT 0,
+                sent_at TEXT NOT NULL DEFAULT '',
+                acked_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
+                cancel_after_sec INTEGER NOT NULL DEFAULT 45,
+                idempotency_key TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(idempotency_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_managed_orders_trade_status
+                ON managed_orders(trade_date, status, id);
+            CREATE INDEX IF NOT EXISTS idx_managed_orders_code_status
+                ON managed_orders(code, status, id);
+            CREATE INDEX IF NOT EXISTS idx_managed_orders_command
+                ON managed_orders(command_id);
+            CREATE INDEX IF NOT EXISTS idx_managed_orders_order_no
+                ON managed_orders(order_no);
+            CREATE TABLE IF NOT EXISTS managed_order_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER,
+                intent_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                event_type TEXT NOT NULL DEFAULT '',
+                status_from TEXT NOT NULL DEFAULT '',
+                status_to TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_managed_order_events_order
+                ON managed_order_events(order_id, id);
+            CREATE INDEX IF NOT EXISTS idx_managed_order_events_intent
+                ON managed_order_events(intent_id, id);
+            CREATE TABLE IF NOT EXISTS order_risk_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                intent_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                side TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                decision TEXT NOT NULL DEFAULT '',
+                idempotency_key TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                operator_message_ko TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_order_risk_decisions_trade
+                ON order_risk_decisions(trade_date, decision, id);
+            CREATE INDEX IF NOT EXISTS idx_order_risk_decisions_intent
+                ON order_risk_decisions(intent_id, id);
+            CREATE TABLE IF NOT EXISTS order_kill_switch_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'NORMAL',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                manual_active INTEGER NOT NULL DEFAULT 0,
+                consecutive_loss_count INTEGER NOT NULL DEFAULT 0,
+                daily_realized_pnl_pct REAL NOT NULL DEFAULT 0,
+                daily_realized_pnl_krw REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_order_kill_switch_trade
+                ON order_kill_switch_state(trade_date, id);
             CREATE TABLE IF NOT EXISTS indicator_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 candidate_id INTEGER,
@@ -7636,6 +7751,436 @@ class TradingDatabase:
         ).fetchone()
         return _row_to_portfolio_risk_snapshot(row) if row else {}
 
+    def save_managed_order_intent(self, intent: dict) -> dict:
+        payload = dict(intent or {})
+        intent_id = payload.get("id") or payload.get("intent_id")
+        params = _managed_order_intent_params(payload)
+        with self.conn:
+            if intent_id:
+                self.conn.execute(
+                    """
+                    UPDATE managed_order_intents SET
+                        source=:source, side=:side, code=:code, name=:name,
+                        account_id_masked=:account_id_masked, quantity=:quantity,
+                        price=:price, hoga=:hoga, status=:status,
+                        candidate_id=:candidate_id, position_id=:position_id,
+                        decision_id=:decision_id, theme_id=:theme_id,
+                        theme_name=:theme_name, reason=:reason,
+                        details_json=:details_json, payload_json=:payload_json
+                    WHERE id=:id
+                    """,
+                    {**params, "id": int(intent_id)},
+                )
+            else:
+                self.conn.execute(
+                    """
+                    INSERT INTO managed_order_intents(
+                        created_at, trade_date, source, side, code, name,
+                        account_id_masked, quantity, price, hoga,
+                        idempotency_key, status, candidate_id, position_id,
+                        decision_id, theme_id, theme_name, reason,
+                        details_json, payload_json
+                    ) VALUES (
+                        :created_at, :trade_date, :source, :side, :code, :name,
+                        :account_id_masked, :quantity, :price, :hoga,
+                        :idempotency_key, :status, :candidate_id, :position_id,
+                        :decision_id, :theme_id, :theme_name, :reason,
+                        :details_json, :payload_json
+                    )
+                    ON CONFLICT(idempotency_key) DO UPDATE SET
+                        status=excluded.status,
+                        details_json=excluded.details_json,
+                        payload_json=excluded.payload_json
+                    """,
+                    params,
+                )
+        row = None
+        if intent_id:
+            row = self.conn.execute("SELECT * FROM managed_order_intents WHERE id = ?", (int(intent_id),)).fetchone()
+        if row is None:
+            row = self.conn.execute(
+                "SELECT * FROM managed_order_intents WHERE idempotency_key = ?",
+                (params["idempotency_key"],),
+            ).fetchone()
+        return _row_to_managed_order_intent(row) if row else payload
+
+    def get_managed_order_intent(self, intent_id: int) -> Optional[dict]:
+        row = self.conn.execute("SELECT * FROM managed_order_intents WHERE id = ?", (int(intent_id),)).fetchone()
+        return _row_to_managed_order_intent(row) if row else None
+
+    def find_managed_order_intent_by_idempotency(self, idempotency_key: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM managed_order_intents WHERE idempotency_key = ?",
+            (str(idempotency_key or ""),),
+        ).fetchone()
+        return _row_to_managed_order_intent(row) if row else None
+
+    def list_managed_order_intents(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        status: Optional[str] = None,
+        code: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if status:
+            clauses.append("status = ?")
+            params.append(str(status))
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM managed_order_intents {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            (*params, int(limit), int(offset)),
+        ).fetchall()
+        return [_row_to_managed_order_intent(row) for row in rows]
+
+    def save_managed_order(self, order: dict) -> dict:
+        payload = dict(order or {})
+        order_id = payload.get("id") or payload.get("order_id")
+        params = _managed_order_params(payload)
+        with self.conn:
+            if order_id:
+                self.conn.execute(
+                    """
+                    UPDATE managed_orders SET
+                        intent_id=:intent_id, trade_date=:trade_date, source=:source,
+                        side=:side, code=:code, account_id_masked=:account_id_masked,
+                        quantity=:quantity, price=:price, hoga=:hoga, status=:status,
+                        candidate_id=:candidate_id, position_id=:position_id,
+                        command_id=:command_id, order_no=:order_no,
+                        original_order_no=:original_order_no,
+                        filled_quantity=:filled_quantity,
+                        remaining_quantity=:remaining_quantity,
+                        avg_fill_price=:avg_fill_price, sent_at=:sent_at,
+                        acked_at=:acked_at, updated_at=:updated_at,
+                        cancel_after_sec=:cancel_after_sec,
+                        details_json=:details_json, payload_json=:payload_json
+                    WHERE id=:id
+                    """,
+                    {**params, "id": int(order_id)},
+                )
+            else:
+                self.conn.execute(
+                    """
+                    INSERT INTO managed_orders(
+                        intent_id, created_at, trade_date, source, side, code,
+                        account_id_masked, quantity, price, hoga, status,
+                        candidate_id, position_id, command_id, order_no,
+                        original_order_no, filled_quantity, remaining_quantity,
+                        avg_fill_price, sent_at, acked_at, updated_at,
+                        cancel_after_sec, idempotency_key, details_json, payload_json
+                    ) VALUES (
+                        :intent_id, :created_at, :trade_date, :source, :side, :code,
+                        :account_id_masked, :quantity, :price, :hoga, :status,
+                        :candidate_id, :position_id, :command_id, :order_no,
+                        :original_order_no, :filled_quantity, :remaining_quantity,
+                        :avg_fill_price, :sent_at, :acked_at, :updated_at,
+                        :cancel_after_sec, :idempotency_key, :details_json, :payload_json
+                    )
+                    ON CONFLICT(idempotency_key) DO UPDATE SET
+                        status=excluded.status,
+                        command_id=excluded.command_id,
+                        order_no=excluded.order_no,
+                        filled_quantity=excluded.filled_quantity,
+                        remaining_quantity=excluded.remaining_quantity,
+                        avg_fill_price=excluded.avg_fill_price,
+                        sent_at=excluded.sent_at,
+                        acked_at=excluded.acked_at,
+                        updated_at=excluded.updated_at,
+                        details_json=excluded.details_json,
+                        payload_json=excluded.payload_json
+                    """,
+                    params,
+                )
+        row = None
+        if order_id:
+            row = self.conn.execute("SELECT * FROM managed_orders WHERE id = ?", (int(order_id),)).fetchone()
+        if row is None:
+            row = self.conn.execute(
+                "SELECT * FROM managed_orders WHERE idempotency_key = ?",
+                (params["idempotency_key"],),
+            ).fetchone()
+        return _row_to_managed_order(row) if row else payload
+
+    def get_managed_order(self, order_id: int) -> Optional[dict]:
+        row = self.conn.execute("SELECT * FROM managed_orders WHERE id = ?", (int(order_id),)).fetchone()
+        return _row_to_managed_order(row) if row else None
+
+    def find_managed_order_by_command_id(self, command_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM managed_orders WHERE command_id = ? ORDER BY id DESC LIMIT 1",
+            (str(command_id or ""),),
+        ).fetchone()
+        return _row_to_managed_order(row) if row else None
+
+    def find_managed_order_by_order_no(self, order_no: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM managed_orders WHERE order_no = ? ORDER BY id DESC LIMIT 1",
+            (str(order_no or ""),),
+        ).fetchone()
+        return _row_to_managed_order(row) if row else None
+
+    def find_managed_order_by_intent_id(self, intent_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM managed_orders WHERE intent_id = ? ORDER BY id DESC LIMIT 1",
+            (int(intent_id),),
+        ).fetchone()
+        return _row_to_managed_order(row) if row else None
+
+    def find_active_managed_order_by_code(self, code: str) -> Optional[dict]:
+        active = ("PENDING_LOCAL", "QUEUED_TO_GATEWAY", "ACKED_BY_GATEWAY", "PARTIALLY_FILLED", "CANCEL_PENDING")
+        placeholders = ",".join("?" for _ in active)
+        row = self.conn.execute(
+            f"SELECT * FROM managed_orders WHERE code = ? AND status IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+            (_clean_stock_code(code) or str(code), *active),
+        ).fetchone()
+        return _row_to_managed_order(row) if row else None
+
+    def find_managed_order_for_execution(
+        self,
+        *,
+        code: str,
+        side: str = "",
+        tag: str = "",
+        idempotency_key: str = "",
+    ) -> Optional[dict]:
+        if idempotency_key:
+            row = self.conn.execute(
+                "SELECT * FROM managed_orders WHERE idempotency_key = ? ORDER BY id DESC LIMIT 1",
+                (str(idempotency_key),),
+            ).fetchone()
+            if row:
+                return _row_to_managed_order(row)
+        clauses = ["code = ?"]
+        params: list[object] = [_clean_stock_code(code) or str(code)]
+        if side:
+            clauses.append("side = ?")
+            params.append(str(side).upper())
+        clauses.append("status IN ('ACKED_BY_GATEWAY', 'PARTIALLY_FILLED', 'QUEUED_TO_GATEWAY')")
+        row = self.conn.execute(
+            f"SELECT * FROM managed_orders WHERE {' AND '.join(clauses)} ORDER BY id DESC LIMIT 1",
+            params,
+        ).fetchone()
+        return _row_to_managed_order(row) if row else None
+
+    def list_managed_orders(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        status: Optional[Union[str, list[str], tuple[str, ...]]] = None,
+        code: Optional[str] = None,
+        side: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if status:
+            statuses = [str(status)] if isinstance(status, str) else [str(item) for item in status]
+            placeholders = ",".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        if side:
+            clauses.append("side = ?")
+            params.append(str(side).upper())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM managed_orders {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            (*params, int(limit), int(offset)),
+        ).fetchall()
+        return [_row_to_managed_order(row) for row in rows]
+
+    def append_managed_order_event(self, event: dict) -> dict:
+        payload = dict(event or {})
+        params = {
+            "order_id": payload.get("order_id"),
+            "intent_id": payload.get("intent_id"),
+            "created_at": str(payload.get("created_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+            "event_type": str(payload.get("event_type") or ""),
+            "status_from": str(payload.get("status_from") or ""),
+            "status_to": str(payload.get("status_to") or ""),
+            "message": str(payload.get("message") or ""),
+            "payload_json": _json_payload(payload.get("payload") or payload),
+        }
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO managed_order_events(
+                    order_id, intent_id, created_at, event_type,
+                    status_from, status_to, message, payload_json
+                ) VALUES (
+                    :order_id, :intent_id, :created_at, :event_type,
+                    :status_from, :status_to, :message, :payload_json
+                )
+                """,
+                params,
+            )
+        row = self.conn.execute("SELECT * FROM managed_order_events WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return _row_to_managed_order_event(row) if row else payload
+
+    def list_managed_order_events(
+        self,
+        *,
+        order_id: Optional[int] = None,
+        intent_id: Optional[int] = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if order_id is not None:
+            clauses.append("order_id = ?")
+            params.append(int(order_id))
+        if intent_id is not None:
+            clauses.append("intent_id = ?")
+            params.append(int(intent_id))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM managed_order_events {where} ORDER BY id DESC LIMIT ?",
+            (*params, int(limit)),
+        ).fetchall()
+        return [_row_to_managed_order_event(row) for row in rows]
+
+    def save_order_risk_decision(self, decision: dict) -> dict:
+        payload = dict(decision or {})
+        params = {
+            "intent_id": payload.get("intent_id"),
+            "created_at": str(payload.get("created_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+            "trade_date": str(payload.get("trade_date") or ""),
+            "side": str(payload.get("side") or ""),
+            "code": _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+            "decision": str(payload.get("decision") or ""),
+            "idempotency_key": str(payload.get("idempotency_key") or ""),
+            "reason_codes_json": _json_list(payload.get("reason_codes") or []),
+            "operator_message_ko": str(payload.get("operator_message_ko") or ""),
+            "details_json": _json_payload(payload.get("details") or {}),
+            "payload_json": _json_payload(payload),
+        }
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO order_risk_decisions(
+                    intent_id, created_at, trade_date, side, code,
+                    decision, idempotency_key, reason_codes_json,
+                    operator_message_ko, details_json, payload_json
+                ) VALUES (
+                    :intent_id, :created_at, :trade_date, :side, :code,
+                    :decision, :idempotency_key, :reason_codes_json,
+                    :operator_message_ko, :details_json, :payload_json
+                )
+                """,
+                params,
+            )
+        row = self.conn.execute("SELECT * FROM order_risk_decisions WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return _row_to_order_risk_decision(row) if row else payload
+
+    def latest_order_risk_decisions(self, *, trade_date: Optional[str] = None, limit: int = 100) -> list[dict]:
+        params: list[object] = []
+        where = ""
+        if trade_date:
+            where = "WHERE trade_date = ?"
+            params.append(str(trade_date))
+        rows = self.conn.execute(
+            f"SELECT * FROM order_risk_decisions {where} ORDER BY id DESC LIMIT ?",
+            (*params, int(limit)),
+        ).fetchall()
+        return [_row_to_order_risk_decision(row) for row in rows]
+
+    def save_order_kill_switch_state(self, state: dict) -> dict:
+        payload = dict(state or {})
+        params = {
+            "created_at": str(payload.get("created_at") or payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+            "trade_date": str(payload.get("trade_date") or ""),
+            "state": str(payload.get("state") or "NORMAL"),
+            "reason_codes_json": _json_list(payload.get("reason_codes") or []),
+            "manual_active": int(bool(payload.get("manual_active"))),
+            "consecutive_loss_count": _safe_int(payload.get("consecutive_loss_count"), 0),
+            "daily_realized_pnl_pct": _float_value(payload.get("daily_realized_pnl_pct")),
+            "daily_realized_pnl_krw": _float_value(payload.get("daily_realized_pnl_krw")),
+            "updated_at": str(payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+            "details_json": _json_payload(payload.get("details") or {}),
+            "payload_json": _json_payload(payload),
+        }
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO order_kill_switch_state(
+                    created_at, trade_date, state, reason_codes_json,
+                    manual_active, consecutive_loss_count,
+                    daily_realized_pnl_pct, daily_realized_pnl_krw,
+                    updated_at, details_json, payload_json
+                ) VALUES (
+                    :created_at, :trade_date, :state, :reason_codes_json,
+                    :manual_active, :consecutive_loss_count,
+                    :daily_realized_pnl_pct, :daily_realized_pnl_krw,
+                    :updated_at, :details_json, :payload_json
+                )
+                """,
+                params,
+            )
+        row = self.conn.execute("SELECT * FROM order_kill_switch_state WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return _row_to_order_kill_switch_state(row) if row else payload
+
+    def latest_order_kill_switch_state(self, *, trade_date: Optional[str] = None) -> dict:
+        params: list[object] = []
+        where = ""
+        if trade_date:
+            where = "WHERE trade_date = ?"
+            params.append(str(trade_date))
+        row = self.conn.execute(
+            f"SELECT * FROM order_kill_switch_state {where} ORDER BY id DESC LIMIT 1",
+            params,
+        ).fetchone()
+        return _row_to_order_kill_switch_state(row) if row else {}
+
+    def managed_order_summary(self, *, trade_date: Optional[str] = None) -> dict:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(f"SELECT * FROM managed_orders {where}", params).fetchall()
+        orders = [_row_to_managed_order(row) for row in rows]
+        status_counts = Counter(str(order.get("status") or "") for order in orders)
+        side_counts = Counter(str(order.get("side") or "").upper() for order in orders)
+        rejected = [
+            order
+            for order in orders
+            if str(order.get("status") or "") in {"REJECTED_BY_GATEWAY", "RECONCILE_REQUIRED"}
+        ]
+        last_reject_reason = ""
+        if rejected:
+            details = dict(rejected[0].get("details") or {})
+            risk = dict(details.get("risk") or {})
+            reason_codes = list(risk.get("reason_codes") or [])
+            last_reject_reason = str(reason_codes[0]) if reason_codes else str(details.get("last_error") or "")
+        return {
+            "trade_date": trade_date or "",
+            "today_buy_order_count": int(side_counts.get("BUY", 0)),
+            "today_sell_order_count": int(side_counts.get("SELL", 0)),
+            "open_order_count": sum(status_counts.get(status, 0) for status in ("QUEUED_TO_GATEWAY", "ACKED_BY_GATEWAY", "PARTIALLY_FILLED")),
+            "pending_cancel_count": int(status_counts.get("CANCEL_PENDING", 0)),
+            "rejected_order_count": len(rejected),
+            "last_order_at": max((str(order.get("created_at") or "") for order in orders), default=""),
+            "last_reject_reason": last_reject_reason,
+            "risk_state": "BLOCKING" if rejected else "READY",
+            "status_counts": dict(status_counts),
+        }
+
     def _latest_reboot_batch(
         self,
         table_name: str,
@@ -13371,6 +13916,177 @@ def _row_to_portfolio_risk_snapshot(row: sqlite3.Row) -> dict:
     payload.setdefault("stop_new_entry_recommended", bool(data.get("stop_new_entry_recommended")))
     payload.setdefault("kill_switch_recommended", bool(data.get("kill_switch_recommended")))
     payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    payload.setdefault("details", _safe_json_loads(data.pop("details_json", "{}"), {}))
+    return payload
+
+
+def _managed_order_intent_params(payload: dict) -> dict:
+    details = payload.get("details") if "details" in payload else payload.get("details_json", {})
+    return {
+        "created_at": str(payload.get("created_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+        "trade_date": str(payload.get("trade_date") or ""),
+        "source": str(payload.get("source") or ""),
+        "side": str(payload.get("side") or "").upper(),
+        "code": _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+        "name": str(payload.get("name") or ""),
+        "account_id_masked": _mask_account(str(payload.get("account_id_masked") or payload.get("account") or "")),
+        "quantity": _safe_int(payload.get("quantity"), 0),
+        "price": _safe_int(payload.get("price"), 0),
+        "hoga": str(payload.get("hoga") or "00"),
+        "idempotency_key": str(payload.get("idempotency_key") or ""),
+        "status": str(payload.get("status") or "CREATED"),
+        "candidate_id": payload.get("candidate_id"),
+        "position_id": str(payload.get("position_id") or ""),
+        "decision_id": payload.get("decision_id"),
+        "theme_id": str(payload.get("theme_id") or ""),
+        "theme_name": str(payload.get("theme_name") or ""),
+        "reason": str(payload.get("reason") or ""),
+        "details_json": details if isinstance(details, str) else _json_payload(details or {}),
+        "payload_json": _json_payload(payload),
+    }
+
+
+def _row_to_managed_order_intent(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in (
+        "id",
+        "created_at",
+        "trade_date",
+        "source",
+        "side",
+        "code",
+        "name",
+        "hoga",
+        "idempotency_key",
+        "status",
+        "position_id",
+        "theme_id",
+        "theme_name",
+        "reason",
+    ):
+        payload.setdefault(key, data.get(key, ""))
+    payload.setdefault("intent_id", data.get("id"))
+    payload.setdefault("account_id_masked", data.get("account_id_masked", ""))
+    payload.setdefault("account", data.get("account_id_masked", ""))
+    for key in ("quantity", "price"):
+        payload.setdefault(key, int(data.get(key) or 0))
+    payload.setdefault("candidate_id", data.get("candidate_id"))
+    payload.setdefault("decision_id", data.get("decision_id"))
+    payload.setdefault("details", _safe_json_loads(data.pop("details_json", "{}"), {}))
+    return payload
+
+
+def _managed_order_params(payload: dict) -> dict:
+    details = payload.get("details") if "details" in payload else payload.get("details_json", {})
+    return {
+        "intent_id": _safe_int(payload.get("intent_id"), 0),
+        "created_at": str(payload.get("created_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+        "trade_date": str(payload.get("trade_date") or ""),
+        "source": str(payload.get("source") or ""),
+        "side": str(payload.get("side") or "").upper(),
+        "code": _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+        "account_id_masked": _mask_account(str(payload.get("account_id_masked") or payload.get("account") or "")),
+        "quantity": _safe_int(payload.get("quantity"), 0),
+        "price": _safe_int(payload.get("price"), 0),
+        "hoga": str(payload.get("hoga") or "00"),
+        "status": str(payload.get("status") or "PENDING_LOCAL"),
+        "candidate_id": payload.get("candidate_id"),
+        "position_id": str(payload.get("position_id") or ""),
+        "command_id": str(payload.get("command_id") or ""),
+        "order_no": str(payload.get("order_no") or ""),
+        "original_order_no": str(payload.get("original_order_no") or ""),
+        "filled_quantity": _safe_int(payload.get("filled_quantity"), 0),
+        "remaining_quantity": _safe_int(payload.get("remaining_quantity"), _safe_int(payload.get("quantity"), 0)),
+        "avg_fill_price": _float_value(payload.get("avg_fill_price")),
+        "sent_at": str(payload.get("sent_at") or ""),
+        "acked_at": str(payload.get("acked_at") or ""),
+        "updated_at": str(payload.get("updated_at") or ""),
+        "cancel_after_sec": _safe_int(payload.get("cancel_after_sec"), 45),
+        "idempotency_key": str(payload.get("idempotency_key") or ""),
+        "details_json": details if isinstance(details, str) else _json_payload(details or {}),
+        "payload_json": _json_payload(payload),
+    }
+
+
+def _row_to_managed_order(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in (
+        "id",
+        "intent_id",
+        "created_at",
+        "trade_date",
+        "source",
+        "side",
+        "code",
+        "hoga",
+        "status",
+        "position_id",
+        "command_id",
+        "order_no",
+        "original_order_no",
+        "sent_at",
+        "acked_at",
+        "updated_at",
+        "idempotency_key",
+    ):
+        payload.setdefault(key, data.get(key, ""))
+    payload.setdefault("order_id", data.get("id"))
+    payload.setdefault("account_id_masked", data.get("account_id_masked", ""))
+    payload.setdefault("account", data.get("account_id_masked", ""))
+    for key in ("quantity", "price", "filled_quantity", "remaining_quantity", "cancel_after_sec"):
+        payload.setdefault(key, int(data.get(key) or 0))
+    payload.setdefault("avg_fill_price", float(data.get("avg_fill_price") or 0.0))
+    payload.setdefault("candidate_id", data.get("candidate_id"))
+    payload.setdefault("details", _safe_json_loads(data.pop("details_json", "{}"), {}))
+    return payload
+
+
+def _row_to_managed_order_event(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["payload"] = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    return data
+
+
+def _row_to_order_risk_decision(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in (
+        "id",
+        "intent_id",
+        "created_at",
+        "trade_date",
+        "side",
+        "code",
+        "decision",
+        "idempotency_key",
+        "operator_message_ko",
+    ):
+        payload.setdefault(key, data.get(key, ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    payload.setdefault("details", _safe_json_loads(data.pop("details_json", "{}"), {}))
+    return payload
+
+
+def _row_to_order_kill_switch_state(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in ("id", "created_at", "trade_date", "state", "updated_at"):
+        payload.setdefault(key, data.get(key, ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    payload.setdefault("manual_active", bool(data.get("manual_active")))
+    payload.setdefault("consecutive_loss_count", int(data.get("consecutive_loss_count") or 0))
+    payload.setdefault("daily_realized_pnl_pct", float(data.get("daily_realized_pnl_pct") or 0.0))
+    payload.setdefault("daily_realized_pnl_krw", float(data.get("daily_realized_pnl_krw") or 0.0))
     payload.setdefault("details", _safe_json_loads(data.pop("details_json", "{}"), {}))
     return payload
 
