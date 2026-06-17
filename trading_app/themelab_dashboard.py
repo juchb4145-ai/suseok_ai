@@ -2473,10 +2473,13 @@ def _condition_statuses(db: TradingDatabase, gateway_state: Any | None = None) -
         command_status = str(command.get("status") or "")
         command_error = str(command.get("last_error") or "")
         command_payload = dict(command.get("payload") or {})
-        registered = command_status == "ACKED"
+        current_session_confirmed = bool(command.get("current_session_confirmed", True))
+        registered = command_status == "ACKED" and current_session_confirmed
         warning = ""
         if not profile:
             warning = "CONDITION_PROFILE_UNRESOLVED"
+        elif command_status == "ACKED" and not current_session_confirmed:
+            warning = "CONDITION_SEND_STALE_SESSION"
         elif command_status in {"FAILED", "EXPIRED", "EXPIRED_BEFORE_DISPATCH"}:
             warning = _condition_command_warning(command_status, command_error)
         elif command_status and command_status != "ACKED":
@@ -2484,6 +2487,9 @@ def _condition_statuses(db: TradingDatabase, gateway_state: Any | None = None) -
         elif profile.last_resolved_index is not None and not command_status:
             warning = "CONDITION_SEND_NOT_CONFIRMED"
         warning_label = _condition_warning_label(warning)
+        command_status_label = _condition_command_status_label(command_status, registered=registered)
+        if warning == "CONDITION_SEND_STALE_SESSION":
+            command_status_label = "등록 확인 필요"
         rows.append(
             {
                 "condition_name": profile.condition_name if profile else default_name,
@@ -2493,8 +2499,9 @@ def _condition_statuses(db: TradingDatabase, gateway_state: Any | None = None) -
                 "registered": registered,
                 "registered_label": "정상" if registered else "확인 필요",
                 "command_status": command_status or "UNKNOWN",
-                "command_status_label": _condition_command_status_label(command_status, registered=registered),
+                "command_status_label": command_status_label,
                 "screen_no": str(command_payload.get("screen_no") or ""),
+                "current_session_confirmed": current_session_confirmed,
                 "include_count": 0,
                 "remove_count": 0,
                 "last_event_at": "",
@@ -2541,6 +2548,7 @@ def _latest_condition_commands(gateway_state: Any | None) -> dict[str, dict[str,
         name = str(payload.get("condition_name") or "")
         if not name:
             continue
+        result_payload = dict(record.get("result_payload") or {})
         current = latest.get(name)
         candidate = {
             "status": str(record.get("status") or ""),
@@ -2548,8 +2556,9 @@ def _latest_condition_commands(gateway_state: Any | None) -> dict[str, dict[str,
             "created_at": str(record.get("created_at") or ""),
             "updated_at": str(record.get("updated_at") or ""),
             "payload": payload,
-            "result_payload": dict(record.get("result_payload") or {}),
+            "result_payload": result_payload,
         }
+        candidate["current_session_confirmed"] = _record_matches_session(candidate, current_session)
         if current is not None and not _prefer_condition_command_record(candidate, current, current_session):
             continue
         latest[name] = candidate
@@ -2583,7 +2592,7 @@ def _record_matches_session(record: dict[str, Any], current_session: set[str]) -
         return True
     record_session = _gateway_session_tokens(record.get("result_payload") or {})
     if not record_session:
-        return True
+        return False
     return not record_session.isdisjoint(current_session)
 
 
@@ -2634,6 +2643,7 @@ def _condition_warning_label(warning: str) -> str:
         "CONDITION_SEND_FAILED": "등록 확인 실패",
         "COMMAND_TTL_EXPIRED": "등록 명령 만료",
         "CONDITION_SEND_NOT_CONFIRMED": "등록 확인 없음",
+        "CONDITION_SEND_STALE_SESSION": "등록 확인 필요",
     }
     if normalized in labels:
         return labels[normalized]
@@ -2660,6 +2670,8 @@ def _condition_warning_detail(
         detail = "조건식 등록 명령이 게이트웨이에서 처리되기 전에 유효 시간이 지났습니다."
     elif normalized == "CONDITION_SEND_NOT_CONFIRMED":
         detail = "조건식 인덱스는 해석됐지만 현재 세션의 등록 명령 이력이 확인되지 않았습니다."
+    elif normalized == "CONDITION_SEND_STALE_SESSION":
+        detail = "이전 세션의 ACK는 있지만 현재 게이트웨이 세션에서 다시 등록된 ACK가 확인되지 않았습니다."
     elif normalized.startswith("CONDITION_SEND_"):
         detail = f"조건식 등록 명령 상태가 {str(command_status or 'UNKNOWN').upper()}입니다."
     else:

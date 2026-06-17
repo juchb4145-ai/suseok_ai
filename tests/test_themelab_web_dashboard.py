@@ -1830,6 +1830,63 @@ def test_condition_status_prefers_current_session_ack_over_later_failed_duplicat
     assert leader["action_hint"] == ""
 
 
+def test_condition_status_rejects_sessionless_ack_when_gateway_has_current_session(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        repo = ConditionProfileRepository(db)
+        repo.upsert_profile(
+            ConditionProfile(
+                condition_name="theme-lab-strong",
+                strategy_profile=StrategyProfile.THEME_DISCOVERY_PROFILE,
+                enabled=True,
+                priority=200,
+                purpose="theme_lab_strong",
+                last_resolved_index=84,
+            )
+        )
+        state = GatewayStateStore()
+        state.status.connected = True
+        state.status.last_heartbeat_at = utc_timestamp()
+        state.status.last_heartbeat_payload = {"ws_session_id": "current-session"}
+        state.enqueue_command(
+            GatewayCommand(
+                type="send_condition",
+                command_id="cmd-cond-sessionless-acked",
+                payload={
+                    "condition_name": "theme-lab-strong",
+                    "condition_index": 84,
+                    "screen_no": "7601",
+                },
+            )
+        )
+        state.ack_command(
+            "cmd-cond-sessionless-acked",
+            status="ACKED",
+            result_payload={"message": "condition sent"},
+        )
+        db.save_theme_lab_flow_result(
+            "2026-06-02T09:04:00",
+            {
+                "market_status": {"market_status": "SELECTIVE"},
+                "theme_rankings": [],
+                "watchset_snapshots": [],
+                "gate_decisions": [],
+                "data_quality": {},
+            },
+        )
+
+        payload = build_theme_lab_dashboard_snapshot(db, gateway_state=state)
+    finally:
+        db.close()
+
+    strong = next(item for item in payload["condition_statuses"] if item["purpose"] == "theme_lab_strong")
+    assert strong["command_status"] == "ACKED"
+    assert strong["current_session_confirmed"] is False
+    assert strong["registered"] is False
+    assert strong["warning"] == "CONDITION_SEND_STALE_SESSION"
+    assert strong["command_status_label"] == "등록 확인 필요"
+
+
 def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, monkeypatch):
     db_path = tmp_path / "trader.sqlite3"
     monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
