@@ -25,6 +25,39 @@ def test_dashboard_v2_empty_sections_return_stable_schema(monkeypatch):
     assert payload["entry_candidates"]["items"] == []
 
 
+def test_dashboard_v2_prefers_active_runtime_reboot_sections(monkeypatch):
+    monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
+    snapshot = {
+        "gateway": {"heartbeat_ok": True},
+        "market_regime": {
+            "status": "OK",
+            "global_status": "DATA_WAIT",
+            "data_wait_count": 1400,
+            "calculated_at": "2026-06-18T09:00:00",
+        },
+        "runtime": {
+            "mode": "DRY_RUN",
+            "data_warmup_status": "ready",
+            "market_regime": {
+                "enabled": True,
+                "status": "OK",
+                "global_status": "SELECTIVE",
+                "kospi_status": "SELECTIVE",
+                "kosdaq_status": "SELECTIVE",
+                "data_wait_count": 0,
+                "calculated_at": "2026-06-18T10:00:00",
+            },
+        },
+    }
+
+    payload = build_dashboard_v2_snapshot(snapshot)
+
+    assert payload["market_overview"]["global_status"] == "SELECTIVE"
+    assert payload["v2_status"]["data_freshness_status"] == "FRESH"
+    assert payload["system_health"]["data_freshness"] == "FRESH"
+    assert payload["system_health"]["latest_market_regime_at"] == "2026-06-18T10:00:00"
+
+
 def test_dashboard_v2_limits_theme_board_to_top5(monkeypatch):
     monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
     snapshot = {

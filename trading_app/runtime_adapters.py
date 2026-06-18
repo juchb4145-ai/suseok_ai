@@ -10,7 +10,7 @@ from trading.strategy.bridge import StrategyMarketDataBridge
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.conditions import ConditionProfileRepository, RegisteredCondition
 from trading.strategy.market_data import MarketDataStore
-from trading.strategy.market_index import IndexCodeMapper, MarketIndexStore
+from trading.strategy.market_index import IndexCodeMapper, MarketIndexStore, zero_padded_index_logical_code
 from trading.theme_engine.runtime import RealTimeThemeRuntime
 
 
@@ -74,7 +74,7 @@ class GatewayEventMarketDataBridge:
                     trade_value=payload.get("trade_value", 0),
                     execution_strength=payload.get("execution_strength", 0),
                     spread_ticks=payload.get("spread_ticks", 0),
-                    instrument_type=self._instrument_type(code, payload.get("instrument_type")),
+                    instrument_type=self._instrument_type(code, payload.get("instrument_type"), payload.get("name")),
                     name=str(payload.get("name") or ""),
                     day_high=payload.get("day_high", 0),
                     day_low=payload.get("day_low", 0),
@@ -90,8 +90,13 @@ class GatewayEventMarketDataBridge:
     def data_quality_snapshot(self) -> dict[str, Any]:
         return self._bridge.data_quality_snapshot()
 
-    def _instrument_type(self, code: str, instrument_type: Any) -> Any:
+    def _instrument_type(self, code: str, instrument_type: Any, name: Any = "") -> Any:
+        explicit = str(instrument_type or "").strip().lower()
+        if explicit == "index":
+            return "index"
         if self.index_code_mapper.is_index_code(code):
+            return "index"
+        if zero_padded_index_logical_code(code) is not None:
             return "index"
         return instrument_type
 
@@ -124,7 +129,7 @@ class GatewayEventThemeRuntimeBridge:
                 continue
             payload = dict(event.payload or {})
             code = str(payload.get("code") or payload.get("stock_code") or "").strip()
-            if not code or self.index_code_mapper.is_index_code(code):
+            if not code or self._is_index_payload(code, payload):
                 continue
             instrument_type = str(payload.get("instrument_type") or "").strip().lower()
             if instrument_type == "index":
@@ -152,7 +157,7 @@ class GatewayEventThemeRuntimeBridge:
         if not code:
             self._warn("THEME_PRICE_TICK_CODE_MISSING")
             return False
-        if self.index_code_mapper.is_index_code(code):
+        if self._is_index_payload(code, payload):
             return False
         instrument_type = str(payload.get("instrument_type") or "").strip().lower()
         if instrument_type == "index":
@@ -169,6 +174,14 @@ class GatewayEventThemeRuntimeBridge:
         if self.warning_sink is not None:
             self.warning_sink(warning)
 
+    def _is_index_payload(self, code: str, payload: dict[str, Any]) -> bool:
+        if self.index_code_mapper.is_index_code(code):
+            return True
+        return zero_padded_index_logical_code(code) is not None and _index_payload_hint(
+            payload.get("instrument_type"),
+            payload.get("name"),
+        )
+
 
 class GatewayCommandRealtimeClient:
     def __init__(
@@ -181,6 +194,12 @@ class GatewayCommandRealtimeClient:
         self.gateway_state = gateway_state
         self.warning_sink = warning_sink
         self.stale_dispatch_timeout_sec = max(5, int(stale_dispatch_timeout_sec))
+        self.subscription_session_id = new_message_id("rt_session")
+        self.subscription_generation = 0
+
+    def advance_subscription_generation(self, reason: str = "") -> int:
+        self.subscription_generation += 1
+        return self.subscription_generation
 
     def register_realtime(self, codes: Iterable[str], screen_no: str = "") -> None:
         clean_codes = _clean_codes(codes)
@@ -188,8 +207,13 @@ class GatewayCommandRealtimeClient:
             return
         self._enqueue(
             "register_realtime",
-            payload={"codes": clean_codes, "screen_no": str(screen_no or "")},
-            key=f"runtime:register_realtime:{screen_no}:{','.join(clean_codes)}",
+            payload={
+                "codes": clean_codes,
+                "screen_no": str(screen_no or ""),
+                "subscription_session_id": self.subscription_session_id,
+                "subscription_generation": self.subscription_generation,
+            },
+            key=self._register_key(screen_no, clean_codes),
         )
 
     def register_realtime_records(self, records: Iterable[Any], screen_no: str = "") -> None:
@@ -214,8 +238,10 @@ class GatewayCommandRealtimeClient:
                 "screen_no": str(screen_no or ""),
                 "code_sources": code_sources,
                 "code_protected": code_protected,
+                "subscription_session_id": self.subscription_session_id,
+                "subscription_generation": self.subscription_generation,
             },
-            key=f"runtime:register_realtime:{screen_no}:{','.join(clean_codes)}",
+            key=self._register_key(screen_no, clean_codes),
         )
 
     def remove_realtime(self, codes: Iterable[str], screen_no: str = "") -> None:
@@ -231,7 +257,11 @@ class GatewayCommandRealtimeClient:
     def remove_all_realtime(self) -> None:
         self._enqueue(
             "remove_all_realtime",
-            payload={"scope": "runtime"},
+            payload={
+                "scope": "runtime",
+                "subscription_session_id": self.subscription_session_id,
+                "subscription_generation": self.subscription_generation,
+            },
             key=f"runtime:remove_all_realtime:{new_message_id('scope')}",
         )
 
@@ -274,6 +304,13 @@ class GatewayCommandRealtimeClient:
         )
         if not result.accepted:
             self._warn(f"REALTIME_COMMAND_REJECTED:{command_type}:{result.reason}:{result.duplicate_of}")
+
+    def _register_key(self, screen_no: str, clean_codes: list[str]) -> str:
+        return (
+            "runtime:register_realtime:"
+            f"{self.subscription_session_id}:g{self.subscription_generation}:"
+            f"{screen_no}:{','.join(clean_codes)}"
+        )
 
     def _warn(self, warning: str) -> None:
         if self.warning_sink is not None:
@@ -603,6 +640,14 @@ def _clean_codes(codes: Iterable[str]) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def _index_payload_hint(instrument_type: Any, name: Any = "") -> bool:
+    explicit = str(instrument_type or "").strip().lower()
+    if explicit == "index":
+        return True
+    display_name = str(name or "").strip().upper()
+    return display_name in {"KOSPI", "KOSDAQ", "코스피", "코스닥"}
 
 
 def _prefer_condition_command_record(

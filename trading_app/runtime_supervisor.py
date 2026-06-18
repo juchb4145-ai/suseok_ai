@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
@@ -85,6 +86,8 @@ class RuntimeSupervisor:
         self._shutdown = False
         self._last_gateway_logged_in: bool | None = None
         self._last_gateway_reconnect_count: int | None = None
+        self._runtime_started_perf = 0.0
+        self._last_realtime_no_tick_repair_perf = 0.0
         if self.mode != "OBSERVE":
             self._warn(f"RUNTIME_ORDER_MODE_FORCED_OBSERVE:{self.mode}")
         if self.settings.runtime_allow_live_orders:
@@ -128,6 +131,7 @@ class RuntimeSupervisor:
         now = _utc_now()
         with self._state_lock:
             self.running = True
+            self._runtime_started_perf = perf_counter()
             self.started_at = now
             self.stopped_at = ""
             self.last_error = ""
@@ -164,6 +168,8 @@ class RuntimeSupervisor:
         with self._state_lock:
             self.running = False
             self.stopped_at = now
+            self._runtime_started_perf = 0.0
+            self._last_realtime_no_tick_repair_perf = 0.0
             if snapshot:
                 self.last_snapshot = snapshot
         self._log_runtime_event("stopped", "stopped", "runtime stopped", snapshot)
@@ -422,6 +428,7 @@ class RuntimeSupervisor:
             self._set_worker_stage("runtime_cycle")
             snapshot = _jsonable(_call_with_optional_timing(self._bundle.runtime.cycle, self._record_cycle_timing))
             snapshot["runtime_forwarded_price_tick_count"] = forwarded_count
+            self._repair_realtime_subscriptions_if_no_ticks_in_worker(snapshot)
             return snapshot
         finally:
             self._set_worker_stage("idle")
@@ -734,6 +741,50 @@ class RuntimeSupervisor:
         marker(reason)
         self._warn(f"REALTIME_SUBSCRIPTIONS_STALE:{reason}")
 
+    def _repair_realtime_subscriptions_if_no_ticks_in_worker(self, snapshot: dict[str, Any]) -> None:
+        if not _env_bool("TRADING_REALTIME_NO_TICK_REPAIR_ENABLED", True):
+            return
+        if str(snapshot.get("market_session_status") or "").strip().lower() == "closed":
+            return
+        if _safe_int(snapshot.get("subscription_active_count"), 0) <= 0:
+            return
+        gateway = self.gateway_state.snapshot()
+        if not gateway.kiwoom_logged_in or not gateway.heartbeat_ok:
+            return
+        if self._pending_price_tick_count() > 0:
+            return
+        quality = self._realtime_data_quality_snapshot()
+        if _safe_int(quality.get("total_price_ticks"), 0) > 0:
+            return
+        started_perf = float(self._runtime_started_perf or 0.0)
+        if started_perf <= 0:
+            return
+        now_perf = perf_counter()
+        wait_sec = max(0, _env_int("TRADING_REALTIME_NO_TICK_REPAIR_AFTER_SEC", 45))
+        if now_perf - started_perf < wait_sec:
+            return
+        cooldown_sec = max(1, _env_int("TRADING_REALTIME_NO_TICK_REPAIR_COOLDOWN_SEC", 60))
+        if self._last_realtime_no_tick_repair_perf and now_perf < self._last_realtime_no_tick_repair_perf + cooldown_sec:
+            return
+        if self._bundle is None:
+            return
+        manager = getattr(getattr(self._bundle, "runtime", None), "subscription_manager", None)
+        marker = getattr(manager, "mark_all_stale", None)
+        if not callable(marker):
+            return
+        reason = "NO_PRICE_TICKS_AFTER_REGISTER"
+        marker(reason)
+        self._last_realtime_no_tick_repair_perf = now_perf
+        warning = f"REALTIME_SUBSCRIPTIONS_STALE:{reason}"
+        self._warn(warning)
+        snapshot["warnings"] = _dedupe_texts(list(snapshot.get("warnings") or []) + [warning, "REALTIME_NO_TICK_REPAIR_ENQUEUED"])
+        snapshot["realtime_subscription_repair"] = {
+            "status": "STALE_MARKED",
+            "reason": reason,
+            "subscription_active_count": _safe_int(snapshot.get("subscription_active_count"), 0),
+            "total_price_ticks": 0,
+        }
+
     def _set_worker_stage(self, stage: str) -> None:
         with self._state_lock:
             self.worker_stage = str(stage or "idle")
@@ -972,3 +1023,36 @@ def _after_seconds(timestamp: str, seconds: int) -> str:
     if base.tzinfo is None:
         base = base.replace(tzinfo=timezone.utc)
     return (base + timedelta(seconds=max(1, int(seconds)))).isoformat(timespec="seconds")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _dedupe_texts(values: list[Any]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result

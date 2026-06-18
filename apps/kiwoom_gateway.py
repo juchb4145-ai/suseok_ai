@@ -512,8 +512,11 @@ def run_real_gateway(args: argparse.Namespace) -> int:
 
     from kiwoom.client import KiwoomClient
 
+    _gateway_boot_log("creating QApplication")
     app = QApplication(sys.argv[:1])
+    _gateway_boot_log("creating KiwoomClient")
     client = KiwoomClient()
+    _gateway_boot_log("creating GatewayRuntime")
     runtime = GatewayRuntime(
         _build_core_client(args),
         source="kiwoom_gateway",
@@ -521,6 +524,7 @@ def run_real_gateway(args: argparse.Namespace) -> int:
         event_drain_limit=args.event_drain_limit,
     )
     _wire_kiwoom_signals(client, runtime)
+    _gateway_boot_log("starting network worker")
     runtime.start_network_worker(interval_sec=args.poll_wait_sec or args.network_interval_sec or args.interval_sec)
 
     heartbeat_timer = QTimer()
@@ -531,11 +535,26 @@ def run_real_gateway(args: argparse.Namespace) -> int:
     command_timer.timeout.connect(lambda: _drain_real_commands(client, runtime))
     command_timer.start(200)
 
-    client.login()
+    _gateway_boot_log("entering Qt event loop")
+    QTimer.singleShot(0, lambda: _request_kiwoom_login(client))
     try:
         return int(app.exec_())
     finally:
+        _gateway_boot_log("stopping GatewayRuntime")
         runtime.stop()
+
+
+def _request_kiwoom_login(client) -> None:
+    _gateway_boot_log("requesting Kiwoom login")
+    try:
+        result = int(client.login() or 0)
+        _gateway_boot_log(f"Kiwoom login requested result={result}")
+    except Exception as exc:
+        _gateway_boot_log(f"Kiwoom login request failed: {exc}")
+
+
+def _gateway_boot_log(message: str) -> None:
+    print(f"[kiwoom_gateway] {utc_now_ms()} {message}", flush=True)
 
 
 def _kiwoom_connect_state(client) -> bool:

@@ -41,7 +41,10 @@ class IndexCodeMapper:
 
     @staticmethod
     def _clean(value: str) -> str:
-        return str(value or "").strip().upper()
+        raw = str(value or "").strip().upper()
+        if raw.startswith("A") and raw[1:].isdigit():
+            return raw[1:]
+        return raw
 
 
 @dataclass(frozen=True)
@@ -149,10 +152,11 @@ class MarketIndexStore:
 
     def state(self, index_code: str) -> MarketIndexState:
         clean_code = self._storage_code(index_code)
-        tick = self.market_data.latest_tick(clean_code)
-        day_high, day_low = self.market_data.day_high_low(clean_code)
+        tick = self._latest_tick(index_code)
+        tick_code = tick.code if tick is not None else clean_code
+        day_high, day_low = self.market_data.day_high_low(tick_code)
         day_mid = ((day_high + day_low) / 2.0) if day_high > 0 and day_low > 0 else None
-        metadata = dict(self._metadata.get(clean_code, {}))
+        metadata = dict(self._metadata.get(clean_code) or self._metadata.get(tick_code) or {})
         metadata["index_return_pct_5m"] = self.return_pct(index_code, 5)
         metadata["index_return_pct_20m"] = self.return_pct(index_code, 20)
         metadata["index_slope_5m_pct"] = metadata["index_return_pct_5m"]
@@ -166,7 +170,7 @@ class MarketIndexStore:
             day_mid=day_mid,
             direction_5m=self._direction_5m(clean_code),
             mid_position=self._mid_position(tick.price if tick else 0, day_mid),
-            low_break_recent=self._low_break_recent.get(clean_code, False),
+            low_break_recent=self._low_break_recent.get(clean_code, self._low_break_recent.get(tick_code, False)),
             metadata=metadata,
         )
 
@@ -208,6 +212,13 @@ class MarketIndexStore:
     def _storage_code(index_code: str) -> str:
         return _index_storage_code(index_code)
 
+    def _latest_tick(self, index_code: str) -> StrategyTick | None:
+        for code in _index_storage_aliases(index_code):
+            tick = self.market_data.latest_tick(code)
+            if tick is not None:
+                return tick
+        return None
+
 
 def _index_storage_code(index_code: str) -> str:
     raw = str(index_code or "").strip().upper()
@@ -217,3 +228,35 @@ def _index_storage_code(index_code: str) -> str:
         raw = raw[1:]
     cleaned = "".join(ch for ch in raw if ch.isalnum())
     return f"IDX{cleaned}"
+
+
+def _index_storage_aliases(index_code: str) -> list[str]:
+    raw = IndexCodeMapper._clean(index_code)
+    aliases: list[str] = []
+
+    def add(value: str) -> None:
+        text = str(value or "").strip().upper()
+        if text and text not in aliases:
+            aliases.append(text)
+
+    add(_index_storage_code(raw))
+    if raw in {"KOSPI", "001", "000001"}:
+        for value in ("IDXKOSPI", "KOSPI", "001", "000001"):
+            add(value)
+    elif raw in {"KOSDAQ", "101", "000101"}:
+        for value in ("IDXKOSDAQ", "KOSDAQ", "101", "000101"):
+            add(value)
+    elif raw.isdigit():
+        add(raw.zfill(6))
+        if len(raw) == 6 and raw.startswith("000"):
+            add(raw[-3:])
+    return aliases
+
+
+def zero_padded_index_logical_code(raw_code: str) -> str | None:
+    raw = IndexCodeMapper._clean(raw_code)
+    if raw == "000001":
+        return "KOSPI"
+    if raw == "000101":
+        return "KOSDAQ"
+    return None

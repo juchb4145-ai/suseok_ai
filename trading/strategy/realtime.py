@@ -151,13 +151,16 @@ class RealTimeSubscriptionManager:
         return set(self.code_to_screen)
 
     def mark_all_stale(self, reason: str = "") -> None:
+        generation = self._advance_client_generation(reason)
+        self._remove_all_client_realtime(reason)
         self.code_to_screen.clear()
         self.screen_to_codes.clear()
         for record in self.records.values():
             record.active = False
             record.screen_no = ""
         suffix = f":{reason}" if reason else ""
-        self.warnings.append(f"REALTIME_SUBSCRIPTIONS_MARKED_STALE{suffix}")
+        generation_suffix = f":g{generation}" if generation is not None else ""
+        self.warnings.append(f"REALTIME_SUBSCRIPTIONS_MARKED_STALE{suffix}{generation_suffix}")
 
     def remove_realtime(self, codes: Iterable[str]) -> None:
         self.warnings = []
@@ -242,6 +245,25 @@ class RealTimeSubscriptionManager:
             if len(screen_to_codes.get(screen_no, set())) < self.screen_size:
                 return screen_no
             screen_number += 1
+
+    def _advance_client_generation(self, reason: str) -> int | None:
+        advance = getattr(self.client, "advance_subscription_generation", None)
+        if not callable(advance):
+            return None
+        try:
+            return int(advance(reason) or 0)
+        except Exception as exc:
+            self.warnings.append(f"REALTIME_SUBSCRIPTION_GENERATION_ADVANCE_FAILED:{exc}")
+            return None
+
+    def _remove_all_client_realtime(self, reason: str) -> None:
+        remove_all = getattr(self.client, "remove_all_realtime", None)
+        if not callable(remove_all):
+            return
+        try:
+            remove_all()
+        except Exception as exc:
+            self.warnings.append(f"REALTIME_REMOVE_ALL_ON_STALE_FAILED:{reason}:{exc}")
 
 
 def _candidate_watchable(candidate: Candidate) -> bool:

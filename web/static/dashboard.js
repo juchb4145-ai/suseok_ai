@@ -1070,6 +1070,7 @@ function renderDashboardV2(snapshot) {
   const entry = payload.entry_candidates || { items: [] };
   const positionRisk = payload.position_risk || { positions: [] };
   const orderManager = payload.order_manager || {};
+  const preMarket = payload.pre_market_check || {};
   const reasons = payload.wait_block_reasons || { items: [] };
   const health = payload.system_health || {};
 
@@ -1079,11 +1080,21 @@ function renderDashboardV2(snapshot) {
   renderDashboardV2Banners(payload.safety_banners || []);
 
   text("dashboard-v2-market-status", `${market.global_status || "-"} / ${market.kospi_status || "-"} / ${market.kosdaq_status || "-"}`);
+  text("dashboard-v2-pre-market-status", preMarket.go_no_go || "-");
   text("dashboard-v2-order-safety", orderManager.live_sim_orders_allowed ? "LIVE_SIM 허용" : "관찰/차단");
   text("dashboard-v2-broker-account", `${status.broker_env || "UNKNOWN"} / ${status.account || "-"}`);
   text("dashboard-v2-kill-switch", status.kill_switch_state || "NORMAL");
   text("dashboard-v2-data-freshness", status.data_freshness_status || "-");
   text("dashboard-v2-runtime-cycle", formatDateTime(status.last_runtime_cycle_at));
+
+  text("dashboard-v2-pre-market-pill", preMarket.go_no_go || "UNKNOWN");
+  cls("dashboard-v2-pre-market-pill", `counter ${preMarketTone(preMarket.go_no_go)}`);
+  text("dashboard-v2-pre-market-message", preMarket.operator_message_ko || "장전 Go/No-Go 결과 대기");
+  text("dashboard-v2-pre-market-mode", preMarket.requested_mode || "OBSERVE");
+  text("dashboard-v2-pre-market-broker", preMarket.broker_env || status.broker_env || "UNKNOWN");
+  text("dashboard-v2-pre-market-sqlite", ((preMarket.sqlite_health || {}).status || (preMarket.sqlite_health || {}).message_ko || "-"));
+  text("dashboard-v2-pre-market-fail-count", preMarket.fail_count || 0);
+  text("dashboard-v2-pre-market-action", preMarket.recommended_action_ko || "점검 결과를 기다립니다.");
 
   text("dashboard-v2-market-pill", market.global_status || "UNKNOWN");
   cls("dashboard-v2-market-pill", `counter ${market.risk_off_detected ? "bad" : market.weak_market_detected ? "warn" : "ok"}`);
@@ -1211,6 +1222,14 @@ function statusTone(value) {
   if (/위험|주문차단/.test(textValue)) return "bad";
   if (/대기|관찰|제한/.test(textValue)) return "warn";
   return "ok";
+}
+
+function preMarketTone(value) {
+  const textValue = String(value || "");
+  if (/NO_GO/i.test(textValue)) return "bad";
+  if (/MANUAL|WARN|UNKNOWN/i.test(textValue)) return "warn";
+  if (/GO_/i.test(textValue)) return "ok";
+  return "muted";
 }
 
 function renderThemeLabSummary(themeLab) {

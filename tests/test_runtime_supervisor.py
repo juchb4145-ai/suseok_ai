@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 
 from trading.broker.gateway_state import GatewayStateStore
-from trading.broker.models import GatewayEvent
+from trading.broker.models import GatewayEvent, utc_timestamp
 from trading_app.dependencies import CoreSettings
 from trading_app.runtime_factory import CoreRuntimeBundle
 from trading_app.runtime_supervisor import RuntimeSupervisor
@@ -35,7 +35,13 @@ class _FakeRuntime:
             time.sleep(self.sleep_cycle)
         if self.fail_cycle:
             raise RuntimeError("cycle boom")
-        return {"started": self.started, "active_candidate_count": 1, "warnings": []}
+        return {
+            "started": self.started,
+            "active_candidate_count": 1,
+            "subscription_active_count": 1,
+            "market_session_status": "open",
+            "warnings": [],
+        }
 
 
 class _FakeBridge:
@@ -270,6 +276,29 @@ def test_gateway_login_marks_realtime_subscriptions_stale(tmp_path):
 
     assert runtime.subscription_manager.stale_reasons == ["LOGIN_STATUS_TRUE"]
     assert "REALTIME_SUBSCRIPTIONS_STALE:LOGIN_STATUS_TRUE" in status["warnings"]
+
+
+def test_no_tick_watchdog_marks_realtime_subscriptions_stale(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRADING_REALTIME_NO_TICK_REPAIR_AFTER_SEC", "0")
+    monkeypatch.setenv("TRADING_REALTIME_NO_TICK_REPAIR_COOLDOWN_SEC", "1")
+    runtime = _FakeRuntime()
+    supervisor, bridge = _supervisor(tmp_path, runtime)
+    bridge.quality_snapshot["total_price_ticks"] = 0
+    supervisor.gateway_state.status.connected = True
+    supervisor.gateway_state.status.kiwoom_logged_in = True
+    supervisor.gateway_state.status.last_heartbeat_at = utc_timestamp()
+
+    async def scenario():
+        await supervisor.start()
+        status = await supervisor.run_once()
+        await supervisor.shutdown()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert runtime.subscription_manager.stale_reasons == ["NO_PRICE_TICKS_AFTER_REGISTER"]
+    assert "REALTIME_SUBSCRIPTIONS_STALE:NO_PRICE_TICKS_AFTER_REGISTER" in status["warnings"]
+    assert status["latest_snapshot"]["realtime_subscription_repair"]["status"] == "STALE_MARKED"
 
 
 def test_gateway_price_ticks_are_coalesced_until_cycle(tmp_path):

@@ -8,6 +8,8 @@ from trading.strategy.candidate_ingestion import (
     source_events_from_opening_burst_result,
 )
 from trading.strategy.models import CandidateState
+from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeStatus
+from trading.theme_engine.repository import ThemeEngineRepository
 
 
 def test_condition_include_becomes_candidate_source_event(tmp_path):
@@ -30,6 +32,37 @@ def test_condition_include_becomes_candidate_source_event(tmp_path):
     assert candidate.code == "005930"
     assert candidate.state == CandidateState.DETECTED
     assert db.list_candidate_source_events(trade_date="2026-06-17")[0]["source_type"] == "condition_search"
+    assert db.conn.execute("SELECT COUNT(*) AS count FROM entry_plans").fetchone()["count"] == 0
+    assert db.list_runtime_order_intents(limit=10) == []
+
+
+def test_condition_include_attaches_current_theme_context_without_order_intent(tmp_path):
+    db = TradingDatabase(str(tmp_path / "test.db"))
+    repo = ThemeEngineRepository(db)
+    _theme(repo, "semis", "Semiconductors", ["005930"])
+    service = CandidateIngestionService(db, theme_repository=repo)
+
+    result = service.handle_condition_event(
+        BrokerConditionEvent(
+            condition_name="theme_alive",
+            code="A005930",
+            condition_index=3,
+            event_type="include",
+            timestamp="2026-06-17T09:01:00",
+        ),
+        trade_date="2026-06-17",
+    )
+
+    candidate = result.candidate
+    assert candidate is not None
+    assert candidate.state == CandidateState.DETECTED
+    assert candidate.theme_ids == ["semis"]
+    assert candidate.metadata["candidate_ingestion"]["primary_theme_id"] == "semis"
+    assert candidate.metadata["candidate_ingestion"]["theme_name"] == "Semiconductors"
+    source_event = db.list_candidate_source_events(trade_date="2026-06-17")[0]
+    assert source_event["theme_id"] == "semis"
+    assert source_event["theme_name"] == "Semiconductors"
+    assert source_event["status"] == "INGESTED"
     assert db.conn.execute("SELECT COUNT(*) AS count FROM entry_plans").fetchone()["count"] == 0
     assert db.list_runtime_order_intents(limit=10) == []
 
@@ -120,3 +153,28 @@ def _opening_result(code: str):
         selected_symbols=(code,),
         ranked_themes=(rank,),
     )
+
+
+def _theme(repo: ThemeEngineRepository, theme_id: str, name: str, codes: list[str]) -> None:
+    repo.upsert_canonical_theme(
+        CanonicalTheme(
+            theme_id=theme_id,
+            canonical_name=name,
+            display_name=name,
+            status=ThemeStatus.ACTIVE,
+            confidence=0.9,
+            trade_eligible=True,
+        )
+    )
+    for index, code in enumerate(codes, 1):
+        repo.upsert_current_membership(
+            ThemeMembership(
+                theme_id=theme_id,
+                stock_code=code,
+                stock_name=f"Stock {code}",
+                membership_score=max(1.0, 100.0 - index),
+                source_count=1,
+                active=True,
+                trade_eligible=True,
+            )
+        )

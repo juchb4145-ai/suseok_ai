@@ -52,6 +52,7 @@
           </div>
           <div id="dashboard-v2-banners" class="alert-list"></div>
           <div class="mini-grid dashboard-v2-status-grid">
+            <div><span>장전 점검</span><strong id="dashboard-v2-pre-market-status">-</strong></div>
             <div><span>시장국면</span><strong id="dashboard-v2-market-status">-</strong></div>
             <div><span>주문안전</span><strong id="dashboard-v2-order-safety">-</strong></div>
             <div><span>브로커 / 계좌</span><strong id="dashboard-v2-broker-account">-</strong></div>
@@ -60,6 +61,17 @@
             <div><span>최근 Runtime</span><strong id="dashboard-v2-runtime-cycle">-</strong></div>
           </div>
           <section class="dashboard-v2-main-grid">
+            <article class="dashboard-v2-panel">
+              <div class="section-head"><h3>장전 점검</h3><span id="dashboard-v2-pre-market-pill" class="counter muted">UNKNOWN</span></div>
+              <p id="dashboard-v2-pre-market-message" class="help-text">장전 Go/No-Go 결과 대기</p>
+              <div class="mini-grid compact">
+                <div><span>요청 모드</span><strong id="dashboard-v2-pre-market-mode">OBSERVE</strong></div>
+                <div><span>Broker</span><strong id="dashboard-v2-pre-market-broker">UNKNOWN</strong></div>
+                <div><span>SQLite</span><strong id="dashboard-v2-pre-market-sqlite">-</strong></div>
+                <div><span>차단</span><strong id="dashboard-v2-pre-market-fail-count">0</strong></div>
+              </div>
+              <p id="dashboard-v2-pre-market-action" class="help-text">점검 결과를 기다립니다.</p>
+            </article>
             <article class="dashboard-v2-panel">
               <div class="section-head"><h3>시장국면</h3><span id="dashboard-v2-market-pill" class="counter muted">UNKNOWN</span></div>
               <p id="dashboard-v2-market-message" class="help-text">시장 데이터 대기</p>

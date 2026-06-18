@@ -10,7 +10,7 @@ from typing import Any, Iterable, Mapping
 from trading.strategy.candidates import normalize_code
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.market_data import MarketDataStore, StrategyTick
-from trading.strategy.market_index import MarketIndexStore, _index_storage_code
+from trading.strategy.market_index import MarketIndexStore, _index_storage_aliases
 from trading.strategy.models import Candidate, CandidateState, StrategyProfile
 
 
@@ -623,7 +623,12 @@ class MarketRegimeEngine:
     def _latest_index_tick(self, side: MarketSide) -> StrategyTick | None:
         if self.market_index_store is None:
             return None
-        return self.market_index_store.market_data.latest_tick(_index_storage_code(side.value))
+        config_code = self.config.kospi_code if side == MarketSide.KOSPI else self.config.kosdaq_code
+        for code in _dedupe([*_index_storage_aliases(side.value), *_index_storage_aliases(config_code)]):
+            tick = self.market_index_store.market_data.latest_tick(code)
+            if tick is not None:
+                return tick
+        return None
 
     def _position_vs_vwap(self, side: MarketSide, price: int) -> str:
         tick = self._latest_index_tick(side)

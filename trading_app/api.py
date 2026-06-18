@@ -70,6 +70,7 @@ from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThe
 from trading.theme_engine.theme_board import theme_board_dashboard_section
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
 from trading_app.dashboard_v2 import build_dashboard_v2_snapshot, dashboard_v2_auto_route_enabled, dashboard_v2_enabled
+from trading_app.pre_market_check import PreMarketCheckConfig, build_pre_market_check_report
 from trading_app.buy_zero_rca import BuyZeroRCAAnalyzer
 from trading_app.conservative_reason_outcomes import (
     ConservativeReasonOutcomeAnalyzer,
@@ -1004,6 +1005,27 @@ def ops_alerts() -> dict[str, Any]:
             dry_run_performance=dry_run_performance_payload,
             logs=build_logs_snapshot(db),
         )
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/pre-market-check")
+def ops_pre_market_check(mode: str = Query("observe")) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return _build_pre_market_check_report_payload(db, requested_mode=mode)
+    finally:
+        close_database(db)
+
+
+@app.post("/api/ops/pre-market-check/rebuild")
+def rebuild_ops_pre_market_check(
+    mode: str = Query("observe"),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return _build_pre_market_check_report_payload(db, requested_mode=mode)
     finally:
         close_database(db)
 
@@ -6825,6 +6847,8 @@ def _ingest_condition_event_v2(db: TradingDatabase, condition_event: BrokerCondi
     result = service.handle_condition_event(condition_event)
     if condition_event.event_type == "remove":
         return
+    if not _condition_event_auto_hydration_enabled():
+        return
     candidate = getattr(result, "candidate", None)
     if candidate is None:
         return
@@ -6832,6 +6856,11 @@ def _ingest_condition_event_v2(db: TradingDatabase, condition_event: BrokerCondi
         CandidateHydrator(db, gateway_state).enqueue_candidate(candidate)
     except Exception as exc:
         db.save_log(f"[candidate_ingestion][WARN] hydration enqueue failed: {candidate.code} {exc}")
+
+
+def _condition_event_auto_hydration_enabled() -> bool:
+    value = str(os.environ.get("TRADING_CONDITION_EVENT_AUTO_HYDRATION_ENABLED", "1") or "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def _update_gateway_condition_event_worker_state(patch: dict[str, Any]) -> None:
@@ -6989,15 +7018,91 @@ def _build_theme_lab_dashboard_snapshot_with_fresh_db(*, include_extended: bool 
         close_database(db)
 
 
+def _build_pre_market_check_report_payload(
+    db: TradingDatabase,
+    *,
+    requested_mode: str = "observe",
+    base_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    base = dict(base_snapshot or {})
+    runtime_status = runtime_supervisor.status()
+    runtime_payload = dict(base.get("runtime") or _runtime_dashboard_payload(runtime_status))
+    today = datetime.now().date().isoformat()
+    order_manager_payload = dict(
+        base.get("order_manager")
+        or runtime_payload.get("order_manager")
+        or order_manager_dashboard_section(db, gateway_state=gateway_state, trade_date=today)
+    )
+    context = {
+        **base,
+        "trade_date": today,
+        "core": dict(base.get("core") or _pre_market_core_payload()),
+        "runtime": runtime_payload,
+        "gateway": gateway_state.snapshot().to_dict(),
+        "commands": gateway_state.command_snapshot(),
+        "order_manager": order_manager_payload,
+        "theme_board": dict(base.get("theme_board") or runtime_payload.get("theme_board") or {}),
+        "market_regime": dict(base.get("market_regime") or runtime_payload.get("market_regime") or {}),
+        "data_preload": dict(base.get("data_preload") or runtime_payload.get("data_preload") or {}),
+        "risk": dict(base.get("risk") or runtime_payload.get("risk") or {}),
+        "sqlite": _sqlite_operational_store_health(db),
+        "dashboard_v2_available": True,
+    }
+    return build_pre_market_check_report(
+        context,
+        config=PreMarketCheckConfig.from_env(requested_mode),
+    ).to_dict()
+
+
+def _pre_market_core_payload() -> dict[str, Any]:
+    settings = get_settings()
+    return {
+        "service": "trading-core-api",
+        "mode": settings.mode,
+        "runtime_enabled": settings.runtime_enabled,
+        "runtime_mode": settings.runtime_mode,
+        "live_order_enabled": settings.live_order_enabled,
+        "timestamp": utc_timestamp(),
+    }
+
+
+def _sqlite_operational_store_health(db: TradingDatabase) -> dict[str, Any]:
+    try:
+        db.conn.execute("CREATE TEMP TABLE IF NOT EXISTS pre_market_check_write_probe(id INTEGER)")
+        db.conn.execute("DELETE FROM pre_market_check_write_probe")
+        db.conn.execute("INSERT INTO pre_market_check_write_probe(id) VALUES (1)")
+        db.conn.execute("DELETE FROM pre_market_check_write_probe")
+        return {"writable": True, "status": "OK"}
+    except Exception as exc:
+        return {"writable": False, "status": "FAIL", "error": str(exc)}
+
+
 def _build_dashboard_snapshot_payload_uncached(*, detail: str = DASHBOARD_SNAPSHOT_DETAIL_SLIM) -> dict[str, Any]:
     db = open_database()
     try:
         payload = build_dashboard_snapshot(db, detail=detail)
+        payload["pre_market_check"] = _build_pre_market_check_report_payload(
+            db,
+            requested_mode=_dashboard_pre_market_check_mode(),
+            base_snapshot=payload,
+        )
         if dashboard_v2_enabled():
             payload["dashboard_v2"] = build_dashboard_v2_snapshot(payload, detail=detail)
         return payload
     finally:
         close_database(db)
+
+
+def _dashboard_pre_market_check_mode() -> str:
+    configured = str(os.getenv("TRADING_PRE_MARKET_CHECK_MODE", "") or "").strip()
+    if configured:
+        return configured
+    settings = get_settings()
+    if str(settings.runtime_mode or "").upper() == "DRY_RUN":
+        return "dry-run"
+    if str(os.getenv("STRATEGY_REBOOT_V2_DRY_RUN", "") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        return "dry-run"
+    return "observe"
 
 
 def _build_dashboard_snapshot_payload(*, force: bool = False, detail: str = DASHBOARD_SNAPSHOT_DETAIL_SLIM) -> dict[str, Any]:

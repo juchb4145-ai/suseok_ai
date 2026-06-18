@@ -44,6 +44,7 @@ entry_candidates
 position_risk
 exit_watch
 order_manager
+pre_market_check
 wait_block_reasons
 system_health
 legacy_debug_link
@@ -84,6 +85,7 @@ OrderManager 상태는 별도 카드로 표시한다.
 - gateway heartbeat stale
 - RISK_OFF
 - order_manager disabled
+- pre-market check NO_GO / MANUAL_REVIEW_REQUIRED / GO_OBSERVE / GO_LIVE_SIM_LIMITED
 
 예시:
 
@@ -93,6 +95,25 @@ OrderManager 상태는 별도 카드로 표시한다.
 RISK_OFF: 신규진입 차단, 보유 리스크 축소 우선
 킬스위치 활성: 신규 매수 차단
 ```
+
+## Pre-Market Check
+
+Dashboard V2는 `pre_market_check` section을 첫 화면에 표시한다.
+
+표시 항목:
+
+- Go/No-Go 상태
+- requested mode
+- broker env
+- account whitelist
+- gateway heartbeat
+- SQLite health
+- kill switch
+- pending reconcile
+- data preload status
+- recommended action
+
+`NO_GO`이면 빨간 banner, `MANUAL_REVIEW_REQUIRED`이면 노란 banner, `GO_OBSERVE`이면 관찰 전용 가능, `GO_LIVE_SIM_LIMITED`이면 모의주문 제한 가능으로 표시한다. 이 section에는 주문 enable 버튼, kill switch reset 버튼, Gateway 주문 호출 버튼을 두지 않는다.
 
 ## Legacy And Debug
 
@@ -124,6 +145,7 @@ Dashboard V2에서는 만들지 않는다.
 ## Verification
 
 ```powershell
+python -m pytest tests/test_pre_market_check.py -q
 python -m pytest tests/test_dashboard_v2_snapshot.py -q
 python -m pytest tests/test_themelab_web_dashboard.py -q
 python -m pytest tests/test_core_runtime_api.py -q

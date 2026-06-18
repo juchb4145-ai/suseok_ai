@@ -33,6 +33,27 @@ def test_index_tick_missing_returns_data_wait_not_exception(tmp_path):
     assert db.list_runtime_order_intents(limit=10) == []
 
 
+def test_zero_padded_index_storage_alias_is_accepted(tmp_path):
+    db, market_data, index_store = _context(tmp_path)
+    _candidate(db, "000017", market="KOSPI")
+    _tick(market_data, "000017", change=1.0)
+    index_store.market_data.update_tick(
+        StrategyTick.from_realtime(
+            "000001",
+            price=3007,
+            change_rate=0.7,
+            timestamp=OPEN_AT,
+        )
+    )
+    _index(index_store, "KOSDAQ", 0.1)
+
+    result = _engine(db, market_data, index_store).build(trade_date=TRADE_DATE, now=OPEN_AT)
+
+    assert result.snapshot.kospi_snapshot.index_price == 3007
+    assert result.snapshot.kospi_status != MarketRegimeStatus.DATA_WAIT
+    assert "INDEX_TICK_MISSING" not in result.snapshot.kospi_snapshot.data_quality_flags
+
+
 def test_risk_off_blocks_new_entry_without_deleting_candidate(tmp_path):
     db, market_data, index_store = _context(tmp_path)
     candidate = _candidate(db, "000002", market="KOSDAQ")

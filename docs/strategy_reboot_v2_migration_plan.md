@@ -535,3 +535,43 @@ python -m pytest tests/test_entry_engine.py -q
 python -m pytest tests/test_exit_engine_reboot.py -q
 python -m pytest -q
 ```
+
+## Phase 11 Pre-Market Ops Check
+
+목표는 장 시작 전 운영자가 OBSERVE / DRY_RUN / LIVE_SIM_LIMITED 중 어떤 모드로 진행 가능한지 자동 점검하고, No-Go 사유를 Dashboard V2와 CLI에서 같은 schema로 확인하게 하는 것이다.
+
+구현 범위:
+
+- `docs/reboot_v2_pre_market_runbook.md`: 장전 운영 Runbook, env profile, Go/No-Go, rollback, 금지 사항
+- `trading_app/pre_market_check.py`: `PreMarketCheckConfig`, `PreMarketCheckStatus`, `PreMarketCheckItem`, `PreMarketCheckReport`, `PreMarketGoNoGoDecision`
+- `GET /api/ops/pre-market-check`
+- `POST /api/ops/pre-market-check/rebuild` with local token
+- `tools/pre_market_check.py`: Core API 호출, JSON export, exit code 0/1/2
+- Dashboard V2 `pre_market_check` section과 safety banner 연동
+
+No-Go 원칙:
+
+- REAL broker/account 감지는 무조건 No-Go
+- SQLite operational store 장애는 No-Go
+- Gateway heartbeat stale, Kiwoom login fail, command queue unhealthy, kill switch active는 No-Go
+- LIVE_SIM_LIMITED에서 account whitelist fail, cancel scheduler disabled, max quantity/amount 초과는 No-Go
+- Warehouse preload 실패는 장중 주문 경로의 동기 장애로 승격하지 않고, local cache가 있으면 `MANUAL_REVIEW_REQUIRED`로 표시
+
+금지:
+
+- 주문 enable/disable API 추가 금지
+- Dashboard 주문 활성화 버튼 추가 금지
+- REAL live 주문 flag 추가 금지
+- Gateway `send_order` / `cancel_order` 직접 호출 금지
+- kill switch reset 버튼 추가 금지
+- 체크 실패를 무시하고 `GO_LIVE_SIM_LIMITED` 반환 금지
+
+검증 명령:
+
+```text
+python -m pytest tests/test_pre_market_check.py -q
+python -m pytest tests/test_dashboard_v2_snapshot.py -q
+python -m pytest tests/test_order_manager_live_sim.py -q
+python -m pytest tests/test_core_runtime_api.py -q
+python -m pytest -q
+```

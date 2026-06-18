@@ -80,6 +80,27 @@ def test_broad_synchronized_theme_becomes_leading_or_spreading(tmp_path):
     assert theme.leader_count >= 1
 
 
+def test_high_quality_broad_theme_becomes_leading_theme(tmp_path):
+    db, repo, market_data = _context(tmp_path)
+    _theme(repo, "ai_infra", "AI Infra", ["000021", "000022", "000023", "000024"])
+    scenarios = [
+        ("000021", 7.2, 12_000_000_000, 190, 2.0, 92.0),
+        ("000022", 6.4, 10_000_000_000, 180, 1.8, 88.0),
+        ("000023", 5.9, 8_000_000_000, 170, 1.5, 84.0),
+        ("000024", 4.8, 6_000_000_000, 155, 1.2, 80.0),
+    ]
+    for code, change, turnover, execution, momentum, source_score in scenarios:
+        _candidate(db, code, theme_id="ai_infra", source_type="opening_burst", source_score=source_score)
+        _tick(market_data, code, change=change, turnover=turnover, execution=execution, momentum=momentum)
+
+    theme = ThemeBoardEngine(db, market_data=market_data, repository=repo, config=_config()).build(trade_date="2026-06-17").snapshot.top_themes[0]
+
+    assert theme.theme_status == "LEADING_THEME"
+    assert theme.strong_count >= 2
+    assert theme.leader_count >= 1
+    assert theme.leader_concentration < 0.75
+
+
 def test_missing_realtime_data_stays_data_wait_not_weak(tmp_path):
     db, repo, market_data = _context(tmp_path)
     _theme(repo, "display", "Display", ["000009", "000010"])

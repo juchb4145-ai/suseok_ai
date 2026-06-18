@@ -4,7 +4,7 @@ import csv
 import json
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from statistics import median
 from typing import Any, Iterable, Optional
@@ -16,6 +16,7 @@ from trading_app.live_sim_canary_performance import LiveSimCanaryPerformanceAnal
 
 
 REPORT_ROOT = Path(__file__).resolve().parents[1] / "reports" / "exit_policy_validation"
+MARKET_TIMEZONE = timezone(timedelta(hours=9))
 
 EXIT_STOP_LOSS = "STOP_LOSS"
 EXIT_TAKE_PROFIT = "TAKE_PROFIT"
@@ -1525,7 +1526,10 @@ def _parse_time(value: Any) -> datetime | None:
     if not text:
         return None
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(MARKET_TIMEZONE).replace(tzinfo=None)
+        return parsed
     except Exception:
         return None
 

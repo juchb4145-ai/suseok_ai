@@ -16,6 +16,7 @@ from trading_app.exit_policy_validation import (
     ExitPolicyShadowSimulator,
     ExitPolicyValidationAnalyzer,
     PricePoint,
+    _price_path_after_entry,
 )
 
 
@@ -207,6 +208,18 @@ def test_shadow_exit_simulator_triggers_core_exit_types():
     assert time_exit.exit_trigger_type == EXIT_TIME
     assert insufficient.exit_trigger_type == EXIT_INSUFFICIENT_DATA
     assert insufficient.net_return_pct is None
+
+
+def test_exit_policy_price_path_accepts_mixed_timezone_timestamps():
+    points = _price_path_after_entry(
+        [
+            {"timestamp": "2026-06-16T23:59:59+00:00", "price": 9900},
+            {"timestamp": "2026-06-17T00:00:01+00:00", "price": 10050},
+        ],
+        "2026-06-17T09:00:00",
+    )
+
+    assert [point.price for point in points] == [10050]
 
 
 def test_exit_policy_validation_compares_shadow_to_actual_and_exports(tmp_path):

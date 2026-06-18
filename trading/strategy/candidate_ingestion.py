@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Iterable, Mapping
@@ -95,10 +95,15 @@ class CandidateIngestionService:
         *,
         clock=None,
         default_ttl_minutes: int = 30,
+        theme_repository: Any | None = None,
+        enrich_theme_context: bool = True,
     ) -> None:
         self.db = db
         self.clock = clock or datetime.now
         self.default_ttl_minutes = max(1, int(default_ttl_minutes))
+        self.enrich_theme_context = bool(enrich_theme_context)
+        self._theme_repository = theme_repository
+        self._theme_repository_checked = theme_repository is not None
 
     def ingest(self, source_event: CandidateSourceEvent) -> CandidateIngestionResult:
         event = source_event.normalized(now=self.clock())
@@ -198,6 +203,7 @@ class CandidateIngestionService:
             trade_date=trade_date or self._trade_date(),
             now=self.clock(),
         )
+        source_event = self._enrich_source_theme_context(source_event)
         if condition_event.event_type == "remove":
             return self.remove_source(source_event)
         return self.ingest(source_event)
@@ -287,6 +293,56 @@ class CandidateIngestionService:
                 "reason": reason,
             }
         )
+
+    def _enrich_source_theme_context(self, event: CandidateSourceEvent) -> CandidateSourceEvent:
+        if not self.enrich_theme_context or event.theme_id or not event.code:
+            return event
+        if event.source_type != CandidateSourceEventType.CONDITION_SEARCH.value:
+            return event
+        repository = self._get_theme_repository()
+        if repository is None:
+            return event
+        try:
+            memberships = list(repository.get_themes_by_stock(event.code, active=True))
+        except Exception:
+            return event
+        if not memberships:
+            return event
+        membership = memberships[0]
+        theme_id = str(getattr(membership, "theme_id", "") or "")
+        if not theme_id:
+            return event
+        theme_name = _theme_display_name(repository, theme_id)
+        stock_name = str(getattr(membership, "stock_name", "") or "")
+        raw_payload = dict(event.raw_payload or {})
+        raw_payload["theme_context"] = {
+            "theme_id": theme_id,
+            "theme_name": theme_name,
+            "membership_score": _float(getattr(membership, "membership_score", 0.0)),
+            "relation_type": _enum_value(getattr(membership, "relation_type", "")),
+            "source_count": _int(getattr(membership, "source_count", 0)),
+            "trade_eligible": bool(getattr(membership, "trade_eligible", False)),
+        }
+        return replace(
+            event,
+            name=event.name or stock_name,
+            theme_id=theme_id,
+            theme_name=theme_name,
+            reason_codes=_dedupe([*event.reason_codes, "THEME_CONTEXT_ATTACHED"]),
+            raw_payload=raw_payload,
+        )
+
+    def _get_theme_repository(self) -> Any | None:
+        if self._theme_repository_checked:
+            return self._theme_repository
+        self._theme_repository_checked = True
+        try:
+            from trading.theme_engine.repository import ThemeEngineRepository
+
+            self._theme_repository = ThemeEngineRepository(self.db)
+        except Exception:
+            self._theme_repository = None
+        return self._theme_repository
 
     def _trade_date(self) -> str:
         return self.clock().date().isoformat()
@@ -438,6 +494,19 @@ def _condition_level(condition_name: str, purpose: str) -> str:
 
 def _condition_score(level: str) -> float:
     return {"LEADER": 80.0, "STRONG": 55.0, "ALIVE": 25.0}.get(str(level or ""), 0.0)
+
+
+def _theme_display_name(repository: Any, theme_id: str) -> str:
+    getter = getattr(repository, "get_canonical_theme", None)
+    if not callable(getter):
+        return theme_id
+    try:
+        theme = getter(theme_id)
+    except Exception:
+        return theme_id
+    if theme is None:
+        return theme_id
+    return str(getattr(theme, "display_name", "") or getattr(theme, "canonical_name", "") or theme_id)
 
 
 def _opening_theme_by_code(result: Any) -> dict[str, dict[str, Any]]:

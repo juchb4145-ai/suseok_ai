@@ -179,7 +179,8 @@ def test_mark_all_stale_forces_next_sync_to_reregister_active_records():
     manager.mark_all_stale("LOGIN_STATUS_TRUE")
     manager.sync()
 
-    assert client.registered_code_order == ["001", "101", "001", "101"]
+    assert client.remove_all_count == 1
+    assert client.registered_code_order == ["001", "101"]
     assert manager.code_to_screen == {"001": "7000", "101": "7000"}
 
 

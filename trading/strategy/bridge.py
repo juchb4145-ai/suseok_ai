@@ -6,7 +6,7 @@ from typing import Any, Callable, Optional
 
 from trading.broker.data_quality import RealtimeDataQualityTracker, RealtimeReliabilityAssessment
 from trading.strategy.candles import CandleBuilder
-from trading.strategy.market_index import IndexCodeMapper, IndexTick, MarketIndexStore
+from trading.strategy.market_index import IndexCodeMapper, IndexTick, MarketIndexStore, zero_padded_index_logical_code
 from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.strategy.realtime_features import RealtimeFeatureCalculator
 
@@ -165,7 +165,7 @@ class StrategyMarketDataBridge:
     ) -> bool:
         if self.market_index_store is None:
             return False
-        logical_code = self.index_code_mapper.logical_code(code)
+        logical_code = self.index_code_mapper.logical_code(code) or zero_padded_index_logical_code(code)
         if logical_code is None:
             return False
         tick = IndexTick.from_realtime(

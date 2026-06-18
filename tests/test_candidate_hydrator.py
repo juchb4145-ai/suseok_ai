@@ -1,7 +1,7 @@
 from storage.db import TradingDatabase
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import GatewayEvent
-from trading.strategy.candidate_hydrator import CandidateHydrator, hydration_idempotency_key
+from trading.strategy.candidate_hydrator import CandidateHydrationConfig, CandidateHydrator, hydration_idempotency_key
 from trading.strategy.candidate_ingestion import CandidateIngestionService, CandidateSourceEvent
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.models import CandidateState
@@ -27,6 +27,23 @@ def test_detected_candidate_moves_to_hydrating_and_enqueues_tr_request(tmp_path)
         tr_code="opt10001",
         bucket="basic",
     )
+
+
+def test_disabled_candidate_hydration_does_not_enqueue_or_transition(tmp_path):
+    db = TradingDatabase(str(tmp_path / "test.db"))
+    gateway = GatewayStateStore()
+    candidate = _candidate(db)
+    hydrator = CandidateHydrator(db, gateway, config=CandidateHydrationConfig(enabled=False))
+
+    result = hydrator.enqueue_candidate(candidate)
+
+    reloaded = db.load_candidate("2026-06-17", "005930")
+    assert result.enqueued is False
+    assert result.reason == "HYDRATION_DISABLED"
+    assert reloaded.state == CandidateState.DETECTED
+    assert gateway.command_snapshot()["queued_count"] == 0
+    assert db.list_candidate_hydration_requests(trade_date="2026-06-17", limit=10) == []
+    assert hydrator.enqueue_due_candidates(trade_date="2026-06-17") == []
 
 
 def test_hydration_idempotency_key_blocks_duplicate_requests(tmp_path):

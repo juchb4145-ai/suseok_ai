@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from storage.db import TradingDatabase
+from trading.broker.command_persistence import SQLiteCommandStore
 from tests.theme_naver_helpers import repo_with_naver_fixture
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import BrokerPriceTick, GatewayCommand, GatewayEvent, utc_timestamp
@@ -102,6 +103,17 @@ def test_gateway_price_tick_routes_known_index_even_when_payload_says_stock():
     assert market_data.latest_tick("101") is None
 
 
+def test_gateway_price_tick_routes_zero_padded_index_alias():
+    market_data = MarketDataStore()
+    market_index_store = MarketIndexStore()
+    bridge = GatewayEventMarketDataBridge(market_data, CandleBuilder(), market_index_store)
+
+    assert bridge.handle_price_tick({"code": "000001", "price": 330000, "instrument_type": "stock"}) is True
+
+    assert market_index_store.state("KOSPI").price == 330000
+    assert market_data.latest_tick("000001") is None
+
+
 def test_gateway_price_tick_updates_theme_runtime_from_kiwoom_tick(tmp_path):
     db, repo = repo_with_naver_fixture(tmp_path)
     try:
@@ -166,6 +178,39 @@ def test_realtime_adapter_register_command_carries_subscription_sources():
     assert payload["code_sources"]["000270"] == ["holding"]
     assert payload["code_sources"]["005930"] == ["candidate_watch"]
     assert payload["code_protected"]["000270"] is True
+
+
+def test_realtime_adapter_register_key_advances_for_repair_and_restart(tmp_path):
+    db_path = tmp_path / "commands.sqlite3"
+    store = SQLiteCommandStore(db_path, dedupe_retention_sec=86400, history_retention_sec=86400)
+    try:
+        state = GatewayStateStore(command_store=store)
+        client = GatewayCommandRealtimeClient(state)
+
+        client.register_realtime(["005930"], screen_no="7000")
+        first = state.dispatch_commands(limit=1)[0]
+        state.ack_command(first.command_id, status="ACKED", result_payload={"message": "registered"})
+        client.register_realtime(["005930"], screen_no="7000")
+
+        assert len(state.list_commands(limit=10, include_finished=True, command_type="register_realtime")) == 1
+
+        client.advance_subscription_generation("NO_PRICE_TICKS_AFTER_REGISTER")
+        client.register_realtime(["005930"], screen_no="7000")
+
+        assert len(state.list_commands(limit=10, include_finished=True, command_type="register_realtime")) == 2
+    finally:
+        store.close()
+
+    restarted_store = SQLiteCommandStore(db_path, dedupe_retention_sec=86400, history_retention_sec=86400)
+    try:
+        restarted_state = GatewayStateStore(command_store=restarted_store)
+        restarted_client = GatewayCommandRealtimeClient(restarted_state)
+
+        restarted_client.register_realtime(["005930"], screen_no="7000")
+
+        assert len(restarted_state.list_commands(limit=10, include_finished=True, command_type="register_realtime")) == 3
+    finally:
+        restarted_store.close()
 
 
 def test_realtime_adapter_expires_stale_dispatched_register_command():

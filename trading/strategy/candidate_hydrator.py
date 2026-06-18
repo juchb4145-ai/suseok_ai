@@ -34,6 +34,7 @@ CANDIDATE_HYDRATION_FIELDS = [
 
 @dataclass(frozen=True)
 class CandidateHydrationConfig:
+    enabled: bool = True
     max_per_cycle: int = 5
     max_pending: int = 10
     ttl_sec: int = 90
@@ -45,6 +46,7 @@ class CandidateHydrationConfig:
     @classmethod
     def from_env(cls) -> "CandidateHydrationConfig":
         return cls(
+            enabled=_bool_env("TRADING_CANDIDATE_HYDRATION_ENABLED", True),
             max_per_cycle=max(1, _int_env("TRADING_CANDIDATE_HYDRATION_MAX_PER_CYCLE", 5)),
             max_pending=max(1, _int_env("TRADING_CANDIDATE_HYDRATION_MAX_PENDING", 10)),
             ttl_sec=max(1, _int_env("TRADING_CANDIDATE_HYDRATION_TTL_SEC", 90)),
@@ -79,6 +81,8 @@ class CandidateHydrator:
         self.clock = clock or datetime.now
 
     def enqueue_due_candidates(self, *, trade_date: str | None = None) -> list[CandidateHydrationEnqueueResult]:
+        if not self.config.enabled:
+            return []
         trade_date = trade_date or self.clock().date().isoformat()
         pending = self._pending_count(trade_date)
         remaining_pending = max(0, self.config.max_pending - pending)
@@ -104,6 +108,14 @@ class CandidateHydrator:
             tr_code=self.config.tr_code,
             bucket=self.config.bucket,
         )
+        if not self.config.enabled:
+            return CandidateHydrationEnqueueResult(
+                candidate_id=candidate.id,
+                code=candidate.code,
+                enqueued=False,
+                reason="HYDRATION_DISABLED",
+                idempotency_key=key,
+            )
         priority_name, command_priority = self._hydration_priority(candidate)
         command = GatewayCommand(
             type="tr_request",
@@ -542,6 +554,13 @@ def _int_env(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return int(default)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
 
 __all__ = [
