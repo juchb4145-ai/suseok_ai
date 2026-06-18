@@ -1073,15 +1073,19 @@ function renderDashboardV2(snapshot) {
   const preMarket = payload.pre_market_check || {};
   const reasons = payload.wait_block_reasons || { items: [] };
   const health = payload.system_health || {};
+  const readModel = payload.read_model || {};
 
-  text("dashboard-v2-message", status.operator_message_ko || "Reboot V2 운영 상태를 요약합니다.");
+  const readModelSuffix = readModel.source
+    ? ` · ${readModel.source}${readModel.snapshot_age_sec !== undefined ? ` ${Math.round(Number(readModel.snapshot_age_sec || 0))}s` : ""}${readModel.stale ? " STALE" : ""}`
+    : "";
+  text("dashboard-v2-message", `${status.operator_message_ko || "Reboot V2 운영 상태를 요약합니다."}${readModelSuffix}`);
   text("dashboard-v2-status-label", status.status_label || "관찰전용");
   cls("dashboard-v2-status-label", `counter ${statusTone(status.status_label)}`);
   renderDashboardV2Banners(payload.safety_banners || []);
 
   text("dashboard-v2-market-status", `${market.global_status || "-"} / ${market.kospi_status || "-"} / ${market.kosdaq_status || "-"}`);
   text("dashboard-v2-pre-market-status", preMarket.go_no_go || "-");
-  text("dashboard-v2-order-safety", orderManager.live_sim_orders_allowed ? "LIVE_SIM 허용" : "관찰/차단");
+  text("dashboard-v2-order-safety", orderManager.stop_new_buy ? "STOP_NEW_BUY" : orderManager.reduce_only ? "REDUCE_ONLY" : orderManager.reconcile_required_count ? "RECONCILE_REQUIRED" : orderManager.live_sim_orders_allowed ? "LIVE_SIM 허용" : "관찰/차단");
   text("dashboard-v2-broker-account", `${status.broker_env || "UNKNOWN"} / ${status.account || "-"}`);
   text("dashboard-v2-kill-switch", status.kill_switch_state || "NORMAL");
   text("dashboard-v2-data-freshness", status.data_freshness_status || "-");

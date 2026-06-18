@@ -1209,6 +1209,26 @@ class TradingDatabase:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(dedupe_key)
             );
+            CREATE TABLE IF NOT EXISTS dashboard_read_models (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                view_name TEXT NOT NULL,
+                schema_version TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                generation INTEGER NOT NULL DEFAULT 0,
+                snapshot_json TEXT NOT NULL DEFAULT '{}',
+                checksum TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'OK',
+                snapshot_at TEXT NOT NULL DEFAULT '',
+                source_runtime_cycle_at TEXT NOT NULL DEFAULT '',
+                source_runtime_cycle_count INTEGER NOT NULL DEFAULT 0,
+                source_event_watermark TEXT NOT NULL DEFAULT '',
+                stale_after_sec INTEGER NOT NULL DEFAULT 5,
+                build_duration_ms REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_error TEXT NOT NULL DEFAULT '',
+                UNIQUE(view_name)
+            );
             CREATE TABLE IF NOT EXISTS gateway_commands (
                 command_id TEXT PRIMARY KEY,
                 request_id TEXT NOT NULL DEFAULT '',
@@ -2232,6 +2252,12 @@ class TradingDatabase:
                 ON gateway_event_log(command_id);
             CREATE INDEX IF NOT EXISTS idx_gateway_event_log_event_id
                 ON gateway_event_log(event_id);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_read_models_view_trade_date
+                ON dashboard_read_models(view_name, trade_date);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_read_models_snapshot_at
+                ON dashboard_read_models(snapshot_at);
+            CREATE INDEX IF NOT EXISTS idx_dashboard_read_models_status
+                ON dashboard_read_models(status);
             CREATE INDEX IF NOT EXISTS idx_gateway_commands_type_created_at
                 ON gateway_commands(command_type, created_at);
             CREATE INDEX IF NOT EXISTS idx_gateway_commands_dedupe_key

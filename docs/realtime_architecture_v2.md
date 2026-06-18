@@ -834,3 +834,186 @@ RebootV2Runtime snapshot:
 - 테스트에서만 flag를 켜 local intent/order lifecycle과 guard를 검증한다.
 
 다음 PR은 Dashboard read model 분리 또는 controlled LIVE_SIM canary 사전 점검 중 하나를 선택한다. 운영 관점에서는 dashboard read model로 order/risk/reconcile 상태를 먼저 분리한 뒤 controlled canary를 진행하는 순서를 권장한다.
+
+## PR 7 구현 상태: Dashboard Read Model
+
+PR 7에서는 Dashboard V2 API와 WebSocket이 요청마다 runtime/raw DB aggregate를 직접 조립하지 않도록 `dashboard_read_models` 기반 read model을 추가했다. 이번 PR은 UI 재설계, 전략 변경, 주문 활성화 PR이 아니다.
+
+DB schema:
+
+| column | purpose |
+|---|---|
+| `id` | local row id |
+| `view_name` | `main`, `system_health`, `developer_summary` 등 view key |
+| `schema_version` | read model schema version |
+| `trade_date` | KST trade date |
+| `generation` | same view snapshot generation |
+| `snapshot_json` | 완성된 Dashboard V2 JSON |
+| `checksum` | dynamic timestamp를 제외한 content checksum |
+| `status` | `OK`, `STALE`, `CORRUPT`, fallback 상태 |
+| `snapshot_at` | snapshot 생성 시각 |
+| `source_runtime_cycle_at` | 원천 runtime cycle 시각 |
+| `source_runtime_cycle_count` | 원천 runtime cycle count |
+| `source_event_watermark` | 추후 EventLog watermark |
+| `stale_after_sec` | stale 판정 기준 |
+| `build_duration_ms` | build duration |
+| `created_at`, `updated_at`, `last_error` | persistence metadata |
+
+Index / constraint:
+
+- `UNIQUE(view_name)`
+- `view_name, trade_date`
+- `snapshot_at`
+- `status`
+
+저장 정책:
+
+- 동일 `view_name` 한 줄만 atomic upsert한다.
+- history row를 매초 누적하지 않는다.
+- JSON 전체를 완성한 뒤 transaction 안에서 저장한다.
+- checksum이 같으면 DB write를 skip한다.
+- 저장 실패가 runtime cycle을 실패시키지 않으며 이전 정상 snapshot은 유지된다.
+- corrupt JSON은 `CORRUPT`로 보고하고 fallback 대상으로만 취급한다.
+
+구성요소:
+
+- `storage.dashboard_read_model.DashboardReadModelRepository`
+- `trading_app.dashboard_read_model.DashboardReadModelConfig`
+- `DashboardReadModelService`
+- `DashboardReadModelWriter`
+- `DashboardReadModelRecord`
+- `trading.runtime_ports.DashboardReadModelPort` 확장 계약
+
+Feature flags:
+
+| env | default |
+|---|---:|
+| `TRADING_DASHBOARD_READ_MODEL_ENABLED` | `true` |
+| `TRADING_DASHBOARD_READ_MODEL_API_ENABLED` | `true` |
+| `TRADING_DASHBOARD_READ_MODEL_PERSIST_ENABLED` | `true` |
+| `TRADING_DASHBOARD_READ_MODEL_WRITE_INTERVAL_SEC` | `1` |
+| `TRADING_DASHBOARD_READ_MODEL_STALE_AFTER_SEC` | `5` |
+| `TRADING_DASHBOARD_READ_MODEL_SKIP_UNCHANGED` | `true` |
+| `TRADING_DASHBOARD_READ_MODEL_FALLBACK_LIVE_BUILD` | `true` |
+| `TRADING_DASHBOARD_READ_MODEL_HISTORY_ENABLED` | `false` |
+| `TRADING_DASHBOARD_READ_MODEL_SHADOW_COMPARE_ENABLED` | `true` |
+| `TRADING_DASHBOARD_READ_MODEL_SHADOW_COMPARE_INTERVAL_SEC` | `30` |
+| `TRADING_DASHBOARD_WS_PUSH_INTERVAL_SEC` | `1` |
+
+Writer cadence / coalescing:
+
+- FastAPI lifespan에서 1초 writer loop를 시작한다.
+- Runtime cycle 성공 시 dirty mark 후 `write_if_due()`를 호출한다.
+- Gateway event ingress도 dirty mark를 추가한다.
+- `price_tick`은 dirty mark 대상에서 제외해 tick마다 snapshot을 쓰지 않는다.
+- writer가 이미 실행 중이면 중복 실행을 skip한다.
+- dirty가 아니면 rebuild하지 않는다.
+- write interval 안의 여러 signal은 coalesce한다.
+- writer callback/build/save 실패는 warning/metric으로만 남기며 runtime/order path를 중단시키지 않는다.
+
+Read model source:
+
+- `RuntimeSupervisor.snapshot()`의 in-memory latest runtime snapshot
+- `RuntimeSupervisor.lightweight_status()`
+- `gateway_state.snapshot()`
+- `gateway_state.command_snapshot()`
+- runtime snapshot 안의 `market_regime`, `theme_board`, `dirty_evaluator`, `candidate_fsm`, `entry_engine`, `exit_engine_reboot`, `position_risk`, `order_manager_v2`
+
+금지한 source:
+
+- API 요청마다 candidate raw scan
+- API 요청마다 theme membership join
+- API 요청마다 command history 전체 조회
+- API 요청마다 BuyZero RCA / postmarket / hybrid validation / replay 재계산
+
+API cutover:
+
+- `GET /api/dashboard-v2/snapshot`: read model 우선
+- `GET /api/snapshot?view=v2`: read model 우선
+- `GET /api/snapshot`: 기존 schema 유지, legacy aggregate path 유지
+- missing/corrupt일 때만 기존 live builder fallback을 허용한다.
+- stale이라는 이유만으로 API 요청 시 live rebuild를 실행하지 않는다.
+- fallback 결과는 `read_model.source=FALLBACK_LIVE_BUILD`, `fallback_used=true`로 표시한다.
+
+WebSocket:
+
+- `/ws/dashboard`는 latest read model을 사용한다.
+- 최초 연결 시 latest snapshot을 전송한다.
+- `generation/checksum/status` signature가 바뀔 때만 push한다.
+- push cadence 기본 1초다.
+- 연결별 raw DB aggregate 조립을 하지 않는다.
+- slow/disconnected client 실패는 read model writer에 영향을 주지 않는다.
+
+Stale / recovery:
+
+- `READ_MODEL_STALE`: read model age > `stale_after_sec`
+- `RUNTIME_SNAPSHOT_STALE`: runtime source age가 기준을 초과
+- `ORDER_RECONCILE_REQUIRED`: order manager가 reconcile/STOP_NEW_BUY 상태
+- stale snapshot은 마지막 정상 데이터를 반환하되 `read_model.stale=true`와 safety banner를 붙인다.
+- 재기동 시 persisted latest snapshot을 복구하고 `recovered=true`, `stale=true`로 표시할 수 있다.
+
+OrderManager V2 반영 필드:
+
+- `status`
+- `enabled`
+- `observe_only`
+- `intent_enabled`
+- `local_order_enabled`
+- `gateway_command_enqueue_enabled`
+- `send_order_allowed`
+- `risk_state`
+- `kill_switch_state`
+- `created_intent_count`
+- `risk_approved_count`
+- `risk_rejected_count`
+- `local_order_created_count`
+- `command_blocked_observe_only_count`
+- `queued_command_count`
+- `reconcile_required_count`
+- `stop_new_buy`
+- `reduce_only`
+- `last_reject_reason`
+- `warnings`
+
+성능 / 관측 지표:
+
+- `build_count`
+- `write_count`
+- `unchanged_skip_count`
+- `coalesced_signal_count`
+- `concurrent_write_skip_count`
+- `build_duration_ms`
+- `db_write_duration_ms`
+- `read_duration_ms`
+- `api_read_count`
+- `fallback_count`
+- `stale_read_count`
+- `websocket_push_count`
+- `websocket_push_skip_unchanged_count`
+- `last_build_at`
+- `last_write_at`
+- `last_error`
+
+Shadow comparison:
+
+- `compare_dashboard_v2_snapshots()` helper를 추가했다.
+- API 요청 경로에서는 legacy builder를 호출하지 않는다.
+- 비교 cadence 기본값은 30초 flag로 남겨두었고, background metric wiring은 후속 PR에서 확대한다.
+
+안전 확인:
+
+- `send_order_allowed=false` 기본값은 변경하지 않았다.
+- `TRADING_SEND_ORDER_ALLOWED=false` 기본값은 변경하지 않았다.
+- `TRADING_ORDER_MANAGER_ENABLED=false`, `TRADING_ORDER_MANAGER_OBSERVE_ONLY=true` 기본값은 유지된다.
+- Dashboard에 order enable / kill switch reset / direct send_order UI를 추가하지 않았다.
+- EntryEngine, DirtyEvaluator, Candidate FSM 판단 의미는 변경하지 않았다.
+- 실제 Gateway `send_order` command 생성 경로는 변경하지 않았다.
+
+검증 명령:
+
+```powershell
+python -m pytest tests\test_dashboard_read_model_repository.py tests\test_dashboard_read_model_writer.py tests\test_dashboard_read_model_api.py tests\test_dashboard_v2_snapshot.py tests\test_runtime_supervisor.py tests\test_core_runtime_api.py
+python -m pytest
+```
+
+다음 PR은 read model shadow comparison을 실제 background metric으로 확대하거나, Gateway order ack/fill/reconcile event consumer를 read model과 OrderManager lifecycle에 연결하는 작업을 권장한다.

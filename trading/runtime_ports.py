@@ -287,7 +287,34 @@ class DashboardReadModelPort(Protocol):
     def update_snapshot(self, events: Sequence[CoreEvent], *, snapshot_at: str) -> None:
         ...
 
+    def build_from_runtime(
+        self,
+        runtime_snapshot: dict[str, Any] | None,
+        gateway_snapshot: dict[str, Any] | None,
+        command_snapshot: dict[str, Any] | None,
+        core_status: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        ...
+
+    def write_if_due(self, *, now: Any = None) -> dict[str, Any]:
+        ...
+
+    def save_snapshot(self, snapshot: dict[str, Any]) -> Any:
+        ...
+
     def read_main_snapshot(self) -> dict[str, Any]:
+        ...
+
+    def read_snapshot(self, view_name: str) -> dict[str, Any]:
+        ...
+
+    def mark_dirty(self, reason: str) -> None:
+        ...
+
+    def snapshot_status(self) -> dict[str, Any]:
+        ...
+
+    def recover_latest_snapshot(self) -> dict[str, Any]:
         ...
 
 

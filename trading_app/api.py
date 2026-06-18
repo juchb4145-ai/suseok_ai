@@ -69,6 +69,12 @@ from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSo
 from trading.theme_engine.sources.naver import NAVER_THEME_SOURCE_NAME, NaverThemeUniverseSource
 from trading.theme_engine.theme_board import theme_board_dashboard_section
 from trading_app.dependencies import close_database, get_settings, open_database, verify_gateway_token
+from trading_app.dashboard_read_model import (
+    DashboardReadModelConfig,
+    DashboardReadModelService,
+    DashboardReadModelWriter,
+    open_dashboard_read_model_service,
+)
 from trading_app.dashboard_v2 import build_dashboard_v2_snapshot, dashboard_v2_auto_route_enabled, dashboard_v2_enabled
 from trading_app.pre_market_check import PreMarketCheckConfig, build_pre_market_check_report
 from trading_app.buy_zero_rca import BuyZeroRCAAnalyzer
@@ -147,9 +153,11 @@ async def lifespan(_: FastAPI):
     await _start_gateway_condition_event_worker()
     await _start_core_ws_event_worker()
     await runtime_supervisor.startup()
+    await _start_dashboard_read_model_writer()
     try:
         yield
     finally:
+        await _stop_dashboard_read_model_writer()
         _shutdown_dashboard_snapshot_refresh_executor()
         _shutdown_theme_lab_dashboard_snapshot_refresh_executor()
         await _stop_core_ws_event_worker()
@@ -597,10 +605,75 @@ _theme_lab_dashboard_snapshot_cache_lock = RLock()
 _theme_lab_dashboard_snapshot_cache: dict[tuple[str, str], tuple[float, Any]] = {}
 _theme_lab_dashboard_snapshot_refreshing: set[tuple[str, str]] = set()
 _theme_lab_dashboard_snapshot_refresh_executor: ThreadPoolExecutor | None = None
+_dashboard_read_model_service: DashboardReadModelService | None = None
+_dashboard_read_model_db_path = ""
+dashboard_read_model_writer: DashboardReadModelWriter | None = None
+_dashboard_read_model_writer_task: asyncio.Task | None = None
 
 
 def _build_runtime_supervisor() -> RuntimeSupervisor:
     return RuntimeSupervisor(settings=get_settings(), gateway_state=gateway_state)
+
+
+def _build_dashboard_read_model_service() -> DashboardReadModelService:
+    settings = get_settings()
+    return open_dashboard_read_model_service(settings.db_path, config=DashboardReadModelConfig.from_env())
+
+
+def _dashboard_read_model_service_instance() -> DashboardReadModelService:
+    global _dashboard_read_model_service
+    global _dashboard_read_model_db_path
+    global dashboard_read_model_writer
+    db_path = _dashboard_database_cache_key()
+    if _dashboard_read_model_service is None or _dashboard_read_model_db_path != db_path:
+        service = _build_dashboard_read_model_service()
+        _dashboard_read_model_service = service
+        _dashboard_read_model_db_path = db_path
+        dashboard_read_model_writer = _build_dashboard_read_model_writer(service)
+        runtime_supervisor.set_dashboard_read_model_writer(dashboard_read_model_writer)
+    return _dashboard_read_model_service
+
+
+def _build_dashboard_read_model_writer(service: DashboardReadModelService) -> DashboardReadModelWriter:
+    return DashboardReadModelWriter(
+        service,
+        runtime_snapshot=runtime_supervisor.snapshot,
+        gateway_snapshot=lambda: gateway_state.snapshot().to_dict(),
+        command_snapshot=gateway_state.command_snapshot,
+        core_status=runtime_supervisor.lightweight_status,
+    )
+
+
+async def _start_dashboard_read_model_writer() -> None:
+    global _dashboard_read_model_writer_task
+    service = _dashboard_read_model_service_instance()
+    if not service.config.enabled:
+        return
+    if _dashboard_read_model_writer_task is not None and not _dashboard_read_model_writer_task.done():
+        return
+    _dashboard_read_model_writer_task = asyncio.create_task(_dashboard_read_model_writer_loop())
+
+
+async def _stop_dashboard_read_model_writer() -> None:
+    global _dashboard_read_model_writer_task
+    task = _dashboard_read_model_writer_task
+    _dashboard_read_model_writer_task = None
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+async def _dashboard_read_model_writer_loop() -> None:
+    while True:
+        service = _dashboard_read_model_service_instance()
+        writer = dashboard_read_model_writer
+        if writer is not None and service.config.enabled:
+            await asyncio.to_thread(writer.write_if_due)
+        await asyncio.sleep(max(0.1, float(service.config.write_interval_sec or 1.0)))
 
 
 def _build_replay_tick_buffer() -> ReplayGradeTickBuffer:
@@ -613,6 +686,10 @@ def _build_replay_tick_buffer() -> ReplayGradeTickBuffer:
 
 runtime_supervisor = _build_runtime_supervisor()
 replay_tick_buffer = _build_replay_tick_buffer()
+_dashboard_read_model_service = _build_dashboard_read_model_service()
+_dashboard_read_model_db_path = str(Path(get_settings().db_path).resolve())
+dashboard_read_model_writer = _build_dashboard_read_model_writer(_dashboard_read_model_service)
+runtime_supervisor.set_dashboard_read_model_writer(dashboard_read_model_writer)
 
 
 def _order_service() -> OrderEnqueueService:
@@ -4070,16 +4147,15 @@ def snapshot(
     detail: str = Query(DASHBOARD_SNAPSHOT_DETAIL_SLIM),
     view: str = Query(""),
 ) -> dict[str, Any]:
-    payload = _build_dashboard_snapshot_payload(force=refresh, detail=detail)
     if str(view or "").strip().lower() == "v2":
-        return build_dashboard_v2_snapshot(payload, detail=detail)
+        return _dashboard_v2_read_model_or_fallback(refresh=refresh, detail=detail)
+    payload = _build_dashboard_snapshot_payload(force=refresh, detail=detail)
     return payload
 
 
 @app.get("/api/dashboard-v2/snapshot")
 def dashboard_v2_snapshot(refresh: bool = Query(False), detail: str = Query(DASHBOARD_SNAPSHOT_DETAIL_SLIM)) -> dict[str, Any]:
-    payload = _build_dashboard_snapshot_payload(force=refresh, detail=detail)
-    return build_dashboard_v2_snapshot(payload, detail=detail)
+    return _dashboard_v2_read_model_or_fallback(refresh=refresh, detail=detail)
 
 
 @app.get("/api/themelab/snapshot")
@@ -5040,6 +5116,7 @@ async def _process_gateway_event(event: GatewayEvent) -> dict[str, Any]:
     event = GatewayEvent.from_dict(processed["event"])
     result = dict(processed["result"])
     if bool(processed.get("accepted")):
+        _mark_dashboard_read_model_dirty(f"gateway_event:{event.type}", event_type=event.type)
         runtime_started = time.perf_counter()
         await runtime_supervisor.handle_gateway_event(event)
         runtime_forward_ms = (time.perf_counter() - runtime_started) * 1000.0
@@ -6343,6 +6420,7 @@ async def _gateway_condition_event_worker_loop_main(worker_index: int = 0) -> No
                 }
             )
             if int(result.get("accepted_count") or 0) > 0:
+                _mark_dashboard_read_model_dirty("condition_event_batch", event_type="condition_event")
                 await _schedule_dashboard_snapshot_broadcast()
         except asyncio.CancelledError:
             raise
@@ -6892,6 +6970,96 @@ def _dashboard_snapshot_detail(detail: str | None = None) -> str:
     if value in {DASHBOARD_SNAPSHOT_DETAIL_FULL, "debug", "verbose"}:
         return DASHBOARD_SNAPSHOT_DETAIL_FULL
     return DASHBOARD_SNAPSHOT_DETAIL_SLIM
+
+
+def _dashboard_read_model_api_enabled() -> bool:
+    try:
+        service = _dashboard_read_model_service_instance()
+        return bool(service.config.enabled and service.config.api_enabled)
+    except Exception:
+        return False
+
+
+def _dashboard_v2_read_model_or_fallback(*, refresh: bool = False, detail: str = DASHBOARD_SNAPSHOT_DETAIL_SLIM) -> dict[str, Any]:
+    service = _dashboard_read_model_service_instance()
+    if service.config.enabled and service.config.api_enabled:
+        payload = service.read_main_snapshot()
+        read_model = dict(payload.get("read_model") or {})
+        status = str(read_model.get("status") or "")
+        if status not in {"MISSING", "CORRUPT"}:
+            return payload
+        if not service.config.fallback_live_build:
+            return payload
+    return _dashboard_v2_fallback_live_build(reason="READ_MODEL_MISSING_OR_CORRUPT", refresh=refresh, detail=detail)
+
+
+def _dashboard_v2_fallback_live_build(*, reason: str, refresh: bool, detail: str) -> dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        payload = _build_dashboard_snapshot_payload(force=refresh, detail=detail)
+        v2_payload = build_dashboard_v2_snapshot(payload, detail=detail)
+        error = ""
+    except Exception as exc:
+        v2_payload = build_dashboard_v2_snapshot({}, detail="slim")
+        error = str(exc)
+    build_ms = (time.perf_counter() - started) * 1000.0
+    existing = dict(v2_payload.get("read_model") or {})
+    v2_payload["read_model"] = {
+        **existing,
+        "enabled": _dashboard_read_model_api_enabled(),
+        "source": "FALLBACK_LIVE_BUILD",
+        "view_name": "main",
+        "schema_version": "dashboard_v2.read_model.v1",
+        "generation": int(existing.get("generation") or 0),
+        "status": "FALLBACK_LIVE_BUILD" if not error else "FALLBACK_FAILED",
+        "snapshot_at": v2_payload.get("generated_at") or utc_timestamp(),
+        "snapshot_age_sec": 0.0,
+        "stale": bool(error),
+        "stale_after_sec": _dashboard_read_model_service_instance().config.stale_after_sec,
+        "checksum": existing.get("checksum") or "",
+        "persisted": False,
+        "fallback_used": True,
+        "fallback_reason": reason,
+        "build_duration_ms": round(build_ms, 3),
+        "last_error": error,
+        "warnings": ["READ_MODEL_FALLBACK_LIVE_BUILD"] + (["READ_MODEL_FALLBACK_FAILED"] if error else []),
+    }
+    banners = list(v2_payload.get("safety_banners") or [])
+    if not any(dict(item).get("reason_code") == "READ_MODEL_FALLBACK_LIVE_BUILD" for item in banners if isinstance(item, dict)):
+        banners.insert(
+            0,
+            {
+                "severity": "warning" if error else "info",
+                "message_ko": "Dashboard read model 대신 안전 fallback snapshot을 표시 중입니다.",
+                "reason_code": "READ_MODEL_FALLBACK_LIVE_BUILD",
+            },
+        )
+    v2_payload["safety_banners"] = banners
+    return v2_payload
+
+
+def _dashboard_snapshot_wrapper_for_v2(v2_payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "snapshot_detail": DASHBOARD_SNAPSHOT_DETAIL_SLIM,
+        "timestamp": v2_payload.get("generated_at") or utc_timestamp(),
+        "gateway": gateway_state.snapshot().to_dict(),
+        "commands": gateway_state.command_snapshot(),
+        "runtime": {
+            "lightweight_status": runtime_supervisor.lightweight_status(),
+            "read_model": dict(v2_payload.get("read_model") or {}),
+        },
+        "dashboard_v2": v2_payload,
+    }
+
+
+def _mark_dashboard_read_model_dirty(reason: str, *, event_type: str = "") -> None:
+    if str(event_type or "").strip() == "price_tick":
+        return
+    try:
+        service = _dashboard_read_model_service_instance()
+        service.mark_dirty(reason)
+    except Exception:
+        pass
 
 
 def _dashboard_database_cache_key(db: TradingDatabase | None = None) -> str:
@@ -7496,12 +7664,31 @@ def enqueue_order(
 @app.websocket("/ws/dashboard")
 async def dashboard_ws(websocket: WebSocket) -> None:
     await dashboard_connections.connect(websocket)
+    last_signature = ""
     try:
         while True:
-            payload = await asyncio.to_thread(_build_dashboard_snapshot_payload)
-            snapshot_payload = _dashboard_snapshot_for_client_count(payload, dashboard_connections.client_count)
-            await dashboard_connections.send_json(websocket, {"type": "snapshot", "snapshot": snapshot_payload})
-            await asyncio.sleep(_dashboard_ws_push_interval_sec())
+            v2_payload = await asyncio.to_thread(_dashboard_v2_read_model_or_fallback)
+            read_model = dict(v2_payload.get("read_model") or {})
+            signature = f"{read_model.get('generation') or 0}:{read_model.get('checksum') or ''}:{read_model.get('status') or ''}"
+            if signature != last_signature:
+                snapshot_payload = _dashboard_snapshot_wrapper_for_v2(v2_payload)
+                snapshot_payload = _dashboard_snapshot_for_client_count(snapshot_payload, dashboard_connections.client_count)
+                await dashboard_connections.send_json(websocket, {"type": "snapshot", "snapshot": snapshot_payload})
+                last_signature = signature
+                try:
+                    _dashboard_read_model_service_instance().metrics["websocket_push_count"] = (
+                        int(_dashboard_read_model_service_instance().metrics.get("websocket_push_count") or 0) + 1
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    _dashboard_read_model_service_instance().metrics["websocket_push_skip_unchanged_count"] = (
+                        int(_dashboard_read_model_service_instance().metrics.get("websocket_push_skip_unchanged_count") or 0) + 1
+                    )
+                except Exception:
+                    pass
+            await asyncio.sleep(_dashboard_read_model_service_instance().config.ws_push_interval_sec)
     except WebSocketDisconnect:
         dashboard_connections.disconnect(websocket)
     except Exception:

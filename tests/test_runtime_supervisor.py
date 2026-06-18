@@ -198,6 +198,31 @@ def test_cycle_exception_is_captured(tmp_path):
     assert "cycle boom" in status["last_error"]
 
 
+def test_read_model_writer_failure_does_not_fail_cycle(tmp_path):
+    class FailingWriter:
+        def mark_dirty(self, reason):
+            self.reason = reason
+
+        def write_if_due(self):
+            raise RuntimeError("read model boom")
+
+    runtime = _FakeRuntime()
+    supervisor, _ = _supervisor(tmp_path, runtime)
+    supervisor.set_dashboard_read_model_writer(FailingWriter())
+
+    async def scenario():
+        await supervisor.start()
+        status = await supervisor.run_once()
+        await supervisor.shutdown()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert status["cycle_count"] == 1
+    assert status["failed_cycle_count"] == 0
+    assert any("DASHBOARD_READ_MODEL_WRITE_FAILED:read model boom" == item for item in status["warnings"])
+
+
 def test_blank_cycle_exception_uses_type_name(tmp_path):
     class BlankFailureRuntime(_FakeRuntime):
         def cycle(self):

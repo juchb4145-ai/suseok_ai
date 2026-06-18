@@ -35,10 +35,12 @@ class RuntimeSupervisor:
         settings: CoreSettings,
         gateway_state: GatewayStateStore,
         runtime_builder: RuntimeBuilder = build_core_strategy_runtime,
+        read_model_writer: Any = None,
     ) -> None:
         self.settings = settings
         self.gateway_state = gateway_state
         self.runtime_builder = runtime_builder
+        self.read_model_writer = read_model_writer
         self.enabled = bool(settings.runtime_enabled)
         self.auto_start = bool(settings.runtime_auto_start)
         self.running = False
@@ -139,6 +141,7 @@ class RuntimeSupervisor:
             self.last_snapshot = snapshot
             self.next_cycle_at = _after_seconds(now, self._interval_sec())
         self._log_runtime_event("started", "running", "runtime started", snapshot)
+        self._flush_dashboard_read_model("runtime_start")
         if self.loop_task is None or self.loop_task.done():
             self.loop_task = asyncio.create_task(self.loop_forever())
         return self.status()
@@ -260,6 +263,7 @@ class RuntimeSupervisor:
                 snapshot,
                 "",
             )
+            self._flush_dashboard_read_model("runtime_cycle")
             return self.status()
 
     async def loop_forever(self) -> None:
@@ -351,6 +355,32 @@ class RuntimeSupervisor:
     def snapshot(self) -> dict[str, Any]:
         with self._state_lock:
             return dict(self.last_snapshot or {})
+
+    def lightweight_status(self) -> dict[str, Any]:
+        with self._state_lock:
+            cycle_worker_pending = self._cycle_future is not None and not self._cycle_future.done()
+            cycle_worker_elapsed_ms = 0
+            if cycle_worker_pending and self._cycle_future_started_perf:
+                cycle_worker_elapsed_ms = int(round((perf_counter() - self._cycle_future_started_perf) * 1000))
+            return {
+                "running": self.running,
+                "started_at": self.started_at,
+                "last_cycle_at": self.last_cycle_at,
+                "next_cycle_at": self.next_cycle_at,
+                "cycle_count": self.cycle_count,
+                "failed_cycle_count": self.failed_cycle_count,
+                "skipped_cycle_count": self.skipped_cycle_count,
+                "last_cycle_duration_ms": self.last_cycle_duration_ms,
+                "last_error": self.last_error,
+                "worker_stage": self.worker_stage,
+                "cycle_worker_pending": cycle_worker_pending,
+                "cycle_worker_started_at": self._cycle_future_started_at if cycle_worker_pending else "",
+                "cycle_worker_elapsed_ms": cycle_worker_elapsed_ms,
+                "cycle_worker_reason": self._cycle_future_reason if cycle_worker_pending else "",
+            }
+
+    def set_dashboard_read_model_writer(self, writer: Any) -> None:
+        self.read_model_writer = writer
 
     def _realtime_data_quality_snapshot(self) -> dict[str, Any]:
         bundle = self._bundle
@@ -980,6 +1010,20 @@ class RuntimeSupervisor:
                 db.close()
         except Exception:
             pass
+
+    def _flush_dashboard_read_model(self, reason: str) -> None:
+        writer = self.read_model_writer
+        if writer is None:
+            return
+        try:
+            marker = getattr(writer, "mark_dirty", None)
+            if callable(marker):
+                marker(reason)
+            flusher = getattr(writer, "write_if_due", None)
+            if callable(flusher):
+                flusher()
+        except Exception as exc:
+            self._warn(f"DASHBOARD_READ_MODEL_WRITE_FAILED:{_exception_message(exc)}")
 
 
 def _order_policy(settings: CoreSettings) -> str:
