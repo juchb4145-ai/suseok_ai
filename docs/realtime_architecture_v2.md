@@ -1519,15 +1519,15 @@ PR 11은 Kiwoom read-only TR로 broker truth snapshot을 staging 저장하고, C
 
 | logical source | TR code | purpose | validation |
 | --- | --- | --- | --- |
-| `OPEN_ORDERS` | `opt10075` | 미체결 주문 snapshot | `SYNTHETIC_ONLY` |
-| `ACCOUNT_POSITIONS` | `opw00018` | 보유 종목 snapshot | `SYNTHETIC_ONLY` |
-| `ACCOUNT_CASH` | `opw00001` | 예수금 snapshot | `SYNTHETIC_ONLY` |
+| `OPEN_ORDERS` | `opt10075` | 미체결 주문 snapshot | `KOA_STUDIO_SCREENSHOT / HOLD` |
+| `ACCOUNT_POSITIONS` | `opw00018` | 보유 종목 snapshot | `KOA_STUDIO_SCREENSHOT / HOLD` |
+| `ACCOUNT_CASH` | `opw00001` | 예수금 snapshot | `KOA_STUDIO_SCREENSHOT / HOLD` |
 
-TR code와 field alias는 `trading.broker.reconcile_tr_specs`의 versioned registry에 정의한다. 실제 KOA Studio 또는 Kiwoom simulation capture 전까지 PASS가 아니라 HOLD로 취급한다.
+TR code와 field alias는 `trading.broker.reconcile_tr_specs`의 versioned registry에 정의한다. `opt10075`, `opw00018`, `opw00001`은 KOA Studio screenshot 기준 입력 계약을 반영했고, `opw00001` expanded output field list도 registry에 반영했다. Kiwoom simulation capture fixture 전까지 PASS가 아니라 HOLD로 취급한다. `opw00018`과 `opw00001`은 KOA sample 기준 `비밀번호`를 공백으로 입력한다.
 
 ### Credential Policy
 
-Core command에는 account password를 넣지 않는다. broker reconcile command payload에는 `account`, `account_token`, `credential_ref`, `reconcile_run_id`, `logical_source`만 포함한다. Gateway는 TR 실행 직전에 local credential provider로 password를 해석하고, ack/Event Log/DB/report에는 password를 쓰지 않는다. credential이 없으면 `CREDENTIAL_UNAVAILABLE`이며 snapshot empty로 간주하지 않는다.
+Core command에는 account password를 넣지 않는다. broker reconcile command payload에는 `account`, `account_token`, `credential_ref`, `reconcile_run_id`, `logical_source`만 포함한다. Gateway는 sensitive TR이 필요할 때만 local credential provider로 password를 해석하고, ack/Event Log/DB/report에는 password를 쓰지 않는다. KOA sample상 `opw00018`과 `opw00001`은 password unused blank input이다. credential이 필요한 TR에서 credential이 없으면 `CREDENTIAL_UNAVAILABLE`이며 snapshot empty로 간주하지 않는다.
 
 ### Capture V2
 

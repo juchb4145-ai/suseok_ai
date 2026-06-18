@@ -51,7 +51,7 @@ class FakeRunner:
         return FakeCaptureResult()
 
 
-def test_gateway_reconcile_capture_uses_password_only_inside_runner(monkeypatch):
+def test_gateway_reconcile_capture_keeps_position_password_blank_even_when_env_exists(monkeypatch):
     monkeypatch.setenv("LOCAL_SECRET_REF", "1357")
     command = build_reconcile_tr_command(
         account="9876543210",
@@ -63,7 +63,28 @@ def test_gateway_reconcile_capture_uses_password_only_inside_runner(monkeypatch)
 
     ack = _execute_broker_reconcile_tr_capture(object(), command, command.payload, tr_runner=runner)
 
-    assert runner.inputs["비밀번호"] == "1357"
+    assert runner.inputs["비밀번호"] == ""
+    assert runner.inputs["비밀번호입력매체구분"] == "00"
+    assert "1357" not in str(ack)
+    assert "credential_ref" not in str(ack)
+    assert ack["purpose"] == "broker_reconcile"
+
+
+def test_cash_reconcile_capture_keeps_password_blank_even_when_env_exists(monkeypatch):
+    monkeypatch.setenv("LOCAL_SECRET_REF", "1357")
+    command = build_reconcile_tr_command(
+        account="9876543210",
+        logical_source=ReconcileSourceType.ACCOUNT_CASH,
+        run_id="run-sec",
+        credential_ref="LOCAL_SECRET_REF",
+    )
+    runner = FakeRunner()
+
+    ack = _execute_broker_reconcile_tr_capture(object(), command, command.payload, tr_runner=runner)
+
+    assert runner.inputs["비밀번호"] == ""
+    assert runner.inputs["비밀번호입력매체구분"] == "00"
+    assert runner.inputs["조회구분"] == "2"
     assert "1357" not in str(ack)
     assert "credential_ref" not in str(ack)
     assert ack["purpose"] == "broker_reconcile"
