@@ -84,6 +84,10 @@ def test_risk_off_market_rejects_new_buy_intent_without_gateway_command(tmp_path
 def _enabled_config() -> OrderManagerConfig:
     return OrderManagerConfig(
         enabled=True,
+        intent_enabled=True,
+        create_local_order=True,
+        enqueue_gateway_command=True,
+        send_order_allowed=True,
         mode="LIVE_SIM",
         allow_live_sim_orders=True,
         observe_only=False,

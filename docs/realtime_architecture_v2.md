@@ -661,3 +661,176 @@ Snapshot fields:
 - `GatewayCommand`, `send_order`, `runtime_order_intents`, `entry_plans` 생성 경로는 변경하지 않았다.
 
 다음 PR은 `OrderIntent -> RiskManager -> CommandQueue -> Ack/Fill/Reconcile` hardening이다. 그 전까지 dirty evaluator는 운영 판단 cadence와 read model 개선용 shadow evaluator로만 사용한다.
+
+## PR 6 구현 상태: OrderIntent / Risk / OrderManager Hardening
+
+PR 6에서는 EntryEngine/DirtyStrategyEvaluator 결과가 바로 `GatewayCommand`로 이어지지 않도록 주문 경계를 더 단단히 분리했다. 기본값은 계속 observe-only이며 실제 Kiwoom `send_order` command는 생성하지 않는다.
+
+기본 설정:
+
+| env | default |
+|---|---:|
+| `TRADING_ORDER_INTENT_ENABLED` | `false` |
+| `TRADING_ORDER_INTENT_SHADOW_MODE` | `true` |
+| `TRADING_ORDER_MANAGER_ENABLED` | `false` |
+| `TRADING_ORDER_MANAGER_OBSERVE_ONLY` | `true` |
+| `TRADING_ORDER_MANAGER_CREATE_LOCAL_ORDER` | `false` |
+| `TRADING_ORDER_MANAGER_ENQUEUE_GATEWAY_COMMAND` | `false` |
+| `TRADING_ORDER_MANAGER_REQUIRE_SIMULATION_BROKER` | `true` |
+| `TRADING_ORDER_MANAGER_BLOCK_REAL_BROKER` | `true` |
+| `TRADING_ORDER_MANAGER_MAX_DAILY_BUY_ORDERS` | `3` |
+| `TRADING_ORDER_MANAGER_MAX_DAILY_SELL_ORDERS` | `10` |
+| `TRADING_ORDER_MANAGER_MAX_DAILY_ORDERS_PER_CODE` | `1` |
+| `TRADING_ORDER_MANAGER_MAX_OPEN_POSITIONS` | `3` |
+| `TRADING_ORDER_MANAGER_MAX_THEME_EXPOSURE_COUNT` | `2` |
+| `TRADING_ORDER_MANAGER_MAX_ORDER_AMOUNT` | `100000` |
+| `TRADING_ORDER_MANAGER_STALE_TICK_SEC` | `10` |
+| `TRADING_ORDER_MANAGER_ACK_TIMEOUT_SEC` | `30` |
+| `TRADING_ORDER_MANAGER_RECONCILE_REQUIRED_BLOCKS_BUY` | `true` |
+| `TRADING_SEND_ORDER_ALLOWED` | `false` |
+
+OrderIntent 표준 구조:
+
+- `trade_date`
+- `source`
+- `side`: `BUY`, `SELL`, `CANCEL_BUY`, `CANCEL_SELL`
+- `code`, `name`
+- `account`
+- `quantity`, `price`, `hoga`
+- `candidate_id`, `decision_id`, `position_id`
+- `theme_id`, `theme_name`
+- `reason`
+- `idempotency_key`
+- `status`
+- `created_at`
+- `details`
+
+BUY idempotency key:
+
+`buy:{trade_date}:{candidate_id}:{code}:{entry_generation}:{price_bucket}`
+
+SELL/CANCEL은 모델과 handler skeleton만 유지한다. 실제 SELL/CANCEL gateway flow 확대는 다음 PR 범위다.
+
+OrderIntent 생성 조건:
+
+- `entry_status=OBSERVE_READY`
+- `candidate_fsm.v2_state=TIMING_READY`
+- `candidate_fsm.blocking_stage in {"", "NONE"}`
+- `price_source != TR_BACKFILL`
+- `latest_tick_fresh != false`
+- `market_action in {ALLOW_NORMAL, ALLOW_REDUCED}`
+- `stock_role in {LEADER, CO_LEADER}`
+- `price_location in {GOOD_PULLBACK, PULLBACK_RECLAIM, VWAP_RECLAIM}`
+- `limit_price_hint` 또는 현재가가 0보다 큼
+- `TRADING_ORDER_INTENT_ENABLED=true`
+
+RiskManager check:
+
+- OrderManager enabled
+- LIVE_SIM mode / live sim flag
+- Kiwoom login / orderable / gateway heartbeat
+- account configured / whitelist
+- simulation broker required
+- real broker block
+- max daily buy/sell/order-per-code
+- max open positions
+- max theme exposure
+- duplicate pending order / existing position
+- reconcile required blocks buy
+- max quantity / max amount
+- stale decision / stale quote / stale tick
+- spread
+- VI / upper-limit near
+- market RISK_OFF / block new entry
+- portfolio stop-new-entry / kill-switch recommendation
+- STOP_NEW_BUY / REDUCE_ONLY / KILL_SWITCH_ACTIVE state
+
+ManagedOrder lifecycle:
+
+- `INTENT_CREATED`
+- `RISK_APPROVED`
+- `RISK_REJECTED`
+- `LOCAL_ORDER_CREATED`
+- `COMMAND_BLOCKED_OBSERVE_ONLY`
+- `COMMAND_QUEUED`
+- `COMMAND_ACKED`
+- `PARTIALLY_FILLED`
+- `FILLED`
+- `CANCEL_PENDING`
+- `CANCELLED`
+- `RECONCILE_REQUIRED`
+- `FAILED`
+- `EXPIRED`
+
+이번 PR 기본 경로:
+
+1. EntryDecision snapshot을 읽는다.
+2. `TRADING_ORDER_INTENT_ENABLED=false`이면 아무 intent도 만들지 않는다.
+3. flag가 켜진 경우 local `ManagedOrderIntent`를 저장한다.
+4. RiskManager가 승인/거절을 기록한다.
+5. 승인되고 `TRADING_ORDER_MANAGER_CREATE_LOCAL_ORDER=true`인 경우 local `ManagedOrder`를 저장한다.
+6. observe-only 또는 `TRADING_SEND_ORDER_ALLOWED=false` 또는 gateway enqueue flag off이면 `COMMAND_BLOCKED_OBSERVE_ONLY`로 기록한다.
+7. `send_order` GatewayCommand enqueue는 모든 guard가 통과한 경우에만 가능하다. 기본값에서는 항상 차단된다.
+
+GatewayCommand enqueue guard:
+
+- `TRADING_ORDER_MANAGER_ENQUEUE_GATEWAY_COMMAND=true`
+- `TRADING_ORDER_MANAGER_OBSERVE_ONLY=false`
+- `TRADING_SEND_ORDER_ALLOWED=true`
+- mode is `LIVE_SIM`
+- live sim flag enabled
+- broker env is `SIMULATION`
+- real broker not detected
+- RiskDecision approved
+- kill switch normal
+
+Gateway event / reconcile skeleton:
+
+- `apply_order_ack(event)`
+- `apply_order_reject(event)`
+- `apply_order_fill(event)`
+- `apply_balance_snapshot(event)`
+- `apply_order_status_snapshot(event)`
+- `reconcile_open_orders()`
+- `reconcile_positions()`
+
+현재 구현은 command id, order no, code, side, idempotency key 기반 matching skeleton이다. ack timeout, unmatched fill, balance mismatch는 `RECONCILE_REQUIRED` 또는 `STOP_NEW_BUY`로 이어진다. 이번 PR에서는 자동 청산/취소 주문은 만들지 않는다.
+
+Candidate FSM 연동:
+
+- risk reject: `blocking_stage=RISK`, primary reason은 RiskManager reason
+- observe-only command block: `blocking_stage=ORDER`, `reason_code=ORDER_MANAGER_OBSERVE_ONLY`
+- reconcile required / unmatched broker event: STOP_NEW_BUY 상태 기록
+- candidate legacy state를 `BLOCKED`로 바꾸지 않는다.
+
+RebootV2Runtime snapshot:
+
+- `order_manager_v2.status`
+- `enabled`
+- `observe_only`
+- `intent_enabled`
+- `local_order_enabled`
+- `gateway_command_enqueue_enabled`
+- `send_order_allowed`
+- `risk_state`
+- `kill_switch_state`
+- `created_intent_count`
+- `risk_approved_count`
+- `risk_rejected_count`
+- `local_order_created_count`
+- `command_blocked_observe_only_count`
+- `queued_command_count`
+- `reconcile_required_count`
+- `stop_new_buy`
+- `reduce_only`
+- `last_reject_reason`
+- `warnings`
+
+주의:
+
+- 실제 Kiwoom `send_order` 활성화 PR이 아니다.
+- `LIVE_SIM/LIVE_REAL` 활성화 PR이 아니다.
+- 기본값에서는 intent도 만들지 않는다.
+- 테스트에서만 flag를 켜 local intent/order lifecycle과 guard를 검증한다.
+
+다음 PR은 Dashboard read model 분리 또는 controlled LIVE_SIM canary 사전 점검 중 하나를 선택한다. 운영 관점에서는 dashboard read model로 order/risk/reconcile 상태를 먼저 분리한 뒤 controlled canary를 진행하는 순서를 권장한다.

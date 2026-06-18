@@ -378,6 +378,12 @@ def build_reboot_v2_runtime_bundle(
         candle_builder=candle_builder,
         config=position_risk_config,
     )
+    order_manager_pipeline = OrderManagerRuntimePipeline(
+        db=db,
+        gateway_state=gateway_state,
+        market_data=market_data,
+        config=OrderManagerConfig.from_env(),
+    )
     runtime = RebootV2Runtime(
         db=db,
         subscription_manager=subscription_manager,
@@ -395,6 +401,7 @@ def build_reboot_v2_runtime_bundle(
         dirty_strategy_evaluator=dirty_strategy_evaluator,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
         position_risk_pipeline=position_risk_pipeline,
+        order_manager_pipeline=order_manager_pipeline,
     )
     readiness_report = build_readiness_report(
         db,
@@ -424,7 +431,7 @@ def build_reboot_v2_runtime_bundle(
         dirty_strategy_evaluator=dirty_strategy_evaluator,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
         position_risk_pipeline=position_risk_pipeline,
-        order_manager_pipeline=None,
+        order_manager_pipeline=order_manager_pipeline,
     )
 
 

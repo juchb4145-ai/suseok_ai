@@ -48,8 +48,6 @@ class OrderRiskManager:
             reason_codes.append("ORDER_MANAGER_NOT_LIVE_SIM_MODE")
         if not self.config.allow_live_sim_orders:
             reason_codes.append("LIVE_SIM_FLAG_DISABLED")
-        if self.config.observe_only:
-            reason_codes.append("ORDER_MANAGER_OBSERVE_ONLY")
 
         if side == OrderSide.BUY.value and kill_switch_state in {
             OrderKillSwitchState.STOP_NEW_BUY.value,
@@ -65,7 +63,7 @@ class OrderRiskManager:
 
         if self._is_kill_switch_reason(reason_codes):
             decision = OrderRiskResult.KILL_SWITCH.value
-        elif any(code in {"STALE_ENTRY_DECISION", "STALE_EXIT_DECISION", "STALE_QUOTE"} for code in reason_codes):
+        elif any(code in {"STALE_ENTRY_DECISION", "STALE_EXIT_DECISION", "STALE_QUOTE", "STALE_TICK"} for code in reason_codes):
             decision = OrderRiskResult.WAIT.value
         elif reason_codes:
             decision = OrderRiskResult.REJECT.value
@@ -130,6 +128,8 @@ class OrderRiskManager:
             reasons.append("DUPLICATE_OPEN_POSITION")
         if self._has_pending_order(code):
             reasons.append("DUPLICATE_PENDING_ORDER")
+        if self.config.reconcile_required_blocks_buy and self._has_reconcile_required_order():
+            reasons.append("RECONCILE_REQUIRED_BLOCKS_BUY")
         if theme_id and self._theme_exposure_count(theme_id) >= self.config.max_theme_exposure_count:
             reasons.append("MAX_THEME_EXPOSURE")
 
@@ -178,6 +178,10 @@ class OrderRiskManager:
             age = _age_sec(quote_at, now)
             if age is not None and age > self.config.quote_stale_after_sec:
                 reasons.append("STALE_QUOTE")
+        if quote_at and self.config.stale_tick_sec > 0:
+            age = _age_sec(quote_at, now)
+            if age is not None and age > self.config.stale_tick_sec:
+                reasons.append("STALE_TICK")
         return reasons
 
     def _daily_code_order_count(self, trade_date: str, code: str) -> int:
@@ -195,6 +199,10 @@ class OrderRiskManager:
     def _has_pending_order(self, code: str) -> bool:
         finder = getattr(self.db, "find_active_managed_order_by_code", None)
         return bool(finder(code)) if callable(finder) else False
+
+    def _has_reconcile_required_order(self) -> bool:
+        rows = _call(self.db, "list_managed_orders", status=["RECONCILE_REQUIRED"], limit=1) or []
+        return bool(rows)
 
     def _theme_exposure_count(self, theme_id: str) -> int:
         rows = _call(self.db, "list_live_sim_positions", status="OPEN", limit=1000) or []

@@ -38,6 +38,7 @@ class RebootV2Runtime:
     dirty_strategy_evaluator: Any = None
     exit_engine_reboot_pipeline: Any = None
     position_risk_pipeline: Any = None
+    order_manager_pipeline: Any = None
     clock: Any = datetime.now
     startup_warnings: list[str] = field(default_factory=list)
     readiness_report: Any = None
@@ -102,9 +103,10 @@ class RebootV2Runtime:
         else:
             snapshot["exit_engine_reboot"] = _disabled_section("NO_OPEN_POSITIONS")
             snapshot["position_risk"] = _disabled_section("NO_OPEN_POSITIONS")
+        self._run_pipeline(snapshot, "order_manager_v2", self.order_manager_pipeline, current)
 
         self._attach_counts(snapshot, current)
-        snapshot["order_manager"] = _disabled_section("ORDER_MANAGER_DISABLED_IN_V2_OBSERVE")
+        snapshot["order_manager"] = snapshot.get("order_manager_v2") or _disabled_section("ORDER_MANAGER_DISABLED_IN_V2_OBSERVE")
         snapshot["legacy_runtime"] = {
             "enabled": False,
             "gate_pipeline_count": 0,
@@ -141,7 +143,7 @@ class RebootV2Runtime:
                 "dirty_strategy_evaluator": _component_enabled(self.dirty_strategy_evaluator),
                 "exit_engine": _component_enabled(self.exit_engine_reboot_pipeline),
                 "position_risk": _component_enabled(self.position_risk_pipeline),
-                "order_manager": False,
+                "order_manager": _component_enabled(self.order_manager_pipeline),
                 "legacy_entry_path": False,
             },
             "warnings": list(self.startup_warnings or []),

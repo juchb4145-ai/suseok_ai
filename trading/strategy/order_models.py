@@ -22,8 +22,11 @@ class OrderIntentSource(str, Enum):
 
 class OrderIntentStatus(str, Enum):
     CREATED = "CREATED"
+    INTENT_CREATED = "INTENT_CREATED"
     RISK_APPROVED = "RISK_APPROVED"
     RISK_REJECTED = "RISK_REJECTED"
+    LOCAL_ORDER_CREATED = "LOCAL_ORDER_CREATED"
+    COMMAND_BLOCKED_OBSERVE_ONLY = "COMMAND_BLOCKED_OBSERVE_ONLY"
     COMMAND_QUEUED = "COMMAND_QUEUED"
     COMMAND_ACKED = "COMMAND_ACKED"
     COMMAND_REJECTED = "COMMAND_REJECTED"
@@ -36,6 +39,11 @@ class OrderIntentStatus(str, Enum):
 
 
 class ManagedOrderStatus(str, Enum):
+    INTENT_CREATED = "INTENT_CREATED"
+    RISK_APPROVED = "RISK_APPROVED"
+    RISK_REJECTED = "RISK_REJECTED"
+    LOCAL_ORDER_CREATED = "LOCAL_ORDER_CREATED"
+    COMMAND_BLOCKED_OBSERVE_ONLY = "COMMAND_BLOCKED_OBSERVE_ONLY"
     PENDING_LOCAL = "PENDING_LOCAL"
     QUEUED_TO_GATEWAY = "QUEUED_TO_GATEWAY"
     ACKED_BY_GATEWAY = "ACKED_BY_GATEWAY"
@@ -65,6 +73,11 @@ class OrderKillSwitchState(str, Enum):
 @dataclass(frozen=True)
 class OrderManagerConfig:
     enabled: bool = False
+    intent_enabled: bool = False
+    intent_shadow_mode: bool = True
+    create_local_order: bool = False
+    enqueue_gateway_command: bool = False
+    send_order_allowed: bool = False
     mode: str = "OBSERVE"
     allow_live_sim_orders: bool = False
     require_simulation_broker: bool = True
@@ -89,6 +102,9 @@ class OrderManagerConfig:
     decision_stale_after_sec: int = 180
     quote_stale_after_sec: int = 45
     max_spread_ticks: int = 5
+    stale_tick_sec: int = 10
+    ack_timeout_sec: int = 30
+    reconcile_required_blocks_buy: bool = True
     block_pyramiding: bool = True
     command_ttl_sec: int = 30
     command_max_attempts: int = 1
@@ -103,19 +119,24 @@ class OrderManagerConfig:
             if item.strip()
         )
         return cls(
+            intent_enabled=_env_bool("TRADING_ORDER_INTENT_ENABLED", False),
+            intent_shadow_mode=_env_bool("TRADING_ORDER_INTENT_SHADOW_MODE", True),
             enabled=_env_bool("TRADING_ORDER_MANAGER_ENABLED", False),
+            create_local_order=_env_bool("TRADING_ORDER_MANAGER_CREATE_LOCAL_ORDER", False),
+            enqueue_gateway_command=_env_bool("TRADING_ORDER_MANAGER_ENQUEUE_GATEWAY_COMMAND", False),
+            send_order_allowed=_env_bool("TRADING_SEND_ORDER_ALLOWED", False),
             mode=_env_choice("TRADING_ORDER_MANAGER_MODE", "OBSERVE", {"OBSERVE", "DRY_RUN", "LIVE_SIM"}),
             allow_live_sim_orders=_env_bool("TRADING_ALLOW_LIVE_SIM_ORDERS", False),
-            require_simulation_broker=_env_bool("TRADING_REQUIRE_SIMULATION_BROKER", True),
-            block_real_broker=_env_bool("TRADING_BLOCK_REAL_BROKER", True),
+            require_simulation_broker=_env_bool("TRADING_ORDER_MANAGER_REQUIRE_SIMULATION_BROKER", _env_bool("TRADING_REQUIRE_SIMULATION_BROKER", True)),
+            block_real_broker=_env_bool("TRADING_ORDER_MANAGER_BLOCK_REAL_BROKER", _env_bool("TRADING_BLOCK_REAL_BROKER", True)),
             live_sim_account_whitelist=whitelist,
             max_order_quantity=_env_int("TRADING_LIVE_SIM_MAX_ORDER_QUANTITY", 1),
-            max_order_amount=_env_int("TRADING_LIVE_SIM_MAX_ORDER_AMOUNT", 100_000),
-            max_daily_buy_orders=_env_int("TRADING_LIVE_SIM_MAX_DAILY_BUY_ORDERS", 3),
-            max_daily_sell_orders=_env_int("TRADING_LIVE_SIM_MAX_DAILY_SELL_ORDERS", 10),
-            max_daily_orders_per_code=_env_int("TRADING_LIVE_SIM_MAX_DAILY_ORDERS_PER_CODE", 1),
-            max_open_positions=_env_int("TRADING_LIVE_SIM_MAX_OPEN_POSITIONS", 3),
-            max_theme_exposure_count=_env_int("TRADING_LIVE_SIM_MAX_THEME_EXPOSURE_COUNT", 2),
+            max_order_amount=_env_int("TRADING_ORDER_MANAGER_MAX_ORDER_AMOUNT", _env_int("TRADING_LIVE_SIM_MAX_ORDER_AMOUNT", 100_000)),
+            max_daily_buy_orders=_env_int("TRADING_ORDER_MANAGER_MAX_DAILY_BUY_ORDERS", _env_int("TRADING_LIVE_SIM_MAX_DAILY_BUY_ORDERS", 3)),
+            max_daily_sell_orders=_env_int("TRADING_ORDER_MANAGER_MAX_DAILY_SELL_ORDERS", _env_int("TRADING_LIVE_SIM_MAX_DAILY_SELL_ORDERS", 10)),
+            max_daily_orders_per_code=_env_int("TRADING_ORDER_MANAGER_MAX_DAILY_ORDERS_PER_CODE", _env_int("TRADING_LIVE_SIM_MAX_DAILY_ORDERS_PER_CODE", 1)),
+            max_open_positions=_env_int("TRADING_ORDER_MANAGER_MAX_OPEN_POSITIONS", _env_int("TRADING_LIVE_SIM_MAX_OPEN_POSITIONS", 3)),
+            max_theme_exposure_count=_env_int("TRADING_ORDER_MANAGER_MAX_THEME_EXPOSURE_COUNT", _env_int("TRADING_LIVE_SIM_MAX_THEME_EXPOSURE_COUNT", 2)),
             cancel_unfilled_after_sec=_env_int("TRADING_LIVE_SIM_CANCEL_UNFILLED_AFTER_SEC", 45),
             order_hoga=os.getenv("TRADING_LIVE_SIM_ORDER_HOGA", "00"),
             use_limit_price=_env_bool("TRADING_LIVE_SIM_USE_LIMIT_PRICE", True),
@@ -128,6 +149,9 @@ class OrderManagerConfig:
             decision_stale_after_sec=_env_int("TRADING_LIVE_SIM_DECISION_STALE_AFTER_SEC", 180),
             quote_stale_after_sec=_env_int("TRADING_LIVE_SIM_QUOTE_STALE_AFTER_SEC", 45),
             max_spread_ticks=_env_int("TRADING_LIVE_SIM_MAX_SPREAD_TICKS", 5),
+            stale_tick_sec=_env_int("TRADING_ORDER_MANAGER_STALE_TICK_SEC", 10),
+            ack_timeout_sec=_env_int("TRADING_ORDER_MANAGER_ACK_TIMEOUT_SEC", 30),
+            reconcile_required_blocks_buy=_env_bool("TRADING_ORDER_MANAGER_RECONCILE_REQUIRED_BLOCKS_BUY", True),
             command_ttl_sec=_env_int("TRADING_LIVE_SIM_COMMAND_TTL_SEC", 30),
             command_max_attempts=_env_int("TRADING_LIVE_SIM_COMMAND_MAX_ATTEMPTS", 1),
             cycle_bucket_sec=_env_int("TRADING_LIVE_SIM_CYCLE_BUCKET_SEC", 30),
@@ -248,6 +272,11 @@ class OrderManagerSnapshot:
     mode: str
     enabled: bool
     live_sim_orders_allowed: bool
+    observe_only: bool = True
+    intent_enabled: bool = False
+    local_order_enabled: bool = False
+    gateway_command_enqueue_enabled: bool = False
+    send_order_allowed: bool = False
     broker_env: str = "UNKNOWN"
     account: str = ""
     account_whitelisted: bool = False
@@ -259,7 +288,14 @@ class OrderManagerSnapshot:
     pending_cancel_count: int = 0
     rejected_order_count: int = 0
     created_intent_count: int = 0
+    risk_approved_count: int = 0
+    risk_rejected_count: int = 0
+    local_order_created_count: int = 0
+    command_blocked_observe_only_count: int = 0
     queued_command_count: int = 0
+    reconcile_required_count: int = 0
+    stop_new_buy: bool = False
+    reduce_only: bool = False
     rejected_intent_count: int = 0
     last_order_at: str = ""
     last_reject_reason: str = ""

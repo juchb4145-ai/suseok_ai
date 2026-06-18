@@ -6,6 +6,7 @@ from typing import Any
 
 from trading.broker.command_queue import CommandPriority
 from trading.broker.models import GatewayCommand, new_message_id
+from trading.strategy.candidate_fsm import CandidateBlockingStage, CandidateFsmService, CandidateReasonCode
 from trading.strategy.kill_switch import OrderKillSwitchManager
 from trading.strategy.order_models import (
     ManagedOrder,
@@ -18,9 +19,11 @@ from trading.strategy.order_models import (
     OrderManagerConfig,
     OrderManagerSnapshot,
     OrderRiskDecision,
+    OrderRiskResult,
     OrderSide,
     UnfilledCancelDecision,
 )
+from trading.strategy.order_reconcile import ManagedOrderReconciler
 from trading.strategy.order_risk import OrderRiskManager, broker_environment_state
 from trading.strategy.unfilled_cancel import UnfilledCancelScheduler
 
@@ -51,6 +54,8 @@ class OrderManagerRuntimePipeline:
         self.risk_manager = OrderRiskManager(db, gateway_state, self.config)
         self.kill_switch = OrderKillSwitchManager(db, self.config)
         self.cancel_scheduler = UnfilledCancelScheduler(db, gateway_state, self.config)
+        self.reconciler = ManagedOrderReconciler(db)
+        self.fsm = CandidateFsmService(db, clock=lambda: self.clock())
         self.last_summary: dict[str, Any] = {}
         self._last_run_at: datetime | None = None
 
@@ -78,6 +83,15 @@ class OrderManagerRuntimePipeline:
             return dict(self.last_summary)
 
         kill_state = self.kill_switch.evaluate(trade_date=trade_date, now=current)
+        reconcile_summary = self.reconcile_open_orders(now=current)
+        if not self.config.intent_enabled:
+            snapshot = self._snapshot(
+                current,
+                reconcile_required_count=int(reconcile_summary.get("reconcile_required_count") or 0),
+                warnings=tuple(_dedupe(["ORDER_INTENT_DISABLED", *list(reconcile_summary.get("warnings") or [])])),
+            )
+            self.last_summary = snapshot.to_dict()
+            return dict(self.last_summary)
         for intent in self._entry_intents(trade_date=trade_date, now=current):
             result = self._process_intent(intent, now=current, kill_switch_state=str(kill_state.get("state") or ""))
             created_intents += int(result.get("created_intent", 0))
@@ -99,7 +113,12 @@ class OrderManagerRuntimePipeline:
             created_intent_count=created_intents,
             queued_command_count=queued_commands,
             rejected_intent_count=rejected_intents,
-            warnings=tuple(_dedupe(warnings)),
+            risk_approved_count=sum(1 for item in self.db.list_managed_order_intents(trade_date=trade_date, limit=500) if str(item.get("status") or "") in {OrderIntentStatus.RISK_APPROVED.value, OrderIntentStatus.LOCAL_ORDER_CREATED.value, OrderIntentStatus.COMMAND_BLOCKED_OBSERVE_ONLY.value, OrderIntentStatus.COMMAND_QUEUED.value}),
+            risk_rejected_count=rejected_intents,
+            local_order_created_count=sum(1 for item in self.db.list_managed_orders(trade_date=trade_date, limit=500) if str(item.get("status") or "") in {ManagedOrderStatus.LOCAL_ORDER_CREATED.value, ManagedOrderStatus.COMMAND_BLOCKED_OBSERVE_ONLY.value, ManagedOrderStatus.QUEUED_TO_GATEWAY.value}),
+            command_blocked_observe_only_count=sum(1 for item in self.db.list_managed_orders(trade_date=trade_date, limit=500) if str(item.get("status") or "") == ManagedOrderStatus.COMMAND_BLOCKED_OBSERVE_ONLY.value),
+            reconcile_required_count=int(reconcile_summary.get("reconcile_required_count") or 0),
+            warnings=tuple(_dedupe([*warnings, *list(reconcile_summary.get("warnings") or [])])),
         )
         self.last_summary = snapshot.to_dict()
         return dict(self.last_summary)
@@ -132,6 +151,7 @@ class OrderManagerRuntimePipeline:
                 payload=risk.to_dict(),
                 message=",".join(risk.reason_codes),
             )
+            self._apply_candidate_fsm_risk(saved_intent, risk, now=now)
             return {"created_intent": 1, "queued_command": 0, "rejected_intent": 1, "warnings": list(risk.reason_codes)}
 
         saved_intent = self.db.save_managed_order_intent(
@@ -141,7 +161,52 @@ class OrderManagerRuntimePipeline:
                 "details": {**dict(saved_intent.get("details") or {}), "risk": risk.to_dict()},
             }
         )
+        if not self.config.create_local_order:
+            self._append_event(
+                None,
+                saved_intent.get("id"),
+                "local_order_blocked_config",
+                status_from=OrderIntentStatus.RISK_APPROVED.value,
+                status_to=OrderIntentStatus.RISK_APPROVED.value,
+                payload={"reason": "LOCAL_ORDER_CREATION_DISABLED"},
+            )
+            return {"created_intent": 1, "queued_command": 0, "rejected_intent": 0, "warnings": ["LOCAL_ORDER_CREATION_DISABLED"]}
         order = self._persist_local_order(saved_intent, now=now)
+        self.db.save_managed_order_intent({**saved_intent, "status": OrderIntentStatus.LOCAL_ORDER_CREATED.value})
+        self._append_event(
+            order.get("id"),
+            saved_intent.get("id"),
+            "local_order_created",
+            status_from=OrderIntentStatus.RISK_APPROVED.value,
+            status_to=ManagedOrderStatus.LOCAL_ORDER_CREATED.value,
+            payload={"order": order},
+        )
+        guard_reasons = self._gateway_command_guard(order, risk)
+        if guard_reasons:
+            blocked_order = self.db.save_managed_order(
+                {
+                    **order,
+                    "status": ManagedOrderStatus.COMMAND_BLOCKED_OBSERVE_ONLY.value,
+                    "updated_at": now.isoformat(),
+                    "details": {
+                        **dict(order.get("details") or {}),
+                        "risk": risk.to_dict(),
+                        "gateway_command_guard_reasons": guard_reasons,
+                    },
+                }
+            )
+            self.db.save_managed_order_intent({**saved_intent, "status": OrderIntentStatus.COMMAND_BLOCKED_OBSERVE_ONLY.value})
+            self._append_event(
+                blocked_order.get("id"),
+                saved_intent.get("id"),
+                "command_blocked_observe_only",
+                status_from=ManagedOrderStatus.LOCAL_ORDER_CREATED.value,
+                status_to=ManagedOrderStatus.COMMAND_BLOCKED_OBSERVE_ONLY.value,
+                payload={"risk": risk.to_dict(), "guard_reasons": guard_reasons},
+                message=",".join(guard_reasons),
+            )
+            self._apply_candidate_fsm_order_block(saved_intent, guard_reasons, now=now)
+            return {"created_intent": 1, "queued_command": 0, "rejected_intent": 0, "warnings": guard_reasons}
         command = self._command_for_order(order)
         enqueue = self.gateway_state.enqueue_command(
             command,
@@ -166,6 +231,7 @@ class OrderManagerRuntimePipeline:
                     "updated_at": now.isoformat(),
                     "details": {
                         **dict(order.get("details") or {}),
+                        "risk": risk.to_dict(),
                         "command": command.to_dict(),
                         "enqueue_result": enqueue.to_dict(),
                     },
@@ -208,6 +274,8 @@ class OrderManagerRuntimePipeline:
         return {"created_intent": 1, "queued_command": 0, "rejected_intent": 1, "warnings": [str(enqueue.reason or "COMMAND_QUEUE_REJECTED")]}
 
     def _entry_intents(self, *, trade_date: str, now: datetime) -> list[ManagedOrderIntent]:
+        if not self.config.intent_enabled:
+            return []
         loader = getattr(self.db, "latest_entry_decisions", None)
         if not callable(loader):
             return []
@@ -220,7 +288,8 @@ class OrderManagerRuntimePipeline:
             price, details = self._price_for_entry(decision, code)
             decision_id = decision.get("id")
             bucket = decision_id or int(now.timestamp() // max(1, self.config.cycle_bucket_sec))
-            idempotency_key = f"reboot_live_sim_buy:{trade_date}:{decision.get('candidate_id') or ''}:{code}:{bucket}"
+            price_bucket = int((price or 0) // 10) * 10
+            idempotency_key = f"buy:{trade_date}:{decision.get('candidate_id') or ''}:{code}:{bucket}:{price_bucket}"
             intents.append(
                 ManagedOrderIntent(
                     trade_date=trade_date,
@@ -241,6 +310,7 @@ class OrderManagerRuntimePipeline:
                     reason="ENTRY_OBSERVE_READY",
                     details={
                         **details,
+                        **dict(decision.get("details") or {}),
                         "decision": decision,
                         "calculated_at": decision.get("calculated_at") or "",
                         "market_status": decision.get("market_status") or "",
@@ -255,6 +325,8 @@ class OrderManagerRuntimePipeline:
         return intents
 
     def _exit_intents(self, *, trade_date: str, now: datetime) -> list[ManagedOrderIntent]:
+        if not self.config.intent_enabled:
+            return []
         loader = getattr(self.db, "latest_exit_decisions_reboot", None)
         if not callable(loader):
             return []
@@ -294,6 +366,7 @@ class OrderManagerRuntimePipeline:
                     reason=exit_reason,
                     details={
                         **details,
+                        **dict(decision.get("details") or {}),
                         "decision": decision,
                         "position": position,
                         "calculated_at": decision.get("calculated_at") or "",
@@ -306,8 +379,6 @@ class OrderManagerRuntimePipeline:
 
     def _entry_decision_allowed(self, decision: dict[str, Any], *, trade_date: str) -> bool:
         if str(decision.get("entry_status") or "") != "OBSERVE_READY":
-            return False
-        if not bool(decision.get("dry_run_intent_allowed") or decision.get("live_sim_intent_allowed")):
             return False
         if str(decision.get("market_action") or "") not in ENTRY_ALLOWED_MARKET_ACTIONS:
             return False
@@ -324,6 +395,16 @@ class OrderManagerRuntimePipeline:
                 state = getattr(getattr(candidate, "state", ""), "value", str(getattr(candidate, "state", "")))
                 if state and state not in ENTRY_ALLOWED_CANDIDATE_STATES:
                     return False
+                fsm = dict(dict(candidate.metadata or {}).get("candidate_fsm") or {})
+                if fsm:
+                    if str(fsm.get("v2_state") or "") != "TIMING_READY":
+                        return False
+                    if str(fsm.get("blocking_stage") or "") not in {"", "NONE"}:
+                        return False
+                    if str(fsm.get("price_source") or "REALTIME").upper() == "TR_BACKFILL":
+                        return False
+                    if str(fsm.get("latest_tick_fresh") or "").lower() == "false":
+                        return False
         return True
 
     def _exit_decision_allowed(self, decision: dict[str, Any], positions: dict[str, dict[str, Any]]) -> bool:
@@ -430,6 +511,29 @@ class OrderManagerRuntimePipeline:
         )
         return self.db.save_managed_order(order.to_dict())
 
+    def _gateway_command_guard(self, order: dict[str, Any], risk: OrderRiskDecision) -> list[str]:
+        reasons: list[str] = []
+        if not self.config.enqueue_gateway_command:
+            reasons.append("GATEWAY_COMMAND_ENQUEUE_DISABLED")
+        if self.config.observe_only:
+            reasons.append("ORDER_MANAGER_OBSERVE_ONLY")
+        if not self.config.send_order_allowed:
+            reasons.append("SEND_ORDER_NOT_ALLOWED")
+        if self.config.mode != "LIVE_SIM":
+            reasons.append("ORDER_MANAGER_NOT_LIVE_SIM_MODE")
+        if not self.config.allow_live_sim_orders:
+            reasons.append("LIVE_SIM_FLAG_DISABLED")
+        broker = self.gateway_state.snapshot().to_dict()
+        if broker_environment_state(broker) != "SIMULATION":
+            reasons.append("SIMULATION_BROKER_REQUIRED")
+        if self.config.block_real_broker and broker_environment_state(broker) == "REAL":
+            reasons.append("REAL_BROKER_BLOCKED")
+        if not risk.approved:
+            reasons.append("RISK_NOT_APPROVED")
+        if self.kill_switch.latest_state(trade_date=str(order.get("trade_date") or "")).get("state") == OrderKillSwitchState.KILL_SWITCH_ACTIVE.value:
+            reasons.append("KILL_SWITCH_ACTIVE")
+        return _dedupe(reasons)
+
     def _command_for_order(self, order: dict[str, Any]) -> GatewayCommand:
         side = str(order.get("side") or "").upper()
         code = str(order.get("code") or "")
@@ -489,7 +593,12 @@ class OrderManagerRuntimePipeline:
         now: datetime,
         *,
         created_intent_count: int = 0,
+        risk_approved_count: int = 0,
+        risk_rejected_count: int = 0,
+        local_order_created_count: int = 0,
+        command_blocked_observe_only_count: int = 0,
         queued_command_count: int = 0,
+        reconcile_required_count: int = 0,
         rejected_intent_count: int = 0,
         warnings: tuple[str, ...] = (),
     ) -> OrderManagerSnapshot:
@@ -507,11 +616,18 @@ class OrderManagerRuntimePipeline:
             status=status,
             mode=self.config.mode,
             enabled=self.config.enabled,
+            observe_only=self.config.observe_only,
+            intent_enabled=self.config.intent_enabled,
+            local_order_enabled=self.config.create_local_order,
+            gateway_command_enqueue_enabled=self.config.enqueue_gateway_command,
+            send_order_allowed=self.config.send_order_allowed,
             live_sim_orders_allowed=bool(
                 self.config.enabled
                 and self.config.mode == "LIVE_SIM"
                 and self.config.allow_live_sim_orders
                 and not self.config.observe_only
+                and self.config.enqueue_gateway_command
+                and self.config.send_order_allowed
                 and env == "SIMULATION"
             ),
             broker_env=env,
@@ -525,13 +641,77 @@ class OrderManagerRuntimePipeline:
             pending_cancel_count=int(summary.get("pending_cancel_count") or 0),
             rejected_order_count=int(summary.get("rejected_order_count") or 0),
             created_intent_count=created_intent_count,
+            risk_approved_count=risk_approved_count,
+            risk_rejected_count=risk_rejected_count,
+            local_order_created_count=local_order_created_count,
+            command_blocked_observe_only_count=command_blocked_observe_only_count,
             queued_command_count=queued_command_count,
+            reconcile_required_count=reconcile_required_count,
+            stop_new_buy=str(kill_state.get("state") or "") in {OrderKillSwitchState.STOP_NEW_BUY.value, OrderKillSwitchState.KILL_SWITCH_ACTIVE.value},
+            reduce_only=str(kill_state.get("state") or "") == OrderKillSwitchState.REDUCE_ONLY.value,
             rejected_intent_count=rejected_intent_count,
             last_order_at=str(summary.get("last_order_at") or ""),
             last_reject_reason=str(summary.get("last_reject_reason") or ""),
             warnings=tuple(warnings),
             recent_orders=tuple(recent),
         )
+
+    def apply_order_ack(self, event: Any) -> dict[str, Any]:
+        payload = dict(getattr(event, "payload", event) or {})
+        result = self.reconciler.handle_command_ack(payload)
+        if not result.get("matched"):
+            self._record_reconcile_required("ORDER_ACK_UNMATCHED", payload)
+        return result
+
+    def apply_order_reject(self, event: Any) -> dict[str, Any]:
+        payload = dict(getattr(event, "payload", event) or {})
+        payload["status"] = "REJECTED"
+        return self.apply_order_ack(payload)
+
+    def apply_order_fill(self, event: Any) -> dict[str, Any]:
+        payload = dict(getattr(event, "payload", event) or {})
+        result = self.reconciler.handle_execution(payload)
+        if not result.matched:
+            self._record_reconcile_required("FILL_WITHOUT_LOCAL_ORDER", payload)
+        return result.to_dict()
+
+    def apply_balance_snapshot(self, event: Any) -> dict[str, Any]:
+        payload = dict(getattr(event, "payload", event) or {})
+        if bool(payload.get("mismatch") or payload.get("local_position_mismatch")):
+            self._record_reconcile_required("BALANCE_MISMATCH", payload)
+            return {"matched": False, "status": "RECONCILE_REQUIRED", "reason": "BALANCE_MISMATCH"}
+        return {"matched": True, "status": "OK"}
+
+    def apply_order_status_snapshot(self, event: Any) -> dict[str, Any]:
+        payload = dict(getattr(event, "payload", event) or {})
+        return {"matched": True, "status": "OBSERVED", "payload": payload}
+
+    def reconcile_open_orders(self, *, now: datetime | None = None) -> dict[str, Any]:
+        current = _clean_time(now or self.clock())
+        rows = self.db.list_managed_orders(
+            status=[ManagedOrderStatus.QUEUED_TO_GATEWAY.value],
+            limit=500,
+        ) if hasattr(self.db, "list_managed_orders") else []
+        count = 0
+        for order in rows:
+            sent_at = str(order.get("sent_at") or order.get("created_at") or "")
+            if _age_sec(sent_at, current) <= self.config.ack_timeout_sec:
+                continue
+            self.db.save_managed_order({**order, "status": ManagedOrderStatus.RECONCILE_REQUIRED.value, "updated_at": current.isoformat()})
+            self._append_event(
+                order.get("id"),
+                order.get("intent_id"),
+                "ack_timeout_reconcile_required",
+                status_from=str(order.get("status") or ""),
+                status_to=ManagedOrderStatus.RECONCILE_REQUIRED.value,
+                payload={"ack_timeout_sec": self.config.ack_timeout_sec},
+            )
+            self._record_reconcile_required("ORDER_ACK_TIMEOUT", order)
+            count += 1
+        return {"status": "OK", "reconcile_required_count": count, "warnings": ["RECONCILE_REQUIRED"] if count else []}
+
+    def reconcile_positions(self, *, now: datetime | None = None) -> dict[str, Any]:
+        return {"status": "SKELETON", "reconcile_required_count": 0}
 
     def _intent_exists(self, idempotency_key: str) -> bool:
         finder = getattr(self.db, "find_managed_order_intent_by_idempotency", None)
@@ -573,6 +753,51 @@ class OrderManagerRuntimePipeline:
                 }
             )
 
+    def _record_reconcile_required(self, reason: str, payload: dict[str, Any]) -> None:
+        trade_date = str(payload.get("trade_date") or datetime.now(timezone.utc).date().isoformat())
+        saver = getattr(self.db, "save_order_kill_switch_state", None)
+        if callable(saver):
+            saver(
+                {
+                    "trade_date": trade_date,
+                    "state": OrderKillSwitchState.STOP_NEW_BUY.value,
+                    "reason_codes": [reason],
+                    "updated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+                    "details": {"payload": payload},
+                }
+            )
+
+    def _apply_candidate_fsm_risk(self, intent: dict[str, Any], risk: OrderRiskDecision, *, now: datetime) -> None:
+        candidate = self._candidate_by_code(str(intent.get("trade_date") or now.date().isoformat()), str(intent.get("code") or ""))
+        if candidate is None:
+            return
+        reason = CandidateReasonCode.ORDER_RISK_REJECTED.value
+        if risk.reason_codes:
+            reason = str(risk.reason_codes[0])
+        self.fsm.apply_blocking_reason(
+            candidate,
+            CandidateBlockingStage.RISK,
+            reason,
+            details={"intent": intent, "risk": risk.to_dict()},
+            source_event_type="order_risk",
+            source_component="OrderManager",
+        )
+        self.db.save_candidate(candidate)
+
+    def _apply_candidate_fsm_order_block(self, intent: dict[str, Any], reasons: list[str], *, now: datetime) -> None:
+        candidate = self._candidate_by_code(str(intent.get("trade_date") or now.date().isoformat()), str(intent.get("code") or ""))
+        if candidate is None:
+            return
+        self.fsm.apply_blocking_reason(
+            candidate,
+            CandidateBlockingStage.ORDER,
+            CandidateReasonCode.ORDER_MANAGER_OBSERVE_ONLY.value,
+            details={"intent": intent, "guard_reasons": reasons},
+            source_event_type="order_command_guard",
+            source_component="OrderManager",
+        )
+        self.db.save_candidate(candidate)
+
 
 def order_manager_dashboard_section(db: Any, *, gateway_state: Any = None, trade_date: str | None = None) -> dict[str, Any]:
     trade_date = trade_date or datetime.now().date().isoformat()
@@ -597,7 +822,12 @@ def order_manager_dashboard_section(db: Any, *, gateway_state: Any = None, trade
         "status": "READY" if config.enabled else "DISABLED",
         "mode": config.mode,
         "enabled": config.enabled,
-        "live_sim_orders_allowed": bool(config.enabled and config.mode == "LIVE_SIM" and config.allow_live_sim_orders and not config.observe_only and env == "SIMULATION"),
+        "observe_only": config.observe_only,
+        "intent_enabled": config.intent_enabled,
+        "local_order_enabled": config.create_local_order,
+        "gateway_command_enqueue_enabled": config.enqueue_gateway_command,
+        "send_order_allowed": config.send_order_allowed,
+        "live_sim_orders_allowed": bool(config.enabled and config.mode == "LIVE_SIM" and config.allow_live_sim_orders and not config.observe_only and config.enqueue_gateway_command and config.send_order_allowed and env == "SIMULATION"),
         "broker_env": env,
         "account": account,
         "account_whitelisted": bool(account and (not whitelist or account in whitelist)),
@@ -631,6 +861,16 @@ def _clean_time(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc, microsecond=0)
     return value.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def _age_sec(value: str, now: datetime) -> float:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=now.tzinfo or timezone.utc)
+    return max(0.0, (_clean_time(now) - _clean_time(parsed)).total_seconds())
 
 
 def _dedupe(values: list[str] | tuple[str, ...]) -> list[str]:

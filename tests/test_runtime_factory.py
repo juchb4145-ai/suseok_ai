@@ -104,7 +104,11 @@ def test_build_core_runtime_routes_to_reboot_v2_observe_only(tmp_path, monkeypat
     assert bundle.exit_engine_reboot_pipeline.config.enabled is True
     assert bundle.position_risk_pipeline.config.enabled is True
     assert bundle.order_sink is None
-    assert bundle.order_manager_pipeline is None
+    assert bundle.order_manager_pipeline is not None
+    assert bundle.order_manager_pipeline.config.enabled is False
+    assert bundle.order_manager_pipeline.config.observe_only is True
+    assert bundle.order_manager_pipeline.config.intent_enabled is False
+    assert bundle.order_manager_pipeline.config.enqueue_gateway_command is False
     assert not hasattr(bundle.runtime, "gate_pipeline")
     assert not hasattr(bundle.runtime, "entry_plan_builder")
 
