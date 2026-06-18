@@ -26,8 +26,8 @@ class PreMarketGoNoGoDecision(str, Enum):
 @dataclass(frozen=True)
 class PreMarketCheckConfig:
     requested_mode: str = "OBSERVE"
-    strategy_reboot_v2_enabled: bool = False
-    dashboard_v2_enabled: bool = False
+    strategy_reboot_v2_enabled: bool = True
+    dashboard_v2_enabled: bool = True
     dry_run_entry_intents_enabled: bool = False
     dry_run_exit_sell_intents_enabled: bool = False
     order_manager_enabled: bool = False
@@ -51,10 +51,10 @@ class PreMarketCheckConfig:
         whitelist = tuple(item.strip() for item in os.getenv("TRADING_LIVE_SIM_ACCOUNT_WHITELIST", "").split(",") if item.strip())
         return cls(
             requested_mode=normalize_requested_mode(requested_mode or os.getenv("TRADING_PRE_MARKET_CHECK_MODE", "OBSERVE")),
-            strategy_reboot_v2_enabled=_env_bool("STRATEGY_REBOOT_V2_ENABLED", False),
+            strategy_reboot_v2_enabled=_env_bool("STRATEGY_REBOOT_V2_ENABLED", True),
             dashboard_v2_enabled=_env_bool(
                 "TRADING_DASHBOARD_V2_ENABLED",
-                _env_bool("STRATEGY_REBOOT_V2_DASHBOARD", False),
+                _env_bool("STRATEGY_REBOOT_V2_DASHBOARD", True),
             ),
             dry_run_entry_intents_enabled=_env_bool("TRADING_ENTRY_ALLOW_DRY_RUN_INTENTS", False),
             dry_run_exit_sell_intents_enabled=_env_bool("TRADING_EXIT_ALLOW_DRY_RUN_SELL_INTENTS", False),
@@ -440,7 +440,12 @@ def _add_reboot_v2_items(
     sqlite_ok: bool,
     market_regime: dict[str, Any],
 ) -> None:
-    profile = str(runtime.get("runtime_profile") or os.getenv("STRATEGY_REBOOT_V2_PROFILE", "LEGACY") or "LEGACY").upper()
+    profile = str(
+        runtime.get("runtime_profile")
+        or os.getenv("STRATEGY_RUNTIME_PROFILE")
+        or os.getenv("STRATEGY_REBOOT_V2_PROFILE")
+        or "V2_OBSERVE"
+    ).upper()
     v2_requested = cfg.strategy_reboot_v2_enabled or profile.startswith("V2_")
     if requested_mode != "OBSERVE" or not v2_requested:
         return

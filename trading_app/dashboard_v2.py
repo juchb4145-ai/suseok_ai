@@ -16,11 +16,11 @@ from trading_app.pre_market_check import pre_market_report_empty
 
 
 def dashboard_v2_enabled() -> bool:
-    return _env_bool("TRADING_DASHBOARD_V2_ENABLED", _env_bool("STRATEGY_REBOOT_V2_DASHBOARD", False))
+    return _env_bool("TRADING_DASHBOARD_V2_ENABLED", _env_bool("STRATEGY_REBOOT_V2_DASHBOARD", True))
 
 
 def dashboard_v2_auto_route_enabled() -> bool:
-    return _env_bool("TRADING_DASHBOARD_V2_AUTO_ROUTE", False)
+    return _env_bool("TRADING_DASHBOARD_V2_AUTO_ROUTE", True)
 
 
 def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str = "slim") -> dict[str, Any]:
@@ -53,7 +53,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
         "system_health": _system_health(base, runtime, gateway, commands),
         "legacy_debug_link": {
             "label": "개발자 상세",
-            "href": "/themelab",
+            "href": "/legacy",
             "debug_href": "/api/snapshot?detail=full",
         },
         "ui_policy": {
@@ -108,10 +108,14 @@ def _v2_status(
     broker_env = str(order_manager.get("broker_env") or _broker_env_from_gateway(gateway))
     kill = str(order_manager.get("kill_switch_state") or "NORMAL")
     market_status = str(market.get("global_status") or "")
-    runtime_profile = str(runtime.get("runtime_profile") or base.get("runtime_profile") or os.getenv("STRATEGY_REBOOT_V2_PROFILE", "LEGACY") or "LEGACY").upper()
-    reboot_v2_enabled = bool(runtime.get("reboot_v2_enabled")) or (
-        runtime_profile != "LEGACY" and _env_bool("STRATEGY_REBOOT_V2_ENABLED", False)
-    )
+    runtime_profile = str(
+        runtime.get("runtime_profile")
+        or base.get("runtime_profile")
+        or os.getenv("STRATEGY_RUNTIME_PROFILE")
+        or os.getenv("STRATEGY_REBOOT_V2_PROFILE")
+        or "V2_OBSERVE"
+    ).upper()
+    reboot_v2_enabled = bool(runtime.get("reboot_v2_enabled")) or runtime_profile != "LEGACY"
     pipeline_status = dict(runtime.get("pipeline_status") or {})
     data_freshness = _data_freshness_status(gateway, market, runtime, reboot_v2_enabled=reboot_v2_enabled)
     live_sim_allowed = bool(order_manager.get("live_sim_orders_allowed"))

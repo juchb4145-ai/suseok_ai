@@ -30,6 +30,21 @@ def test_runtime_disabled_status_and_start(tmp_path, monkeypatch):
     assert started["running"] is False
 
 
+def test_root_defaults_to_dashboard_v2_and_legacy_route_keeps_themelab(tmp_path, monkeypatch):
+    monkeypatch.delenv("TRADING_DASHBOARD_V2_AUTO_ROUTE", raising=False)
+    with _client(tmp_path, monkeypatch, enabled="0") as client:
+        root = client.get("/")
+        legacy = client.get("/legacy")
+        themelab = client.get("/themelab")
+
+    assert root.status_code == 200
+    assert "/static/dashboard.js" in root.text or "dashboard-v2" in root.text
+    assert legacy.status_code == 200
+    assert "/static/themelab.js" in legacy.text
+    assert themelab.status_code == 200
+    assert "/static/themelab.js" in themelab.text
+
+
 def test_runtime_dashboard_payload_preserves_reboot_v2_snapshot_fields(monkeypatch):
     monkeypatch.setenv("TRADING_DB_PATH", "unused.db")
     import trading_app.api as api

@@ -11,6 +11,7 @@ from typing import Any
 
 class RebootV2RuntimeProfile(str, Enum):
     LEGACY = "LEGACY"
+    THEME_CORE_V3 = "THEME_CORE_V3"
     V2_OBSERVE = "V2_OBSERVE"
     V2_DRY_RUN = "V2_DRY_RUN"
     V2_LIVE_SIM_DISABLED = "V2_LIVE_SIM_DISABLED"
@@ -200,17 +201,30 @@ def normalize_stock_code(code: str) -> str:
 
 
 def strategy_reboot_v2_enabled() -> bool:
-    return _bool_env("STRATEGY_REBOOT_V2_ENABLED", False)
+    return reboot_v2_runtime_profile() != RebootV2RuntimeProfile.LEGACY
 
 
 def reboot_v2_runtime_profile() -> RebootV2RuntimeProfile:
-    if not strategy_reboot_v2_enabled():
+    raw = _runtime_profile_env()
+    if raw:
+        if raw in {"THEME_CORE_V3", "V3", "RT_TLS", "OPENING_THEME_BURST"}:
+            return RebootV2RuntimeProfile.THEME_CORE_V3
+        try:
+            return RebootV2RuntimeProfile(raw)
+        except ValueError:
+            return RebootV2RuntimeProfile.V2_OBSERVE
+    legacy_flag = os.getenv("STRATEGY_REBOOT_V2_ENABLED")
+    if legacy_flag is not None and not _bool_text(legacy_flag):
         return RebootV2RuntimeProfile.LEGACY
-    raw = str(os.getenv("STRATEGY_REBOOT_V2_PROFILE", RebootV2RuntimeProfile.V2_OBSERVE.value) or "").strip().upper()
-    try:
-        return RebootV2RuntimeProfile(raw)
-    except ValueError:
-        return RebootV2RuntimeProfile.V2_OBSERVE
+    return RebootV2RuntimeProfile.V2_OBSERVE
+
+
+def _runtime_profile_env() -> str:
+    for name in ("STRATEGY_RUNTIME_PROFILE", "STRATEGY_REBOOT_V2_PROFILE"):
+        value = str(os.getenv(name, "") or "").strip().upper()
+        if value:
+            return value
+    return ""
 
 
 def _clean_time(value: datetime | None = None) -> datetime:
@@ -224,7 +238,11 @@ def _bool_env(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return bool(default)
-    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+    return _bool_text(raw)
+
+
+def _bool_text(value: str) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 __all__ = [

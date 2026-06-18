@@ -107,6 +107,11 @@ def build_legacy_runtime_bundle(
     settings: CoreSettings,
     warning_sink: Callable[[str], None] | None = None,
 ) -> CoreRuntimeBundle:
+    """Frozen legacy trading path.
+
+    This bundle is kept only for explicit LEGACY rollback/debug operation. New
+    strategy decisions and runtime wiring should be added to Reboot V2 instead.
+    """
     config_result = StrategyRuntimeConfigRepository(db).load()
     runtime_settings = StrategyRuntimeSettingsRepository(db).load()
     condition_seed_result = ensure_default_condition_profiles(db)

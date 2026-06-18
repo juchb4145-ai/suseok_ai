@@ -2044,6 +2044,7 @@ def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, 
     db_path = tmp_path / "trader.sqlite3"
     monkeypatch.setenv("TRADING_DB_PATH", str(db_path))
     monkeypatch.setenv("TRADING_CORE_TOKEN", "test-token")
+    monkeypatch.setenv("TRADING_DASHBOARD_V2_AUTO_ROUTE", "0")
     import trading_app.api as api
 
     api = importlib.reload(api)
@@ -2065,11 +2066,13 @@ def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, 
     with TestClient(api.app) as client:
         root_page = client.get("/")
         page = client.get("/themelab")
+        legacy_page = client.get("/legacy")
         direct = client.get("/api/themelab/snapshot").json()
         snapshot = client.get("/api/snapshot").json()
 
     root_soup = BeautifulSoup(root_page.text, "html.parser")
     theme_soup = BeautifulSoup(page.text, "html.parser")
+    legacy_soup = BeautifulSoup(legacy_page.text, "html.parser")
     assert root_page.status_code == 200
     assert root_soup.select_one(".terminal-shell") is not None
     assert root_soup.select_one("#tab-main") is not None
@@ -2085,6 +2088,9 @@ def test_theme_lab_api_route_and_dashboard_snapshot_include_theme_lab(tmp_path, 
     assert page.status_code == 200
     assert theme_soup.select_one(".terminal-shell") is not None
     assert theme_soup.select_one("#tab-system") is not None
+    assert legacy_page.status_code == 200
+    assert legacy_soup.select_one(".terminal-shell") is not None
+    assert legacy_soup.select_one("#tab-system") is not None
     assert direct["summary"]["ready_count"] == 1
     assert direct["ranked_themes"][0]["members"][0]["symbol"] == "000002"
     assert direct["ranked_themes"][0]["members"][0]["condition_label"] == "LEADER"

@@ -1,5 +1,14 @@
 from trading_app.dashboard_labels import reason_label_ko
-from trading_app.dashboard_v2 import build_dashboard_v2_snapshot
+from trading_app.dashboard_v2 import build_dashboard_v2_snapshot, dashboard_v2_auto_route_enabled, dashboard_v2_enabled
+
+
+def test_dashboard_v2_is_default_enabled_and_auto_route(monkeypatch):
+    monkeypatch.delenv("TRADING_DASHBOARD_V2_ENABLED", raising=False)
+    monkeypatch.delenv("TRADING_DASHBOARD_V2_AUTO_ROUTE", raising=False)
+    monkeypatch.delenv("STRATEGY_REBOOT_V2_DASHBOARD", raising=False)
+
+    assert dashboard_v2_enabled() is True
+    assert dashboard_v2_auto_route_enabled() is True
 
 
 def test_dashboard_v2_empty_sections_return_stable_schema(monkeypatch):

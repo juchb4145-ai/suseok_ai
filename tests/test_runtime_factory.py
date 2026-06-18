@@ -51,8 +51,21 @@ def test_provider_cache_ttl_accepts_policy_aliases():
     assert _provider_cache_ttl_sec({"cache_ttl_sec": "bad"}, default=60) == 60
 
 
-def test_build_core_runtime_routes_to_legacy_when_reboot_v2_disabled(tmp_path, monkeypatch):
-    monkeypatch.setenv("STRATEGY_REBOOT_V2_ENABLED", "0")
+def test_build_core_runtime_defaults_to_reboot_v2_observe(tmp_path, monkeypatch):
+    monkeypatch.delenv("STRATEGY_RUNTIME_PROFILE", raising=False)
+    monkeypatch.delenv("STRATEGY_REBOOT_V2_PROFILE", raising=False)
+    monkeypatch.delenv("STRATEGY_REBOOT_V2_ENABLED", raising=False)
+    db = TradingDatabase(str(tmp_path / "v2-default.db"))
+
+    bundle = build_core_strategy_runtime(db, GatewayStateStore(), settings=_settings(tmp_path))
+
+    assert bundle.runtime_profile == "V2_OBSERVE"
+    assert isinstance(bundle.runtime, RebootV2Runtime)
+    assert isinstance(bundle.theme_board_pipeline, ThemeCoreV3RuntimePipeline)
+
+
+def test_build_core_runtime_routes_to_legacy_only_when_profile_is_explicit(tmp_path, monkeypatch):
+    monkeypatch.setenv("STRATEGY_RUNTIME_PROFILE", "LEGACY")
     db = TradingDatabase(str(tmp_path / "legacy.db"))
 
     bundle = build_core_strategy_runtime(db, GatewayStateStore(), settings=_settings(tmp_path))
@@ -66,8 +79,7 @@ def test_build_core_runtime_routes_to_legacy_when_reboot_v2_disabled(tmp_path, m
 
 
 def test_build_core_runtime_routes_to_reboot_v2_observe_only(tmp_path, monkeypatch):
-    monkeypatch.setenv("STRATEGY_REBOOT_V2_ENABLED", "1")
-    monkeypatch.setenv("STRATEGY_REBOOT_V2_PROFILE", "V2_OBSERVE")
+    monkeypatch.setenv("STRATEGY_RUNTIME_PROFILE", "V2_OBSERVE")
     monkeypatch.setenv("TRADING_ORDER_MANAGER_ENABLED", "0")
     db = TradingDatabase(str(tmp_path / "v2.db"))
 
@@ -91,8 +103,21 @@ def test_build_core_runtime_routes_to_reboot_v2_observe_only(tmp_path, monkeypat
     assert not hasattr(bundle.runtime, "entry_plan_builder")
 
 
+def test_build_core_runtime_accepts_theme_core_v3_profile_alias(tmp_path, monkeypatch):
+    monkeypatch.setenv("STRATEGY_RUNTIME_PROFILE", "THEME_CORE_V3")
+    db = TradingDatabase(str(tmp_path / "theme-core-v3.db"))
+
+    bundle = build_core_strategy_runtime(db, GatewayStateStore(), settings=_settings(tmp_path))
+
+    assert bundle.runtime_profile == "THEME_CORE_V3"
+    assert isinstance(bundle.runtime, RebootV2Runtime)
+    assert isinstance(bundle.theme_board_pipeline, ThemeCoreV3RuntimePipeline)
+    assert bundle.theme_board_pipeline.config.enabled is True
+    assert bundle.theme_board_pipeline.config.ingest_candidate_source_events is False
+
+
 def test_build_core_runtime_respects_explicit_reboot_v2_component_disable(tmp_path, monkeypatch):
-    monkeypatch.setenv("STRATEGY_REBOOT_V2_ENABLED", "1")
+    monkeypatch.setenv("STRATEGY_RUNTIME_PROFILE", "V2_OBSERVE")
     monkeypatch.setenv("TRADING_THEME_BOARD_ENABLED", "0")
     db = TradingDatabase(str(tmp_path / "v2-disabled-component.db"))
 

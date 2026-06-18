@@ -18,6 +18,20 @@ $env:TRADING_MODE = "OBSERVE"
 python -m uvicorn trading_app.api:app --host 127.0.0.1 --port 8000 --reload
 ```
 
+### Default Reboot V2 Runtime
+
+The default intraday Core runtime is Reboot V2 observe with Theme Core V3:
+
+```powershell
+.\tools\start_reboot_v2_observe.ps1
+```
+
+This script sets `STRATEGY_RUNTIME_PROFILE=THEME_CORE_V3`, enables Dashboard V2 at `/`, keeps `TRADING_THEME_CORE_V3_INGEST_CANDIDATES=0`, and keeps all order paths disabled. Legacy trading runtime is rollback/debug only and must be requested explicitly:
+
+```powershell
+$env:STRATEGY_RUNTIME_PROFILE="LEGACY"
+```
+
 주요 Core 환경변수:
 
 - `TRADING_CORE_TOKEN`: local Gateway/Core token.
