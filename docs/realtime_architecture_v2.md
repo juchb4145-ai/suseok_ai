@@ -452,3 +452,114 @@ Data quality 기준:
 - `price_source=TR_BACKFILL`: `TR_BACKFILL_PRICE_ONLY`
 
 현재 dirty codes는 생성만 한다. EntryEngine incremental evaluation에 연결하지 않는다. raw tick full DB write는 여전히 금지이며, batch flush는 기본 disabled다. 다음 PR은 Candidate FSM migration 또는 Dirty-code StrategyEvaluator 중 하나를 선택할 수 있으나, 운영 관점에서는 `Candidate FSM + blocking_stage`를 먼저 고정한 뒤 dirty-code evaluator를 붙이는 순서를 권장한다.
+
+## PR 4 구현 상태: Candidate FSM Migration
+
+PR 4에서는 기존 `CandidateState`를 즉시 제거하지 않고, V2 candidate FSM을 metadata와 transition journal로 병행 도입한다. 기존 StrategyRuntime/RebootV2Runtime/EntryEngine/OrderManager의 판단 및 주문 경로는 변경하지 않는다.
+
+V2 상태:
+
+- `DISCOVERED`
+- `HYDRATING`
+- `WATCHING`
+- `SETUP_READY`
+- `TIMING_READY`
+- `ORDER_INTENT_CREATED`
+- `ORDER_PENDING`
+- `POSITION_OPEN`
+- `EXIT_PENDING`
+- `CLOSED`
+- `REMOVED`
+- `EXPIRED`
+
+기존 `CandidateState` 매핑:
+
+| 기존 상태 | V2 표현 |
+|---|---|
+| `DETECTED` | `DISCOVERED` |
+| `HYDRATING` | `HYDRATING` |
+| `WATCHING` | `WATCHING` |
+| `WAIT_DATA` | `WATCHING + blocking_stage=DATA` |
+| `READY` | `TIMING_READY` 호환 매핑. 신규 승격은 다음 EntryEngine PR까지 보류 |
+| `BLOCKED` | `WATCHING + blocking_stage=RISK/PRICE/MARKET` |
+| `EXPIRED` | `EXPIRED` |
+| `REMOVED` | `REMOVED` |
+
+`WAIT_DATA`, `WAIT_MARKET`, `WAIT_THEME`, `WAIT_PRICE`, `BLOCK_RISK`는 V2 상태가 아니다. V2에서는 `candidate.metadata["candidate_fsm"]` 아래의 다음 필드로 관리한다.
+
+- `v2_state`
+- `blocking_stage`
+- `primary_reason_code`
+- `reason_codes`
+- `next_required_action`
+- `source_event_ids`
+- `last_transition_at`
+
+`blocking_stage`:
+
+- `NONE`
+- `DATA`
+- `THEME`
+- `MARKET`
+- `ROLE`
+- `PRICE`
+- `RISK`
+- `ORDER`
+- `SYSTEM`
+
+대표 `reason_code`:
+
+- `LATEST_TICK_MISSING`
+- `LATEST_TICK_STALE`
+- `TR_BACKFILL_PRICE_ONLY`
+- `HYDRATION_PENDING`
+- `THEME_NOT_READY`
+- `MARKET_RISK_OFF`
+- `ROLE_NOT_ALLOWED`
+- `PRICE_TIMING_NOT_READY`
+- `CHASE_RISK`
+- `VWAP_OVEREXTENDED`
+- `ORDER_RISK_BLOCKED`
+- `GATEWAY_UNHEALTHY`
+
+Transition 저장:
+
+`candidate_state_transitions` table을 추가했다.
+
+| field | 설명 |
+|---|---|
+| `id` | row id |
+| `candidate_id` | candidate id |
+| `trade_date` | 거래일 |
+| `code` | 종목 코드 |
+| `from_state`, `to_state` | V2 state transition |
+| `blocking_stage` | 현재 차단 단계 |
+| `reason_code` | primary reason |
+| `reason_codes_json` | reason list |
+| `next_required_action` | 다음 필요 조치 |
+| `source_event_id` | 원천 event id |
+| `source_event_type` | 원천 event type |
+| `source_component` | transition 기록 component |
+| `details_json` | 감사 payload |
+| `occurred_at`, `created_at` | 발생/저장 시각 |
+
+전이 규칙:
+
+- condition include는 `DISCOVERED` 생성/갱신만 가능하다.
+- condition include만으로 `SETUP_READY`, `TIMING_READY`, `OrderIntent`, `GatewayCommand`를 만들 수 없다.
+- hydration request는 `DISCOVERED -> HYDRATING` transition을 기록한다.
+- hydration result가 TR backfill 가격만 가진 경우 `SETUP_READY/TIMING_READY`로 승격하지 않고 `blocking_stage=DATA`, `reason_code=TR_BACKFILL_PRICE_ONLY` 또는 `LATEST_TICK_MISSING`을 기록한다.
+- fresh realtime tick이 확인되면 `WATCHING`까지만 승격한다. `SETUP_READY/TIMING_READY`는 다음 EntryEngine PR에서 처리한다.
+- stale/missing tick은 기존 state를 가능한 유지하고 `blocking_stage=DATA`와 `reason_code=LATEST_TICK_STALE/LATEST_TICK_MISSING`으로 표현한다.
+- risk block은 candidate state를 `BLOCKED`로 오염시키지 않고 `blocking_stage=RISK`, `reason_code=ORDER_RISK_BLOCKED`로 표현한다.
+
+RebootV2Runtime snapshot에는 최소 요약만 추가한다.
+
+- `candidate_fsm.status`
+- `candidate_fsm.state_counts`
+- `candidate_fsm.blocking_stage_counts`
+- `candidate_fsm.top_reason_codes`
+- `candidate_fsm.transition_count`
+- `candidate_fsm.last_transition_at`
+
+현재 dirty-code StrategyEvaluator 연결은 아직 없다. 주문 경로와 EntryEngine 판단 결과도 변경하지 않는다. 다음 PR에서는 `Dirty-code StrategyEvaluator`를 붙이되, 이번 PR에서 만든 `v2_state/blocking_stage/reason_code`를 입력 조건으로 사용한다.

@@ -9,6 +9,7 @@ from trading.broker.command_queue import CommandPriority, CommandStatus
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import GatewayCommand, GatewayEvent, new_message_id
 from trading.strategy.candidates import normalize_code
+from trading.strategy.candidate_fsm import CandidateBlockingStage, CandidateFsmService, CandidateReasonCode
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.models import Candidate, CandidateEvent, CandidateState
 from trading.theme_engine.backfill import OPT10001_FIELDS, parse_opt10001_backfill
@@ -95,6 +96,7 @@ class CandidateHydrator:
         self.market_data = market_data
         self.config = config or CandidateHydrationConfig.from_env()
         self.clock = clock or datetime.now
+        self.fsm = CandidateFsmService(db, clock=self.clock)
 
     def enqueue_due_candidates(self, *, trade_date: str | None = None) -> list[CandidateHydrationEnqueueResult]:
         if not self.config.enabled:
@@ -299,6 +301,16 @@ class CandidateHydrator:
             ],
         )
         self._save_result(saved, raw_payload, parsed, status="MERGED", reason="")
+        self.fsm.on_hydration_result(
+            saved,
+            {
+                "command_id": command_id,
+                "market_data_merged": market_merged,
+                "parsed": parsed,
+                "source_event_id": event.event_id if event else "",
+            },
+        )
+        saved = self.db.save_candidate(saved)
         updater = getattr(self.db, "update_candidate_hydration_request_status", None)
         if callable(updater) and command_id:
             updater(command_id=command_id, status="ACKED", result_status="MERGED")
@@ -377,6 +389,16 @@ class CandidateHydrator:
             ],
         )
         self._save_result(saved, raw_payload, parsed_payload, status="FAILED", reason=reason)
+        self.fsm.apply_blocking_reason(
+            saved,
+            CandidateBlockingStage.DATA,
+            reason or CandidateReasonCode.HYDRATION_PENDING.value,
+            details={"command_id": command_id, "reason": reason, "retry_count": retry_count},
+            source_event_id=event.event_id if event else "",
+            source_event_type="hydration_failure",
+            source_component="CandidateHydrator",
+        )
+        saved = self.db.save_candidate(saved)
         updater = getattr(self.db, "update_candidate_hydration_request_status", None)
         if callable(updater) and command_id:
             updater(command_id=command_id, status="FAILED", result_status=reason)
@@ -445,7 +467,7 @@ class CandidateHydrator:
         }
         candidate.metadata = metadata
         candidate.last_seen_at = _format_time(self.clock())
-        return self.db.save_candidate_with_events(
+        saved = self.db.save_candidate_with_events(
             candidate,
             [
                 CandidateEvent(
@@ -464,6 +486,8 @@ class CandidateHydrator:
                 )
             ],
         )
+        self.fsm.on_hydration_requested(saved)
+        return self.db.save_candidate(saved)
 
     def _save_request(
         self,

@@ -539,6 +539,30 @@ class TradingDatabase:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 payload_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS candidate_state_transitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                candidate_id INTEGER,
+                trade_date TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                from_state TEXT NOT NULL DEFAULT '',
+                to_state TEXT NOT NULL DEFAULT '',
+                blocking_stage TEXT NOT NULL DEFAULT 'NONE',
+                reason_code TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                next_required_action TEXT NOT NULL DEFAULT '',
+                source_event_id TEXT NOT NULL DEFAULT '',
+                source_event_type TEXT NOT NULL DEFAULT '',
+                source_component TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                occurred_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_candidate_state_transitions_candidate
+                ON candidate_state_transitions(candidate_id, occurred_at);
+            CREATE INDEX IF NOT EXISTS idx_candidate_state_transitions_trade_code
+                ON candidate_state_transitions(trade_date, code, occurred_at);
+            CREATE INDEX IF NOT EXISTS idx_candidate_state_transitions_reason
+                ON candidate_state_transitions(reason_code, occurred_at);
             CREATE TABLE IF NOT EXISTS candidate_source_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -6791,6 +6815,86 @@ class TradingDatabase:
             (candidate_id,),
         ).fetchall()
         return [self._row_to_candidate_event(row) for row in rows]
+
+    def save_candidate_state_transition(self, transition) -> dict:
+        payload = _candidate_state_transition_payload(transition)
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO candidate_state_transitions(
+                    candidate_id, trade_date, code, from_state, to_state,
+                    blocking_stage, reason_code, reason_codes_json,
+                    next_required_action, source_event_id, source_event_type,
+                    source_component, details_json, occurred_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["candidate_id"],
+                    payload["trade_date"],
+                    payload["code"],
+                    payload["from_state"],
+                    payload["to_state"],
+                    payload["blocking_stage"],
+                    payload["reason_code"],
+                    payload["reason_codes_json"],
+                    payload["next_required_action"],
+                    payload["source_event_id"],
+                    payload["source_event_type"],
+                    payload["source_component"],
+                    payload["details_json"],
+                    payload["occurred_at"],
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM candidate_state_transitions WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+            return _row_to_candidate_state_transition(row)
+
+    def list_candidate_state_transitions(
+        self,
+        *,
+        candidate_id: int | None = None,
+        trade_date: str | None = None,
+        code: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if candidate_id is not None:
+            clauses.append("candidate_id = ?")
+            params.append(candidate_id)
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        query = "SELECT * FROM candidate_state_transitions"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY occurred_at DESC, id DESC LIMIT ?"
+        params.append(max(0, int(limit)))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [_row_to_candidate_state_transition(row) for row in rows]
+
+    def candidate_fsm_summary(self, *, trade_date: str | None = None) -> dict:
+        params: list[object] = []
+        suffix = ""
+        if trade_date:
+            suffix = " WHERE trade_date = ?"
+            params.append(str(trade_date))
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS transition_count, MAX(occurred_at) AS last_transition_at
+            FROM candidate_state_transitions{suffix}
+            """,
+            tuple(params),
+        ).fetchone()
+        return {
+            "transition_count": int(row["transition_count"] or 0) if row else 0,
+            "last_transition_at": str(row["last_transition_at"] or "") if row else "",
+        }
 
     def save_candidate_with_events(self, candidate: Candidate, events: Iterable[CandidateEvent]) -> Candidate:
         with self.conn:
@@ -13666,6 +13770,48 @@ def _row_to_candidate_hydration_result(row: sqlite3.Row) -> dict:
     data = dict(row)
     data["parsed_payload"] = _safe_json_loads(data.pop("parsed_payload_json", "{}"), {})
     data["raw_payload"] = _safe_json_loads(data.pop("raw_payload_json", "{}"), {})
+    return data
+
+
+def _candidate_state_transition_payload(transition) -> dict:
+    def _value(value: object) -> str:
+        return str(value.value if hasattr(value, "value") else value or "")
+
+    details = getattr(transition, "details", None)
+    if details is None and isinstance(transition, dict):
+        details = transition.get("details")
+    reason_codes = getattr(transition, "reason_codes", None)
+    if reason_codes is None and isinstance(transition, dict):
+        reason_codes = transition.get("reason_codes")
+    candidate_id = getattr(transition, "candidate_id", None)
+    if candidate_id is None and isinstance(transition, dict):
+        candidate_id = transition.get("candidate_id")
+    try:
+        candidate_id_value = int(candidate_id or 0) or None
+    except (TypeError, ValueError):
+        candidate_id_value = None
+    return {
+        "candidate_id": candidate_id_value,
+        "trade_date": _value(getattr(transition, "trade_date", "") if not isinstance(transition, dict) else transition.get("trade_date")),
+        "code": _clean_stock_code(getattr(transition, "code", "") if not isinstance(transition, dict) else transition.get("code")),
+        "from_state": _value(getattr(transition, "from_state", "") if not isinstance(transition, dict) else transition.get("from_state")),
+        "to_state": _value(getattr(transition, "to_state", "") if not isinstance(transition, dict) else transition.get("to_state")),
+        "blocking_stage": _value(getattr(transition, "blocking_stage", "") if not isinstance(transition, dict) else transition.get("blocking_stage")) or "NONE",
+        "reason_code": _value(getattr(transition, "reason_code", "") if not isinstance(transition, dict) else transition.get("reason_code")),
+        "reason_codes_json": _json_list(list(reason_codes or [])),
+        "next_required_action": _value(getattr(transition, "next_required_action", "") if not isinstance(transition, dict) else transition.get("next_required_action")),
+        "source_event_id": _value(getattr(transition, "source_event_id", "") if not isinstance(transition, dict) else transition.get("source_event_id")),
+        "source_event_type": _value(getattr(transition, "source_event_type", "") if not isinstance(transition, dict) else transition.get("source_event_type")),
+        "source_component": _value(getattr(transition, "source_component", "") if not isinstance(transition, dict) else transition.get("source_component")),
+        "details_json": _json_payload(details or {}),
+        "occurred_at": _value(getattr(transition, "occurred_at", "") if not isinstance(transition, dict) else transition.get("occurred_at")),
+    }
+
+
+def _row_to_candidate_state_transition(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["reason_codes"] = _safe_json_loads(data.pop("reason_codes_json", "[]"), [])
+    data["details"] = _safe_json_loads(data.pop("details_json", "{}"), {})
     return data
 
 

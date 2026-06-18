@@ -31,6 +31,8 @@ class CandidateRuntimeState(str, Enum):
     POSITION_OPEN = "POSITION_OPEN"
     EXIT_PENDING = "EXIT_PENDING"
     CLOSED = "CLOSED"
+    REMOVED = "REMOVED"
+    EXPIRED = "EXPIRED"
 
 
 class BlockingStage(str, Enum):
@@ -150,9 +152,15 @@ class CandidateStateTransition:
     to_state: CandidateRuntimeState | str
     occurred_at: str
     reason_code: str
+    transition_id: str = ""
+    trade_date: str = ""
+    reason_codes: tuple[str, ...] = ()
     blocking_stage: BlockingStage | str = BlockingStage.NONE
     source_event_id: str = ""
+    source_event_type: str = ""
+    source_component: str = ""
     next_required_action: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

@@ -8,6 +8,7 @@ from typing import Any, Iterable, Mapping
 
 from trading.broker.models import BrokerConditionEvent
 from trading.strategy.candidates import normalize_code
+from trading.strategy.candidate_fsm import CandidateFsmService
 from trading.strategy.models import (
     BlockType,
     Candidate,
@@ -104,6 +105,7 @@ class CandidateIngestionService:
         self.enrich_theme_context = bool(enrich_theme_context)
         self._theme_repository = theme_repository
         self._theme_repository_checked = theme_repository is not None
+        self.fsm = CandidateFsmService(db, clock=self.clock)
 
     def ingest(self, source_event: CandidateSourceEvent) -> CandidateIngestionResult:
         event = source_event.normalized(now=self.clock())
@@ -141,6 +143,8 @@ class CandidateIngestionService:
             ],
         )
         self._save_source_event(event, candidate_id=saved.id, status="INGESTED", reason="")
+        self.fsm.on_condition_include({"candidate": saved, **event.to_dict()})
+        saved = self.db.save_candidate(saved)
         return CandidateIngestionResult(
             candidate=saved,
             source_event=event,
@@ -195,6 +199,8 @@ class CandidateIngestionService:
             ],
         )
         self._save_source_event(event, candidate_id=saved.id, status="REMOVED", reason="")
+        self.fsm.on_condition_remove({"candidate": saved, **event.to_dict()})
+        saved = self.db.save_candidate(saved)
         return CandidateIngestionResult(candidate=saved, source_event=event, removed=True, reason="REMOVED")
 
     def handle_condition_event(self, condition_event: BrokerConditionEvent, *, trade_date: str | None = None) -> CandidateIngestionResult:

@@ -7,6 +7,7 @@ from typing import Any, Iterable, Mapping
 
 from trading.strategy.candidates import normalize_code
 from trading.strategy.candles import CandleBuilder
+from trading.strategy.candidate_fsm import build_candidate_fsm_summary
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import MarketIndexStore
 from trading.strategy.models import Candidate, CandidateState, VirtualOrderStatus
@@ -258,6 +259,7 @@ class RebootV2Runtime:
         snapshot["exit_decision_count"] = 0
         snapshot["review_count"] = 0
         snapshot["db_write_count_per_cycle"] = 0
+        snapshot["candidate_fsm"] = build_candidate_fsm_summary(self.db, trade_date=now.date().isoformat())
 
     def _overall_status(self, snapshot: Mapping[str, Any]) -> str:
         if not self.started:
