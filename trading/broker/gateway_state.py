@@ -27,8 +27,10 @@ class GatewayStatusSnapshot:
     pending_command_count: int = 0
     received_event_count: int = 0
     deduped_event_count: int = 0
+    event_log_append_error_count: int = 0
     reconnect_count: int = 0
     gateway_client_id: str = ""
+    event_log_last_warning: str = ""
     last_heartbeat_payload: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -40,7 +42,9 @@ class GatewayStateStore:
     heartbeat_timeout_sec: int = 15
     max_recent_events: int = 200
     command_store: CommandStoreProtocol | None = None
+    event_log_store: Any = None
     expire_stale_dispatched_on_recovery: bool = True
+    max_event_log_warnings: int = 50
     status: GatewayStatusSnapshot = field(default_factory=GatewayStatusSnapshot)
 
     def __post_init__(self) -> None:
@@ -48,6 +52,7 @@ class GatewayStateStore:
         self._lock = RLock()
         self._command_queue = CommandQueue()
         self._recent_events: list[GatewayEvent] = []
+        self._event_log_warnings: list[str] = []
         self._seen_event_ids: set[str] = set()
         self._latest_ticks: dict[str, dict[str, Any]] = {}
         self.recovered_queued_count = 0
@@ -108,6 +113,7 @@ class GatewayStateStore:
             self._recent_events.append(event)
             if len(self._recent_events) > self.max_recent_events:
                 self._recent_events = self._recent_events[-self.max_recent_events :]
+            self._append_event_log_locked(event)
             return True
 
     def record_heartbeat_hint(self, event: GatewayEvent) -> None:
@@ -441,6 +447,38 @@ class GatewayStateStore:
     def latest_ticks(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:
             return list(self._latest_ticks.values())[-max(0, int(limit)) :]
+
+    def event_log_warnings(self, limit: int = 50) -> list[str]:
+        with self._lock:
+            return list(self._event_log_warnings[-max(0, int(limit)) :])
+
+    def _append_event_log_locked(self, event: GatewayEvent) -> None:
+        if self.event_log_store is None:
+            return
+        appender = getattr(self.event_log_store, "append_gateway_event", None)
+        if not callable(appender):
+            return
+        try:
+            result = appender(event)
+        except Exception as exc:
+            self._record_event_log_warning_locked(f"EVENT_LOG_APPEND_FAILED:{event.event_id}:{exc}")
+            return
+        warning = str(getattr(result, "warning", "") or "")
+        if warning:
+            self._record_event_log_warning_locked(warning)
+            return
+        if bool(getattr(result, "ignored", False)) or bool(getattr(result, "duplicate", False)):
+            return
+        if not bool(getattr(result, "appended", True)):
+            reason = str(getattr(result, "reason", "") or "EVENT_LOG_APPEND_NOT_ACCEPTED")
+            self._record_event_log_warning_locked(f"EVENT_LOG_APPEND_NOT_ACCEPTED:{event.event_id}:{reason}")
+
+    def _record_event_log_warning_locked(self, warning: str) -> None:
+        self.status.event_log_append_error_count += 1
+        self.status.event_log_last_warning = str(warning or "")
+        self._event_log_warnings.append(self.status.event_log_last_warning)
+        if len(self._event_log_warnings) > self.max_event_log_warnings:
+            self._event_log_warnings = self._event_log_warnings[-self.max_event_log_warnings :]
 
 
 def _age_seconds(timestamp: str) -> float | None:

@@ -1168,6 +1168,23 @@ class TradingDatabase:
                 blocked_but_later_rallied INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS gateway_event_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                command_id TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                received_at TEXT NOT NULL,
+                processed_at TEXT NOT NULL DEFAULT '',
+                processing_status TEXT NOT NULL DEFAULT 'PENDING',
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(dedupe_key)
+            );
             CREATE TABLE IF NOT EXISTS gateway_commands (
                 command_id TEXT PRIMARY KEY,
                 request_id TEXT NOT NULL DEFAULT '',
@@ -2179,6 +2196,18 @@ class TradingDatabase:
                 ON hybrid_gate_validation_events(hybrid_primary_reason);
             CREATE INDEX IF NOT EXISTS idx_gateway_commands_status_created_at
                 ON gateway_commands(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_gateway_event_log_event_type
+                ON gateway_event_log(event_type);
+            CREATE INDEX IF NOT EXISTS idx_gateway_event_log_processing_status
+                ON gateway_event_log(processing_status);
+            CREATE INDEX IF NOT EXISTS idx_gateway_event_log_received_at
+                ON gateway_event_log(received_at);
+            CREATE INDEX IF NOT EXISTS idx_gateway_event_log_trade_date_code
+                ON gateway_event_log(trade_date, code);
+            CREATE INDEX IF NOT EXISTS idx_gateway_event_log_command_id
+                ON gateway_event_log(command_id);
+            CREATE INDEX IF NOT EXISTS idx_gateway_event_log_event_id
+                ON gateway_event_log(event_id);
             CREATE INDEX IF NOT EXISTS idx_gateway_commands_type_created_at
                 ON gateway_commands(command_type, created_at);
             CREATE INDEX IF NOT EXISTS idx_gateway_commands_dedupe_key

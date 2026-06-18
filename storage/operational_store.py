@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from storage.db import TradingDatabase
+from storage.event_log import EventLogRepository
 from storage.interfaces import OperationalRecoveryState, StoreHealth, StoreRole
 from storage.outbox import InMemoryOutboxBuffer, OutboxEvent
 from trading.broker.command_persistence import SQLiteCommandStore
@@ -34,6 +35,7 @@ class SQLiteOperationalStore:
         *,
         database: TradingDatabase | None = None,
         command_store: SQLiteCommandStore | None = None,
+        event_log_store: EventLogRepository | None = None,
         outbox: InMemoryOutboxBuffer | None = None,
     ) -> None:
         self.config = config
@@ -43,6 +45,7 @@ class SQLiteOperationalStore:
             dedupe_retention_sec=config.dedupe_retention_sec,
             history_retention_sec=config.history_retention_sec,
         )
+        self.event_log_store = event_log_store or EventLogRepository(config.db_path)
         self.outbox = outbox or InMemoryOutboxBuffer()
 
     def health(self) -> StoreHealth:
@@ -89,5 +92,6 @@ class SQLiteOperationalStore:
         return self.outbox.append(event)
 
     def close(self) -> None:
+        self.event_log_store.close()
         self.command_store.close()
         self.database.close()
