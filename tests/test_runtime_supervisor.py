@@ -301,6 +301,38 @@ def test_no_tick_watchdog_marks_realtime_subscriptions_stale(monkeypatch, tmp_pa
     assert status["latest_snapshot"]["realtime_subscription_repair"]["status"] == "STALE_MARKED"
 
 
+def test_realtime_stale_warning_clears_after_ticks_recover(tmp_path):
+    runtime = _FakeRuntime()
+    supervisor, bridge = _supervisor(tmp_path, runtime)
+    bridge.quality_snapshot["total_price_ticks"] = 3
+
+    async def scenario():
+        await supervisor.start()
+        supervisor._warn("REALTIME_SUBSCRIPTIONS_STALE:NO_PRICE_TICKS_AFTER_REGISTER")
+        supervisor._warn("REALTIME_NO_TICK_REPAIR_ENQUEUED")
+        with supervisor._state_lock:
+            supervisor.last_snapshot = {
+                "market_session_status": "open",
+                "warnings": ["REALTIME_SUBSCRIPTIONS_STALE:NO_PRICE_TICKS_AFTER_REGISTER", "KEEP_ME"],
+                "realtime_subscription_repair": {
+                    "status": "STALE_MARKED",
+                    "reason": "NO_PRICE_TICKS_AFTER_REGISTER",
+                    "total_price_ticks": 0,
+                },
+            }
+        status = supervisor.status()
+        await supervisor.shutdown()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert status["warnings"] == []
+    assert status["latest_snapshot"]["warnings"] == ["KEEP_ME"]
+    assert status["latest_snapshot"]["realtime_subscription_repair"]["status"] == "RECOVERED"
+    assert status["latest_snapshot"]["realtime_subscription_repair"]["reason"] == "PRICE_TICK_RECEIVED"
+    assert status["latest_snapshot"]["realtime_subscription_repair"]["total_price_ticks"] == 3
+
+
 def test_gateway_price_ticks_are_coalesced_until_cycle(tmp_path):
     runtime = _FakeRuntime()
     supervisor, bridge = _supervisor(tmp_path, runtime)

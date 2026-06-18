@@ -159,11 +159,17 @@ class RebootV2Runtime:
             code = normalize_code(str(getattr(order, "code", "") or ""))
             if code:
                 manager.ensure_subscription(code, "reboot_v2_position", protected=True)
-        active = manager.sync()
         snapshot["base_realtime_subscription"] = {
             "status": "OK",
             "source": "reboot_v2_index/reboot_v2_position",
-            "active_count": len(active),
+            "active_count": len(
+                [
+                    code
+                    for code, record in manager.records.items()
+                    if code in manager.code_to_screen
+                    and ("reboot_v2_index" in record.sources or "reboot_v2_position" in record.sources)
+                ]
+            ),
             "warnings": list(manager.warnings),
         }
 
@@ -204,6 +210,18 @@ class RebootV2Runtime:
             if code:
                 manager.ensure_subscription(code, source)
         active = manager.sync()
+        base_section = dict(snapshot.get("base_realtime_subscription") or {})
+        if base_section:
+            base_section["active_count"] = len(
+                [
+                    code
+                    for code, record in manager.records.items()
+                    if code in active
+                    and ("reboot_v2_index" in record.sources or "reboot_v2_position" in record.sources)
+                ]
+            )
+            base_section["warnings"] = list(manager.warnings)
+            snapshot["base_realtime_subscription"] = base_section
         snapshot["candidate_realtime_subscription"] = {
             "status": "OK",
             "sources": {source: sum(1 for value in selected.values() if value == source) for source in sorted(set(selected.values()))},

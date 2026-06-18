@@ -37,6 +37,8 @@ def test_dashboard_v2_prefers_active_runtime_reboot_sections(monkeypatch):
         },
         "runtime": {
             "mode": "DRY_RUN",
+            "runtime_profile": "V2_OBSERVE",
+            "reboot_v2_enabled": True,
             "data_warmup_status": "ready",
             "market_regime": {
                 "enabled": True,
@@ -56,6 +58,27 @@ def test_dashboard_v2_prefers_active_runtime_reboot_sections(monkeypatch):
     assert payload["v2_status"]["data_freshness_status"] == "FRESH"
     assert payload["system_health"]["data_freshness"] == "FRESH"
     assert payload["system_health"]["latest_market_regime_at"] == "2026-06-18T10:00:00"
+
+
+def test_dashboard_v2_disabled_pipeline_is_not_data_wait(monkeypatch):
+    monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
+    snapshot = {
+        "gateway": {"heartbeat_ok": True},
+        "runtime": {
+            "runtime_profile": "V2_OBSERVE",
+            "reboot_v2_enabled": True,
+            "pipeline_status": {"order_manager": False, "entry_engine": True},
+            "order_manager": {"enabled": False, "status": "DISABLED", "blocking_reason": "ORDER_MANAGER_DISABLED_IN_V2_OBSERVE"},
+            "entry_engine": {"enabled": True, "status": "OK", "calculated_at": "2026-06-18T09:03:00"},
+            "data_warmup_status": "waiting_index",
+        },
+    }
+
+    payload = build_dashboard_v2_snapshot(snapshot)
+
+    assert payload["v2_status"]["data_freshness_status"] == "FRESH"
+    assert payload["v2_status"]["stages"]["order_manager"]["status"] == "DISABLED"
+    assert payload["v2_status"]["stages"]["order_manager"]["blocking_reason"] == "ORDER_MANAGER_DISABLED_IN_V2_OBSERVE"
 
 
 def test_dashboard_v2_limits_theme_board_to_top5(monkeypatch):

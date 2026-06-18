@@ -536,7 +536,7 @@ class CandidateHydrator:
             "backfill_source": CANDIDATE_HYDRATION_PURPOSE,
         }
         try:
-            return bool(self.market_data.apply_theme_backfill(code, payload))
+            return bool(self.market_data.apply_theme_backfill(code, payload, now=self.clock()))
         except Exception:
             return False
 

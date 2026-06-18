@@ -59,6 +59,25 @@ def test_scheduler_idempotency_blocks_duplicate_seed_time():
     assert len(commands) == 1
 
 
+def test_scheduler_late_start_catch_up_enqueues_once_when_no_seed_batch():
+    gateway_state = GatewayStateStore()
+    scheduler = OpeningBurstScheduler(gateway_state, config=_config())
+
+    catch_up = scheduler.enqueue_if_due(_dt("2026-06-15T09:20:00"), seed_batch_exists=False)
+    duplicate = scheduler.enqueue_if_due(_dt("2026-06-15T09:21:00"), seed_batch_exists=False)
+    skipped = scheduler.enqueue_if_due(_dt("2026-06-15T09:22:00"), seed_batch_exists=True)
+
+    commands = gateway_state.list_commands(include_finished=True, limit=10)
+    assert catch_up["enqueued"] is True
+    assert catch_up["catch_up"] is True
+    assert catch_up["idempotency_key"] == "opening_burst:seed:2026-06-15:catchup"
+    assert duplicate["duplicate"] is True
+    assert skipped["enqueued"] is False
+    assert skipped["paused_reason"] == "NOT_SEED_TIME"
+    assert len(commands) == 1
+    assert commands[0]["command"]["payload"]["catch_up"] is True
+
+
 def test_scheduler_hard_pauses_outside_observe_or_regular_session(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     try:

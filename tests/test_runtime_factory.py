@@ -78,10 +78,27 @@ def test_build_core_runtime_routes_to_reboot_v2_observe_only(tmp_path, monkeypat
     assert bundle.candidate_hydrator is not None
     assert bundle.theme_board_pipeline is not None
     assert bundle.entry_engine_pipeline is not None
+    assert bundle.theme_board_pipeline.config.enabled is True
+    assert bundle.market_regime_pipeline.config.enabled is True
+    assert bundle.entry_engine_pipeline.config.enabled is True
+    assert bundle.exit_engine_reboot_pipeline.config.enabled is True
+    assert bundle.position_risk_pipeline.config.enabled is True
     assert bundle.order_sink is None
     assert bundle.order_manager_pipeline is None
     assert not hasattr(bundle.runtime, "gate_pipeline")
     assert not hasattr(bundle.runtime, "entry_plan_builder")
+
+
+def test_build_core_runtime_respects_explicit_reboot_v2_component_disable(tmp_path, monkeypatch):
+    monkeypatch.setenv("STRATEGY_REBOOT_V2_ENABLED", "1")
+    monkeypatch.setenv("TRADING_THEME_BOARD_ENABLED", "0")
+    db = TradingDatabase(str(tmp_path / "v2-disabled-component.db"))
+
+    bundle = build_core_strategy_runtime(db, GatewayStateStore(), settings=_settings(tmp_path))
+
+    assert bundle.runtime_profile == "V2_OBSERVE"
+    assert bundle.theme_board_pipeline.config.enabled is False
+    assert bundle.market_regime_pipeline.config.enabled is True
 
 
 def _settings(tmp_path):

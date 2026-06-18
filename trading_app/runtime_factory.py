@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, replace
 from time import perf_counter
 from typing import Any, Callable
 
@@ -294,37 +295,57 @@ def build_reboot_v2_runtime_bundle(
         candidate_ingestion_service=candidate_ingestion_service,
         candidate_hydrator=candidate_hydrator,
     )
+    theme_board_config = replace(
+        ThemeBoardConfig.from_env(),
+        enabled=_v2_component_enabled("TRADING_THEME_BOARD_ENABLED", default=True),
+    )
+    market_regime_config = replace(
+        MarketRegimeConfig.from_env(),
+        enabled=_v2_component_enabled("TRADING_MARKET_REGIME_ENABLED", default=True),
+    )
+    entry_engine_config = replace(
+        EntryEngineConfig.from_env(),
+        enabled=_v2_component_enabled("TRADING_ENTRY_ENGINE_ENABLED", default=True),
+    )
+    exit_engine_config = replace(
+        ExitEngineConfig.from_env(),
+        enabled=_v2_component_enabled("TRADING_EXIT_ENGINE_ENABLED", default=True),
+    )
+    position_risk_config = replace(
+        PositionRiskConfig.from_env(),
+        enabled=_v2_component_enabled("TRADING_POSITION_RISK_ENABLED", default=True),
+    )
     theme_board_pipeline = ThemeBoardRuntimePipeline(
         db=db,
         market_data=market_data,
         repository=theme_repository,
         candle_builder=candle_builder,
-        config=ThemeBoardConfig.from_env(),
+        config=theme_board_config,
     )
     market_regime_pipeline = MarketRegimeRuntimePipeline(
         db=db,
         market_data=market_data,
         market_index_store=market_index_store,
         candle_builder=candle_builder,
-        config=MarketRegimeConfig.from_env(),
+        config=market_regime_config,
     )
     entry_engine_pipeline = EntryEngineRuntimePipeline(
         db=db,
         market_data=market_data,
         candle_builder=candle_builder,
-        config=EntryEngineConfig.from_env(),
+        config=entry_engine_config,
     )
     exit_engine_reboot_pipeline = ExitEngineRuntimePipeline(
         db=db,
         market_data=market_data,
         candle_builder=candle_builder,
-        config=ExitEngineConfig.from_env(),
+        config=exit_engine_config,
     )
     position_risk_pipeline = PositionRiskRuntimePipeline(
         db=db,
         market_data=market_data,
         candle_builder=candle_builder,
-        config=PositionRiskConfig.from_env(),
+        config=position_risk_config,
     )
     runtime = RebootV2Runtime(
         db=db,
@@ -393,6 +414,13 @@ def _theme_lab_shadow_ab_provider(
         )
 
     return _cached_report_provider(load_report, ttl_sec=_provider_cache_ttl_sec(policy, default=300))
+
+
+def _v2_component_enabled(env_name: str, *, default: bool) -> bool:
+    raw = os.getenv(env_name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 def _shadow_small_entry_promotion_provider(

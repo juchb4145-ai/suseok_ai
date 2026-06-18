@@ -88,6 +88,7 @@ class RuntimeSupervisor:
         self._last_gateway_reconnect_count: int | None = None
         self._runtime_started_perf = 0.0
         self._last_realtime_no_tick_repair_perf = 0.0
+        self._last_realtime_stale_total_ticks = 0
         if self.mode != "OBSERVE":
             self._warn(f"RUNTIME_ORDER_MODE_FORCED_OBSERVE:{self.mode}")
         if self.settings.runtime_allow_live_orders:
@@ -285,8 +286,23 @@ class RuntimeSupervisor:
             else _dry_run_order_summary(self.settings.db_path)
         )
         realtime_data_quality = self._realtime_data_quality_snapshot()
+        pending_price_tick_count = self._pending_price_tick_count()
         with self._state_lock:
-            snapshot = dict(self.last_snapshot or {})
+            snapshot_source = dict(self.last_snapshot or {})
+            realtime_stale_present = _has_realtime_stale_state(self.warnings, snapshot_source)
+            realtime_recovered = realtime_stale_present and _realtime_ticks_recovered(
+                realtime_data_quality,
+                pending_price_tick_count,
+                baseline_total_ticks=self._last_realtime_stale_total_ticks,
+            )
+            if realtime_recovered:
+                self.warnings = _without_realtime_stale_warnings(self.warnings)
+            snapshot = _snapshot_with_recovered_realtime_repair(
+                snapshot_source,
+                realtime_data_quality,
+                pending_price_tick_count,
+                recovered=realtime_recovered,
+            )
             warnings = list(self.warnings[-50:])
             cycle_worker_pending = self._cycle_future is not None and not self._cycle_future.done()
             cycle_worker_elapsed_ms = 0
@@ -327,7 +343,7 @@ class RuntimeSupervisor:
                 "commands": command_summary,
                 "dry_run_orders": dry_run_order_summary,
                 "realtime_data_quality": realtime_data_quality,
-                "pending_price_tick_count": self._pending_price_tick_count(),
+                "pending_price_tick_count": pending_price_tick_count,
                 "dropped_price_tick_count": self._dropped_price_tick_count,
                 "db_path": str(self.settings.db_path),
             }
@@ -630,6 +646,8 @@ class RuntimeSupervisor:
                     forwarded_count += 1
             except Exception as exc:
                 self._warn(f"RUNTIME_GATEWAY_EVENT_FAILED:{event.type}:{exc}")
+        if forwarded_count:
+            self._clear_realtime_subscription_stale_warnings()
         theme_bridge = getattr(self._bundle, "theme_runtime_bridge", None)
         if theme_bridge is not None:
             try:
@@ -736,6 +754,11 @@ class RuntimeSupervisor:
             self._warn("REALTIME_SUBSCRIPTION_STALE_MARK_UNSUPPORTED")
             return
         marker(reason)
+        with self._state_lock:
+            self._last_realtime_stale_total_ticks = _safe_int(
+                self._realtime_data_quality_snapshot().get("total_price_ticks"),
+                0,
+            )
         self._warn(f"REALTIME_SUBSCRIPTIONS_STALE:{reason}")
 
     def _repair_realtime_subscriptions_if_no_ticks_in_worker(self, snapshot: dict[str, Any]) -> None:
@@ -771,6 +794,11 @@ class RuntimeSupervisor:
             return
         reason = "NO_PRICE_TICKS_AFTER_REGISTER"
         marker(reason)
+        with self._state_lock:
+            self._last_realtime_stale_total_ticks = _safe_int(
+                self._realtime_data_quality_snapshot().get("total_price_ticks"),
+                0,
+            )
         self._last_realtime_no_tick_repair_perf = now_perf
         warning = f"REALTIME_SUBSCRIPTIONS_STALE:{reason}"
         self._warn(warning)
@@ -908,6 +936,14 @@ class RuntimeSupervisor:
                 self.warnings.append(str(warning))
                 self.warnings = self.warnings[-100:]
 
+    def _clear_realtime_subscription_stale_warnings(self) -> None:
+        with self._state_lock:
+            self.warnings = _without_realtime_stale_warnings(self.warnings)
+            self._last_realtime_stale_total_ticks = _safe_int(
+                self._realtime_data_quality_snapshot().get("total_price_ticks"),
+                0,
+            )
+
     def _log_runtime_event(self, event_type: str, status: str, message: str, payload: dict[str, Any] | None = None) -> None:
         try:
             db = TradingDatabase(str(self.settings.db_path))
@@ -960,6 +996,57 @@ def _readiness_summary(snapshot: dict[str, Any], warnings: list[str]) -> dict[st
         "warning_count": len(warnings) + len(snapshot.get("warnings") or []),
         "warnings": (snapshot.get("warnings") or [])[-20:],
     }
+
+
+def _has_realtime_stale_state(warnings: list[Any], snapshot: dict[str, Any]) -> bool:
+    if any(str(warning or "").startswith("REALTIME_SUBSCRIPTIONS_STALE:") for warning in warnings):
+        return True
+    repair = dict(snapshot.get("realtime_subscription_repair") or {})
+    return str(repair.get("status") or "").upper() == "STALE_MARKED"
+
+
+def _realtime_ticks_recovered(
+    realtime_data_quality: dict[str, Any],
+    pending_price_tick_count: int,
+    *,
+    baseline_total_ticks: int = 0,
+) -> bool:
+    return pending_price_tick_count > 0 or _safe_int(realtime_data_quality.get("total_price_ticks"), 0) > int(baseline_total_ticks or 0)
+
+
+def _without_realtime_stale_warnings(warnings: list[Any]) -> list[str]:
+    return [
+        str(warning)
+        for warning in warnings
+        if str(warning or "").strip()
+        and not str(warning or "").startswith("REALTIME_SUBSCRIPTIONS_STALE:")
+        and str(warning or "") != "REALTIME_NO_TICK_REPAIR_ENQUEUED"
+    ]
+
+
+def _snapshot_with_recovered_realtime_repair(
+    snapshot: dict[str, Any],
+    realtime_data_quality: dict[str, Any],
+    pending_price_tick_count: int,
+    *,
+    recovered: bool,
+) -> dict[str, Any]:
+    repair = dict(snapshot.get("realtime_subscription_repair") or {})
+    if str(repair.get("status") or "").upper() != "STALE_MARKED":
+        return snapshot
+    if not recovered:
+        return snapshot
+    repair.update(
+        {
+            "status": "RECOVERED",
+            "reason": "PRICE_TICK_RECEIVED",
+            "total_price_ticks": _safe_int(realtime_data_quality.get("total_price_ticks"), 0),
+            "pending_price_tick_count": int(pending_price_tick_count),
+        }
+    )
+    snapshot["realtime_subscription_repair"] = repair
+    snapshot["warnings"] = _without_realtime_stale_warnings(list(snapshot.get("warnings") or []))
+    return snapshot
 
 
 def _jsonable(value: Any) -> Any:

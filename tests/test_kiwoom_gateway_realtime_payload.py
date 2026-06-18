@@ -1,4 +1,7 @@
-from apps.kiwoom_gateway import GatewayRuntime, _execute_command, _kiwoom_heartbeat_payload, _wire_kiwoom_signals
+import threading
+import time
+
+from apps.kiwoom_gateway import GatewayRuntime, _execute_command, _kiwoom_heartbeat_payload, _request_kiwoom_login, _wire_kiwoom_signals
 from trading.broker.models import BrokerPriceTick, ConditionInfo, GatewayCommand, Signal
 
 
@@ -13,8 +16,20 @@ class FakeCoreClient:
     post_error_count = 0
     last_poll_command_count = 0
 
+    def __init__(self):
+        self.posted_events = []
+
     def snapshot(self):
         return {}
+
+    def post_event(self, event):
+        self.posted_events.append(event)
+        self.post_count += 1
+        return {"ok": True}
+
+    def poll_commands(self, *, wait_sec=0.0, limit=20):
+        self.poll_count += 1
+        return []
 
 
 class SignalClient:
@@ -97,11 +112,13 @@ def test_gateway_runtime_keeps_old_price_received_fallback_path():
 
 def test_gateway_runtime_emits_market_symbols_after_login_success():
     runtime = GatewayRuntime(FakeCoreClient())
+    runtime.command_polling_paused = True
     client = SignalClient(rich=True)
     _wire_kiwoom_signals(client, runtime)
 
     client.connected.emit(True, 0, "ok")
 
+    assert runtime.command_polling_paused is False
     events = runtime.events.drain()
     assert [event.type for event in events] == ["login_status", "market_symbols"]
     assert events[1].payload["markets"] == [
@@ -145,6 +162,50 @@ def test_kiwoom_heartbeat_payload_keeps_unknown_environment_fail_closed():
     assert payload["broker_env"] == "UNKNOWN"
     assert payload["server_mode"] == "UNKNOWN"
     assert payload["account_mode"] == "UNKNOWN"
+
+
+def test_threaded_login_does_not_block_gateway_heartbeat_payload():
+    started = threading.Event()
+    release = threading.Event()
+
+    class Client:
+        def login(self):
+            started.set()
+            release.wait(timeout=2)
+            return 0
+
+        def get_accounts(self):
+            raise AssertionError("heartbeat must not query ActiveX while login is in progress")
+
+    runtime = GatewayRuntime(FakeCoreClient())
+
+    _request_kiwoom_login(Client(), runtime, threaded=True)
+    assert started.wait(timeout=1)
+
+    payload = _kiwoom_heartbeat_payload(Client(), runtime)
+
+    assert payload["kiwoom_logged_in"] is False
+    assert payload["login_in_progress"] is True
+    assert payload["command_polling_paused"] is False
+
+    release.set()
+
+
+def test_gateway_network_loop_drains_events_while_command_polling_paused():
+    core = FakeCoreClient()
+    runtime = GatewayRuntime(core)
+    runtime.command_polling_paused = True
+    runtime.start_network_worker(interval_sec=0.05)
+    try:
+        runtime.emit("heartbeat", {"kiwoom_logged_in": False, "orderable": False})
+        deadline = time.time() + 1.0
+        while time.time() < deadline and not core.posted_events:
+            time.sleep(0.02)
+    finally:
+        runtime.stop()
+
+    assert [event.type for event in core.posted_events] == ["heartbeat"]
+    assert core.poll_count == 0
 
 
 def test_gateway_send_condition_failure_message_includes_result_code():

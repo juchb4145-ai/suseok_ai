@@ -30,6 +30,39 @@ def test_runtime_disabled_status_and_start(tmp_path, monkeypatch):
     assert started["running"] is False
 
 
+def test_runtime_dashboard_payload_preserves_reboot_v2_snapshot_fields(monkeypatch):
+    monkeypatch.setenv("TRADING_DB_PATH", "unused.db")
+    import trading_app.api as api
+
+    payload = api._runtime_dashboard_payload(
+        {
+            "enabled": True,
+            "running": True,
+            "mode": "DRY_RUN",
+            "latest_snapshot": {
+                "runtime": "strategy_reboot_v2",
+                "runtime_profile": "V2_OBSERVE",
+                "reboot_v2_enabled": True,
+                "pipeline_status": {"theme_board": True, "market_regime": True},
+                "data_warmup_status": "ready",
+                "theme_board": {"enabled": True, "status": "OK"},
+                "market_regime": {"enabled": True, "status": "OK", "global_status": "SELECTIVE"},
+                "exit_engine_reboot": {"enabled": True, "status": "OK"},
+                "candidate_realtime_subscription": {"selected_count": 3},
+            },
+            "readiness": {"data_warmup_status": "warmup"},
+        }
+    )
+
+    assert payload["runtime_profile"] == "V2_OBSERVE"
+    assert payload["reboot_v2_enabled"] is True
+    assert payload["pipeline_status"]["theme_board"] is True
+    assert payload["data_warmup_status"] == "ready"
+    assert payload["theme_board"]["status"] == "OK"
+    assert payload["exit_engine"]["status"] == "OK"
+    assert payload["candidate_realtime_subscription"]["selected_count"] == 3
+
+
 def test_start_kiwoom_gateway_skips_when_gateway_connected(tmp_path, monkeypatch):
     with _client(tmp_path, monkeypatch, enabled="0") as client:
         client.post(

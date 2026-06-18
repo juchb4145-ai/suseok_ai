@@ -8,6 +8,8 @@ from pathlib import Path
 import sys
 import threading
 import time
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -71,6 +73,50 @@ CONTROL_EVENT_TYPES = {
 }
 
 
+class _UrllibResponse:
+    def __init__(self, status_code: int, body: bytes) -> None:
+        self.status_code = int(status_code)
+        self._body = bytes(body or b"")
+        self.text = self._body.decode("utf-8", errors="replace")
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}: {self.text[:300]}")
+
+    def json(self) -> Any:
+        return json.loads(self.text or "{}")
+
+
+class _UrllibSession:
+    def post(self, url: str, *, json: dict[str, Any] | None = None, headers: dict[str, str] | None = None, timeout: float = 5.0):
+        payload = json_encode_bytes(json or {})
+        request_headers = {"Content-Type": "application/json", **dict(headers or {})}
+        request = Request(url, data=payload, headers=request_headers, method="POST")
+        with urlopen(request, timeout=timeout) as response:
+            return _UrllibResponse(int(getattr(response, "status", 200) or 200), response.read())
+
+    def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 5.0,
+    ):
+        query = urlencode({key: value for key, value in dict(params or {}).items() if value is not None})
+        target = f"{url}?{query}" if query else url
+        request = Request(target, headers=dict(headers or {}), method="GET")
+        with urlopen(request, timeout=timeout) as response:
+            return _UrllibResponse(int(getattr(response, "status", 200) or 200), response.read())
+
+    def close(self) -> None:
+        return None
+
+
+def json_encode_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
 @dataclass
 class RestCoreClient:
     core_url: str
@@ -91,9 +137,12 @@ class RestCoreClient:
     @property
     def session(self):
         if self._session is None:
-            import requests
+            try:
+                import requests
 
-            self._session = requests.Session()
+                self._session = requests.Session()
+            except ImportError:
+                self._session = _UrllibSession()
         return self._session
 
     @property
@@ -224,6 +273,14 @@ class GatewayRuntime:
         self.coalesced_tick_count = 0
         self.data_quality = RealtimeDataQualityTracker()
         self.tr_runner = None
+        self.command_polling_paused = False
+        self.login_in_progress = False
+        self.login_requested = False
+        self.login_result_code: int | None = None
+        self.login_error = ""
+        self.login_started_at = ""
+        self.login_finished_at = ""
+        self.login_threaded = False
 
     def emit(self, event_type: str, payload: dict[str, Any] | None = None, **kwargs) -> None:
         raw_payload = dict(payload or {})
@@ -287,6 +344,9 @@ class GatewayRuntime:
                 self.drained_event_count += len(drained)
                 for event in drained:
                     self.core_client.post_event(event)
+                if self.command_polling_paused:
+                    time.sleep(max(0.1, interval_sec))
+                    continue
                 for command in self.core_client.poll_commands(wait_sec=interval_sec):
                     self.commands.put(
                         _command_with_gateway_trace(
@@ -325,6 +385,14 @@ class GatewayRuntime:
             "gateway_event_post_error_count": self.core_client.post_error_count,
             "gateway_last_poll_command_count": self.core_client.last_poll_command_count,
             "gateway_event_drain_limit": self.event_drain_limit,
+            "gateway_command_polling_paused": self.command_polling_paused,
+            "gateway_login_in_progress": self.login_in_progress,
+            "gateway_login_requested": self.login_requested,
+            "gateway_login_result_code": self.login_result_code,
+            "gateway_login_error": self.login_error,
+            "gateway_login_started_at": self.login_started_at,
+            "gateway_login_finished_at": self.login_finished_at,
+            "gateway_login_threaded": self.login_threaded,
             **client_snapshot,
             "gateway_transport_metrics": {
                 "last_poll_ms": round(self.core_client.last_poll_ms, 3),
@@ -359,6 +427,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-enabled", action="store_true", default=os.environ.get("TRADING_TRANSPORT_METRICS_ENABLED", "1") != "0")
     parser.add_argument("--metrics-sample-price-tick-rate", type=float, default=float(os.environ.get("TRADING_TRANSPORT_METRICS_SAMPLE_PRICE_TICK_RATE", "0.01")))
     parser.add_argument("--metrics-sample-heartbeat-rate", type=float, default=float(os.environ.get("TRADING_TRANSPORT_METRICS_SAMPLE_HEARTBEAT_RATE", "0.1")))
+    parser.add_argument(
+        "--auto-login",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("TRADING_GATEWAY_AUTO_LOGIN", True),
+        help="Request Kiwoom login after gateway startup.",
+    )
+    parser.add_argument(
+        "--threaded-login",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("TRADING_GATEWAY_THREADED_LOGIN", True),
+        help="Run CommConnect in a daemon thread so gateway heartbeat stays alive if login blocks.",
+    )
     return parser.parse_args()
 
 
@@ -524,6 +604,7 @@ def run_real_gateway(args: argparse.Namespace) -> int:
         event_queue_size=args.event_queue_size,
         event_drain_limit=args.event_drain_limit,
     )
+    runtime.command_polling_paused = True
     _wire_kiwoom_signals(client, runtime)
     _gateway_boot_log("starting network worker")
     runtime.start_network_worker(interval_sec=args.poll_wait_sec or args.network_interval_sec or args.interval_sec)
@@ -538,7 +619,17 @@ def run_real_gateway(args: argparse.Namespace) -> int:
 
     _gateway_boot_log("entering Qt event loop")
     QTimer.singleShot(100, lambda: runtime.emit("heartbeat", _kiwoom_heartbeat_payload(client, runtime)))
-    QTimer.singleShot(1500, lambda: _request_kiwoom_login(client))
+    if bool(getattr(args, "auto_login", True)):
+        QTimer.singleShot(
+            1500,
+            lambda: _request_kiwoom_login(
+                client,
+                runtime,
+                threaded=bool(getattr(args, "threaded_login", True)),
+            ),
+        )
+    else:
+        runtime.emit("gateway_error", {"message": "KIWOOM_AUTO_LOGIN_DISABLED"})
     try:
         return int(app.exec_())
     finally:
@@ -546,13 +637,67 @@ def run_real_gateway(args: argparse.Namespace) -> int:
         runtime.stop()
 
 
-def _request_kiwoom_login(client) -> None:
-    _gateway_boot_log("requesting Kiwoom login")
-    try:
-        result = int(client.login() or 0)
-        _gateway_boot_log(f"Kiwoom login requested result={result}")
-    except Exception as exc:
-        _gateway_boot_log(f"Kiwoom login request failed: {exc}")
+def _request_kiwoom_login(client, runtime: GatewayRuntime | None = None, *, threaded: bool = True) -> None:
+    if runtime is not None and runtime.login_in_progress:
+        _gateway_boot_log("Kiwoom login request skipped: already in progress")
+        return
+
+    def run_login() -> None:
+        if runtime is not None:
+            runtime.login_in_progress = True
+            runtime.login_requested = True
+            runtime.login_error = ""
+            runtime.login_result_code = None
+            runtime.login_started_at = utc_now_ms()
+            runtime.login_finished_at = ""
+            runtime.login_threaded = bool(threaded)
+        _gateway_boot_log("requesting Kiwoom login")
+        try:
+            result = int(client.login() or 0)
+            if runtime is not None:
+                runtime.login_result_code = result
+                runtime.login_finished_at = utc_now_ms()
+                runtime.login_in_progress = False
+            _gateway_boot_log(f"Kiwoom login requested result={result}")
+        except Exception as exc:
+            if runtime is not None:
+                runtime.login_error = str(exc)
+                runtime.login_finished_at = utc_now_ms()
+                runtime.login_in_progress = False
+                runtime.emit("gateway_error", {"message": f"KIWOOM_LOGIN_REQUEST_FAILED:{exc}"})
+            _gateway_boot_log(f"Kiwoom login request failed: {exc}")
+
+    if threaded:
+        thread = threading.Thread(target=run_login, name="kiwoom-login-request", daemon=True)
+        thread.start()
+        return
+    run_login()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _kiwoom_runtime_login_in_progress(runtime: GatewayRuntime | None) -> bool:
+    return bool(getattr(runtime, "login_in_progress", False))
+
+
+def _kiwoom_runtime_login_payload(runtime: GatewayRuntime | None) -> dict[str, Any]:
+    if runtime is None:
+        return {}
+    return {
+        "login_in_progress": bool(runtime.login_in_progress),
+        "login_requested": bool(runtime.login_requested),
+        "login_result_code": runtime.login_result_code,
+        "login_error": runtime.login_error,
+        "login_started_at": runtime.login_started_at,
+        "login_finished_at": runtime.login_finished_at,
+        "login_threaded": bool(runtime.login_threaded),
+        "command_polling_paused": bool(runtime.command_polling_paused),
+    }
 
 
 def _gateway_boot_log(message: str) -> None:
@@ -644,7 +789,10 @@ def _heartbeat_broker_mode_payload(client, *, logged_in: bool) -> dict[str, str]
 
 
 def _kiwoom_heartbeat_payload(client, runtime: GatewayRuntime) -> dict[str, Any]:
-    logged_in = _kiwoom_connect_state(client)
+    login_in_progress = _kiwoom_runtime_login_in_progress(runtime)
+    logged_in = False if login_in_progress else _kiwoom_connect_state(client)
+    if logged_in:
+        runtime.command_polling_paused = False
     accounts = _kiwoom_accounts(client) if logged_in else []
     configured_account = os.environ.get("TRADING_ACCOUNT", "").strip()
     account = configured_account or (accounts[0] if accounts else "")
@@ -659,6 +807,7 @@ def _kiwoom_heartbeat_payload(client, runtime: GatewayRuntime) -> dict[str, Any]
         "last_error": runtime.last_error,
         "reconnect_count": runtime.reconnect_count,
         "rate_limit": runtime.rate_limiter.snapshot(),
+        **_kiwoom_runtime_login_payload(runtime),
         **runtime.transport_snapshot(),
     }
 
@@ -742,6 +891,11 @@ def _wire_kiwoom_signals(client, runtime: GatewayRuntime) -> None:
 
 
 def _emit_login_status(client, runtime: GatewayRuntime, ok: bool, code: int, message: str) -> None:
+    runtime.login_in_progress = False
+    runtime.login_finished_at = utc_now_ms()
+    runtime.login_result_code = int(code)
+    runtime.login_error = "" if ok else str(message or code)
+    runtime.command_polling_paused = not bool(ok)
     runtime.emit(
         "login_status",
         {"logged_in": bool(ok), "code": int(code), "message": str(message or "")},

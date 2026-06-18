@@ -10025,11 +10025,16 @@ def _append_reason_codes(existing: list[Any], additions: list[str]) -> list[str]
 def _runtime_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
     snapshot_payload = dict(status.get("latest_snapshot") or {})
     readiness = dict(status.get("readiness") or {})
-    return {
+    payload = {
         "enabled": status.get("enabled", False),
         "running": status.get("running", False),
         "mode": status.get("mode", "OBSERVE"),
         "order_policy": status.get("order_policy", "OBSERVE_VIRTUAL_ONLY"),
+        "runtime": snapshot_payload.get("runtime", ""),
+        "runtime_profile": snapshot_payload.get("runtime_profile", ""),
+        "reboot_v2_enabled": bool(snapshot_payload.get("reboot_v2_enabled", False)),
+        "status": snapshot_payload.get("status", ""),
+        "pipeline_status": dict(snapshot_payload.get("pipeline_status") or {}),
         "last_cycle_at": status.get("last_cycle_at", ""),
         "next_cycle_at": status.get("next_cycle_at", ""),
         "cycle_count": status.get("cycle_count", 0),
@@ -10063,13 +10068,28 @@ def _runtime_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
         "last_dry_run_exit_order_intent_at": snapshot_payload.get("last_dry_run_exit_order_intent_at", ""),
         "last_dry_run_exit_order_reject_reason": snapshot_payload.get("last_dry_run_exit_order_reject_reason", ""),
         "reason_summary": snapshot_payload.get("reason_summary", {}),
-        "market_session_status": readiness.get("market_session_status", ""),
-        "data_warmup_status": readiness.get("data_warmup_status", ""),
-        "gate_skip_reason": readiness.get("gate_skip_reason", ""),
+        "market_session_status": snapshot_payload.get("market_session_status", readiness.get("market_session_status", "")),
+        "data_warmup_status": snapshot_payload.get("data_warmup_status", readiness.get("data_warmup_status", "")),
+        "gate_skip_reason": snapshot_payload.get("gate_skip_reason", readiness.get("gate_skip_reason", "")),
+        "candidate_count": snapshot_payload.get("candidate_count", 0),
+        "watching_candidate_count": snapshot_payload.get("watching_candidate_count", 0),
+        "wait_data_candidate_count": snapshot_payload.get("wait_data_candidate_count", 0),
+        "subscription_active_count": snapshot_payload.get("subscription_active_count", 0),
+        "candidate_hydration": dict(snapshot_payload.get("candidate_hydration") or {}),
+        "candidate_realtime_subscription": dict(snapshot_payload.get("candidate_realtime_subscription") or {}),
+        "base_realtime_subscription": dict(snapshot_payload.get("base_realtime_subscription") or {}),
+        "opening_burst": dict(snapshot_payload.get("opening_burst") or {}),
+        "theme_board": dict(snapshot_payload.get("theme_board") or {}),
+        "market_regime": dict(snapshot_payload.get("market_regime") or {}),
+        "entry_engine": dict(snapshot_payload.get("entry_engine") or {}),
+        "exit_engine": dict(snapshot_payload.get("exit_engine") or snapshot_payload.get("exit_engine_reboot") or {}),
+        "position_risk": dict(snapshot_payload.get("position_risk") or {}),
+        "order_manager": dict(snapshot_payload.get("order_manager") or {}),
         "realtime_data_quality": dict(status.get("realtime_data_quality") or {}),
         "warnings": (status.get("warnings") or [])[-10:],
         "last_error": status.get("last_error", ""),
     }
+    return payload
 
 
 def _transport_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:

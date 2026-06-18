@@ -45,7 +45,20 @@ def _snapshot() -> dict:
     return {
         "trade_date": "2026-06-18",
         "core": {"service": "trading-core-api", "mode": "OBSERVE"},
-        "runtime": {"last_error": ""},
+        "runtime": {
+            "last_error": "",
+            "runtime_profile": "V2_OBSERVE",
+            "reboot_v2_enabled": True,
+            "pipeline_status": {
+                "candidate_ingestion": True,
+                "candidate_hydrator": True,
+                "opening_burst": True,
+                "theme_board": True,
+                "market_regime": True,
+                "entry_engine": True,
+            },
+            "index_watch_codes_configured": True,
+        },
         "dashboard_v2_available": True,
         "sqlite": {"writable": True, "status": "OK"},
         "gateway": {
@@ -57,7 +70,7 @@ def _snapshot() -> dict:
             "account": "SIM12345",
             "last_heartbeat_payload": {"server_gubun": "1"},
         },
-        "commands": {"queued_count": 0, "dispatched_count": 0, "stale_dispatched_count": 0},
+        "commands": {"queued_count": 0, "dispatched_count": 0, "stale_dispatched_count": 0, "acked_count": 1},
         "order_manager": {
             "enabled": True,
             "mode": "LIVE_SIM",
