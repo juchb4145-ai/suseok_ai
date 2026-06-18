@@ -137,6 +137,7 @@ class DashboardReadModelService:
             "exit_engine": dict(runtime.get("exit_engine_reboot") or runtime.get("exit_engine") or {}),
             "position_risk": dict(runtime.get("position_risk") or {}),
             "order_manager": order_manager,
+            "order_lifecycle": dict(core.get("order_event_consumer") or runtime.get("order_lifecycle") or {}),
             "candidates": dict(runtime.get("candidates") or {}),
             "pre_market_check": dict(runtime.get("pre_market_check") or pre_market_report_empty()),
         }
@@ -560,6 +561,51 @@ class DashboardReadModelService:
                 "last_reject_reason": order.get("last_reject_reason", ""),
             },
         )
+        order_lifecycle = dict(core.get("order_event_consumer") or payload.get("order_lifecycle") or {})
+        if order_lifecycle:
+            payload["order_lifecycle"] = order_lifecycle
+            health["order_lifecycle"] = {
+                "status": order_lifecycle.get("status", ""),
+                "consumer_enabled": bool(order_lifecycle.get("consumer_enabled")),
+                "consumer_running": bool(order_lifecycle.get("consumer_running")),
+                "order_lifecycle_ready": bool(order_lifecycle.get("order_lifecycle_ready")),
+                "pending_event_count": int(order_lifecycle.get("pending_event_count") or 0),
+                "retry_wait_count": int(order_lifecycle.get("retry_wait_count") or 0),
+                "failed_count": int(order_lifecycle.get("failed_count") or 0),
+                "dead_letter_count": int(order_lifecycle.get("dead_letter_count") or 0),
+                "oldest_pending_age_sec": float(order_lifecycle.get("oldest_pending_age_sec") or 0.0),
+                "processed_count": int(order_lifecycle.get("processed_count") or 0),
+                "duplicate_applied_count": int(order_lifecycle.get("duplicate_applied_count") or 0),
+                "unmatched_event_count": int(order_lifecycle.get("unmatched_event_count") or 0),
+                "reconcile_required_count": int(order_lifecycle.get("reconcile_required_count") or 0),
+                "last_event_type": order_lifecycle.get("last_event_type", ""),
+                "last_event_at": order_lifecycle.get("last_event_at", ""),
+                "last_processed_at": order_lifecycle.get("last_processed_at", ""),
+                "last_error": order_lifecycle.get("last_error", ""),
+                "replay_status": order_lifecycle.get("replay_status", ""),
+                "replay_duration_ms": float(order_lifecycle.get("replay_duration_ms") or 0.0),
+            }
+            if not bool(order_lifecycle.get("order_lifecycle_ready", True)):
+                payload["safety_banners"] = _add_banner(
+                    payload.get("safety_banners") or [],
+                    "critical",
+                    "주문 이벤트 처리/복구 상태 확인이 필요합니다.",
+                    "ORDER_LIFECYCLE_NOT_READY",
+                )
+            if int(order_lifecycle.get("dead_letter_count") or 0) > 0:
+                payload["safety_banners"] = _add_banner(
+                    payload.get("safety_banners") or [],
+                    "critical",
+                    "주문 이벤트 Dead Letter가 있어 신규 매수를 중지해야 합니다.",
+                    "ORDER_EVENT_DEAD_LETTER",
+                )
+            if int(order_lifecycle.get("unmatched_event_count") or 0) > 0:
+                payload["safety_banners"] = _add_banner(
+                    payload.get("safety_banners") or [],
+                    "critical",
+                    "미확인 주문/체결 이벤트가 있어 reconciliation이 필요합니다.",
+                    "UNMATCHED_ORDER_EVENT",
+                )
         health["read_model"] = {
             "generation": dict(payload.get("read_model") or {}).get("generation", 0),
             "age_sec": dict(payload.get("read_model") or {}).get("snapshot_age_sec", 0),

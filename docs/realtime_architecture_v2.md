@@ -1017,3 +1017,370 @@ python -m pytest
 ```
 
 다음 PR은 read model shadow comparison을 실제 background metric으로 확대하거나, Gateway order ack/fill/reconcile event consumer를 read model과 OrderManager lifecycle에 연결하는 작업을 권장한다.
+
+## PR 8 구현 상태: Gateway Order Lifecycle Event Consumer & Replay
+
+PR 8은 Event Log 위에 broker 주문 생명주기 consumer를 추가한다. 이 PR은 주문 생성, LIVE_SIM 주문 활성화, 실제 Kiwoom `send_order` 활성화 PR이 아니다. 이미 Gateway에서 도착한 주문 승인, 거절, 체결, 잔고/포지션 snapshot 이벤트를 보존한 뒤 idempotent하게 관측하고 복구하는 기반이다.
+
+안전 기본값은 유지한다.
+
+| setting | default |
+|---|---:|
+| `TRADING_SEND_ORDER_ALLOWED` | `false` |
+| `TRADING_ORDER_MANAGER_ENABLED` | `false` |
+| `TRADING_ORDER_MANAGER_OBSERVE_ONLY` | `true` |
+| `TRADING_ORDER_MANAGER_ENQUEUE_GATEWAY_COMMAND` | `false` |
+| `TRADING_ORDER_INTENT_ENABLED` | `false` |
+| `TRADING_EVENT_REPLAY_PRICE_TICK_ENABLED` | `false` |
+| `TRADING_EVENT_REPLAY_HEARTBEAT_ENABLED` | `false` |
+
+### Canonical Event Mapping
+
+| raw GatewayEvent | canonical event | note |
+|---|---|---|
+| `command_ack` + `command_type=send_order` + `order_no` | `ORDER_ACCEPTED` | broker order number required |
+| `command_ack` + `command_type=cancel_order` + `order_no` | `ORDER_CANCEL_ACCEPTED` | cancel command accepted |
+| `command_ack` without `order_no` | `COMMAND_ACK` | order command이면 broker accepted로 보지 않고 reconcile required |
+| rejected/failed `command_ack` | `ORDER_REJECTED` or `COMMAND_FAILED` | order command이면 order rejected |
+| `command_failed`, `command_timeout`, `command_expired` | `COMMAND_FAILED` | send_order 자동 재전송 금지 |
+| `execution_event`, `execution`, `fill`, `order_fill` | `ORDER_PARTIALLY_FILLED` or `ORDER_FILLED` | `remaining_quantity` 기준 |
+| `order_ack` | `ORDER_ACCEPTED` | future parser output |
+| `order_reject` | `ORDER_REJECTED` | future parser output |
+| `cancel_ack` | `ORDER_CANCEL_ACCEPTED` | future parser output |
+| `order_cancel`, `order_cancelled` | `ORDER_CANCELLED` | future parser output |
+| `order_status_snapshot` | `ORDER_STATUS_SNAPSHOT` | latest projection |
+| `balance_snapshot` | `BALANCE_SNAPSHOT` | reconcile/projection input |
+| `position_snapshot` | `POSITION_SNAPSHOT` | reconcile/projection input |
+| unsupported non-order event | `IGNORED` | reason stored |
+| `price_tick`, `heartbeat` | excluded | logging/replay disabled by default |
+
+`command_ack`는 Gateway command 실행 결과다. `order_no`가 없으면 증권사 주문 접수로 해석하지 않는다. ack timeout 또는 missing `order_no` 때문에 동일 BUY command를 자동 재전송하지 않는다.
+
+### Live 처리 순서
+
+1. Gateway가 `GatewayEvent`를 보낸다.
+2. `GatewayStateStore.record_event()`가 상태를 갱신하고 `gateway_event_log`에 append한다.
+3. `RuntimeSupervisor.handle_gateway_event()`가 주문 lifecycle event를 전용 `order-event-consumer` executor로 전달한다.
+4. `GatewayEventDispatcher.consume_live_event()`가 Event Log row를 찾아 claim한다.
+5. `GatewayEventCodec`이 raw type을 canonical type으로 정규화한다.
+6. `OrderLifecycleEventConsumer`가 `order_gateway_event_receipts`를 확인한다.
+7. OrderManager generic API가 lifecycle update를 적용한다.
+8. `broker_order_state` 또는 `broker_position_state` projection을 갱신한다.
+9. receipt를 저장한다.
+10. Event Log row를 `PROCESSED`, `IGNORED`, `RETRY_WAIT`, `DEAD_LETTER` 중 하나로 닫는다.
+11. Dashboard read model에는 dirty mark만 전달한다. snapshot DB write는 기존 1초 coalescing writer가 담당한다.
+
+Critical order event는 Event Log append 전에 OrderManager로 전달하지 않는다. Event Log append가 불가능하면 `EVENT_LOG_UNAVAILABLE`로 fail-closed 처리하고 신규 매수는 `STOP_NEW_BUY` 상태로 막아야 한다.
+
+### Event Log Claim/Retry/Dead Letter
+
+`gateway_event_log`에는 다음 processing column이 추가됐다.
+
+| column | purpose |
+|---|---|
+| `processing_attempts` | claim attempt count |
+| `claimed_at` | lease start |
+| `claimed_by` | worker id |
+| `next_retry_at` | lease expiry or retry eligibility |
+| `handler_name` | consumer name |
+| `handler_version` | consumer contract version |
+| `last_attempt_at` | last processing attempt |
+| `dead_lettered_at` | terminal failure time |
+| `processing_result_json` | canonical result detail |
+
+지원 상태:
+
+- `PENDING`
+- `PROCESSING`
+- `PROCESSED`
+- `RETRY_WAIT`
+- `FAILED`
+- `DEAD_LETTER`
+- `IGNORED`
+
+Claim 정렬은 `received_at ASC, id ASC`이며 batch size는 `TRADING_EVENT_REPLAY_BATCH_SIZE`로 제한한다. stale `PROCESSING` lease는 startup/periodic replay worker가 복구한다.
+
+### Receipt와 Idempotency
+
+`order_gateway_event_receipts`는 이미 적용된 broker event를 기록한다.
+
+- `UNIQUE(source_event_id)`
+- `UNIQUE(dedupe_key)`
+
+체결 dedupe는 `account + order_no + execution_id`를 우선한다. 같은 체결이 다른 transport event_id로 다시 들어와도 filled quantity를 두 번 증가시키지 않는다. Order DB update와 receipt 저장 후 Core가 `mark_processed` 전에 죽으면, 재기동 replay는 receipt를 보고 `DUPLICATE_ALREADY_APPLIED`로 Event Log만 닫는다.
+
+### Broker Projection
+
+추가 projection:
+
+- `broker_order_state`
+- `broker_position_state`
+
+projection은 latest state다. append-only 원장은 `gateway_event_log`이며, projection은 dashboard와 reconcile을 위한 broker truth cache다.
+
+### Out-of-order 정책
+
+- fill-before-ack: matching 가능하면 즉시 partial/full fill로 승격한다.
+- late ack: FILLED/PARTIALLY_FILLED를 ACKED로 되돌리지 않는다.
+- duplicate fill: receipt dedupe로 no-op 처리한다.
+- cancel ack 후 late execution: 안전하게 matching되지 않으면 reconcile required.
+- balance-before-fill: projection은 보존하고 mismatch는 fail-closed 대상이다.
+- unmatched fill: raw event/receipt/result를 보존하고 `RECONCILE_REQUIRED + STOP_NEW_BUY`로 둔다.
+
+### Matching 우선순위
+
+1. `managed_order_id`
+2. `command_id`
+3. `idempotency_key`
+4. `account + order_no`
+5. `account + original_order_no`
+6. `account + code + side + nearby sent_at`
+7. 정확히 하나의 pending local order
+
+현재 구현은 기존 `ManagedOrderReconciler`의 `order_no`, `command_id`, idempotency/code/side fallback을 사용한다. ambiguous heuristic은 자동 matching하지 않고 `RECONCILE_REQUIRED`를 우선한다.
+
+### RuntimeSupervisor와 Dashboard
+
+RuntimeSupervisor는 optional `order_event_consumer` hook을 갖는다. 주문 lifecycle event는 runtime cycle executor가 아니라 전용 `order-event-consumer` executor에서 처리한다. `command_ack`와 `command_failed`는 lifecycle 관측 후 기존 candidate hydration/command handler 경로도 계속 탄다.
+
+Startup 순서:
+
+1. Gateway/condition/core event worker 시작
+2. stale Event Log claim 복구
+3. critical pending order event replay
+4. RuntimeSupervisor startup
+5. periodic Event Log replay worker 시작
+6. Dashboard read-model writer 시작
+
+Dashboard read model은 `order_lifecycle` 섹션을 노출한다.
+
+- `status`
+- `consumer_enabled`
+- `consumer_running`
+- `order_lifecycle_ready`
+- `pending_event_count`
+- `retry_wait_count`
+- `failed_count`
+- `dead_letter_count`
+- `oldest_pending_age_sec`
+- `processed_count`
+- `duplicate_applied_count`
+- `unmatched_event_count`
+- `reconcile_required_count`
+- `last_event_type`
+- `last_event_at`
+- `last_processed_at`
+- `last_error`
+- `replay_status`
+- `replay_duration_ms`
+
+Safety banner:
+
+- order lifecycle not ready
+- order event dead letter
+- unmatched order event
+
+### 운영 Runbook
+
+Backlog 확인:
+
+1. Dashboard `order_lifecycle.pending_event_count`, `retry_wait_count`, `oldest_pending_age_sec`를 확인한다.
+2. `gateway_event_log`에서 `PENDING`, `PROCESSING`, `RETRY_WAIT` row를 `received_at, id` 순으로 본다.
+3. row를 삭제하지 않는다. replay와 idempotency 증거가 사라진다.
+
+Dead Letter:
+
+1. `payload_json`과 `processing_result_json`을 확인한다.
+2. malformed payload, wrong account/order match, terminal state regression 중 무엇인지 분류한다.
+3. broker order/position과 local state가 맞을 때까지 `STOP_NEW_BUY`를 유지한다.
+4. 자동 삭제와 자동 send_order retry는 금지한다.
+
+Unmatched fill:
+
+1. account, code, side, order_no, command_id, idempotency_key, execution_id를 확인한다.
+2. `broker_order_state`, `broker_position_state`, managed orders, Kiwoom 계좌 화면을 비교한다.
+3. local order 누락 또는 ambiguous matching이면 수동 reconcile 전까지 신규 매수를 열지 않는다.
+
+Balance mismatch:
+
+1. `broker_position_state`와 local managed/live-sim position projection을 비교한다.
+2. broker에 local이 모르는 실제 포지션이 있으면 `REDUCE_ONLY`를 검토한다.
+3. 이 PR은 자동 매도 command를 생성하지 않는다.
+
+Replay:
+
+1. startup replay와 periodic replay가 기본 활성화되어 있다.
+2. manual replay는 replay worker/repository API를 사용한다.
+3. row를 수동 삭제하지 않는다. lost fill을 숨기고 receipt 기반 복구를 깨뜨릴 수 있다.
+
+### 남은 작업
+
+- 실제 Kiwoom Chejan 주문/체결/잔고 parser의 canonical field mapping 강화
+- 다계좌 partition ordering
+- reconcile용 TR request orchestration
+- Candidate FSM lifecycle transition hook 확장
+- REDUCE_ONLY escalation/operator workflow
+- Event Log/receipt drilldown용 dashboard developer detail
+
+## PR 9 구현 상태: OBSERVE Reliability Qualification Gate
+
+PR 9는 Realtime Architecture V2를 LIVE 주문 활성화 전에 검증하기 위한 qualification framework다. 이 PR은 LIVE_SIM 주문 활성화, LIVE_REAL 주문 활성화, 전략 수익성 검증, 주문 command 생성 PR이 아니다.
+
+안전 기본값은 유지한다.
+
+| setting | required value |
+|---|---|
+| `TRADING_SEND_ORDER_ALLOWED` | `false` |
+| `TRADING_ORDER_MANAGER_OBSERVE_ONLY` | `true` |
+| `TRADING_ORDER_MANAGER_ENQUEUE_GATEWAY_COMMAND` | `false` |
+| `TRADING_ORDER_INTENT_ENABLED` | `false` |
+| `TRADING_RELIABILITY_TEST_MODE` | `true` for execution |
+| broker/account mode | not `REAL` |
+
+### Components
+
+- `trading.reliability.models`: profile, scenario, report, SLO model.
+- `trading.reliability.metrics`: bounded metric series, percentile summary, process/DB sampling.
+- `trading.reliability.slo`: hard safety gate와 operational SLO 판정.
+- `trading.reliability.guards`: REAL broker, production DB, order-enabled flag 실행 차단.
+- `trading.reliability.workload`: deterministic synthetic GatewayEvent generator.
+- `trading.reliability.replay`: isolated DB deterministic replay digest verifier.
+- `trading.reliability.faults`: F01-F18 deterministic fault scenario controller.
+- `trading.reliability.soak`: observe soak metric sampler.
+- `trading.reliability.qualification`: profile runner와 PASS/HOLD/FAIL 판정.
+- `tools/runtime_reliability_qualification.py`: local CLI entrypoint.
+
+기존 `tools/websocket_real_pilot_soak.py`는 삭제하지 않는다. Qualification report의 transport subsection에서 참조하며, transport PASS가 전체 runtime PASS를 의미하지 않는다고 기록한다.
+
+### Profiles
+
+| profile | purpose | expected CI status |
+|---|---|---|
+| `quick-ci` | synthetic replay + mandatory fault subset | `HOLD` if long soak not run |
+| `replay` | bundle or synthetic deterministic replay | `HOLD` until enough market sessions |
+| `fault-suite` | F01-F18 deterministic faults | `HOLD` without long soak |
+| `observe-soak` | runtime/core-url long observation | `PASS` only with enough duration and SLO pass |
+| `full` | replay + fault suite + observe soak | `PASS` only after all mandatory evidence |
+
+실행하지 않은 1시간/4시간 soak는 `NOT_RUN` 또는 `SAMPLE_INSUFFICIENT`로 남기며 PASS로 기록하지 않는다.
+
+### Deterministic Replay
+
+동일 입력을 격리된 두 SQLite DB에서 실행한 뒤 digest를 비교한다.
+
+비교 대상:
+
+- `gateway_event_log`
+- `order_gateway_event_receipts`
+- `managed_orders`
+- `managed_order_intents`
+- `broker_order_state`
+- `broker_position_state`
+- `order_kill_switch_state`
+- `dashboard_read_models`
+
+제외 대상:
+
+- local auto id
+- generated/created/updated/processed timestamps
+- processing duration
+- worker id
+- runtime-specific transient fields
+
+`--bundle`이 지정되면 `gateway_events.jsonl`, `gateway_events.json`, 기존 strategy replay `ticks.csv` 순서로 입력을 재사용한다. bundle이 없으면 deterministic synthetic GatewayEvent를 만든다.
+
+### Fault Scenarios
+
+F01-F18은 named deterministic scenario로 등록되어 있다.
+
+- duplicate price tick은 latest snapshot regression과 full scan amplification을 확인한다.
+- duplicate execution은 receipt dedupe와 filled quantity single-apply를 확인한다.
+- fill-before-ack은 late ack가 FILLED/PARTIALLY_FILLED를 ACKED로 되돌리지 않는지 확인한다.
+- crash-after-receipt는 Event Log `PROCESSED` 전 crash replay에서 중복 반영이 없는지 확인한다.
+- stale claim은 lease 만료 후 다른 worker가 회수할 수 있는지 확인한다.
+- append failure는 `STOP_NEW_BUY`와 lifecycle not ready를 확인한다.
+- malformed event는 `RECONCILE_REQUIRED` 또는 dead-letter 계열 fail-closed를 확인한다.
+- dead letter present는 lifecycle ready false를 확인한다.
+
+Fault scenario 내부의 의도된 append failure/dead letter는 scenario 성공 조건이며, top-level hard gate의 예상 밖 운영 위반과 분리해 집계한다.
+
+### Hard Safety Gate
+
+하나라도 위반하면 FAIL이다.
+
+- order command count = 0
+- REAL broker access count = 0
+- critical event lost count = 0
+- duplicate execution applied count = 0
+- terminal state regression count = 0
+- negative remaining quantity count = 0
+- overfill count = 0
+- silent unmatched fill count = 0
+- unresolved event consumer crash count = 0
+- event log append failure인데 lifecycle ready true인 경우 = 0
+- dead letter가 있는데 lifecycle ready true인 경우 = 0
+- reconcile required인데 신규 매수 가능 상태인 경우 = 0
+- runtime DB corruption count = 0
+
+### Operational SLO
+
+기본 threshold는 env로 조정 가능하다.
+
+- `TRADING_RELIABILITY_RUNTIME_CYCLE_P95_MS=1500`
+- `TRADING_RELIABILITY_DIRTY_EVALUATOR_P95_MS=500`
+- `TRADING_RELIABILITY_ORDER_EVENT_P95_MS=250`
+- `TRADING_RELIABILITY_DASHBOARD_READ_P95_MS=100`
+- `TRADING_RELIABILITY_READ_MODEL_MAX_AGE_SEC=5`
+- `TRADING_RELIABILITY_BACKLOG_MAX_AGE_SEC=5`
+- `TRADING_RELIABILITY_REPLAY_DRAIN_MAX_SEC=10`
+- `TRADING_RELIABILITY_MAX_CAPACITY_DROPS=0`
+- `TRADING_RELIABILITY_MAX_RSS_GROWTH_MB=200`
+
+CI unit test에서는 짧은 wall-clock threshold를 hard assertion으로 쓰지 않는다. 장시간 성능 SLO는 `observe-soak` 또는 `full` profile에서 판정한다.
+
+### Report Artifacts
+
+산출물:
+
+- `reports/reliability/{run_id}/qualification.json`
+- `reports/reliability/{run_id}/summary.md`
+- `reports/reliability/{run_id}/metrics.json`
+- `reports/reliability/{run_id}/scenario_results.json`
+- `reports/reliability/{run_id}/failures.json`
+
+Read-only API:
+
+- `GET /api/runtime/reliability/latest`
+- `GET /api/runtime/reliability/runs`
+- `GET /api/runtime/reliability/runs/{run_id}`
+
+Dashboard developer/system detail은 이 report를 읽어 latest status, recommendation, hard gate failure count, SLO count, event loss, duplicate apply, dead letter, peak backlog, runtime p95, event consumer p95, memory growth, report link를 표시할 수 있다. Main 운영 화면에는 qualification 실행 버튼이나 fault injection 버튼을 추가하지 않는다.
+
+### CLI
+
+```powershell
+python tools\runtime_reliability_qualification.py --profile quick-ci --output-dir reports\reliability
+python tools\runtime_reliability_qualification.py --profile replay --bundle reports\strategy_replay\bundles\bundle-2026-06-18 --repeat 2 --output-dir reports\reliability
+python tools\runtime_reliability_qualification.py --profile observe-soak --duration-sec 3600 --core-url http://127.0.0.1:8000 --output-dir reports\reliability
+python tools\runtime_reliability_qualification.py --profile full --duration-sec 14400 --seed 20260618 --output-dir reports\reliability
+```
+
+Exit code:
+
+- `0`: PASS
+- `2`: HOLD
+- `1`: FAIL
+- `3`: execution/configuration error
+
+### Runbook
+
+운영 절차는 `docs/runtime_reliability_qualification_runbook.md`에 둔다.
+
+핵심 원칙:
+
+- 운영 DB row를 수동 삭제하지 않는다.
+- dead letter를 자동 삭제하지 않는다.
+- STOP_NEW_BUY를 자동 reset하지 않는다.
+- unmatched fill 상태에서 신규 매수를 허용하지 않는다.
+- qualification recommendation은 설정을 자동 변경하지 않는다.
+- LIVE_SIM flag는 수동 review 전까지 활성화하지 않는다.

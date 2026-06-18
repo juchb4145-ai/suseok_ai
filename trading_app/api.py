@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from storage.db import TradingDatabase
+from storage.event_log import EventLogConfig, EventLogRepository
 from trading.broker.command_persistence import SQLiteCommandStore
 from trading.broker.command_queue import ORDER_COMMAND_TYPES, CommandPriority, CommandStatus
 from trading.broker.gateway_state import GatewayStateStore
@@ -90,6 +91,13 @@ from trading_app.exit_policy_validation import (
     ExitPolicyValidationConfig,
     config_from_dry_run_config as exit_policy_config_from_dry_run_config,
 )
+from trading_app.gateway_event_consumer import (
+    EventLogReplayWorker,
+    GatewayEventConsumerConfig,
+    GatewayEventDispatcher,
+    OrderLifecycleEventConsumer,
+)
+from trading.reliability.report import ReliabilityReportReader
 from trading_app.intraday_outcomes import (
     IntradayOutcomeLabeler,
     ThemeLabFlowPricePathProvider,
@@ -152,11 +160,14 @@ async def lifespan(_: FastAPI):
     replay_tick_buffer.start()
     await _start_gateway_condition_event_worker()
     await _start_core_ws_event_worker()
+    await _startup_event_replay()
     await runtime_supervisor.startup()
+    await _start_event_replay_worker()
     await _start_dashboard_read_model_writer()
     try:
         yield
     finally:
+        await _stop_event_replay_worker()
         await _stop_dashboard_read_model_writer()
         _shutdown_dashboard_snapshot_refresh_executor()
         _shutdown_theme_lab_dashboard_snapshot_refresh_executor()
@@ -381,6 +392,14 @@ OPERATOR_ACTION_CATALOG = {
 }
 
 
+def _build_event_log_repository() -> EventLogRepository:
+    settings = get_settings()
+    return EventLogRepository(settings.db_path, config=EventLogConfig.from_env())
+
+
+event_log_repository = _build_event_log_repository()
+
+
 def _build_gateway_state() -> GatewayStateStore:
     settings = get_settings()
     command_store = SQLiteCommandStore(
@@ -390,6 +409,7 @@ def _build_gateway_state() -> GatewayStateStore:
     )
     return GatewayStateStore(
         command_store=command_store,
+        event_log_store=event_log_repository,
         expire_stale_dispatched_on_recovery=settings.command_recovery_expire_stale_dispatched,
     )
 
@@ -609,10 +629,26 @@ _dashboard_read_model_service: DashboardReadModelService | None = None
 _dashboard_read_model_db_path = ""
 dashboard_read_model_writer: DashboardReadModelWriter | None = None
 _dashboard_read_model_writer_task: asyncio.Task | None = None
+_event_replay_worker_task: asyncio.Task | None = None
 
 
 def _build_runtime_supervisor() -> RuntimeSupervisor:
     return RuntimeSupervisor(settings=get_settings(), gateway_state=gateway_state)
+
+
+def _build_gateway_event_dispatcher() -> GatewayEventDispatcher:
+    config = GatewayEventConsumerConfig.from_env()
+    order_consumer = OrderLifecycleEventConsumer(
+        db_path=get_settings().db_path,
+        gateway_state=gateway_state,
+        config=config,
+        dirty_callback=lambda reason: _mark_dashboard_read_model_dirty(reason, event_type="order_lifecycle"),
+    )
+    return GatewayEventDispatcher(
+        event_log=event_log_repository,
+        order_consumer=order_consumer,
+        config=config,
+    )
 
 
 def _build_dashboard_read_model_service() -> DashboardReadModelService:
@@ -640,8 +676,22 @@ def _build_dashboard_read_model_writer(service: DashboardReadModelService) -> Da
         runtime_snapshot=runtime_supervisor.snapshot,
         gateway_snapshot=lambda: gateway_state.snapshot().to_dict(),
         command_snapshot=gateway_state.command_snapshot,
-        core_status=runtime_supervisor.lightweight_status,
+        core_status=_core_status_with_order_lifecycle,
     )
+
+
+def _core_status_with_order_lifecycle() -> dict[str, Any]:
+    status_payload = dict(runtime_supervisor.lightweight_status() or {})
+    status_payload["order_event_consumer"] = gateway_event_dispatcher.consumer_health()
+    status_payload["event_replay"] = {
+        "status": gateway_event_dispatcher.metrics.get("replay_status") or "IDLE",
+        "duration_ms": float(gateway_event_dispatcher.metrics.get("replay_duration_ms") or 0.0),
+        "enabled": gateway_event_dispatcher.config.replay_enabled,
+        "interval_sec": gateway_event_dispatcher.config.replay_interval_sec,
+        "batch_size": gateway_event_dispatcher.config.replay_batch_size,
+    }
+    status_payload["order_lifecycle_ready"] = bool(status_payload["order_event_consumer"].get("order_lifecycle_ready"))
+    return status_payload
 
 
 async def _start_dashboard_read_model_writer() -> None:
@@ -667,6 +717,54 @@ async def _stop_dashboard_read_model_writer() -> None:
         pass
 
 
+async def _startup_event_replay() -> None:
+    gateway_event_dispatcher.start()
+    try:
+        await asyncio.to_thread(event_replay_worker.recover_stale_claims)
+        if gateway_event_dispatcher.config.replay_on_startup:
+            await asyncio.to_thread(event_replay_worker.replay_pending, limit=gateway_event_dispatcher.config.replay_batch_size)
+        _mark_dashboard_read_model_dirty("event_replay_startup", event_type="order_lifecycle")
+    except Exception as exc:
+        gateway_event_dispatcher.metrics["last_error"] = f"STARTUP_EVENT_REPLAY_FAILED:{exc}"
+        _mark_dashboard_read_model_dirty("event_replay_startup_failed", event_type="order_lifecycle")
+
+
+async def _start_event_replay_worker() -> None:
+    global _event_replay_worker_task
+    if not gateway_event_dispatcher.config.replay_enabled:
+        return
+    if _event_replay_worker_task is not None and not _event_replay_worker_task.done():
+        return
+    gateway_event_dispatcher.start()
+    _event_replay_worker_task = asyncio.create_task(_event_replay_worker_loop())
+
+
+async def _stop_event_replay_worker() -> None:
+    global _event_replay_worker_task
+    task = _event_replay_worker_task
+    _event_replay_worker_task = None
+    gateway_event_dispatcher.stop()
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+async def _event_replay_worker_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(event_replay_worker.recover_stale_claims)
+            await asyncio.to_thread(event_replay_worker.replay_pending, limit=gateway_event_dispatcher.config.replay_batch_size)
+            _mark_dashboard_read_model_dirty("event_replay_worker", event_type="order_lifecycle")
+        except Exception as exc:
+            gateway_event_dispatcher.metrics["last_error"] = f"EVENT_REPLAY_WORKER_FAILED:{exc}"
+            _mark_dashboard_read_model_dirty("event_replay_worker_failed", event_type="order_lifecycle")
+        await asyncio.sleep(max(0.1, float(gateway_event_dispatcher.config.replay_interval_sec or 1.0)))
+
+
 async def _dashboard_read_model_writer_loop() -> None:
     while True:
         service = _dashboard_read_model_service_instance()
@@ -685,6 +783,9 @@ def _build_replay_tick_buffer() -> ReplayGradeTickBuffer:
 
 
 runtime_supervisor = _build_runtime_supervisor()
+gateway_event_dispatcher = _build_gateway_event_dispatcher()
+event_replay_worker = EventLogReplayWorker(gateway_event_dispatcher)
+runtime_supervisor.set_order_event_consumer(gateway_event_dispatcher)
 replay_tick_buffer = _build_replay_tick_buffer()
 _dashboard_read_model_service = _build_dashboard_read_model_service()
 _dashboard_read_model_db_path = str(Path(get_settings().db_path).resolve())
@@ -1660,10 +1761,32 @@ def gateway_transport_websocket_pilot_status() -> dict[str, Any]:
     return _real_gateway_websocket_pilot_status(gateway_state.snapshot().last_heartbeat_payload)
 
 
+def _reliability_report_reader() -> ReliabilityReportReader:
+    return ReliabilityReportReader(output_dir=os.getenv("TRADING_RELIABILITY_REPORT_DIR", "reports/reliability"))
+
+
 @app.get("/api/runtime/status")
 def runtime_status() -> dict[str, Any]:
     payload = runtime_supervisor.status()
     payload["replay_tick_history"] = replay_tick_buffer.snapshot()
+    return payload
+
+
+@app.get("/api/runtime/reliability/latest")
+def runtime_reliability_latest() -> dict[str, Any]:
+    return _reliability_report_reader().latest()
+
+
+@app.get("/api/runtime/reliability/runs")
+def runtime_reliability_runs(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
+    return {"runs": _reliability_report_reader().list_runs(limit=limit)}
+
+
+@app.get("/api/runtime/reliability/runs/{run_id}")
+def runtime_reliability_run(run_id: str) -> dict[str, Any]:
+    payload = _reliability_report_reader().get_run(run_id)
+    if payload.get("status") == "NOT_FOUND":
+        raise HTTPException(status_code=404, detail="reliability qualification run not found")
     return payload
 
 
@@ -6834,6 +6957,7 @@ def _process_condition_event_with_db(db: TradingDatabase, collector: CandidateCo
             core_receive_ms=wall_ms(trace_from_payload(event.payload).get("gateway_event_post_end_at_utc"), core_received_at),
             core_persist_ms=persist_ms,
         )
+        _consume_gateway_event_live(event)
     else:
         event = _event_with_trace(
             event,
@@ -8576,6 +8700,14 @@ def _dashboard_slim_intraday_decisions_payload(payload: dict[str, Any]) -> dict[
     for key in ("top_block_reasons", "top_wait_reasons", "top_data_quality_issues"):
         result[key] = list(data.get(key) or [])[:10]
     return result
+
+
+def _consume_gateway_event_live(event: GatewayEvent) -> dict[str, Any]:
+    try:
+        return gateway_event_dispatcher.consume_live_event(event).to_dict()
+    except Exception as exc:
+        gateway_event_dispatcher.metrics["last_error"] = f"LIVE_EVENT_CONSUME_FAILED:{exc}"
+        return {"status": "FAILED", "error": str(exc), "event_id": event.event_id, "event_type": event.type}
 
 
 def _dashboard_slim_shadow_strategies_payload(payload: dict[str, Any]) -> dict[str, Any]:

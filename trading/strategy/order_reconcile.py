@@ -40,6 +40,20 @@ class ManagedOrderReconciler:
         else:
             next_status = ManagedOrderStatus.ACKED_BY_GATEWAY.value
             intent_status = OrderIntentStatus.COMMAND_ACKED.value
+        current_status = str(order.get("status") or "")
+        if next_status == ManagedOrderStatus.ACKED_BY_GATEWAY.value and current_status in {
+            ManagedOrderStatus.PARTIALLY_FILLED.value,
+            ManagedOrderStatus.FILLED.value,
+            ManagedOrderStatus.CANCELLED.value,
+        }:
+            next_status = current_status
+            intent_status = (
+                OrderIntentStatus.FILLED.value
+                if current_status == ManagedOrderStatus.FILLED.value
+                else OrderIntentStatus.PARTIALLY_FILLED.value
+                if current_status == ManagedOrderStatus.PARTIALLY_FILLED.value
+                else OrderIntentStatus.CANCELLED.value
+            )
 
         updated = {
             **order,
@@ -86,11 +100,16 @@ class ManagedOrderReconciler:
             )
 
         previous_filled = int(order.get("filled_quantity") or 0)
+        previous_remaining = int(order.get("remaining_quantity") or max(0, int(order.get("quantity") or 0) - previous_filled))
         event_filled = int(execution.filled_quantity or execution.quantity or 0)
         filled_quantity = max(previous_filled, event_filled)
         remaining_quantity = int(execution.remaining_quantity)
         if remaining_quantity <= 0:
             remaining_quantity = max(0, int(order.get("quantity") or 0) - filled_quantity)
+        if previous_filled > 0 or str(order.get("status") or "") == ManagedOrderStatus.PARTIALLY_FILLED.value:
+            remaining_quantity = min(max(0, previous_remaining), max(0, remaining_quantity))
+        if int(order.get("quantity") or 0) > 0:
+            remaining_quantity = min(remaining_quantity, max(0, int(order.get("quantity") or 0) - filled_quantity))
         next_status = ManagedOrderStatus.FILLED.value if remaining_quantity <= 0 else ManagedOrderStatus.PARTIALLY_FILLED.value
         avg_price = float(execution.price or order.get("avg_fill_price") or order.get("price") or 0)
         now = str(execution.timestamp or _now())

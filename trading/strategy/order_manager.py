@@ -686,6 +686,118 @@ class OrderManagerRuntimePipeline:
         payload = dict(getattr(event, "payload", event) or {})
         return {"matched": True, "status": "OBSERVED", "payload": payload}
 
+    def apply_gateway_event(self, event: Any, source_event_id: str = "") -> dict[str, Any]:
+        event_type = str(getattr(event, "type", "") or "")
+        payload = dict(getattr(event, "payload", event) or {})
+        if source_event_id:
+            payload.setdefault("source_event_id", source_event_id)
+        mapping = {
+            "command_ack": "ORDER_ACCEPTED" if _payload_order_no(payload) else "COMMAND_ACK",
+            "command_failed": "COMMAND_FAILED",
+            "command_timeout": "COMMAND_FAILED",
+            "command_expired": "COMMAND_FAILED",
+            "order_ack": "ORDER_ACCEPTED",
+            "order_reject": "ORDER_REJECTED",
+            "execution_event": "ORDER_FILLED" if int(payload.get("remaining_quantity") or 0) <= 0 else "ORDER_PARTIALLY_FILLED",
+            "execution": "ORDER_FILLED" if int(payload.get("remaining_quantity") or 0) <= 0 else "ORDER_PARTIALLY_FILLED",
+            "fill": "ORDER_FILLED" if int(payload.get("remaining_quantity") or 0) <= 0 else "ORDER_PARTIALLY_FILLED",
+            "order_fill": "ORDER_FILLED" if int(payload.get("remaining_quantity") or 0) <= 0 else "ORDER_PARTIALLY_FILLED",
+            "balance_snapshot": "BALANCE_SNAPSHOT",
+            "position_snapshot": "POSITION_SNAPSHOT",
+            "order_status_snapshot": "ORDER_STATUS_SNAPSHOT",
+        }
+        canonical = mapping.get(event_type, "IGNORED")
+        return self.apply_canonical_order_event(canonical, payload, source_event_id=source_event_id)
+
+    def apply_canonical_order_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        source_event_id: str = "",
+    ) -> dict[str, Any]:
+        canonical = str(event_type or "").upper()
+        data = dict(payload or {})
+        if source_event_id:
+            data.setdefault("source_event_id", source_event_id)
+        if canonical == "IGNORED":
+            return {"matched": True, "status": "IGNORED", "reason": "NON_ORDER_EVENT"}
+        if canonical == "COMMAND_ACK":
+            if str(data.get("command_type") or "") in {"send_order", "cancel_order", "modify_order"}:
+                self._record_reconcile_required("ORDER_SUBMIT_UNKNOWN_NO_ORDER_NO", data)
+                return {
+                    "matched": False,
+                    "status": ManagedOrderStatus.RECONCILE_REQUIRED.value,
+                    "reason": "ORDER_SUBMIT_UNKNOWN_NO_ORDER_NO",
+                    "reconcile_required": True,
+                    "payload": data,
+                }
+            return {"matched": True, "status": "COMMAND_ACK_OBSERVED", "payload": data}
+        if canonical in {"COMMAND_FAILED", "ORDER_REJECTED"}:
+            return self.apply_order_reject(data)
+        if canonical in {"ORDER_ACCEPTED", "ORDER_CANCEL_ACCEPTED"}:
+            return self.apply_order_ack(data)
+        if canonical in {"ORDER_PARTIALLY_FILLED", "ORDER_FILLED"}:
+            return self.apply_order_fill(data)
+        if canonical == "ORDER_CANCELLED":
+            data["status"] = "CANCELLED"
+            return self.apply_order_ack(data) if data.get("command_id") else self.apply_order_status_snapshot(data)
+        if canonical == "BALANCE_SNAPSHOT":
+            return self.apply_balance_snapshot(data)
+        if canonical == "POSITION_SNAPSHOT":
+            return self.reconcile_positions(now=self.clock())
+        if canonical in {"ORDER_STATUS_SNAPSHOT", "RECONCILE_SNAPSHOT"}:
+            return self.apply_order_status_snapshot(data)
+        self._record_reconcile_required("UNSUPPORTED_ORDER_EVENT", data)
+        return {
+            "matched": False,
+            "status": ManagedOrderStatus.RECONCILE_REQUIRED.value,
+            "reason": "UNSUPPORTED_ORDER_EVENT",
+            "reconcile_required": True,
+            "payload": data,
+        }
+
+    def lifecycle_health(self) -> dict[str, Any]:
+        trade_date = datetime.now(timezone.utc).date().isoformat()
+        summary = self.db.managed_order_summary(trade_date=trade_date) if hasattr(self.db, "managed_order_summary") else {}
+        lifecycle = self.db.order_lifecycle_summary() if hasattr(self.db, "order_lifecycle_summary") else {}
+        kill = self.db.latest_order_kill_switch_state(trade_date=trade_date) if hasattr(self.db, "latest_order_kill_switch_state") else {}
+        reconcile_required = int(summary.get("reconcile_required_count") or lifecycle.get("reconcile_required_count") or 0)
+        return {
+            "status": "READY" if reconcile_required <= 0 else "RECONCILE_REQUIRED",
+            "order_lifecycle_ready": reconcile_required <= 0 and str(kill.get("state") or "") != OrderKillSwitchState.STOP_NEW_BUY.value,
+            "reconcile_required_count": reconcile_required,
+            "stop_new_buy": str(kill.get("state") or "") in {OrderKillSwitchState.STOP_NEW_BUY.value, OrderKillSwitchState.KILL_SWITCH_ACTIVE.value},
+            "reduce_only": str(kill.get("state") or "") == OrderKillSwitchState.REDUCE_ONLY.value,
+            "summary": summary,
+            "lifecycle": lifecycle,
+            "kill_switch": kill,
+        }
+
+    def mark_reconcile_required(self, reason: str, payload: dict[str, Any] | None = None, source_event_id: str = "") -> dict[str, Any]:
+        data = dict(payload or {})
+        if source_event_id:
+            data.setdefault("source_event_id", source_event_id)
+        self._record_reconcile_required(str(reason or "RECONCILE_REQUIRED"), data)
+        return {
+            "matched": False,
+            "status": ManagedOrderStatus.RECONCILE_REQUIRED.value,
+            "reason": str(reason or "RECONCILE_REQUIRED"),
+            "reconcile_required": True,
+            "payload": data,
+        }
+
+    def reconcile_from_snapshots(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        order_summary = self.reconcile_open_orders(now=kwargs.get("now"))
+        position_summary = self.reconcile_positions(now=kwargs.get("now"))
+        return {
+            "status": "OK",
+            "orders": order_summary,
+            "positions": position_summary,
+            "reconcile_required_count": int(order_summary.get("reconcile_required_count") or 0)
+            + int(position_summary.get("reconcile_required_count") or 0),
+        }
+
     def reconcile_open_orders(self, *, now: datetime | None = None) -> dict[str, Any]:
         current = _clean_time(now or self.clock())
         rows = self.db.list_managed_orders(
@@ -871,6 +983,11 @@ def _age_sec(value: str, now: datetime) -> float:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=now.tzinfo or timezone.utc)
     return max(0.0, (_clean_time(now) - _clean_time(parsed)).total_seconds())
+
+
+def _payload_order_no(payload: dict[str, Any]) -> str:
+    order_result = payload.get("order_result") if isinstance(payload.get("order_result"), dict) else {}
+    return str(payload.get("order_no") or payload.get("broker_order_id") or order_result.get("order_no") or "")
 
 
 def _dedupe(values: list[str] | tuple[str, ...]) -> list[str]:

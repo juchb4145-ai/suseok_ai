@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Sequence
 
 from trading.broker.models import GatewayEvent
 from trading.runtime_ports import EventLogAppendResult, EventLogRecord
@@ -19,6 +19,8 @@ class EventLogConfig:
     price_tick_enabled: bool = False
     heartbeat_enabled: bool = False
     max_pending_replay: int = 500
+    processing_lease_sec: int = 30
+    max_attempts: int = 5
 
     @classmethod
     def from_env(cls) -> "EventLogConfig":
@@ -27,6 +29,8 @@ class EventLogConfig:
             price_tick_enabled=_env_bool("TRADING_EVENT_LOG_PRICE_TICK_ENABLED", False),
             heartbeat_enabled=_env_bool("TRADING_EVENT_LOG_HEARTBEAT_ENABLED", False),
             max_pending_replay=max(1, _env_int("TRADING_EVENT_LOG_MAX_PENDING_REPLAY", 500)),
+            processing_lease_sec=max(1, _env_int("TRADING_EVENT_PROCESSING_LEASE_SEC", 30)),
+            max_attempts=max(1, _env_int("TRADING_EVENT_MAX_ATTEMPTS", 5)),
         )
 
 
@@ -86,8 +90,8 @@ class EventLogRepository:
                     INSERT INTO gateway_event_log(
                         event_id, event_type, dedupe_key, source, command_id, code,
                         trade_date, payload_json, received_at, processed_at,
-                        processing_status, error, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)
+                        processing_status, error, created_at, processing_result_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, '{}')
                     """,
                     (
                         str(event.event_id or ""),
@@ -137,6 +141,101 @@ class EventLogRepository:
             rows = self.conn.execute(query, tuple(params)).fetchall()
             return [_row_to_record(row) for row in rows]
 
+    def claim_pending_events(
+        self,
+        *,
+        limit: int,
+        event_types: Sequence[str] | None = None,
+        worker_id: str = "",
+        lease_sec: int | None = None,
+        now: datetime | str | None = None,
+    ) -> list[EventLogRecord]:
+        resolved_limit = min(max(0, int(limit)), self.config.max_pending_replay)
+        if resolved_limit <= 0:
+            return []
+        current = _coerce_time(now)
+        current_text = _format_time(current)
+        event_type_filter = [str(item) for item in (event_types or ()) if str(item or "")]
+        statuses = ("PENDING", "RETRY_WAIT")
+        where = ["processing_status IN (?, ?)"]
+        params: list[Any] = list(statuses)
+        if event_type_filter:
+            placeholders = ",".join("?" for _ in event_type_filter)
+            where.append(f"event_type IN ({placeholders})")
+            params.extend(event_type_filter)
+        where.append("(processing_status != 'RETRY_WAIT' OR next_retry_at = '' OR next_retry_at <= ?)")
+        params.append(current_text)
+        query = (
+            "SELECT id FROM gateway_event_log WHERE "
+            + " AND ".join(where)
+            + " ORDER BY received_at ASC, id ASC LIMIT ?"
+        )
+        params.append(resolved_limit)
+        claimed: list[EventLogRecord] = []
+        with self._lock, self.conn:
+            rows = self.conn.execute(query, tuple(params)).fetchall()
+            lease_until = _format_time(current + timedelta(seconds=max(1, int(lease_sec or self.config.processing_lease_sec))))
+            for row in rows:
+                row_id = int(row["id"])
+                cursor = self.conn.execute(
+                    """
+                    UPDATE gateway_event_log
+                    SET processing_status = 'PROCESSING',
+                        processing_attempts = processing_attempts + 1,
+                        claimed_at = ?,
+                        claimed_by = ?,
+                        next_retry_at = ?,
+                        last_attempt_at = ?
+                    WHERE id = ?
+                      AND (
+                          processing_status = 'PENDING'
+                          OR (processing_status = 'RETRY_WAIT' AND (next_retry_at = '' OR next_retry_at <= ?))
+                      )
+                    """,
+                    (current_text, str(worker_id or ""), lease_until, current_text, row_id, current_text),
+                )
+                if cursor.rowcount:
+                    record = self._get_by_id_no_lock(row_id)
+                    if record is not None:
+                        claimed.append(record)
+        return claimed
+
+    def claim_event(
+        self,
+        event_log_id: int | str,
+        *,
+        worker_id: str = "",
+        lease_sec: int | None = None,
+        now: datetime | str | None = None,
+    ) -> EventLogRecord | None:
+        current = _coerce_time(now)
+        current_text = _format_time(current)
+        lease_until = _format_time(current + timedelta(seconds=max(1, int(lease_sec or self.config.processing_lease_sec))))
+        with self._lock, self.conn:
+            row = self._get_row_by_identifier_no_lock(event_log_id)
+            if row is None:
+                return None
+            status = str(row["processing_status"] or "")
+            if status in {"PROCESSED", "IGNORED", "DEAD_LETTER"}:
+                return _row_to_record(row)
+            cursor = self.conn.execute(
+                """
+                UPDATE gateway_event_log
+                SET processing_status = 'PROCESSING',
+                    processing_attempts = processing_attempts + 1,
+                    claimed_at = ?,
+                    claimed_by = ?,
+                    next_retry_at = ?,
+                    last_attempt_at = ?
+                WHERE id = ?
+                  AND processing_status NOT IN ('PROCESSED', 'IGNORED', 'DEAD_LETTER')
+                """,
+                (current_text, str(worker_id or ""), lease_until, current_text, int(row["id"])),
+            )
+            if not cursor.rowcount:
+                return None
+            return self._get_by_id_no_lock(int(row["id"]))
+
     def mark_processed(
         self,
         event_log_id: int | str,
@@ -146,11 +245,73 @@ class EventLogRepository:
     ) -> None:
         current = str(processed_at or _format_time(_now()))
         with self._lock, self.conn:
-            self._update_status_no_lock(event_log_id, "PROCESSED", processed_at=current, error="")
+            result = {"status": "PROCESSED", "core_events": core_events}
+            self._update_status_no_lock(
+                event_log_id,
+                "PROCESSED",
+                processed_at=current,
+                error="",
+                processing_result_json=_json_payload(result),
+            )
 
     def mark_failed(self, event_log_id: int | str, *, error: str) -> None:
         with self._lock, self.conn:
             self._update_status_no_lock(event_log_id, "FAILED", processed_at="", error=str(error or ""))
+
+    def mark_processing_result(
+        self,
+        event_log_id: int | str,
+        *,
+        status: str = "PROCESSED",
+        result: dict[str, Any] | None = None,
+        processed_at: str | None = None,
+        handler_name: str = "",
+        handler_version: str = "",
+    ) -> None:
+        resolved = str(status or "PROCESSED").upper()
+        current = str(processed_at or _format_time(_now()))
+        with self._lock, self.conn:
+            self._update_status_no_lock(
+                event_log_id,
+                resolved,
+                processed_at=current if resolved in {"PROCESSED", "IGNORED"} else "",
+                error="" if resolved in {"PROCESSED", "IGNORED"} else str((result or {}).get("error") or ""),
+                processing_result_json=_json_payload(result or {"status": resolved}),
+                handler_name=handler_name,
+                handler_version=handler_version,
+            )
+
+    def mark_retry_wait(self, event_log_id: int | str, *, error: str, next_retry_at: str) -> None:
+        with self._lock, self.conn:
+            self._update_status_no_lock(
+                event_log_id,
+                "RETRY_WAIT",
+                processed_at="",
+                error=str(error or ""),
+                next_retry_at=str(next_retry_at or ""),
+            )
+
+    def mark_dead_letter(self, event_log_id: int | str, *, error: str) -> None:
+        current = _format_time(_now())
+        with self._lock, self.conn:
+            self._update_status_no_lock(
+                event_log_id,
+                "DEAD_LETTER",
+                processed_at="",
+                error=str(error or ""),
+                dead_lettered_at=current,
+            )
+
+    def mark_ignored(self, event_log_id: int | str, *, reason: str) -> None:
+        current = _format_time(_now())
+        with self._lock, self.conn:
+            self._update_status_no_lock(
+                event_log_id,
+                "IGNORED",
+                processed_at=current,
+                error="",
+                processing_result_json=_json_payload({"status": "IGNORED", "reason": str(reason or "")}),
+            )
 
     def find_by_dedupe_key(self, dedupe_key: str) -> EventLogRecord | None:
         with self._lock:
@@ -159,6 +320,79 @@ class EventLogRepository:
                 (str(dedupe_key or ""),),
             ).fetchone()
             return _row_to_record(row) if row else None
+
+    def get_event(self, event_log_id: int | str) -> EventLogRecord | None:
+        with self._lock:
+            row = self._get_row_by_identifier_no_lock(event_log_id)
+            return _row_to_record(row) if row else None
+
+    def get_by_event_id(self, event_id: str) -> EventLogRecord | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM gateway_event_log WHERE event_id = ? ORDER BY id DESC LIMIT 1",
+                (str(event_id or ""),),
+            ).fetchone()
+            return _row_to_record(row) if row else None
+
+    def recover_stale_claims(self, *, now: datetime | str | None = None) -> int:
+        current_text = _format_time(_coerce_time(now))
+        with self._lock, self.conn:
+            cursor = self.conn.execute(
+                """
+                UPDATE gateway_event_log
+                SET processing_status = 'PENDING',
+                    claimed_at = '',
+                    claimed_by = '',
+                    next_retry_at = '',
+                    processing_result_json = ?
+                WHERE processing_status = 'PROCESSING'
+                  AND next_retry_at != ''
+                  AND next_retry_at <= ?
+                """,
+                (_json_payload({"status": "PENDING", "recovered_from_stale_claim_at": current_text}), current_text),
+            )
+            return int(cursor.rowcount or 0)
+
+    def critical_backlog_snapshot(self) -> dict[str, Any]:
+        critical_types = tuple(sorted(REPLAYABLE_GATEWAY_EVENT_TYPES))
+        placeholders = ",".join("?" for _ in critical_types)
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT processing_status, COUNT(*) AS count
+                FROM gateway_event_log
+                WHERE event_type IN ({placeholders})
+                GROUP BY processing_status
+                """,
+                critical_types,
+            ).fetchall()
+            oldest = self.conn.execute(
+                f"""
+                SELECT MIN(received_at) AS value
+                FROM gateway_event_log
+                WHERE event_type IN ({placeholders})
+                  AND processing_status IN ('PENDING', 'PROCESSING', 'RETRY_WAIT')
+                """,
+                critical_types,
+            ).fetchone()["value"]
+            counts = {str(row["processing_status"]): int(row["count"]) for row in rows}
+            return {
+                "critical_event_types": list(critical_types),
+                "pending_event_count": counts.get("PENDING", 0),
+                "processing_count": counts.get("PROCESSING", 0),
+                "retry_wait_count": counts.get("RETRY_WAIT", 0),
+                "failed_count": counts.get("FAILED", 0),
+                "dead_letter_count": counts.get("DEAD_LETTER", 0),
+                "ignored_count": counts.get("IGNORED", 0),
+                "processed_count": counts.get("PROCESSED", 0),
+                "oldest_pending_at": str(oldest or ""),
+                "order_lifecycle_ready": (
+                    counts.get("PENDING", 0) == 0
+                    and counts.get("PROCESSING", 0) == 0
+                    and counts.get("RETRY_WAIT", 0) == 0
+                    and counts.get("DEAD_LETTER", 0) == 0
+                ),
+            }
 
     def event_log_snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -172,6 +406,7 @@ class EventLogRepository:
                 "SELECT MAX(received_at) AS value FROM gateway_event_log"
             ).fetchone()["value"]
             counts = {str(row["processing_status"]): int(row["count"]) for row in rows}
+            critical = self.critical_backlog_snapshot()
             return {
                 "enabled": self.config.enabled,
                 "price_tick_enabled": self.config.price_tick_enabled,
@@ -180,9 +415,14 @@ class EventLogRepository:
                 "pending_count": counts.get("PENDING", 0),
                 "processed_count": counts.get("PROCESSED", 0),
                 "failed_count": counts.get("FAILED", 0),
+                "processing_count": counts.get("PROCESSING", 0),
+                "retry_wait_count": counts.get("RETRY_WAIT", 0),
+                "dead_letter_count": counts.get("DEAD_LETTER", 0),
+                "ignored_count": counts.get("IGNORED", 0),
                 "total_count": sum(counts.values()),
                 "event_type_counts": {str(row["event_type"]): int(row["count"]) for row in type_rows},
                 "last_received_at": str(last_received or ""),
+                "critical_backlog": critical,
             }
 
     def _migrate(self) -> None:
@@ -204,6 +444,15 @@ class EventLogRepository:
                     processing_status TEXT NOT NULL DEFAULT 'PENDING',
                     error TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    processing_attempts INTEGER NOT NULL DEFAULT 0,
+                    claimed_at TEXT NOT NULL DEFAULT '',
+                    claimed_by TEXT NOT NULL DEFAULT '',
+                    next_retry_at TEXT NOT NULL DEFAULT '',
+                    handler_name TEXT NOT NULL DEFAULT '',
+                    handler_version TEXT NOT NULL DEFAULT '',
+                    last_attempt_at TEXT NOT NULL DEFAULT '',
+                    dead_lettered_at TEXT NOT NULL DEFAULT '',
+                    processing_result_json TEXT NOT NULL DEFAULT '{}',
                     UNIQUE(dedupe_key)
                 );
                 CREATE INDEX IF NOT EXISTS idx_gateway_event_log_event_type
@@ -220,6 +469,24 @@ class EventLogRepository:
                     ON gateway_event_log(event_id);
                 """
             )
+            for column, ddl in (
+                ("processing_attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("claimed_at", "TEXT NOT NULL DEFAULT ''"),
+                ("claimed_by", "TEXT NOT NULL DEFAULT ''"),
+                ("next_retry_at", "TEXT NOT NULL DEFAULT ''"),
+                ("handler_name", "TEXT NOT NULL DEFAULT ''"),
+                ("handler_version", "TEXT NOT NULL DEFAULT ''"),
+                ("last_attempt_at", "TEXT NOT NULL DEFAULT ''"),
+                ("dead_lettered_at", "TEXT NOT NULL DEFAULT ''"),
+                ("processing_result_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                _ensure_column(self.conn, "gateway_event_log", column, ddl)
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_gateway_event_log_claim
+                    ON gateway_event_log(processing_status, next_retry_at, received_at, id)
+                """
+            )
 
     def _get_by_id_no_lock(self, row_id: int) -> EventLogRecord | None:
         row = self.conn.execute(
@@ -228,6 +495,17 @@ class EventLogRepository:
         ).fetchone()
         return _row_to_record(row) if row else None
 
+    def _get_row_by_identifier_no_lock(self, event_log_id: int | str) -> sqlite3.Row | None:
+        if isinstance(event_log_id, int) or str(event_log_id).isdigit():
+            return self.conn.execute(
+                "SELECT * FROM gateway_event_log WHERE id = ?",
+                (int(event_log_id),),
+            ).fetchone()
+        return self.conn.execute(
+            "SELECT * FROM gateway_event_log WHERE event_id = ? ORDER BY id DESC LIMIT 1",
+            (str(event_log_id or ""),),
+        ).fetchone()
+
     def _update_status_no_lock(
         self,
         event_log_id: int | str,
@@ -235,25 +513,69 @@ class EventLogRepository:
         *,
         processed_at: str,
         error: str,
+        processing_result_json: str | None = None,
+        next_retry_at: str | None = None,
+        dead_lettered_at: str | None = None,
+        handler_name: str | None = None,
+        handler_version: str | None = None,
     ) -> None:
+        updates = [
+            "processing_status = ?",
+            "processed_at = ?",
+            "error = ?",
+            "claimed_at = ''",
+            "claimed_by = ''",
+        ]
+        params: list[Any] = [status, processed_at, error]
+        if processing_result_json is not None:
+            updates.append("processing_result_json = ?")
+            params.append(processing_result_json)
+        if next_retry_at is not None:
+            updates.append("next_retry_at = ?")
+            params.append(next_retry_at)
+        elif status not in {"PROCESSING", "RETRY_WAIT"}:
+            updates.append("next_retry_at = ''")
+        if dead_lettered_at is not None:
+            updates.append("dead_lettered_at = ?")
+            params.append(dead_lettered_at)
+        if handler_name is not None:
+            updates.append("handler_name = ?")
+            params.append(handler_name)
+        if handler_version is not None:
+            updates.append("handler_version = ?")
+            params.append(handler_version)
         if isinstance(event_log_id, int) or str(event_log_id).isdigit():
+            params.append(int(event_log_id))
             self.conn.execute(
-                """
-                UPDATE gateway_event_log
-                SET processing_status = ?, processed_at = ?, error = ?
-                WHERE id = ?
-                """,
-                (status, processed_at, error, int(event_log_id)),
+                f"UPDATE gateway_event_log SET {', '.join(updates)} WHERE id = ?",
+                tuple(params),
             )
             return
+        params.append(str(event_log_id or ""))
         self.conn.execute(
-            """
-            UPDATE gateway_event_log
-            SET processing_status = ?, processed_at = ?, error = ?
-            WHERE event_id = ?
-            """,
-            (status, processed_at, error, str(event_log_id or "")),
+            f"UPDATE gateway_event_log SET {', '.join(updates)} WHERE event_id = ?",
+            tuple(params),
         )
+
+
+REPLAYABLE_GATEWAY_EVENT_TYPES = {
+    "command_ack",
+    "command_failed",
+    "command_timeout",
+    "command_expired",
+    "order_ack",
+    "order_reject",
+    "order_fill",
+    "execution",
+    "execution_event",
+    "fill",
+    "cancel_ack",
+    "order_cancel",
+    "order_cancelled",
+    "order_status_snapshot",
+    "balance_snapshot",
+    "position_snapshot",
+}
 
 
 def dedupe_key_for_gateway_event(event: GatewayEvent) -> str:
@@ -267,7 +589,7 @@ def dedupe_key_for_gateway_event(event: GatewayEvent) -> str:
             command_id=command_id,
             status=str(payload.get("status") or payload.get("command_status") or ""),
         )
-    if event_type in {"order_ack", "order_fill", "execution", "fill"}:
+    if event_type in {"order_ack", "order_fill", "execution", "execution_event", "fill"}:
         return "order:{account}:{order_no}:{execution_id}".format(
             account=str(payload.get("account") or ""),
             order_no=str(payload.get("order_no") or payload.get("original_order_no") or ""),
@@ -316,6 +638,15 @@ def _row_to_record(row: sqlite3.Row) -> EventLogRecord:
         processing_status=str(row["processing_status"] or ""),
         error=str(row["error"] or ""),
         created_at=str(row["created_at"] or ""),
+        processing_attempts=int(row["processing_attempts"] or 0) if "processing_attempts" in row.keys() else 0,
+        claimed_at=str(row["claimed_at"] or "") if "claimed_at" in row.keys() else "",
+        claimed_by=str(row["claimed_by"] or "") if "claimed_by" in row.keys() else "",
+        next_retry_at=str(row["next_retry_at"] or "") if "next_retry_at" in row.keys() else "",
+        handler_name=str(row["handler_name"] or "") if "handler_name" in row.keys() else "",
+        handler_version=str(row["handler_version"] or "") if "handler_version" in row.keys() else "",
+        last_attempt_at=str(row["last_attempt_at"] or "") if "last_attempt_at" in row.keys() else "",
+        dead_lettered_at=str(row["dead_lettered_at"] or "") if "dead_lettered_at" in row.keys() else "",
+        processing_result_json=str(row["processing_result_json"] or "{}") if "processing_result_json" in row.keys() else "{}",
     )
 
 
@@ -364,6 +695,36 @@ def _format_time(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat(timespec="seconds")
 
 
+def _coerce_time(value: datetime | str | None) -> datetime:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc).replace(microsecond=0)
+        return value.astimezone(timezone.utc).replace(microsecond=0)
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return _now()
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).replace(microsecond=0)
+    return _now()
+
+
+def _json_payload(payload: Any) -> str:
+    try:
+        return json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception as exc:
+        return json.dumps({"serialization_error": str(exc)}, ensure_ascii=False, sort_keys=True)
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    if any(str(row["name"]) == column for row in rows):
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -381,5 +742,6 @@ def _env_int(name: str, default: int) -> int:
 __all__ = [
     "EventLogConfig",
     "EventLogRepository",
+    "REPLAYABLE_GATEWAY_EVENT_TYPES",
     "dedupe_key_for_gateway_event",
 ]

@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Protocol, Sequence
 
 from trading.broker.models import GatewayCommand, GatewayEvent
-from trading.strategy.entry_engine import EntryDecision
-from trading.strategy.order_models import ManagedOrder, ManagedOrderIntent
+
+if TYPE_CHECKING:
+    from trading.strategy.entry_engine import EntryDecision
+    from trading.strategy.order_models import ManagedOrder, ManagedOrderIntent
+else:
+    EntryDecision = Any
+    ManagedOrder = Any
+    ManagedOrderIntent = Any
 
 
 class CoreEventType(str, Enum):
@@ -76,6 +82,15 @@ class EventLogRecord:
     processing_status: str = "PENDING"
     error: str = ""
     created_at: str = ""
+    processing_attempts: int = 0
+    claimed_at: str = ""
+    claimed_by: str = ""
+    next_retry_at: str = ""
+    handler_name: str = ""
+    handler_version: str = ""
+    last_attempt_at: str = ""
+    dead_lettered_at: str = ""
+    processing_result_json: str = "{}"
 
 
 @dataclass(frozen=True)
@@ -219,6 +234,72 @@ class EventLogPort(Protocol):
     def mark_failed(self, event_id: str, *, error: str) -> None:
         ...
 
+    def claim_pending_events(
+        self,
+        *,
+        limit: int,
+        event_types: Sequence[str] | None = None,
+        worker_id: str = "",
+        lease_sec: int = 30,
+        now: Any = None,
+    ) -> Sequence[EventLogRecord]:
+        ...
+
+    def claim_event(self, event_log_id: int | str, *, worker_id: str = "", lease_sec: int = 30) -> EventLogRecord | None:
+        ...
+
+    def mark_processing_result(self, event_log_id: int | str, *, status: str, result: dict[str, Any] | None = None) -> None:
+        ...
+
+    def mark_retry_wait(self, event_log_id: int | str, *, error: str, next_retry_at: str) -> None:
+        ...
+
+    def mark_dead_letter(self, event_log_id: int | str, *, error: str) -> None:
+        ...
+
+    def mark_ignored(self, event_log_id: int | str, *, reason: str) -> None:
+        ...
+
+    def recover_stale_claims(self, *, now: Any = None) -> int:
+        ...
+
+    def get_event(self, event_log_id: int | str) -> EventLogRecord | None:
+        ...
+
+    def get_by_event_id(self, event_id: str) -> EventLogRecord | None:
+        ...
+
+    def critical_backlog_snapshot(self) -> dict[str, Any]:
+        ...
+
+
+class GatewayEventConsumerPort(Protocol):
+    def consume_live_event(self, event: GatewayEvent) -> Any:
+        ...
+
+    def consume_event_log_record(self, record: EventLogRecord) -> Any:
+        ...
+
+    def dispatch(self, event: GatewayEvent, *, source_event_id: str = "") -> Any:
+        ...
+
+    def consumer_health(self) -> dict[str, Any]:
+        ...
+
+    def start(self) -> None:
+        ...
+
+    def stop(self) -> None:
+        ...
+
+
+class EventReplayPort(Protocol):
+    def replay_pending(self, *, limit: int | None = None) -> dict[str, Any]:
+        ...
+
+    def recover_stale_claims(self) -> int:
+        ...
+
 
 class GatewayCommandPort(Protocol):
     def enqueue_command(self, command: GatewayCommand, *, metadata: dict[str, Any] | None = None) -> Any:
@@ -333,7 +414,9 @@ __all__ = [
     "EventLogAppendResult",
     "EventLogPort",
     "EventLogRecord",
+    "EventReplayPort",
     "GatewayCommandPort",
+    "GatewayEventConsumerPort",
     "ManagedOrderEnvelope",
     "MarketDataServicePort",
     "MarketDataSnapshot",

@@ -1011,6 +1011,71 @@ class TradingDatabase:
                 ON managed_order_events(order_id, id);
             CREATE INDEX IF NOT EXISTS idx_managed_order_events_intent
                 ON managed_order_events(intent_id, id);
+            CREATE TABLE IF NOT EXISTS order_gateway_event_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_event_id TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL,
+                raw_event_type TEXT NOT NULL DEFAULT '',
+                canonical_event_type TEXT NOT NULL DEFAULT '',
+                account TEXT NOT NULL DEFAULT '',
+                command_id TEXT NOT NULL DEFAULT '',
+                order_no TEXT NOT NULL DEFAULT '',
+                original_order_no TEXT NOT NULL DEFAULT '',
+                execution_id TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                managed_order_id INTEGER,
+                managed_intent_id INTEGER,
+                apply_status TEXT NOT NULL DEFAULT '',
+                payload_checksum TEXT NOT NULL DEFAULT '',
+                applied_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(source_event_id),
+                UNIQUE(dedupe_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_order_gateway_event_receipts_order
+                ON order_gateway_event_receipts(account, order_no, execution_id);
+            CREATE INDEX IF NOT EXISTS idx_order_gateway_event_receipts_command
+                ON order_gateway_event_receipts(command_id);
+            CREATE TABLE IF NOT EXISTS broker_order_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account TEXT NOT NULL DEFAULT '',
+                order_no TEXT NOT NULL DEFAULT '',
+                original_order_no TEXT NOT NULL DEFAULT '',
+                command_id TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                order_qty INTEGER NOT NULL DEFAULT 0,
+                filled_qty INTEGER NOT NULL DEFAULT 0,
+                remaining_qty INTEGER NOT NULL DEFAULT 0,
+                avg_fill_price REAL NOT NULL DEFAULT 0,
+                broker_status TEXT NOT NULL DEFAULT '',
+                last_event_id TEXT NOT NULL DEFAULT '',
+                last_event_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(account, order_no)
+            );
+            CREATE INDEX IF NOT EXISTS idx_broker_order_state_command
+                ON broker_order_state(command_id);
+            CREATE INDEX IF NOT EXISTS idx_broker_order_state_code
+                ON broker_order_state(code, broker_status);
+            CREATE TABLE IF NOT EXISTS broker_position_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                quantity INTEGER NOT NULL DEFAULT 0,
+                available_quantity INTEGER NOT NULL DEFAULT 0,
+                avg_price REAL NOT NULL DEFAULT 0,
+                last_snapshot_id TEXT NOT NULL DEFAULT '',
+                snapshot_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(account, code)
+            );
+            CREATE INDEX IF NOT EXISTS idx_broker_position_state_code
+                ON broker_position_state(code);
             CREATE TABLE IF NOT EXISTS order_risk_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 intent_id INTEGER,
@@ -2511,6 +2576,7 @@ class TradingDatabase:
         self._ensure_buy_zero_rca_trace_columns()
         self._ensure_gateway_transport_latency_columns()
         self._ensure_gateway_transport_latency_indexes()
+        self._ensure_gateway_event_log_processing_columns()
         self._seed_legacy_strategy_runtime_settings()
         self._ensure_trade_review_columns()
         self.conn.execute(
@@ -8213,6 +8279,210 @@ class TradingDatabase:
         ).fetchall()
         return [_row_to_managed_order_event(row) for row in rows]
 
+    def save_order_gateway_event_receipt(self, receipt: dict) -> dict:
+        payload = dict(receipt or {})
+        params = {
+            "source_event_id": str(payload.get("source_event_id") or ""),
+            "dedupe_key": str(payload.get("dedupe_key") or ""),
+            "raw_event_type": str(payload.get("raw_event_type") or ""),
+            "canonical_event_type": str(payload.get("canonical_event_type") or ""),
+            "account": str(payload.get("account") or ""),
+            "command_id": str(payload.get("command_id") or ""),
+            "order_no": str(payload.get("order_no") or ""),
+            "original_order_no": str(payload.get("original_order_no") or ""),
+            "execution_id": str(payload.get("execution_id") or ""),
+            "code": _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+            "side": str(payload.get("side") or "").upper(),
+            "managed_order_id": payload.get("managed_order_id"),
+            "managed_intent_id": payload.get("managed_intent_id"),
+            "apply_status": str(payload.get("apply_status") or ""),
+            "payload_checksum": str(payload.get("payload_checksum") or ""),
+            "applied_at": str(payload.get("applied_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+            "created_at": str(payload.get("created_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+            "details_json": _json_payload(payload.get("details") or payload),
+        }
+        if not params["source_event_id"]:
+            params["source_event_id"] = params["dedupe_key"]
+        if not params["dedupe_key"]:
+            params["dedupe_key"] = params["source_event_id"]
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO order_gateway_event_receipts(
+                    source_event_id, dedupe_key, raw_event_type, canonical_event_type,
+                    account, command_id, order_no, original_order_no, execution_id,
+                    code, side, managed_order_id, managed_intent_id, apply_status,
+                    payload_checksum, applied_at, created_at, details_json
+                ) VALUES (
+                    :source_event_id, :dedupe_key, :raw_event_type, :canonical_event_type,
+                    :account, :command_id, :order_no, :original_order_no, :execution_id,
+                    :code, :side, :managed_order_id, :managed_intent_id, :apply_status,
+                    :payload_checksum, :applied_at, :created_at, :details_json
+                )
+                ON CONFLICT(source_event_id) DO UPDATE SET
+                    apply_status=excluded.apply_status,
+                    details_json=excluded.details_json
+                """,
+                params,
+            )
+        row = self.conn.execute(
+            "SELECT * FROM order_gateway_event_receipts WHERE source_event_id = ?",
+            (params["source_event_id"],),
+        ).fetchone()
+        return _row_to_order_gateway_event_receipt(row) if row else payload
+
+    def find_order_gateway_event_receipt(
+        self,
+        *,
+        source_event_id: str = "",
+        dedupe_key: str = "",
+    ) -> Optional[dict]:
+        if source_event_id:
+            row = self.conn.execute(
+                "SELECT * FROM order_gateway_event_receipts WHERE source_event_id = ?",
+                (str(source_event_id),),
+            ).fetchone()
+            if row:
+                return _row_to_order_gateway_event_receipt(row)
+        if dedupe_key:
+            row = self.conn.execute(
+                "SELECT * FROM order_gateway_event_receipts WHERE dedupe_key = ?",
+                (str(dedupe_key),),
+            ).fetchone()
+            if row:
+                return _row_to_order_gateway_event_receipt(row)
+        return None
+
+    def upsert_broker_order_state(self, state: dict) -> dict:
+        payload = dict(state or {})
+        params = {
+            "account": str(payload.get("account") or ""),
+            "order_no": str(payload.get("order_no") or ""),
+            "original_order_no": str(payload.get("original_order_no") or ""),
+            "command_id": str(payload.get("command_id") or ""),
+            "code": _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+            "side": str(payload.get("side") or "").upper(),
+            "order_qty": _safe_int(payload.get("order_qty") or payload.get("quantity"), 0),
+            "filled_qty": _safe_int(payload.get("filled_qty") or payload.get("filled_quantity"), 0),
+            "remaining_qty": max(0, _safe_int(payload.get("remaining_qty") or payload.get("remaining_quantity"), 0)),
+            "avg_fill_price": _float_value(payload.get("avg_fill_price") or payload.get("price")),
+            "broker_status": str(payload.get("broker_status") or payload.get("status") or ""),
+            "last_event_id": str(payload.get("last_event_id") or ""),
+            "last_event_at": str(payload.get("last_event_at") or payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+            "updated_at": str(payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+            "details_json": _json_payload(payload.get("details") or payload),
+        }
+        if not params["order_no"]:
+            return payload
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO broker_order_state(
+                    account, order_no, original_order_no, command_id, code, side,
+                    order_qty, filled_qty, remaining_qty, avg_fill_price,
+                    broker_status, last_event_id, last_event_at, updated_at, details_json
+                ) VALUES (
+                    :account, :order_no, :original_order_no, :command_id, :code, :side,
+                    :order_qty, :filled_qty, :remaining_qty, :avg_fill_price,
+                    :broker_status, :last_event_id, :last_event_at, :updated_at, :details_json
+                )
+                ON CONFLICT(account, order_no) DO UPDATE SET
+                    original_order_no=excluded.original_order_no,
+                    command_id=COALESCE(NULLIF(excluded.command_id, ''), broker_order_state.command_id),
+                    code=COALESCE(NULLIF(excluded.code, ''), broker_order_state.code),
+                    side=COALESCE(NULLIF(excluded.side, ''), broker_order_state.side),
+                    order_qty=MAX(broker_order_state.order_qty, excluded.order_qty),
+                    filled_qty=MAX(broker_order_state.filled_qty, excluded.filled_qty),
+                    remaining_qty=excluded.remaining_qty,
+                    avg_fill_price=CASE WHEN excluded.avg_fill_price > 0 THEN excluded.avg_fill_price ELSE broker_order_state.avg_fill_price END,
+                    broker_status=COALESCE(NULLIF(excluded.broker_status, ''), broker_order_state.broker_status),
+                    last_event_id=excluded.last_event_id,
+                    last_event_at=excluded.last_event_at,
+                    updated_at=excluded.updated_at,
+                    details_json=excluded.details_json
+                """,
+                params,
+            )
+        row = self.conn.execute(
+            "SELECT * FROM broker_order_state WHERE account = ? AND order_no = ?",
+            (params["account"], params["order_no"]),
+        ).fetchone()
+        return _row_to_broker_order_state(row) if row else payload
+
+    def get_broker_order_state(self, *, account: str = "", order_no: str = "") -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM broker_order_state WHERE account = ? AND order_no = ?",
+            (str(account or ""), str(order_no or "")),
+        ).fetchone()
+        return _row_to_broker_order_state(row) if row else None
+
+    def upsert_broker_position_state(self, state: dict) -> dict:
+        payload = dict(state or {})
+        params = {
+            "account": str(payload.get("account") or ""),
+            "code": _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+            "quantity": _safe_int(payload.get("quantity"), 0),
+            "available_quantity": _safe_int(payload.get("available_quantity") or payload.get("available_qty"), 0),
+            "avg_price": _float_value(payload.get("avg_price") or payload.get("average_price")),
+            "last_snapshot_id": str(payload.get("last_snapshot_id") or payload.get("source_event_id") or ""),
+            "snapshot_at": str(payload.get("snapshot_at") or payload.get("timestamp") or ""),
+            "updated_at": str(payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+            "details_json": _json_payload(payload.get("details") or payload),
+        }
+        if not params["account"] or not params["code"]:
+            return payload
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO broker_position_state(
+                    account, code, quantity, available_quantity, avg_price,
+                    last_snapshot_id, snapshot_at, updated_at, details_json
+                ) VALUES (
+                    :account, :code, :quantity, :available_quantity, :avg_price,
+                    :last_snapshot_id, :snapshot_at, :updated_at, :details_json
+                )
+                ON CONFLICT(account, code) DO UPDATE SET
+                    quantity=excluded.quantity,
+                    available_quantity=excluded.available_quantity,
+                    avg_price=excluded.avg_price,
+                    last_snapshot_id=excluded.last_snapshot_id,
+                    snapshot_at=excluded.snapshot_at,
+                    updated_at=excluded.updated_at,
+                    details_json=excluded.details_json
+                """,
+                params,
+            )
+        row = self.conn.execute(
+            "SELECT * FROM broker_position_state WHERE account = ? AND code = ?",
+            (params["account"], params["code"]),
+        ).fetchone()
+        return _row_to_broker_position_state(row) if row else payload
+
+    def get_broker_position_state(self, *, account: str = "", code: str = "") -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM broker_position_state WHERE account = ? AND code = ?",
+            (str(account or ""), _clean_stock_code(code) or str(code or "")),
+        ).fetchone()
+        return _row_to_broker_position_state(row) if row else None
+
+    def order_lifecycle_summary(self) -> dict:
+        receipt_rows = self.conn.execute(
+            "SELECT apply_status, COUNT(*) AS count FROM order_gateway_event_receipts GROUP BY apply_status"
+        ).fetchall()
+        broker_orders = self.conn.execute(
+            "SELECT broker_status, COUNT(*) AS count FROM broker_order_state GROUP BY broker_status"
+        ).fetchall()
+        receipts = {str(row["apply_status"]): int(row["count"]) for row in receipt_rows}
+        statuses = {str(row["broker_status"]): int(row["count"]) for row in broker_orders}
+        return {
+            "receipt_counts": receipts,
+            "broker_order_status_counts": statuses,
+            "processed_count": int(receipts.get("APPLIED", 0)) + int(receipts.get("DUPLICATE_ALREADY_APPLIED", 0)),
+            "duplicate_applied_count": int(receipts.get("DUPLICATE_ALREADY_APPLIED", 0)),
+            "unmatched_event_count": int(receipts.get("RECONCILE_REQUIRED", 0)),
+            "reconcile_required_count": int(receipts.get("RECONCILE_REQUIRED", 0)),
+        }
+
     def save_order_risk_decision(self, decision: dict) -> dict:
         payload = dict(decision or {})
         params = {
@@ -11245,6 +11515,27 @@ class TradingDatabase:
             """
         )
 
+    def _ensure_gateway_event_log_processing_columns(self) -> None:
+        columns = {
+            "processing_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "claimed_at": "TEXT NOT NULL DEFAULT ''",
+            "claimed_by": "TEXT NOT NULL DEFAULT ''",
+            "next_retry_at": "TEXT NOT NULL DEFAULT ''",
+            "handler_name": "TEXT NOT NULL DEFAULT ''",
+            "handler_version": "TEXT NOT NULL DEFAULT ''",
+            "last_attempt_at": "TEXT NOT NULL DEFAULT ''",
+            "dead_lettered_at": "TEXT NOT NULL DEFAULT ''",
+            "processing_result_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for name, definition in columns.items():
+            self._ensure_column("gateway_event_log", name, definition)
+        self.conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_gateway_event_log_claim
+                ON gateway_event_log(processing_status, next_retry_at, received_at, id);
+            """
+        )
+
     def _seed_legacy_strategy_runtime_settings(self) -> None:
         from trading.strategy.runtime_settings import legacy_profile_payload
 
@@ -14251,6 +14542,31 @@ def _row_to_managed_order(row: sqlite3.Row) -> dict:
 def _row_to_managed_order_event(row: sqlite3.Row) -> dict:
     data = dict(row)
     data["payload"] = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    return data
+
+
+def _row_to_order_gateway_event_receipt(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["details"] = _safe_json_loads(data.pop("details_json", "{}"), {})
+    return data
+
+
+def _row_to_broker_order_state(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["details"] = _safe_json_loads(data.pop("details_json", "{}"), {})
+    data["order_qty"] = int(data.get("order_qty") or 0)
+    data["filled_qty"] = int(data.get("filled_qty") or 0)
+    data["remaining_qty"] = int(data.get("remaining_qty") or 0)
+    data["avg_fill_price"] = float(data.get("avg_fill_price") or 0.0)
+    return data
+
+
+def _row_to_broker_position_state(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["details"] = _safe_json_loads(data.pop("details_json", "{}"), {})
+    data["quantity"] = int(data.get("quantity") or 0)
+    data["available_quantity"] = int(data.get("available_quantity") or 0)
+    data["avg_price"] = float(data.get("avg_price") or 0.0)
     return data
 
 

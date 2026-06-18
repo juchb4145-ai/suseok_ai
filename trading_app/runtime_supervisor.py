@@ -26,6 +26,25 @@ from trading_app.shadow_strategy import ShadowStrategyEvaluator, config_from_set
 
 RuntimeBuilder = Callable[..., CoreRuntimeBundle]
 MAX_PENDING_PRICE_TICKS = 2000
+ORDER_LIFECYCLE_EVENT_TYPES = {
+    "command_ack",
+    "command_failed",
+    "command_timeout",
+    "command_expired",
+    "order_ack",
+    "order_reject",
+    "order_fill",
+    "execution",
+    "execution_event",
+    "fill",
+    "cancel_ack",
+    "order_cancel",
+    "order_cancelled",
+    "order_status_snapshot",
+    "balance_snapshot",
+    "position_snapshot",
+    "reconcile_snapshot",
+}
 
 
 class RuntimeSupervisor:
@@ -36,11 +55,13 @@ class RuntimeSupervisor:
         gateway_state: GatewayStateStore,
         runtime_builder: RuntimeBuilder = build_core_strategy_runtime,
         read_model_writer: Any = None,
+        order_event_consumer: Any = None,
     ) -> None:
         self.settings = settings
         self.gateway_state = gateway_state
         self.runtime_builder = runtime_builder
         self.read_model_writer = read_model_writer
+        self.order_event_consumer = order_event_consumer
         self.enabled = bool(settings.runtime_enabled)
         self.auto_start = bool(settings.runtime_auto_start)
         self.running = False
@@ -71,6 +92,7 @@ class RuntimeSupervisor:
         self._pending_price_ticks: dict[str, GatewayEvent] = {}
         self._dropped_price_tick_count = 0
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strategy-runtime")
+        self._order_event_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="order-event-consumer")
         self._diagnostics_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strategy-diagnostics")
         self._diagnostics_future: asyncio.Future | None = None
         self._diagnostics_started_perf = 0.0
@@ -334,6 +356,7 @@ class RuntimeSupervisor:
                 "cycle_worker_elapsed_ms": cycle_worker_elapsed_ms,
                 "cycle_worker_reason": self._cycle_future_reason if cycle_worker_pending else "",
                 "post_cycle_diagnostics": self._post_cycle_diagnostics_status_locked(),
+                "order_event_consumer": self._order_event_consumer_status_locked(),
                 "last_cycle_timings": dict(self.last_cycle_timings),
                 "warnings": warnings,
                 "latest_snapshot": snapshot,
@@ -377,10 +400,26 @@ class RuntimeSupervisor:
                 "cycle_worker_started_at": self._cycle_future_started_at if cycle_worker_pending else "",
                 "cycle_worker_elapsed_ms": cycle_worker_elapsed_ms,
                 "cycle_worker_reason": self._cycle_future_reason if cycle_worker_pending else "",
+                "order_event_consumer": self._order_event_consumer_status_locked(),
             }
 
     def set_dashboard_read_model_writer(self, writer: Any) -> None:
         self.read_model_writer = writer
+
+    def set_order_event_consumer(self, consumer: Any) -> None:
+        self.order_event_consumer = consumer
+
+    def _order_event_consumer_status_locked(self) -> dict[str, Any]:
+        consumer = self.order_event_consumer
+        if consumer is None:
+            return {"enabled": False, "status": "NOT_CONFIGURED", "order_lifecycle_ready": False}
+        health = getattr(consumer, "consumer_health", None)
+        if callable(health):
+            try:
+                return dict(health() or {})
+            except Exception as exc:
+                return {"enabled": True, "status": "ERROR", "order_lifecycle_ready": False, "last_error": str(exc)}
+        return {"enabled": True, "status": "UNKNOWN", "order_lifecycle_ready": False}
 
     def _realtime_data_quality_snapshot(self) -> dict[str, Any]:
         bundle = self._bundle
@@ -394,6 +433,11 @@ class RuntimeSupervisor:
             return {"status": "ERROR", "error": str(exc)}
 
     async def handle_gateway_event(self, event: GatewayEvent) -> None:
+        if event.type in ORDER_LIFECYCLE_EVENT_TYPES and self.order_event_consumer is not None:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._order_event_executor, self._consume_order_event_in_worker, event)
+            if event.type not in {"command_ack", "command_failed", "command_timeout", "command_expired"}:
+                return
         if not self.enabled or self._bundle is None:
             return
         session_reset_reason = self._gateway_session_reset_reason(event)
@@ -418,6 +462,16 @@ class RuntimeSupervisor:
             return
         self._queue_price_tick(event)
 
+    def _consume_order_event_in_worker(self, event: GatewayEvent) -> None:
+        consumer = self.order_event_consumer
+        handler = getattr(consumer, "consume_live_event", None)
+        if not callable(handler):
+            return
+        try:
+            handler(event)
+        except Exception as exc:
+            self._warn(f"ORDER_EVENT_CONSUME_FAILED:{event.type}:{exc}")
+
     async def readiness(self) -> dict[str, Any]:
         if self._bundle is not None:
             return self.status()["readiness"]
@@ -434,6 +488,7 @@ class RuntimeSupervisor:
         if future is not None and not future.done():
             future.cancel()
         self._executor.shutdown(wait=True, cancel_futures=True)
+        self._order_event_executor.shutdown(wait=True, cancel_futures=True)
         self._diagnostics_executor.shutdown(wait=True, cancel_futures=True)
 
     def _start_in_worker(self) -> dict[str, Any]:
