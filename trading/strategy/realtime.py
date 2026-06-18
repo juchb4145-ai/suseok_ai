@@ -8,6 +8,11 @@ from trading.strategy.models import BlockType, Candidate, CandidateState
 
 
 SOURCE_PRIORITIES = {
+    "reboot_v2_index": 110,
+    "reboot_v2_position": 105,
+    "reboot_v2_opening_seed": 70,
+    "reboot_v2_candidate": 65,
+    "reboot_v2_theme_board": 60,
     "index": 100,
     "leading_stock": 90,
     "semiconductor_signal": 90,
@@ -15,12 +20,15 @@ SOURCE_PRIORITIES = {
     "virtual_order": 84,
     "holding": 80,
     "candidate_watch": 50,
+    "theme_board_watch": 56,
     "theme_lab_watchset": 55,
     "theme_lab_bootstrap": 54,
     "theme_lab_outcome_tracking": 53,
     "theme_universe": 45,
 }
 PROTECTED_SOURCES = {
+    "reboot_v2_index",
+    "reboot_v2_position",
     "index",
     "leading_stock",
     "semiconductor_signal",
@@ -29,12 +37,18 @@ PROTECTED_SOURCES = {
     "holding",
 }
 FALLBACK_SOURCE_ORDER = {
+    "reboot_v2_index": 0,
+    "reboot_v2_position": 1,
+    "reboot_v2_opening_seed": 2,
+    "reboot_v2_candidate": 3,
+    "reboot_v2_theme_board": 4,
     "index": 0,
     "leading_stock": 1,
     "semiconductor_signal": 1,
     "holding": 2,
     "virtual_position": 3,
     "virtual_order": 4,
+    "theme_board_watch": 5,
     "candidate_watch": 5,
     "theme_lab_watchset": 5,
     "theme_lab_bootstrap": 5,
@@ -267,7 +281,13 @@ class RealTimeSubscriptionManager:
 
 
 def _candidate_watchable(candidate: Candidate) -> bool:
-    if candidate.state in {CandidateState.DETECTED, CandidateState.WATCHING, CandidateState.READY}:
+    if candidate.state in {
+        CandidateState.DETECTED,
+        CandidateState.HYDRATING,
+        CandidateState.WATCHING,
+        CandidateState.WAIT_DATA,
+        CandidateState.READY,
+    }:
         return True
     return (
         candidate.state == CandidateState.BLOCKED

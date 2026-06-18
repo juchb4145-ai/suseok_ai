@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from inspect import Parameter, signature
 from time import perf_counter
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 from uuid import uuid4
 
 from trading.strategy.candidates import (
@@ -70,6 +70,13 @@ ACTIVE_RUNTIME_STATES = {
     CandidateState.WATCHING,
     CandidateState.READY,
 }
+REALTIME_WATCH_CANDIDATE_STATES = {
+    CandidateState.DETECTED,
+    CandidateState.HYDRATING,
+    CandidateState.WATCHING,
+    CandidateState.WAIT_DATA,
+    CandidateState.READY,
+}
 TERMINAL_CANDIDATE_STATES = {CandidateState.EXPIRED, CandidateState.REMOVED}
 MARKET_SESSION_OPEN = "open"
 MARKET_SESSION_CLOSED = "closed"
@@ -82,6 +89,7 @@ GATE_SKIP_DATA_WARMUP = "DATA_WARMUP"
 THEME_LAB_WATCHSET_SOURCE = "theme_lab_watchset"
 THEME_LAB_BOOTSTRAP_SOURCE = "theme_lab_bootstrap"
 THEME_LAB_OUTCOME_TRACKING_SOURCE = "theme_lab_outcome_tracking"
+THEME_BOARD_WATCH_SOURCE = "theme_board_watch"
 THEME_LAB_OUTCOME_TRACKING_DEFAULT_TTL_SEC = 30 * 60
 THEME_LAB_OUTCOME_TRACKING_DEFAULT_MAX_CODES = 40
 THEME_LAB_OUTCOME_TRACKING_READINESS = {"WARMUP", "PROVISIONAL", "MISSING_CORE", "STALE"}
@@ -1645,6 +1653,7 @@ class StrategyRuntime:
                 theme_lab_selected_count = self._sync_theme_lab_watchset_subscriptions(snapshot, candidates)
             else:
                 self._sync_theme_universe_subscriptions(snapshot)
+            theme_board_selected_count = self._sync_theme_board_watch_subscriptions(snapshot)
             for raw_index_code in self.config.index_watch_codes.values():
                 self.subscription_manager.ensure_subscription(raw_index_code, "index", protected=True)
             for code in self.config.leader_watch_codes:
@@ -1658,9 +1667,9 @@ class StrategyRuntime:
             desired_candidates = candidates[: self.config.max_candidates_to_watch]
             if self._theme_lab_flow_active():
                 desired_candidates = []
-                snapshot.candidate_subscription_selected_count = theme_lab_selected_count
+                snapshot.candidate_subscription_selected_count = theme_lab_selected_count + theme_board_selected_count
             else:
-                snapshot.candidate_subscription_selected_count = len(desired_candidates)
+                snapshot.candidate_subscription_selected_count = len(desired_candidates) + theme_board_selected_count
             watched = self.subscription_manager.watch_candidates(desired_candidates)
             for candidate in desired_candidates:
                 if candidate.state == CandidateState.DETECTED and normalize_code(candidate.code) in watched:
@@ -2154,6 +2163,43 @@ class StrategyRuntime:
     def _theme_lab_flow_active(self) -> bool:
         return self.config.theme_engine_mode == "themelab_flow" and self.theme_lab_pipeline is not None
 
+    def _sync_theme_board_watch_subscriptions(self, snapshot: StrategyRuntimeSnapshot) -> int:
+        target_codes = set(self._theme_board_watch_codes())
+        for code, record in list(self.subscription_manager.records.items()):
+            if THEME_BOARD_WATCH_SOURCE in record.sources and code not in target_codes:
+                self.subscription_manager.remove_subscription(code, THEME_BOARD_WATCH_SOURCE)
+        for code in sorted(target_codes):
+            self.subscription_manager.ensure_subscription(code, THEME_BOARD_WATCH_SOURCE, protected=False)
+        if target_codes:
+            snapshot.warnings.append(f"THEME_BOARD_WATCH_SUBSCRIPTIONS={len(target_codes)}")
+        return len(target_codes)
+
+    def _theme_board_watch_codes(self) -> list[str]:
+        if self.theme_board_pipeline is None:
+            return []
+        result = getattr(self.theme_board_pipeline, "last_result", None)
+        board_snapshot = getattr(result, "snapshot", None)
+        top_themes = []
+        if board_snapshot is not None:
+            top_themes = list(getattr(board_snapshot, "top_themes", ()) or [])
+        if not top_themes:
+            summary = getattr(self.theme_board_pipeline, "last_summary", None)
+            if isinstance(summary, dict):
+                top_themes = list(summary.get("top_themes") or [])
+
+        codes: list[str] = []
+        limit = max(0, min(int(self.config.max_candidates_to_watch or 0), int(self.config.realtime_subscription_limit or 0)))
+        for theme in top_themes:
+            stocks = _theme_board_theme_stocks(theme)
+            for stock in stocks:
+                code = normalize_code(_theme_board_stock_code(stock))
+                if not code or code in codes:
+                    continue
+                codes.append(code)
+                if limit and len(codes) >= limit:
+                    return codes
+        return codes
+
     def _sync_theme_universe_subscriptions(self, snapshot: StrategyRuntimeSnapshot) -> None:
         try:
             target_codes = set(ThemeUniverseBuilder(ThemeEngineRepository(self.db)).build_active_universe())
@@ -2239,7 +2285,7 @@ class StrategyRuntime:
                 continue
             if not has_open_activity and quality_status not in {QUALITY_ACTIONABLE, QUALITY_DATA_WAIT}:
                 continue
-            if candidate.state in ACTIVE_RUNTIME_STATES:
+            if candidate.state in REALTIME_WATCH_CANDIDATE_STATES:
                 result.append((candidate, quality_status))
             elif (
                 candidate.state == CandidateState.BLOCKED
@@ -4368,12 +4414,26 @@ def _theme_lab_candidate_condition_level(candidate: Candidate) -> int:
     return level
 
 
+def _theme_board_theme_stocks(theme: Any) -> list[Any]:
+    if isinstance(theme, Mapping):
+        return list(theme.get("stocks") or [])
+    return list(getattr(theme, "stocks", ()) or [])
+
+
+def _theme_board_stock_code(stock: Any) -> str:
+    if isinstance(stock, Mapping):
+        return str(stock.get("code") or stock.get("symbol") or "")
+    return str(getattr(stock, "code", "") or getattr(stock, "symbol", "") or "")
+
+
 def _candidate_state_priority(state: CandidateState) -> int:
     return {
         CandidateState.READY: 0,
         CandidateState.WATCHING: 1,
-        CandidateState.DETECTED: 2,
-        CandidateState.BLOCKED: 3,
+        CandidateState.HYDRATING: 2,
+        CandidateState.DETECTED: 3,
+        CandidateState.WAIT_DATA: 4,
+        CandidateState.BLOCKED: 5,
     }.get(state, 9)
 
 

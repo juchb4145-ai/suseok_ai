@@ -56,6 +56,9 @@ class OpeningBurstRuntimeConfig:
     top_n_per_call: int = 100
     max_union_size: int = 300
     max_realtime_register: int = 100
+    catch_up_enabled: bool = True
+    catch_up_start: str = "09:15"
+    catch_up_end: str = "10:00"
     tr_ttl_sec: int = 60
     register_ttl_sec: int = 60
     tr_screen_no: str = OPENING_SCREEN_NO
@@ -78,6 +81,9 @@ class OpeningBurstRuntimeConfig:
             top_n_per_call=max(1, _int_env("TRADING_OPENING_BURST_TOP_N_PER_CALL", 100)),
             max_union_size=max(1, _int_env("TRADING_OPENING_BURST_MAX_UNION_SIZE", 300)),
             max_realtime_register=max(1, _int_env("TRADING_OPENING_BURST_MAX_REALTIME_REGISTER", 100)),
+            catch_up_enabled=_bool_env("TRADING_OPENING_BURST_CATCH_UP_ENABLED", True),
+            catch_up_start=_valid_seed_time(os.getenv("TRADING_OPENING_BURST_CATCH_UP_START", "09:15")) or "09:15",
+            catch_up_end=_valid_seed_time(os.getenv("TRADING_OPENING_BURST_CATCH_UP_END", "10:00")) or "10:00",
         )
 
     def engine_config(self) -> OpeningBurstConfig:
@@ -130,7 +136,7 @@ class OpeningBurstScheduler:
         self.gateway_state = gateway_state
         self.config = config or OpeningBurstRuntimeConfig.from_env()
 
-    def enqueue_if_due(self, now: datetime) -> dict[str, Any]:
+    def enqueue_if_due(self, now: datetime, *, seed_batch_exists: bool = False) -> dict[str, Any]:
         cfg = self.config
         summary = {
             "enabled": cfg.enabled,
@@ -144,6 +150,7 @@ class OpeningBurstScheduler:
             "idempotency_key": "",
             "seed_time": "",
             "trade_date": "",
+            "catch_up": False,
         }
         current = _as_kst(now)
         trade_date = current.date().isoformat()
@@ -159,11 +166,20 @@ class OpeningBurstScheduler:
         if not _is_regular_session(current):
             summary["paused_reason"] = "NOT_REGULAR_SESSION"
             return summary
+        catch_up = False
         if seed_time not in set(cfg.seed_times):
+            catch_up = _catch_up_due(current, cfg, seed_batch_exists=seed_batch_exists)
+            if not catch_up:
+                summary["paused_reason"] = "NOT_SEED_TIME"
+                return summary
+            seed_time = "catchup"
+            summary["catch_up"] = True
+            summary["seed_time"] = seed_time
+        if catch_up and seed_batch_exists:
             summary["paused_reason"] = "NOT_SEED_TIME"
             return summary
         summary["scheduled"] = True
-        command = opening_seed_tr_command(cfg, trade_date=trade_date, seed_time=seed_time)
+        command = opening_seed_tr_command(cfg, trade_date=trade_date, seed_time=seed_time, catch_up=catch_up)
         summary["command_id"] = command.command_id
         summary["idempotency_key"] = command.idempotency_key
         if self.gateway_state.has_duplicate(command.idempotency_key):
@@ -219,7 +235,7 @@ class OpeningThemeBurstRuntimePipeline:
         summary = empty_opening_theme_burst_section(enabled=self.config.enabled, observe_only=self.config.observe_only)
         summary["trade_date"] = trade_date
         summary["calculated_at"] = current.isoformat()
-        scheduler_summary = self.scheduler.enqueue_if_due(current)
+        scheduler_summary = self.scheduler.enqueue_if_due(current, seed_batch_exists=bool(self._batch_headers(trade_date)))
         summary["scheduler"] = scheduler_summary
         if scheduler_summary.get("paused_reason") and scheduler_summary.get("paused_reason") not in {"DISABLED", "NOT_SEED_TIME"}:
             summary["warnings"].append(str(scheduler_summary["paused_reason"]))
@@ -504,9 +520,15 @@ class OpeningThemeBurstRuntimePipeline:
             self.warnings.append(f"OPENING_BURST_CANDIDATE_INGESTION_FAILED:{exc}")
 
 
-def opening_seed_tr_command(cfg: OpeningBurstRuntimeConfig, *, trade_date: str, seed_time: str) -> GatewayCommand:
+def opening_seed_tr_command(
+    cfg: OpeningBurstRuntimeConfig,
+    *,
+    trade_date: str,
+    seed_time: str,
+    catch_up: bool = False,
+) -> GatewayCommand:
     compact_time = seed_time.replace(":", "")
-    idempotency_key = f"opening_burst:seed:{trade_date}:{compact_time}"
+    idempotency_key = f"opening_burst:seed:{trade_date}:catchup" if catch_up else f"opening_burst:seed:{trade_date}:{compact_time}"
     return GatewayCommand(
         type="tr_request",
         command_id=new_message_id("cmd_opening_seed"),
@@ -522,6 +544,7 @@ def opening_seed_tr_command(cfg: OpeningBurstRuntimeConfig, *, trade_date: str, 
             "fields": list(OPT10032_FIELDS),
             "trade_date": trade_date,
             "seed_time": seed_time,
+            "catch_up": bool(catch_up),
             "top_n": cfg.top_n_per_call,
         },
     )
@@ -920,6 +943,18 @@ def _valid_seed_time(value: Any) -> str:
     except ValueError:
         return ""
     return parsed.strftime("%H:%M")
+
+
+def _catch_up_due(value: datetime, cfg: OpeningBurstRuntimeConfig, *, seed_batch_exists: bool) -> bool:
+    if seed_batch_exists or not cfg.catch_up_enabled:
+        return False
+    current_text = _as_kst(value).strftime("%H:%M")
+    start = _valid_seed_time(cfg.catch_up_start) or "09:15"
+    end = _valid_seed_time(cfg.catch_up_end) or "10:00"
+    if not (start <= current_text <= end):
+        return False
+    latest_seed_time = max((_valid_seed_time(item) for item in cfg.seed_times), default=start)
+    return current_text >= latest_seed_time
 
 
 def _as_kst(value: datetime) -> datetime:

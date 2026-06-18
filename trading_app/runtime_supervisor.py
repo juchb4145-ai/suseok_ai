@@ -93,7 +93,7 @@ class RuntimeSupervisor:
         if self.settings.runtime_allow_live_orders:
             self._warn("RUNTIME_LIVE_ORDERS_DISABLED_IN_PR5")
 
-    def build_runtime(self) -> StrategyRuntime:
+    def build_runtime(self) -> Any:
         db = TradingDatabase(str(self.settings.db_path))
         self._bundle = self.runtime_builder(
             db,
@@ -364,11 +364,7 @@ class RuntimeSupervisor:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
             return
-        if event.type == "command_ack" and str((event.payload or {}).get("purpose") or "") in {
-            "theme_data_backfill",
-            "opening_turnover_seed",
-            "candidate_hydration",
-        }:
+        if event.type in {"command_ack", "command_failed", "command_timeout", "command_expired"}:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
             return
@@ -577,26 +573,27 @@ class RuntimeSupervisor:
     def _handle_gateway_event_in_worker(self, event: GatewayEvent) -> None:
         if self._bundle is None:
             return
+        v2_runtime = self._is_reboot_v2_bundle()
         candidate_hydrator = getattr(self._bundle, "candidate_hydrator", None)
-        if candidate_hydrator is not None:
+        if v2_runtime and candidate_hydrator is not None:
             handler = getattr(candidate_hydrator, "handle_event", None)
             if callable(handler) and handler(event):
                 return
         if event.type == "condition_event":
-            candidate_ingestion = getattr(self._bundle, "candidate_ingestion_service", None)
+            candidate_ingestion = getattr(self._bundle, "candidate_ingestion_service", None) if v2_runtime else None
             if candidate_ingestion is not None:
                 condition_event = BrokerConditionEvent.from_dict(event.payload)
-                result = candidate_ingestion.handle_condition_event(condition_event)
-                if condition_event.event_type != "remove" and getattr(result, "candidate", None) is not None and candidate_hydrator is not None:
-                    candidate_hydrator.enqueue_candidate(result.candidate)
+                candidate_ingestion.handle_condition_event(condition_event)
+                return
+            if v2_runtime:
                 return
         condition_adapter = getattr(self._bundle.runtime, "condition_adapter", None)
         if condition_adapter is not None:
             handler = getattr(condition_adapter, "handle_event", None)
             if callable(handler) and handler(event):
                 return
-        opening_burst_pipeline = getattr(self._bundle.runtime, "opening_burst_pipeline", None)
-        if opening_burst_pipeline is not None:
+        opening_burst_pipeline = getattr(self._bundle, "opening_burst_pipeline", None) or getattr(self._bundle.runtime, "opening_burst_pipeline", None)
+        if v2_runtime and opening_burst_pipeline is not None:
             handler = getattr(opening_burst_pipeline, "handle_event", None)
             if callable(handler) and handler(event):
                 return
@@ -831,10 +828,20 @@ class RuntimeSupervisor:
             self.post_cycle_diagnostics_stage = str(stage or "idle")
 
     def _post_cycle_diagnostics_enabled(self) -> bool:
+        if self._is_reboot_v2_bundle():
+            return False
         return bool(getattr(self.settings, "intraday_outcome_enabled", True)) or (
             bool(getattr(self.settings, "shadow_strategy_enabled", True))
             and bool(getattr(self.settings, "shadow_strategy_runtime_hook_enabled", True))
         )
+
+    def _is_reboot_v2_bundle(self) -> bool:
+        bundle = self._bundle
+        if bundle is None:
+            return False
+        if str(getattr(bundle, "runtime_profile", "") or "").upper() != "LEGACY":
+            return True
+        return bool(getattr(getattr(bundle, "runtime", None), "is_reboot_v2_runtime", False))
 
     def _post_cycle_diagnostics_status_locked(self) -> dict[str, Any]:
         enabled = self._post_cycle_diagnostics_enabled()

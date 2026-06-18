@@ -1,0 +1,94 @@
+[CmdletBinding()]
+param(
+    [string]$ProjectRoot = "",
+    [string]$DbPath = "",
+    [string]$BindHost = "127.0.0.1",
+    [int]$Port = 8000,
+    [string]$Token = ""
+)
+
+$ErrorActionPreference = "Stop"
+$Utf8Encoding = New-Object System.Text.UTF8Encoding -ArgumentList $false
+[Console]::OutputEncoding = $Utf8Encoding
+$OutputEncoding = $Utf8Encoding
+
+if (-not $ProjectRoot) {
+    $ProjectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+} else {
+    $ProjectRoot = Resolve-Path $ProjectRoot
+}
+$ProjectRoot = [string]$ProjectRoot
+
+if (-not $DbPath) {
+    $DbPath = Join-Path $ProjectRoot "data\trader.sqlite3"
+}
+$DbPath = [string](Resolve-Path $DbPath)
+
+if (-not $Token) {
+    $Token = if ($env:TRADING_CORE_TOKEN) { $env:TRADING_CORE_TOKEN } else { "local-dev-token" }
+}
+
+$Python64 = Join-Path $ProjectRoot "venv_64\Scripts\python.exe"
+if (-not (Test-Path $Python64)) {
+    $Python64 = "python"
+}
+
+$env:PYTHONIOENCODING = "utf-8"
+$env:TRADING_CORE_TOKEN = $Token
+$env:TRADING_DB_PATH = $DbPath
+
+$env:TRADING_MODE = "OBSERVE"
+$env:TRADING_RUNTIME_ENABLED = "1"
+$env:TRADING_RUNTIME_AUTO_START = "1"
+$env:TRADING_RUNTIME_MODE = "OBSERVE"
+$env:TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS = "0"
+$env:TRADING_RUNTIME_ALLOW_LIVE_ORDERS = "0"
+$env:STRATEGY_REBOOT_V2_ENABLED = "1"
+$env:STRATEGY_REBOOT_V2_PROFILE = "V2_OBSERVE"
+$env:TRADING_OPENING_BURST_ENABLED = "1"
+$env:TRADING_OPENING_BURST_CONFIGURED = "1"
+$env:TRADING_OPENING_BURST_CATCH_UP_ENABLED = "1"
+$env:TRADING_THEME_BOARD_ENABLED = "1"
+$env:TRADING_MARKET_REGIME_ENABLED = "1"
+$env:TRADING_ENTRY_ENGINE_ENABLED = "1"
+$env:TRADING_EXIT_ENGINE_ENABLED = "0"
+$env:TRADING_POSITION_RISK_ENABLED = "0"
+$env:TRADING_ORDER_MANAGER_ENABLED = "0"
+$env:TRADING_ALLOW_LIVE_SIM_ORDERS = "0"
+$env:TRADING_ENTRY_ALLOW_DRY_RUN_INTENTS = "0"
+$env:TRADING_EXIT_ALLOW_DRY_RUN_SELL_INTENTS = "0"
+$env:TRADING_DASHBOARD_V2_ENABLED = "1"
+$env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY = "1"
+$env:TRADING_SHADOW_STRATEGY_ALLOW_APPLY = "0"
+$env:TRADING_CHANGE_PROPOSAL_ALLOW_AUTO_APPLY = "0"
+
+$required = [ordered]@{
+    TRADING_MODE = "OBSERVE"
+    TRADING_RUNTIME_MODE = "OBSERVE"
+    TRADING_RUNTIME_ALLOW_DRY_RUN_ORDERS = "0"
+    STRATEGY_REBOOT_V2_ENABLED = "1"
+    STRATEGY_REBOOT_V2_PROFILE = "V2_OBSERVE"
+    TRADING_OPENING_BURST_ENABLED = "1"
+    TRADING_THEME_BOARD_ENABLED = "1"
+    TRADING_MARKET_REGIME_ENABLED = "1"
+    TRADING_ENTRY_ENGINE_ENABLED = "1"
+    TRADING_ORDER_MANAGER_ENABLED = "0"
+    TRADING_ALLOW_LIVE_SIM_ORDERS = "0"
+    TRADING_ENTRY_ALLOW_DRY_RUN_INTENTS = "0"
+    TRADING_EXIT_ALLOW_DRY_RUN_SELL_INTENTS = "0"
+    TRADING_DASHBOARD_V2_ENABLED = "1"
+}
+
+Write-Host "Effective Reboot V2 OBSERVE configuration"
+foreach ($key in $required.Keys) {
+    $value = [Environment]::GetEnvironmentVariable($key)
+    Write-Host ("  {0}={1}" -f $key, $value)
+    if ($value -ne $required[$key]) {
+        throw "Required flag mismatch: $key expected $($required[$key]) got $value"
+    }
+}
+Write-Host ("  TRADING_DB_PATH={0}" -f $env:TRADING_DB_PATH)
+Write-Host ("  Bind={0}:{1}" -f $BindHost, $Port)
+
+Set-Location $ProjectRoot
+& $Python64 -m uvicorn trading_app.api:app --host $BindHost --port $Port

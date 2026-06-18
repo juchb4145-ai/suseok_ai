@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable, Mapping
 
-from trading.broker.command_queue import CommandPriority
+from trading.broker.command_queue import CommandPriority, CommandStatus
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import GatewayCommand, GatewayEvent, new_message_id
 from trading.strategy.candidates import normalize_code
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.models import Candidate, CandidateEvent, CandidateState
+from trading.theme_engine.backfill import OPT10001_FIELDS, parse_opt10001_backfill
 
 
 CANDIDATE_HYDRATION_PURPOSE = "candidate_hydration"
@@ -19,17 +20,26 @@ CANDIDATE_HYDRATION_RQ_NAME = "CandidateHydration_opt10001"
 CANDIDATE_HYDRATION_SCREEN_NO = "8730"
 CANDIDATE_HYDRATION_BUCKET = "basic"
 
-CANDIDATE_HYDRATION_FIELDS = [
-    "stock_name",
-    "current_price",
-    "change_rate",
-    "volume",
-    "trade_value",
-    "open_price",
-    "day_high",
-    "day_low",
-    "prev_close",
-]
+
+@dataclass(frozen=True)
+class TrFieldSpec:
+    broker_field: str
+    normalized_field: str
+    aliases: tuple[str, ...] = ()
+
+
+CANDIDATE_HYDRATION_FIELD_SPECS = (
+    TrFieldSpec("종목명", "stock_name", ("종목명", "stock_name", "name")),
+    TrFieldSpec("현재가", "current_price", ("현재가", "current_price", "price")),
+    TrFieldSpec("등락율", "change_rate", ("등락율", "등락률", "change_rate")),
+    TrFieldSpec("거래량", "volume", ("거래량", "volume")),
+    TrFieldSpec("거래대금", "trade_value", ("거래대금", "trade_value", "turnover", "turnover_krw")),
+    TrFieldSpec("시가", "open_price", ("시가", "open_price", "open")),
+    TrFieldSpec("고가", "day_high", ("고가", "day_high", "session_high", "high")),
+    TrFieldSpec("저가", "day_low", ("저가", "day_low", "session_low", "low")),
+    TrFieldSpec("기준가", "prev_close", ("기준가", "prev_close", "previous_close", "base_price")),
+)
+CANDIDATE_HYDRATION_FIELDS = list(OPT10001_FIELDS)
 
 
 @dataclass(frozen=True)
@@ -38,6 +48,9 @@ class CandidateHydrationConfig:
     max_per_cycle: int = 5
     max_pending: int = 10
     ttl_sec: int = 90
+    max_attempts: int = 3
+    retry_base_sec: int = 15
+    retry_max_sec: int = 300
     tr_code: str = CANDIDATE_HYDRATION_TR_CODE
     rq_name: str = CANDIDATE_HYDRATION_RQ_NAME
     screen_no: str = CANDIDATE_HYDRATION_SCREEN_NO
@@ -50,6 +63,9 @@ class CandidateHydrationConfig:
             max_per_cycle=max(1, _int_env("TRADING_CANDIDATE_HYDRATION_MAX_PER_CYCLE", 5)),
             max_pending=max(1, _int_env("TRADING_CANDIDATE_HYDRATION_MAX_PENDING", 10)),
             ttl_sec=max(1, _int_env("TRADING_CANDIDATE_HYDRATION_TTL_SEC", 90)),
+            max_attempts=max(1, _int_env("TRADING_CANDIDATE_HYDRATION_MAX_ATTEMPTS", 3)),
+            retry_base_sec=max(1, _int_env("TRADING_CANDIDATE_HYDRATION_RETRY_BASE_SEC", 15)),
+            retry_max_sec=max(1, _int_env("TRADING_CANDIDATE_HYDRATION_RETRY_MAX_SEC", 300)),
         )
 
 
@@ -83,6 +99,7 @@ class CandidateHydrator:
     def enqueue_due_candidates(self, *, trade_date: str | None = None) -> list[CandidateHydrationEnqueueResult]:
         if not self.config.enabled:
             return []
+        self.recover_from_command_history()
         trade_date = trade_date or self.clock().date().isoformat()
         pending = self._pending_count(trade_date)
         remaining_pending = max(0, self.config.max_pending - pending)
@@ -102,11 +119,13 @@ class CandidateHydrator:
         return results
 
     def enqueue_candidate(self, candidate: Candidate) -> CandidateHydrationEnqueueResult:
+        generation = self._retry_generation(candidate)
+        bucket = self.config.bucket if generation <= 0 else f"{self.config.bucket}:retry{generation}"
         key = hydration_idempotency_key(
             trade_date=candidate.trade_date,
             code=candidate.code,
             tr_code=self.config.tr_code,
-            bucket=self.config.bucket,
+            bucket=bucket,
         )
         if not self.config.enabled:
             return CandidateHydrationEnqueueResult(
@@ -131,9 +150,11 @@ class CandidateHydrator:
                 "tr_code": self.config.tr_code,
                 "rq_name": self.config.rq_name,
                 "screen_no": self.config.screen_no,
-                "inputs": {"종목코드": candidate.code, "code": candidate.code},
+                "inputs": {"종목코드": candidate.code},
                 "fields": list(CANDIDATE_HYDRATION_FIELDS),
+                "field_specs": [field.__dict__ for field in CANDIDATE_HYDRATION_FIELD_SPECS],
                 "bucket": self.config.bucket,
+                "retry_generation": generation,
             },
         )
         duplicate_of = self.gateway_state.duplicate_of(key)
@@ -171,11 +192,26 @@ class CandidateHydrator:
         )
 
     def handle_event(self, event: GatewayEvent) -> bool:
-        if event.type != "command_ack":
+        if event.type not in {"command_ack", "command_failed", "command_timeout", "command_expired"}:
             return False
         payload = dict(event.payload or {})
-        if str(payload.get("purpose") or "") != CANDIDATE_HYDRATION_PURPOSE:
+        command_id = str(payload.get("command_id") or event.command_id or "")
+        command_payload = self._command_payload(command_id)
+        if str(payload.get("purpose") or command_payload.get("purpose") or "") != CANDIDATE_HYDRATION_PURPOSE:
             return False
+        if event.type != "command_ack":
+            reason = {
+                "command_failed": "COMMAND_FAILED",
+                "command_timeout": "TIMEOUT",
+                "command_expired": "EXPIRED",
+            }.get(event.type, event.type.upper())
+            self.mark_failure(payload, event=event, reason=reason)
+            return True
+        status = str(payload.get("status") or payload.get("command_status") or CommandStatus.ACKED.value).upper()
+        result_code = _int(payload.get("result_code") or payload.get("code"))
+        if status != CommandStatus.ACKED.value or result_code < 0:
+            self.mark_failure(payload, event=event, reason=status if status != CommandStatus.ACKED.value else "REJECTED")
+            return True
         self.merge_ack(payload, event=event)
         return True
 
@@ -189,7 +225,10 @@ class CandidateHydrator:
         parsed = _parsed_hydration_payload(raw_payload)
         if not parsed:
             rows = _ack_rows(raw_payload)
-            parsed = parse_candidate_hydration_rows(rows)
+            parsed = parse_candidate_hydration_rows(rows, code=code)
+        failure_reason = _hydration_parse_failure_reason(parsed, _ack_rows(raw_payload))
+        if failure_reason:
+            return self.mark_failure(raw_payload, event=event, reason=failure_reason, parsed=parsed)
         if not code:
             code = normalize_code(str(parsed.get("code") or ""))
         candidate = self.db.load_candidate_by_id(candidate_id) if candidate_id else None
@@ -204,11 +243,13 @@ class CandidateHydrator:
         current_metadata.update(
             {
                 "status": "ACKED",
+                "failure_status": "",
                 "command_id": command_id,
                 "idempotency_key": str(raw_payload.get("idempotency_key") or command_payload.get("idempotency_key") or ""),
                 "merged_at": _format_time(self.clock()),
                 "parsed": dict(parsed),
                 "raw_rows": _ack_rows(raw_payload)[:5],
+                "last_error": "",
             }
         )
         metadata["candidate_hydration"] = current_metadata
@@ -263,6 +304,123 @@ class CandidateHydrator:
             updater(command_id=command_id, status="ACKED", result_status="MERGED")
         return saved
 
+    def mark_failure(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        event: GatewayEvent | None = None,
+        reason: str,
+        parsed: Mapping[str, Any] | None = None,
+    ) -> Candidate | None:
+        raw_payload = dict(payload or {})
+        command_id = str(raw_payload.get("command_id") or (event.command_id if event else "") or "")
+        command_payload = self._command_payload(command_id)
+        trade_date = str(raw_payload.get("trade_date") or command_payload.get("trade_date") or self.clock().date().isoformat())
+        code = normalize_code(str(raw_payload.get("code") or command_payload.get("code") or ""))
+        candidate_id = _int(raw_payload.get("candidate_id") or command_payload.get("candidate_id"))
+        candidate = self.db.load_candidate_by_id(candidate_id) if candidate_id else None
+        if candidate is None and trade_date and code:
+            candidate = self.db.load_candidate(trade_date, code)
+        parsed_payload = dict(parsed or _parsed_hydration_payload(raw_payload) or {})
+        if candidate is None:
+            self._save_result(None, raw_payload, parsed_payload, status="ORPHAN_FAILURE", reason=reason)
+            return None
+        now = self.clock().replace(microsecond=0)
+        previous_state = candidate.state
+        if candidate.state in {CandidateState.DETECTED, CandidateState.HYDRATING, CandidateState.WAIT_DATA}:
+            candidate.state = CandidateState.WAIT_DATA
+        metadata = dict(candidate.metadata or {})
+        hydration = dict(metadata.get("candidate_hydration") or {})
+        retry_count = int(hydration.get("retry_count") or 0) + 1
+        retry_generation = int(hydration.get("retry_generation") or 0) + 1
+        retryable = retry_count < max(1, self.config.max_attempts)
+        retry_after_at = now + timedelta(seconds=self._retry_delay_sec(retry_count)) if retryable else None
+        hydration.update(
+            {
+                "status": "RETRY_WAIT" if retryable else "FAILED",
+                "failure_status": str(reason or "FAILED"),
+                "command_id": command_id,
+                "idempotency_key": str(raw_payload.get("idempotency_key") or command_payload.get("idempotency_key") or ""),
+                "last_error": str(raw_payload.get("error") or raw_payload.get("message") or reason or "FAILED"),
+                "retry_count": retry_count,
+                "retry_generation": retry_generation,
+                "retry_after_at": retry_after_at.isoformat() if retry_after_at else "",
+                "failed_at": now.isoformat(),
+                "parsed": parsed_payload,
+                "raw_rows": _ack_rows(raw_payload)[:5],
+            }
+        )
+        reason_codes = _dedupe([*list(metadata.get("reason_codes") or []), "WAIT_DATA", str(reason or "FAILED")])
+        metadata["reason_codes"] = reason_codes
+        metadata["candidate_hydration"] = hydration
+        candidate.metadata = metadata
+        candidate.last_seen_at = now.isoformat()
+        saved = self.db.save_candidate_with_events(
+            candidate,
+            [
+                CandidateEvent(
+                    candidate_id=candidate.id,
+                    event_type="candidate_hydration_failed",
+                    from_state=previous_state,
+                    to_state=candidate.state,
+                    source=None,
+                    reason=str(reason or "candidate hydration failed"),
+                    created_at=candidate.last_seen_at,
+                    payload={
+                        "command_id": command_id,
+                        "code": candidate.code,
+                        "reason": reason,
+                        "retry_count": retry_count,
+                        "retry_after_at": retry_after_at.isoformat() if retry_after_at else "",
+                    },
+                )
+            ],
+        )
+        self._save_result(saved, raw_payload, parsed_payload, status="FAILED", reason=reason)
+        updater = getattr(self.db, "update_candidate_hydration_request_status", None)
+        if callable(updater) and command_id:
+            updater(command_id=command_id, status="FAILED", result_status=reason)
+        return saved
+
+    def recover_from_command_history(self) -> dict[str, int]:
+        self.gateway_state.expire_old_commands(self.clock())
+        summary = {"processed": 0, "expired": 0, "failed": 0}
+        for record in self.gateway_state.list_commands(include_finished=True, command_type="tr_request", limit=200):
+            payload = _record_payload(record)
+            result_payload = _record_result_payload(record)
+            if str(payload.get("purpose") or result_payload.get("purpose") or "") != CANDIDATE_HYDRATION_PURPOSE:
+                continue
+            status = str(record.get("status") or "").upper()
+            command_id = str(record.get("command_id") or payload.get("command_id") or "")
+            candidate = self._candidate_for_command_payload(payload, result_payload)
+            if candidate is None or not self._candidate_waiting_on_command(candidate, command_id):
+                continue
+            if status == CommandStatus.ACKED.value:
+                parsed = _parsed_hydration_payload(result_payload)
+                if not parsed:
+                    parsed = parse_candidate_hydration_rows(_ack_rows(result_payload), code=str(payload.get("code") or ""))
+                reason = _hydration_parse_failure_reason(parsed, _ack_rows(result_payload))
+                if reason:
+                    self.mark_failure({**payload, **result_payload, "command_id": command_id}, reason=reason, parsed=parsed)
+                    summary["processed"] += 1
+                    summary["failed"] += 1
+                continue
+            if status in {
+                CommandStatus.REJECTED.value,
+                CommandStatus.FAILED.value,
+                CommandStatus.EXPIRED.value,
+                CommandStatus.CANCELLED.value,
+                CommandStatus.EXPIRED_BEFORE_DISPATCH.value,
+            }:
+                reason = "EXPIRED" if status in {CommandStatus.EXPIRED.value, CommandStatus.EXPIRED_BEFORE_DISPATCH.value} else status
+                self.mark_failure({**payload, **result_payload, "command_id": command_id}, reason=reason)
+                summary["processed"] += 1
+                if reason == "EXPIRED":
+                    summary["expired"] += 1
+                else:
+                    summary["failed"] += 1
+        return summary
+
     def _mark_hydrating(
         self,
         candidate: Candidate,
@@ -283,6 +441,7 @@ class CandidateHydrator:
             "priority": priority,
             "requested_at": _format_time(self.clock()),
             "purpose": CANDIDATE_HYDRATION_PURPOSE,
+            "retry_generation": _int((command.payload or {}).get("retry_generation")),
         }
         candidate.metadata = metadata
         candidate.last_seen_at = _format_time(self.clock())
@@ -384,8 +543,17 @@ class CandidateHydrator:
     def _needs_hydration(self, candidate: Candidate) -> bool:
         metadata = dict(candidate.metadata or {})
         hydration = dict(metadata.get("candidate_hydration") or {})
-        if str(hydration.get("status") or "") in {"ACKED", "MERGED", "OK"}:
+        status = str(hydration.get("status") or "").upper()
+        if status in {"ACKED", "MERGED", "OK"}:
             return False
+        if status == "PENDING":
+            return False
+        if status == "FAILED" and int(hydration.get("retry_count") or 0) >= max(1, self.config.max_attempts):
+            return False
+        if status == "RETRY_WAIT":
+            retry_after_at = _parse_time(hydration.get("retry_after_at"))
+            if retry_after_at is not None and self.clock().replace(microsecond=0) < retry_after_at:
+                return False
         return True
 
     def _pending_count(self, trade_date: str) -> int:
@@ -427,16 +595,54 @@ class CandidateHydrator:
             return dict(command_data.get("payload") or record.get("payload") or {})
         return {}
 
+    def _candidate_for_command_payload(self, payload: Mapping[str, Any], result_payload: Mapping[str, Any]) -> Candidate | None:
+        candidate_id = _int(result_payload.get("candidate_id") or payload.get("candidate_id"))
+        candidate = self.db.load_candidate_by_id(candidate_id) if candidate_id else None
+        if candidate is not None:
+            return candidate
+        trade_date = str(result_payload.get("trade_date") or payload.get("trade_date") or "")
+        code = normalize_code(str(result_payload.get("code") or payload.get("code") or ""))
+        if trade_date and code:
+            return self.db.load_candidate(trade_date, code)
+        return None
+
+    @staticmethod
+    def _candidate_waiting_on_command(candidate: Candidate, command_id: str) -> bool:
+        hydration = dict(dict(candidate.metadata or {}).get("candidate_hydration") or {})
+        status = str(hydration.get("status") or "").upper()
+        return bool(command_id and str(hydration.get("command_id") or "") == command_id and status == "PENDING")
+
+    def _retry_generation(self, candidate: Candidate) -> int:
+        hydration = dict(dict(candidate.metadata or {}).get("candidate_hydration") or {})
+        return max(_int(hydration.get("retry_generation")), _int(hydration.get("retry_count")))
+
+    def _retry_delay_sec(self, retry_count: int) -> int:
+        attempt_index = max(0, int(retry_count or 1) - 1)
+        delay = int(self.config.retry_base_sec) * (2**attempt_index)
+        return max(1, min(int(self.config.retry_max_sec), delay))
+
 
 def hydration_idempotency_key(*, trade_date: str, code: str, tr_code: str = CANDIDATE_HYDRATION_TR_CODE, bucket: str = CANDIDATE_HYDRATION_BUCKET) -> str:
     return f"candidate_hydration:{trade_date}:{normalize_code(code)}:{tr_code}:{bucket}"
 
 
-def parse_candidate_hydration_rows(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
-    for raw in rows:
+def parse_candidate_hydration_rows(rows: Iterable[Mapping[str, Any]], *, code: str = "") -> dict[str, Any]:
+    raw_rows = [dict(row) for row in rows if isinstance(row, Mapping)]
+    parsed = parse_opt10001_backfill(raw_rows, code=code)
+    if parsed:
+        if parsed.get("turnover") is not None and parsed.get("trade_value") is None:
+            parsed["trade_value"] = parsed.get("turnover")
+        if parsed.get("session_high") is not None and parsed.get("day_high") is None:
+            parsed["day_high"] = parsed.get("session_high")
+        if parsed.get("session_low") is not None and parsed.get("day_low") is None:
+            parsed["day_low"] = parsed.get("session_low")
+        parsed["raw"] = raw_rows[0] if raw_rows else {}
+        if parsed.get("parser_status") != "EMPTY":
+            return parsed
+    for raw in raw_rows:
         normalized = {_normalize_field_name(key): value for key, value in dict(raw).items()}
-        parsed = {
-            "code": normalize_code(str(_field_value(normalized, _CODE_FIELDS) or "")),
+        fallback = {
+            "code": normalize_code(str(code or _field_value(normalized, _CODE_FIELDS) or "")),
             "stock_name": str(_field_value(normalized, _NAME_FIELDS) or "").strip(),
             "current_price": abs(_float(_field_value(normalized, _PRICE_FIELDS))),
             "change_rate": _float(_field_value(normalized, _CHANGE_RATE_FIELDS)),
@@ -448,9 +654,9 @@ def parse_candidate_hydration_rows(rows: Iterable[Mapping[str, Any]]) -> dict[st
             "prev_close": abs(_float(_field_value(normalized, _PREV_CLOSE_FIELDS))),
             "raw": dict(raw),
         }
-        if parsed["code"] or parsed["current_price"] > 0 or parsed["stock_name"]:
-            return parsed
-    return {}
+        if fallback["code"] or fallback["current_price"] > 0 or fallback["stock_name"]:
+            return fallback
+    return parsed or {}
 
 
 def _parsed_hydration_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -496,6 +702,31 @@ def _ack_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     if not rows and isinstance(raw, Mapping):
         rows = raw.get("tr_rows") or raw.get("rows")
     return [dict(row) for row in list(rows or []) if isinstance(row, Mapping)]
+
+
+def _hydration_parse_failure_reason(parsed: Mapping[str, Any], rows: Iterable[Mapping[str, Any]]) -> str:
+    row_list = list(rows or [])
+    status = str(parsed.get("parser_status") or "").upper()
+    if status == "EMPTY" or not row_list:
+        return "TR_EMPTY"
+    missing = {str(item) for item in list(parsed.get("parser_missing_fields") or [])}
+    if not parsed or ("current_price" in missing and _float(parsed.get("current_price")) <= 0):
+        return "PARSE_ERROR"
+    return ""
+
+
+def _record_payload(record: Mapping[str, Any]) -> dict[str, Any]:
+    command = dict(record.get("command") or {})
+    payload = command.get("payload")
+    if isinstance(payload, Mapping):
+        return dict(payload)
+    payload = record.get("payload")
+    return dict(payload or {}) if isinstance(payload, Mapping) else {}
+
+
+def _record_result_payload(record: Mapping[str, Any]) -> dict[str, Any]:
+    payload = record.get("result_payload")
+    return dict(payload or {}) if isinstance(payload, Mapping) else {}
 
 
 def _field_value(normalized: Mapping[str, Any], aliases: Iterable[str]) -> Any:
@@ -549,6 +780,16 @@ def _int(value: Any) -> int:
         return 0
 
 
+def _parse_time(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def _int_env(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)))
@@ -570,6 +811,7 @@ __all__ = [
     "CandidateHydrationConfig",
     "CandidateHydrationEnqueueResult",
     "CandidateHydrator",
+    "TrFieldSpec",
     "hydration_idempotency_key",
     "parse_candidate_hydration_rows",
 ]

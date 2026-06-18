@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+
+
+class RebootV2RuntimeProfile(str, Enum):
+    LEGACY = "LEGACY"
+    V2_OBSERVE = "V2_OBSERVE"
+    V2_DRY_RUN = "V2_DRY_RUN"
+    V2_LIVE_SIM_DISABLED = "V2_LIVE_SIM_DISABLED"
 
 
 class CandidateV2State(str, Enum):
@@ -191,11 +199,32 @@ def normalize_stock_code(code: str) -> str:
     return value
 
 
+def strategy_reboot_v2_enabled() -> bool:
+    return _bool_env("STRATEGY_REBOOT_V2_ENABLED", False)
+
+
+def reboot_v2_runtime_profile() -> RebootV2RuntimeProfile:
+    if not strategy_reboot_v2_enabled():
+        return RebootV2RuntimeProfile.LEGACY
+    raw = str(os.getenv("STRATEGY_REBOOT_V2_PROFILE", RebootV2RuntimeProfile.V2_OBSERVE.value) or "").strip().upper()
+    try:
+        return RebootV2RuntimeProfile(raw)
+    except ValueError:
+        return RebootV2RuntimeProfile.V2_OBSERVE
+
+
 def _clean_time(value: datetime | None = None) -> datetime:
     current = value or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     return current.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 __all__ = [
@@ -210,8 +239,11 @@ __all__ = [
     "HydrationPriority",
     "HydrationRequestKey",
     "MarketRegime",
+    "RebootV2RuntimeProfile",
     "StockRole",
     "ThemeStatus",
     "build_tr_hydration_idempotency_key",
     "normalize_stock_code",
+    "reboot_v2_runtime_profile",
+    "strategy_reboot_v2_enabled",
 ]

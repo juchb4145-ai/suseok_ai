@@ -29,6 +29,8 @@ from trading.strategy.pipeline import GatePipeline
 from trading.strategy.position_risk import PositionRiskConfig, PositionRiskRuntimePipeline
 from trading.strategy.readiness import build_readiness_report, dedupe_warnings
 from trading.strategy.realtime import RealTimeSubscriptionManager
+from trading.strategy.reboot_v2 import RebootV2RuntimeProfile, reboot_v2_runtime_profile
+from trading.strategy.reboot_v2_runtime import RebootV2Runtime
 from trading.strategy.review import TradeReviewService
 from trading.strategy.runtime import StrategyRuntime
 from trading.strategy.runtime_settings import StrategyRuntimeSettingsRepository
@@ -55,14 +57,16 @@ from trading_app.runtime_load_guard import runtime_load_guard_from_theme_result
 
 @dataclass
 class CoreRuntimeBundle:
-    runtime: StrategyRuntime
+    runtime: Any
     market_data_bridge: GatewayEventMarketDataBridge
     db: TradingDatabase
+    runtime_profile: str = RebootV2RuntimeProfile.LEGACY.value
     theme_runtime: Any = None
     theme_runtime_bridge: Any = None
     order_sink: Any = None
     candidate_ingestion_service: Any = None
     candidate_hydrator: Any = None
+    opening_burst_pipeline: Any = None
     theme_board_pipeline: Any = None
     market_regime_pipeline: Any = None
     entry_engine_pipeline: Any = None
@@ -72,6 +76,30 @@ class CoreRuntimeBundle:
 
 
 def build_core_strategy_runtime(
+    db: TradingDatabase,
+    gateway_state: GatewayStateStore,
+    *,
+    settings: CoreSettings,
+    warning_sink: Callable[[str], None] | None = None,
+) -> CoreRuntimeBundle:
+    profile = reboot_v2_runtime_profile()
+    if profile == RebootV2RuntimeProfile.LEGACY:
+        return build_legacy_runtime_bundle(
+            db,
+            gateway_state,
+            settings=settings,
+            warning_sink=warning_sink,
+        )
+    return build_reboot_v2_runtime_bundle(
+        db,
+        gateway_state,
+        settings=settings,
+        warning_sink=warning_sink,
+        profile=profile,
+    )
+
+
+def build_legacy_runtime_bundle(
     db: TradingDatabase,
     gateway_state: GatewayStateStore,
     *,
@@ -130,46 +158,14 @@ def build_core_strategy_runtime(
     order_sink = _build_order_sink(settings, gateway_state, warning_sink, runtime_settings=runtime_settings)
     theme_lab_shadow_ab_provider = _theme_lab_shadow_ab_provider(db, runtime_settings)
     shadow_small_entry_promotion_provider = _shadow_small_entry_promotion_provider(db, runtime_settings)
-    candidate_ingestion_service = CandidateIngestionService(db)
-    candidate_hydrator = CandidateHydrator(db, gateway_state, market_data=market_data)
-    theme_board_pipeline = ThemeBoardRuntimePipeline(
-        db=db,
-        market_data=market_data,
-        repository=theme_repository,
-        candle_builder=candle_builder,
-        config=ThemeBoardConfig.from_env(),
-    )
-    market_regime_pipeline = MarketRegimeRuntimePipeline(
-        db=db,
-        market_data=market_data,
-        market_index_store=market_index_store,
-        candle_builder=candle_builder,
-        config=MarketRegimeConfig.from_env(),
-    )
-    entry_engine_pipeline = EntryEngineRuntimePipeline(
-        db=db,
-        market_data=market_data,
-        candle_builder=candle_builder,
-        config=EntryEngineConfig.from_env(),
-    )
-    exit_engine_reboot_pipeline = ExitEngineRuntimePipeline(
-        db=db,
-        market_data=market_data,
-        candle_builder=candle_builder,
-        config=ExitEngineConfig.from_env(),
-    )
-    position_risk_pipeline = PositionRiskRuntimePipeline(
-        db=db,
-        market_data=market_data,
-        candle_builder=candle_builder,
-        config=PositionRiskConfig.from_env(),
-    )
-    order_manager_pipeline = OrderManagerRuntimePipeline(
-        db=db,
-        gateway_state=gateway_state,
-        market_data=market_data,
-        config=OrderManagerConfig.from_env(),
-    )
+    candidate_ingestion_service = None
+    candidate_hydrator = None
+    theme_board_pipeline = None
+    market_regime_pipeline = None
+    entry_engine_pipeline = None
+    exit_engine_reboot_pipeline = None
+    position_risk_pipeline = None
+    order_manager_pipeline = None
     theme_lab_pipeline = None
     if config.theme_engine_mode == "themelab_flow":
         theme_backfill_service = ThemeBackfillService(
@@ -189,15 +185,7 @@ def build_core_strategy_runtime(
             engine=ThemeLabFlowEngine(theme_lab_config_from_settings(runtime_settings)),
             backfill_service=theme_backfill_service,
         )
-    opening_burst_pipeline = OpeningThemeBurstRuntimePipeline(
-        db=db,
-        gateway_state=gateway_state,
-        market_data=market_data,
-        repository=theme_repository,
-        config=OpeningBurstRuntimeConfig.from_env(trading_mode=settings.mode),
-        candidate_ingestion_service=candidate_ingestion_service,
-        candidate_hydrator=candidate_hydrator,
-    )
+    opening_burst_pipeline = None
     runtime = StrategyRuntime(
         db=db,
         candidate_collector=candidate_collector,
@@ -250,6 +238,7 @@ def build_core_strategy_runtime(
     return CoreRuntimeBundle(
         runtime=runtime,
         market_data_bridge=market_data_bridge,
+        runtime_profile=RebootV2RuntimeProfile.LEGACY.value,
         theme_runtime=theme_runtime,
         theme_runtime_bridge=theme_runtime_bridge,
         db=db,
@@ -262,6 +251,126 @@ def build_core_strategy_runtime(
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
         position_risk_pipeline=position_risk_pipeline,
         order_manager_pipeline=order_manager_pipeline,
+    )
+
+
+def build_reboot_v2_runtime_bundle(
+    db: TradingDatabase,
+    gateway_state: GatewayStateStore,
+    *,
+    settings: CoreSettings,
+    warning_sink: Callable[[str], None] | None = None,
+    profile: RebootV2RuntimeProfile = RebootV2RuntimeProfile.V2_OBSERVE,
+) -> CoreRuntimeBundle:
+    config_result = StrategyRuntimeConfigRepository(db).load()
+    runtime_settings = StrategyRuntimeSettingsRepository(db).load()
+    condition_seed_result = ensure_default_condition_profiles(db)
+    config = config_result.config
+    config.order_mode = OrderMode.OBSERVE
+    if settings.runtime_evaluation_interval_sec > 0:
+        config.evaluation_interval_sec = settings.runtime_evaluation_interval_sec
+    config.exit_context_risk_enabled = bool(settings.exit_context_risk_enabled)
+
+    market_data = MarketDataStore()
+    candle_builder = CandleBuilder()
+    market_index_store = MarketIndexStore()
+    market_data_bridge = GatewayEventMarketDataBridge(
+        market_data,
+        candle_builder,
+        market_index_store,
+        warning_sink=warning_sink,
+    )
+    theme_repository = ThemeEngineRepository(db)
+    realtime_client = GatewayCommandRealtimeClient(gateway_state, warning_sink=warning_sink)
+    subscription_manager = RealTimeSubscriptionManager(realtime_client, max_codes=config.realtime_subscription_limit)
+    candidate_ingestion_service = CandidateIngestionService(db)
+    candidate_hydrator = CandidateHydrator(db, gateway_state, market_data=market_data)
+    opening_burst_pipeline = OpeningThemeBurstRuntimePipeline(
+        db=db,
+        gateway_state=gateway_state,
+        market_data=market_data,
+        repository=theme_repository,
+        config=OpeningBurstRuntimeConfig.from_env(trading_mode=settings.mode),
+        candidate_ingestion_service=candidate_ingestion_service,
+        candidate_hydrator=candidate_hydrator,
+    )
+    theme_board_pipeline = ThemeBoardRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        repository=theme_repository,
+        candle_builder=candle_builder,
+        config=ThemeBoardConfig.from_env(),
+    )
+    market_regime_pipeline = MarketRegimeRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=market_index_store,
+        candle_builder=candle_builder,
+        config=MarketRegimeConfig.from_env(),
+    )
+    entry_engine_pipeline = EntryEngineRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        candle_builder=candle_builder,
+        config=EntryEngineConfig.from_env(),
+    )
+    exit_engine_reboot_pipeline = ExitEngineRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        candle_builder=candle_builder,
+        config=ExitEngineConfig.from_env(),
+    )
+    position_risk_pipeline = PositionRiskRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        candle_builder=candle_builder,
+        config=PositionRiskConfig.from_env(),
+    )
+    runtime = RebootV2Runtime(
+        db=db,
+        subscription_manager=subscription_manager,
+        candle_builder=candle_builder,
+        market_data=market_data,
+        market_index_store=market_index_store,
+        config=config,
+        profile=profile,
+        candidate_ingestion_service=candidate_ingestion_service,
+        candidate_hydrator=candidate_hydrator,
+        opening_burst_pipeline=opening_burst_pipeline,
+        theme_board_pipeline=theme_board_pipeline,
+        market_regime_pipeline=market_regime_pipeline,
+        entry_engine_pipeline=entry_engine_pipeline,
+        exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
+        position_risk_pipeline=position_risk_pipeline,
+    )
+    readiness_report = build_readiness_report(
+        db,
+        subscription_manager=subscription_manager,
+        theme_engine_mode="reboot_v2",
+        theme_lab_flow_wired=False,
+        condition_adapter=None,
+    )
+    runtime.readiness_report = readiness_report
+    runtime.startup_warnings = dedupe_warnings(
+        list(config_result.warnings)
+        + runtime_settings.validation_warnings
+        + condition_seed_result.warnings
+        + readiness_report.warnings
+    )
+    return CoreRuntimeBundle(
+        runtime=runtime,
+        market_data_bridge=market_data_bridge,
+        runtime_profile=profile.value,
+        db=db,
+        candidate_ingestion_service=candidate_ingestion_service,
+        candidate_hydrator=candidate_hydrator,
+        opening_burst_pipeline=opening_burst_pipeline,
+        theme_board_pipeline=theme_board_pipeline,
+        market_regime_pipeline=market_regime_pipeline,
+        entry_engine_pipeline=entry_engine_pipeline,
+        exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
+        position_risk_pipeline=position_risk_pipeline,
+        order_manager_pipeline=None,
     )
 
 

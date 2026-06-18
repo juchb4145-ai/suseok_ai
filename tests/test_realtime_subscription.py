@@ -57,6 +57,19 @@ def test_subscription_batches_new_codes_by_screen():
     assert set(registered) == {"005930", "000660", "035420"}
 
 
+def test_data_wait_and_hydrating_candidates_are_watchable_for_realtime():
+    client = MockKiwoomClient()
+    manager = RealTimeSubscriptionManager(client, max_codes=10)
+
+    registered = manager.watch_candidates([
+        candidate("000001", CandidateState.HYDRATING),
+        candidate("000002", CandidateState.WAIT_DATA),
+    ])
+
+    assert set(registered) == {"000001", "000002"}
+    assert client.registered_codes == {"000001", "000002"}
+
+
 def test_theme_universe_source_is_non_protected_and_below_candidate_priority():
     client = MockKiwoomClient()
     manager = RealTimeSubscriptionManager(client, max_codes=1)

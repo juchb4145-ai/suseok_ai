@@ -44,7 +44,7 @@ class PreMarketCheckConfig:
     cancel_unfilled_after_sec: int = 45
     live_sim_max_order_quantity_ceiling: int = 1
     live_sim_max_order_amount_ceiling: int = 100_000
-    opening_burst_configured: bool = True
+    opening_burst_configured: bool = False
 
     @classmethod
     def from_env(cls, requested_mode: str | None = None) -> "PreMarketCheckConfig":
@@ -72,7 +72,10 @@ class PreMarketCheckConfig:
             cancel_unfilled_after_sec=_env_int("TRADING_LIVE_SIM_CANCEL_UNFILLED_AFTER_SEC", 45),
             live_sim_max_order_quantity_ceiling=_env_int("TRADING_PRE_MARKET_LIVE_SIM_MAX_QTY_CEILING", 1),
             live_sim_max_order_amount_ceiling=_env_int("TRADING_PRE_MARKET_LIVE_SIM_MAX_AMOUNT_CEILING", 100_000),
-            opening_burst_configured=_env_bool("TRADING_OPENING_BURST_CONFIGURED", True),
+            opening_burst_configured=_env_bool(
+                "TRADING_OPENING_BURST_CONFIGURED",
+                _env_bool("TRADING_OPENING_BURST_ENABLED", False) or _env_bool("TRADING_OPENING_BURST_FALLBACK_CONFIGURED", False),
+            ),
         )
 
 
@@ -188,12 +191,13 @@ def build_pre_market_check_report(
     )
     market_status = str(market_regime.get("global_status") or market_regime.get("status") or "")
 
+    core_ok = bool(core) or base.get("core_health_ok") is True
     add(
         "core_health",
         "core",
         "Core health",
-        PreMarketCheckStatus.PASS if core or base.get("core_health_ok", True) else PreMarketCheckStatus.UNKNOWN,
-        reason_code="" if core or base.get("core_health_ok", True) else "CORE_HEALTH_UNKNOWN",
+        PreMarketCheckStatus.PASS if core_ok else PreMarketCheckStatus.FAIL,
+        reason_code="" if core_ok else "CORE_HEALTH_MISSING",
         message_ko="Core API 응답 확인",
     )
     add(
@@ -213,7 +217,7 @@ def build_pre_market_check_report(
         message_ko="Dashboard V2 snapshot 확인" if dashboard_available else "Dashboard V2 snapshot이 아직 생성되지 않았습니다.",
         manual_review=not dashboard_available and requested_mode != "OBSERVE",
     )
-    sqlite_ok = bool(sqlite.get("writable", system_health.get("sqlite_health") in {"OK", "PASS", "정상"} or not sqlite))
+    sqlite_ok = bool(sqlite) and sqlite.get("writable") is True
     add(
         "sqlite_operational_store",
         "core",
@@ -357,6 +361,7 @@ def build_pre_market_check_report(
         details={"enabled": cfg.order_manager_enabled, "mode": cfg.order_manager_mode, "allow_live_sim_orders": cfg.allow_live_sim_orders},
     )
 
+    _add_reboot_v2_items(add, requested_mode, cfg, runtime, gateway, commands, sqlite_ok, market_regime)
     _add_data_preload_items(add, requested_mode, data_preload, theme_board, market_regime, cfg)
     _add_risk_items(add, requested_mode, cfg, risk, market_status)
 
@@ -425,6 +430,103 @@ def pre_market_report_empty(*, requested_mode: str = "OBSERVE") -> dict[str, Any
     ).to_dict()
 
 
+def _add_reboot_v2_items(
+    add: Any,
+    requested_mode: str,
+    cfg: PreMarketCheckConfig,
+    runtime: dict[str, Any],
+    gateway: dict[str, Any],
+    commands: dict[str, Any],
+    sqlite_ok: bool,
+    market_regime: dict[str, Any],
+) -> None:
+    profile = str(runtime.get("runtime_profile") or os.getenv("STRATEGY_REBOOT_V2_PROFILE", "LEGACY") or "LEGACY").upper()
+    v2_requested = cfg.strategy_reboot_v2_enabled or profile.startswith("V2_")
+    if requested_mode != "OBSERVE" or not v2_requested:
+        return
+    pipeline_status = dict(runtime.get("pipeline_status") or {})
+    add(
+        "reboot_v2_top_level",
+        "reboot_v2",
+        "Reboot V2 top-level router",
+        PreMarketCheckStatus.PASS if cfg.strategy_reboot_v2_enabled and profile.startswith("V2_") else PreMarketCheckStatus.FAIL,
+        reason_code="" if cfg.strategy_reboot_v2_enabled and profile.startswith("V2_") else "REBOOT_V2_ROUTER_DISABLED",
+        message_ko=f"profile={profile}, enabled={cfg.strategy_reboot_v2_enabled}",
+        details={"runtime_profile": profile, "strategy_reboot_v2_enabled": cfg.strategy_reboot_v2_enabled},
+    )
+    for key, label in (
+        ("candidate_ingestion", "CandidateIngestion"),
+        ("candidate_hydrator", "CandidateHydrator"),
+        ("theme_board", "ThemeBoard"),
+        ("market_regime", "MarketRegime"),
+        ("entry_engine", "EntryEngine"),
+    ):
+        _add_v2_component_item(add, key, label, pipeline_status, runtime.get(key))
+    opening_enabled = bool(pipeline_status.get("opening_burst")) or bool(dict(runtime.get("opening_burst") or {}).get("enabled"))
+    fallback_configured = _env_bool("TRADING_OPENING_BURST_FALLBACK_CONFIGURED", False)
+    add(
+        "v2_opening_burst_or_fallback",
+        "reboot_v2",
+        "Opening Burst or fallback",
+        PreMarketCheckStatus.PASS if opening_enabled or fallback_configured else PreMarketCheckStatus.SKIP,
+        reason_code="" if opening_enabled or fallback_configured else "CONFIG_DISABLED",
+        message_ko="Opening Burst 또는 fallback 구성 확인",
+        required=False,
+        details={"opening_burst_enabled": opening_enabled, "fallback_configured": fallback_configured},
+    )
+    index_configured = bool(market_regime.get("index_watch_codes_configured") or runtime.get("index_watch_codes_configured"))
+    add(
+        "v2_index_watch_configured",
+        "reboot_v2",
+        "Index watch configured",
+        PreMarketCheckStatus.PASS if index_configured else PreMarketCheckStatus.FAIL,
+        reason_code="" if index_configured else "INDEX_WATCH_NOT_CONFIGURED",
+        message_ko="KOSPI/KOSDAQ index watch 구성 확인",
+    )
+    add(
+        "v2_sqlite_writable",
+        "reboot_v2",
+        "SQLite writable",
+        PreMarketCheckStatus.PASS if sqlite_ok else PreMarketCheckStatus.FAIL,
+        reason_code="" if sqlite_ok else "SQLITE_NOT_WRITABLE",
+        message_ko="SQLite writable 확인",
+    )
+    gateway_ok = bool(gateway.get("heartbeat_ok")) and bool(gateway.get("kiwoom_logged_in"))
+    add(
+        "v2_gateway_login_heartbeat",
+        "reboot_v2",
+        "Gateway heartbeat/login",
+        PreMarketCheckStatus.PASS if gateway_ok else PreMarketCheckStatus.FAIL,
+        reason_code="" if gateway_ok else "GATEWAY_LOGIN_HEARTBEAT_NOT_READY",
+        message_ko="Gateway heartbeat/login 확인",
+    )
+    acked = int(commands.get("acked_count") or commands.get("register_realtime_acked_count") or 0)
+    add(
+        "v2_subscription_command_ack",
+        "reboot_v2",
+        "Subscription command ACK",
+        PreMarketCheckStatus.PASS if acked > 0 else PreMarketCheckStatus.FAIL,
+        reason_code="" if acked > 0 else "SUBSCRIPTION_ACK_MISSING",
+        message_ko="register_realtime ACK 확인",
+        details={"acked_count": acked},
+    )
+
+
+def _add_v2_component_item(add: Any, key: str, label: str, pipeline_status: dict[str, Any], section: Any) -> None:
+    data = dict(section or {}) if isinstance(section, dict) else {}
+    enabled = bool(pipeline_status.get(key)) or bool(data.get("enabled"))
+    add(
+        f"v2_{key}_enabled",
+        "reboot_v2",
+        label,
+        PreMarketCheckStatus.PASS if enabled else PreMarketCheckStatus.SKIP,
+        reason_code="" if enabled else "CONFIG_DISABLED",
+        message_ko=f"{label} enabled 확인" if enabled else f"{label} disabled",
+        required=False if not enabled else True,
+        details={"enabled": enabled, "status": data.get("status", "")},
+    )
+
+
 def _add_data_preload_items(
     add: Any,
     requested_mode: str,
@@ -433,13 +535,13 @@ def _add_data_preload_items(
     market_regime: dict[str, Any],
     cfg: PreMarketCheckConfig,
 ) -> None:
-    theme_membership_loaded = bool(data_preload.get("theme_membership_loaded", theme_board.get("status") not in {None, "", "EMPTY"}))
-    symbol_master_loaded = bool(data_preload.get("symbol_master_loaded", True))
-    prev_close_loaded = bool(data_preload.get("prev_close_loaded", data_preload.get("avg_turnover_loaded", True)))
+    theme_membership_loaded = bool(data_preload.get("theme_membership_loaded", False))
+    symbol_master_loaded = bool(data_preload.get("symbol_master_loaded", False))
+    prev_close_loaded = bool(data_preload.get("prev_close_loaded", data_preload.get("avg_turnover_loaded", False)))
     warehouse_status = str(data_preload.get("warehouse_preload_status") or data_preload.get("preload_status") or "").upper()
     local_cache_available = bool(data_preload.get("local_cache_available"))
     latest_theme_board = bool(theme_board.get("calculated_at") or theme_board.get("items") or theme_board.get("top_themes"))
-    market_index_configured = bool(market_regime.get("index_watch_codes_configured", market_regime.get("status") not in {None, "", "EMPTY"}))
+    market_index_configured = bool(market_regime.get("index_watch_codes_configured", False))
 
     if warehouse_status in {"FAIL", "FAILED", "ERROR"} and local_cache_available:
         add(
@@ -502,15 +604,15 @@ def _add_data_preload_items(
         "opening_burst_schedule",
         "data",
         "Opening Burst schedule",
-        PreMarketCheckStatus.PASS if cfg.opening_burst_configured else PreMarketCheckStatus.WARN,
-        reason_code="" if cfg.opening_burst_configured else "OPENING_BURST_SCHEDULE_MISSING",
+        PreMarketCheckStatus.PASS if cfg.opening_burst_configured else PreMarketCheckStatus.SKIP,
+        reason_code="" if cfg.opening_burst_configured else "CONFIG_DISABLED",
         message_ko="Opening Burst schedule 확인" if cfg.opening_burst_configured else "Opening Burst schedule 확인 필요",
         manual_review=not cfg.opening_burst_configured and requested_mode != "OBSERVE",
     )
 
 
 def _add_risk_items(add: Any, requested_mode: str, cfg: PreMarketCheckConfig, risk: dict[str, Any], market_status: str) -> None:
-    daily_loss_loaded = bool(risk.get("daily_loss_state_loaded", True))
+    daily_loss_loaded = bool(risk.get("daily_loss_state_loaded", False))
     limits_ok = (
         cfg.max_order_quantity > 0
         and cfg.max_order_amount > 0

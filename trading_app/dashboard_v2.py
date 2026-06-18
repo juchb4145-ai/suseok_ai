@@ -108,7 +108,12 @@ def _v2_status(
     broker_env = str(order_manager.get("broker_env") or _broker_env_from_gateway(gateway))
     kill = str(order_manager.get("kill_switch_state") or "NORMAL")
     market_status = str(market.get("global_status") or "")
-    data_freshness = _data_freshness_status(gateway, market, runtime)
+    runtime_profile = str(runtime.get("runtime_profile") or base.get("runtime_profile") or os.getenv("STRATEGY_REBOOT_V2_PROFILE", "LEGACY") or "LEGACY").upper()
+    reboot_v2_enabled = bool(runtime.get("reboot_v2_enabled")) or (
+        runtime_profile != "LEGACY" and _env_bool("STRATEGY_REBOOT_V2_ENABLED", False)
+    )
+    pipeline_status = dict(runtime.get("pipeline_status") or {})
+    data_freshness = _data_freshness_status(gateway, market, runtime, reboot_v2_enabled=reboot_v2_enabled)
     live_sim_allowed = bool(order_manager.get("live_sim_orders_allowed"))
     observe_only = bool("ORDER_MANAGER_OBSERVE_ONLY" in set(order_manager.get("warnings") or [])) or not live_sim_allowed
     label = "정상"
@@ -123,7 +128,8 @@ def _v2_status(
     if data_freshness == "WAIT_DATA":
         label = "데이터대기"
     return {
-        "reboot_v2_enabled": True,
+        "reboot_v2_enabled": reboot_v2_enabled,
+        "runtime_profile": runtime_profile,
         "dashboard_v2_enabled": dashboard_v2_enabled(),
         "trading_mode": core.get("mode") or runtime.get("mode") or "OBSERVE",
         "order_manager_mode": order_manager.get("mode", "OBSERVE"),
@@ -139,6 +145,18 @@ def _v2_status(
         "last_runtime_cycle_at": runtime.get("last_cycle_at") or runtime.get("cycle_at") or "",
         "last_gateway_heartbeat_at": gateway.get("last_heartbeat_at") or "",
         "data_freshness_status": data_freshness,
+        "pipeline_status": pipeline_status,
+        "stages": {
+            "candidate_ingestion": _stage_status("candidate_ingestion", runtime.get("candidate_ingestion"), pipeline_status),
+            "candidate_hydrator": _stage_status("candidate_hydrator", runtime.get("candidate_hydration"), pipeline_status),
+            "opening_burst": _stage_status("opening_burst", runtime.get("opening_burst"), pipeline_status),
+            "theme_board": _stage_status("theme_board", runtime.get("theme_board"), pipeline_status),
+            "market_regime": _stage_status("market_regime", runtime.get("market_regime"), pipeline_status),
+            "entry_engine": _stage_status("entry_engine", runtime.get("entry_engine"), pipeline_status),
+            "exit_engine": _stage_status("exit_engine", runtime.get("exit_engine_reboot") or runtime.get("exit_engine"), pipeline_status),
+            "position_risk": _stage_status("position_risk", runtime.get("position_risk"), pipeline_status),
+            "order_manager": _stage_status("order_manager", runtime.get("order_manager"), pipeline_status),
+        },
         "kill_switch_state": kill,
         "status_label": label,
         "operator_message_ko": _status_message(label, market_status, broker_env, kill, live_sim_allowed),
@@ -468,7 +486,12 @@ def _system_health(base: dict[str, Any], runtime: dict[str, Any], gateway: dict[
         "sqlite_health": "OK",
         "runtime_cycle_duration": runtime.get("last_cycle_duration_ms"),
         "last_exception": runtime.get("last_error", ""),
-        "data_freshness": _data_freshness_status(gateway, market, runtime),
+        "data_freshness": _data_freshness_status(
+            gateway,
+            market,
+            runtime,
+            reboot_v2_enabled=bool(runtime.get("reboot_v2_enabled")) or str(runtime.get("runtime_profile") or "").upper() != "LEGACY",
+        ),
         "latest_tick_age_percentile": transport.get("price_tick_age_p95_sec"),
         "latest_theme_board_at": themes.get("calculated_at", ""),
         "latest_market_regime_at": market.get("calculated_at", ""),
@@ -683,14 +706,42 @@ def _status_message(label: str, market_status: str, broker_env: str, kill: str, 
     return f"Dashboard V2 상태: {label}"
 
 
-def _data_freshness_status(gateway: dict[str, Any], market: dict[str, Any], runtime: dict[str, Any]) -> str:
+def _data_freshness_status(
+    gateway: dict[str, Any],
+    market: dict[str, Any],
+    runtime: dict[str, Any],
+    *,
+    reboot_v2_enabled: bool = False,
+) -> str:
+    if not reboot_v2_enabled:
+        return "DISABLED"
     if not bool(gateway.get("heartbeat_ok")):
         return "STALE"
-    if runtime.get("data_warmup_status") not in {"", None, "ready"}:
+    if any(str(dict(runtime.get(name) or {}).get("status") or "").upper() == "ERROR" for name in ("theme_board", "market_regime", "entry_engine")):
+        return "ERROR"
+    if not reboot_v2_enabled and runtime.get("data_warmup_status") not in {"", None, "ready"}:
         return "WAIT_DATA"
     if bool(market.get("enabled")) and market.get("global_status") == "DATA_WAIT":
         return "WAIT_DATA"
     return "FRESH"
+
+
+def _stage_status(name: str, section: Any, pipeline_status: dict[str, Any]) -> dict[str, Any]:
+    data = dict(section or {}) if isinstance(section, dict) else {}
+    enabled = bool(data.get("enabled")) if "enabled" in data else bool(pipeline_status.get(name))
+    status = str(data.get("status") or ("WARMUP" if enabled else "DISABLED")).upper()
+    if not enabled and status in {"", "WARMUP", "DATA_WAIT"}:
+        status = "DISABLED"
+    return {
+        "enabled": enabled,
+        "status": status,
+        "last_run_at": data.get("calculated_at") or data.get("last_run_at") or "",
+        "last_input_at": data.get("last_input_at") or data.get("last_seed_batch_at") or "",
+        "input_count": int(data.get("input_count") or data.get("candidate_count") or data.get("seed_symbol_count") or data.get("open_position_count") or 0),
+        "output_count": int(data.get("output_count") or data.get("selected_count") or data.get("observe_ready_count") or data.get("active_theme_count") or 0),
+        "blocking_reason": data.get("blocking_reason") or data.get("paused_reason") or data.get("reason") or "",
+        "next_required_action": data.get("next_required_action") or ("ENABLE_CONFIG" if not enabled else ""),
+    }
 
 
 def _broker_env_from_gateway(gateway: dict[str, Any]) -> str:

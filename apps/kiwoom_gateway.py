@@ -52,6 +52,7 @@ from trading.broker.transport_metrics import (
     utc_now_ms,
 )
 from kiwoom.tr import KiwoomTrRunner
+from trading.strategy.candidate_hydrator import CANDIDATE_HYDRATION_PURPOSE, parse_candidate_hydration_rows
 from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE, parse_theme_backfill
 
 CONTROL_EVENT_TYPES = {
@@ -536,7 +537,8 @@ def run_real_gateway(args: argparse.Namespace) -> int:
     command_timer.start(200)
 
     _gateway_boot_log("entering Qt event loop")
-    QTimer.singleShot(0, lambda: _request_kiwoom_login(client))
+    QTimer.singleShot(100, lambda: runtime.emit("heartbeat", _kiwoom_heartbeat_payload(client, runtime)))
+    QTimer.singleShot(1500, lambda: _request_kiwoom_login(client))
     try:
         return int(app.exec_())
     finally:
@@ -1008,6 +1010,15 @@ def _execute_command(client, command: GatewayCommand, *, tr_runner=None) -> dict
                         message=f"PARSE_ERROR:{exc}",
                         raw={"tr_rows": rows, "warnings": result.warnings, "errors": [f"PARSE_ERROR:{exc}"]},
                     )
+            elif str(payload.get("purpose") or "") == CANDIDATE_HYDRATION_PURPOSE:
+                try:
+                    parsed = parse_candidate_hydration_rows(rows, code=str(payload.get("code") or ""))
+                except Exception as exc:
+                    return _result_payload(
+                        result_code=-1,
+                        message=f"PARSE_ERROR:{exc}",
+                        raw={"tr_rows": rows, "warnings": result.warnings, "errors": [f"PARSE_ERROR:{exc}"]},
+                    )
             latency_ms = round((time.perf_counter() - capture_started) * 1000.0, 3)
             ack = _result_payload(
                 result_code=0,
@@ -1017,6 +1028,7 @@ def _execute_command(client, command: GatewayCommand, *, tr_runner=None) -> dict
                     "warnings": result.warnings,
                     "errors": result.errors,
                     "parsed_backfill": parsed,
+                    "parsed_hydration": parsed if str(payload.get("purpose") or "") == CANDIDATE_HYDRATION_PURPOSE else {},
                     "source_tr_code": tr_code,
                     "code": str(payload.get("code") or parsed.get("code") or ""),
                     "purpose": str(payload.get("purpose") or ""),
@@ -1029,6 +1041,7 @@ def _execute_command(client, command: GatewayCommand, *, tr_runner=None) -> dict
             ack.update(
                 {
                     "parsed_backfill": parsed,
+                    "parsed_hydration": parsed if str(payload.get("purpose") or "") == CANDIDATE_HYDRATION_PURPOSE else {},
                     "source_tr_code": tr_code,
                     "code": str(payload.get("code") or parsed.get("code") or ""),
                     "purpose": str(payload.get("purpose") or ""),

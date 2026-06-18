@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from kiwoom.client import MockKiwoomClient
 from main import build_observe_runtime
@@ -14,6 +15,7 @@ from trading.strategy.models import Candidate, CandidateState, OrderMode
 from trading.strategy.pipeline import GatePipelineResult
 from trading.strategy.readiness import ReadinessReport
 from trading.strategy.runtime import (
+    THEME_BOARD_WATCH_SOURCE,
     THEME_LAB_BOOTSTRAP_SOURCE,
     THEME_LAB_WATCHSET_SOURCE,
     StrategyRuntimeConfig,
@@ -35,6 +37,7 @@ from trading.theme_engine.lab import (
 from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeStatus
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline, theme_lab_config_from_settings
+from trading.theme_engine.theme_board import ThemeBoardSnapshot, ThemeBoardStockSnapshot, ThemeBoardThemeSnapshot
 
 
 def test_themelab_flow_is_default_and_runtime_contains_pipeline(tmp_path):
@@ -547,6 +550,40 @@ def test_theme_lab_empty_watchset_bootstraps_candidate_realtime_subscriptions(tm
     db.close()
 
 
+def test_theme_lab_bootstrap_includes_hydrating_and_wait_data_candidates(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    client = MockKiwoomClient()
+    runtime = build_observe_runtime(client, db)
+    _seed_theme(db)
+    now = datetime(2026, 6, 1, 9, 1, 0)
+    for code, state in (("000001", CandidateState.HYDRATING), ("000002", CandidateState.WAIT_DATA)):
+        db.save_candidate(
+            Candidate(
+                trade_date="2026-06-01",
+                code=code,
+                state=state,
+                detected_at=now.isoformat(),
+                last_seen_at=now.isoformat(),
+                expires_at=(now + timedelta(minutes=30)).isoformat(),
+                condition_names=["alive"],
+                metadata={
+                    "condition_purposes": {"alive": "theme_lab_alive"},
+                    "sub_status": "DATA_INSUFFICIENT" if state == CandidateState.WAIT_DATA else "",
+                    "insufficient_reason": ["DATA_INSUFFICIENT"] if state == CandidateState.WAIT_DATA else [],
+                },
+            )
+        )
+
+    snapshot = runtime.start(now)
+
+    assert {"000001", "000002"} <= set(client.registered_codes)
+    assert snapshot.candidate_subscription_selected_count >= 2
+    assert "THEME_LAB_BOOTSTRAP_SUBSCRIPTIONS=2" in snapshot.warnings
+    for code in ("000001", "000002"):
+        assert THEME_LAB_BOOTSTRAP_SOURCE in runtime.subscription_manager.records[code].sources
+    db.close()
+
+
 def test_theme_lab_nonempty_watchset_still_bootstraps_exploration_candidates(tmp_path):
     db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
     client = MockKiwoomClient()
@@ -663,6 +700,44 @@ def test_theme_lab_bootstrap_reserves_capacity_for_nonprotected_watchset(tmp_pat
     assert THEME_LAB_BOOTSTRAP_SOURCE in runtime.subscription_manager.records["000005"].sources
     assert "000002" not in runtime.subscription_manager.records
     assert "000003" not in runtime.subscription_manager.records
+    db.close()
+
+
+def test_theme_board_top_theme_stocks_are_realtime_watch_subscriptions(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    client = MockKiwoomClient()
+    runtime = build_observe_runtime(client, db)
+    now = datetime(2026, 6, 1, 9, 1, 0)
+    runtime.theme_board_pipeline = SimpleNamespace(
+        last_result=SimpleNamespace(
+            snapshot=ThemeBoardSnapshot(
+                trade_date="2026-06-01",
+                calculated_at=now.isoformat(),
+                top_themes=(
+                    ThemeBoardThemeSnapshot(
+                        theme_id="ai",
+                        theme_name="AI",
+                        theme_rank=1,
+                        stocks=(
+                            ThemeBoardStockSnapshot(code="000011", theme_id="ai", stock_score=80.0),
+                            ThemeBoardStockSnapshot(code="000012", theme_id="ai", stock_score=70.0),
+                        ),
+                    ),
+                ),
+            )
+        ),
+        last_summary={},
+    )
+
+    snapshot = StrategyRuntimeSnapshot(cycle_at=now.isoformat())
+    selected_count = runtime._sync_theme_board_watch_subscriptions(snapshot)
+    runtime.subscription_manager.sync()
+
+    assert selected_count == 2
+    assert {"000011", "000012"} <= set(client.registered_codes)
+    assert THEME_BOARD_WATCH_SOURCE in runtime.subscription_manager.records["000011"].sources
+    assert THEME_BOARD_WATCH_SOURCE in runtime.subscription_manager.records["000012"].sources
+    assert "THEME_BOARD_WATCH_SUBSCRIPTIONS=2" in snapshot.warnings
     db.close()
 
 

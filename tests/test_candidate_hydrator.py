@@ -21,6 +21,8 @@ def test_detected_candidate_moves_to_hydrating_and_enqueues_tr_request(tmp_path)
     command = gateway.list_commands(limit=1)[0]["command"]
     assert command["type"] == "tr_request"
     assert command["payload"]["purpose"] == "candidate_hydration"
+    assert command["payload"]["inputs"] == {"종목코드": "005930"}
+    assert command["payload"]["fields"] == ["종목명", "현재가", "등락율", "거래량", "거래대금", "시가", "고가", "저가", "기준가"]
     assert command["idempotency_key"] == hydration_idempotency_key(
         trade_date="2026-06-17",
         code="005930",
@@ -83,12 +85,15 @@ def test_candidate_hydration_ack_merges_candidate_and_market_data(tmp_path):
                 "raw": {
                     "tr_rows": [
                         {
-                            "code": "005930",
-                            "stock_name": "Samsung",
-                            "current_price": "70000",
-                            "change_rate": "1.2",
-                            "volume": "1000",
-                            "trade_value": "70000000",
+                            "종목명": "Samsung",
+                            "현재가": "70000",
+                            "등락율": "1.2",
+                            "거래량": "1000",
+                            "거래대금": "70000000",
+                            "시가": "69000",
+                            "고가": "70500",
+                            "저가": "68800",
+                            "기준가": "69100",
                         }
                     ]
                 },
@@ -122,7 +127,7 @@ def test_candidate_hydration_ack_with_missing_data_goes_wait_data(tmp_path):
                 "command_id": enqueue.command_id,
                 "trade_date": "2026-06-17",
                 "code": "005930",
-                "raw": {"tr_rows": [{"code": "005930", "stock_name": "Samsung"}]},
+                "raw": {"tr_rows": [{"종목명": "Samsung"}]},
             },
         )
     )
@@ -130,7 +135,40 @@ def test_candidate_hydration_ack_with_missing_data_goes_wait_data(tmp_path):
     reloaded = db.load_candidate("2026-06-17", "005930")
     assert reloaded.state == CandidateState.WAIT_DATA
     assert "WAIT_DATA" in reloaded.metadata["reason_codes"]
-    assert "WAIT_DATA_PRICE_MISSING" in reloaded.metadata["reason_codes"]
+    assert "PARSE_ERROR" in reloaded.metadata["reason_codes"]
+    assert reloaded.metadata["candidate_hydration"]["status"] == "RETRY_WAIT"
+
+
+def test_candidate_hydration_failure_retries_with_new_generation(tmp_path):
+    db = TradingDatabase(str(tmp_path / "test.db"))
+    gateway = GatewayStateStore()
+    candidate = _candidate(db, theme_id="semis")
+    now = "2026-06-17T09:01:00"
+    hydrator = CandidateHydrator(
+        db,
+        gateway,
+        config=CandidateHydrationConfig(max_attempts=2, retry_base_sec=1),
+    )
+    first = hydrator.enqueue_candidate(candidate)
+
+    assert hydrator.handle_event(
+        GatewayEvent(
+            type="command_failed",
+            command_id=first.command_id,
+            payload={"command_id": first.command_id, "error": "TIMEOUT"},
+        )
+    )
+    reloaded = db.load_candidate("2026-06-17", "005930")
+    assert reloaded.state == CandidateState.WAIT_DATA
+    assert reloaded.metadata["candidate_hydration"]["status"] == "RETRY_WAIT"
+
+    reloaded.metadata["candidate_hydration"]["retry_after_at"] = now
+    db.save_candidate(reloaded)
+    second = hydrator.enqueue_candidate(db.load_candidate("2026-06-17", "005930"))
+
+    assert second.enqueued is True
+    assert second.idempotency_key.endswith(":basic:retry1")
+    assert second.command_id != first.command_id
 
 
 def _candidate(db: TradingDatabase, *, theme_id: str = ""):
