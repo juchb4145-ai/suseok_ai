@@ -42,6 +42,7 @@ class CandidateReasonCode(str, Enum):
     HYDRATION_REQUESTED = "HYDRATION_REQUESTED"
     HYDRATION_RESULT = "HYDRATION_RESULT"
     REALTIME_TICK_FRESH = "REALTIME_TICK_FRESH"
+    OBSERVE_READY_ORDER_DISABLED = "OBSERVE_READY_ORDER_DISABLED"
 
 
 NEXT_REQUIRED_ACTION = {
@@ -55,6 +56,7 @@ NEXT_REQUIRED_ACTION = {
     CandidateReasonCode.PRICE_TIMING_NOT_READY.value: "WAIT_PRICE_OR_VWAP_RECOVERY",
     CandidateReasonCode.ORDER_RISK_BLOCKED.value: "CHECK_ORDER_RISK",
     CandidateReasonCode.GATEWAY_UNHEALTHY.value: "CHECK_GATEWAY_HEALTH",
+    CandidateReasonCode.OBSERVE_READY_ORDER_DISABLED.value: "WAIT_ORDER_MANAGER_PR",
 }
 
 
@@ -199,7 +201,7 @@ class CandidateFsmService:
         source_event_type: str = "",
         source_component: str = "CandidateFsmService",
     ) -> CandidateStateTransition:
-        current = legacy_to_v2_state(candidate.state) if candidate.state == CandidateState.WAIT_DATA else self.v2_state(candidate)
+        current = legacy_to_v2_state(candidate.state) if candidate.state in {CandidateState.WAIT_DATA, CandidateState.WATCHING} else self.v2_state(candidate)
         stage = _enum_value(blocking_stage)
         reason = _enum_value(reason_code)
         target = current
@@ -333,6 +335,12 @@ class CandidateFsmService:
                 "last_transition_at": occurred_at,
             }
         )
+        if "is_fresh" in details:
+            fsm["latest_tick_fresh"] = "true" if bool(details.get("is_fresh")) else "false"
+        if details.get("freshness_status"):
+            fsm["freshness_status"] = str(details.get("freshness_status") or "")
+        if details.get("price_source"):
+            fsm["price_source"] = str(details.get("price_source") or "")
         metadata["candidate_fsm"] = fsm
         candidate.metadata = metadata
         transition = CandidateStateTransition(

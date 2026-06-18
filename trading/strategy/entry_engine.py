@@ -221,8 +221,47 @@ class EntryEngine:
             for candidate in list(self.db.list_candidates(trade_date=trade_date) or [])
             if candidate.state in ENTRY_ENGINE_CANDIDATE_STATES
         ]
-        decisions = tuple(self._decision(candidate, trade_date, current) for candidate in candidates)
-        updated_count = self._merge_candidate_metadata(decisions, trade_date, current)
+        return self.evaluate_candidates(candidates, trade_date=trade_date, now=current, save=save)
+
+    def evaluate_codes(
+        self,
+        codes: Iterable[str],
+        *,
+        trade_date: str | None = None,
+        now: datetime | None = None,
+        save: bool = True,
+    ) -> EntryDecisionResult:
+        current = (now or self.clock()).replace(microsecond=0)
+        trade_date = trade_date or current.date().isoformat()
+        candidates: list[Candidate] = []
+        seen: set[str] = set()
+        for raw_code in codes:
+            code = _normalize_code(raw_code)
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            candidate = self.db.load_candidate(trade_date, code)
+            if candidate is not None and candidate.state in ENTRY_ENGINE_CANDIDATE_STATES:
+                candidates.append(candidate)
+        return self.evaluate_candidates(candidates, trade_date=trade_date, now=current, save=save)
+
+    def evaluate_candidates(
+        self,
+        candidates: Iterable[Candidate],
+        *,
+        trade_date: str | None = None,
+        now: datetime | None = None,
+        save: bool = True,
+    ) -> EntryDecisionResult:
+        current = (now or self.clock()).replace(microsecond=0)
+        trade_date = trade_date or current.date().isoformat()
+        candidate_list = [
+            candidate
+            for candidate in list(candidates or [])
+            if candidate is not None and candidate.state in ENTRY_ENGINE_CANDIDATE_STATES
+        ]
+        decisions = tuple(self._decision(candidate, trade_date, current) for candidate in candidate_list)
+        updated_count = self._merge_candidate_metadata(decisions, trade_date, current) if save else 0
         saved = False
         if save:
             saver = getattr(self.db, "save_entry_decisions", None)
@@ -841,6 +880,14 @@ def _dedupe(values: Iterable[Any]) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def _normalize_code(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if text.startswith("A") and len(text) == 7:
+        text = text[1:]
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits.zfill(6) if digits else text
 
 
 def _jsonable(value: Any) -> Any:

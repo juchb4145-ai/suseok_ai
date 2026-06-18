@@ -35,6 +35,7 @@ class RebootV2Runtime:
     theme_board_pipeline: Any = None
     market_regime_pipeline: Any = None
     entry_engine_pipeline: Any = None
+    dirty_strategy_evaluator: Any = None
     exit_engine_reboot_pipeline: Any = None
     position_risk_pipeline: Any = None
     clock: Any = datetime.now
@@ -84,7 +85,17 @@ class RebootV2Runtime:
         self._reconcile_candidate_subscriptions(snapshot, current)
         self._run_pipeline(snapshot, "theme_board", self.theme_board_pipeline, current)
         self._run_pipeline(snapshot, "market_regime", self.market_regime_pipeline, current)
-        self._run_pipeline(snapshot, "entry_engine", self.entry_engine_pipeline, current)
+        self._run_pipeline(snapshot, "dirty_evaluator", self.dirty_strategy_evaluator, current)
+        if _component_enabled(self.dirty_strategy_evaluator):
+            snapshot["entry_engine"] = {
+                "enabled": False,
+                "status": "SHADOWED_BY_DIRTY_EVALUATOR",
+                "fallback_full_scan_available": _component_enabled(self.entry_engine_pipeline),
+                "live_order_allowed": False,
+                "dry_run_order_allowed": False,
+            }
+        else:
+            self._run_pipeline(snapshot, "entry_engine", self.entry_engine_pipeline, current)
         if self._has_open_positions():
             self._run_pipeline(snapshot, "exit_engine_reboot", self.exit_engine_reboot_pipeline, current)
             self._run_pipeline(snapshot, "position_risk", self.position_risk_pipeline, current)
@@ -127,6 +138,7 @@ class RebootV2Runtime:
                 "theme_board": _component_enabled(self.theme_board_pipeline),
                 "market_regime": _component_enabled(self.market_regime_pipeline),
                 "entry_engine": _component_enabled(self.entry_engine_pipeline),
+                "dirty_strategy_evaluator": _component_enabled(self.dirty_strategy_evaluator),
                 "exit_engine": _component_enabled(self.exit_engine_reboot_pipeline),
                 "position_risk": _component_enabled(self.position_risk_pipeline),
                 "order_manager": False,
@@ -266,7 +278,7 @@ class RebootV2Runtime:
             return "NOT_STARTED"
         statuses = [
             str(dict(snapshot.get(name) or {}).get("status") or "").upper()
-            for name in ("opening_burst", "theme_board", "market_regime", "entry_engine")
+            for name in ("opening_burst", "theme_board", "market_regime", "dirty_evaluator", "entry_engine")
         ]
         if any(status == "ERROR" for status in statuses):
             return "ERROR"

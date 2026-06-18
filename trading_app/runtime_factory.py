@@ -14,6 +14,11 @@ from trading.strategy.candidate_ingestion import CandidateIngestionService
 from trading.strategy.conditions import ConditionProfileRepository, ensure_default_condition_profiles, ensure_theme_lab_condition_profiles
 from trading.strategy.config import StrategyRuntimeConfigRepository
 from trading.strategy.entry import EntryPlanBuilder
+from trading.strategy.dirty_strategy_evaluator import (
+    DirtyStrategyEvaluator,
+    DirtyStrategyEvaluatorConfig,
+    DirtyStrategyEvaluatorRuntimePipeline,
+)
 from trading.strategy.entry_engine import EntryEngineConfig, EntryEngineRuntimePipeline
 from trading.strategy.exit import ExitDecisionEngine, VirtualPositionService
 from trading.strategy.exit_engine_reboot import ExitEngineConfig, ExitEngineRuntimePipeline
@@ -71,6 +76,7 @@ class CoreRuntimeBundle:
     theme_board_pipeline: Any = None
     market_regime_pipeline: Any = None
     entry_engine_pipeline: Any = None
+    dirty_strategy_evaluator: Any = None
     exit_engine_reboot_pipeline: Any = None
     position_risk_pipeline: Any = None
     order_manager_pipeline: Any = None
@@ -169,6 +175,7 @@ def build_legacy_runtime_bundle(
     theme_board_pipeline = None
     market_regime_pipeline = None
     entry_engine_pipeline = None
+    dirty_strategy_evaluator = None
     exit_engine_reboot_pipeline = None
     position_risk_pipeline = None
     order_manager_pipeline = None
@@ -223,6 +230,7 @@ def build_legacy_runtime_bundle(
     runtime.theme_board_pipeline = theme_board_pipeline
     runtime.market_regime_pipeline = market_regime_pipeline
     runtime.entry_engine_pipeline = entry_engine_pipeline
+    runtime.dirty_strategy_evaluator = dirty_strategy_evaluator
     runtime.exit_engine_reboot_pipeline = exit_engine_reboot_pipeline
     runtime.position_risk_pipeline = position_risk_pipeline
     runtime.order_manager_pipeline = order_manager_pipeline
@@ -254,6 +262,7 @@ def build_legacy_runtime_bundle(
         theme_board_pipeline=theme_board_pipeline,
         market_regime_pipeline=market_regime_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
+        dirty_strategy_evaluator=dirty_strategy_evaluator,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
         position_risk_pipeline=position_risk_pipeline,
         order_manager_pipeline=order_manager_pipeline,
@@ -300,16 +309,22 @@ def build_reboot_v2_runtime_bundle(
         candidate_ingestion_service=candidate_ingestion_service,
         candidate_hydrator=candidate_hydrator,
     )
+    dirty_evaluator_config = replace(
+        DirtyStrategyEvaluatorConfig.from_env(),
+        order_intent_enabled=False,
+    )
     theme_core_v3_config = replace(
         ThemeCoreV3RuntimeConfig.from_env(),
         enabled=_v2_component_enabled(
             "TRADING_THEME_CORE_V3_ENABLED",
             default=_v2_component_enabled("TRADING_THEME_BOARD_ENABLED", default=True),
         ),
+        interval_sec=dirty_evaluator_config.theme_cadence_sec,
     )
     market_regime_config = replace(
         MarketRegimeConfig.from_env(),
         enabled=_v2_component_enabled("TRADING_MARKET_REGIME_ENABLED", default=True),
+        interval_sec=dirty_evaluator_config.market_cadence_sec,
     )
     entry_engine_config = replace(
         EntryEngineConfig.from_env(),
@@ -343,6 +358,14 @@ def build_reboot_v2_runtime_bundle(
         candle_builder=candle_builder,
         config=entry_engine_config,
     )
+    dirty_strategy_evaluator = DirtyStrategyEvaluatorRuntimePipeline(
+        DirtyStrategyEvaluator(
+            db=db,
+            market_data_service=market_data_bridge.service,
+            entry_engine=entry_engine_pipeline.engine,
+            config=dirty_evaluator_config,
+        )
+    )
     exit_engine_reboot_pipeline = ExitEngineRuntimePipeline(
         db=db,
         market_data=market_data,
@@ -369,6 +392,7 @@ def build_reboot_v2_runtime_bundle(
         theme_board_pipeline=theme_board_pipeline,
         market_regime_pipeline=market_regime_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
+        dirty_strategy_evaluator=dirty_strategy_evaluator,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
         position_risk_pipeline=position_risk_pipeline,
     )
@@ -397,6 +421,7 @@ def build_reboot_v2_runtime_bundle(
         theme_board_pipeline=theme_board_pipeline,
         market_regime_pipeline=market_regime_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
+        dirty_strategy_evaluator=dirty_strategy_evaluator,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
         position_risk_pipeline=position_risk_pipeline,
         order_manager_pipeline=None,

@@ -563,3 +563,101 @@ RebootV2Runtime snapshot에는 최소 요약만 추가한다.
 - `candidate_fsm.last_transition_at`
 
 현재 dirty-code StrategyEvaluator 연결은 아직 없다. 주문 경로와 EntryEngine 판단 결과도 변경하지 않는다. 다음 PR에서는 `Dirty-code StrategyEvaluator`를 붙이되, 이번 PR에서 만든 `v2_state/blocking_stage/reason_code`를 입력 조건으로 사용한다.
+
+## PR 5 구현 상태: Dirty-code StrategyEvaluator
+
+PR 5에서는 `MarketDataService`의 `DirtyCodeQueue`를 소비하는 `DirtyStrategyEvaluator`를 추가했다. 기존 EntryEngine 판단식은 바꾸지 않고, full scan `build()` API도 유지한다. 신규 경로는 dirty code로 좁혀진 후보만 `EntryEngine.evaluate_candidates()` / `EntryEngine.evaluate_codes()`로 평가하는 shadow 구조다.
+
+기본 설정:
+
+| env | default |
+|---|---:|
+| `TRADING_DIRTY_EVALUATOR_ENABLED` | `true` |
+| `TRADING_DIRTY_EVALUATOR_SHADOW_MODE` | `true` |
+| `TRADING_DIRTY_EVALUATOR_MAX_CODES_PER_CYCLE` | `50` |
+| `TRADING_DIRTY_EVALUATOR_MAX_CANDIDATES_PER_CYCLE` | `100` |
+| `TRADING_DIRTY_EVALUATOR_DEBOUNCE_MS` | `200` |
+| `TRADING_DIRTY_EVALUATOR_FALLBACK_FULL_SCAN` | `true` |
+| `TRADING_DIRTY_EVALUATOR_THEME_CADENCE_SEC` | `1` |
+| `TRADING_DIRTY_EVALUATOR_MARKET_CADENCE_SEC` | `1` |
+| `TRADING_DIRTY_EVALUATOR_SAVE_DECISIONS` | `true` |
+| `TRADING_DIRTY_EVALUATOR_ORDER_INTENT_ENABLED` | `false` |
+
+구조:
+
+- `trading/strategy/dirty_strategy_evaluator.py`
+- `DirtyStrategyEvaluatorConfig`
+- `DirtyStrategyEvaluator`
+- `DirtyStrategyEvaluatorRuntimePipeline`
+- `DirtyStrategyEvaluatorResult`
+
+Dirty code 소비 규칙:
+
+- `PRICE_TICK`: 해당 code의 active candidate만 평가한다.
+- `CANDLE_BOUNDARY`: 해당 code의 candle/VWAP/price timing 재평가로 합쳐진다.
+- `DATA_QUALITY_CHANGED`: 해당 code의 `DATA_READY` 결과 재평가로 합쳐진다.
+- `SPREAD_CHANGED`: 해당 code의 price/risk 관련 reason으로 합쳐진다.
+- `MARKET_REGIME_CHANGED`: active candidate 전체를 대상으로 market 단계만 좁혀 재평가할 수 있도록 전체 후보 pool을 연다.
+- `THEME_ROLE_CHANGED`, `ORDER_EVENT`, `POSITION_EVENT`: reason enum과 summary는 보존하되 실제 OrderManager 연계는 다음 PR로 미룬다.
+
+Candidate debounce:
+
+- candidate id 또는 code 기준으로 `last_evaluated_at`을 메모리에 기록한다.
+- `TRADING_DIRTY_EVALUATOR_DEBOUNCE_MS` 이내 재평가는 skip/coalesce한다.
+- skip 수는 `dirty_evaluator.debounced_count`에 노출한다.
+
+EntryEngine partial evaluation:
+
+- 기존 `EntryEngine.build()` full scan API는 유지한다.
+- 신규 API:
+  - `EntryEngine.evaluate_candidates(candidates, trade_date, now, save)`
+  - `EntryEngine.evaluate_codes(codes, trade_date, now, save)`
+- `save=False`는 shadow comparison용이며 candidate metadata를 갱신하지 않는다.
+- 판단 순서와 reason 생성은 기존 EntryEngine 내부 로직을 그대로 사용한다.
+
+Candidate FSM 연동:
+
+- `DATA_READY` 실패: `blocking_stage=DATA`
+- `THEME_READY` 실패: `blocking_stage=THEME`
+- `MARKET_ALLOWED` 실패: `blocking_stage=MARKET`
+- `ROLE_ALLOWED` 실패: `blocking_stage=ROLE`
+- `PRICE_TIMING_READY` 실패: `v2_state=SETUP_READY`, `blocking_stage=PRICE`
+- 모든 단계 통과: `v2_state=TIMING_READY`, `blocking_stage=NONE`, `reason_code=OBSERVE_READY_ORDER_DISABLED`
+- fresh realtime tick이 없거나 `price_source=TR_BACKFILL`이면 `SETUP_READY/TIMING_READY`로 승격하지 않는다.
+- transition journal은 상태/primary reason이 바뀔 때만 기록해 tick마다 과도하게 증가하지 않도록 한다.
+
+RebootV2Runtime 연결:
+
+- `dirty_evaluator` snapshot section을 추가했다.
+- dirty evaluator가 enabled이면 기존 `entry_engine` full scan pipeline은 직접 실행하지 않고 `SHADOWED_BY_DIRTY_EVALUATOR`로 표시한다.
+- dirty code가 없는 cycle에서는 EntryEngine full scan을 수행하지 않는다.
+- dirty code가 있는 cycle에서만 shadow comparison을 위해 `save=False` full scan을 수행할 수 있다.
+- ThemeBoard / MarketRegime cadence는 dirty evaluator config의 1초 기본값으로 조정된다.
+
+Snapshot fields:
+
+- `dirty_evaluator.status`
+- `dirty_evaluator.enabled`
+- `dirty_evaluator.shadow_mode`
+- `dirty_evaluator.dirty_code_count`
+- `dirty_evaluator.evaluated_code_count`
+- `dirty_evaluator.evaluated_candidate_count`
+- `dirty_evaluator.debounced_count`
+- `dirty_evaluator.skipped_count`
+- `dirty_evaluator.saved_decision_count`
+- `dirty_evaluator.full_scan_fallback_used`
+- `dirty_evaluator.last_evaluated_at`
+- `dirty_evaluator.duration_ms`
+- `dirty_evaluator.top_dirty_reasons`
+- `dirty_evaluator.blocking_stage_counts`
+- `dirty_evaluator.warnings`
+- `dirty_evaluator.shadow_comparison`
+
+주문 경로 제한:
+
+- `DirtyStrategyEvaluator`는 `OrderIntent`를 만들지 않는다.
+- `TRADING_DIRTY_EVALUATOR_ORDER_INTENT_ENABLED` 기본값은 `false`이며 factory에서도 `false`로 강제한다.
+- `OBSERVE_READY`가 나와도 `TIMING_READY + OBSERVE_READY_ORDER_DISABLED`까지만 기록한다.
+- `GatewayCommand`, `send_order`, `runtime_order_intents`, `entry_plans` 생성 경로는 변경하지 않았다.
+
+다음 PR은 `OrderIntent -> RiskManager -> CommandQueue -> Ack/Fill/Reconcile` hardening이다. 그 전까지 dirty evaluator는 운영 판단 cadence와 read model 개선용 shadow evaluator로만 사용한다.

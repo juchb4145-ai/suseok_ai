@@ -92,9 +92,15 @@ def test_build_core_runtime_routes_to_reboot_v2_observe_only(tmp_path, monkeypat
     assert bundle.theme_board_pipeline is not None
     assert isinstance(bundle.theme_board_pipeline, ThemeCoreV3RuntimePipeline)
     assert bundle.entry_engine_pipeline is not None
+    assert bundle.dirty_strategy_evaluator is not None
     assert bundle.theme_board_pipeline.config.enabled is True
+    assert bundle.theme_board_pipeline.config.interval_sec == 1
     assert bundle.market_regime_pipeline.config.enabled is True
+    assert bundle.market_regime_pipeline.config.interval_sec == 1
     assert bundle.entry_engine_pipeline.config.enabled is True
+    assert bundle.dirty_strategy_evaluator.config.enabled is True
+    assert bundle.dirty_strategy_evaluator.config.shadow_mode is True
+    assert bundle.dirty_strategy_evaluator.config.order_intent_enabled is False
     assert bundle.exit_engine_reboot_pipeline.config.enabled is True
     assert bundle.position_risk_pipeline.config.enabled is True
     assert bundle.order_sink is None
