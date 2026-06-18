@@ -63,8 +63,8 @@ class EventLogRecord:
     event_id: str
     event_type: str
     dedupe_key: str
-    received_at: str
-    payload_json: str
+    received_at: str = ""
+    payload_json: str = "{}"
     id: int = 0
     source: str = "kiwoom_gateway"
     command_id: str = ""
@@ -112,8 +112,21 @@ class CandleSnapshot:
 class MarketDataSnapshot:
     code: str
     price: int
-    tick_at: str
-    received_at: str
+    tick_at: str = ""
+    received_at: str = ""
+    name: str = ""
+    change_rate: float = 0.0
+    trade_value: float = 0.0
+    cum_volume: int = 0
+    best_ask: int = 0
+    best_bid: int = 0
+    open_price: int = 0
+    tick_timestamp: str = ""
+    tick_age_sec: float = 0.0
+    freshness_status: str = "UNKNOWN"
+    data_quality_status: str = "UNKNOWN"
+    price_source: str = ""
+    updated_at: str = ""
     source_event_id: str = ""
     is_fresh: bool = False
     tick_age_ms: int = 0

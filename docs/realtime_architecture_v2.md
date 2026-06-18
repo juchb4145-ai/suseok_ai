@@ -389,3 +389,66 @@ Dedupe 기준:
 - `heartbeat`: 기본 logging disabled이면 append하지 않음
 
 현재 Event Log는 replay 가능한 저장 기반만 제공한다. MarketDataService, Candidate FSM, StrategyEvaluator, OrderManager consumer 전환은 다음 PR 범위다. 특히 `price_tick` full logging은 장중 DB write 부하를 만들 수 있으므로 기본 비활성으로 유지하며, MarketDataService PR에서 1~3초 batch flush 및 dirty-code 정책과 함께 다시 다룬다.
+
+## PR 3 구현 상태: MarketDataService Extraction
+
+PR 3에서는 `GatewayEventMarketDataBridge` 내부의 price tick 정규화와 market data update 경계를 `MarketDataService`로 분리한다. 이 변경은 extraction/shadow 성격이며, EntryEngine incremental evaluation 전환이나 Candidate FSM migration은 포함하지 않는다.
+
+구현 범위:
+
+- `trading.strategy.market_data_service.MarketDataService` 추가
+- `MarketDataSnapshot` 필드 확장
+- `DirtyCodeQueue`와 `DirtyReason` 추가
+- `GatewayEventMarketDataBridge`가 기존 public API를 유지한 채 `MarketDataService`로 위임
+- 기존 `MarketDataStore`, `CandleBuilder`, `MarketIndexStore`, `RealtimeDataQualityTracker` 업데이트 경로 유지
+- batch flush hook 추가. 기본값은 disabled이며 저장소가 없으면 no-op
+
+`MarketDataService` 책임:
+
+- `price_tick` payload 정규화
+- `latest_snapshot_by_code` in-memory cache 관리
+- 기존 `MarketDataStore` latest tick update
+- 기존 `CandleBuilder` 1m candle update 및 3m/5m aggregation 준비
+- VWAP, turnover, execution_strength, spread, day_high/day_low snapshot 관리
+- tick freshness 및 data quality status 산출
+- `source_event_id`를 snapshot metadata에 보존
+- dirty code 생성
+- batch flush hook 제공
+
+`MarketDataSnapshot` 주요 필드:
+
+- `code`, `name`
+- `price`, `change_rate`, `trade_value`, `cum_volume`
+- `execution_strength`, `best_ask`, `best_bid`, `spread_ticks`
+- `day_high`, `day_low`, `open_price`, `vwap`
+- `tick_timestamp`, `tick_age_sec`, `freshness_status`
+- `data_quality_status`, `source_event_id`, `price_source`
+- `updated_at`, `metadata`
+
+Dirty code 생성 기준:
+
+- fresh stock `price_tick` 처리 성공: `PRICE_TICK`
+- 1m/3m/5m completed candle count 증가: `CANDLE_BOUNDARY`
+- data quality status 변화: `DATA_QUALITY_CHANGED`
+- spread tick 변화: `SPREAD_CHANGED`
+- `ORDER_EVENT`, `POSITION_EVENT`, `THEME_ROLE_CHANGED`, `MARKET_REGIME_CHANGED`는 다음 PR consumer 연결을 위한 reason enum만 준비
+
+Feature flag 기본값:
+
+| flag | default | 의미 |
+|---|---:|---|
+| `TRADING_MARKET_DATA_SERVICE_ENABLED` | `true` | MarketDataService update 활성화 |
+| `TRADING_MARKET_DATA_DIRTY_QUEUE_ENABLED` | `true` | dirty code queue 생성 활성화 |
+| `TRADING_MARKET_DATA_BATCH_FLUSH_ENABLED` | `false` | batch flush write 비활성 |
+| `TRADING_MARKET_DATA_MAX_TICK_AGE_SEC` | `10` | freshness 판단 기준 |
+| `TRADING_MARKET_DATA_DIRTY_DEBOUNCE_MS` | `200` | dirty reason debounce |
+
+Data quality 기준:
+
+- latest tick 없음: consumer 관점에서 `MISSING_TICK`
+- tick age 초과: `STALE_TICK`
+- `price <= 0`: `MISSING_PRICE`
+- `trade_value <= 0` 및 `cum_volume <= 0`: `TURNOVER_MISSING`
+- `price_source=TR_BACKFILL`: `TR_BACKFILL_PRICE_ONLY`
+
+현재 dirty codes는 생성만 한다. EntryEngine incremental evaluation에 연결하지 않는다. raw tick full DB write는 여전히 금지이며, batch flush는 기본 disabled다. 다음 PR은 Candidate FSM migration 또는 Dirty-code StrategyEvaluator 중 하나를 선택할 수 있으나, 운영 관점에서는 `Candidate FSM + blocking_stage`를 먼저 고정한 뒤 dirty-code evaluator를 붙이는 순서를 권장한다.

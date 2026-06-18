@@ -6,11 +6,11 @@ from typing import Any, Callable, Iterable
 from trading.broker.command_queue import CommandPriority, CommandStatus, EnqueueResult
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import ConditionInfo, GatewayCommand, GatewayEvent, Signal, new_message_id
-from trading.strategy.bridge import StrategyMarketDataBridge
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.conditions import ConditionProfileRepository, RegisteredCondition
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import IndexCodeMapper, MarketIndexStore, zero_padded_index_logical_code
+from trading.strategy.market_data_service import MarketDataService, MarketDataServiceConfig
 from trading.theme_engine.runtime import RealTimeThemeRuntime
 
 
@@ -26,14 +26,18 @@ class GatewayEventMarketDataBridge:
         *,
         warning_sink: WarningSink | None = None,
         clock: Callable[[], datetime] | None = None,
+        market_data_service: MarketDataService | None = None,
+        service_config: MarketDataServiceConfig | None = None,
     ) -> None:
         self.warning_sink = warning_sink
         self.index_code_mapper = IndexCodeMapper()
-        self._bridge = StrategyMarketDataBridge(
+        self.service = market_data_service or MarketDataService(
             market_data,
             candle_builder,
             market_index_store=market_index_store,
             index_code_mapper=self.index_code_mapper,
+            config=service_config or MarketDataServiceConfig.from_env(),
+            warning_sink=warning_sink,
             clock=clock,
         )
 
@@ -42,7 +46,12 @@ class GatewayEventMarketDataBridge:
             if event.type == "command_ack":
                 return self.handle_theme_backfill_ack(dict(event.payload or {}))
             return False
-        return self.handle_price_tick(dict(event.payload or {}))
+        try:
+            return self.service.update_from_gateway_event(event)
+        except Exception as exc:
+            code = str(dict(event.payload or {}).get("code") or "")
+            self._warn(f"PRICE_TICK_BRIDGE_FAILED:{code}:{exc}")
+            return False
 
     def handle_theme_backfill_ack(self, payload: dict[str, Any]) -> bool:
         if str(payload.get("purpose") or "") != "theme_data_backfill":
@@ -52,7 +61,7 @@ class GatewayEventMarketDataBridge:
         if not code or not parsed:
             return False
         try:
-            return bool(self._bridge.market_data.apply_theme_backfill(code, parsed))
+            return bool(self.service.market_data.apply_theme_backfill(code, parsed))
         except Exception as exc:
             self._warn(f"THEME_BACKFILL_MERGE_FAILED:{code}:{exc}")
             return False
@@ -63,32 +72,25 @@ class GatewayEventMarketDataBridge:
             self._warn("PRICE_TICK_CODE_MISSING")
             return False
         try:
-            return bool(
-                self._bridge.on_realtime_tick(
-                    code=code,
-                    price=payload.get("price", 0),
-                    change_rate=payload.get("change_rate", 0.0),
-                    cum_volume=payload.get("cum_volume", payload.get("volume", 0)),
-                    best_ask=payload.get("best_ask", 0),
-                    best_bid=payload.get("best_bid", 0),
-                    trade_value=payload.get("trade_value", 0),
-                    execution_strength=payload.get("execution_strength", 0),
-                    spread_ticks=payload.get("spread_ticks", 0),
-                    instrument_type=self._instrument_type(code, payload.get("instrument_type"), payload.get("name")),
-                    name=str(payload.get("name") or ""),
-                    day_high=payload.get("day_high", 0),
-                    day_low=payload.get("day_low", 0),
-                    trade_time=str(payload.get("trade_time") or ""),
-                    open_price=payload.get("open_price", 0),
-                    metadata=_tick_metadata(payload),
-                )
-            )
+            return bool(self.service.handle_price_tick(payload))
         except Exception as exc:
             self._warn(f"PRICE_TICK_BRIDGE_FAILED:{code}:{exc}")
             return False
 
     def data_quality_snapshot(self) -> dict[str, Any]:
-        return self._bridge.data_quality_snapshot()
+        return self.service.data_quality_snapshot()
+
+    def latest_snapshot(self, code: str):
+        return self.service.latest_snapshot(code)
+
+    def pop_dirty_codes(self, limit: int = 100) -> list[str]:
+        return self.service.dirty_codes(limit=limit)
+
+    def dirty_queue_snapshot(self) -> dict[str, Any]:
+        return self.service.dirty_queue.snapshot()
+
+    def flush_batch(self) -> dict[str, Any]:
+        return self.service.flush_batch()
 
     def _instrument_type(self, code: str, instrument_type: Any, name: Any = "") -> Any:
         explicit = str(instrument_type or "").strip().lower()
