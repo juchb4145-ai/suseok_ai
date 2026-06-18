@@ -174,6 +174,12 @@ class GatewayEventCodec:
             return self._ignored(event, payload, resolved_source_event_id, "HEARTBEAT_REPLAY_DISABLED")
         if raw_type in {"command_ack", "command_failed", "command_timeout", "command_expired"}:
             return self._decode_command_event(event, payload, resolved_source_event_id)
+        if raw_type == "kiwoom_order_chejan":
+            return self._decode_kiwoom_order_chejan(event, payload, resolved_source_event_id)
+        if raw_type == "kiwoom_balance_chejan":
+            return self._canonical(event, payload, resolved_source_event_id, "POSITION_SNAPSHOT")
+        if raw_type == "kiwoom_special_chejan":
+            return self._ignored(event, payload, resolved_source_event_id, "KIWOOM_SPECIAL_CHEJAN_DIAGNOSTIC_ONLY")
         if raw_type in FILL_EVENT_TYPES:
             canonical = "ORDER_FILLED" if _remaining_quantity(payload) <= 0 else "ORDER_PARTIALLY_FILLED"
             return self._canonical(event, payload, resolved_source_event_id, canonical)
@@ -192,6 +198,35 @@ class GatewayEventCodec:
         if canonical:
             return self._canonical(event, payload, resolved_source_event_id, canonical)
         return self._ignored(event, payload, resolved_source_event_id, "NON_ORDER_EVENT_HANDLED_BY_LEGACY")
+
+    def _decode_kiwoom_order_chejan(
+        self,
+        event: GatewayEvent,
+        payload: dict[str, Any],
+        source_event_id: str,
+    ) -> CanonicalGatewayEvent:
+        parser_status = str(payload.get("parser_status") or "").upper()
+        if parser_status == "INVALID":
+            data = {**payload, "status": "REJECTED", "reason": "KIWOOM_CHEJAN_PARSER_INVALID"}
+            return self._canonical(event, data, source_event_id, "ORDER_REJECTED")
+        event_kind = str(payload.get("event_kind") or "").lower()
+        reject_reason = str(payload.get("reject_reason") or "")
+        order_status = str(payload.get("order_status") or "")
+        has_fill_identity = bool(payload.get("execution_id"))
+        has_fill_quantity = _safe_int(payload.get("incremental_execution_quantity") or payload.get("execution_quantity"), 0) > 0
+        if event_kind == "order_fill" and (has_fill_identity or has_fill_quantity):
+            canonical = "ORDER_FILLED" if _remaining_quantity(payload) <= 0 else "ORDER_PARTIALLY_FILLED"
+            return self._canonical(event, payload, source_event_id, canonical)
+        if event_kind == "order_rejected" or reject_reason or "거부" in order_status or "거절" in order_status:
+            data = {**payload, "status": "REJECTED"}
+            return self._canonical(event, data, source_event_id, "ORDER_REJECTED")
+        if event_kind == "order_cancelled":
+            return self._canonical(event, payload, source_event_id, "ORDER_CANCELLED")
+        if event_kind == "order_cancel_accepted":
+            return self._canonical(event, payload, source_event_id, "ORDER_CANCEL_ACCEPTED")
+        if event_kind == "order_accepted" and payload.get("order_no"):
+            return self._canonical(event, payload, source_event_id, "ORDER_ACCEPTED")
+        return self._canonical(event, payload, source_event_id, "ORDER_STATUS_SNAPSHOT")
 
     def _decode_command_event(
         self,
@@ -726,6 +761,8 @@ def _normalized_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _canonical_dedupe_key(canonical_type: str, payload: dict[str, Any], source_event_id: str, event: GatewayEvent) -> str:
     if canonical_type in {"ORDER_PARTIALLY_FILLED", "ORDER_FILLED"}:
+        if payload.get("broker_event_key"):
+            return f"kiwoom-fill:{payload.get('broker_event_key')}"
         execution_id = str(_execution_id(payload) or "")
         if execution_id:
             return "fill:{account}:{order_no}:{execution_id}".format(
@@ -734,6 +771,8 @@ def _canonical_dedupe_key(canonical_type: str, payload: dict[str, Any], source_e
                 execution_id=execution_id,
             )
     if canonical_type in {"ORDER_ACCEPTED", "ORDER_REJECTED", "ORDER_CANCEL_ACCEPTED", "ORDER_CANCELLED", "COMMAND_ACK", "COMMAND_FAILED"}:
+        if payload.get("broker_event_key"):
+            return f"kiwoom-order:{payload.get('broker_event_key')}"
         command_id = str(payload.get("command_id") or event.command_id or "")
         if command_id:
             return "order-command:{command_id}:{status}:{order_no}".format(

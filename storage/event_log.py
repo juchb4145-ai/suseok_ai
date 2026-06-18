@@ -575,6 +575,9 @@ REPLAYABLE_GATEWAY_EVENT_TYPES = {
     "order_status_snapshot",
     "balance_snapshot",
     "position_snapshot",
+    "kiwoom_order_chejan",
+    "kiwoom_balance_chejan",
+    "kiwoom_special_chejan",
 }
 
 
@@ -589,6 +592,8 @@ def dedupe_key_for_gateway_event(event: GatewayEvent) -> str:
             command_id=command_id,
             status=str(payload.get("status") or payload.get("command_status") or ""),
         )
+    if event_type in {"kiwoom_order_chejan", "kiwoom_balance_chejan"} and payload.get("broker_event_key"):
+        return f"kiwoom-chejan:{payload.get('broker_event_key')}"
     if event_type in {"order_ack", "order_fill", "execution", "execution_event", "fill"}:
         return "order:{account}:{order_no}:{execution_id}".format(
             account=str(payload.get("account") or ""),

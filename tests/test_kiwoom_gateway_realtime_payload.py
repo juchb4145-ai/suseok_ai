@@ -147,6 +147,31 @@ def test_kiwoom_heartbeat_payload_reports_simulation_broker_environment():
     assert payload["server_gubun"] == "1"
 
 
+def test_kiwoom_heartbeat_payload_includes_chejan_parser_metrics():
+    class Metrics:
+        def to_dict(self):
+            return {
+                "total_count": 3,
+                "by_status": {"OK": 2, "DEGRADED": 1},
+                "by_gateway_event_type": {"kiwoom_order_chejan": 3},
+            }
+
+    class Client:
+        chejan_parser_metrics = Metrics()
+
+        def get_accounts(self):
+            return ["1234567890"]
+
+        def get_server_gubun(self):
+            return "1"
+
+    runtime = GatewayRuntime(FakeCoreClient())
+    payload = _kiwoom_heartbeat_payload(Client(), runtime)
+
+    assert payload["kiwoom_chejan_parser"]["total_count"] == 3
+    assert payload["kiwoom_chejan_parser"]["by_status"]["DEGRADED"] == 1
+
+
 def test_kiwoom_heartbeat_payload_keeps_unknown_environment_fail_closed():
     class Client:
         def get_accounts(self):

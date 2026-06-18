@@ -227,6 +227,7 @@ class ReliabilityReport:
     report_dir: str = ""
     transport: dict[str, Any] = field(default_factory=dict)
     deterministic_replay: dict[str, Any] = field(default_factory=dict)
+    parser_validation: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -248,6 +249,7 @@ class ReliabilityReport:
             "report_dir": self.report_dir,
             "transport": dict(self.transport),
             "deterministic_replay": dict(self.deterministic_replay),
+            "parser_validation": dict(self.parser_validation),
         }
 
 

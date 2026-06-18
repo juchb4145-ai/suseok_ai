@@ -39,9 +39,12 @@ class ThemeStateSnapshot:
     transition: str = ""
     persistence_count: int = 1
     theme_score: float = 0.0
+    theme_score_delta: float = 0.0
     leader_symbol: str = ""
+    previous_leader_symbol: str = ""
     co_leader_symbols: tuple[str, ...] = ()
     leader_changed: bool = False
+    leader_stability_count: int = 1
     data_quality_reason: str = ""
     reason_codes: tuple[str, ...] = ()
     cohort: ThemeCohortSnapshot | None = None
@@ -51,6 +54,9 @@ class ThemeStateMachine:
     def __init__(self, config: ThemeStateConfig | None = None) -> None:
         self.config = config or ThemeStateConfig()
         self._previous: dict[str, ThemeStateSnapshot] = {}
+
+    def restore(self, snapshots: Iterable[ThemeStateSnapshot]) -> None:
+        self._previous = {item.theme_id: item for item in snapshots if item.theme_id}
 
     def apply(self, cohorts: Iterable[ThemeCohortSnapshot]) -> list[ThemeStateSnapshot]:
         current = [self._apply_one(cohort) for cohort in cohorts]
@@ -81,6 +87,9 @@ class ThemeStateMachine:
             reasons.append("LEADING_PERSISTENCE_CONFIRMED")
         previous_state = previous.theme_state if previous is not None else ""
         leader_changed = bool(previous is not None and previous.leader_symbol and previous.leader_symbol != cohort.leader_symbol)
+        leader_stability = 1
+        if previous is not None and previous.leader_symbol and previous.leader_symbol == cohort.leader_symbol:
+            leader_stability = previous.leader_stability_count + 1
         return ThemeStateSnapshot(
             theme_id=cohort.theme_id,
             theme_name=cohort.theme_name,
@@ -89,9 +98,12 @@ class ThemeStateMachine:
             transition=f"{previous_state or 'NONE'}->{final_state.value}",
             persistence_count=persistence,
             theme_score=round(score, 4),
+            theme_score_delta=round(score - previous.theme_score, 4) if previous is not None else 0.0,
             leader_symbol=cohort.leader_symbol,
+            previous_leader_symbol=previous.leader_symbol if previous is not None else "",
             co_leader_symbols=cohort.co_leader_symbols,
             leader_changed=leader_changed,
+            leader_stability_count=leader_stability,
             data_quality_reason=cohort.data_quality_reason,
             reason_codes=tuple(dict.fromkeys([*cohort.reason_codes, *reasons])),
             cohort=cohort,

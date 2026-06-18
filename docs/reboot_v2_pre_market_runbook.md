@@ -20,9 +20,14 @@ TRADING_RUNTIME_ENABLED=1
 TRADING_RUNTIME_AUTO_START=1
 TRADING_RUNTIME_MODE=OBSERVE
 TRADING_THEME_CORE_V3_ENABLED=1
-TRADING_THEME_CORE_V3_INGEST_CANDIDATES=0
+TRADING_THEME_CORE_V3_USE_RUNTIME_MARKET_CONTEXT=1
+TRADING_THEME_CORE_V3_INGEST_CANDIDATES=1
+TRADING_THEME_EXPANSION_SUBSCRIPTIONS_ENABLED=1
+TRADING_STRATEGY_CONTEXT_V3_ENABLED=1
 TRADING_OPENING_BURST_ENABLED=1
 TRADING_OPENING_BURST_CONFIGURED=1
+TRADING_ENTRY_USE_STRATEGY_CONTEXT_V3=1
+TRADING_ENTRY_ALLOW_LEGACY_THEME_CONTEXT_FALLBACK=0
 TRADING_DASHBOARD_V2_ENABLED=1
 TRADING_DASHBOARD_V2_AUTO_ROUTE=1
 TRADING_ORDER_MANAGER_ENABLED=0
@@ -62,7 +67,9 @@ Before 09:00:
 - confirm `/api/gateway/commands` has zero `send_order` commands
 - confirm `TRADING_ORDER_MANAGER_ENABLED=0`
 - confirm `TRADING_ALLOW_LIVE_SIM_ORDERS=0`
-- confirm `TRADING_THEME_CORE_V3_INGEST_CANDIDATES=0`
+- confirm `TRADING_THEME_CORE_V3_INGEST_CANDIDATES=1`
+- confirm `TRADING_STRATEGY_CONTEXT_V3_ENABLED=1`
+- confirm `TRADING_ENTRY_ALLOW_LEGACY_THEME_CONTEXT_FALLBACK=0`
 - confirm legacy dashboard is reachable only through `/legacy` or `/themelab`
 
 ## Opening Observe Window
@@ -71,8 +78,10 @@ During 09:00-09:15 the runtime observes Opening Burst + Theme Core V3 outputs on
 
 - opening turnover seeds
 - realtime theme leadership
-- candidate bridge source events in observe mode
 - market regime
+- focused expansion realtime subscriptions
+- candidate bridge source events and Candidate FSM discovery/watch updates in observe mode
+- StrategyContext V3 snapshots
 - entry/exit observe summaries
 - Dashboard V2 leading theme and wait/block summaries
 

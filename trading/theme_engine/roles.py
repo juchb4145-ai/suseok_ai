@@ -50,6 +50,7 @@ class StockRoleEngine:
         signals: Iterable[LiveSeedSignal] | None = None,
         *,
         market_phase: str = "SELECTIVE",
+        market_phase_by_side: dict[str, str] | None = None,
     ) -> list[StockRoleDecision]:
         cohort_signals = tuple(signals if signals is not None else (theme_state.cohort.signals if theme_state.cohort else ()))
         ranked = sorted(cohort_signals, key=_role_score, reverse=True)
@@ -59,7 +60,8 @@ class StockRoleEngine:
         top_return = max((signal.change_rate_pct for signal in ranked), default=0.0)
         for index, signal in enumerate(ranked, start=1):
             raw_role = _raw_role(signal, leader_code, co_leaders, top_return, index)
-            trade_role, reasons = _trade_role(raw_role, theme_state, signal, market_phase)
+            signal_market_phase = _market_phase_for_signal(signal, market_phase, market_phase_by_side)
+            trade_role, reasons = _trade_role(raw_role, theme_state, signal, signal_market_phase)
             decisions.append(
                 StockRoleDecision(
                     code=signal.code,
@@ -131,6 +133,15 @@ def _role_score(signal: LiveSeedSignal) -> float:
         + min(20.0, max(0.0, signal.change_rate_pct) * 2.0)
         + min(20.0, max(0.0, signal.execution_strength - 80.0) / 5.0)
     )
+
+
+def _market_phase_for_signal(signal: LiveSeedSignal, default: str, by_side: dict[str, str] | None) -> str:
+    if not by_side:
+        return str(default or "SELECTIVE").upper()
+    side = str(getattr(signal, "market", "") or "").upper()
+    if side in by_side:
+        return str(by_side[side] or default or "SELECTIVE").upper()
+    return str(by_side.get("UNKNOWN") or by_side.get("GLOBAL") or default or "SELECTIVE").upper()
 
 
 __all__ = [

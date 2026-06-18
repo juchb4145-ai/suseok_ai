@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Callable, Iterable, Optional
 
 from trading.broker.models import (
@@ -12,6 +13,8 @@ from trading.broker.models import (
     ConditionLoadState,
     Signal,
 )
+from trading.broker.chejan_capture import ChejanCaptureConfig, KiwoomChejanCaptureWriter
+from kiwoom.chejan import ChejanParserMetrics, KiwoomChejanParser, KiwoomChejanRawReader, PARSER_VERSION
 
 
 FID_CURRENT_PRICE = 10
@@ -87,6 +90,7 @@ class KiwoomClient:
         self.price_tick_received = Signal()
         self.order_result = Signal()
         self.execution_received = Signal()
+        self.chejan_event_received = Signal()
         self.message_received = Signal()
         self.condition_state_changed = Signal()
         self.condition_load_result = Signal()
@@ -99,6 +103,9 @@ class KiwoomClient:
         self.condition_load_state = ConditionLoadState.IDLE
         self._conditions: list[ConditionInfo] = []
         self._realtime_screen_codes: dict[str, set[str]] = {}
+        self.chejan_parser = KiwoomChejanParser.from_env()
+        self.chejan_parser_metrics = ChejanParserMetrics()
+        self.chejan_capture_writer = KiwoomChejanCaptureWriter(ChejanCaptureConfig.from_env())
 
         self.ocx = QAxWidget("KHOPENAPI.KHOpenAPICtrl.1")
         if self.ocx.isNull():
@@ -475,28 +482,66 @@ class KiwoomClient:
         )
 
     def _on_receive_chejan_data(self, gubun: str, item_count: int, fid_list: str) -> None:
-        order_no = self._chejan(9203)
-        code = self._chejan(9001).replace("A", "")
-        side_name = self._chejan(907)
-        side = "buy" if side_name in {"2", "매수"} else "sell"
-        quantity = self._parse_int(self._chejan(900))
-        price = self._parse_int(self._chejan(901))
-        filled = self._parse_int(self._chejan(911))
-        remaining = self._parse_int(self._chejan(902))
-        tag = self._chejan(920)
-        if code and order_no:
-            self.execution_received.emit(
-                ExecutionEvent(
-                    code=code,
-                    order_no=order_no,
-                    side=side,
-                    quantity=quantity,
-                    price=price,
-                    filled_quantity=filled,
-                    remaining_quantity=remaining,
-                    tag=tag,
+        parser = getattr(self, "chejan_parser", None) or KiwoomChejanParser.from_env()
+        metrics = getattr(self, "chejan_parser_metrics", None) or ChejanParserMetrics()
+        self.chejan_parser = parser
+        self.chejan_parser_metrics = metrics
+        reader = KiwoomChejanRawReader(lambda fid: self._chejan(fid))
+        raw_fids = reader.read(gubun=str(gubun or ""), fid_list=str(fid_list or ""))
+        result = parser.parse(
+            gubun=str(gubun or ""),
+            item_count=int(item_count or 0),
+            fid_list=str(fid_list or ""),
+            raw_fids=raw_fids,
+        )
+        metrics.observe(result)
+        self._capture_chejan_parse_result(gubun=str(gubun or ""), item_count=int(item_count or 0), fid_list=str(fid_list or ""), raw_fids=raw_fids, result=result)
+        self.chejan_event_received.emit(result)
+        if _env_bool("TRADING_KIWOOM_CHEJAN_EMIT_LEGACY_EXECUTION_EVENT", False):
+            payload = dict(result.canonical_payload or {})
+            if result.gubun == "0" and result.event_kind == "order_fill" and payload.get("code") and payload.get("order_no"):
+                self.execution_received.emit(
+                    ExecutionEvent(
+                        code=str(payload.get("code") or ""),
+                        order_no=str(payload.get("order_no") or ""),
+                        side=str(payload.get("side") or "").lower(),
+                        quantity=int(payload.get("quantity") or 0),
+                        price=int(payload.get("price") or 0),
+                        filled_quantity=int(payload.get("filled_quantity") or 0),
+                        remaining_quantity=int(payload.get("remaining_quantity") or 0),
+                        tag=str(payload.get("legacy_tag") or ""),
+                        account=str(payload.get("account") or ""),
+                        execution_id=str(payload.get("execution_id") or ""),
+                        timestamp=str(payload.get("timestamp") or ""),
+                        raw={"parser_version": PARSER_VERSION, "raw_fids": raw_fids},
+                    )
                 )
+
+    def _capture_chejan_parse_result(
+        self,
+        *,
+        gubun: str,
+        item_count: int,
+        fid_list: str,
+        raw_fids: dict[str, str],
+        result,
+    ) -> None:
+        writer = getattr(self, "chejan_capture_writer", None)
+        if writer is None:
+            return
+        try:
+            broker_env = "SIMULATION" if self.get_server_gubun() == "1" else "REAL"
+            writer.write(
+                broker_env=broker_env,
+                gubun=gubun,
+                item_count=item_count,
+                fid_list=fid_list,
+                raw_fids=raw_fids,
+                parser_result=result.to_dict(),
+                gateway_session_id="",
             )
+        except Exception as exc:
+            self.message_received.emit(f"KIWOOM_CHEJAN_CAPTURE_FAILED:{exc}")
 
     def _real_int(self, code: str, fid: int) -> int:
         return self._parse_int(self._real_raw(code, fid))
@@ -520,6 +565,13 @@ class KiwoomClient:
             return 0
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 class MockKiwoomClient:
     def __init__(self) -> None:
         self.connected = Signal()
@@ -527,6 +579,7 @@ class MockKiwoomClient:
         self.price_tick_received = Signal()
         self.order_result = Signal()
         self.execution_received = Signal()
+        self.chejan_event_received = Signal()
         self.message_received = Signal()
         self.condition_state_changed = Signal()
         self.condition_load_result = Signal()

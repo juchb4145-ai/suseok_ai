@@ -34,6 +34,7 @@ class RebootV2Runtime:
     opening_burst_pipeline: Any = None
     theme_board_pipeline: Any = None
     market_regime_pipeline: Any = None
+    strategy_context_pipeline: Any = None
     entry_engine_pipeline: Any = None
     dirty_strategy_evaluator: Any = None
     exit_engine_reboot_pipeline: Any = None
@@ -81,11 +82,20 @@ class RebootV2Runtime:
 
         self._recover_hydration(snapshot)
         self._reconcile_base_subscriptions(snapshot)
+        self._run_pipeline(snapshot, "market_regime", self.market_regime_pipeline, current)
         self._run_pipeline(snapshot, "opening_burst", self.opening_burst_pipeline, current)
+        self._run_pipeline(snapshot, "theme_board", self.theme_board_pipeline, current, market_context=snapshot.get("market_regime"))
+        self._reconcile_theme_expansion_subscriptions(snapshot, current)
         self._enqueue_hydration(snapshot, current)
         self._reconcile_candidate_subscriptions(snapshot, current)
-        self._run_pipeline(snapshot, "theme_board", self.theme_board_pipeline, current)
-        self._run_pipeline(snapshot, "market_regime", self.market_regime_pipeline, current)
+        self._run_pipeline(
+            snapshot,
+            "strategy_context",
+            self.strategy_context_pipeline,
+            current,
+            market_context=snapshot.get("market_regime"),
+            theme_board=getattr(self.theme_board_pipeline, "last_result", None) or self._latest_theme_board(current.date().isoformat()),
+        )
         self._run_pipeline(snapshot, "dirty_evaluator", self.dirty_strategy_evaluator, current)
         if _component_enabled(self.dirty_strategy_evaluator):
             snapshot["entry_engine"] = {
@@ -139,6 +149,7 @@ class RebootV2Runtime:
                 "opening_burst": _component_enabled(self.opening_burst_pipeline),
                 "theme_board": _component_enabled(self.theme_board_pipeline),
                 "market_regime": _component_enabled(self.market_regime_pipeline),
+                "strategy_context": _component_enabled(self.strategy_context_pipeline),
                 "entry_engine": _component_enabled(self.entry_engine_pipeline),
                 "dirty_strategy_evaluator": _component_enabled(self.dirty_strategy_evaluator),
                 "exit_engine": _component_enabled(self.exit_engine_reboot_pipeline),
@@ -245,7 +256,69 @@ class RebootV2Runtime:
             "warnings": list(manager.warnings),
         }
 
-    def _run_pipeline(self, snapshot: dict[str, Any], name: str, pipeline: Any, now: datetime) -> None:
+    def _reconcile_theme_expansion_subscriptions(self, snapshot: dict[str, Any], now: datetime) -> None:
+        plan = getattr(self.theme_board_pipeline, "last_expansion_plan", None)
+        config = getattr(getattr(self.theme_board_pipeline, "config", None), "theme_expansion_subscriptions_enabled", False)
+        source = str(getattr(plan, "source", "reboot_v2_theme_expansion") or "reboot_v2_theme_expansion")
+        if not plan or not bool(config):
+            snapshot["theme_expansion_subscription"] = _disabled_section("THEME_EXPANSION_SUBSCRIPTIONS_DISABLED")
+            return
+        targets = list(getattr(plan, "targets", ()) or ())
+        target_codes = {normalize_code(getattr(target, "code", "")): target for target in targets if normalize_code(getattr(target, "code", ""))}
+        manager = self.subscription_manager
+        for code, record in list(manager.records.items()):
+            if source in record.sources and code not in target_codes:
+                manager.remove_subscription(code, source)
+                self._save_expansion_subscription_decision(now, code=code, target=None, action="REMOVE", status="STALE")
+        for code, target in target_codes.items():
+            manager.ensure_subscription(code, source, protected=bool(getattr(target, "protected", False)))
+            self._save_expansion_subscription_decision(now, code=code, target=target, action="ENSURE", status="SELECTED")
+        active = manager.sync()
+        by_theme: dict[str, int] = {}
+        waiting = 0
+        for code, target in target_codes.items():
+            theme_id = str(getattr(target, "theme_id", "") or "")
+            by_theme[theme_id] = by_theme.get(theme_id, 0) + 1
+            if code not in active:
+                waiting += 1
+        rejected = list(getattr(plan, "excluded", ()) or [])
+        reason_counts: dict[str, int] = {}
+        for target in rejected:
+            for reason in tuple(getattr(target, "reason_codes", ()) or ()):
+                reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + 1
+        snapshot["theme_expansion_subscription"] = {
+            "enabled": True,
+            "status": "OK",
+            "source": source,
+            "selected_count": len(target_codes),
+            "active_count": len([code for code in target_codes if code in active]),
+            "rejected_count": len(rejected),
+            "by_theme": by_theme,
+            "budget_used": len(target_codes),
+            "waiting_for_tick_count": waiting,
+            "top_reject_reasons": [{"reason": key, "count": count} for key, count in sorted(reason_counts.items(), key=lambda item: item[1], reverse=True)[:10]],
+            "warnings": list(manager.warnings),
+        }
+
+    def _save_expansion_subscription_decision(self, now: datetime, *, code: str, target: Any | None, action: str, status: str) -> None:
+        saver = getattr(self.db, "save_theme_expansion_subscription_decision", None)
+        if not callable(saver):
+            return
+        saver(
+            {
+                "trade_date": now.date().isoformat(),
+                "calculated_at": now.isoformat(),
+                "code": code,
+                "theme_id": str(getattr(target, "theme_id", "") or "") if target is not None else "",
+                "source": str(getattr(target, "source", "reboot_v2_theme_expansion") or "reboot_v2_theme_expansion") if target is not None else "reboot_v2_theme_expansion",
+                "action": action,
+                "status": status,
+                "reason_codes": list(getattr(target, "reason_codes", ()) or ()) if target is not None else ["STALE_EXPANSION_TARGET"],
+                "target": getattr(target, "__dict__", {}) if target is not None else {},
+            }
+        )
+
+    def _run_pipeline(self, snapshot: dict[str, Any], name: str, pipeline: Any, now: datetime, **kwargs: Any) -> None:
         if pipeline is None:
             snapshot[name] = _disabled_section("CONFIG_DISABLED")
             return
@@ -254,7 +327,7 @@ class RebootV2Runtime:
             snapshot[name] = _disabled_section("NO_RUNNER")
             return
         try:
-            snapshot[name] = dict(runner(now) or {})
+            snapshot[name] = dict(runner(now, **kwargs) or {})
         except Exception as exc:
             snapshot[name] = {"enabled": True, "status": "ERROR", "blocking_reason": str(exc), "next_required_action": "CHECK_RUNTIME_LOG"}
             snapshot.setdefault("warnings", []).append(f"{name.upper()}_FAILED:{exc}")
@@ -280,7 +353,7 @@ class RebootV2Runtime:
             return "NOT_STARTED"
         statuses = [
             str(dict(snapshot.get(name) or {}).get("status") or "").upper()
-            for name in ("opening_burst", "theme_board", "market_regime", "dirty_evaluator", "entry_engine")
+            for name in ("opening_burst", "theme_board", "market_regime", "strategy_context", "dirty_evaluator", "entry_engine")
         ]
         if any(status == "ERROR" for status in statuses):
             return "ERROR"
@@ -307,10 +380,7 @@ class RebootV2Runtime:
         return codes
 
     def _theme_board_codes(self, trade_date: str) -> list[str]:
-        loader = getattr(self.db, "latest_theme_board_snapshot", None)
-        if not callable(loader):
-            return []
-        snapshot = dict(loader(trade_date=trade_date) or {})
+        snapshot = self._latest_theme_board(trade_date)
         stocks = list(snapshot.get("stocks") or snapshot.get("stocks_json") or [])
         codes: list[str] = []
         for item in stocks:
@@ -323,6 +393,12 @@ class RebootV2Runtime:
             if code and code not in codes:
                 codes.append(code)
         return codes
+
+    def _latest_theme_board(self, trade_date: str) -> dict[str, Any]:
+        loader = getattr(self.db, "latest_theme_board_snapshot", None)
+        if not callable(loader):
+            return {}
+        return dict(loader(trade_date=trade_date) or {})
 
     def _open_positions(self) -> list[Any]:
         loader = getattr(self.db, "list_open_virtual_positions", None)

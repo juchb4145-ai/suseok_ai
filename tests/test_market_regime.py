@@ -231,11 +231,11 @@ def test_dashboard_and_candidate_snapshot_include_market_regime(tmp_path):
     _candidate(db, "000015", market="KOSPI")
     _index(index_store, "KOSPI", 0.7)
     _tick(market_data, "000015", change=1.3)
-    _engine(db, market_data, index_store).build(trade_date=datetime.now().date().isoformat(), now=OPEN_AT)
+    _engine(db, market_data, index_store).build(trade_date=TRADE_DATE, now=OPEN_AT)
 
-    section = market_regime_dashboard_section(db, trade_date=datetime.now().date().isoformat())
+    section = market_regime_dashboard_section(db, trade_date=TRADE_DATE)
     dashboard = build_dashboard_snapshot(db)
-    candidates = build_candidates_snapshot(db, trade_date=datetime.now().date().isoformat())
+    candidates = build_candidates_snapshot(db, trade_date=TRADE_DATE)
 
     assert section["status"] == "OK"
     assert "market_regime" in dashboard

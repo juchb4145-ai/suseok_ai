@@ -31,6 +31,8 @@ class ThemeCoreV3RuntimeConfig:
     top_theme_count: int = 5
     save_candidate_source_events: bool = True
     ingest_candidate_source_events: bool = False
+    use_runtime_market_context: bool = False
+    theme_expansion_subscriptions_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "ThemeCoreV3RuntimeConfig":
@@ -43,6 +45,8 @@ class ThemeCoreV3RuntimeConfig:
             top_theme_count=max(1, _env_int("TRADING_THEME_CORE_V3_TOP_THEME_COUNT", 5)),
             save_candidate_source_events=_env_bool("TRADING_THEME_CORE_V3_SAVE_SOURCE_EVENTS", True),
             ingest_candidate_source_events=_env_bool("TRADING_THEME_CORE_V3_INGEST_CANDIDATES", False),
+            use_runtime_market_context=_env_bool("TRADING_THEME_CORE_V3_USE_RUNTIME_MARKET_CONTEXT", False),
+            theme_expansion_subscriptions_enabled=_env_bool("TRADING_THEME_EXPANSION_SUBSCRIPTIONS_ENABLED", False),
         )
 
 
@@ -77,22 +81,24 @@ class ThemeCoreV3RuntimePipeline:
         self.clock = clock or datetime.now
         self.last_result: dict[str, Any] | None = None
         self.last_summary: dict[str, Any] = _empty_summary(enabled=self.config.enabled, observe_only=self.config.observe_only)
+        self.last_expansion_plan = None
         self.last_run_at: datetime | None = None
 
-    def run_if_due(self, now: datetime | None = None) -> dict[str, Any]:
+    def run_if_due(self, now: datetime | None = None, *, market_context: Mapping[str, Any] | None = None) -> dict[str, Any]:
         current = (now or self.clock()).replace(microsecond=0)
         if not self.config.enabled:
             self.last_summary = _empty_summary(enabled=False, observe_only=self.config.observe_only)
             return dict(self.last_summary)
         if self.last_run_at is not None and (current - self.last_run_at).total_seconds() < self.config.interval_sec:
             return dict(self.last_summary)
-        return self.run(current)
+        return self.run(current, market_context=market_context)
 
-    def run(self, now: datetime | None = None) -> dict[str, Any]:
+    def run(self, now: datetime | None = None, *, market_context: Mapping[str, Any] | None = None) -> dict[str, Any]:
         current = (now or self.clock()).replace(microsecond=0)
         trade_date = current.date().isoformat()
         theme_inputs = _load_theme_inputs(self.repository)
         seed_signals = self._seed_signals(theme_inputs, trade_date=trade_date)
+        market_input = _theme_core_market_input(market_context, config=self.config)
         summary = _empty_summary(enabled=self.config.enabled, observe_only=self.config.observe_only)
         summary.update(
             {
@@ -101,6 +107,9 @@ class ThemeCoreV3RuntimePipeline:
                 "calculated_at": current.isoformat(),
                 "theme_input_count": len(theme_inputs),
                 "seed_signal_count": len(seed_signals),
+                "market_context_status": market_input["status"],
+                "market_phase": market_input["market_phase"],
+                "kosdaq_risk_state": market_input["kosdaq_risk_state"],
             }
         )
         if not theme_inputs:
@@ -113,19 +122,26 @@ class ThemeCoreV3RuntimePipeline:
             summary["status"] = "DATA_WAIT"
             summary["reason_codes"] = ["SEED_SIGNAL_EMPTY"]
 
+        self._restore_theme_state(trade_date)
         cohorts = self.cohort_engine.build(theme_inputs, seed_signals)
         theme_states = self.state_machine.apply(cohorts)
+        self._persist_theme_states(theme_states, trade_date=trade_date, calculated_at=current.isoformat())
         role_decisions = [
             decision
             for state in theme_states
-            for decision in self.role_engine.classify(state, market_phase=self.config.market_phase)
+            for decision in self.role_engine.classify(
+                state,
+                market_phase=market_input["market_phase"],
+                market_phase_by_side=market_input["market_phase_by_side"],
+            )
         ]
         expansion_plan = self.expansion_planner.plan(
             theme_states,
             role_decisions,
-            market_phase=self.config.market_phase,
-            kosdaq_risk_state=self.config.kosdaq_risk_state,
+            market_phase=market_input["market_phase"],
+            kosdaq_risk_state=market_input["kosdaq_risk_state"],
         )
+        self.last_expansion_plan = expansion_plan
         bridge_result = self.candidate_bridge.build_events(
             role_decisions,
             trade_date=trade_date,
@@ -156,6 +172,9 @@ class ThemeCoreV3RuntimePipeline:
                 "candidate_bridge_excluded_count": len(bridge_result.excluded),
                 "candidate_source_event_saved_count": bridge_saved,
                 "candidate_ingestion_enabled": bool(self.config.ingest_candidate_source_events),
+                "theme_expansion_subscriptions_enabled": bool(self.config.theme_expansion_subscriptions_enabled),
+                "theme_expansion_selected_count": len(expansion_plan.targets),
+                "theme_expansion_rejected_count": len(expansion_plan.excluded),
                 "ready_allowed": False,
                 "order_intent_allowed": False,
                 "output_mode": THEME_CORE_V3_OUTPUT_MODE,
@@ -164,6 +183,9 @@ class ThemeCoreV3RuntimePipeline:
         )
         if not seed_signals:
             summary["status"] = "DATA_WAIT"
+        if market_input["status"] == "DATA_WAIT":
+            summary["status"] = "DATA_WAIT"
+            summary["reason_codes"] = list(dict.fromkeys([*list(summary.get("reason_codes") or []), *market_input["reason_codes"]]))
         self.last_result = snapshot
         self.last_summary = summary
         self.last_run_at = current
@@ -226,6 +248,27 @@ class ThemeCoreV3RuntimePipeline:
             return False
         saver(snapshot)
         return True
+
+    def _restore_theme_state(self, trade_date: str) -> None:
+        loader = getattr(self.db, "list_theme_state_runtime", None)
+        if not callable(loader):
+            return
+        rows = list(loader(trade_date=trade_date) or [])
+        snapshots = [_state_snapshot_from_runtime_row(row) for row in rows]
+        restore = getattr(self.state_machine, "restore", None)
+        if callable(restore):
+            restore([snapshot for snapshot in snapshots if snapshot.theme_id])
+
+    def _persist_theme_states(self, states: Iterable[ThemeStateSnapshot], *, trade_date: str, calculated_at: str) -> int:
+        saver = getattr(self.db, "save_theme_state_runtime", None)
+        if not callable(saver):
+            return 0
+        count = 0
+        for state in states:
+            payload = _theme_state_payload(state, trade_date=trade_date, calculated_at=calculated_at)
+            saver(payload, trade_date=trade_date, calculated_at=calculated_at)
+            count += 1
+        return count
 
 
 def _load_theme_inputs(repository: ThemeEngineRepository) -> list[tuple[str, str, list[ThemeMembership]]]:
@@ -406,13 +449,25 @@ def _theme_payload(state: ThemeStateSnapshot, rank: int) -> dict[str, Any]:
         "theme_rank": rank,
         "theme_status": state.theme_state,
         "theme_state": state.theme_state,
+        "previous_theme_state": state.previous_state,
+        "theme_transition": state.transition,
         "theme_score": state.theme_score,
+        "theme_score_delta": getattr(state, "theme_score_delta", 0.0),
+        "persistence_count": state.persistence_count,
         "strong_count": getattr(cohort, "strong_count", 0) if cohort is not None else 0,
         "leader_count": getattr(cohort, "leader_count", 0) if cohort is not None else 0,
+        "breadth_ratio": getattr(cohort, "strong_ratio", 0.0) if cohort is not None else 0.0,
+        "weighted_return_pct": getattr(cohort, "weighted_return_pct", 0.0) if cohort is not None else 0.0,
+        "leader_concentration": getattr(cohort, "leader_concentration", 0.0) if cohort is not None else 0.0,
+        "coverage_ratio": getattr(cohort, "coverage_ratio", 0.0) if cohort is not None else 0.0,
         "theme_turnover_krw": getattr(cohort, "theme_turnover_krw", 0.0) if cohort is not None else 0.0,
         "leader_symbol": state.leader_symbol,
+        "previous_leader_symbol": getattr(state, "previous_leader_symbol", ""),
         "co_leader_symbols": list(state.co_leader_symbols),
         "data_quality_reason": state.data_quality_reason,
+        "data_quality_status": state.data_quality_reason or "OK",
+        "leader_changed": bool(state.leader_changed),
+        "leader_stability_count": getattr(state, "leader_stability_count", 1),
         "reason_codes": list(state.reason_codes),
     }
 
@@ -427,10 +482,92 @@ def _stock_payload(decision: StockRoleDecision) -> dict[str, Any]:
         "raw_role": decision.raw_role,
         "trade_role": decision.trade_role,
         "stock_score": decision.role_score,
+        "role_score": decision.role_score,
         "entry_usable": False,
         "source_rank": decision.source_rank,
         "reason_codes": list(decision.reason_codes),
     }
+
+
+def _theme_core_market_input(market_context: Mapping[str, Any] | None, *, config: ThemeCoreV3RuntimeConfig) -> dict[str, Any]:
+    if not config.use_runtime_market_context:
+        phase = str(config.market_phase or "SELECTIVE").upper()
+        return {
+            "status": "OK",
+            "market_phase": phase,
+            "kosdaq_risk_state": str(config.kosdaq_risk_state or "").upper(),
+            "market_phase_by_side": {"GLOBAL": phase, "UNKNOWN": phase},
+            "reason_codes": [],
+        }
+    payload = dict(market_context or {})
+    if not payload or not str(payload.get("calculated_at") or ""):
+        return {
+            "status": "DATA_WAIT",
+            "market_phase": "DATA_WAIT",
+            "kosdaq_risk_state": "DATA_WAIT",
+            "market_phase_by_side": {"GLOBAL": "DATA_WAIT", "UNKNOWN": "DATA_WAIT", "KOSPI": "DATA_WAIT", "KOSDAQ": "DATA_WAIT"},
+            "reason_codes": ["MARKET_CONTEXT_NOT_READY"],
+        }
+    global_status = str(payload.get("global_status") or "DATA_WAIT").upper()
+    kospi_status = str(payload.get("kospi_status") or global_status).upper()
+    kosdaq_status = str(payload.get("kosdaq_status") or global_status).upper()
+    return {
+        "status": "DATA_WAIT" if global_status in {"", "DATA_WAIT", "MARKET_CLOSED"} else "OK",
+        "market_phase": _market_phase(global_status),
+        "kosdaq_risk_state": kosdaq_status if kosdaq_status in {"WEAK", "RISK_OFF"} else "",
+        "market_phase_by_side": {
+            "GLOBAL": _market_phase(global_status),
+            "UNKNOWN": _market_phase(global_status),
+            "KOSPI": _market_phase(kospi_status),
+            "KOSDAQ": _market_phase(kosdaq_status),
+        },
+        "reason_codes": list(payload.get("reason_codes") or []),
+    }
+
+
+def _market_phase(status: str) -> str:
+    value = str(status or "").upper()
+    if value == "EXPANSION":
+        return "EXPANSION"
+    if value in {"SELECTIVE", "CHOPPY"}:
+        return "SELECTIVE"
+    if value in {"WEAK", "RISK_OFF"}:
+        return "RISK_OFF"
+    return "DATA_WAIT"
+
+
+def _theme_state_payload(state: ThemeStateSnapshot, *, trade_date: str, calculated_at: str) -> dict[str, Any]:
+    return {
+        **_theme_payload(state, 0),
+        "trade_date": trade_date,
+        "calculated_at": calculated_at,
+        "previous_state": state.previous_state,
+        "current_state": state.theme_state,
+        "transition": state.transition,
+        "persistence_count": state.persistence_count,
+        "last_calculated_at": calculated_at,
+    }
+
+
+def _state_snapshot_from_runtime_row(row: Mapping[str, Any]) -> ThemeStateSnapshot:
+    return ThemeStateSnapshot(
+        theme_id=str(row.get("theme_id") or ""),
+        theme_name=str(row.get("theme_name") or ""),
+        theme_state=str(row.get("theme_state") or row.get("current_state") or ThemeCoreState.SEED_WAIT.value),
+        previous_state=str(row.get("previous_state") or ""),
+        transition=str(row.get("transition") or ""),
+        persistence_count=_int(row.get("persistence_count")),
+        theme_score=_float(row.get("theme_score")),
+        theme_score_delta=_float(row.get("theme_score_delta")),
+        leader_symbol=normalize_code(str(row.get("leader_symbol") or "")),
+        previous_leader_symbol=normalize_code(str(row.get("previous_leader_symbol") or "")),
+        co_leader_symbols=tuple(normalize_code(str(item)) for item in list(row.get("co_leader_symbols") or []) if normalize_code(str(item))),
+        leader_changed=_bool(row.get("leader_changed")),
+        leader_stability_count=max(1, _int(row.get("leader_stability_count"))),
+        data_quality_reason=str(row.get("data_quality_reason") or row.get("data_quality_status") or ""),
+        reason_codes=tuple(str(item) for item in list(row.get("reason_codes") or [])),
+        cohort=None,
+    )
 
 
 def _summary_from_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:

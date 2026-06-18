@@ -247,6 +247,10 @@ def _entry_candidates(entry: dict[str, Any], candidates: dict[str, Any], order_m
         entry_status = str(item.get("entry_status") or item.get("display_state") or "")
         bucket = _entry_bucket(item, pending_codes)
         reasons = _entry_reasons(item)
+        context = _row_strategy_context(item)
+        context_theme = dict(context.get("theme") or {})
+        context_stock = dict(context.get("stock") or {})
+        context_sources = dict(context.get("source_timestamps") or {})
         rows.append(
             {
                 "code": code,
@@ -269,6 +273,19 @@ def _entry_candidates(entry: dict[str, Any], candidates: dict[str, Any], order_m
                 "position_size_multiplier_hint": _num(item.get("position_size_multiplier_hint")),
                 "dry_run_intent_allowed": bool(item.get("dry_run_intent_allowed") or item.get("entry_dry_run_intent_allowed")),
                 "live_order_allowed": bool(item.get("live_order_allowed") or item.get("entry_live_order_allowed")),
+                "strategy_context_version": context.get("schema_version") or item.get("strategy_context_version") or "",
+                "strategy_context_id": context.get("context_id") or item.get("strategy_context_id") or "",
+                "session_phase": context.get("session_phase") or item.get("session_phase") or "",
+                "market_context_at": context_sources.get("market_context_at") or "",
+                "theme_context_at": context_sources.get("theme_context_at") or "",
+                "context_fresh": bool(context.get("context_fresh") or item.get("context_fresh")),
+                "theme_transition": context_theme.get("theme_transition") or "",
+                "theme_persistence_count": int(_num(context_theme.get("persistence_count"))),
+                "raw_stock_role": context_stock.get("raw_stock_role") or "",
+                "trade_stock_role": context_stock.get("trade_stock_role") or "",
+                "focused_expansion_source": item.get("focused_expansion_source") or "",
+                "blocking_stage": context.get("blocking_stage") or item.get("blocking_stage") or "",
+                "next_required_action": item.get("next_required_action") or "",
                 "reason_summary_ko": _reason_summary_ko(reasons),
                 "operator_message_ko": item.get("operator_message_ko") or item.get("entry_operator_message_ko") or _entry_message(bucket),
                 "reason_codes": reasons,
@@ -284,6 +301,21 @@ def _entry_candidates(entry: dict[str, Any], candidates: dict[str, Any], order_m
         "items": rows,
         "bucket_counts": dict(bucket_counts),
     }
+
+
+def _row_strategy_context(item: dict[str, Any]) -> dict[str, Any]:
+    direct = item.get("strategy_context_v3")
+    if isinstance(direct, dict):
+        return dict(direct)
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict) and isinstance(metadata.get("strategy_context_v3"), dict):
+        return dict(metadata.get("strategy_context_v3") or {})
+    details = item.get("details")
+    if isinstance(details, dict):
+        context = details.get("strategy_context_v3")
+        if isinstance(context, dict):
+            return dict(context)
+    return {}
 
 
 def _position_risk(position_risk: dict[str, Any], exit_engine: dict[str, Any]) -> dict[str, Any]:

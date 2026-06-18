@@ -1,0 +1,269 @@
+from datetime import datetime
+
+from storage.db import TradingDatabase
+from trading.strategy.candles import CandleBuilder
+from trading.strategy.entry_engine import EntryDecisionStatus, EntryEngine, EntryEngineConfig
+from trading.strategy.market_data import MarketDataStore, StrategyTick
+from trading.strategy.models import Candidate, CandidateState
+from trading.strategy.strategy_context import StrategyContextAssembler, session_phase
+
+
+TRADE_DATE = "2026-06-19"
+
+
+def test_strategy_context_assembler_persists_nested_context_without_order_permissions(tmp_path):
+    db = TradingDatabase(str(tmp_path / "context.db"))
+    market_data = MarketDataStore()
+    candidate = _candidate(db)
+    _tick(market_data, "000001")
+    db.save_market_regime_snapshot(_market_snapshot())
+    db.save_theme_board_snapshot(_theme_board())
+
+    assembler = StrategyContextAssembler(db, market_data=market_data)
+    snapshot = assembler.assemble_candidate(candidate, now=datetime(2026, 6, 19, 9, 20, 0))
+    assembler.save_snapshots([candidate], [snapshot], calculated_at=snapshot.calculated_at)
+
+    saved = db.latest_strategy_context(trade_date=TRADE_DATE, code="000001")
+    reloaded = db.load_candidate(TRADE_DATE, "000001")
+
+    assert snapshot.schema_version == "strategy_context_v3"
+    assert snapshot.session_phase == "MORNING_TREND"
+    assert snapshot.market.side_market_regime == "EXPANSION"
+    assert snapshot.theme.theme_state == "LEADING_THEME"
+    assert snapshot.stock.trade_stock_role == "LEADER_CONFIRMED"
+    assert snapshot.ready_allowed is False
+    assert snapshot.order_intent_allowed is False
+    assert saved["context_id"] == snapshot.context_id
+    assert reloaded.metadata["strategy_context_v3"]["context_id"] == snapshot.context_id
+    assert reloaded.metadata["strategy_context_v3"]["theme"]["theme_state"] == "LEADING_THEME"
+
+
+def test_entry_engine_uses_strategy_context_v3_without_legacy_theme_board_metadata(tmp_path):
+    db = TradingDatabase(str(tmp_path / "entry-context.db"))
+    market_data = MarketDataStore()
+    candidate = _candidate(db)
+    _tick(market_data, "000001")
+    db.save_market_regime_snapshot(_market_snapshot())
+    db.save_theme_board_snapshot(_theme_board())
+    assembler = StrategyContextAssembler(db, market_data=market_data)
+    snapshot = assembler.assemble_candidate(candidate, now=datetime(2026, 6, 19, 9, 20, 0))
+    assembler.save_snapshots([candidate], [snapshot], calculated_at=snapshot.calculated_at)
+
+    engine = EntryEngine(
+        db,
+        market_data=market_data,
+        candle_builder=CandleBuilder(),
+        config=EntryEngineConfig(
+            enabled=True,
+            min_1m_candles=0,
+            require_vwap=False,
+            use_strategy_context_v3=True,
+            allow_legacy_theme_context_fallback=False,
+        ),
+    )
+    result = engine.evaluate_candidates([db.load_candidate(TRADE_DATE, "000001")], now=datetime(2026, 6, 19, 9, 20, 1))
+
+    assert result.evaluated_count == 1
+    decision = result.decisions[0]
+    assert decision.theme_status == "LEADING_THEME"
+    assert decision.stock_role == "LEADER_CONFIRMED"
+    assert decision.market_status == "EXPANSION"
+    assert decision.entry_status in {EntryDecisionStatus.OBSERVE_READY, EntryDecisionStatus.PRICE_WAIT}
+    assert decision.dry_run_intent_allowed is False
+    assert decision.live_order_allowed is False
+
+
+def test_entry_engine_blocks_when_strategy_context_v3_missing_and_fallback_disabled(tmp_path):
+    db = TradingDatabase(str(tmp_path / "entry-context-missing.db"))
+    market_data = MarketDataStore()
+    candidate = _candidate(db)
+    _tick(market_data, "000001")
+
+    engine = EntryEngine(
+        db,
+        market_data=market_data,
+        candle_builder=CandleBuilder(),
+        config=EntryEngineConfig(
+            enabled=True,
+            min_1m_candles=0,
+            require_vwap=False,
+            use_strategy_context_v3=True,
+            allow_legacy_theme_context_fallback=False,
+        ),
+    )
+    result = engine.evaluate_candidates([candidate], now=datetime(2026, 6, 19, 9, 20, 1))
+
+    assert result.decisions[0].entry_status == EntryDecisionStatus.DATA_WAIT
+    assert "STRATEGY_CONTEXT_V3_MISSING" in result.decisions[0].reason_codes
+
+
+def test_session_phase_boundaries():
+    assert session_phase(datetime(2026, 6, 19, 8, 59)).value == "PRE_OPEN"
+    assert session_phase(datetime(2026, 6, 19, 9, 1)).value == "OPENING_DISCOVERY"
+    assert session_phase(datetime(2026, 6, 19, 11, 30)).value == "MIDDAY_CHOP"
+    assert session_phase(datetime(2026, 6, 19, 14, 45)).value == "CLOSING_RISK"
+
+
+def test_theme_state_runtime_latest_persists_same_day_leader_stability(tmp_path):
+    db = TradingDatabase(str(tmp_path / "theme-state.db"))
+    first = db.save_theme_state_runtime(
+        {
+            "theme_id": "ai",
+            "theme_name": "AI",
+            "previous_state": "",
+            "current_state": "SPREADING_THEME",
+            "theme_state": "SPREADING_THEME",
+            "theme_score": 72.0,
+            "leader_symbol": "000001",
+            "leader_stability_count": 1,
+            "persistence_count": 1,
+        },
+        trade_date=TRADE_DATE,
+        calculated_at="2026-06-19T09:05:00",
+    )
+    second = db.save_theme_state_runtime(
+        {
+            **first,
+            "previous_state": "SPREADING_THEME",
+            "current_state": "LEADING_THEME",
+            "theme_state": "LEADING_THEME",
+            "theme_score": 80.0,
+            "theme_score_delta": 8.0,
+            "leader_symbol": "000001",
+            "leader_stability_count": 2,
+            "persistence_count": 2,
+        },
+        trade_date=TRADE_DATE,
+        calculated_at="2026-06-19T09:06:00",
+    )
+
+    restored = db.load_theme_state_runtime(trade_date=TRADE_DATE, theme_id="ai")
+    previous_day = db.load_theme_state_runtime(trade_date="2026-06-18", theme_id="ai")
+
+    assert second["theme_state"] == "LEADING_THEME"
+    assert restored["persistence_count"] == 2
+    assert restored["leader_stability_count"] == 2
+    assert previous_day == {}
+
+
+def _candidate(db: TradingDatabase) -> Candidate:
+    return db.save_candidate(
+        Candidate(
+            trade_date=TRADE_DATE,
+            code="000001",
+            name="Leader",
+            market="KOSDAQ",
+            state=CandidateState.WATCHING,
+            metadata={},
+        )
+    )
+
+
+def _tick(market_data: MarketDataStore, code: str) -> None:
+    market_data.update_tick(
+        StrategyTick.from_realtime(
+            code,
+            price=10000,
+            change_rate=5.4,
+            cum_volume=100_000,
+            trade_value=8_000_000_000,
+            execution_strength=155,
+            spread_ticks=1,
+            timestamp=datetime(2026, 6, 19, 9, 20, 0),
+            metadata={
+                "vwap": 9900,
+                "day_high": 10300,
+                "day_low": 9400,
+                "turnover_speed": 800_000_000,
+                "momentum_1m": 0.7,
+                "momentum_3m": 0.5,
+                "momentum_5m": 0.3,
+                "upper_limit_gap_pct": 10.0,
+            },
+        )
+    )
+
+
+def _market_snapshot() -> dict:
+    return {
+        "trade_date": TRADE_DATE,
+        "calculated_at": "2026-06-19T09:20:00",
+        "global_status": "EXPANSION",
+        "kospi_status": "SELECTIVE",
+        "kosdaq_status": "EXPANSION",
+        "kosdaq_snapshot": {
+            "side": "KOSDAQ",
+            "status": "EXPANSION",
+            "index_return_pct": 0.8,
+            "index_slope_1m_pct": 0.1,
+            "index_slope_3m_pct": 0.2,
+            "index_slope_5m_pct": 0.3,
+            "breadth_pct": 0.62,
+            "turnover_weighted_return_pct": 1.1,
+            "risk_score": 0.0,
+        },
+        "kospi_snapshot": {"side": "KOSPI", "status": "SELECTIVE"},
+        "candidate_policy_by_code": {
+            "000001": {
+                "code": "000001",
+                "market_side": "KOSDAQ",
+                "market_status": "EXPANSION",
+                "global_market_status": "EXPANSION",
+                "market_action": "ALLOW_NORMAL",
+                "position_size_multiplier_hint": 1.0,
+                "block_new_entry": False,
+                "reason_codes": ["MARKET_EXPANSION_ALLOW"],
+            }
+        },
+        "reason_codes": ["INDEX_UP"],
+    }
+
+
+def _theme_board() -> dict:
+    return {
+        "trade_date": TRADE_DATE,
+        "calculated_at": "2026-06-19T09:20:00",
+        "board_status": "OBSERVE",
+        "theme_count": 1,
+        "active_theme_count": 1,
+        "top_themes": [
+            {
+                "theme_id": "ai",
+                "theme_name": "AI",
+                "theme_rank": 1,
+                "theme_status": "LEADING_THEME",
+                "theme_state": "LEADING_THEME",
+                "previous_theme_state": "SPREADING_THEME",
+                "theme_transition": "SPREADING_THEME->LEADING_THEME",
+                "theme_score": 82.0,
+                "theme_score_delta": 5.0,
+                "persistence_count": 3,
+                "leader_symbol": "000001",
+                "co_leader_symbols": [],
+                "leader_stability_count": 3,
+                "strong_count": 3,
+                "leader_count": 1,
+                "breadth_ratio": 0.75,
+                "weighted_return_pct": 4.5,
+                "leader_concentration": 0.42,
+                "coverage_ratio": 0.9,
+                "reason_codes": ["LEADING_PERSISTENCE_CONFIRMED"],
+            }
+        ],
+        "stocks": [
+            {
+                "code": "000001",
+                "name": "Leader",
+                "theme_id": "ai",
+                "theme_name": "AI",
+                "stock_role": "LEADER",
+                "raw_role": "LEADER",
+                "trade_role": "LEADER_CONFIRMED",
+                "stock_score": 88.0,
+                "source_rank": 1,
+                "reason_codes": ["LEADER_CONFIRMED"],
+            }
+        ],
+        "ready_allowed": False,
+        "order_intent_allowed": False,
+    }

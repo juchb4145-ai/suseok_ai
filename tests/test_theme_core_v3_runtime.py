@@ -84,6 +84,57 @@ def test_theme_core_v3_runtime_can_run_without_opening_seed_when_realtime_theme_
     assert result["ready_allowed"] is False
 
 
+def test_theme_core_v3_runtime_requires_runtime_market_context_when_enabled(tmp_path):
+    db = TradingDatabase(str(tmp_path / "theme-core-v3-market-wait.db"))
+    repo = ThemeEngineRepository(db)
+    market_data = MarketDataStore()
+    _theme(repo, "ai", "AI Infra", ["000001", "000002", "000003"])
+    _tick(market_data, "000001", 5.5, 8_000_000_000, speed=900_000_000, execution=150)
+    _tick(market_data, "000002", 5.1, 7_000_000_000, speed=800_000_000, execution=145)
+    _tick(market_data, "000003", 3.4, 3_000_000_000, speed=500_000_000, execution=125)
+
+    pipeline = ThemeCoreV3RuntimePipeline(
+        db=db,
+        market_data=market_data,
+        repository=repo,
+        config=ThemeCoreV3RuntimeConfig(enabled=True, interval_sec=1, use_runtime_market_context=True),
+    )
+    result = pipeline.run(datetime(2026, 6, 18, 9, 7, 0))
+
+    assert result["status"] == "DATA_WAIT"
+    assert result["market_context_status"] == "DATA_WAIT"
+    assert "MARKET_CONTEXT_NOT_READY" in result["reason_codes"]
+
+
+def test_theme_core_v3_candidate_bridge_ingests_confirmed_roles_only_when_enabled(tmp_path):
+    db = TradingDatabase(str(tmp_path / "theme-core-v3-ingest.db"))
+    repo = ThemeEngineRepository(db)
+    market_data = MarketDataStore()
+    _theme(repo, "ai", "AI Infra", ["000001", "000002", "000003"])
+    _tick(market_data, "000001", 5.5, 8_000_000_000, speed=900_000_000, execution=150)
+    _tick(market_data, "000002", 5.1, 7_000_000_000, speed=800_000_000, execution=145)
+    _tick(market_data, "000003", 3.4, 3_000_000_000, speed=500_000_000, execution=125)
+
+    pipeline = ThemeCoreV3RuntimePipeline(
+        db=db,
+        market_data=market_data,
+        repository=repo,
+        config=ThemeCoreV3RuntimeConfig(enabled=True, interval_sec=1, ingest_candidate_source_events=True),
+        candidate_ingestion_service=CandidateIngestionService(db),
+    )
+    pipeline.run(datetime(2026, 6, 18, 9, 5, 0))
+    result = pipeline.run(datetime(2026, 6, 18, 9, 5, 5))
+
+    candidates = db.list_candidates(trade_date="2026-06-18")
+    source_events = db.list_candidate_source_events(trade_date="2026-06-18")
+
+    assert result["candidate_ingestion_enabled"] is True
+    assert candidates
+    assert {event["status"] for event in source_events} == {"INGESTED"}
+    assert db.conn.execute("SELECT COUNT(*) AS count FROM entry_plans").fetchone()["count"] == 0
+    assert db.list_runtime_order_intents(limit=10) == []
+
+
 def test_reboot_v2_cycle_runs_theme_core_v3_pipeline_without_order_path(tmp_path):
     db = TradingDatabase(str(tmp_path / "theme-core-v3-reboot.db"))
     gateway = GatewayStateStore()
@@ -127,6 +178,50 @@ def test_reboot_v2_cycle_runs_theme_core_v3_pipeline_without_order_path(tmp_path
     assert second["entry_plan_count"] == 0
     assert second["virtual_order_count"] == 0
     assert [row for row in gateway.list_commands(include_finished=True, limit=50) if row["command_type"] == "send_order"] == []
+
+
+def test_reboot_v2_cycle_registers_focused_expansion_subscriptions(tmp_path):
+    db = TradingDatabase(str(tmp_path / "theme-core-v3-expansion.db"))
+    gateway = GatewayStateStore()
+    repo = ThemeEngineRepository(db)
+    market_data = MarketDataStore()
+    candle_builder = CandleBuilder()
+    market_index_store = MarketIndexStore()
+    _theme(repo, "ai", "AI Infra", ["000001", "000002", "000003"])
+    _tick(market_data, "000001", 5.5, 8_000_000_000, speed=900_000_000, execution=150)
+    _tick(market_data, "000002", 5.1, 7_000_000_000, speed=800_000_000, execution=145)
+    _tick(market_data, "000003", 3.4, 3_000_000_000, speed=500_000_000, execution=125)
+    theme_core = ThemeCoreV3RuntimePipeline(
+        db=db,
+        market_data=market_data,
+        repository=repo,
+        config=ThemeCoreV3RuntimeConfig(
+            enabled=True,
+            interval_sec=1,
+            use_runtime_market_context=True,
+            theme_expansion_subscriptions_enabled=True,
+        ),
+    )
+    runtime = RebootV2Runtime(
+        db=db,
+        subscription_manager=RealTimeSubscriptionManager(GatewayCommandRealtimeClient(gateway), max_codes=20),
+        candle_builder=candle_builder,
+        market_data=market_data,
+        market_index_store=market_index_store,
+        config=StrategyRuntimeConfig(max_candidates_to_watch=20, realtime_subscription_limit=20),
+        profile=RebootV2RuntimeProfile.V2_OBSERVE,
+        theme_board_pipeline=theme_core,
+        market_regime_pipeline=_MarketContextPipeline(),
+    )
+
+    runtime.start(datetime(2026, 6, 18, 9, 5, 0))
+    first = runtime.cycle(datetime(2026, 6, 18, 9, 5, 5))
+    second = runtime.cycle(datetime(2026, 6, 18, 9, 5, 10))
+
+    assert second["theme_expansion_subscription"]["selected_count"] >= 2
+    assert any("reboot_v2_theme_expansion" in record.sources for record in runtime.subscription_manager.records.values())
+    assert db.conn.execute("SELECT COUNT(*) AS count FROM theme_expansion_subscription_decisions").fetchone()["count"] > 0
+    assert first["theme_board"]["market_context_status"] == "OK"
 
 
 def _theme(repo: ThemeEngineRepository, theme_id: str, name: str, codes: list[str]) -> None:
@@ -198,6 +293,7 @@ def _tick(
             timestamp=datetime(2026, 6, 18, 9, 5, 0),
             metadata={
                 "turnover_speed": speed,
+                "market": "KOSDAQ",
                 "momentum_1m": 1.0,
                 "momentum_3m": 0.8,
                 "momentum_5m": 0.6,
@@ -205,3 +301,20 @@ def _tick(
             },
         )
     )
+
+
+class _MarketContextPipeline:
+    config = type("_Config", (), {"enabled": True})()
+
+    def run_if_due(self, now):
+        return {
+            "enabled": True,
+            "status": "OK",
+            "trade_date": now.date().isoformat(),
+            "calculated_at": now.isoformat(),
+            "global_status": "EXPANSION",
+            "kospi_status": "SELECTIVE",
+            "kosdaq_status": "EXPANSION",
+            "output_mode": "OBSERVE",
+            "reason_codes": ["INDEX_UP"],
+        }

@@ -90,6 +90,7 @@ class DirtyStrategyEvaluator:
         self.fsm = fsm or CandidateFsmService(db, clock=self.clock)
         self.last_result = DirtyStrategyEvaluatorResult(status="DISABLED" if not self.config.enabled else "IDLE", enabled=self.config.enabled, shadow_mode=self.config.shadow_mode)
         self._last_evaluated_at_by_candidate: dict[str, datetime] = {}
+        self._last_context_id_by_candidate: dict[str, str] = {}
 
     def run_if_due(self, now: datetime | None = None) -> dict[str, Any]:
         return self.evaluate_dirty(now=now).to_dict()
@@ -173,7 +174,14 @@ class DirtyStrategyEvaluator:
         candidates: list[Candidate] = []
         debounced = 0
         skipped = 0
-        if any(DirtyReason.MARKET_REGIME_CHANGED.value in _split_reasons(reason) for reason in reason_by_code.values()):
+        broad_reasons = {
+            DirtyReason.MARKET_REGIME_CHANGED.value,
+            DirtyReason.THEME_STATE_CHANGED.value,
+            DirtyReason.THEME_LEADER_CHANGED.value,
+            DirtyReason.THEME_ROLE_CHANGED.value,
+            DirtyReason.STRATEGY_CONTEXT_CHANGED.value,
+        }
+        if any(set(_split_reasons(reason)) & broad_reasons for reason in reason_by_code.values()):
             pool = list(self.db.list_candidates(trade_date=trade_date) or [])
         else:
             pool = []
@@ -192,9 +200,20 @@ class DirtyStrategyEvaluator:
             if apply_debounce and self._debounced(key, now):
                 debounced += 1
                 continue
+            context_id = str(dict(candidate.metadata or {}).get("strategy_context_id") or "")
+            if (
+                apply_debounce
+                and context_id
+                and DirtyReason.STRATEGY_CONTEXT_CHANGED.value in _split_reasons(reason_by_code.get(candidate.code, ""))
+                and self._last_context_id_by_candidate.get(key) == context_id
+            ):
+                debounced += 1
+                continue
             seen.add(key)
             candidates.append(candidate)
             self._last_evaluated_at_by_candidate[key] = now
+            if context_id:
+                self._last_context_id_by_candidate[key] = context_id
             if len(candidates) >= self.config.max_candidates_per_cycle:
                 break
         return tuple(candidates), debounced, skipped

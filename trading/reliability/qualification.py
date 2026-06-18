@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import csv
 import json
 import time
@@ -52,6 +53,7 @@ class ReliabilityQualificationRunner:
         warnings: list[str] = list(guard.warnings)
         not_run: list[str] = []
         deterministic: dict[str, Any] = {}
+        parser_validation: dict[str, Any] = {}
         transport = {
             "status": "NOT_RUN",
             "tool": "tools/websocket_real_pilot_soak.py",
@@ -73,6 +75,7 @@ class ReliabilityQualificationRunner:
                 warnings=warnings,
                 not_run=not_run,
                 deterministic=deterministic,
+                parser_validation=parser_validation,
                 transport=transport,
                 run_dir=run_dir,
             )
@@ -85,6 +88,8 @@ class ReliabilityQualificationRunner:
             deterministic = self._run_deterministic_replay(config, run_dir, scenarios, failures)
         else:
             not_run.append("DETERMINISTIC_REPLAY")
+
+        parser_validation = _run_parser_validation_if_available(run_dir)
 
         if profile in {"quick-ci", "fault-suite", "full"}:
             scenario_ids = _quick_fault_subset() if profile == "quick-ci" else [item.value for item in ScenarioId]
@@ -124,6 +129,9 @@ class ReliabilityQualificationRunner:
         )
         final_status = _final_status(slo.status, scenarios, failures)
         recommendation = _recommendation(final_status, profile, executed_long_soak)
+        if not parser_validation or parser_validation.get("status") == "HOLD":
+            if recommendation == QualificationRecommendation.READY_FOR_RECONCILE_TR_PILOT:
+                recommendation = QualificationRecommendation.READY_FOR_KIWOOM_PARSER_VALIDATION
         report = self._build_report(
             config=config,
             started_at=started_at,
@@ -137,6 +145,7 @@ class ReliabilityQualificationRunner:
             warnings=warnings + list(slo.warnings),
             not_run=not_run,
             deterministic=deterministic,
+            parser_validation=parser_validation,
             transport=transport,
             run_dir=run_dir,
         )
@@ -206,6 +215,7 @@ class ReliabilityQualificationRunner:
         warnings: list[str],
         not_run: list[str],
         deterministic: dict[str, Any],
+        parser_validation: dict[str, Any],
         transport: dict[str, Any],
         run_dir: Path,
     ) -> ReliabilityReport:
@@ -239,6 +249,7 @@ class ReliabilityQualificationRunner:
             report_dir=str(run_dir),
             transport=transport,
             deterministic_replay=deterministic,
+            parser_validation=parser_validation,
         )
 
 
@@ -312,6 +323,27 @@ def _quick_fault_subset() -> list[str]:
         ScenarioId.F16_CORE_RESTART_WITH_BACKLOG.value,
         ScenarioId.F18_DEAD_LETTER_PRESENT.value,
     ]
+
+
+def _run_parser_validation_if_available(run_dir: Path) -> dict[str, Any]:
+    fixture_dir = Path(os.getenv("TRADING_KIWOOM_CHEJAN_FIXTURE_DIR", "tests/fixtures/kiwoom_chejan")).expanduser()
+    if not fixture_dir.exists():
+        return {"status": "NOT_RUN", "reason": "KIWOOM_CHEJAN_FIXTURE_DIR_NOT_FOUND", "fixture_dir": str(fixture_dir)}
+    try:
+        from tools.kiwoom_chejan_parser_validation import validate_fixture_dir
+
+        report = validate_fixture_dir(fixture_dir, output_dir=run_dir / "kiwoom_chejan_validation")
+        return {
+            "status": report.get("status", ""),
+            "recommendation": report.get("recommendation", ""),
+            "source": report.get("source", ""),
+            "case_count": report.get("case_count", 0),
+            "missing_required_cases": report.get("missing_required_cases", []),
+            "failure_count": len(report.get("failures") or []),
+            "output_dir": report.get("output_dir", ""),
+        }
+    except Exception as exc:
+        return {"status": "ERROR", "reason": str(exc), "fixture_dir": str(fixture_dir)}
 
 
 def _load_bundle_events(bundle_path: str) -> list[GatewayEvent]:

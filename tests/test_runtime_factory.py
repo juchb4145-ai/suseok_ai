@@ -75,6 +75,7 @@ def test_build_core_runtime_routes_to_legacy_only_when_profile_is_explicit(tmp_p
     assert bundle.candidate_ingestion_service is None
     assert bundle.candidate_hydrator is None
     assert bundle.theme_board_pipeline is None
+    assert bundle.strategy_context_pipeline is None
     assert bundle.entry_engine_pipeline is None
 
 
@@ -95,9 +96,16 @@ def test_build_core_runtime_routes_to_reboot_v2_observe_only(tmp_path, monkeypat
     assert bundle.dirty_strategy_evaluator is not None
     assert bundle.theme_board_pipeline.config.enabled is True
     assert bundle.theme_board_pipeline.config.interval_sec == 1
+    assert bundle.theme_board_pipeline.config.ingest_candidate_source_events is True
+    assert bundle.theme_board_pipeline.config.use_runtime_market_context is True
+    assert bundle.theme_board_pipeline.config.theme_expansion_subscriptions_enabled is True
     assert bundle.market_regime_pipeline.config.enabled is True
     assert bundle.market_regime_pipeline.config.interval_sec == 1
+    assert bundle.strategy_context_pipeline is not None
+    assert bundle.strategy_context_pipeline.enabled is True
     assert bundle.entry_engine_pipeline.config.enabled is True
+    assert bundle.entry_engine_pipeline.config.use_strategy_context_v3 is True
+    assert bundle.entry_engine_pipeline.config.allow_legacy_theme_context_fallback is False
     assert bundle.dirty_strategy_evaluator.config.enabled is True
     assert bundle.dirty_strategy_evaluator.config.shadow_mode is True
     assert bundle.dirty_strategy_evaluator.config.order_intent_enabled is False
@@ -123,7 +131,7 @@ def test_build_core_runtime_accepts_theme_core_v3_profile_alias(tmp_path, monkey
     assert isinstance(bundle.runtime, RebootV2Runtime)
     assert isinstance(bundle.theme_board_pipeline, ThemeCoreV3RuntimePipeline)
     assert bundle.theme_board_pipeline.config.enabled is True
-    assert bundle.theme_board_pipeline.config.ingest_candidate_source_events is False
+    assert bundle.theme_board_pipeline.config.ingest_candidate_source_events is True
 
 
 def test_build_core_runtime_respects_explicit_reboot_v2_component_disable(tmp_path, monkeypatch):

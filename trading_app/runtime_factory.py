@@ -37,6 +37,7 @@ from trading.strategy.readiness import build_readiness_report, dedupe_warnings
 from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.reboot_v2 import RebootV2RuntimeProfile, reboot_v2_runtime_profile
 from trading.strategy.reboot_v2_runtime import RebootV2Runtime
+from trading.strategy.strategy_context import StrategyContextRuntimePipeline
 from trading.strategy.review import TradeReviewService
 from trading.strategy.runtime import StrategyRuntime
 from trading.strategy.runtime_settings import StrategyRuntimeSettingsRepository
@@ -75,6 +76,7 @@ class CoreRuntimeBundle:
     opening_burst_pipeline: Any = None
     theme_board_pipeline: Any = None
     market_regime_pipeline: Any = None
+    strategy_context_pipeline: Any = None
     entry_engine_pipeline: Any = None
     dirty_strategy_evaluator: Any = None
     exit_engine_reboot_pipeline: Any = None
@@ -174,6 +176,7 @@ def build_legacy_runtime_bundle(
     candidate_hydrator = None
     theme_board_pipeline = None
     market_regime_pipeline = None
+    strategy_context_pipeline = None
     entry_engine_pipeline = None
     dirty_strategy_evaluator = None
     exit_engine_reboot_pipeline = None
@@ -229,6 +232,7 @@ def build_legacy_runtime_bundle(
     runtime.candidate_hydrator = candidate_hydrator
     runtime.theme_board_pipeline = theme_board_pipeline
     runtime.market_regime_pipeline = market_regime_pipeline
+    runtime.strategy_context_pipeline = strategy_context_pipeline
     runtime.entry_engine_pipeline = entry_engine_pipeline
     runtime.dirty_strategy_evaluator = dirty_strategy_evaluator
     runtime.exit_engine_reboot_pipeline = exit_engine_reboot_pipeline
@@ -261,6 +265,7 @@ def build_legacy_runtime_bundle(
         candidate_hydrator=candidate_hydrator,
         theme_board_pipeline=theme_board_pipeline,
         market_regime_pipeline=market_regime_pipeline,
+        strategy_context_pipeline=strategy_context_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
         dirty_strategy_evaluator=dirty_strategy_evaluator,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
@@ -320,6 +325,9 @@ def build_reboot_v2_runtime_bundle(
             default=_v2_component_enabled("TRADING_THEME_BOARD_ENABLED", default=True),
         ),
         interval_sec=dirty_evaluator_config.theme_cadence_sec,
+        ingest_candidate_source_events=_v2_component_enabled("TRADING_THEME_CORE_V3_INGEST_CANDIDATES", default=True),
+        use_runtime_market_context=_v2_component_enabled("TRADING_THEME_CORE_V3_USE_RUNTIME_MARKET_CONTEXT", default=True),
+        theme_expansion_subscriptions_enabled=_v2_component_enabled("TRADING_THEME_EXPANSION_SUBSCRIPTIONS_ENABLED", default=True),
     )
     market_regime_config = replace(
         MarketRegimeConfig.from_env(),
@@ -329,6 +337,8 @@ def build_reboot_v2_runtime_bundle(
     entry_engine_config = replace(
         EntryEngineConfig.from_env(),
         enabled=_v2_component_enabled("TRADING_ENTRY_ENGINE_ENABLED", default=True),
+        use_strategy_context_v3=_v2_component_enabled("TRADING_ENTRY_USE_STRATEGY_CONTEXT_V3", default=True),
+        allow_legacy_theme_context_fallback=_v2_component_enabled("TRADING_ENTRY_ALLOW_LEGACY_THEME_CONTEXT_FALLBACK", default=False),
     )
     exit_engine_config = replace(
         ExitEngineConfig.from_env(),
@@ -351,6 +361,12 @@ def build_reboot_v2_runtime_bundle(
         market_index_store=market_index_store,
         candle_builder=candle_builder,
         config=market_regime_config,
+    )
+    strategy_context_pipeline = StrategyContextRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        candle_builder=candle_builder,
+        enabled=_v2_component_enabled("TRADING_STRATEGY_CONTEXT_V3_ENABLED", default=True),
     )
     entry_engine_pipeline = EntryEngineRuntimePipeline(
         db=db,
@@ -397,6 +413,7 @@ def build_reboot_v2_runtime_bundle(
         opening_burst_pipeline=opening_burst_pipeline,
         theme_board_pipeline=theme_board_pipeline,
         market_regime_pipeline=market_regime_pipeline,
+        strategy_context_pipeline=strategy_context_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
         dirty_strategy_evaluator=dirty_strategy_evaluator,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
@@ -427,6 +444,7 @@ def build_reboot_v2_runtime_bundle(
         opening_burst_pipeline=opening_burst_pipeline,
         theme_board_pipeline=theme_board_pipeline,
         market_regime_pipeline=market_regime_pipeline,
+        strategy_context_pipeline=strategy_context_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
         dirty_strategy_evaluator=dirty_strategy_evaluator,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,

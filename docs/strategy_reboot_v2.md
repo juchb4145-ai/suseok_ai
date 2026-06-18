@@ -1,5 +1,42 @@
 # Strategy Reboot V2 Design
 
+## Strategy Context V3 Cutover
+
+Reboot V2 default runtime now uses Strategy Context V3 as the contract between MarketRegime, Theme Core V3, Candidate FSM, DirtyStrategyEvaluator, and EntryEngine.
+
+Runtime order is:
+
+```text
+MarketDataService
+MarketRegime
+Opening Burst
+Theme Core V3
+FocusedExpansion realtime subscription reconcile
+CandidateBridge confirmed event ingest
+CandidateHydrator
+Candidate realtime subscription reconcile
+StrategyContextAssembler
+DirtyStrategyEvaluator / EntryEngine
+Dashboard snapshot
+```
+
+V2 runtime defaults:
+
+```text
+TRADING_STRATEGY_CONTEXT_V3_ENABLED=true
+TRADING_THEME_CORE_V3_USE_RUNTIME_MARKET_CONTEXT=true
+TRADING_THEME_CORE_V3_INGEST_CANDIDATES=true
+TRADING_THEME_EXPANSION_SUBSCRIPTIONS_ENABLED=true
+TRADING_ENTRY_USE_STRATEGY_CONTEXT_V3=true
+TRADING_ENTRY_ALLOW_LEGACY_THEME_CONTEXT_FALLBACK=false
+```
+
+`theme_board_*` flat metadata is now compatibility projection only. In the V2 path, EntryEngine reads `candidate.metadata["strategy_context_v3"]`; if the context is missing, it returns `DATA_WAIT` with `STRATEGY_CONTEXT_V3_MISSING` instead of falling back to static theme metadata.
+
+CandidateBridge ingestion remains observe-only. It may create or update Candidate FSM discovery/watch context, but it must not create READY, EntryPlan, OrderIntent, or Gateway `send_order` commands.
+
+Theme state persistence is same-day only via `theme_state_runtime_latest` and `theme_state_transitions`, so Core restart restores today's persistence and leader stability without carrying previous trading-day state into the current session.
+
 ## 목적
 
 Strategy Reboot V2는 기존 hybrid gate, final grade, shadow/promotion, threshold A/B, 복잡한 관측 로직을 더 고도화하지 않고, 조건검색 + TR + 실시간 시세를 분리된 판단 엔진으로 연결하는 새 전략 흐름이다.

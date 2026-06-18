@@ -10,6 +10,7 @@ from trading.strategy.models import BlockType, Candidate, CandidateState
 SOURCE_PRIORITIES = {
     "reboot_v2_index": 110,
     "reboot_v2_position": 105,
+    "reboot_v2_theme_expansion": 82,
     "reboot_v2_opening_seed": 70,
     "reboot_v2_candidate": 65,
     "reboot_v2_theme_board": 60,
@@ -39,9 +40,10 @@ PROTECTED_SOURCES = {
 FALLBACK_SOURCE_ORDER = {
     "reboot_v2_index": 0,
     "reboot_v2_position": 1,
-    "reboot_v2_opening_seed": 2,
-    "reboot_v2_candidate": 3,
-    "reboot_v2_theme_board": 4,
+    "reboot_v2_theme_expansion": 2,
+    "reboot_v2_opening_seed": 3,
+    "reboot_v2_candidate": 4,
+    "reboot_v2_theme_board": 5,
     "index": 0,
     "leading_stock": 1,
     "semiconductor_signal": 1,

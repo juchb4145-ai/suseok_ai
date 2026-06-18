@@ -1,0 +1,19 @@
+{
+  "schema_version": "1",
+  "parser_version": "kiwoom_chejan_v2",
+  "source": "SYNTHETIC",
+  "captured_date": "",
+  "redaction_status": "SYNTHETIC_NO_REAL_ACCOUNT",
+  "known_missing_cases": [],
+  "cases": [
+    {"case_id": "order_accepted", "file": "order_accepted.json", "gubun": "0", "expected_event_kind": "order_accepted", "expected_canonical": "ORDER_ACCEPTED"},
+    {"case_id": "order_rejected", "file": "order_rejected.json", "gubun": "0", "expected_event_kind": "order_rejected", "expected_canonical": "ORDER_REJECTED"},
+    {"case_id": "partial_fill", "file": "partial_fill.json", "gubun": "0", "expected_event_kind": "order_fill", "expected_canonical": "ORDER_PARTIALLY_FILLED"},
+    {"case_id": "full_fill", "file": "full_fill.json", "gubun": "0", "expected_event_kind": "order_fill", "expected_canonical": "ORDER_FILLED"},
+    {"case_id": "cancel_accepted", "file": "cancel_accepted.json", "gubun": "0", "expected_event_kind": "order_cancel_accepted", "expected_canonical": "ORDER_CANCEL_ACCEPTED"},
+    {"case_id": "cancelled", "file": "cancelled.json", "gubun": "0", "expected_event_kind": "order_cancelled", "expected_canonical": "ORDER_CANCELLED"},
+    {"case_id": "balance_increase", "file": "balance_increase.json", "gubun": "1", "expected_event_kind": "position_delta", "expected_canonical": "POSITION_SNAPSHOT"},
+    {"case_id": "balance_zero", "file": "balance_zero.json", "gubun": "1", "expected_event_kind": "position_delta", "expected_canonical": "POSITION_SNAPSHOT"},
+    {"case_id": "unknown_gubun", "file": "unknown_gubun.json", "gubun": "9", "expected_event_kind": "unsupported_gubun", "expected_canonical": "IGNORED"}
+  ]
+}

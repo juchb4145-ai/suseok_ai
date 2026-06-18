@@ -1,0 +1,9 @@
+{
+  "gubun": "9",
+  "item_count": 2,
+  "fid_list": "9999;9201",
+  "raw_fids": {
+    "9999": "diagnostic",
+    "9201": "ACC_TOKEN_SYNTHETIC"
+  }
+}

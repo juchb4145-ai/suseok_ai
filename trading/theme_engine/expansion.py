@@ -12,6 +12,8 @@ class FocusedExpansionConfig:
     max_per_theme: int = 6
     max_total: int = 30
     source: str = "reboot_v2_theme_expansion"
+    subscription_ttl_sec: int = 90
+    minimum_hold_sec: int = 30
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,10 @@ class FocusedExpansionTarget:
     source: str = "reboot_v2_theme_expansion"
     trade_role: str = ""
     raw_role: str = ""
+    protected: bool = False
+    subscription_ttl_sec: int = 90
+    minimum_hold_sec: int = 30
+    selected_at: str = ""
     reason_codes: tuple[str, ...] = ()
 
 
@@ -61,7 +67,7 @@ class FocusedExpansionPlanner:
         reasons: list[str] = []
         for decision in sorted(role_decisions, key=_priority):
             state = state_by_theme.get(decision.theme_id)
-            target = _target(decision, self.config.source)
+            target = _target(decision, self.config)
             if state is None or state.theme_state not in eligible_states:
                 excluded.append(_with_reason(target, "THEME_NOT_EXPANSION_ELIGIBLE"))
                 continue
@@ -104,16 +110,19 @@ def _priority(decision: StockRoleDecision) -> tuple[int, float]:
     return (role_priority + raw_bonus, -decision.role_score)
 
 
-def _target(decision: StockRoleDecision, source: str) -> FocusedExpansionTarget:
+def _target(decision: StockRoleDecision, config: FocusedExpansionConfig) -> FocusedExpansionTarget:
     return FocusedExpansionTarget(
         code=decision.code,
         name=decision.name,
         theme_id=decision.theme_id,
         theme_name=decision.theme_name,
         priority=_priority(decision)[0],
-        source=source,
+        source=config.source,
         trade_role=decision.trade_role,
         raw_role=decision.raw_role,
+        protected=False,
+        subscription_ttl_sec=max(1, int(config.subscription_ttl_sec)),
+        minimum_hold_sec=max(0, int(config.minimum_hold_sec)),
         reason_codes=decision.reason_codes,
     )
 

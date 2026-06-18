@@ -807,9 +807,25 @@ def _kiwoom_heartbeat_payload(client, runtime: GatewayRuntime) -> dict[str, Any]
         "last_error": runtime.last_error,
         "reconnect_count": runtime.reconnect_count,
         "rate_limit": runtime.rate_limiter.snapshot(),
+        "kiwoom_chejan_parser": _kiwoom_chejan_parser_metrics_payload(client),
         **_kiwoom_runtime_login_payload(runtime),
         **runtime.transport_snapshot(),
     }
+
+
+def _kiwoom_chejan_parser_metrics_payload(client) -> dict[str, Any]:
+    metrics = getattr(client, "chejan_parser_metrics", None)
+    if metrics is None:
+        return {}
+    snapshot = getattr(metrics, "to_dict", None)
+    if callable(snapshot):
+        try:
+            return dict(snapshot())
+        except Exception:
+            return {"available": False, "error": "CHEJAN_PARSER_METRICS_UNAVAILABLE"}
+    if isinstance(metrics, dict):
+        return dict(metrics)
+    return {}
 
 
 def _wire_kiwoom_signals(client, runtime: GatewayRuntime) -> None:
@@ -841,6 +857,9 @@ def _wire_kiwoom_signals(client, runtime: GatewayRuntime) -> None:
             )
         )
     client.order_result.connect(lambda result: runtime.emit("order_result", result.to_dict()))
+    chejan_signal = getattr(client, "chejan_event_received", None)
+    if chejan_signal is not None and callable(getattr(chejan_signal, "connect", None)):
+        chejan_signal.connect(lambda result: runtime.emit(result.gateway_event_type, result.to_event_payload()))
     client.execution_received.connect(lambda event: runtime.emit("execution_event", event.to_dict()))
     client.message_received.connect(lambda message: runtime.emit("gateway_log", {"message": str(message or "")}))
     client.condition_load_result.connect(

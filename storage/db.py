@@ -676,6 +676,94 @@ class TradingDatabase:
                 ON theme_board_stock_snapshots(board_snapshot_id, theme_id, stock_score);
             CREATE INDEX IF NOT EXISTS idx_theme_board_stock_snapshots_trade_code
                 ON theme_board_stock_snapshots(trade_date, code, id);
+            CREATE TABLE IF NOT EXISTS theme_state_runtime_latest (
+                trade_date TEXT NOT NULL,
+                theme_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                previous_state TEXT NOT NULL DEFAULT '',
+                current_state TEXT NOT NULL DEFAULT '',
+                persistence_count INTEGER NOT NULL DEFAULT 0,
+                theme_score REAL NOT NULL DEFAULT 0,
+                theme_score_delta REAL NOT NULL DEFAULT 0,
+                leader_symbol TEXT NOT NULL DEFAULT '',
+                previous_leader_symbol TEXT NOT NULL DEFAULT '',
+                leader_stability_count INTEGER NOT NULL DEFAULT 0,
+                leader_changed INTEGER NOT NULL DEFAULT 0,
+                last_transition_at TEXT NOT NULL DEFAULT '',
+                last_calculated_at TEXT NOT NULL DEFAULT '',
+                data_quality_status TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (trade_date, theme_id)
+            );
+            CREATE TABLE IF NOT EXISTS theme_state_transitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                theme_id TEXT NOT NULL,
+                previous_state TEXT NOT NULL DEFAULT '',
+                current_state TEXT NOT NULL DEFAULT '',
+                transition TEXT NOT NULL DEFAULT '',
+                leader_symbol TEXT NOT NULL DEFAULT '',
+                previous_leader_symbol TEXT NOT NULL DEFAULT '',
+                persistence_count INTEGER NOT NULL DEFAULT 0,
+                theme_score REAL NOT NULL DEFAULT 0,
+                theme_score_delta REAL NOT NULL DEFAULT 0,
+                occurred_at TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_theme_state_transitions_trade_theme
+                ON theme_state_transitions(trade_date, theme_id, id);
+            CREATE TABLE IF NOT EXISTS strategy_context_latest (
+                trade_date TEXT NOT NULL,
+                code TEXT NOT NULL,
+                candidate_id INTEGER,
+                context_id TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                session_phase TEXT NOT NULL DEFAULT '',
+                context_fresh INTEGER NOT NULL DEFAULT 0,
+                blocking_stage TEXT NOT NULL DEFAULT '',
+                primary_reason_code TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (trade_date, code)
+            );
+            CREATE TABLE IF NOT EXISTS strategy_context_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                code TEXT NOT NULL,
+                candidate_id INTEGER,
+                context_id TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                session_phase TEXT NOT NULL DEFAULT '',
+                context_fresh INTEGER NOT NULL DEFAULT 0,
+                blocking_stage TEXT NOT NULL DEFAULT '',
+                primary_reason_code TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_strategy_context_snapshots_trade_code
+                ON strategy_context_snapshots(trade_date, code, id);
+            CREATE INDEX IF NOT EXISTS idx_strategy_context_snapshots_context
+                ON strategy_context_snapshots(context_id);
+            CREATE TABLE IF NOT EXISTS theme_expansion_subscription_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                code TEXT NOT NULL,
+                theme_id TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'reboot_v2_theme_expansion',
+                action TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_theme_expansion_subscription_decisions_trade
+                ON theme_expansion_subscription_decisions(trade_date, calculated_at, id);
             CREATE TABLE IF NOT EXISTS market_regime_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -7318,6 +7406,246 @@ class TradingDatabase:
                 """
             ).fetchone()
         return _row_to_theme_board_snapshot(row) if row else {}
+
+    def save_theme_state_runtime(self, state: dict, *, trade_date: Optional[str] = None, calculated_at: Optional[str] = None) -> dict:
+        payload = dict(state or {})
+        trade_date = str(trade_date or payload.get("trade_date") or "")
+        calculated_at = str(calculated_at or payload.get("calculated_at") or payload.get("last_calculated_at") or "")
+        theme_id = str(payload.get("theme_id") or "")
+        previous_state = str(payload.get("previous_state") or payload.get("previous_theme_state") or "")
+        current_state = str(payload.get("theme_state") or payload.get("current_state") or "")
+        transition = str(payload.get("transition") or payload.get("theme_transition") or f"{previous_state or 'NONE'}->{current_state}")
+        leader_symbol = _clean_stock_code(payload.get("leader_symbol")) or str(payload.get("leader_symbol") or "")
+        previous_leader_symbol = _clean_stock_code(payload.get("previous_leader_symbol")) or str(payload.get("previous_leader_symbol") or "")
+        theme_score = _float_value(payload.get("theme_score"))
+        theme_score_delta = _float_value(payload.get("theme_score_delta"))
+        persistence_count = _safe_int(payload.get("persistence_count"), 0)
+        leader_stability_count = _safe_int(payload.get("leader_stability_count"), 0)
+        leader_changed = bool(payload.get("leader_changed"))
+        reason_codes = list(payload.get("reason_codes") or [])
+        data_quality = str(payload.get("data_quality_status") or payload.get("data_quality_reason") or "")
+        with self.conn:
+            previous = self.load_theme_state_runtime(trade_date=trade_date, theme_id=theme_id)
+            self.conn.execute(
+                """
+                INSERT INTO theme_state_runtime_latest(
+                    trade_date, theme_id, previous_state, current_state, persistence_count,
+                    theme_score, theme_score_delta, leader_symbol, previous_leader_symbol,
+                    leader_stability_count, leader_changed, last_transition_at,
+                    last_calculated_at, data_quality_status, reason_codes_json, payload_json,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(trade_date, theme_id) DO UPDATE SET
+                    previous_state=excluded.previous_state,
+                    current_state=excluded.current_state,
+                    persistence_count=excluded.persistence_count,
+                    theme_score=excluded.theme_score,
+                    theme_score_delta=excluded.theme_score_delta,
+                    leader_symbol=excluded.leader_symbol,
+                    previous_leader_symbol=excluded.previous_leader_symbol,
+                    leader_stability_count=excluded.leader_stability_count,
+                    leader_changed=excluded.leader_changed,
+                    last_transition_at=excluded.last_transition_at,
+                    last_calculated_at=excluded.last_calculated_at,
+                    data_quality_status=excluded.data_quality_status,
+                    reason_codes_json=excluded.reason_codes_json,
+                    payload_json=excluded.payload_json,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    trade_date,
+                    theme_id,
+                    previous_state,
+                    current_state,
+                    persistence_count,
+                    theme_score,
+                    theme_score_delta,
+                    leader_symbol,
+                    previous_leader_symbol,
+                    leader_stability_count,
+                    int(leader_changed),
+                    calculated_at if previous_state != current_state or leader_changed else str(payload.get("last_transition_at") or calculated_at),
+                    calculated_at,
+                    data_quality,
+                    _json_list(reason_codes),
+                    _json_payload({**payload, "trade_date": trade_date, "calculated_at": calculated_at}),
+                ),
+            )
+            should_record_transition = not previous or previous.get("current_state") != current_state or previous.get("leader_symbol") != leader_symbol
+            if should_record_transition:
+                self.conn.execute(
+                    """
+                    INSERT INTO theme_state_transitions(
+                        trade_date, theme_id, previous_state, current_state, transition,
+                        leader_symbol, previous_leader_symbol, persistence_count,
+                        theme_score, theme_score_delta, occurred_at,
+                        reason_codes_json, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade_date,
+                        theme_id,
+                        previous_state,
+                        current_state,
+                        transition,
+                        leader_symbol,
+                        previous_leader_symbol,
+                        persistence_count,
+                        theme_score,
+                        theme_score_delta,
+                        calculated_at,
+                        _json_list(reason_codes),
+                        _json_payload({**payload, "trade_date": trade_date, "calculated_at": calculated_at}),
+                    ),
+                )
+        return self.load_theme_state_runtime(trade_date=trade_date, theme_id=theme_id) or {}
+
+    def load_theme_state_runtime(self, *, trade_date: str, theme_id: str) -> dict:
+        row = self.conn.execute(
+            "SELECT * FROM theme_state_runtime_latest WHERE trade_date = ? AND theme_id = ?",
+            (str(trade_date), str(theme_id)),
+        ).fetchone()
+        return _row_to_theme_state_runtime(row) if row else {}
+
+    def list_theme_state_runtime(self, *, trade_date: str) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM theme_state_runtime_latest
+            WHERE trade_date = ?
+            ORDER BY theme_score DESC, theme_id
+            """,
+            (str(trade_date),),
+        ).fetchall()
+        return [_row_to_theme_state_runtime(row) for row in rows]
+
+    def save_strategy_context_snapshot(self, snapshot: dict) -> dict:
+        payload = dict(snapshot or {})
+        trade_date = str(payload.get("trade_date") or "")
+        code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
+        candidate_id = payload.get("candidate_id")
+        context_id = str(payload.get("context_id") or "")
+        calculated_at = str(payload.get("calculated_at") or "")
+        session_phase = str(payload.get("session_phase") or "")
+        context_fresh = int(bool(payload.get("context_fresh")))
+        blocking_stage = str(payload.get("blocking_stage") or "")
+        primary_reason_code = str(payload.get("primary_reason_code") or "")
+        reason_codes = list(payload.get("reason_codes") or [])
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO strategy_context_latest(
+                    trade_date, code, candidate_id, context_id, calculated_at,
+                    session_phase, context_fresh, blocking_stage, primary_reason_code,
+                    reason_codes_json, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(trade_date, code) DO UPDATE SET
+                    candidate_id=excluded.candidate_id,
+                    context_id=excluded.context_id,
+                    calculated_at=excluded.calculated_at,
+                    session_phase=excluded.session_phase,
+                    context_fresh=excluded.context_fresh,
+                    blocking_stage=excluded.blocking_stage,
+                    primary_reason_code=excluded.primary_reason_code,
+                    reason_codes_json=excluded.reason_codes_json,
+                    payload_json=excluded.payload_json,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    trade_date,
+                    code,
+                    candidate_id,
+                    context_id,
+                    calculated_at,
+                    session_phase,
+                    context_fresh,
+                    blocking_stage,
+                    primary_reason_code,
+                    _json_list(reason_codes),
+                    _json_payload(payload),
+                ),
+            )
+            cursor = self.conn.execute(
+                """
+                INSERT INTO strategy_context_snapshots(
+                    trade_date, code, candidate_id, context_id, calculated_at,
+                    session_phase, context_fresh, blocking_stage, primary_reason_code,
+                    reason_codes_json, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_date,
+                    code,
+                    candidate_id,
+                    context_id,
+                    calculated_at,
+                    session_phase,
+                    context_fresh,
+                    blocking_stage,
+                    primary_reason_code,
+                    _json_list(reason_codes),
+                    _json_payload(payload),
+                ),
+            )
+        return self.get_strategy_context_snapshot(int(cursor.lastrowid)) or {}
+
+    def get_strategy_context_snapshot(self, snapshot_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_context_snapshots WHERE id = ?",
+            (int(snapshot_id),),
+        ).fetchone()
+        return _row_to_strategy_context_snapshot(row) if row else None
+
+    def latest_strategy_context(self, *, trade_date: str, code: str) -> dict:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_context_latest WHERE trade_date = ? AND code = ?",
+            (str(trade_date), _clean_stock_code(code) or str(code)),
+        ).fetchone()
+        return _row_to_strategy_context_snapshot(row) if row else {}
+
+    def list_strategy_context_snapshots(self, *, trade_date: Optional[str] = None, code: Optional[str] = None, limit: int = 100) -> list[dict]:
+        query = "SELECT * FROM strategy_context_snapshots"
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY calculated_at DESC, id DESC LIMIT ?"
+        params.append(max(1, int(limit or 100)))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [_row_to_strategy_context_snapshot(row) for row in rows]
+
+    def save_theme_expansion_subscription_decision(self, decision: dict) -> dict:
+        payload = dict(decision or {})
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO theme_expansion_subscription_decisions(
+                    trade_date, calculated_at, code, theme_id, source, action,
+                    status, reason_codes_json, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(payload.get("trade_date") or ""),
+                    str(payload.get("calculated_at") or ""),
+                    _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                    str(payload.get("theme_id") or ""),
+                    str(payload.get("source") or "reboot_v2_theme_expansion"),
+                    str(payload.get("action") or ""),
+                    str(payload.get("status") or ""),
+                    _json_list(payload.get("reason_codes") or []),
+                    _json_payload(payload),
+                ),
+            )
+        row = self.conn.execute(
+            "SELECT * FROM theme_expansion_subscription_decisions WHERE id = ?",
+            (int(cursor.lastrowid),),
+        ).fetchone()
+        return _row_to_theme_expansion_subscription_decision(row) if row else {}
 
     def save_market_regime_snapshot(self, snapshot: dict) -> dict:
         payload = dict(snapshot or {})
@@ -14176,6 +14504,69 @@ def _row_to_market_regime_snapshot(row: sqlite3.Row) -> dict:
     payload.setdefault("output_mode", "OBSERVE")
     payload.setdefault("ready_allowed", False)
     payload.setdefault("order_intent_allowed", False)
+    return payload
+
+
+def _row_to_theme_state_runtime(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("theme_id", data.get("theme_id", ""))
+    payload.setdefault("updated_at", data.get("updated_at", ""))
+    payload.setdefault("previous_state", data.get("previous_state", ""))
+    payload.setdefault("current_state", data.get("current_state", ""))
+    payload.setdefault("theme_state", data.get("current_state", ""))
+    payload.setdefault("persistence_count", int(data.get("persistence_count") or 0))
+    payload.setdefault("theme_score", _float_value(data.get("theme_score")))
+    payload.setdefault("theme_score_delta", _float_value(data.get("theme_score_delta")))
+    payload.setdefault("leader_symbol", data.get("leader_symbol", ""))
+    payload.setdefault("previous_leader_symbol", data.get("previous_leader_symbol", ""))
+    payload.setdefault("leader_stability_count", int(data.get("leader_stability_count") or 0))
+    payload.setdefault("leader_changed", bool(data.get("leader_changed")))
+    payload.setdefault("last_transition_at", data.get("last_transition_at", ""))
+    payload.setdefault("last_calculated_at", data.get("last_calculated_at", ""))
+    payload.setdefault("data_quality_status", data.get("data_quality_status", ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    return payload
+
+
+def _row_to_strategy_context_snapshot(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("id", data.get("id"))
+    payload.setdefault("created_at", data.get("created_at", ""))
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("code", data.get("code", ""))
+    payload.setdefault("candidate_id", data.get("candidate_id"))
+    payload.setdefault("context_id", data.get("context_id", ""))
+    payload.setdefault("calculated_at", data.get("calculated_at", ""))
+    payload.setdefault("session_phase", data.get("session_phase", ""))
+    payload.setdefault("context_fresh", bool(data.get("context_fresh")))
+    payload.setdefault("blocking_stage", data.get("blocking_stage", ""))
+    payload.setdefault("primary_reason_code", data.get("primary_reason_code", ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    return payload
+
+
+def _row_to_theme_expansion_subscription_decision(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("id", data.get("id"))
+    payload.setdefault("created_at", data.get("created_at", ""))
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("calculated_at", data.get("calculated_at", ""))
+    payload.setdefault("code", data.get("code", ""))
+    payload.setdefault("theme_id", data.get("theme_id", ""))
+    payload.setdefault("source", data.get("source", ""))
+    payload.setdefault("action", data.get("action", ""))
+    payload.setdefault("status", data.get("status", ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
     return payload
 
 

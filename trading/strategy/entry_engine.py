@@ -66,6 +66,8 @@ class EntryEngineConfig:
     max_spread_ticks: int = 3
     vi_cooldown_sec: int = 180
     upper_limit_min_gap_pct: float = 3.0
+    use_strategy_context_v3: bool = False
+    allow_legacy_theme_context_fallback: bool = True
 
     @classmethod
     def from_env(cls) -> "EntryEngineConfig":
@@ -88,6 +90,8 @@ class EntryEngineConfig:
             max_spread_ticks=max(0, _env_int("TRADING_ENTRY_MAX_SPREAD_TICKS", 3)),
             vi_cooldown_sec=max(0, _env_int("TRADING_ENTRY_VI_COOLDOWN_SEC", 180)),
             upper_limit_min_gap_pct=_env_float("TRADING_ENTRY_UPPER_LIMIT_MIN_GAP_PCT", 3.0),
+            use_strategy_context_v3=_env_bool("TRADING_ENTRY_USE_STRATEGY_CONTEXT_V3", False),
+            allow_legacy_theme_context_fallback=_env_bool("TRADING_ENTRY_ALLOW_LEGACY_THEME_CONTEXT_FALLBACK", True),
         )
 
 
@@ -283,11 +287,12 @@ class EntryEngine:
 
     def _decision(self, candidate: Candidate, trade_date: str, now: datetime) -> EntryDecision:
         metadata = dict(candidate.metadata or {})
+        strategy_context = _strategy_context_v3(metadata)
         tick = self.market_data.latest_tick(candidate.code) if self.market_data is not None else None
         data = self._data_ready(candidate, tick, now)
-        theme = self._theme_ready(candidate, metadata)
-        market = self._market_ready(metadata)
-        role = self._role_ready(metadata, market)
+        theme = self._theme_ready(candidate, metadata, strategy_context)
+        market = self._market_ready(metadata, strategy_context)
+        role = self._role_ready(metadata, market, strategy_context)
         price = self._price_timing(candidate, metadata, tick, data, theme, market, role)
         entry_status = self._entry_status(data, theme, market, role, price)
         reason_codes = _dedupe(
@@ -314,21 +319,27 @@ class EntryEngine:
             "price": price.details,
             "observe_only": self.config.observe_only,
             "dry_run_intent_emitter": "disabled" if not self.config.allow_dry_run_intents else "guarded",
+            "strategy_context_version": str(strategy_context.get("schema_version") or ""),
+            "strategy_context_id": str(strategy_context.get("context_id") or ""),
+            "strategy_context_v3": strategy_context,
         }
         current_price = int(getattr(tick, "price", 0) or 0) if tick is not None else 0
+        context_theme = _context_theme(strategy_context)
+        context_stock = _context_stock(strategy_context)
+        context_market = _context_market(strategy_context)
         return EntryDecision(
             trade_date=trade_date,
             calculated_at=now.isoformat(),
             candidate_id=candidate.id,
             code=candidate.code,
             name=candidate.name,
-            theme_id=str(metadata.get("theme_board_theme_id") or ""),
-            theme_name=str(metadata.get("theme_board_theme_name") or ""),
-            theme_status=str(metadata.get("theme_board_theme_status") or ""),
-            stock_role=str(metadata.get("theme_board_stock_role") or ""),
-            market_side=str(metadata.get("market_side") or ""),
-            market_status=str(metadata.get("market_regime_status") or ""),
-            market_action=str(metadata.get("market_action") or ""),
+            theme_id=str(context_theme.get("theme_id") or metadata.get("theme_board_theme_id") or ""),
+            theme_name=str(context_theme.get("theme_name") or metadata.get("theme_board_theme_name") or ""),
+            theme_status=str(context_theme.get("theme_state") or metadata.get("theme_board_theme_status") or ""),
+            stock_role=str(context_stock.get("trade_stock_role") or metadata.get("theme_board_stock_role") or ""),
+            market_side=str(context_market.get("market_side") or metadata.get("market_side") or ""),
+            market_status=str(context_market.get("side_market_regime") or metadata.get("market_regime_status") or ""),
+            market_action=str(context_market.get("market_action") or metadata.get("market_action") or ""),
             price_location=price.price_location.value,
             entry_status=entry_status,
             data_ready_status=data.status,
@@ -406,19 +417,29 @@ class EntryEngine:
             return EntryDataReadiness(status=EntryCheckStatus.WAIT, reason_codes=tuple(_dedupe(reasons)), data_quality_flags=tuple(_dedupe(flags)), details=details)
         return EntryDataReadiness(status=EntryCheckStatus.PASS, reason_codes=("DATA_READY",), data_quality_flags=(), details=details)
 
-    def _theme_ready(self, candidate: Candidate, metadata: Mapping[str, Any]) -> EntryThemeReadiness:
-        status = str(metadata.get("theme_board_theme_status") or "").strip().upper()
-        role = str(metadata.get("theme_board_stock_role") or "").strip().upper()
-        score = _float(metadata.get("theme_board_theme_score"))
-        details = {"theme_status": status, "stock_role": role, "theme_score": score}
+    def _theme_ready(self, candidate: Candidate, metadata: Mapping[str, Any], strategy_context: Mapping[str, Any]) -> EntryThemeReadiness:
+        if self.config.use_strategy_context_v3:
+            if not strategy_context:
+                return EntryThemeReadiness(status=EntryCheckStatus.DATA_WAIT, reason_codes=("STRATEGY_CONTEXT_V3_MISSING",), details={"strategy_context_required": True})
+            theme_context = _context_theme(strategy_context)
+            stock_context = _context_stock(strategy_context)
+            status = str(theme_context.get("theme_state") or "").strip().upper()
+            role = str(stock_context.get("trade_stock_role") or "").strip().upper()
+            score = _float(theme_context.get("theme_score"))
+            details = {"theme_status": status, "stock_role": role, "theme_score": score, "strategy_context_id": strategy_context.get("context_id")}
+        else:
+            status = str(metadata.get("theme_board_theme_status") or "").strip().upper()
+            role = str(metadata.get("theme_board_stock_role") or "").strip().upper()
+            score = _float(metadata.get("theme_board_theme_score"))
+            details = {"theme_status": status, "stock_role": role, "theme_score": score}
         if not status:
             return EntryThemeReadiness(status=EntryCheckStatus.WAIT, reason_codes=("THEME_STATUS_MISSING",), details=details)
-        if status == "DATA_WAIT":
+        if status in {"DATA_WAIT", "SEED_WAIT", "UNIVERSE_EMPTY"}:
             return EntryThemeReadiness(status=EntryCheckStatus.DATA_WAIT, reason_codes=("THEME_DATA_WAIT",), details=details)
-        if status == "WEAK_THEME":
+        if status in {"WEAK_THEME", "FADING_THEME"}:
             return EntryThemeReadiness(status=EntryCheckStatus.BLOCK, reason_codes=("THEME_WEAK",), details=details)
         if status == "LEADER_ONLY_THEME":
-            if role in {"LEADER", "CO_LEADER"}:
+            if role in {"LEADER", "CO_LEADER", "LEADER_CONFIRMED", "CO_LEADER_CONFIRMED"}:
                 return EntryThemeReadiness(status=EntryCheckStatus.PASS, reason_codes=("THEME_LEADER_ONLY",), details=details)
             return EntryThemeReadiness(status=EntryCheckStatus.BLOCK, reason_codes=("THEME_LEADER_ONLY_FOLLOWER_BLOCK",), details=details)
         if status in {"LEADING_THEME", "SPREADING_THEME"}:
@@ -428,12 +449,20 @@ class EntryEngine:
             return EntryThemeReadiness(status=EntryCheckStatus.PASS, reason_codes=(reason,), details=details)
         if status == "WATCH_THEME":
             return EntryThemeReadiness(status=EntryCheckStatus.WAIT, reason_codes=("THEME_WATCH",), details=details)
+        if status == "EMERGING_THEME":
+            return EntryThemeReadiness(status=EntryCheckStatus.WAIT, reason_codes=("THEME_WAIT",), details=details)
         return EntryThemeReadiness(status=EntryCheckStatus.WAIT, reason_codes=("THEME_STATUS_UNKNOWN",), details=details)
 
-    def _market_ready(self, metadata: Mapping[str, Any]) -> EntryMarketReadiness:
-        action = str(metadata.get("market_action") or "").strip().upper()
-        market_status = str(metadata.get("market_regime_status") or "").strip().upper()
-        multiplier = _float(metadata.get("market_position_size_multiplier_hint"))
+    def _market_ready(self, metadata: Mapping[str, Any], strategy_context: Mapping[str, Any]) -> EntryMarketReadiness:
+        if self.config.use_strategy_context_v3:
+            if not strategy_context:
+                return EntryMarketReadiness(status=EntryCheckStatus.DATA_WAIT, reason_codes=("STRATEGY_CONTEXT_V3_MISSING",), details={"strategy_context_required": True})
+            market_context = _context_market(strategy_context)
+        else:
+            market_context = {}
+        action = str(market_context.get("market_action") or metadata.get("market_action") or "").strip().upper()
+        market_status = str(market_context.get("side_market_regime") or metadata.get("market_regime_status") or "").strip().upper()
+        multiplier = _float(market_context.get("position_size_multiplier_hint", metadata.get("market_position_size_multiplier_hint")))
         details = {"market_action": action, "market_status": market_status}
         if not action:
             return EntryMarketReadiness(status=EntryCheckStatus.DATA_WAIT, reason_codes=("MARKET_DATA_WAIT",), details=details)
@@ -457,24 +486,31 @@ class EntryEngine:
             return EntryMarketReadiness(status=EntryCheckStatus.BLOCK, reason_codes=("MARKET_CLOSED",), position_size_multiplier_hint=0.0, details=details)
         return EntryMarketReadiness(status=EntryCheckStatus.DATA_WAIT, reason_codes=("MARKET_ACTION_UNKNOWN",), position_size_multiplier_hint=0.0, details=details)
 
-    def _role_ready(self, metadata: Mapping[str, Any], market: EntryMarketReadiness) -> EntryRoleReadiness:
-        role = str(metadata.get("theme_board_stock_role") or "").strip().upper()
-        theme_status = str(metadata.get("theme_board_theme_status") or "").strip().upper()
-        market_status = str(metadata.get("market_regime_status") or "").strip().upper()
-        details = {"stock_role": role, "theme_status": theme_status, "market_status": market_status}
-        if role == "LEADER":
+    def _role_ready(self, metadata: Mapping[str, Any], market: EntryMarketReadiness, strategy_context: Mapping[str, Any]) -> EntryRoleReadiness:
+        stock_context = _context_stock(strategy_context) if self.config.use_strategy_context_v3 else {}
+        theme_context = _context_theme(strategy_context) if self.config.use_strategy_context_v3 else {}
+        role = str(stock_context.get("trade_stock_role") or metadata.get("theme_board_stock_role") or "").strip().upper()
+        raw_role = str(stock_context.get("raw_stock_role") or "").strip().upper()
+        theme_status = str(theme_context.get("theme_state") or metadata.get("theme_board_theme_status") or "").strip().upper()
+        market_status = str(market.details.get("market_status") or metadata.get("market_regime_status") or "").strip().upper()
+        details = {"stock_role": role, "raw_stock_role": raw_role, "theme_status": theme_status, "market_status": market_status}
+        if role in {"LEADER", "LEADER_CONFIRMED"}:
             return EntryRoleReadiness(status=EntryCheckStatus.PASS, reason_codes=("ROLE_LEADER",), dry_run_role_allowed=True, details=details)
-        if role == "CO_LEADER":
+        if role in {"CO_LEADER", "CO_LEADER_CONFIRMED"}:
             return EntryRoleReadiness(status=EntryCheckStatus.PASS, reason_codes=("ROLE_CO_LEADER",), dry_run_role_allowed=True, details=details)
-        if role == "FOLLOWER":
+        if role in {"FOLLOWER", "FOLLOWER_ALLOWED"}:
             if market_status == "EXPANSION" and theme_status in {"LEADING_THEME", "SPREADING_THEME"}:
                 return EntryRoleReadiness(status=EntryCheckStatus.PASS, reason_codes=("ROLE_FOLLOWER_EXPANSION_ONLY",), dry_run_role_allowed=False, details=details)
             return EntryRoleReadiness(status=EntryCheckStatus.BLOCK, reason_codes=("ROLE_FOLLOWER_EXPANSION_ONLY",), dry_run_role_allowed=False, details=details)
-        if role == "LATE_LAGGARD":
+        if role == "LEADER_CANDIDATE_DATA_WAIT":
+            return EntryRoleReadiness(status=EntryCheckStatus.WAIT, reason_codes=("ROLE_LEADER_CANDIDATE_DATA_WAIT",), details=details)
+        if role == "FOLLOWER_BLOCKED_LEADER_ONLY":
+            return EntryRoleReadiness(status=EntryCheckStatus.BLOCK, reason_codes=("ROLE_FOLLOWER_BLOCKED_LEADER_ONLY",), details=details)
+        if role in {"LATE_LAGGARD", "LATE_LAGGARD_BLOCKED"}:
             return EntryRoleReadiness(status=EntryCheckStatus.BLOCK, reason_codes=("ROLE_LATE_LAGGARD_BLOCK",), details=details)
-        if role == "WEAK_MEMBER":
+        if role in {"WEAK_MEMBER", "WEAK_MEMBER_BLOCKED"}:
             return EntryRoleReadiness(status=EntryCheckStatus.BLOCK, reason_codes=("ROLE_WEAK_MEMBER_BLOCK",), details=details)
-        if role == "OVERHEATED":
+        if role in {"OVERHEATED", "OVERHEATED_BLOCKED"}:
             return EntryRoleReadiness(status=EntryCheckStatus.BLOCK, reason_codes=("ROLE_OVERHEATED_BLOCK",), details=details)
         return EntryRoleReadiness(status=EntryCheckStatus.WAIT, reason_codes=("ROLE_MISSING",), details=details)
 
@@ -503,8 +539,8 @@ class EntryEngine:
         breakout = _first_number(tick_metadata.get("breakout_level"), tick_metadata.get("session_high"), day_high)
         pullback = ((day_high - price) / day_high) * 100.0 if day_high > 0 and price > 0 else 100.0
         vwap_gap = ((price - vwap) / vwap) * 100.0 if vwap > 0 and price > 0 else 0.0
-        role_name = str(metadata.get("theme_board_stock_role") or "").strip().upper()
-        market_status = str(metadata.get("market_regime_status") or "").strip().upper()
+        role_name = str(role.details.get("stock_role") or metadata.get("theme_board_stock_role") or "").strip().upper()
+        market_status = str(market.details.get("market_status") or metadata.get("market_regime_status") or "").strip().upper()
         momentum = _first_number(tick_metadata.get("momentum_1m"), tick_metadata.get("momentum_3m"), self._candle_momentum(candidate.code, 1))
         details = {
             "current_price": price,
@@ -871,6 +907,26 @@ def _env_float(name: str, default: float) -> float:
         return float(str(raw).strip())
     except (TypeError, ValueError):
         return default
+
+
+def _strategy_context_v3(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    context = metadata.get("strategy_context_v3") if isinstance(metadata, Mapping) else None
+    return dict(context or {}) if isinstance(context, Mapping) else {}
+
+
+def _context_theme(context: Mapping[str, Any]) -> dict[str, Any]:
+    value = dict(context or {}).get("theme")
+    return dict(value or {}) if isinstance(value, Mapping) else {}
+
+
+def _context_stock(context: Mapping[str, Any]) -> dict[str, Any]:
+    value = dict(context or {}).get("stock")
+    return dict(value or {}) if isinstance(value, Mapping) else {}
+
+
+def _context_market(context: Mapping[str, Any]) -> dict[str, Any]:
+    value = dict(context or {}).get("market")
+    return dict(value or {}) if isinstance(value, Mapping) else {}
 
 
 def _dedupe(values: Iterable[Any]) -> list[str]:

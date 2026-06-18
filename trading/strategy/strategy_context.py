@@ -1,0 +1,765 @@
+from __future__ import annotations
+
+import hashlib
+from dataclasses import asdict, dataclass, field, is_dataclass
+from datetime import datetime, time
+from enum import Enum
+from typing import Any, Iterable, Mapping
+
+from trading.strategy.candidates import normalize_code
+from trading.strategy.market_data import MarketDataStore, StrategyTick
+from trading.strategy.models import Candidate, CandidateState
+
+
+STRATEGY_CONTEXT_SCHEMA_VERSION = "strategy_context_v3"
+STRATEGY_CONTEXT_OUTPUT_MODE = "OBSERVE"
+
+
+class StrategyContextVersion(str, Enum):
+    V3 = STRATEGY_CONTEXT_SCHEMA_VERSION
+
+
+class SessionPhase(str, Enum):
+    PRE_OPEN = "PRE_OPEN"
+    OPENING_DISCOVERY = "OPENING_DISCOVERY"
+    MORNING_TREND = "MORNING_TREND"
+    MIDDAY_CHOP = "MIDDAY_CHOP"
+    AFTERNOON_ROTATION = "AFTERNOON_ROTATION"
+    CLOSING_RISK = "CLOSING_RISK"
+    MARKET_CLOSED = "MARKET_CLOSED"
+
+
+@dataclass(frozen=True)
+class StrategyMarketContext:
+    market_side: str = "UNKNOWN"
+    side_market_regime: str = "DATA_WAIT"
+    global_market_regime: str = "DATA_WAIT"
+    market_action: str = "DATA_WAIT"
+    position_size_multiplier_hint: float = 0.0
+    block_new_entry: bool = False
+    index_return_pct: float = 0.0
+    index_slope_1m_pct: float | None = None
+    index_slope_3m_pct: float | None = None
+    index_slope_5m_pct: float | None = None
+    breadth_pct: float = 0.0
+    breadth_trust_level: str = "LOW"
+    turnover_weighted_return_pct: float = 0.0
+    risk_score: float = 0.0
+    calculated_at: str = ""
+    freshness_status: str = "DATA_WAIT"
+    reason_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StrategyThemeContext:
+    theme_id: str = ""
+    theme_name: str = ""
+    theme_state: str = "DATA_WAIT"
+    previous_theme_state: str = ""
+    theme_transition: str = ""
+    theme_score: float = 0.0
+    theme_score_delta: float = 0.0
+    persistence_count: int = 0
+    leader_symbol: str = ""
+    co_leader_symbols: tuple[str, ...] = ()
+    leader_changed: bool = False
+    leader_stability_count: int = 0
+    strong_count: int = 0
+    leader_count: int = 0
+    breadth_ratio: float = 0.0
+    weighted_return_pct: float = 0.0
+    leader_concentration: float = 0.0
+    coverage_ratio: float = 0.0
+    data_quality_status: str = "DATA_WAIT"
+    calculated_at: str = ""
+    freshness_status: str = "DATA_WAIT"
+    reason_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StrategyStockContext:
+    code: str = ""
+    name: str = ""
+    raw_stock_role: str = ""
+    trade_stock_role: str = ""
+    role_score: float = 0.0
+    source_rank: int = 0
+    relative_strength_vs_index_pct: float = 0.0
+    change_rate_pct: float = 0.0
+    turnover_krw: float = 0.0
+    turnover_speed: float = 0.0
+    execution_strength: float = 0.0
+    momentum_1m: float = 0.0
+    momentum_3m: float = 0.0
+    momentum_5m: float = 0.0
+    vwap: float = 0.0
+    pullback_from_high_pct: float = 0.0
+    vi_active: bool = False
+    upper_limit_near: bool = False
+    overheated: bool = False
+    reason_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StrategyDataContext:
+    realtime_tick_available: bool = False
+    realtime_tick_age_sec: float = 0.0
+    realtime_tick_fresh: bool = False
+    price_source: str = ""
+    candle_1m_count: int = 0
+    candle_3m_count: int = 0
+    candle_5m_count: int = 0
+    vwap_ready: bool = False
+    day_high_low_ready: bool = False
+    turnover_ready: bool = False
+    theme_context_fresh: bool = False
+    market_context_fresh: bool = False
+    data_quality_status: str = "DATA_WAIT"
+    blocking_reason_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StrategyRiskContext:
+    market_block_new_entry: bool = False
+    theme_entry_allowed: bool = False
+    trade_role_entry_allowed: bool = False
+    overheat_block: bool = False
+    vi_block: bool = False
+    chase_risk: bool = False
+    stale_data_block: bool = False
+    position_size_multiplier_hint: float = 0.0
+    reason_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StrategyContextSnapshot:
+    context_id: str
+    trade_date: str
+    calculated_at: str
+    candidate_id: int | None
+    code: str
+    session_phase: str
+    market: StrategyMarketContext
+    theme: StrategyThemeContext
+    stock: StrategyStockContext
+    data: StrategyDataContext
+    risk: StrategyRiskContext
+    source_versions: dict[str, str] = field(default_factory=dict)
+    source_timestamps: dict[str, str] = field(default_factory=dict)
+    context_fresh: bool = False
+    blocking_stage: str = "DATA"
+    primary_reason_code: str = "STRATEGY_CONTEXT_V3_DATA_WAIT"
+    reason_codes: tuple[str, ...] = ()
+    ready_allowed: bool = False
+    order_intent_allowed: bool = False
+    live_order_allowed: bool = False
+    schema_version: str = STRATEGY_CONTEXT_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(asdict(self))
+
+
+class StrategyContextAssembler:
+    def __init__(
+        self,
+        db: Any,
+        *,
+        market_data: MarketDataStore | None = None,
+        candle_builder: Any | None = None,
+        clock=None,
+    ) -> None:
+        self.db = db
+        self.market_data = market_data
+        self.candle_builder = candle_builder
+        self.clock = clock or datetime.now
+
+    def assemble_candidate(
+        self,
+        candidate: Candidate,
+        *,
+        trade_date: str | None = None,
+        now: datetime | None = None,
+        market_context: Mapping[str, Any] | None = None,
+        theme_board: Mapping[str, Any] | None = None,
+    ) -> StrategyContextSnapshot:
+        current = (now or self.clock()).replace(microsecond=0)
+        trade_date = trade_date or candidate.trade_date or current.date().isoformat()
+        code = normalize_code(candidate.code)
+        market_payload = dict(market_context or self._latest_market_context(trade_date) or {})
+        theme_payload = dict(theme_board or self._latest_theme_board(trade_date) or {})
+        tick = self.market_data.latest_tick(code) if self.market_data is not None else None
+        stock_payload = _stock_payload_for_code(theme_payload, code)
+        theme_payload_for_stock = _theme_payload_for_stock(theme_payload, stock_payload, candidate)
+
+        market = _market_context(candidate, market_payload, code)
+        theme = _theme_context(theme_payload_for_stock, stock_payload, theme_payload)
+        stock = _stock_context(candidate, stock_payload, tick, market)
+        data = _data_context(code, tick, theme=theme, market=market, candle_builder=self.candle_builder)
+        risk = _risk_context(market, theme, stock, data)
+        reason_codes = _dedupe(
+            [
+                *market.reason_codes,
+                *theme.reason_codes,
+                *stock.reason_codes,
+                *data.blocking_reason_codes,
+                *risk.reason_codes,
+                "STRATEGY_CONTEXT_V3_OBSERVE_ONLY",
+            ]
+        )
+        blocking_stage, primary = _blocking_stage(data, market, theme, stock, risk, reason_codes)
+        context_id = _context_id(
+            candidate_id=candidate.id,
+            code=code,
+            market_at=market.calculated_at,
+            theme_at=theme.calculated_at,
+            role=stock.trade_stock_role,
+            theme_state=theme.theme_state,
+        )
+        return StrategyContextSnapshot(
+            context_id=context_id,
+            trade_date=trade_date,
+            calculated_at=current.isoformat(),
+            candidate_id=candidate.id,
+            code=code,
+            session_phase=session_phase(current).value,
+            market=market,
+            theme=theme,
+            stock=stock,
+            data=data,
+            risk=risk,
+            source_versions={
+                "strategy_context": STRATEGY_CONTEXT_SCHEMA_VERSION,
+                "theme_core": str(theme_payload.get("output_mode") or ""),
+                "market_regime": str(market_payload.get("output_mode") or ""),
+            },
+            source_timestamps={
+                "market_context_at": market.calculated_at,
+                "theme_context_at": theme.calculated_at,
+            },
+            context_fresh=bool(data.theme_context_fresh and data.market_context_fresh),
+            blocking_stage=blocking_stage,
+            primary_reason_code=primary,
+            reason_codes=tuple(reason_codes),
+            ready_allowed=False,
+            order_intent_allowed=False,
+            live_order_allowed=False,
+        )
+
+    def assemble_active_candidates(
+        self,
+        *,
+        trade_date: str | None = None,
+        now: datetime | None = None,
+        market_context: Mapping[str, Any] | None = None,
+        theme_board: Mapping[str, Any] | None = None,
+        save: bool = True,
+    ) -> list[StrategyContextSnapshot]:
+        current = (now or self.clock()).replace(microsecond=0)
+        trade_date = trade_date or current.date().isoformat()
+        candidates = [
+            candidate
+            for candidate in list(self.db.list_candidates(trade_date=trade_date) or [])
+            if candidate.state not in {CandidateState.REMOVED, CandidateState.EXPIRED}
+        ]
+        snapshots = [
+            self.assemble_candidate(
+                candidate,
+                trade_date=trade_date,
+                now=current,
+                market_context=market_context,
+                theme_board=theme_board,
+            )
+            for candidate in candidates
+        ]
+        if save:
+            self.save_snapshots(candidates, snapshots, calculated_at=current.isoformat())
+        return snapshots
+
+    def save_snapshots(
+        self,
+        candidates: Iterable[Candidate],
+        snapshots: Iterable[StrategyContextSnapshot],
+        *,
+        calculated_at: str,
+    ) -> int:
+        candidate_by_key = {(candidate.trade_date, normalize_code(candidate.code)): candidate for candidate in candidates}
+        snapshot_list = list(snapshots)
+        saver = getattr(self.db, "save_strategy_context_snapshot", None)
+        saved = 0
+        for snapshot in snapshot_list:
+            payload = snapshot.to_dict()
+            if callable(saver):
+                saver(payload)
+                saved += 1
+            candidate = candidate_by_key.get((snapshot.trade_date, snapshot.code))
+            if candidate is None:
+                continue
+            metadata = dict(candidate.metadata or {})
+            metadata["strategy_context_v3"] = payload
+            metadata["strategy_context_version"] = STRATEGY_CONTEXT_SCHEMA_VERSION
+            metadata["strategy_context_id"] = snapshot.context_id
+            metadata["session_phase"] = snapshot.session_phase
+            metadata["blocking_stage"] = snapshot.blocking_stage
+            metadata["primary_reason_code"] = snapshot.primary_reason_code
+            metadata["context_fresh"] = snapshot.context_fresh
+            metadata["updated_by_strategy_context_at"] = calculated_at
+            candidate.metadata = metadata
+            self.db.save_candidate(candidate)
+        return saved
+
+    def _latest_market_context(self, trade_date: str) -> dict[str, Any]:
+        loader = getattr(self.db, "latest_market_regime_snapshot", None)
+        return dict(loader(trade_date=trade_date) or {}) if callable(loader) else {}
+
+    def _latest_theme_board(self, trade_date: str) -> dict[str, Any]:
+        loader = getattr(self.db, "latest_theme_board_snapshot", None)
+        return dict(loader(trade_date=trade_date) or {}) if callable(loader) else {}
+
+
+@dataclass
+class StrategyContextRuntimePipeline:
+    db: Any
+    market_data: MarketDataStore
+    candle_builder: Any | None = None
+    assembler: StrategyContextAssembler | None = None
+    enabled: bool = True
+    clock: Any = datetime.now
+
+    def __post_init__(self) -> None:
+        self.assembler = self.assembler or StrategyContextAssembler(
+            self.db,
+            market_data=self.market_data,
+            candle_builder=self.candle_builder,
+            clock=self.clock,
+        )
+        self.last_summary: dict[str, Any] = {"enabled": self.enabled, "status": "IDLE", "schema_version": STRATEGY_CONTEXT_SCHEMA_VERSION}
+        self.last_result: list[dict[str, Any]] = []
+
+    @property
+    def config(self):
+        return type("_StrategyContextPipelineConfig", (), {"enabled": self.enabled})()
+
+    def run_if_due(
+        self,
+        now: datetime | None = None,
+        *,
+        market_context: Mapping[str, Any] | None = None,
+        theme_board: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.run(now, market_context=market_context, theme_board=theme_board)
+
+    def run(
+        self,
+        now: datetime | None = None,
+        *,
+        market_context: Mapping[str, Any] | None = None,
+        theme_board: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        current = (now or self.clock()).replace(microsecond=0)
+        if not self.enabled:
+            self.last_summary = {"enabled": False, "status": "DISABLED", "schema_version": STRATEGY_CONTEXT_SCHEMA_VERSION}
+            return dict(self.last_summary)
+        snapshots = self.assembler.assemble_active_candidates(
+            trade_date=current.date().isoformat(),
+            now=current,
+            market_context=market_context,
+            theme_board=theme_board,
+            save=True,
+        )
+        rows = [snapshot.to_dict() for snapshot in snapshots]
+        self.last_result = rows
+        status_counts: dict[str, int] = {}
+        stage_counts: dict[str, int] = {}
+        for row in rows:
+            status_counts[str(row.get("primary_reason_code") or "")] = status_counts.get(str(row.get("primary_reason_code") or ""), 0) + 1
+            stage_counts[str(row.get("blocking_stage") or "")] = stage_counts.get(str(row.get("blocking_stage") or ""), 0) + 1
+        self.last_summary = {
+            "enabled": True,
+            "status": "OK",
+            "schema_version": STRATEGY_CONTEXT_SCHEMA_VERSION,
+            "calculated_at": current.isoformat(),
+            "assembled_count": len(rows),
+            "context_fresh_count": sum(1 for row in rows if bool(row.get("context_fresh"))),
+            "blocking_stage_counts": stage_counts,
+            "top_reason_counts": status_counts,
+            "ready_allowed": False,
+            "order_intent_allowed": False,
+            "live_order_allowed": False,
+        }
+        return dict(self.last_summary)
+
+
+def session_phase(now: datetime) -> SessionPhase:
+    current = now.time()
+    if current < time(9, 0):
+        return SessionPhase.PRE_OPEN
+    if time(9, 0) <= current < time(9, 15):
+        return SessionPhase.OPENING_DISCOVERY
+    if time(9, 15) <= current < time(11, 0):
+        return SessionPhase.MORNING_TREND
+    if time(11, 0) <= current < time(13, 30):
+        return SessionPhase.MIDDAY_CHOP
+    if time(13, 30) <= current < time(14, 30):
+        return SessionPhase.AFTERNOON_ROTATION
+    if time(14, 30) <= current <= time(15, 20):
+        return SessionPhase.CLOSING_RISK
+    return SessionPhase.MARKET_CLOSED
+
+
+def _market_context(candidate: Candidate, payload: Mapping[str, Any], code: str) -> StrategyMarketContext:
+    if not payload:
+        return StrategyMarketContext(reason_codes=("MARKET_CONTEXT_NOT_READY",), block_new_entry=True)
+    policies = dict(payload.get("candidate_policy_by_code") or {})
+    policy = dict(policies.get(code) or {})
+    side = str(policy.get("market_side") or _candidate_side(candidate) or "UNKNOWN")
+    side_snapshot = _side_snapshot(payload, side)
+    status = str(policy.get("market_status") or side_snapshot.get("status") or payload.get("global_status") or "DATA_WAIT")
+    global_status = str(policy.get("global_market_status") or payload.get("global_status") or "DATA_WAIT")
+    action = str(policy.get("market_action") or _market_action_from_status(status, global_status))
+    reasons = _dedupe([*list(payload.get("reason_codes") or []), *list(policy.get("reason_codes") or [])])
+    if not reasons:
+        reasons = ["MARKET_CONTEXT_READY"]
+    return StrategyMarketContext(
+        market_side=side,
+        side_market_regime=status,
+        global_market_regime=global_status,
+        market_action=action,
+        position_size_multiplier_hint=_float(policy.get("position_size_multiplier_hint"), _multiplier_for_action(action)),
+        block_new_entry=bool(policy.get("block_new_entry")) or action in {"BLOCK_NEW_ENTRY", "MARKET_CLOSED"},
+        index_return_pct=_float(side_snapshot.get("index_return_pct")),
+        index_slope_1m_pct=_optional_float(side_snapshot.get("index_slope_1m_pct")),
+        index_slope_3m_pct=_optional_float(side_snapshot.get("index_slope_3m_pct")),
+        index_slope_5m_pct=_optional_float(side_snapshot.get("index_slope_5m_pct")),
+        breadth_pct=_float(side_snapshot.get("breadth_pct")),
+        breadth_trust_level="LOW" if "LOW_TRUST_BREADTH" in set(side_snapshot.get("data_quality_flags") or []) else "NORMAL",
+        turnover_weighted_return_pct=_float(side_snapshot.get("turnover_weighted_return_pct")),
+        risk_score=_float(side_snapshot.get("risk_score")),
+        calculated_at=str(payload.get("calculated_at") or ""),
+        freshness_status="FRESH" if str(payload.get("calculated_at") or "") else "DATA_WAIT",
+        reason_codes=tuple(reasons),
+    )
+
+
+def _theme_context(theme: Mapping[str, Any], stock: Mapping[str, Any], board: Mapping[str, Any]) -> StrategyThemeContext:
+    if not theme:
+        return StrategyThemeContext(calculated_at=str(board.get("calculated_at") or ""), reason_codes=("THEME_CONTEXT_NOT_READY",))
+    reasons = _dedupe([*list(theme.get("reason_codes") or []), *list(stock.get("reason_codes") or [])])
+    return StrategyThemeContext(
+        theme_id=str(theme.get("theme_id") or stock.get("theme_id") or ""),
+        theme_name=str(theme.get("theme_name") or stock.get("theme_name") or ""),
+        theme_state=str(theme.get("theme_state") or theme.get("theme_status") or "DATA_WAIT"),
+        previous_theme_state=str(theme.get("previous_theme_state") or theme.get("previous_state") or ""),
+        theme_transition=str(theme.get("theme_transition") or theme.get("transition") or ""),
+        theme_score=_float(theme.get("theme_score")),
+        theme_score_delta=_float(theme.get("theme_score_delta")),
+        persistence_count=_int(theme.get("persistence_count")),
+        leader_symbol=normalize_code(theme.get("leader_symbol") or ""),
+        co_leader_symbols=tuple(normalize_code(item) for item in list(theme.get("co_leader_symbols") or []) if normalize_code(item)),
+        leader_changed=bool(theme.get("leader_changed")),
+        leader_stability_count=_int(theme.get("leader_stability_count")),
+        strong_count=_int(theme.get("strong_count")),
+        leader_count=_int(theme.get("leader_count")),
+        breadth_ratio=_float(theme.get("breadth_ratio") or theme.get("strong_ratio")),
+        weighted_return_pct=_float(theme.get("weighted_return_pct")),
+        leader_concentration=_float(theme.get("leader_concentration")),
+        coverage_ratio=_float(theme.get("coverage_ratio")),
+        data_quality_status=str(theme.get("data_quality_status") or theme.get("data_quality_reason") or "OK"),
+        calculated_at=str(board.get("calculated_at") or theme.get("calculated_at") or ""),
+        freshness_status="FRESH" if board.get("calculated_at") else "DATA_WAIT",
+        reason_codes=tuple(reasons or ["THEME_CONTEXT_READY"]),
+    )
+
+
+def _stock_context(candidate: Candidate, stock: Mapping[str, Any], tick: StrategyTick | None, market: StrategyMarketContext) -> StrategyStockContext:
+    metadata = dict(getattr(tick, "metadata", {}) or {}) if tick is not None else {}
+    raw_role = str(stock.get("raw_role") or stock.get("stock_role") or "")
+    trade_role = str(stock.get("trade_role") or stock.get("stock_role") or "")
+    price = float(getattr(tick, "price", 0) or 0)
+    day_high = _float(metadata.get("day_high") or metadata.get("session_high"))
+    pullback = ((day_high - price) / day_high) * 100.0 if day_high > 0 and price > 0 else _float(metadata.get("pullback_from_high_pct"))
+    index_return = market.index_return_pct
+    change = _float(getattr(tick, "change_rate", 0.0) if tick is not None else stock.get("change_rate_pct"))
+    reasons = list(stock.get("reason_codes") or [])
+    if not stock:
+        reasons.append("STOCK_ROLE_CONTEXT_NOT_READY")
+    return StrategyStockContext(
+        code=normalize_code(candidate.code),
+        name=candidate.name or str(stock.get("name") or metadata.get("stock_name") or ""),
+        raw_stock_role=raw_role,
+        trade_stock_role=trade_role,
+        role_score=_float(stock.get("stock_score") or stock.get("role_score")),
+        source_rank=_int(stock.get("source_rank")),
+        relative_strength_vs_index_pct=round(change - index_return, 4),
+        change_rate_pct=change,
+        turnover_krw=_float(getattr(tick, "trade_value", 0.0) if tick is not None else stock.get("turnover_krw")),
+        turnover_speed=_float(metadata.get("turnover_speed") or metadata.get("turnover_krw_per_min")),
+        execution_strength=_float(getattr(tick, "execution_strength", 0.0) if tick is not None else stock.get("execution_strength")),
+        momentum_1m=_float(metadata.get("momentum_1m")),
+        momentum_3m=_float(metadata.get("momentum_3m")),
+        momentum_5m=_float(metadata.get("momentum_5m")),
+        vwap=_float(metadata.get("vwap")),
+        pullback_from_high_pct=round(pullback, 4),
+        vi_active=bool(metadata.get("vi_active")),
+        upper_limit_near=bool(metadata.get("upper_limit_near")) or _float(metadata.get("upper_limit_gap_pct"), 100.0) <= 3.0,
+        overheated=bool(metadata.get("overheated")) or raw_role == "OVERHEATED" or trade_role == "OVERHEATED_BLOCKED",
+        reason_codes=tuple(_dedupe(reasons)),
+    )
+
+
+def _data_context(
+    code: str,
+    tick: StrategyTick | None,
+    *,
+    theme: StrategyThemeContext,
+    market: StrategyMarketContext,
+    candle_builder: Any | None,
+) -> StrategyDataContext:
+    reasons: list[str] = []
+    tick_age = 0.0
+    fresh = False
+    price_source = ""
+    if tick is None:
+        reasons.append("LATEST_TICK_MISSING")
+    else:
+        tick_age = max(0.0, (datetime.now(tick.timestamp.tzinfo) - tick.timestamp).total_seconds()) if tick.timestamp.tzinfo else 0.0
+        metadata = dict(tick.metadata or {})
+        price_source = str(metadata.get("price_source") or "REALTIME")
+        fresh = price_source.upper() != "TR_BACKFILL" and int(tick.price or 0) > 0
+        if not fresh:
+            reasons.append("LATEST_TICK_NOT_FRESH")
+    candle_counts = _candle_counts(candle_builder, code)
+    vwap_ready = bool(tick is not None and _float(dict(tick.metadata or {}).get("vwap")) > 0)
+    high_low_ready = bool(tick is not None and (_float(dict(tick.metadata or {}).get("day_high")) > 0 or _float(dict(tick.metadata or {}).get("session_high")) > 0))
+    turnover_ready = bool(tick is not None and float(tick.trade_value or 0.0) > 0)
+    theme_fresh = theme.freshness_status == "FRESH" and theme.theme_state not in {"", "DATA_WAIT"}
+    market_fresh = market.freshness_status == "FRESH" and market.global_market_regime not in {"", "DATA_WAIT"}
+    if not theme_fresh:
+        reasons.append("THEME_CONTEXT_NOT_READY")
+    if not market_fresh:
+        reasons.append("MARKET_CONTEXT_NOT_READY")
+    return StrategyDataContext(
+        realtime_tick_available=tick is not None,
+        realtime_tick_age_sec=round(tick_age, 3),
+        realtime_tick_fresh=fresh,
+        price_source=price_source,
+        candle_1m_count=candle_counts.get(1, 0),
+        candle_3m_count=candle_counts.get(3, 0),
+        candle_5m_count=candle_counts.get(5, 0),
+        vwap_ready=vwap_ready,
+        day_high_low_ready=high_low_ready,
+        turnover_ready=turnover_ready,
+        theme_context_fresh=theme_fresh,
+        market_context_fresh=market_fresh,
+        data_quality_status="OK" if not reasons else "DATA_WAIT",
+        blocking_reason_codes=tuple(_dedupe(reasons)),
+    )
+
+
+def _risk_context(
+    market: StrategyMarketContext,
+    theme: StrategyThemeContext,
+    stock: StrategyStockContext,
+    data: StrategyDataContext,
+) -> StrategyRiskContext:
+    theme_allowed = theme.theme_state in {"LEADING_THEME", "SPREADING_THEME", "LEADER_ONLY_THEME"}
+    trade_role_allowed = stock.trade_stock_role in {"LEADER_CONFIRMED", "CO_LEADER_CONFIRMED"} or (
+        stock.trade_stock_role == "FOLLOWER_ALLOWED" and market.side_market_regime == "EXPANSION"
+    )
+    reasons: list[str] = []
+    if market.block_new_entry:
+        reasons.append("MARKET_BLOCK_NEW_ENTRY")
+    if not theme_allowed:
+        reasons.append("THEME_NOT_ENTRY_ALLOWED")
+    if not trade_role_allowed:
+        reasons.append("TRADE_ROLE_NOT_ENTRY_ALLOWED")
+    if stock.overheated:
+        reasons.append("OVERHEATED_BLOCKED")
+    if stock.vi_active:
+        reasons.append("VI_ACTIVE_BLOCK")
+    if not data.realtime_tick_fresh:
+        reasons.append("STALE_DATA_BLOCK")
+    return StrategyRiskContext(
+        market_block_new_entry=market.block_new_entry,
+        theme_entry_allowed=theme_allowed,
+        trade_role_entry_allowed=trade_role_allowed,
+        overheat_block=stock.overheated,
+        vi_block=stock.vi_active,
+        chase_risk=stock.pullback_from_high_pct < 0.3 if stock.pullback_from_high_pct else False,
+        stale_data_block=not data.realtime_tick_fresh,
+        position_size_multiplier_hint=market.position_size_multiplier_hint,
+        reason_codes=tuple(_dedupe(reasons)),
+    )
+
+
+def _blocking_stage(
+    data: StrategyDataContext,
+    market: StrategyMarketContext,
+    theme: StrategyThemeContext,
+    stock: StrategyStockContext,
+    risk: StrategyRiskContext,
+    reasons: list[str],
+) -> tuple[str, str]:
+    if not data.realtime_tick_fresh or not data.market_context_fresh or not data.theme_context_fresh:
+        return "DATA", _primary_reason(reasons, "STRATEGY_CONTEXT_V3_DATA_WAIT")
+    if market.block_new_entry or market.market_action in {"BLOCK_NEW_ENTRY", "MARKET_CLOSED"}:
+        return "MARKET", _primary_reason(reasons, "MARKET_BLOCK_NEW_ENTRY")
+    if not risk.theme_entry_allowed:
+        return "THEME", _primary_reason(reasons, "THEME_NOT_ENTRY_ALLOWED")
+    if not risk.trade_role_entry_allowed:
+        return "ROLE", _primary_reason(reasons, "TRADE_ROLE_NOT_ENTRY_ALLOWED")
+    if risk.overheat_block or risk.vi_block or risk.chase_risk:
+        return "RISK", _primary_reason(reasons, "RISK_BLOCK")
+    return "PRICE", "WAIT_PRICE_TIMING"
+
+
+def _stock_payload_for_code(board: Mapping[str, Any], code: str) -> dict[str, Any]:
+    for item in list(board.get("stocks") or []):
+        stock = dict(item or {})
+        if normalize_code(stock.get("code") or "") == code:
+            return stock
+    return {}
+
+
+def _theme_payload_for_stock(board: Mapping[str, Any], stock: Mapping[str, Any], candidate: Candidate) -> dict[str, Any]:
+    theme_id = str(stock.get("theme_id") or "")
+    if not theme_id:
+        theme_ids = list(candidate.theme_ids or [])
+        theme_id = str(theme_ids[0]) if theme_ids else str(dict(candidate.metadata or {}).get("best_theme_id") or "")
+    for item in list(board.get("top_themes") or []):
+        theme = dict(item or {})
+        if str(theme.get("theme_id") or "") == theme_id:
+            return theme
+    return {}
+
+
+def _side_snapshot(payload: Mapping[str, Any], side: str) -> dict[str, Any]:
+    key = f"{str(side or '').lower()}_snapshot"
+    snapshot = dict(payload.get(key) or {})
+    if snapshot:
+        return snapshot
+    if side == "KOSPI":
+        return dict(payload.get("kospi_snapshot") or {})
+    if side == "KOSDAQ":
+        return dict(payload.get("kosdaq_snapshot") or {})
+    return {}
+
+
+def _candidate_side(candidate: Candidate) -> str:
+    metadata = dict(candidate.metadata or {})
+    return str(metadata.get("market_side") or candidate.market or "UNKNOWN").upper()
+
+
+def _market_action_from_status(status: str, global_status: str) -> str:
+    if "RISK_OFF" in {status, global_status}:
+        return "BLOCK_NEW_ENTRY"
+    if "WEAK" in {status, global_status}:
+        return "WAIT_MARKET"
+    if status == "EXPANSION":
+        return "ALLOW_NORMAL"
+    if status == "SELECTIVE" or global_status == "SELECTIVE":
+        return "ALLOW_REDUCED"
+    if status == "MARKET_CLOSED" or global_status == "MARKET_CLOSED":
+        return "MARKET_CLOSED"
+    return "DATA_WAIT" if status == "DATA_WAIT" or global_status == "DATA_WAIT" else "WAIT_MARKET"
+
+
+def _multiplier_for_action(action: str) -> float:
+    return {"ALLOW_NORMAL": 1.0, "ALLOW_REDUCED": 0.6, "WAIT_MARKET": 0.35}.get(str(action or ""), 0.0)
+
+
+def _candle_counts(candle_builder: Any | None, code: str) -> dict[int, int]:
+    counts = {1: 0, 3: 0, 5: 0}
+    if candle_builder is None:
+        return counts
+    for interval in counts:
+        try:
+            active = 1 if candle_builder.active_candle(code) is not None and interval == 1 else 0
+            counts[interval] = len(candle_builder.completed_candles(code, interval)) + active
+        except Exception:
+            counts[interval] = 0
+    return counts
+
+
+def _context_id(*, candidate_id: int | None, code: str, market_at: str, theme_at: str, role: str, theme_state: str) -> str:
+    raw = "|".join(
+        [
+            STRATEGY_CONTEXT_SCHEMA_VERSION,
+            str(candidate_id or ""),
+            normalize_code(code),
+            str(market_at or ""),
+            str(theme_at or ""),
+            str(role or ""),
+            str(theme_state or ""),
+        ]
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _primary_reason(reasons: Iterable[str], default: str) -> str:
+    for reason in reasons:
+        text = str(reason or "")
+        if text and not text.endswith("_READY"):
+            return text
+    return default
+
+
+def _jsonable(value: Any) -> Any:
+    if is_dataclass(value):
+        return _jsonable(asdict(value))
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def _dedupe(values: Iterable[Any]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _float(value: Any, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return float(default)
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    return _float(value)
+
+
+def _int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(str(value or default).replace(",", "")))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+__all__ = [
+    "STRATEGY_CONTEXT_OUTPUT_MODE",
+    "STRATEGY_CONTEXT_SCHEMA_VERSION",
+    "SessionPhase",
+    "StrategyContextAssembler",
+    "StrategyContextRuntimePipeline",
+    "StrategyContextSnapshot",
+    "StrategyContextVersion",
+    "StrategyDataContext",
+    "StrategyMarketContext",
+    "StrategyRiskContext",
+    "StrategyStockContext",
+    "StrategyThemeContext",
+    "session_phase",
+]

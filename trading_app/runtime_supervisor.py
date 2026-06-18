@@ -44,6 +44,9 @@ ORDER_LIFECYCLE_EVENT_TYPES = {
     "balance_snapshot",
     "position_snapshot",
     "reconcile_snapshot",
+    "kiwoom_order_chejan",
+    "kiwoom_balance_chejan",
+    "kiwoom_special_chejan",
 }
 
 

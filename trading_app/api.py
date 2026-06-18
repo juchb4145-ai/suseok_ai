@@ -5744,6 +5744,9 @@ _CORE_WS_CONTROL_MESSAGE_TYPES = {
     "order_result",
     "execution_event",
     "execution",
+    "kiwoom_order_chejan",
+    "kiwoom_balance_chejan",
+    "kiwoom_special_chejan",
 }
 
 

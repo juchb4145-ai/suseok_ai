@@ -1384,3 +1384,129 @@ Exit code:
 - unmatched fill 상태에서 신규 매수를 허용하지 않는다.
 - qualification recommendation은 설정을 자동 변경하지 않는다.
 - LIVE_SIM flag는 수동 review 전까지 활성화하지 않는다.
+
+## PR 10 구현 상태: Kiwoom Chejan Canonical Parser & Real Payload Validation
+
+PR 10은 Kiwoom OpenAPI+ `OnReceiveChejanData`의 `gubun`과 FID payload를 broker-specific raw event로 보존하고, Core `GatewayEventCodec`이 PR8 order lifecycle canonical event로 안전하게 변환하도록 만드는 단계다. 이 PR도 LIVE_SIM/LIVE_REAL 주문 활성화 PR이 아니다.
+
+### gubun Routing
+
+| gubun | GatewayEvent type | handling |
+|---|---|---|
+| `0` | `kiwoom_order_chejan` | 주문접수, 주문거절, 부분체결, 완전체결, 취소 |
+| `1` | `kiwoom_balance_chejan` | 국내주식 단일 종목 balance/position delta |
+| `3` | `kiwoom_special_chejan` | diagnostic only, order lifecycle ignored |
+| unknown | `kiwoom_special_chejan` | `UNSUPPORTED`, raw preserved, lifecycle ignored |
+
+`gubun=1`은 계좌 전체 snapshot이 아니라 단일 종목 delta일 수 있으므로 `snapshot_scope=SINGLE_CODE_DELTA`, `full_account_snapshot=false`를 명시한다.
+
+### FID Registry
+
+현재 registry는 PR10 fixture와 Kiwoom Chejan contract validation을 위해 다음 FID를 명명한다.
+
+- 주문/체결: `9201`, `9203`, `9001`, `912`, `913`, `302`, `900`, `901`, `902`, `903`, `904`, `905`, `906`, `907`, `908`, `909`, `910`, `911`, `914`, `915`, `919`, `920`
+- 잔고: `9201`, `9001`, `302`, `10`, `930`, `931`, `932`, `933`, `945`, `946`, `951`, `27`, `28`, `307`, `8019`
+
+실제 모의투자 fixture에서 값과 의미가 불일치하면 fixture와 공식 계약을 기준으로 registry를 수정한다.
+
+### FID 920
+
+`FID 920`은 `screen_no`로만 취급한다. strategy tag, candidate id, managed order id, command id, idempotency key를 Chejan FID에서 임의 복원하지 않는다.
+
+호환 필드:
+
+- `legacy_tag=""`
+- `tag_source="UNAVAILABLE_FROM_CHEJAN"`
+
+### Canonical Payload
+
+주문 payload는 account, code, order_no, original_order_no, order_status, order_gubun, side, order_quantity, order_price, unfilled_quantity, cumulative_filled_quantity, execution_id, execution_price, execution_quantity, unit_execution_quantity, incremental_execution_quantity, reject_reason, screen_no, broker_event_key, parser_status를 포함한다.
+
+잔고 payload는 account, code, position_quantity, orderable_quantity, average_buy_price, total_buy_amount, current_price, intraday_net_buy_quantity, best ask/bid, profit_rate, `snapshot_scope`, `full_account_snapshot`, broker_event_key, parser_status를 포함한다. 보유수량 0 이벤트도 position close delta로 보존한다.
+
+### Event Classification
+
+Core codec은 다음을 함께 보고 canonical type을 결정한다.
+
+- `event_kind`
+- `order_status`
+- `reject_reason`
+- `execution_id`
+- `incremental_execution_quantity`
+- `cumulative_filled_quantity`
+- `unfilled_quantity`
+- `original_order_no`
+
+금지 규칙:
+
+- `remaining_quantity=0`만으로 FILLED 분류 금지
+- `execution_id` 또는 체결량 없는 이벤트를 fill로 분류 금지
+- `command_ack`를 broker order accepted로 간주 금지
+- reject reason이 있는데 accepted 분류 금지
+- late ack로 FILLED/PARTIALLY_FILLED 상태 역행 금지
+
+### broker_event_key / Dedupe
+
+- 체결 우선 키: `account + order_no + execution_id`
+- execution id 누락 fallback: `account + order_no + event_time + incremental_execution_quantity + execution_price + cumulative_filled_quantity`
+- fallback 사용 시 `dedupe_confidence=LOW`, `EXECUTION_ID_MISSING`, `DEGRADED`
+- 잔고 delta 키: `account + code + position_quantity + orderable_quantity + average_buy_price + raw checksum`
+
+Event Log dedupe와 receipt idempotency는 `broker_event_key`를 우선 사용한다.
+
+### Capture / Redaction
+
+`trading.broker.chejan_capture`는 simulation-only raw capture writer를 제공한다.
+
+기본 flag:
+
+- `TRADING_KIWOOM_CHEJAN_RAW_CAPTURE_ENABLED=false`
+- `TRADING_KIWOOM_CHEJAN_CAPTURE_SIMULATION_ONLY=true`
+- `TRADING_KIWOOM_CHEJAN_CAPTURE_DIR=reports/kiwoom_chejan`
+- `TRADING_KIWOOM_CHEJAN_CAPTURE_MAX_ROWS=10000`
+
+계좌번호는 deterministic token으로 치환하고 password/user id/token 계열 key는 저장하지 않는다. REAL broker capture는 거부한다.
+
+### Parser Validation
+
+CLI:
+
+```powershell
+python tools\kiwoom_chejan_parser_validation.py --fixture-dir tests\fixtures\kiwoom_chejan --output-dir reports\kiwoom_chejan_validation
+```
+
+산출물:
+
+- `validation.json`
+- `summary.md`
+- `field_coverage.json`
+- `unknown_fids.json`
+- `classification_matrix.json`
+- `failures.json`
+
+현재 repo fixture는 `source=SYNTHETIC`이므로 validation은 `HOLD`가 정상이다. 실제 모의서버 sanitized fixture가 `source=KIWOOM_SIMULATION`이고 필수 case coverage를 만족해야 `PASS`가 가능하다.
+
+### Qualification 연결
+
+PR9 qualification report에는 parser validation subsection이 추가된다.
+
+recommendation 흐름:
+
+- qualification 안전성 FAIL: `NOT_READY`
+- synthetic parser fixture만 통과: `READY_FOR_KIWOOM_PARSER_VALIDATION`
+- actual simulation fixture 통과: `READY_FOR_RECONCILE_TR_PILOT`
+- reconcile TR pilot까지 통과: `READY_FOR_LIVE_SIM_CANARY_REVIEW`
+
+qualification은 parser flag나 주문 flag를 자동 변경하지 않는다.
+
+### 실제 주문 경로
+
+유지되는 금지 사항:
+
+- `TRADING_SEND_ORDER_ALLOWED=false`
+- `TRADING_ORDER_MANAGER_ENABLED=false`
+- `TRADING_ORDER_MANAGER_OBSERVE_ONLY=true`
+- `TRADING_ORDER_MANAGER_ENQUEUE_GATEWAY_COMMAND=false`
+- `TRADING_ORDER_INTENT_ENABLED=false`
+- `TRADING_KIWOOM_CHEJAN_EMIT_LEGACY_EXECUTION_EVENT=false`
+- 실제 `send_order`, `cancel_order`, `modify_order` command 생성 없음
