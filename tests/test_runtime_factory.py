@@ -2,6 +2,7 @@ from storage.db import TradingDatabase
 from trading.broker.gateway_state import GatewayStateStore
 from trading.strategy.reboot_v2_runtime import RebootV2Runtime
 from trading.strategy.runtime import StrategyRuntime
+from trading.theme_engine.core_v3_runtime import ThemeCoreV3RuntimePipeline
 from trading_app.dependencies import CoreSettings
 from trading_app.runtime_factory import (
     _cached_report_provider,
@@ -77,6 +78,7 @@ def test_build_core_runtime_routes_to_reboot_v2_observe_only(tmp_path, monkeypat
     assert bundle.candidate_ingestion_service is not None
     assert bundle.candidate_hydrator is not None
     assert bundle.theme_board_pipeline is not None
+    assert isinstance(bundle.theme_board_pipeline, ThemeCoreV3RuntimePipeline)
     assert bundle.entry_engine_pipeline is not None
     assert bundle.theme_board_pipeline.config.enabled is True
     assert bundle.market_regime_pipeline.config.enabled is True

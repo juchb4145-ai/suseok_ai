@@ -85,7 +85,7 @@ def _raw_role(signal: LiveSeedSignal, leader_code: str, co_leaders: set[str], to
         return RawStockRole.LEADER
     if signal.code in co_leaders or (rank <= 3 and signal.change_rate_pct >= 5.0):
         return RawStockRole.CO_LEADER
-    if top_return >= 5.0 and signal.change_rate_pct < 3.0 and top_return - signal.change_rate_pct >= 4.0:
+    if signal.realtime_valid and top_return >= 5.0 and signal.change_rate_pct < 3.0 and top_return - signal.change_rate_pct >= 4.0:
         return RawStockRole.LATE_LAGGARD
     if signal.change_rate_pct >= 3.0 and signal.realtime_valid:
         return RawStockRole.FOLLOWER

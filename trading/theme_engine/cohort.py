@@ -96,7 +96,7 @@ class ThemeCohortEngine:
         leader = max(tradable_realtime, key=lambda item: item.turnover_krw + item.change_rate_pct * 100_000_000, default=None)
         co_leaders = tuple(
             signal.code
-            for signal in sorted(tradable_realtime, key=lambda item: (item.turnover_krw, item.change_rate_pct), reverse=True)
+            for signal in sorted(leaders, key=lambda item: (item.turnover_krw, item.change_rate_pct), reverse=True)
             if leader is None or signal.code != leader.code
         )[:2]
         cohesion = _cohesion_passed(member_count, len(strong), self.config)

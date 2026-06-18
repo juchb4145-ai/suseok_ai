@@ -38,12 +38,12 @@ from trading.strategy.runtime_settings import StrategyRuntimeSettingsRepository
 from trading.strategy.virtual_orders import VirtualOrderService
 from trading.theme_engine.backfill import ThemeBackfillConfig, ThemeBackfillService
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
+from trading.theme_engine.core_v3_runtime import ThemeCoreV3RuntimeConfig, ThemeCoreV3RuntimePipeline
 from trading.theme_engine.opening_runtime import OpeningBurstRuntimeConfig, OpeningThemeBurstRuntimePipeline
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime import RealTimeThemeRuntime
 from trading.theme_engine.runtime_pipeline import ThemeLabRuntimePipeline, theme_lab_config_from_settings
 from trading.theme_engine.lab import ThemeLabFlowEngine
-from trading.theme_engine.theme_board import ThemeBoardConfig, ThemeBoardRuntimePipeline
 from trading_app.dependencies import CoreSettings
 from trading_app.runtime_adapters import (
     GatewayCommandConditionAdapter,
@@ -295,9 +295,12 @@ def build_reboot_v2_runtime_bundle(
         candidate_ingestion_service=candidate_ingestion_service,
         candidate_hydrator=candidate_hydrator,
     )
-    theme_board_config = replace(
-        ThemeBoardConfig.from_env(),
-        enabled=_v2_component_enabled("TRADING_THEME_BOARD_ENABLED", default=True),
+    theme_core_v3_config = replace(
+        ThemeCoreV3RuntimeConfig.from_env(),
+        enabled=_v2_component_enabled(
+            "TRADING_THEME_CORE_V3_ENABLED",
+            default=_v2_component_enabled("TRADING_THEME_BOARD_ENABLED", default=True),
+        ),
     )
     market_regime_config = replace(
         MarketRegimeConfig.from_env(),
@@ -315,12 +318,12 @@ def build_reboot_v2_runtime_bundle(
         PositionRiskConfig.from_env(),
         enabled=_v2_component_enabled("TRADING_POSITION_RISK_ENABLED", default=True),
     )
-    theme_board_pipeline = ThemeBoardRuntimePipeline(
+    theme_board_pipeline = ThemeCoreV3RuntimePipeline(
         db=db,
         market_data=market_data,
         repository=theme_repository,
-        candle_builder=candle_builder,
-        config=theme_board_config,
+        config=theme_core_v3_config,
+        candidate_ingestion_service=candidate_ingestion_service,
     )
     market_regime_pipeline = MarketRegimeRuntimePipeline(
         db=db,
