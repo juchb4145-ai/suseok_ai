@@ -1510,3 +1510,102 @@ qualification은 parser flag나 주문 flag를 자동 변경하지 않는다.
 - `TRADING_ORDER_INTENT_ENABLED=false`
 - `TRADING_KIWOOM_CHEJAN_EMIT_LEGACY_EXECUTION_EVENT=false`
 - 실제 `send_order`, `cancel_order`, `modify_order` command 생성 없음
+
+## PR 11 구현 상태: Kiwoom Reconcile TR Orchestrator & Broker Truth Snapshot
+
+PR 11은 Kiwoom read-only TR로 broker truth snapshot을 staging 저장하고, Chejan/local projection과 비교하는 기반이다. 이 PR도 LIVE_SIM/LIVE_REAL 주문 활성화 PR이 아니며 자동 보정, 자동 청산, STOP_NEW_BUY 자동 해제를 수행하지 않는다.
+
+### Logical Sources
+
+| logical source | TR code | purpose | validation |
+| --- | --- | --- | --- |
+| `OPEN_ORDERS` | `opt10075` | 미체결 주문 snapshot | `SYNTHETIC_ONLY` |
+| `ACCOUNT_POSITIONS` | `opw00018` | 보유 종목 snapshot | `SYNTHETIC_ONLY` |
+| `ACCOUNT_CASH` | `opw00001` | 예수금 snapshot | `SYNTHETIC_ONLY` |
+
+TR code와 field alias는 `trading.broker.reconcile_tr_specs`의 versioned registry에 정의한다. 실제 KOA Studio 또는 Kiwoom simulation capture 전까지 PASS가 아니라 HOLD로 취급한다.
+
+### Credential Policy
+
+Core command에는 account password를 넣지 않는다. broker reconcile command payload에는 `account`, `account_token`, `credential_ref`, `reconcile_run_id`, `logical_source`만 포함한다. Gateway는 TR 실행 직전에 local credential provider로 password를 해석하고, ack/Event Log/DB/report에는 password를 쓰지 않는다. credential이 없으면 `CREDENTIAL_UNAVAILABLE`이며 snapshot empty로 간주하지 않는다.
+
+### Capture V2
+
+`KiwoomTrRunner.request_capture()`는 `single`, `rows`, `pages`, `page_count`, `prev_next_sequence`, `complete`, warnings/errors를 보존한다.
+
+- single output과 multi output을 분리한다.
+- `prev_next=2` pagination을 보존한다.
+- max page 도달 시 `complete=false`다.
+- partial page failure는 broker truth publish 대상이 아니다.
+- valid empty와 parser miss를 구분한다.
+
+Gateway `command_ack` for reconcile includes:
+
+- `purpose=broker_reconcile`
+- `reconcile_run_id`
+- `logical_source`
+- `tr_code`
+- `rq_name`
+- `captured_single`
+- `captured_rows`
+- `pages`
+- `page_count`
+- `complete`
+- `parser_warnings`
+- `parser_errors`
+- `latency_ms`
+
+### Event Routing
+
+`payload.purpose == broker_reconcile`인 `command_ack`는 order lifecycle consumer가 주문 ack로 처리하지 않는다. RuntimeSupervisor는 optional reconcile orchestrator에 먼저 전달하고, order consumer는 `BROKER_RECONCILE_EVENT_ROUTED_TO_RECONCILE_CONSUMER`로 ignore한다.
+
+### DB Staging
+
+추가된 staging tables:
+
+- `broker_reconcile_runs`
+- `broker_reconcile_source_results`
+- `broker_reconcile_open_orders`
+- `broker_reconcile_positions`
+- `broker_reconcile_cash`
+- `broker_reconcile_discrepancies`
+
+TR source 결과는 run 단위 staging으로 저장한다. complete run이 되기 전에는 `broker_order_state`/`broker_position_state` latest projection을 삭제하거나 덮어쓰지 않는다.
+
+### Discrepancy Policy
+
+현재 comparator는 다음을 fail-closed discrepancy로 기록한다.
+
+- `BROKER_ONLY_OPEN_ORDER` -> `STOP_NEW_BUY`
+- `LOCAL_ONLY_PENDING_ORDER` -> `STOP_NEW_BUY`
+- `REMAINING_QUANTITY_MISMATCH` -> `STOP_NEW_BUY`
+- `BROKER_ONLY_POSITION` -> `REDUCE_ONLY`
+- `POSITION_QUANTITY_MISMATCH` -> `REDUCE_ONLY`
+
+clean reconcile이어도 STOP_NEW_BUY/REDUCE_ONLY를 자동 해제하지 않는다.
+
+### Runtime / Dashboard / API
+
+Runtime status에는 `broker_reconcile` section을 노출한다. Dashboard read model은 broker truth readiness, discrepancy count, STOP_NEW_BUY/REDUCE_ONLY banner를 표시한다.
+
+Read-only API:
+
+- `GET /api/runtime/reconcile/status`
+- `GET /api/runtime/reconcile/runs`
+- `GET /api/runtime/reconcile/runs/{run_id}`
+- `GET /api/runtime/reconcile/discrepancies`
+- `GET /api/runtime/reconcile/latest-snapshot`
+
+manual dispatch API와 Dashboard 실행 버튼은 추가하지 않았다.
+
+### Safety Defaults
+
+- `TRADING_RECONCILE_TR_SERVICE_ENABLED=true`
+- `TRADING_RECONCILE_TR_DISPATCH_ENABLED=false`
+- `TRADING_RECONCILE_TR_SIMULATION_ONLY=true`
+- `TRADING_RECONCILE_TR_STARTUP_ENABLED=false`
+- `TRADING_RECONCILE_TR_RECONNECT_ENABLED=false`
+- `TRADING_RECONCILE_TR_PERIODIC_ENABLED=false`
+- `TRADING_RECONCILE_TR_AUTO_HEAL_ENABLED=false`
+- `TRADING_RECONCILE_TR_AUTO_CLEAR_STOP_NEW_BUY=false`
+- actual simulation fixture가 없으면 qualification recommendation은 HOLD다.

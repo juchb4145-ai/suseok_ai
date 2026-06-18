@@ -1164,6 +1164,132 @@ class TradingDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_broker_position_state_code
                 ON broker_position_state(code);
+            CREATE TABLE IF NOT EXISTS broker_reconcile_runs (
+                run_id TEXT PRIMARY KEY,
+                account_token TEXT NOT NULL DEFAULT '',
+                broker_env TEXT NOT NULL DEFAULT '',
+                trigger TEXT NOT NULL DEFAULT '',
+                gateway_session_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                required_sources_json TEXT NOT NULL DEFAULT '[]',
+                completed_sources_json TEXT NOT NULL DEFAULT '[]',
+                source_event_watermark TEXT NOT NULL DEFAULT '',
+                chejan_watermark TEXT NOT NULL DEFAULT '',
+                snapshot_complete INTEGER NOT NULL DEFAULT 0,
+                broker_truth_ready INTEGER NOT NULL DEFAULT 0,
+                reconcile_clean INTEGER NOT NULL DEFAULT 0,
+                discrepancy_count INTEGER NOT NULL DEFAULT 0,
+                critical_discrepancy_count INTEGER NOT NULL DEFAULT 0,
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                errors_json TEXT NOT NULL DEFAULT '[]',
+                started_at TEXT NOT NULL DEFAULT '',
+                completed_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_broker_reconcile_runs_account_status
+                ON broker_reconcile_runs(account_token, status, updated_at);
+            CREATE TABLE IF NOT EXISTS broker_reconcile_source_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL DEFAULT '',
+                logical_source TEXT NOT NULL DEFAULT '',
+                tr_code TEXT NOT NULL DEFAULT '',
+                rq_name TEXT NOT NULL DEFAULT '',
+                command_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                complete INTEGER NOT NULL DEFAULT 0,
+                page_count INTEGER NOT NULL DEFAULT 0,
+                row_count INTEGER NOT NULL DEFAULT 0,
+                parser_version TEXT NOT NULL DEFAULT '',
+                parser_status TEXT NOT NULL DEFAULT '',
+                parser_warnings_json TEXT NOT NULL DEFAULT '[]',
+                parser_errors_json TEXT NOT NULL DEFAULT '[]',
+                raw_checksum TEXT NOT NULL DEFAULT '',
+                captured_at TEXT NOT NULL DEFAULT '',
+                parsed_at TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(run_id, logical_source)
+            );
+            CREATE INDEX IF NOT EXISTS idx_broker_reconcile_source_results_run
+                ON broker_reconcile_source_results(run_id, logical_source, status);
+            CREATE TABLE IF NOT EXISTS broker_reconcile_open_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL DEFAULT '',
+                account_token TEXT NOT NULL DEFAULT '',
+                order_no TEXT NOT NULL DEFAULT '',
+                original_order_no TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                order_quantity INTEGER NOT NULL DEFAULT 0,
+                order_price INTEGER NOT NULL DEFAULT 0,
+                filled_quantity INTEGER NOT NULL DEFAULT 0,
+                remaining_quantity INTEGER NOT NULL DEFAULT 0,
+                order_status TEXT NOT NULL DEFAULT '',
+                order_time TEXT NOT NULL DEFAULT '',
+                source_tr TEXT NOT NULL DEFAULT '',
+                snapshot_at TEXT NOT NULL DEFAULT '',
+                UNIQUE(run_id, account_token, order_no)
+            );
+            CREATE INDEX IF NOT EXISTS idx_broker_reconcile_open_orders_run
+                ON broker_reconcile_open_orders(run_id, account_token, order_no, code);
+            CREATE TABLE IF NOT EXISTS broker_reconcile_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL DEFAULT '',
+                account_token TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                quantity INTEGER NOT NULL DEFAULT 0,
+                orderable_quantity INTEGER NOT NULL DEFAULT 0,
+                average_price REAL NOT NULL DEFAULT 0,
+                total_buy_amount REAL NOT NULL DEFAULT 0,
+                current_price REAL NOT NULL DEFAULT 0,
+                evaluation_amount REAL NOT NULL DEFAULT 0,
+                evaluation_pnl REAL NOT NULL DEFAULT 0,
+                profit_rate REAL NOT NULL DEFAULT 0,
+                source_tr TEXT NOT NULL DEFAULT '',
+                snapshot_at TEXT NOT NULL DEFAULT '',
+                UNIQUE(run_id, account_token, code)
+            );
+            CREATE INDEX IF NOT EXISTS idx_broker_reconcile_positions_run
+                ON broker_reconcile_positions(run_id, account_token, code);
+            CREATE TABLE IF NOT EXISTS broker_reconcile_cash (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL DEFAULT '',
+                account_token TEXT NOT NULL DEFAULT '',
+                deposit INTEGER NOT NULL DEFAULT 0,
+                orderable_cash INTEGER NOT NULL DEFAULT 0,
+                withdrawable_cash INTEGER NOT NULL DEFAULT 0,
+                d1_estimated_deposit INTEGER NOT NULL DEFAULT 0,
+                d2_estimated_deposit INTEGER NOT NULL DEFAULT 0,
+                source_tr TEXT NOT NULL DEFAULT '',
+                snapshot_at TEXT NOT NULL DEFAULT '',
+                UNIQUE(run_id, account_token)
+            );
+            CREATE INDEX IF NOT EXISTS idx_broker_reconcile_cash_run
+                ON broker_reconcile_cash(run_id, account_token);
+            CREATE TABLE IF NOT EXISTS broker_reconcile_discrepancies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL DEFAULT '',
+                account_token TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
+                severity TEXT NOT NULL DEFAULT '',
+                entity_type TEXT NOT NULL DEFAULT '',
+                entity_key TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                order_no TEXT NOT NULL DEFAULT '',
+                local_json TEXT NOT NULL DEFAULT '{}',
+                chejan_projection_json TEXT NOT NULL DEFAULT '{}',
+                tr_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                first_detected_at TEXT NOT NULL DEFAULT '',
+                last_detected_at TEXT NOT NULL DEFAULT '',
+                resolved_at TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                operator_action_required INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS idx_broker_reconcile_discrepancies_run
+                ON broker_reconcile_discrepancies(run_id, account_token, category, severity);
+            CREATE INDEX IF NOT EXISTS idx_broker_reconcile_discrepancies_order
+                ON broker_reconcile_discrepancies(order_no, code);
             CREATE TABLE IF NOT EXISTS order_risk_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 intent_id INTEGER,
@@ -8793,6 +8919,300 @@ class TradingDatabase:
         ).fetchone()
         return _row_to_broker_position_state(row) if row else None
 
+    def save_broker_reconcile_run(self, run: dict) -> dict:
+        payload = dict(run or {})
+        now = datetime.utcnow().replace(microsecond=0).isoformat()
+        params = {
+            "run_id": str(payload.get("run_id") or ""),
+            "account_token": str(payload.get("account_token") or ""),
+            "broker_env": str(payload.get("broker_env") or ""),
+            "trigger": str(payload.get("trigger") or ""),
+            "gateway_session_id": str(payload.get("gateway_session_id") or ""),
+            "status": str(payload.get("status") or ""),
+            "required_sources_json": _json_list(payload.get("required_sources") or []),
+            "completed_sources_json": _json_list(payload.get("completed_sources") or []),
+            "source_event_watermark": str(payload.get("source_event_watermark") or ""),
+            "chejan_watermark": str(payload.get("chejan_watermark") or ""),
+            "snapshot_complete": 1 if payload.get("snapshot_complete") else 0,
+            "broker_truth_ready": 1 if payload.get("broker_truth_ready") else 0,
+            "reconcile_clean": 1 if payload.get("reconcile_clean") else 0,
+            "discrepancy_count": _safe_int(payload.get("discrepancy_count"), 0),
+            "critical_discrepancy_count": _safe_int(payload.get("critical_discrepancy_count"), 0),
+            "warnings_json": _json_list(payload.get("warnings") or []),
+            "errors_json": _json_list(payload.get("errors") or []),
+            "started_at": str(payload.get("started_at") or now),
+            "completed_at": str(payload.get("completed_at") or ""),
+            "created_at": str(payload.get("created_at") or now),
+            "updated_at": str(payload.get("updated_at") or now),
+        }
+        if not params["run_id"]:
+            return payload
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO broker_reconcile_runs(
+                    run_id, account_token, broker_env, trigger, gateway_session_id,
+                    status, required_sources_json, completed_sources_json,
+                    source_event_watermark, chejan_watermark, snapshot_complete,
+                    broker_truth_ready, reconcile_clean, discrepancy_count,
+                    critical_discrepancy_count, warnings_json, errors_json,
+                    started_at, completed_at, created_at, updated_at
+                ) VALUES (
+                    :run_id, :account_token, :broker_env, :trigger, :gateway_session_id,
+                    :status, :required_sources_json, :completed_sources_json,
+                    :source_event_watermark, :chejan_watermark, :snapshot_complete,
+                    :broker_truth_ready, :reconcile_clean, :discrepancy_count,
+                    :critical_discrepancy_count, :warnings_json, :errors_json,
+                    :started_at, :completed_at, :created_at, :updated_at
+                )
+                ON CONFLICT(run_id) DO UPDATE SET
+                    status=excluded.status,
+                    completed_sources_json=excluded.completed_sources_json,
+                    snapshot_complete=excluded.snapshot_complete,
+                    broker_truth_ready=excluded.broker_truth_ready,
+                    reconcile_clean=excluded.reconcile_clean,
+                    discrepancy_count=excluded.discrepancy_count,
+                    critical_discrepancy_count=excluded.critical_discrepancy_count,
+                    warnings_json=excluded.warnings_json,
+                    errors_json=excluded.errors_json,
+                    completed_at=excluded.completed_at,
+                    updated_at=excluded.updated_at
+                """,
+                params,
+            )
+        return self.get_broker_reconcile_run(params["run_id"]) or payload
+
+    def get_broker_reconcile_run(self, run_id: str) -> Optional[dict]:
+        row = self.conn.execute("SELECT * FROM broker_reconcile_runs WHERE run_id = ?", (str(run_id or ""),)).fetchone()
+        return _row_to_broker_reconcile_run(row) if row else None
+
+    def list_broker_reconcile_runs(self, *, limit: int = 50) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM broker_reconcile_runs ORDER BY updated_at DESC, created_at DESC LIMIT ?",
+            (max(1, int(limit or 50)),),
+        ).fetchall()
+        return [_row_to_broker_reconcile_run(row) for row in rows]
+
+    def save_broker_reconcile_source_result(self, result: dict) -> dict:
+        payload = dict(result or {})
+        now = datetime.utcnow().replace(microsecond=0).isoformat()
+        params = {
+            "run_id": str(payload.get("run_id") or ""),
+            "logical_source": str(payload.get("logical_source") or ""),
+            "tr_code": str(payload.get("tr_code") or ""),
+            "rq_name": str(payload.get("rq_name") or ""),
+            "command_id": str(payload.get("command_id") or ""),
+            "status": str(payload.get("status") or ""),
+            "complete": 1 if payload.get("complete") else 0,
+            "page_count": _safe_int(payload.get("page_count"), 0),
+            "row_count": _safe_int(payload.get("row_count"), 0),
+            "parser_version": str(payload.get("parser_version") or ""),
+            "parser_status": str(payload.get("parser_status") or ""),
+            "parser_warnings_json": _json_list(payload.get("parser_warnings") or payload.get("warnings") or []),
+            "parser_errors_json": _json_list(payload.get("parser_errors") or payload.get("errors") or []),
+            "raw_checksum": str(payload.get("raw_checksum") or ""),
+            "captured_at": str(payload.get("captured_at") or now),
+            "parsed_at": str(payload.get("parsed_at") or now),
+            "details_json": _json_payload(payload.get("details") or payload),
+        }
+        if not params["run_id"] or not params["logical_source"]:
+            return payload
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO broker_reconcile_source_results(
+                    run_id, logical_source, tr_code, rq_name, command_id, status,
+                    complete, page_count, row_count, parser_version, parser_status,
+                    parser_warnings_json, parser_errors_json, raw_checksum,
+                    captured_at, parsed_at, details_json
+                ) VALUES (
+                    :run_id, :logical_source, :tr_code, :rq_name, :command_id, :status,
+                    :complete, :page_count, :row_count, :parser_version, :parser_status,
+                    :parser_warnings_json, :parser_errors_json, :raw_checksum,
+                    :captured_at, :parsed_at, :details_json
+                )
+                ON CONFLICT(run_id, logical_source) DO UPDATE SET
+                    status=excluded.status,
+                    complete=excluded.complete,
+                    page_count=excluded.page_count,
+                    row_count=excluded.row_count,
+                    parser_status=excluded.parser_status,
+                    parser_warnings_json=excluded.parser_warnings_json,
+                    parser_errors_json=excluded.parser_errors_json,
+                    raw_checksum=excluded.raw_checksum,
+                    captured_at=excluded.captured_at,
+                    parsed_at=excluded.parsed_at,
+                    details_json=excluded.details_json
+                """,
+                params,
+            )
+        row = self.conn.execute(
+            "SELECT * FROM broker_reconcile_source_results WHERE run_id = ? AND logical_source = ?",
+            (params["run_id"], params["logical_source"]),
+        ).fetchone()
+        return _row_to_broker_reconcile_source_result(row) if row else payload
+
+    def list_broker_reconcile_source_results(self, run_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM broker_reconcile_source_results WHERE run_id = ? ORDER BY id",
+            (str(run_id or ""),),
+        ).fetchall()
+        return [_row_to_broker_reconcile_source_result(row) for row in rows]
+
+    def replace_broker_reconcile_snapshots(
+        self,
+        *,
+        run_id: str,
+        open_orders: list[dict] | None = None,
+        positions: list[dict] | None = None,
+        cash: dict | None = None,
+    ) -> None:
+        run_id = str(run_id or "")
+        if not run_id:
+            return
+        now = datetime.utcnow().replace(microsecond=0).isoformat()
+        with self.conn:
+            if open_orders is not None:
+                self.conn.execute("DELETE FROM broker_reconcile_open_orders WHERE run_id = ?", (run_id,))
+                for item in open_orders:
+                    self.conn.execute(
+                        """
+                        INSERT OR REPLACE INTO broker_reconcile_open_orders(
+                            run_id, account_token, order_no, original_order_no, code, side,
+                            order_quantity, order_price, filled_quantity, remaining_quantity,
+                            order_status, order_time, source_tr, snapshot_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            str(item.get("account_token") or ""),
+                            str(item.get("order_no") or ""),
+                            str(item.get("original_order_no") or ""),
+                            _clean_stock_code(item.get("code")) or str(item.get("code") or ""),
+                            str(item.get("side") or ""),
+                            _safe_int(item.get("order_quantity"), 0),
+                            _safe_int(item.get("order_price"), 0),
+                            _safe_int(item.get("filled_quantity"), 0),
+                            max(0, _safe_int(item.get("remaining_quantity"), 0)),
+                            str(item.get("order_status") or ""),
+                            str(item.get("order_time") or ""),
+                            str(item.get("source") or "OPEN_ORDERS"),
+                            str(item.get("snapshot_at") or now),
+                        ),
+                    )
+            if positions is not None:
+                self.conn.execute("DELETE FROM broker_reconcile_positions WHERE run_id = ?", (run_id,))
+                for item in positions:
+                    self.conn.execute(
+                        """
+                        INSERT OR REPLACE INTO broker_reconcile_positions(
+                            run_id, account_token, code, quantity, orderable_quantity,
+                            average_price, total_buy_amount, current_price, evaluation_amount,
+                            evaluation_pnl, profit_rate, source_tr, snapshot_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            str(item.get("account_token") or ""),
+                            _clean_stock_code(item.get("code")) or str(item.get("code") or ""),
+                            _safe_int(item.get("quantity"), 0),
+                            _safe_int(item.get("orderable_quantity"), 0),
+                            _float_value(item.get("average_price")),
+                            _float_value(item.get("total_buy_amount")),
+                            _float_value(item.get("current_price")),
+                            _float_value(item.get("evaluation_amount")),
+                            _float_value(item.get("evaluation_pnl")),
+                            _float_value(item.get("profit_rate")),
+                            str(item.get("source") or "ACCOUNT_POSITIONS"),
+                            str(item.get("snapshot_at") or now),
+                        ),
+                    )
+            if cash is not None:
+                self.conn.execute("DELETE FROM broker_reconcile_cash WHERE run_id = ?", (run_id,))
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO broker_reconcile_cash(
+                        run_id, account_token, deposit, orderable_cash, withdrawable_cash,
+                        d1_estimated_deposit, d2_estimated_deposit, source_tr, snapshot_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        str(cash.get("account_token") or ""),
+                        _safe_int(cash.get("deposit"), 0),
+                        _safe_int(cash.get("orderable_cash"), 0),
+                        _safe_int(cash.get("withdrawable_cash"), 0),
+                        _safe_int(cash.get("d1_estimated_deposit"), 0),
+                        _safe_int(cash.get("d2_estimated_deposit"), 0),
+                        str(cash.get("source") or "ACCOUNT_CASH"),
+                        str(cash.get("snapshot_at") or now),
+                    ),
+                )
+
+    def list_broker_reconcile_open_orders(self, run_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM broker_reconcile_open_orders WHERE run_id = ? ORDER BY id",
+            (str(run_id or ""),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_broker_reconcile_positions(self, run_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM broker_reconcile_positions WHERE run_id = ? ORDER BY id",
+            (str(run_id or ""),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_broker_reconcile_discrepancies(self, run_id: str, discrepancies: list[dict]) -> None:
+        run_id = str(run_id or "")
+        if not run_id:
+            return
+        with self.conn:
+            self.conn.execute("DELETE FROM broker_reconcile_discrepancies WHERE run_id = ?", (run_id,))
+            for item in discrepancies:
+                self.conn.execute(
+                    """
+                    INSERT INTO broker_reconcile_discrepancies(
+                        run_id, account_token, category, severity, entity_type, entity_key,
+                        code, order_no, local_json, chejan_projection_json, tr_snapshot_json,
+                        reason_codes_json, first_detected_at, last_detected_at, resolved_at,
+                        status, operator_action_required
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        str(item.get("account_token") or ""),
+                        str(item.get("category") or ""),
+                        str(item.get("severity") or ""),
+                        str(item.get("entity_type") or ""),
+                        str(item.get("entity_key") or ""),
+                        _clean_stock_code(item.get("code")) or str(item.get("code") or ""),
+                        str(item.get("order_no") or ""),
+                        _json_payload(item.get("local") or {}),
+                        _json_payload(item.get("chejan_projection") or {}),
+                        _json_payload(item.get("tr_snapshot") or {}),
+                        _json_list(item.get("reason_codes") or []),
+                        str(item.get("first_detected_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                        str(item.get("last_detected_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                        str(item.get("resolved_at") or ""),
+                        str(item.get("status") or "OPEN"),
+                        1 if item.get("operator_action_required", True) else 0,
+                    ),
+                )
+
+    def list_broker_reconcile_discrepancies(self, *, run_id: str = "", limit: int = 100) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if run_id:
+            clauses.append("run_id = ?")
+            params.append(str(run_id))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM broker_reconcile_discrepancies {where} ORDER BY id DESC LIMIT ?",
+            (*params, max(1, int(limit or 100))),
+        ).fetchall()
+        return [_row_to_broker_reconcile_discrepancy(row) for row in rows]
+
     def order_lifecycle_summary(self) -> dict:
         receipt_rows = self.conn.execute(
             "SELECT apply_status, COUNT(*) AS count FROM order_gateway_event_receipts GROUP BY apply_status"
@@ -14958,6 +15378,41 @@ def _row_to_broker_position_state(row: sqlite3.Row) -> dict:
     data["quantity"] = int(data.get("quantity") or 0)
     data["available_quantity"] = int(data.get("available_quantity") or 0)
     data["avg_price"] = float(data.get("avg_price") or 0.0)
+    return data
+
+
+def _row_to_broker_reconcile_run(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["required_sources"] = _safe_json_loads(data.pop("required_sources_json", "[]"), [])
+    data["completed_sources"] = _safe_json_loads(data.pop("completed_sources_json", "[]"), [])
+    data["warnings"] = _safe_json_loads(data.pop("warnings_json", "[]"), [])
+    data["errors"] = _safe_json_loads(data.pop("errors_json", "[]"), [])
+    data["snapshot_complete"] = bool(data.get("snapshot_complete"))
+    data["broker_truth_ready"] = bool(data.get("broker_truth_ready"))
+    data["reconcile_clean"] = bool(data.get("reconcile_clean"))
+    data["discrepancy_count"] = int(data.get("discrepancy_count") or 0)
+    data["critical_discrepancy_count"] = int(data.get("critical_discrepancy_count") or 0)
+    return data
+
+
+def _row_to_broker_reconcile_source_result(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["complete"] = bool(data.get("complete"))
+    data["page_count"] = int(data.get("page_count") or 0)
+    data["row_count"] = int(data.get("row_count") or 0)
+    data["parser_warnings"] = _safe_json_loads(data.pop("parser_warnings_json", "[]"), [])
+    data["parser_errors"] = _safe_json_loads(data.pop("parser_errors_json", "[]"), [])
+    data["details"] = _safe_json_loads(data.pop("details_json", "{}"), {})
+    return data
+
+
+def _row_to_broker_reconcile_discrepancy(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["local"] = _safe_json_loads(data.pop("local_json", "{}"), {})
+    data["chejan_projection"] = _safe_json_loads(data.pop("chejan_projection_json", "{}"), {})
+    data["tr_snapshot"] = _safe_json_loads(data.pop("tr_snapshot_json", "{}"), {})
+    data["reason_codes"] = _safe_json_loads(data.pop("reason_codes_json", "[]"), [])
+    data["operator_action_required"] = bool(data.get("operator_action_required"))
     return data
 
 

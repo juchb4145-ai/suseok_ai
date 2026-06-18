@@ -59,12 +59,14 @@ class RuntimeSupervisor:
         runtime_builder: RuntimeBuilder = build_core_strategy_runtime,
         read_model_writer: Any = None,
         order_event_consumer: Any = None,
+        reconcile_orchestrator: Any = None,
     ) -> None:
         self.settings = settings
         self.gateway_state = gateway_state
         self.runtime_builder = runtime_builder
         self.read_model_writer = read_model_writer
         self.order_event_consumer = order_event_consumer
+        self.reconcile_orchestrator = reconcile_orchestrator
         self.enabled = bool(settings.runtime_enabled)
         self.auto_start = bool(settings.runtime_auto_start)
         self.running = False
@@ -96,6 +98,7 @@ class RuntimeSupervisor:
         self._dropped_price_tick_count = 0
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strategy-runtime")
         self._order_event_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="order-event-consumer")
+        self._reconcile_event_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="reconcile-event-consumer")
         self._diagnostics_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strategy-diagnostics")
         self._diagnostics_future: asyncio.Future | None = None
         self._diagnostics_started_perf = 0.0
@@ -360,6 +363,7 @@ class RuntimeSupervisor:
                 "cycle_worker_reason": self._cycle_future_reason if cycle_worker_pending else "",
                 "post_cycle_diagnostics": self._post_cycle_diagnostics_status_locked(),
                 "order_event_consumer": self._order_event_consumer_status_locked(),
+                "broker_reconcile": self._broker_reconcile_status_locked(),
                 "last_cycle_timings": dict(self.last_cycle_timings),
                 "warnings": warnings,
                 "latest_snapshot": snapshot,
@@ -404,6 +408,7 @@ class RuntimeSupervisor:
                 "cycle_worker_elapsed_ms": cycle_worker_elapsed_ms,
                 "cycle_worker_reason": self._cycle_future_reason if cycle_worker_pending else "",
                 "order_event_consumer": self._order_event_consumer_status_locked(),
+                "broker_reconcile": self._broker_reconcile_status_locked(),
             }
 
     def set_dashboard_read_model_writer(self, writer: Any) -> None:
@@ -411,6 +416,9 @@ class RuntimeSupervisor:
 
     def set_order_event_consumer(self, consumer: Any) -> None:
         self.order_event_consumer = consumer
+
+    def set_reconcile_orchestrator(self, orchestrator: Any) -> None:
+        self.reconcile_orchestrator = orchestrator
 
     def _order_event_consumer_status_locked(self) -> dict[str, Any]:
         consumer = self.order_event_consumer
@@ -424,6 +432,18 @@ class RuntimeSupervisor:
                 return {"enabled": True, "status": "ERROR", "order_lifecycle_ready": False, "last_error": str(exc)}
         return {"enabled": True, "status": "UNKNOWN", "order_lifecycle_ready": False}
 
+    def _broker_reconcile_status_locked(self) -> dict[str, Any]:
+        orchestrator = self.reconcile_orchestrator
+        if orchestrator is None:
+            return {"enabled": False, "status": "NOT_CONFIGURED", "broker_truth_ready": False}
+        health = getattr(orchestrator, "health_snapshot", None)
+        if callable(health):
+            try:
+                return dict(health() or {})
+            except Exception as exc:
+                return {"enabled": True, "status": "ERROR", "broker_truth_ready": False, "last_error": str(exc)}
+        return {"enabled": True, "status": "UNKNOWN", "broker_truth_ready": False}
+
     def _realtime_data_quality_snapshot(self) -> dict[str, Any]:
         bundle = self._bundle
         bridge = getattr(bundle, "market_data_bridge", None) if bundle is not None else None
@@ -436,6 +456,10 @@ class RuntimeSupervisor:
             return {"status": "ERROR", "error": str(exc)}
 
     async def handle_gateway_event(self, event: GatewayEvent) -> None:
+        if _is_broker_reconcile_event(event) and self.reconcile_orchestrator is not None:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._reconcile_event_executor, self._consume_reconcile_event_in_worker, event)
+            return
         if event.type in ORDER_LIFECYCLE_EVENT_TYPES and self.order_event_consumer is not None:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._order_event_executor, self._consume_order_event_in_worker, event)
@@ -475,6 +499,16 @@ class RuntimeSupervisor:
         except Exception as exc:
             self._warn(f"ORDER_EVENT_CONSUME_FAILED:{event.type}:{exc}")
 
+    def _consume_reconcile_event_in_worker(self, event: GatewayEvent) -> None:
+        orchestrator = self.reconcile_orchestrator
+        handler = getattr(orchestrator, "handle_gateway_event", None)
+        if not callable(handler):
+            return
+        try:
+            handler(event)
+        except Exception as exc:
+            self._warn(f"BROKER_RECONCILE_EVENT_CONSUME_FAILED:{event.type}:{exc}")
+
     async def readiness(self) -> dict[str, Any]:
         if self._bundle is not None:
             return self.status()["readiness"]
@@ -492,6 +526,7 @@ class RuntimeSupervisor:
             future.cancel()
         self._executor.shutdown(wait=True, cancel_futures=True)
         self._order_event_executor.shutdown(wait=True, cancel_futures=True)
+        self._reconcile_event_executor.shutdown(wait=True, cancel_futures=True)
         self._diagnostics_executor.shutdown(wait=True, cancel_futures=True)
 
     def _start_in_worker(self) -> dict[str, Any]:
@@ -1187,6 +1222,12 @@ def _price_tick_key(event: GatewayEvent) -> str:
     if key:
         return key
     return str(event.event_id or event.command_id or "").strip()
+
+
+def _is_broker_reconcile_event(event: GatewayEvent) -> bool:
+    if event.type not in {"command_ack", "command_failed", "command_timeout", "command_expired"}:
+        return False
+    return str(dict(event.payload or {}).get("purpose") or "") == "broker_reconcile"
 
 
 def _should_replace_pending_price_tick(existing: GatewayEvent, incoming: GatewayEvent) -> bool:

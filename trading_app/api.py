@@ -1790,6 +1790,77 @@ def runtime_reliability_run(run_id: str) -> dict[str, Any]:
     return payload
 
 
+@app.get("/api/runtime/reconcile/status")
+def runtime_reconcile_status() -> dict[str, Any]:
+    status_payload = dict(runtime_supervisor.status().get("broker_reconcile") or {})
+    db = open_database()
+    try:
+        latest = db.list_broker_reconcile_runs(limit=1)
+        status_payload["latest_run"] = latest[0] if latest else {}
+        return status_payload
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/reconcile/runs")
+def runtime_reconcile_runs(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return {"runs": db.list_broker_reconcile_runs(limit=limit)}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/reconcile/runs/{run_id}")
+def runtime_reconcile_run(run_id: str) -> dict[str, Any]:
+    db = open_database()
+    try:
+        run = db.get_broker_reconcile_run(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="broker reconcile run not found")
+        return {
+            "run": run,
+            "source_results": db.list_broker_reconcile_source_results(run_id),
+            "open_orders": db.list_broker_reconcile_open_orders(run_id),
+            "positions": db.list_broker_reconcile_positions(run_id),
+            "discrepancies": db.list_broker_reconcile_discrepancies(run_id=run_id, limit=500),
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/reconcile/discrepancies")
+def runtime_reconcile_discrepancies(
+    run_id: str = Query("", max_length=128),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    db = open_database()
+    try:
+        return {"discrepancies": db.list_broker_reconcile_discrepancies(run_id=run_id, limit=limit)}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/reconcile/latest-snapshot")
+def runtime_reconcile_latest_snapshot() -> dict[str, Any]:
+    db = open_database()
+    try:
+        runs = [row for row in db.list_broker_reconcile_runs(limit=50) if row.get("snapshot_complete")]
+        if not runs:
+            return {"status": "NOT_FOUND", "snapshot_complete": False}
+        run = runs[0]
+        run_id = str(run.get("run_id") or "")
+        return {
+            "status": "OK",
+            "run": run,
+            "open_orders": db.list_broker_reconcile_open_orders(run_id),
+            "positions": db.list_broker_reconcile_positions(run_id),
+            "discrepancies": db.list_broker_reconcile_discrepancies(run_id=run_id, limit=500),
+        }
+    finally:
+        close_database(db)
+
+
 @app.post("/api/runtime/start")
 async def runtime_start(_: None = Depends(verify_gateway_token)) -> dict[str, Any]:
     return await runtime_supervisor.start()
@@ -7765,6 +7836,12 @@ def enqueue_gateway_command(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="ORDER_COMMAND_REQUIRES_ORDER_ENQUEUE",
         )
+    sensitive_path = _sensitive_command_payload_path(command.payload)
+    if sensitive_path:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"SENSITIVE_COMMAND_PAYLOAD_FORBIDDEN:{sensitive_path}",
+        )
     result = gateway_state.enqueue_command(
         command,
         priority=command_in.priority,
@@ -9980,6 +10057,25 @@ def _command_dict_with_trace(command: GatewayCommand, trace_updates: dict[str, A
     )
     data["payload"] = payload
     return data
+
+
+def _sensitive_command_payload_path(payload: Any, prefix: str = "payload") -> str:
+    sensitive_tokens = ("password", "passwd", "비밀번호", "account_password", "secret", "access_token", "api_token")
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            text_key = str(key)
+            lowered = text_key.lower()
+            if any(token in lowered for token in sensitive_tokens):
+                return f"{prefix}.{text_key}"
+            nested = _sensitive_command_payload_path(value, f"{prefix}.{text_key}")
+            if nested:
+                return nested
+    elif isinstance(payload, list):
+        for index, item in enumerate(payload):
+            nested = _sensitive_command_payload_path(item, f"{prefix}[{index}]")
+            if nested:
+                return nested
+    return ""
 
 
 def _save_gateway_event_transport_sample(

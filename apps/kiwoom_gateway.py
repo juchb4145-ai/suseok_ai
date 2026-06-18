@@ -54,6 +54,8 @@ from trading.broker.transport_metrics import (
     utc_now_ms,
 )
 from kiwoom.tr import KiwoomTrRunner
+from trading.broker.kiwoom_reconcile_tr import BROKER_RECONCILE_PURPOSE, GatewayLocalCredentialProvider
+from trading.broker.reconcile_tr_specs import KiwoomReconcileTrSpecRegistry
 from trading.strategy.candidate_hydrator import CANDIDATE_HYDRATION_PURPOSE, parse_candidate_hydration_rows
 from trading.theme_engine.backfill import THEME_BACKFILL_PURPOSE, parse_theme_backfill
 
@@ -1132,6 +1134,8 @@ def _execute_command(client, command: GatewayCommand, *, tr_runner=None) -> dict
         )
         return _result_payload(result_code=0, message="condition stopped")
     elif command.type == "tr_request":
+        if str(payload.get("purpose") or "") == BROKER_RECONCILE_PURPOSE:
+            return _execute_broker_reconcile_tr_capture(client, command, payload, tr_runner=tr_runner)
         if str(payload.get("response_mode") or "") == "capture":
             capture_started = time.perf_counter()
             runner = tr_runner or KiwoomTrRunner(client)
@@ -1263,6 +1267,101 @@ def _execute_command(client, command: GatewayCommand, *, tr_runner=None) -> dict
         "result_code": -1,
         "raw": {},
     }
+
+
+def _execute_broker_reconcile_tr_capture(client, command: GatewayCommand, payload: dict[str, Any], *, tr_runner=None) -> dict[str, Any]:
+    capture_started = time.perf_counter()
+    logical_source = str(payload.get("logical_source") or "")
+    registry = KiwoomReconcileTrSpecRegistry()
+    try:
+        spec = registry.get(logical_source)
+    except KeyError:
+        return _result_payload(
+            result_code=-1,
+            message=f"RECONCILE_SPEC_NOT_FOUND:{logical_source}",
+            raw={"purpose": BROKER_RECONCILE_PURPOSE, "logical_source": logical_source},
+        )
+    credential = GatewayLocalCredentialProvider().get_password(
+        account=str(payload.get("account") or ""),
+        credential_ref=str(payload.get("credential_ref") or ""),
+    )
+    if spec.sensitive_input_fields and not credential.available:
+        return _result_payload(
+            result_code=-1,
+            message="CREDENTIAL_UNAVAILABLE",
+            raw={
+                "purpose": BROKER_RECONCILE_PURPOSE,
+                "reconcile_run_id": str(payload.get("reconcile_run_id") or ""),
+                "logical_source": spec.source_value,
+                "tr_code": spec.tr_code,
+                "rq_name": spec.rq_name,
+                "parser_errors": ["CREDENTIAL_UNAVAILABLE"],
+                "complete": False,
+            },
+        )
+    inputs = _broker_reconcile_inputs(payload, spec, credential.password if credential.available else "")
+    runner = tr_runner or KiwoomTrRunner(client)
+    result = runner.request_capture(
+        tr_code=spec.tr_code,
+        rq_name=spec.rq_name,
+        inputs=inputs,
+        single_fields=list(spec.single_fields),
+        multi_fields=list(spec.multi_fields),
+        screen_no=str(payload.get("screen_no") or spec.screen_no),
+        max_pages=int(payload.get("max_pages") or 20),
+    )
+    latency_ms = round((time.perf_counter() - capture_started) * 1000.0, 3)
+    complete = bool(result.complete and not result.errors)
+    raw = {
+        "purpose": BROKER_RECONCILE_PURPOSE,
+        "reconcile_run_id": str(payload.get("reconcile_run_id") or ""),
+        "logical_source": spec.source_value,
+        "account": str(payload.get("account") or ""),
+        "account_token": str(payload.get("account_token") or ""),
+        "tr_code": spec.tr_code,
+        "rq_name": spec.rq_name,
+        "captured_single": result.merged_single,
+        "captured_rows": result.merged_rows,
+        "pages": [
+            {
+                "meta": page.meta.__dict__,
+                "single": dict(page.single or {}),
+                "rows": [dict(row) for row in page.rows],
+            }
+            for page in result.pages
+        ],
+        "page_count": result.page_count,
+        "request_count": result.request_count,
+        "prev_next_sequence": result.prev_next_sequence,
+        "complete": complete,
+        "parser_warnings": list(result.warnings),
+        "parser_errors": list(result.errors),
+        "latency_ms": latency_ms,
+        "spec_validation_source": spec.spec_validation_source,
+        "spec_validation_status": str(getattr(spec.spec_validation_status, "value", spec.spec_validation_status)),
+    }
+    ack = _result_payload(
+        result_code=0 if complete else -1,
+        message="broker reconcile tr captured" if complete else "broker reconcile tr capture incomplete",
+        raw=raw,
+    )
+    ack.update(raw)
+    return ack
+
+
+def _broker_reconcile_inputs(payload: dict[str, Any], spec, password: str) -> dict[str, str]:
+    inputs: dict[str, str] = {}
+    account = str(payload.get("account") or "")
+    for field_name, source in dict(spec.input_fields or {}).items():
+        if field_name in set(spec.sensitive_input_fields or ()):
+            inputs[field_name] = str(password or "")
+        elif source == "account":
+            inputs[field_name] = account
+        elif source == "credential_ref":
+            inputs[field_name] = ""
+        else:
+            inputs[field_name] = str(source)
+    return inputs
 
 
 def _safe_master_last_price(client, code: str) -> float | None:

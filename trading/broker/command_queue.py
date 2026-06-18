@@ -56,6 +56,13 @@ ACTIVE_DEDUPE_STATUSES = {
     CommandStatus.ACKED,
 }
 ORDER_COMMAND_TYPES = {"send_order", "cancel_order", "modify_order"}
+COMMAND_CLASS_RANK = {
+    "ORDER": 0,
+    "BROKER_RECONCILE": 1,
+    "CONTROL": 2,
+    "HYDRATION": 3,
+    "BACKFILL": 4,
+}
 DEFAULT_TTL_SEC = {
     "send_order": 30,
     "cancel_order": 30,
@@ -460,7 +467,7 @@ class CommandQueue:
             for command_id in self._sequence
             if self._records.get(command_id) is not None and self._records[command_id].status == CommandStatus.QUEUED
         ]
-        return sorted(candidates, key=lambda record: (priority_rank[record.priority], record.created_at))
+        return sorted(candidates, key=lambda record: (priority_rank[record.priority], command_class_rank(record), record.created_at))
 
     def _finish(
         self,
@@ -485,6 +492,24 @@ def default_priority(command_type: str) -> CommandPriority:
     if command_type in {"login", "load_conditions"}:
         return CommandPriority.LOW
     return CommandPriority.NORMAL
+
+
+def command_class_rank(record: CommandRecord) -> int:
+    command_class = str((record.metadata or {}).get("command_class") or dict(record.command.payload or {}).get("command_class") or "").upper()
+    if not command_class:
+        payload = dict(record.command.payload or {})
+        purpose = str(payload.get("purpose") or "")
+        if record.command_type in ORDER_COMMAND_TYPES:
+            command_class = "ORDER"
+        elif purpose == "broker_reconcile":
+            command_class = "BROKER_RECONCILE"
+        elif purpose in {"candidate_hydration"}:
+            command_class = "HYDRATION"
+        elif purpose:
+            command_class = "BACKFILL"
+        elif record.command_type in {"login", "load_conditions", "send_condition", "register_realtime", "remove_realtime", "remove_all_realtime", "stop_condition"}:
+            command_class = "CONTROL"
+    return COMMAND_CLASS_RANK.get(command_class, 3)
 
 
 def dedupe_key_for_command(command: GatewayCommand) -> str:

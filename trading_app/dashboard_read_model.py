@@ -138,6 +138,7 @@ class DashboardReadModelService:
             "position_risk": dict(runtime.get("position_risk") or {}),
             "order_manager": order_manager,
             "order_lifecycle": dict(core.get("order_event_consumer") or runtime.get("order_lifecycle") or {}),
+            "broker_reconcile": dict(core.get("broker_reconcile") or runtime.get("broker_reconcile") or {}),
             "candidates": dict(runtime.get("candidates") or {}),
             "pre_market_check": dict(runtime.get("pre_market_check") or pre_market_report_empty()),
         }
@@ -605,6 +606,42 @@ class DashboardReadModelService:
                     "critical",
                     "미확인 주문/체결 이벤트가 있어 reconciliation이 필요합니다.",
                     "UNMATCHED_ORDER_EVENT",
+                )
+        broker_reconcile = dict(core.get("broker_reconcile") or payload.get("broker_reconcile") or {})
+        if broker_reconcile:
+            payload["broker_reconcile"] = broker_reconcile
+            health["broker_reconcile"] = {
+                "status": broker_reconcile.get("status", ""),
+                "dispatch_enabled": bool(broker_reconcile.get("dispatch_enabled")),
+                "broker_truth_ready": bool(broker_reconcile.get("broker_truth_ready")),
+                "reconcile_clean": bool(broker_reconcile.get("reconcile_clean")),
+                "snapshot_complete": bool(broker_reconcile.get("snapshot_complete")),
+                "discrepancy_count": int(broker_reconcile.get("discrepancy_count") or 0),
+                "critical_discrepancy_count": int(broker_reconcile.get("critical_discrepancy_count") or 0),
+                "stop_new_buy": bool(broker_reconcile.get("stop_new_buy")),
+                "reduce_only": bool(broker_reconcile.get("reduce_only")),
+                "last_error": broker_reconcile.get("last_error", ""),
+            }
+            if not bool(broker_reconcile.get("broker_truth_ready", True)):
+                payload["safety_banners"] = _add_banner(
+                    payload.get("safety_banners") or [],
+                    "warning",
+                    "계좌 동기화 확인 대기 중입니다.",
+                    "BROKER_RECONCILE_NOT_READY",
+                )
+            if int(broker_reconcile.get("critical_discrepancy_count") or 0) > 0:
+                payload["safety_banners"] = _add_banner(
+                    payload.get("safety_banners") or [],
+                    "critical",
+                    "broker/local 계좌 불일치가 있습니다.",
+                    "BROKER_RECONCILE_DISCREPANCY",
+                )
+            if bool(broker_reconcile.get("reduce_only")):
+                payload["safety_banners"] = _add_banner(
+                    payload.get("safety_banners") or [],
+                    "critical",
+                    "Reduce-only 검토가 필요합니다.",
+                    "BROKER_RECONCILE_REDUCE_ONLY",
                 )
         health["read_model"] = {
             "generation": dict(payload.get("read_model") or {}).get("generation", 0),

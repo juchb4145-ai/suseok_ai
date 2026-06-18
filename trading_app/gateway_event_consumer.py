@@ -172,6 +172,8 @@ class GatewayEventCodec:
             return self._ignored(event, payload, resolved_source_event_id, "PRICE_TICK_REPLAY_DISABLED")
         if raw_type == "heartbeat" and not self.config.replay_heartbeat_enabled:
             return self._ignored(event, payload, resolved_source_event_id, "HEARTBEAT_REPLAY_DISABLED")
+        if str(payload.get("purpose") or "") == "broker_reconcile":
+            return self._ignored(event, payload, resolved_source_event_id, "BROKER_RECONCILE_EVENT_ROUTED_TO_RECONCILE_CONSUMER")
         if raw_type in {"command_ack", "command_failed", "command_timeout", "command_expired"}:
             return self._decode_command_event(event, payload, resolved_source_event_id)
         if raw_type == "kiwoom_order_chejan":
