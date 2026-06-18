@@ -2,8 +2,13 @@ from storage.db import TradingDatabase
 from trading.strategy.candidate_ingestion import CandidateIngestionService, CandidateSourceEvent
 from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.strategy.models import CandidateState
+from trading.theme_engine.board_view import ThemeBoardView
+from trading.theme_engine.expansion import FocusedExpansionPlan, FocusedExpansionTarget
 from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeStatus
 from trading.theme_engine.repository import ThemeEngineRepository
+from trading.theme_engine.roles import RawStockRole, StockRoleDecision, TradeStockRole
+from trading.theme_engine.signals import LiveSeedSignal, SeedSourceType, ThemeDataWaitReason
+from trading.theme_engine.state_machine import ThemeCoreState, ThemeStateSnapshot
 from trading.theme_engine.theme_board import ThemeBoardConfig, ThemeBoardEngine, theme_board_dashboard_section
 from trading_app.api import build_dashboard_snapshot
 
@@ -185,6 +190,55 @@ def test_dashboard_snapshot_includes_theme_board_section(tmp_path):
     assert dashboard["theme_board"]["ready_allowed"] is False
 
 
+def test_theme_board_view_projects_theme_core_v3_observe_fields():
+    leading = ThemeStateSnapshot(
+        theme_id="ai",
+        theme_name="AI",
+        theme_state=ThemeCoreState.LEADING_THEME.value,
+        theme_score=82.0,
+        leader_symbol="000001",
+        co_leader_symbols=("000002",),
+    )
+    data_wait = ThemeStateSnapshot(
+        theme_id="display",
+        theme_name="Display",
+        theme_state=ThemeCoreState.DATA_WAIT.value,
+        theme_score=0.0,
+        data_quality_reason=ThemeDataWaitReason.REALTIME_COVERAGE_LOW.value,
+    )
+    decisions = [
+        _role_decision("000001", leading, RawStockRole.LEADER.value, TradeStockRole.LEADER_CONFIRMED.value, 91.0),
+        _role_decision("000002", leading, RawStockRole.CO_LEADER.value, TradeStockRole.CO_LEADER_CONFIRMED.value, 85.0),
+        _role_decision("000003", leading, RawStockRole.LATE_LAGGARD.value, TradeStockRole.LATE_LAGGARD_BLOCKED.value, 40.0),
+        _role_decision("000004", leading, RawStockRole.OVERHEATED.value, TradeStockRole.OVERHEATED_BLOCKED.value, 30.0),
+    ]
+    plan = FocusedExpansionPlan(
+        targets=(
+            FocusedExpansionTarget(code="000001", theme_id="ai", trade_role=TradeStockRole.LEADER_CONFIRMED.value),
+        ),
+        focused_expansion_count=1,
+    )
+
+    snapshot = ThemeBoardView().build(
+        trade_date="2026-06-17",
+        calculated_at="2026-06-17T09:05:00",
+        theme_states=[leading, data_wait],
+        role_decisions=decisions,
+        expansion_plan=plan,
+    )
+
+    assert snapshot.output_mode == "OBSERVE"
+    assert snapshot.ready_allowed is False
+    assert snapshot.order_intent_allowed is False
+    assert snapshot.top_themes[0]["theme_id"] == "ai"
+    assert snapshot.leaders_by_theme[0]["leaders"][0]["code"] == "000001"
+    assert snapshot.excluded_late_laggard_count == 1
+    assert snapshot.excluded_overheated_count == 1
+    assert snapshot.condition_booster_inflow_count == 1
+    assert snapshot.focused_expansion_count == 1
+    assert snapshot.data_wait_reasons[ThemeDataWaitReason.REALTIME_COVERAGE_LOW.value] == 1
+
+
 def _context(tmp_path):
     db = TradingDatabase(str(tmp_path / "test.db"))
     repo = ThemeEngineRepository(db)
@@ -279,4 +333,27 @@ def _tick(
                 "upper_limit_gap_pct": upper_limit_gap_pct,
             },
         )
+    )
+
+
+def _role_decision(
+    code: str,
+    theme_state: ThemeStateSnapshot,
+    raw_role: str,
+    trade_role: str,
+    role_score: float,
+) -> StockRoleDecision:
+    return StockRoleDecision(
+        code=code,
+        name=f"Stock {code}",
+        theme_id=theme_state.theme_id,
+        theme_name=theme_state.theme_name,
+        raw_role=raw_role,
+        trade_role=trade_role,
+        role_score=role_score,
+        signal=LiveSeedSignal(
+            code=code,
+            source_types=(SeedSourceType.CONDITION_INCLUDE.value,) if code == "000001" else (),
+        ),
+        theme_state=theme_state,
     )

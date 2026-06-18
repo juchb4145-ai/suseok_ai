@@ -495,29 +495,16 @@ class OpeningThemeBurstRuntimePipeline:
         trade_date: str,
         summary: dict[str, Any],
     ) -> None:
-        service = self.candidate_ingestion_service
-        if service is None:
-            return
-        try:
-            ingestion_results = list(service.ingest_opening_burst_result(result, trade_date=trade_date) or [])
-            summary["candidate_ingestion"] = {
-                "source": "opening_burst",
-                "selected_count": len(result.selected_symbols),
-                "ingested_count": sum(1 for item in ingestion_results if getattr(item, "candidate", None) is not None),
-                "created_count": sum(1 for item in ingestion_results if bool(getattr(item, "created", False))),
-                "merged_count": sum(1 for item in ingestion_results if bool(getattr(item, "merged", False))),
-            }
-            hydrator = self.candidate_hydrator
-            if hydrator is not None:
-                hydration_results = list(hydrator.enqueue_due_candidates(trade_date=trade_date) or [])
-                summary["candidate_ingestion"]["hydration_enqueued_count"] = sum(
-                    1 for item in hydration_results if bool(getattr(item, "enqueued", False))
-                )
-                summary["candidate_ingestion"]["hydration_duplicate_count"] = sum(
-                    1 for item in hydration_results if bool(getattr(item, "duplicate", False))
-                )
-        except Exception as exc:
-            self.warnings.append(f"OPENING_BURST_CANDIDATE_INGESTION_FAILED:{exc}")
+        summary["candidate_ingestion"] = {
+            "source": "opening_burst",
+            "selected_count": len(result.selected_symbols),
+            "ingested_count": 0,
+            "created_count": 0,
+            "merged_count": 0,
+            "status": "SKIPPED",
+            "reason": "OPENING_BURST_OBSERVE_ONLY_CANDIDATE_BRIDGE_REQUIRED",
+            "trade_date": trade_date,
+        }
 
 
 def opening_seed_tr_command(

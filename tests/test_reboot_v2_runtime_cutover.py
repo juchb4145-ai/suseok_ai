@@ -14,6 +14,9 @@ from trading.strategy.reboot_v2 import RebootV2RuntimeProfile
 from trading.strategy.reboot_v2_runtime import RebootV2Runtime
 from trading.strategy.runtime import StrategyRuntimeConfig
 from trading_app.runtime_adapters import GatewayCommandRealtimeClient, GatewayEventMarketDataBridge
+from trading.theme_engine.candidate_bridge import CandidateBridge
+from trading.theme_engine.roles import RawStockRole, StockRoleDecision, TradeStockRole
+from trading.theme_engine.state_machine import ThemeCoreState, ThemeStateSnapshot
 
 
 class _Pipeline:
@@ -141,3 +144,56 @@ def test_reboot_v2_condition_hydration_subscription_cutover_blocks_legacy_orders
     assert second["entry_plan_count"] == 0
     assert second["virtual_order_count"] == 0
     assert send_order_commands == []
+
+
+def test_theme_core_v3_candidate_bridge_emits_observe_events_without_ready_or_order_intent(tmp_path):
+    db = TradingDatabase(str(tmp_path / "v3_bridge.db"))
+    state = ThemeStateSnapshot(
+        theme_id="ai",
+        theme_name="AI",
+        theme_state=ThemeCoreState.LEADING_THEME.value,
+        leader_symbol="000001",
+    )
+    blocked_state = ThemeStateSnapshot(
+        theme_id="weak",
+        theme_name="Weak",
+        theme_state=ThemeCoreState.WATCH_THEME.value,
+        leader_symbol="000002",
+    )
+
+    result = CandidateBridge().build_events(
+        [
+            StockRoleDecision(
+                code="000001",
+                name="AI Leader",
+                theme_id="ai",
+                theme_name="AI",
+                raw_role=RawStockRole.LEADER.value,
+                trade_role=TradeStockRole.LEADER_CONFIRMED.value,
+                role_score=91.0,
+                theme_state=state,
+            ),
+            StockRoleDecision(
+                code="000002",
+                name="Weak Watch",
+                theme_id="weak",
+                theme_name="Weak",
+                raw_role=RawStockRole.LEADER.value,
+                trade_role=TradeStockRole.LEADER_CONFIRMED.value,
+                role_score=88.0,
+                theme_state=blocked_state,
+            ),
+        ],
+        trade_date="2026-06-17",
+        detected_at="2026-06-17T09:05:00",
+    )
+
+    assert len(result.events) == 1
+    assert result.excluded[0].code == "000002"
+    assert result.events[0].source_type == "theme_board"
+    assert result.events[0].raw_payload["ready_allowed"] is False
+    assert result.events[0].raw_payload["order_intent_allowed"] is False
+    assert result.ready_allowed is False
+    assert result.order_intent_allowed is False
+    assert db.conn.execute("SELECT COUNT(*) AS count FROM entry_plans").fetchone()["count"] == 0
+    assert db.list_runtime_order_intents(limit=10) == []

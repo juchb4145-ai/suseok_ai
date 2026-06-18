@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
+from typing import Iterable
 
 from trading.theme_engine.models import ThemeMembership, ThemeStatus
 from trading.theme_engine.normalizer import normalize_stock_code
@@ -12,6 +14,86 @@ class ThemeUniverseConfig:
     max_size: int = 500
     min_membership_score: float = 0.55
     min_trade_membership_score: float = 0.65
+
+
+@dataclass(frozen=True)
+class ThemeUniverseSnapshot:
+    theme_id: str
+    theme_name: str = ""
+    member_count: int = 0
+    tradable_member_count: int = 0
+    kospi_member_count: int = 0
+    kosdaq_member_count: int = 0
+    membership_quality: float = 0.0
+    reason_codes: tuple[str, ...] = ()
+
+
+class ThemeRegistry:
+    def __init__(self, repository: ThemeEngineRepository | None = None, config: ThemeUniverseConfig | None = None) -> None:
+        self.repository = repository
+        self.config = config or ThemeUniverseConfig()
+
+    def build(
+        self,
+        theme_inputs: Iterable[tuple[str, str, list[ThemeMembership]]] | None = None,
+    ) -> list[ThemeUniverseSnapshot]:
+        groups = self._groups_from_inputs(theme_inputs) if theme_inputs is not None else self._groups_from_repository()
+        snapshots = [self._snapshot(theme_id, theme_name, memberships) for theme_id, theme_name, memberships in groups]
+        return sorted(snapshots, key=lambda item: (item.membership_quality, item.tradable_member_count, item.member_count), reverse=True)
+
+    def _groups_from_repository(self) -> list[tuple[str, str, list[ThemeMembership]]]:
+        if self.repository is None:
+            return []
+        grouped: dict[str, list[ThemeMembership]] = defaultdict(list)
+        for membership in self.repository.list_current_memberships(active=True):
+            grouped[membership.theme_id].append(membership)
+        groups: list[tuple[str, str, list[ThemeMembership]]] = []
+        for theme_id, memberships in grouped.items():
+            theme = self.repository.get_canonical_theme(theme_id)
+            theme_name = (
+                (theme.display_name or theme.canonical_name or theme.theme_id)
+                if theme is not None
+                else theme_id
+            )
+            groups.append((theme_id, theme_name, memberships))
+        return groups
+
+    def _groups_from_inputs(
+        self,
+        theme_inputs: Iterable[tuple[str, str, list[ThemeMembership]]],
+    ) -> list[tuple[str, str, list[ThemeMembership]]]:
+        return [(theme_id, theme_name, list(memberships or [])) for theme_id, theme_name, memberships in theme_inputs]
+
+    def _snapshot(
+        self,
+        theme_id: str,
+        theme_name: str,
+        memberships: list[ThemeMembership],
+    ) -> ThemeUniverseSnapshot:
+        active = [item for item in memberships if item.active]
+        tradable = [
+            item
+            for item in active
+            if item.trade_eligible and _normalized_membership_score(item.membership_score) >= self.config.min_trade_membership_score
+        ]
+        reasons: list[str] = []
+        if not active:
+            reasons.append("UNIVERSE_EMPTY")
+        if not tradable:
+            reasons.append("NO_TRADABLE_MEMBERS")
+        quality = _membership_quality(active)
+        if quality < self.config.min_membership_score:
+            reasons.append("LOW_MEMBERSHIP_QUALITY")
+        return ThemeUniverseSnapshot(
+            theme_id=theme_id,
+            theme_name=theme_name or theme_id,
+            member_count=len(active),
+            tradable_member_count=len(tradable),
+            kospi_member_count=sum(1 for item in active if _member_market(item) == "KOSPI"),
+            kosdaq_member_count=sum(1 for item in active if _member_market(item) == "KOSDAQ"),
+            membership_quality=round(quality, 4),
+            reason_codes=tuple(dict.fromkeys(reasons)),
+        )
 
 
 class ThemeUniverseBuilder:
@@ -90,3 +172,41 @@ def _status_priority(status) -> int:
     if value == ThemeStatus.WATCH.value:
         return 1
     return 0
+
+
+def _membership_quality(memberships: list[ThemeMembership]) -> float:
+    if not memberships:
+        return 0.0
+    return sum(_normalized_membership_score(item.membership_score) for item in memberships) / len(memberships)
+
+
+def _normalized_membership_score(value: float) -> float:
+    try:
+        number = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if number > 1.0:
+        return max(0.0, min(1.0, number / 100.0))
+    return max(0.0, min(1.0, number))
+
+
+def _member_market(member: ThemeMembership) -> str:
+    raw = getattr(member, "market", "")
+    if not raw:
+        raw_payload = getattr(member, "raw", None)
+        if isinstance(raw_payload, dict):
+            raw = raw_payload.get("market", "")
+    value = str(raw or "").strip().upper()
+    if value in {"KOSPI", "KS", "P"}:
+        return "KOSPI"
+    if value in {"KOSDAQ", "KQ", "Q"}:
+        return "KOSDAQ"
+    return ""
+
+
+__all__ = [
+    "ThemeRegistry",
+    "ThemeUniverseBuilder",
+    "ThemeUniverseConfig",
+    "ThemeUniverseSnapshot",
+]

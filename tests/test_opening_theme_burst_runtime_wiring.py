@@ -5,6 +5,7 @@ from datetime import datetime
 from storage.db import TradingDatabase
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import GatewayEvent
+from trading.strategy.candidate_ingestion import CandidateIngestionService
 from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.theme_engine.leadership import StockLeadershipRole, ThemeLeadershipStatus
 from trading.theme_engine.models import CanonicalTheme, ThemeMembership, ThemeStatus
@@ -191,6 +192,38 @@ def test_runtime_computes_observe_result_without_condition_profiles(tmp_path):
         assert summary["selected_symbols"]
         assert db.latest_opening_theme_burst_result(trade_date="2026-06-15")["ready_allowed"] is False
         assert all(item["command_type"] != "send_order" for item in gateway_state.list_commands(include_finished=True))
+    finally:
+        db.close()
+
+
+def test_opening_burst_selected_symbols_do_not_directly_create_candidates(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        gateway_state = GatewayStateStore()
+        market_data = MarketDataStore()
+        repo = ThemeEngineRepository(db)
+        _seed_theme(repo)
+        _seed_batch(db, "2026-06-15", [("000001", 1, 9_000_000_000), ("000002", 2, 7_000_000_000), ("000003", 3, 4_000_000_000)])
+        _tick(market_data, "000001", 6.0, 9_000_000_000, speed=1_500_000_000, execution=155)
+        _tick(market_data, "000002", 5.0, 7_000_000_000, speed=1_100_000_000, execution=145)
+        _tick(market_data, "000003", 3.4, 4_000_000_000, speed=800_000_000, execution=130)
+
+        pipeline = OpeningThemeBurstRuntimePipeline(
+            db=db,
+            gateway_state=gateway_state,
+            market_data=market_data,
+            repository=repo,
+            config=_config(),
+            candidate_ingestion_service=CandidateIngestionService(db),
+        )
+        summary = pipeline.run(_dt("2026-06-15T09:04:00"))
+
+        assert summary["selected_symbols"]
+        assert summary["candidate_ingestion"]["status"] == "SKIPPED"
+        assert summary["candidate_ingestion"]["ingested_count"] == 0
+        assert db.list_candidates(trade_date="2026-06-15") == []
+        assert db.conn.execute("SELECT COUNT(*) AS count FROM entry_plans").fetchone()["count"] == 0
+        assert db.list_runtime_order_intents(limit=10) == []
     finally:
         db.close()
 
