@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Iterable
 
@@ -235,17 +235,6 @@ class KiwoomOrderChejanParser:
         execution_quantity = _parse_int_field(self.registry, raw, 911)
         unit_execution_price = _parse_int_field(self.registry, raw, 914)
         unit_execution_quantity = _parse_int_field(self.registry, raw, 915)
-        for field in (
-            order_quantity,
-            order_price,
-            unfilled_quantity,
-            cumulative_fill_amount,
-            execution_price,
-            execution_quantity,
-            unit_execution_price,
-            unit_execution_quantity,
-        ):
-            warnings.extend(field.warning_codes)
         if _env_bool("TRADING_KIWOOM_CHEJAN_REQUIRE_ACCOUNT", True) and not account:
             missing.append("account")
         if _env_bool("TRADING_KIWOOM_CHEJAN_REQUIRE_ORDER_NO", True) and not order_no:
@@ -259,10 +248,11 @@ class KiwoomOrderChejanParser:
             unfilled_quantity=unfilled_quantity.parsed_value,
             execution_quantity=execution_quantity.parsed_value,
         )
-        fill_like = _has_positive(incremental_qty) or _has_positive(execution_quantity.parsed_value)
+        fill_status = _is_fill_status(order_status)
+        fill_like = _has_positive(incremental_qty) or _has_positive(execution_quantity.parsed_value) or fill_status
         has_execution = bool(execution_id) or fill_like
-        cancel_like = "취소" in order_status or "취소" in order_gubun or "CANCEL" in order_status.upper()
-        reject_like = bool(reject_reason) or any(token in order_status for token in ("거부", "거절")) or "REJECT" in order_status.upper()
+        cancel_like = _is_cancel_status(order_status) or _is_cancel_order_gubun(order_gubun)
+        reject_like = _is_reject_reason(reject_reason) or _is_reject_status(order_status)
         if has_execution:
             event_kind = "order_fill"
         elif reject_like:
@@ -273,6 +263,13 @@ class KiwoomOrderChejanParser:
             event_kind = "order_accepted"
         else:
             event_kind = "order_status_snapshot"
+        for field in (order_quantity, order_price, unfilled_quantity):
+            warnings.extend(field.warning_codes)
+        if cumulative_fill_amount.field_present:
+            warnings.extend(cumulative_fill_amount.warning_codes)
+        if event_kind == "order_fill":
+            for field in (execution_price, execution_quantity, unit_execution_price, unit_execution_quantity):
+                warnings.extend(field.warning_codes)
         if fill_like and not execution_id:
             warnings.append("EXECUTION_ID_MISSING")
         if common["item_count"] and len(common["requested_fids"]) and common["item_count"] != len(common["requested_fids"]):
@@ -608,9 +605,9 @@ def parse_fid_list(fid_list: str) -> list[int]:
 
 def normalize_order_side(*, side_code: str = "", order_gubun: str = "") -> str:
     side_text = f"{side_code} {order_gubun}".upper()
-    if str(side_code).strip() == "2" or "매수" in order_gubun or "BUY" in side_text:
+    if str(side_code).strip() == "2" or _contains_any(order_gubun, ("매수",)) or "BUY" in side_text:
         return "BUY"
-    if str(side_code).strip() == "1" or "매도" in order_gubun or "SELL" in side_text:
+    if str(side_code).strip() == "1" or _contains_any(order_gubun, ("매도",)) or "SELL" in side_text:
         return "SELL"
     return ""
 
@@ -696,6 +693,39 @@ def _value_or_zero(value: Any) -> int:
         return 0
 
 
+def _contains_any(value: str, tokens: Iterable[str]) -> bool:
+    text = str(value or "")
+    return any(token and token in text for token in tokens)
+
+
+def _is_fill_status(order_status: str) -> bool:
+    text = str(order_status or "").upper()
+    return _contains_any(text, ("체결", "FILLED", "EXECUTED"))
+
+
+def _is_cancel_status(order_status: str) -> bool:
+    text = str(order_status or "").upper()
+    return _contains_any(text, ("취소", "CANCEL"))
+
+
+def _is_cancel_order_gubun(order_gubun: str) -> bool:
+    text = str(order_gubun or "").upper()
+    return _contains_any(text, ("취소", "CANCEL"))
+
+
+def _is_reject_status(order_status: str) -> bool:
+    text = str(order_status or "").upper()
+    return _contains_any(text, ("거부", "거절", "REJECT"))
+
+
+def _is_reject_reason(reject_reason: str) -> bool:
+    text = str(reject_reason or "").strip()
+    if not text:
+        return False
+    normalized = text.replace(" ", "").replace("\t", "")
+    return normalized not in {"0", "00", "000", "0000", "정상"}
+
+
 def _order_broker_event_key(**kwargs: Any) -> str:
     if kwargs.get("execution_id"):
         return _business_key("fill", kwargs.get("account"), kwargs.get("order_no"), kwargs.get("execution_id"))
@@ -733,8 +763,10 @@ def _raw_checksum(raw: dict[str, str]) -> str:
 def _kiwoom_event_time(value: str) -> str:
     text = str(value or "").strip()
     if len(text) == 6 and text.isdigit():
-        now = datetime.now(timezone.utc)
-        return now.replace(hour=int(text[:2]), minute=int(text[2:4]), second=int(text[4:6]), microsecond=0).isoformat()
+        kst = timezone(timedelta(hours=9))
+        now = datetime.now(kst)
+        event_time = now.replace(hour=int(text[:2]), minute=int(text[2:4]), second=int(text[4:6]), microsecond=0)
+        return event_time.astimezone(timezone.utc).isoformat()
     return utc_timestamp()
 
 

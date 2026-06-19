@@ -219,7 +219,7 @@ class GatewayEventCodec:
         if event_kind == "order_fill" and (has_fill_identity or has_fill_quantity):
             canonical = "ORDER_FILLED" if _remaining_quantity(payload) <= 0 else "ORDER_PARTIALLY_FILLED"
             return self._canonical(event, payload, source_event_id, canonical)
-        if event_kind == "order_rejected" or reject_reason or "거부" in order_status or "거절" in order_status:
+        if event_kind == "order_rejected" or _is_reject_reason(reject_reason) or _is_reject_status(order_status):
             data = {**payload, "status": "REJECTED"}
             return self._canonical(event, data, source_event_id, "ORDER_REJECTED")
         if event_kind == "order_cancelled":
@@ -863,6 +863,19 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return int(default)
+
+
+def _is_reject_status(order_status: str) -> bool:
+    text = str(order_status or "").upper()
+    return any(token in text for token in ("거부", "거절", "REJECT"))
+
+
+def _is_reject_reason(reject_reason: str) -> bool:
+    text = str(reject_reason or "").strip()
+    if not text:
+        return False
+    normalized = text.replace(" ", "").replace("\t", "")
+    return normalized not in {"0", "00", "000", "0000", "정상"}
 
 
 def _now_text() -> str:

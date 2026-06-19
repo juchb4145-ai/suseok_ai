@@ -19,6 +19,24 @@ def test_reconcile_command_contains_credential_ref_not_password():
     assert "password" not in str(payload).lower()
     assert "1357" not in str(payload)
     assert payload["account_token"].startswith("ACC_TOKEN_")
+    assert "input_fields" not in payload
+    assert _sensitive_command_payload_path(payload) == ""
+
+
+def test_reconcile_commands_are_safe_for_core_enqueue_api():
+    for source in (
+        ReconcileSourceType.OPEN_ORDERS,
+        ReconcileSourceType.ACCOUNT_POSITIONS,
+        ReconcileSourceType.ACCOUNT_CASH,
+    ):
+        command = build_reconcile_tr_command(
+            account="9876543210",
+            logical_source=source,
+            run_id="run-sec",
+            credential_ref="LOCAL_SECRET_REF",
+        )
+
+        assert _sensitive_command_payload_path(command.payload) == ""
 
 
 @dataclass

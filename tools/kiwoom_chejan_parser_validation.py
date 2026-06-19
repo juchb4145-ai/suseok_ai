@@ -60,10 +60,14 @@ def validate_fixture_dir(fixture_dir: str | Path, *, output_dir: str | Path) -> 
     field_coverage: Counter[str] = Counter()
     classification: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    covered_cases: set[str] = {str(item.get("case_id") or item.get("name") or "") for item in cases if item.get("case_id") or item.get("name")}
+    observed_broker_envs: set[str] = set()
     for case in cases:
         case_id = str(case.get("case_id") or case.get("name") or "")
         file_name = str(case.get("file") or f"{case_id}.json")
         payload = json.loads((fixture_path / file_name).read_text(encoding="utf-8"))
+        if payload.get("broker_env"):
+            observed_broker_envs.add(str(payload.get("broker_env") or "").upper())
         raw_fids = dict(payload.get("raw_fids") or payload.get("fids") or {})
         result = parser.parse(
             gubun=str(payload.get("gubun", case.get("gubun", ""))),
@@ -89,6 +93,7 @@ def validate_fixture_dir(fixture_dir: str | Path, *, output_dir: str | Path) -> 
             case_failures.append({"case_id": case_id, "reason": "REDACTION_FAILED", "leaks": redaction["leaks"]})
         if result.parse_status == ChejanParseStatus.INVALID and str(case.get("expected_status") or "") != ChejanParseStatus.INVALID.value:
             case_failures.append({"case_id": case_id, "reason": "UNEXPECTED_INVALID", "missing": result.missing_required_fields})
+        covered_cases.add(_coverage_case_id(result))
         failures.extend(case_failures)
         classification.append(
             {
@@ -114,9 +119,10 @@ def validate_fixture_dir(fixture_dir: str | Path, *, output_dir: str | Path) -> 
                 },
             }
         )
-    source = str(manifest.get("source") or "SYNTHETIC")
-    covered = {str(item.get("case_id") or item.get("name") or "") for item in cases}
-    missing_cases = sorted(REQUIRED_CASES - covered)
+    source = str(manifest.get("source") or "")
+    if not source:
+        source = "KIWOOM_SIMULATION" if "SIMULATION" in observed_broker_envs else "SYNTHETIC"
+    missing_cases = sorted(REQUIRED_CASES - covered_cases)
     status = "FAIL" if failures else "PASS"
     recommendation = "READY_FOR_RECONCILE_TR_PILOT"
     if source != "KIWOOM_SIMULATION" or missing_cases:
@@ -160,6 +166,28 @@ def _summary(report: dict[str, Any]) -> str:
             "",
         ]
     )
+
+
+def _coverage_case_id(result: Any) -> str:
+    kind = str(getattr(result, "event_kind", "") or "")
+    payload = dict(getattr(result, "canonical_payload", {}) or {})
+    if kind == "order_fill":
+        remaining = payload.get("remaining_quantity")
+        try:
+            return "full_fill" if int(remaining or 0) <= 0 else "partial_fill"
+        except (TypeError, ValueError):
+            return "partial_fill"
+    if kind == "position_delta":
+        try:
+            return "balance_zero" if int(payload.get("quantity") or 0) <= 0 else "balance_increase"
+        except (TypeError, ValueError):
+            return "balance_increase"
+    return {
+        "order_accepted": "order_accepted",
+        "order_rejected": "order_rejected",
+        "order_cancel_accepted": "cancel_accepted",
+        "order_cancelled": "cancelled",
+    }.get(kind, kind)
 
 
 def _parser() -> argparse.ArgumentParser:

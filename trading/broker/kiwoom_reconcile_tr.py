@@ -67,7 +67,6 @@ def build_reconcile_tr_command(
         "rq_name": spec.rq_name,
         "screen_no": spec.screen_no,
         "response_mode": "capture_v2",
-        "input_fields": dict(spec.input_fields),
         "single_fields": list(spec.single_fields),
         "multi_fields": list(spec.multi_fields),
         "max_pages": max(1, int(max_pages or 20)),

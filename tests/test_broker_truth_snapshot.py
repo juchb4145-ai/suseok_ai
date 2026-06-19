@@ -1,4 +1,5 @@
 from storage.db import TradingDatabase
+from trading.broker.models import GatewayEvent
 from trading.strategy.broker_reconcile import BrokerReconcileOrchestrator
 
 
@@ -32,6 +33,33 @@ def test_reconcile_source_result_is_staged_without_publishing_projection(tmp_pat
     assert db.get_broker_order_state(account="ACC_TOKEN_NOT_USED", order_no="OID-1") is None
 
 
+def test_nested_broker_reconcile_command_ack_is_staged(tmp_path):
+    db = TradingDatabase(str(tmp_path / "reconcile-nested.db"))
+    orchestrator = BrokerReconcileOrchestrator(db=db)
+    run = orchestrator.request_manual_reconcile(account="1234567890", broker_env="SIMULATION", sources=["OPEN_ORDERS"])
+    event = GatewayEvent(
+        type="command_ack",
+        command_id="cmd-reconcile",
+        payload={
+            "payload": {
+                "purpose": "broker_reconcile",
+                "reconcile_run_id": run["run_id"],
+                "logical_source": "OPEN_ORDERS",
+                "account": "1234567890",
+                "complete": True,
+                "captured_rows": [],
+            }
+        },
+    )
+
+    result = orchestrator.handle_gateway_event(event)
+
+    assert result["status"] == "PROCESSED"
+    source_results = db.list_broker_reconcile_source_results(run["run_id"])
+    assert source_results[0]["command_id"] == "cmd-reconcile"
+    assert source_results[0]["status"] == "VALID_EMPTY"
+
+
 def test_broker_only_open_order_creates_stop_new_buy_discrepancy(tmp_path):
     db = TradingDatabase(str(tmp_path / "reconcile-mismatch.db"))
     orchestrator = BrokerReconcileOrchestrator(db=db)
@@ -63,4 +91,3 @@ def test_broker_only_open_order_creates_stop_new_buy_discrepancy(tmp_path):
     assert discrepancies[0]["category"] == "BROKER_ONLY_OPEN_ORDER"
     assert discrepancies[0]["severity"] == "STOP_NEW_BUY"
     assert db.get_broker_reconcile_run(run["run_id"])["broker_truth_ready"] is False
-

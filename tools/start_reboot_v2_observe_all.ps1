@@ -13,6 +13,10 @@ param(
     [switch]$NoRequireLogin,
     [switch]$SkipGateway,
     [switch]$StopExisting,
+    [switch]$EnableChejanCapture,
+    [string]$ChejanCaptureDir = "",
+    [int]$ChejanCaptureMaxRows = 1000,
+    [bool]$ChejanCaptureIncludeUnknownFids = $true,
     [switch]$DryRun
 )
 
@@ -53,6 +57,12 @@ $CoreErr = Join-Path $LogDir "reboot_v2_observe_core_$Timestamp.err.log"
 $GatewayOut = Join-Path $LogDir "reboot_v2_observe_gateway_$Timestamp.out.log"
 $GatewayErr = Join-Path $LogDir "reboot_v2_observe_gateway_$Timestamp.err.log"
 $PidFile = Join-Path $LogDir "reboot_v2_observe_$Timestamp.pid.json"
+if ($EnableChejanCapture -and (-not $ChejanCaptureDir)) {
+    $ChejanCaptureDir = Join-Path $ProjectRoot ("reports\kiwoom_chejan\sim_{0}" -f $Timestamp)
+}
+if ($ChejanCaptureDir) {
+    $ChejanCaptureDir = [string]$ChejanCaptureDir
+}
 
 function Write-Step([string]$Message) {
     Write-Host ("[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $Message)
@@ -154,6 +164,16 @@ function Set-GatewayObserveEnv {
     $env:TRADING_ALLOW_LIVE_SIM_ORDERS = "0"
     $env:TRADING_ENTRY_ALLOW_DRY_RUN_INTENTS = "0"
     $env:TRADING_EXIT_ALLOW_DRY_RUN_SELL_INTENTS = "0"
+    if ($EnableChejanCapture) {
+        $env:TRADING_KIWOOM_CHEJAN_RAW_CAPTURE_ENABLED = "true"
+        $env:TRADING_KIWOOM_CHEJAN_CAPTURE_SIMULATION_ONLY = "true"
+        $env:TRADING_KIWOOM_CHEJAN_CAPTURE_DIR = $ChejanCaptureDir
+        $env:TRADING_KIWOOM_CHEJAN_CAPTURE_MAX_ROWS = "$ChejanCaptureMaxRows"
+        $env:TRADING_KIWOOM_CHEJAN_CAPTURE_INCLUDE_UNKNOWN_FIDS = if ($ChejanCaptureIncludeUnknownFids) { "true" } else { "false" }
+        $env:TRADING_KIWOOM_CHEJAN_EMIT_LEGACY_EXECUTION_EVENT = "false"
+    } else {
+        $env:TRADING_KIWOOM_CHEJAN_RAW_CAPTURE_ENABLED = "false"
+    }
 }
 
 function Test-Py32Available {
@@ -194,6 +214,9 @@ Write-Step "CoreScript=$CoreScript"
 Write-Step "DbPath=$DbPath"
 Write-Step "CoreUrl=$CoreUrl"
 Write-Step "LogDir=$LogDir"
+if ($EnableChejanCapture) {
+    Write-Step "ChejanCapture=enabled dir=$ChejanCaptureDir max_rows=$ChejanCaptureMaxRows include_unknown_fids=$ChejanCaptureIncludeUnknownFids"
+}
 
 if ($StopExisting) {
     $stopScript = Join-Path $ProjectRoot "tools\stop_market_close.ps1"
@@ -246,6 +269,9 @@ if ($DryRun) {
         dry_run = $true
         core_command = "powershell " + ($coreArgs -join " ")
         gateway_command = if ($SkipGateway) { "" } else { "py " + ($gatewayArgs -join " ") }
+        chejan_capture_enabled = [bool]$EnableChejanCapture
+        chejan_capture_dir = if ($EnableChejanCapture) { $ChejanCaptureDir } else { "" }
+        chejan_capture_max_rows = if ($EnableChejanCapture) { $ChejanCaptureMaxRows } else { 0 }
         core_stdout = $CoreOut
         core_stderr = $CoreErr
         gateway_stdout = $GatewayOut
@@ -277,6 +303,9 @@ if (-not $SkipGateway) {
     }
     Set-GatewayObserveEnv
     Assert-NoUnsafeOrderEnv
+    if ($EnableChejanCapture) {
+        New-Item -ItemType Directory -Path $ChejanCaptureDir -Force | Out-Null
+    }
     Write-Step "Starting 32-bit Kiwoom Gateway"
     $gatewayProcess = Start-Process `
         -FilePath "py" `
@@ -312,6 +341,10 @@ $summary = [pscustomobject]@{
     command_total_count = $commandStatus.total_count
     runtime_status = $runtimeStatus.status
     runtime_mode = $runtimeStatus.mode
+    chejan_capture_enabled = [bool]$EnableChejanCapture
+    chejan_capture_dir = if ($EnableChejanCapture) { $ChejanCaptureDir } else { "" }
+    chejan_capture_max_rows = if ($EnableChejanCapture) { $ChejanCaptureMaxRows } else { 0 }
+    chejan_capture_include_unknown_fids = if ($EnableChejanCapture) { [bool]$ChejanCaptureIncludeUnknownFids } else { $false }
     core_stdout = $CoreOut
     core_stderr = $CoreErr
     gateway_stdout = $GatewayOut

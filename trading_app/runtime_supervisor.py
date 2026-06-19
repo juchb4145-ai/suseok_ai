@@ -1231,7 +1231,11 @@ def _price_tick_key(event: GatewayEvent) -> str:
 def _is_broker_reconcile_event(event: GatewayEvent) -> bool:
     if event.type not in {"command_ack", "command_failed", "command_timeout", "command_expired"}:
         return False
-    return str(dict(event.payload or {}).get("purpose") or "") == "broker_reconcile"
+    payload = dict(event.payload or {})
+    if str(payload.get("purpose") or "") == "broker_reconcile":
+        return True
+    nested = payload.get("payload")
+    return isinstance(nested, dict) and str(nested.get("purpose") or "") == "broker_reconcile"
 
 
 def _should_replace_pending_price_tick(existing: GatewayEvent, incoming: GatewayEvent) -> bool:

@@ -250,7 +250,7 @@ class BrokerReconcileOrchestrator:
         return self._start_run(account=account, broker_env=broker_env, trigger="PERIODIC")
 
     def handle_gateway_event(self, event: Any) -> dict[str, Any]:
-        payload = dict(getattr(event, "payload", {}) or {})
+        payload = _broker_reconcile_payload(event)
         if str(payload.get("purpose") or "") != "broker_reconcile":
             return {"status": "IGNORED", "reason": "NOT_BROKER_RECONCILE"}
         try:
@@ -405,6 +405,16 @@ class BrokerReconcileOrchestrator:
                 "warnings": [] if self.config.dispatch_enabled else ["RECONCILE_TR_DISPATCH_DISABLED"],
             }
         )
+
+
+def _broker_reconcile_payload(event: Any) -> dict[str, Any]:
+    payload = dict(getattr(event, "payload", {}) or {})
+    if str(payload.get("purpose") or "") == "broker_reconcile":
+        return payload
+    nested = payload.get("payload")
+    if isinstance(nested, dict) and str(nested.get("purpose") or "") == "broker_reconcile":
+        return dict(nested)
+    return payload
 
 
 def _discrepancy(
