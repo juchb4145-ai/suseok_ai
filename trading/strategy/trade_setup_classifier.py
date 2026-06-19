@@ -219,12 +219,18 @@ class TradeSetupClassifier:
         leader_like: bool,
         strong_theme: bool,
     ) -> bool:
-        market_statuses = {
-            snapshot["candidate_market_status"],
-            snapshot["candidate_market_confirmed_status"],
-            snapshot["global_market_status"],
-        }
-        market_weak = bool(market_statuses & self.WEAK_MARKET_STATUSES)
+        if snapshot["systemic_risk_off"]:
+            return False
+        has_side_context = bool(snapshot["side_market_regime"] or snapshot["market_action"] or snapshot["market_side"])
+        if has_side_context:
+            market_weak = snapshot["side_market_regime"] in self.WEAK_MARKET_STATUSES
+        else:
+            market_statuses = {
+                snapshot["candidate_market_status"],
+                snapshot["candidate_market_confirmed_status"],
+                snapshot["global_market_status"],
+            }
+            market_weak = bool(market_statuses & self.WEAK_MARKET_STATUSES)
         has_signal = bool(reasons & self.RELATIVE_STRENGTH_CODES) or bool(snapshot["risk_off_entry_allowed"])
         if not has_signal and _number(snapshot["risk_off_relative_strength_pct"]) is not None:
             has_signal = float(snapshot["risk_off_relative_strength_pct"] or 0.0) >= 4.0
@@ -369,6 +375,11 @@ def _snapshot(details: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_market_status": _upper_first(details, "candidate_market_status", "market_status"),
         "candidate_market_confirmed_status": _upper_first(details, "candidate_market_confirmed_status", "market_confirmed_status"),
         "global_market_status": _upper_first(details, "global_market_status"),
+        "market_side": _upper_first(details, "market_side") or _nested_upper(details, "strategy_context_v3", "market", "market_side"),
+        "side_market_regime": _upper_first(details, "side_market_regime") or _nested_upper(details, "strategy_context_v3", "market", "side_market_regime"),
+        "market_action": _upper_first(details, "market_action") or _nested_upper(details, "strategy_context_v3", "market", "market_action"),
+        "systemic_risk_off": _bool(_first(details, "systemic_risk_off"))
+        or _nested_bool(details, "strategy_context_v3", "market", "systemic_risk_off"),
         "data_quality_bucket": _upper_first(details, "data_quality_bucket"),
         "missing_core_fields": [str(item) for item in _list(_first(details, "missing_core_fields"))],
         "reason_codes": reasons,
@@ -422,6 +433,26 @@ def _upper_first(details: Mapping[str, Any], *keys: str) -> str:
     if hasattr(value, "value"):
         value = value.value
     return str(value or "").strip().upper()
+
+
+def _nested_upper(details: Mapping[str, Any], *keys: str) -> str:
+    value: Any = details
+    for key in keys:
+        if not isinstance(value, Mapping):
+            return ""
+        value = value.get(key)
+    if hasattr(value, "value"):
+        value = value.value
+    return str(value or "").strip().upper()
+
+
+def _nested_bool(details: Mapping[str, Any], *keys: str) -> bool:
+    value: Any = details
+    for key in keys:
+        if not isinstance(value, Mapping):
+            return False
+        value = value.get(key)
+    return _bool(value)
 
 
 def _list(value: Any) -> list[Any]:

@@ -38,6 +38,7 @@ class RebootV2Runtime:
     strategy_context_pipeline: Any = None
     entry_engine_pipeline: Any = None
     dirty_strategy_evaluator: Any = None
+    market_relative_strength_shadow_pipeline: Any = None
     exit_engine_reboot_pipeline: Any = None
     position_risk_pipeline: Any = None
     order_manager_pipeline: Any = None
@@ -109,6 +110,7 @@ class RebootV2Runtime:
             }
         else:
             self._run_pipeline(snapshot, "entry_engine", self.entry_engine_pipeline, current)
+        self._run_pipeline(snapshot, "market_relative_strength_shadow", self.market_relative_strength_shadow_pipeline, current)
         if self._has_open_positions():
             self._run_pipeline(snapshot, "exit_engine_reboot", self.exit_engine_reboot_pipeline, current)
             self._run_pipeline(snapshot, "position_risk", self.position_risk_pipeline, current)
@@ -155,6 +157,7 @@ class RebootV2Runtime:
                 "strategy_context": _component_enabled(self.strategy_context_pipeline),
                 "entry_engine": _component_enabled(self.entry_engine_pipeline),
                 "dirty_strategy_evaluator": _component_enabled(self.dirty_strategy_evaluator),
+                "market_relative_strength_shadow": _component_enabled(self.market_relative_strength_shadow_pipeline),
                 "exit_engine": _component_enabled(self.exit_engine_reboot_pipeline),
                 "position_risk": _component_enabled(self.position_risk_pipeline),
                 "order_manager": _component_enabled(self.order_manager_pipeline),

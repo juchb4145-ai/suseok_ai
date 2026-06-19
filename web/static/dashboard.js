@@ -1095,6 +1095,7 @@ function renderDashboardV2(snapshot) {
   const entry = payload.entry_candidates || { items: [] };
   const positionRisk = payload.position_risk || { positions: [] };
   const orderManager = payload.order_manager || {};
+  const marketRsShadow = payload.market_relative_strength_shadow || {};
   const preMarket = payload.pre_market_check || {};
   const reasons = payload.wait_block_reasons || { items: [] };
   const health = payload.system_health || {};
@@ -1135,6 +1136,7 @@ function renderDashboardV2(snapshot) {
   text("dashboard-v2-kosdaq", `${formatPercentValue(market.kosdaq_return_pct)} / ${formatPercentValue(Number(market.kosdaq_breadth_pct || 0) * 100)}`);
   text("dashboard-v2-market-blocks", market.block_new_entry_count || 0);
   text("dashboard-v2-market-waits", market.wait_market_count || 0);
+  renderDashboardV2MarketRsShadow(marketRsShadow);
 
   text("dashboard-v2-order-pill", orderManager.mode || "OBSERVE");
   cls("dashboard-v2-order-pill", `counter ${orderManager.real_broker_blocked ? "bad" : orderManager.live_sim_orders_allowed ? "ok" : "muted"}`);
@@ -1180,6 +1182,47 @@ function renderDashboardV2Banners(rows) {
       <span>${escapeHtml(item.reason_code || "")}</span>
     </div>
   `).join("");
+}
+
+function renderDashboardV2MarketRsShadow(payload) {
+  const data = payload || {};
+  const status = data.status || "NO_DATA";
+  text("dashboard-v2-market-rs-shadow-pill", status);
+  cls("dashboard-v2-market-rs-shadow-pill", `counter ${status === "OK" || status === "READY" ? "ok" : status === "DISABLED" ? "muted" : "warn"}`);
+  text("dashboard-v2-market-rs-shadow-message", data.operator_message_ko || "분석/관측전용 shadow 검증입니다.");
+  text("dashboard-v2-market-rs-shadow-total", data.shadow_candidate_count || 0);
+  text("dashboard-v2-market-rs-shadow-healthy", data.healthy_side_reduced_count || 0);
+  text("dashboard-v2-market-rs-shadow-weak", data.weak_side_shadow_candidate_count || 0);
+  text("dashboard-v2-market-rs-shadow-riskoff", data.risk_off_side_diagnostic_count || 0);
+  text("dashboard-v2-market-rs-shadow-systemic", data.systemic_excluded_count || 0);
+  text("dashboard-v2-market-rs-shadow-labeled", data.labeled_count || 0);
+  text("dashboard-v2-market-rs-shadow-mfe10", formatPercentValue(data.avg_mfe_10m));
+  text("dashboard-v2-market-rs-shadow-mae10", formatPercentValue(data.avg_mae_10m));
+  text("dashboard-v2-market-rs-shadow-edge", formatRate(data.shadow_edge_rate_10m));
+  text("dashboard-v2-market-rs-shadow-risk", formatRate(data.shadow_risk_case_rate_10m));
+  text("dashboard-v2-market-rs-shadow-recommendation", data.current_recommendation || "NO_DATA");
+  text("dashboard-v2-market-rs-shadow-mode", data.actual_order_mode_label || "분석/관측전용");
+  text("dashboard-v2-market-rs-shadow-order", data.actual_order_mode_label || "분석/관측전용");
+  renderDashboardV2MarketRsShadowRecent(data.recent_candidates || []);
+}
+
+function renderDashboardV2MarketRsShadowRecent(rows) {
+  const node = document.getElementById("dashboard-v2-market-rs-shadow-recent");
+  if (!node) return;
+  if (!rows.length) {
+    node.innerHTML = '<span class="empty">관측 후보 데이터가 없습니다</span>';
+    return;
+  }
+  node.innerHTML = rows.slice(0, 5).map((item) => {
+    const riskOffNote = item.shadow_scenario === "RISK_OFF_SIDE_DIAGNOSTIC" ? " · no promotion" : "";
+    return `
+      <div class="dashboard-v2-list-item">
+        <div><strong>${escapeHtml(`${item.code || "-"} ${item.name || ""}`.trim())}</strong>${badge(item.actual_order_mode_label || "분석/관측전용", "observe")}</div>
+        <p>${escapeHtml(item.shadow_scenario || "-")} · ${escapeHtml(item.market_side || "-")} ${escapeHtml(item.side_market_regime || "")} · RS ${formatPercentValue(item.relative_strength_vs_index_pct)}${riskOffNote}</p>
+        <p>${escapeHtml(item.actual_market_action || "-")} / ${escapeHtml(item.actual_entry_status || "-")} → ${escapeHtml(item.counterfactual_action || "-")}</p>
+      </div>
+    `;
+  }).join("");
 }
 
 function renderDashboardV2Themes(rows) {

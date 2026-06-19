@@ -115,6 +115,21 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
         "shadow-small-entry-pilot-generate-report",
         "dashboard-v2-snapshot-source",
         "dashboard-v2-snapshot-generation",
+        "dashboard-v2-market-rs-shadow-pill",
+        "dashboard-v2-market-rs-shadow-message",
+        "dashboard-v2-market-rs-shadow-total",
+        "dashboard-v2-market-rs-shadow-healthy",
+        "dashboard-v2-market-rs-shadow-weak",
+        "dashboard-v2-market-rs-shadow-riskoff",
+        "dashboard-v2-market-rs-shadow-systemic",
+        "dashboard-v2-market-rs-shadow-labeled",
+        "dashboard-v2-market-rs-shadow-mfe10",
+        "dashboard-v2-market-rs-shadow-mae10",
+        "dashboard-v2-market-rs-shadow-edge",
+        "dashboard-v2-market-rs-shadow-risk",
+        "dashboard-v2-market-rs-shadow-recommendation",
+        "dashboard-v2-market-rs-shadow-order",
+        "dashboard-v2-market-rs-shadow-recent",
     ]:
         assert soup.select_one(f"#{node_id}") is not None
     assert soup.select_one("#transport-real-pilot-price-sample-rate") is not None
@@ -169,6 +184,10 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "composite_market_mode" in js
     assert "systemic_risk_off" in js
     assert "SYSTEMIC_RISK_OFF" in js
+    assert "market_relative_strength_shadow" in js
+    assert "function renderDashboardV2MarketRsShadow" in js
+    assert "function renderDashboardV2MarketRsShadowRecent" in js
+    assert "RISK_OFF_SIDE_DIAGNOSTIC" in js
     assert "SNAPSHOT_POLL_INTERVAL_MS = 30000" in js
     assert "SNAPSHOT_INITIAL_FALLBACK_MS = 7000" in js
     assert "function stopPolling" in js

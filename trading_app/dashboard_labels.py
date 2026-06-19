@@ -56,6 +56,32 @@ REASON_LABELS_KO: dict[str, str] = {
     "UNMATCHED_EXECUTION": "체결 이벤트 수동 대조 필요",
 }
 
+REASON_LABELS_KO.update(
+    {
+        "MARKET_RS_SHADOW_CANDIDATE": "분리장세 상대강도 관측 후보",
+        "MARKET_RS_SHADOW_REJECT": "분리장세 상대강도 관측 제외",
+        "HEALTHY_SIDE_REDUCED_OBSERVE": "건강 시장 축소 관측",
+        "COUNTERPART_DATA_DEGRADED_OBSERVE": "반대 시장 데이터 부족 축소 관측",
+        "WEAK_SIDE_RELATIVE_STRENGTH_SHADOW": "WEAK 시장 상대강도 shadow",
+        "RISK_OFF_SIDE_DIAGNOSTIC_ONLY": "RISK_OFF 시장 진단 전용",
+        "SYSTEMIC_RISK_SHADOW_EXCLUDED": "전시장 위험 shadow 제외",
+        "MARKET_RS_CONTEXT_NOT_READY": "상대강도 관측 context 대기",
+        "MARKET_RS_ROLE_NOT_ALLOWED": "상대강도 관측 역할 제외",
+        "MARKET_RS_THEME_NOT_ALLOWED": "상대강도 관측 테마 제외",
+        "MARKET_RS_PERSISTENCE_INSUFFICIENT": "상대강도 관측 지속성 부족",
+        "MARKET_RS_BELOW_THRESHOLD": "상대강도 관측 기준 미달",
+        "MARKET_RS_PRICE_LOCATION_NOT_ALLOWED": "상대강도 관측 가격 위치 제외",
+        "MARKET_RS_VI_BLOCK": "상대강도 관측 VI 제외",
+        "MARKET_RS_OVERHEAT_BLOCK": "상대강도 관측 과열 제외",
+        "MARKET_RS_CHASE_BLOCK": "상대강도 관측 추격 제외",
+        "MARKET_RS_STALE_DATA": "상대강도 관측 stale data",
+        "MARKET_RS_DUPLICATE_SUPPRESSED": "상대강도 관측 중복 억제",
+        "MARKET_RS_OUTCOME_INSUFFICIENT": "상대강도 outcome 부족",
+        "MARKET_RS_SHADOW_EDGE": "상대강도 shadow edge",
+        "MARKET_RS_SHADOW_RISK_CASE": "상대강도 shadow risk case",
+    }
+)
+
 THEME_STATUS_LABELS_KO = {
     "LEADING_THEME": "주도테마",
     "SPREADING_THEME": "확산테마",
@@ -122,6 +148,14 @@ def suggested_action_ko(reason_code: Any) -> str:
         return "추격 구간을 피하고 VWAP/눌림 재확인을 기다린다."
     if "KILL_SWITCH" in code:
         return "신규 매수는 중단하고 포지션 축소와 runbook 기준을 확인한다."
+    if code.startswith("MARKET_RS") or code in {
+        "HEALTHY_SIDE_REDUCED_OBSERVE",
+        "COUNTERPART_DATA_DEGRADED_OBSERVE",
+        "WEAK_SIDE_RELATIVE_STRENGTH_SHADOW",
+        "RISK_OFF_SIDE_DIAGNOSTIC_ONLY",
+        "SYSTEMIC_RISK_SHADOW_EXCLUDED",
+    }:
+        return "분리장세 상대강도 리포트에서 관측 전용 근거와 outcome 누적을 확인합니다."
     if code.startswith("MAX_") or "LIMIT" in code:
         return "일일 한도와 테마/종목 노출을 확인한다."
     return "관련 섹션의 상세 사유와 최신 데이터를 확인한다."

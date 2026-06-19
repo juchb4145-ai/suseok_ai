@@ -41,6 +41,8 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
     exit_engine = _prefer_runtime_section(base.get("exit_engine"), runtime.get("exit_engine"))
     pos_risk = _prefer_runtime_section(base.get("position_risk"), runtime.get("position_risk"))
     order_manager = _prefer_runtime_section(base.get("order_manager"), runtime.get("order_manager"))
+    market_rs_shadow = _prefer_runtime_section(base.get("market_relative_strength_shadow"), runtime.get("market_relative_strength_shadow"))
+    market_rs_outcomes = _prefer_runtime_section(base.get("market_relative_strength_outcomes"), runtime.get("market_relative_strength_outcomes"))
     candidates = dict(base.get("candidates") or {})
 
     payload = {
@@ -58,6 +60,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
         "position_risk": _position_risk(pos_risk, exit_engine),
         "exit_watch": _exit_watch(exit_engine),
         "order_manager": _order_manager(order_manager, gateway, commands),
+        "market_relative_strength_shadow": _market_relative_strength_shadow(market_rs_shadow, market_rs_outcomes),
         "pre_market_check": _pre_market_check(base),
         "wait_block_reasons": _wait_block_reasons(base, runtime),
         "system_health": _system_health(base, runtime, gateway, commands),
@@ -83,6 +86,8 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
             "exit_engine": exit_engine,
             "position_risk": pos_risk,
             "order_manager": order_manager,
+            "market_relative_strength_shadow": market_rs_shadow,
+            "market_relative_strength_outcomes": market_rs_outcomes,
         }
     return payload
 
@@ -168,6 +173,11 @@ def _v2_status(
             "theme_board": _stage_status("theme_board", runtime.get("theme_board"), pipeline_status),
             "market_regime": _stage_status("market_regime", runtime.get("market_regime"), pipeline_status),
             "entry_engine": _stage_status("entry_engine", runtime.get("entry_engine"), pipeline_status),
+            "market_relative_strength_shadow": _stage_status(
+                "market_relative_strength_shadow",
+                runtime.get("market_relative_strength_shadow"),
+                pipeline_status,
+            ),
             "exit_engine": _stage_status("exit_engine", runtime.get("exit_engine_reboot") or runtime.get("exit_engine"), pipeline_status),
             "position_risk": _stage_status("position_risk", runtime.get("position_risk"), pipeline_status),
             "order_manager": _stage_status("order_manager", runtime.get("order_manager"), pipeline_status),
@@ -459,6 +469,72 @@ def _order_manager(order_manager: dict[str, Any], gateway: dict[str, Any], comma
     }
 
 
+def _market_relative_strength_shadow(shadow: dict[str, Any], outcomes: dict[str, Any]) -> dict[str, Any]:
+    summary = dict(outcomes.get("summary") or {})
+    recommendations = dict(outcomes.get("recommendations") or {})
+    scenario_counts = dict(shadow.get("scenario_counts") or {})
+    status_counts = dict(shadow.get("shadow_status_counts") or {})
+    recent_rows = []
+    for raw in list(shadow.get("recent_candidates") or [])[:8]:
+        item = dict(raw or {})
+        scenario = str(item.get("shadow_scenario") or "")
+        variant = str(item.get("shadow_variant") or "")
+        promotion_eligible = bool(item.get("promotion_eligible")) and scenario == "WEAK_SIDE_STRICT_SHADOW" and variant == "STRICT"
+        if scenario == "RISK_OFF_SIDE_DIAGNOSTIC":
+            promotion_eligible = False
+        recent_rows.append(
+            {
+                "code": item.get("code") or "",
+                "name": item.get("name") or "",
+                "market_side": item.get("market_side") or "",
+                "side_market_regime": item.get("side_market_regime") or "",
+                "shadow_scenario": scenario,
+                "shadow_variant": variant,
+                "shadow_status": item.get("shadow_status") or "",
+                "actual_market_action": item.get("actual_market_action") or "",
+                "actual_entry_status": item.get("actual_entry_status") or "",
+                "counterfactual_action": item.get("counterfactual_action") or "",
+                "relative_strength_vs_index_pct": _num(item.get("relative_strength_vs_index_pct")),
+                "price_location": item.get("price_location") or "",
+                "promotion_eligible": promotion_eligible,
+                "actual_order_mode_label": "분석/관측전용",
+            }
+        )
+    candidate_count = int(summary.get("shadow_candidate_count") or status_counts.get("SHADOW_CANDIDATE") or 0)
+    labeled_count = int(summary.get("labeled_count") or 0)
+    status = str(shadow.get("status") or outcomes.get("status") or "NO_DATA")
+    recommendation = str(recommendations.get("current_recommendation") or "NO_DATA")
+    return {
+        "status": status,
+        "enabled": bool(shadow.get("enabled")),
+        "calculated_at": shadow.get("calculated_at") or outcomes.get("generated_at") or "",
+        "title_ko": "분리장세 상대강도 관찰",
+        "operator_message_ko": "실제 주문과 분리된 분석/관측전용 shadow 검증입니다.",
+        "actual_order_mode_label": "분석/관측전용",
+        "analysis_only": True,
+        "creates_orders": False,
+        "order_intent_allowed": False,
+        "dry_run_order_allowed": False,
+        "live_order_allowed": False,
+        "shadow_candidate_count": candidate_count,
+        "healthy_side_reduced_count": int(summary.get("healthy_side_reduced_count") or scenario_counts.get("HEALTHY_SIDE_REDUCED") or 0),
+        "counterpart_data_degraded_count": int(scenario_counts.get("COUNTERPART_DATA_DEGRADED_REDUCED") or 0),
+        "weak_side_shadow_candidate_count": int(summary.get("weak_side_shadow_candidate_count") or scenario_counts.get("WEAK_SIDE_STRICT_SHADOW") or 0),
+        "risk_off_side_diagnostic_count": int(summary.get("risk_off_side_diagnostic_count") or scenario_counts.get("RISK_OFF_SIDE_DIAGNOSTIC") or 0),
+        "systemic_excluded_count": int(summary.get("systemic_excluded_count") or scenario_counts.get("SYSTEMIC_RISK_EXCLUDED") or 0),
+        "data_wait_excluded_count": int(summary.get("market_side_unresolved_count") or scenario_counts.get("DATA_WAIT_EXCLUDED") or 0),
+        "labeled_count": labeled_count,
+        "avg_mfe_10m": _num(summary.get("avg_mfe_10m")),
+        "avg_mae_10m": _num(summary.get("avg_mae_10m")),
+        "avg_return_10m": _num(summary.get("avg_return_10m")),
+        "shadow_edge_rate_10m": _num(summary.get("shadow_edge_rate_10m")),
+        "shadow_risk_case_rate_10m": _num(summary.get("shadow_risk_case_rate_10m")),
+        "current_recommendation": recommendation,
+        "risk_off_promotion_allowed": False,
+        "recent_candidates": recent_rows,
+    }
+
+
 def _pre_market_check(base: dict[str, Any]) -> dict[str, Any]:
     report = dict(base.get("pre_market_check") or {})
     if not report:
@@ -507,11 +583,13 @@ def _wait_block_reasons(base: dict[str, Any], runtime: dict[str, Any]) -> dict[s
     exit_engine = _prefer_runtime_section(base.get("exit_engine"), runtime.get("exit_engine"))
     pos_risk = _prefer_runtime_section(base.get("position_risk"), runtime.get("position_risk"))
     order_manager = _prefer_runtime_section(base.get("order_manager"), runtime.get("order_manager"))
+    market_rs_shadow = _prefer_runtime_section(base.get("market_relative_strength_shadow"), runtime.get("market_relative_strength_shadow"))
     reason_sources = [
         base.get("candidate_ingestion"),
         themes,
         market,
         entry,
+        market_rs_shadow,
         exit_engine,
         pos_risk,
         order_manager,
@@ -659,7 +737,7 @@ def _collect_reasons(source: Any, counts: Counter[str], samples: defaultdict[str
                     code = item.get("code")
                     if code:
                         samples[str(reason)].append(str(code))
-    for key in ("items", "top_ready_candidates", "positions", "managed_orders", "orders", "ready_exit_decisions"):
+    for key in ("items", "top_ready_candidates", "positions", "managed_orders", "orders", "ready_exit_decisions", "recent_candidates"):
         for item in list(source.get(key) or []):
             _collect_reasons(item, counts, samples)
 

@@ -29,9 +29,11 @@ def test_dashboard_v2_empty_sections_return_stable_schema(monkeypatch):
         "wait_block_reasons",
         "system_health",
         "legacy_debug_link",
+        "market_relative_strength_shadow",
     }
     assert payload["leading_themes"]["items"] == []
     assert payload["entry_candidates"]["items"] == []
+    assert payload["market_relative_strength_shadow"]["analysis_only"] is True
 
 
 def test_dashboard_v2_prefers_active_runtime_reboot_sections(monkeypatch):
@@ -217,3 +219,64 @@ def test_dashboard_v2_wait_block_reasons_aggregate_and_unknown_reason_fallback(m
     assert reasons["LATEST_TICK_MISSING"]["reason_ko"] == "실시간 tick 대기"
     assert reasons["UNKNOWN_NEW_REASON"]["reason_ko"] == "UNKNOWN_NEW_REASON"
     assert reason_label_ko("UNKNOWN_NEW_REASON") == "UNKNOWN_NEW_REASON"
+
+
+def test_dashboard_v2_market_relative_strength_shadow_panel_is_analysis_only(monkeypatch):
+    monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
+    snapshot = {
+        "runtime": {
+            "runtime_profile": "V2_OBSERVE",
+            "reboot_v2_enabled": True,
+            "market_relative_strength_shadow": {
+                "enabled": True,
+                "status": "OK",
+                "scenario_counts": {
+                    "HEALTHY_SIDE_REDUCED": 2,
+                    "WEAK_SIDE_STRICT_SHADOW": 1,
+                    "RISK_OFF_SIDE_DIAGNOSTIC": 1,
+                    "SYSTEMIC_RISK_EXCLUDED": 1,
+                },
+                "shadow_status_counts": {"SHADOW_CANDIDATE": 3},
+                "recent_candidates": [
+                    {
+                        "code": "000001",
+                        "name": "RiskOff",
+                        "market_side": "KOSDAQ",
+                        "side_market_regime": "RISK_OFF",
+                        "shadow_scenario": "RISK_OFF_SIDE_DIAGNOSTIC",
+                        "shadow_variant": "STRICT",
+                        "shadow_status": "SHADOW_CANDIDATE",
+                        "actual_market_action": "BLOCK_NEW_ENTRY",
+                        "actual_entry_status": "HARD_BLOCK",
+                        "counterfactual_action": "OBSERVE_ONLY",
+                        "relative_strength_vs_index_pct": 5.2,
+                        "promotion_eligible": True,
+                    }
+                ],
+            },
+            "market_relative_strength_outcomes": {
+                "status": "READY",
+                "summary": {
+                    "shadow_candidate_count": 3,
+                    "labeled_count": 10,
+                    "avg_mfe_10m": 1.7,
+                    "avg_mae_10m": -0.5,
+                    "shadow_edge_rate_10m": 0.6,
+                    "shadow_risk_case_rate_10m": 0.1,
+                },
+                "recommendations": {"current_recommendation": "WATCH_MORE"},
+            },
+        }
+    }
+
+    payload = build_dashboard_v2_snapshot(snapshot)
+    shadow = payload["market_relative_strength_shadow"]
+
+    assert shadow["analysis_only"] is True
+    assert shadow["creates_orders"] is False
+    assert shadow["actual_order_mode_label"] == "분석/관측전용"
+    assert shadow["shadow_candidate_count"] == 3
+    assert shadow["avg_mfe_10m"] == 1.7
+    assert shadow["current_recommendation"] == "WATCH_MORE"
+    assert shadow["recent_candidates"][0]["promotion_eligible"] is False
+    assert shadow["recent_candidates"][0]["actual_market_action"] == "BLOCK_NEW_ENTRY"

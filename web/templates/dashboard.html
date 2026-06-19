@@ -107,6 +107,32 @@
           </section>
           <section class="dashboard-v2-main-grid dashboard-v2-two">
             <article class="dashboard-v2-panel">
+              <div class="section-head"><h3>분리장세 상대강도 관찰</h3><span id="dashboard-v2-market-rs-shadow-pill" class="counter muted">NO_DATA</span></div>
+              <p id="dashboard-v2-market-rs-shadow-message" class="help-text">분석/관측전용 shadow 검증입니다.</p>
+              <div class="mini-grid compact">
+                <div><span>Shadow 후보</span><strong id="dashboard-v2-market-rs-shadow-total">0</strong></div>
+                <div><span>Healthy 축소</span><strong id="dashboard-v2-market-rs-shadow-healthy">0</strong></div>
+                <div><span>WEAK 관찰</span><strong id="dashboard-v2-market-rs-shadow-weak">0</strong></div>
+                <div><span>RISK_OFF 진단</span><strong id="dashboard-v2-market-rs-shadow-riskoff">0</strong></div>
+                <div><span>Systemic 제외</span><strong id="dashboard-v2-market-rs-shadow-systemic">0</strong></div>
+                <div><span>Outcome</span><strong id="dashboard-v2-market-rs-shadow-labeled">0</strong></div>
+                <div><span>10m MFE</span><strong id="dashboard-v2-market-rs-shadow-mfe10">-</strong></div>
+                <div><span>10m MAE</span><strong id="dashboard-v2-market-rs-shadow-mae10">-</strong></div>
+              </div>
+            </article>
+            <article class="dashboard-v2-panel">
+              <div class="section-head"><h3>관측 결과</h3><span id="dashboard-v2-market-rs-shadow-mode" class="counter muted">분석/관측전용</span></div>
+              <div class="mini-grid compact">
+                <div><span>Edge rate</span><strong id="dashboard-v2-market-rs-shadow-edge">0</strong></div>
+                <div><span>Risk rate</span><strong id="dashboard-v2-market-rs-shadow-risk">0</strong></div>
+                <div><span>권고</span><strong id="dashboard-v2-market-rs-shadow-recommendation">NO_DATA</strong></div>
+                <div><span>실주문</span><strong id="dashboard-v2-market-rs-shadow-order">분석/관측전용</strong></div>
+              </div>
+              <div id="dashboard-v2-market-rs-shadow-recent" class="operator-list"></div>
+            </article>
+          </section>
+          <section class="dashboard-v2-main-grid dashboard-v2-two">
+            <article class="dashboard-v2-panel">
               <div class="section-head"><h3>주도테마 TOP5</h3><span id="dashboard-v2-theme-count" class="counter">0</span></div>
               <div id="dashboard-v2-themes" class="operator-list"></div>
             </article>

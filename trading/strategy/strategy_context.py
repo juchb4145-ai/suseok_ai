@@ -39,12 +39,18 @@ class SessionPhase(str, Enum):
 @dataclass(frozen=True)
 class StrategyMarketContext:
     market_side: str = "UNKNOWN"
+    market_side_resolution_status: str = "UNRESOLVED"
     side_market_regime: str = "DATA_WAIT"
+    counterpart_market_side: str = "UNKNOWN"
+    counterpart_market_regime: str = "DATA_WAIT"
+    composite_market_mode: str = "DATA_DEGRADED"
+    systemic_risk_off: bool = False
     global_market_regime: str = "DATA_WAIT"
     market_action: str = "DATA_WAIT"
     position_size_multiplier_hint: float = 0.0
     block_new_entry: bool = False
     index_return_pct: float = 0.0
+    counterpart_index_return_pct: float = 0.0
     index_slope_1m_pct: float | None = None
     index_slope_3m_pct: float | None = None
     index_slope_5m_pct: float | None = None
@@ -52,6 +58,7 @@ class StrategyMarketContext:
     breadth_trust_level: str = "LOW"
     turnover_weighted_return_pct: float = 0.0
     risk_score: float = 0.0
+    counterpart_risk_score: float = 0.0
     calculated_at: str = ""
     freshness_status: str = "DATA_WAIT"
     reason_codes: tuple[str, ...] = ()
@@ -100,10 +107,15 @@ class StrategyStockContext:
     momentum_3m: float = 0.0
     momentum_5m: float = 0.0
     vwap: float = 0.0
+    price_vs_vwap_pct: float = 0.0
+    vwap_position: str = "UNKNOWN"
+    momentum_alignment: str = "UNKNOWN"
+    relative_strength_band: str = "LT_2"
     pullback_from_high_pct: float = 0.0
     vi_active: bool = False
     upper_limit_near: bool = False
     overheated: bool = False
+    stock_data_quality_status: str = "DATA_WAIT"
     reason_codes: tuple[str, ...] = ()
 
 
@@ -422,6 +434,16 @@ def _market_context(candidate: Candidate, payload: Mapping[str, Any], code: str)
     side_snapshot = _side_snapshot(payload, side)
     status = str(policy.get("market_status") or side_snapshot.get("status") or "DATA_WAIT").upper()
     global_status = str(policy.get("global_market_status") or payload.get("global_status") or "DATA_WAIT")
+    counterpart_side = _counterpart_side(side)
+    counterpart_snapshot = _side_snapshot(payload, counterpart_side)
+    counterpart_status = str(counterpart_snapshot.get("status") or "DATA_WAIT").upper()
+    systemic = _bool(payload.get("systemic_risk_off"))
+    if "systemic_risk_off" not in payload:
+        systemic, _systemic_reasons = systemic_risk_off_state(
+            str(payload.get("kospi_status") or dict(payload.get("kospi_snapshot") or {}).get("status") or ""),
+            str(payload.get("kosdaq_status") or dict(payload.get("kosdaq_snapshot") or {}).get("status") or ""),
+            market_open=str(payload.get("market_session_status") or "").lower() != "closed",
+        )
     if policy:
         action = str(policy.get("market_action") or _market_action_from_status(status, global_status)).upper()
         multiplier = _float(policy.get("position_size_multiplier_hint"), _multiplier_for_action(action))
@@ -435,12 +457,18 @@ def _market_context(candidate: Candidate, payload: Mapping[str, Any], code: str)
         reasons = ["MARKET_CONTEXT_READY"]
     return StrategyMarketContext(
         market_side=side,
+        market_side_resolution_status=str(policy.get("market_side_resolution_status") or ("RESOLVED" if side in {"KOSPI", "KOSDAQ"} else "UNRESOLVED")),
         side_market_regime=status,
+        counterpart_market_side=counterpart_side,
+        counterpart_market_regime=counterpart_status,
+        composite_market_mode=str(payload.get("composite_market_mode") or "DATA_DEGRADED"),
+        systemic_risk_off=systemic,
         global_market_regime=global_status,
         market_action=action,
         position_size_multiplier_hint=multiplier,
         block_new_entry=block_new_entry,
         index_return_pct=_float(side_snapshot.get("index_return_pct")),
+        counterpart_index_return_pct=_float(counterpart_snapshot.get("index_return_pct")),
         index_slope_1m_pct=_optional_float(side_snapshot.get("index_slope_1m_pct")),
         index_slope_3m_pct=_optional_float(side_snapshot.get("index_slope_3m_pct")),
         index_slope_5m_pct=_optional_float(side_snapshot.get("index_slope_5m_pct")),
@@ -448,6 +476,7 @@ def _market_context(candidate: Candidate, payload: Mapping[str, Any], code: str)
         breadth_trust_level="LOW" if "LOW_TRUST_BREADTH" in set(side_snapshot.get("data_quality_flags") or []) else "NORMAL",
         turnover_weighted_return_pct=_float(side_snapshot.get("turnover_weighted_return_pct")),
         risk_score=_float(side_snapshot.get("risk_score")),
+        counterpart_risk_score=_float(counterpart_snapshot.get("risk_score")),
         calculated_at=str(payload.get("calculated_at") or ""),
         freshness_status="FRESH" if str(payload.get("calculated_at") or "") else "DATA_WAIT",
         reason_codes=tuple(reasons),
@@ -493,6 +522,10 @@ def _stock_context(candidate: Candidate, stock: Mapping[str, Any], tick: Strateg
     pullback = ((day_high - price) / day_high) * 100.0 if day_high > 0 and price > 0 else _float(metadata.get("pullback_from_high_pct"))
     index_return = market.index_return_pct
     change = _float(getattr(tick, "change_rate", 0.0) if tick is not None else stock.get("change_rate_pct"))
+    vwap = _float(metadata.get("vwap"))
+    price_vs_vwap = round(((price - vwap) / vwap) * 100.0, 4) if price > 0 and vwap > 0 else 0.0
+    momentum_values = [_float(metadata.get(key)) for key in ("momentum_1m", "momentum_3m", "momentum_5m")]
+    relative_strength = round(change - index_return, 4)
     reasons = list(stock.get("reason_codes") or [])
     if not stock:
         reasons.append("STOCK_ROLE_CONTEXT_NOT_READY")
@@ -503,19 +536,24 @@ def _stock_context(candidate: Candidate, stock: Mapping[str, Any], tick: Strateg
         trade_stock_role=trade_role,
         role_score=_float(stock.get("stock_score") or stock.get("role_score")),
         source_rank=_int(stock.get("source_rank")),
-        relative_strength_vs_index_pct=round(change - index_return, 4),
+        relative_strength_vs_index_pct=relative_strength,
         change_rate_pct=change,
         turnover_krw=_float(getattr(tick, "trade_value", 0.0) if tick is not None else stock.get("turnover_krw")),
         turnover_speed=_float(metadata.get("turnover_speed") or metadata.get("turnover_krw_per_min")),
         execution_strength=_float(getattr(tick, "execution_strength", 0.0) if tick is not None else stock.get("execution_strength")),
-        momentum_1m=_float(metadata.get("momentum_1m")),
-        momentum_3m=_float(metadata.get("momentum_3m")),
-        momentum_5m=_float(metadata.get("momentum_5m")),
-        vwap=_float(metadata.get("vwap")),
+        momentum_1m=momentum_values[0],
+        momentum_3m=momentum_values[1],
+        momentum_5m=momentum_values[2],
+        vwap=vwap,
+        price_vs_vwap_pct=price_vs_vwap,
+        vwap_position="ABOVE" if price > 0 and vwap > 0 and price >= vwap else "BELOW" if price > 0 and vwap > 0 else "UNKNOWN",
+        momentum_alignment=_momentum_alignment(momentum_values),
+        relative_strength_band=_relative_strength_band(relative_strength),
         pullback_from_high_pct=round(pullback, 4),
         vi_active=bool(metadata.get("vi_active")),
         upper_limit_near=bool(metadata.get("upper_limit_near")) or _float(metadata.get("upper_limit_gap_pct"), 100.0) <= 3.0,
         overheated=bool(metadata.get("overheated")) or raw_role == "OVERHEATED" or trade_role == "OVERHEATED_BLOCKED",
+        stock_data_quality_status="OK" if tick is not None and price > 0 else "DATA_WAIT",
         reason_codes=tuple(_dedupe(reasons)),
     )
 
@@ -658,6 +696,14 @@ def _side_snapshot(payload: Mapping[str, Any], side: str) -> dict[str, Any]:
     return {}
 
 
+def _counterpart_side(side: str) -> str:
+    if str(side or "").upper() == MarketSide.KOSPI.value:
+        return MarketSide.KOSDAQ.value
+    if str(side or "").upper() == MarketSide.KOSDAQ.value:
+        return MarketSide.KOSPI.value
+    return MarketSide.UNKNOWN.value
+
+
 def _candidate_side(candidate: Candidate) -> str:
     metadata = dict(candidate.metadata or {})
     return str(candidate.market or metadata.get("market") or metadata.get("market_side") or "UNKNOWN").upper()
@@ -714,6 +760,30 @@ def _fallback_market_policy(payload: Mapping[str, Any], side: str, status: str) 
 
 def _multiplier_for_action(action: str) -> float:
     return {"ALLOW_NORMAL": 1.0, "ALLOW_REDUCED": 0.6, "WAIT_MARKET": 0.35}.get(str(action or ""), 0.0)
+
+
+def _momentum_alignment(values: Iterable[float]) -> str:
+    items = [float(value or 0.0) for value in values]
+    if not items:
+        return "UNKNOWN"
+    if all(value > 0 for value in items):
+        return "ALL_POSITIVE"
+    if any(value > 0 for value in items) and all(value >= 0 for value in items):
+        return "NON_NEGATIVE"
+    if any(value > 0 for value in items):
+        return "MIXED"
+    return "NEGATIVE"
+
+
+def _relative_strength_band(value: float) -> str:
+    number = float(value or 0.0)
+    if number < 2.0:
+        return "LT_2"
+    if number < 4.0:
+        return "2_TO_4"
+    if number < 6.0:
+        return "4_TO_6"
+    return "GE_6"
 
 
 def _candle_counts(candle_builder: Any | None, code: str) -> dict[int, int]:
@@ -795,6 +865,14 @@ def _int(value: Any, default: int = 0) -> int:
         return int(float(str(value or default).replace(",", "")))
     except (TypeError, ValueError):
         return int(default)
+
+
+def _bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 __all__ = [

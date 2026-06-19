@@ -61,6 +61,71 @@ def test_weak_market_leader_relative_strength_classifies_relative_strength():
     assert decision.recommended_action == "SMALL_OBSERVE"
 
 
+def test_reboot_v2_side_context_prevents_global_only_relative_strength_classification():
+    decision = classify_trade_setup(
+        {
+            "final_gate_status": "WAIT",
+            "theme_status": "LEADING_THEME",
+            "dynamic_theme_score": 88.0,
+            "stock_role": "CO_LEADER",
+            "price_location_status": "PULLBACK_RECLAIM",
+            "risk_level": "PASS",
+            "global_market_status": "RISK_OFF",
+            "market_side": "KOSPI",
+            "side_market_regime": "EXPANSION",
+            "market_action": "ALLOW_REDUCED",
+            "risk_off_entry_allowed": True,
+            "risk_off_relative_strength_pct": 7.0,
+        }
+    )
+
+    assert decision.setup_type != TradeSetupType.RELATIVE_STRENGTH
+
+
+def test_reboot_v2_side_context_allows_relative_strength_when_side_is_weak():
+    decision = classify_trade_setup(
+        {
+            "final_gate_status": "WAIT",
+            "theme_status": "LEADING_THEME",
+            "dynamic_theme_score": 88.0,
+            "stock_role": "CO_LEADER",
+            "price_location_status": "PULLBACK_RECLAIM",
+            "risk_level": "PASS",
+            "global_market_status": "SELECTIVE",
+            "strategy_context_v3": {
+                "market": {
+                    "market_side": "KOSDAQ",
+                    "side_market_regime": "WEAK",
+                    "systemic_risk_off": False,
+                    "market_action": "WAIT_MARKET",
+                }
+            },
+            "reason_codes": ["RELATIVE_STRENGTH"],
+        }
+    )
+
+    assert decision.setup_type == TradeSetupType.RELATIVE_STRENGTH
+
+
+def test_reboot_v2_systemic_risk_context_blocks_relative_strength_classification():
+    decision = classify_trade_setup(
+        {
+            "final_gate_status": "WAIT",
+            "theme_status": "LEADING_THEME",
+            "dynamic_theme_score": 88.0,
+            "stock_role": "CO_LEADER",
+            "price_location_status": "PULLBACK_RECLAIM",
+            "risk_level": "PASS",
+            "side_market_regime": "WEAK",
+            "market_action": "WAIT_MARKET",
+            "systemic_risk_off": True,
+            "reason_codes": ["RELATIVE_STRENGTH"],
+        }
+    )
+
+    assert decision.setup_type != TradeSetupType.RELATIVE_STRENGTH
+
+
 def test_breakout_leader_low_risk_classifies_momentum_continuation_observe():
     decision = classify_trade_setup(
         {

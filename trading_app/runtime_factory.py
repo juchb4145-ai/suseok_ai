@@ -29,6 +29,10 @@ from trading.strategy.intraday import IntradayStateTracker
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import MarketIndexStore
 from trading.strategy.market_regime import MarketRegimeConfig, MarketRegimeRuntimePipeline
+from trading.strategy.market_relative_strength_shadow import (
+    MarketRelativeStrengthShadowConfig,
+    MarketRelativeStrengthShadowRuntimePipeline,
+)
 from trading.strategy.models import OrderMode
 from trading.strategy.order_manager import OrderManagerConfig, OrderManagerRuntimePipeline
 from trading.strategy.pipeline import GatePipeline
@@ -81,6 +85,7 @@ class CoreRuntimeBundle:
     strategy_context_pipeline: Any = None
     entry_engine_pipeline: Any = None
     dirty_strategy_evaluator: Any = None
+    market_relative_strength_shadow_pipeline: Any = None
     exit_engine_reboot_pipeline: Any = None
     position_risk_pipeline: Any = None
     order_manager_pipeline: Any = None
@@ -181,6 +186,7 @@ def build_legacy_runtime_bundle(
     strategy_context_pipeline = None
     entry_engine_pipeline = None
     dirty_strategy_evaluator = None
+    market_relative_strength_shadow_pipeline = None
     exit_engine_reboot_pipeline = None
     position_risk_pipeline = None
     order_manager_pipeline = None
@@ -273,6 +279,7 @@ def build_legacy_runtime_bundle(
         strategy_context_pipeline=strategy_context_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
         dirty_strategy_evaluator=dirty_strategy_evaluator,
+        market_relative_strength_shadow_pipeline=market_relative_strength_shadow_pipeline,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
         position_risk_pipeline=position_risk_pipeline,
         order_manager_pipeline=order_manager_pipeline,
@@ -391,6 +398,10 @@ def build_reboot_v2_runtime_bundle(
             config=dirty_evaluator_config,
         )
     )
+    market_relative_strength_shadow_pipeline = MarketRelativeStrengthShadowRuntimePipeline(
+        db=db,
+        config=MarketRelativeStrengthShadowConfig.from_env(),
+    )
     exit_engine_reboot_pipeline = ExitEngineRuntimePipeline(
         db=db,
         market_data=market_data,
@@ -426,6 +437,7 @@ def build_reboot_v2_runtime_bundle(
         strategy_context_pipeline=strategy_context_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
         dirty_strategy_evaluator=dirty_strategy_evaluator,
+        market_relative_strength_shadow_pipeline=market_relative_strength_shadow_pipeline,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
         position_risk_pipeline=position_risk_pipeline,
         order_manager_pipeline=order_manager_pipeline,
@@ -458,6 +470,7 @@ def build_reboot_v2_runtime_bundle(
         strategy_context_pipeline=strategy_context_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
         dirty_strategy_evaluator=dirty_strategy_evaluator,
+        market_relative_strength_shadow_pipeline=market_relative_strength_shadow_pipeline,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
         position_risk_pipeline=position_risk_pipeline,
         order_manager_pipeline=order_manager_pipeline,
