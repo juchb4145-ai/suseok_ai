@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from time import perf_counter
@@ -380,12 +381,12 @@ class RebootV2Runtime:
         manager = self.subscription_manager
         self._restore_expansion_leases(now)
         protected_codes = self._protected_codes()
-        fresh_tick_codes = self._fresh_tick_codes(now)
+        fresh_tick_events = self._fresh_tick_events(now)
         lease_snapshot = self.expansion_lease_manager.reconcile(
             targets,
             now=now,
             active_codes=list(manager.code_to_screen.keys()),
-            fresh_tick_codes=fresh_tick_codes,
+            fresh_tick_events=fresh_tick_events,
             protected_codes=protected_codes,
         )
         self._persist_expansion_leases(lease_snapshot, trade_date=now.date().isoformat())
@@ -475,7 +476,12 @@ class RebootV2Runtime:
             return
         for lease in list(getattr(lease_snapshot, "leases", ()) or ()):
             if "THEME_EXPANSION_TICK_READY" in set(getattr(lease, "reason_codes", ()) or ()) and str(getattr(lease, "first_fresh_tick_at", "") or "") == now.isoformat():
-                mark(getattr(lease, "code", ""), DirtyReason.THEME_EXPANSION_TICK_READY.value, marked_at=now)
+                mark(
+                    getattr(lease, "code", ""),
+                    DirtyReason.THEME_EXPANSION_TICK_READY.value,
+                    source_event_id=str(getattr(lease, "first_tick_source_event_id", "") or ""),
+                    marked_at=now,
+                )
 
     def _protected_codes(self) -> set[str]:
         codes: set[str] = set()
@@ -489,17 +495,32 @@ class RebootV2Runtime:
                 codes.add(code)
         return codes
 
-    def _fresh_tick_codes(self, now: datetime) -> set[str]:
-        codes: set[str] = set()
+    def _fresh_tick_events(self, now: datetime) -> dict[str, dict[str, Any]]:
+        events: dict[str, dict[str, Any]] = {}
+        max_tick_age_sec = _market_data_max_tick_age_sec()
         for code in list(getattr(self.subscription_manager, "code_to_screen", {}) or {}):
             tick = self.market_data.latest_tick(code)
             if tick is None or getattr(tick, "price", 0) <= 0:
                 continue
+            tick_at = getattr(tick, "timestamp", None)
+            if tick_at is None:
+                continue
+            age_sec = max(0.0, (now - tick_at.replace(tzinfo=None)).total_seconds())
+            if age_sec > max_tick_age_sec:
+                continue
             metadata = dict(getattr(tick, "metadata", {}) or {})
             if str(metadata.get("price_source") or "REALTIME").upper() == "TR_BACKFILL":
                 continue
-            codes.add(normalize_code(code))
-        return codes
+            clean_code = normalize_code(code)
+            if clean_code:
+                events[clean_code] = {
+                    "code": clean_code,
+                    "tick_at": tick_at.replace(tzinfo=None).isoformat(),
+                    "age_sec": round(age_sec, 3),
+                    "price_source": str(metadata.get("price_source") or "REALTIME"),
+                    "source_event_id": str(metadata.get("source_event_id") or metadata.get("event_id") or ""),
+                }
+        return events
 
     def _run_pipeline(self, snapshot: dict[str, Any], name: str, pipeline: Any, now: datetime, **kwargs: Any) -> None:
         if pipeline is None:
@@ -608,6 +629,13 @@ def _component_enabled(component: Any) -> bool:
     return True
 
 
+def _market_data_max_tick_age_sec() -> int:
+    try:
+        return max(1, int(str(os.getenv("TRADING_MARKET_DATA_MAX_TICK_AGE_SEC", "10")).strip()))
+    except (TypeError, ValueError):
+        return 10
+
+
 def _disabled_section(reason: str) -> dict[str, Any]:
     return {
         "enabled": False,
@@ -633,6 +661,27 @@ def _dirty_publish_payload(result: Any) -> dict[str, Any]:
 
 
 def _expansion_lease_payload(snapshot: Any) -> dict[str, Any]:
+    leases = []
+    for lease in list(getattr(snapshot, "leases", ()) or ()):
+        leases.append(
+            {
+                "code": getattr(lease, "code", ""),
+                "theme_id": getattr(lease, "theme_id", ""),
+                "source": getattr(lease, "source", ""),
+                "subscription_generation": int(getattr(lease, "subscription_generation", 1) or 1),
+                "status": getattr(lease, "status", ""),
+                "selected_at": getattr(lease, "selected_at", ""),
+                "selected_tick_baseline_at": getattr(lease, "selected_tick_baseline_at", ""),
+                "first_active_at": getattr(lease, "first_active_at", ""),
+                "first_fresh_tick_at": getattr(lease, "first_fresh_tick_at", ""),
+                "first_post_subscription_tick_at": getattr(lease, "first_post_subscription_tick_at", ""),
+                "first_tick_source_event_id": getattr(lease, "first_tick_source_event_id", ""),
+                "minimum_hold_until": getattr(lease, "minimum_hold_until", ""),
+                "expires_at": getattr(lease, "expires_at", ""),
+                "cooldown_until": getattr(lease, "cooldown_until", ""),
+                "reason_codes": list(getattr(lease, "reason_codes", ()) or ()),
+            }
+        )
     return {
         "calculated_at": str(getattr(snapshot, "calculated_at", "") or ""),
         "active_lease_count": int(getattr(snapshot, "active_lease_count", 0) or 0),
@@ -644,6 +693,7 @@ def _expansion_lease_payload(snapshot: Any) -> dict[str, Any]:
         "first_tick_wait_count": int(getattr(snapshot, "first_tick_wait_count", 0) or 0),
         "leases_by_theme": dict(getattr(snapshot, "lease_by_theme", {}) or {}),
         "top_removal_reasons": list(getattr(snapshot, "top_removal_reasons", ()) or ()),
+        "leases": leases,
     }
 
 

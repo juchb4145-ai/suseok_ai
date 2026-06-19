@@ -22,6 +22,7 @@ def test_dashboard_v2_empty_sections_return_stable_schema(monkeypatch):
         "v2_status",
         "market_overview",
         "leading_themes",
+        "theme_rotation",
         "entry_candidates",
         "position_risk",
         "exit_watch",
@@ -32,6 +33,7 @@ def test_dashboard_v2_empty_sections_return_stable_schema(monkeypatch):
         "market_relative_strength_shadow",
     }
     assert payload["leading_themes"]["items"] == []
+    assert payload["theme_rotation"]["state_mismatch_count"] == 0
     assert payload["entry_candidates"]["items"] == []
     assert payload["market_relative_strength_shadow"]["analysis_only"] is True
 
@@ -109,6 +111,50 @@ def test_dashboard_v2_limits_theme_board_to_top5(monkeypatch):
     assert payload["leading_themes"]["top5_count"] == 5
     assert [item["theme_name"] for item in payload["leading_themes"]["items"]] == ["테마1", "테마2", "테마3", "테마4", "테마5"]
     assert payload["leading_themes"]["items"][0]["theme_status_label"] == "주도테마"
+
+
+def test_dashboard_v2_exposes_theme_rotation_and_leadership_fields(monkeypatch):
+    monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
+    snapshot = {
+        "runtime": {
+            "theme_expansion_subscription": {
+                "lease_snapshot": {
+                    "active_lease_count": 2,
+                    "holding_count": 1,
+                    "pending_removal_count": 1,
+                    "churn_count": 3,
+                    "first_tick_wait_count": 1,
+                }
+            }
+        },
+        "theme_board": {
+            "status": "OK",
+            "calculated_at": "2026-06-19T09:20:00",
+            "leadership_handover": {"transition_count": 2},
+            "top_themes": [
+                {
+                    "theme_id": "ai",
+                    "theme_name": "AI",
+                    "theme_status": "LEADING_THEME",
+                    "theme_score": 80,
+                    "leadership_status": "INCUMBENT",
+                    "leadership_score": 90,
+                    "recent_flow_score": 70,
+                    "state_leadership_consistent": False,
+                    "state_leadership_mismatch_code": "LEADING_WITH_LOSING_OR_ROTATED",
+                },
+                {"theme_id": "robot", "theme_name": "Robot", "theme_status": "SPREADING_THEME", "leadership_status": "CHALLENGER"},
+            ],
+        },
+    }
+
+    payload = build_dashboard_v2_snapshot(snapshot)
+
+    assert payload["theme_rotation"]["current_incumbent_theme_id"] == "ai"
+    assert payload["theme_rotation"]["challenger_count"] == 1
+    assert payload["theme_rotation"]["state_mismatch_count"] == 1
+    assert payload["theme_rotation"]["active_expansion_lease_count"] == 2
+    assert payload["leading_themes"]["items"][0]["leadership_status"] == "INCUMBENT"
 
 
 def test_dashboard_v2_entry_decisions_map_to_operator_buckets(monkeypatch):

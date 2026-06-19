@@ -53,13 +53,52 @@ def test_data_wait_theme_cannot_takeover_even_with_high_score():
     assert by_theme["ai"].status == ThemeLeadershipStatus.INCUMBENT.value
 
 
-def _leader(theme_id: str, *, score: float, share: float, state: str = ThemeCoreState.SPREADING_THEME.value):
+def test_incumbent_one_cycle_flow_collapse_stays_in_grace_before_losing():
+    engine = LeadershipHandoverEngine(
+        LeadershipHandoverConfig(
+            losing_confirm_cycles=2,
+            losing_confirm_sec=20,
+            rotated_out_cooldown_sec=60,
+            min_score_advantage=5.0,
+            min_flow_share_advantage=0.01,
+        )
+    )
+    now = datetime(2026, 6, 19, 9, 20, 0)
+
+    engine.apply([_leader("ai", score=80, share=0.3, flow_delta=0.0)], now=now)
+    grace, _ = engine.apply([_leader("ai", score=79, share=0.22, flow_delta=-0.06)], now=now + timedelta(seconds=5))
+    losing, _ = engine.apply([_leader("ai", score=78, share=0.2, flow_delta=-0.07)], now=now + timedelta(seconds=25))
+
+    assert grace[0].status == ThemeLeadershipStatus.INCUMBENT.value
+    assert "INCUMBENT_GRACE_ACTIVE" in grace[0].handover_reason_codes
+    assert losing[0].status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value
+    assert losing[0].losing_cycle_count >= 2
+
+
+def test_losing_leadership_rotates_out_only_after_cooldown():
+    engine = LeadershipHandoverEngine(
+        LeadershipHandoverConfig(losing_confirm_cycles=1, losing_confirm_sec=0, rotated_out_cooldown_sec=30)
+    )
+    now = datetime(2026, 6, 19, 9, 20, 0)
+
+    engine.apply([_leader("ai", score=80, share=0.3, flow_delta=0.0)], now=now)
+    losing, _ = engine.apply([_leader("ai", score=60, share=0.2, flow_delta=-0.08)], now=now + timedelta(seconds=1))
+    still_losing, _ = engine.apply([_leader("ai", score=0, share=0.0, flow_delta=-0.08, state=ThemeCoreState.DATA_WAIT.value)], now=now + timedelta(seconds=10))
+    rotated, _ = engine.apply([_leader("ai", score=0, share=0.0, flow_delta=-0.08, state=ThemeCoreState.DATA_WAIT.value)], now=now + timedelta(seconds=35))
+
+    assert losing[0].status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value
+    assert still_losing[0].status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value
+    assert rotated[0].status == ThemeLeadershipStatus.ROTATED_OUT.value
+
+
+def _leader(theme_id: str, *, score: float, share: float, state: str = ThemeCoreState.SPREADING_THEME.value, flow_delta: float = 0.0):
     return ThemeLeadershipSnapshot(
         theme_id=theme_id,
         theme_name=theme_id,
         current_rank=1,
         leadership_score=score,
         flow_share=share,
+        flow_share_delta=flow_delta,
         recent_flow_score=score,
         theme_state=ThemeStateSnapshot(theme_id=theme_id, theme_name=theme_id, theme_state=state, theme_score=score),
     )

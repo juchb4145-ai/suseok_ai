@@ -853,6 +853,12 @@ def _theme_payload(state: ThemeStateSnapshot, rank: int, *, flow: Any = None, le
         "leadership_rank": getattr(leadership, "current_rank", 0),
         "leadership_rank_delta": getattr(leadership, "rank_delta", 0),
         "takeover_pending_since": getattr(leadership, "takeover_pending_since", ""),
+        "losing_since": getattr(leadership, "losing_since", ""),
+        "losing_cycle_count": getattr(leadership, "losing_cycle_count", 0),
+        "recovery_pending_since": getattr(leadership, "recovery_pending_since", ""),
+        "recovery_cycle_count": getattr(leadership, "recovery_cycle_count", 0),
+        "rotated_out_until": getattr(leadership, "rotated_out_until", ""),
+        **_state_leadership_consistency(state, leadership),
         "leader_symbol": state.leader_symbol,
         "previous_leader_symbol": getattr(state, "previous_leader_symbol", ""),
         "co_leader_symbols": list(state.co_leader_symbols),
@@ -902,8 +908,38 @@ def _leadership_payload(item: Any) -> dict[str, Any]:
         "takeover_pending_since": getattr(item, "takeover_pending_since", ""),
         "takeover_pending_cycle_count": getattr(item, "takeover_pending_cycle_count", 0),
         "takeover_confirmed_at": getattr(item, "takeover_confirmed_at", ""),
+        "losing_since": getattr(item, "losing_since", ""),
+        "losing_cycle_count": getattr(item, "losing_cycle_count", 0),
+        "recovery_pending_since": getattr(item, "recovery_pending_since", ""),
+        "recovery_cycle_count": getattr(item, "recovery_cycle_count", 0),
+        "rotated_out_until": getattr(item, "rotated_out_until", ""),
         "previous_incumbent_theme_id": getattr(item, "previous_incumbent_theme_id", ""),
         "reason_codes": list(getattr(item, "handover_reason_codes", ()) or ()),
+    }
+
+
+def _state_leadership_consistency(state: ThemeStateSnapshot, leadership: Any | None) -> dict[str, Any]:
+    if leadership is None:
+        return {
+            "state_leadership_consistent": True,
+            "state_leadership_mismatch_code": "",
+        }
+    theme_state = str(getattr(state, "theme_state", "") or "")
+    status = str(getattr(leadership, "status", "") or "")
+    mismatch = ""
+    if theme_state == ThemeCoreState.LEADING_THEME.value and status in {"LOSING_LEADERSHIP", "ROTATED_OUT"}:
+        mismatch = "LEADING_WITH_LOSING_OR_ROTATED"
+    elif theme_state == ThemeCoreState.FADING_THEME.value and status in {"INCUMBENT", "TAKEOVER_CONFIRMED"}:
+        mismatch = "FADING_WITH_INCUMBENT"
+    elif theme_state == ThemeCoreState.DATA_WAIT.value and status == "TAKEOVER_PENDING":
+        mismatch = "DATA_WAIT_WITH_TAKEOVER_PENDING"
+    elif theme_state == ThemeCoreState.WEAK_THEME.value and status in {"INCUMBENT", "TAKEOVER_CONFIRMED"}:
+        mismatch = "WEAK_WITH_INCUMBENT"
+    return {
+        "state_leadership_consistent": not bool(mismatch),
+        "state_leadership_mismatch_code": mismatch,
+        "mismatch_since": getattr(leadership, "status_entered_at", "") if mismatch else "",
+        "mismatch_cycle_count": getattr(leadership, "status_cycle_count", 0) if mismatch else 0,
     }
 
 
@@ -1068,6 +1104,11 @@ def _leadership_snapshot_from_row(row: Mapping[str, Any]) -> ThemeLeadershipSnap
         challenger_since=str(row.get("challenger_since") or ""),
         takeover_pending_since=str(row.get("takeover_pending_since") or ""),
         takeover_confirmed_at=str(row.get("takeover_confirmed_at") or ""),
+        losing_since=str(row.get("losing_since") or ""),
+        losing_cycle_count=_int(row.get("losing_cycle_count")),
+        recovery_pending_since=str(row.get("recovery_pending_since") or ""),
+        recovery_cycle_count=_int(row.get("recovery_cycle_count")),
+        rotated_out_until=str(row.get("rotated_out_until") or ""),
         previous_incumbent_theme_id=str(row.get("previous_incumbent_theme_id") or ""),
         handover_reason_codes=tuple(str(item) for item in list(row.get("reason_codes") or row.get("handover_reason_codes") or [])),
     )

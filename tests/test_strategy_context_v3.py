@@ -94,6 +94,46 @@ def test_entry_engine_uses_strategy_context_v3_without_legacy_theme_board_metada
     assert decision.live_order_allowed is False
 
 
+def test_takeover_pending_leadership_policy_waits_new_entry(tmp_path):
+    db = TradingDatabase(str(tmp_path / "context-leadership-wait.db"))
+    market_data = MarketDataStore()
+    candidate = _candidate(db)
+    _tick(market_data, "000001")
+    db.save_market_regime_snapshot(_market_snapshot())
+    db.save_theme_board_snapshot(_theme_board_with_leadership("TAKEOVER_PENDING"))
+    assembler = StrategyContextAssembler(db, market_data=market_data)
+    snapshot = assembler.assemble_candidate(candidate, now=datetime(2026, 6, 19, 9, 20, 0))
+    assembler.save_snapshots([candidate], [snapshot], calculated_at=snapshot.calculated_at)
+
+    decision = _entry_decision(db, market_data)
+
+    assert snapshot.theme.leadership_wait_new_entry is True
+    assert snapshot.blocking_stage == "THEME"
+    assert snapshot.primary_reason_code == "THEME_TAKEOVER_PENDING_WAIT"
+    assert decision.entry_status == EntryDecisionStatus.THEME_WAIT
+    assert "THEME_TAKEOVER_PENDING_WAIT" in decision.reason_codes
+
+
+def test_rotated_out_leadership_policy_hard_blocks_new_entry(tmp_path):
+    db = TradingDatabase(str(tmp_path / "context-leadership-block.db"))
+    market_data = MarketDataStore()
+    candidate = _candidate(db)
+    _tick(market_data, "000001")
+    db.save_market_regime_snapshot(_market_snapshot())
+    db.save_theme_board_snapshot(_theme_board_with_leadership("ROTATED_OUT"))
+    assembler = StrategyContextAssembler(db, market_data=market_data)
+    snapshot = assembler.assemble_candidate(candidate, now=datetime(2026, 6, 19, 9, 20, 0))
+    assembler.save_snapshots([candidate], [snapshot], calculated_at=snapshot.calculated_at)
+
+    decision = _entry_decision(db, market_data)
+
+    assert snapshot.theme.leadership_block_new_entry is True
+    assert snapshot.blocking_stage == "THEME"
+    assert snapshot.primary_reason_code == "THEME_ROTATED_OUT_BLOCK"
+    assert decision.entry_status == EntryDecisionStatus.HARD_BLOCK
+    assert "THEME_ROTATED_OUT_BLOCK" in decision.reason_codes
+
+
 def test_entry_engine_blocks_when_strategy_context_v3_missing_and_fallback_disabled(tmp_path):
     db = TradingDatabase(str(tmp_path / "entry-context-missing.db"))
     market_data = MarketDataStore()
@@ -287,6 +327,22 @@ def _candidate(db: TradingDatabase, *, market: str = "KOSDAQ") -> Candidate:
     )
 
 
+def _entry_decision(db: TradingDatabase, market_data: MarketDataStore):
+    engine = EntryEngine(
+        db,
+        market_data=market_data,
+        candle_builder=CandleBuilder(),
+        config=EntryEngineConfig(
+            enabled=True,
+            min_1m_candles=0,
+            require_vwap=False,
+            use_strategy_context_v3=True,
+            allow_legacy_theme_context_fallback=False,
+        ),
+    )
+    return engine.evaluate_candidates([db.load_candidate(TRADE_DATE, "000001")], now=datetime(2026, 6, 19, 9, 20, 1)).decisions[0]
+
+
 def _tick(market_data: MarketDataStore, code: str) -> None:
     market_data.update_tick(
         StrategyTick.from_realtime(
@@ -395,6 +451,18 @@ def _theme_board() -> dict:
         "ready_allowed": False,
         "order_intent_allowed": False,
     }
+
+
+def _theme_board_with_leadership(status: str) -> dict:
+    board = _theme_board()
+    theme = dict(board["top_themes"][0])
+    theme["leadership_status"] = status
+    theme["leadership_score"] = 80.0
+    theme["leadership_rank"] = 1
+    board["top_themes"] = [theme]
+    board["themes_by_id"] = {"ai": theme}
+    board["stock_contexts_by_code"] = {"000001": [dict(board["stocks"][0])]}
+    return board
 
 
 def _multi_theme_board(*, primary: str, calculated_at: str) -> dict:

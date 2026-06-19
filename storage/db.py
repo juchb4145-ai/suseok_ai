@@ -851,9 +851,13 @@ class TradingDatabase:
                 code TEXT NOT NULL,
                 theme_id TEXT NOT NULL DEFAULT '',
                 source TEXT NOT NULL DEFAULT '',
+                subscription_generation INTEGER NOT NULL DEFAULT 1,
                 selected_at TEXT NOT NULL DEFAULT '',
+                selected_tick_baseline_at TEXT NOT NULL DEFAULT '',
                 first_active_at TEXT NOT NULL DEFAULT '',
                 first_fresh_tick_at TEXT NOT NULL DEFAULT '',
+                first_post_subscription_tick_at TEXT NOT NULL DEFAULT '',
+                first_tick_source_event_id TEXT NOT NULL DEFAULT '',
                 minimum_hold_until TEXT NOT NULL DEFAULT '',
                 expires_at TEXT NOT NULL DEFAULT '',
                 last_eligible_at TEXT NOT NULL DEFAULT '',
@@ -2955,6 +2959,7 @@ class TradingDatabase:
         self._ensure_column("virtual_orders", "details_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("virtual_positions", "details_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_theme_state_runtime_columns()
+        self._ensure_theme_expansion_lease_columns()
         self._ensure_strategy_runtime_settings_columns()
         self._ensure_runtime_order_intent_columns()
         self._ensure_runtime_order_intent_indexes()
@@ -7975,6 +7980,19 @@ class TradingDatabase:
         row = self.conn.execute("SELECT * FROM theme_leadership_transitions WHERE id = ?", (transition_id,)).fetchone()
         return _row_to_theme_leadership_transition(row) if row else {}
 
+    def list_theme_leadership_transitions(self, *, trade_date: str, limit: int = 100) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM theme_leadership_transitions
+            WHERE trade_date = ?
+            ORDER BY detected_at DESC, id DESC
+            LIMIT ?
+            """,
+            (str(trade_date), max(1, int(limit or 100))),
+        ).fetchall()
+        return [_row_to_theme_leadership_transition(row) for row in rows]
+
     def save_theme_expansion_lease(self, lease: dict, *, trade_date: str) -> dict:
         payload = dict(lease or {})
         code = _clean_stock_code(payload.get("code") or payload.get("stock_code")) or ""
@@ -7986,16 +8004,22 @@ class TradingDatabase:
             self.conn.execute(
                 """
                 INSERT INTO theme_expansion_leases(
-                    trade_date, code, theme_id, source, selected_at,
-                    first_active_at, first_fresh_tick_at, minimum_hold_until,
+                    trade_date, code, theme_id, source, subscription_generation,
+                    selected_at, selected_tick_baseline_at,
+                    first_active_at, first_fresh_tick_at, first_post_subscription_tick_at,
+                    first_tick_source_event_id, minimum_hold_until,
                     expires_at, last_eligible_at, removal_pending_at,
                     cooldown_until, status, reason_codes_json, target_json,
                     payload_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(trade_date, code, theme_id, source) DO UPDATE SET
+                    subscription_generation=excluded.subscription_generation,
                     selected_at=excluded.selected_at,
+                    selected_tick_baseline_at=excluded.selected_tick_baseline_at,
                     first_active_at=excluded.first_active_at,
                     first_fresh_tick_at=excluded.first_fresh_tick_at,
+                    first_post_subscription_tick_at=excluded.first_post_subscription_tick_at,
+                    first_tick_source_event_id=excluded.first_tick_source_event_id,
                     minimum_hold_until=excluded.minimum_hold_until,
                     expires_at=excluded.expires_at,
                     last_eligible_at=excluded.last_eligible_at,
@@ -8012,9 +8036,13 @@ class TradingDatabase:
                     code,
                     theme_id,
                     source,
+                    _safe_int(payload.get("subscription_generation"), 1),
                     str(payload.get("selected_at") or ""),
+                    str(payload.get("selected_tick_baseline_at") or payload.get("selected_at") or ""),
                     str(payload.get("first_active_at") or ""),
                     str(payload.get("first_fresh_tick_at") or ""),
+                    str(payload.get("first_post_subscription_tick_at") or ""),
+                    str(payload.get("first_tick_source_event_id") or ""),
                     str(payload.get("minimum_hold_until") or ""),
                     str(payload.get("expires_at") or ""),
                     str(payload.get("last_eligible_at") or ""),
@@ -8058,6 +8086,19 @@ class TradingDatabase:
             params,
         ).fetchall()
         return [_row_to_theme_expansion_lease(row) for row in rows]
+
+    def list_theme_expansion_subscription_decisions(self, *, trade_date: str, limit: int = 100) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM theme_expansion_subscription_decisions
+            WHERE trade_date = ?
+            ORDER BY calculated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (str(trade_date), max(1, int(limit or 100))),
+        ).fetchall()
+        return [_row_to_theme_expansion_subscription_decision(row) for row in rows]
 
     def save_strategy_context_snapshot(self, snapshot: dict) -> dict:
         payload = dict(snapshot or {})
@@ -13216,6 +13257,16 @@ class TradingDatabase:
         for name, definition in columns.items():
             self._ensure_column("theme_state_runtime_latest", name, definition)
 
+    def _ensure_theme_expansion_lease_columns(self) -> None:
+        columns = {
+            "subscription_generation": "INTEGER NOT NULL DEFAULT 1",
+            "selected_tick_baseline_at": "TEXT NOT NULL DEFAULT ''",
+            "first_post_subscription_tick_at": "TEXT NOT NULL DEFAULT ''",
+            "first_tick_source_event_id": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in columns.items():
+            self._ensure_column("theme_expansion_leases", name, definition)
+
     def _seed_legacy_strategy_runtime_settings(self) -> None:
         from trading.strategy.runtime_settings import legacy_profile_payload
 
@@ -15954,9 +16005,13 @@ def _row_to_theme_expansion_lease(row: sqlite3.Row) -> dict:
     payload.setdefault("code", data.get("code", ""))
     payload.setdefault("theme_id", data.get("theme_id", ""))
     payload.setdefault("source", data.get("source", ""))
+    payload.setdefault("subscription_generation", int(data.get("subscription_generation") or 1))
     payload.setdefault("selected_at", data.get("selected_at", ""))
+    payload.setdefault("selected_tick_baseline_at", data.get("selected_tick_baseline_at", ""))
     payload.setdefault("first_active_at", data.get("first_active_at", ""))
     payload.setdefault("first_fresh_tick_at", data.get("first_fresh_tick_at", ""))
+    payload.setdefault("first_post_subscription_tick_at", data.get("first_post_subscription_tick_at", ""))
+    payload.setdefault("first_tick_source_event_id", data.get("first_tick_source_event_id", ""))
     payload.setdefault("minimum_hold_until", data.get("minimum_hold_until", ""))
     payload.setdefault("expires_at", data.get("expires_at", ""))
     payload.setdefault("last_eligible_at", data.get("last_eligible_at", ""))

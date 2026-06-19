@@ -442,7 +442,32 @@ class EntryEngine:
             status = str(theme_context.get("theme_state") or "").strip().upper()
             role = str(stock_context.get("trade_stock_role") or "").strip().upper()
             score = _float(theme_context.get("theme_score"))
-            details = {"theme_status": status, "stock_role": role, "theme_score": score, "strategy_context_id": strategy_context.get("context_id")}
+            leadership_policy = str(theme_context.get("leadership_entry_policy") or "").strip().upper()
+            leadership_status = str(theme_context.get("leadership_status") or "").strip().upper()
+            leadership_reasons = _dedupe(list(theme_context.get("leadership_reason_codes") or []))
+            details = {
+                "theme_status": status,
+                "stock_role": role,
+                "theme_score": score,
+                "strategy_context_id": strategy_context.get("context_id"),
+                "leadership_status": leadership_status,
+                "leadership_entry_policy": leadership_policy,
+                "leadership_reason_codes": leadership_reasons,
+            }
+            if bool(theme_context.get("leadership_block_new_entry")):
+                reason = _first_reason(
+                    leadership_reasons,
+                    {"THEME_LOSING_LEADERSHIP_BLOCK", "THEME_ROTATED_OUT_BLOCK", "THEME_LEADERSHIP_DATA_WAIT_BLOCK"},
+                    "THEME_LEADERSHIP_BLOCK",
+                )
+                return EntryThemeReadiness(status=EntryCheckStatus.BLOCK, reason_codes=(reason,), details=details)
+            if bool(theme_context.get("leadership_wait_new_entry")):
+                reason = _first_reason(
+                    leadership_reasons,
+                    {"THEME_TAKEOVER_PENDING_WAIT", "THEME_CHALLENGER_WAIT", "THEME_NEUTRAL_WAIT"},
+                    "THEME_LEADERSHIP_WAIT",
+                )
+                return EntryThemeReadiness(status=EntryCheckStatus.WAIT, reason_codes=(reason,), details=details)
         else:
             status = str(metadata.get("theme_board_theme_status") or "").strip().upper()
             role = str(metadata.get("theme_board_stock_role") or "").strip().upper()

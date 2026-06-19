@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from trading.strategy.candidates import normalize_code
 from trading.theme_engine.expansion import FocusedExpansionTarget
@@ -22,9 +22,13 @@ class ExpansionLease:
     code: str
     theme_id: str = ""
     source: str = "reboot_v2_theme_expansion"
+    subscription_generation: int = 1
     selected_at: str = ""
+    selected_tick_baseline_at: str = ""
     first_active_at: str = ""
     first_fresh_tick_at: str = ""
+    first_post_subscription_tick_at: str = ""
+    first_tick_source_event_id: str = ""
     minimum_hold_until: str = ""
     expires_at: str = ""
     last_eligible_at: str = ""
@@ -74,11 +78,12 @@ class ExpansionLeaseManager:
         now: datetime | None = None,
         active_codes: Iterable[str] = (),
         fresh_tick_codes: Iterable[str] = (),
+        fresh_tick_events: Mapping[str, Any] | None = None,
         protected_codes: Iterable[str] = (),
     ) -> ExpansionLeaseSnapshot:
         current = (now or self.clock()).replace(microsecond=0)
         active_code_set = {normalize_code(code) for code in active_codes if normalize_code(code)}
-        fresh_code_set = {normalize_code(code) for code in fresh_tick_codes if normalize_code(code)}
+        fresh_events = _fresh_events(fresh_tick_events, fresh_tick_codes=fresh_tick_codes, now=current)
         protected_code_set = {normalize_code(code) for code in protected_codes if normalize_code(code)}
         target_by_key = {
             (normalize_code(target.code), str(target.theme_id or "")): target
@@ -96,8 +101,15 @@ class ExpansionLeaseManager:
             code, _theme_id = key
             if code in active_code_set and not lease.first_active_at:
                 lease = replace(lease, first_active_at=current.isoformat())
-            if code in fresh_code_set and not lease.first_fresh_tick_at:
-                lease = replace(lease, first_fresh_tick_at=current.isoformat(), reason_codes=tuple(_dedupe([*lease.reason_codes, "THEME_EXPANSION_TICK_READY"])))
+            event = fresh_events.get(code)
+            if event and not lease.first_fresh_tick_at and _post_subscription_fresh_tick(lease, event):
+                lease = replace(
+                    lease,
+                    first_fresh_tick_at=current.isoformat(),
+                    first_post_subscription_tick_at=str(event.get("tick_at") or ""),
+                    first_tick_source_event_id=str(event.get("source_event_id") or ""),
+                    reason_codes=tuple(_dedupe([*lease.reason_codes, "THEME_EXPANSION_TICK_READY"])),
+                )
             self._leases[key] = lease
         for key, lease in list(self._leases.items()):
             if key in target_by_key:
@@ -167,7 +179,9 @@ def _new_lease(target: FocusedExpansionTarget, *, now: datetime) -> ExpansionLea
         code=normalize_code(target.code),
         theme_id=str(target.theme_id or ""),
         source=str(target.source or "reboot_v2_theme_expansion"),
+        subscription_generation=1,
         selected_at=now.isoformat(),
+        selected_tick_baseline_at=now.isoformat(),
         minimum_hold_until=(now + timedelta(seconds=hold)).isoformat(),
         expires_at=(now + timedelta(seconds=ttl)).isoformat(),
         last_eligible_at=now.isoformat(),
@@ -183,6 +197,7 @@ def _refresh_lease(lease: ExpansionLease, target: FocusedExpansionTarget, *, now
     return replace(
         lease,
         source=str(target.source or lease.source),
+        selected_tick_baseline_at=lease.selected_tick_baseline_at or lease.selected_at,
         last_eligible_at=now.isoformat(),
         expires_at=(now + timedelta(seconds=ttl)).isoformat(),
         cooldown_until="",
@@ -223,9 +238,13 @@ def _lease_from_mapping(value: dict[str, Any]) -> ExpansionLease:
         code=normalize_code(raw.get("code") or raw.get("stock_code") or ""),
         theme_id=str(raw.get("theme_id") or ""),
         source=str(raw.get("source") or "reboot_v2_theme_expansion"),
+        subscription_generation=int(raw.get("subscription_generation") or 1),
         selected_at=str(raw.get("selected_at") or ""),
+        selected_tick_baseline_at=str(raw.get("selected_tick_baseline_at") or raw.get("selected_at") or ""),
         first_active_at=str(raw.get("first_active_at") or ""),
         first_fresh_tick_at=str(raw.get("first_fresh_tick_at") or ""),
+        first_post_subscription_tick_at=str(raw.get("first_post_subscription_tick_at") or raw.get("first_fresh_tick_at") or ""),
+        first_tick_source_event_id=str(raw.get("first_tick_source_event_id") or ""),
         minimum_hold_until=str(raw.get("minimum_hold_until") or ""),
         expires_at=str(raw.get("expires_at") or ""),
         last_eligible_at=str(raw.get("last_eligible_at") or ""),
@@ -240,6 +259,43 @@ def _lease_from_mapping(value: dict[str, Any]) -> ExpansionLease:
 def _before(now: datetime, timestamp: str) -> bool:
     parsed = _parse_time(timestamp)
     return parsed is not None and now < parsed
+
+
+def _fresh_events(
+    fresh_tick_events: Mapping[str, Any] | None,
+    *,
+    fresh_tick_codes: Iterable[str],
+    now: datetime,
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    if isinstance(fresh_tick_events, Mapping):
+        for raw_code, raw_event in fresh_tick_events.items():
+            code = normalize_code(str(raw_code or ""))
+            if not code:
+                continue
+            event = dict(raw_event or {}) if isinstance(raw_event, Mapping) else {"tick_at": str(raw_event or "")}
+            event.setdefault("tick_at", now.isoformat())
+            result[code] = event
+    for raw_code in fresh_tick_codes:
+        code = normalize_code(raw_code)
+        if code and code not in result:
+            result[code] = {"tick_at": now.isoformat(), "source_event_id": ""}
+    return result
+
+
+def _post_subscription_fresh_tick(lease: ExpansionLease, event: Mapping[str, Any]) -> bool:
+    tick_at = _parse_time(str(event.get("tick_at") or ""))
+    if tick_at is None:
+        return False
+    baselines = [
+        _parse_time(lease.selected_tick_baseline_at),
+        _parse_time(lease.first_active_at),
+        _parse_time(lease.selected_at),
+    ]
+    baseline = max((item for item in baselines if item is not None), default=None)
+    if baseline is None:
+        return False
+    return tick_at >= baseline
 
 
 def _parse_time(value: str) -> datetime | None:

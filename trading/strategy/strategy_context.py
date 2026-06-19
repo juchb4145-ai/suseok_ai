@@ -83,6 +83,10 @@ class StrategyThemeContext:
     leadership_score: float = 0.0
     leadership_rank: int = 0
     leadership_rank_delta: int = 0
+    leadership_entry_policy: str = "USE_THEME_ROLE_POLICY"
+    leadership_block_new_entry: bool = False
+    leadership_wait_new_entry: bool = False
+    leadership_reason_codes: tuple[str, ...] = ()
     strong_count: int = 0
     leader_count: int = 0
     breadth_ratio: float = 0.0
@@ -151,6 +155,9 @@ class StrategyRiskContext:
     vi_block: bool = False
     chase_risk: bool = False
     stale_data_block: bool = False
+    leadership_block_new_entry: bool = False
+    leadership_wait_new_entry: bool = False
+    leadership_entry_policy: str = "USE_THEME_ROLE_POLICY"
     position_size_multiplier_hint: float = 0.0
     reason_codes: tuple[str, ...] = ()
 
@@ -258,6 +265,7 @@ class StrategyContextAssembler:
             theme_state=theme.theme_state,
             selected_theme_id=best_theme.selected_theme_id,
             leadership_status=theme.leadership_status,
+            leadership_entry_policy=theme.leadership_entry_policy,
         )
         return StrategyContextSnapshot(
             context_id=context_id,
@@ -534,6 +542,8 @@ def _theme_context(theme: Mapping[str, Any], stock: Mapping[str, Any], board: Ma
     if not theme:
         return StrategyThemeContext(calculated_at=str(board.get("calculated_at") or ""), reason_codes=("THEME_CONTEXT_NOT_READY",))
     reasons = _dedupe([*list(theme.get("reason_codes") or []), *list(stock.get("reason_codes") or [])])
+    policy = _leadership_entry_policy(theme)
+    reasons = _dedupe([*reasons, *policy["reason_codes"]])
     return StrategyThemeContext(
         theme_id=str(theme.get("theme_id") or stock.get("theme_id") or ""),
         theme_name=str(theme.get("theme_name") or stock.get("theme_name") or ""),
@@ -551,6 +561,10 @@ def _theme_context(theme: Mapping[str, Any], stock: Mapping[str, Any], board: Ma
         leadership_score=_float(theme.get("leadership_score")),
         leadership_rank=_int(theme.get("leadership_rank") or theme.get("theme_rank")),
         leadership_rank_delta=_int(theme.get("leadership_rank_delta") or theme.get("rank_delta")),
+        leadership_entry_policy=policy["policy"],
+        leadership_block_new_entry=bool(policy["block_new_entry"]),
+        leadership_wait_new_entry=bool(policy["wait_new_entry"]),
+        leadership_reason_codes=tuple(policy["reason_codes"]),
         strong_count=_int(theme.get("strong_count")),
         leader_count=_int(theme.get("leader_count")),
         breadth_ratio=_float(theme.get("breadth_ratio") or theme.get("strong_ratio")),
@@ -681,6 +695,10 @@ def _risk_context(
         reasons.append("VI_ACTIVE_BLOCK")
     if not data.realtime_tick_fresh:
         reasons.append("STALE_DATA_BLOCK")
+    if theme.leadership_block_new_entry:
+        reasons.extend(theme.leadership_reason_codes or ("THEME_LEADERSHIP_BLOCK",))
+    if theme.leadership_wait_new_entry:
+        reasons.extend(theme.leadership_reason_codes or ("THEME_LEADERSHIP_WAIT",))
     return StrategyRiskContext(
         market_block_new_entry=market.block_new_entry,
         theme_entry_allowed=theme_allowed,
@@ -689,6 +707,9 @@ def _risk_context(
         vi_block=stock.vi_active,
         chase_risk=stock.pullback_from_high_pct < 0.3 if stock.pullback_from_high_pct else False,
         stale_data_block=not data.realtime_tick_fresh,
+        leadership_block_new_entry=theme.leadership_block_new_entry,
+        leadership_wait_new_entry=theme.leadership_wait_new_entry,
+        leadership_entry_policy=theme.leadership_entry_policy,
         position_size_multiplier_hint=market.position_size_multiplier_hint,
         reason_codes=tuple(_dedupe(reasons)),
     )
@@ -706,6 +727,8 @@ def _blocking_stage(
         return "DATA", _primary_reason(reasons, "STRATEGY_CONTEXT_V3_DATA_WAIT")
     if market.block_new_entry or market.market_action in {"BLOCK_NEW_ENTRY", "MARKET_CLOSED"}:
         return "MARKET", _primary_reason(reasons, "MARKET_BLOCK_NEW_ENTRY")
+    if risk.leadership_block_new_entry or risk.leadership_wait_new_entry:
+        return "THEME", _primary_reason(theme.leadership_reason_codes or risk.reason_codes, "THEME_LEADERSHIP_WAIT")
     if not risk.theme_entry_allowed:
         return "THEME", _primary_reason(reasons, "THEME_NOT_ENTRY_ALLOWED")
     if not risk.trade_role_entry_allowed:
@@ -870,6 +893,7 @@ def _context_id(
     theme_state: str,
     selected_theme_id: str = "",
     leadership_status: str = "",
+    leadership_entry_policy: str = "",
 ) -> str:
     raw = "|".join(
         [
@@ -882,9 +906,30 @@ def _context_id(
             str(role or ""),
             str(theme_state or ""),
             str(leadership_status or ""),
+            str(leadership_entry_policy or ""),
         ]
     )
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _leadership_entry_policy(theme: Mapping[str, Any]) -> dict[str, Any]:
+    status = str(theme.get("leadership_status") or "").upper()
+    theme_state = str(theme.get("theme_state") or theme.get("theme_status") or "").upper()
+    if status in {"INCUMBENT", "TAKEOVER_CONFIRMED"}:
+        if theme_state == "DATA_WAIT":
+            return {"policy": "BLOCK_DATA_WAIT", "block_new_entry": True, "wait_new_entry": False, "reason_codes": ["THEME_LEADERSHIP_DATA_WAIT_BLOCK"]}
+        return {"policy": "USE_THEME_ROLE_POLICY", "block_new_entry": False, "wait_new_entry": False, "reason_codes": []}
+    if status == "CHALLENGER":
+        return {"policy": "WAIT_CHALLENGER", "block_new_entry": False, "wait_new_entry": True, "reason_codes": ["THEME_CHALLENGER_WAIT"]}
+    if status == "TAKEOVER_PENDING":
+        return {"policy": "WAIT_TAKEOVER_PENDING", "block_new_entry": False, "wait_new_entry": True, "reason_codes": ["THEME_TAKEOVER_PENDING_WAIT"]}
+    if status == "LOSING_LEADERSHIP":
+        return {"policy": "BLOCK_LOSING_LEADERSHIP", "block_new_entry": True, "wait_new_entry": False, "reason_codes": ["THEME_LOSING_LEADERSHIP_BLOCK"]}
+    if status == "ROTATED_OUT":
+        return {"policy": "HARD_BLOCK_ROTATED_OUT", "block_new_entry": True, "wait_new_entry": False, "reason_codes": ["THEME_ROTATED_OUT_BLOCK"]}
+    if status == "NEUTRAL" and theme_state not in {"LEADING_THEME", "SPREADING_THEME", "LEADER_ONLY_THEME"}:
+        return {"policy": "WAIT_NEUTRAL_THEME", "block_new_entry": False, "wait_new_entry": True, "reason_codes": ["THEME_NEUTRAL_WAIT"]}
+    return {"policy": "USE_THEME_ROLE_POLICY", "block_new_entry": False, "wait_new_entry": False, "reason_codes": []}
 
 
 def _primary_reason(reasons: Iterable[str], default: str) -> str:

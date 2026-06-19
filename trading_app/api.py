@@ -4466,6 +4466,129 @@ def dashboard_v2_source_status() -> dict[str, Any]:
     }
 
 
+@app.get("/api/theme-rotation/latest")
+def theme_rotation_latest(trade_date: str | None = Query(None)) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    db = open_database()
+    try:
+        return _theme_rotation_latest_payload(db, resolved)
+    finally:
+        close_database(db)
+
+
+@app.get("/api/theme-rotation/transitions")
+def theme_rotation_transitions(trade_date: str | None = Query(None), limit: int = Query(100, ge=1, le=1000)) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    max_rows = _theme_rotation_limit(limit)
+    db = open_database()
+    try:
+        loader = getattr(db, "list_theme_leadership_transitions", None)
+        rows = list(loader(trade_date=resolved, limit=max_rows) or []) if callable(loader) else []
+        return {"trade_date": resolved, "transition_count": len(rows), "transitions": rows, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/theme-rotation/leases")
+def theme_rotation_leases(
+    trade_date: str | None = Query(None),
+    status: str | None = Query(None),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    normalized_status = str(status or "").upper() if isinstance(status, str) else ""
+    db = open_database()
+    try:
+        leases = list(db.list_theme_expansion_leases(trade_date=resolved, active_only=False) or [])
+        if normalized_status:
+            leases = [lease for lease in leases if str(lease.get("status") or "").upper() == normalized_status]
+        return {"trade_date": resolved, "status": normalized_status, "lease_count": len(leases), "leases": leases, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/theme-rotation/best-theme-changes")
+def theme_rotation_best_theme_changes(trade_date: str | None = Query(None), limit: int = Query(100, ge=1, le=1000)) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    max_rows = _theme_rotation_limit(limit)
+    db = open_database()
+    try:
+        rows = db.list_strategy_context_snapshots(trade_date=resolved, limit=max_rows)
+        changes = _best_theme_changes(rows)
+        return {"trade_date": resolved, "change_count": len(changes), "changes": changes, "read_only": True}
+    finally:
+        close_database(db)
+
+
+def _theme_rotation_trade_date(trade_date: str | None) -> str:
+    return str(trade_date or datetime.now().date().isoformat())
+
+
+def _theme_rotation_limit(limit: Any, default: int = 100) -> int:
+    try:
+        return max(1, min(1000, int(limit)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _theme_rotation_latest_payload(db: TradingDatabase, trade_date: str) -> dict[str, Any]:
+    leadership = list(db.list_theme_leadership_latest(trade_date=trade_date) or [])
+    transitions = list(getattr(db, "list_theme_leadership_transitions", lambda **_: [])(trade_date=trade_date, limit=100) or [])
+    leases = list(db.list_theme_expansion_leases(trade_date=trade_date, active_only=False) or [])
+    contexts = list(db.list_strategy_context_snapshots(trade_date=trade_date, limit=500) or [])
+    board = dict(db.latest_theme_board_snapshot(trade_date=trade_date) or {})
+    themes = list(board.get("top_themes") or [])
+    incumbent = next((item for item in leadership if str(item.get("leadership_status") or item.get("status") or "").upper() in {"INCUMBENT", "TAKEOVER_CONFIRMED"}), {})
+    challenger_ids = [str(item.get("theme_id") or "") for item in leadership if str(item.get("leadership_status") or item.get("status") or "").upper() == "CHALLENGER"]
+    pending = next((item for item in leadership if str(item.get("leadership_status") or item.get("status") or "").upper() == "TAKEOVER_PENDING"), {})
+    confirmed = next((item for item in leadership if str(item.get("leadership_status") or item.get("status") or "").upper() == "TAKEOVER_CONFIRMED"), {})
+    losing_ids = [str(item.get("theme_id") or "") for item in leadership if str(item.get("leadership_status") or item.get("status") or "").upper() == "LOSING_LEADERSHIP"]
+    rotated_ids = [str(item.get("theme_id") or "") for item in leadership if str(item.get("leadership_status") or item.get("status") or "").upper() == "ROTATED_OUT"]
+    return {
+        "trade_date": trade_date,
+        "calculated_at": board.get("calculated_at") or "",
+        "current_incumbent_theme_id": incumbent.get("theme_id", ""),
+        "current_incumbent_name": incumbent.get("theme_name", ""),
+        "challenger_theme_ids": challenger_ids,
+        "takeover_pending_theme_id": pending.get("theme_id", ""),
+        "takeover_confirmed_theme_id": confirmed.get("theme_id", ""),
+        "losing_theme_ids": losing_ids,
+        "rotated_out_theme_ids": rotated_ids,
+        "latest_transition_at": transitions[0].get("detected_at", "") if transitions else "",
+        "transition_count": len(transitions),
+        "mismatch_count": sum(1 for item in themes if item.get("state_leadership_consistent") is False),
+        "active_expansion_lease_count": sum(1 for lease in leases if str(lease.get("status") or "").upper() in {"ACTIVE", "HOLDING", "PROTECTED"}),
+        "subscription_churn_count": len(getattr(db, "list_theme_expansion_subscription_decisions", lambda **_: [])(trade_date=trade_date, limit=500) or []),
+        "best_theme_change_count": len(_best_theme_changes(contexts)),
+        "read_only": True,
+        "order_intent_allowed": False,
+        "live_order_allowed": False,
+    }
+
+
+def _best_theme_changes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered = sorted(rows, key=lambda row: (str(row.get("code") or ""), str(row.get("calculated_at") or ""), int(row.get("id") or 0)))
+    previous_by_code: dict[str, str] = {}
+    changes: list[dict[str, Any]] = []
+    for row in ordered:
+        code = str(row.get("code") or "")
+        selected = str(row.get("selected_theme_id") or dict(row.get("theme") or {}).get("theme_id") or "")
+        previous = previous_by_code.get(code, "")
+        if code and selected and previous and previous != selected:
+            changes.append(
+                {
+                    "code": code,
+                    "calculated_at": row.get("calculated_at", ""),
+                    "previous_selected_theme_id": previous,
+                    "selected_theme_id": selected,
+                    "context_id": row.get("context_id", ""),
+                    "reason_codes": list(row.get("reason_codes") or []),
+                }
+            )
+        if code and selected:
+            previous_by_code[code] = selected
+    return list(reversed(changes))
+
+
 @app.get("/api/themelab/snapshot")
 def theme_lab_snapshot(refresh: bool = Query(False)) -> dict[str, Any]:
     db = open_database()

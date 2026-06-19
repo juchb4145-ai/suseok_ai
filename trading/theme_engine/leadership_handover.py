@@ -43,6 +43,11 @@ class ThemeLeadershipSnapshot:
     challenger_since: str = ""
     takeover_pending_since: str = ""
     takeover_confirmed_at: str = ""
+    losing_since: str = ""
+    losing_cycle_count: int = 0
+    recovery_pending_since: str = ""
+    recovery_cycle_count: int = 0
+    rotated_out_until: str = ""
     previous_incumbent_theme_id: str = ""
     handover_reason_codes: tuple[str, ...] = ()
     theme_state: ThemeStateSnapshot | None = None
@@ -72,6 +77,10 @@ class LeadershipHandoverConfig:
     min_flow_share_advantage: float = 0.03
     incumbent_grace_sec: int = 60
     rotated_out_cooldown_sec: int = 60
+    losing_confirm_cycles: int = 2
+    losing_confirm_sec: int = 20
+    incumbent_recovery_confirm_cycles: int = 2
+    incumbent_recovery_confirm_sec: int = 20
     fast_takeover_enabled: bool = False
 
 
@@ -134,14 +143,16 @@ class LeadershipHandoverEngine:
         items = list(ranked)
         previous_incumbent = self._incumbent_theme_id
         incumbent_previous = self._previous.get(previous_incumbent) if previous_incumbent else None
+        incumbent_current = next((item for item in items if previous_incumbent and item.theme_id == previous_incumbent), None)
+        incumbent_reference = incumbent_current or incumbent_previous
         top = items[0] if items else None
-        takeover_theme = _takeover_candidate(top, previous_incumbent, incumbent_previous, self.config)
+        takeover_theme = _takeover_candidate(top, previous_incumbent, incumbent_reference, self.config)
         updated: list[ThemeLeadershipSnapshot] = []
         transitions: list[ThemeLeadershipTransition] = []
         confirmed_theme = ""
         for item in items:
             previous = self._previous.get(item.theme_id)
-            status = self._status(item, previous, takeover_theme, previous_incumbent, incumbent_previous)
+            status = self._status(item, previous, takeover_theme, previous_incumbent, incumbent_reference, current_time)
             status_entered_at = previous.status_entered_at if previous is not None and previous.status == status and previous.status_entered_at else current_time.isoformat()
             status_cycle_count = previous.status_cycle_count + 1 if previous is not None and previous.status == status else 1
             status_age_sec = _elapsed_sec(status_entered_at, current_time)
@@ -174,6 +185,11 @@ class LeadershipHandoverEngine:
                 challenger_since=_status_since(previous, status, current_time, ThemeLeadershipStatus.CHALLENGER.value),
                 takeover_pending_since=_status_since(previous, status, current_time, ThemeLeadershipStatus.TAKEOVER_PENDING.value),
                 takeover_confirmed_at=current_time.isoformat() if status == ThemeLeadershipStatus.TAKEOVER_CONFIRMED.value and getattr(previous, "status", "") != status else item.takeover_confirmed_at,
+                losing_since=_losing_since(previous, item, status, current_time),
+                losing_cycle_count=_losing_cycle_count(previous, item, status),
+                recovery_pending_since=_recovery_pending_since(previous, item, status, current_time),
+                recovery_cycle_count=_recovery_cycle_count(previous, item, status),
+                rotated_out_until=(current_time.isoformat() if status == ThemeLeadershipStatus.ROTATED_OUT.value else getattr(previous, "rotated_out_until", "") if previous is not None else ""),
                 previous_incumbent_theme_id=previous_incumbent,
                 handover_reason_codes=tuple(_dedupe([*item.handover_reason_codes, *reasons])),
             )
@@ -206,16 +222,27 @@ class LeadershipHandoverEngine:
         takeover_theme: str,
         previous_incumbent: str,
         incumbent_previous: ThemeLeadershipSnapshot | None,
+        now: datetime,
     ) -> str:
         if not _can_takeover(item):
-            if previous is not None and previous.status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value:
+            if previous is not None and previous.status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value and _losing_cooldown_elapsed(previous, now, self.config):
                 return ThemeLeadershipStatus.ROTATED_OUT.value
+            if previous is not None and previous.status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value:
+                return ThemeLeadershipStatus.LOSING_LEADERSHIP.value
             return ThemeLeadershipStatus.NEUTRAL.value
         if not previous_incumbent and item.current_rank == 1:
             return ThemeLeadershipStatus.INCUMBENT.value
         if item.theme_id == previous_incumbent:
-            if _flow_collapse(item):
+            if previous is not None and previous.status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value:
+                if _incumbent_recovery_confirmed(previous, item, now, self.config):
+                    return ThemeLeadershipStatus.INCUMBENT.value
+                if _losing_cooldown_elapsed(previous, now, self.config) and not _incumbent_recovering(item):
+                    return ThemeLeadershipStatus.ROTATED_OUT.value
                 return ThemeLeadershipStatus.LOSING_LEADERSHIP.value
+            if _flow_collapse(item):
+                if _losing_confirmed(previous, item, now, self.config):
+                    return ThemeLeadershipStatus.LOSING_LEADERSHIP.value
+                return ThemeLeadershipStatus.INCUMBENT.value
             return ThemeLeadershipStatus.INCUMBENT.value
         if item.theme_id == takeover_theme and _challenger_advantage(item, incumbent_previous, self.config):
             return ThemeLeadershipStatus.TAKEOVER_PENDING.value
@@ -317,6 +344,71 @@ def _flow_collapse(item: ThemeLeadershipSnapshot) -> bool:
     return item.flow_share_delta <= -0.05 or item.recent_flow_score <= 5.0
 
 
+def _losing_confirmed(
+    previous: ThemeLeadershipSnapshot | None,
+    item: ThemeLeadershipSnapshot,
+    now: datetime,
+    config: LeadershipHandoverConfig,
+) -> bool:
+    if not _flow_collapse(item):
+        return False
+    losing_since = previous.losing_since if previous is not None and previous.losing_since else now.isoformat()
+    losing_cycles = (previous.losing_cycle_count + 1) if previous is not None and previous.losing_since else 1
+    return (
+        _elapsed_sec(losing_since, now) >= config.losing_confirm_sec
+        and losing_cycles >= config.losing_confirm_cycles
+    )
+
+
+def _losing_since(previous: ThemeLeadershipSnapshot | None, item: ThemeLeadershipSnapshot, status: str, now: datetime) -> str:
+    if status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value or _flow_collapse(item):
+        return previous.losing_since if previous is not None and previous.losing_since else now.isoformat()
+    return ""
+
+
+def _losing_cycle_count(previous: ThemeLeadershipSnapshot | None, item: ThemeLeadershipSnapshot, status: str) -> int:
+    if status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value or _flow_collapse(item):
+        return (previous.losing_cycle_count + 1) if previous is not None and previous.losing_since else 1
+    return 0
+
+
+def _losing_cooldown_elapsed(previous: ThemeLeadershipSnapshot, now: datetime, config: LeadershipHandoverConfig) -> bool:
+    started = previous.status_entered_at or previous.losing_since
+    return bool(started) and _elapsed_sec(started, now) >= config.rotated_out_cooldown_sec
+
+
+def _incumbent_recovering(item: ThemeLeadershipSnapshot) -> bool:
+    return _can_takeover(item) and item.current_rank <= 2 and item.recent_flow_score > 10.0 and item.flow_share_delta >= -0.01
+
+
+def _incumbent_recovery_confirmed(
+    previous: ThemeLeadershipSnapshot,
+    item: ThemeLeadershipSnapshot,
+    now: datetime,
+    config: LeadershipHandoverConfig,
+) -> bool:
+    if not _incumbent_recovering(item):
+        return False
+    recovery_since = previous.recovery_pending_since or now.isoformat()
+    recovery_cycles = previous.recovery_cycle_count + 1 if previous.recovery_pending_since else 1
+    return (
+        _elapsed_sec(recovery_since, now) >= config.incumbent_recovery_confirm_sec
+        and recovery_cycles >= config.incumbent_recovery_confirm_cycles
+    )
+
+
+def _recovery_pending_since(previous: ThemeLeadershipSnapshot | None, item: ThemeLeadershipSnapshot, status: str, now: datetime) -> str:
+    if previous is not None and previous.status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value and status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value and _incumbent_recovering(item):
+        return previous.recovery_pending_since or now.isoformat()
+    return ""
+
+
+def _recovery_cycle_count(previous: ThemeLeadershipSnapshot | None, item: ThemeLeadershipSnapshot, status: str) -> int:
+    if previous is not None and previous.status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value and status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value and _incumbent_recovering(item):
+        return previous.recovery_cycle_count + 1 if previous.recovery_pending_since else 1
+    return 0
+
+
 def _handover_reasons(item: ThemeLeadershipSnapshot, previous: ThemeLeadershipSnapshot | None, status: str) -> list[str]:
     reasons = []
     if previous is not None and item.current_rank != previous.current_rank:
@@ -327,6 +419,10 @@ def _handover_reasons(item: ThemeLeadershipSnapshot, previous: ThemeLeadershipSn
         reasons.append("TAKEOVER_CONFIRMED")
     if status == ThemeLeadershipStatus.LOSING_LEADERSHIP.value:
         reasons.append("INCUMBENT_FLOW_COLLAPSE")
+    if previous is not None and previous.status == ThemeLeadershipStatus.INCUMBENT.value and _flow_collapse(item) and status == ThemeLeadershipStatus.INCUMBENT.value:
+        reasons.append("INCUMBENT_GRACE_ACTIVE")
+    if status == ThemeLeadershipStatus.ROTATED_OUT.value:
+        reasons.append("ROTATED_OUT_COOLDOWN_CONFIRMED")
     return reasons
 
 

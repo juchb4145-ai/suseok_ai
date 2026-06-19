@@ -56,6 +56,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
         "v2_status": _v2_status(base, runtime, gateway, market, order_manager, pos_risk),
         "market_overview": _market_overview(market),
         "leading_themes": _leading_themes(themes),
+        "theme_rotation": _theme_rotation_summary(themes, runtime),
         "entry_candidates": _entry_candidates(entry, candidates, order_manager),
         "position_risk": _position_risk(pos_risk, exit_engine),
         "exit_watch": _exit_watch(exit_engine),
@@ -235,6 +236,19 @@ def _leading_themes(theme_board: dict[str, Any]) -> dict[str, Any]:
                 "strong_count": int(item.get("strong_count") or 0),
                 "leader_count": int(item.get("leader_count") or 0),
                 "theme_turnover_krw": _num(item.get("theme_turnover_krw")),
+                "previous_rank": int(item.get("previous_rank") or 0),
+                "rank_delta": int(item.get("leadership_rank_delta") or item.get("rank_delta") or 0),
+                "state_age_sec": int(item.get("state_age_sec") or 0),
+                "temporal_persistence_sec": int(item.get("temporal_persistence_sec") or 0),
+                "state_cycle_count": int(item.get("state_cycle_count") or item.get("persistence_count") or 0),
+                "leadership_status": item.get("leadership_status", ""),
+                "leadership_score": _num(item.get("leadership_score")),
+                "recent_flow_score": _num(item.get("recent_flow_score")),
+                "flow_share": _num(item.get("theme_flow_share") or item.get("flow_share")),
+                "flow_share_delta": _num(item.get("theme_flow_share_delta") or item.get("flow_share_delta")),
+                "state_leadership_consistent": bool(item.get("state_leadership_consistent", True)),
+                "state_leadership_mismatch_code": item.get("state_leadership_mismatch_code", ""),
+                "last_fresh_signal_at": item.get("last_fresh_signal_at", ""),
                 "market_overlay": {
                     "dominant_market_side": item.get("dominant_market_side", ""),
                     "market_risk_flag": bool(item.get("market_risk_flag")),
@@ -250,6 +264,37 @@ def _leading_themes(theme_board: dict[str, Any]) -> dict[str, Any]:
         "items": rows,
         "top5_count": len(rows),
         "hidden_total_hint": "전체 테마 표는 개발자 상세에서 확인",
+    }
+
+
+def _theme_rotation_summary(theme_board: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    handover = dict(theme_board.get("leadership_handover") or {})
+    expansion = dict(runtime.get("theme_expansion_subscription") or theme_board.get("theme_expansion_subscription") or {})
+    lease = dict(expansion.get("lease_snapshot") or {})
+    top_themes = [dict(item or {}) for item in list(theme_board.get("top_themes") or [])]
+    incumbent = next((item for item in top_themes if str(item.get("leadership_status") or "").upper() in {"INCUMBENT", "TAKEOVER_CONFIRMED"}), {})
+    challengers = [item for item in top_themes if str(item.get("leadership_status") or "").upper() == "CHALLENGER"]
+    pending = [item for item in top_themes if str(item.get("leadership_status") or "").upper() == "TAKEOVER_PENDING"]
+    losing = [item for item in top_themes if str(item.get("leadership_status") or "").upper() == "LOSING_LEADERSHIP"]
+    rotated = [item for item in top_themes if str(item.get("leadership_status") or "").upper() == "ROTATED_OUT"]
+    mismatches = [item for item in top_themes if item.get("state_leadership_consistent") is False]
+    return {
+        "status": theme_board.get("status", "EMPTY"),
+        "calculated_at": theme_board.get("calculated_at", ""),
+        "current_incumbent_theme_id": incumbent.get("theme_id", ""),
+        "current_incumbent_name": incumbent.get("theme_name", ""),
+        "challenger_count": len(challengers),
+        "takeover_pending_count": len(pending),
+        "losing_leadership_count": len(losing),
+        "rotated_out_count": len(rotated),
+        "state_mismatch_count": len(mismatches),
+        "transition_count": int(handover.get("transition_count") or 0),
+        "active_expansion_lease_count": int(lease.get("active_lease_count") or 0),
+        "holding_lease_count": int(lease.get("holding_count") or 0),
+        "pending_removal_lease_count": int(lease.get("pending_removal_count") or 0),
+        "subscription_churn_count": int(lease.get("churn_count") or 0),
+        "first_fresh_tick_wait_count": int(lease.get("first_tick_wait_count") or 0),
+        "mismatch_codes": [item.get("state_leadership_mismatch_code", "") for item in mismatches if item.get("state_leadership_mismatch_code")],
     }
 
 
@@ -312,6 +357,12 @@ def _entry_candidates(entry: dict[str, Any], candidates: dict[str, Any], order_m
                 "theme_persistence_count": int(_num(context_theme.get("persistence_count"))),
                 "raw_stock_role": context_stock.get("raw_stock_role") or "",
                 "trade_stock_role": context_stock.get("trade_stock_role") or "",
+                "selected_theme_id": context.get("selected_theme_id") or "",
+                "previous_selected_theme_id": context.get("previous_selected_theme_id") or "",
+                "theme_selection_changed": bool(context.get("theme_selection_changed")),
+                "alternative_theme_count": len(list(context.get("alternative_theme_ids") or [])),
+                "leadership_status": context_theme.get("leadership_status") or "",
+                "leadership_entry_policy": context_theme.get("leadership_entry_policy") or "",
                 "focused_expansion_source": item.get("focused_expansion_source") or "",
                 "blocking_stage": context.get("blocking_stage") or item.get("blocking_stage") or "",
                 "next_required_action": item.get("next_required_action") or "",
