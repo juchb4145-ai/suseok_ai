@@ -14,6 +14,7 @@ from trading.strategy.models import Candidate, CandidateState, VirtualOrderStatu
 from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.reboot_v2 import RebootV2RuntimeProfile
 from trading.strategy.runtime import StrategyRuntimeConfig
+from trading.strategy.context_dirty_publisher import MarketRegimeDirtyPublisher, StrategyContextDirtyPublisher, ThemeStateDirtyPublisher
 
 
 V2_RUNTIME_MODE = "strategy_reboot_v2"
@@ -38,6 +39,9 @@ class RebootV2Runtime:
     strategy_context_pipeline: Any = None
     entry_engine_pipeline: Any = None
     dirty_strategy_evaluator: Any = None
+    market_dirty_publisher: Any = None
+    theme_dirty_publisher: Any = None
+    strategy_context_dirty_publisher: Any = None
     market_relative_strength_shadow_pipeline: Any = None
     exit_engine_reboot_pipeline: Any = None
     position_risk_pipeline: Any = None
@@ -53,6 +57,9 @@ class RebootV2Runtime:
         self.last_snapshot: dict[str, Any] = {}
         self.is_reboot_v2_runtime = True
         self.runtime_profile = self.profile.value
+        self.market_dirty_publisher = self.market_dirty_publisher or MarketRegimeDirtyPublisher()
+        self.theme_dirty_publisher = self.theme_dirty_publisher or ThemeStateDirtyPublisher()
+        self.strategy_context_dirty_publisher = self.strategy_context_dirty_publisher or StrategyContextDirtyPublisher()
 
     def start(self, now: datetime | None = None) -> dict[str, Any]:
         current = (now or self.clock()).replace(microsecond=0)
@@ -83,11 +90,14 @@ class RebootV2Runtime:
         snapshot["steps"] = []
 
         self._recover_hydration(snapshot)
+        self._recover_intraday_discovery(snapshot)
         self._reconcile_base_subscriptions(snapshot)
         self._run_pipeline(snapshot, "market_regime", self.market_regime_pipeline, current)
+        self._publish_market_dirty(snapshot, current)
         self._run_pipeline(snapshot, "opening_burst", self.opening_burst_pipeline, current)
         self._run_pipeline(snapshot, "intraday_discovery", self.intraday_discovery_pipeline, current)
         self._run_pipeline(snapshot, "theme_board", self.theme_board_pipeline, current, market_context=snapshot.get("market_regime"))
+        self._publish_theme_dirty(snapshot, current)
         self._reconcile_theme_expansion_subscriptions(snapshot, current)
         self._enqueue_hydration(snapshot, current)
         self._reconcile_candidate_subscriptions(snapshot, current)
@@ -99,6 +109,7 @@ class RebootV2Runtime:
             market_context=snapshot.get("market_regime"),
             theme_board=getattr(self.theme_board_pipeline, "last_result", None) or self._latest_theme_board(current.date().isoformat()),
         )
+        self._publish_strategy_context_dirty(snapshot, current)
         self._run_pipeline(snapshot, "dirty_evaluator", self.dirty_strategy_evaluator, current)
         if _component_enabled(self.dirty_strategy_evaluator):
             snapshot["entry_engine"] = {
@@ -177,6 +188,86 @@ class RebootV2Runtime:
         except Exception as exc:
             snapshot["candidate_hydration_recovery"] = {"status": "ERROR", "error": str(exc)}
             snapshot.setdefault("warnings", []).append(f"CANDIDATE_HYDRATION_RECOVERY_FAILED:{exc}")
+
+    def _recover_intraday_discovery(self, snapshot: dict[str, Any]) -> None:
+        pipeline = self.intraday_discovery_pipeline
+        recover = getattr(pipeline, "recover_from_command_history", None)
+        if not callable(recover):
+            snapshot["intraday_discovery_recovery"] = {"status": "DISABLED"}
+            return
+        try:
+            snapshot["intraday_discovery_recovery"] = dict(recover() or {})
+        except Exception as exc:
+            snapshot["intraday_discovery_recovery"] = {"status": "ERROR", "error": str(exc)}
+            snapshot.setdefault("warnings", []).append(f"INTRADAY_DISCOVERY_RECOVERY_FAILED:{exc}")
+
+    def _publish_market_dirty(self, snapshot: dict[str, Any], now: datetime) -> None:
+        publisher = self.market_dirty_publisher
+        queue = self._dirty_queue()
+        if publisher is None or queue is None:
+            snapshot["market_dirty_publish"] = _disabled_section("DIRTY_QUEUE_UNAVAILABLE")
+            return
+        result = publisher.publish(
+            dict(snapshot.get("market_regime") or {}),
+            dirty_queue=queue,
+            codes_by_side=self._candidate_codes_by_side(now),
+            now=now,
+        )
+        snapshot["market_dirty_publish"] = _dirty_publish_payload(result)
+
+    def _publish_theme_dirty(self, snapshot: dict[str, Any], now: datetime) -> None:
+        publisher = self.theme_dirty_publisher
+        queue = self._dirty_queue()
+        if publisher is None or queue is None:
+            snapshot["theme_dirty_publish"] = _disabled_section("DIRTY_QUEUE_UNAVAILABLE")
+            return
+        board = getattr(self.theme_board_pipeline, "last_result", None) or self._latest_theme_board(now.date().isoformat())
+        result = publisher.publish(
+            list(dict(board or {}).get("top_themes") or []),
+            dirty_queue=queue,
+            code_by_theme=self._theme_codes_by_theme(board),
+            stock_roles=list(dict(board or {}).get("stocks") or []),
+            now=now,
+        )
+        snapshot["theme_dirty_publish"] = _dirty_publish_payload(result)
+
+    def _publish_strategy_context_dirty(self, snapshot: dict[str, Any], now: datetime) -> None:
+        publisher = self.strategy_context_dirty_publisher
+        queue = self._dirty_queue()
+        if publisher is None or queue is None:
+            snapshot["strategy_context_dirty_publish"] = _disabled_section("DIRTY_QUEUE_UNAVAILABLE")
+            return
+        contexts = list(getattr(self.strategy_context_pipeline, "last_result", []) or [])
+        result = publisher.publish(contexts, dirty_queue=queue, now=now)
+        snapshot["strategy_context_dirty_publish"] = _dirty_publish_payload(result)
+
+    def _dirty_queue(self) -> Any | None:
+        evaluator = getattr(self.dirty_strategy_evaluator, "evaluator", None)
+        service = getattr(evaluator, "market_data_service", None)
+        return getattr(service, "dirty_queue", None)
+
+    def _candidate_codes_by_side(self, now: datetime) -> dict[str, list[str]]:
+        codes = [normalize_code(candidate.code) for candidate in self.db.list_candidates(trade_date=now.date().isoformat()) if normalize_code(candidate.code)]
+        by_side = {"KOSPI": [], "KOSDAQ": [], "UNKNOWN": []}
+        for code in codes:
+            tick = self.market_data.latest_tick(code)
+            side = str(dict(getattr(tick, "metadata", {}) or {}).get("market") or "UNKNOWN").upper() if tick is not None else "UNKNOWN"
+            if side not in by_side:
+                side = "UNKNOWN"
+            by_side[side].append(code)
+            by_side["UNKNOWN"].append(code)
+        return by_side
+
+    def _theme_codes_by_theme(self, board: Mapping[str, Any] | None) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for stock in list(dict(board or {}).get("stocks") or []):
+            if not isinstance(stock, Mapping):
+                continue
+            theme_id = str(stock.get("theme_id") or "")
+            code = normalize_code(str(stock.get("code") or ""))
+            if theme_id and code:
+                result.setdefault(theme_id, []).append(code)
+        return result
 
     def _reconcile_base_subscriptions(self, snapshot: dict[str, Any]) -> None:
         manager = self.subscription_manager
@@ -437,6 +528,19 @@ def _disabled_section(reason: str) -> dict[str, Any]:
         "status": "DISABLED",
         "blocking_reason": reason,
         "next_required_action": "ENABLE_CONFIG" if reason == "CONFIG_DISABLED" else "NONE",
+        "live_order_allowed": False,
+        "dry_run_order_allowed": False,
+    }
+
+
+def _dirty_publish_payload(result: Any) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "status": "OK",
+        "published_count": int(getattr(result, "published_count", 0) or 0),
+        "skipped_count": int(getattr(result, "skipped_count", 0) or 0),
+        "reason": str(getattr(result, "reason", "") or ""),
+        "codes": list(getattr(result, "codes", ()) or ()),
         "live_order_allowed": False,
         "dry_run_order_allowed": False,
     }

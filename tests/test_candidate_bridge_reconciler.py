@@ -36,6 +36,28 @@ def test_candidate_bridge_reconciler_blocks_leader_only_followers():
     assert result.active_state == ()
 
 
+def test_candidate_bridge_reconciler_restore_prevents_repeated_include_after_restart():
+    state = ThemeStateSnapshot(theme_id="ai", theme_name="AI", theme_state=ThemeCoreState.LEADING_THEME.value)
+    first = CandidateBridgeSourceReconciler()
+    first_result = first.reconcile(
+        [_decision("000001", TradeStockRole.LEADER_CONFIRMED.value, RawStockRole.LEADER.value, state)],
+        trade_date="2026-06-19",
+        detected_at="2026-06-19T09:20:00",
+    )
+    restarted = CandidateBridgeSourceReconciler()
+    restarted.restore(first_result.active_state)
+    second_result = restarted.reconcile(
+        [_decision("000001", TradeStockRole.LEADER_CONFIRMED.value, RawStockRole.LEADER.value, state)],
+        trade_date="2026-06-19",
+        detected_at="2026-06-19T09:21:00",
+    )
+
+    assert first_result.included_count == 1
+    assert second_result.included_count == 0
+    assert second_result.removed_count == 0
+    assert len(second_result.active_state) == 1
+
+
 def _decision(code: str, trade_role: str, raw_role: str, state: ThemeStateSnapshot) -> StockRoleDecision:
     return StockRoleDecision(
         code=code,

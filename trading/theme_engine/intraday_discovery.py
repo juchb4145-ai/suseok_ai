@@ -9,7 +9,7 @@ from typing import Any, Iterable, Mapping
 
 from trading.broker.command_queue import CommandPriority
 from trading.broker.gateway_state import GatewayStateStore
-from trading.broker.models import GatewayCommand, new_message_id
+from trading.broker.models import GatewayCommand, GatewayEvent, new_message_id
 from trading.theme_engine.opening_runtime import (
     OPENING_RQ_NAME,
     OPENING_SCREEN_NO,
@@ -211,8 +211,9 @@ class IntradayDiscoveryScheduler:
 
 
 class IntradayDiscoveryRuntimePipeline:
-    def __init__(self, *, gateway_state: GatewayStateStore, config: IntradayDiscoveryConfig | None = None) -> None:
+    def __init__(self, *, gateway_state: GatewayStateStore, db: Any | None = None, config: IntradayDiscoveryConfig | None = None) -> None:
         self.gateway_state = gateway_state
+        self.db = db
         self.config = config or IntradayDiscoveryConfig.from_env()
         self.scheduler = IntradayDiscoveryScheduler(gateway_state, config=self.config)
         self.last_summary: dict[str, Any] = {"enabled": self.config.enabled, "status": "IDLE"}
@@ -220,6 +221,128 @@ class IntradayDiscoveryRuntimePipeline:
     def run_if_due(self, now: datetime) -> dict[str, Any]:
         self.last_summary = self.scheduler.enqueue_if_due(now)
         return dict(self.last_summary)
+
+    def handle_event(self, event: GatewayEvent) -> bool:
+        if event.type not in {"command_ack", "command_failed", "command_timeout", "command_expired"}:
+            return False
+        payload = dict(event.payload or {})
+        if str(payload.get("purpose") or "") != INTRADAY_TURNOVER_SEED_PURPOSE:
+            return False
+        if self.db is None:
+            self.last_summary = {
+                "enabled": self.config.enabled,
+                "status": "ERROR",
+                "paused_reason": "DB_UNAVAILABLE",
+                "ready_allowed": False,
+                "order_intent_allowed": False,
+                "output_mode": INTRADAY_OUTPUT_MODE,
+            }
+            return True
+        batch = self._batch_from_event(event, payload)
+        saved = self._save_batch(batch)
+        self.last_summary = {
+            "enabled": self.config.enabled,
+            "status": batch["status"],
+            "trade_date": batch["trade_date"],
+            "phase": batch["session_phase"],
+            "bucket": batch["bucket"],
+            "last_ack_at": batch["observed_at"] if event.type == "command_ack" else "",
+            "last_batch_row_count": int(batch["row_count"] or 0),
+            "parser_status": batch["parser_status"],
+            "failure_count": 1 if batch["status"] in {"FAILED", "TIMEOUT", "EXPIRED", "EMPTY", "PARSE_ERROR"} else 0,
+            "saved_batch_id": int(dict(saved or {}).get("id") or 0),
+            "ready_allowed": False,
+            "order_intent_allowed": False,
+            "output_mode": INTRADAY_OUTPUT_MODE,
+        }
+        return True
+
+    def recover_from_command_history(self, *, limit: int = 100) -> dict[str, Any]:
+        if self.db is None:
+            return {"status": "DISABLED", "recovered_count": 0, "reason": "DB_UNAVAILABLE"}
+        recovered = 0
+        skipped = 0
+        for record in self.gateway_state.list_commands(command_type="tr_request", include_finished=True, limit=limit):
+            command = dict(record.get("command") or {})
+            command_payload = dict(command.get("payload") or {})
+            result_payload = dict(record.get("result_payload") or {})
+            if str(command_payload.get("purpose") or result_payload.get("purpose") or "") != INTRADAY_TURNOVER_SEED_PURPOSE:
+                skipped += 1
+                continue
+            payload = {**command_payload, **result_payload}
+            payload.setdefault("command_id", record.get("command_id") or command.get("command_id") or "")
+            payload.setdefault("idempotency_key", record.get("idempotency_key") or command.get("idempotency_key") or "")
+            event_type = "command_ack" if str(record.get("status") or "").upper() in {"ACKED", "SUCCEEDED", "SUCCESS"} else "command_failed"
+            event = GatewayEvent(type=event_type, command_id=str(payload.get("command_id") or ""), idempotency_key=str(payload.get("idempotency_key") or ""), payload=payload)
+            if self.handle_event(event):
+                recovered += 1
+        return {"status": "OK", "recovered_count": recovered, "skipped_count": skipped}
+
+    def _batch_from_event(self, event: GatewayEvent, payload: Mapping[str, Any]) -> dict[str, Any]:
+        command_id = str(payload.get("command_id") or event.command_id or "")
+        idempotency_key = str(payload.get("idempotency_key") or event.idempotency_key or "")
+        fallback = _request_fields_from_idempotency(idempotency_key)
+        trade_date = str(payload.get("trade_date") or fallback.get("trade_date") or event.timestamp[:10])
+        session_phase = str(payload.get("session_phase") or fallback.get("session_phase") or "")
+        bucket = str(payload.get("bucket") or fallback.get("bucket") or "")
+        observed_at = str(payload.get("observed_at") or payload.get("batch_time") or _observed_at(trade_date, bucket, event.timestamp))
+        raw_rows = _extract_rows(payload)
+        status = _event_status(event.type, raw_rows)
+        error = str(payload.get("error") or payload.get("message") or "")
+        if status != "OK":
+            return {
+                "trade_date": trade_date,
+                "observed_at": observed_at,
+                "session_phase": session_phase,
+                "bucket": bucket,
+                "command_id": command_id,
+                "idempotency_key": idempotency_key,
+                "status": status,
+                "parser_status": status,
+                "row_count": len(raw_rows),
+                "parsed_count": 0,
+                "error": error,
+                "raw_summary": _raw_summary(payload, raw_rows),
+                "rows": [],
+            }
+        parsed = parse_intraday_discovery_rows(raw_rows, observed_at=observed_at, session_phase=session_phase)
+        rows = [
+            {
+                "stock_code": row.stock_code,
+                "stock_name": row.stock_name,
+                "rank": row.rank,
+                "current_turnover_krw": row.current_turnover_krw,
+                "change_rate_pct": row.change_rate_pct,
+                "observed_at": row.observed_at,
+                "session_phase": row.session_phase,
+                "parser_status": row.parser_status,
+                "raw": row.raw_json or {},
+            }
+            for row in parsed.rows
+        ]
+        parser_status = parsed.parser_status
+        save_status = "PARSE_ERROR" if parser_status not in {"OK", "PARTIAL"} and rows else "OK"
+        return {
+            "trade_date": trade_date,
+            "observed_at": observed_at,
+            "session_phase": session_phase,
+            "bucket": bucket,
+            "command_id": command_id,
+            "idempotency_key": idempotency_key,
+            "status": save_status,
+            "parser_status": parser_status,
+            "row_count": len(raw_rows),
+            "parsed_count": len(rows),
+            "error": "" if save_status == "OK" else parser_status,
+            "raw_summary": _raw_summary(payload, raw_rows),
+            "rows": rows,
+        }
+
+    def _save_batch(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+        saver = getattr(self.db, "save_intraday_theme_discovery_batch", None)
+        if not callable(saver):
+            return {}
+        return dict(saver(dict(batch)) or {})
 
 
 def intraday_discovery_tr_command(config: IntradayDiscoveryConfig, request: IntradayDiscoveryRequest) -> GatewayCommand:
@@ -257,6 +380,66 @@ def parse_intraday_discovery_rows(rows: Iterable[Mapping[str, Any]], *, observed
         rows=tuple(_row_from_parsed(row, observed_at=observed_at, session_phase=session_phase) for row in parsed.rows),
         parser_status=parsed.parser_status,
     )
+
+
+def _extract_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    sources: list[Any] = [
+        payload.get("rows"),
+        payload.get("captured_rows"),
+        payload.get("merged_rows"),
+        payload.get("tr_rows"),
+    ]
+    for container_key in ("raw", "result", "result_payload"):
+        container = payload.get(container_key)
+        if isinstance(container, Mapping):
+            sources.extend(
+                [
+                    container.get("rows"),
+                    container.get("captured_rows"),
+                    container.get("merged_rows"),
+                    container.get("tr_rows"),
+                ]
+            )
+    for source in sources:
+        if source:
+            return [dict(row or {}) for row in list(source or [])]
+    return []
+
+
+def _event_status(event_type: str, rows: Iterable[Mapping[str, Any]]) -> str:
+    if event_type == "command_failed":
+        return "FAILED"
+    if event_type == "command_timeout":
+        return "TIMEOUT"
+    if event_type == "command_expired":
+        return "EXPIRED"
+    return "OK" if list(rows) else "EMPTY"
+
+
+def _raw_summary(payload: Mapping[str, Any], rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    return {
+        "row_count": len(list(rows)),
+        "keys": sorted(str(key) for key in payload.keys()),
+        "ready_allowed": False,
+        "order_intent_allowed": False,
+    }
+
+
+def _observed_at(trade_date: str, bucket: str, event_timestamp: str) -> str:
+    if trade_date and bucket:
+        return f"{trade_date}T{bucket}:00"
+    return str(event_timestamp or "")
+
+
+def _request_fields_from_idempotency(idempotency_key: str) -> dict[str, str]:
+    parts = str(idempotency_key or "").split(":")
+    if len(parts) < 7 or parts[:3] != ["intraday_theme_discovery", "seed"]:
+        return {}
+    return {
+        "trade_date": parts[3],
+        "session_phase": parts[4],
+        "bucket": f"{parts[5]}:{parts[6]}",
+    }
 
 
 def _row_from_parsed(row: ParsedOpeningSeedRow, *, observed_at: str, session_phase: str) -> IntradayDiscoveryRow:

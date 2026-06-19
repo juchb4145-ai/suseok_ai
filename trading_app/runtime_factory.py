@@ -327,6 +327,7 @@ def build_reboot_v2_runtime_bundle(
         candidate_hydrator=candidate_hydrator,
     )
     intraday_discovery_pipeline = IntradayDiscoveryRuntimePipeline(
+        db=db,
         gateway_state=gateway_state,
         config=IntradayDiscoveryConfig.from_env(trading_mode=settings.mode),
     )

@@ -35,6 +35,14 @@ class CandidateBridgeSourceReconciler:
         self.source_id_prefix = source_id_prefix
         self._active: dict[tuple[str, str], CandidateBridgeSourceState] = {}
 
+    def restore(self, states: Iterable[CandidateBridgeSourceState | dict[str, Any]]) -> None:
+        active: dict[tuple[str, str], CandidateBridgeSourceState] = {}
+        for state in states:
+            item = _state_from_mapping(state)
+            if item.code and item.theme_id and item.source_id:
+                active[(item.code, item.theme_id)] = item
+        self._active = active
+
     def reconcile(
         self,
         decisions: Iterable[StockRoleDecision],
@@ -89,6 +97,20 @@ def _state_from_decision(decision: StockRoleDecision, *, prefix: str) -> Candida
         trade_role=decision.trade_role,
         leadership_status=status,
         role_score=decision.role_score,
+    )
+
+
+def _state_from_mapping(value: CandidateBridgeSourceState | dict[str, Any]) -> CandidateBridgeSourceState:
+    if isinstance(value, CandidateBridgeSourceState):
+        return value
+    raw = dict(value or {})
+    return CandidateBridgeSourceState(
+        code=str(raw.get("code") or ""),
+        theme_id=str(raw.get("theme_id") or ""),
+        source_id=str(raw.get("source_id") or ""),
+        trade_role=str(raw.get("trade_role") or ""),
+        leadership_status=str(raw.get("theme_state") or raw.get("leadership_status") or ""),
+        role_score=float(raw.get("role_score") or raw.get("source_score") or 0.0),
     )
 
 

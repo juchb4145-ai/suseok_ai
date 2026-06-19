@@ -31,9 +31,9 @@ def test_theme_core_v3_runtime_saves_observe_theme_board_snapshot_without_candid
             ("000003", 3, 4_000_000_000, 3.6),
         ],
     )
-    _tick(market_data, "000001", 6.4, 12_000_000_000, speed=1_500_000_000, execution=170)
-    _tick(market_data, "000002", 5.8, 9_000_000_000, speed=1_100_000_000, execution=155)
-    _tick(market_data, "000003", 3.6, 4_000_000_000, speed=700_000_000, execution=135)
+    _tick(market_data, "000001", 6.4, 12_000_000_000, speed=1_500_000_000, execution=170, timestamp=datetime(2026, 6, 18, 9, 21, 5))
+    _tick(market_data, "000002", 5.8, 9_000_000_000, speed=1_100_000_000, execution=155, timestamp=datetime(2026, 6, 18, 9, 21, 5))
+    _tick(market_data, "000003", 3.6, 4_000_000_000, speed=700_000_000, execution=135, timestamp=datetime(2026, 6, 18, 9, 21, 5))
 
     pipeline = ThemeCoreV3RuntimePipeline(
         db=db,
@@ -82,6 +82,89 @@ def test_theme_core_v3_runtime_can_run_without_opening_seed_when_realtime_theme_
     assert result["seed_signal_count"] == 3
     assert result["top_themes"][0]["theme_id"] == "robot"
     assert result["ready_allowed"] is False
+
+
+def test_theme_core_v3_runtime_uses_intraday_discovery_rows_as_active_seed_source(tmp_path):
+    db = TradingDatabase(str(tmp_path / "theme-core-v3-intraday.db"))
+    repo = ThemeEngineRepository(db)
+    market_data = MarketDataStore()
+    _theme(repo, "ai", "AI Infra", ["000001", "000002", "000003"])
+    db.save_intraday_theme_discovery_batch(
+        {
+            "trade_date": "2026-06-18",
+            "observed_at": "2026-06-18T09:21:00",
+            "session_phase": "MORNING",
+            "bucket": "09:20",
+            "command_id": "cmd-intraday",
+            "status": "OK",
+            "parser_status": "OK",
+            "row_count": 3,
+            "parsed_count": 3,
+            "rows": [
+                {"stock_code": "000001", "stock_name": "One", "rank": 1, "current_turnover_krw": 12_000_000_000, "change_rate_pct": 6.4, "observed_at": "2026-06-18T09:21:00"},
+                {"stock_code": "000002", "stock_name": "Two", "rank": 2, "current_turnover_krw": 9_000_000_000, "change_rate_pct": 5.8, "observed_at": "2026-06-18T09:21:00"},
+                {"stock_code": "000003", "stock_name": "Three", "rank": 3, "current_turnover_krw": 4_000_000_000, "change_rate_pct": 3.6, "observed_at": "2026-06-18T09:21:00"},
+            ],
+        }
+    )
+    _tick(market_data, "000001", 6.4, 12_000_000_000, speed=1_500_000_000, execution=170, timestamp=datetime(2026, 6, 18, 9, 21, 5))
+    _tick(market_data, "000002", 5.8, 9_000_000_000, speed=1_100_000_000, execution=155, timestamp=datetime(2026, 6, 18, 9, 21, 5))
+    _tick(market_data, "000003", 3.6, 4_000_000_000, speed=700_000_000, execution=135, timestamp=datetime(2026, 6, 18, 9, 21, 5))
+
+    pipeline = ThemeCoreV3RuntimePipeline(
+        db=db,
+        market_data=market_data,
+        repository=repo,
+        config=ThemeCoreV3RuntimeConfig(enabled=True, interval_sec=1),
+    )
+    result = pipeline.run(datetime(2026, 6, 18, 9, 21, 5))
+
+    active = db.list_active_seed_signals(trade_date="2026-06-18")
+    observations = db.list_turnover_flow_observations(trade_date="2026-06-18")
+
+    assert result["status"] == "OK"
+    assert result["source_delta_signal_count"] == 6
+    assert result["active_seed_registry"]["source_counts"] == {"MANUAL": 3, "INTRADAY": 3}
+    assert result["top_themes"][0]["theme_id"] == "ai"
+    assert {row["source_type"] for row in active} == {"INTRADAY", "MANUAL"}
+    assert {row["code"] for row in observations} == {"000001", "000002", "000003"}
+    assert db.conn.execute("SELECT COUNT(*) AS count FROM entry_plans").fetchone()["count"] == 0
+    assert db.list_runtime_order_intents(limit=10) == []
+
+
+def test_theme_core_v3_runtime_does_not_reactivate_expired_seed_from_same_raw_row(tmp_path):
+    db = TradingDatabase(str(tmp_path / "theme-core-v3-expired-seed.db"))
+    repo = ThemeEngineRepository(db)
+    market_data = MarketDataStore()
+    _theme(repo, "ai", "AI Infra", ["000001", "000002", "000003"])
+    _seed_batch(
+        db,
+        "2026-06-18",
+        [
+            ("000001", 1, 12_000_000_000, 6.4),
+            ("000002", 2, 9_000_000_000, 5.8),
+            ("000003", 3, 4_000_000_000, 3.6),
+        ],
+    )
+    _tick(market_data, "000001", 6.4, 12_000_000_000, speed=1_500_000_000, execution=170, timestamp=datetime(2026, 6, 18, 9, 3, 30))
+    _tick(market_data, "000002", 5.8, 9_000_000_000, speed=1_100_000_000, execution=155, timestamp=datetime(2026, 6, 18, 9, 3, 30))
+    _tick(market_data, "000003", 3.6, 4_000_000_000, speed=700_000_000, execution=135, timestamp=datetime(2026, 6, 18, 9, 3, 30))
+
+    pipeline = ThemeCoreV3RuntimePipeline(
+        db=db,
+        market_data=market_data,
+        repository=repo,
+        config=ThemeCoreV3RuntimeConfig(enabled=True, interval_sec=1, signal_ttl_sec=60),
+    )
+    first = pipeline.run(datetime(2026, 6, 18, 9, 3, 30))
+    expired = pipeline.run(datetime(2026, 6, 18, 9, 4, 5))
+
+    assert first["active_seed_count"] == 6
+    assert expired["status"] == "OK"
+    assert expired["active_seed_count"] == 3
+    assert expired["expired_seed_count"] == 3
+    assert expired["active_seed_registry"]["source_counts"] == {"MANUAL": 3}
+    assert {row["source_type"] for row in db.list_active_seed_signals(trade_date="2026-06-18")} == {"MANUAL"}
 
 
 def test_theme_core_v3_runtime_requires_runtime_market_context_when_enabled(tmp_path):
@@ -280,6 +363,7 @@ def _tick(
     *,
     speed: float,
     execution: float,
+    timestamp: datetime | None = None,
 ) -> None:
     market_data.update_tick(
         StrategyTick.from_realtime(
@@ -290,7 +374,7 @@ def _tick(
             trade_value=turnover,
             execution_strength=execution,
             spread_ticks=1,
-            timestamp=datetime(2026, 6, 18, 9, 5, 0),
+            timestamp=timestamp or datetime(2026, 6, 18, 9, 5, 0),
             metadata={
                 "turnover_speed": speed,
                 "market": "KOSDAQ",

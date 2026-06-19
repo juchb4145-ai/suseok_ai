@@ -48,6 +48,23 @@ EntryEngine observe fallback only
 Dashboard V2
 ```
 
+## P0 Runtime Wiring Completion
+
+The P0 runtime wiring makes Theme Core V3 consume persisted discovery and live snapshot state instead of relying on transient in-memory rows.
+
+Completed contracts:
+
+- Gateway `command_ack`, `command_failed`, `command_timeout`, and `command_expired` events with `purpose=intraday_turnover_seed` are consumed by `IntradayDiscoveryRuntimePipeline` before the generic market-data bridge.
+- Intraday discovery batches and rows are persisted idempotently by `command_id` or by `(trade_date, session_phase, bucket)`.
+- Failed, timed-out, expired, or empty discovery responses are stored as batches but do not create seed rows.
+- `ThemeCoreV3RuntimePipeline` restores active seed, turnover-flow, and candidate-bridge source state from DB at runtime start.
+- Active seed sources include realtime theme-membership ticks, opening turnover seed, intraday discovery seed, and optional condition include booster sources.
+- Replayed raw seed rows do not extend TTL or keep historical max turnover/change values alive. The latest observation wins, and stale sources expire.
+- Turnover flow persists minute observations and detects duplicate timestamps, out-of-order timestamps, and cumulative reset events.
+- CandidateBridge include/remove state is reconciled from the restored active source state, so a restart does not re-emit the same include.
+- Reboot V2 runtime publishes dirty codes from market-regime, theme-state, theme-leader, theme-role, and strategy-context changes before the dirty evaluator runs.
+- All outputs remain observe-only: no `READY`, `EntryPlan`, `RuntimeOrderIntent`, virtual order, Gateway `send_order`, or Gateway `cancel_order` is produced by this path.
+
 ## Intraday opt10032 Discovery
 
 `trading/theme_engine/intraday_discovery.py` schedules rolling `opt10032` turnover seed requests after the opening burst window.
@@ -84,6 +101,8 @@ The request uses the same opt10032 input contract as Opening Burst:
 ## Active Seed Registry
 
 `trading/theme_engine/signal_registry.py` keeps seed sources active only while they are fresh.
+
+The registry is the source of truth for Theme Core V3 source availability. Core reads opening seed rows, intraday discovery rows, realtime theme-membership ticks, and condition include events as source deltas, merges them into the registry, then ranks themes from the active registry snapshot.
 
 Tracked fields:
 
@@ -206,6 +225,18 @@ Blocked:
 
 Remove events mean the Theme Core V3 source is no longer active. They do not assert that the whole candidate must be deleted if another source is still active.
 
+The reconciler persists active bridge source state. On restart, Core restores that state before reconciling the current role decisions. This prevents repeated include events for unchanged leader/co-leader sources while still emitting remove events when a previously active source disappears.
+
+## Dirty Publisher Wiring
+
+Dirty publishers connect observation products to `DirtyStrategyEvaluator` without invoking the legacy full-scan path:
+
+- `MarketRegimeDirtyPublisher` marks only codes for the changed market side after the initial publish.
+- `ThemeStateDirtyPublisher` separates `THEME_STATE_CHANGED`, `THEME_LEADER_CHANGED`, and `THEME_ROLE_CHANGED`.
+- `StrategyContextDirtyPublisher` marks a code only when its context id changes.
+- The dirty queue is consumed by `DirtyStrategyEvaluator` in shadow/observe mode only.
+- Dirty publishing does not authorize order intents or live orders.
+
 ## Best Theme Context
 
 `trading/theme_engine/context_resolver.py` resolves multi-theme stocks to the most actionable current theme by freshness, theme state, trade role, leadership score, theme score, persistence, and role score.
@@ -242,9 +273,11 @@ python -m pytest tests/test_theme_cohort_engine.py -q
 python -m pytest tests/test_theme_leadership_handover.py -q
 python -m pytest tests/test_theme_expansion_lease.py -q
 python -m pytest tests/test_candidate_bridge_reconciler.py -q
+python -m pytest tests/test_context_dirty_publisher.py -q
 python -m pytest tests/test_best_theme_context_resolver.py -q
 python -m pytest tests/test_theme_core_v3_runtime.py -q
 python -m pytest tests/test_runtime_factory.py -q
+python -m pytest tests/test_runtime_supervisor.py -q
 ```
 
 Safety checks:

@@ -779,6 +779,11 @@ class RuntimeSupervisor:
             handler = getattr(opening_burst_pipeline, "handle_event", None)
             if callable(handler) and handler(event):
                 return
+        intraday_discovery_pipeline = getattr(self._bundle, "intraday_discovery_pipeline", None) or getattr(self._bundle.runtime, "intraday_discovery_pipeline", None)
+        if v2_runtime and intraday_discovery_pipeline is not None:
+            handler = getattr(intraday_discovery_pipeline, "handle_event", None)
+            if callable(handler) and handler(event):
+                return
         self._bundle.market_data_bridge.handle_event(event)
         theme_bridge = getattr(self._bundle, "theme_runtime_bridge", None)
         if theme_bridge is not None:

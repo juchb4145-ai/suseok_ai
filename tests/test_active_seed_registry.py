@@ -63,3 +63,61 @@ def test_active_seed_registry_remove_source_does_not_remove_other_sources():
     assert removed is True
     assert snapshot.active_count == 1
     assert snapshot.active_signals[0].source_type == ActiveSeedSource.INTRADAY.value
+
+
+def test_active_seed_registry_keeps_latest_observation_instead_of_historical_max():
+    now = datetime(2026, 6, 19, 9, 20, 0)
+    registry = ActiveSeedRegistry(ttl_sec=600)
+
+    registry.merge(
+        {
+            "code": "000001",
+            "source_type": ActiveSeedSource.INTRADAY.value,
+            "source_id": "opt10032:09:20",
+            "observed_at": now.isoformat(),
+            "turnover_krw": 10_000_000_000,
+            "change_rate_pct": 8.0,
+            "rank": 1,
+        },
+        now=now,
+    )
+    registry.merge(
+        {
+            "code": "000001",
+            "source_type": ActiveSeedSource.INTRADAY.value,
+            "source_id": "opt10032:09:20",
+            "observed_at": (now + timedelta(minutes=1)).isoformat(),
+            "turnover_krw": 9_000_000_000,
+            "change_rate_pct": 4.0,
+            "rank": 3,
+        },
+        now=now + timedelta(minutes=1),
+    )
+
+    signal = registry.snapshot(now=now + timedelta(minutes=1)).active_signals[0]
+
+    assert signal.latest_turnover_krw == 9_000_000_000
+    assert signal.latest_change_rate_pct == 4.0
+    assert signal.seed_rank == 3
+    assert signal.rank_delta == -2
+    assert signal.seen_count == 2
+
+
+def test_active_seed_registry_does_not_extend_ttl_from_replayed_same_raw_row():
+    now = datetime(2026, 6, 19, 9, 20, 0)
+    registry = ActiveSeedRegistry(ttl_sec=60)
+    signal = {
+        "code": "000001",
+        "source_type": ActiveSeedSource.INTRADAY.value,
+        "source_id": "opt10032:09:20",
+        "observed_at": now.isoformat(),
+        "turnover_krw": 10_000_000_000,
+        "change_rate_pct": 8.0,
+        "rank": 1,
+    }
+
+    first = registry.merge(signal, now=now)
+    second = registry.merge(signal, now=now + timedelta(seconds=30))
+
+    assert second == first
+    assert registry.snapshot(now=now + timedelta(seconds=61)).active_count == 0

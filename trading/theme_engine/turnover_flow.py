@@ -62,6 +62,25 @@ class TurnoverFlowTracker:
         if not item.code:
             return None
         history = self._history.setdefault(item.code, [])
+        if history and item.observed_at == history[-1].observed_at:
+            previous = self._latest_stock_flow.get(item.code)
+            if previous is not None:
+                self._latest_stock_flow[item.code] = replace(
+                    previous,
+                    reason_codes=tuple(_dedupe([*previous.reason_codes, "TURNOVER_DUPLICATE_OBSERVATION"])),
+                )
+                return self._latest_stock_flow[item.code]
+        if history and _is_out_of_order(history[-1], item):
+            previous = self._latest_stock_flow.get(item.code)
+            if previous is not None:
+                self._latest_stock_flow[item.code] = replace(
+                    previous,
+                    reason_codes=tuple(_dedupe([*previous.reason_codes, "TURNOVER_TIMESTAMP_OUT_OF_ORDER"])),
+                    flow_freshness="STALE",
+                )
+                return self._latest_stock_flow[item.code]
+        if history and item.cumulative_turnover_krw < history[-1].cumulative_turnover_krw:
+            item = replace(item, reason_codes=tuple(_dedupe([*item.reason_codes, "TURNOVER_CUMULATIVE_RESET"])))
         history.append(item)
         del history[:-self.max_history]
         flow = self._stock_flow(item.code, history)
@@ -72,6 +91,8 @@ class TurnoverFlowTracker:
     def observe_signals(self, signals: Iterable[LiveSeedSignal], *, observed_at: str = "") -> dict[str, StockTurnoverFlow]:
         result: dict[str, StockTurnoverFlow] = {}
         for signal in signals:
+            if not _signal_flow_eligible(signal):
+                continue
             item = TurnoverObservation(
                 code=signal.code,
                 observed_at=signal.last_seen_at or signal.tick_at or signal.observed_at or observed_at,
@@ -119,7 +140,7 @@ class TurnoverFlowTracker:
                 theme_turnover_delta_1m=round(delta_1m, 4),
                 theme_turnover_delta_3m=round(sum(max(0.0, self.latest_stock_flow(signal.code).turnover_delta_3m) for cohort in cohorts if cohort.theme_id == theme_id for signal in cohort.signals if self.latest_stock_flow(signal.code)), 4),
                 theme_turnover_delta_5m=round(sum(max(0.0, self.latest_stock_flow(signal.code).turnover_delta_5m) for cohort in cohorts if cohort.theme_id == theme_id for signal in cohort.signals if self.latest_stock_flow(signal.code)), 4),
-                theme_turnover_acceleration=0.0,
+                theme_turnover_acceleration=round(sum(self.latest_stock_flow(signal.code).turnover_acceleration for cohort in cohorts if cohort.theme_id == theme_id for signal in cohort.signals if self.latest_stock_flow(signal.code)), 4),
                 theme_flow_share=round(share, 6),
                 theme_flow_share_delta=round(share - previous_share, 6),
                 theme_flow_percentile=round(percentile_by_theme.get(theme_id, 0.0), 4),
@@ -139,8 +160,9 @@ class TurnoverFlowTracker:
         speed_3m = delta_3m / 3.0
         acceleration = speed_1m - speed_3m
         reasons = list(latest.reason_codes)
-        if any("TURNOVER_RESET" in item.reason_codes for item in history[-2:]):
+        if any("TURNOVER_CUMULATIVE_RESET" in item.reason_codes or "TURNOVER_RESET" in item.reason_codes for item in history[-2:]):
             reasons.append("TURNOVER_RESET_DETECTED")
+        freshness = "STALE" if any(reason in reasons for reason in {"TURNOVER_TIMESTAMP_OUT_OF_ORDER", "TURNOVER_STALE_OBSERVATION"}) else "FRESH"
         return StockTurnoverFlow(
             code=code,
             observed_at=latest.observed_at,
@@ -151,7 +173,7 @@ class TurnoverFlowTracker:
             turnover_speed_1m=round(speed_1m, 4),
             turnover_speed_3m=round(speed_3m, 4),
             turnover_acceleration=round(acceleration, 4),
-            flow_freshness="FRESH",
+            flow_freshness=freshness,
             reason_codes=tuple(_dedupe(reasons)),
         )
 
@@ -199,6 +221,24 @@ def _delta_since(history: list[TurnoverObservation], latest: TurnoverObservation
     if delta < 0:
         return 0.0
     return delta
+
+
+def _signal_flow_eligible(signal: LiveSeedSignal) -> bool:
+    normalized = signal.normalized()
+    freshness = str(normalized.freshness_status or "").upper()
+    if not normalized.active:
+        return False
+    if freshness in {"STALE", "TR_BACKFILL_ONLY", "MISSING"}:
+        return False
+    if normalized.tr_backfill_valid and not normalized.realtime_valid:
+        return False
+    return bool(normalized.realtime_valid)
+
+
+def _is_out_of_order(previous: TurnoverObservation, current: TurnoverObservation) -> bool:
+    previous_time = _parse_time(previous.observed_at)
+    current_time = _parse_time(current.observed_at)
+    return previous_time is not None and current_time is not None and current_time < previous_time
 
 
 def _rank_percentiles(values: dict[str, float]) -> dict[str, float]:

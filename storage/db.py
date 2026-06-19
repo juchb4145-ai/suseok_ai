@@ -298,6 +298,83 @@ class TradingDatabase:
                 parser_missing_fields_json TEXT NOT NULL DEFAULT '[]',
                 raw_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS intraday_theme_discovery_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                session_phase TEXT NOT NULL DEFAULT '',
+                bucket TEXT NOT NULL DEFAULT '',
+                command_id TEXT NOT NULL DEFAULT '',
+                idempotency_key TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'OK',
+                parser_status TEXT NOT NULL DEFAULT '',
+                row_count INTEGER NOT NULL DEFAULT 0,
+                parsed_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',
+                raw_summary_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(trade_date, session_phase, bucket)
+            );
+            CREATE TABLE IF NOT EXISTS intraday_theme_discovery_rows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                batch_id INTEGER NOT NULL,
+                trade_date TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                session_phase TEXT NOT NULL DEFAULT '',
+                bucket TEXT NOT NULL DEFAULT '',
+                stock_code TEXT NOT NULL DEFAULT '',
+                stock_name TEXT NOT NULL DEFAULT '',
+                rank INTEGER NOT NULL DEFAULT 0,
+                current_turnover_krw REAL NOT NULL DEFAULT 0,
+                change_rate_pct REAL NOT NULL DEFAULT 0,
+                parser_status TEXT NOT NULL DEFAULT '',
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(batch_id, stock_code)
+            );
+            CREATE TABLE IF NOT EXISTS active_seed_signals (
+                trade_date TEXT NOT NULL,
+                code TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_id TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT '',
+                last_seen_at TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                removed_at TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                seed_rank INTEGER NOT NULL DEFAULT 0,
+                rank_delta INTEGER NOT NULL DEFAULT 0,
+                seen_count INTEGER NOT NULL DEFAULT 0,
+                latest_turnover_krw REAL NOT NULL DEFAULT 0,
+                latest_change_rate_pct REAL NOT NULL DEFAULT 0,
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, code, source_type, source_id)
+            );
+            CREATE TABLE IF NOT EXISTS turnover_flow_observations (
+                trade_date TEXT NOT NULL,
+                code TEXT NOT NULL,
+                observed_minute TEXT NOT NULL,
+                observed_at TEXT NOT NULL DEFAULT '',
+                cumulative_turnover_krw REAL NOT NULL DEFAULT 0,
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, code, observed_minute)
+            );
+            CREATE TABLE IF NOT EXISTS candidate_bridge_source_state (
+                trade_date TEXT NOT NULL,
+                code TEXT NOT NULL,
+                theme_id TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
+                trade_role TEXT NOT NULL DEFAULT '',
+                theme_state TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                included_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                removed_at TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY(trade_date, code, theme_id, source_id)
+            );
             CREATE TABLE IF NOT EXISTS opening_theme_burst_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -2489,6 +2566,23 @@ class TradingDatabase:
                 ON opening_turnover_seed_rows(batch_id, rank, stock_code);
             CREATE INDEX IF NOT EXISTS idx_opening_turnover_seed_rows_trade_date
                 ON opening_turnover_seed_rows(trade_date, stock_code);
+            CREATE INDEX IF NOT EXISTS idx_intraday_theme_discovery_batches_trade
+                ON intraday_theme_discovery_batches(trade_date, observed_at, id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_intraday_theme_discovery_batches_command
+                ON intraday_theme_discovery_batches(command_id)
+                WHERE command_id != '';
+            CREATE INDEX IF NOT EXISTS idx_intraday_theme_discovery_rows_batch
+                ON intraday_theme_discovery_rows(batch_id, rank, stock_code);
+            CREATE INDEX IF NOT EXISTS idx_intraday_theme_discovery_rows_trade
+                ON intraday_theme_discovery_rows(trade_date, stock_code, observed_at);
+            CREATE INDEX IF NOT EXISTS idx_active_seed_signals_trade_active
+                ON active_seed_signals(trade_date, active, code);
+            CREATE INDEX IF NOT EXISTS idx_active_seed_signals_expires
+                ON active_seed_signals(trade_date, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_turnover_flow_observations_lookup
+                ON turnover_flow_observations(trade_date, code, observed_minute);
+            CREATE INDEX IF NOT EXISTS idx_candidate_bridge_source_state_active
+                ON candidate_bridge_source_state(trade_date, active, code);
             CREATE INDEX IF NOT EXISTS idx_opening_theme_burst_results_trade_date
                 ON opening_theme_burst_results(trade_date, calculated_at);
             CREATE INDEX IF NOT EXISTS idx_dynamic_theme_clusters_status
@@ -9661,6 +9755,421 @@ class TradingDatabase:
         ).fetchall()
         return [self._opening_seed_row(row) for row in rows]
 
+    def save_intraday_theme_discovery_batch(self, batch: dict) -> dict:
+        trade_date = str(batch.get("trade_date") or "")
+        observed_at = str(batch.get("observed_at") or "")
+        session_phase = str(batch.get("session_phase") or "")
+        bucket = str(batch.get("bucket") or "")
+        command_id = str(batch.get("command_id") or "")
+        idempotency_key = str(batch.get("idempotency_key") or "")
+        status = str(batch.get("status") or "OK")
+        rows = list(batch.get("rows") or [])
+        raw_summary = dict(batch.get("raw_summary") or batch.get("raw") or {})
+        with self.conn:
+            existing = None
+            if command_id:
+                existing = self.conn.execute(
+                    "SELECT id FROM intraday_theme_discovery_batches WHERE command_id = ?",
+                    (command_id,),
+                ).fetchone()
+            if existing is None and trade_date and session_phase and bucket:
+                existing = self.conn.execute(
+                    """
+                    SELECT id
+                    FROM intraday_theme_discovery_batches
+                    WHERE trade_date = ? AND session_phase = ? AND bucket = ?
+                    """,
+                    (trade_date, session_phase, bucket),
+                ).fetchone()
+            if existing is None:
+                cursor = self.conn.execute(
+                    """
+                    INSERT INTO intraday_theme_discovery_batches(
+                        trade_date, observed_at, session_phase, bucket, command_id,
+                        idempotency_key, status, parser_status, row_count,
+                        parsed_count, error, raw_summary_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade_date,
+                        observed_at,
+                        session_phase,
+                        bucket,
+                        command_id,
+                        idempotency_key,
+                        status,
+                        str(batch.get("parser_status") or ""),
+                        int(batch.get("row_count") or len(rows) or 0),
+                        int(batch.get("parsed_count") or 0),
+                        str(batch.get("error") or ""),
+                        json.dumps(raw_summary, ensure_ascii=False, sort_keys=True, default=str),
+                    ),
+                )
+                batch_id = int(cursor.lastrowid)
+            else:
+                batch_id = int(existing["id"])
+                self.conn.execute(
+                    """
+                    UPDATE intraday_theme_discovery_batches
+                    SET trade_date = ?, observed_at = ?, session_phase = ?, bucket = ?,
+                        command_id = ?, idempotency_key = ?, status = ?,
+                        parser_status = ?, row_count = ?, parsed_count = ?,
+                        error = ?, raw_summary_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        trade_date,
+                        observed_at,
+                        session_phase,
+                        bucket,
+                        command_id,
+                        idempotency_key,
+                        status,
+                        str(batch.get("parser_status") or ""),
+                        int(batch.get("row_count") or len(rows) or 0),
+                        int(batch.get("parsed_count") or 0),
+                        str(batch.get("error") or ""),
+                        json.dumps(raw_summary, ensure_ascii=False, sort_keys=True, default=str),
+                        batch_id,
+                    ),
+                )
+                self.conn.execute("DELETE FROM intraday_theme_discovery_rows WHERE batch_id = ?", (batch_id,))
+            cleaned_rows = []
+            for row in rows:
+                cleaned_rows.append(
+                    (
+                        batch_id,
+                        trade_date,
+                        str(row.get("observed_at") or observed_at),
+                        str(row.get("session_phase") or session_phase),
+                        bucket,
+                        _clean_stock_code(row.get("stock_code") or row.get("code")),
+                        str(row.get("stock_name") or row.get("name") or ""),
+                        int(_float_value(row.get("rank"))),
+                        _float_value(row.get("current_turnover_krw") or row.get("turnover_krw")),
+                        _float_value(row.get("change_rate_pct")),
+                        str(row.get("parser_status") or ""),
+                        json.dumps(row.get("raw_json") or row.get("raw") or {}, ensure_ascii=False, sort_keys=True, default=str),
+                    )
+                )
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO intraday_theme_discovery_rows(
+                    batch_id, trade_date, observed_at, session_phase, bucket,
+                    stock_code, stock_name, rank, current_turnover_krw,
+                    change_rate_pct, parser_status, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                cleaned_rows,
+            )
+        return self.get_intraday_theme_discovery_batch(batch_id) or dict(batch)
+
+    def get_intraday_theme_discovery_batch(self, batch_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM intraday_theme_discovery_batches WHERE id = ?",
+            (int(batch_id),),
+        ).fetchone()
+        return self._intraday_discovery_batch_row(row) if row else None
+
+    def list_intraday_theme_discovery_batches(
+        self,
+        *,
+        trade_date: str | None = None,
+        status: str | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if status:
+            clauses.append("status = ?")
+            params.append(str(status))
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, int(limit or 20)))
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM (
+                SELECT *
+                FROM intraday_theme_discovery_batches
+                {where}
+                ORDER BY observed_at DESC, id DESC
+                LIMIT ?
+            )
+            ORDER BY observed_at ASC, id ASC
+            """,
+            params,
+        ).fetchall()
+        return [self._intraday_discovery_batch_row(row) for row in rows]
+
+    def list_intraday_theme_discovery_rows(
+        self,
+        *,
+        batch_id: int | None = None,
+        trade_date: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if batch_id is not None:
+            clauses.append("batch_id = ?")
+            params.append(int(batch_id))
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, int(limit or 1000)))
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM intraday_theme_discovery_rows
+            {where}
+            ORDER BY observed_at ASC, rank ASC, id ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [self._intraday_discovery_row(row) for row in rows]
+
+    def save_active_seed_signal(self, signal: dict, *, trade_date: str) -> dict:
+        payload = dict(signal or {})
+        code = _clean_stock_code(payload.get("code") or payload.get("stock_code"))
+        source_type = str(payload.get("source_type") or "")
+        source_id = str(payload.get("source_id") or "")
+        if not trade_date or not code or not source_type:
+            return {}
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO active_seed_signals(
+                    trade_date, code, source_type, source_id, first_seen_at,
+                    last_seen_at, active, removed_at, expires_at, seed_rank,
+                    rank_delta, seen_count, latest_turnover_krw,
+                    latest_change_rate_pct, reason_codes_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_date, code, source_type, source_id)
+                DO UPDATE SET
+                    first_seen_at = excluded.first_seen_at,
+                    last_seen_at = excluded.last_seen_at,
+                    active = excluded.active,
+                    removed_at = excluded.removed_at,
+                    expires_at = excluded.expires_at,
+                    seed_rank = excluded.seed_rank,
+                    rank_delta = excluded.rank_delta,
+                    seen_count = excluded.seen_count,
+                    latest_turnover_krw = excluded.latest_turnover_krw,
+                    latest_change_rate_pct = excluded.latest_change_rate_pct,
+                    reason_codes_json = excluded.reason_codes_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(trade_date),
+                    code,
+                    source_type,
+                    source_id,
+                    str(payload.get("first_seen_at") or ""),
+                    str(payload.get("last_seen_at") or ""),
+                    int(bool(payload.get("active", True))),
+                    str(payload.get("removed_at") or ""),
+                    str(payload.get("expires_at") or ""),
+                    int(_float_value(payload.get("seed_rank"))),
+                    int(_float_value(payload.get("rank_delta"))),
+                    int(_float_value(payload.get("seen_count"))),
+                    _float_value(payload.get("latest_turnover_krw")),
+                    _float_value(payload.get("latest_change_rate_pct")),
+                    _json_list(payload.get("reason_codes_json", payload.get("reason_codes", []))),
+                    str(payload.get("updated_at") or datetime.now().replace(microsecond=0).isoformat()),
+                ),
+            )
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM active_seed_signals
+            WHERE trade_date = ? AND code = ? AND source_type = ? AND source_id = ?
+            """,
+            (str(trade_date), code, source_type, source_id),
+        ).fetchone()
+        return self._active_seed_signal_row(row) if row else {}
+
+    def save_active_seed_signals(self, signals: Iterable[dict], *, trade_date: str) -> int:
+        count = 0
+        for signal in signals:
+            if self.save_active_seed_signal(signal, trade_date=trade_date):
+                count += 1
+        return count
+
+    def list_active_seed_signals(
+        self,
+        *,
+        trade_date: str,
+        active: bool | None = True,
+        limit: int = 1000,
+    ) -> list[dict]:
+        clauses = ["trade_date = ?"]
+        params: list[object] = [str(trade_date)]
+        if active is not None:
+            clauses.append("active = ?")
+            params.append(int(bool(active)))
+        params.append(max(1, int(limit or 1000)))
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM active_seed_signals
+            WHERE {" AND ".join(clauses)}
+            ORDER BY last_seen_at ASC, seed_rank ASC, code ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [self._active_seed_signal_row(row) for row in rows]
+
+    def save_turnover_flow_observations(self, observations: Iterable[dict], *, trade_date: str) -> int:
+        cleaned = []
+        for item in observations:
+            payload = dict(item or {})
+            code = _clean_stock_code(payload.get("code") or payload.get("stock_code"))
+            observed_at = str(payload.get("observed_at") or "")
+            observed_minute = str(payload.get("observed_minute") or observed_at[:16])
+            if not trade_date or not code or not observed_minute:
+                continue
+            cleaned.append(
+                (
+                    str(trade_date),
+                    code,
+                    observed_minute,
+                    observed_at,
+                    _float_value(payload.get("cumulative_turnover_krw") or payload.get("turnover_krw")),
+                    _json_list(payload.get("reason_codes_json", payload.get("reason_codes", []))),
+                    str(payload.get("updated_at") or datetime.now().replace(microsecond=0).isoformat()),
+                )
+            )
+        if not cleaned:
+            return 0
+        with self.conn:
+            before = self.conn.total_changes
+            self.conn.executemany(
+                """
+                INSERT INTO turnover_flow_observations(
+                    trade_date, code, observed_minute, observed_at,
+                    cumulative_turnover_krw, reason_codes_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_date, code, observed_minute)
+                DO UPDATE SET
+                    observed_at = excluded.observed_at,
+                    cumulative_turnover_krw = excluded.cumulative_turnover_krw,
+                    reason_codes_json = excluded.reason_codes_json,
+                    updated_at = excluded.updated_at
+                """,
+                cleaned,
+            )
+            return self.conn.total_changes - before
+
+    def list_turnover_flow_observations(
+        self,
+        *,
+        trade_date: str,
+        code: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        clauses = ["trade_date = ?"]
+        params: list[object] = [str(trade_date)]
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        params.append(max(1, int(limit or 1000)))
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM turnover_flow_observations
+            WHERE {" AND ".join(clauses)}
+            ORDER BY observed_minute ASC, code ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [self._turnover_flow_observation_row(row) for row in rows]
+
+    def save_candidate_bridge_source_state(self, state: dict, *, trade_date: str) -> dict:
+        payload = dict(state or {})
+        code = _clean_stock_code(payload.get("code") or payload.get("stock_code"))
+        theme_id = str(payload.get("theme_id") or "")
+        source_id = str(payload.get("source_id") or "")
+        if not trade_date or not code or not source_id:
+            return {}
+        now = str(payload.get("updated_at") or datetime.now().replace(microsecond=0).isoformat())
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO candidate_bridge_source_state(
+                    trade_date, code, theme_id, source_id, trade_role,
+                    theme_state, active, included_at, updated_at, removed_at,
+                    reason_codes_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_date, code, theme_id, source_id)
+                DO UPDATE SET
+                    trade_role = excluded.trade_role,
+                    theme_state = excluded.theme_state,
+                    active = excluded.active,
+                    included_at = CASE
+                        WHEN candidate_bridge_source_state.included_at = ''
+                        THEN excluded.included_at
+                        ELSE candidate_bridge_source_state.included_at
+                    END,
+                    updated_at = excluded.updated_at,
+                    removed_at = excluded.removed_at,
+                    reason_codes_json = excluded.reason_codes_json
+                """,
+                (
+                    str(trade_date),
+                    code,
+                    theme_id,
+                    source_id,
+                    str(payload.get("trade_role") or ""),
+                    str(payload.get("theme_state") or payload.get("leadership_status") or ""),
+                    int(bool(payload.get("active", True))),
+                    str(payload.get("included_at") or now),
+                    now,
+                    str(payload.get("removed_at") or ""),
+                    _json_list(payload.get("reason_codes_json", payload.get("reason_codes", []))),
+                ),
+            )
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM candidate_bridge_source_state
+            WHERE trade_date = ? AND code = ? AND theme_id = ? AND source_id = ?
+            """,
+            (str(trade_date), code, theme_id, source_id),
+        ).fetchone()
+        return self._candidate_bridge_source_state_row(row) if row else {}
+
+    def list_candidate_bridge_source_state(
+        self,
+        *,
+        trade_date: str,
+        active: bool | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        clauses = ["trade_date = ?"]
+        params: list[object] = [str(trade_date)]
+        if active is not None:
+            clauses.append("active = ?")
+            params.append(int(bool(active)))
+        params.append(max(1, int(limit or 1000)))
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM candidate_bridge_source_state
+            WHERE {" AND ".join(clauses)}
+            ORDER BY updated_at DESC, code ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [self._candidate_bridge_source_state_row(row) for row in rows]
+
     def save_opening_theme_burst_result(self, result: dict) -> dict:
         payload = dict(result.get("payload") or result)
         selected_symbols = list(result.get("selected_symbols") or payload.get("selected_symbols") or [])
@@ -9878,6 +10387,89 @@ class TradingDatabase:
             "parser_status": row["parser_status"],
             "parser_missing_fields": _safe_json_loads(row["parser_missing_fields_json"], []),
             "raw": _safe_json_loads(row["raw_json"], {}),
+        }
+
+    def _intraday_discovery_batch_row(self, row) -> dict:
+        return {
+            "id": int(row["id"]),
+            "created_at": row["created_at"],
+            "trade_date": row["trade_date"],
+            "observed_at": row["observed_at"],
+            "session_phase": row["session_phase"],
+            "bucket": row["bucket"],
+            "command_id": row["command_id"],
+            "idempotency_key": row["idempotency_key"],
+            "status": row["status"],
+            "parser_status": row["parser_status"],
+            "row_count": int(row["row_count"] or 0),
+            "parsed_count": int(row["parsed_count"] or 0),
+            "error": row["error"],
+            "raw_summary": _safe_json_loads(row["raw_summary_json"], {}),
+        }
+
+    def _intraday_discovery_row(self, row) -> dict:
+        return {
+            "id": int(row["id"]),
+            "created_at": row["created_at"],
+            "batch_id": int(row["batch_id"]),
+            "trade_date": row["trade_date"],
+            "observed_at": row["observed_at"],
+            "session_phase": row["session_phase"],
+            "bucket": row["bucket"],
+            "stock_code": row["stock_code"],
+            "stock_name": row["stock_name"],
+            "rank": int(row["rank"] or 0),
+            "current_turnover_krw": float(row["current_turnover_krw"] or 0.0),
+            "turnover_krw": float(row["current_turnover_krw"] or 0.0),
+            "change_rate_pct": float(row["change_rate_pct"] or 0.0),
+            "parser_status": row["parser_status"],
+            "raw": _safe_json_loads(row["raw_json"], {}),
+        }
+
+    def _active_seed_signal_row(self, row) -> dict:
+        return {
+            "trade_date": row["trade_date"],
+            "code": row["code"],
+            "source_type": row["source_type"],
+            "source_id": row["source_id"],
+            "first_seen_at": row["first_seen_at"],
+            "last_seen_at": row["last_seen_at"],
+            "active": bool(row["active"]),
+            "removed_at": row["removed_at"],
+            "expires_at": row["expires_at"],
+            "seed_rank": int(row["seed_rank"] or 0),
+            "rank_delta": int(row["rank_delta"] or 0),
+            "seen_count": int(row["seen_count"] or 0),
+            "latest_turnover_krw": float(row["latest_turnover_krw"] or 0.0),
+            "latest_change_rate_pct": float(row["latest_change_rate_pct"] or 0.0),
+            "reason_codes": _safe_json_loads(row["reason_codes_json"], []),
+            "updated_at": row["updated_at"],
+        }
+
+    def _turnover_flow_observation_row(self, row) -> dict:
+        return {
+            "trade_date": row["trade_date"],
+            "code": row["code"],
+            "observed_minute": row["observed_minute"],
+            "observed_at": row["observed_at"],
+            "cumulative_turnover_krw": float(row["cumulative_turnover_krw"] or 0.0),
+            "reason_codes": _safe_json_loads(row["reason_codes_json"], []),
+            "updated_at": row["updated_at"],
+        }
+
+    def _candidate_bridge_source_state_row(self, row) -> dict:
+        return {
+            "trade_date": row["trade_date"],
+            "code": row["code"],
+            "theme_id": row["theme_id"],
+            "source_id": row["source_id"],
+            "trade_role": row["trade_role"],
+            "theme_state": row["theme_state"],
+            "active": bool(row["active"]),
+            "included_at": row["included_at"],
+            "updated_at": row["updated_at"],
+            "removed_at": row["removed_at"],
+            "reason_codes": _safe_json_loads(row["reason_codes_json"], []),
         }
 
     def _opening_theme_burst_result_row(self, row) -> dict:

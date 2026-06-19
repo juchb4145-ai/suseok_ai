@@ -4,6 +4,7 @@ from pathlib import Path
 
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import GatewayEvent, utc_timestamp
+from trading.theme_engine.intraday_discovery import INTRADAY_TURNOVER_SEED_PURPOSE
 from trading_app.dependencies import CoreSettings
 from trading_app.runtime_factory import CoreRuntimeBundle
 from trading_app.runtime_supervisor import RuntimeSupervisor
@@ -284,6 +285,46 @@ def test_gateway_event_is_forwarded_to_runtime_bridge(tmp_path):
 
     assert queued["pending_price_tick_count"] == 1
     assert bridge.events[0].type == "price_tick"
+
+
+def test_intraday_discovery_ack_is_consumed_by_pipeline_before_market_bridge(tmp_path):
+    class Pipeline:
+        def __init__(self):
+            self.events = []
+
+        def handle_event(self, event):
+            self.events.append(event)
+            return True
+
+    runtime = _FakeRuntime()
+    bridge = _FakeBridge()
+    pipeline = Pipeline()
+
+    def builder(*args, **kwargs):
+        return CoreRuntimeBundle(
+            runtime=runtime,
+            market_data_bridge=bridge,
+            db=_FakeDb(),
+            runtime_profile="V2_OBSERVE",
+            intraday_discovery_pipeline=pipeline,
+        )
+
+    supervisor = RuntimeSupervisor(settings=_settings(tmp_path), gateway_state=GatewayStateStore(), runtime_builder=builder)
+
+    async def scenario():
+        await supervisor.start()
+        await supervisor.handle_gateway_event(
+            GatewayEvent(
+                type="command_ack",
+                payload={"purpose": INTRADAY_TURNOVER_SEED_PURPOSE, "command_id": "cmd-intraday", "rows": []},
+            )
+        )
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+    assert [event.type for event in pipeline.events] == ["command_ack"]
+    assert bridge.events == []
 
 
 def test_gateway_login_marks_realtime_subscriptions_stale(tmp_path):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable, Mapping
 
 from trading.strategy.candidates import normalize_code
@@ -16,10 +16,10 @@ from trading.theme_engine.leadership_handover import LeadershipHandoverEngine, T
 from trading.theme_engine.models import ThemeMembership
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.roles import RawStockRole, StockRoleDecision, StockRoleEngine
-from trading.theme_engine.signal_registry import ActiveSeedRegistry
+from trading.theme_engine.signal_registry import ActiveSeedRegistry, ActiveSeedSignal, ActiveSeedSource
 from trading.theme_engine.signals import LiveSeedSignal, SeedSourceType, apply_signal_freshness, merge_seed_signals
 from trading.theme_engine.state_machine import ThemeCoreState, ThemeStateMachine, ThemeStateSnapshot
-from trading.theme_engine.turnover_flow import TurnoverFlowTracker
+from trading.theme_engine.turnover_flow import TurnoverFlowTracker, TurnoverObservation
 
 
 THEME_CORE_V3_OUTPUT_MODE = "OBSERVE"
@@ -107,6 +107,9 @@ class ThemeCoreV3RuntimePipeline:
         self.last_summary: dict[str, Any] = _empty_summary(enabled=self.config.enabled, observe_only=self.config.observe_only)
         self.last_expansion_plan = None
         self.last_run_at: datetime | None = None
+        self._active_registry_restored_trade_date = ""
+        self._turnover_flow_restored_trade_date = ""
+        self._bridge_reconciler_restored_trade_date = ""
 
     def run_if_due(self, now: datetime | None = None, *, market_context: Mapping[str, Any] | None = None) -> dict[str, Any]:
         current = (now or self.clock()).replace(microsecond=0)
@@ -121,9 +124,11 @@ class ThemeCoreV3RuntimePipeline:
         current = (now or self.clock()).replace(microsecond=0)
         trade_date = current.date().isoformat()
         theme_inputs = _load_theme_inputs(self.repository)
-        seed_signals = self._seed_signals(theme_inputs, trade_date=trade_date)
+        self._restore_active_seed_registry(trade_date)
+        source_delta_signals = self._source_delta_signals(trade_date=trade_date, theme_inputs=theme_inputs)
+        active_seed_snapshot = self._update_active_seed_registry(source_delta_signals, current, trade_date=trade_date)
+        seed_signals = self._active_seed_signals(active_seed_snapshot, current)
         seed_signals = self._fresh_seed_signals(seed_signals, current)
-        active_seed_snapshot = self._update_active_seed_registry(seed_signals, current)
         market_input = _theme_core_market_input(market_context, config=self.config)
         summary = _empty_summary(enabled=self.config.enabled, observe_only=self.config.observe_only)
         summary.update(
@@ -133,6 +138,7 @@ class ThemeCoreV3RuntimePipeline:
                 "calculated_at": current.isoformat(),
                 "theme_input_count": len(theme_inputs),
                 "seed_signal_count": len(seed_signals),
+                "source_delta_signal_count": len(source_delta_signals),
                 "active_seed_count": active_seed_snapshot.active_count,
                 "expired_seed_count": active_seed_snapshot.expired_count,
                 "market_context_status": market_input["status"],
@@ -152,7 +158,9 @@ class ThemeCoreV3RuntimePipeline:
 
         self._restore_theme_state(trade_date)
         if self.config.turnover_flow_enabled:
-            self.turnover_flow_tracker.observe_signals(seed_signals, observed_at=current.isoformat())
+            self._restore_turnover_flow(trade_date)
+            stock_flows = self.turnover_flow_tracker.observe_signals(seed_signals, observed_at=current.isoformat())
+            self._persist_turnover_observations(stock_flows.values(), trade_date=trade_date)
         cohorts = self.cohort_engine.build(theme_inputs, seed_signals)
         theme_flows = self.turnover_flow_tracker.theme_flows(cohorts, observed_at=current.isoformat()) if self.config.turnover_flow_enabled else {}
         theme_states = self.state_machine.apply(cohorts)
@@ -175,14 +183,13 @@ class ThemeCoreV3RuntimePipeline:
             kosdaq_risk_state=market_input["kosdaq_risk_state"],
         )
         self.last_expansion_plan = expansion_plan
-        bridge_result = self.candidate_bridge.build_events(
-            role_decisions,
-            trade_date=trade_date,
-            detected_at=current.isoformat(),
-        )
-        bridge_saved = self._persist_bridge_events(bridge_result.events)
+        self._restore_bridge_source_state(trade_date)
         bridge_reconcile = self.bridge_reconciler.reconcile(role_decisions, trade_date=trade_date, detected_at=current.isoformat()) if self.config.bridge_reconcile_enabled else None
-        bridge_removed = self._persist_bridge_events(getattr(bridge_reconcile, "remove_events", ()) or ())
+        bridge_events = [*list(getattr(bridge_reconcile, "include_events", ()) or ()), *list(getattr(bridge_reconcile, "remove_events", ()) or ())]
+        bridge_saved = self._persist_bridge_events(bridge_events)
+        bridge_removed = len(list(getattr(bridge_reconcile, "remove_events", ()) or ()))
+        bridge_included = len(list(getattr(bridge_reconcile, "include_events", ()) or ()))
+        bridge_active_state_saved = self._persist_bridge_source_state(bridge_reconcile, trade_date=trade_date, calculated_at=current.isoformat())
         view = self.board_view.build(
             trade_date=trade_date,
             calculated_at=current.isoformat(),
@@ -205,10 +212,12 @@ class ThemeCoreV3RuntimePipeline:
         summary.update(
             {
                 "status": summary.get("status") or "OK",
-                "candidate_bridge_event_count": len(bridge_result.events),
-                "candidate_bridge_excluded_count": len(bridge_result.excluded),
+                "candidate_bridge_event_count": len(bridge_events),
+                "candidate_bridge_include_count": bridge_included,
+                "candidate_bridge_excluded_count": 0,
                 "candidate_source_event_saved_count": bridge_saved,
                 "candidate_bridge_removed_count": bridge_removed,
+                "candidate_bridge_active_state_saved_count": bridge_active_state_saved,
                 "candidate_bridge_reconcile": _bridge_reconcile_summary(bridge_reconcile),
                 "candidate_ingestion_enabled": bool(self.config.ingest_candidate_source_events),
                 "theme_expansion_subscriptions_enabled": bool(self.config.theme_expansion_subscriptions_enabled),
@@ -243,36 +252,164 @@ class ThemeCoreV3RuntimePipeline:
             for signal in signals
         ]
 
-    def _update_active_seed_registry(self, signals: Iterable[LiveSeedSignal], now: datetime):
+    def _restore_active_seed_registry(self, trade_date: str) -> None:
+        if self._active_registry_restored_trade_date == trade_date:
+            return
+        loader = getattr(self.db, "list_active_seed_signals", None)
+        if not callable(loader):
+            self._active_registry_restored_trade_date = trade_date
+            return
+        for row in list(loader(trade_date=trade_date, active=True, limit=3000) or []):
+            self.active_seed_registry.merge(
+                ActiveSeedSignal(
+                    code=str(row.get("code") or ""),
+                    source_type=str(row.get("source_type") or ""),
+                    source_id=str(row.get("source_id") or ""),
+                    first_seen_at=str(row.get("first_seen_at") or ""),
+                    last_seen_at=str(row.get("last_seen_at") or ""),
+                    removed_at=str(row.get("removed_at") or ""),
+                    active=bool(row.get("active", True)),
+                    seed_rank=_int(row.get("seed_rank")),
+                    rank_delta=_int(row.get("rank_delta")),
+                    seen_count=max(1, _int(row.get("seen_count"))),
+                    expires_at=str(row.get("expires_at") or ""),
+                    latest_turnover_krw=_float(row.get("latest_turnover_krw")),
+                    latest_change_rate_pct=_float(row.get("latest_change_rate_pct")),
+                    reason_codes=tuple(str(item) for item in list(row.get("reason_codes") or [])),
+                ),
+                now=self.clock().replace(microsecond=0),
+                ttl_sec=self.config.signal_ttl_sec,
+            )
+        self._active_registry_restored_trade_date = trade_date
+
+    def _update_active_seed_registry(self, signals: Iterable[LiveSeedSignal], now: datetime, *, trade_date: str):
         for signal in signals:
             self.active_seed_registry.merge(signal, now=now, ttl_sec=self.config.signal_ttl_sec)
-        return self.active_seed_registry.snapshot(now=now)
+        snapshot = self.active_seed_registry.snapshot(now=now)
+        self._persist_active_seed_snapshot(snapshot, trade_date=trade_date, calculated_at=now.isoformat())
+        return snapshot
 
-    def _seed_signals(
-        self,
-        theme_inputs: list[tuple[str, str, list[ThemeMembership]]],
-        *,
-        trade_date: str,
-    ) -> list[LiveSeedSignal]:
+    def _source_delta_signals(self, *, trade_date: str, theme_inputs: Iterable[tuple[str, str, list[ThemeMembership]]] = ()) -> list[LiveSeedSignal]:
         signals: list[LiveSeedSignal] = []
+        for member in _theme_members(theme_inputs).values():
+            code = normalize_code(member.stock_code)
+            tick = self.market_data.latest_tick(code)
+            if tick is not None:
+                signals.append(_signal_from_tick(tick, membership=member, ttl_sec=self.config.signal_ttl_sec))
         seed_rows = _opening_seed_rows(self.db, trade_date=trade_date)
         for row in seed_rows:
             code = normalize_code(str(row.get("stock_code") or row.get("code") or ""))
             if not code:
                 continue
-            tick = self.market_data.latest_tick(code)
-            signals.append(_signal_from_seed_row(row, tick=tick))
-        for code, membership in _theme_members(theme_inputs).items():
-            tick = self.market_data.latest_tick(code)
-            if tick is not None:
-                signals.append(_signal_from_tick(tick, membership=membership))
+            row = dict(row)
+            row["expiry_at"] = _expiry_at(str(row.get("observed_at") or ""), self.config.signal_ttl_sec)
+            signals.append(_signal_from_seed_row(row, tick=None, seed_scope=ActiveSeedSource.OPENING.value))
+        intraday_rows = _intraday_seed_rows(self.db, trade_date=trade_date)
+        for row in intraday_rows:
+            code = normalize_code(str(row.get("stock_code") or row.get("code") or ""))
+            if not code:
+                continue
+            row = dict(row)
+            row["expiry_at"] = _expiry_at(str(row.get("observed_at") or ""), self.config.signal_ttl_sec)
+            signals.append(_signal_from_seed_row(row, tick=None, seed_scope=ActiveSeedSource.INTRADAY.value))
         for event in _condition_source_events(self.db, trade_date=trade_date):
             code = normalize_code(str(event.get("code") or ""))
             if not code:
                 continue
-            tick = self.market_data.latest_tick(code)
-            signals.append(_signal_from_condition_event(event, tick=tick))
+            if _candidate_source_event_type(event) == "remove":
+                self.active_seed_registry.remove_source(
+                    code,
+                    ActiveSeedSource.CONDITION.value,
+                    _condition_source_id(event),
+                    now=self.clock().replace(microsecond=0),
+                    reason="CONDITION_SOURCE_REMOVED",
+                )
+                continue
+            signals.append(_signal_from_condition_event(event, tick=None, ttl_sec=self.config.signal_ttl_sec))
+        return signals
+
+    def _active_seed_signals(self, snapshot: Any, now: datetime) -> list[LiveSeedSignal]:
+        signals: list[LiveSeedSignal] = []
+        for active in tuple(getattr(snapshot, "active_signals", ()) or ()):
+            tick = self.market_data.latest_tick(active.code)
+            signals.append(_signal_from_active_seed(active, tick=tick, now=now))
         return merge_seed_signals(signals)
+
+    def _persist_active_seed_snapshot(self, snapshot: Any, *, trade_date: str, calculated_at: str) -> int:
+        saver = getattr(self.db, "save_active_seed_signals", None)
+        if not callable(saver):
+            return 0
+        rows = [
+            _active_seed_payload(item, calculated_at=calculated_at)
+            for item in [*list(getattr(snapshot, "active_signals", ()) or ()), *list(getattr(snapshot, "expired_signals", ()) or ())]
+        ]
+        return int(saver(rows, trade_date=trade_date) or 0)
+
+    def _restore_turnover_flow(self, trade_date: str) -> None:
+        if self._turnover_flow_restored_trade_date == trade_date:
+            return
+        loader = getattr(self.db, "list_turnover_flow_observations", None)
+        if callable(loader):
+            for row in list(loader(trade_date=trade_date, limit=5000) or []):
+                self.turnover_flow_tracker.observe(
+                    TurnoverObservation(
+                        code=str(row.get("code") or ""),
+                        observed_at=str(row.get("observed_at") or ""),
+                        cumulative_turnover_krw=_float(row.get("cumulative_turnover_krw")),
+                        reason_codes=tuple(str(item) for item in list(row.get("reason_codes") or [])),
+                    )
+                )
+        self._turnover_flow_restored_trade_date = trade_date
+
+    def _persist_turnover_observations(self, flows: Iterable[Any], *, trade_date: str) -> int:
+        saver = getattr(self.db, "save_turnover_flow_observations", None)
+        if not callable(saver):
+            return 0
+        rows = [
+            {
+                "code": flow.code,
+                "observed_at": flow.observed_at,
+                "cumulative_turnover_krw": flow.cumulative_turnover_krw,
+                "reason_codes": list(flow.reason_codes or ()),
+            }
+            for flow in flows
+        ]
+        return int(saver(rows, trade_date=trade_date) or 0)
+
+    def _persist_bridge_source_state(self, reconcile: Any, *, trade_date: str, calculated_at: str) -> int:
+        saver = getattr(self.db, "save_candidate_bridge_source_state", None)
+        if not callable(saver) or reconcile is None:
+            return 0
+        count = 0
+        for state in list(getattr(reconcile, "active_state", ()) or ()):
+            if saver({**getattr(state, "__dict__", {}), "active": True, "updated_at": calculated_at}, trade_date=trade_date):
+                count += 1
+        for event in list(getattr(reconcile, "remove_events", ()) or ()):
+            payload = event.to_dict()
+            raw = dict(payload.get("raw_payload") or {})
+            state = {
+                "code": payload.get("code"),
+                "theme_id": payload.get("theme_id"),
+                "source_id": payload.get("source_id"),
+                "trade_role": payload.get("stock_role"),
+                "theme_state": raw.get("leadership_status"),
+                "active": False,
+                "removed_at": calculated_at,
+                "updated_at": calculated_at,
+                "reason_codes": payload.get("reason_codes") or [],
+            }
+            if saver(state, trade_date=trade_date):
+                count += 1
+        return count
+
+    def _restore_bridge_source_state(self, trade_date: str) -> None:
+        if self._bridge_reconciler_restored_trade_date == trade_date:
+            return
+        loader = getattr(self.db, "list_candidate_bridge_source_state", None)
+        restore = getattr(self.bridge_reconciler, "restore", None)
+        if callable(loader) and callable(restore):
+            restore(list(loader(trade_date=trade_date, active=True, limit=3000) or []))
+        self._bridge_reconciler_restored_trade_date = trade_date
 
     def _persist_bridge_events(self, events: Iterable[Any]) -> int:
         event_list = list(events)
@@ -354,7 +491,33 @@ def _opening_seed_rows(db: Any, *, trade_date: str) -> list[dict[str, Any]]:
         batch_time = str(dict(batch or {}).get("batch_time") or "")
         for row in list(row_loader(batch_id=batch_id, limit=100) or []):
             item = dict(row or {})
+            observed_at = _seed_observed_at(trade_date, str(item.get("batch_time") or batch_time or ""))
             item.setdefault("batch_time", batch_time)
+            item.setdefault("observed_at", observed_at)
+            item.setdefault("last_seen_at", observed_at)
+            item.setdefault("expiry_at", _expiry_at(observed_at, 600))
+            item.setdefault("source_id", f"opening:{batch_id}")
+            rows.append(item)
+    return rows
+
+
+def _intraday_seed_rows(db: Any, *, trade_date: str) -> list[dict[str, Any]]:
+    batch_loader = getattr(db, "list_intraday_theme_discovery_batches", None)
+    row_loader = getattr(db, "list_intraday_theme_discovery_rows", None)
+    if not callable(batch_loader) or not callable(row_loader):
+        return []
+    rows: list[dict[str, Any]] = []
+    for batch in list(batch_loader(trade_date=trade_date, status="OK", limit=20) or []):
+        batch_id = int(dict(batch or {}).get("id") or 0)
+        observed_at = str(dict(batch or {}).get("observed_at") or "")
+        bucket = str(dict(batch or {}).get("bucket") or "")
+        for row in list(row_loader(batch_id=batch_id, limit=100) or []):
+            item = dict(row or {})
+            item.setdefault("observed_at", observed_at)
+            item.setdefault("last_seen_at", observed_at)
+            item.setdefault("batch_time", bucket)
+            item.setdefault("expiry_at", _expiry_at(observed_at, 600))
+            item.setdefault("source_id", f"intraday:{batch_id}")
             rows.append(item)
     return rows
 
@@ -370,6 +533,15 @@ def _condition_source_events(db: Any, *, trade_date: str) -> list[dict[str, Any]
     ]
 
 
+def _candidate_source_event_type(event: Mapping[str, Any]) -> str:
+    raw = dict(event.get("raw_payload") or {})
+    return str(raw.get("event_type") or event.get("event_type") or "include").lower()
+
+
+def _condition_source_id(event: Mapping[str, Any]) -> str:
+    return str(event.get("source_id") or event.get("condition_name") or "condition_search")
+
+
 def _theme_members(theme_inputs: Iterable[tuple[str, str, list[ThemeMembership]]]) -> dict[str, ThemeMembership]:
     result: dict[str, ThemeMembership] = {}
     for _theme_id, _theme_name, members in theme_inputs:
@@ -380,7 +552,7 @@ def _theme_members(theme_inputs: Iterable[tuple[str, str, list[ThemeMembership]]
     return result
 
 
-def _signal_from_seed_row(row: Mapping[str, Any], *, tick: StrategyTick | None) -> LiveSeedSignal:
+def _signal_from_seed_row(row: Mapping[str, Any], *, tick: StrategyTick | None, seed_scope: str) -> LiveSeedSignal:
     code = normalize_code(str(row.get("stock_code") or row.get("code") or ""))
     source_types = [SeedSourceType.OPT10032.value]
     if tick is not None:
@@ -392,22 +564,30 @@ def _signal_from_seed_row(row: Mapping[str, Any], *, tick: StrategyTick | None) 
         seed_rank=_int(row.get("rank") or row.get("seed_rank")),
         row=row,
         tick=tick,
+        seed_scope=seed_scope,
     )
 
 
-def _signal_from_tick(tick: StrategyTick, *, membership: ThemeMembership | None = None) -> LiveSeedSignal:
+def _signal_from_tick(tick: StrategyTick, *, membership: ThemeMembership | None = None, ttl_sec: int = 600) -> LiveSeedSignal:
     metadata = dict(tick.metadata or {})
+    observed_at = tick.timestamp.isoformat() if tick.timestamp else ""
     return _signal(
         code=tick.code,
         name=str(metadata.get("stock_name") or getattr(membership, "stock_name", "") or ""),
         source_types=[SeedSourceType.REALTIME_TICK.value],
         seed_rank=0,
-        row={},
+        row={
+            "source_id": f"realtime:{normalize_code(tick.code)}",
+            "observed_at": observed_at,
+            "last_seen_at": observed_at,
+            "expiry_at": _expiry_at(observed_at, ttl_sec),
+        },
         tick=tick,
+        seed_scope=ActiveSeedSource.MANUAL.value,
     )
 
 
-def _signal_from_condition_event(event: Mapping[str, Any], *, tick: StrategyTick | None) -> LiveSeedSignal:
+def _signal_from_condition_event(event: Mapping[str, Any], *, tick: StrategyTick | None, ttl_sec: int = 600) -> LiveSeedSignal:
     source_types = [SeedSourceType.CONDITION_INCLUDE.value]
     if tick is not None:
         source_types.append(SeedSourceType.REALTIME_TICK.value)
@@ -416,10 +596,71 @@ def _signal_from_condition_event(event: Mapping[str, Any], *, tick: StrategyTick
         name=str(event.get("name") or ""),
         source_types=source_types,
         seed_rank=_int(event.get("source_rank")),
-        row={"reason_codes": list(event.get("reason_codes") or [])},
+        row={
+            "reason_codes": list(event.get("reason_codes") or []),
+            "source_id": _condition_source_id(event),
+            "observed_at": str(event.get("detected_at") or ""),
+            "last_seen_at": str(event.get("detected_at") or ""),
+            "expiry_at": _expiry_at(str(event.get("detected_at") or ""), ttl_sec),
+        },
         tick=tick,
         condition_score=_float(event.get("source_score")),
+        seed_scope=ActiveSeedSource.CONDITION.value,
     )
+
+
+def _signal_from_active_seed(active: ActiveSeedSignal, *, tick: StrategyTick | None, now: datetime) -> LiveSeedSignal:
+    base = active.to_live_signal()
+    metadata = dict(base.metadata or {})
+    metadata["source_id"] = active.source_id
+    metadata["seed_scope"] = active.source_type
+    if tick is None:
+        return LiveSeedSignal(
+            code=base.code,
+            name=base.name,
+            source_types=base.source_types,
+            seed_rank=base.seed_rank,
+            change_rate_pct=base.change_rate_pct,
+            turnover_krw=base.turnover_krw,
+            realtime_valid=False,
+            tr_backfill_valid=True,
+            observed_at=base.observed_at,
+            last_seen_at=base.last_seen_at,
+            active=active.active,
+            expiry_at=active.expires_at,
+            metadata=metadata,
+            reason_codes=tuple(base.reason_codes),
+        ).normalized()
+    tick_metadata = dict(tick.metadata or {})
+    metadata.update(tick_metadata)
+    upper_gap = _float(tick_metadata.get("upper_limit_gap_pct"), default=100.0)
+    source_types = tuple(dict.fromkeys([*base.source_types, SeedSourceType.REALTIME_TICK.value]))
+    return LiveSeedSignal(
+        code=base.code,
+        name=base.name or str(tick_metadata.get("stock_name") or tick_metadata.get("name") or ""),
+        source_types=source_types,
+        seed_rank=base.seed_rank,
+        change_rate_pct=_float(getattr(tick, "change_rate", 0.0)),
+        turnover_krw=_float(getattr(tick, "trade_value", 0.0)) or base.turnover_krw,
+        turnover_speed=_float(tick_metadata.get("turnover_speed") or tick_metadata.get("turnover_krw_per_min")),
+        execution_strength=_float(getattr(tick, "execution_strength", 0.0)),
+        realtime_valid=bool(getattr(tick, "price", 0) > 0 and tick_metadata.get("price_source") != "TR_BACKFILL"),
+        tr_backfill_valid=bool(tick_metadata.get("price_source") == "TR_BACKFILL"),
+        observed_at=base.observed_at,
+        last_seen_at=base.last_seen_at,
+        tick_at=tick.timestamp.isoformat() if tick.timestamp else now.isoformat(),
+        active=active.active,
+        expiry_at=active.expires_at,
+        market=str(tick_metadata.get("market") or ""),
+        momentum_1m=_float(tick_metadata.get("momentum_1m")),
+        momentum_3m=_float(tick_metadata.get("momentum_3m")),
+        momentum_5m=_float(tick_metadata.get("momentum_5m")),
+        vi_active=_bool(tick_metadata.get("vi_active")),
+        upper_limit_near=_bool(tick_metadata.get("upper_limit_near")) or upper_gap <= 3.0,
+        overheated=_bool(tick_metadata.get("overheated")),
+        reason_codes=tuple(base.reason_codes),
+        metadata=metadata,
+    ).normalized()
 
 
 def _signal(
@@ -431,12 +672,20 @@ def _signal(
     row: Mapping[str, Any],
     tick: StrategyTick | None,
     condition_score: float = 0.0,
+    seed_scope: str = "",
 ) -> LiveSeedSignal:
     metadata = dict(getattr(tick, "metadata", {}) or {}) if tick is not None else {}
     upper_gap = _float(metadata.get("upper_limit_gap_pct"), default=100.0)
     reason_codes = list(row.get("reason_codes") or [])
     if condition_score > 0:
         reason_codes.append("CONDITION_INCLUDE_BOOSTER_ONLY")
+    observed_at = str(row.get("observed_at") or row.get("batch_time") or row.get("detected_at") or "")
+    metadata.update(
+        {
+            "seed_scope": seed_scope,
+            "source_id": str(row.get("source_id") or row.get("batch_id") or seed_scope or ""),
+        }
+    )
     return LiveSeedSignal(
         code=code,
         name=name or str(metadata.get("stock_name") or metadata.get("name") or ""),
@@ -449,9 +698,10 @@ def _signal(
         realtime_valid=bool(tick is not None and getattr(tick, "price", 0) > 0 and metadata.get("price_source") != "TR_BACKFILL"),
         tr_backfill_valid=bool(tick is None or metadata.get("price_source") == "TR_BACKFILL"),
         reason_codes=tuple(reason_codes),
-        observed_at=str(row.get("observed_at") or row.get("batch_time") or row.get("detected_at") or ""),
-        last_seen_at=str(row.get("last_seen_at") or row.get("observed_at") or row.get("batch_time") or row.get("detected_at") or ""),
+        observed_at=observed_at,
+        last_seen_at=str(row.get("last_seen_at") or observed_at),
         tick_at=tick.timestamp.isoformat() if tick is not None and tick.timestamp else "",
+        expiry_at=str(row.get("expiry_at") or _expiry_at(observed_at, 600)),
         market=str(metadata.get("market") or ""),
         momentum_1m=_float(metadata.get("momentum_1m")),
         momentum_3m=_float(metadata.get("momentum_3m")),
@@ -622,6 +872,50 @@ def _market_phase(status: str) -> str:
     if value in {"WEAK", "RISK_OFF"}:
         return "RISK_OFF"
     return "DATA_WAIT"
+
+
+def _seed_observed_at(trade_date: str, timestamp: str) -> str:
+    value = str(timestamp or "")
+    if "T" in value:
+        return value
+    if trade_date and len(value) >= 5:
+        return f"{trade_date}T{value[:5]}:00"
+    return value
+
+
+def _expiry_at(observed_at: str, ttl_sec: int) -> str:
+    parsed = _parse_time(observed_at)
+    if parsed is None:
+        return ""
+    return (parsed + timedelta(seconds=max(1, int(ttl_sec or 600)))).replace(microsecond=0).isoformat()
+
+
+def _parse_time(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=None)
+
+
+def _active_seed_payload(item: ActiveSeedSignal, *, calculated_at: str) -> dict[str, Any]:
+    return {
+        "code": item.code,
+        "source_type": item.source_type,
+        "source_id": item.source_id,
+        "first_seen_at": item.first_seen_at,
+        "last_seen_at": item.last_seen_at,
+        "active": item.active,
+        "removed_at": item.removed_at,
+        "expires_at": item.expires_at,
+        "seed_rank": item.seed_rank,
+        "rank_delta": item.rank_delta,
+        "seen_count": item.seen_count,
+        "latest_turnover_krw": item.latest_turnover_krw,
+        "latest_change_rate_pct": item.latest_change_rate_pct,
+        "reason_codes": list(item.reason_codes or ()),
+        "updated_at": calculated_at,
+    }
 
 
 def _theme_state_payload(state: ThemeStateSnapshot, *, trade_date: str, calculated_at: str) -> dict[str, Any]:

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Iterable
 
-from trading.strategy.candidates import normalize_code
+from trading.theme_engine.normalizer import normalize_stock_code as normalize_code
 from trading.theme_engine.signals import LiveSeedSignal, SeedSourceType, merge_seed_signals
 
 
@@ -48,6 +48,7 @@ class ActiveSeedSignal:
             active=self.active,
             expiry_at=self.expires_at,
             reason_codes=self.reason_codes,
+            metadata={"source_id": self.source_id, "source_type": self.source_type},
         ).normalized()
 
 
@@ -138,7 +139,8 @@ def _active_seed(value: ActiveSeedSignal | LiveSeedSignal | dict[str, Any], *, n
     if isinstance(value, LiveSeedSignal):
         signal = value.normalized()
         source_type = _active_source_from_signal(signal)
-        source_id = ":".join(signal.source_types) or source_type
+        metadata = dict(signal.metadata or {})
+        source_id = str(metadata.get("source_id") or ":".join(signal.source_types) or source_type)
         return ActiveSeedSignal(
             code=signal.code,
             source_type=source_type,
@@ -169,13 +171,17 @@ def _active_seed(value: ActiveSeedSignal | LiveSeedSignal | dict[str, Any], *, n
 
 
 def _merge_active(previous: ActiveSeedSignal, current: ActiveSeedSignal) -> ActiveSeedSignal:
+    if not previous.active and current.last_seen_at <= previous.last_seen_at:
+        return previous
+    if current.last_seen_at <= previous.last_seen_at and current.latest_turnover_krw == previous.latest_turnover_krw:
+        return previous
     return replace(
         current,
         first_seen_at=previous.first_seen_at or current.first_seen_at,
         seen_count=previous.seen_count + 1,
         rank_delta=_positive_rank(previous.seed_rank) - _positive_rank(current.seed_rank),
-        latest_turnover_krw=max(previous.latest_turnover_krw, current.latest_turnover_krw),
-        latest_change_rate_pct=max(previous.latest_change_rate_pct, current.latest_change_rate_pct),
+        latest_turnover_krw=current.latest_turnover_krw,
+        latest_change_rate_pct=current.latest_change_rate_pct,
         condition_active=previous.condition_active or current.condition_active,
         reason_codes=tuple(_dedupe([*previous.reason_codes, *current.reason_codes])),
     )
@@ -183,8 +189,13 @@ def _merge_active(previous: ActiveSeedSignal, current: ActiveSeedSignal) -> Acti
 
 def _active_source_from_signal(signal: LiveSeedSignal) -> str:
     sources = set(signal.source_types)
+    scope = str(dict(signal.metadata or {}).get("seed_scope") or "").upper()
     if SeedSourceType.CONDITION_INCLUDE.value in sources:
         return ActiveSeedSource.CONDITION.value
+    if scope == ActiveSeedSource.OPENING.value:
+        return ActiveSeedSource.OPENING.value
+    if scope == ActiveSeedSource.INTRADAY.value:
+        return ActiveSeedSource.INTRADAY.value
     if SeedSourceType.OPT10032.value in sources:
         return ActiveSeedSource.INTRADAY.value
     if SeedSourceType.HOLDING.value in sources:

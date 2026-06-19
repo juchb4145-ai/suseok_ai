@@ -95,6 +95,7 @@ def test_build_core_runtime_routes_to_reboot_v2_observe_only(tmp_path, monkeypat
     assert bundle.candidate_ingestion_service is not None
     assert bundle.candidate_hydrator is not None
     assert isinstance(bundle.intraday_discovery_pipeline, IntradayDiscoveryRuntimePipeline)
+    assert bundle.intraday_discovery_pipeline.db is db
     assert bundle.intraday_discovery_pipeline.config.observe_only is True
     assert bundle.theme_board_pipeline is not None
     assert isinstance(bundle.theme_board_pipeline, ThemeCoreV3RuntimePipeline)
@@ -136,6 +137,7 @@ def test_build_core_runtime_accepts_theme_core_v3_profile_alias(tmp_path, monkey
     assert bundle.runtime_profile == "THEME_CORE_V3"
     assert isinstance(bundle.runtime, RebootV2Runtime)
     assert isinstance(bundle.intraday_discovery_pipeline, IntradayDiscoveryRuntimePipeline)
+    assert bundle.intraday_discovery_pipeline.db is db
     assert isinstance(bundle.theme_board_pipeline, ThemeCoreV3RuntimePipeline)
     assert bundle.theme_board_pipeline.config.enabled is True
     assert bundle.theme_board_pipeline.config.ingest_candidate_source_events is True

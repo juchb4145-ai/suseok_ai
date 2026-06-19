@@ -176,17 +176,12 @@ def merge_seed_signals(signals: Iterable[LiveSeedSignal]) -> list[LiveSeedSignal
 def _merge(previous: LiveSeedSignal | None, current: LiveSeedSignal) -> LiveSeedSignal:
     if previous is None:
         return current
-    best = current if current.turnover_krw >= previous.turnover_krw else previous
+    best = _best_payload_signal(previous, current)
     return replace(
         best,
         source_types=tuple(_dedupe([*previous.source_types, *current.source_types])),
         seed_rank=min(_positive_rank(previous.seed_rank), _positive_rank(current.seed_rank)),
-        change_rate_pct=max(previous.change_rate_pct, current.change_rate_pct),
-        turnover_krw=max(previous.turnover_krw, current.turnover_krw),
-        turnover_speed=max(previous.turnover_speed, current.turnover_speed),
-        execution_strength=max(previous.execution_strength, current.execution_strength),
-        realtime_valid=previous.realtime_valid or current.realtime_valid,
-        tr_backfill_valid=previous.tr_backfill_valid or current.tr_backfill_valid,
+        source_confirmation_count=len(_dedupe([*previous.source_types, *current.source_types])),
         reason_codes=tuple(_dedupe([*previous.reason_codes, *current.reason_codes])),
     )
 
@@ -210,6 +205,35 @@ def _parse_time(value: str) -> datetime | None:
 
 def _positive_rank(value: int) -> int:
     return int(value) if int(value or 0) > 0 else 9999
+
+
+def _signal_time(signal: LiveSeedSignal) -> str:
+    return str(signal.tick_at or signal.last_seen_at or signal.observed_at or "")
+
+
+def _best_payload_signal(previous: LiveSeedSignal, current: LiveSeedSignal) -> LiveSeedSignal:
+    previous_priority = _payload_priority(previous)
+    current_priority = _payload_priority(current)
+    if current_priority > previous_priority:
+        return current
+    if previous_priority > current_priority:
+        return previous
+    previous_time = _signal_time(previous)
+    current_time = _signal_time(current)
+    if current_time and (not previous_time or current_time > previous_time):
+        return current
+    return previous
+
+
+def _payload_priority(signal: LiveSeedSignal) -> int:
+    sources = set(signal.source_types)
+    if signal.realtime_valid or SeedSourceType.REALTIME_TICK.value in sources:
+        return 4
+    if SeedSourceType.OPT10032.value in sources or SeedSourceType.HYDRATION.value in sources:
+        return 3
+    if SeedSourceType.HOLDING.value in sources or SeedSourceType.PENDING_ORDER.value in sources:
+        return 2
+    return 1
 
 
 def _dedupe(values: Iterable[Any]) -> list[str]:

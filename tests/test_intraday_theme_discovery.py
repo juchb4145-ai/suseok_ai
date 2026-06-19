@@ -1,10 +1,13 @@
 from datetime import datetime
 
+from storage.db import TradingDatabase
+from trading.broker.models import GatewayEvent
 from trading.broker.gateway_state import GatewayStateStore
 from trading.theme_engine.intraday_discovery import (
     INTRADAY_TURNOVER_SEED_PURPOSE,
     IntradayDiscoveryConfig,
     IntradayDiscoveryScheduler,
+    IntradayDiscoveryRuntimePipeline,
 )
 
 
@@ -71,3 +74,81 @@ def test_intraday_discovery_respects_observe_only_mode():
 
     assert summary["status"] == "SKIPPED"
     assert summary["paused_reason"] == "NOT_OBSERVE_MODE"
+
+
+def test_intraday_discovery_ack_saves_idempotent_batch_rows(tmp_path):
+    db = TradingDatabase(str(tmp_path / "intraday-ack.db"))
+    command_id = "cmd-intraday-1"
+    pipeline = IntradayDiscoveryRuntimePipeline(
+        gateway_state=GatewayStateStore(),
+        db=db,
+        config=IntradayDiscoveryConfig(enabled=True, trading_mode="OBSERVE"),
+    )
+    event = GatewayEvent(
+        type="command_ack",
+        command_id=command_id,
+        timestamp="2026-06-19T09:21:05",
+        payload={
+            "purpose": INTRADAY_TURNOVER_SEED_PURPOSE,
+            "command_id": command_id,
+            "trade_date": "2026-06-19",
+            "session_phase": "MORNING",
+            "bucket": "09:20",
+            "observed_at": "2026-06-19T09:21:00",
+            "raw": {
+                "tr_rows": [
+                    {"종목코드": "A000001", "종목명": "One", "현재순위": "1", "거래대금": "12000000000", "등락률": "+6.4"},
+                    {"종목코드": "000002", "종목명": "Two", "현재순위": "2", "거래대금": "9000000000", "등락률": "+5.5"},
+                ]
+            },
+        },
+    )
+
+    assert pipeline.handle_event(event) is True
+    assert pipeline.handle_event(event) is True
+
+    batches = db.list_intraday_theme_discovery_batches(trade_date="2026-06-19")
+    rows = db.list_intraday_theme_discovery_rows(trade_date="2026-06-19")
+
+    assert len(batches) == 1
+    assert batches[0]["command_id"] == command_id
+    assert batches[0]["status"] == "OK"
+    assert len(rows) == 2
+    assert rows[0]["stock_code"] == "000001"
+    assert rows[0]["current_turnover_krw"] == 12_000_000_000
+    assert pipeline.last_summary["ready_allowed"] is False
+    assert pipeline.last_summary["order_intent_allowed"] is False
+
+
+def test_intraday_discovery_failed_ack_saves_batch_without_seed_rows(tmp_path):
+    db = TradingDatabase(str(tmp_path / "intraday-failed.db"))
+    pipeline = IntradayDiscoveryRuntimePipeline(
+        gateway_state=GatewayStateStore(),
+        db=db,
+        config=IntradayDiscoveryConfig(enabled=True, trading_mode="OBSERVE"),
+    )
+
+    handled = pipeline.handle_event(
+        GatewayEvent(
+            type="command_failed",
+            command_id="cmd-failed",
+            timestamp="2026-06-19T13:21:05",
+            payload={
+                "purpose": INTRADAY_TURNOVER_SEED_PURPOSE,
+                "command_id": "cmd-failed",
+                "trade_date": "2026-06-19",
+                "session_phase": "AFTERNOON",
+                "bucket": "13:20",
+                "error": "timeout",
+                "rows": [{"종목코드": "000001"}],
+            },
+        )
+    )
+
+    batches = db.list_intraday_theme_discovery_batches(trade_date="2026-06-19", status="FAILED")
+    rows = db.list_intraday_theme_discovery_rows(trade_date="2026-06-19")
+
+    assert handled is True
+    assert len(batches) == 1
+    assert batches[0]["parsed_count"] == 0
+    assert rows == []
