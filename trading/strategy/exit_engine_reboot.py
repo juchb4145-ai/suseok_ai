@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.position_risk import (
+    PositionMarketAction,
     PositionRiskStatus,
     PositionRuntimeService,
     PositionRuntimeSnapshot,
@@ -229,15 +230,15 @@ class ExitEngine:
             return self._make_decision(position, now, ExitDecisionStatus.EXIT_NOW, ExitReason.STOP_LOSS_FAST, ("FAST_STOP_LOSS",))
         if position.current_return_pct <= self.config.stop_loss_pct:
             return self._make_decision(position, now, ExitDecisionStatus.EXIT_NOW, ExitReason.STOP_LOSS, ("STOP_LOSS",))
-        market = self._market_decision(position, now)
-        if market is not None:
-            return market
         support = self._support_loss(position, now)
         if support is not None:
             return support
         vwap = self._vwap_loss(position, now)
         if vwap is not None:
             return vwap
+        market = self._market_decision(position, now)
+        if market is not None:
+            return market
         trailing = self._trailing_stop(position, now)
         if trailing is not None:
             return trailing
@@ -284,18 +285,71 @@ class ExitEngine:
         return None
 
     def _market_decision(self, position: PositionRuntimeSnapshot, now: datetime) -> ExitDecision | None:
+        risk = self._latest_position_risk(position)
+        details = dict(risk.get("details") or {}) if risk else {}
+        action = str(risk.get("position_market_action") or details.get("position_market_action") or "").upper()
+        if not action:
+            return None
+        if action == PositionMarketAction.HOLD.value:
+            return None
         context = self._context(position)
-        status = str(context.get("market_status") or context.get("market_regime_status") or "").upper()
-        action = str(context.get("market_action") or "").upper()
         breadth = str(context.get("breadth_status") or "").upper()
-        if status == "RISK_OFF":
-            return self._make_decision(position, now, ExitDecisionStatus.EXIT_NOW, ExitReason.MARKET_RISK_OFF_EXIT, ("MARKET_RISK_OFF_EXIT",))
         if breadth in {"COLLAPSE", "BREADTH_COLLAPSE"} or bool(context.get("breadth_collapse")):
             return self._make_decision(position, now, ExitDecisionStatus.EXIT_NOW, ExitReason.BREADTH_COLLAPSE_EXIT, ("BREADTH_COLLAPSE_EXIT",))
-        if status == "WEAK" or action == "BLOCK_NEW_ENTRY":
+        reason_codes = tuple(details.get("position_action_reason_codes") or risk.get("position_action_reason_codes") or (action,))
+        if action == PositionMarketAction.DATA_WAIT.value:
+            return self._make_decision(
+                position,
+                now,
+                ExitDecisionStatus.DATA_WAIT,
+                ExitReason.STALE_DATA_EXIT_GUARD,
+                tuple(_dedupe([*reason_codes, "SELL_INTENT_BLOCKED_BY_DATA_GUARD"])),
+                quantity=0,
+                details={"position_market_action": action, "position_risk": risk},
+            )
+        if action == PositionMarketAction.TIGHTEN_STOP.value:
+            return self._make_decision(
+                position,
+                now,
+                ExitDecisionStatus.WAIT_CONFIRMATION,
+                ExitReason.MARKET_WEAK_EXIT,
+                reason_codes,
+                quantity=0,
+                details={"position_market_action": action, "position_risk": risk},
+            )
+        if action == PositionMarketAction.EXIT_IF_LOSER.value:
             if position.current_return_pct < 0:
-                return self._make_decision(position, now, ExitDecisionStatus.EXIT_NOW, ExitReason.MARKET_WEAK_EXIT, ("MARKET_WEAK_EXIT",))
-            return self._make_decision(position, now, ExitDecisionStatus.WAIT_CONFIRMATION, ExitReason.MARKET_WEAK_EXIT, ("MARKET_WEAK_CONFIRMATION",), quantity=0)
+                return self._make_decision(
+                    position,
+                    now,
+                    ExitDecisionStatus.WAIT_CONFIRMATION,
+                    ExitReason.MARKET_WEAK_EXIT,
+                    reason_codes,
+                    quantity=0,
+                    details={"position_market_action": action, "position_risk": risk},
+                )
+            return None
+        if action == PositionMarketAction.SCALE_OUT.value:
+            ratio = max(0.0, min(1.0, _float(details.get("recommended_exit_ratio") or risk.get("recommended_exit_ratio") or 0.5)))
+            quantity = max(1, int(round(int(position.remaining_quantity or 0) * ratio)))
+            return self._make_decision(
+                position,
+                now,
+                ExitDecisionStatus.SCALE_OUT,
+                ExitReason.MARKET_WEAK_EXIT,
+                reason_codes,
+                quantity=quantity,
+                details={"position_market_action": action, "position_risk": risk, "recommended_exit_ratio": ratio},
+            )
+        if action == PositionMarketAction.EXIT_NOW.value:
+            return self._make_decision(
+                position,
+                now,
+                ExitDecisionStatus.EXIT_NOW,
+                ExitReason.MARKET_RISK_OFF_EXIT,
+                reason_codes,
+                details={"position_market_action": action, "position_risk": risk},
+            )
         return None
 
     def _support_loss(self, position: PositionRuntimeSnapshot, now: datetime) -> ExitDecision | None:
@@ -486,6 +540,25 @@ class ExitEngine:
         if not callable(loader):
             return []
         return list(loader(trade_date=trade_date) or [])
+
+    def _latest_position_risk(self, position: PositionRuntimeSnapshot) -> dict[str, Any]:
+        details = dict(position.details or {})
+        if details.get("position_market_action"):
+            return {
+                "position_id": position.position_id,
+                "position_market_action": details.get("position_market_action"),
+                "recommended_exit_ratio": details.get("recommended_exit_ratio", 0.0),
+                "position_action_reason_codes": details.get("position_action_reason_codes", []),
+                "details": details,
+            }
+        loader = getattr(self.db, "latest_position_risk_snapshots", None)
+        if not callable(loader):
+            return {}
+        for row in list(loader(trade_date=position.trade_date) or []):
+            item = dict(row or {})
+            if str(item.get("position_id") or "") == str(position.position_id):
+                return item
+        return {}
 
     def _context(self, position: PositionRuntimeSnapshot) -> dict[str, Any]:
         details = dict(position.details or {})

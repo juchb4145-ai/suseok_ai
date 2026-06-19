@@ -509,6 +509,14 @@ function formatBp(value, digits = 1) {
   return formatted === "-" ? "-" : `${formatted}bp`;
 }
 
+function formatCurrencyShort(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number) || number <= 0) return "0";
+  if (number >= 100000000) return `${(number / 100000000).toFixed(1)}억`;
+  if (number >= 10000) return `${Math.round(number / 10000)}만`;
+  return String(Math.round(number));
+}
+
 function formatMs(value) {
   if (value == null || value === "") return "-";
   const number = Number(value);
@@ -1153,6 +1161,7 @@ function renderDashboardV2(snapshot) {
   text("dashboard-v2-exit-now", positionRisk.exit_now_count || 0);
   text("dashboard-v2-scale-out", positionRisk.scale_out_count || 0);
   text("dashboard-v2-risk-message", positionRisk.kill_switch_recommended ? "킬스위치 권고: 신규 매수 차단 확인" : positionRisk.stop_new_entry_recommended ? "신규진입 중지 권고" : "보유 리스크 관찰");
+  renderDashboardV2MarketSideBudgets(positionRisk.market_side_budgets || {});
 
   text("dashboard-v2-theme-count", themes.top5_count || (themes.items || []).length || 0);
   renderDashboardV2Themes(themes.items || []);
@@ -1285,11 +1294,32 @@ function renderDashboardV2PositionRows(rows) {
     <tr>
       <td>${textCell(`${item.code || "-"} ${item.name || ""}`.trim())}</td>
       <td>${textCell(formatPercentValue(item.current_return_pct))}</td>
-      <td>${badge(item.exit_status || "HOLD")}</td>
+      <td>${badge(item.exit_status || item.position_market_action || "HOLD")}</td>
       <td>${textCell(`${item.holding_minutes || 0}분`)}</td>
-      <td>${textCell(item.risk_message_ko || "-")}</td>
+      <td>${textCell(`${item.market_side || "-"} ${item.market_status || "-"} / ${item.position_market_action || "-"} / ${item.actual_order_status || "OBSERVE_ONLY"}`)}</td>
     </tr>
   `).join("");
+}
+
+function renderDashboardV2MarketSideBudgets(budgets) {
+  const node = document.getElementById("dashboard-v2-market-side-budgets");
+  if (!node) return;
+  const sides = ["KOSPI", "KOSDAQ"];
+  node.innerHTML = sides.map((side) => {
+    const item = budgets[side] || {};
+    const reserved = Number(item.reserved_exposure_krw || 0);
+    const limit = Number(item.effective_exposure_limit_krw || 0);
+    const slots = item.available_position_slots ?? "-";
+    return `
+      <div class="dashboard-v2-budget-row">
+        <strong>${side}</strong>
+        ${badge(item.budget_action || "DATA_WAIT")}
+        <span>${escapeHtml(item.side_market_regime || "-")}</span>
+        <span>${formatCurrencyShort(reserved)} / ${limit ? formatCurrencyShort(limit) : "-"}</span>
+        <span>slots ${escapeHtml(slots)}</span>
+      </div>
+    `;
+  }).join("");
 }
 
 function statusTone(value) {

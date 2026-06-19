@@ -123,8 +123,8 @@ class RebootV2Runtime:
             self._run_pipeline(snapshot, "entry_engine", self.entry_engine_pipeline, current)
         self._run_pipeline(snapshot, "market_relative_strength_shadow", self.market_relative_strength_shadow_pipeline, current)
         if self._has_open_positions():
-            self._run_pipeline(snapshot, "exit_engine_reboot", self.exit_engine_reboot_pipeline, current)
             self._run_pipeline(snapshot, "position_risk", self.position_risk_pipeline, current)
+            self._run_pipeline(snapshot, "exit_engine_reboot", self.exit_engine_reboot_pipeline, current)
         else:
             snapshot["exit_engine_reboot"] = _disabled_section("NO_OPEN_POSITIONS")
             snapshot["position_risk"] = _disabled_section("NO_OPEN_POSITIONS")

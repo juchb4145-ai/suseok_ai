@@ -4,7 +4,9 @@ from storage.db import TradingDatabase
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.position_risk import (
+    MarketSideBudgetAction,
     PortfolioRiskSnapshot,
+    PositionMarketAction,
     PositionRiskConfig,
     PositionRiskManager,
     PositionRiskRuntimePipeline,
@@ -117,6 +119,100 @@ def test_portfolio_snapshot_round_trips(tmp_path):
     assert db.latest_portfolio_risk_snapshot(trade_date=TRADE_DATE)["risk_level"] == "NORMAL"
 
 
+def test_market_side_portfolio_budget_split_market_and_pending_buy_reservation(tmp_path):
+    db = TradingDatabase(str(tmp_path / "test.db"))
+    _market_regime(db, kospi="EXPANSION", kosdaq="RISK_OFF", composite="SPLIT_KOSPI_ON")
+    db.save_managed_order_intent(
+        {
+            "trade_date": TRADE_DATE,
+            "source": "TEST_ONLY",
+            "side": "BUY",
+            "code": "300001",
+            "quantity": 2,
+            "price": 1000,
+            "status": "RISK_APPROVED",
+            "idempotency_key": "pending:kospi",
+            "details": {"market_side": "KOSPI"},
+        }
+    )
+    config = PositionRiskConfig(
+        market_side_portfolio_enabled=True,
+        portfolio_gross_exposure_limit_krw=100_000,
+        kospi_max_open_positions=5,
+        kosdaq_max_open_positions=5,
+    )
+    positions = [
+        _position("virtual:1", "300001", market_side="KOSPI", current_price=1000, remaining_quantity=10),
+        _position("virtual:2", "300002", market_side="KOSDAQ", current_price=1000, remaining_quantity=10),
+    ]
+
+    result = PositionRiskManager(db, config=config).build(trade_date=TRADE_DATE, now=NOW, positions=positions)
+
+    budgets = result.portfolio_risk.market_side_budgets
+    assert budgets["KOSPI"]["budget_action"] == MarketSideBudgetAction.REDUCED_BUDGET.value
+    assert budgets["KOSPI"]["pending_buy_exposure_krw"] == 2000
+    assert "PENDING_BUY_EXPOSURE_RESERVED" in budgets["KOSPI"]["reason_codes"]
+    assert budgets["KOSDAQ"]["budget_action"] == MarketSideBudgetAction.STOP_NEW_ENTRY.value
+    assert result.portfolio_risk.gross_reserved_exposure_krw == 22_000
+
+
+def test_position_market_action_ignores_counterpart_risk_for_healthy_side(tmp_path):
+    db = TradingDatabase(str(tmp_path / "test.db"))
+    position = _position(
+        "virtual:1",
+        "300003",
+        market_side="KOSPI",
+        market_side_resolution_status="RESOLVED",
+        side_market_regime="EXPANSION",
+        counterpart_market_regime="RISK_OFF",
+        composite_market_mode="SPLIT_KOSPI_ON",
+        market_context_calculated_at=NOW.isoformat(),
+        market_context_fresh=True,
+    )
+
+    risk = PositionRiskManager(db).build(trade_date=TRADE_DATE, now=NOW, positions=[position]).position_risks[0]
+
+    assert risk.position_market_action == PositionMarketAction.HOLD.value
+    assert "COUNTERPART_MARKET_RISK_IGNORED" in risk.position_action_reason_codes
+
+
+def test_position_market_action_weak_loser_with_structure_break_exits_now(tmp_path):
+    db = TradingDatabase(str(tmp_path / "test.db"))
+    position = _position(
+        "virtual:1",
+        "300004",
+        market_side="KOSDAQ",
+        market_side_resolution_status="RESOLVED",
+        side_market_regime="WEAK",
+        market_context_calculated_at=NOW.isoformat(),
+        market_context_fresh=True,
+        current_return_pct=-1.0,
+        details={"support_broken": True, "market_side": "KOSDAQ"},
+    )
+
+    risk = PositionRiskManager(db).build(trade_date=TRADE_DATE, now=NOW, positions=[position]).position_risks[0]
+
+    assert risk.position_market_action == PositionMarketAction.EXIT_NOW.value
+    assert "POSITION_MARKET_EXIT_NOW" in risk.position_action_reason_codes
+
+
+def test_unknown_or_stale_position_market_context_is_data_wait(tmp_path):
+    db = TradingDatabase(str(tmp_path / "test.db"))
+    position = _position(
+        "virtual:1",
+        "300005",
+        market_side="UNKNOWN",
+        market_side_resolution_status="UNRESOLVED",
+        side_market_regime="EXPANSION",
+        market_context_fresh=False,
+    )
+
+    risk = PositionRiskManager(db).build(trade_date=TRADE_DATE, now=NOW, positions=[position]).position_risks[0]
+
+    assert risk.position_market_action == PositionMarketAction.DATA_WAIT.value
+    assert "POSITION_MARKET_CONTEXT_STALE" in risk.position_action_reason_codes
+
+
 def _position(position_id: str, code: str, **overrides) -> PositionRuntimeSnapshot:
     payload = {
         "trade_date": TRADE_DATE,
@@ -150,7 +246,34 @@ def _position(position_id: str, code: str, **overrides) -> PositionRuntimeSnapsh
         "last_tick_at": NOW.isoformat(),
         "data_quality_flags": (),
         "risk_status": PositionRiskStatus.OPEN,
+        "market_side": "KOSDAQ",
+        "market_side_source": "test",
+        "market_side_resolution_status": "RESOLVED",
+        "side_market_regime": "EXPANSION",
+        "counterpart_market_regime": "EXPANSION",
+        "composite_market_mode": "BROAD_RISK_ON",
+        "systemic_risk_off": False,
+        "market_context_calculated_at": NOW.isoformat(),
+        "market_context_fresh": True,
+        "candidate_market_action": "ALLOW_NORMAL",
+        "strategy_context_id": "ctx-test",
         "details": {"market_side": "KOSDAQ"},
     }
     payload.update(overrides)
     return PositionRuntimeSnapshot(**payload)
+
+
+def _market_regime(db: TradingDatabase, *, kospi: str, kosdaq: str, composite: str) -> None:
+    db.save_market_regime_snapshot(
+        {
+            "trade_date": TRADE_DATE,
+            "calculated_at": NOW.isoformat(),
+            "global_status": "SELECTIVE",
+            "kospi_status": kospi,
+            "kosdaq_status": kosdaq,
+            "market_session_status": "REGULAR",
+            "risk_off_detected": composite == "SYSTEMIC_RISK_OFF",
+            "weak_market_detected": kospi in {"WEAK", "RISK_OFF"} or kosdaq in {"WEAK", "RISK_OFF"},
+            "composite_market_mode": composite,
+        }
+    )

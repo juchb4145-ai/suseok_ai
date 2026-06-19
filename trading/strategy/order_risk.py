@@ -57,7 +57,7 @@ class OrderRiskManager:
             reason_codes.append("KILL_SWITCH_BLOCKS_BUY")
 
         if side == OrderSide.BUY.value:
-            reason_codes.extend(self._buy_limits(payload))
+            reason_codes.extend(self._buy_limits(payload, now=now))
 
         reason_codes.extend(self._common_order_checks(payload, now=now))
 
@@ -81,7 +81,7 @@ class OrderRiskManager:
                 "broker": broker,
                 "intent": payload,
                 "kill_switch_state": kill_switch_state,
-                "limits": self._limit_details(payload),
+                "limits": self._limit_details(payload, now=now),
             },
         )
 
@@ -111,7 +111,7 @@ class OrderRiskManager:
             reasons.append("COMMAND_QUEUE_UNHEALTHY")
         return reasons
 
-    def _buy_limits(self, payload: dict[str, Any]) -> list[str]:
+    def _buy_limits(self, payload: dict[str, Any], *, now: datetime) -> list[str]:
         reasons: list[str] = []
         trade_date = str(payload.get("trade_date") or "")
         code = str(payload.get("code") or "")
@@ -143,7 +143,94 @@ class OrderRiskManager:
             reasons.append("POSITION_RISK_STOP_NEW_ENTRY")
         if bool(portfolio.get("kill_switch_recommended")):
             reasons.append("POSITION_RISK_KILL_SWITCH_RECOMMENDED")
+        market_side_reasons, _ = self._market_side_budget_reasons(payload, now=now)
+        if self.config.market_side_portfolio_enforce_buy_limits:
+            reasons.extend(market_side_reasons)
         return reasons
+
+    def _market_side_budget_reasons(self, payload: dict[str, Any], *, now: datetime | None = None) -> tuple[list[str], dict[str, Any]]:
+        diagnostics: dict[str, Any] = {"enabled": bool(self.config.market_side_portfolio_enabled)}
+        if not self.config.market_side_portfolio_enabled:
+            return [], diagnostics
+        reasons: list[str] = []
+        trade_date = str(payload.get("trade_date") or "")
+        details = dict(payload.get("details") or {})
+        side = self._resolve_market_side(payload)
+        diagnostics["market_side"] = side
+        if side not in {"KOSPI", "KOSDAQ"}:
+            reasons.append("MARKET_SIDE_UNKNOWN_BUY_BLOCK")
+            diagnostics["reason_codes"] = reasons
+            diagnostics["informational_reason_codes"] = _dedupe([*reasons, "MARKET_SIDE_BUDGET_OBSERVE_ONLY"])
+            return reasons, diagnostics
+        portfolio = _call(self.db, "latest_portfolio_risk_snapshot", trade_date=trade_date) or {}
+        if not portfolio:
+            reasons.append("MARKET_SIDE_BUDGET_DATA_WAIT")
+            diagnostics["reason_codes"] = reasons
+            diagnostics["informational_reason_codes"] = _dedupe([*reasons, "MARKET_SIDE_BUDGET_OBSERVE_ONLY"])
+            return reasons, diagnostics
+        age = _age_sec(str(portfolio.get("calculated_at") or ""), now or datetime.now(timezone.utc))
+        if age is None or age > self.config.market_side_budget_max_age_sec:
+            reasons.append("MARKET_SIDE_BUDGET_DATA_WAIT")
+        budgets = dict(portfolio.get("market_side_budgets") or dict(portfolio.get("details") or {}).get("market_side_budgets") or {})
+        budget = dict(budgets.get(side) or {})
+        diagnostics["portfolio_calculated_at"] = portfolio.get("calculated_at", "")
+        diagnostics["budget"] = budget
+        if not budget:
+            reasons.append("MARKET_SIDE_BUDGET_DATA_WAIT")
+        action = str(budget.get("budget_action") or "").upper()
+        if action in {"STOP_NEW_ENTRY", "MARKET_CLOSED"}:
+            reasons.append("MARKET_SIDE_STOP_NEW_ENTRY")
+        if action == "DATA_WAIT":
+            reasons.append("MARKET_SIDE_BUDGET_DATA_WAIT")
+        price = int(payload.get("price") or details.get("current_price") or 0)
+        quantity = int(payload.get("quantity") or 0)
+        order_amount = max(0, price) * max(0, quantity)
+        reserved = int(budget.get("reserved_exposure_krw") or 0)
+        projected_side = reserved + order_amount
+        side_limit = int(budget.get("effective_exposure_limit_krw") or 0)
+        if side_limit > 0 and projected_side > side_limit:
+            reasons.append("MARKET_SIDE_EXPOSURE_LIMIT")
+        gross_limit = int(portfolio.get("gross_exposure_limit_krw") or 0)
+        gross_reserved = int(portfolio.get("gross_reserved_exposure_krw") or portfolio.get("total_exposure") or 0)
+        projected_gross = gross_reserved + order_amount
+        if gross_limit > 0 and projected_gross > gross_limit:
+            reasons.append("PORTFOLIO_GROSS_EXPOSURE_LIMIT")
+        available_slots = int(budget.get("available_position_slots") or 0)
+        max_slots = int(budget.get("max_open_positions") or 0)
+        if max_slots > 0 and available_slots <= 0:
+            reasons.append("MARKET_SIDE_POSITION_LIMIT")
+        diagnostic_reasons: list[str] = []
+        if int(budget.get("pending_buy_exposure_krw") or 0) > 0:
+            diagnostic_reasons.append("PENDING_BUY_EXPOSURE_RESERVED")
+        diagnostics.update(
+            {
+                "order_amount": order_amount,
+                "reserved_exposure_krw": reserved,
+                "projected_side_exposure_krw": projected_side,
+                "projected_gross_exposure_krw": projected_gross,
+                "enforce_buy_limits": bool(self.config.market_side_portfolio_enforce_buy_limits),
+                "observe_only": bool(self.config.market_side_portfolio_observe_only),
+            }
+        )
+        reasons = _dedupe(reasons)
+        diagnostics["reason_codes"] = reasons
+        diagnostics["informational_reason_codes"] = _dedupe([*reasons, *diagnostic_reasons, "MARKET_SIDE_BUDGET_OBSERVE_ONLY"]) if (reasons or diagnostic_reasons) and not self.config.market_side_portfolio_enforce_buy_limits else _dedupe([*reasons, *diagnostic_reasons])
+        return reasons, diagnostics
+
+    def _resolve_market_side(self, payload: dict[str, Any]) -> str:
+        details = dict(payload.get("details") or {})
+        context = dict(details.get("strategy_context_v3") or {})
+        market = dict(context.get("market") or {})
+        for value in (
+            market.get("market_side"),
+            details.get("market_side"),
+            payload.get("market_side"),
+            details.get("market"),
+        ):
+            side = _normalized_side(value)
+            if side in {"KOSPI", "KOSDAQ"}:
+                return side
+        return "UNKNOWN"
 
     def _common_order_checks(self, payload: dict[str, Any], *, now: datetime) -> list[str]:
         reasons: list[str] = []
@@ -227,12 +314,13 @@ class OrderRiskManager:
         whitelist = tuple(self.config.live_sim_account_whitelist or ())
         return bool(account) and (not whitelist or account in whitelist)
 
-    def _limit_details(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _limit_details(self, payload: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
         return {
             "max_order_quantity": self.config.max_order_quantity,
             "max_order_amount": self.config.max_order_amount,
             "quantity": int(payload.get("quantity") or 0),
             "price": int(payload.get("price") or 0),
+            "market_side_budget": self._market_side_budget_reasons(payload, now=now)[1],
         }
 
     def _operator_message(self, decision: str, reason_codes: list[str]) -> str:
@@ -275,6 +363,15 @@ def _call(target: Any, name: str, **kwargs):
     if not callable(fn):
         return None
     return fn(**kwargs)
+
+
+def _normalized_side(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if text in {"KOSPI", "STK", "001", "0", "KRX"}:
+        return "KOSPI"
+    if text in {"KOSDAQ", "KSQ", "101", "10", "KQ"}:
+        return "KOSDAQ"
+    return "UNKNOWN"
 
 
 def _age_sec(value: str, now: datetime) -> float | None:

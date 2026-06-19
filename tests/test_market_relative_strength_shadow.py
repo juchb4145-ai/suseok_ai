@@ -53,7 +53,9 @@ def test_weak_side_strict_shadow_keeps_actual_wait_market_contract() -> None:
     assert decision.actual_entry_status == "MARKET_WAIT"
     assert decision.actual_ready_allowed is False
     assert decision.actual_dry_run_intent_allowed is False
-    assert decision.promotion_eligible is True
+    assert decision.shadow_filter_passed is True
+    assert decision.review_candidate is True
+    assert decision.promotion_eligible is False
 
 
 def test_risk_off_side_diagnostic_is_observe_only_and_never_promotion_eligible() -> None:

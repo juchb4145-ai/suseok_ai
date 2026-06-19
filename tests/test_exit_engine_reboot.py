@@ -12,7 +12,7 @@ from trading.strategy.exit_engine_reboot import (
 )
 from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.strategy.models import Candidate, CandidateSourceType, CandidateState, VirtualPosition
-from trading.strategy.position_risk import PositionRiskStatus, PositionRuntimeService, PositionRuntimeSnapshot
+from trading.strategy.position_risk import PositionMarketAction, PositionRiskStatus, PositionRuntimeService, PositionRuntimeSnapshot
 
 
 TRADE_DATE = "2026-06-18"
@@ -120,6 +120,7 @@ def test_leader_collapse_exit_fires_on_confirmed_leader_break(tmp_path):
 def test_market_risk_off_exit_now(tmp_path):
     db, _, candles = _context(tmp_path)
     position = _position(details={"market_status": "RISK_OFF"})
+    _position_risk(db, position, PositionMarketAction.EXIT_NOW.value, ["SIDE_MARKET_RISK_OFF_POSITION_RISK", "POSITION_MARKET_EXIT_NOW"])
 
     decision = _engine(db, candles).build(trade_date=TRADE_DATE, now=NOW, positions=[position]).decisions[0]
 
@@ -130,11 +131,22 @@ def test_market_risk_off_exit_now(tmp_path):
 def test_weak_market_waits_when_position_is_profitable(tmp_path):
     db, _, candles = _context(tmp_path)
     position = _position(current_price=1010, current_return_pct=1.0, details={"market_status": "WEAK"})
+    _position_risk(db, position, PositionMarketAction.TIGHTEN_STOP.value, ["SIDE_MARKET_WEAK_POSITION_RISK", "POSITION_MARKET_TIGHTEN_STOP"])
 
     decision = _engine(db, candles).build(trade_date=TRADE_DATE, now=NOW, positions=[position]).decisions[0]
 
     assert decision.exit_status == ExitDecisionStatus.WAIT_CONFIRMATION
     assert decision.exit_reason == ExitReason.MARKET_WEAK_EXIT
+
+
+def test_block_new_entry_is_not_position_sell_signal(tmp_path):
+    db, _, candles = _context(tmp_path)
+    position = _position(details={"market_action": "BLOCK_NEW_ENTRY", "market_status": "RISK_OFF"})
+
+    decision = _engine(db, candles).build(trade_date=TRADE_DATE, now=NOW, positions=[position]).decisions[0]
+
+    assert decision.exit_status == ExitDecisionStatus.HOLD
+    assert decision.exit_reason == ExitReason.HOLD
 
 
 def test_stale_tick_becomes_data_wait_and_no_sell_intent(tmp_path):
@@ -289,6 +301,31 @@ def _position(**overrides) -> PositionRuntimeSnapshot:
     }
     payload.update(overrides)
     return PositionRuntimeSnapshot(**payload)
+
+
+def _position_risk(db: TradingDatabase, position: PositionRuntimeSnapshot, action: str, reasons: list[str]) -> None:
+    db.save_position_risk_snapshots(
+        [
+            {
+                "trade_date": TRADE_DATE,
+                "calculated_at": NOW.isoformat(),
+                "position_id": position.position_id,
+                "candidate_id": position.candidate_id,
+                "code": position.code,
+                "risk_status": position.risk_status.value,
+                "risk_level": "REDUCE" if action == PositionMarketAction.EXIT_NOW.value else "CAUTION",
+                "position_market_action": action,
+                "recommended_exit_ratio": 1.0 if action == PositionMarketAction.EXIT_NOW.value else 0.0,
+                "position_action_reason_codes": reasons,
+                "reason_codes": reasons,
+                "details": {
+                    "position_market_action": action,
+                    "recommended_exit_ratio": 1.0 if action == PositionMarketAction.EXIT_NOW.value else 0.0,
+                    "position_action_reason_codes": reasons,
+                },
+            }
+        ]
+    )
 
 
 def _tick(market_data: MarketDataStore, candles: CandleBuilder, code: str, price: int, timestamp: datetime) -> None:

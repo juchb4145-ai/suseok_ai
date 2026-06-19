@@ -965,6 +965,26 @@ td {
   font-size: 12px;
 }
 
+.dashboard-v2-budget-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.dashboard-v2-budget-row {
+  display: grid;
+  grid-template-columns: 52px minmax(96px, auto) 72px minmax(112px, 1fr) 64px;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.dashboard-v2-budget-row strong {
+  color: var(--text);
+}
+
 .dashboard-v2-debug {
   margin-top: 14px;
   border-top: 1px solid var(--line);

@@ -6,7 +6,8 @@ from trading.broker.models import GatewayEvent, utc_timestamp
 from trading.strategy.candidate_ingestion import CandidateIngestionService, CandidateSourceEvent
 from trading.strategy.models import CandidateState
 from trading.strategy.order_manager import OrderManagerConfig, OrderManagerRuntimePipeline
-from trading.strategy.order_models import ManagedOrderStatus, OrderIntentStatus, OrderKillSwitchState
+from trading.strategy.order_models import ManagedOrderIntent, ManagedOrderStatus, OrderIntentStatus, OrderKillSwitchState
+from trading.strategy.order_risk import OrderRiskManager
 
 
 NOW = datetime(2026, 6, 18, 9, 10, tzinfo=timezone.utc)
@@ -161,6 +162,82 @@ def test_ack_timeout_sets_reconcile_required_and_stop_new_buy(tmp_path):
     assert "ORDER_ACK_TIMEOUT" in kill["reason_codes"]
 
 
+def test_market_side_budget_observe_only_records_diagnostics_without_rejecting_buy(tmp_path):
+    db = TradingDatabase(str(tmp_path / "test.db"))
+    gateway = _sim_gateway()
+    _portfolio_budget(db, action="STOP_NEW_ENTRY", reserved=9000, limit=9000)
+    config = _observe_config(
+        market_side_portfolio_enabled=True,
+        market_side_portfolio_enforce_buy_limits=False,
+        market_side_budget_max_age_sec=9999,
+        max_open_positions=99,
+    )
+    intent = _intent("BUY", "400001", details={"market_side": "KOSDAQ"})
+
+    decision = OrderRiskManager(db, gateway, config).evaluate(intent, now=NOW)
+
+    assert decision.approved is True
+    assert "MARKET_SIDE_STOP_NEW_ENTRY" not in decision.reason_codes
+    diagnostic = decision.details["limits"]["market_side_budget"]
+    assert "MARKET_SIDE_STOP_NEW_ENTRY" in diagnostic["informational_reason_codes"]
+    assert "MARKET_SIDE_BUDGET_OBSERVE_ONLY" in diagnostic["informational_reason_codes"]
+
+
+def test_market_side_budget_enforce_rejects_buy_over_side_limit(tmp_path):
+    db = TradingDatabase(str(tmp_path / "test.db"))
+    gateway = _sim_gateway()
+    _portfolio_budget(db, action="ALLOW_BUDGET", reserved=9000, limit=9500)
+    config = _observe_config(
+        market_side_portfolio_enabled=True,
+        market_side_portfolio_enforce_buy_limits=True,
+        market_side_budget_max_age_sec=9999,
+        max_open_positions=99,
+    )
+    intent = _intent("BUY", "400002", quantity=1, price=1000, details={"market_side": "KOSDAQ"})
+
+    decision = OrderRiskManager(db, gateway, config).evaluate(intent, now=NOW)
+
+    assert decision.approved is False
+    assert "MARKET_SIDE_EXPOSURE_LIMIT" in decision.reason_codes
+
+
+def test_pending_buy_reservation_is_diagnostic_when_projected_exposure_is_within_limit(tmp_path):
+    db = TradingDatabase(str(tmp_path / "test.db"))
+    gateway = _sim_gateway()
+    _portfolio_budget(db, action="ALLOW_BUDGET", reserved=1000, limit=10_000, pending=1000)
+    config = _observe_config(
+        market_side_portfolio_enabled=True,
+        market_side_portfolio_enforce_buy_limits=True,
+        market_side_budget_max_age_sec=9999,
+        max_open_positions=99,
+    )
+    intent = _intent("BUY", "400004", quantity=1, price=1000, details={"market_side": "KOSDAQ"})
+
+    decision = OrderRiskManager(db, gateway, config).evaluate(intent, now=NOW)
+
+    assert decision.approved is True
+    assert "PENDING_BUY_EXPOSURE_RESERVED" not in decision.reason_codes
+    assert "PENDING_BUY_EXPOSURE_RESERVED" in decision.details["limits"]["market_side_budget"]["informational_reason_codes"]
+
+
+def test_market_side_budget_does_not_block_sell(tmp_path):
+    db = TradingDatabase(str(tmp_path / "test.db"))
+    gateway = _sim_gateway()
+    _portfolio_budget(db, action="STOP_NEW_ENTRY", reserved=9000, limit=9000)
+    config = _observe_config(
+        market_side_portfolio_enabled=True,
+        market_side_portfolio_enforce_buy_limits=True,
+        market_side_budget_max_age_sec=9999,
+        max_open_positions=99,
+    )
+    intent = _intent("SELL", "400003", details={"market_side": "KOSDAQ"})
+
+    decision = OrderRiskManager(db, gateway, config).evaluate(intent, now=NOW)
+
+    assert decision.approved is True
+    assert not any(str(reason).startswith("MARKET_SIDE_") for reason in decision.reason_codes)
+
+
 def _observe_config(**overrides) -> OrderManagerConfig:
     payload = {
         "enabled": True,
@@ -255,4 +332,59 @@ def _entry_decision(db: TradingDatabase, code: str, *, candidate_id: int | None 
                 "details": details or {},
             }
         ]
+    )
+
+
+def _intent(side: str, code: str, *, quantity: int = 1, price: int = 1000, details: dict | None = None) -> ManagedOrderIntent:
+    return ManagedOrderIntent(
+        trade_date=TRADE_DATE,
+        source="TEST_ONLY",
+        side=side,
+        code=code,
+        quantity=quantity,
+        price=price,
+        idempotency_key=f"{side}:{code}",
+        created_at=NOW.isoformat(),
+        details=details or {},
+    )
+
+
+def _portfolio_budget(db: TradingDatabase, *, action: str, reserved: int, limit: int, pending: int = 0) -> None:
+    db.save_portfolio_risk_snapshot(
+        {
+            "trade_date": TRADE_DATE,
+            "calculated_at": NOW.isoformat(),
+            "open_position_count": 1,
+            "total_exposure": reserved,
+            "gross_exposure_limit_krw": 100_000,
+            "gross_reserved_exposure_krw": reserved,
+            "market_side_budgets": {
+                "KOSDAQ": {
+                    "market_side": "KOSDAQ",
+                    "budget_action": action,
+                    "side_market_regime": "EXPANSION",
+                    "effective_exposure_limit_krw": limit,
+                    "reserved_exposure_krw": reserved,
+                    "pending_buy_exposure_krw": pending,
+                    "available_position_slots": 5,
+                    "max_open_positions": 5,
+                    "reason_codes": [],
+                }
+            },
+            "details": {
+                "market_side_budgets": {
+                    "KOSDAQ": {
+                        "market_side": "KOSDAQ",
+                        "budget_action": action,
+                        "side_market_regime": "EXPANSION",
+                        "effective_exposure_limit_krw": limit,
+                        "reserved_exposure_krw": reserved,
+                        "pending_buy_exposure_krw": pending,
+                        "available_position_slots": 5,
+                        "max_open_positions": 5,
+                        "reason_codes": [],
+                    }
+                }
+            },
+        }
     )

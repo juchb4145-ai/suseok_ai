@@ -99,6 +99,8 @@ class MarketRelativeStrengthShadowDecision:
     shadow_status: str = MarketRelativeStrengthShadowStatus.NOT_APPLICABLE.value
     counterfactual_action: str = MarketRelativeStrengthCounterfactualAction.EXCLUDED.value
     counterfactual_position_size_multiplier_hint: float = 0.0
+    shadow_filter_passed: bool = False
+    review_candidate: bool = False
     promotion_eligible: bool = False
     trade_stock_role: str = ""
     theme_id: str = ""
@@ -225,6 +227,12 @@ class MarketRelativeStrengthShadowEvaluator:
             variant=variant.value,
             material_key=material_key,
         )
+        shadow_filter_passed = shadow_status == MarketRelativeStrengthShadowStatus.SHADOW_CANDIDATE
+        review_candidate = (
+            shadow_filter_passed
+            and scenario == MarketRelativeStrengthShadowScenario.WEAK_SIDE_STRICT_SHADOW
+            and variant == MarketRelativeStrengthShadowVariant.STRICT
+        )
         return MarketRelativeStrengthShadowDecision(
             shadow_decision_id=shadow_decision_id,
             trade_date=candidate.trade_date or current.date().isoformat(),
@@ -249,9 +257,9 @@ class MarketRelativeStrengthShadowEvaluator:
             shadow_status=shadow_status.value,
             counterfactual_action=counterfactual_action.value,
             counterfactual_position_size_multiplier_hint=counterfactual_multiplier,
-            promotion_eligible=shadow_status == MarketRelativeStrengthShadowStatus.SHADOW_CANDIDATE
-            and scenario == MarketRelativeStrengthShadowScenario.WEAK_SIDE_STRICT_SHADOW
-            and variant == MarketRelativeStrengthShadowVariant.STRICT,
+            shadow_filter_passed=shadow_filter_passed,
+            review_candidate=review_candidate,
+            promotion_eligible=False,
             trade_stock_role=str(stock.get("trade_stock_role") or ""),
             theme_id=str(theme.get("theme_id") or ""),
             theme_name=str(theme.get("theme_name") or ""),

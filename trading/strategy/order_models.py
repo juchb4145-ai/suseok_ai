@@ -106,6 +106,10 @@ class OrderManagerConfig:
     ack_timeout_sec: int = 30
     reconcile_required_blocks_buy: bool = True
     block_pyramiding: bool = True
+    market_side_portfolio_enabled: bool = False
+    market_side_portfolio_observe_only: bool = True
+    market_side_portfolio_enforce_buy_limits: bool = False
+    market_side_budget_max_age_sec: int = 60
     command_ttl_sec: int = 30
     command_max_attempts: int = 1
     cycle_bucket_sec: int = 30
@@ -152,6 +156,10 @@ class OrderManagerConfig:
             stale_tick_sec=_env_int("TRADING_ORDER_MANAGER_STALE_TICK_SEC", 10),
             ack_timeout_sec=_env_int("TRADING_ORDER_MANAGER_ACK_TIMEOUT_SEC", 30),
             reconcile_required_blocks_buy=_env_bool("TRADING_ORDER_MANAGER_RECONCILE_REQUIRED_BLOCKS_BUY", True),
+            market_side_portfolio_enabled=_env_bool("TRADING_MARKET_SIDE_PORTFOLIO_ENABLED", False),
+            market_side_portfolio_observe_only=_env_bool("TRADING_MARKET_SIDE_PORTFOLIO_OBSERVE_ONLY", True),
+            market_side_portfolio_enforce_buy_limits=_env_bool("TRADING_MARKET_SIDE_PORTFOLIO_ENFORCE_BUY_LIMITS", False),
+            market_side_budget_max_age_sec=max(1, _env_int("TRADING_MARKET_SIDE_BUDGET_MAX_AGE_SEC", 60)),
             command_ttl_sec=_env_int("TRADING_LIVE_SIM_COMMAND_TTL_SEC", 30),
             command_max_attempts=_env_int("TRADING_LIVE_SIM_COMMAND_MAX_ATTEMPTS", 1),
             cycle_bucket_sec=_env_int("TRADING_LIVE_SIM_CYCLE_BUCKET_SEC", 30),

@@ -365,7 +365,12 @@ def _position_risk(position_risk: dict[str, Any], exit_engine: dict[str, Any]) -
                 "max_drawdown_pct": _num(item.get("max_drawdown_pct")),
                 "holding_minutes": int(_num(item.get("holding_minutes"))),
                 "theme_status": dict(item.get("details") or {}).get("theme_status", ""),
-                "market_status": dict(item.get("details") or {}).get("market_status", ""),
+                "market_side": item.get("market_side") or dict(item.get("details") or {}).get("market_side", ""),
+                "market_status": item.get("side_market_regime") or dict(item.get("details") or {}).get("market_status", ""),
+                "position_market_action": item.get("position_market_action") or dict(item.get("details") or {}).get("position_market_action", ""),
+                "recommended_exit_ratio": _num(item.get("recommended_exit_ratio")),
+                "structure_intact": bool(item.get("structure_intact", True)),
+                "actual_order_status": "OBSERVE_ONLY",
                 "exit_status": exit_decision.get("exit_status", ""),
                 "exit_reason": exit_decision.get("exit_reason", ""),
                 "stop_loss_price": int(_num(item.get("stop_loss_price"))),
@@ -380,6 +385,18 @@ def _position_risk(position_risk: dict[str, Any], exit_engine: dict[str, Any]) -
         "portfolio_risk_level": position_risk.get("portfolio_risk_level", "NORMAL"),
         "open_position_count": int(position_risk.get("open_position_count") or 0),
         "total_exposure": int(_num(position_risk.get("total_exposure"))),
+        "gross_exposure_limit_krw": int(_num(position_risk.get("gross_exposure_limit_krw"))),
+        "gross_pending_buy_exposure_krw": int(_num(position_risk.get("gross_pending_buy_exposure_krw"))),
+        "gross_reserved_exposure_krw": int(_num(position_risk.get("gross_reserved_exposure_krw"))),
+        "gross_available_exposure_krw": int(_num(position_risk.get("gross_available_exposure_krw"))),
+        "gross_utilization_pct": _num(position_risk.get("gross_utilization_pct")),
+        "composite_market_mode": position_risk.get("composite_market_mode", ""),
+        "systemic_risk_off": bool(position_risk.get("systemic_risk_off")),
+        "market_context_fresh": bool(position_risk.get("market_context_fresh")),
+        "market_side_budgets": dict(position_risk.get("market_side_budgets") or {}),
+        "stop_new_entry_by_side": dict(position_risk.get("stop_new_entry_by_side") or {}),
+        "reduce_only_by_side": dict(position_risk.get("reduce_only_by_side") or {}),
+        "position_market_action_counts": dict(position_risk.get("position_market_action_counts") or {}),
         "theme_exposure_top": _top_mapping(position_risk.get("theme_exposure") or {}, limit=5),
         "market_side_exposure": dict(position_risk.get("market_side_exposure") or {}),
         "unrealized_pnl_pct": _num(position_risk.get("unrealized_pnl_pct")),
@@ -479,9 +496,7 @@ def _market_relative_strength_shadow(shadow: dict[str, Any], outcomes: dict[str,
         item = dict(raw or {})
         scenario = str(item.get("shadow_scenario") or "")
         variant = str(item.get("shadow_variant") or "")
-        promotion_eligible = bool(item.get("promotion_eligible")) and scenario == "WEAK_SIDE_STRICT_SHADOW" and variant == "STRICT"
-        if scenario == "RISK_OFF_SIDE_DIAGNOSTIC":
-            promotion_eligible = False
+        promotion_eligible = False
         recent_rows.append(
             {
                 "code": item.get("code") or "",
@@ -497,6 +512,8 @@ def _market_relative_strength_shadow(shadow: dict[str, Any], outcomes: dict[str,
                 "relative_strength_vs_index_pct": _num(item.get("relative_strength_vs_index_pct")),
                 "price_location": item.get("price_location") or "",
                 "promotion_eligible": promotion_eligible,
+                "shadow_filter_passed": bool(item.get("shadow_filter_passed")),
+                "review_candidate": bool(item.get("review_candidate")) and scenario == "WEAK_SIDE_STRICT_SHADOW" and variant == "STRICT",
                 "actual_order_mode_label": "분석/관측전용",
             }
         )

@@ -12,6 +12,18 @@ from trading.strategy.market_data import MarketDataStore, StrategyTick
 
 
 POSITION_RISK_OUTPUT_MODE = "OBSERVE"
+MARKET_SIDES = ("KOSPI", "KOSDAQ")
+PENDING_BUY_STATUSES = {
+    "RISK_APPROVED",
+    "LOCAL_ORDER_CREATED",
+    "COMMAND_BLOCKED_OBSERVE_ONLY",
+    "COMMAND_QUEUED",
+    "QUEUED_TO_GATEWAY",
+    "ACKED_BY_GATEWAY",
+    "COMMAND_ACKED",
+    "PARTIALLY_FILLED",
+    "RECONCILE_REQUIRED",
+}
 
 
 class PositionRiskStatus(str, Enum):
@@ -21,6 +33,23 @@ class PositionRiskStatus(str, Enum):
     CLOSED = "CLOSED"
     DATA_WAIT = "DATA_WAIT"
     STALE_DATA_RISK = "STALE_DATA_RISK"
+
+
+class MarketSideBudgetAction(str, Enum):
+    ALLOW_BUDGET = "ALLOW_BUDGET"
+    REDUCED_BUDGET = "REDUCED_BUDGET"
+    STOP_NEW_ENTRY = "STOP_NEW_ENTRY"
+    DATA_WAIT = "DATA_WAIT"
+    MARKET_CLOSED = "MARKET_CLOSED"
+
+
+class PositionMarketAction(str, Enum):
+    HOLD = "HOLD"
+    TIGHTEN_STOP = "TIGHTEN_STOP"
+    SCALE_OUT = "SCALE_OUT"
+    EXIT_IF_LOSER = "EXIT_IF_LOSER"
+    EXIT_NOW = "EXIT_NOW"
+    DATA_WAIT = "DATA_WAIT"
 
 
 @dataclass(frozen=True)
@@ -56,6 +85,17 @@ class PositionRuntimeSnapshot:
     last_tick_at: str = ""
     data_quality_flags: tuple[str, ...] = ()
     risk_status: PositionRiskStatus = PositionRiskStatus.OPEN
+    market_side: str = "UNKNOWN"
+    market_side_source: str = ""
+    market_side_resolution_status: str = "UNRESOLVED"
+    side_market_regime: str = "DATA_WAIT"
+    counterpart_market_regime: str = "DATA_WAIT"
+    composite_market_mode: str = "DATA_DEGRADED"
+    systemic_risk_off: bool = False
+    market_context_calculated_at: str = ""
+    market_context_fresh: bool = False
+    candidate_market_action: str = "DATA_WAIT"
+    strategy_context_id: str = ""
     details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -73,6 +113,17 @@ class PositionRiskConfig:
     stop_new_entry_exposure_krw: int = 10_000_000
     reduce_drawdown_pct: float = -4.0
     kill_switch_drawdown_pct: float = -8.0
+    portfolio_gross_exposure_limit_krw: int = 10_000_000
+    kospi_exposure_limit_krw: int = 0
+    kosdaq_exposure_limit_krw: int = 0
+    kospi_max_open_positions: int = 3
+    kosdaq_max_open_positions: int = 3
+    market_side_pending_buy_included: bool = True
+    market_side_portfolio_enabled: bool = False
+    market_side_portfolio_observe_only: bool = True
+    market_side_portfolio_enforce_buy_limits: bool = False
+    market_side_budget_max_age_sec: int = 60
+    position_market_context_max_age_sec: int = 60
 
     @classmethod
     def from_env(cls) -> "PositionRiskConfig":
@@ -86,6 +137,17 @@ class PositionRiskConfig:
             stop_new_entry_exposure_krw=max(0, _env_int("TRADING_POSITION_RISK_STOP_NEW_ENTRY_EXPOSURE_KRW", 10_000_000)),
             reduce_drawdown_pct=_env_float("TRADING_POSITION_RISK_REDUCE_DRAWDOWN_PCT", -4.0),
             kill_switch_drawdown_pct=_env_float("TRADING_POSITION_RISK_KILL_SWITCH_DRAWDOWN_PCT", -8.0),
+            portfolio_gross_exposure_limit_krw=max(0, _env_int("TRADING_PORTFOLIO_GROSS_EXPOSURE_LIMIT_KRW", 10_000_000)),
+            kospi_exposure_limit_krw=max(0, _env_int("TRADING_KOSPI_EXPOSURE_LIMIT_KRW", 0)),
+            kosdaq_exposure_limit_krw=max(0, _env_int("TRADING_KOSDAQ_EXPOSURE_LIMIT_KRW", 0)),
+            kospi_max_open_positions=max(0, _env_int("TRADING_KOSPI_MAX_OPEN_POSITIONS", 3)),
+            kosdaq_max_open_positions=max(0, _env_int("TRADING_KOSDAQ_MAX_OPEN_POSITIONS", 3)),
+            market_side_pending_buy_included=_env_bool("TRADING_MARKET_SIDE_PENDING_BUY_INCLUDED", True),
+            market_side_portfolio_enabled=_env_bool("TRADING_MARKET_SIDE_PORTFOLIO_ENABLED", False),
+            market_side_portfolio_observe_only=_env_bool("TRADING_MARKET_SIDE_PORTFOLIO_OBSERVE_ONLY", True),
+            market_side_portfolio_enforce_buy_limits=_env_bool("TRADING_MARKET_SIDE_PORTFOLIO_ENFORCE_BUY_LIMITS", False),
+            market_side_budget_max_age_sec=max(1, _env_int("TRADING_MARKET_SIDE_BUDGET_MAX_AGE_SEC", 60)),
+            position_market_context_max_age_sec=max(1, _env_int("TRADING_POSITION_MARKET_CONTEXT_MAX_AGE_SEC", 60)),
         )
 
 
@@ -118,8 +180,49 @@ class PositionRiskSnapshot:
     theme_risk_level: str = "NORMAL"
     market_risk_level: str = "NORMAL"
     data_risk_level: str = "NORMAL"
+    market_side: str = "UNKNOWN"
+    side_market_regime: str = "DATA_WAIT"
+    counterpart_market_regime: str = "DATA_WAIT"
+    composite_market_mode: str = "DATA_DEGRADED"
+    systemic_risk_off: bool = False
+    position_market_action: str = PositionMarketAction.HOLD.value
+    recommended_exit_ratio: float = 0.0
+    recommended_trailing_gap_pct: float = 0.0
+    position_action_reason_codes: tuple[str, ...] = ()
+    market_context_fresh: bool = False
+    structure_intact: bool = True
+    support_broken: bool = False
+    vwap_broken: bool = False
+    theme_weak: bool = False
+    leader_collapsed: bool = False
     reason_codes: tuple[str, ...] = ()
     details: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(asdict(self))
+
+
+@dataclass(frozen=True)
+class MarketSidePortfolioBudget:
+    market_side: str
+    side_market_regime: str = "DATA_WAIT"
+    counterpart_market_regime: str = "DATA_WAIT"
+    composite_market_mode: str = "DATA_DEGRADED"
+    systemic_risk_off: bool = False
+    base_exposure_limit_krw: int = 0
+    effective_exposure_limit_krw: int = 0
+    open_exposure_krw: int = 0
+    pending_buy_exposure_krw: int = 0
+    reserved_exposure_krw: int = 0
+    available_exposure_krw: int = 0
+    utilization_pct: float = 0.0
+    open_position_count: int = 0
+    pending_buy_count: int = 0
+    max_open_positions: int = 0
+    available_position_slots: int = 0
+    budget_action: str = MarketSideBudgetAction.DATA_WAIT.value
+    reason_codes: tuple[str, ...] = ()
+    data_quality_flags: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(asdict(self))
@@ -139,6 +242,19 @@ class PortfolioRiskSnapshot:
     risk_level: str = "NORMAL"
     stop_new_entry_recommended: bool = False
     kill_switch_recommended: bool = False
+    gross_exposure_limit_krw: int = 0
+    gross_open_exposure_krw: int = 0
+    gross_pending_buy_exposure_krw: int = 0
+    gross_reserved_exposure_krw: int = 0
+    gross_available_exposure_krw: int = 0
+    gross_utilization_pct: float = 0.0
+    composite_market_mode: str = "DATA_DEGRADED"
+    systemic_risk_off: bool = False
+    market_side_budgets: dict[str, dict[str, Any]] = field(default_factory=dict)
+    stop_new_entry_by_side: dict[str, bool] = field(default_factory=dict)
+    reduce_only_by_side: dict[str, bool] = field(default_factory=dict)
+    market_context_calculated_at: str = ""
+    market_context_fresh: bool = False
     reason_codes: tuple[str, ...] = ()
     details: dict[str, Any] = field(default_factory=dict)
 
@@ -266,7 +382,7 @@ class PositionRuntimeService:
                     realized_return_pct=_float(item.get("realized_pnl_pct")),
                     existing_max_return_pct=_float(item.get("max_return_pct")),
                     existing_max_drawdown_pct=_float(item.get("max_drawdown_pct")),
-                    details=dict(item.get("details") or {}),
+                    details={**dict(item.get("details") or {}), "candidate_metadata": self._candidate_metadata(candidate)},
                 )
             )
         return snapshots
@@ -321,6 +437,23 @@ class PositionRuntimeService:
             status = PositionRiskStatus.STALE_DATA_RISK
         if "CURRENT_PRICE_MISSING" in flags or "LATEST_TICK_MISSING" in flags:
             status = PositionRiskStatus.DATA_WAIT
+        market_context = self._position_market_context(
+            code=code,
+            trade_date=trade_date,
+            now=now,
+            details=details,
+        )
+        merged_details = {
+            **details,
+            "tick_age_sec": None if tick_age is None else round(max(0.0, tick_age), 3),
+            "vwap": _vwap_from_tick_or_candles(code, tick, self.candle_builder),
+            "recent_support": _recent_support(code, tick, self.candle_builder),
+            "recent_high": _recent_high(code, tick, self.candle_builder),
+            "momentum_1m": _candle_momentum(code, self.candle_builder, 1),
+            "momentum_3m": _candle_momentum(code, self.candle_builder, 3),
+            "spread_ticks": int(getattr(tick, "spread_ticks", 0) or 0) if tick is not None else 0,
+            **market_context,
+        }
         return PositionRuntimeSnapshot(
             trade_date=trade_date,
             calculated_at=now.isoformat(),
@@ -353,16 +486,18 @@ class PositionRuntimeService:
             last_tick_at=last_tick_at,
             data_quality_flags=tuple(_dedupe(flags)),
             risk_status=status,
-            details={
-                **details,
-                "tick_age_sec": None if tick_age is None else round(max(0.0, tick_age), 3),
-                "vwap": _vwap_from_tick_or_candles(code, tick, self.candle_builder),
-                "recent_support": _recent_support(code, tick, self.candle_builder),
-                "recent_high": _recent_high(code, tick, self.candle_builder),
-                "momentum_1m": _candle_momentum(code, self.candle_builder, 1),
-                "momentum_3m": _candle_momentum(code, self.candle_builder, 3),
-                "spread_ticks": int(getattr(tick, "spread_ticks", 0) or 0) if tick is not None else 0,
-            },
+            market_side=str(market_context.get("market_side") or "UNKNOWN"),
+            market_side_source=str(market_context.get("market_side_source") or ""),
+            market_side_resolution_status=str(market_context.get("market_side_resolution_status") or "UNRESOLVED"),
+            side_market_regime=str(market_context.get("side_market_regime") or "DATA_WAIT"),
+            counterpart_market_regime=str(market_context.get("counterpart_market_regime") or "DATA_WAIT"),
+            composite_market_mode=str(market_context.get("composite_market_mode") or "DATA_DEGRADED"),
+            systemic_risk_off=bool(market_context.get("systemic_risk_off")),
+            market_context_calculated_at=str(market_context.get("market_context_calculated_at") or ""),
+            market_context_fresh=bool(market_context.get("market_context_fresh")),
+            candidate_market_action=str(market_context.get("candidate_market_action") or "DATA_WAIT"),
+            strategy_context_id=str(market_context.get("strategy_context_id") or ""),
+            details=merged_details,
         )
 
     def _candidate(self, candidate_id: int | None, trade_date: str):
@@ -376,6 +511,126 @@ class PositionRuntimeService:
     @staticmethod
     def _candidate_metadata(candidate: Any) -> dict[str, Any]:
         return dict(getattr(candidate, "metadata", {}) or {}) if candidate is not None else {}
+
+    def _position_market_context(
+        self,
+        *,
+        code: str,
+        trade_date: str,
+        now: datetime,
+        details: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        details = dict(details or {})
+        candidate_metadata = dict(details.get("candidate_metadata") or {})
+        strategy_context = dict(candidate_metadata.get("strategy_context_v3") or details.get("strategy_context_v3") or {})
+        context_market = dict(strategy_context.get("market") or {})
+        latest_regime = self._latest_market_regime(trade_date)
+        side, source, status = self._resolve_market_side(code, candidate_metadata, context_market, details)
+        side_status, counterpart_status = self._side_regimes(side, latest_regime, context_market, details)
+        calculated_at = str(
+            latest_regime.get("calculated_at")
+            or context_market.get("calculated_at")
+            or strategy_context.get("calculated_at")
+            or details.get("market_context_calculated_at")
+            or ""
+        )
+        fresh = bool(calculated_at) and _fresh_iso(calculated_at, now, self.config.position_market_context_max_age_sec)
+        if side not in MARKET_SIDES:
+            status = "UNRESOLVED"
+            fresh = False
+        if not fresh:
+            side_status = "DATA_WAIT"
+            counterpart_status = "DATA_WAIT"
+        return {
+            "market_side": side,
+            "market_side_source": source,
+            "market_side_resolution_status": status,
+            "side_market_regime": side_status,
+            "counterpart_market_regime": counterpart_status,
+            "composite_market_mode": str(
+                latest_regime.get("composite_market_mode")
+                or context_market.get("composite_market_mode")
+                or details.get("composite_market_mode")
+                or "DATA_DEGRADED"
+            ).upper(),
+            "systemic_risk_off": bool(
+                latest_regime.get("systemic_risk_off")
+                or latest_regime.get("risk_off_detected")
+                or context_market.get("systemic_risk_off")
+                or details.get("systemic_risk_off")
+            ),
+            "market_context_calculated_at": calculated_at,
+            "market_context_fresh": fresh,
+            "candidate_market_action": str(context_market.get("market_action") or candidate_metadata.get("market_action") or details.get("market_action") or "DATA_WAIT").upper(),
+            "candidate_metadata": candidate_metadata,
+            "strategy_context_id": str(strategy_context.get("context_id") or candidate_metadata.get("strategy_context_id") or ""),
+        }
+
+    def _resolve_market_side(
+        self,
+        code: str,
+        candidate_metadata: Mapping[str, Any],
+        context_market: Mapping[str, Any],
+        details: Mapping[str, Any],
+    ) -> tuple[str, str, str]:
+        side = _normalized_side(context_market.get("market_side"))
+        if side in MARKET_SIDES:
+            return side, "strategy_context_v3.market.market_side", "RESOLVED"
+        side = _normalized_side(candidate_metadata.get("market_side") or candidate_metadata.get("market"))
+        if side in MARKET_SIDES:
+            return side, "candidate.market", "RESOLVED"
+        side = self._symbol_master_side(code)
+        if side in MARKET_SIDES:
+            return side, "kiwoom_symbol_master", "RESOLVED"
+        side = _normalized_side(details.get("market_side"))
+        if side in MARKET_SIDES:
+            return side, "position.details.market_side", "RESOLVED"
+        return "UNKNOWN", "unresolved", "UNRESOLVED"
+
+    def _symbol_master_side(self, code: str) -> str:
+        loader = getattr(self.db, "list_kiwoom_symbol_master", None)
+        if not callable(loader) or not code:
+            return "UNKNOWN"
+        try:
+            rows = list(loader([code]) or [])
+        except Exception:
+            return "UNKNOWN"
+        for row in rows:
+            item = dict(row or {})
+            side = _normalized_side(item.get("market_side") or item.get("market") or item.get("market_type"))
+            if side in MARKET_SIDES:
+                return side
+        return "UNKNOWN"
+
+    def _latest_market_regime(self, trade_date: str) -> dict[str, Any]:
+        loader = getattr(self.db, "latest_market_regime_snapshot", None)
+        if not callable(loader):
+            return {}
+        try:
+            return dict(loader(trade_date=trade_date) or {})
+        except TypeError:
+            return dict(loader() or {})
+
+    @staticmethod
+    def _side_regimes(
+        side: str,
+        latest_regime: Mapping[str, Any],
+        context_market: Mapping[str, Any],
+        details: Mapping[str, Any],
+    ) -> tuple[str, str]:
+        if side == "KOSPI":
+            side_status = latest_regime.get("kospi_status")
+            counterpart_status = latest_regime.get("kosdaq_status")
+        elif side == "KOSDAQ":
+            side_status = latest_regime.get("kosdaq_status")
+            counterpart_status = latest_regime.get("kospi_status")
+        else:
+            side_status = ""
+            counterpart_status = ""
+        return (
+            str(side_status or context_market.get("side_market_regime") or details.get("side_market_regime") or details.get("market_status") or "DATA_WAIT").upper(),
+            str(counterpart_status or context_market.get("counterpart_market_regime") or details.get("counterpart_market_regime") or "DATA_WAIT").upper(),
+        )
 
     @staticmethod
     def _dedupe_positions(items: Iterable[PositionRuntimeSnapshot]) -> list[PositionRuntimeSnapshot]:
@@ -434,8 +689,10 @@ class PositionRiskManager:
         theme_level = "NORMAL"
         market_level = "NORMAL"
         details = dict(position.details or {})
-        market_status = str(details.get("market_status") or details.get("market_regime_status") or "").upper()
+        market_status = str(position.side_market_regime or details.get("side_market_regime") or details.get("market_status") or details.get("market_regime_status") or "DATA_WAIT").upper()
         theme_status = str(details.get("theme_status") or details.get("theme_board_theme_status") or "").upper()
+        support_broken, vwap_broken, theme_weak, leader_collapsed = self._structure_flags(position, details, theme_status)
+        structure_intact = not (support_broken or vwap_broken or theme_weak or leader_collapsed)
         if position.risk_status == PositionRiskStatus.DATA_WAIT:
             data_level = "DATA_WAIT"
             reasons.append("POSITION_DATA_WAIT")
@@ -445,12 +702,26 @@ class PositionRiskManager:
         if theme_status in {"WEAK_THEME", "WATCH_THEME"}:
             theme_level = "CAUTION" if theme_status == "WATCH_THEME" else "REDUCE"
             reasons.append("THEME_RISK_ELEVATED")
-        if market_status == "RISK_OFF":
+        if market_status == "RISK_OFF" or bool(position.systemic_risk_off):
             market_level = "REDUCE"
-            reasons.append("MARKET_RISK_OFF")
+            reasons.append("SIDE_MARKET_RISK_OFF_POSITION_RISK" if not position.systemic_risk_off else "SYSTEMIC_RISK_OFF_POSITION_RISK")
         elif market_status == "WEAK":
             market_level = "CAUTION"
-            reasons.append("MARKET_WEAK")
+            reasons.append("SIDE_MARKET_WEAK_POSITION_RISK")
+        position_action, exit_ratio, trailing_gap, action_reasons = self._position_market_action(
+            position,
+            side_market_regime=market_status,
+            structure_intact=structure_intact,
+            support_broken=support_broken,
+            vwap_broken=vwap_broken,
+            theme_weak=theme_weak,
+            leader_collapsed=leader_collapsed,
+        )
+        reasons.extend(action_reasons)
+        if position_action in {PositionMarketAction.EXIT_NOW.value, PositionMarketAction.SCALE_OUT.value}:
+            market_level = _max_risk_level([market_level, "REDUCE"])
+        elif position_action in {PositionMarketAction.TIGHTEN_STOP.value, PositionMarketAction.EXIT_IF_LOSER.value, PositionMarketAction.DATA_WAIT.value}:
+            market_level = _max_risk_level([market_level, "CAUTION"])
         risk_level = _max_risk_level([data_level, theme_level, market_level])
         if position.current_return_pct <= self.config.stop_loss_pct:
             risk_level = _max_risk_level([risk_level, "REDUCE"])
@@ -469,9 +740,118 @@ class PositionRiskManager:
             theme_risk_level=theme_level,
             market_risk_level=market_level,
             data_risk_level=data_level,
+            market_side=position.market_side,
+            side_market_regime=market_status,
+            counterpart_market_regime=position.counterpart_market_regime,
+            composite_market_mode=position.composite_market_mode,
+            systemic_risk_off=position.systemic_risk_off,
+            position_market_action=position_action,
+            recommended_exit_ratio=exit_ratio,
+            recommended_trailing_gap_pct=trailing_gap,
+            position_action_reason_codes=tuple(_dedupe(action_reasons)),
+            market_context_fresh=position.market_context_fresh,
+            structure_intact=structure_intact,
+            support_broken=support_broken,
+            vwap_broken=vwap_broken,
+            theme_weak=theme_weak,
+            leader_collapsed=leader_collapsed,
             reason_codes=tuple(_dedupe(reasons)),
-            details={"theme_status": theme_status, "market_status": market_status},
+            details={
+                "theme_status": theme_status,
+                "market_status": market_status,
+                "market_side": position.market_side,
+                "market_side_source": position.market_side_source,
+                "market_side_resolution_status": position.market_side_resolution_status,
+                "side_market_regime": market_status,
+                "counterpart_market_regime": position.counterpart_market_regime,
+                "composite_market_mode": position.composite_market_mode,
+                "systemic_risk_off": position.systemic_risk_off,
+                "market_context_calculated_at": position.market_context_calculated_at,
+                "market_context_fresh": position.market_context_fresh,
+                "candidate_market_action": position.candidate_market_action,
+                "strategy_context_id": position.strategy_context_id,
+                "position_market_action": position_action,
+                "recommended_exit_ratio": exit_ratio,
+                "recommended_trailing_gap_pct": trailing_gap,
+                "position_action_reason_codes": list(_dedupe(action_reasons)),
+                "structure_intact": structure_intact,
+                "support_broken": support_broken,
+                "vwap_broken": vwap_broken,
+                "theme_weak": theme_weak,
+                "leader_collapsed": leader_collapsed,
+            },
         )
+
+    def _structure_flags(
+        self,
+        position: PositionRuntimeSnapshot,
+        details: Mapping[str, Any],
+        theme_status: str,
+    ) -> tuple[bool, bool, bool, bool]:
+        support = int(_first_number(details.get("recent_support"), details.get("support_price")))
+        support_broken = bool(details.get("support_broken")) or (support > 0 and int(position.current_price or 0) > 0 and int(position.current_price or 0) < support)
+        vwap = _float(details.get("vwap"))
+        momentum = _float(details.get("momentum_1m"))
+        vwap_broken = bool(details.get("vwap_broken")) or (vwap > 0 and int(position.current_price or 0) > 0 and int(position.current_price or 0) < vwap and momentum < 0)
+        theme_weak = bool(details.get("theme_weak")) or theme_status in {"WEAK_THEME", "WATCH_THEME"}
+        leader_collapsed = bool(details.get("leader_collapsed") or details.get("leader_vwap_broken") or details.get("leader_support_broken"))
+        return support_broken, vwap_broken, theme_weak, leader_collapsed
+
+    def _position_market_action(
+        self,
+        position: PositionRuntimeSnapshot,
+        *,
+        side_market_regime: str,
+        structure_intact: bool,
+        support_broken: bool,
+        vwap_broken: bool,
+        theme_weak: bool,
+        leader_collapsed: bool,
+    ) -> tuple[str, float, float, list[str]]:
+        reasons: list[str] = []
+        damaged = not structure_intact
+        profitable = float(position.current_return_pct or 0.0) >= 0.0
+        tight_gap = round(max(0.1, min(float(self.config.trailing_gap_pct or 0.0), 0.6)), 6)
+        side = str(position.market_side or "UNKNOWN").upper()
+        if position.risk_status in {PositionRiskStatus.DATA_WAIT, PositionRiskStatus.STALE_DATA_RISK}:
+            return PositionMarketAction.DATA_WAIT.value, 0.0, 0.0, ["POSITION_MARKET_DATA_WAIT"]
+        if not bool(position.market_context_fresh):
+            return PositionMarketAction.DATA_WAIT.value, 0.0, 0.0, ["POSITION_MARKET_CONTEXT_STALE"]
+        if side not in MARKET_SIDES or str(position.market_side_resolution_status or "").upper() != "RESOLVED":
+            return PositionMarketAction.DATA_WAIT.value, 0.0, 0.0, ["POSITION_MARKET_SIDE_UNRESOLVED"]
+        if bool(position.systemic_risk_off):
+            reasons.append("SYSTEMIC_RISK_OFF_POSITION_RISK")
+            if not profitable or damaged:
+                return PositionMarketAction.EXIT_NOW.value, 1.0, 0.0, reasons + ["POSITION_MARKET_EXIT_NOW"]
+            return PositionMarketAction.SCALE_OUT.value, 0.5, tight_gap, reasons + ["POSITION_MARKET_SCALE_OUT"]
+        status = str(side_market_regime or "DATA_WAIT").upper()
+        counterpart = str(position.counterpart_market_regime or "").upper()
+        if status in {"EXPANSION", "SELECTIVE"}:
+            reasons.append("POSITION_MARKET_HOLD")
+            if counterpart in {"WEAK", "RISK_OFF"}:
+                reasons.append("COUNTERPART_MARKET_RISK_IGNORED")
+            return PositionMarketAction.HOLD.value, 0.0, 0.0, reasons
+        if status == "CHOPPY":
+            if support_broken or vwap_broken:
+                return PositionMarketAction.EXIT_NOW.value, 1.0, 0.0, ["POSITION_MARKET_EXIT_NOW"]
+            return PositionMarketAction.TIGHTEN_STOP.value, 0.0, tight_gap, ["POSITION_MARKET_TIGHTEN_STOP"]
+        if status == "WEAK":
+            reasons.append("SIDE_MARKET_WEAK_POSITION_RISK")
+            if not profitable and damaged:
+                return PositionMarketAction.EXIT_NOW.value, 1.0, 0.0, reasons + ["POSITION_MARKET_EXIT_NOW"]
+            if not profitable:
+                return PositionMarketAction.EXIT_IF_LOSER.value, 0.0, tight_gap, reasons + ["POSITION_MARKET_EXIT_IF_LOSER"]
+            if theme_weak or leader_collapsed or support_broken or vwap_broken:
+                return PositionMarketAction.SCALE_OUT.value, 0.5, tight_gap, reasons + ["POSITION_MARKET_SCALE_OUT"]
+            return PositionMarketAction.TIGHTEN_STOP.value, 0.0, tight_gap, reasons + ["POSITION_MARKET_TIGHTEN_STOP"]
+        if status == "RISK_OFF":
+            reasons.append("SIDE_MARKET_RISK_OFF_POSITION_RISK")
+            if not profitable or damaged:
+                return PositionMarketAction.EXIT_NOW.value, 1.0, 0.0, reasons + ["POSITION_MARKET_EXIT_NOW"]
+            return PositionMarketAction.SCALE_OUT.value, 0.5, tight_gap, reasons + ["POSITION_MARKET_SCALE_OUT"]
+        if status in {"DATA_WAIT", "MARKET_CLOSED", "UNKNOWN", ""}:
+            return PositionMarketAction.DATA_WAIT.value, 0.0, 0.0, ["POSITION_MARKET_DATA_WAIT"]
+        return PositionMarketAction.DATA_WAIT.value, 0.0, 0.0, ["POSITION_MARKET_DATA_WAIT"]
 
     def _merge_candidate_metadata(
         self,
@@ -518,22 +898,73 @@ class PositionRiskManager:
     ) -> PortfolioRiskSnapshot:
         exposure_by_theme: defaultdict[str, int] = defaultdict(int)
         exposure_by_side: defaultdict[str, int] = defaultdict(int)
+        open_count_by_side: Counter[str] = Counter()
+        quality_flags_by_side: defaultdict[str, list[str]] = defaultdict(list)
         total_exposure = 0
         weighted_return = 0.0
         realized_values: list[float] = []
         for position in positions:
-            exposure = max(0, int(position.remaining_quantity or 0)) * max(0, int(position.current_price or 0))
+            side = _normalized_side(position.market_side)
+            if side not in MARKET_SIDES:
+                side = _normalized_side((position.details or {}).get("market_side"))
+            price = int(position.current_price or 0)
+            if price <= 0:
+                fallback_price = int(_first_number(position.avg_entry_price, position.entry_price))
+                if fallback_price > 0:
+                    price = fallback_price
+                    quality_flags_by_side[side].append("OPEN_EXPOSURE_PRICE_FALLBACK")
+                else:
+                    quality_flags_by_side[side].append("OPEN_EXPOSURE_PRICE_MISSING")
+            exposure = max(0, int(position.remaining_quantity or 0)) * max(0, price)
             total_exposure += exposure
             exposure_by_theme[position.theme_name or position.theme_id or "UNKNOWN"] += exposure
-            side = str((position.details or {}).get("market_side") or "UNKNOWN")
             exposure_by_side[side] += exposure
+            if side in MARKET_SIDES:
+                open_count_by_side[side] += 1
             weighted_return += exposure * float(position.unrealized_return_pct or 0.0)
             realized_values.append(float(position.realized_return_pct or 0.0))
+        pending_by_side, pending_count_by_side, pending_quality = self._pending_buy_reservations(trade_date)
+        for side, flags in pending_quality.items():
+            quality_flags_by_side[side].extend(flags)
         unrealized = weighted_return / total_exposure if total_exposure > 0 else 0.0
         max_drawdown = min([float(position.max_drawdown_pct or 0.0) for position in positions] or [0.0])
         daily_realized = sum(realized_values) / len(realized_values) if realized_values else 0.0
         reasons: list[str] = []
         risk_level = "NORMAL"
+        latest_regime = self._latest_market_regime(trade_date)
+        market_calculated_at = str(latest_regime.get("calculated_at") or "")
+        market_fresh = bool(market_calculated_at) and _fresh_iso(market_calculated_at, now, self.config.market_side_budget_max_age_sec)
+        composite = str(latest_regime.get("composite_market_mode") or "DATA_DEGRADED").upper()
+        systemic = bool(latest_regime.get("systemic_risk_off") or latest_regime.get("risk_off_detected") or composite == "SYSTEMIC_RISK_OFF")
+        side_status = {
+            "KOSPI": str(latest_regime.get("kospi_status") or self._latest_position_side_status(positions, "KOSPI") or "DATA_WAIT").upper(),
+            "KOSDAQ": str(latest_regime.get("kosdaq_status") or self._latest_position_side_status(positions, "KOSDAQ") or "DATA_WAIT").upper(),
+        }
+        if not market_fresh:
+            composite = "DATA_DEGRADED"
+            side_status = {side: "DATA_WAIT" for side in MARKET_SIDES}
+            for side in MARKET_SIDES:
+                quality_flags_by_side[side].append("MARKET_CONTEXT_STALE")
+        budgets: dict[str, dict[str, Any]] = {}
+        for side in MARKET_SIDES:
+            counterpart = "KOSDAQ" if side == "KOSPI" else "KOSPI"
+            budget = self._market_side_budget(
+                side=side,
+                side_status=side_status[side],
+                counterpart_status=side_status.get(counterpart, "DATA_WAIT"),
+                composite=composite,
+                systemic=systemic,
+                open_exposure=int(exposure_by_side.get(side, 0)),
+                pending_exposure=int(pending_by_side.get(side, 0)),
+                open_count=int(open_count_by_side.get(side, 0)),
+                pending_count=int(pending_count_by_side.get(side, 0)),
+                data_quality_flags=quality_flags_by_side.get(side, []),
+                market_fresh=market_fresh,
+            )
+            budgets[side] = budget.to_dict()
+            reasons.extend(budget.reason_codes)
+            if budget.budget_action in {MarketSideBudgetAction.STOP_NEW_ENTRY.value, MarketSideBudgetAction.DATA_WAIT.value, MarketSideBudgetAction.MARKET_CLOSED.value}:
+                risk_level = _max_risk_level([risk_level, "STOP_NEW_ENTRY"])
         if any(item.data_risk_level in {"DATA_WAIT", "STALE"} for item in position_risks):
             risk_level = _max_risk_level([risk_level, "CAUTION"])
             reasons.append("PORTFOLIO_DATA_RISK")
@@ -543,12 +974,20 @@ class PositionRiskManager:
         if total_exposure >= self.config.stop_new_entry_exposure_krw > 0:
             risk_level = _max_risk_level([risk_level, "STOP_NEW_ENTRY"])
             reasons.append("PORTFOLIO_EXPOSURE_LIMIT")
+        gross_pending = sum(int(value or 0) for value in pending_by_side.values())
+        gross_reserved = total_exposure + gross_pending
+        gross_limit = int(self.config.portfolio_gross_exposure_limit_krw or 0)
+        if gross_limit > 0 and gross_reserved >= gross_limit:
+            risk_level = _max_risk_level([risk_level, "STOP_NEW_ENTRY"])
+            reasons.append("PORTFOLIO_GROSS_EXPOSURE_LIMIT")
         if max_drawdown <= self.config.reduce_drawdown_pct:
             risk_level = _max_risk_level([risk_level, "REDUCE"])
             reasons.append("PORTFOLIO_DRAWDOWN_REDUCE")
         if max_drawdown <= self.config.kill_switch_drawdown_pct:
             risk_level = _max_risk_level([risk_level, "KILL_SWITCH_RECOMMENDED"])
             reasons.append("PORTFOLIO_DRAWDOWN_KILL_SWITCH")
+        gross_available = max(0, gross_limit - gross_reserved) if gross_limit > 0 else 0
+        gross_utilization = round((gross_reserved / gross_limit) * 100.0, 6) if gross_limit > 0 else 0.0
         return PortfolioRiskSnapshot(
             trade_date=trade_date,
             calculated_at=now.isoformat(),
@@ -562,9 +1001,231 @@ class PositionRiskManager:
             risk_level=risk_level,
             stop_new_entry_recommended=risk_level in {"STOP_NEW_ENTRY", "KILL_SWITCH_RECOMMENDED"},
             kill_switch_recommended=risk_level == "KILL_SWITCH_RECOMMENDED",
+            gross_exposure_limit_krw=gross_limit,
+            gross_open_exposure_krw=total_exposure,
+            gross_pending_buy_exposure_krw=gross_pending,
+            gross_reserved_exposure_krw=gross_reserved,
+            gross_available_exposure_krw=gross_available,
+            gross_utilization_pct=gross_utilization,
+            composite_market_mode=composite,
+            systemic_risk_off=systemic,
+            market_side_budgets=budgets,
+            stop_new_entry_by_side={
+                side: budgets[side]["budget_action"] in {MarketSideBudgetAction.STOP_NEW_ENTRY.value, MarketSideBudgetAction.DATA_WAIT.value, MarketSideBudgetAction.MARKET_CLOSED.value}
+                for side in MARKET_SIDES
+            },
+            reduce_only_by_side={
+                side: budgets[side]["budget_action"] in {MarketSideBudgetAction.STOP_NEW_ENTRY.value, MarketSideBudgetAction.DATA_WAIT.value, MarketSideBudgetAction.MARKET_CLOSED.value}
+                for side in MARKET_SIDES
+            },
+            market_context_calculated_at=market_calculated_at,
+            market_context_fresh=market_fresh,
             reason_codes=tuple(_dedupe(reasons)),
-            details={"position_risk_counts": dict(Counter(item.risk_level for item in position_risks))},
+            details={
+                "position_risk_counts": dict(Counter(item.risk_level for item in position_risks)),
+                "position_market_action_counts": dict(Counter(item.position_market_action for item in position_risks)),
+                "market_side_budgets": budgets,
+                "market_side_portfolio_enabled": self.config.market_side_portfolio_enabled,
+                "market_side_portfolio_observe_only": self.config.market_side_portfolio_observe_only,
+                "market_side_portfolio_enforce_buy_limits": self.config.market_side_portfolio_enforce_buy_limits,
+            },
         )
+
+    def _market_side_budget(
+        self,
+        *,
+        side: str,
+        side_status: str,
+        counterpart_status: str,
+        composite: str,
+        systemic: bool,
+        open_exposure: int,
+        pending_exposure: int,
+        open_count: int,
+        pending_count: int,
+        data_quality_flags: Iterable[str],
+        market_fresh: bool,
+    ) -> MarketSidePortfolioBudget:
+        side_limit = self.config.kospi_exposure_limit_krw if side == "KOSPI" else self.config.kosdaq_exposure_limit_krw
+        gross = int(self.config.portfolio_gross_exposure_limit_krw or 0)
+        composite_multiplier = _composite_budget_multiplier(composite)
+        side_multiplier = _side_budget_multiplier(side_status)
+        derived_limit = int(round(gross * composite_multiplier * side_multiplier)) if gross > 0 else 0
+        base_limit = int(side_limit or gross or 0)
+        effective_limit = min(side_limit, derived_limit) if side_limit > 0 else derived_limit
+        reserved = max(0, int(open_exposure or 0)) + max(0, int(pending_exposure or 0))
+        max_positions = self.config.kospi_max_open_positions if side == "KOSPI" else self.config.kosdaq_max_open_positions
+        available_slots = max(0, int(max_positions or 0) - int(open_count or 0) - int(pending_count or 0)) if max_positions > 0 else 0
+        action, reasons = self._budget_action(
+            side=side,
+            side_status=side_status,
+            composite=composite,
+            systemic=systemic,
+            effective_limit=effective_limit,
+            market_fresh=market_fresh,
+            data_quality_flags=list(data_quality_flags),
+            composite_multiplier=composite_multiplier,
+            side_multiplier=side_multiplier,
+        )
+        if effective_limit > 0 and reserved >= effective_limit:
+            reasons.append("MARKET_SIDE_EXPOSURE_LIMIT")
+            if action == MarketSideBudgetAction.ALLOW_BUDGET.value:
+                action = MarketSideBudgetAction.STOP_NEW_ENTRY.value
+        if max_positions > 0 and available_slots <= 0:
+            reasons.append("MARKET_SIDE_POSITION_LIMIT")
+            if action == MarketSideBudgetAction.ALLOW_BUDGET.value:
+                action = MarketSideBudgetAction.STOP_NEW_ENTRY.value
+        if pending_exposure > 0:
+            reasons.append("PENDING_BUY_EXPOSURE_RESERVED")
+        available = max(0, effective_limit - reserved) if effective_limit > 0 else 0
+        utilization = round((reserved / effective_limit) * 100.0, 6) if effective_limit > 0 else 0.0
+        return MarketSidePortfolioBudget(
+            market_side=side,
+            side_market_regime=side_status,
+            counterpart_market_regime=counterpart_status,
+            composite_market_mode=composite,
+            systemic_risk_off=systemic,
+            base_exposure_limit_krw=base_limit,
+            effective_exposure_limit_krw=effective_limit,
+            open_exposure_krw=open_exposure,
+            pending_buy_exposure_krw=pending_exposure,
+            reserved_exposure_krw=reserved,
+            available_exposure_krw=available,
+            utilization_pct=utilization,
+            open_position_count=open_count,
+            pending_buy_count=pending_count,
+            max_open_positions=max_positions,
+            available_position_slots=available_slots,
+            budget_action=action,
+            reason_codes=tuple(_dedupe(reasons)),
+            data_quality_flags=tuple(_dedupe(data_quality_flags)),
+        )
+
+    def _budget_action(
+        self,
+        *,
+        side: str,
+        side_status: str,
+        composite: str,
+        systemic: bool,
+        effective_limit: int,
+        market_fresh: bool,
+        data_quality_flags: list[str],
+        composite_multiplier: float,
+        side_multiplier: float,
+    ) -> tuple[str, list[str]]:
+        reasons: list[str] = []
+        if side not in MARKET_SIDES:
+            return MarketSideBudgetAction.DATA_WAIT.value, ["MARKET_SIDE_UNKNOWN_BUY_BLOCK"]
+        if not market_fresh or data_quality_flags:
+            reasons.append("MARKET_SIDE_BUDGET_DATA_WAIT")
+            return MarketSideBudgetAction.DATA_WAIT.value, reasons
+        if systemic or composite == "SYSTEMIC_RISK_OFF":
+            return MarketSideBudgetAction.STOP_NEW_ENTRY.value, reasons + ["MARKET_SIDE_STOP_NEW_ENTRY"]
+        if composite == "MARKET_CLOSED" or side_status == "MARKET_CLOSED":
+            return MarketSideBudgetAction.MARKET_CLOSED.value, reasons + ["MARKET_SIDE_STOP_NEW_ENTRY"]
+        if side_status in {"DATA_WAIT", "UNKNOWN", ""}:
+            return MarketSideBudgetAction.DATA_WAIT.value, reasons + ["MARKET_SIDE_BUDGET_DATA_WAIT"]
+        if side_status in {"RISK_OFF", "WEAK", "CHOPPY"} or effective_limit <= 0:
+            return MarketSideBudgetAction.STOP_NEW_ENTRY.value, reasons + ["MARKET_SIDE_STOP_NEW_ENTRY"]
+        if side_status == "SELECTIVE" or composite_multiplier < 1.0 or side_multiplier < 1.0:
+            return MarketSideBudgetAction.REDUCED_BUDGET.value, reasons + ["MARKET_SIDE_BUDGET_REDUCED"]
+        return MarketSideBudgetAction.ALLOW_BUDGET.value, reasons + ["MARKET_SIDE_BUDGET_ALLOW"]
+
+    def _pending_buy_reservations(self, trade_date: str) -> tuple[Counter[str], Counter[str], dict[str, list[str]]]:
+        exposure: Counter[str] = Counter()
+        counts: Counter[str] = Counter()
+        quality: defaultdict[str, list[str]] = defaultdict(list)
+        if not self.config.market_side_pending_buy_included:
+            return exposure, counts, dict(quality)
+        seen: set[str] = set()
+        orders = _call(self.db, "list_managed_orders", trade_date=trade_date, status=list(PENDING_BUY_STATUSES), side="BUY", limit=1000) or []
+        for row in orders:
+            item = dict(row or {})
+            key = self._pending_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            side = self._pending_market_side(item)
+            qty = _pending_remaining_quantity(item)
+            price = int(_first_number(item.get("price"), item.get("limit_price_hint"), dict(item.get("details") or {}).get("current_price")))
+            if price <= 0:
+                quality[side].append("PENDING_BUY_PRICE_MISSING")
+                continue
+            amount = max(0, qty) * price
+            if amount > 0:
+                exposure[side] += amount
+                counts[side] += 1
+        intents = _call(self.db, "list_managed_order_intents", trade_date=trade_date, limit=1000) or []
+        for row in intents:
+            item = dict(row or {})
+            if str(item.get("side") or "").upper() != "BUY" or str(item.get("status") or "").upper() not in PENDING_BUY_STATUSES:
+                continue
+            key = self._pending_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            side = self._pending_market_side(item)
+            qty = max(0, int(item.get("quantity") or 0))
+            price = int(_first_number(item.get("price"), dict(item.get("details") or {}).get("current_price")))
+            if price <= 0:
+                quality[side].append("PENDING_BUY_PRICE_MISSING")
+                continue
+            amount = qty * price
+            if amount > 0:
+                exposure[side] += amount
+                counts[side] += 1
+        return exposure, counts, dict(quality)
+
+    def _pending_key(self, item: Mapping[str, Any]) -> str:
+        if item.get("intent_id"):
+            return f"intent:{item.get('intent_id')}"
+        if item.get("idempotency_key"):
+            return f"idem:{item.get('idempotency_key')}"
+        if item.get("id") or item.get("order_id"):
+            return f"order:{item.get('id') or item.get('order_id')}"
+        return f"{item.get('code')}:{item.get('side')}:{item.get('status')}"
+
+    def _pending_market_side(self, item: Mapping[str, Any]) -> str:
+        details = dict(item.get("details") or {})
+        context = dict(details.get("strategy_context_v3") or {})
+        market = dict(context.get("market") or {})
+        side = _normalized_side(market.get("market_side") or details.get("market_side") or item.get("market_side"))
+        if side in MARKET_SIDES:
+            return side
+        side = self._symbol_master_side(str(item.get("code") or ""))
+        return side if side in MARKET_SIDES else "UNKNOWN"
+
+    def _symbol_master_side(self, code: str) -> str:
+        loader = getattr(self.db, "list_kiwoom_symbol_master", None)
+        if not callable(loader) or not code:
+            return "UNKNOWN"
+        try:
+            rows = list(loader([code]) or [])
+        except Exception:
+            return "UNKNOWN"
+        for row in rows:
+            item = dict(row or {})
+            side = _normalized_side(item.get("market_side") or item.get("market") or item.get("market_type"))
+            if side in MARKET_SIDES:
+                return side
+        return "UNKNOWN"
+
+    def _latest_market_regime(self, trade_date: str) -> dict[str, Any]:
+        loader = getattr(self.db, "latest_market_regime_snapshot", None)
+        if not callable(loader):
+            return {}
+        try:
+            return dict(loader(trade_date=trade_date) or {})
+        except TypeError:
+            return dict(loader() or {})
+
+    @staticmethod
+    def _latest_position_side_status(positions: Iterable[PositionRuntimeSnapshot], side: str) -> str:
+        for position in positions:
+            if _normalized_side(position.market_side) == side and str(position.side_market_regime or ""):
+                return str(position.side_market_regime or "")
+        return ""
 
     def _latest_positions(self, trade_date: str) -> list[dict[str, Any]]:
         loader = getattr(self.db, "latest_position_runtime_snapshots", None)
@@ -633,15 +1294,56 @@ def position_risk_dashboard_payload(
     position_items = [_position_dict(item) for item in positions]
     if not position_items:
         position_items = []
+    risk_by_position = {str(item.get("position_id") or ""): dict(item or {}) for item in risks}
+    for item in position_items:
+        risk = risk_by_position.get(str(item.get("position_id") or ""))
+        if not risk:
+            continue
+        details = dict(risk.get("details") or {})
+        item.update(
+            {
+                "risk_level": risk.get("risk_level", "NORMAL"),
+                "market_side": risk.get("market_side") or item.get("market_side") or details.get("market_side") or "",
+                "side_market_regime": risk.get("side_market_regime") or details.get("side_market_regime") or "",
+                "position_market_action": risk.get("position_market_action") or details.get("position_market_action") or "",
+                "recommended_exit_ratio": float(risk.get("recommended_exit_ratio") or details.get("recommended_exit_ratio") or 0.0),
+                "recommended_trailing_gap_pct": float(risk.get("recommended_trailing_gap_pct") or details.get("recommended_trailing_gap_pct") or 0.0),
+                "structure_intact": bool(risk.get("structure_intact", details.get("structure_intact", True))),
+                "support_broken": bool(risk.get("support_broken") or details.get("support_broken")),
+                "vwap_broken": bool(risk.get("vwap_broken") or details.get("vwap_broken")),
+                "theme_weak": bool(risk.get("theme_weak") or details.get("theme_weak")),
+                "leader_collapsed": bool(risk.get("leader_collapsed") or details.get("leader_collapsed")),
+            }
+        )
     reason_counter = Counter()
+    action_counter = Counter()
     for item in risks:
         for reason in list(item.get("reason_codes") or []):
             reason_counter[str(reason)] += 1
+        action = str(item.get("position_market_action") or dict(item.get("details") or {}).get("position_market_action") or "")
+        if action:
+            action_counter[action] += 1
+    side_budgets = dict(portfolio.get("market_side_budgets") or dict(portfolio.get("details") or {}).get("market_side_budgets") or {})
     return {
         "calculated_at": data.get("calculated_at") or portfolio.get("calculated_at", ""),
         "trade_date": data.get("trade_date") or portfolio.get("trade_date", ""),
         "portfolio_risk_level": portfolio.get("risk_level", "NORMAL"),
         "open_position_count": int(portfolio.get("open_position_count") or len(position_items)),
+        "total_exposure": int(portfolio.get("total_exposure") or 0),
+        "gross_exposure_limit_krw": int(portfolio.get("gross_exposure_limit_krw") or 0),
+        "gross_open_exposure_krw": int(portfolio.get("gross_open_exposure_krw") or portfolio.get("total_exposure") or 0),
+        "gross_pending_buy_exposure_krw": int(portfolio.get("gross_pending_buy_exposure_krw") or 0),
+        "gross_reserved_exposure_krw": int(portfolio.get("gross_reserved_exposure_krw") or 0),
+        "gross_available_exposure_krw": int(portfolio.get("gross_available_exposure_krw") or 0),
+        "gross_utilization_pct": float(portfolio.get("gross_utilization_pct") or 0.0),
+        "composite_market_mode": portfolio.get("composite_market_mode", "DATA_DEGRADED"),
+        "systemic_risk_off": bool(portfolio.get("systemic_risk_off")),
+        "market_context_calculated_at": portfolio.get("market_context_calculated_at", ""),
+        "market_context_fresh": bool(portfolio.get("market_context_fresh")),
+        "market_side_budgets": side_budgets,
+        "stop_new_entry_by_side": dict(portfolio.get("stop_new_entry_by_side") or {}),
+        "reduce_only_by_side": dict(portfolio.get("reduce_only_by_side") or {}),
+        "position_market_action_counts": dict(action_counter),
         "theme_exposure": dict(portfolio.get("theme_exposure_by_theme") or {}),
         "market_side_exposure": dict(portfolio.get("market_side_exposure") or {}),
         "unrealized_pnl_pct": float(portfolio.get("unrealized_pnl_pct") or 0.0),
@@ -709,6 +1411,17 @@ def _position_snapshot_from(item: PositionRuntimeSnapshot | Mapping[str, Any]) -
         last_tick_at=str(data.get("last_tick_at") or ""),
         data_quality_flags=tuple(str(value) for value in list(data.get("data_quality_flags") or [])),
         risk_status=PositionRiskStatus(str(data.get("risk_status") or PositionRiskStatus.OPEN.value)),
+        market_side=str(data.get("market_side") or dict(data.get("details") or {}).get("market_side") or "UNKNOWN"),
+        market_side_source=str(data.get("market_side_source") or dict(data.get("details") or {}).get("market_side_source") or ""),
+        market_side_resolution_status=str(data.get("market_side_resolution_status") or dict(data.get("details") or {}).get("market_side_resolution_status") or "UNRESOLVED"),
+        side_market_regime=str(data.get("side_market_regime") or dict(data.get("details") or {}).get("side_market_regime") or "DATA_WAIT"),
+        counterpart_market_regime=str(data.get("counterpart_market_regime") or dict(data.get("details") or {}).get("counterpart_market_regime") or "DATA_WAIT"),
+        composite_market_mode=str(data.get("composite_market_mode") or dict(data.get("details") or {}).get("composite_market_mode") or "DATA_DEGRADED"),
+        systemic_risk_off=bool(data.get("systemic_risk_off") or dict(data.get("details") or {}).get("systemic_risk_off")),
+        market_context_calculated_at=str(data.get("market_context_calculated_at") or dict(data.get("details") or {}).get("market_context_calculated_at") or ""),
+        market_context_fresh=bool(data.get("market_context_fresh") or dict(data.get("details") or {}).get("market_context_fresh")),
+        candidate_market_action=str(data.get("candidate_market_action") or dict(data.get("details") or {}).get("candidate_market_action") or "DATA_WAIT"),
+        strategy_context_id=str(data.get("strategy_context_id") or dict(data.get("details") or {}).get("strategy_context_id") or ""),
         details=dict(data.get("details") or {}),
     )
 
@@ -772,7 +1485,12 @@ def _holding_minutes(opened_at: str, now: datetime) -> int:
     opened = _parse_dt(opened_at)
     if opened is None:
         return 0
-    return max(0, int((now - opened).total_seconds() // 60))
+    current = now
+    if opened.tzinfo is not None and current.tzinfo is None:
+        current = current.replace(tzinfo=opened.tzinfo)
+    if opened.tzinfo is None and current.tzinfo is not None:
+        opened = opened.replace(tzinfo=current.tzinfo)
+    return max(0, int((current - opened).total_seconds() // 60))
 
 
 def _parse_dt(value: str) -> datetime | None:
@@ -780,9 +1498,21 @@ def _parse_dt(value: str) -> datetime | None:
     if not text:
         return None
     try:
-        return datetime.fromisoformat(text)
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _fresh_iso(value: str, now: datetime, max_age_sec: int) -> bool:
+    parsed = _parse_dt(value)
+    if parsed is None:
+        return False
+    current = now
+    if parsed.tzinfo is not None and current.tzinfo is None:
+        current = current.replace(tzinfo=parsed.tzinfo)
+    if parsed.tzinfo is None and current.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=current.tzinfo)
+    return (current - parsed).total_seconds() <= max(0, int(max_age_sec or 0))
 
 
 def _return_pct(price: int, base: int) -> float:
@@ -822,6 +1552,56 @@ def _float(value: Any, default: float = 0.0) -> float:
 def _optional_int(value: Any) -> int | None:
     if value in (None, ""):
         return None
+
+
+def _normalized_side(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if text in {"KOSPI", "STK", "001", "0", "KRX"}:
+        return "KOSPI"
+    if text in {"KOSDAQ", "KSQ", "101", "10", "KQ"}:
+        return "KOSDAQ"
+    return "UNKNOWN"
+
+
+def _composite_budget_multiplier(mode: str) -> float:
+    return {
+        "BROAD_RISK_ON": 1.0,
+        "SPLIT_KOSPI_ON": 0.7,
+        "SPLIT_KOSDAQ_ON": 0.7,
+        "MIXED_CAUTION": 0.6,
+        "DATA_DEGRADED": 0.5,
+        "SYSTEMIC_RISK_OFF": 0.0,
+        "MARKET_CLOSED": 0.0,
+    }.get(str(mode or "").upper(), 0.5)
+
+
+def _side_budget_multiplier(status: str) -> float:
+    return {
+        "EXPANSION": 1.0,
+        "SELECTIVE": 0.6,
+        "CHOPPY": 0.0,
+        "WEAK": 0.0,
+        "RISK_OFF": 0.0,
+        "DATA_WAIT": 0.0,
+        "MARKET_CLOSED": 0.0,
+    }.get(str(status or "").upper(), 0.0)
+
+
+def _pending_remaining_quantity(item: Mapping[str, Any]) -> int:
+    status = str(item.get("status") or "").upper()
+    quantity = max(0, int(item.get("quantity") or 0))
+    remaining = int(item.get("remaining_quantity") or 0)
+    filled = int(item.get("filled_quantity") or 0)
+    if status == "PARTIALLY_FILLED":
+        return max(0, remaining if remaining > 0 else quantity - filled)
+    return max(0, remaining if remaining > 0 else quantity)
+
+
+def _call(target: Any, name: str, **kwargs):
+    fn = getattr(target, name, None)
+    if not callable(fn):
+        return None
+    return fn(**kwargs)
     try:
         return int(float(str(value).strip()))
     except (TypeError, ValueError):
