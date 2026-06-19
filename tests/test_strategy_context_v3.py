@@ -97,6 +97,54 @@ def test_entry_engine_blocks_when_strategy_context_v3_missing_and_fallback_disab
     assert "STRATEGY_CONTEXT_V3_MISSING" in result.decisions[0].reason_codes
 
 
+def test_entry_engine_v3_ignores_legacy_metadata_when_context_fields_are_missing(tmp_path):
+    db = TradingDatabase(str(tmp_path / "entry-context-no-legacy-fallback.db"))
+    market_data = MarketDataStore()
+    candidate = _candidate(db)
+    _tick(market_data, "000001")
+    candidate.metadata.update(
+        {
+            "theme_board_theme_status": "LEADING_THEME",
+            "theme_board_stock_role": "LEADER_CONFIRMED",
+            "market_regime_status": "EXPANSION",
+            "market_action": "ALLOW_NORMAL",
+            "strategy_context_v3": {
+                "schema_version": "strategy_context_v3",
+                "context_id": "ctx-empty-sections",
+                "theme": {},
+                "stock": {},
+                "market": {},
+                "data": {},
+                "risk": {},
+            },
+            "strategy_context_id": "ctx-empty-sections",
+        }
+    )
+    candidate = db.save_candidate(candidate)
+
+    engine = EntryEngine(
+        db,
+        market_data=market_data,
+        candle_builder=CandleBuilder(),
+        config=EntryEngineConfig(
+            enabled=True,
+            min_1m_candles=0,
+            require_vwap=False,
+            use_strategy_context_v3=True,
+            allow_legacy_theme_context_fallback=False,
+        ),
+    )
+    result = engine.evaluate_candidates([candidate], now=datetime(2026, 6, 19, 9, 20, 1))
+
+    decision = result.decisions[0]
+    assert decision.entry_status != EntryDecisionStatus.OBSERVE_READY
+    assert decision.theme_status == ""
+    assert decision.stock_role == ""
+    assert decision.market_action == ""
+    assert "MARKET_DATA_WAIT" in decision.reason_codes
+    assert "ROLE_MISSING" in decision.reason_codes
+
+
 def test_session_phase_boundaries():
     assert session_phase(datetime(2026, 6, 19, 8, 59)).value == "PRE_OPEN"
     assert session_phase(datetime(2026, 6, 19, 9, 1)).value == "OPENING_DISCOVERY"

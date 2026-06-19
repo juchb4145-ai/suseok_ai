@@ -327,19 +327,35 @@ class EntryEngine:
         context_theme = _context_theme(strategy_context)
         context_stock = _context_stock(strategy_context)
         context_market = _context_market(strategy_context)
+        if self.config.use_strategy_context_v3:
+            decision_theme_id = str(context_theme.get("theme_id") or "")
+            decision_theme_name = str(context_theme.get("theme_name") or "")
+            decision_theme_status = str(context_theme.get("theme_state") or "")
+            decision_stock_role = str(context_stock.get("trade_stock_role") or "")
+            decision_market_side = str(context_market.get("market_side") or "")
+            decision_market_status = str(context_market.get("side_market_regime") or "")
+            decision_market_action = str(context_market.get("market_action") or "")
+        else:
+            decision_theme_id = str(metadata.get("theme_board_theme_id") or "")
+            decision_theme_name = str(metadata.get("theme_board_theme_name") or "")
+            decision_theme_status = str(metadata.get("theme_board_theme_status") or "")
+            decision_stock_role = str(metadata.get("theme_board_stock_role") or "")
+            decision_market_side = str(metadata.get("market_side") or "")
+            decision_market_status = str(metadata.get("market_regime_status") or "")
+            decision_market_action = str(metadata.get("market_action") or "")
         return EntryDecision(
             trade_date=trade_date,
             calculated_at=now.isoformat(),
             candidate_id=candidate.id,
             code=candidate.code,
             name=candidate.name,
-            theme_id=str(context_theme.get("theme_id") or metadata.get("theme_board_theme_id") or ""),
-            theme_name=str(context_theme.get("theme_name") or metadata.get("theme_board_theme_name") or ""),
-            theme_status=str(context_theme.get("theme_state") or metadata.get("theme_board_theme_status") or ""),
-            stock_role=str(context_stock.get("trade_stock_role") or metadata.get("theme_board_stock_role") or ""),
-            market_side=str(context_market.get("market_side") or metadata.get("market_side") or ""),
-            market_status=str(context_market.get("side_market_regime") or metadata.get("market_regime_status") or ""),
-            market_action=str(context_market.get("market_action") or metadata.get("market_action") or ""),
+            theme_id=decision_theme_id,
+            theme_name=decision_theme_name,
+            theme_status=decision_theme_status,
+            stock_role=decision_stock_role,
+            market_side=decision_market_side,
+            market_status=decision_market_status,
+            market_action=decision_market_action,
             price_location=price.price_location.value,
             entry_status=entry_status,
             data_ready_status=data.status,
@@ -458,11 +474,14 @@ class EntryEngine:
             if not strategy_context:
                 return EntryMarketReadiness(status=EntryCheckStatus.DATA_WAIT, reason_codes=("STRATEGY_CONTEXT_V3_MISSING",), details={"strategy_context_required": True})
             market_context = _context_market(strategy_context)
+            action = str(market_context.get("market_action") or "").strip().upper()
+            market_status = str(market_context.get("side_market_regime") or "").strip().upper()
+            multiplier = _float(market_context.get("position_size_multiplier_hint"))
         else:
             market_context = {}
-        action = str(market_context.get("market_action") or metadata.get("market_action") or "").strip().upper()
-        market_status = str(market_context.get("side_market_regime") or metadata.get("market_regime_status") or "").strip().upper()
-        multiplier = _float(market_context.get("position_size_multiplier_hint", metadata.get("market_position_size_multiplier_hint")))
+            action = str(metadata.get("market_action") or "").strip().upper()
+            market_status = str(metadata.get("market_regime_status") or "").strip().upper()
+            multiplier = _float(metadata.get("market_position_size_multiplier_hint"))
         details = {"market_action": action, "market_status": market_status}
         if not action:
             return EntryMarketReadiness(status=EntryCheckStatus.DATA_WAIT, reason_codes=("MARKET_DATA_WAIT",), details=details)
@@ -489,10 +508,16 @@ class EntryEngine:
     def _role_ready(self, metadata: Mapping[str, Any], market: EntryMarketReadiness, strategy_context: Mapping[str, Any]) -> EntryRoleReadiness:
         stock_context = _context_stock(strategy_context) if self.config.use_strategy_context_v3 else {}
         theme_context = _context_theme(strategy_context) if self.config.use_strategy_context_v3 else {}
-        role = str(stock_context.get("trade_stock_role") or metadata.get("theme_board_stock_role") or "").strip().upper()
-        raw_role = str(stock_context.get("raw_stock_role") or "").strip().upper()
-        theme_status = str(theme_context.get("theme_state") or metadata.get("theme_board_theme_status") or "").strip().upper()
-        market_status = str(market.details.get("market_status") or metadata.get("market_regime_status") or "").strip().upper()
+        if self.config.use_strategy_context_v3:
+            role = str(stock_context.get("trade_stock_role") or "").strip().upper()
+            raw_role = str(stock_context.get("raw_stock_role") or "").strip().upper()
+            theme_status = str(theme_context.get("theme_state") or "").strip().upper()
+            market_status = str(market.details.get("market_status") or "").strip().upper()
+        else:
+            role = str(metadata.get("theme_board_stock_role") or "").strip().upper()
+            raw_role = ""
+            theme_status = str(metadata.get("theme_board_theme_status") or "").strip().upper()
+            market_status = str(market.details.get("market_status") or metadata.get("market_regime_status") or "").strip().upper()
         details = {"stock_role": role, "raw_stock_role": raw_role, "theme_status": theme_status, "market_status": market_status}
         if role in {"LEADER", "LEADER_CONFIRMED"}:
             return EntryRoleReadiness(status=EntryCheckStatus.PASS, reason_codes=("ROLE_LEADER",), dry_run_role_allowed=True, details=details)
