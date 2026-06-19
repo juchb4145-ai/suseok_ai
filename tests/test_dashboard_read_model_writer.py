@@ -93,6 +93,62 @@ def test_writer_coalesces_many_dirty_signals_within_one_second(tmp_path):
     assert service.metrics["write_count"] == 1
 
 
+def test_read_model_uses_reboot_v2_namespace_by_default(tmp_path):
+    clock = _Clock()
+    service = _service(tmp_path, clock)
+
+    payload = service.build_from_runtime(
+        _runtime_snapshot(),
+        {"heartbeat_ok": True},
+        {"queued_count": 0},
+        {"running": True, "cycle_count": 1, "last_cycle_at": "2026-06-18T00:00:00+00:00"},
+    )
+    record = service.save_snapshot(payload)
+    read_back = service.read_main_snapshot()
+
+    assert payload["snapshot_namespace"] == "reboot_v2.main"
+    assert payload["read_model"]["view_name"] == "reboot_v2.main"
+    assert record.view_name == "reboot_v2.main"
+    assert read_back["read_model"]["snapshot_namespace"] == "reboot_v2.main"
+
+
+def test_latest_cache_does_not_hide_newer_persisted_record(tmp_path):
+    clock = _Clock()
+    repo = DashboardReadModelRepository(tmp_path / "read_model.sqlite3")
+    service = DashboardReadModelService(
+        repo,
+        config=DashboardReadModelConfig(write_interval_sec=1, stale_after_sec=5, skip_unchanged=True),
+        clock=clock,
+    )
+    service.save_snapshot(
+        service.build_from_runtime(
+            _runtime_snapshot(),
+            {"heartbeat_ok": True},
+            {},
+            {"running": True, "cycle_count": 1, "last_cycle_at": "2026-06-18T00:00:00+00:00"},
+        )
+    )
+
+    repo.save_snapshot(
+        {
+            "schema_version": "dashboard_v2.reboot_ops.v1",
+            "snapshot_namespace": "reboot_v2.main",
+            "market_overview": {"global_status": "RISK_OFF"},
+            "read_model": {"view_name": "reboot_v2.main"},
+        },
+        view_name="reboot_v2.main",
+        generation=5,
+        source_runtime_cycle_count=5,
+        snapshot_at="2026-06-18T00:00:05+00:00",
+        skip_unchanged=False,
+    )
+
+    read_back = service.read_main_snapshot()
+
+    assert read_back["read_model"]["generation"] == 5
+    assert read_back["market_overview"]["global_status"] == "RISK_OFF"
+
+
 def test_writer_skips_until_write_interval_elapsed(tmp_path):
     clock = _Clock()
     service = _service(tmp_path, clock)

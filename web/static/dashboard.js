@@ -6,6 +6,14 @@ const state = {
   wsConnected: false,
   lastSnapshotAt: 0,
   latestSnapshot: null,
+  pollSeq: 0,
+  pollController: null,
+  dashboardV2Snapshot: {
+    identity: null,
+    rejectedSnapshotCount: 0,
+    duplicateSnapshotCount: 0,
+    lastRejectReason: "",
+  },
   tables: {},
   buyZeroRca: {
     inFlight: false,
@@ -30,6 +38,8 @@ const state = {
 const SNAPSHOT_POLL_INTERVAL_MS = 30000;
 const SNAPSHOT_INITIAL_FALLBACK_MS = 7000;
 const SNAPSHOT_RECONNECT_MS = 3000;
+const DASHBOARD_V2_SCHEMA_VERSION = "dashboard_v2.reboot_ops.v1";
+const DASHBOARD_V2_NAMESPACE = "reboot_v2.main";
 const SHADOW_SMALL_ENTRY_OPS_ENDPOINTS = {
   preflight: "/api/shadow-small-entry-ops/preflight",
   arm: "/api/shadow-small-entry-ops/arm",
@@ -1056,7 +1066,7 @@ function renderOpsAlerts(payload) {
 }
 
 function renderDashboardV2(snapshot) {
-  const payload = (snapshot || {}).dashboard_v2 || {};
+  const payload = normalizeSnapshotEnvelope(snapshot).snapshot || {};
   const root = document.getElementById("dashboard-v2-root");
   if (!root) return;
   if (!payload.schema_version) {
@@ -1083,12 +1093,15 @@ function renderDashboardV2(snapshot) {
   cls("dashboard-v2-status-label", `counter ${statusTone(status.status_label)}`);
   renderDashboardV2Banners(payload.safety_banners || []);
 
+  const identity = state.dashboardV2Snapshot.identity || snapshotIdentity(payload);
+  text("dashboard-v2-snapshot-source", `${identity.sourceKind || readModel.source || "-"}${identity.fallbackUsed ? " fallback" : ""}`);
+  text("dashboard-v2-snapshot-generation", identity.generation ? `#${identity.generation}` : "-");
   text("dashboard-v2-market-status", `${market.global_status || "-"} / ${market.kospi_status || "-"} / ${market.kosdaq_status || "-"}`);
   text("dashboard-v2-pre-market-status", preMarket.go_no_go || "-");
   text("dashboard-v2-order-safety", orderManager.stop_new_buy ? "STOP_NEW_BUY" : orderManager.reduce_only ? "REDUCE_ONLY" : orderManager.reconcile_required_count ? "RECONCILE_REQUIRED" : orderManager.live_sim_orders_allowed ? "LIVE_SIM 허용" : "관찰/차단");
   text("dashboard-v2-broker-account", `${status.broker_env || "UNKNOWN"} / ${status.account || "-"}`);
   text("dashboard-v2-kill-switch", status.kill_switch_state || "NORMAL");
-  text("dashboard-v2-data-freshness", status.data_freshness_status || "-");
+  text("dashboard-v2-data-freshness", `${status.data_freshness_status || "-"}${readModel.stale ? " / STALE" : ""}`);
   text("dashboard-v2-runtime-cycle", formatDateTime(status.last_runtime_cycle_at));
 
   text("dashboard-v2-pre-market-pill", preMarket.go_no_go || "UNKNOWN");
@@ -2611,16 +2624,109 @@ function compactPlain(value) {
   return `${textValue.substring(0, 10)}...${textValue.substring(textValue.length - 8)}`;
 }
 
+function normalizeSnapshotEnvelope(payload) {
+  const raw = payload || {};
+  const directV2 = raw.schema_version === DASHBOARD_V2_SCHEMA_VERSION ? raw : null;
+  const nestedV2 = raw.dashboard_v2 || null;
+  const snapshot = directV2 || nestedV2 || {};
+  const readModel = snapshot.read_model || (raw.runtime || {}).read_model || {};
+  if (directV2) {
+    return {
+      wrapper: {
+        snapshot_detail: "slim",
+        timestamp: snapshot.generated_at || readModel.snapshot_at || "",
+        runtime: { read_model: readModel },
+        dashboard_v2: snapshot,
+      },
+      snapshot,
+      readModel,
+    };
+  }
+  return { wrapper: raw, snapshot, readModel };
+}
+
+function snapshotIdentity(snapshot) {
+  const payload = snapshot || {};
+  const readModel = payload.read_model || {};
+  return {
+    namespace: String(readModel.snapshot_namespace || payload.snapshot_namespace || readModel.view_name || payload.view_name || ""),
+    schemaVersion: String(payload.schema_version || ""),
+    generation: numberOrZero(readModel.generation || payload.generation),
+    sourceCycle: numberOrZero(readModel.source_runtime_cycle_count || payload.source_runtime_cycle_count),
+    sourceEpoch: String(readModel.source_epoch_id || readModel.boot_id || payload.source_epoch_id || payload.boot_id || ""),
+    snapshotAt: String(readModel.snapshot_at || payload.generated_at || payload.snapshot_at || ""),
+    checksum: String(readModel.checksum || payload.checksum || ""),
+    sourceKind: String(readModel.source_kind || readModel.source || payload.source_kind || ""),
+    stale: Boolean(readModel.stale),
+    fallbackUsed: Boolean(readModel.fallback_used),
+  };
+}
+
+function compareSnapshotOrder(current, incoming) {
+  if (!incoming.schemaVersion) return { order: -1, reason: "SNAPSHOT_SCHEMA_MISSING" };
+  if (incoming.schemaVersion !== DASHBOARD_V2_SCHEMA_VERSION) return { order: -1, reason: "SCHEMA_MISMATCH" };
+  if (incoming.namespace && incoming.namespace !== DASHBOARD_V2_NAMESPACE) return { order: -1, reason: "NAMESPACE_MISMATCH" };
+  if (!current || !current.schemaVersion) return { order: 1, reason: "FIRST_ACCEPTED" };
+  if (incoming.generation < current.generation) return { order: -1, reason: "STALE_GENERATION_REJECTED" };
+  if (incoming.generation > current.generation) return { order: 1, reason: "NEWER_GENERATION" };
+  if (incoming.sourceCycle < current.sourceCycle) return { order: -1, reason: "STALE_RUNTIME_CYCLE_REJECTED" };
+  if (incoming.sourceCycle > current.sourceCycle) return { order: 1, reason: "NEWER_RUNTIME_CYCLE" };
+  if (incoming.checksum && incoming.checksum === current.checksum) return { order: 0, reason: "DUPLICATE_CHECKSUM" };
+  if (incoming.snapshotAt && current.snapshotAt && incoming.snapshotAt < current.snapshotAt) {
+    return { order: -1, reason: "STALE_SNAPSHOT_AT_REJECTED" };
+  }
+  if (incoming.checksum && current.checksum && incoming.checksum !== current.checksum && incoming.generation === current.generation) {
+    return { order: -1, reason: "SAME_GENERATION_CHECKSUM_CONFLICT" };
+  }
+  return { order: 1, reason: "NEWER_OR_UNCHECKED" };
+}
+
+function shouldAcceptSnapshot(current, incoming) {
+  const decision = compareSnapshotOrder(current, incoming);
+  return { accept: decision.order > 0, duplicate: decision.order === 0, reason: decision.reason };
+}
+
+function applySnapshotIfNewer(snapshot, transport) {
+  const normalized = normalizeSnapshotEnvelope(snapshot);
+  const incoming = snapshotIdentity(normalized.snapshot);
+  const decision = shouldAcceptSnapshot(state.dashboardV2Snapshot.identity, incoming);
+  if (decision.duplicate) {
+    state.dashboardV2Snapshot.duplicateSnapshotCount += 1;
+    state.dashboardV2Snapshot.lastRejectReason = decision.reason;
+    return false;
+  }
+  if (!decision.accept) {
+    state.dashboardV2Snapshot.rejectedSnapshotCount += 1;
+    state.dashboardV2Snapshot.lastRejectReason = decision.reason;
+    return false;
+  }
+  state.dashboardV2Snapshot.identity = { ...incoming, transport };
+  state.dashboardV2Snapshot.lastRejectReason = "";
+  state.lastSnapshotAt = Date.now();
+  render(normalized.wrapper);
+  return true;
+}
+
+function numberOrZero(value) {
+  const parsed = Number(value || 0);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 async function pollSnapshot() {
   if (state.pollInFlight) return;
+  const pollSeq = state.pollSeq + 1;
+  state.pollSeq = pollSeq;
+  const controller = new AbortController();
+  state.pollController = controller;
   state.pollInFlight = true;
   try {
-    const response = await fetch("/api/snapshot");
+    const response = await fetch("/api/snapshot?view=v2", { signal: controller.signal });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     const snapshot = await response.json();
-    state.lastSnapshotAt = Date.now();
-    render(snapshot);
+    if (pollSeq !== state.pollSeq) return;
+    applySnapshotIfNewer(snapshot, "poll");
   } finally {
+    if (state.pollController === controller) state.pollController = null;
     state.pollInFlight = false;
   }
 }
@@ -2742,15 +2848,15 @@ function connectWebSocket() {
   state.ws = ws;
   ws.onopen = () => {
     state.wsConnected = true;
+    if (state.pollController) state.pollController.abort();
     stopPolling();
   };
   ws.onmessage = (event) => {
     const payload = JSON.parse(event.data);
     if (payload.type === "snapshot") {
       state.wsConnected = true;
-      state.lastSnapshotAt = Date.now();
       stopPolling();
-      render(payload.snapshot);
+      applySnapshotIfNewer(payload.snapshot, "ws");
     }
   };
   ws.onclose = () => {

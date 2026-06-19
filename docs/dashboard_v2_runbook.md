@@ -68,6 +68,8 @@ safety_banners
 
 `GET /api/snapshot?view=v2` returns the same Dashboard V2 schema. `GET /api/snapshot` keeps the existing schema and includes additive `dashboard_v2` when Dashboard V2 is enabled.
 
+`GET /api/dashboard-v2/source-status` returns read-only source diagnostics for the active canonical snapshot, including namespace, view, generation, checksum prefix, source runtime cycle, DB path fingerprint, stale/fallback flags, and the active REST/WS contract.
+
 ## Read Model Operation
 
 Dashboard V2 now reads `dashboard_read_models` first for:
@@ -78,11 +80,14 @@ Dashboard V2 now reads `dashboard_read_models` first for:
 
 The read model is built from the latest in-memory runtime snapshot, gateway health, command summary, and lightweight runtime supervisor status. It should not trigger raw candidate/theme/order table scans on every dashboard request.
 
+The canonical Reboot V2 view is `reboot_v2.main`. Legacy compatibility rows may remain in `dashboard_read_models`, but Reboot V2 does not write to or select from the legacy `main` row as its source of truth.
+
 Read model metadata appears under `read_model`:
 
 - `source=READ_MODEL`: persisted/in-memory read model was used.
 - `source=FALLBACK_LIVE_BUILD`: read model was missing/corrupt and the legacy live builder was used.
 - `generation`: monotonic generation per `view_name`.
+- `snapshot_namespace`: canonical namespace. Reboot V2 uses `reboot_v2.main`.
 - `snapshot_at`: source snapshot timestamp.
 - `snapshot_age_sec`: current age of the snapshot.
 - `stale=true`: the dashboard is showing the last known snapshot, not current live state.

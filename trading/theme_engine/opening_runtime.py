@@ -31,6 +31,9 @@ OPENING_RQ_NAME = "OpeningTurnoverSeed_opt10032"
 OPENING_SCREEN_NO = "8720"
 OPENING_REALTIME_SCREEN_NO = "8721"
 OPENING_BURST_OUTPUT_MODE = "OBSERVE"
+OPT10032_DEFAULT_MARKET_CODE = "000"
+OPT10032_DEFAULT_INCLUDE_MANAGEMENT = "0"
+OPT10032_DEFAULT_EXCHANGE_CODE = "3"
 KST = timezone(timedelta(hours=9), "KST")
 REGULAR_OPEN = time(9, 0)
 REGULAR_CLOSE = time(15, 30)
@@ -38,12 +41,18 @@ REGULAR_CLOSE = time(15, 30)
 
 OPT10032_FIELDS = [
     "\uc885\ubaa9\ucf54\ub4dc",
+    "\ud604\uc7ac\uc21c\uc704",
+    "\uc804\uc77c\uc21c\uc704",
     "\uc885\ubaa9\uba85",
     "\ud604\uc7ac\uac00",
+    "\uc804\uc77c\ub300\ube44\uae30\ud638",
+    "\uc804\uc77c\ub300\ube44",
     "\ub4f1\ub77d\ub960",
+    "\ub9e4\ub3c4\ud638\uac00",
+    "\ub9e4\uc218\ud638\uac00",
+    "\ud604\uc7ac\uac70\ub798\ub7c9",
+    "\uc804\uc77c\uac70\ub798\ub7c9",
     "\uac70\ub798\ub300\uae08",
-    "\uac70\ub798\ub7c9",
-    "\uc21c\uc704",
 ]
 
 
@@ -63,6 +72,9 @@ class OpeningBurstRuntimeConfig:
     register_ttl_sec: int = 60
     tr_screen_no: str = OPENING_SCREEN_NO
     realtime_screen_no: str = OPENING_REALTIME_SCREEN_NO
+    opt10032_market_code: str = OPT10032_DEFAULT_MARKET_CODE
+    opt10032_include_management: str = OPT10032_DEFAULT_INCLUDE_MANAGEMENT
+    opt10032_exchange_code: str = OPT10032_DEFAULT_EXCHANGE_CODE
 
     @classmethod
     def from_env(cls, *, trading_mode: str | None = None) -> "OpeningBurstRuntimeConfig":
@@ -84,6 +96,15 @@ class OpeningBurstRuntimeConfig:
             catch_up_enabled=_bool_env("TRADING_OPENING_BURST_CATCH_UP_ENABLED", True),
             catch_up_start=_valid_seed_time(os.getenv("TRADING_OPENING_BURST_CATCH_UP_START", "09:15")) or "09:15",
             catch_up_end=_valid_seed_time(os.getenv("TRADING_OPENING_BURST_CATCH_UP_END", "10:00")) or "10:00",
+            opt10032_market_code=_opt10032_market_code(
+                os.getenv("TRADING_OPENING_BURST_OPT10032_MARKET_CODE", OPT10032_DEFAULT_MARKET_CODE)
+            ),
+            opt10032_include_management=_opt10032_include_management(
+                os.getenv("TRADING_OPENING_BURST_OPT10032_INCLUDE_MANAGEMENT", OPT10032_DEFAULT_INCLUDE_MANAGEMENT)
+            ),
+            opt10032_exchange_code=_opt10032_exchange_code(
+                os.getenv("TRADING_OPENING_BURST_OPT10032_EXCHANGE_CODE", OPT10032_DEFAULT_EXCHANGE_CODE)
+            ),
         )
 
     def engine_config(self) -> OpeningBurstConfig:
@@ -284,12 +305,14 @@ class OpeningThemeBurstRuntimePipeline:
 
     def save_seed_batch_from_ack(self, payload: Mapping[str, Any], *, event: GatewayEvent | None = None) -> dict[str, Any]:
         raw = dict(payload.get("raw") or {})
-        rows = [dict(row) for row in list(raw.get("tr_rows") or payload.get("tr_rows") or []) if isinstance(row, Mapping)]
+        source_rows = [dict(row) for row in list(raw.get("tr_rows") or payload.get("tr_rows") or []) if isinstance(row, Mapping)]
         command_id = str(payload.get("command_id") or (event.command_id if event else "") or "")
         command = self.gateway_state.get_command(command_id) if command_id else None
         command_payload = dict(getattr(command, "command", None).payload or {}) if command is not None else {}
         trade_date = str(payload.get("trade_date") or command_payload.get("trade_date") or _as_kst(datetime.now()).date().isoformat())
         batch_time = str(payload.get("seed_time") or command_payload.get("seed_time") or _seed_time_from_idempotency(payload) or "")
+        top_n = max(1, _int(payload.get("top_n") or command_payload.get("top_n") or self.config.top_n_per_call))
+        rows = source_rows[:top_n]
         parsed = parse_opt10032_seed_rows(rows, batch_time=batch_time)
         batch = {
             "trade_date": trade_date,
@@ -300,9 +323,11 @@ class OpeningThemeBurstRuntimePipeline:
             "parser_status": parsed.parser_status,
             "parser_missing_fields": list(parsed.parser_missing_fields),
             "raw": {
-                "ack_payload": _redacted_ack_payload(payload),
+                "ack_payload": _redacted_ack_payload({**dict(payload), "raw": {**raw, "tr_rows": rows}}),
                 "errors": list(raw.get("errors") or []),
                 "warnings": list(raw.get("warnings") or []),
+                "source_row_count": len(source_rows),
+                "stored_row_count": len(rows),
             },
             "rows": [row.to_storage_dict() for row in parsed.rows],
         }
@@ -527,7 +552,7 @@ def opening_seed_tr_command(
             "tr_code": OPENING_TR_CODE,
             "rq_name": OPENING_RQ_NAME,
             "screen_no": cfg.tr_screen_no,
-            "inputs": {},
+            "inputs": opt10032_seed_inputs(cfg),
             "fields": list(OPT10032_FIELDS),
             "trade_date": trade_date,
             "seed_time": seed_time,
@@ -537,13 +562,28 @@ def opening_seed_tr_command(
     )
 
 
+def opt10032_seed_inputs(cfg: OpeningBurstRuntimeConfig) -> dict[str, str]:
+    return {
+        "\uc2dc\uc7a5\uad6c\ubd84": _opt10032_market_code(cfg.opt10032_market_code),
+        "\uad00\ub9ac\uc885\ubaa9\ud3ec\ud568": _opt10032_include_management(cfg.opt10032_include_management),
+        "\uac70\ub798\uc18c\uad6c\ubd84": _opt10032_exchange_code(cfg.opt10032_exchange_code),
+    }
+
+
+def _normalize_opt10032_stock_code(value: Any) -> str:
+    text = str(value or "").strip()
+    if "_" in text:
+        text = text.split("_", 1)[0]
+    return normalize_stock_code(text)
+
+
 def parse_opt10032_seed_rows(rows: Iterable[Mapping[str, Any]], *, batch_time: str = "") -> OpeningSeedParseResult:
     parsed_rows: list[ParsedOpeningSeedRow] = []
     all_missing: list[str] = []
     raw_rows = [dict(row) for row in rows]
     for index, raw in enumerate(raw_rows, start=1):
         normalized = {_normalize_field_name(key): value for key, value in raw.items()}
-        code = normalize_stock_code(str(_field_value(normalized, _CODE_FIELDS) or ""))
+        code = _normalize_opt10032_stock_code(_field_value(normalized, _CODE_FIELDS))
         name = str(_field_value(normalized, _NAME_FIELDS) or "").strip()
         rank = _int(_field_value(normalized, _RANK_FIELDS)) or index
         turnover = abs(_float(_field_value(normalized, _TURNOVER_FIELDS)))
@@ -746,8 +786,8 @@ _NAME_FIELDS = ("stock_name", "name", "\uc885\ubaa9\uba85")
 _PRICE_FIELDS = ("current_price", "price", "\ud604\uc7ac\uac00")
 _CHANGE_RATE_FIELDS = ("change_rate_pct", "change_rate", "\ub4f1\ub77d\ub960", "\ub4f1\ub77d\uc728")
 _TURNOVER_FIELDS = ("turnover_krw", "turnover", "trade_value", "\uac70\ub798\ub300\uae08")
-_VOLUME_FIELDS = ("volume", "cum_volume", "\uac70\ub798\ub7c9")
-_RANK_FIELDS = ("rank", "seed_rank", "\uc21c\uc704")
+_VOLUME_FIELDS = ("volume", "cum_volume", "\ud604\uc7ac\uac70\ub798\ub7c9", "\uac70\ub798\ub7c9")
+_RANK_FIELDS = ("rank", "seed_rank", "\ud604\uc7ac\uc21c\uc704", "\uc21c\uc704")
 
 
 def _load_theme_inputs(repository: ThemeEngineRepository) -> list[tuple[str, str, list[ThemeMembership]]]:
@@ -932,6 +972,27 @@ def _valid_seed_time(value: Any) -> str:
     return parsed.strftime("%H:%M")
 
 
+def _opt10032_market_code(value: Any) -> str:
+    text = str(value or "").strip()
+    if text in {"000", "001", "101"}:
+        return text
+    return OPT10032_DEFAULT_MARKET_CODE
+
+
+def _opt10032_include_management(value: Any) -> str:
+    text = str(value or "").strip()
+    if text in {"0", "1"}:
+        return text
+    return OPT10032_DEFAULT_INCLUDE_MANAGEMENT
+
+
+def _opt10032_exchange_code(value: Any) -> str:
+    text = str(value or "").strip()
+    if text in {"", "1", "2", "3"}:
+        return text
+    return OPT10032_DEFAULT_EXCHANGE_CODE
+
+
 def _catch_up_due(value: datetime, cfg: OpeningBurstRuntimeConfig, *, seed_batch_exists: bool) -> bool:
     if seed_batch_exists or not cfg.catch_up_enabled:
         return False
@@ -1049,6 +1110,7 @@ __all__ = [
     "opening_result_payload",
     "opening_seed_tr_command",
     "opening_theme_burst_dashboard_section",
+    "opt10032_seed_inputs",
     "parse_opt10032_seed_rows",
     "realtime_exclusion_reason",
     "select_realtime_registration_targets",

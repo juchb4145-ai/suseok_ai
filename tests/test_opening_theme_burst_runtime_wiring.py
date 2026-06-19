@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 from storage.db import TradingDatabase
@@ -18,6 +19,7 @@ from trading.theme_engine.opening_runtime import (
     OpeningBurstScheduler,
     OpeningThemeBurstRuntimePipeline,
     opening_theme_burst_dashboard_section,
+    opt10032_seed_inputs,
     parse_opt10032_seed_rows,
 )
 from trading.theme_engine.repository import ThemeEngineRepository
@@ -44,6 +46,40 @@ def test_scheduler_enqueues_opt10032_only_at_seed_times():
     assert payload["tr_code"] == OPENING_TR_CODE
     assert payload["rq_name"] == OPENING_RQ_NAME
     assert payload["screen_no"] == "8720"
+    assert payload["inputs"] == {
+        "\uc2dc\uc7a5\uad6c\ubd84": "000",
+        "\uad00\ub9ac\uc885\ubaa9\ud3ec\ud568": "0",
+        "\uac70\ub798\uc18c\uad6c\ubd84": "3",
+    }
+
+
+def test_opt10032_seed_inputs_can_be_overridden_by_config():
+    custom = replace(
+        _config(),
+        opt10032_market_code="101",
+        opt10032_include_management="1",
+        opt10032_exchange_code="1",
+    )
+
+    assert opt10032_seed_inputs(custom) == {
+        "\uc2dc\uc7a5\uad6c\ubd84": "101",
+        "\uad00\ub9ac\uc885\ubaa9\ud3ec\ud568": "1",
+        "\uac70\ub798\uc18c\uad6c\ubd84": "1",
+    }
+
+
+def test_opt10032_seed_inputs_can_be_configured_from_env(monkeypatch):
+    monkeypatch.setenv("TRADING_OPENING_BURST_OPT10032_MARKET_CODE", "001")
+    monkeypatch.setenv("TRADING_OPENING_BURST_OPT10032_INCLUDE_MANAGEMENT", "1")
+    monkeypatch.setenv("TRADING_OPENING_BURST_OPT10032_EXCHANGE_CODE", "2")
+
+    cfg = OpeningBurstRuntimeConfig.from_env(trading_mode="OBSERVE")
+
+    assert opt10032_seed_inputs(cfg) == {
+        "\uc2dc\uc7a5\uad6c\ubd84": "001",
+        "\uad00\ub9ac\uc885\ubaa9\ud3ec\ud568": "1",
+        "\uac70\ub798\uc18c\uad6c\ubd84": "2",
+    }
 
 
 def test_scheduler_idempotency_blocks_duplicate_seed_time():
@@ -104,13 +140,19 @@ def test_opt10032_parser_uses_field_name_fallbacks():
     parsed = parse_opt10032_seed_rows(
         [
             {
-                "\uc885\ubaa9\ucf54\ub4dc": "A000001",
+                "\uc885\ubaa9\ucf54\ub4dc": "A000001_AL",
+                "\ud604\uc7ac\uc21c\uc704": "1",
+                "\uc804\uc77c\uc21c\uc704": "4",
                 "\uc885\ubaa9\uba85": "stock-1",
                 "\ud604\uc7ac\uac00": "+10100",
+                "\uc804\uc77c\ub300\ube44\uae30\ud638": "2",
+                "\uc804\uc77c\ub300\ube44": "+500",
                 "\ub4f1\ub77d\ub960": "+5.2%",
+                "\ub9e4\ub3c4\ud638\uac00": "10150",
+                "\ub9e4\uc218\ud638\uac00": "10100",
+                "\ud604\uc7ac\uac70\ub798\ub7c9": "120,000",
+                "\uc804\uc77c\uac70\ub798\ub7c9": "80,000",
                 "\uac70\ub798\ub300\uae08": "9,000,000,000",
-                "\uac70\ub798\ub7c9": "120,000",
-                "\uc21c\uc704": "1",
             }
         ],
         batch_time="09:03",
@@ -125,7 +167,47 @@ def test_opt10032_parser_uses_field_name_fallbacks():
     assert row.seed.change_rate_pct == 5.2
     assert row.current_price == 10100
     assert row.volume == 120000
-    assert row.seed.raw["\uc885\ubaa9\ucf54\ub4dc"] == "A000001"
+    assert row.seed.raw["\uc885\ubaa9\ucf54\ub4dc"] == "A000001_AL"
+
+
+def test_seed_batch_save_limits_opt10032_rows_to_top_n(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        pipeline = OpeningThemeBurstRuntimePipeline(
+            db=db,
+            gateway_state=GatewayStateStore(),
+            market_data=MarketDataStore(),
+            repository=ThemeEngineRepository(db),
+            config=_config(),
+        )
+
+        pipeline.save_seed_batch_from_ack(
+            {
+                "purpose": OPENING_TURNOVER_SEED_PURPOSE,
+                "command_id": "cmd-top-n",
+                "trade_date": "2026-06-15",
+                "seed_time": "09:03",
+                "top_n": 2,
+                "raw": {
+                    "tr_rows": [
+                        _opt10032_raw_row("000001_AL", 1),
+                        _opt10032_raw_row("000002_AL", 2),
+                        _opt10032_raw_row("000003_AL", 3),
+                    ]
+                },
+            }
+        )
+
+        batches = db.list_opening_turnover_seed_batches(trade_date="2026-06-15")
+        rows = db.list_opening_turnover_seed_rows(batch_id=batches[0]["id"], limit=10)
+        assert batches[0]["row_count"] == 2
+        assert batches[0]["parsed_count"] == 2
+        assert batches[0]["parser_status"] == "OK"
+        assert batches[0]["raw"]["source_row_count"] == 3
+        assert batches[0]["raw"]["stored_row_count"] == 2
+        assert [row["stock_code"] for row in rows] == ["000001", "000002"]
+    finally:
+        db.close()
 
 
 def test_parser_missing_fields_preserves_raw_row_and_does_not_crash(tmp_path):
@@ -333,6 +415,24 @@ def test_dashboard_snapshot_includes_opening_theme_burst_section(tmp_path):
         assert snapshot["opening_theme_burst"]["ready_allowed"] is False
     finally:
         db.close()
+
+
+def _opt10032_raw_row(code: str, rank: int) -> dict[str, str]:
+    return {
+        "\uc885\ubaa9\ucf54\ub4dc": code,
+        "\ud604\uc7ac\uc21c\uc704": str(rank),
+        "\uc804\uc77c\uc21c\uc704": str(rank),
+        "\uc885\ubaa9\uba85": f"stock-{rank}",
+        "\ud604\uc7ac\uac00": "+10000",
+        "\uc804\uc77c\ub300\ube44\uae30\ud638": "2",
+        "\uc804\uc77c\ub300\ube44": "+500",
+        "\ub4f1\ub77d\ub960": "+5.0",
+        "\ub9e4\ub3c4\ud638\uac00": "10050",
+        "\ub9e4\uc218\ud638\uac00": "10000",
+        "\ud604\uc7ac\uac70\ub798\ub7c9": "1000",
+        "\uc804\uc77c\uac70\ub798\ub7c9": "800",
+        "\uac70\ub798\ub300\uae08": "1000000",
+    }
 
 
 def _config(*, trading_mode: str = "OBSERVE", max_realtime_register: int = 100) -> OpeningBurstRuntimeConfig:

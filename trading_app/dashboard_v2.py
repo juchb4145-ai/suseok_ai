@@ -15,6 +15,12 @@ from trading_app.dashboard_labels import (
 from trading_app.pre_market_check import pre_market_report_empty
 
 
+DASHBOARD_V2_SCHEMA_VERSION = "dashboard_v2.reboot_ops.v1"
+DASHBOARD_V2_NAMESPACE = "reboot_v2.main"
+DASHBOARD_V2_VIEW_NAME = "reboot_v2.main"
+DASHBOARD_V2_PAYLOAD_TYPE = "dashboard_v2_snapshot"
+
+
 def dashboard_v2_enabled() -> bool:
     return _env_bool("TRADING_DASHBOARD_V2_ENABLED", _env_bool("STRATEGY_REBOOT_V2_DASHBOARD", True))
 
@@ -38,7 +44,11 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
     candidates = dict(base.get("candidates") or {})
 
     payload = {
-        "schema_version": "dashboard_v2.reboot_ops.v1",
+        "schema_version": DASHBOARD_V2_SCHEMA_VERSION,
+        "payload_type": DASHBOARD_V2_PAYLOAD_TYPE,
+        "snapshot_namespace": DASHBOARD_V2_NAMESPACE,
+        "view_name": DASHBOARD_V2_VIEW_NAME,
+        "source_kind": str(base.get("source_kind") or "CANONICAL_V2_BUILDER"),
         "generated_at": base.get("timestamp") or _now(),
         "enabled": dashboard_v2_enabled(),
         "v2_status": _v2_status(base, runtime, gateway, market, order_manager, pos_risk),

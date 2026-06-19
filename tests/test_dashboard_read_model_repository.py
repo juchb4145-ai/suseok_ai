@@ -1,5 +1,7 @@
 import sqlite3
 
+import pytest
+
 from storage.dashboard_read_model import DashboardReadModelRepository
 from storage.db import TradingDatabase
 
@@ -101,3 +103,63 @@ def test_failed_write_leaves_previous_snapshot_readable(tmp_path):
 
     assert record is not None
     assert record.snapshot["value"] == "good"
+
+
+def test_stale_generation_write_is_rejected(tmp_path):
+    repo = DashboardReadModelRepository(tmp_path / "read_model.sqlite3")
+    try:
+        repo.save_snapshot(
+            {"schema_version": "dashboard_v2.reboot_ops.v1", "value": "new"},
+            view_name="reboot_v2.main",
+            generation=11,
+            source_runtime_cycle_count=101,
+            snapshot_at="2026-06-18T09:00:11+00:00",
+        )
+
+        with pytest.raises(ValueError, match="STALE_GENERATION_REJECTED"):
+            repo.save_snapshot(
+                {"schema_version": "dashboard_v2.reboot_ops.v1", "value": "old"},
+                view_name="reboot_v2.main",
+                generation=10,
+                source_runtime_cycle_count=102,
+                snapshot_at="2026-06-18T09:00:12+00:00",
+                skip_unchanged=False,
+            )
+        record = repo.read_snapshot("reboot_v2.main")
+    finally:
+        repo.close()
+
+    assert record is not None
+    assert record.generation == 11
+    assert record.source_runtime_cycle_count == 101
+    assert record.snapshot["value"] == "new"
+
+
+def test_stale_runtime_cycle_write_is_rejected(tmp_path):
+    repo = DashboardReadModelRepository(tmp_path / "read_model.sqlite3")
+    try:
+        repo.save_snapshot(
+            {"schema_version": "dashboard_v2.reboot_ops.v1", "value": "cycle-101"},
+            view_name="reboot_v2.main",
+            generation=11,
+            source_runtime_cycle_count=101,
+            snapshot_at="2026-06-18T09:00:11+00:00",
+        )
+
+        with pytest.raises(ValueError, match="STALE_RUNTIME_CYCLE_REJECTED"):
+            repo.save_snapshot(
+                {"schema_version": "dashboard_v2.reboot_ops.v1", "value": "cycle-100"},
+                view_name="reboot_v2.main",
+                generation=12,
+                source_runtime_cycle_count=100,
+                snapshot_at="2026-06-18T09:00:12+00:00",
+                skip_unchanged=False,
+            )
+        record = repo.read_snapshot("reboot_v2.main")
+    finally:
+        repo.close()
+
+    assert record is not None
+    assert record.generation == 11
+    assert record.source_runtime_cycle_count == 101
+    assert record.snapshot["value"] == "cycle-101"

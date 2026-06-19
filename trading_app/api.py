@@ -76,7 +76,13 @@ from trading_app.dashboard_read_model import (
     DashboardReadModelWriter,
     open_dashboard_read_model_service,
 )
-from trading_app.dashboard_v2 import build_dashboard_v2_snapshot, dashboard_v2_auto_route_enabled, dashboard_v2_enabled
+from trading_app.dashboard_v2 import (
+    DASHBOARD_V2_NAMESPACE,
+    DASHBOARD_V2_VIEW_NAME,
+    build_dashboard_v2_snapshot,
+    dashboard_v2_auto_route_enabled,
+    dashboard_v2_enabled,
+)
 from trading_app.pre_market_check import PreMarketCheckConfig, build_pre_market_check_report, pre_market_report_empty
 from trading_app.buy_zero_rca import BuyZeroRCAAnalyzer
 from trading_app.conservative_reason_outcomes import (
@@ -4412,6 +4418,42 @@ def dashboard_v2_snapshot(refresh: bool = Query(False), detail: str = Query(DASH
     return _dashboard_v2_read_model_or_fallback(refresh=refresh, detail=detail)
 
 
+@app.get("/api/dashboard-v2/source-status")
+def dashboard_v2_source_status() -> dict[str, Any]:
+    payload = _dashboard_v2_read_model_or_fallback(refresh=False, detail=DASHBOARD_SNAPSHOT_DETAIL_SLIM)
+    read_model = dict(payload.get("read_model") or {})
+    service = _dashboard_read_model_service_instance()
+    metrics = dict(service.metrics)
+    db_path = str(get_settings().db_path)
+    checksum = str(read_model.get("checksum") or "")
+    return {
+        "canonical_namespace": read_model.get("snapshot_namespace") or payload.get("snapshot_namespace") or DASHBOARD_V2_NAMESPACE,
+        "view_name": read_model.get("view_name") or DASHBOARD_V2_VIEW_NAME,
+        "schema_version": payload.get("schema_version") or "",
+        "read_model_schema_version": read_model.get("schema_version") or "",
+        "resolved_db_path_fingerprint": _dashboard_db_path_fingerprint(db_path),
+        "writer_id": read_model.get("writer_id") or "",
+        "process_id": read_model.get("process_id") or os.getpid(),
+        "source_epoch_id": read_model.get("source_epoch_id") or read_model.get("boot_id") or "",
+        "generation": int(read_model.get("generation") or 0),
+        "source_runtime_cycle_count": int(read_model.get("source_runtime_cycle_count") or 0),
+        "snapshot_at": read_model.get("snapshot_at") or "",
+        "age_sec": float(read_model.get("snapshot_age_sec") or 0.0),
+        "checksum_prefix": checksum[:12],
+        "source_kind": read_model.get("source_kind") or read_model.get("source") or "",
+        "stale": bool(read_model.get("stale")),
+        "fallback_used": bool(read_model.get("fallback_used")),
+        "fallback_count": int(metrics.get("fallback_count") or 0),
+        "source_switch_count": int(metrics.get("source_switch_count") or 0),
+        "stale_write_reject_count": int(metrics.get("stale_write_reject_count") or 0),
+        "active_rest_contract": "direct_dashboard_v2",
+        "active_ws_contract": "snapshot_wrapper.dashboard_v2",
+        "legacy_snapshot_writer_detected": False,
+        "conflicting_writer_detected": False,
+        "last_conflict_reason": metrics.get("last_conflict_reason") or "",
+    }
+
+
 @app.get("/api/themelab/snapshot")
 def theme_lab_snapshot(refresh: bool = Query(False)) -> dict[str, Any]:
     db = open_database()
@@ -7254,6 +7296,11 @@ def _dashboard_v2_read_model_or_fallback(*, refresh: bool = False, detail: str =
 def _dashboard_v2_fallback_live_build(*, reason: str, refresh: bool, detail: str) -> dict[str, Any]:
     started = time.perf_counter()
     try:
+        service = _dashboard_read_model_service_instance()
+        service.metrics["fallback_count"] = int(service.metrics.get("fallback_count") or 0) + 1
+    except Exception:
+        pass
+    try:
         payload = _build_dashboard_snapshot_payload(force=refresh, detail=detail)
         v2_payload = build_dashboard_v2_snapshot(payload, detail=detail)
         error = ""
@@ -7266,11 +7313,14 @@ def _dashboard_v2_fallback_live_build(*, reason: str, refresh: bool, detail: str
         **existing,
         "enabled": _dashboard_read_model_api_enabled(),
         "source": "FALLBACK_LIVE_BUILD",
-        "view_name": "main",
+        "view_name": DASHBOARD_V2_VIEW_NAME,
         "schema_version": "dashboard_v2.read_model.v1",
+        "snapshot_namespace": DASHBOARD_V2_NAMESPACE,
+        "source_kind": "LEGACY_LIVE_FALLBACK_ADAPTER",
         "generation": int(existing.get("generation") or 0),
         "status": "FALLBACK_LIVE_BUILD" if not error else "FALLBACK_FAILED",
         "snapshot_at": v2_payload.get("generated_at") or utc_timestamp(),
+        "published_at": v2_payload.get("generated_at") or utc_timestamp(),
         "snapshot_age_sec": 0.0,
         "stale": bool(error),
         "stale_after_sec": _dashboard_read_model_service_instance().config.stale_after_sec,
@@ -7319,6 +7369,12 @@ def _dashboard_snapshot_wrapper_for_v2(v2_payload: dict[str, Any]) -> dict[str, 
     }
 
 
+def _dashboard_snapshot_payload_for_ws_client_count(client_count: int) -> dict[str, Any]:
+    v2_payload = _dashboard_v2_read_model_or_fallback()
+    snapshot_payload = _dashboard_snapshot_wrapper_for_v2(v2_payload)
+    return _dashboard_snapshot_for_client_count(snapshot_payload, client_count)
+
+
 def _mark_dashboard_read_model_dirty(reason: str, *, event_type: str = "") -> None:
     if str(event_type or "").strip() == "price_tick":
         return
@@ -7336,6 +7392,11 @@ def _dashboard_database_cache_key(db: TradingDatabase | None = None) -> str:
         return str(Path(get_settings().db_path).resolve())
     except Exception:
         return ""
+
+
+def _dashboard_db_path_fingerprint(path: str | Path) -> str:
+    normalized = str(Path(path).expanduser().resolve(strict=False)).lower()
+    return f"crc32:{zlib.crc32(normalized.encode('utf-8')) & 0xFFFFFFFF:08x}"
 
 
 def _cached_dashboard_fragment(
@@ -7678,8 +7739,7 @@ async def _broadcast_dashboard_snapshot_after(delay_sec: float) -> None:
         await asyncio.sleep(delay_sec)
     if dashboard_connections.client_count <= 0:
         return
-    payload = await asyncio.to_thread(_build_dashboard_snapshot_payload)
-    snapshot = _dashboard_snapshot_for_client_count(payload, dashboard_connections.client_count)
+    snapshot = await asyncio.to_thread(_dashboard_snapshot_payload_for_ws_client_count, dashboard_connections.client_count)
     await dashboard_connections.broadcast_json({"type": "snapshot", "snapshot": snapshot})
     _dashboard_snapshot_last_sent_monotonic = time.monotonic()
 

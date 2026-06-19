@@ -9,7 +9,11 @@ from threading import RLock
 from typing import Any, Callable, Sequence
 
 from storage.dashboard_read_model import DashboardReadModelRecord, DashboardReadModelRepository, checksum_snapshot
-from trading_app.dashboard_v2 import build_dashboard_v2_snapshot
+from trading_app.dashboard_v2 import (
+    DASHBOARD_V2_NAMESPACE,
+    DASHBOARD_V2_VIEW_NAME,
+    build_dashboard_v2_snapshot,
+)
 from trading_app.pre_market_check import pre_market_report_empty
 
 
@@ -27,6 +31,10 @@ class DashboardReadModelConfig:
     shadow_compare_interval_sec: int = 30
     ws_push_interval_sec: float = 1.0
     schema_version: str = "dashboard_v2.read_model.v1"
+    view_name: str = DASHBOARD_V2_VIEW_NAME
+    snapshot_namespace: str = DASHBOARD_V2_NAMESPACE
+    writer_id: str = ""
+    source_epoch_id: str = ""
 
     @classmethod
     def from_env(cls) -> "DashboardReadModelConfig":
@@ -42,6 +50,10 @@ class DashboardReadModelConfig:
             shadow_compare_enabled=_env_bool("TRADING_DASHBOARD_READ_MODEL_SHADOW_COMPARE_ENABLED", True),
             shadow_compare_interval_sec=max(1, _env_int("TRADING_DASHBOARD_READ_MODEL_SHADOW_COMPARE_INTERVAL_SEC", 30)),
             ws_push_interval_sec=max(1.0, _env_float("TRADING_DASHBOARD_WS_PUSH_INTERVAL_SEC", 1.0)),
+            view_name=os.getenv("TRADING_DASHBOARD_READ_MODEL_VIEW_NAME", DASHBOARD_V2_VIEW_NAME),
+            snapshot_namespace=os.getenv("TRADING_DASHBOARD_SNAPSHOT_NAMESPACE", DASHBOARD_V2_NAMESPACE),
+            writer_id=os.getenv("TRADING_DASHBOARD_READ_MODEL_WRITER_ID", ""),
+            source_epoch_id=os.getenv("TRADING_DASHBOARD_READ_MODEL_SOURCE_EPOCH_ID", ""),
         )
 
 
@@ -58,6 +70,8 @@ class DashboardReadModelService:
         self.clock = clock or (lambda: datetime.now(timezone.utc).replace(microsecond=0))
         self._lock = RLock()
         self._latest: DashboardReadModelRecord | None = None
+        self.writer_id = self.config.writer_id or f"dashboard-read-model:{os.getpid()}"
+        self.source_epoch_id = self.config.source_epoch_id or f"{self.writer_id}:{int(self.clock().timestamp())}"
         self._dirty = True
         self._dirty_reasons: list[str] = ["INIT"]
         self.metrics: dict[str, Any] = {
@@ -72,11 +86,14 @@ class DashboardReadModelService:
             "api_read_count": 0,
             "fallback_count": 0,
             "stale_read_count": 0,
+            "stale_write_reject_count": 0,
+            "source_switch_count": 0,
             "websocket_push_count": 0,
             "websocket_push_skip_unchanged_count": 0,
             "last_build_at": "",
             "last_write_at": "",
             "last_error": "",
+            "last_conflict_reason": "",
             "writer_status": "IDLE",
         }
 
@@ -92,10 +109,11 @@ class DashboardReadModelService:
         core_status: dict[str, Any] | None,
         *,
         snapshot_at: str | None = None,
-        view_name: str = "main",
+        view_name: str | None = None,
     ) -> dict[str, Any]:
         started = time.perf_counter()
         now_text = snapshot_at or _format_time(self.clock())
+        resolved_view_name = str(view_name or self.config.view_name or DASHBOARD_V2_VIEW_NAME)
         runtime = dict(runtime_snapshot or {})
         gateway = dict(gateway_snapshot or {})
         commands = dict(command_snapshot or {})
@@ -124,28 +142,20 @@ class DashboardReadModelService:
             )
         base = {
             "snapshot_detail": "slim",
+            "source_kind": "READ_MODEL_RUNTIME",
             "timestamp": now_text,
             "core": core,
             "gateway": gateway,
             "commands": commands,
             "transport": dict(runtime.get("transport") or {}),
             "runtime": runtime_for_builder,
-            "candidate_ingestion": dict(runtime.get("candidate_ingestion") or {}),
-            "theme_board": dict(runtime.get("theme_board") or {}),
-            "market_regime": dict(runtime.get("market_regime") or {}),
-            "entry_engine": dict(runtime.get("entry_engine") or {}),
-            "exit_engine": dict(runtime.get("exit_engine_reboot") or runtime.get("exit_engine") or {}),
-            "position_risk": dict(runtime.get("position_risk") or {}),
-            "order_manager": order_manager,
-            "order_lifecycle": dict(core.get("order_event_consumer") or runtime.get("order_lifecycle") or {}),
-            "broker_reconcile": dict(core.get("broker_reconcile") or runtime.get("broker_reconcile") or {}),
             "candidates": dict(runtime.get("candidates") or {}),
             "pre_market_check": dict(runtime.get("pre_market_check") or pre_market_report_empty()),
         }
         payload = build_dashboard_v2_snapshot(base, detail="slim")
         build_duration_ms = (time.perf_counter() - started) * 1000.0
         payload["read_model"] = self._metadata(
-            view_name=view_name,
+            view_name=resolved_view_name,
             generation=0,
             status="BUILT",
             snapshot_at=now_text,
@@ -208,6 +218,9 @@ class DashboardReadModelService:
                 self._dirty = True
                 self.metrics["last_error"] = str(exc)
                 self.metrics["writer_status"] = "FAILED"
+                if any(reason in str(exc) for reason in ("STALE_", "WRITER_EPOCH_MISMATCH", "SNAPSHOT_NAMESPACE_MISMATCH")):
+                    self.metrics["stale_write_reject_count"] = int(self.metrics.get("stale_write_reject_count") or 0) + 1
+                    self.metrics["last_conflict_reason"] = str(exc)
             return {"status": "FAILED", "written": False, "error": str(exc)}
         finally:
             with self._lock:
@@ -217,7 +230,7 @@ class DashboardReadModelService:
     def save_snapshot(self, snapshot: dict[str, Any]) -> DashboardReadModelRecord:
         payload = dict(snapshot or {})
         metadata = dict(payload.get("read_model") or {})
-        view_name = str(metadata.get("view_name") or "main")
+        view_name = str(metadata.get("view_name") or self.config.view_name or DASHBOARD_V2_VIEW_NAME)
         snapshot_at = str(metadata.get("snapshot_at") or _format_time(self.clock()))
         source_cycle_at = str(metadata.get("source_runtime_cycle_at") or "")
         source_cycle_count = _safe_int(metadata.get("source_runtime_cycle_count"), 0)
@@ -230,8 +243,15 @@ class DashboardReadModelService:
             "source": "READ_MODEL",
             "view_name": view_name,
             "schema_version": self.config.schema_version,
+            "snapshot_namespace": self.config.snapshot_namespace,
+            "source_kind": "READ_MODEL",
+            "writer_id": self.writer_id,
+            "process_id": os.getpid(),
+            "source_epoch_id": self.source_epoch_id,
             "status": "OK",
             "snapshot_at": snapshot_at,
+            "published_at": snapshot_at,
+            "trade_date": snapshot_at[:10],
             "snapshot_age_sec": 0.0,
             "stale": False,
             "stale_after_sec": self.config.stale_after_sec,
@@ -291,11 +311,11 @@ class DashboardReadModelService:
         return record
 
     def read_main_snapshot(self) -> dict[str, Any]:
-        return self.read_snapshot("main")
+        return self.read_snapshot(self.config.view_name)
 
     def read_snapshot(self, view_name: str) -> dict[str, Any]:
         started = time.perf_counter()
-        record = self._record_for_read(view_name)
+        record = self._record_for_read(view_name or self.config.view_name)
         with self._lock:
             self.metrics["api_read_count"] = int(self.metrics.get("api_read_count") or 0) + 1
             self.metrics["read_duration_ms"] = (time.perf_counter() - started) * 1000.0
@@ -332,12 +352,12 @@ class DashboardReadModelService:
 
     def recover_latest_snapshot(self) -> dict[str, Any]:
         if self.repository is None:
-            return self._empty_snapshot("MISSING", view_name="main")
-        record = self.repository.recover_latest_snapshot("main")
+            return self._empty_snapshot("MISSING", view_name=self.config.view_name)
+        record = self.repository.recover_latest_snapshot(self.config.view_name)
         with self._lock:
             self._latest = record
         if record is None:
-            return self._empty_snapshot("MISSING", view_name="main")
+            return self._empty_snapshot("MISSING", view_name=self.config.view_name)
         payload = self._with_current_metadata(dict(record.snapshot or {}), record)
         read_model = dict(payload.get("read_model") or {})
         read_model["recovered"] = True
@@ -357,16 +377,18 @@ class DashboardReadModelService:
         return payload
 
     def _record_for_read(self, view_name: str) -> DashboardReadModelRecord | None:
-        view = str(view_name or "main")
+        view = str(view_name or self.config.view_name or DASHBOARD_V2_VIEW_NAME)
         with self._lock:
-            if self._latest is not None and self._latest.view_name == view:
-                return self._latest
+            latest = self._latest if self._latest is not None and self._latest.view_name == view else None
         if self.repository is None:
-            return None
+            return latest
         record = self.repository.read_snapshot(view)
         with self._lock:
-            if record is not None:
+            if record is not None and (latest is None or _record_newer_than(record, latest)):
                 self._latest = record
+                return record
+            if latest is not None:
+                return latest
         return record
 
     def _with_current_metadata(self, payload: dict[str, Any], record: DashboardReadModelRecord) -> dict[str, Any]:
@@ -391,9 +413,16 @@ class DashboardReadModelService:
                 "source": metadata.get("source") or "READ_MODEL",
                 "view_name": record.view_name,
                 "schema_version": record.schema_version or self.config.schema_version,
+                "snapshot_namespace": metadata.get("snapshot_namespace") or self.config.snapshot_namespace,
+                "source_kind": metadata.get("source_kind") or "READ_MODEL",
+                "writer_id": metadata.get("writer_id") or self.writer_id,
+                "process_id": metadata.get("process_id") or os.getpid(),
+                "source_epoch_id": metadata.get("source_epoch_id") or self.source_epoch_id,
                 "generation": record.generation,
                 "status": "STALE" if stale_reasons else record.status,
                 "snapshot_at": record.snapshot_at,
+                "published_at": metadata.get("published_at") or record.updated_at or record.snapshot_at,
+                "trade_date": record.trade_date,
                 "snapshot_age_sec": round(age_sec, 3),
                 "stale": bool(stale_reasons),
                 "stale_after_sec": record.stale_after_sec,
@@ -463,9 +492,16 @@ class DashboardReadModelService:
             "source": "READ_MODEL",
             "view_name": view_name,
             "schema_version": self.config.schema_version,
+            "snapshot_namespace": self.config.snapshot_namespace,
+            "source_kind": "READ_MODEL",
+            "writer_id": self.writer_id,
+            "process_id": os.getpid(),
+            "source_epoch_id": self.source_epoch_id,
             "generation": int(generation or 0),
             "status": status,
             "snapshot_at": snapshot_at,
+            "published_at": snapshot_at,
+            "trade_date": snapshot_at[:10],
             "snapshot_age_sec": 0.0,
             "stale": False,
             "stale_after_sec": self.config.stale_after_sec,
@@ -896,6 +932,14 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(float(str(value).strip()))
     except (TypeError, ValueError):
         return default
+
+
+def _record_newer_than(candidate: DashboardReadModelRecord, current: DashboardReadModelRecord) -> bool:
+    if candidate.generation != current.generation:
+        return candidate.generation > current.generation
+    if candidate.source_runtime_cycle_count != current.source_runtime_cycle_count:
+        return candidate.source_runtime_cycle_count > current.source_runtime_cycle_count
+    return str(candidate.snapshot_at or "") > str(current.snapshot_at or "")
 
 
 def _env_bool(name: str, default: bool) -> bool:

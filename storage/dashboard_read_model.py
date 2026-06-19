@@ -59,7 +59,7 @@ class DashboardReadModelRecord:
 
 class DashboardReadModelRepository:
     def __init__(self, db_path: str | Path) -> None:
-        self.path = Path(db_path).expanduser()
+        self.path = Path(db_path).expanduser().resolve(strict=False)
         if self.path.parent:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
@@ -101,9 +101,28 @@ class DashboardReadModelRepository:
         snapshot_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
         with self._lock, self.conn:
             existing = self._read_record_no_lock(view)
+            explicit_generation = int(generation or 0)
+            incoming_cycle_count = int(source_runtime_cycle_count or 0)
+            if existing is not None:
+                if explicit_generation > 0 and explicit_generation < existing.generation:
+                    raise ValueError("STALE_GENERATION_REJECTED")
+                if (
+                    explicit_generation > 0
+                    and explicit_generation == existing.generation
+                    and existing.checksum != resolved_checksum
+                ):
+                    raise ValueError("STALE_GENERATION_REJECTED")
+                if (
+                    incoming_cycle_count > 0
+                    and existing.source_runtime_cycle_count > 0
+                    and incoming_cycle_count < existing.source_runtime_cycle_count
+                ):
+                    raise ValueError("STALE_RUNTIME_CYCLE_REJECTED")
+                if _writer_epoch_conflicts(existing.snapshot or {}, payload):
+                    raise ValueError("WRITER_EPOCH_MISMATCH")
             if existing is not None and skip_unchanged and existing.checksum == resolved_checksum:
                 return replace(existing, unchanged=True, persisted=True)
-            next_generation = int(generation or 0)
+            next_generation = explicit_generation
             if next_generation <= 0:
                 next_generation = int(existing.generation + 1 if existing else 1)
             now_text = _format_time(_now())
@@ -298,6 +317,24 @@ def _stable_for_checksum(value: Any) -> Any:
     if isinstance(value, list):
         return [_stable_for_checksum(item) for item in value]
     return value
+
+
+def _writer_epoch_conflicts(existing: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    existing_meta = dict(existing.get("read_model") or {}) if isinstance(existing, dict) else {}
+    incoming_meta = dict(incoming.get("read_model") or {}) if isinstance(incoming, dict) else {}
+    existing_epoch = str(existing_meta.get("source_epoch_id") or existing_meta.get("boot_id") or "")
+    incoming_epoch = str(incoming_meta.get("source_epoch_id") or incoming_meta.get("boot_id") or "")
+    if not existing_epoch or not incoming_epoch or existing_epoch == incoming_epoch:
+        return False
+    existing_generation = int(existing_meta.get("generation") or 0)
+    incoming_generation = int(incoming_meta.get("generation") or 0)
+    existing_cycle = int(existing_meta.get("source_runtime_cycle_count") or 0)
+    incoming_cycle = int(incoming_meta.get("source_runtime_cycle_count") or 0)
+    if incoming_generation and existing_generation and incoming_generation < existing_generation:
+        return True
+    if incoming_cycle and existing_cycle and incoming_cycle < existing_cycle:
+        return True
+    return False
 
 
 def _trade_date(timestamp: str) -> str:

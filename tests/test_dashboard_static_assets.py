@@ -113,6 +113,8 @@ def test_dashboard_html_has_tabs_paginated_tables_and_detail_drawer():
         "shadow-small-entry-pilot-start",
         "shadow-small-entry-pilot-complete",
         "shadow-small-entry-pilot-generate-report",
+        "dashboard-v2-snapshot-source",
+        "dashboard-v2-snapshot-generation",
     ]:
         assert soup.select_one(f"#{node_id}") is not None
     assert soup.select_one("#transport-real-pilot-price-sample-rate") is not None
@@ -166,6 +168,15 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "SNAPSHOT_INITIAL_FALLBACK_MS = 7000" in js
     assert "function stopPolling" in js
     assert "state.wsConnected" in js
+    assert "function normalizeSnapshotEnvelope" in js
+    assert "function snapshotIdentity" in js
+    assert "function compareSnapshotOrder" in js
+    assert "function shouldAcceptSnapshot" in js
+    assert "function applySnapshotIfNewer" in js
+    assert 'fetch("/api/snapshot?view=v2", { signal: controller.signal })' in js
+    assert 'applySnapshotIfNewer(snapshot, "poll")' in js
+    assert 'applySnapshotIfNewer(payload.snapshot, "ws")' in js
+    assert 'render(payload.snapshot)' not in js
     assert "setTimeout(startPolling, 2000)" not in js
     assert "ops_alerts" in js
     assert "theme_lab" in js

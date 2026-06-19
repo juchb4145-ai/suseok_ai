@@ -10,6 +10,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from trading_app.dependencies import resolve_trading_db_path
+
 
 def load_project_env(path: Path = PROJECT_ROOT / ".env") -> None:
     if not path.exists():
@@ -40,7 +42,7 @@ def main() -> int:
     load_project_env()
     args = parse_args()
     if args.db:
-        os.environ["TRADING_DB_PATH"] = args.db
+        os.environ["TRADING_DB_PATH"] = str(resolve_trading_db_path(args.db))
     if args.token:
         os.environ["TRADING_CORE_TOKEN"] = args.token
     if args.mode:

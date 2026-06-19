@@ -15,6 +15,14 @@ DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "trader.sqlite3"
 DEFAULT_LOCAL_TOKEN = "local-dev-token"
 
 
+def resolve_trading_db_path(raw_path: str | Path | None = None, *, project_root: Path = PROJECT_ROOT) -> Path:
+    raw = str(raw_path if raw_path is not None else os.environ.get("TRADING_DB_PATH", "")).strip()
+    path = Path(raw).expanduser() if raw else DEFAULT_DB_PATH
+    if not path.is_absolute():
+        path = project_root / path
+    return path.resolve(strict=False)
+
+
 @dataclass(frozen=True)
 class CoreSettings:
     db_path: Path
@@ -144,7 +152,7 @@ def get_settings() -> CoreSettings:
     if runtime_mode not in {"OBSERVE", "DRY_RUN"}:
         runtime_mode = "OBSERVE"
     return CoreSettings(
-        db_path=Path(os.environ.get("TRADING_DB_PATH", str(DEFAULT_DB_PATH))).expanduser(),
+        db_path=resolve_trading_db_path(),
         local_token=os.environ.get("TRADING_CORE_TOKEN", DEFAULT_LOCAL_TOKEN),
         mode=mode,
         allow_live=os.environ.get("TRADING_ALLOW_LIVE", "0") == "1",

@@ -107,6 +107,28 @@ def test_snapshot_view_v2_returns_same_read_model_generation(tmp_path, monkeypat
     assert direct["read_model"]["checksum"] == via_snapshot["read_model"]["checksum"]
 
 
+def test_dashboard_v2_source_status_exposes_canonical_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    clock = _Clock()
+    service = _service(tmp_path, clock)
+    service.save_snapshot(
+        service.build_from_runtime(_runtime_snapshot(), {"heartbeat_ok": True}, {}, {"cycle_count": 4}),
+    )
+    _install_service(api, service)
+
+    status = api.dashboard_v2_source_status()
+
+    assert status["canonical_namespace"] == "reboot_v2.main"
+    assert status["view_name"] == "reboot_v2.main"
+    assert status["generation"] == 1
+    assert status["checksum_prefix"]
+    assert status["active_rest_contract"] == "direct_dashboard_v2"
+    assert status["active_ws_contract"] == "snapshot_wrapper.dashboard_v2"
+
+
 def test_dashboard_v2_ws_wrapper_includes_core_identity(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
     import trading_app.api as api
@@ -130,6 +152,41 @@ def test_dashboard_v2_ws_wrapper_includes_core_identity(tmp_path, monkeypatch):
     assert result["core"]["running"] is True
     assert result["core"]["cycle_count"] == 7
     assert result["runtime"]["lightweight_status"]["running"] is True
+
+
+def test_dashboard_ws_broadcast_uses_canonical_read_model_wrapper(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    monkeypatch.setattr(
+        api,
+        "_dashboard_v2_read_model_or_fallback",
+        lambda **_: {
+            "schema_version": "dashboard_v2.reboot_ops.v1",
+            "snapshot_namespace": "reboot_v2.main",
+            "generated_at": "2026-06-18T00:00:00+00:00",
+            "market_overview": {"global_status": "SELECTIVE"},
+            "read_model": {
+                "view_name": "reboot_v2.main",
+                "snapshot_namespace": "reboot_v2.main",
+                "generation": 7,
+                "checksum": "read-model-checksum",
+                "status": "OK",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        api,
+        "_build_dashboard_snapshot_payload",
+        lambda **_: (_ for _ in ()).throw(AssertionError("legacy live builder called")),
+    )
+
+    result = api._dashboard_snapshot_payload_for_ws_client_count(2)
+
+    assert result["dashboard_v2"]["read_model"]["generation"] == 7
+    assert result["dashboard_v2"]["read_model"]["checksum"] == "read-model-checksum"
+    assert result["dashboard_v2"]["snapshot_namespace"] == "reboot_v2.main"
 
 
 def test_dashboard_read_model_runtime_snapshot_includes_pre_market_check(tmp_path, monkeypatch):
