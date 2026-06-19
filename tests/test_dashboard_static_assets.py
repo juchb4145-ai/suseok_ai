@@ -164,6 +164,11 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "invalid local gateway token" in js
     assert "function renderOpsAlerts" in js
     assert "function renderThemeLabSummary" in js
+    assert 'timeZone: "Asia/Seoul"' in js
+    assert " KST" in js
+    assert "composite_market_mode" in js
+    assert "systemic_risk_off" in js
+    assert "SYSTEMIC_RISK_OFF" in js
     assert "SNAPSHOT_POLL_INTERVAL_MS = 30000" in js
     assert "SNAPSHOT_INITIAL_FALLBACK_MS = 7000" in js
     assert "function stopPolling" in js

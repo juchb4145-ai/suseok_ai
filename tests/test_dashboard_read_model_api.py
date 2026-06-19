@@ -263,6 +263,27 @@ def test_stale_read_model_does_not_trigger_live_fallback(tmp_path, monkeypatch):
     assert any(item["reason_code"] == "READ_MODEL_STALE" for item in result["safety_banners"])
 
 
+def test_order_reconcile_warning_does_not_mark_snapshot_stale(tmp_path):
+    clock = _Clock()
+    service = _service(tmp_path, clock)
+    payload = service.build_from_runtime(
+        _runtime_snapshot(),
+        {"heartbeat_ok": True},
+        {},
+        {"cycle_count": 4, "last_cycle_at": "2026-06-18T00:00:00+00:00"},
+    )
+    service.save_snapshot(payload)
+
+    result = service.read_main_snapshot()
+
+    assert result["read_model"]["stale"] is False
+    assert result["read_model"]["status"] == "OK"
+    assert "ORDER_RECONCILE_REQUIRED" in result["read_model"]["warnings"]
+    messages = [item["message_ko"] for item in result["safety_banners"]]
+    assert "Dashboard snapshot이 오래되었습니다. 마지막 정상 데이터를 표시 중입니다." not in messages
+    assert any(item["reason_code"] == "ORDER_RECONCILE_REQUIRED" for item in result["safety_banners"])
+
+
 def test_missing_read_model_uses_marked_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
     import trading_app.api as api

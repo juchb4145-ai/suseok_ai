@@ -145,6 +145,65 @@ def test_entry_engine_v3_ignores_legacy_metadata_when_context_fields_are_missing
     assert "ROLE_MISSING" in decision.reason_codes
 
 
+def test_strategy_context_fallback_does_not_treat_legacy_global_risk_off_as_systemic(tmp_path):
+    db = TradingDatabase(str(tmp_path / "context-split-market.db"))
+    market_data = MarketDataStore()
+    candidate = _candidate(db, market="KOSPI")
+    _tick(market_data, "000001")
+    db.save_market_regime_snapshot(
+        {
+            **_market_snapshot(),
+            "global_status": "RISK_OFF",
+            "kospi_status": "EXPANSION",
+            "kosdaq_status": "RISK_OFF",
+            "systemic_risk_off": False,
+            "candidate_policy_by_code": {},
+            "kospi_snapshot": {"side": "KOSPI", "status": "EXPANSION", "index_return_pct": 0.9},
+            "kosdaq_snapshot": {"side": "KOSDAQ", "status": "RISK_OFF", "index_return_pct": -3.0},
+        }
+    )
+    db.save_theme_board_snapshot(_theme_board())
+
+    snapshot = StrategyContextAssembler(db, market_data=market_data).assemble_candidate(
+        candidate,
+        now=datetime(2026, 6, 19, 9, 20, 0),
+    )
+
+    assert snapshot.market.global_market_regime == "RISK_OFF"
+    assert snapshot.market.side_market_regime == "EXPANSION"
+    assert snapshot.market.market_action == "ALLOW_REDUCED"
+    assert snapshot.market.block_new_entry is False
+    assert "SPLIT_MARKET_HEALTHY_SIDE_REDUCED" in snapshot.market.reason_codes
+
+
+def test_strategy_context_fallback_infers_systemic_risk_off_from_side_statuses(tmp_path):
+    db = TradingDatabase(str(tmp_path / "context-systemic-market.db"))
+    market_data = MarketDataStore()
+    candidate = _candidate(db, market="KOSPI")
+    _tick(market_data, "000001")
+    payload = {
+        **_market_snapshot(),
+        "global_status": "RISK_OFF",
+        "kospi_status": "WEAK",
+        "kosdaq_status": "RISK_OFF",
+        "candidate_policy_by_code": {},
+        "kospi_snapshot": {"side": "KOSPI", "status": "WEAK", "index_return_pct": -1.1},
+        "kosdaq_snapshot": {"side": "KOSDAQ", "status": "RISK_OFF", "index_return_pct": -3.0},
+    }
+    payload.pop("systemic_risk_off", None)
+    db.save_market_regime_snapshot(payload)
+    db.save_theme_board_snapshot(_theme_board())
+
+    snapshot = StrategyContextAssembler(db, market_data=market_data).assemble_candidate(
+        candidate,
+        now=datetime(2026, 6, 19, 9, 20, 0),
+    )
+
+    assert snapshot.market.market_action == "BLOCK_NEW_ENTRY"
+    assert snapshot.market.block_new_entry is True
+    assert "SYSTEMIC_RISK_OFF_BLOCK" in snapshot.market.reason_codes
+
+
 def test_session_phase_boundaries():
     assert session_phase(datetime(2026, 6, 19, 8, 59)).value == "PRE_OPEN"
     assert session_phase(datetime(2026, 6, 19, 9, 1)).value == "OPENING_DISCOVERY"
@@ -194,13 +253,13 @@ def test_theme_state_runtime_latest_persists_same_day_leader_stability(tmp_path)
     assert previous_day == {}
 
 
-def _candidate(db: TradingDatabase) -> Candidate:
+def _candidate(db: TradingDatabase, *, market: str = "KOSDAQ") -> Candidate:
     return db.save_candidate(
         Candidate(
             trade_date=TRADE_DATE,
             code="000001",
             name="Leader",
-            market="KOSDAQ",
+            market=market,
             state=CandidateState.WATCHING,
             metadata={},
         )

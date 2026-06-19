@@ -396,13 +396,14 @@ class DashboardReadModelService:
         age_sec = _age_sec(record.snapshot_at, current)
         source_age_sec = _age_sec(record.source_runtime_cycle_at, current) if record.source_runtime_cycle_at else 0.0
         stale_reasons: list[str] = []
+        caution_reasons: list[str] = []
         if age_sec > record.stale_after_sec:
             stale_reasons.append("READ_MODEL_STALE")
         if record.source_runtime_cycle_at and source_age_sec > max(record.stale_after_sec, 10):
             stale_reasons.append("RUNTIME_SNAPSHOT_STALE")
         order = dict(payload.get("order_manager") or {})
         if bool(order.get("reconcile_required_count")) or bool(order.get("stop_new_buy")):
-            stale_reasons.append("ORDER_RECONCILE_REQUIRED")
+            caution_reasons.append("ORDER_RECONCILE_REQUIRED")
         if stale_reasons:
             with self._lock:
                 self.metrics["stale_read_count"] = int(self.metrics.get("stale_read_count") or 0) + 1
@@ -434,7 +435,7 @@ class DashboardReadModelService:
                 "fallback_used": False,
                 "build_duration_ms": record.build_duration_ms,
                 "last_error": record.last_error,
-                "warnings": _dedupe_texts(list(metadata.get("warnings") or []) + stale_reasons),
+                "warnings": _dedupe_texts(list(metadata.get("warnings") or []) + stale_reasons + caution_reasons),
             }
         )
         payload["read_model"] = metadata
@@ -444,6 +445,13 @@ class DashboardReadModelService:
                 "warning",
                 "Dashboard snapshot이 오래되었습니다. 마지막 정상 데이터를 표시 중입니다.",
                 stale_reasons[0],
+            )
+        if caution_reasons:
+            payload["safety_banners"] = _add_banner(
+                payload.get("safety_banners") or [],
+                "warning",
+                "주문/계좌 reconcile 확인이 필요합니다. 신규 매수 차단 상태를 점검하세요.",
+                caution_reasons[0],
             )
         self._augment_system_health(payload, {}, {}, {}, {})
         return payload

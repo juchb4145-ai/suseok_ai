@@ -477,30 +477,58 @@ class EntryEngine:
             action = str(market_context.get("market_action") or "").strip().upper()
             market_status = str(market_context.get("side_market_regime") or "").strip().upper()
             multiplier = _float(market_context.get("position_size_multiplier_hint"))
+            reason_codes = _dedupe(list(market_context.get("reason_codes") or []))
+            market_side = str(market_context.get("market_side") or "").strip().upper()
         else:
             market_context = {}
             action = str(metadata.get("market_action") or "").strip().upper()
             market_status = str(metadata.get("market_regime_status") or "").strip().upper()
             multiplier = _float(metadata.get("market_position_size_multiplier_hint"))
-        details = {"market_action": action, "market_status": market_status}
+            reason_codes = _dedupe(list(metadata.get("market_reason_codes") or []))
+            market_side = str(metadata.get("market_side") or "").strip().upper()
+        details = {"market_action": action, "market_status": market_status, "market_side": market_side, "reason_codes": reason_codes}
         if not action:
             return EntryMarketReadiness(status=EntryCheckStatus.DATA_WAIT, reason_codes=("MARKET_DATA_WAIT",), details=details)
         if action == "ALLOW_NORMAL":
             return EntryMarketReadiness(status=EntryCheckStatus.PASS, reason_codes=("MARKET_EXPANSION",), position_size_multiplier_hint=1.0, details=details)
         if action == "ALLOW_REDUCED":
+            reason = _first_reason(
+                reason_codes,
+                {
+                    "SIDE_MARKET_SELECTIVE_REDUCED",
+                    "SPLIT_MARKET_HEALTHY_SIDE_REDUCED",
+                    "COUNTERPART_MARKET_DATA_WAIT_REDUCED",
+                    "MARKET_SELECTIVE_REDUCED",
+                },
+                "SIDE_MARKET_SELECTIVE_REDUCED",
+            )
             return EntryMarketReadiness(
                 status=EntryCheckStatus.PASS,
-                reason_codes=("MARKET_SELECTIVE_REDUCED",),
+                reason_codes=(reason,),
                 position_size_multiplier_hint=multiplier if multiplier > 0 else 0.6,
                 details=details,
             )
         if action == "WAIT_MARKET":
-            reason = "MARKET_CHOPPY_WAIT" if market_status == "CHOPPY" else "MARKET_WEAK_WAIT"
+            reason = _first_reason(
+                reason_codes,
+                {"SIDE_MARKET_CHOPPY_WAIT", "SIDE_MARKET_WEAK_WAIT", "MARKET_CHOPPY_WAIT", "MARKET_WEAK_WAIT"},
+                "SIDE_MARKET_CHOPPY_WAIT" if market_status == "CHOPPY" else "SIDE_MARKET_WEAK_WAIT",
+            )
             return EntryMarketReadiness(status=EntryCheckStatus.WAIT, reason_codes=(reason,), position_size_multiplier_hint=0.0, details=details)
         if action == "BLOCK_NEW_ENTRY":
-            return EntryMarketReadiness(status=EntryCheckStatus.BLOCK, reason_codes=("MARKET_RISK_OFF_BLOCK",), position_size_multiplier_hint=0.0, details=details)
+            reason = _first_reason(
+                reason_codes,
+                {"SYSTEMIC_RISK_OFF_BLOCK", "SIDE_MARKET_RISK_OFF_BLOCK", "MARKET_RISK_OFF_BLOCK"},
+                "SIDE_MARKET_RISK_OFF_BLOCK",
+            )
+            return EntryMarketReadiness(status=EntryCheckStatus.BLOCK, reason_codes=(reason,), position_size_multiplier_hint=0.0, details=details)
         if action == "DATA_WAIT":
-            return EntryMarketReadiness(status=EntryCheckStatus.DATA_WAIT, reason_codes=("MARKET_DATA_WAIT",), position_size_multiplier_hint=0.0, details=details)
+            reason = _first_reason(
+                reason_codes,
+                {"MARKET_SIDE_UNRESOLVED", "MARKET_DATA_WAIT"},
+                "MARKET_DATA_WAIT",
+            )
+            return EntryMarketReadiness(status=EntryCheckStatus.DATA_WAIT, reason_codes=(reason,), position_size_multiplier_hint=0.0, details=details)
         if action == "MARKET_CLOSED":
             return EntryMarketReadiness(status=EntryCheckStatus.BLOCK, reason_codes=("MARKET_CLOSED",), position_size_multiplier_hint=0.0, details=details)
         return EntryMarketReadiness(status=EntryCheckStatus.DATA_WAIT, reason_codes=("MARKET_ACTION_UNKNOWN",), position_size_multiplier_hint=0.0, details=details)
@@ -679,7 +707,8 @@ class EntryEngine:
             return False
         if entry_status != EntryDecisionStatus.OBSERVE_READY:
             return False
-        if str(metadata.get("market_action") or "") not in {"ALLOW_NORMAL", "ALLOW_REDUCED"}:
+        market_action = str(market.details.get("market_action") or metadata.get("market_action") or "")
+        if market_action not in {"ALLOW_NORMAL", "ALLOW_REDUCED"}:
             return False
         if not role.dry_run_role_allowed:
             return False
@@ -961,6 +990,14 @@ def _dedupe(values: Iterable[Any]) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def _first_reason(values: Iterable[Any], allowed: set[str], default: str) -> str:
+    for value in values or []:
+        text = str(value or "").strip()
+        if text in allowed:
+            return text
+    return default
 
 
 def _normalize_code(value: Any) -> str:

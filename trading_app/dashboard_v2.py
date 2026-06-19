@@ -118,6 +118,7 @@ def _v2_status(
     broker_env = str(order_manager.get("broker_env") or _broker_env_from_gateway(gateway))
     kill = str(order_manager.get("kill_switch_state") or "NORMAL")
     market_status = str(market.get("global_status") or "")
+    systemic_risk_off = _systemic_risk_off(market)
     runtime_profile = str(
         runtime.get("runtime_profile")
         or base.get("runtime_profile")
@@ -135,7 +136,7 @@ def _v2_status(
         label = "위험"
     elif broker_env == "REAL":
         label = "주문차단"
-    elif market_status == "RISK_OFF":
+    elif systemic_risk_off:
         label = "위험"
     elif not live_sim_allowed:
         label = "관찰전용"
@@ -173,15 +174,20 @@ def _v2_status(
         },
         "kill_switch_state": kill,
         "status_label": label,
-        "operator_message_ko": _status_message(label, market_status, broker_env, kill, live_sim_allowed),
+        "operator_message_ko": _status_message(label, market_status, broker_env, kill, live_sim_allowed, systemic_risk_off),
     }
 
 
 def _market_overview(market: dict[str, Any]) -> dict[str, Any]:
     global_status = str(market.get("global_status") or market.get("status") or "UNKNOWN")
+    systemic_risk_off = _systemic_risk_off(market)
+    composite_mode = str(market.get("composite_market_mode") or "")
     return {
         "status": market.get("status", "EMPTY"),
         "global_status": global_status,
+        "composite_market_mode": composite_mode,
+        "composite_market_mode_label_ko": market.get("composite_market_mode_label_ko") or _composite_mode_label_ko(composite_mode),
+        "systemic_risk_off": systemic_risk_off,
         "kospi_status": market.get("kospi_status", "UNKNOWN"),
         "kosdaq_status": market.get("kosdaq_status", "UNKNOWN"),
         "kospi_return_pct": _num(market.get("kospi_return_pct")),
@@ -190,9 +196,12 @@ def _market_overview(market: dict[str, Any]) -> dict[str, Any]:
         "kosdaq_breadth_pct": _num(market.get("kosdaq_breadth_pct")),
         "risk_off_detected": bool(market.get("risk_off_detected") or global_status == "RISK_OFF"),
         "weak_market_detected": bool(market.get("weak_market_detected") or global_status == "WEAK"),
+        "candidate_policy_summary_by_side": dict(market.get("candidate_policy_summary_by_side") or {}),
+        "market_side_unresolved_count": int(market.get("market_side_unresolved_count") or 0),
+        "split_market_reduced_count": int(market.get("split_market_reduced_count") or 0),
         "block_new_entry_count": int(market.get("block_new_entry_count") or 0),
         "wait_market_count": int(market.get("wait_market_count") or 0),
-        "market_operator_message_ko": _market_message(global_status, market),
+        "market_operator_message_ko": market.get("market_operator_message_ko") or _market_message(global_status, market, systemic_risk_off),
         "top_reasons": [_reason_item(item) for item in list(market.get("top_reasons") or [])[:5]],
     }
 
@@ -610,8 +619,10 @@ def _safety_banners(payload: dict[str, Any]) -> list[dict[str, Any]]:
         banners.append({"severity": "warning", "message_ko": "계좌 whitelist 대기", "reason_code": "ACCOUNT_NOT_WHITELISTED"})
     if status.get("kill_switch_state") in {"KILL_SWITCH_ACTIVE", "STOP_NEW_BUY", "REDUCE_ONLY"}:
         banners.append({"severity": "critical", "message_ko": "킬스위치 활성: 신규 매수 차단", "reason_code": "KILL_SWITCH_BLOCKS_BUY"})
-    if market.get("risk_off_detected"):
-        banners.append({"severity": "critical", "message_ko": "RISK_OFF: 신규진입 차단, 보유 리스크 축소 우선", "reason_code": "MARKET_RISK_OFF_BLOCK"})
+    if market.get("systemic_risk_off"):
+        banners.append({"severity": "critical", "message_ko": "SYSTEMIC RISK_OFF: 전체 신규진입 차단", "reason_code": "SYSTEMIC_RISK_OFF_BLOCK"})
+    elif market.get("risk_off_detected"):
+        banners.append({"severity": "warning", "message_ko": "분리장세 주의: 위험 시장만 차단하고 정상 시장은 축소 관찰", "reason_code": "SPLIT_MARKET_HEALTHY_SIDE_REDUCED"})
     if status.get("data_freshness_status") == "STALE":
         banners.append({"severity": "warning", "message_ko": "Gateway heartbeat 지연: 데이터 신선도 점검", "reason_code": "GATEWAY_HEARTBEAT_STALE"})
     if not order.get("order_manager_enabled"):
@@ -742,9 +753,14 @@ def _order_reason_summary(item: dict[str, Any]) -> str:
     return status or "-"
 
 
-def _market_message(status: str, market: dict[str, Any]) -> str:
+def _market_message(status: str, market: dict[str, Any], systemic_risk_off: bool = False) -> str:
+    if systemic_risk_off:
+        return "시장국면: SYSTEMIC_RISK_OFF - 전체 신규진입 차단"
+    composite = str(market.get("composite_market_mode") or "")
+    if composite in {"SPLIT_KOSPI_ON", "SPLIT_KOSDAQ_ON"}:
+        return market.get("market_operator_message_ko") or f"시장국면: {_composite_mode_label_ko(composite)}"
     if status == "RISK_OFF":
-        return "시장국면: RISK_OFF - 신규진입 차단, 보유 리스크 축소 우선"
+        return "시장국면: 분리장세 RISK_OFF - 해당 시장만 신규진입 차단"
     if status == "SELECTIVE":
         return "시장국면: SELECTIVE - 대장주 중심 축소 진입만 관찰"
     if status == "EXPANSION":
@@ -756,13 +772,13 @@ def _market_message(status: str, market: dict[str, Any]) -> str:
     return f"시장국면: {status or 'UNKNOWN'}"
 
 
-def _status_message(label: str, market_status: str, broker_env: str, kill: str, live_sim_allowed: bool) -> str:
+def _status_message(label: str, market_status: str, broker_env: str, kill: str, live_sim_allowed: bool, systemic_risk_off: bool = False) -> str:
     if broker_env == "REAL":
         return "실계좌 환경 감지: 모든 자동주문 차단"
     if kill in {"KILL_SWITCH_ACTIVE", "REDUCE_ONLY", "STOP_NEW_BUY"}:
         return "킬스위치 활성: 신규 매수 차단"
-    if market_status == "RISK_OFF":
-        return "RISK_OFF: 신규진입 차단, 보유 리스크 축소 우선"
+    if systemic_risk_off:
+        return "SYSTEMIC RISK_OFF: 전체 신규진입 차단"
     if not live_sim_allowed:
         return "관찰 전용 또는 모의주문 비활성 상태입니다."
     return f"Dashboard V2 상태: {label}"
@@ -786,6 +802,28 @@ def _data_freshness_status(
     if bool(market.get("enabled")) and market.get("global_status") == "DATA_WAIT":
         return "WAIT_DATA"
     return "FRESH"
+
+
+def _systemic_risk_off(market: dict[str, Any]) -> bool:
+    if "systemic_risk_off" in market:
+        return bool(market.get("systemic_risk_off"))
+    kospi = str(market.get("kospi_status") or "").upper()
+    kosdaq = str(market.get("kosdaq_status") or "").upper()
+    return (kospi == "RISK_OFF" and kosdaq in {"RISK_OFF", "WEAK"}) or (
+        kosdaq == "RISK_OFF" and kospi in {"RISK_OFF", "WEAK"}
+    )
+
+
+def _composite_mode_label_ko(mode: str) -> str:
+    return {
+        "BROAD_RISK_ON": "전반적 위험 선호",
+        "SPLIT_KOSPI_ON": "분리장세 - KOSPI 우위",
+        "SPLIT_KOSDAQ_ON": "분리장세 - KOSDAQ 우위",
+        "MIXED_CAUTION": "혼조 주의",
+        "DATA_DEGRADED": "시장 데이터 일부 대기",
+        "SYSTEMIC_RISK_OFF": "시스템 전체 위험",
+        "MARKET_CLOSED": "장 종료",
+    }.get(str(mode or ""), str(mode or "UNKNOWN"))
 
 
 def _stage_status(name: str, section: Any, pipeline_status: dict[str, Any]) -> dict[str, Any]:

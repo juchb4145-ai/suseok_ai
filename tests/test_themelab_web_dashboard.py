@@ -37,6 +37,9 @@ def test_themelab_page_is_standalone_dark_terminal():
     assert soup.select_one(".terminal-shell") is not None
     assert soup.select_one("#operator-main-action") is not None
     assert soup.select_one("#operator-main-action-message") is not None
+    assert "SYSTEMIC_RISK_OFF_BLOCK" in js
+    assert "SIDE_MARKET_RISK_OFF_BLOCK" in js
+    assert "MARKET_SIDE_UNRESOLVED" in js
     assert soup.select_one("#themelab-tab-nav") is not None
     assert soup.select_one("#tab-main") is not None
     assert "active" in soup.select_one("#tab-main").get("class", [])

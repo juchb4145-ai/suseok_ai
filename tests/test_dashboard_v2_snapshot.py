@@ -146,6 +146,7 @@ def test_dashboard_v2_risk_off_and_real_broker_create_safety_banners(monkeypatch
         "market_regime": {
             "global_status": "RISK_OFF",
             "risk_off_detected": True,
+            "systemic_risk_off": True,
             "block_new_entry_count": 3,
         },
         "order_manager": {
@@ -161,10 +162,41 @@ def test_dashboard_v2_risk_off_and_real_broker_create_safety_banners(monkeypatch
 
     payload = build_dashboard_v2_snapshot(snapshot)
 
-    messages = [item["message_ko"] for item in payload["safety_banners"]]
-    assert "실계좌 환경 감지: 모든 자동주문 차단" in messages
-    assert "RISK_OFF: 신규진입 차단, 보유 리스크 축소 우선" in messages
-    assert "킬스위치 활성: 신규 매수 차단" in messages
+    reasons = {item["reason_code"]: item for item in payload["safety_banners"]}
+    assert reasons["REAL_BROKER_BLOCKED"]["severity"] == "critical"
+    assert reasons["SYSTEMIC_RISK_OFF_BLOCK"]["severity"] == "critical"
+    assert reasons["KILL_SWITCH_BLOCKS_BUY"]["severity"] == "critical"
+
+
+def test_dashboard_v2_split_risk_off_is_warning_not_systemic_danger(monkeypatch):
+    monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
+    snapshot = {
+        "gateway": {"heartbeat_ok": True},
+        "market_regime": {
+            "global_status": "RISK_OFF",
+            "kospi_status": "EXPANSION",
+            "kosdaq_status": "RISK_OFF",
+            "composite_market_mode": "SPLIT_KOSPI_ON",
+            "systemic_risk_off": False,
+            "risk_off_detected": True,
+            "candidate_policy_summary_by_side": {
+                "KOSPI": {"total": 1, "ALLOW_REDUCED": 1},
+                "KOSDAQ": {"total": 1, "BLOCK_NEW_ENTRY": 1},
+            },
+            "split_market_reduced_count": 1,
+        },
+        "order_manager": {"enabled": True, "mode": "LIVE_SIM", "live_sim_orders_allowed": True},
+    }
+
+    payload = build_dashboard_v2_snapshot(snapshot)
+
+    reasons = {item["reason_code"]: item for item in payload["safety_banners"]}
+    assert payload["market_overview"]["systemic_risk_off"] is False
+    assert payload["market_overview"]["composite_market_mode"] == "SPLIT_KOSPI_ON"
+    assert payload["market_overview"]["split_market_reduced_count"] == 1
+    assert "SYSTEMIC_RISK_OFF_BLOCK" not in reasons
+    assert reasons["SPLIT_MARKET_HEALTHY_SIDE_REDUCED"]["severity"] == "warning"
+    assert payload["v2_status"]["status_label"] != "위험"
 
 
 def test_dashboard_v2_wait_block_reasons_aggregate_and_unknown_reason_fallback(monkeypatch):

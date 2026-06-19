@@ -518,7 +518,22 @@ function formatMs(value) {
 
 function formatDateTime(value) {
   if (!value) return "-";
-  return String(value).replace("T", " ").replace("+00:00", "Z");
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) return String(value).replace("T", " ");
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date).reduce((acc, part) => {
+    acc[part.type] = part.value;
+    return acc;
+  }, {});
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} KST`;
 }
 
 function yesNo(value) {
@@ -1096,7 +1111,7 @@ function renderDashboardV2(snapshot) {
   const identity = state.dashboardV2Snapshot.identity || snapshotIdentity(payload);
   text("dashboard-v2-snapshot-source", `${identity.sourceKind || readModel.source || "-"}${identity.fallbackUsed ? " fallback" : ""}`);
   text("dashboard-v2-snapshot-generation", identity.generation ? `#${identity.generation}` : "-");
-  text("dashboard-v2-market-status", `${market.global_status || "-"} / ${market.kospi_status || "-"} / ${market.kosdaq_status || "-"}`);
+  text("dashboard-v2-market-status", `${market.composite_market_mode_label_ko || market.composite_market_mode || market.global_status || "-"} / ${market.kospi_status || "-"} / ${market.kosdaq_status || "-"}`);
   text("dashboard-v2-pre-market-status", preMarket.go_no_go || "-");
   text("dashboard-v2-order-safety", orderManager.stop_new_buy ? "STOP_NEW_BUY" : orderManager.reduce_only ? "REDUCE_ONLY" : orderManager.reconcile_required_count ? "RECONCILE_REQUIRED" : orderManager.live_sim_orders_allowed ? "LIVE_SIM 허용" : "관찰/차단");
   text("dashboard-v2-broker-account", `${status.broker_env || "UNKNOWN"} / ${status.account || "-"}`);
@@ -1113,8 +1128,8 @@ function renderDashboardV2(snapshot) {
   text("dashboard-v2-pre-market-fail-count", preMarket.fail_count || 0);
   text("dashboard-v2-pre-market-action", preMarket.recommended_action_ko || "점검 결과를 기다립니다.");
 
-  text("dashboard-v2-market-pill", market.global_status || "UNKNOWN");
-  cls("dashboard-v2-market-pill", `counter ${market.risk_off_detected ? "bad" : market.weak_market_detected ? "warn" : "ok"}`);
+  text("dashboard-v2-market-pill", market.systemic_risk_off ? "SYSTEMIC_RISK_OFF" : market.composite_market_mode || market.global_status || "UNKNOWN");
+  cls("dashboard-v2-market-pill", `counter ${market.systemic_risk_off ? "bad" : market.risk_off_detected || market.weak_market_detected ? "warn" : "ok"}`);
   text("dashboard-v2-market-message", market.market_operator_message_ko || "시장 데이터 대기");
   text("dashboard-v2-kospi", `${formatPercentValue(market.kospi_return_pct)} / ${formatPercentValue(Number(market.kospi_breadth_pct || 0) * 100)}`);
   text("dashboard-v2-kosdaq", `${formatPercentValue(market.kosdaq_return_pct)} / ${formatPercentValue(Number(market.kosdaq_breadth_pct || 0) * 100)}`);

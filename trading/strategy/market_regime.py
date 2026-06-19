@@ -12,6 +12,7 @@ from trading.strategy.candles import CandleBuilder
 from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.strategy.market_index import MarketIndexStore, _index_storage_aliases
 from trading.strategy.models import Candidate, CandidateState, StrategyProfile
+from trading.strategy.reason_codes import ReasonCode
 
 
 MARKET_REGIME_OUTPUT_MODE = "OBSERVE"
@@ -33,6 +34,16 @@ class MarketSide(str, Enum):
     KOSPI = "KOSPI"
     KOSDAQ = "KOSDAQ"
     UNKNOWN = "UNKNOWN"
+
+
+class CompositeMarketMode(str, Enum):
+    BROAD_RISK_ON = "BROAD_RISK_ON"
+    SPLIT_KOSPI_ON = "SPLIT_KOSPI_ON"
+    SPLIT_KOSDAQ_ON = "SPLIT_KOSDAQ_ON"
+    MIXED_CAUTION = "MIXED_CAUTION"
+    DATA_DEGRADED = "DATA_DEGRADED"
+    SYSTEMIC_RISK_OFF = "SYSTEMIC_RISK_OFF"
+    MARKET_CLOSED = "MARKET_CLOSED"
 
 
 class CandidateMarketAction(str, Enum):
@@ -138,10 +149,24 @@ class MarketSideSnapshot:
 
 
 @dataclass(frozen=True)
+class MarketSideResolution:
+    code: str
+    side: MarketSide = MarketSide.UNKNOWN
+    source: str = "unknown"
+    status: str = "UNRESOLVED"
+    resolved_at: str = ""
+    reason_codes: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(asdict(self))
+
+
+@dataclass(frozen=True)
 class CandidateMarketPolicy:
     code: str
     market_side: MarketSide
     market_side_source: str
+    market_side_resolution_status: str
     market_status: MarketRegimeStatus
     global_market_status: MarketRegimeStatus
     market_action: CandidateMarketAction
@@ -162,6 +187,8 @@ class MarketRegimeSnapshot:
     global_status: MarketRegimeStatus
     kospi_status: MarketRegimeStatus
     kosdaq_status: MarketRegimeStatus
+    composite_market_mode: CompositeMarketMode
+    systemic_risk_off: bool
     kospi_snapshot: MarketSideSnapshot
     kosdaq_snapshot: MarketSideSnapshot
     candidate_policy_by_code: dict[str, CandidateMarketPolicy] = field(default_factory=dict)
@@ -172,6 +199,10 @@ class MarketRegimeSnapshot:
     weak_market_detected: bool = False
     data_wait_count: int = 0
     policy_summary: dict[str, int] = field(default_factory=dict)
+    systemic_reason_codes: tuple[str, ...] = ()
+    candidate_policy_summary_by_side: dict[str, dict[str, int]] = field(default_factory=dict)
+    market_side_unresolved_count: int = 0
+    split_market_reduced_count: int = 0
     data_quality_flags: tuple[str, ...] = ()
     reason_codes: tuple[str, ...] = ()
     output_mode: str = MARKET_REGIME_OUTPUT_MODE
@@ -192,6 +223,232 @@ class MarketRegimeResult:
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(asdict(self))
+
+
+class MarketSideResolver:
+    def __init__(self, db: Any, *, resolved_at: str = "") -> None:
+        self.db = db
+        self.resolved_at = resolved_at
+
+    def resolve_many(self, candidates: Iterable[Candidate]) -> dict[str, MarketSideResolution]:
+        candidate_list = list(candidates or [])
+        master = self._symbol_master(candidate_list)
+        return {
+            normalize_code(candidate.code): self.resolve(candidate, master_by_code=master)
+            for candidate in candidate_list
+            if normalize_code(candidate.code)
+        }
+
+    def resolve(
+        self,
+        candidate: Candidate,
+        *,
+        master_by_code: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> MarketSideResolution:
+        code = normalize_code(candidate.code)
+        master = dict((master_by_code or {}).get(code) or {})
+        master_side = _market_side_value(master.get("market"))
+        if master_side in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
+            return MarketSideResolution(
+                code=code,
+                side=master_side,
+                source="kiwoom_symbol_master",
+                status="RESOLVED",
+                resolved_at=self.resolved_at,
+                reason_codes=(ReasonCode.MARKET_SIDE_RESOLVED_FROM_KIWOOM_MASTER.value,),
+            )
+
+        candidate_side = _market_side_value(candidate.market)
+        if candidate_side in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
+            return MarketSideResolution(
+                code=code,
+                side=candidate_side,
+                source="candidate.market",
+                status="RESOLVED",
+                resolved_at=self.resolved_at,
+                reason_codes=(),
+            )
+
+        payload_side, payload_source = _source_payload_market_side(candidate)
+        if payload_side in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
+            return MarketSideResolution(
+                code=code,
+                side=payload_side,
+                source=payload_source,
+                status="RESOLVED",
+                resolved_at=self.resolved_at,
+                reason_codes=(),
+            )
+
+        profile_side = _strategy_profile_market_side(candidate.strategy_profile)
+        if profile_side in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
+            return MarketSideResolution(
+                code=code,
+                side=profile_side,
+                source="strategy_profile",
+                status="RESOLVED",
+                resolved_at=self.resolved_at,
+                reason_codes=(),
+            )
+
+        return MarketSideResolution(
+            code=code,
+            side=MarketSide.UNKNOWN,
+            source="unknown",
+            status="UNRESOLVED",
+            resolved_at=self.resolved_at,
+            reason_codes=("MARKET_SIDE_UNKNOWN", ReasonCode.MARKET_SIDE_UNRESOLVED.value),
+        )
+
+    def _symbol_master(self, candidates: Iterable[Candidate]) -> dict[str, Mapping[str, Any]]:
+        loader = getattr(self.db, "list_kiwoom_symbol_master", None)
+        if not callable(loader):
+            return {}
+        codes = [normalize_code(candidate.code) for candidate in candidates if normalize_code(candidate.code)]
+        if not codes:
+            return {}
+        try:
+            rows = list(loader(codes) or [])
+        except Exception:
+            return {}
+        return {normalize_code(row.get("code")): dict(row or {}) for row in rows if normalize_code(row.get("code"))}
+
+
+def systemic_risk_off_state(
+    kospi: MarketRegimeStatus | str,
+    kosdaq: MarketRegimeStatus | str,
+    *,
+    market_open: bool = True,
+) -> tuple[bool, tuple[str, ...]]:
+    if not market_open:
+        return False, ()
+    kospi_status = _market_status_value(kospi)
+    kosdaq_status = _market_status_value(kosdaq)
+    if kospi_status == MarketRegimeStatus.RISK_OFF and kosdaq_status == MarketRegimeStatus.RISK_OFF:
+        return True, (ReasonCode.SYSTEMIC_RISK_OFF_BLOCK.value, "BOTH_MARKETS_RISK_OFF")
+    if kospi_status == MarketRegimeStatus.RISK_OFF and kosdaq_status == MarketRegimeStatus.WEAK:
+        return True, (ReasonCode.SYSTEMIC_RISK_OFF_BLOCK.value, "KOSPI_RISK_OFF_KOSDAQ_WEAK")
+    if kosdaq_status == MarketRegimeStatus.RISK_OFF and kospi_status == MarketRegimeStatus.WEAK:
+        return True, (ReasonCode.SYSTEMIC_RISK_OFF_BLOCK.value, "KOSDAQ_RISK_OFF_KOSPI_WEAK")
+    return False, ()
+
+
+def composite_market_mode(
+    kospi: MarketRegimeStatus | str,
+    kosdaq: MarketRegimeStatus | str,
+    *,
+    market_open: bool = True,
+    systemic_risk_off: bool | None = None,
+) -> CompositeMarketMode:
+    if not market_open:
+        return CompositeMarketMode.MARKET_CLOSED
+    kospi_status = _market_status_value(kospi)
+    kosdaq_status = _market_status_value(kosdaq)
+    systemic = systemic_risk_off
+    if systemic is None:
+        systemic, _reasons = systemic_risk_off_state(kospi_status, kosdaq_status, market_open=market_open)
+    if systemic:
+        return CompositeMarketMode.SYSTEMIC_RISK_OFF
+    healthy = {MarketRegimeStatus.EXPANSION, MarketRegimeStatus.SELECTIVE}
+    pressured = {MarketRegimeStatus.WEAK, MarketRegimeStatus.RISK_OFF}
+    if MarketRegimeStatus.DATA_WAIT in {kospi_status, kosdaq_status}:
+        return CompositeMarketMode.DATA_DEGRADED
+    if kospi_status in healthy and kosdaq_status in healthy:
+        return CompositeMarketMode.BROAD_RISK_ON
+    if kospi_status in healthy and kosdaq_status in pressured:
+        return CompositeMarketMode.SPLIT_KOSPI_ON
+    if kosdaq_status in healthy and kospi_status in pressured:
+        return CompositeMarketMode.SPLIT_KOSDAQ_ON
+    return CompositeMarketMode.MIXED_CAUTION
+
+
+def market_policy_for_side(
+    status: MarketRegimeStatus | str,
+    counterpart_status: MarketRegimeStatus | str,
+    *,
+    market_open: bool = True,
+    systemic_risk_off: bool = False,
+    market_side_known: bool = True,
+) -> tuple[CandidateMarketAction, float, bool, str, list[str]]:
+    side_status = _market_status_value(status)
+    other_status = _market_status_value(counterpart_status)
+    if not market_open or side_status == MarketRegimeStatus.MARKET_CLOSED:
+        return CandidateMarketAction.MARKET_CLOSED, 0.0, True, "MARKET_CLOSED", ["MARKET_CLOSED"]
+    if systemic_risk_off:
+        return (
+            CandidateMarketAction.BLOCK_NEW_ENTRY,
+            0.0,
+            True,
+            "SYSTEMIC_RISK_OFF",
+            [ReasonCode.SYSTEMIC_RISK_OFF_BLOCK.value],
+        )
+    if not market_side_known:
+        return (
+            CandidateMarketAction.DATA_WAIT,
+            0.0,
+            True,
+            ReasonCode.MARKET_SIDE_UNRESOLVED.value,
+            ["MARKET_SIDE_UNKNOWN", ReasonCode.MARKET_SIDE_UNRESOLVED.value],
+        )
+    if side_status == MarketRegimeStatus.RISK_OFF:
+        return (
+            CandidateMarketAction.BLOCK_NEW_ENTRY,
+            0.0,
+            True,
+            "RISK_OFF",
+            [ReasonCode.SIDE_MARKET_RISK_OFF_BLOCK.value],
+        )
+    if side_status == MarketRegimeStatus.WEAK:
+        return (
+            CandidateMarketAction.WAIT_MARKET,
+            0.0,
+            True,
+            "WEAK_MARKET",
+            [ReasonCode.SIDE_MARKET_WEAK_WAIT.value],
+        )
+    if side_status == MarketRegimeStatus.CHOPPY:
+        return (
+            CandidateMarketAction.WAIT_MARKET,
+            0.35,
+            False,
+            "CHOPPY_MARKET",
+            [ReasonCode.SIDE_MARKET_CHOPPY_WAIT.value],
+        )
+    if side_status == MarketRegimeStatus.DATA_WAIT:
+        return (
+            CandidateMarketAction.DATA_WAIT,
+            0.0,
+            True,
+            "DATA_WAIT",
+            ["MARKET_DATA_WAIT"],
+        )
+    if side_status == MarketRegimeStatus.SELECTIVE:
+        return (
+            CandidateMarketAction.ALLOW_REDUCED,
+            0.6,
+            False,
+            "SELECTIVE_MARKET",
+            [ReasonCode.SIDE_MARKET_SELECTIVE_REDUCED.value],
+        )
+    if side_status == MarketRegimeStatus.EXPANSION:
+        if other_status == MarketRegimeStatus.DATA_WAIT:
+            return (
+                CandidateMarketAction.ALLOW_REDUCED,
+                0.6,
+                False,
+                "COUNTERPART_MARKET_DATA_WAIT",
+                [ReasonCode.COUNTERPART_MARKET_DATA_WAIT_REDUCED.value],
+            )
+        if other_status in {MarketRegimeStatus.WEAK, MarketRegimeStatus.RISK_OFF, MarketRegimeStatus.CHOPPY}:
+            return (
+                CandidateMarketAction.ALLOW_REDUCED,
+                0.6,
+                False,
+                "SPLIT_MARKET_REDUCED",
+                [ReasonCode.SPLIT_MARKET_HEALTHY_SIDE_REDUCED.value],
+            )
+        return CandidateMarketAction.ALLOW_NORMAL, 1.0, False, "", ["MARKET_EXPANSION_ALLOW"]
+    return CandidateMarketAction.DATA_WAIT, 0.0, True, "DATA_WAIT", ["MARKET_DATA_WAIT"]
 
 
 class MarketRegimeEngine:
@@ -228,7 +485,9 @@ class MarketRegimeEngine:
             for candidate in list(self.db.list_candidates(trade_date=trade_date) or [])
             if candidate.state not in MARKET_REGIME_EXCLUDED_STATES
         ]
-        breadth_by_side = self._breadth_by_side(candidates, current)
+        resolver = MarketSideResolver(self.db, resolved_at=current.isoformat())
+        market_side_by_code = resolver.resolve_many(candidates)
+        breadth_by_side = self._breadth_by_side(candidates, current, market_side_by_code=market_side_by_code)
         kospi_snapshot = self._side_snapshot(
             MarketSide.KOSPI,
             current,
@@ -242,6 +501,17 @@ class MarketRegimeEngine:
             market_open=market_open,
         )
         global_status = self._global_status(kospi_snapshot.status, kosdaq_snapshot.status, market_open=market_open)
+        systemic_risk_off, systemic_reason_codes = systemic_risk_off_state(
+            kospi_snapshot.status,
+            kosdaq_snapshot.status,
+            market_open=market_open,
+        )
+        composite_mode = composite_market_mode(
+            kospi_snapshot.status,
+            kosdaq_snapshot.status,
+            market_open=market_open,
+            systemic_risk_off=systemic_risk_off,
+        )
         policies = self._candidate_policies(
             candidates,
             side_status={
@@ -249,27 +519,37 @@ class MarketRegimeEngine:
                 MarketSide.KOSDAQ: kosdaq_snapshot.status,
             },
             global_status=global_status,
+            market_open=market_open,
+            systemic_risk_off=systemic_risk_off,
+            market_side_by_code=market_side_by_code,
         )
         policy_summary = Counter(policy.market_action.value for policy in policies.values())
+        policy_summary_by_side = _policy_summary_by_side(policies.values())
         data_quality_flags = _dedupe(
             list(kospi_snapshot.data_quality_flags)
             + list(kosdaq_snapshot.data_quality_flags)
             + (["MARKET_REGIME_OBSERVE_ONLY"] if self.config.observe_only else [])
         )
-        reason_codes = _dedupe(list(kospi_snapshot.reason_codes) + list(kosdaq_snapshot.reason_codes))
+        reason_codes = _dedupe(
+            list(kospi_snapshot.reason_codes)
+            + list(kosdaq_snapshot.reason_codes)
+            + list(systemic_reason_codes)
+        )
         snapshot = MarketRegimeSnapshot(
             trade_date=trade_date,
             calculated_at=current.isoformat(),
             global_status=global_status,
             kospi_status=kospi_snapshot.status,
             kosdaq_status=kosdaq_snapshot.status,
+            composite_market_mode=composite_mode,
+            systemic_risk_off=systemic_risk_off,
             kospi_snapshot=kospi_snapshot,
             kosdaq_snapshot=kosdaq_snapshot,
             candidate_policy_by_code=policies,
             market_session_status=market_session_status,
             market_open=market_open,
             market_closed=not market_open,
-            risk_off_detected=global_status == MarketRegimeStatus.RISK_OFF,
+            risk_off_detected=MarketRegimeStatus.RISK_OFF in {kospi_snapshot.status, kosdaq_snapshot.status},
             weak_market_detected=global_status in {MarketRegimeStatus.WEAK, MarketRegimeStatus.RISK_OFF},
             data_wait_count=sum(
                 1
@@ -278,6 +558,15 @@ class MarketRegimeEngine:
             )
             + policy_summary.get(CandidateMarketAction.DATA_WAIT.value, 0),
             policy_summary=dict(policy_summary),
+            systemic_reason_codes=tuple(systemic_reason_codes),
+            candidate_policy_summary_by_side=policy_summary_by_side,
+            market_side_unresolved_count=int(policy_summary_by_side.get(MarketSide.UNKNOWN.value, {}).get("total", 0)),
+            split_market_reduced_count=sum(
+                1
+                for policy in policies.values()
+                if ReasonCode.SPLIT_MARKET_HEALTHY_SIDE_REDUCED.value in set(policy.reason_codes)
+                or ReasonCode.COUNTERPART_MARKET_DATA_WAIT_REDUCED.value in set(policy.reason_codes)
+            ),
             data_quality_flags=tuple(data_quality_flags),
             reason_codes=tuple(reason_codes),
             output_mode=MARKET_REGIME_OUTPUT_MODE,
@@ -500,19 +789,33 @@ class MarketRegimeEngine:
         *,
         side_status: Mapping[MarketSide, MarketRegimeStatus],
         global_status: MarketRegimeStatus,
+        market_open: bool,
+        systemic_risk_off: bool,
+        market_side_by_code: Mapping[str, MarketSideResolution],
     ) -> dict[str, CandidateMarketPolicy]:
         policies: dict[str, CandidateMarketPolicy] = {}
         for candidate in candidates:
             if candidate.state not in MARKET_REGIME_ALLOWED_STATES:
                 continue
-            side, source = _candidate_market_side(candidate)
-            status = side_status.get(side, global_status) if side != MarketSide.UNKNOWN else global_status
-            action, multiplier, block, wait_reason, reasons = _policy_for_status(status, global_status)
-            side_reasons = [f"MARKET_SIDE_{side.value}"] if side != MarketSide.UNKNOWN else ["MARKET_SIDE_UNKNOWN"]
+            code = normalize_code(candidate.code)
+            resolution = market_side_by_code.get(code) or MarketSideResolver(self.db).resolve(candidate)
+            side = resolution.side
+            counterpart = _counterpart_side(side)
+            status = side_status.get(side, MarketRegimeStatus.DATA_WAIT) if side != MarketSide.UNKNOWN else MarketRegimeStatus.DATA_WAIT
+            counterpart_status = side_status.get(counterpart, MarketRegimeStatus.DATA_WAIT)
+            action, multiplier, block, wait_reason, reasons = market_policy_for_side(
+                status,
+                counterpart_status,
+                market_open=market_open,
+                systemic_risk_off=systemic_risk_off,
+                market_side_known=side != MarketSide.UNKNOWN,
+            )
+            side_reasons = [f"MARKET_SIDE_{side.value}"] if side != MarketSide.UNKNOWN else []
             policies[candidate.code] = CandidateMarketPolicy(
                 code=candidate.code,
                 market_side=side,
-                market_side_source=source,
+                market_side_source=resolution.source,
+                market_side_resolution_status=resolution.status,
                 market_status=status,
                 global_market_status=global_status,
                 market_action=action,
@@ -520,7 +823,7 @@ class MarketRegimeEngine:
                 block_new_entry=block,
                 wait_reason=wait_reason,
                 recheck_after_sec=5 if action in {CandidateMarketAction.DATA_WAIT, CandidateMarketAction.WAIT_MARKET} else 0,
-                reason_codes=tuple(_dedupe(side_reasons + reasons)),
+                reason_codes=tuple(_dedupe(side_reasons + list(resolution.reason_codes) + reasons)),
             )
         return policies
 
@@ -540,25 +843,37 @@ class MarketRegimeEngine:
             policy_dict = policy.to_dict()
             metadata["market_side"] = policy.market_side.value
             metadata["market_side_source"] = policy.market_side_source
+            metadata["market_side_resolved_at"] = updated_at
+            metadata["market_side_resolution_status"] = policy.market_side_resolution_status
             metadata["market_regime_status"] = policy.market_status.value
             metadata["global_market_regime_status"] = policy.global_market_status.value
             metadata["market_action"] = policy.market_action.value
             metadata["market_position_size_multiplier_hint"] = policy.position_size_multiplier_hint
             metadata["market_block_new_entry"] = policy.block_new_entry
+            metadata["market_wait_reason"] = policy.wait_reason
             metadata["market_reason_codes"] = list(policy.reason_codes)
             metadata["updated_by_market_regime_at"] = updated_at
             metadata["candidate_market_policy"] = policy_dict
+            if policy.market_side in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
+                candidate.market = policy.market_side.value
             candidate.metadata = metadata
             self.db.save_candidate(candidate)
             updated += 1
         return updated
 
-    def _breadth_by_side(self, candidates: Iterable[Candidate], now: datetime) -> dict[MarketSide, MarketBreadthSnapshot]:
+    def _breadth_by_side(
+        self,
+        candidates: Iterable[Candidate],
+        now: datetime,
+        *,
+        market_side_by_code: Mapping[str, MarketSideResolution],
+    ) -> dict[MarketSide, MarketBreadthSnapshot]:
         grouped: dict[MarketSide, list[Candidate]] = defaultdict(list)
         for candidate in candidates:
             if candidate.state in MARKET_REGIME_EXCLUDED_STATES:
                 continue
-            side, _source = _candidate_market_side(candidate)
+            resolution = market_side_by_code.get(normalize_code(candidate.code))
+            side = resolution.side if resolution is not None else _candidate_market_side(candidate)[0]
             if side in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
                 grouped[side].append(candidate)
         return {
@@ -685,6 +1000,8 @@ class MarketRegimeEngine:
         payload["market_regime_overlay"] = {
             "calculated_at": snapshot.calculated_at,
             "global_status": snapshot.global_status.value,
+            "composite_market_mode": snapshot.composite_market_mode.value,
+            "systemic_risk_off": snapshot.systemic_risk_off,
             "kospi_status": snapshot.kospi_status.value,
             "kosdaq_status": snapshot.kosdaq_status.value,
             "risk_off_detected": snapshot.risk_off_detected,
@@ -745,6 +1062,17 @@ def market_regime_dashboard_payload(snapshot: MarketRegimeSnapshot | Mapping[str
     kospi = dict(data.get("kospi_snapshot") or {})
     kosdaq = dict(data.get("kosdaq_snapshot") or {})
     policy_summary = dict(data.get("policy_summary") or {})
+    systemic = _systemic_from_snapshot(data)
+    composite_mode = str(
+        data.get("composite_market_mode")
+        or composite_market_mode(
+            str(data.get("kospi_status") or ""),
+            str(data.get("kosdaq_status") or ""),
+            market_open=not bool(data.get("market_closed")),
+            systemic_risk_off=systemic,
+        ).value
+    )
+    policy_summary_by_side = dict(data.get("candidate_policy_summary_by_side") or {})
     reason_counter = Counter()
     for reason in list(data.get("reason_codes") or []):
         reason_counter[str(reason)] += 1
@@ -757,6 +1085,10 @@ def market_regime_dashboard_payload(snapshot: MarketRegimeSnapshot | Mapping[str
         "calculated_at": data.get("calculated_at", ""),
         "trade_date": data.get("trade_date", ""),
         "global_status": data.get("global_status", ""),
+        "composite_market_mode": composite_mode,
+        "composite_market_mode_label_ko": _composite_mode_label_ko(composite_mode),
+        "systemic_risk_off": systemic,
+        "systemic_reason_codes": list(data.get("systemic_reason_codes") or []),
         "kospi_status": data.get("kospi_status", ""),
         "kosdaq_status": data.get("kosdaq_status", ""),
         "kospi_return_pct": kospi.get("index_return_pct", 0.0),
@@ -769,9 +1101,19 @@ def market_regime_dashboard_payload(snapshot: MarketRegimeSnapshot | Mapping[str
         "weak_reason": _status_reason(data, MarketRegimeStatus.WEAK.value),
         "risk_off_reason": _status_reason(data, MarketRegimeStatus.RISK_OFF.value),
         "candidate_policy_summary": policy_summary,
+        "candidate_policy_summary_by_side": policy_summary_by_side,
+        "market_side_unresolved_count": int(data.get("market_side_unresolved_count") or policy_summary_by_side.get(MarketSide.UNKNOWN.value, {}).get("total", 0) or 0),
+        "split_market_reduced_count": int(data.get("split_market_reduced_count") or 0),
+        "market_operator_message_ko": _market_operator_message_ko(composite_mode, data, systemic),
         "block_new_entry_count": int(policy_summary.get(CandidateMarketAction.BLOCK_NEW_ENTRY.value, 0)),
         "wait_market_count": int(policy_summary.get(CandidateMarketAction.WAIT_MARKET.value, 0)),
         "data_wait_count": int(data.get("data_wait_count") or policy_summary.get(CandidateMarketAction.DATA_WAIT.value, 0)),
+        "risk_off_detected": bool(
+            data.get("risk_off_detected")
+            or MarketRegimeStatus.RISK_OFF.value
+            in {str(data.get("kospi_status") or ""), str(data.get("kosdaq_status") or "")}
+        ),
+        "weak_market_detected": bool(data.get("weak_market_detected")),
         "warnings": list(data.get("data_quality_flags") or []),
         "top_reasons": [{"reason": key, "count": count} for key, count in reason_counter.most_common(10)],
         "output_mode": data.get("output_mode", MARKET_REGIME_OUTPUT_MODE),
@@ -796,38 +1138,150 @@ def _policy_for_status(
     status: MarketRegimeStatus,
     global_status: MarketRegimeStatus,
 ) -> tuple[CandidateMarketAction, float, bool, str, list[str]]:
-    if global_status == MarketRegimeStatus.MARKET_CLOSED or status == MarketRegimeStatus.MARKET_CLOSED:
-        return CandidateMarketAction.MARKET_CLOSED, 0.0, True, "MARKET_CLOSED", ["MARKET_CLOSED"]
-    if global_status == MarketRegimeStatus.RISK_OFF or status == MarketRegimeStatus.RISK_OFF:
-        return CandidateMarketAction.BLOCK_NEW_ENTRY, 0.0, True, "RISK_OFF", ["MARKET_RISK_OFF_BLOCK"]
-    if global_status == MarketRegimeStatus.WEAK or status == MarketRegimeStatus.WEAK:
-        return CandidateMarketAction.WAIT_MARKET, 0.0, True, "WEAK_MARKET", ["MARKET_WEAK_WAIT"]
-    if status == MarketRegimeStatus.DATA_WAIT or global_status == MarketRegimeStatus.DATA_WAIT:
-        return CandidateMarketAction.DATA_WAIT, 0.0, False, "DATA_WAIT", ["MARKET_DATA_WAIT"]
-    if status == MarketRegimeStatus.EXPANSION and global_status in {MarketRegimeStatus.EXPANSION, MarketRegimeStatus.SELECTIVE}:
-        return CandidateMarketAction.ALLOW_NORMAL, 1.0, False, "", ["MARKET_EXPANSION_ALLOW"]
-    if status == MarketRegimeStatus.SELECTIVE or global_status == MarketRegimeStatus.SELECTIVE:
-        return CandidateMarketAction.ALLOW_REDUCED, 0.6, False, "SELECTIVE_MARKET", ["MARKET_SELECTIVE_REDUCED"]
-    if status == MarketRegimeStatus.CHOPPY or global_status == MarketRegimeStatus.CHOPPY:
-        return CandidateMarketAction.WAIT_MARKET, 0.35, False, "CHOPPY_MARKET", ["MARKET_CHOPPY_WAIT"]
-    return CandidateMarketAction.DATA_WAIT, 0.0, False, "DATA_WAIT", ["MARKET_DATA_WAIT"]
+    return market_policy_for_side(
+        status,
+        global_status,
+        market_open=global_status != MarketRegimeStatus.MARKET_CLOSED,
+        systemic_risk_off=False,
+        market_side_known=True,
+    )
 
 
 def _candidate_market_side(candidate: Candidate) -> tuple[MarketSide, str]:
     metadata = dict(candidate.metadata or {})
-    raw = str(metadata.get("market_side") or "").strip().upper()
-    if raw in {MarketSide.KOSPI.value, MarketSide.KOSDAQ.value}:
-        return MarketSide(raw), "metadata"
-    market = str(candidate.market or "").strip().upper()
-    if market in {MarketSide.KOSPI.value, MarketSide.KOSDAQ.value}:
-        return MarketSide(market), "candidate.market"
-    profile = candidate.strategy_profile
+    market = _market_side_value(candidate.market)
+    if market in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
+        return market, "candidate.market"
+    payload_side, payload_source = _source_payload_market_side(candidate)
+    if payload_side in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
+        return payload_side, payload_source
+    profile_side = _strategy_profile_market_side(candidate.strategy_profile)
+    if profile_side in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
+        return profile_side, "strategy_profile"
+    raw = _market_side_value(metadata.get("market_side"))
+    if raw in {MarketSide.KOSPI, MarketSide.KOSDAQ}:
+        return raw, "metadata.market_side"
+    return MarketSide.UNKNOWN, "unknown"
+
+
+def _policy_summary_by_side(policies: Iterable[CandidateMarketPolicy]) -> dict[str, dict[str, int]]:
+    summary: dict[str, Counter] = {side.value: Counter() for side in MarketSide}
+    for policy in policies:
+        side = policy.market_side.value
+        summary.setdefault(side, Counter())
+        summary[side][policy.market_action.value] += 1
+        summary[side]["total"] += 1
+    return {side: dict(counter) for side, counter in summary.items()}
+
+
+def _counterpart_side(side: MarketSide) -> MarketSide:
+    if side == MarketSide.KOSPI:
+        return MarketSide.KOSDAQ
+    if side == MarketSide.KOSDAQ:
+        return MarketSide.KOSPI
+    return MarketSide.UNKNOWN
+
+
+def _market_side_value(value: Any) -> MarketSide:
+    text = str(value.value if isinstance(value, Enum) else value or "").strip().upper()
+    if text.startswith("A") and len(text) == 7 and text[1:].isdigit():
+        return MarketSide.UNKNOWN
+    aliases = {
+        "0": MarketSide.KOSPI,
+        "001": MarketSide.KOSPI,
+        "KOSPI": MarketSide.KOSPI,
+        "KS": MarketSide.KOSPI,
+        "10": MarketSide.KOSDAQ,
+        "101": MarketSide.KOSDAQ,
+        "KOSDAQ": MarketSide.KOSDAQ,
+        "KQ": MarketSide.KOSDAQ,
+    }
+    return aliases.get(text, MarketSide.UNKNOWN)
+
+
+def _market_status_value(value: MarketRegimeStatus | str) -> MarketRegimeStatus:
+    if isinstance(value, MarketRegimeStatus):
+        return value
+    text = str(value or "").strip().upper()
+    try:
+        return MarketRegimeStatus(text)
+    except ValueError:
+        return MarketRegimeStatus.DATA_WAIT
+
+
+def _strategy_profile_market_side(profile: Any) -> MarketSide:
     profile_value = profile.value if isinstance(profile, StrategyProfile) else str(profile or "")
     if profile_value == StrategyProfile.KOSDAQ_THEME_PROFILE.value:
-        return MarketSide.KOSDAQ, "strategy_profile"
+        return MarketSide.KOSDAQ
     if profile_value in {StrategyProfile.KOSPI_LEADER_PROFILE.value, StrategyProfile.SEMICONDUCTOR_SIGNAL_PROFILE.value}:
-        return MarketSide.KOSPI, "strategy_profile"
-    return MarketSide.UNKNOWN, "unknown"
+        return MarketSide.KOSPI
+    return MarketSide.UNKNOWN
+
+
+def _source_payload_market_side(candidate: Candidate) -> tuple[MarketSide, str]:
+    metadata = dict(candidate.metadata or {})
+    for key in ("market", "market_type", "source_market", "candidate_market"):
+        side = _market_side_value(metadata.get(key))
+        if side != MarketSide.UNKNOWN:
+            return side, f"metadata.{key}"
+    payloads = []
+    for key in ("source_payload", "raw_payload", "source_event", "candidate_source_event"):
+        value = metadata.get(key)
+        if isinstance(value, Mapping):
+            payloads.append((key, dict(value)))
+    ingestion = metadata.get("candidate_ingestion")
+    if isinstance(ingestion, Mapping):
+        for key in ("source_payload", "raw_payload", "primary_source_payload"):
+            value = dict(ingestion).get(key)
+            if isinstance(value, Mapping):
+                payloads.append((f"candidate_ingestion.{key}", dict(value)))
+    for source_name, payload in payloads:
+        for key in ("market", "market_type", "market_side", "candidate_market"):
+            side = _market_side_value(payload.get(key))
+            if side != MarketSide.UNKNOWN:
+                return side, f"{source_name}.{key}"
+    return MarketSide.UNKNOWN, ""
+
+
+def _systemic_from_snapshot(data: Mapping[str, Any]) -> bool:
+    if "systemic_risk_off" in data:
+        return bool(data.get("systemic_risk_off"))
+    systemic, _reasons = systemic_risk_off_state(
+        str(data.get("kospi_status") or ""),
+        str(data.get("kosdaq_status") or ""),
+        market_open=str(data.get("market_session_status") or "").lower() != "closed",
+    )
+    return systemic
+
+
+def _composite_mode_label_ko(mode: str) -> str:
+    return {
+        CompositeMarketMode.BROAD_RISK_ON.value: "전반적 위험 선호",
+        CompositeMarketMode.SPLIT_KOSPI_ON.value: "분리장세 - KOSPI 우위",
+        CompositeMarketMode.SPLIT_KOSDAQ_ON.value: "분리장세 - KOSDAQ 우위",
+        CompositeMarketMode.MIXED_CAUTION.value: "혼조 주의",
+        CompositeMarketMode.DATA_DEGRADED.value: "시장 데이터 일부 대기",
+        CompositeMarketMode.SYSTEMIC_RISK_OFF.value: "시스템 전체 위험",
+        CompositeMarketMode.MARKET_CLOSED.value: "장 종료",
+    }.get(str(mode or ""), str(mode or "UNKNOWN"))
+
+
+def _market_operator_message_ko(mode: str, data: Mapping[str, Any], systemic: bool) -> str:
+    if systemic:
+        return "시스템 전체차단: 예. 양 시장 신규매수를 차단합니다."
+    kospi = str(data.get("kospi_status") or "UNKNOWN")
+    kosdaq = str(data.get("kosdaq_status") or "UNKNOWN")
+    if mode == CompositeMarketMode.SPLIT_KOSPI_ON.value:
+        return f"분리장세: KOSPI {kospi}, KOSDAQ {kosdaq}. KOSPI는 축소 허용, KOSDAQ 위험 쪽은 차단/대기입니다."
+    if mode == CompositeMarketMode.SPLIT_KOSDAQ_ON.value:
+        return f"분리장세: KOSDAQ {kosdaq}, KOSPI {kospi}. KOSDAQ은 축소 허용, KOSPI 위험 쪽은 차단/대기입니다."
+    if mode == CompositeMarketMode.DATA_DEGRADED.value:
+        return "시장 데이터 일부 대기: 정상 확인된 시장만 보수적으로 축소 허용합니다."
+    if mode == CompositeMarketMode.BROAD_RISK_ON.value:
+        return "양 시장이 대체로 정상입니다. 후보별 시장 상태 기준으로 진입 정책을 적용합니다."
+    if mode == CompositeMarketMode.MARKET_CLOSED.value:
+        return "장 종료 상태입니다. 신규 진입은 허용하지 않습니다."
+    return f"시장 모드: {_composite_mode_label_ko(mode)}"
 
 
 def _market_session_status(now: datetime) -> str:

@@ -6,6 +6,7 @@ from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.strategy.market_index import IndexTick, MarketIndexStore
 from trading.strategy.market_regime import (
     CandidateMarketAction,
+    CompositeMarketMode,
     MarketRegimeConfig,
     MarketRegimeEngine,
     MarketRegimeRuntimePipeline,
@@ -13,7 +14,7 @@ from trading.strategy.market_regime import (
     MarketSide,
     market_regime_dashboard_section,
 )
-from trading.strategy.models import CandidateState
+from trading.strategy.models import CandidateState, StrategyProfile
 from trading_app.api import build_candidates_snapshot, build_dashboard_snapshot
 
 
@@ -88,6 +89,7 @@ def test_expansion_allows_normal_size(tmp_path):
     db, market_data, index_store = _context(tmp_path)
     _candidate(db, "000004", market="KOSPI")
     _index(index_store, "KOSPI", 1.0)
+    _index(index_store, "KOSDAQ", 0.7)
     _tick(market_data, "000004", change=2.0)
 
     policy = _engine(db, market_data, index_store).build(trade_date=TRADE_DATE, now=OPEN_AT).snapshot.candidate_policy_by_code["000004"]
@@ -241,6 +243,164 @@ def test_dashboard_and_candidate_snapshot_include_market_regime(tmp_path):
     assert "market_regime" in dashboard
     assert dashboard["market_regime"]["ready_allowed"] is False
     assert candidates["items"][0]["market_action"]
+
+
+def test_split_kospi_on_reduces_healthy_side_without_global_block(tmp_path):
+    db, market_data, index_store = _context(tmp_path)
+    _candidate(db, "000201", market="KOSPI")
+    _candidate(db, "000202", market="KOSDAQ")
+    _index(index_store, "KOSPI", 1.1)
+    _index(index_store, "KOSDAQ", -3.0)
+    _tick(market_data, "000201", change=2.4)
+    _tick(market_data, "000202", change=-2.8)
+
+    snapshot = _engine(db, market_data, index_store).build(trade_date=TRADE_DATE, now=OPEN_AT).snapshot
+
+    kospi_policy = snapshot.candidate_policy_by_code["000201"]
+    kosdaq_policy = snapshot.candidate_policy_by_code["000202"]
+    assert snapshot.global_status == MarketRegimeStatus.RISK_OFF
+    assert snapshot.composite_market_mode == CompositeMarketMode.SPLIT_KOSPI_ON
+    assert snapshot.systemic_risk_off is False
+    assert kospi_policy.market_action == CandidateMarketAction.ALLOW_REDUCED
+    assert kospi_policy.position_size_multiplier_hint == 0.6
+    assert "SPLIT_MARKET_HEALTHY_SIDE_REDUCED" in kospi_policy.reason_codes
+    assert kosdaq_policy.market_action == CandidateMarketAction.BLOCK_NEW_ENTRY
+    assert "SIDE_MARKET_RISK_OFF_BLOCK" in kosdaq_policy.reason_codes
+
+
+def test_split_kosdaq_on_reduces_healthy_side_without_global_block(tmp_path):
+    db, market_data, index_store = _context(tmp_path)
+    _candidate(db, "000203", market="KOSPI")
+    _candidate(db, "000204", market="KOSDAQ")
+    _index(index_store, "KOSPI", -2.3)
+    _index(index_store, "KOSDAQ", 1.0)
+    _tick(market_data, "000203", change=-2.5)
+    _tick(market_data, "000204", change=2.8)
+
+    snapshot = _engine(db, market_data, index_store).build(trade_date=TRADE_DATE, now=OPEN_AT).snapshot
+
+    kospi_policy = snapshot.candidate_policy_by_code["000203"]
+    kosdaq_policy = snapshot.candidate_policy_by_code["000204"]
+    assert snapshot.global_status == MarketRegimeStatus.RISK_OFF
+    assert snapshot.composite_market_mode == CompositeMarketMode.SPLIT_KOSDAQ_ON
+    assert snapshot.systemic_risk_off is False
+    assert kospi_policy.market_action == CandidateMarketAction.BLOCK_NEW_ENTRY
+    assert "SIDE_MARKET_RISK_OFF_BLOCK" in kospi_policy.reason_codes
+    assert kosdaq_policy.market_action == CandidateMarketAction.ALLOW_REDUCED
+    assert "SPLIT_MARKET_HEALTHY_SIDE_REDUCED" in kosdaq_policy.reason_codes
+
+
+def test_systemic_risk_off_blocks_all_sides(tmp_path):
+    db, market_data, index_store = _context(tmp_path)
+    _candidate(db, "000205", market="KOSPI")
+    _candidate(db, "000206", market="KOSDAQ")
+    _index(index_store, "KOSPI", -2.5)
+    _index(index_store, "KOSDAQ", -3.0)
+    _tick(market_data, "000205", change=-2.2)
+    _tick(market_data, "000206", change=-3.2)
+
+    snapshot = _engine(db, market_data, index_store).build(trade_date=TRADE_DATE, now=OPEN_AT).snapshot
+
+    assert snapshot.composite_market_mode == CompositeMarketMode.SYSTEMIC_RISK_OFF
+    assert snapshot.systemic_risk_off is True
+    assert "SYSTEMIC_RISK_OFF_BLOCK" in snapshot.systemic_reason_codes
+    assert {
+        policy.market_action for policy in snapshot.candidate_policy_by_code.values()
+    } == {CandidateMarketAction.BLOCK_NEW_ENTRY}
+    assert all("SYSTEMIC_RISK_OFF_BLOCK" in policy.reason_codes for policy in snapshot.candidate_policy_by_code.values())
+
+
+def test_one_risk_off_one_weak_is_systemic_and_blocks_all_sides(tmp_path):
+    db, market_data, index_store = _context(tmp_path)
+    _candidate(db, "000207", market="KOSPI")
+    _candidate(db, "000208", market="KOSDAQ")
+    _index(index_store, "KOSPI", -1.2)
+    _index(index_store, "KOSDAQ", -3.0)
+    _tick(market_data, "000207", change=-0.7)
+    _tick(market_data, "000208", change=-2.7)
+
+    snapshot = _engine(db, market_data, index_store).build(trade_date=TRADE_DATE, now=OPEN_AT).snapshot
+
+    assert snapshot.kospi_status == MarketRegimeStatus.WEAK
+    assert snapshot.kosdaq_status == MarketRegimeStatus.RISK_OFF
+    assert snapshot.systemic_risk_off is True
+    assert snapshot.composite_market_mode == CompositeMarketMode.SYSTEMIC_RISK_OFF
+    assert all("SYSTEMIC_RISK_OFF_BLOCK" in policy.reason_codes for policy in snapshot.candidate_policy_by_code.values())
+
+
+def test_counterpart_data_wait_reduces_healthy_expansion_side(tmp_path):
+    db, market_data, index_store = _context(tmp_path)
+    _candidate(db, "000209", market="KOSPI")
+    _candidate(db, "000210", market="KOSDAQ")
+    _index(index_store, "KOSPI", 1.0)
+    _tick(market_data, "000209", change=2.2)
+    _tick(market_data, "000210", change=1.0)
+
+    snapshot = _engine(db, market_data, index_store).build(trade_date=TRADE_DATE, now=OPEN_AT).snapshot
+
+    kospi_policy = snapshot.candidate_policy_by_code["000209"]
+    kosdaq_policy = snapshot.candidate_policy_by_code["000210"]
+    assert snapshot.composite_market_mode == CompositeMarketMode.DATA_DEGRADED
+    assert kospi_policy.market_action == CandidateMarketAction.ALLOW_REDUCED
+    assert "COUNTERPART_MARKET_DATA_WAIT_REDUCED" in kospi_policy.reason_codes
+    assert kosdaq_policy.market_action == CandidateMarketAction.DATA_WAIT
+
+
+def test_unknown_market_side_waits_without_inheriting_global_status(tmp_path):
+    db, market_data, index_store = _context(tmp_path)
+    _candidate(db, "000211", market="")
+    _index(index_store, "KOSPI", 1.0)
+    _index(index_store, "KOSDAQ", 0.8)
+    _tick(market_data, "000211", change=2.0)
+
+    snapshot = _engine(db, market_data, index_store).build(trade_date=TRADE_DATE, now=OPEN_AT).snapshot
+    policy = snapshot.candidate_policy_by_code["000211"]
+    reloaded = db.load_candidate(TRADE_DATE, "000211")
+
+    assert snapshot.composite_market_mode == CompositeMarketMode.BROAD_RISK_ON
+    assert policy.market_side == MarketSide.UNKNOWN
+    assert policy.market_action == CandidateMarketAction.DATA_WAIT
+    assert policy.position_size_multiplier_hint == 0.0
+    assert policy.block_new_entry is True
+    assert policy.wait_reason == "MARKET_SIDE_UNRESOLVED"
+    assert "MARKET_SIDE_UNKNOWN" in policy.reason_codes
+    assert "MARKET_SIDE_UNRESOLVED" in policy.reason_codes
+    assert reloaded.state == CandidateState.WATCHING
+    assert reloaded.market == ""
+    assert db.list_runtime_order_intents(limit=10) == []
+
+
+def test_kiwoom_symbol_master_has_resolution_priority_and_persists_market(tmp_path):
+    db, market_data, index_store = _context(tmp_path)
+    candidate = _candidate(db, "000212", market="KOSPI")
+    candidate.strategy_profile = StrategyProfile.KOSPI_LEADER_PROFILE
+    candidate.metadata["source_payload"] = {"market": "KOSPI"}
+    db.save_candidate(candidate)
+    db.upsert_kiwoom_symbol_master(
+        [
+            {
+                "code": "000212",
+                "name": "Master 000212",
+                "market": "KOSDAQ",
+                "market_code": "10",
+                "source": "test_master",
+            }
+        ]
+    )
+    _index(index_store, "KOSPI", 1.0)
+    _index(index_store, "KOSDAQ", 0.9)
+    _tick(market_data, "000212", change=2.5)
+
+    snapshot = _engine(db, market_data, index_store).build(trade_date=TRADE_DATE, now=OPEN_AT).snapshot
+    policy = snapshot.candidate_policy_by_code["000212"]
+    reloaded = db.load_candidate(TRADE_DATE, "000212")
+
+    assert policy.market_side == MarketSide.KOSDAQ
+    assert policy.market_side_source == "kiwoom_symbol_master"
+    assert policy.market_side_resolution_status == "RESOLVED"
+    assert "MARKET_SIDE_RESOLVED_FROM_KIWOOM_MASTER" in policy.reason_codes
+    assert reloaded.market == "KOSDAQ"
+    assert reloaded.metadata["market_side_source"] == "kiwoom_symbol_master"
 
 
 def test_runtime_pipeline_disabled_by_default(tmp_path):

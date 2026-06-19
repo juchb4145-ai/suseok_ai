@@ -8,6 +8,13 @@ from typing import Any, Iterable, Mapping
 
 from trading.strategy.candidates import normalize_code
 from trading.strategy.market_data import MarketDataStore, StrategyTick
+from trading.strategy.market_regime import (
+    CandidateMarketAction,
+    MarketRegimeStatus,
+    MarketSide,
+    market_policy_for_side,
+    systemic_risk_off_state,
+)
 from trading.strategy.models import Candidate, CandidateState
 
 
@@ -411,12 +418,19 @@ def _market_context(candidate: Candidate, payload: Mapping[str, Any], code: str)
         return StrategyMarketContext(reason_codes=("MARKET_CONTEXT_NOT_READY",), block_new_entry=True)
     policies = dict(payload.get("candidate_policy_by_code") or {})
     policy = dict(policies.get(code) or {})
-    side = str(policy.get("market_side") or _candidate_side(candidate) or "UNKNOWN")
+    side = str(policy.get("market_side") or _candidate_side(candidate) or MarketSide.UNKNOWN.value).upper()
     side_snapshot = _side_snapshot(payload, side)
-    status = str(policy.get("market_status") or side_snapshot.get("status") or payload.get("global_status") or "DATA_WAIT")
+    status = str(policy.get("market_status") or side_snapshot.get("status") or "DATA_WAIT").upper()
     global_status = str(policy.get("global_market_status") or payload.get("global_status") or "DATA_WAIT")
-    action = str(policy.get("market_action") or _market_action_from_status(status, global_status))
-    reasons = _dedupe([*list(payload.get("reason_codes") or []), *list(policy.get("reason_codes") or [])])
+    if policy:
+        action = str(policy.get("market_action") or _market_action_from_status(status, global_status)).upper()
+        multiplier = _float(policy.get("position_size_multiplier_hint"), _multiplier_for_action(action))
+        block_new_entry = bool(policy.get("block_new_entry")) or action in {"BLOCK_NEW_ENTRY", "MARKET_CLOSED", "DATA_WAIT"}
+        policy_reasons = list(policy.get("reason_codes") or [])
+    else:
+        action, multiplier, block_new_entry, _wait_reason, policy_reasons = _fallback_market_policy(payload, side, status)
+        action = str(action)
+    reasons = _dedupe([*list(payload.get("reason_codes") or []), *policy_reasons])
     if not reasons:
         reasons = ["MARKET_CONTEXT_READY"]
     return StrategyMarketContext(
@@ -424,8 +438,8 @@ def _market_context(candidate: Candidate, payload: Mapping[str, Any], code: str)
         side_market_regime=status,
         global_market_regime=global_status,
         market_action=action,
-        position_size_multiplier_hint=_float(policy.get("position_size_multiplier_hint"), _multiplier_for_action(action)),
-        block_new_entry=bool(policy.get("block_new_entry")) or action in {"BLOCK_NEW_ENTRY", "MARKET_CLOSED"},
+        position_size_multiplier_hint=multiplier,
+        block_new_entry=block_new_entry,
         index_return_pct=_float(side_snapshot.get("index_return_pct")),
         index_slope_1m_pct=_optional_float(side_snapshot.get("index_slope_1m_pct")),
         index_slope_3m_pct=_optional_float(side_snapshot.get("index_slope_3m_pct")),
@@ -532,7 +546,7 @@ def _data_context(
     high_low_ready = bool(tick is not None and (_float(dict(tick.metadata or {}).get("day_high")) > 0 or _float(dict(tick.metadata or {}).get("session_high")) > 0))
     turnover_ready = bool(tick is not None and float(tick.trade_value or 0.0) > 0)
     theme_fresh = theme.freshness_status == "FRESH" and theme.theme_state not in {"", "DATA_WAIT"}
-    market_fresh = market.freshness_status == "FRESH" and market.global_market_regime not in {"", "DATA_WAIT"}
+    market_fresh = market.freshness_status == "FRESH" and market.market_action != "DATA_WAIT"
     if not theme_fresh:
         reasons.append("THEME_CONTEXT_NOT_READY")
     if not market_fresh:
@@ -646,21 +660,56 @@ def _side_snapshot(payload: Mapping[str, Any], side: str) -> dict[str, Any]:
 
 def _candidate_side(candidate: Candidate) -> str:
     metadata = dict(candidate.metadata or {})
-    return str(metadata.get("market_side") or candidate.market or "UNKNOWN").upper()
+    return str(candidate.market or metadata.get("market") or metadata.get("market_side") or "UNKNOWN").upper()
 
 
 def _market_action_from_status(status: str, global_status: str) -> str:
-    if "RISK_OFF" in {status, global_status}:
+    if status == "MARKET_CLOSED" or global_status == "MARKET_CLOSED":
+        return "MARKET_CLOSED"
+    if status == "RISK_OFF":
         return "BLOCK_NEW_ENTRY"
-    if "WEAK" in {status, global_status}:
+    if status == "WEAK":
+        return "WAIT_MARKET"
+    if status == "CHOPPY":
         return "WAIT_MARKET"
     if status == "EXPANSION":
         return "ALLOW_NORMAL"
-    if status == "SELECTIVE" or global_status == "SELECTIVE":
+    if status == "SELECTIVE":
         return "ALLOW_REDUCED"
-    if status == "MARKET_CLOSED" or global_status == "MARKET_CLOSED":
-        return "MARKET_CLOSED"
-    return "DATA_WAIT" if status == "DATA_WAIT" or global_status == "DATA_WAIT" else "WAIT_MARKET"
+    return "DATA_WAIT" if status == "DATA_WAIT" else "WAIT_MARKET"
+
+
+def _fallback_market_policy(payload: Mapping[str, Any], side: str, status: str) -> tuple[str, float, bool, str, list[str]]:
+    normalized_side = side if side in {MarketSide.KOSPI.value, MarketSide.KOSDAQ.value} else MarketSide.UNKNOWN.value
+    if normalized_side == MarketSide.UNKNOWN.value:
+        return (
+            CandidateMarketAction.DATA_WAIT.value,
+            0.0,
+            True,
+            "MARKET_SIDE_UNRESOLVED",
+            ["MARKET_SIDE_UNKNOWN", "MARKET_SIDE_UNRESOLVED"],
+        )
+    market_open = str(payload.get("market_session_status") or "").lower() != "closed"
+    kospi_status = str(payload.get("kospi_status") or dict(payload.get("kospi_snapshot") or {}).get("status") or "")
+    kosdaq_status = str(payload.get("kosdaq_status") or dict(payload.get("kosdaq_snapshot") or {}).get("status") or "")
+    systemic = bool(payload.get("systemic_risk_off"))
+    if "systemic_risk_off" not in payload:
+        systemic, _reasons = systemic_risk_off_state(kospi_status, kosdaq_status, market_open=market_open)
+    counterpart = MarketSide.KOSDAQ.value if normalized_side == MarketSide.KOSPI.value else MarketSide.KOSPI.value
+    counterpart_snapshot = _side_snapshot(payload, counterpart)
+    counterpart_status = str(
+        counterpart_snapshot.get("status")
+        or (kosdaq_status if counterpart == MarketSide.KOSDAQ.value else kospi_status)
+        or MarketRegimeStatus.DATA_WAIT.value
+    )
+    action, multiplier, block, wait_reason, reasons = market_policy_for_side(
+        status or MarketRegimeStatus.DATA_WAIT.value,
+        counterpart_status,
+        market_open=market_open,
+        systemic_risk_off=systemic,
+        market_side_known=True,
+    )
+    return action.value, multiplier, block, wait_reason, reasons
 
 
 def _multiplier_for_action(action: str) -> float:

@@ -68,15 +68,58 @@ def test_leader_only_theme_follower_is_blocked(tmp_path):
 
 def test_risk_off_candidate_is_hard_block_without_deleting_candidate(tmp_path):
     db, market_data, candles = _context(tmp_path)
-    _candidate(db, "000005", market_action="BLOCK_NEW_ENTRY", market_status="RISK_OFF")
+    _candidate(
+        db,
+        "000005",
+        market_action="BLOCK_NEW_ENTRY",
+        market_status="RISK_OFF",
+        market_reason_codes=["SIDE_MARKET_RISK_OFF_BLOCK"],
+    )
     _ready_ticks(market_data, candles, "000005", [1000, 990, 985, 980], metadata={"recent_support": 978})
 
     decision = _engine(db, market_data, candles).build(trade_date=TRADE_DATE, now=OPEN_AT).decisions[0]
     reloaded = db.load_candidate(TRADE_DATE, "000005")
 
     assert decision.entry_status == EntryDecisionStatus.HARD_BLOCK
-    assert "MARKET_RISK_OFF_BLOCK" in decision.reason_codes
+    assert "SIDE_MARKET_RISK_OFF_BLOCK" in decision.reason_codes
     assert reloaded.state == CandidateState.WATCHING
+
+
+def test_split_market_reduced_policy_passes_with_scaled_multiplier(tmp_path):
+    db, market_data, candles = _context(tmp_path)
+    _candidate(
+        db,
+        "000105",
+        market_action="ALLOW_REDUCED",
+        market_status="EXPANSION",
+        market_reason_codes=["SPLIT_MARKET_HEALTHY_SIDE_REDUCED"],
+    )
+    _ready_ticks(market_data, candles, "000105", [1000, 990, 985, 980], metadata={"recent_support": 978})
+
+    decision = _engine(db, market_data, candles).build(trade_date=TRADE_DATE, now=OPEN_AT).decisions[0]
+
+    assert decision.market_ready_status == "PASS"
+    assert decision.position_size_multiplier_hint == 0.6
+    assert "SPLIT_MARKET_HEALTHY_SIDE_REDUCED" in decision.reason_codes
+    assert decision.entry_status == EntryDecisionStatus.OBSERVE_READY
+
+
+def test_unresolved_market_side_data_wait_blocks_before_price_checks(tmp_path):
+    db, market_data, candles = _context(tmp_path)
+    _candidate(
+        db,
+        "000106",
+        market_action="DATA_WAIT",
+        market_status="DATA_WAIT",
+        market_reason_codes=["MARKET_SIDE_UNRESOLVED"],
+    )
+    _ready_ticks(market_data, candles, "000106", [1000, 990, 985, 980], metadata={"recent_support": 978})
+
+    decision = _engine(db, market_data, candles).build(trade_date=TRADE_DATE, now=OPEN_AT).decisions[0]
+
+    assert decision.entry_status == EntryDecisionStatus.DATA_WAIT
+    assert decision.market_ready_status == "DATA_WAIT"
+    assert "MARKET_SIDE_UNRESOLVED" in decision.reason_codes
 
 
 def test_selective_market_follower_does_not_pass(tmp_path):
@@ -251,6 +294,7 @@ def _candidate(
     role: str = "LEADER",
     market_action: str = "ALLOW_NORMAL",
     market_status: str = "EXPANSION",
+    market_reason_codes: list[str] | None = None,
 ):
     candidate = CandidateIngestionService(db).ingest(
         CandidateSourceEvent(
@@ -280,6 +324,7 @@ def _candidate(
             "market_action": market_action,
             "market_position_size_multiplier_hint": 1.0 if market_action == "ALLOW_NORMAL" else 0.6,
             "market_block_new_entry": market_action == "BLOCK_NEW_ENTRY",
+            "market_reason_codes": list(market_reason_codes or []),
         }
     )
     return db.save_candidate(candidate)
