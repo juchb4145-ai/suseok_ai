@@ -77,7 +77,7 @@ from trading_app.dashboard_read_model import (
     open_dashboard_read_model_service,
 )
 from trading_app.dashboard_v2 import build_dashboard_v2_snapshot, dashboard_v2_auto_route_enabled, dashboard_v2_enabled
-from trading_app.pre_market_check import PreMarketCheckConfig, build_pre_market_check_report
+from trading_app.pre_market_check import PreMarketCheckConfig, build_pre_market_check_report, pre_market_report_empty
 from trading_app.buy_zero_rca import BuyZeroRCAAnalyzer
 from trading_app.conservative_reason_outcomes import (
     ConservativeReasonOutcomeAnalyzer,
@@ -673,11 +673,71 @@ def _dashboard_read_model_service_instance() -> DashboardReadModelService:
 def _build_dashboard_read_model_writer(service: DashboardReadModelService) -> DashboardReadModelWriter:
     return DashboardReadModelWriter(
         service,
-        runtime_snapshot=runtime_supervisor.snapshot,
+        runtime_snapshot=_dashboard_read_model_runtime_snapshot,
         gateway_snapshot=lambda: gateway_state.snapshot().to_dict(),
         command_snapshot=gateway_state.command_snapshot,
         core_status=_core_status_with_order_lifecycle,
     )
+
+
+def _dashboard_read_model_runtime_snapshot() -> dict[str, Any]:
+    runtime_snapshot = dict(runtime_supervisor.snapshot() or {})
+    requested_mode = _dashboard_pre_market_check_mode()
+    db: TradingDatabase | None = None
+    try:
+        db = open_database()
+        today = datetime.now().date().isoformat()
+        runtime_payload = _runtime_dashboard_payload(runtime_supervisor.status())
+        order_manager_payload = order_manager_dashboard_section(db, gateway_state=gateway_state, trade_date=today)
+        candidate_ingestion_payload = build_candidate_ingestion_snapshot(db, trade_date=today)
+        theme_board_payload = theme_board_dashboard_section(db, trade_date=today)
+        market_regime_payload = market_regime_dashboard_section(db, trade_date=today)
+        entry_engine_payload = entry_engine_dashboard_section(db, trade_date=today)
+        exit_engine_payload = exit_engine_dashboard_section(db, trade_date=today)
+        position_risk_payload = position_risk_dashboard_section(db, trade_date=today)
+        runtime_snapshot.update(
+            {
+                "candidate_ingestion": candidate_ingestion_payload,
+                "theme_board": theme_board_payload,
+                "market_regime": market_regime_payload,
+                "entry_engine": entry_engine_payload,
+                "exit_engine": exit_engine_payload,
+                "position_risk": position_risk_payload,
+                "order_manager": order_manager_payload,
+            }
+        )
+        if not runtime_snapshot.get("pre_market_check"):
+            runtime_snapshot["pre_market_check"] = _build_pre_market_check_report_payload(
+                db,
+                requested_mode=requested_mode,
+                base_snapshot={
+                    "core": _pre_market_core_payload(),
+                    "runtime": runtime_payload,
+                    "gateway": gateway_state.snapshot().to_dict(),
+                    "commands": gateway_state.command_snapshot(),
+                    "order_manager": order_manager_payload,
+                    "candidate_ingestion": candidate_ingestion_payload,
+                    "theme_board": theme_board_payload,
+                    "market_regime": market_regime_payload,
+                    "entry_engine": entry_engine_payload,
+                    "dashboard_v2_available": True,
+                },
+            )
+    except Exception as exc:
+        fallback = pre_market_report_empty(requested_mode=requested_mode)
+        warnings = list(fallback.get("warning_reasons") or [])
+        if "PRE_MARKET_READ_MODEL_BUILD_FAILED" not in warnings:
+            warnings.append("PRE_MARKET_READ_MODEL_BUILD_FAILED")
+        fallback["warning_reasons"] = warnings
+        fallback["last_error"] = str(exc)
+        runtime_snapshot["pre_market_check"] = fallback
+        runtime_snapshot["warnings"] = list(runtime_snapshot.get("warnings") or []) + [
+            f"PRE_MARKET_READ_MODEL_BUILD_FAILED:{exc}"
+        ]
+    finally:
+        if db is not None:
+            close_database(db)
+    return runtime_snapshot
 
 
 def _core_status_with_order_lifecycle() -> dict[str, Any]:
@@ -7237,13 +7297,22 @@ def _dashboard_v2_fallback_live_build(*, reason: str, refresh: bool, detail: str
 
 
 def _dashboard_snapshot_wrapper_for_v2(v2_payload: dict[str, Any]) -> dict[str, Any]:
+    settings = get_settings()
+    lightweight_status = runtime_supervisor.lightweight_status()
     return {
         "snapshot_detail": DASHBOARD_SNAPSHOT_DETAIL_SLIM,
         "timestamp": v2_payload.get("generated_at") or utc_timestamp(),
+        "core": {
+            "service": "trading-core-api",
+            "mode": settings.mode,
+            "running": bool(lightweight_status.get("running")),
+            "cycle_count": int(lightweight_status.get("cycle_count") or 0),
+            "last_cycle_at": lightweight_status.get("last_cycle_at") or "",
+        },
         "gateway": gateway_state.snapshot().to_dict(),
         "commands": gateway_state.command_snapshot(),
         "runtime": {
-            "lightweight_status": runtime_supervisor.lightweight_status(),
+            "lightweight_status": lightweight_status,
             "read_model": dict(v2_payload.get("read_model") or {}),
         },
         "dashboard_v2": v2_payload,

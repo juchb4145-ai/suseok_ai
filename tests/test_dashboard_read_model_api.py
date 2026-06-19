@@ -107,6 +107,84 @@ def test_snapshot_view_v2_returns_same_read_model_generation(tmp_path, monkeypat
     assert direct["read_model"]["checksum"] == via_snapshot["read_model"]["checksum"]
 
 
+def test_dashboard_v2_ws_wrapper_includes_core_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    monkeypatch.setattr(
+        api.runtime_supervisor,
+        "lightweight_status",
+        lambda: {"running": True, "cycle_count": 7, "last_cycle_at": "2026-06-18T00:00:01+00:00"},
+    )
+
+    result = api._dashboard_snapshot_wrapper_for_v2(
+        {
+            "schema_version": "dashboard_v2.reboot_ops.v1",
+            "read_model": {"generation": 3, "checksum": "abc", "status": "OK"},
+        }
+    )
+
+    assert result["core"]["service"] == "trading-core-api"
+    assert result["core"]["mode"] == api.get_settings().mode
+    assert result["core"]["running"] is True
+    assert result["core"]["cycle_count"] == 7
+    assert result["runtime"]["lightweight_status"]["running"] is True
+
+
+def test_dashboard_read_model_runtime_snapshot_includes_pre_market_check(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
+    import trading_app.api as api
+
+    api = importlib.reload(api)
+    captured = {}
+    monkeypatch.setattr(api.runtime_supervisor, "snapshot", lambda: {"runtime_profile": "V2_OBSERVE"})
+    monkeypatch.setattr(
+        api,
+        "order_manager_dashboard_section",
+        lambda *args, **kwargs: {"mode": "OBSERVE", "kill_switch_state": "NORMAL"},
+    )
+    monkeypatch.setattr(api, "build_candidate_ingestion_snapshot", lambda *args, **kwargs: {"enabled": True})
+    monkeypatch.setattr(api, "theme_board_dashboard_section", lambda *args, **kwargs: {"enabled": True, "status": "OK"})
+    monkeypatch.setattr(
+        api,
+        "market_regime_dashboard_section",
+        lambda *args, **kwargs: {"enabled": True, "status": "OK", "index_watch_codes_configured": False},
+    )
+    monkeypatch.setattr(api, "entry_engine_dashboard_section", lambda *args, **kwargs: {"enabled": True, "status": "EMPTY"})
+    monkeypatch.setattr(api, "exit_engine_dashboard_section", lambda *args, **kwargs: {"enabled": True, "status": "EMPTY"})
+    monkeypatch.setattr(api, "position_risk_dashboard_section", lambda *args, **kwargs: {"enabled": True, "status": "OK"})
+
+    def _pre_market_payload(db, *, requested_mode, base_snapshot=None):
+        captured.update(base_snapshot or {})
+        return {
+            "schema_version": "pre_market_check.v1",
+            "requested_mode": requested_mode.upper(),
+            "go_no_go": "NO_GO",
+            "operator_message_ko": "운영 금지",
+            "items": [{"key": "broker_environment", "details": {"broker_env": "SIMULATION"}}],
+        }
+
+    monkeypatch.setattr(
+        api,
+        "_build_pre_market_check_report_payload",
+        _pre_market_payload,
+    )
+
+    result = api._dashboard_read_model_runtime_snapshot()
+
+    assert result["runtime_profile"] == "V2_OBSERVE"
+    assert result["pre_market_check"]["go_no_go"] == "NO_GO"
+    assert result["pre_market_check"]["operator_message_ko"] == "운영 금지"
+    assert captured["dashboard_v2_available"] is True
+    assert captured["order_manager"]["mode"] == "OBSERVE"
+    assert captured["theme_board"]["status"] == "OK"
+    assert captured["market_regime"]["index_watch_codes_configured"] is False
+    assert result["candidate_ingestion"]["enabled"] is True
+    assert result["entry_engine"]["status"] == "EMPTY"
+    assert result["position_risk"]["status"] == "OK"
+
+
 def test_stale_read_model_does_not_trigger_live_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADING_DB_PATH", str(tmp_path / "trader.sqlite3"))
     import trading_app.api as api

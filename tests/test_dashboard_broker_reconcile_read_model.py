@@ -27,3 +27,23 @@ def test_dashboard_read_model_exposes_broker_reconcile_health():
     assert payload["broker_reconcile"]["status"] == "RECONCILE_REQUIRED"
     assert payload["system_health"]["broker_reconcile"]["broker_truth_ready"] is False
     assert any(item.get("reason_code") == "BROKER_RECONCILE_DISCREPANCY" for item in payload["safety_banners"])
+
+
+def test_dashboard_read_model_does_not_warn_for_not_configured_broker_reconcile():
+    service = DashboardReadModelService(repository=None)
+
+    payload = service.build_from_runtime(
+        runtime_snapshot={},
+        gateway_snapshot={"connected": True, "heartbeat_ok": True},
+        command_snapshot={},
+        core_status={
+            "broker_reconcile": {
+                "enabled": False,
+                "status": "NOT_CONFIGURED",
+                "broker_truth_ready": False,
+            }
+        },
+    )
+
+    assert payload["system_health"]["broker_reconcile"]["status"] == "NOT_CONFIGURED"
+    assert not any(item.get("reason_code") == "BROKER_RECONCILE_NOT_READY" for item in payload["safety_banners"])

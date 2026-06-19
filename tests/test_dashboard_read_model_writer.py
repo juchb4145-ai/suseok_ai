@@ -46,6 +46,29 @@ def _service(tmp_path, clock):
     )
 
 
+def test_read_model_normalizes_disabled_order_manager_warning_in_observe_mode(tmp_path):
+    clock = _Clock()
+    service = _service(tmp_path, clock)
+    runtime = _runtime_snapshot()
+    runtime["order_manager_v2"] = {
+        **runtime["order_manager_v2"],
+        "mode": "OBSERVE",
+        "warnings": ["ORDER_MANAGER_DISABLED"],
+    }
+
+    payload = service.build_from_runtime(
+        runtime,
+        {"heartbeat_ok": True},
+        {"queued_count": 0},
+        {"running": True, "cycle_count": 1, "last_cycle_at": "2026-06-18T00:00:00+00:00"},
+    )
+
+    reasons = {item["reason_code"] for item in payload["wait_block_reasons"]["items"]}
+    assert payload["order_manager"]["warnings"] == ["ORDER_MANAGER_OBSERVE_ONLY"]
+    assert "ORDER_MANAGER_OBSERVE_ONLY" in reasons
+    assert "ORDER_MANAGER_DISABLED" not in reasons
+
+
 def test_writer_coalesces_many_dirty_signals_within_one_second(tmp_path):
     clock = _Clock()
     service = _service(tmp_path, clock)

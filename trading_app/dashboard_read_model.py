@@ -622,7 +622,10 @@ class DashboardReadModelService:
                 "reduce_only": bool(broker_reconcile.get("reduce_only")),
                 "last_error": broker_reconcile.get("last_error", ""),
             }
-            if not bool(broker_reconcile.get("broker_truth_ready", True)):
+            reconcile_configured = bool(broker_reconcile.get("enabled")) or str(
+                broker_reconcile.get("status") or ""
+            ).upper() not in {"", "NOT_CONFIGURED", "DISABLED"}
+            if reconcile_configured and not bool(broker_reconcile.get("broker_truth_ready", True)):
                 payload["safety_banners"] = _add_banner(
                     payload.get("safety_banners") or [],
                     "warning",
@@ -785,8 +788,32 @@ def _order_manager_source(runtime: dict[str, Any]) -> dict[str, Any]:
     for key in ("order_manager_v2", "order_manager"):
         value = runtime.get(key)
         if isinstance(value, dict) and value:
-            return dict(value)
+            return _normalize_order_manager_source(dict(value))
     return {}
+
+
+def _normalize_order_manager_source(value: dict[str, Any]) -> dict[str, Any]:
+    warnings = []
+    for warning in list(value.get("warnings") or []):
+        text = str(warning or "").strip()
+        if text == "ORDER_MANAGER_DISABLED" and _order_manager_is_observe_only(value):
+            text = "ORDER_MANAGER_OBSERVE_ONLY"
+        if text and text not in warnings:
+            warnings.append(text)
+    if warnings:
+        value["warnings"] = warnings
+    return value
+
+
+def _order_manager_is_observe_only(value: dict[str, Any]) -> bool:
+    mode = str(value.get("mode") or "").strip().upper()
+    if bool(value.get("observe_only")) or mode == "OBSERVE":
+        return True
+    if "live_sim_orders_allowed" in value and not bool(value.get("live_sim_orders_allowed")):
+        return True
+    if "send_order_allowed" in value and not bool(value.get("send_order_allowed")):
+        return True
+    return False
 
 
 def _path(value: dict[str, Any], *keys: str) -> Any:

@@ -2282,7 +2282,9 @@ function render(snapshot) {
   text("snapshot-time", snapshot.timestamp || "대기 중");
   text("core-mode", core.mode || "OBSERVE");
   cls("core-mode", `pill ${core.mode === "LIVE" ? "warn" : core.mode === "DRY_RUN" ? "ok" : "muted"}`);
-  text("core-state", core.service ? "정상" : "대기");
+  const coreHealthy = Boolean(core.service || core.running || (runtime.lightweight_status || {}).running);
+  text("core-state", coreHealthy ? "정상" : "대기");
+  cls("core-state", `pill ${coreHealthy ? "ok" : "warn"}`);
   const gatewayState = gateway.connection_state || "DISCONNECTED";
   text("gateway-state", gatewayState);
   text("gateway-connection", gatewayState);
