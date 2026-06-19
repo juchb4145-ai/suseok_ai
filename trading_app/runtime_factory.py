@@ -45,6 +45,7 @@ from trading.strategy.virtual_orders import VirtualOrderService
 from trading.theme_engine.backfill import ThemeBackfillConfig, ThemeBackfillService
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
 from trading.theme_engine.core_v3_runtime import ThemeCoreV3RuntimeConfig, ThemeCoreV3RuntimePipeline
+from trading.theme_engine.intraday_discovery import IntradayDiscoveryConfig, IntradayDiscoveryRuntimePipeline
 from trading.theme_engine.opening_runtime import OpeningBurstRuntimeConfig, OpeningThemeBurstRuntimePipeline
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.runtime import RealTimeThemeRuntime
@@ -74,6 +75,7 @@ class CoreRuntimeBundle:
     candidate_ingestion_service: Any = None
     candidate_hydrator: Any = None
     opening_burst_pipeline: Any = None
+    intraday_discovery_pipeline: Any = None
     theme_board_pipeline: Any = None
     market_regime_pipeline: Any = None
     strategy_context_pipeline: Any = None
@@ -202,6 +204,7 @@ def build_legacy_runtime_bundle(
             backfill_service=theme_backfill_service,
         )
     opening_burst_pipeline = None
+    intraday_discovery_pipeline = None
     runtime = StrategyRuntime(
         db=db,
         candidate_collector=candidate_collector,
@@ -263,6 +266,8 @@ def build_legacy_runtime_bundle(
         order_sink=order_sink,
         candidate_ingestion_service=candidate_ingestion_service,
         candidate_hydrator=candidate_hydrator,
+        opening_burst_pipeline=opening_burst_pipeline,
+        intraday_discovery_pipeline=intraday_discovery_pipeline,
         theme_board_pipeline=theme_board_pipeline,
         market_regime_pipeline=market_regime_pipeline,
         strategy_context_pipeline=strategy_context_pipeline,
@@ -313,6 +318,10 @@ def build_reboot_v2_runtime_bundle(
         config=OpeningBurstRuntimeConfig.from_env(trading_mode=settings.mode),
         candidate_ingestion_service=candidate_ingestion_service,
         candidate_hydrator=candidate_hydrator,
+    )
+    intraday_discovery_pipeline = IntradayDiscoveryRuntimePipeline(
+        gateway_state=gateway_state,
+        config=IntradayDiscoveryConfig.from_env(trading_mode=settings.mode),
     )
     dirty_evaluator_config = replace(
         DirtyStrategyEvaluatorConfig.from_env(),
@@ -411,6 +420,7 @@ def build_reboot_v2_runtime_bundle(
         candidate_ingestion_service=candidate_ingestion_service,
         candidate_hydrator=candidate_hydrator,
         opening_burst_pipeline=opening_burst_pipeline,
+        intraday_discovery_pipeline=intraday_discovery_pipeline,
         theme_board_pipeline=theme_board_pipeline,
         market_regime_pipeline=market_regime_pipeline,
         strategy_context_pipeline=strategy_context_pipeline,
@@ -442,6 +452,7 @@ def build_reboot_v2_runtime_bundle(
         candidate_ingestion_service=candidate_ingestion_service,
         candidate_hydrator=candidate_hydrator,
         opening_burst_pipeline=opening_burst_pipeline,
+        intraday_discovery_pipeline=intraday_discovery_pipeline,
         theme_board_pipeline=theme_board_pipeline,
         market_regime_pipeline=market_regime_pipeline,
         strategy_context_pipeline=strategy_context_pipeline,

@@ -1486,6 +1486,25 @@ python tools\kiwoom_chejan_parser_validation.py --fixture-dir tests\fixtures\kiw
 
 현재 repo fixture는 `source=SYNTHETIC`이므로 validation은 `HOLD`가 정상이다. 실제 모의서버 sanitized fixture가 `source=KIWOOM_SIMULATION`이고 필수 case coverage를 만족해야 `PASS`가 가능하다.
 
+### Actual Simulation Validation Status
+
+2026-06-19 모의서버 capture 기준으로 다음 case는 실제 Chejan payload에서 관측했다.
+
+- `order_accepted`
+- `cancel_accepted`
+- `cancelled`
+- `partial_fill`
+- `full_fill`
+- `balance_increase`
+- `balance_zero`
+
+명시적 잔여 리스크:
+
+- `order_rejected`는 실제 Chejan payload로 아직 관측하지 못했다.
+- 보유하지 않은 종목 매도 주문은 Kiwoom 주문창/서버 pre-check에서 팝업으로 차단될 수 있으며, 이 경우 Chejan 거절 이벤트가 발생하지 않는다.
+- `reject_reason=0`인 과거 row는 정상/접수 계열 이벤트로 재분류해야 하며 실제 주문거절 fixture로 인정하지 않는다.
+- 따라서 PR10 실제 모의서버 검증 상태는 `HOLD / NOT_OBSERVED_IN_SIMULATION`이며, PR11 read-only reconcile pilot은 진행 가능하지만 LIVE_SIM canary review 전에는 별도 operator review가 필요하다.
+
 ### Qualification 연결
 
 PR9 qualification report에는 parser validation subsection이 추가된다.
@@ -1519,11 +1538,15 @@ PR 11은 Kiwoom read-only TR로 broker truth snapshot을 staging 저장하고, C
 
 | logical source | TR code | purpose | validation |
 | --- | --- | --- | --- |
-| `OPEN_ORDERS` | `opt10075` | 미체결 주문 snapshot | `KOA_STUDIO_SCREENSHOT / HOLD` |
-| `ACCOUNT_POSITIONS` | `opw00018` | 보유 종목 snapshot | `KOA_STUDIO_SCREENSHOT / HOLD` |
-| `ACCOUNT_CASH` | `opw00001` | 예수금 snapshot | `KOA_STUDIO_SCREENSHOT / HOLD` |
+| `OPEN_ORDERS` | `opt10075` | 미체결 주문 snapshot | `KOA_STUDIO_SCREENSHOT + KIWOOM_SIM_CAPTURE / HOLD` |
+| `ACCOUNT_POSITIONS` | `opw00018` | 보유 종목 snapshot | `KOA_STUDIO_SCREENSHOT + KIWOOM_SIM_CAPTURE / HOLD` |
+| `ACCOUNT_CASH` | `opw00001` | 예수금 snapshot | `KOA_STUDIO_SCREENSHOT + KIWOOM_SIM_CAPTURE / HOLD` |
 
-TR code와 field alias는 `trading.broker.reconcile_tr_specs`의 versioned registry에 정의한다. `opt10075`, `opw00018`, `opw00001`은 KOA Studio screenshot 기준 입력 계약을 반영했고, `opw00001` expanded output field list도 registry에 반영했다. Kiwoom simulation capture fixture 전까지 PASS가 아니라 HOLD로 취급한다. `opw00018`과 `opw00001`은 KOA sample 기준 `비밀번호`를 공백으로 입력한다.
+TR code와 field alias는 `trading.broker.reconcile_tr_specs`의 versioned registry에 정의한다. `opt10075`, `opw00018`, `opw00001`은 KOA Studio screenshot 기준 입력 계약을 반영했고, `opw00001` expanded output field list도 registry에 반영했다. `opw00018`과 `opw00001`은 KOA sample 기준 `비밀번호`를 공백으로 입력한다.
+
+2026-06-19 모의서버에서 `opt10075`, `opw00018`, `opw00001` read-only capture/parser smoke를 실행했다. 결과는 `reports/reconcile_tr/pr11_tr_20260619_135842_raw.json`과 `reports/reconcile_tr/pr11_tr_20260619_135842_parsed_summary.json`에 보존한다. 이 검증은 실제 Kiwoom payload 기반 field alias 확인이며, 현재 실행 중 Core의 `broker_reconcile` service가 `NOT_CONFIGURED`였기 때문에 자동 staging/reconcile pipeline 통과로는 보지 않는다.
+
+이후 통합 OBSERVE 스크립트에 `-EnableReconcileTrPilot -EnableReconcileTrStartup -ReconcileTrIncludeCash`를 추가해 자동 startup pilot도 실행했다. run `reconcile_ae0e75b47da8421fa3e3069d30292498`는 `OPEN_ORDERS`, `ACCOUNT_POSITIONS`, `ACCOUNT_CASH`를 모두 완료했고 `CLEAN`, `broker_truth_ready=true`, `discrepancy_count=0`으로 종료됐다. 이 실행에서도 실제 order command는 생성하지 않았다.
 
 ### Credential Policy
 

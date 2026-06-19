@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import Enum
 from typing import Any, Iterable
 
@@ -23,6 +24,14 @@ class SeedDataQualityStatus(str, Enum):
     TR_BACKFILL_ONLY = "TR_BACKFILL_ONLY"
     SIGNAL_STALE = "SIGNAL_STALE"
     DATA_WAIT = "DATA_WAIT"
+
+
+class SeedFreshnessStatus(str, Enum):
+    FRESH = "FRESH"
+    DEGRADED = "DEGRADED"
+    STALE = "STALE"
+    TR_BACKFILL_ONLY = "TR_BACKFILL_ONLY"
+    MISSING = "MISSING"
 
 
 class ThemeDataWaitReason(str, Enum):
@@ -51,6 +60,14 @@ class LiveSeedSignal:
     tr_backfill_valid: bool = False
     data_quality_status: str = SeedDataQualityStatus.DATA_WAIT.value
     reason_codes: tuple[str, ...] = ()
+    observed_at: str = ""
+    last_seen_at: str = ""
+    tick_at: str = ""
+    tick_age_sec: float = 0.0
+    freshness_status: str = ""
+    source_confirmation_count: int = 0
+    active: bool = True
+    expiry_at: str = ""
     market: str = ""
     momentum_1m: float = 0.0
     momentum_3m: float = 0.0
@@ -66,6 +83,7 @@ class LiveSeedSignal:
         realtime_valid = bool(self.realtime_valid)
         tr_backfill_valid = bool(self.tr_backfill_valid)
         quality = self.data_quality_status
+        freshness = self.freshness_status
         if not quality or quality == SeedDataQualityStatus.DATA_WAIT.value:
             if realtime_valid:
                 quality = SeedDataQualityStatus.REALTIME_VALID.value
@@ -73,12 +91,21 @@ class LiveSeedSignal:
                 quality = SeedDataQualityStatus.TR_BACKFILL_ONLY.value
             else:
                 quality = SeedDataQualityStatus.DATA_WAIT.value
+        if not freshness:
+            if realtime_valid:
+                freshness = SeedFreshnessStatus.FRESH.value
+            elif tr_backfill_valid:
+                freshness = SeedFreshnessStatus.TR_BACKFILL_ONLY.value
+            else:
+                freshness = SeedFreshnessStatus.MISSING.value
         return replace(
             self,
             code=normalize_stock_code(self.code),
             source_types=source_types,
             reason_codes=reason_codes,
             data_quality_status=str(quality),
+            freshness_status=str(freshness),
+            source_confirmation_count=self.source_confirmation_count or len(source_types),
             market=_normalize_market(self.market),
             metadata=dict(self.metadata or {}),
         )
@@ -86,7 +113,53 @@ class LiveSeedSignal:
     @property
     def tradable_realtime(self) -> bool:
         signal = self.normalized()
-        return signal.realtime_valid and not signal.vi_active and not signal.upper_limit_near and not signal.overheated
+        if signal.freshness_status in {SeedFreshnessStatus.STALE.value, SeedFreshnessStatus.TR_BACKFILL_ONLY.value, SeedFreshnessStatus.MISSING.value}:
+            return False
+        return signal.realtime_valid and signal.active and not signal.vi_active and not signal.upper_limit_near and not signal.overheated
+
+
+def apply_signal_freshness(
+    signal: LiveSeedSignal,
+    *,
+    now: datetime,
+    max_tick_age_sec: int,
+    stale_multiplier: float = 3.0,
+) -> LiveSeedSignal:
+    normalized = signal.normalized()
+    tick_at = normalized.tick_at or normalized.last_seen_at or normalized.observed_at
+    if not tick_at and normalized.realtime_valid:
+        freshness = SeedFreshnessStatus.FRESH.value
+        age = 0.0
+    elif not tick_at:
+        freshness = SeedFreshnessStatus.TR_BACKFILL_ONLY.value if normalized.tr_backfill_valid else SeedFreshnessStatus.MISSING.value
+        age = 0.0
+    else:
+        parsed = _parse_time(tick_at)
+        age = max(0.0, (now - parsed).total_seconds()) if parsed is not None else 0.0
+        if normalized.tr_backfill_valid and not normalized.realtime_valid:
+            freshness = SeedFreshnessStatus.TR_BACKFILL_ONLY.value
+        elif age <= max_tick_age_sec:
+            freshness = SeedFreshnessStatus.FRESH.value
+        elif age <= max_tick_age_sec * max(1.0, float(stale_multiplier)):
+            freshness = SeedFreshnessStatus.DEGRADED.value
+        else:
+            freshness = SeedFreshnessStatus.STALE.value
+    reasons = list(normalized.reason_codes)
+    if freshness == SeedFreshnessStatus.STALE.value:
+        reasons.append("SIGNAL_STALE")
+    elif freshness == SeedFreshnessStatus.DEGRADED.value:
+        reasons.append("SIGNAL_DEGRADED")
+    elif freshness == SeedFreshnessStatus.TR_BACKFILL_ONLY.value:
+        reasons.append("TR_BACKFILL_ONLY")
+    return replace(
+        normalized,
+        tick_age_sec=round(age, 3),
+        freshness_status=freshness,
+        data_quality_status=SeedDataQualityStatus.SIGNAL_STALE.value
+        if freshness == SeedFreshnessStatus.STALE.value
+        else normalized.data_quality_status,
+        reason_codes=tuple(_dedupe(reasons)),
+    )
 
 
 def merge_seed_signals(signals: Iterable[LiveSeedSignal]) -> list[LiveSeedSignal]:
@@ -127,6 +200,14 @@ def _normalize_market(value: str) -> str:
     return raw
 
 
+def _parse_time(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=None)
+
+
 def _positive_rank(value: int) -> int:
     return int(value) if int(value or 0) > 0 else 9999
 
@@ -143,7 +224,9 @@ def _dedupe(values: Iterable[Any]) -> list[str]:
 __all__ = [
     "LiveSeedSignal",
     "SeedDataQualityStatus",
+    "SeedFreshnessStatus",
     "SeedSourceType",
     "ThemeDataWaitReason",
+    "apply_signal_freshness",
     "merge_seed_signals",
 ]

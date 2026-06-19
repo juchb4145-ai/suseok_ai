@@ -53,6 +53,27 @@ def test_realtime_coverage_shortage_is_data_wait_reason_not_weak_evidence():
     assert cohort.data_quality_reason == ThemeDataWaitReason.TR_BACKFILL_ONLY.value
 
 
+def test_stale_realtime_signal_does_not_count_as_strong_or_leader():
+    cohort = ThemeCohortEngine().build(
+        [_theme("drone", ["000001", "000002", "000003"])],
+        [
+            LiveSeedSignal(
+                code="000001",
+                source_types=(SeedSourceType.OPT10032.value, SeedSourceType.REALTIME_TICK.value),
+                change_rate_pct=8.0,
+                turnover_krw=9_000_000_000,
+                realtime_valid=True,
+                freshness_status="STALE",
+            )
+        ],
+    )[0]
+
+    assert cohort.realtime_valid_count == 1
+    assert cohort.strong_count == 0
+    assert cohort.leader_count == 0
+    assert ThemeDataWaitReason.SIGNAL_STALE.value in cohort.reason_codes
+
+
 def _theme(theme_id: str, codes: list[str]):
     return (
         theme_id,

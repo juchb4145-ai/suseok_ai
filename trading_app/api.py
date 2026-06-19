@@ -103,6 +103,7 @@ from trading_app.gateway_event_consumer import (
     GatewayEventDispatcher,
     OrderLifecycleEventConsumer,
 )
+from trading_app.reconcile_tr_orchestrator import BrokerReconcileConfig, BrokerReconcileOrchestrator
 from trading.reliability.report import ReliabilityReportReader
 from trading_app.intraday_outcomes import (
     IntradayOutcomeLabeler,
@@ -657,6 +658,15 @@ def _build_gateway_event_dispatcher() -> GatewayEventDispatcher:
     )
 
 
+def _build_broker_reconcile_orchestrator() -> BrokerReconcileOrchestrator:
+    settings = get_settings()
+    return BrokerReconcileOrchestrator(
+        db=TradingDatabase(str(settings.db_path), check_same_thread=False),
+        gateway_state=gateway_state,
+        config=BrokerReconcileConfig.from_env(),
+    )
+
+
 def _build_dashboard_read_model_service() -> DashboardReadModelService:
     settings = get_settings()
     return open_dashboard_read_model_service(settings.db_path, config=DashboardReadModelConfig.from_env())
@@ -852,6 +862,8 @@ runtime_supervisor = _build_runtime_supervisor()
 gateway_event_dispatcher = _build_gateway_event_dispatcher()
 event_replay_worker = EventLogReplayWorker(gateway_event_dispatcher)
 runtime_supervisor.set_order_event_consumer(gateway_event_dispatcher)
+broker_reconcile_orchestrator = _build_broker_reconcile_orchestrator()
+runtime_supervisor.set_reconcile_orchestrator(broker_reconcile_orchestrator)
 replay_tick_buffer = _build_replay_tick_buffer()
 _dashboard_read_model_service = _build_dashboard_read_model_service()
 _dashboard_read_model_db_path = str(Path(get_settings().db_path).resolve())

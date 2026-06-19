@@ -4,7 +4,10 @@ param(
     [string]$DbPath = "",
     [string]$BindHost = "127.0.0.1",
     [int]$Port = 8000,
-    [string]$Token = ""
+    [string]$Token = "",
+    [switch]$EnableReconcileTrPilot,
+    [switch]$EnableReconcileTrStartup,
+    [switch]$ReconcileTrIncludeCash
 )
 
 $ErrorActionPreference = "Stop"
@@ -73,6 +76,15 @@ $env:TRADING_ORDER_INTENT_ENABLED = "false"
 $env:TRADING_ALLOW_LIVE_SIM_ORDERS = "0"
 $env:TRADING_ENTRY_ALLOW_DRY_RUN_INTENTS = "0"
 $env:TRADING_EXIT_ALLOW_DRY_RUN_SELL_INTENTS = "0"
+$env:TRADING_RECONCILE_TR_SERVICE_ENABLED = "true"
+$env:TRADING_RECONCILE_TR_DISPATCH_ENABLED = if ($EnableReconcileTrPilot) { "true" } else { "false" }
+$env:TRADING_RECONCILE_TR_SIMULATION_ONLY = "true"
+$env:TRADING_RECONCILE_TR_STARTUP_ENABLED = if ($EnableReconcileTrStartup) { "true" } else { "false" }
+$env:TRADING_RECONCILE_TR_RECONNECT_ENABLED = "false"
+$env:TRADING_RECONCILE_TR_PERIODIC_ENABLED = "false"
+$env:TRADING_RECONCILE_TR_CASH_REQUIRED = if ($ReconcileTrIncludeCash) { "true" } else { "false" }
+$env:TRADING_RECONCILE_TR_AUTO_HEAL_ENABLED = "false"
+$env:TRADING_RECONCILE_TR_AUTO_CLEAR_STOP_NEW_BUY = "false"
 $env:TRADING_DASHBOARD_V2_ENABLED = "1"
 $env:TRADING_DASHBOARD_V2_AUTO_ROUTE = "1"
 $env:TRADING_SHADOW_STRATEGY_OBSERVE_ONLY = "1"
@@ -110,6 +122,9 @@ $required = [ordered]@{
     TRADING_ALLOW_LIVE_SIM_ORDERS = "0"
     TRADING_ENTRY_ALLOW_DRY_RUN_INTENTS = "0"
     TRADING_EXIT_ALLOW_DRY_RUN_SELL_INTENTS = "0"
+    TRADING_RECONCILE_TR_SIMULATION_ONLY = "true"
+    TRADING_RECONCILE_TR_AUTO_HEAL_ENABLED = "false"
+    TRADING_RECONCILE_TR_AUTO_CLEAR_STOP_NEW_BUY = "false"
     TRADING_DASHBOARD_V2_ENABLED = "1"
     TRADING_DASHBOARD_V2_AUTO_ROUTE = "1"
 }

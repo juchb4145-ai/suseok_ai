@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Any
 
-from trading.broker.kiwoom_reconcile_tr import ReconcileTrParser
+from trading.broker.kiwoom_reconcile_tr import ReconcileTrParser, build_reconcile_tr_command
 from trading.broker.models import new_message_id
 from trading.broker.reconcile_tr_models import (
     BrokerReconcileDiscrepancy,
@@ -230,150 +231,163 @@ class BrokerReconcileOrchestrator:
         self.last_success_at = ""
         self.last_failure_at = ""
         self.last_trigger = ""
+        self._lock = RLock()
 
     def request_manual_reconcile(self, *, account: str, broker_env: str = "SIMULATION", sources: list[str] | None = None) -> dict[str, Any]:
-        return self._start_run(account=account, broker_env=broker_env, trigger="MANUAL_PILOT", sources=sources)
+        with self._lock:
+            return self._start_run(account=account, broker_env=broker_env, trigger="MANUAL_PILOT", sources=sources)
 
     def request_startup_reconcile(self, *, account: str, broker_env: str = "SIMULATION") -> dict[str, Any]:
-        if not self.config.startup_enabled:
-            return {"status": ReconcileRunStatus.DISABLED.value, "reason": "STARTUP_RECONCILE_DISABLED"}
-        return self._start_run(account=account, broker_env=broker_env, trigger="STARTUP")
+        with self._lock:
+            if not self.config.startup_enabled:
+                return {"status": ReconcileRunStatus.DISABLED.value, "reason": "STARTUP_RECONCILE_DISABLED"}
+            return self._start_run(account=account, broker_env=broker_env, trigger="STARTUP")
 
     def request_reconnect_reconcile(self, *, account: str, broker_env: str = "SIMULATION") -> dict[str, Any]:
-        if not self.config.reconnect_enabled:
-            return {"status": ReconcileRunStatus.DISABLED.value, "reason": "RECONNECT_RECONCILE_DISABLED"}
-        return self._start_run(account=account, broker_env=broker_env, trigger="RECONNECT")
+        with self._lock:
+            if not self.config.reconnect_enabled:
+                return {"status": ReconcileRunStatus.DISABLED.value, "reason": "RECONNECT_RECONCILE_DISABLED"}
+            return self._start_run(account=account, broker_env=broker_env, trigger="RECONNECT")
 
     def request_periodic_reconcile(self, *, account: str, broker_env: str = "SIMULATION") -> dict[str, Any]:
-        if not self.config.periodic_enabled:
-            return {"status": ReconcileRunStatus.DISABLED.value, "reason": "PERIODIC_RECONCILE_DISABLED"}
-        return self._start_run(account=account, broker_env=broker_env, trigger="PERIODIC")
+        with self._lock:
+            if not self.config.periodic_enabled:
+                return {"status": ReconcileRunStatus.DISABLED.value, "reason": "PERIODIC_RECONCILE_DISABLED"}
+            return self._start_run(account=account, broker_env=broker_env, trigger="PERIODIC")
 
     def handle_gateway_event(self, event: Any) -> dict[str, Any]:
-        payload = _broker_reconcile_payload(event)
-        if str(payload.get("purpose") or "") != "broker_reconcile":
-            return {"status": "IGNORED", "reason": "NOT_BROKER_RECONCILE"}
-        try:
-            result = self.parser.parse_command_ack(payload)
-            self.apply_source_result(result, command_id=str(getattr(event, "command_id", "") or payload.get("command_id") or ""))
-            return {"status": "PROCESSED", "run_id": result.run_id, "logical_source": result.logical_source}
-        except Exception as exc:
-            self.last_error = str(exc)
-            self.last_failure_at = _now()
-            return {"status": "FAILED", "error": str(exc)}
+        with self._lock:
+            payload = _broker_reconcile_payload(event)
+            if str(payload.get("purpose") or "") != "broker_reconcile":
+                return {"status": "IGNORED", "reason": "NOT_BROKER_RECONCILE"}
+            try:
+                result = self.parser.parse_command_ack(payload)
+                self.apply_source_result(result, command_id=str(getattr(event, "command_id", "") or payload.get("command_id") or ""))
+                return {"status": "PROCESSED", "run_id": result.run_id, "logical_source": result.logical_source}
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.last_failure_at = _now()
+                return {"status": "FAILED", "error": str(exc)}
 
     def apply_source_result(self, result: ReconcileTrParseResult, *, command_id: str = "") -> dict[str, Any]:
-        parsed = result.to_dict()
-        self.db.save_broker_reconcile_source_result(
-            {
-                "run_id": result.run_id,
-                "logical_source": result.logical_source,
-                "tr_code": result.tr_code,
-                "rq_name": result.rq_name,
-                "command_id": command_id,
-                "status": ReconcileSourceStatus.VALID_EMPTY.value if result.valid_empty else ReconcileSourceStatus.PARSED.value if result.complete else ReconcileSourceStatus.INVALID.value,
-                "complete": result.complete,
-                "page_count": result.page_count,
-                "row_count": result.row_count,
-                "parser_version": result.parser_version,
-                "parser_status": parsed.get("parser_status"),
-                "parser_warnings": parsed.get("warnings"),
-                "parser_errors": parsed.get("errors"),
-                "raw_checksum": result.raw_checksum,
-                "details": parsed,
-            }
-        )
-        if result.logical_source == ReconcileSourceType.OPEN_ORDERS.value:
-            self.db.replace_broker_reconcile_snapshots(run_id=result.run_id, open_orders=[item.to_dict() for item in result.open_orders])
-        elif result.logical_source == ReconcileSourceType.ACCOUNT_POSITIONS.value:
-            self.db.replace_broker_reconcile_snapshots(run_id=result.run_id, positions=[item.to_dict() for item in result.positions])
-        elif result.logical_source == ReconcileSourceType.ACCOUNT_CASH.value and result.cash:
-            self.db.replace_broker_reconcile_snapshots(run_id=result.run_id, cash=result.cash.to_dict())
-        return parsed
+        with self._lock:
+            parsed = result.to_dict()
+            self.db.save_broker_reconcile_source_result(
+                {
+                    "run_id": result.run_id,
+                    "logical_source": result.logical_source,
+                    "tr_code": result.tr_code,
+                    "rq_name": result.rq_name,
+                    "command_id": command_id,
+                    "status": ReconcileSourceStatus.VALID_EMPTY.value if result.valid_empty else ReconcileSourceStatus.PARSED.value if result.complete else ReconcileSourceStatus.INVALID.value,
+                    "complete": result.complete,
+                    "page_count": result.page_count,
+                    "row_count": result.row_count,
+                    "parser_version": result.parser_version,
+                    "parser_status": parsed.get("parser_status"),
+                    "parser_warnings": parsed.get("warnings"),
+                    "parser_errors": parsed.get("errors"),
+                    "raw_checksum": result.raw_checksum,
+                    "details": parsed,
+                }
+            )
+            if result.logical_source == ReconcileSourceType.OPEN_ORDERS.value:
+                self.db.replace_broker_reconcile_snapshots(run_id=result.run_id, open_orders=[item.to_dict() for item in result.open_orders])
+            elif result.logical_source == ReconcileSourceType.ACCOUNT_POSITIONS.value:
+                self.db.replace_broker_reconcile_snapshots(run_id=result.run_id, positions=[item.to_dict() for item in result.positions])
+            elif result.logical_source == ReconcileSourceType.ACCOUNT_CASH.value and result.cash:
+                self.db.replace_broker_reconcile_snapshots(run_id=result.run_id, cash=result.cash.to_dict())
+            self._update_run_after_source_result(result)
+            return parsed
 
     def finalize_run(self, run_id: str) -> BrokerTruthSnapshot:
-        run = self.db.get_broker_reconcile_run(run_id) or {}
-        token = str(run.get("account_token") or "")
-        discrepancies = BrokerReconcileComparator(self.db, config=self.config).compare_snapshots(run_id=run_id, account_token_value=token)
-        discrepancy_dicts = [item.to_dict() for item in discrepancies]
-        self.db.save_broker_reconcile_discrepancies(run_id, discrepancy_dicts)
-        critical_count = sum(1 for item in discrepancy_dicts if str(item.get("severity") or "") in CRITICAL_SEVERITIES)
-        clean = not discrepancy_dicts
-        status = ReconcileRunStatus.CLEAN.value if clean else ReconcileRunStatus.RECONCILE_REQUIRED.value
-        self.db.save_broker_reconcile_run(
-            {
-                **run,
-                "run_id": run_id,
-                "status": status,
-                "snapshot_complete": True,
-                "broker_truth_ready": clean,
-                "reconcile_clean": clean,
-                "discrepancy_count": len(discrepancy_dicts),
-                "critical_discrepancy_count": critical_count,
-                "completed_at": _now(),
-            }
-        )
-        if clean:
-            self.last_success_at = _now()
-        else:
-            self.last_failure_at = _now()
-        return BrokerTruthSnapshot(
-            run_id=run_id,
-            account_token=token,
-            snapshot_complete=True,
-            broker_truth_ready=clean,
-            reconcile_clean=clean,
-            open_orders=tuple(self.db.list_broker_reconcile_open_orders(run_id)),
-            positions=tuple(self.db.list_broker_reconcile_positions(run_id)),
-            discrepancies=tuple(discrepancy_dicts),
-        )
+        with self._lock:
+            run = self.db.get_broker_reconcile_run(run_id) or {}
+            token = str(run.get("account_token") or "")
+            discrepancies = BrokerReconcileComparator(self.db, config=self.config).compare_snapshots(run_id=run_id, account_token_value=token)
+            discrepancy_dicts = [item.to_dict() for item in discrepancies]
+            self.db.save_broker_reconcile_discrepancies(run_id, discrepancy_dicts)
+            critical_count = sum(1 for item in discrepancy_dicts if str(item.get("severity") or "") in CRITICAL_SEVERITIES)
+            clean = not discrepancy_dicts
+            status = ReconcileRunStatus.CLEAN.value if clean else ReconcileRunStatus.RECONCILE_REQUIRED.value
+            self.db.save_broker_reconcile_run(
+                {
+                    **run,
+                    "run_id": run_id,
+                    "status": status,
+                    "snapshot_complete": True,
+                    "broker_truth_ready": clean,
+                    "reconcile_clean": clean,
+                    "discrepancy_count": len(discrepancy_dicts),
+                    "critical_discrepancy_count": critical_count,
+                    "completed_at": _now(),
+                }
+            )
+            if clean:
+                self.last_success_at = _now()
+            else:
+                self.last_failure_at = _now()
+            return BrokerTruthSnapshot(
+                run_id=run_id,
+                account_token=token,
+                snapshot_complete=True,
+                broker_truth_ready=clean,
+                reconcile_clean=clean,
+                open_orders=tuple(self.db.list_broker_reconcile_open_orders(run_id)),
+                positions=tuple(self.db.list_broker_reconcile_positions(run_id)),
+                discrepancies=tuple(discrepancy_dicts),
+            )
 
     def health_snapshot(self) -> dict[str, Any]:
-        run = self.db.get_broker_reconcile_run(self.current_run_id) if self.current_run_id else None
-        discrepancies = self.db.list_broker_reconcile_discrepancies(run_id=self.current_run_id, limit=100) if self.current_run_id else []
-        critical = [item for item in discrepancies if str(item.get("severity") or "") in CRITICAL_SEVERITIES]
-        return {
-            "enabled": self.config.service_enabled,
-            "dispatch_enabled": self.config.dispatch_enabled,
-            "status": str((run or {}).get("status") or ("DISABLED" if not self.config.service_enabled else "IDLE")),
-            "current_run_id": self.current_run_id,
-            "trigger": self.last_trigger,
-            "account_masked": str((run or {}).get("account_token") or ""),
-            "required_sources": list((run or {}).get("required_sources") or []),
-            "completed_sources": list((run or {}).get("completed_sources") or []),
-            "snapshot_complete": bool((run or {}).get("snapshot_complete")),
-            "broker_truth_ready": bool((run or {}).get("broker_truth_ready")),
-            "reconcile_clean": bool((run or {}).get("reconcile_clean")),
-            "discrepancy_count": len(discrepancies),
-            "critical_discrepancy_count": len(critical),
-            "stop_new_buy": any(str(item.get("severity") or "") == ReconcileDiscrepancySeverity.STOP_NEW_BUY.value for item in discrepancies),
-            "reduce_only": any(str(item.get("severity") or "") == ReconcileDiscrepancySeverity.REDUCE_ONLY.value for item in discrepancies),
-            "last_success_at": self.last_success_at,
-            "last_failure_at": self.last_failure_at,
-            "last_error": self.last_error,
-            "warnings": list((run or {}).get("warnings") or []),
-        }
+        with self._lock:
+            run = self.db.get_broker_reconcile_run(self.current_run_id) if self.current_run_id else None
+            discrepancies = self.db.list_broker_reconcile_discrepancies(run_id=self.current_run_id, limit=100) if self.current_run_id else []
+            critical = [item for item in discrepancies if str(item.get("severity") or "") in CRITICAL_SEVERITIES]
+            return {
+                "enabled": self.config.service_enabled,
+                "dispatch_enabled": self.config.dispatch_enabled,
+                "status": str((run or {}).get("status") or ("DISABLED" if not self.config.service_enabled else "IDLE")),
+                "current_run_id": self.current_run_id,
+                "trigger": self.last_trigger,
+                "account_masked": str((run or {}).get("account_token") or ""),
+                "required_sources": list((run or {}).get("required_sources") or []),
+                "completed_sources": list((run or {}).get("completed_sources") or []),
+                "snapshot_complete": bool((run or {}).get("snapshot_complete")),
+                "broker_truth_ready": bool((run or {}).get("broker_truth_ready")),
+                "reconcile_clean": bool((run or {}).get("reconcile_clean")),
+                "discrepancy_count": len(discrepancies),
+                "critical_discrepancy_count": len(critical),
+                "stop_new_buy": any(str(item.get("severity") or "") == ReconcileDiscrepancySeverity.STOP_NEW_BUY.value for item in discrepancies),
+                "reduce_only": any(str(item.get("severity") or "") == ReconcileDiscrepancySeverity.REDUCE_ONLY.value for item in discrepancies),
+                "last_success_at": self.last_success_at,
+                "last_failure_at": self.last_failure_at,
+                "last_error": self.last_error,
+                "warnings": list((run or {}).get("warnings") or []),
+            }
 
     def latest_complete_snapshot(self, account_token_value: str) -> dict[str, Any]:
-        rows = [
-            row for row in self.db.list_broker_reconcile_runs(limit=100)
-            if row.get("account_token") == account_token_value and row.get("snapshot_complete")
-        ]
-        return rows[0] if rows else {}
+        with self._lock:
+            rows = [
+                row for row in self.db.list_broker_reconcile_runs(limit=100)
+                if row.get("account_token") == account_token_value and row.get("snapshot_complete")
+            ]
+            return rows[0] if rows else {}
 
     def mark_stale(self) -> None:
-        if not self.current_run_id:
-            return
-        run = self.db.get_broker_reconcile_run(self.current_run_id)
-        if run:
-            self.db.save_broker_reconcile_run({**run, "status": ReconcileRunStatus.STALE.value, "broker_truth_ready": False})
+        with self._lock:
+            if not self.current_run_id:
+                return
+            run = self.db.get_broker_reconcile_run(self.current_run_id)
+            if run:
+                self.db.save_broker_reconcile_run({**run, "status": ReconcileRunStatus.STALE.value, "broker_truth_ready": False})
 
     def cancel_pending_run(self, reason: str) -> None:
-        if not self.current_run_id:
-            return
-        run = self.db.get_broker_reconcile_run(self.current_run_id)
-        if run:
-            self.db.save_broker_reconcile_run({**run, "status": ReconcileRunStatus.CANCELLED.value, "errors": [str(reason or "")]})
+        with self._lock:
+            if not self.current_run_id:
+                return
+            run = self.db.get_broker_reconcile_run(self.current_run_id)
+            if run:
+                self.db.save_broker_reconcile_run({**run, "status": ReconcileRunStatus.CANCELLED.value, "errors": [str(reason or "")]})
 
     def _start_run(self, *, account: str, broker_env: str, trigger: str, sources: list[str] | None = None) -> dict[str, Any]:
         if not self.config.service_enabled:
@@ -390,7 +404,7 @@ class BrokerReconcileOrchestrator:
         status = ReconcileRunStatus.QUEUED.value if self.config.dispatch_enabled else ReconcileRunStatus.WAIT_GATEWAY.value
         self.current_run_id = run_id
         self.last_trigger = trigger
-        return self.db.save_broker_reconcile_run(
+        saved = self.db.save_broker_reconcile_run(
             {
                 "run_id": run_id,
                 "account_token": token,
@@ -405,6 +419,89 @@ class BrokerReconcileOrchestrator:
                 "warnings": [] if self.config.dispatch_enabled else ["RECONCILE_TR_DISPATCH_DISABLED"],
             }
         )
+        if self.config.dispatch_enabled:
+            dispatch_summary = self._dispatch_reconcile_commands(account=account, run_id=run_id, sources=required)
+            warnings = list(saved.get("warnings") or [])
+            errors = list(saved.get("errors") or [])
+            warnings.extend(dispatch_summary.get("warnings") or [])
+            errors.extend(dispatch_summary.get("errors") or [])
+            saved = self.db.save_broker_reconcile_run(
+                {
+                    **saved,
+                    "status": ReconcileRunStatus.RUNNING.value
+                    if dispatch_summary.get("enqueued_count") == len(required) and not errors
+                    else ReconcileRunStatus.FAILED.value,
+                    "warnings": warnings,
+                    "errors": errors,
+                }
+            )
+        return saved
+
+    def _dispatch_reconcile_commands(self, *, account: str, run_id: str, sources: list[str]) -> dict[str, Any]:
+        if self.gateway_state is None:
+            return {"enqueued_count": 0, "warnings": [], "errors": ["GATEWAY_STATE_UNAVAILABLE"]}
+        enqueued = 0
+        warnings: list[str] = []
+        errors: list[str] = []
+        for source in sources:
+            try:
+                command = build_reconcile_tr_command(
+                    account=account,
+                    logical_source=source,
+                    run_id=run_id,
+                    max_pages=self.config.max_pages,
+                )
+                result = self.gateway_state.enqueue_command(
+                    command,
+                    priority="NORMAL",
+                    ttl_sec=self.config.timeout_sec,
+                    max_attempts=self.config.max_attempts,
+                    metadata={
+                        "command_class": "BROKER_RECONCILE",
+                        "reconcile_run_id": run_id,
+                        "logical_source": source,
+                    },
+                )
+                if getattr(result, "accepted", False):
+                    enqueued += 1
+                else:
+                    errors.append(f"RECONCILE_TR_COMMAND_REJECTED:{source}:{getattr(result, 'reason', '')}")
+            except Exception as exc:
+                errors.append(f"RECONCILE_TR_COMMAND_ENQUEUE_FAILED:{source}:{exc}")
+        if enqueued and enqueued < len(sources):
+            warnings.append("RECONCILE_TR_PARTIAL_DISPATCH")
+        return {"enqueued_count": enqueued, "warnings": warnings, "errors": errors}
+
+    def _update_run_after_source_result(self, result: ReconcileTrParseResult) -> None:
+        run = self.db.get_broker_reconcile_run(result.run_id) or {}
+        if not run:
+            return
+        required = [str(item) for item in list(run.get("required_sources") or [])]
+        completed = [str(item) for item in list(run.get("completed_sources") or [])]
+        errors = list(run.get("errors") or [])
+        warnings = list(run.get("warnings") or [])
+        for warning in result.warnings:
+            text = str(warning or "")
+            if text and text not in warnings:
+                warnings.append(text)
+        for error in result.errors:
+            text = str(error or "")
+            if text and text not in errors:
+                errors.append(text)
+        if result.complete and not result.errors and result.logical_source not in completed:
+            completed.append(result.logical_source)
+        all_required_complete = bool(required) and all(source in completed for source in required)
+        self.db.save_broker_reconcile_run(
+            {
+                **run,
+                "status": ReconcileRunStatus.COMPLETE.value if all_required_complete else ReconcileRunStatus.PARTIAL.value,
+                "completed_sources": completed,
+                "warnings": warnings,
+                "errors": errors,
+            }
+        )
+        if all_required_complete:
+            self.finalize_run(result.run_id)
 
 
 def _broker_reconcile_payload(event: Any) -> dict[str, Any]:

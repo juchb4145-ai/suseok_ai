@@ -33,11 +33,11 @@ from trading.strategy.conditions import ConditionProfile
 
 
 class TradingDatabase:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, check_same_thread: bool = True) -> None:
         self.path = Path(path)
         if self.path.parent:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+        self.conn = sqlite3.connect(self.path, check_same_thread=check_same_thread)
         self.conn.row_factory = sqlite3.Row
         self._configure_connection()
         self._migrate()

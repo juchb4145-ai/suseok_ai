@@ -17,6 +17,9 @@ param(
     [string]$ChejanCaptureDir = "",
     [int]$ChejanCaptureMaxRows = 1000,
     [bool]$ChejanCaptureIncludeUnknownFids = $true,
+    [switch]$EnableReconcileTrPilot,
+    [switch]$EnableReconcileTrStartup,
+    [switch]$ReconcileTrIncludeCash,
     [switch]$DryRun
 )
 
@@ -217,6 +220,9 @@ Write-Step "LogDir=$LogDir"
 if ($EnableChejanCapture) {
     Write-Step "ChejanCapture=enabled dir=$ChejanCaptureDir max_rows=$ChejanCaptureMaxRows include_unknown_fids=$ChejanCaptureIncludeUnknownFids"
 }
+if ($EnableReconcileTrPilot) {
+    Write-Step "ReconcileTrPilot=enabled startup=$([bool]$EnableReconcileTrStartup) include_cash=$([bool]$ReconcileTrIncludeCash)"
+}
 
 if ($StopExisting) {
     $stopScript = Join-Path $ProjectRoot "tools\stop_market_close.ps1"
@@ -249,6 +255,15 @@ $coreArgs = @(
     "-Port", "$Port",
     "-Token", $Token
 )
+if ($EnableReconcileTrPilot) {
+    $coreArgs += "-EnableReconcileTrPilot"
+}
+if ($EnableReconcileTrStartup) {
+    $coreArgs += "-EnableReconcileTrStartup"
+}
+if ($ReconcileTrIncludeCash) {
+    $coreArgs += "-ReconcileTrIncludeCash"
+}
 $gatewayArgs = @(
     "-3.9-32",
     "apps\kiwoom_gateway.py",
@@ -272,6 +287,9 @@ if ($DryRun) {
         chejan_capture_enabled = [bool]$EnableChejanCapture
         chejan_capture_dir = if ($EnableChejanCapture) { $ChejanCaptureDir } else { "" }
         chejan_capture_max_rows = if ($EnableChejanCapture) { $ChejanCaptureMaxRows } else { 0 }
+        reconcile_tr_pilot_enabled = [bool]$EnableReconcileTrPilot
+        reconcile_tr_startup_enabled = [bool]$EnableReconcileTrStartup
+        reconcile_tr_include_cash = [bool]$ReconcileTrIncludeCash
         core_stdout = $CoreOut
         core_stderr = $CoreErr
         gateway_stdout = $GatewayOut
@@ -345,6 +363,9 @@ $summary = [pscustomobject]@{
     chejan_capture_dir = if ($EnableChejanCapture) { $ChejanCaptureDir } else { "" }
     chejan_capture_max_rows = if ($EnableChejanCapture) { $ChejanCaptureMaxRows } else { 0 }
     chejan_capture_include_unknown_fids = if ($EnableChejanCapture) { [bool]$ChejanCaptureIncludeUnknownFids } else { $false }
+    reconcile_tr_pilot_enabled = [bool]$EnableReconcileTrPilot
+    reconcile_tr_startup_enabled = [bool]$EnableReconcileTrStartup
+    reconcile_tr_include_cash = [bool]$ReconcileTrIncludeCash
     core_stdout = $CoreOut
     core_stderr = $CoreErr
     gateway_stdout = $GatewayOut

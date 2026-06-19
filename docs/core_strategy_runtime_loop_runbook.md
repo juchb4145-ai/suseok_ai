@@ -84,6 +84,21 @@ Core still persists candidate/execution/order events through the existing path. 
 
 Raw ticks are not bulk inserted into SQLite.
 
+## Reboot V2 Intraday Theme Rotation
+
+The default Reboot V2 observe path now runs Opening Burst first, then the intraday theme rotation layer described in [intraday_theme_rotation.md](intraday_theme_rotation.md).
+
+Intraday discovery schedules rolling `opt10032` turnover seed requests after the opening burst window:
+
+- 09:20-11:00 every 5 minutes
+- 11:00-13:20 every 10 minutes
+- 13:20-14:30 every 5 minutes
+- 14:30-15:00 every 10 minutes
+
+The commands are `tr_request` only, with `purpose=intraday_turnover_seed` and `response_mode=capture`. They do not bypass the Gateway queue or rate limiter and they never create `send_order` or `cancel_order`.
+
+Condition-search include events are optional boosters only. They can add or refresh a source, but they cannot directly create `READY`, `EntryPlan`, `RuntimeOrderIntent`, virtual buy orders, or Gateway order commands.
+
 ## Realtime and Condition Commands
 
 Runtime does not call Kiwoom directly.

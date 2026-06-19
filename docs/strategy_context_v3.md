@@ -13,9 +13,14 @@ hydration ACK/failure merge
 base realtime subscriptions
 MarketRegime
 Opening Burst
+Intraday Discovery
+ActiveSeedRegistry
+TurnoverFlow
 Theme Core V3
+LeadershipHandover
 FocusedExpansion realtime subscription reconcile
 CandidateBridge confirmed event ingest
+BestThemeContextResolver
 CandidateHydrator enqueue/retry
 Candidate realtime subscription reconcile
 StrategyContextAssembler
@@ -25,6 +30,8 @@ Dashboard snapshot
 ```
 
 Theme Core V3 receives the current MarketRegime snapshot in the same cycle. In the V2 runtime path, missing market context is `DATA_WAIT` with `MARKET_CONTEXT_NOT_READY`; it must not fall back to a static `SELECTIVE` phase.
+
+Intraday theme rotation is documented in [intraday_theme_rotation.md](intraday_theme_rotation.md). It enriches Theme Core V3 observation state with rolling `opt10032` seeds, active seed TTL, recent turnover flow, leadership handover, expansion leases, and source reconciliation. It does not create readiness or orders.
 
 ## Snapshot Contract
 
@@ -99,6 +106,13 @@ Still disabled in this PR:
 python -m pytest tests/test_strategy_context_v3.py -q
 python -m pytest tests/test_market_regime.py -q
 python -m pytest tests/test_theme_core_v3_runtime.py -q
+python -m pytest tests/test_intraday_theme_discovery.py -q
+python -m pytest tests/test_active_seed_registry.py -q
+python -m pytest tests/test_theme_turnover_flow.py -q
+python -m pytest tests/test_theme_leadership_handover.py -q
+python -m pytest tests/test_theme_expansion_lease.py -q
+python -m pytest tests/test_candidate_bridge_reconciler.py -q
+python -m pytest tests/test_best_theme_context_resolver.py -q
 python -m pytest tests/test_theme_expansion_planner.py -q
 python -m pytest tests/test_candidate_fsm.py -q
 python -m pytest tests/test_entry_engine.py -q

@@ -3,6 +3,7 @@ from trading.broker.gateway_state import GatewayStateStore
 from trading.strategy.reboot_v2_runtime import RebootV2Runtime
 from trading.strategy.runtime import StrategyRuntime
 from trading.theme_engine.core_v3_runtime import ThemeCoreV3RuntimePipeline
+from trading.theme_engine.intraday_discovery import IntradayDiscoveryRuntimePipeline
 from trading_app.dependencies import CoreSettings
 from trading_app.runtime_factory import (
     _cached_report_provider,
@@ -61,6 +62,8 @@ def test_build_core_runtime_defaults_to_reboot_v2_observe(tmp_path, monkeypatch)
 
     assert bundle.runtime_profile == "V2_OBSERVE"
     assert isinstance(bundle.runtime, RebootV2Runtime)
+    assert isinstance(bundle.intraday_discovery_pipeline, IntradayDiscoveryRuntimePipeline)
+    assert bundle.runtime.intraday_discovery_pipeline is bundle.intraday_discovery_pipeline
     assert isinstance(bundle.theme_board_pipeline, ThemeCoreV3RuntimePipeline)
 
 
@@ -74,6 +77,7 @@ def test_build_core_runtime_routes_to_legacy_only_when_profile_is_explicit(tmp_p
     assert isinstance(bundle.runtime, StrategyRuntime)
     assert bundle.candidate_ingestion_service is None
     assert bundle.candidate_hydrator is None
+    assert bundle.intraday_discovery_pipeline is None
     assert bundle.theme_board_pipeline is None
     assert bundle.strategy_context_pipeline is None
     assert bundle.entry_engine_pipeline is None
@@ -90,6 +94,8 @@ def test_build_core_runtime_routes_to_reboot_v2_observe_only(tmp_path, monkeypat
     assert isinstance(bundle.runtime, RebootV2Runtime)
     assert bundle.candidate_ingestion_service is not None
     assert bundle.candidate_hydrator is not None
+    assert isinstance(bundle.intraday_discovery_pipeline, IntradayDiscoveryRuntimePipeline)
+    assert bundle.intraday_discovery_pipeline.config.observe_only is True
     assert bundle.theme_board_pipeline is not None
     assert isinstance(bundle.theme_board_pipeline, ThemeCoreV3RuntimePipeline)
     assert bundle.entry_engine_pipeline is not None
@@ -129,6 +135,7 @@ def test_build_core_runtime_accepts_theme_core_v3_profile_alias(tmp_path, monkey
 
     assert bundle.runtime_profile == "THEME_CORE_V3"
     assert isinstance(bundle.runtime, RebootV2Runtime)
+    assert isinstance(bundle.intraday_discovery_pipeline, IntradayDiscoveryRuntimePipeline)
     assert isinstance(bundle.theme_board_pipeline, ThemeCoreV3RuntimePipeline)
     assert bundle.theme_board_pipeline.config.enabled is True
     assert bundle.theme_board_pipeline.config.ingest_candidate_source_events is True

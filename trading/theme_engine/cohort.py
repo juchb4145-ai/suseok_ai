@@ -39,6 +39,19 @@ class ThemeCohortSnapshot:
     leader_symbol: str = ""
     co_leader_symbols: tuple[str, ...] = ()
     coverage_ratio: float = 0.0
+    universe_member_count: int = 0
+    tradable_member_count: int = 0
+    observed_member_count: int = 0
+    target_sample_count: int = 0
+    fresh_sample_count: int = 0
+    full_universe_coverage_ratio: float = 0.0
+    planned_sample_coverage_ratio: float = 0.0
+    breadth_trust_level: str = "LOW"
+    signal_latest_at: str = ""
+    signal_age_sec: float = 0.0
+    cumulative_strength_score: float = 0.0
+    recent_flow_score: float = 0.0
+    rotation_score: float = 0.0
     signal_persistence_count: int = 0
     cohesion_passed: bool = False
     leader_only_candidate: bool = False
@@ -88,10 +101,19 @@ class ThemeCohortEngine:
         seed_count = len(signals)
         realtime_valid = [signal for signal in signals if signal.realtime_valid]
         tradable_realtime = [signal for signal in signals if signal.tradable_realtime]
+        fresh_signals = [
+            signal
+            for signal in signals
+            if signal.tradable_realtime and str(signal.freshness_status or "FRESH") in {"", "FRESH", "DEGRADED"}
+        ]
         alive = [signal for signal in tradable_realtime if signal.change_rate_pct >= self.config.alive_threshold_pct]
         strong = [signal for signal in tradable_realtime if signal.change_rate_pct >= self.config.strong_threshold_pct]
         leaders = [signal for signal in tradable_realtime if signal.change_rate_pct >= self.config.leader_threshold_pct]
         denominator = member_count or 1
+        target_sample_count = max(seed_count, min(member_count, len(signals))) or member_count
+        full_coverage = seed_count / denominator
+        planned_coverage = len(fresh_signals) / (target_sample_count or 1)
+        trust = _breadth_trust_level(full_coverage, planned_coverage, seed_count)
         turnover = sum(max(0.0, signal.turnover_krw) for signal in signals)
         leader = max(tradable_realtime, key=lambda item: item.turnover_krw + item.change_rate_pct * 100_000_000, default=None)
         co_leaders = tuple(
@@ -114,6 +136,8 @@ class ThemeCohortEngine:
         elif len(realtime_valid) / denominator < self.config.min_realtime_valid_ratio:
             reason = ThemeDataWaitReason.REALTIME_COVERAGE_LOW.value
             reasons.append(reason)
+        if any(str(signal.freshness_status) == "STALE" for signal in signals):
+            reasons.append(ThemeDataWaitReason.SIGNAL_STALE.value)
         if len(leaders) == 1 and not cohesion:
             reasons.append("SINGLE_LEADER_ONLY_CANDIDATE")
         return ThemeCohortSnapshot(
@@ -134,6 +158,17 @@ class ThemeCohortEngine:
             leader_symbol=leader.code if leader else "",
             co_leader_symbols=co_leaders,
             coverage_ratio=round(seed_count / denominator, 4),
+            universe_member_count=member_count,
+            tradable_member_count=len(tradable_realtime),
+            observed_member_count=seed_count,
+            target_sample_count=target_sample_count,
+            fresh_sample_count=len(fresh_signals),
+            full_universe_coverage_ratio=round(full_coverage, 4),
+            planned_sample_coverage_ratio=round(planned_coverage, 4),
+            breadth_trust_level=trust,
+            signal_latest_at=max((signal.last_seen_at or signal.tick_at or signal.observed_at for signal in signals), default=""),
+            signal_age_sec=max((float(signal.tick_age_sec or 0.0) for signal in signals), default=0.0),
+            cumulative_strength_score=round(min(100.0, len(strong) * 18.0 + len(leaders) * 12.0 + max(0.0, _weighted_return(signals)) * 4.0), 4),
             signal_persistence_count=max((len(signal.source_types) for signal in signals), default=0),
             cohesion_passed=cohesion,
             leader_only_candidate=bool(len(leaders) >= 1 and not cohesion),
@@ -149,6 +184,10 @@ class ThemeCohortEngine:
             seed_member_count=len(signals),
             realtime_valid_count=sum(1 for signal in signals if signal.realtime_valid),
             theme_turnover_krw=sum(max(0.0, signal.turnover_krw) for signal in signals),
+            observed_member_count=len(signals),
+            target_sample_count=len(signals),
+            fresh_sample_count=sum(1 for signal in signals if signal.tradable_realtime),
+            breadth_trust_level="UNMAPPED",
             signals=tuple(signals),
             data_quality_reason=ThemeDataWaitReason.UNMAPPED_SEED.value,
             reason_codes=(ThemeDataWaitReason.UNMAPPED_SEED.value,),
@@ -159,6 +198,16 @@ def _cohesion_passed(member_count: int, strong_count: int, config: ThemeCohortCo
     if member_count <= config.small_theme_member_count:
         return strong_count >= config.min_strong_count_small_theme
     return strong_count >= config.min_strong_count
+
+
+def _breadth_trust_level(full_coverage: float, planned_coverage: float, seed_count: int) -> str:
+    if seed_count <= 0:
+        return "NO_SAMPLE"
+    if planned_coverage >= 0.8 and full_coverage >= 0.35:
+        return "FULL"
+    if planned_coverage >= 0.5:
+        return "SAMPLED"
+    return "LOW_TRUST"
 
 
 def _weighted_return(signals: Iterable[LiveSeedSignal]) -> float:

@@ -32,6 +32,7 @@ class RebootV2Runtime:
     candidate_ingestion_service: Any = None
     candidate_hydrator: Any = None
     opening_burst_pipeline: Any = None
+    intraday_discovery_pipeline: Any = None
     theme_board_pipeline: Any = None
     market_regime_pipeline: Any = None
     strategy_context_pipeline: Any = None
@@ -84,6 +85,7 @@ class RebootV2Runtime:
         self._reconcile_base_subscriptions(snapshot)
         self._run_pipeline(snapshot, "market_regime", self.market_regime_pipeline, current)
         self._run_pipeline(snapshot, "opening_burst", self.opening_burst_pipeline, current)
+        self._run_pipeline(snapshot, "intraday_discovery", self.intraday_discovery_pipeline, current)
         self._run_pipeline(snapshot, "theme_board", self.theme_board_pipeline, current, market_context=snapshot.get("market_regime"))
         self._reconcile_theme_expansion_subscriptions(snapshot, current)
         self._enqueue_hydration(snapshot, current)
@@ -147,6 +149,7 @@ class RebootV2Runtime:
                 "candidate_ingestion": _component_enabled(self.candidate_ingestion_service),
                 "candidate_hydrator": _component_enabled(self.candidate_hydrator),
                 "opening_burst": _component_enabled(self.opening_burst_pipeline),
+                "intraday_discovery": _component_enabled(self.intraday_discovery_pipeline),
                 "theme_board": _component_enabled(self.theme_board_pipeline),
                 "market_regime": _component_enabled(self.market_regime_pipeline),
                 "strategy_context": _component_enabled(self.strategy_context_pipeline),

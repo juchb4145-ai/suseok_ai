@@ -9,13 +9,17 @@ from trading.strategy.candidates import normalize_code
 from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.theme_engine.board_view import ThemeBoardView
 from trading.theme_engine.candidate_bridge import CandidateBridge
+from trading.theme_engine.candidate_bridge_reconciler import CandidateBridgeSourceReconciler
 from trading.theme_engine.cohort import ThemeCohortEngine
 from trading.theme_engine.expansion import FocusedExpansionPlanner
+from trading.theme_engine.leadership_handover import LeadershipHandoverEngine, ThemeLeadershipRanker
 from trading.theme_engine.models import ThemeMembership
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.roles import RawStockRole, StockRoleDecision, StockRoleEngine
-from trading.theme_engine.signals import LiveSeedSignal, SeedSourceType, merge_seed_signals
+from trading.theme_engine.signal_registry import ActiveSeedRegistry
+from trading.theme_engine.signals import LiveSeedSignal, SeedSourceType, apply_signal_freshness, merge_seed_signals
 from trading.theme_engine.state_machine import ThemeCoreState, ThemeStateMachine, ThemeStateSnapshot
+from trading.theme_engine.turnover_flow import TurnoverFlowTracker
 
 
 THEME_CORE_V3_OUTPUT_MODE = "OBSERVE"
@@ -33,6 +37,11 @@ class ThemeCoreV3RuntimeConfig:
     ingest_candidate_source_events: bool = False
     use_runtime_market_context: bool = False
     theme_expansion_subscriptions_enabled: bool = False
+    signal_ttl_sec: int = 600
+    max_tick_age_sec: int = 10
+    turnover_flow_enabled: bool = True
+    leadership_handover_enabled: bool = True
+    bridge_reconcile_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "ThemeCoreV3RuntimeConfig":
@@ -47,6 +56,11 @@ class ThemeCoreV3RuntimeConfig:
             ingest_candidate_source_events=_env_bool("TRADING_THEME_CORE_V3_INGEST_CANDIDATES", False),
             use_runtime_market_context=_env_bool("TRADING_THEME_CORE_V3_USE_RUNTIME_MARKET_CONTEXT", False),
             theme_expansion_subscriptions_enabled=_env_bool("TRADING_THEME_EXPANSION_SUBSCRIPTIONS_ENABLED", False),
+            signal_ttl_sec=max(1, _env_int("TRADING_THEME_SIGNAL_TTL_SEC", 600)),
+            max_tick_age_sec=max(1, _env_int("TRADING_MARKET_DATA_MAX_TICK_AGE_SEC", 10)),
+            turnover_flow_enabled=_env_bool("TRADING_THEME_TURNOVER_FLOW_ENABLED", True),
+            leadership_handover_enabled=_env_bool("TRADING_THEME_LEADERSHIP_HANDOVER_ENABLED", True),
+            bridge_reconcile_enabled=_env_bool("TRADING_THEME_BRIDGE_RECONCILE_ENABLED", True),
         )
 
 
@@ -64,6 +78,11 @@ class ThemeCoreV3RuntimePipeline:
         expansion_planner: FocusedExpansionPlanner | None = None,
         candidate_bridge: CandidateBridge | None = None,
         board_view: ThemeBoardView | None = None,
+        active_seed_registry: ActiveSeedRegistry | None = None,
+        turnover_flow_tracker: TurnoverFlowTracker | None = None,
+        leadership_ranker: ThemeLeadershipRanker | None = None,
+        handover_engine: LeadershipHandoverEngine | None = None,
+        bridge_reconciler: CandidateBridgeSourceReconciler | None = None,
         candidate_ingestion_service: Any | None = None,
         clock=None,
     ) -> None:
@@ -77,6 +96,11 @@ class ThemeCoreV3RuntimePipeline:
         self.expansion_planner = expansion_planner or FocusedExpansionPlanner()
         self.candidate_bridge = candidate_bridge or CandidateBridge()
         self.board_view = board_view or ThemeBoardView()
+        self.active_seed_registry = active_seed_registry or ActiveSeedRegistry(ttl_sec=self.config.signal_ttl_sec)
+        self.turnover_flow_tracker = turnover_flow_tracker or TurnoverFlowTracker()
+        self.leadership_ranker = leadership_ranker or ThemeLeadershipRanker()
+        self.handover_engine = handover_engine or LeadershipHandoverEngine()
+        self.bridge_reconciler = bridge_reconciler or CandidateBridgeSourceReconciler()
         self.candidate_ingestion_service = candidate_ingestion_service
         self.clock = clock or datetime.now
         self.last_result: dict[str, Any] | None = None
@@ -98,6 +122,8 @@ class ThemeCoreV3RuntimePipeline:
         trade_date = current.date().isoformat()
         theme_inputs = _load_theme_inputs(self.repository)
         seed_signals = self._seed_signals(theme_inputs, trade_date=trade_date)
+        seed_signals = self._fresh_seed_signals(seed_signals, current)
+        active_seed_snapshot = self._update_active_seed_registry(seed_signals, current)
         market_input = _theme_core_market_input(market_context, config=self.config)
         summary = _empty_summary(enabled=self.config.enabled, observe_only=self.config.observe_only)
         summary.update(
@@ -107,6 +133,8 @@ class ThemeCoreV3RuntimePipeline:
                 "calculated_at": current.isoformat(),
                 "theme_input_count": len(theme_inputs),
                 "seed_signal_count": len(seed_signals),
+                "active_seed_count": active_seed_snapshot.active_count,
+                "expired_seed_count": active_seed_snapshot.expired_count,
                 "market_context_status": market_input["status"],
                 "market_phase": market_input["market_phase"],
                 "kosdaq_risk_state": market_input["kosdaq_risk_state"],
@@ -123,9 +151,14 @@ class ThemeCoreV3RuntimePipeline:
             summary["reason_codes"] = ["SEED_SIGNAL_EMPTY"]
 
         self._restore_theme_state(trade_date)
+        if self.config.turnover_flow_enabled:
+            self.turnover_flow_tracker.observe_signals(seed_signals, observed_at=current.isoformat())
         cohorts = self.cohort_engine.build(theme_inputs, seed_signals)
+        theme_flows = self.turnover_flow_tracker.theme_flows(cohorts, observed_at=current.isoformat()) if self.config.turnover_flow_enabled else {}
         theme_states = self.state_machine.apply(cohorts)
         self._persist_theme_states(theme_states, trade_date=trade_date, calculated_at=current.isoformat())
+        leadership_ranks = self.leadership_ranker.rank(theme_states, flows=theme_flows) if self.config.leadership_handover_enabled else []
+        leadership_snapshots, leadership_transitions = self.handover_engine.apply(leadership_ranks, now=current) if self.config.leadership_handover_enabled else ([], [])
         role_decisions = [
             decision
             for state in theme_states
@@ -148,6 +181,8 @@ class ThemeCoreV3RuntimePipeline:
             detected_at=current.isoformat(),
         )
         bridge_saved = self._persist_bridge_events(bridge_result.events)
+        bridge_reconcile = self.bridge_reconciler.reconcile(role_decisions, trade_date=trade_date, detected_at=current.isoformat()) if self.config.bridge_reconcile_enabled else None
+        bridge_removed = self._persist_bridge_events(getattr(bridge_reconcile, "remove_events", ()) or ())
         view = self.board_view.build(
             trade_date=trade_date,
             calculated_at=current.isoformat(),
@@ -159,6 +194,8 @@ class ThemeCoreV3RuntimePipeline:
             view.to_dict(),
             theme_states=theme_states,
             role_decisions=role_decisions,
+            theme_flows=theme_flows,
+            leadership_snapshots=leadership_snapshots,
             trade_date=trade_date,
             calculated_at=current.isoformat(),
             top_theme_count=self.config.top_theme_count,
@@ -171,10 +208,19 @@ class ThemeCoreV3RuntimePipeline:
                 "candidate_bridge_event_count": len(bridge_result.events),
                 "candidate_bridge_excluded_count": len(bridge_result.excluded),
                 "candidate_source_event_saved_count": bridge_saved,
+                "candidate_bridge_removed_count": bridge_removed,
+                "candidate_bridge_reconcile": _bridge_reconcile_summary(bridge_reconcile),
                 "candidate_ingestion_enabled": bool(self.config.ingest_candidate_source_events),
                 "theme_expansion_subscriptions_enabled": bool(self.config.theme_expansion_subscriptions_enabled),
                 "theme_expansion_selected_count": len(expansion_plan.targets),
                 "theme_expansion_rejected_count": len(expansion_plan.excluded),
+                "turnover_flow": _turnover_flow_summary(theme_flows),
+                "leadership_handover": _leadership_summary(leadership_snapshots, leadership_transitions),
+                "active_seed_registry": {
+                    "active_count": active_seed_snapshot.active_count,
+                    "expired_count": active_seed_snapshot.expired_count,
+                    "source_counts": dict(active_seed_snapshot.source_counts or {}),
+                },
                 "ready_allowed": False,
                 "order_intent_allowed": False,
                 "output_mode": THEME_CORE_V3_OUTPUT_MODE,
@@ -190,6 +236,17 @@ class ThemeCoreV3RuntimePipeline:
         self.last_summary = summary
         self.last_run_at = current
         return dict(summary)
+
+    def _fresh_seed_signals(self, signals: Iterable[LiveSeedSignal], now: datetime) -> list[LiveSeedSignal]:
+        return [
+            apply_signal_freshness(signal, now=now, max_tick_age_sec=self.config.max_tick_age_sec)
+            for signal in signals
+        ]
+
+    def _update_active_seed_registry(self, signals: Iterable[LiveSeedSignal], now: datetime):
+        for signal in signals:
+            self.active_seed_registry.merge(signal, now=now, ttl_sec=self.config.signal_ttl_sec)
+        return self.active_seed_registry.snapshot(now=now)
 
     def _seed_signals(
         self,
@@ -392,6 +449,9 @@ def _signal(
         realtime_valid=bool(tick is not None and getattr(tick, "price", 0) > 0 and metadata.get("price_source") != "TR_BACKFILL"),
         tr_backfill_valid=bool(tick is None or metadata.get("price_source") == "TR_BACKFILL"),
         reason_codes=tuple(reason_codes),
+        observed_at=str(row.get("observed_at") or row.get("batch_time") or row.get("detected_at") or ""),
+        last_seen_at=str(row.get("last_seen_at") or row.get("observed_at") or row.get("batch_time") or row.get("detected_at") or ""),
+        tick_at=tick.timestamp.isoformat() if tick is not None and tick.timestamp else "",
         market=str(metadata.get("market") or ""),
         momentum_1m=_float(metadata.get("momentum_1m")),
         momentum_3m=_float(metadata.get("momentum_3m")),
@@ -408,13 +468,25 @@ def _theme_board_snapshot(
     *,
     theme_states: Iterable[ThemeStateSnapshot],
     role_decisions: Iterable[StockRoleDecision],
+    theme_flows: Mapping[str, Any] | None = None,
+    leadership_snapshots: Iterable[Any] = (),
     trade_date: str,
     calculated_at: str,
     top_theme_count: int,
 ) -> dict[str, Any]:
     states = sorted(list(theme_states), key=lambda item: item.theme_score, reverse=True)
     decisions = list(role_decisions)
-    top_themes = [_theme_payload(state, index) for index, state in enumerate(states[:top_theme_count], start=1)]
+    flow_by_theme = dict(theme_flows or {})
+    leadership_by_theme = {item.theme_id: item for item in list(leadership_snapshots or []) if getattr(item, "theme_id", "")}
+    top_themes = [
+        _theme_payload(
+            state,
+            index,
+            flow=flow_by_theme.get(state.theme_id),
+            leadership=leadership_by_theme.get(state.theme_id),
+        )
+        for index, state in enumerate(states[:top_theme_count], start=1)
+    ]
     stocks = [_stock_payload(decision) for decision in sorted(decisions, key=lambda item: (item.theme_id, item.source_rank, -item.role_score))]
     active_states = {
         ThemeCoreState.LEADING_THEME.value,
@@ -431,6 +503,8 @@ def _theme_board_snapshot(
         "data_wait_theme_count": sum(1 for state in states if state.theme_state == ThemeCoreState.DATA_WAIT.value),
         "top_themes": top_themes,
         "stocks": stocks,
+        "turnover_flow": _turnover_flow_summary(flow_by_theme),
+        "leadership_handover": _leadership_summary(leadership_by_theme.values(), ()),
         "source_counts": dict(view.get("source_counts") or {}),
         "data_quality_flags": [state.data_quality_reason for state in states if state.data_quality_reason],
         "reason_codes": list(view.get("reason_codes") or []),
@@ -441,7 +515,7 @@ def _theme_board_snapshot(
     }
 
 
-def _theme_payload(state: ThemeStateSnapshot, rank: int) -> dict[str, Any]:
+def _theme_payload(state: ThemeStateSnapshot, rank: int, *, flow: Any = None, leadership: Any = None) -> dict[str, Any]:
     cohort = state.cohort
     return {
         "theme_id": state.theme_id,
@@ -460,7 +534,21 @@ def _theme_payload(state: ThemeStateSnapshot, rank: int) -> dict[str, Any]:
         "weighted_return_pct": getattr(cohort, "weighted_return_pct", 0.0) if cohort is not None else 0.0,
         "leader_concentration": getattr(cohort, "leader_concentration", 0.0) if cohort is not None else 0.0,
         "coverage_ratio": getattr(cohort, "coverage_ratio", 0.0) if cohort is not None else 0.0,
+        "full_universe_coverage_ratio": getattr(cohort, "full_universe_coverage_ratio", 0.0) if cohort is not None else 0.0,
+        "planned_sample_coverage_ratio": getattr(cohort, "planned_sample_coverage_ratio", 0.0) if cohort is not None else 0.0,
+        "fresh_sample_count": getattr(cohort, "fresh_sample_count", 0) if cohort is not None else 0,
+        "target_sample_count": getattr(cohort, "target_sample_count", 0) if cohort is not None else 0,
+        "breadth_trust_level": getattr(cohort, "breadth_trust_level", "") if cohort is not None else "",
         "theme_turnover_krw": getattr(cohort, "theme_turnover_krw", 0.0) if cohort is not None else 0.0,
+        "theme_turnover_delta_1m": getattr(flow, "theme_turnover_delta_1m", 0.0),
+        "theme_flow_share": getattr(flow, "theme_flow_share", 0.0),
+        "theme_flow_share_delta": getattr(flow, "theme_flow_share_delta", 0.0),
+        "fresh_flow_coverage_ratio": getattr(flow, "fresh_flow_coverage_ratio", 0.0),
+        "leadership_status": getattr(leadership, "status", "NEUTRAL"),
+        "leadership_score": getattr(leadership, "leadership_score", 0.0),
+        "leadership_rank": getattr(leadership, "current_rank", 0),
+        "leadership_rank_delta": getattr(leadership, "rank_delta", 0),
+        "takeover_pending_since": getattr(leadership, "takeover_pending_since", ""),
         "leader_symbol": state.leader_symbol,
         "previous_leader_symbol": getattr(state, "previous_leader_symbol", ""),
         "co_leader_symbols": list(state.co_leader_symbols),
@@ -584,6 +672,77 @@ def _summary_from_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         ][:10],
         "excluded_late_laggard_count": sum(1 for stock in stocks if str(stock.get("raw_role") or "") == RawStockRole.LATE_LAGGARD.value),
         "excluded_overheated_count": sum(1 for stock in stocks if str(stock.get("raw_role") or "") == RawStockRole.OVERHEATED.value),
+    }
+
+
+def _turnover_flow_summary(flows: Mapping[str, Any]) -> dict[str, Any]:
+    values = list(flows.values())
+    return {
+        "enabled": True,
+        "theme_flow_count": len(values),
+        "top_flow_themes": [
+            {
+                "theme_id": flow.theme_id,
+                "flow_share": flow.theme_flow_share,
+                "flow_share_delta": flow.theme_flow_share_delta,
+                "theme_turnover_delta_1m": flow.theme_turnover_delta_1m,
+                "fresh_flow_coverage_ratio": flow.fresh_flow_coverage_ratio,
+            }
+            for flow in sorted(values, key=lambda item: (item.theme_flow_share, item.theme_turnover_delta_1m), reverse=True)[:5]
+        ],
+        "ready_allowed": False,
+        "order_intent_allowed": False,
+    }
+
+
+def _leadership_summary(snapshots: Iterable[Any], transitions: Iterable[Any]) -> dict[str, Any]:
+    snapshot_list = list(snapshots or [])
+    transition_list = list(transitions or [])
+    return {
+        "enabled": True,
+        "ranked_theme_count": len(snapshot_list),
+        "transition_count": len(transition_list),
+        "top_leadership": [
+            {
+                "theme_id": item.theme_id,
+                "theme_name": item.theme_name,
+                "current_rank": item.current_rank,
+                "previous_rank": item.previous_rank,
+                "rank_delta": item.rank_delta,
+                "leadership_status": item.status,
+                "leadership_score": item.leadership_score,
+                "recent_flow_score": item.recent_flow_score,
+                "flow_share": item.flow_share,
+                "handover_reason_codes": list(item.handover_reason_codes),
+            }
+            for item in snapshot_list[:5]
+        ],
+        "transitions": [
+            {
+                "theme_id": item.theme_id,
+                "previous_status": item.previous_status,
+                "current_status": item.current_status,
+                "reason_codes": list(item.reason_codes),
+            }
+            for item in transition_list[:10]
+        ],
+        "ready_allowed": False,
+        "order_intent_allowed": False,
+    }
+
+
+def _bridge_reconcile_summary(result: Any) -> dict[str, Any]:
+    if result is None:
+        return {"enabled": False, "status": "DISABLED"}
+    return {
+        "enabled": True,
+        "included_count": int(getattr(result, "included_count", 0) or 0),
+        "removed_count": int(getattr(result, "removed_count", 0) or 0),
+        "unchanged_count": int(getattr(result, "unchanged_count", 0) or 0),
+        "active_source_count": len(tuple(getattr(result, "active_state", ()) or ())),
+        "reason_codes": list(getattr(result, "reason_codes", ()) or ()),
+        "ready_allowed": False,
+        "order_intent_allowed": False,
     }
 
 

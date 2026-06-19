@@ -119,6 +119,8 @@ class RuntimeSupervisor:
         self._runtime_started_perf = 0.0
         self._last_realtime_no_tick_repair_perf = 0.0
         self._last_realtime_stale_total_ticks = 0
+        self._broker_reconcile_startup_requested = False
+        self._broker_reconcile_reconnect_watermark: int | None = None
         if self.mode != "OBSERVE":
             self._warn(f"RUNTIME_ORDER_MODE_FORCED_OBSERVE:{self.mode}")
         if self.settings.runtime_allow_live_orders:
@@ -468,6 +470,7 @@ class RuntimeSupervisor:
         if not self.enabled or self._bundle is None:
             return
         session_reset_reason = self._gateway_session_reset_reason(event)
+        await self._maybe_request_broker_reconcile_from_gateway_event(event, session_reset_reason=session_reset_reason)
         if session_reset_reason:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._executor, self._mark_realtime_subscriptions_stale_in_worker, session_reset_reason)
@@ -508,6 +511,46 @@ class RuntimeSupervisor:
             handler(event)
         except Exception as exc:
             self._warn(f"BROKER_RECONCILE_EVENT_CONSUME_FAILED:{event.type}:{exc}")
+
+    async def _maybe_request_broker_reconcile_from_gateway_event(self, event: GatewayEvent, *, session_reset_reason: str = "") -> None:
+        if event.type != "heartbeat" or self.reconcile_orchestrator is None:
+            return
+        payload = dict(event.payload or {})
+        if not bool(payload.get("kiwoom_logged_in")):
+            return
+        account = str(payload.get("account") or getattr(self.gateway_state.snapshot(), "account", "") or "")
+        if not account:
+            return
+        broker_env = str(payload.get("broker_env") or payload.get("server_mode") or "SIMULATION")
+        orchestrator = self.reconcile_orchestrator
+        config = getattr(orchestrator, "config", None)
+        if config is None or not bool(getattr(config, "service_enabled", False)):
+            return
+        loop = asyncio.get_running_loop()
+        if bool(getattr(config, "startup_enabled", False)) and not self._broker_reconcile_startup_requested:
+            self._broker_reconcile_startup_requested = True
+            await loop.run_in_executor(
+                self._reconcile_event_executor,
+                lambda: orchestrator.request_startup_reconcile(account=account, broker_env=broker_env),
+            )
+            self._flush_dashboard_read_model("broker_reconcile_startup_requested")
+            return
+        if not bool(getattr(config, "reconnect_enabled", False)):
+            return
+        if "RECONNECT_COUNT_CHANGED" not in str(session_reset_reason or ""):
+            return
+        try:
+            reconnect_count = int(payload.get("reconnect_count") or 0)
+        except (TypeError, ValueError):
+            reconnect_count = 0
+        if self._broker_reconcile_reconnect_watermark == reconnect_count:
+            return
+        self._broker_reconcile_reconnect_watermark = reconnect_count
+        await loop.run_in_executor(
+            self._reconcile_event_executor,
+            lambda: orchestrator.request_reconnect_reconcile(account=account, broker_env=broker_env),
+        )
+        self._flush_dashboard_read_model("broker_reconcile_reconnect_requested")
 
     async def readiness(self) -> dict[str, Any]:
         if self._bundle is not None:

@@ -44,6 +44,27 @@ $env:TRADING_KIWOOM_CHEJAN_CAPTURE_DIR="reports/kiwoom_chejan"
 
 자동매매 시스템의 `send_order`는 계속 비활성이다.
 
+## 2026-06-19 Actual Simulation Status
+
+현재 모의서버 capture 기준으로 다음 case는 실제 Kiwoom Chejan payload에서 관측했다.
+
+- 주문접수
+- 부분체결
+- 완전체결
+- 미체결 취소접수
+- 취소완료
+- 잔고증가
+- 보유수량 0
+
+잔여 리스크:
+
+- `order_rejected`는 아직 실제 Chejan payload로 관측하지 못했다.
+- 보유하지 않은 종목 매도 시도는 주문창/서버 pre-check 단계에서 팝업으로 차단되어 `OnReceiveChejanData` 거절 이벤트가 발생하지 않을 수 있다.
+- 과거 `reject_reason=0`을 거절로 오분류했던 row는 실제 거절 fixture로 인정하지 않는다.
+- 따라서 PR10 실제 모의서버 parser validation은 `HOLD`이며, `order_rejected`는 `NOT_OBSERVED_IN_SIMULATION` 잔여 리스크로 유지한다.
+
+이 잔여 리스크는 PR11 read-only TR reconcile pilot 진행을 막지는 않는다. 다만 LIVE_SIM canary review 전에는 실제 거절 Chejan fixture를 추가로 확보하거나, 운영자가 `order_rejected` 미관측 리스크를 명시 승인해야 한다.
+
 ## Fixture Validation
 
 수집 후 redacted fixture 디렉터리를 만든다.
@@ -122,3 +143,4 @@ python tools\kiwoom_chejan_parser_validation.py --fixture-dir tests\fixtures\kiw
 4. Event Log replay에서 duplicate execution apply 0.
 5. order command count 0.
 6. operator review 전까지 LIVE_SIM flag를 켜지 않음.
+7. `order_rejected`가 실제 모의서버에서 미관측이면 `NOT_OBSERVED_IN_SIMULATION` 잔여 리스크를 review 문서에 남김.

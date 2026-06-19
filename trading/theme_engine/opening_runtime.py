@@ -5,16 +5,14 @@ import json
 import os
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, time, timedelta, timezone
-from typing import Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
 from trading.broker.command_queue import CommandPriority
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import GatewayCommand, GatewayEvent, new_message_id
-from trading.strategy.candidates import normalize_code
-from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.theme_engine.leadership import StockLeadershipRole
 from trading.theme_engine.models import StockSnapshot, ThemeMembership, ThemeStatus
-from trading.theme_engine.normalizer import normalize_stock_code
+from trading.theme_engine.normalizer import normalize_stock_code as normalize_code
 from trading.theme_engine.opening_burst import (
     OpeningBurstConfig,
     OpeningThemeBurstEngine,
@@ -23,6 +21,9 @@ from trading.theme_engine.opening_burst import (
     OpeningTurnoverSeedCollector,
 )
 from trading.theme_engine.repository import ThemeEngineRepository
+
+if TYPE_CHECKING:
+    from trading.strategy.market_data import MarketDataStore, StrategyTick
 
 
 OPENING_TURNOVER_SEED_PURPOSE = "opening_turnover_seed"
@@ -574,7 +575,7 @@ def _normalize_opt10032_stock_code(value: Any) -> str:
     text = str(value or "").strip()
     if "_" in text:
         text = text.split("_", 1)[0]
-    return normalize_stock_code(text)
+    return normalize_code(text)
 
 
 def parse_opt10032_seed_rows(rows: Iterable[Mapping[str, Any]], *, batch_time: str = "") -> OpeningSeedParseResult:
