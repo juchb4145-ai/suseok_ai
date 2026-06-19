@@ -326,6 +326,31 @@ def test_no_tick_watchdog_marks_realtime_subscriptions_stale(monkeypatch, tmp_pa
     assert status["latest_snapshot"]["realtime_subscription_repair"]["status"] == "STALE_MARKED"
 
 
+def test_no_tick_watchdog_marks_stale_when_tick_counter_stalls(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRADING_REALTIME_NO_TICK_REPAIR_AFTER_SEC", "0")
+    monkeypatch.setenv("TRADING_REALTIME_NO_TICK_REPAIR_COOLDOWN_SEC", "1")
+    runtime = _FakeRuntime()
+    supervisor, bridge = _supervisor(tmp_path, runtime)
+    bridge.quality_snapshot["total_price_ticks"] = 1
+    supervisor.gateway_state.status.connected = True
+    supervisor.gateway_state.status.kiwoom_logged_in = True
+    supervisor.gateway_state.status.last_heartbeat_at = utc_timestamp()
+
+    async def scenario():
+        await supervisor.start()
+        first = await supervisor.run_once()
+        second = await supervisor.run_once()
+        await supervisor.shutdown()
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert runtime.subscription_manager.stale_reasons == ["NO_PRICE_TICKS_AFTER_REGISTER"]
+    assert "realtime_subscription_repair" not in first["latest_snapshot"]
+    assert second["latest_snapshot"]["realtime_subscription_repair"]["status"] == "STALE_MARKED"
+    assert second["latest_snapshot"]["realtime_subscription_repair"]["total_price_ticks"] == 1
+
+
 def test_realtime_stale_warning_clears_after_ticks_recover(tmp_path):
     runtime = _FakeRuntime()
     supervisor, bridge = _supervisor(tmp_path, runtime)

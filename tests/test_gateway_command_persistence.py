@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from trading.broker.command_persistence import SQLiteCommandStore
-from trading.broker.command_queue import CommandStatus
+from trading.broker.command_queue import CommandRecord, CommandStatus
 from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import GatewayCommand
 
@@ -26,6 +26,16 @@ def test_enqueue_creates_gateway_command_row(tmp_path):
     assert record is not None
     assert record.status == CommandStatus.QUEUED
     assert state.command_snapshot()["queued_count"] == 1
+
+
+def test_naive_command_record_time_is_interpreted_as_local_time():
+    naive_local = datetime(2026, 6, 19, 9, 37, 0)
+
+    record = CommandRecord.create(GatewayCommand(type="register_realtime", command_id="cmd-naive-local"), now=naive_local)
+
+    expected = naive_local.astimezone(timezone.utc).replace(microsecond=0).isoformat(timespec="seconds")
+    assert record.created_at == expected
+    assert record.expires_at == (naive_local + timedelta(seconds=60)).astimezone(timezone.utc).replace(microsecond=0).isoformat(timespec="seconds")
 
 
 def test_dispatch_ack_fail_cancel_and_expire_are_persisted(tmp_path):

@@ -564,7 +564,7 @@ def _clean_time(value: datetime | None = None) -> datetime:
     if value is None:
         value = datetime.now(timezone.utc)
     if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
+        value = value.astimezone()
     return value.astimezone(timezone.utc).replace(microsecond=0)
 
 

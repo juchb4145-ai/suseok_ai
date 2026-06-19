@@ -897,8 +897,12 @@ class RuntimeSupervisor:
         if self._pending_price_tick_count() > 0:
             return
         quality = self._realtime_data_quality_snapshot()
-        if _safe_int(quality.get("total_price_ticks"), 0) > 0:
-            return
+        total_ticks = _safe_int(quality.get("total_price_ticks"), 0)
+        with self._state_lock:
+            baseline_ticks = int(self._last_realtime_stale_total_ticks or 0)
+            if total_ticks > baseline_ticks:
+                self._last_realtime_stale_total_ticks = total_ticks
+                return
         started_perf = float(self._runtime_started_perf or 0.0)
         if started_perf <= 0:
             return
@@ -930,7 +934,7 @@ class RuntimeSupervisor:
             "status": "STALE_MARKED",
             "reason": reason,
             "subscription_active_count": _safe_int(snapshot.get("subscription_active_count"), 0),
-            "total_price_ticks": 0,
+            "total_price_ticks": total_ticks,
         }
 
     def _set_worker_stage(self, stage: str) -> None:
