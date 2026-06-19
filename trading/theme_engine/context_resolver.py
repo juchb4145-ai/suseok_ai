@@ -28,7 +28,7 @@ class BestThemeContextResolver:
         previous_selected_theme_id: str = "",
     ) -> BestThemeContext:
         clean_code = normalize_code(code)
-        stocks = [dict(item or {}) for item in list(theme_board.get("stocks") or []) if normalize_code(dict(item or {}).get("code") or "") == clean_code]
+        stocks = _stock_contexts(theme_board, clean_code)
         themes_by_id = _themes_by_id(theme_board)
         candidates = []
         for stock in stocks:
@@ -90,11 +90,26 @@ def _themes_by_id(board: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     return themes
 
 
-def _score(stock: Mapping[str, Any], theme: Mapping[str, Any]) -> tuple[int, int, int, float, float, int, float]:
+def _stock_contexts(board: Mapping[str, Any], code: str) -> list[dict[str, Any]]:
+    contexts: list[dict[str, Any]] = []
+    grouped = board.get("stock_contexts_by_code")
+    if isinstance(grouped, Mapping):
+        contexts.extend(dict(item or {}) for item in list(grouped.get(code) or []))
+    contexts.extend(dict(item or {}) for item in list(board.get("stocks") or []) if normalize_code(dict(item or {}).get("code") or "") == code)
+    by_theme: dict[str, dict[str, Any]] = {}
+    for stock in contexts:
+        theme_id = str(stock.get("theme_id") or "")
+        if theme_id:
+            by_theme[theme_id] = stock
+    return list(by_theme.values())
+
+
+def _score(stock: Mapping[str, Any], theme: Mapping[str, Any]) -> tuple[int, int, int, int, float, float, int, float]:
     return (
         _freshness_priority(theme),
         _theme_state_priority(theme),
         _trade_role_priority(stock),
+        _leadership_status_priority(theme),
         _float(theme.get("leadership_score")),
         _float(theme.get("theme_score")),
         _int(theme.get("persistence_count")),
@@ -125,6 +140,18 @@ def _theme_state_priority(theme: Mapping[str, Any]) -> int:
 def _trade_role_priority(stock: Mapping[str, Any]) -> int:
     role = str(stock.get("trade_role") or stock.get("stock_role") or "").upper()
     return {"LEADER_CONFIRMED": 5, "CO_LEADER_CONFIRMED": 4, "FOLLOWER_ALLOWED": 3, "LEADER": 2, "CO_LEADER": 2}.get(role, 0)
+
+
+def _leadership_status_priority(theme: Mapping[str, Any]) -> int:
+    status = str(theme.get("leadership_status") or "").upper()
+    return {
+        "TAKEOVER_CONFIRMED": 6,
+        "INCUMBENT": 5,
+        "CHALLENGER": 4,
+        "TAKEOVER_PENDING": 3,
+        "LOSING_LEADERSHIP": 2,
+        "ROTATED_OUT": 0,
+    }.get(status, 1)
 
 
 def _reason(stock: Mapping[str, Any], theme: Mapping[str, Any]) -> str:

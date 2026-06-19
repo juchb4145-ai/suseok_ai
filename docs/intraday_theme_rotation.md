@@ -182,9 +182,38 @@ Statuses:
 Rules:
 
 - A challenger must beat the incumbent by score and flow-share advantage.
-- Takeover requires persistence by seconds or cycles.
+- Takeover requires both persistence seconds and persistence cycles. Seconds and cycles are tracked independently, and either one alone is insufficient.
 - `DATA_WAIT`, stale, or weak themes cannot take over.
 - An incumbent can enter `LOSING_LEADERSHIP` when recent flow collapses.
+- Latest leadership status is restored from `theme_leadership_latest` at runtime start and transitions are appended to `theme_leadership_transitions`.
+
+## Theme State Time Hysteresis
+
+`ThemeStateMachine.apply(cohorts, now=current)` keeps time-aware state fields so Theme Core V3 does not promote or demote a theme on a single cycle.
+
+Default controls:
+
+```text
+TRADING_THEME_MIN_LEADING_PERSISTENCE_CYCLES=3
+TRADING_THEME_MIN_LEADING_PERSISTENCE_SEC=30
+TRADING_THEME_MIN_LEADER_STABILITY_CYCLES=2
+TRADING_THEME_MIN_LEADER_STABILITY_SEC=20
+TRADING_THEME_STATE_MIN_DWELL_SEC=15
+TRADING_THEME_FADING_MIN_HOLD_SEC=30
+TRADING_THEME_RECOVERY_CONFIRM_CYCLES=3
+TRADING_THEME_RECOVERY_CONFIRM_SEC=30
+```
+
+Tracked fields include `state_entered_at`, `state_age_sec`, `state_cycle_count`, `strong_since`, `spreading_since`, `leading_since`, `fading_since`, `recovery_pending_since`, `recovery_cycle_count`, `temporal_persistence_sec`, `leader_stability_sec`, `last_strong_at`, and `last_fresh_signal_at`.
+
+LEADING confirmation requires all of:
+
+- enough spreading or leading cycles
+- enough elapsed persistence seconds
+- enough same-leader cycles
+- enough same-leader seconds
+
+Short realtime gaps are handled by stale grace: an active theme is not immediately downgraded to `FADING_THEME` only because the latest tick became stale within the grace window. Once grace is exhausted, normal FADING and recovery confirmation rules apply.
 
 ## Expansion Lease
 
@@ -197,6 +226,8 @@ Lease behavior:
 - first fresh tick is tracked separately
 - removed themes enter removal pending only after minimum hold
 - expired leases are removable
+- leases are persisted in `theme_expansion_leases` and restored at runtime start
+- a code is removable only when no retained lease remains for that code across all themes
 
 This protects the realtime registration set from rapid add/remove churn while still allowing rotation out when a theme is no longer eligible.
 
@@ -242,6 +273,14 @@ Dirty publishers connect observation products to `DirtyStrategyEvaluator` withou
 `trading/theme_engine/context_resolver.py` resolves multi-theme stocks to the most actionable current theme by freshness, theme state, trade role, leadership score, theme score, persistence, and role score.
 
 This prevents a stock that belongs to several themes from being evaluated with stale or weaker context just because that theme appeared first in the board.
+
+The resolver consumes the full Theme Core V3 context maps:
+
+- `themes_by_id`
+- `stock_contexts_by_code`
+- `leadership_by_theme`
+
+The selected theme id is part of Strategy Context V3. If the best theme for a stock changes, the strategy context id changes and the dirty publisher can re-evaluate that stock without relying on Dashboard TOP5 membership.
 
 ## Dashboard Direction
 

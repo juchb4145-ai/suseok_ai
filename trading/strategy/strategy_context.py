@@ -16,6 +16,7 @@ from trading.strategy.market_regime import (
     systemic_risk_off_state,
 )
 from trading.strategy.models import Candidate, CandidateState
+from trading.theme_engine.context_resolver import BestThemeContextResolver
 
 
 STRATEGY_CONTEXT_SCHEMA_VERSION = "strategy_context_v3"
@@ -78,6 +79,10 @@ class StrategyThemeContext:
     co_leader_symbols: tuple[str, ...] = ()
     leader_changed: bool = False
     leader_stability_count: int = 0
+    leadership_status: str = ""
+    leadership_score: float = 0.0
+    leadership_rank: int = 0
+    leadership_rank_delta: int = 0
     strong_count: int = 0
     leader_count: int = 0
     breadth_ratio: float = 0.0
@@ -163,6 +168,16 @@ class StrategyContextSnapshot:
     stock: StrategyStockContext
     data: StrategyDataContext
     risk: StrategyRiskContext
+    selected_theme_id: str = ""
+    previous_selected_theme_id: str = ""
+    theme_selection_changed: bool = False
+    theme_selection_reason: str = ""
+    alternative_theme_ids: tuple[str, ...] = ()
+    resolver_version: str = "best_theme_context_v1"
+    selected_theme_leadership_status: str = ""
+    selected_theme_leadership_score: float = 0.0
+    selected_theme_rank: int = 0
+    selected_theme_rank_delta: int = 0
     source_versions: dict[str, str] = field(default_factory=dict)
     source_timestamps: dict[str, str] = field(default_factory=dict)
     context_fresh: bool = False
@@ -185,11 +200,13 @@ class StrategyContextAssembler:
         *,
         market_data: MarketDataStore | None = None,
         candle_builder: Any | None = None,
+        best_theme_context_resolver: BestThemeContextResolver | None = None,
         clock=None,
     ) -> None:
         self.db = db
         self.market_data = market_data
         self.candle_builder = candle_builder
+        self.best_theme_context_resolver = best_theme_context_resolver or BestThemeContextResolver()
         self.clock = clock or datetime.now
 
     def assemble_candidate(
@@ -207,8 +224,14 @@ class StrategyContextAssembler:
         market_payload = dict(market_context or self._latest_market_context(trade_date) or {})
         theme_payload = dict(theme_board or self._latest_theme_board(trade_date) or {})
         tick = self.market_data.latest_tick(code) if self.market_data is not None else None
-        stock_payload = _stock_payload_for_code(theme_payload, code)
-        theme_payload_for_stock = _theme_payload_for_stock(theme_payload, stock_payload, candidate)
+        previous_selected_theme_id = self._previous_selected_theme_id(trade_date, code)
+        best_theme = self.best_theme_context_resolver.resolve(
+            code,
+            theme_board=theme_payload,
+            previous_selected_theme_id=previous_selected_theme_id,
+        )
+        stock_payload = dict(best_theme.stock or _stock_payload_for_code(theme_payload, code) or {})
+        theme_payload_for_stock = dict(best_theme.theme or _theme_payload_for_stock(theme_payload, stock_payload, candidate) or {})
 
         market = _market_context(candidate, market_payload, code)
         theme = _theme_context(theme_payload_for_stock, stock_payload, theme_payload)
@@ -233,6 +256,8 @@ class StrategyContextAssembler:
             theme_at=theme.calculated_at,
             role=stock.trade_stock_role,
             theme_state=theme.theme_state,
+            selected_theme_id=best_theme.selected_theme_id,
+            leadership_status=theme.leadership_status,
         )
         return StrategyContextSnapshot(
             context_id=context_id,
@@ -240,6 +265,16 @@ class StrategyContextAssembler:
             calculated_at=current.isoformat(),
             candidate_id=candidate.id,
             code=code,
+            selected_theme_id=best_theme.selected_theme_id,
+            previous_selected_theme_id=best_theme.previous_selected_theme_id,
+            theme_selection_changed=best_theme.theme_selection_changed,
+            theme_selection_reason=best_theme.selected_reason,
+            alternative_theme_ids=best_theme.alternative_theme_ids,
+            resolver_version=best_theme.resolver_version,
+            selected_theme_leadership_status=theme.leadership_status,
+            selected_theme_leadership_score=theme.leadership_score,
+            selected_theme_rank=_int(theme_payload_for_stock.get("theme_rank") or theme_payload_for_stock.get("leadership_rank")),
+            selected_theme_rank_delta=theme.leadership_rank_delta,
             session_phase=session_phase(current).value,
             market=market,
             theme=theme,
@@ -317,6 +352,9 @@ class StrategyContextAssembler:
             metadata["strategy_context_v3"] = payload
             metadata["strategy_context_version"] = STRATEGY_CONTEXT_SCHEMA_VERSION
             metadata["strategy_context_id"] = snapshot.context_id
+            metadata["selected_theme_id"] = snapshot.selected_theme_id
+            metadata["previous_selected_theme_id"] = snapshot.previous_selected_theme_id
+            metadata["theme_selection_changed"] = snapshot.theme_selection_changed
             metadata["session_phase"] = snapshot.session_phase
             metadata["blocking_stage"] = snapshot.blocking_stage
             metadata["primary_reason_code"] = snapshot.primary_reason_code
@@ -333,6 +371,15 @@ class StrategyContextAssembler:
     def _latest_theme_board(self, trade_date: str) -> dict[str, Any]:
         loader = getattr(self.db, "latest_theme_board_snapshot", None)
         return dict(loader(trade_date=trade_date) or {}) if callable(loader) else {}
+
+    def _previous_selected_theme_id(self, trade_date: str, code: str) -> str:
+        loader = getattr(self.db, "latest_strategy_context", None)
+        if not callable(loader):
+            return ""
+        previous = dict(loader(trade_date=trade_date, code=code) or {})
+        if not previous:
+            return ""
+        return str(previous.get("selected_theme_id") or dict(previous.get("theme") or {}).get("theme_id") or "")
 
 
 @dataclass
@@ -500,6 +547,10 @@ def _theme_context(theme: Mapping[str, Any], stock: Mapping[str, Any], board: Ma
         co_leader_symbols=tuple(normalize_code(item) for item in list(theme.get("co_leader_symbols") or []) if normalize_code(item)),
         leader_changed=bool(theme.get("leader_changed")),
         leader_stability_count=_int(theme.get("leader_stability_count")),
+        leadership_status=str(theme.get("leadership_status") or ""),
+        leadership_score=_float(theme.get("leadership_score")),
+        leadership_rank=_int(theme.get("leadership_rank") or theme.get("theme_rank")),
+        leadership_rank_delta=_int(theme.get("leadership_rank_delta") or theme.get("rank_delta")),
         strong_count=_int(theme.get("strong_count")),
         leader_count=_int(theme.get("leader_count")),
         breadth_ratio=_float(theme.get("breadth_ratio") or theme.get("strong_ratio")),
@@ -665,6 +716,11 @@ def _blocking_stage(
 
 
 def _stock_payload_for_code(board: Mapping[str, Any], code: str) -> dict[str, Any]:
+    grouped = board.get("stock_contexts_by_code")
+    if isinstance(grouped, Mapping):
+        items = [dict(item or {}) for item in list(grouped.get(code) or [])]
+        if items:
+            return items[0]
     for item in list(board.get("stocks") or []):
         stock = dict(item or {})
         if normalize_code(stock.get("code") or "") == code:
@@ -677,6 +733,11 @@ def _theme_payload_for_stock(board: Mapping[str, Any], stock: Mapping[str, Any],
     if not theme_id:
         theme_ids = list(candidate.theme_ids or [])
         theme_id = str(theme_ids[0]) if theme_ids else str(dict(candidate.metadata or {}).get("best_theme_id") or "")
+    themes_by_id = board.get("themes_by_id")
+    if isinstance(themes_by_id, Mapping) and theme_id:
+        theme = dict(themes_by_id.get(theme_id) or {})
+        if theme:
+            return theme
     for item in list(board.get("top_themes") or []):
         theme = dict(item or {})
         if str(theme.get("theme_id") or "") == theme_id:
@@ -799,16 +860,28 @@ def _candle_counts(candle_builder: Any | None, code: str) -> dict[int, int]:
     return counts
 
 
-def _context_id(*, candidate_id: int | None, code: str, market_at: str, theme_at: str, role: str, theme_state: str) -> str:
+def _context_id(
+    *,
+    candidate_id: int | None,
+    code: str,
+    market_at: str,
+    theme_at: str,
+    role: str,
+    theme_state: str,
+    selected_theme_id: str = "",
+    leadership_status: str = "",
+) -> str:
     raw = "|".join(
         [
             STRATEGY_CONTEXT_SCHEMA_VERSION,
             str(candidate_id or ""),
             normalize_code(code),
+            str(selected_theme_id or ""),
             str(market_at or ""),
             str(theme_at or ""),
             str(role or ""),
             str(theme_state or ""),
+            str(leadership_status or ""),
         ]
     )
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]

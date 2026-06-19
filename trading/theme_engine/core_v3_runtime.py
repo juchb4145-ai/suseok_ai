@@ -12,7 +12,7 @@ from trading.theme_engine.candidate_bridge import CandidateBridge
 from trading.theme_engine.candidate_bridge_reconciler import CandidateBridgeSourceReconciler
 from trading.theme_engine.cohort import ThemeCohortEngine
 from trading.theme_engine.expansion import FocusedExpansionPlanner
-from trading.theme_engine.leadership_handover import LeadershipHandoverEngine, ThemeLeadershipRanker
+from trading.theme_engine.leadership_handover import LeadershipHandoverEngine, ThemeLeadershipRanker, ThemeLeadershipSnapshot
 from trading.theme_engine.models import ThemeMembership
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.roles import RawStockRole, StockRoleDecision, StockRoleEngine
@@ -106,10 +106,16 @@ class ThemeCoreV3RuntimePipeline:
         self.last_result: dict[str, Any] | None = None
         self.last_summary: dict[str, Any] = _empty_summary(enabled=self.config.enabled, observe_only=self.config.observe_only)
         self.last_expansion_plan = None
+        self.last_theme_states: list[ThemeStateSnapshot] = []
+        self.last_role_decisions: list[StockRoleDecision] = []
+        self.last_leadership_snapshots: list[Any] = []
+        self.last_theme_flows: dict[str, Any] = {}
         self.last_run_at: datetime | None = None
         self._active_registry_restored_trade_date = ""
+        self._theme_state_restored_trade_date = ""
         self._turnover_flow_restored_trade_date = ""
         self._bridge_reconciler_restored_trade_date = ""
+        self._leadership_restored_trade_date = ""
 
     def run_if_due(self, now: datetime | None = None, *, market_context: Mapping[str, Any] | None = None) -> dict[str, Any]:
         current = (now or self.clock()).replace(microsecond=0)
@@ -163,10 +169,12 @@ class ThemeCoreV3RuntimePipeline:
             self._persist_turnover_observations(stock_flows.values(), trade_date=trade_date)
         cohorts = self.cohort_engine.build(theme_inputs, seed_signals)
         theme_flows = self.turnover_flow_tracker.theme_flows(cohorts, observed_at=current.isoformat()) if self.config.turnover_flow_enabled else {}
-        theme_states = self.state_machine.apply(cohorts)
+        theme_states = self.state_machine.apply(cohorts, now=current)
         self._persist_theme_states(theme_states, trade_date=trade_date, calculated_at=current.isoformat())
-        leadership_ranks = self.leadership_ranker.rank(theme_states, flows=theme_flows) if self.config.leadership_handover_enabled else []
+        self._restore_leadership_state(trade_date)
+        leadership_ranks = self.leadership_ranker.rank(theme_states, flows=theme_flows, previous=self.handover_engine.previous_by_theme()) if self.config.leadership_handover_enabled else []
         leadership_snapshots, leadership_transitions = self.handover_engine.apply(leadership_ranks, now=current) if self.config.leadership_handover_enabled else ([], [])
+        self._persist_leadership_state(leadership_snapshots, leadership_transitions, trade_date=trade_date, calculated_at=current.isoformat())
         role_decisions = [
             decision
             for state in theme_states
@@ -242,6 +250,10 @@ class ThemeCoreV3RuntimePipeline:
             summary["status"] = "DATA_WAIT"
             summary["reason_codes"] = list(dict.fromkeys([*list(summary.get("reason_codes") or []), *market_input["reason_codes"]]))
         self.last_result = snapshot
+        self.last_theme_states = list(theme_states)
+        self.last_role_decisions = list(role_decisions)
+        self.last_leadership_snapshots = list(leadership_snapshots)
+        self.last_theme_flows = dict(theme_flows or {})
         self.last_summary = summary
         self.last_run_at = current
         return dict(summary)
@@ -444,14 +456,18 @@ class ThemeCoreV3RuntimePipeline:
         return True
 
     def _restore_theme_state(self, trade_date: str) -> None:
+        if self._theme_state_restored_trade_date == trade_date:
+            return
         loader = getattr(self.db, "list_theme_state_runtime", None)
         if not callable(loader):
+            self._theme_state_restored_trade_date = trade_date
             return
         rows = list(loader(trade_date=trade_date) or [])
         snapshots = [_state_snapshot_from_runtime_row(row) for row in rows]
         restore = getattr(self.state_machine, "restore", None)
         if callable(restore):
             restore([snapshot for snapshot in snapshots if snapshot.theme_id])
+        self._theme_state_restored_trade_date = trade_date
 
     def _persist_theme_states(self, states: Iterable[ThemeStateSnapshot], *, trade_date: str, calculated_at: str) -> int:
         saver = getattr(self.db, "save_theme_state_runtime", None)
@@ -462,6 +478,28 @@ class ThemeCoreV3RuntimePipeline:
             payload = _theme_state_payload(state, trade_date=trade_date, calculated_at=calculated_at)
             saver(payload, trade_date=trade_date, calculated_at=calculated_at)
             count += 1
+        return count
+
+    def _restore_leadership_state(self, trade_date: str) -> None:
+        if self._leadership_restored_trade_date == trade_date:
+            return
+        loader = getattr(self.db, "list_theme_leadership_latest", None)
+        restore = getattr(self.handover_engine, "restore", None)
+        if callable(loader) and callable(restore):
+            restore(_leadership_snapshot_from_row(row) for row in list(loader(trade_date=trade_date) or []))
+        self._leadership_restored_trade_date = trade_date
+
+    def _persist_leadership_state(self, snapshots: Iterable[Any], transitions: Iterable[Any], *, trade_date: str, calculated_at: str) -> int:
+        saver = getattr(self.db, "save_theme_leadership_latest", None)
+        transition_saver = getattr(self.db, "save_theme_leadership_transition", None)
+        count = 0
+        if callable(saver):
+            for snapshot in list(snapshots or []):
+                if saver(_leadership_state_payload(snapshot, trade_date=trade_date, calculated_at=calculated_at)):
+                    count += 1
+        if callable(transition_saver):
+            for transition in list(transitions or []):
+                transition_saver(_leadership_transition_payload(transition, trade_date=trade_date, calculated_at=calculated_at))
         return count
 
 
@@ -728,16 +766,22 @@ def _theme_board_snapshot(
     decisions = list(role_decisions)
     flow_by_theme = dict(theme_flows or {})
     leadership_by_theme = {item.theme_id: item for item in list(leadership_snapshots or []) if getattr(item, "theme_id", "")}
-    top_themes = [
+    all_theme_payloads = [
         _theme_payload(
             state,
             index,
             flow=flow_by_theme.get(state.theme_id),
             leadership=leadership_by_theme.get(state.theme_id),
         )
-        for index, state in enumerate(states[:top_theme_count], start=1)
+        for index, state in enumerate(states, start=1)
     ]
+    top_themes = all_theme_payloads[:top_theme_count]
     stocks = [_stock_payload(decision) for decision in sorted(decisions, key=lambda item: (item.theme_id, item.source_rank, -item.role_score))]
+    stock_contexts_by_code: dict[str, list[dict[str, Any]]] = {}
+    for stock in stocks:
+        code = normalize_code(str(stock.get("code") or ""))
+        if code:
+            stock_contexts_by_code.setdefault(code, []).append(stock)
     active_states = {
         ThemeCoreState.LEADING_THEME.value,
         ThemeCoreState.SPREADING_THEME.value,
@@ -752,6 +796,9 @@ def _theme_board_snapshot(
         "watch_theme_count": sum(1 for state in states if state.theme_state == ThemeCoreState.WATCH_THEME.value),
         "data_wait_theme_count": sum(1 for state in states if state.theme_state == ThemeCoreState.DATA_WAIT.value),
         "top_themes": top_themes,
+        "themes_by_id": {str(theme.get("theme_id") or ""): theme for theme in all_theme_payloads if str(theme.get("theme_id") or "")},
+        "leadership_by_theme": {theme_id: _leadership_payload(leadership) for theme_id, leadership in leadership_by_theme.items()},
+        "stock_contexts_by_code": stock_contexts_by_code,
         "stocks": stocks,
         "turnover_flow": _turnover_flow_summary(flow_by_theme),
         "leadership_handover": _leadership_summary(leadership_by_theme.values(), ()),
@@ -778,6 +825,13 @@ def _theme_payload(state: ThemeStateSnapshot, rank: int, *, flow: Any = None, le
         "theme_score": state.theme_score,
         "theme_score_delta": getattr(state, "theme_score_delta", 0.0),
         "persistence_count": state.persistence_count,
+        "state_entered_at": getattr(state, "state_entered_at", ""),
+        "state_age_sec": getattr(state, "state_age_sec", 0),
+        "state_cycle_count": getattr(state, "state_cycle_count", 0),
+        "temporal_persistence_sec": getattr(state, "temporal_persistence_sec", 0),
+        "fading_since": getattr(state, "fading_since", ""),
+        "recovery_pending_since": getattr(state, "recovery_pending_since", ""),
+        "recovery_cycle_count": getattr(state, "recovery_cycle_count", 0),
         "strong_count": getattr(cohort, "strong_count", 0) if cohort is not None else 0,
         "leader_count": getattr(cohort, "leader_count", 0) if cohort is not None else 0,
         "breadth_ratio": getattr(cohort, "strong_ratio", 0.0) if cohort is not None else 0.0,
@@ -802,6 +856,9 @@ def _theme_payload(state: ThemeStateSnapshot, rank: int, *, flow: Any = None, le
         "leader_symbol": state.leader_symbol,
         "previous_leader_symbol": getattr(state, "previous_leader_symbol", ""),
         "co_leader_symbols": list(state.co_leader_symbols),
+        "leader_stability_sec": getattr(state, "leader_stability_sec", 0),
+        "last_strong_at": getattr(state, "last_strong_at", ""),
+        "last_fresh_signal_at": getattr(state, "last_fresh_signal_at", ""),
         "data_quality_reason": state.data_quality_reason,
         "data_quality_status": state.data_quality_reason or "OK",
         "leader_changed": bool(state.leader_changed),
@@ -824,6 +881,29 @@ def _stock_payload(decision: StockRoleDecision) -> dict[str, Any]:
         "entry_usable": False,
         "source_rank": decision.source_rank,
         "reason_codes": list(decision.reason_codes),
+    }
+
+
+def _leadership_payload(item: Any) -> dict[str, Any]:
+    return {
+        "theme_id": getattr(item, "theme_id", ""),
+        "theme_name": getattr(item, "theme_name", ""),
+        "current_rank": getattr(item, "current_rank", 0),
+        "previous_rank": getattr(item, "previous_rank", 0),
+        "rank_delta": getattr(item, "rank_delta", 0),
+        "leadership_status": getattr(item, "status", "NEUTRAL"),
+        "leadership_score": getattr(item, "leadership_score", 0.0),
+        "recent_flow_score": getattr(item, "recent_flow_score", 0.0),
+        "flow_share": getattr(item, "flow_share", 0.0),
+        "flow_share_delta": getattr(item, "flow_share_delta", 0.0),
+        "status_entered_at": getattr(item, "status_entered_at", ""),
+        "status_age_sec": getattr(item, "status_age_sec", 0),
+        "status_cycle_count": getattr(item, "status_cycle_count", 0),
+        "takeover_pending_since": getattr(item, "takeover_pending_since", ""),
+        "takeover_pending_cycle_count": getattr(item, "takeover_pending_cycle_count", 0),
+        "takeover_confirmed_at": getattr(item, "takeover_confirmed_at", ""),
+        "previous_incumbent_theme_id": getattr(item, "previous_incumbent_theme_id", ""),
+        "reason_codes": list(getattr(item, "handover_reason_codes", ()) or ()),
     }
 
 
@@ -948,8 +1028,79 @@ def _state_snapshot_from_runtime_row(row: Mapping[str, Any]) -> ThemeStateSnapsh
         leader_stability_count=max(1, _int(row.get("leader_stability_count"))),
         data_quality_reason=str(row.get("data_quality_reason") or row.get("data_quality_status") or ""),
         reason_codes=tuple(str(item) for item in list(row.get("reason_codes") or [])),
+        state_entered_at=str(row.get("state_entered_at") or ""),
+        state_age_sec=_int(row.get("state_age_sec")),
+        state_cycle_count=max(1, _int(row.get("state_cycle_count"))),
+        strong_since=str(row.get("strong_since") or ""),
+        spreading_since=str(row.get("spreading_since") or ""),
+        leading_since=str(row.get("leading_since") or ""),
+        fading_since=str(row.get("fading_since") or ""),
+        recovery_pending_since=str(row.get("recovery_pending_since") or ""),
+        recovery_cycle_count=_int(row.get("recovery_cycle_count")),
+        temporal_persistence_sec=_int(row.get("temporal_persistence_sec")),
+        leader_stability_sec=_int(row.get("leader_stability_sec")),
+        last_strong_at=str(row.get("last_strong_at") or ""),
+        last_fresh_signal_at=str(row.get("last_fresh_signal_at") or ""),
         cohort=None,
     )
+
+
+def _leadership_snapshot_from_row(row: Mapping[str, Any]) -> ThemeLeadershipSnapshot:
+    return ThemeLeadershipSnapshot(
+        theme_id=str(row.get("theme_id") or ""),
+        theme_name=str(row.get("theme_name") or ""),
+        current_rank=_int(row.get("current_rank")),
+        previous_rank=_int(row.get("previous_rank")),
+        rank_delta=_int(row.get("rank_delta")),
+        status=str(row.get("leadership_status") or row.get("status") or "NEUTRAL"),
+        recent_flow_score=_float(row.get("recent_flow_score")),
+        leadership_score=_float(row.get("leadership_score")),
+        flow_share=_float(row.get("flow_share")),
+        flow_share_delta=_float(row.get("flow_share_delta")),
+        status_entered_at=str(row.get("status_entered_at") or ""),
+        status_age_sec=_int(row.get("status_age_sec")),
+        status_cycle_count=_int(row.get("status_cycle_count")),
+        challenger_cycle_count=_int(row.get("challenger_cycle_count")),
+        takeover_pending_cycle_count=_int(row.get("takeover_pending_cycle_count")),
+        incumbent_cycle_count=_int(row.get("incumbent_cycle_count")),
+        last_ranked_at=str(row.get("last_ranked_at") or ""),
+        incumbent_since=str(row.get("incumbent_since") or ""),
+        challenger_since=str(row.get("challenger_since") or ""),
+        takeover_pending_since=str(row.get("takeover_pending_since") or ""),
+        takeover_confirmed_at=str(row.get("takeover_confirmed_at") or ""),
+        previous_incumbent_theme_id=str(row.get("previous_incumbent_theme_id") or ""),
+        handover_reason_codes=tuple(str(item) for item in list(row.get("reason_codes") or row.get("handover_reason_codes") or [])),
+    )
+
+
+def _leadership_state_payload(item: Any, *, trade_date: str, calculated_at: str) -> dict[str, Any]:
+    return {
+        **_leadership_payload(item),
+        "trade_date": trade_date,
+        "calculated_at": calculated_at,
+        "status": getattr(item, "status", ""),
+        "base_strength_score": getattr(item, "base_strength_score", 0.0),
+        "challenger_cycle_count": getattr(item, "challenger_cycle_count", 0),
+        "incumbent_cycle_count": getattr(item, "incumbent_cycle_count", 0),
+        "last_ranked_at": getattr(item, "last_ranked_at", ""),
+        "incumbent_since": getattr(item, "incumbent_since", ""),
+        "challenger_since": getattr(item, "challenger_since", ""),
+        "handover_reason_codes": list(getattr(item, "handover_reason_codes", ()) or ()),
+    }
+
+
+def _leadership_transition_payload(item: Any, *, trade_date: str, calculated_at: str) -> dict[str, Any]:
+    return {
+        "trade_date": trade_date,
+        "calculated_at": calculated_at,
+        "theme_id": getattr(item, "theme_id", ""),
+        "previous_status": getattr(item, "previous_status", ""),
+        "current_status": getattr(item, "current_status", ""),
+        "detected_at": getattr(item, "detected_at", calculated_at),
+        "previous_incumbent_theme_id": getattr(item, "previous_incumbent_theme_id", ""),
+        "current_incumbent_theme_id": getattr(item, "current_incumbent_theme_id", ""),
+        "reason_codes": list(getattr(item, "reason_codes", ()) or ()),
+    }
 
 
 def _summary_from_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -1008,6 +1159,11 @@ def _leadership_summary(snapshots: Iterable[Any], transitions: Iterable[Any]) ->
                 "recent_flow_score": item.recent_flow_score,
                 "flow_share": item.flow_share,
                 "handover_reason_codes": list(item.handover_reason_codes),
+                "status_age_sec": getattr(item, "status_age_sec", 0),
+                "status_cycle_count": getattr(item, "status_cycle_count", 0),
+                "takeover_pending_since": getattr(item, "takeover_pending_since", ""),
+                "takeover_pending_cycle_count": getattr(item, "takeover_pending_cycle_count", 0),
+                "takeover_confirmed_at": getattr(item, "takeover_confirmed_at", ""),
             }
             for item in snapshot_list[:5]
         ],
@@ -1016,6 +1172,8 @@ def _leadership_summary(snapshots: Iterable[Any], transitions: Iterable[Any]) ->
                 "theme_id": item.theme_id,
                 "previous_status": item.previous_status,
                 "current_status": item.current_status,
+                "previous_incumbent_theme_id": getattr(item, "previous_incumbent_theme_id", ""),
+                "current_incumbent_theme_id": getattr(item, "current_incumbent_theme_id", ""),
                 "reason_codes": list(item.reason_codes),
             }
             for item in transition_list[:10]

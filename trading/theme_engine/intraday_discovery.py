@@ -127,7 +127,7 @@ class IntradayDiscoveryScheduler:
 
     def enqueue_if_due(self, now: datetime) -> dict[str, Any]:
         current = _as_kst(now)
-        phase = _phase(current)
+        phase = _phase(current, self.config)
         summary = {
             "enabled": self.config.enabled,
             "status": "WAITING",
@@ -456,15 +456,19 @@ def _row_from_parsed(row: ParsedOpeningSeedRow, *, observed_at: str, session_pha
     )
 
 
-def _phase(now: datetime) -> IntradayDiscoveryPhase:
+def _phase(now: datetime, config: IntradayDiscoveryConfig) -> IntradayDiscoveryPhase:
     current = now.time()
-    if time(9, 20) <= current < time(11, 0):
+    start = _parse_hhmm(config.start, time(9, 20))
+    end = _parse_hhmm(config.end, time(15, 0))
+    if current < start or current >= end:
+        return IntradayDiscoveryPhase.CLOSED
+    if start <= current < time(11, 0):
         return IntradayDiscoveryPhase.MORNING
     if time(11, 0) <= current < time(13, 20):
         return IntradayDiscoveryPhase.MIDDAY
     if time(13, 20) <= current < time(14, 30):
         return IntradayDiscoveryPhase.ROTATION
-    if time(14, 30) <= current < time(15, 0):
+    if time(14, 30) <= current < end:
         return IntradayDiscoveryPhase.LATE
     return IntradayDiscoveryPhase.CLOSED
 
@@ -490,6 +494,14 @@ def _as_kst(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(microsecond=0)
     return value.astimezone(KST).replace(microsecond=0)
+
+
+def _parse_hhmm(value: str, default: time) -> time:
+    try:
+        hour, minute = str(value or "").split(":", 1)
+        return time(max(0, min(23, int(hour))), max(0, min(59, int(minute))))
+    except (TypeError, ValueError):
+        return default
 
 
 def _env_bool(name: str, default: bool) -> bool:

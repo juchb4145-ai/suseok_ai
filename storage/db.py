@@ -766,6 +766,19 @@ class TradingDatabase:
                 previous_leader_symbol TEXT NOT NULL DEFAULT '',
                 leader_stability_count INTEGER NOT NULL DEFAULT 0,
                 leader_changed INTEGER NOT NULL DEFAULT 0,
+                state_entered_at TEXT NOT NULL DEFAULT '',
+                state_age_sec INTEGER NOT NULL DEFAULT 0,
+                state_cycle_count INTEGER NOT NULL DEFAULT 0,
+                strong_since TEXT NOT NULL DEFAULT '',
+                spreading_since TEXT NOT NULL DEFAULT '',
+                leading_since TEXT NOT NULL DEFAULT '',
+                fading_since TEXT NOT NULL DEFAULT '',
+                recovery_pending_since TEXT NOT NULL DEFAULT '',
+                recovery_cycle_count INTEGER NOT NULL DEFAULT 0,
+                temporal_persistence_sec INTEGER NOT NULL DEFAULT 0,
+                leader_stability_sec INTEGER NOT NULL DEFAULT 0,
+                last_strong_at TEXT NOT NULL DEFAULT '',
+                last_fresh_signal_at TEXT NOT NULL DEFAULT '',
                 last_transition_at TEXT NOT NULL DEFAULT '',
                 last_calculated_at TEXT NOT NULL DEFAULT '',
                 data_quality_status TEXT NOT NULL DEFAULT '',
@@ -792,6 +805,69 @@ class TradingDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_theme_state_transitions_trade_theme
                 ON theme_state_transitions(trade_date, theme_id, id);
+            CREATE TABLE IF NOT EXISTS theme_leadership_latest (
+                trade_date TEXT NOT NULL,
+                theme_id TEXT NOT NULL,
+                theme_name TEXT NOT NULL DEFAULT '',
+                current_rank INTEGER NOT NULL DEFAULT 0,
+                previous_rank INTEGER NOT NULL DEFAULT 0,
+                rank_delta INTEGER NOT NULL DEFAULT 0,
+                leadership_status TEXT NOT NULL DEFAULT '',
+                leadership_score REAL NOT NULL DEFAULT 0,
+                recent_flow_score REAL NOT NULL DEFAULT 0,
+                flow_share REAL NOT NULL DEFAULT 0,
+                flow_share_delta REAL NOT NULL DEFAULT 0,
+                status_entered_at TEXT NOT NULL DEFAULT '',
+                status_age_sec INTEGER NOT NULL DEFAULT 0,
+                status_cycle_count INTEGER NOT NULL DEFAULT 0,
+                incumbent_since TEXT NOT NULL DEFAULT '',
+                challenger_since TEXT NOT NULL DEFAULT '',
+                takeover_pending_since TEXT NOT NULL DEFAULT '',
+                takeover_pending_cycle_count INTEGER NOT NULL DEFAULT 0,
+                takeover_confirmed_at TEXT NOT NULL DEFAULT '',
+                previous_incumbent_theme_id TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (trade_date, theme_id)
+            );
+            CREATE TABLE IF NOT EXISTS theme_leadership_transitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                theme_id TEXT NOT NULL,
+                previous_status TEXT NOT NULL DEFAULT '',
+                current_status TEXT NOT NULL DEFAULT '',
+                detected_at TEXT NOT NULL DEFAULT '',
+                previous_incumbent_theme_id TEXT NOT NULL DEFAULT '',
+                current_incumbent_theme_id TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_theme_leadership_transitions_trade_theme
+                ON theme_leadership_transitions(trade_date, theme_id, id);
+            CREATE TABLE IF NOT EXISTS theme_expansion_leases (
+                trade_date TEXT NOT NULL,
+                code TEXT NOT NULL,
+                theme_id TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                selected_at TEXT NOT NULL DEFAULT '',
+                first_active_at TEXT NOT NULL DEFAULT '',
+                first_fresh_tick_at TEXT NOT NULL DEFAULT '',
+                minimum_hold_until TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                last_eligible_at TEXT NOT NULL DEFAULT '',
+                removal_pending_at TEXT NOT NULL DEFAULT '',
+                cooldown_until TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                target_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (trade_date, code, theme_id, source)
+            );
+            CREATE INDEX IF NOT EXISTS idx_theme_expansion_leases_trade_status
+                ON theme_expansion_leases(trade_date, status, code);
             CREATE TABLE IF NOT EXISTS strategy_context_latest (
                 trade_date TEXT NOT NULL,
                 code TEXT NOT NULL,
@@ -2878,6 +2954,7 @@ class TradingDatabase:
         self._ensure_column("virtual_orders", "weight_pct", "REAL NOT NULL DEFAULT 100")
         self._ensure_column("virtual_orders", "details_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("virtual_positions", "details_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_theme_state_runtime_columns()
         self._ensure_strategy_runtime_settings_columns()
         self._ensure_runtime_order_intent_columns()
         self._ensure_runtime_order_intent_indexes()
@@ -7644,6 +7721,19 @@ class TradingDatabase:
         leader_changed = bool(payload.get("leader_changed"))
         reason_codes = list(payload.get("reason_codes") or [])
         data_quality = str(payload.get("data_quality_status") or payload.get("data_quality_reason") or "")
+        state_entered_at = str(payload.get("state_entered_at") or calculated_at)
+        state_age_sec = _safe_int(payload.get("state_age_sec"), 0)
+        state_cycle_count = _safe_int(payload.get("state_cycle_count"), persistence_count)
+        strong_since = str(payload.get("strong_since") or "")
+        spreading_since = str(payload.get("spreading_since") or "")
+        leading_since = str(payload.get("leading_since") or "")
+        fading_since = str(payload.get("fading_since") or "")
+        recovery_pending_since = str(payload.get("recovery_pending_since") or "")
+        recovery_cycle_count = _safe_int(payload.get("recovery_cycle_count"), 0)
+        temporal_persistence_sec = _safe_int(payload.get("temporal_persistence_sec"), 0)
+        leader_stability_sec = _safe_int(payload.get("leader_stability_sec"), 0)
+        last_strong_at = str(payload.get("last_strong_at") or "")
+        last_fresh_signal_at = str(payload.get("last_fresh_signal_at") or "")
         with self.conn:
             previous = self.load_theme_state_runtime(trade_date=trade_date, theme_id=theme_id)
             self.conn.execute(
@@ -7651,10 +7741,13 @@ class TradingDatabase:
                 INSERT INTO theme_state_runtime_latest(
                     trade_date, theme_id, previous_state, current_state, persistence_count,
                     theme_score, theme_score_delta, leader_symbol, previous_leader_symbol,
-                    leader_stability_count, leader_changed, last_transition_at,
-                    last_calculated_at, data_quality_status, reason_codes_json, payload_json,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    leader_stability_count, leader_changed, state_entered_at, state_age_sec,
+                    state_cycle_count, strong_since, spreading_since, leading_since,
+                    fading_since, recovery_pending_since, recovery_cycle_count,
+                    temporal_persistence_sec, leader_stability_sec, last_strong_at,
+                    last_fresh_signal_at, last_transition_at, last_calculated_at,
+                    data_quality_status, reason_codes_json, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(trade_date, theme_id) DO UPDATE SET
                     previous_state=excluded.previous_state,
                     current_state=excluded.current_state,
@@ -7665,6 +7758,19 @@ class TradingDatabase:
                     previous_leader_symbol=excluded.previous_leader_symbol,
                     leader_stability_count=excluded.leader_stability_count,
                     leader_changed=excluded.leader_changed,
+                    state_entered_at=excluded.state_entered_at,
+                    state_age_sec=excluded.state_age_sec,
+                    state_cycle_count=excluded.state_cycle_count,
+                    strong_since=excluded.strong_since,
+                    spreading_since=excluded.spreading_since,
+                    leading_since=excluded.leading_since,
+                    fading_since=excluded.fading_since,
+                    recovery_pending_since=excluded.recovery_pending_since,
+                    recovery_cycle_count=excluded.recovery_cycle_count,
+                    temporal_persistence_sec=excluded.temporal_persistence_sec,
+                    leader_stability_sec=excluded.leader_stability_sec,
+                    last_strong_at=excluded.last_strong_at,
+                    last_fresh_signal_at=excluded.last_fresh_signal_at,
                     last_transition_at=excluded.last_transition_at,
                     last_calculated_at=excluded.last_calculated_at,
                     data_quality_status=excluded.data_quality_status,
@@ -7684,6 +7790,19 @@ class TradingDatabase:
                     previous_leader_symbol,
                     leader_stability_count,
                     int(leader_changed),
+                    state_entered_at,
+                    state_age_sec,
+                    state_cycle_count,
+                    strong_since,
+                    spreading_since,
+                    leading_since,
+                    fading_since,
+                    recovery_pending_since,
+                    recovery_cycle_count,
+                    temporal_persistence_sec,
+                    leader_stability_sec,
+                    last_strong_at,
+                    last_fresh_signal_at,
                     calculated_at if previous_state != current_state or leader_changed else str(payload.get("last_transition_at") or calculated_at),
                     calculated_at,
                     data_quality,
@@ -7737,6 +7856,208 @@ class TradingDatabase:
             (str(trade_date),),
         ).fetchall()
         return [_row_to_theme_state_runtime(row) for row in rows]
+
+    def save_theme_leadership_latest(self, snapshot: dict) -> dict:
+        payload = dict(snapshot or {})
+        trade_date = str(payload.get("trade_date") or "")
+        theme_id = str(payload.get("theme_id") or "")
+        if not trade_date or not theme_id:
+            return {}
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO theme_leadership_latest(
+                    trade_date, theme_id, theme_name, current_rank, previous_rank,
+                    rank_delta, leadership_status, leadership_score, recent_flow_score,
+                    flow_share, flow_share_delta, status_entered_at, status_age_sec,
+                    status_cycle_count, incumbent_since, challenger_since,
+                    takeover_pending_since, takeover_pending_cycle_count,
+                    takeover_confirmed_at, previous_incumbent_theme_id,
+                    reason_codes_json, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(trade_date, theme_id) DO UPDATE SET
+                    theme_name=excluded.theme_name,
+                    current_rank=excluded.current_rank,
+                    previous_rank=excluded.previous_rank,
+                    rank_delta=excluded.rank_delta,
+                    leadership_status=excluded.leadership_status,
+                    leadership_score=excluded.leadership_score,
+                    recent_flow_score=excluded.recent_flow_score,
+                    flow_share=excluded.flow_share,
+                    flow_share_delta=excluded.flow_share_delta,
+                    status_entered_at=excluded.status_entered_at,
+                    status_age_sec=excluded.status_age_sec,
+                    status_cycle_count=excluded.status_cycle_count,
+                    incumbent_since=excluded.incumbent_since,
+                    challenger_since=excluded.challenger_since,
+                    takeover_pending_since=excluded.takeover_pending_since,
+                    takeover_pending_cycle_count=excluded.takeover_pending_cycle_count,
+                    takeover_confirmed_at=excluded.takeover_confirmed_at,
+                    previous_incumbent_theme_id=excluded.previous_incumbent_theme_id,
+                    reason_codes_json=excluded.reason_codes_json,
+                    payload_json=excluded.payload_json,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    trade_date,
+                    theme_id,
+                    str(payload.get("theme_name") or ""),
+                    _safe_int(payload.get("current_rank"), 0),
+                    _safe_int(payload.get("previous_rank"), 0),
+                    _safe_int(payload.get("rank_delta"), 0),
+                    str(payload.get("leadership_status") or payload.get("status") or ""),
+                    _float_value(payload.get("leadership_score")),
+                    _float_value(payload.get("recent_flow_score")),
+                    _float_value(payload.get("flow_share")),
+                    _float_value(payload.get("flow_share_delta")),
+                    str(payload.get("status_entered_at") or ""),
+                    _safe_int(payload.get("status_age_sec"), 0),
+                    _safe_int(payload.get("status_cycle_count"), 0),
+                    str(payload.get("incumbent_since") or ""),
+                    str(payload.get("challenger_since") or ""),
+                    str(payload.get("takeover_pending_since") or ""),
+                    _safe_int(payload.get("takeover_pending_cycle_count"), 0),
+                    str(payload.get("takeover_confirmed_at") or ""),
+                    str(payload.get("previous_incumbent_theme_id") or ""),
+                    _json_list(payload.get("reason_codes") or payload.get("handover_reason_codes") or []),
+                    _json_payload(payload),
+                ),
+            )
+        return self.load_theme_leadership_latest(trade_date=trade_date, theme_id=theme_id)
+
+    def load_theme_leadership_latest(self, *, trade_date: str, theme_id: str) -> dict:
+        row = self.conn.execute(
+            "SELECT * FROM theme_leadership_latest WHERE trade_date = ? AND theme_id = ?",
+            (str(trade_date), str(theme_id)),
+        ).fetchone()
+        return _row_to_theme_leadership_latest(row) if row else {}
+
+    def list_theme_leadership_latest(self, *, trade_date: str) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM theme_leadership_latest
+            WHERE trade_date = ?
+            ORDER BY current_rank ASC, leadership_score DESC, theme_id
+            """,
+            (str(trade_date),),
+        ).fetchall()
+        return [_row_to_theme_leadership_latest(row) for row in rows]
+
+    def save_theme_leadership_transition(self, transition: dict) -> dict:
+        payload = dict(transition or {})
+        trade_date = str(payload.get("trade_date") or "")
+        theme_id = str(payload.get("theme_id") or "")
+        if not trade_date or not theme_id:
+            return {}
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO theme_leadership_transitions(
+                    trade_date, theme_id, previous_status, current_status,
+                    detected_at, previous_incumbent_theme_id,
+                    current_incumbent_theme_id, reason_codes_json, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_date,
+                    theme_id,
+                    str(payload.get("previous_status") or ""),
+                    str(payload.get("current_status") or ""),
+                    str(payload.get("detected_at") or payload.get("calculated_at") or ""),
+                    str(payload.get("previous_incumbent_theme_id") or ""),
+                    str(payload.get("current_incumbent_theme_id") or ""),
+                    _json_list(payload.get("reason_codes") or []),
+                    _json_payload(payload),
+                ),
+            )
+            transition_id = int(cursor.lastrowid)
+        row = self.conn.execute("SELECT * FROM theme_leadership_transitions WHERE id = ?", (transition_id,)).fetchone()
+        return _row_to_theme_leadership_transition(row) if row else {}
+
+    def save_theme_expansion_lease(self, lease: dict, *, trade_date: str) -> dict:
+        payload = dict(lease or {})
+        code = _clean_stock_code(payload.get("code") or payload.get("stock_code")) or ""
+        theme_id = str(payload.get("theme_id") or "")
+        source = str(payload.get("source") or "reboot_v2_theme_expansion")
+        if not trade_date or not code or not source:
+            return {}
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO theme_expansion_leases(
+                    trade_date, code, theme_id, source, selected_at,
+                    first_active_at, first_fresh_tick_at, minimum_hold_until,
+                    expires_at, last_eligible_at, removal_pending_at,
+                    cooldown_until, status, reason_codes_json, target_json,
+                    payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(trade_date, code, theme_id, source) DO UPDATE SET
+                    selected_at=excluded.selected_at,
+                    first_active_at=excluded.first_active_at,
+                    first_fresh_tick_at=excluded.first_fresh_tick_at,
+                    minimum_hold_until=excluded.minimum_hold_until,
+                    expires_at=excluded.expires_at,
+                    last_eligible_at=excluded.last_eligible_at,
+                    removal_pending_at=excluded.removal_pending_at,
+                    cooldown_until=excluded.cooldown_until,
+                    status=excluded.status,
+                    reason_codes_json=excluded.reason_codes_json,
+                    target_json=excluded.target_json,
+                    payload_json=excluded.payload_json,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    str(trade_date),
+                    code,
+                    theme_id,
+                    source,
+                    str(payload.get("selected_at") or ""),
+                    str(payload.get("first_active_at") or ""),
+                    str(payload.get("first_fresh_tick_at") or ""),
+                    str(payload.get("minimum_hold_until") or ""),
+                    str(payload.get("expires_at") or ""),
+                    str(payload.get("last_eligible_at") or ""),
+                    str(payload.get("removal_pending_at") or ""),
+                    str(payload.get("cooldown_until") or ""),
+                    str(payload.get("status") or ""),
+                    _json_list(payload.get("reason_codes") or []),
+                    _json_payload(payload.get("target") or {}),
+                    _json_payload(payload),
+                ),
+            )
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM theme_expansion_leases
+            WHERE trade_date = ? AND code = ? AND theme_id = ? AND source = ?
+            """,
+            (str(trade_date), code, theme_id, source),
+        ).fetchone()
+        return _row_to_theme_expansion_lease(row) if row else {}
+
+    def save_theme_expansion_leases(self, leases: Iterable[dict], *, trade_date: str) -> int:
+        count = 0
+        for lease in leases:
+            if self.save_theme_expansion_lease(lease, trade_date=trade_date):
+                count += 1
+        return count
+
+    def list_theme_expansion_leases(self, *, trade_date: str, active_only: bool = False) -> list[dict]:
+        clauses = ["trade_date = ?"]
+        params: list[object] = [str(trade_date)]
+        if active_only:
+            clauses.append("status IN ('ACTIVE', 'HOLDING', 'REMOVAL_PENDING', 'PROTECTED')")
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM theme_expansion_leases
+            WHERE {" AND ".join(clauses)}
+            ORDER BY code, theme_id, source
+            """,
+            params,
+        ).fetchall()
+        return [_row_to_theme_expansion_lease(row) for row in rows]
 
     def save_strategy_context_snapshot(self, snapshot: dict) -> dict:
         payload = dict(snapshot or {})
@@ -12876,6 +13197,25 @@ class TradingDatabase:
             """
         )
 
+    def _ensure_theme_state_runtime_columns(self) -> None:
+        columns = {
+            "state_entered_at": "TEXT NOT NULL DEFAULT ''",
+            "state_age_sec": "INTEGER NOT NULL DEFAULT 0",
+            "state_cycle_count": "INTEGER NOT NULL DEFAULT 0",
+            "strong_since": "TEXT NOT NULL DEFAULT ''",
+            "spreading_since": "TEXT NOT NULL DEFAULT ''",
+            "leading_since": "TEXT NOT NULL DEFAULT ''",
+            "fading_since": "TEXT NOT NULL DEFAULT ''",
+            "recovery_pending_since": "TEXT NOT NULL DEFAULT ''",
+            "recovery_cycle_count": "INTEGER NOT NULL DEFAULT 0",
+            "temporal_persistence_sec": "INTEGER NOT NULL DEFAULT 0",
+            "leader_stability_sec": "INTEGER NOT NULL DEFAULT 0",
+            "last_strong_at": "TEXT NOT NULL DEFAULT ''",
+            "last_fresh_signal_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in columns.items():
+            self._ensure_column("theme_state_runtime_latest", name, definition)
+
     def _seed_legacy_strategy_runtime_settings(self) -> None:
         from trading.strategy.runtime_settings import legacy_profile_payload
 
@@ -15537,10 +15877,95 @@ def _row_to_theme_state_runtime(row: sqlite3.Row) -> dict:
     payload.setdefault("previous_leader_symbol", data.get("previous_leader_symbol", ""))
     payload.setdefault("leader_stability_count", int(data.get("leader_stability_count") or 0))
     payload.setdefault("leader_changed", bool(data.get("leader_changed")))
+    payload.setdefault("state_entered_at", data.get("state_entered_at", ""))
+    payload.setdefault("state_age_sec", int(data.get("state_age_sec") or 0))
+    payload.setdefault("state_cycle_count", int(data.get("state_cycle_count") or 0))
+    payload.setdefault("strong_since", data.get("strong_since", ""))
+    payload.setdefault("spreading_since", data.get("spreading_since", ""))
+    payload.setdefault("leading_since", data.get("leading_since", ""))
+    payload.setdefault("fading_since", data.get("fading_since", ""))
+    payload.setdefault("recovery_pending_since", data.get("recovery_pending_since", ""))
+    payload.setdefault("recovery_cycle_count", int(data.get("recovery_cycle_count") or 0))
+    payload.setdefault("temporal_persistence_sec", int(data.get("temporal_persistence_sec") or 0))
+    payload.setdefault("leader_stability_sec", int(data.get("leader_stability_sec") or 0))
+    payload.setdefault("last_strong_at", data.get("last_strong_at", ""))
+    payload.setdefault("last_fresh_signal_at", data.get("last_fresh_signal_at", ""))
     payload.setdefault("last_transition_at", data.get("last_transition_at", ""))
     payload.setdefault("last_calculated_at", data.get("last_calculated_at", ""))
     payload.setdefault("data_quality_status", data.get("data_quality_status", ""))
     payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    return payload
+
+
+def _row_to_theme_leadership_latest(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("theme_id", data.get("theme_id", ""))
+    payload.setdefault("theme_name", data.get("theme_name", ""))
+    payload.setdefault("current_rank", int(data.get("current_rank") or 0))
+    payload.setdefault("previous_rank", int(data.get("previous_rank") or 0))
+    payload.setdefault("rank_delta", int(data.get("rank_delta") or 0))
+    payload.setdefault("leadership_status", data.get("leadership_status", ""))
+    payload.setdefault("status", data.get("leadership_status", ""))
+    payload.setdefault("leadership_score", _float_value(data.get("leadership_score")))
+    payload.setdefault("recent_flow_score", _float_value(data.get("recent_flow_score")))
+    payload.setdefault("flow_share", _float_value(data.get("flow_share")))
+    payload.setdefault("flow_share_delta", _float_value(data.get("flow_share_delta")))
+    payload.setdefault("status_entered_at", data.get("status_entered_at", ""))
+    payload.setdefault("status_age_sec", int(data.get("status_age_sec") or 0))
+    payload.setdefault("status_cycle_count", int(data.get("status_cycle_count") or 0))
+    payload.setdefault("incumbent_since", data.get("incumbent_since", ""))
+    payload.setdefault("challenger_since", data.get("challenger_since", ""))
+    payload.setdefault("takeover_pending_since", data.get("takeover_pending_since", ""))
+    payload.setdefault("takeover_pending_cycle_count", int(data.get("takeover_pending_cycle_count") or 0))
+    payload.setdefault("takeover_confirmed_at", data.get("takeover_confirmed_at", ""))
+    payload.setdefault("previous_incumbent_theme_id", data.get("previous_incumbent_theme_id", ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    payload.setdefault("updated_at", data.get("updated_at", ""))
+    return payload
+
+
+def _row_to_theme_leadership_transition(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("id", data.get("id"))
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("theme_id", data.get("theme_id", ""))
+    payload.setdefault("previous_status", data.get("previous_status", ""))
+    payload.setdefault("current_status", data.get("current_status", ""))
+    payload.setdefault("detected_at", data.get("detected_at", ""))
+    payload.setdefault("previous_incumbent_theme_id", data.get("previous_incumbent_theme_id", ""))
+    payload.setdefault("current_incumbent_theme_id", data.get("current_incumbent_theme_id", ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    return payload
+
+
+def _row_to_theme_expansion_lease(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("code", data.get("code", ""))
+    payload.setdefault("theme_id", data.get("theme_id", ""))
+    payload.setdefault("source", data.get("source", ""))
+    payload.setdefault("selected_at", data.get("selected_at", ""))
+    payload.setdefault("first_active_at", data.get("first_active_at", ""))
+    payload.setdefault("first_fresh_tick_at", data.get("first_fresh_tick_at", ""))
+    payload.setdefault("minimum_hold_until", data.get("minimum_hold_until", ""))
+    payload.setdefault("expires_at", data.get("expires_at", ""))
+    payload.setdefault("last_eligible_at", data.get("last_eligible_at", ""))
+    payload.setdefault("removal_pending_at", data.get("removal_pending_at", ""))
+    payload.setdefault("cooldown_until", data.get("cooldown_until", ""))
+    payload.setdefault("status", data.get("status", ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    payload.setdefault("target", _safe_json_loads(data.pop("target_json", "{}"), {}))
+    payload.setdefault("updated_at", data.get("updated_at", ""))
     return payload
 
 

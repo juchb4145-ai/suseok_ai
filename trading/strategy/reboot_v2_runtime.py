@@ -15,6 +15,8 @@ from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.reboot_v2 import RebootV2RuntimeProfile
 from trading.strategy.runtime import StrategyRuntimeConfig
 from trading.strategy.context_dirty_publisher import MarketRegimeDirtyPublisher, StrategyContextDirtyPublisher, ThemeStateDirtyPublisher
+from trading.strategy.market_data_service import DirtyReason
+from trading.theme_engine.expansion_lease import ExpansionLeaseManager
 
 
 V2_RUNTIME_MODE = "strategy_reboot_v2"
@@ -42,6 +44,7 @@ class RebootV2Runtime:
     market_dirty_publisher: Any = None
     theme_dirty_publisher: Any = None
     strategy_context_dirty_publisher: Any = None
+    expansion_lease_manager: Any = None
     market_relative_strength_shadow_pipeline: Any = None
     exit_engine_reboot_pipeline: Any = None
     position_risk_pipeline: Any = None
@@ -60,6 +63,8 @@ class RebootV2Runtime:
         self.market_dirty_publisher = self.market_dirty_publisher or MarketRegimeDirtyPublisher()
         self.theme_dirty_publisher = self.theme_dirty_publisher or ThemeStateDirtyPublisher()
         self.strategy_context_dirty_publisher = self.strategy_context_dirty_publisher or StrategyContextDirtyPublisher()
+        self.expansion_lease_manager = self.expansion_lease_manager or ExpansionLeaseManager()
+        self._expansion_lease_restored_trade_date = ""
 
     def start(self, now: datetime | None = None) -> dict[str, Any]:
         current = (now or self.clock()).replace(microsecond=0)
@@ -222,11 +227,13 @@ class RebootV2Runtime:
             snapshot["theme_dirty_publish"] = _disabled_section("DIRTY_QUEUE_UNAVAILABLE")
             return
         board = getattr(self.theme_board_pipeline, "last_result", None) or self._latest_theme_board(now.date().isoformat())
+        theme_states = list(getattr(self.theme_board_pipeline, "last_theme_states", []) or [])
+        stock_roles = list(getattr(self.theme_board_pipeline, "last_role_decisions", []) or [])
         result = publisher.publish(
-            list(dict(board or {}).get("top_themes") or []),
+            theme_states or list(dict(board or {}).get("top_themes") or []),
             dirty_queue=queue,
-            code_by_theme=self._theme_codes_by_theme(board),
-            stock_roles=list(dict(board or {}).get("stocks") or []),
+            code_by_theme=self._theme_codes_by_theme_from_roles(stock_roles) if stock_roles else self._theme_codes_by_theme(board),
+            stock_roles=stock_roles or list(dict(board or {}).get("stocks") or []),
             now=now,
         )
         snapshot["theme_dirty_publish"] = _dirty_publish_payload(result)
@@ -265,6 +272,15 @@ class RebootV2Runtime:
                 continue
             theme_id = str(stock.get("theme_id") or "")
             code = normalize_code(str(stock.get("code") or ""))
+            if theme_id and code:
+                result.setdefault(theme_id, []).append(code)
+        return result
+
+    def _theme_codes_by_theme_from_roles(self, roles: Iterable[Any]) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for role in list(roles or []):
+            theme_id = str(getattr(role, "theme_id", "") or "")
+            code = normalize_code(str(getattr(role, "code", "") or ""))
             if theme_id and code:
                 result.setdefault(theme_id, []).append(code)
         return result
@@ -361,14 +377,27 @@ class RebootV2Runtime:
             snapshot["theme_expansion_subscription"] = _disabled_section("THEME_EXPANSION_SUBSCRIPTIONS_DISABLED")
             return
         targets = list(getattr(plan, "targets", ()) or ())
-        target_codes = {normalize_code(getattr(target, "code", "")): target for target in targets if normalize_code(getattr(target, "code", ""))}
         manager = self.subscription_manager
+        self._restore_expansion_leases(now)
+        protected_codes = self._protected_codes()
+        fresh_tick_codes = self._fresh_tick_codes(now)
+        lease_snapshot = self.expansion_lease_manager.reconcile(
+            targets,
+            now=now,
+            active_codes=list(manager.code_to_screen.keys()),
+            fresh_tick_codes=fresh_tick_codes,
+            protected_codes=protected_codes,
+        )
+        self._persist_expansion_leases(lease_snapshot, trade_date=now.date().isoformat())
+        self._publish_expansion_tick_ready(lease_snapshot, now)
+        retained_leases = list(getattr(self.expansion_lease_manager, "retained_leases", lambda: ())() or ())
+        target_codes = {normalize_code(getattr(lease, "code", "")): lease for lease in retained_leases if normalize_code(getattr(lease, "code", ""))}
         for code, record in list(manager.records.items()):
             if source in record.sources and code not in target_codes:
                 manager.remove_subscription(code, source)
                 self._save_expansion_subscription_decision(now, code=code, target=None, action="REMOVE", status="STALE")
         for code, target in target_codes.items():
-            manager.ensure_subscription(code, source, protected=bool(getattr(target, "protected", False)))
+            manager.ensure_subscription(code, source, protected=code in protected_codes or str(getattr(target, "status", "")) == "PROTECTED")
             self._save_expansion_subscription_decision(now, code=code, target=target, action="ENSURE", status="SELECTED")
         active = manager.sync()
         by_theme: dict[str, int] = {}
@@ -394,6 +423,7 @@ class RebootV2Runtime:
             "budget_used": len(target_codes),
             "waiting_for_tick_count": waiting,
             "top_reject_reasons": [{"reason": key, "count": count} for key, count in sorted(reason_counts.items(), key=lambda item: item[1], reverse=True)[:10]],
+            "lease_snapshot": _expansion_lease_payload(lease_snapshot),
             "warnings": list(manager.warnings),
         }
 
@@ -414,6 +444,62 @@ class RebootV2Runtime:
                 "target": getattr(target, "__dict__", {}) if target is not None else {},
             }
         )
+
+    def _restore_expansion_leases(self, now: datetime) -> None:
+        trade_date = now.date().isoformat()
+        if self._expansion_lease_restored_trade_date == trade_date:
+            return
+        loader = getattr(self.db, "list_theme_expansion_leases", None)
+        restore = getattr(self.expansion_lease_manager, "restore", None)
+        if callable(loader) and callable(restore):
+            restore(list(loader(trade_date=trade_date, active_only=True) or []))
+        self._expansion_lease_restored_trade_date = trade_date
+
+    def _persist_expansion_leases(self, lease_snapshot: Any, *, trade_date: str) -> int:
+        saver = getattr(self.db, "save_theme_expansion_leases", None)
+        if not callable(saver):
+            return 0
+        rows = []
+        for lease in list(getattr(lease_snapshot, "leases", ()) or ()):
+            payload = dict(getattr(lease, "__dict__", {}) or {})
+            target = payload.get("target")
+            payload["target"] = dict(getattr(target, "__dict__", {}) or {}) if target is not None else {}
+            payload["reason_codes"] = list(getattr(lease, "reason_codes", ()) or ())
+            rows.append(payload)
+        return int(saver(rows, trade_date=trade_date) or 0)
+
+    def _publish_expansion_tick_ready(self, lease_snapshot: Any, now: datetime) -> None:
+        queue = self._dirty_queue()
+        mark = getattr(queue, "mark_dirty", None)
+        if not callable(mark):
+            return
+        for lease in list(getattr(lease_snapshot, "leases", ()) or ()):
+            if "THEME_EXPANSION_TICK_READY" in set(getattr(lease, "reason_codes", ()) or ()) and str(getattr(lease, "first_fresh_tick_at", "") or "") == now.isoformat():
+                mark(getattr(lease, "code", ""), DirtyReason.THEME_EXPANSION_TICK_READY.value, marked_at=now)
+
+    def _protected_codes(self) -> set[str]:
+        codes: set[str] = set()
+        for position in self._open_positions():
+            code = normalize_code(str(getattr(position, "code", "") or getattr(position, "stock_code", "") or ""))
+            if code:
+                codes.add(code)
+        for order in self._pending_orders():
+            code = normalize_code(str(getattr(order, "code", "") or getattr(order, "stock_code", "") or ""))
+            if code:
+                codes.add(code)
+        return codes
+
+    def _fresh_tick_codes(self, now: datetime) -> set[str]:
+        codes: set[str] = set()
+        for code in list(getattr(self.subscription_manager, "code_to_screen", {}) or {}):
+            tick = self.market_data.latest_tick(code)
+            if tick is None or getattr(tick, "price", 0) <= 0:
+                continue
+            metadata = dict(getattr(tick, "metadata", {}) or {})
+            if str(metadata.get("price_source") or "REALTIME").upper() == "TR_BACKFILL":
+                continue
+            codes.add(normalize_code(code))
+        return codes
 
     def _run_pipeline(self, snapshot: dict[str, Any], name: str, pipeline: Any, now: datetime, **kwargs: Any) -> None:
         if pipeline is None:
@@ -543,6 +629,21 @@ def _dirty_publish_payload(result: Any) -> dict[str, Any]:
         "codes": list(getattr(result, "codes", ()) or ()),
         "live_order_allowed": False,
         "dry_run_order_allowed": False,
+    }
+
+
+def _expansion_lease_payload(snapshot: Any) -> dict[str, Any]:
+    return {
+        "calculated_at": str(getattr(snapshot, "calculated_at", "") or ""),
+        "active_lease_count": int(getattr(snapshot, "active_lease_count", 0) or 0),
+        "holding_count": int(getattr(snapshot, "holding_count", 0) or 0),
+        "protected_count": int(getattr(snapshot, "protected_count", 0) or 0),
+        "pending_removal_count": int(getattr(snapshot, "pending_removal_count", 0) or 0),
+        "expired_count": int(getattr(snapshot, "expired_count", 0) or 0),
+        "churn_count": int(getattr(snapshot, "churn_count", 0) or 0),
+        "first_tick_wait_count": int(getattr(snapshot, "first_tick_wait_count", 0) or 0),
+        "leases_by_theme": dict(getattr(snapshot, "lease_by_theme", {}) or {}),
+        "top_removal_reasons": list(getattr(snapshot, "top_removal_reasons", ()) or ()),
     }
 
 

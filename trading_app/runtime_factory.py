@@ -49,6 +49,7 @@ from trading.strategy.virtual_orders import VirtualOrderService
 from trading.theme_engine.backfill import ThemeBackfillConfig, ThemeBackfillService
 from trading.theme_engine.context_provider import DynamicThemeContextProvider
 from trading.theme_engine.core_v3_runtime import ThemeCoreV3RuntimeConfig, ThemeCoreV3RuntimePipeline
+from trading.theme_engine.expansion_lease import ExpansionLeaseManager
 from trading.theme_engine.intraday_discovery import IntradayDiscoveryConfig, IntradayDiscoveryRuntimePipeline
 from trading.theme_engine.opening_runtime import OpeningBurstRuntimeConfig, OpeningThemeBurstRuntimePipeline
 from trading.theme_engine.repository import ThemeEngineRepository
@@ -421,6 +422,7 @@ def build_reboot_v2_runtime_bundle(
         market_data=market_data,
         config=OrderManagerConfig.from_env(),
     )
+    expansion_lease_manager = ExpansionLeaseManager()
     runtime = RebootV2Runtime(
         db=db,
         subscription_manager=subscription_manager,
@@ -442,6 +444,7 @@ def build_reboot_v2_runtime_bundle(
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
         position_risk_pipeline=position_risk_pipeline,
         order_manager_pipeline=order_manager_pipeline,
+        expansion_lease_manager=expansion_lease_manager,
     )
     readiness_report = build_readiness_report(
         db,

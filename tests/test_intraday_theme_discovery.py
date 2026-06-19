@@ -76,6 +76,30 @@ def test_intraday_discovery_respects_observe_only_mode():
     assert summary["paused_reason"] == "NOT_OBSERVE_MODE"
 
 
+def test_intraday_discovery_respects_configured_start_end_window():
+    scheduler = IntradayDiscoveryScheduler(
+        GatewayStateStore(),
+        config=IntradayDiscoveryConfig(
+            enabled=True,
+            trading_mode="OBSERVE",
+            start="10:00",
+            end="10:30",
+            max_pending_commands=99,
+            queue_depth_limit=99,
+        ),
+    )
+
+    before = scheduler.enqueue_if_due(datetime(2026, 6, 19, 9, 59, 59))
+    inside = scheduler.enqueue_if_due(datetime(2026, 6, 19, 10, 0, 0))
+    after = scheduler.enqueue_if_due(datetime(2026, 6, 19, 10, 30, 1))
+
+    assert before["status"] == "SKIPPED"
+    assert before["paused_reason"] == "OUTSIDE_DISCOVERY_WINDOW"
+    assert inside["status"] == "QUEUED"
+    assert after["status"] == "SKIPPED"
+    assert after["paused_reason"] == "OUTSIDE_DISCOVERY_WINDOW"
+
+
 def test_intraday_discovery_ack_saves_idempotent_batch_rows(tmp_path):
     db = TradingDatabase(str(tmp_path / "intraday-ack.db"))
     command_id = "cmd-intraday-1"

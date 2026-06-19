@@ -38,6 +38,27 @@ def test_strategy_context_assembler_persists_nested_context_without_order_permis
     assert reloaded.metadata["strategy_context_v3"]["theme"]["theme_state"] == "LEADING_THEME"
 
 
+def test_strategy_context_id_changes_when_best_theme_selection_changes(tmp_path):
+    db = TradingDatabase(str(tmp_path / "context-best-theme.db"))
+    market_data = MarketDataStore()
+    candidate = _candidate(db)
+    _tick(market_data, "000001")
+    db.save_market_regime_snapshot(_market_snapshot())
+    db.save_theme_board_snapshot(_multi_theme_board(primary="ai", calculated_at="2026-06-19T09:20:00"))
+    assembler = StrategyContextAssembler(db, market_data=market_data)
+
+    first = assembler.assemble_candidate(candidate, now=datetime(2026, 6, 19, 9, 20, 0))
+    assembler.save_snapshots([candidate], [first], calculated_at=first.calculated_at)
+    db.save_theme_board_snapshot(_multi_theme_board(primary="robot", calculated_at="2026-06-19T09:21:00"))
+    second = assembler.assemble_candidate(candidate, now=datetime(2026, 6, 19, 9, 21, 0))
+
+    assert first.selected_theme_id == "ai"
+    assert second.selected_theme_id == "robot"
+    assert second.previous_selected_theme_id == "ai"
+    assert second.theme_selection_changed is True
+    assert second.context_id != first.context_id
+
+
 def test_entry_engine_uses_strategy_context_v3_without_legacy_theme_board_metadata(tmp_path):
     db = TradingDatabase(str(tmp_path / "entry-context.db"))
     market_data = MarketDataStore()
@@ -371,6 +392,48 @@ def _theme_board() -> dict:
                 "reason_codes": ["LEADER_CONFIRMED"],
             }
         ],
+        "ready_allowed": False,
+        "order_intent_allowed": False,
+    }
+
+
+def _multi_theme_board(*, primary: str, calculated_at: str) -> dict:
+    ai_score = 91.0 if primary == "ai" else 76.0
+    robot_score = 91.0 if primary == "robot" else 76.0
+    return {
+        "trade_date": TRADE_DATE,
+        "calculated_at": calculated_at,
+        "board_status": "OBSERVE",
+        "top_themes": [],
+        "themes_by_id": {
+            "ai": {
+                "theme_id": "ai",
+                "theme_name": "AI",
+                "theme_state": "LEADING_THEME" if primary == "ai" else "SPREADING_THEME",
+                "theme_status": "LEADING_THEME" if primary == "ai" else "SPREADING_THEME",
+                "theme_score": ai_score,
+                "leadership_score": ai_score,
+                "leadership_status": "INCUMBENT" if primary == "ai" else "CHALLENGER",
+                "persistence_count": 4,
+            },
+            "robot": {
+                "theme_id": "robot",
+                "theme_name": "Robot",
+                "theme_state": "LEADING_THEME" if primary == "robot" else "SPREADING_THEME",
+                "theme_status": "LEADING_THEME" if primary == "robot" else "SPREADING_THEME",
+                "theme_score": robot_score,
+                "leadership_score": robot_score,
+                "leadership_status": "INCUMBENT" if primary == "robot" else "CHALLENGER",
+                "persistence_count": 4,
+            },
+        },
+        "stock_contexts_by_code": {
+            "000001": [
+                {"code": "000001", "theme_id": "ai", "theme_name": "AI", "trade_role": "LEADER_CONFIRMED", "stock_role": "LEADER", "stock_score": 88.0},
+                {"code": "000001", "theme_id": "robot", "theme_name": "Robot", "trade_role": "LEADER_CONFIRMED", "stock_role": "LEADER", "stock_score": 88.0},
+            ]
+        },
+        "stocks": [],
         "ready_allowed": False,
         "order_intent_allowed": False,
     }

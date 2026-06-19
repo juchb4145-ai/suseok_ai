@@ -1,19 +1,24 @@
+from datetime import datetime, timedelta
+
 from trading.theme_engine.cohort import ThemeCohortSnapshot
 from trading.theme_engine.signals import ThemeDataWaitReason
 from trading.theme_engine.state_machine import ThemeCoreState, ThemeStateMachine
 
 
-def test_leading_theme_requires_two_persistent_cycles():
+def test_leading_theme_requires_cycles_and_seconds_persistence():
     machine = ThemeStateMachine()
     cohort = _cohort()
+    now = datetime(2026, 6, 19, 9, 20, 0)
 
-    first = machine.apply([cohort])[0]
-    second = machine.apply([cohort])[0]
+    first = machine.apply([cohort], now=now)[0]
+    second = machine.apply([cohort], now=now + timedelta(seconds=15))[0]
+    third = machine.apply([cohort], now=now + timedelta(seconds=31))[0]
 
     assert first.theme_state == ThemeCoreState.SPREADING_THEME.value
     assert "LEADING_REQUIRES_PERSISTENCE" in first.reason_codes
-    assert second.theme_state == ThemeCoreState.LEADING_THEME.value
-    assert "LEADING_PERSISTENCE_CONFIRMED" in second.reason_codes
+    assert second.theme_state == ThemeCoreState.SPREADING_THEME.value
+    assert third.theme_state == ThemeCoreState.LEADING_THEME.value
+    assert "LEADING_PERSISTENCE_CONFIRMED" in third.reason_codes
 
 
 def test_data_wait_theme_stays_data_wait_not_weak_theme():

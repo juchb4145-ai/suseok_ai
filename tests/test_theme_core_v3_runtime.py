@@ -43,14 +43,16 @@ def test_theme_core_v3_runtime_saves_observe_theme_board_snapshot_without_candid
         candidate_ingestion_service=CandidateIngestionService(db),
     )
     first = pipeline.run(datetime(2026, 6, 18, 9, 5, 0))
-    second = pipeline.run(datetime(2026, 6, 18, 9, 5, 5))
+    second = pipeline.run(datetime(2026, 6, 18, 9, 5, 15))
+    third = pipeline.run(datetime(2026, 6, 18, 9, 5, 31))
     snapshot = db.latest_theme_board_snapshot(trade_date="2026-06-18")
     source_events = db.list_candidate_source_events(trade_date="2026-06-18")
 
     assert first["top_themes"][0]["theme_status"] == "SPREADING_THEME"
-    assert second["top_themes"][0]["theme_status"] == "LEADING_THEME"
-    assert second["ready_allowed"] is False
-    assert second["order_intent_allowed"] is False
+    assert second["top_themes"][0]["theme_status"] == "SPREADING_THEME"
+    assert third["top_themes"][0]["theme_status"] == "LEADING_THEME"
+    assert third["ready_allowed"] is False
+    assert third["order_intent_allowed"] is False
     assert snapshot["board_status"] == "OBSERVE"
     assert snapshot["top_themes"][0]["theme_status"] == "LEADING_THEME"
     assert {stock["code"] for stock in snapshot["stocks"] if stock["stock_role"] in {"LEADER", "CO_LEADER"}} == {"000001", "000002"}
@@ -252,14 +254,16 @@ def test_reboot_v2_cycle_runs_theme_core_v3_pipeline_without_order_path(tmp_path
 
     runtime.start(datetime(2026, 6, 18, 9, 5, 0))
     first = runtime.cycle(datetime(2026, 6, 18, 9, 5, 5))
-    second = runtime.cycle(datetime(2026, 6, 18, 9, 5, 10))
+    second = runtime.cycle(datetime(2026, 6, 18, 9, 5, 20))
+    third = runtime.cycle(datetime(2026, 6, 18, 9, 5, 40))
 
     assert first["theme_board"]["top_themes"][0]["theme_status"] == "SPREADING_THEME"
-    assert second["theme_board"]["top_themes"][0]["theme_status"] == "LEADING_THEME"
-    assert second["theme_board"]["ready_allowed"] is False
-    assert second["theme_board"]["order_intent_allowed"] is False
-    assert second["entry_plan_count"] == 0
-    assert second["virtual_order_count"] == 0
+    assert second["theme_board"]["top_themes"][0]["theme_status"] == "SPREADING_THEME"
+    assert third["theme_board"]["top_themes"][0]["theme_status"] == "LEADING_THEME"
+    assert third["theme_board"]["ready_allowed"] is False
+    assert third["theme_board"]["order_intent_allowed"] is False
+    assert third["entry_plan_count"] == 0
+    assert third["virtual_order_count"] == 0
     assert [row for row in gateway.list_commands(include_finished=True, limit=50) if row["command_type"] == "send_order"] == []
 
 
