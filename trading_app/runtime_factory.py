@@ -41,6 +41,8 @@ from trading.strategy.readiness import build_readiness_report, dedupe_warnings
 from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.reboot_v2 import RebootV2RuntimeProfile, reboot_v2_runtime_profile
 from trading.strategy.reboot_v2_runtime import RebootV2Runtime
+from trading.strategy.setup_runtime import SetupRouterV3RuntimePipeline
+from trading.strategy.setup_router_v3 import SetupRouterConfig
 from trading.strategy.strategy_context import StrategyContextRuntimePipeline
 from trading.strategy.review import TradeReviewService
 from trading.strategy.runtime import StrategyRuntime
@@ -90,6 +92,7 @@ class CoreRuntimeBundle:
     strategy_context_pipeline: Any = None
     entry_engine_pipeline: Any = None
     dirty_strategy_evaluator: Any = None
+    setup_router_v3_pipeline: Any = None
     market_relative_strength_shadow_pipeline: Any = None
     market_relative_strength_outcome_pipeline: Any = None
     exit_engine_reboot_pipeline: Any = None
@@ -287,6 +290,7 @@ def build_legacy_runtime_bundle(
         strategy_context_pipeline=strategy_context_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
         dirty_strategy_evaluator=dirty_strategy_evaluator,
+        setup_router_v3_pipeline=None,
         market_relative_strength_shadow_pipeline=market_relative_strength_shadow_pipeline,
         market_relative_strength_outcome_pipeline=market_relative_strength_outcome_pipeline,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
@@ -408,6 +412,15 @@ def build_reboot_v2_runtime_bundle(
             config=dirty_evaluator_config,
         )
     )
+    setup_router_v3_pipeline = SetupRouterV3RuntimePipeline(
+        db=db,
+        market_data=market_data,
+        candle_builder=candle_builder,
+        config=replace(
+            SetupRouterConfig.from_env(),
+            observe_only=True,
+        ),
+    )
     market_relative_strength_shadow_pipeline = MarketRelativeStrengthShadowRuntimePipeline(
         db=db,
         config=MarketRelativeStrengthShadowConfig.from_env(),
@@ -452,6 +465,7 @@ def build_reboot_v2_runtime_bundle(
         strategy_context_pipeline=strategy_context_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
         dirty_strategy_evaluator=dirty_strategy_evaluator,
+        setup_router_v3_pipeline=setup_router_v3_pipeline,
         market_relative_strength_shadow_pipeline=market_relative_strength_shadow_pipeline,
         market_relative_strength_outcome_pipeline=market_relative_strength_outcome_pipeline,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
@@ -487,6 +501,7 @@ def build_reboot_v2_runtime_bundle(
         strategy_context_pipeline=strategy_context_pipeline,
         entry_engine_pipeline=entry_engine_pipeline,
         dirty_strategy_evaluator=dirty_strategy_evaluator,
+        setup_router_v3_pipeline=setup_router_v3_pipeline,
         market_relative_strength_shadow_pipeline=market_relative_strength_shadow_pipeline,
         market_relative_strength_outcome_pipeline=market_relative_strength_outcome_pipeline,
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,

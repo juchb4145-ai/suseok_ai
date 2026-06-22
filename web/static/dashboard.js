@@ -1101,6 +1101,7 @@ function renderDashboardV2(snapshot) {
   const market = payload.market_overview || {};
   const themes = payload.leading_themes || { items: [] };
   const entry = payload.entry_candidates || { items: [] };
+  const setupRouter = payload.setup_router_v3 || { items: [] };
   const positionRisk = payload.position_risk || { positions: [] };
   const orderManager = payload.order_manager || {};
   const marketRsShadow = payload.market_relative_strength_shadow || {};
@@ -1169,6 +1170,7 @@ function renderDashboardV2(snapshot) {
   renderDashboardV2Reasons(reasons.items || []);
   text("dashboard-v2-entry-count", Number(entry.observe_ready_count || 0));
   renderDashboardV2EntryRows(entry.items || [], entry);
+  renderDashboardV2SetupRouter(setupRouter);
   text("dashboard-v2-position-count", (positionRisk.positions || []).length || 0);
   renderDashboardV2PositionRows(positionRisk.positions || []);
 
@@ -1286,6 +1288,45 @@ function renderDashboardV2EntryRows(rows, meta = {}) {
       <td>${textCell(item.reason_summary_ko || item.operator_message_ko || "-")}</td>
     </tr>
   `).join("");
+}
+
+function renderDashboardV2SetupRouter(payload = {}) {
+  const data = payload || {};
+  const rows = data.items || [];
+  text("dashboard-v2-setup-router-count", Number(data.observation_count || rows.length || 0));
+  text("dashboard-v2-setup-router-valid", Number(data.valid_observe_count || 0));
+  text("dashboard-v2-setup-router-pending", Number(data.pending_count || 0));
+  text("dashboard-v2-setup-router-data-wait", Number(data.data_wait_count || 0));
+  text("dashboard-v2-setup-router-blocked", Number(data.context_blocked_count || data.avoid_count || 0));
+  const node = document.getElementById("dashboard-v2-setup-router-rows");
+  if (!node) return;
+  if (!rows.length) {
+    const status = data.status || "EMPTY";
+    const message = status === "DISABLED" ? "SetupRouter V3가 비활성 상태입니다" : "관측된 setup 유형이 없습니다";
+    node.innerHTML = `<tr><td colspan="6" class="empty">${escapeHtml(message)}</td></tr>`;
+    return;
+  }
+  node.innerHTML = rows.slice(0, 12).map((item) => {
+    const structure = item.price_structure || {};
+    const reason = item.reason_summary_ko || (item.reason_codes || []).slice(0, 2).join(", ") || "-";
+    const priceHint = structure.current_above_vwap_pct !== undefined
+      ? `VWAP ${fmtOptionalNumber(structure.current_above_vwap_pct, 2)}%`
+      : structure.pullback_from_high_pct !== undefined
+        ? `눌림 ${fmtOptionalNumber(structure.pullback_from_high_pct, 2)}%`
+        : structure.breakout_level
+          ? `돌파 ${fmtOptionalNumber(structure.breakout_level, 0)}`
+          : "";
+    return `
+      <tr>
+        <td>${textCell(`${item.code || "-"} ${item.name || ""}`.trim())}</td>
+        <td>${textCell(item.theme_name || "-")}</td>
+        <td>${badge(item.setup_type || "-")}${item.primary_setup ? badge("PRIMARY", "observe") : ""}</td>
+        <td>${textCell(`${item.shape_status || "-"} / ${item.context_status || "-"}`)}</td>
+        <td>${textCell(item.entry_alignment_status || "-")}</td>
+        <td>${textCell(`${reason}${priceHint ? ` · ${priceHint}` : ""}`)}</td>
+      </tr>
+    `;
+  }).join("");
 }
 
 function renderDashboardV2PositionRows(rows) {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -261,9 +262,11 @@ class MarketRelativeStrengthOutcomeRuntimePipeline:
 class GatewayPriceTickPathProvider:
     """Fast runtime price path provider backed by persisted gateway ticks."""
 
-    def __init__(self, db: Any, *, max_rows: int = 300) -> None:
+    def __init__(self, db: Any, *, max_rows: int = 300, cache_by_code: bool = False) -> None:
         self.db = db
         self.max_rows = max(1, int(max_rows or 300))
+        self.cache_by_code = bool(cache_by_code)
+        self._code_cache: dict[tuple[str, str], tuple[list[str], list[dict[str, Any]]]] = {}
 
     def __call__(self, decision: dict[str, Any], horizon_sec: int, now: datetime) -> dict[str, Any]:
         code = _normalize_code(decision.get("code"))
@@ -271,6 +274,9 @@ class GatewayPriceTickPathProvider:
         if not code or decision_at is None or not hasattr(self.db, "conn"):
             return {"source": "gateway_price_ticks", "samples": []}
         horizon_at = min(decision_at + timedelta(seconds=max(1, int(horizon_sec or 1))), now)
+        if self.cache_by_code:
+            rows = self._cached_rows(decision_at.date().isoformat(), code, decision_at, horizon_at)
+            return {"source": "gateway_price_ticks", "samples": self._samples_from_rows(rows)}
         try:
             rows = self.db.conn.execute(
                 """
@@ -290,20 +296,48 @@ class GatewayPriceTickPathProvider:
             ).fetchall()
         except Exception:
             return {"source": "gateway_price_ticks", "samples": []}
+        return {"source": "gateway_price_ticks", "samples": self._samples_from_rows([dict(row) for row in rows])}
+
+    def _cached_rows(self, trade_date: str, code: str, start_at: datetime, end_at: datetime) -> list[dict[str, Any]]:
+        key = (trade_date, code)
+        cached = self._code_cache.get(key)
+        if cached is None:
+            try:
+                rows = [
+                    dict(row)
+                    for row in self.db.conn.execute(
+                        """
+                        SELECT timestamp, price, source
+                        FROM gateway_price_ticks
+                        WHERE trade_date = ? AND code = ? AND price IS NOT NULL
+                        ORDER BY timestamp ASC, id ASC
+                        """,
+                        (trade_date, code),
+                    ).fetchall()
+                ]
+            except Exception:
+                rows = []
+            cached = ([str(row.get("timestamp") or "") for row in rows], rows)
+            self._code_cache[key] = cached
+        timestamps, rows = cached
+        start = bisect_left(timestamps, start_at.isoformat(timespec="seconds"))
+        end = bisect_right(timestamps, end_at.isoformat(timespec="seconds"))
+        return rows[start:end][: self.max_rows]
+
+    def _samples_from_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         samples: list[dict[str, Any]] = []
         seen: set[tuple[str, float]] = set()
         for row in rows:
-            data = dict(row)
-            price = _positive_float(data.get("price"))
-            at = str(data.get("timestamp") or "")
+            price = _positive_float(row.get("price"))
+            at = str(row.get("timestamp") or "")
             if not price or not at:
                 continue
             key = (at, price)
             if key in seen:
                 continue
             seen.add(key)
-            samples.append({"at": at, "price": price, "source": data.get("source") or "gateway_price_ticks"})
-        return {"source": "gateway_price_ticks", "samples": samples}
+            samples.append({"at": at, "price": price, "source": row.get("source") or "gateway_price_ticks"})
+        return samples
 
 
 class MarketRelativeStrengthOutcomeAnalyzer:

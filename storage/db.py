@@ -1031,6 +1031,119 @@ class TradingDatabase:
                 ON entry_decision_checks(entry_decision_id, id);
             CREATE INDEX IF NOT EXISTS idx_entry_decision_checks_trade_status
                 ON entry_decision_checks(trade_date, check_name, check_status, id);
+            CREATE TABLE IF NOT EXISTS setup_router_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                calculated_at TEXT NOT NULL,
+                schema_version TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 0,
+                observe_only INTEGER NOT NULL DEFAULT 1,
+                candidate_count INTEGER NOT NULL DEFAULT 0,
+                evaluated_count INTEGER NOT NULL DEFAULT 0,
+                observation_count INTEGER NOT NULL DEFAULT 0,
+                valid_observe_count INTEGER NOT NULL DEFAULT 0,
+                pending_count INTEGER NOT NULL DEFAULT 0,
+                data_wait_count INTEGER NOT NULL DEFAULT 0,
+                context_blocked_count INTEGER NOT NULL DEFAULT 0,
+                avoid_count INTEGER NOT NULL DEFAULT 0,
+                unknown_count INTEGER NOT NULL DEFAULT 0,
+                invalidated_count INTEGER NOT NULL DEFAULT 0,
+                expired_count INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_runs_trade_calc
+                ON setup_router_runs(trade_date, calculated_at, id);
+            CREATE TABLE IF NOT EXISTS setup_observations_latest (
+                trade_date TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                setup_type TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                calculated_at TEXT NOT NULL,
+                schema_version TEXT NOT NULL DEFAULT '',
+                router_status TEXT NOT NULL DEFAULT '',
+                shape_status TEXT NOT NULL DEFAULT '',
+                context_status TEXT NOT NULL DEFAULT '',
+                entry_alignment_status TEXT NOT NULL DEFAULT '',
+                primary_setup INTEGER NOT NULL DEFAULT 0,
+                setup_quality_score REAL NOT NULL DEFAULT 0,
+                context_id TEXT NOT NULL DEFAULT '',
+                theme_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                theme_state TEXT NOT NULL DEFAULT '',
+                leadership_status TEXT NOT NULL DEFAULT '',
+                stock_role TEXT NOT NULL DEFAULT '',
+                market_side TEXT NOT NULL DEFAULT '',
+                market_action TEXT NOT NULL DEFAULT '',
+                session_phase TEXT NOT NULL DEFAULT '',
+                current_price REAL NOT NULL DEFAULT 0,
+                fingerprint TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                price_structure_json TEXT NOT NULL DEFAULT '{}',
+                safety_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, candidate_instance_id, setup_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_observations_latest_trade_status
+                ON setup_observations_latest(trade_date, router_status, code);
+            CREATE INDEX IF NOT EXISTS idx_setup_observations_latest_code
+                ON setup_observations_latest(code, trade_date);
+            CREATE TABLE IF NOT EXISTS setup_observation_transitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                setup_type TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                transitioned_at TEXT NOT NULL,
+                previous_router_status TEXT NOT NULL DEFAULT '',
+                current_router_status TEXT NOT NULL DEFAULT '',
+                previous_shape_status TEXT NOT NULL DEFAULT '',
+                current_shape_status TEXT NOT NULL DEFAULT '',
+                previous_context_status TEXT NOT NULL DEFAULT '',
+                current_context_status TEXT NOT NULL DEFAULT '',
+                previous_fingerprint TEXT NOT NULL DEFAULT '',
+                current_fingerprint TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_observation_transitions_trade
+                ON setup_observation_transitions(trade_date, transitioned_at, id);
+            CREATE INDEX IF NOT EXISTS idx_setup_observation_transitions_code
+                ON setup_observation_transitions(code, id);
+            CREATE TABLE IF NOT EXISTS setup_router_primary_latest (
+                trade_date TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                calculated_at TEXT NOT NULL,
+                setup_type TEXT NOT NULL DEFAULT '',
+                router_status TEXT NOT NULL DEFAULT '',
+                shape_status TEXT NOT NULL DEFAULT '',
+                context_status TEXT NOT NULL DEFAULT '',
+                entry_alignment_status TEXT NOT NULL DEFAULT '',
+                setup_quality_score REAL NOT NULL DEFAULT 0,
+                context_id TEXT NOT NULL DEFAULT '',
+                theme_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                theme_state TEXT NOT NULL DEFAULT '',
+                stock_role TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, candidate_instance_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_primary_latest_trade_status
+                ON setup_router_primary_latest(trade_date, router_status, code);
             CREATE TABLE IF NOT EXISTS position_runtime_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -8522,6 +8635,336 @@ class TradingDatabase:
             (int(entry_decision_id),),
         ).fetchall()
         return [_row_to_entry_decision_check(row) for row in rows]
+
+    def save_setup_router_run(self, summary: dict) -> dict:
+        payload = dict(summary or {})
+        reason_codes = [str(item.get("reason") if isinstance(item, dict) else item) for item in list(payload.get("top_reasons") or [])]
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO setup_router_runs(
+                    trade_date, calculated_at, schema_version, enabled, observe_only,
+                    candidate_count, evaluated_count, observation_count,
+                    valid_observe_count, pending_count, data_wait_count,
+                    context_blocked_count, avoid_count, unknown_count,
+                    invalidated_count, expired_count, duration_ms, status,
+                    reason_codes_json, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(payload.get("trade_date") or ""),
+                    str(payload.get("calculated_at") or ""),
+                    str(payload.get("schema_version") or ""),
+                    int(bool(payload.get("enabled"))),
+                    int(bool(payload.get("observe_only", True))),
+                    _safe_int(payload.get("candidate_count"), 0),
+                    _safe_int(payload.get("evaluated_count"), 0),
+                    _safe_int(payload.get("observation_count"), 0),
+                    _safe_int(payload.get("valid_observe_count"), 0),
+                    _safe_int(payload.get("pending_count"), 0),
+                    _safe_int(payload.get("data_wait_count"), 0),
+                    _safe_int(payload.get("context_blocked_count"), 0),
+                    _safe_int(payload.get("avoid_count"), 0),
+                    _safe_int(payload.get("unknown_count"), 0),
+                    _safe_int(payload.get("invalidated_count"), 0),
+                    _safe_int(payload.get("expired_count"), 0),
+                    _safe_int(payload.get("duration_ms"), 0),
+                    str(payload.get("status") or ""),
+                    _json_list(reason_codes),
+                    _json_payload(payload),
+                ),
+            )
+        return self.get_setup_router_run(int(cursor.lastrowid)) or {}
+
+    def get_setup_router_run(self, run_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM setup_router_runs WHERE id = ?",
+            (int(run_id),),
+        ).fetchone()
+        return _row_to_setup_router_run(row) if row else None
+
+    def latest_setup_router_run(self, *, trade_date: Optional[str] = None) -> dict:
+        if trade_date:
+            row = self.conn.execute(
+                """
+                SELECT * FROM setup_router_runs
+                WHERE trade_date = ?
+                ORDER BY calculated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (str(trade_date),),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                """
+                SELECT * FROM setup_router_runs
+                ORDER BY calculated_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return _row_to_setup_router_run(row) if row else {}
+
+    def save_setup_observations(self, observations: Iterable[dict]) -> int:
+        cleaned = [dict(item or {}) for item in observations or []]
+        if not cleaned:
+            return 0
+        saved_count = 0
+        with self.conn:
+            for payload in cleaned:
+                trade_date = str(payload.get("trade_date") or "")
+                code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
+                candidate_id = payload.get("candidate_id")
+                candidate_instance_id = str(payload.get("candidate_instance_id") or f"{trade_date}:{code}:{candidate_id or 0}")
+                setup_type = str(payload.get("setup_type") or "")
+                previous = self.conn.execute(
+                    """
+                    SELECT * FROM setup_observations_latest
+                    WHERE trade_date = ? AND candidate_instance_id = ? AND setup_type = ?
+                    """,
+                    (trade_date, candidate_instance_id, setup_type),
+                ).fetchone()
+                previous_payload = _row_to_setup_observation(previous) if previous else {}
+                current_fingerprint = str(payload.get("fingerprint") or "")
+                previous_fingerprint = str(previous_payload.get("fingerprint") or "")
+                transition_needed = (
+                    not previous_payload
+                    or str(previous_payload.get("router_status") or "") != str(payload.get("router_status") or "")
+                    or str(previous_payload.get("shape_status") or "") != str(payload.get("shape_status") or "")
+                    or str(previous_payload.get("context_status") or "") != str(payload.get("context_status") or "")
+                ) and current_fingerprint != previous_fingerprint
+                self.conn.execute(
+                    """
+                    INSERT INTO setup_observations_latest(
+                        trade_date, candidate_instance_id, setup_type, candidate_id, code, name,
+                        calculated_at, schema_version, router_status, shape_status, context_status,
+                        entry_alignment_status, primary_setup, setup_quality_score, context_id,
+                        theme_id, theme_name, theme_state, leadership_status, stock_role,
+                        market_side, market_action, session_phase, current_price, fingerprint,
+                        reason_codes_json, price_structure_json, safety_json, payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(trade_date, candidate_instance_id, setup_type) DO UPDATE SET
+                        candidate_id=excluded.candidate_id,
+                        code=excluded.code,
+                        name=excluded.name,
+                        calculated_at=excluded.calculated_at,
+                        schema_version=excluded.schema_version,
+                        router_status=excluded.router_status,
+                        shape_status=excluded.shape_status,
+                        context_status=excluded.context_status,
+                        entry_alignment_status=excluded.entry_alignment_status,
+                        primary_setup=excluded.primary_setup,
+                        setup_quality_score=excluded.setup_quality_score,
+                        context_id=excluded.context_id,
+                        theme_id=excluded.theme_id,
+                        theme_name=excluded.theme_name,
+                        theme_state=excluded.theme_state,
+                        leadership_status=excluded.leadership_status,
+                        stock_role=excluded.stock_role,
+                        market_side=excluded.market_side,
+                        market_action=excluded.market_action,
+                        session_phase=excluded.session_phase,
+                        current_price=excluded.current_price,
+                        fingerprint=excluded.fingerprint,
+                        reason_codes_json=excluded.reason_codes_json,
+                        price_structure_json=excluded.price_structure_json,
+                        safety_json=excluded.safety_json,
+                        payload_json=excluded.payload_json,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    _setup_observation_db_values(payload, trade_date, candidate_instance_id, setup_type, code, candidate_id),
+                )
+                if transition_needed:
+                    self.conn.execute(
+                        """
+                        INSERT INTO setup_observation_transitions(
+                            trade_date, candidate_instance_id, setup_type, candidate_id, code, name,
+                            transitioned_at, previous_router_status, current_router_status,
+                            previous_shape_status, current_shape_status, previous_context_status,
+                            current_context_status, previous_fingerprint, current_fingerprint,
+                            reason_codes_json, payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            trade_date,
+                            candidate_instance_id,
+                            setup_type,
+                            candidate_id,
+                            code,
+                            str(payload.get("name") or ""),
+                            str(payload.get("calculated_at") or ""),
+                            str(previous_payload.get("router_status") or ""),
+                            str(payload.get("router_status") or ""),
+                            str(previous_payload.get("shape_status") or ""),
+                            str(payload.get("shape_status") or ""),
+                            str(previous_payload.get("context_status") or ""),
+                            str(payload.get("context_status") or ""),
+                            previous_fingerprint,
+                            current_fingerprint,
+                            _json_list(payload.get("reason_codes") or []),
+                            _json_payload({"previous": previous_payload, "current": payload}),
+                        ),
+                    )
+                if bool(payload.get("primary_setup")):
+                    self.conn.execute(
+                        """
+                        INSERT INTO setup_router_primary_latest(
+                            trade_date, candidate_instance_id, candidate_id, code, name,
+                            calculated_at, setup_type, router_status, shape_status, context_status,
+                            entry_alignment_status, setup_quality_score, context_id, theme_id,
+                            theme_name, theme_state, stock_role, fingerprint, payload_json,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(trade_date, candidate_instance_id) DO UPDATE SET
+                            candidate_id=excluded.candidate_id,
+                            code=excluded.code,
+                            name=excluded.name,
+                            calculated_at=excluded.calculated_at,
+                            setup_type=excluded.setup_type,
+                            router_status=excluded.router_status,
+                            shape_status=excluded.shape_status,
+                            context_status=excluded.context_status,
+                            entry_alignment_status=excluded.entry_alignment_status,
+                            setup_quality_score=excluded.setup_quality_score,
+                            context_id=excluded.context_id,
+                            theme_id=excluded.theme_id,
+                            theme_name=excluded.theme_name,
+                            theme_state=excluded.theme_state,
+                            stock_role=excluded.stock_role,
+                            fingerprint=excluded.fingerprint,
+                            payload_json=excluded.payload_json,
+                            updated_at=CURRENT_TIMESTAMP
+                        """,
+                        (
+                            trade_date,
+                            candidate_instance_id,
+                            candidate_id,
+                            code,
+                            str(payload.get("name") or ""),
+                            str(payload.get("calculated_at") or ""),
+                            setup_type,
+                            str(payload.get("router_status") or ""),
+                            str(payload.get("shape_status") or ""),
+                            str(payload.get("context_status") or ""),
+                            str(payload.get("entry_alignment_status") or ""),
+                            _float_value(payload.get("setup_quality_score")),
+                            str(payload.get("context_id") or ""),
+                            str(payload.get("theme_id") or ""),
+                            str(payload.get("theme_name") or ""),
+                            str(payload.get("theme_state") or ""),
+                            str(payload.get("stock_role") or ""),
+                            current_fingerprint,
+                            _json_payload(payload),
+                        ),
+                    )
+                saved_count += 1
+        return saved_count
+
+    def list_setup_observations_latest(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        setup_type: Optional[str] = None,
+        router_status: Optional[str] = None,
+        shape_status: Optional[str] = None,
+        context_status: Optional[str] = None,
+        session_phase: Optional[str] = None,
+        theme_id: Optional[str] = None,
+        leadership_status: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        query = "SELECT * FROM setup_observations_latest"
+        clauses: list[str] = []
+        params: list[object] = []
+        _append_setup_filter(clauses, params, "trade_date", trade_date)
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        _append_setup_filter(clauses, params, "setup_type", setup_type)
+        _append_setup_filter(clauses, params, "router_status", router_status)
+        _append_setup_filter(clauses, params, "shape_status", shape_status)
+        _append_setup_filter(clauses, params, "context_status", context_status)
+        _append_setup_filter(clauses, params, "session_phase", session_phase)
+        _append_setup_filter(clauses, params, "theme_id", theme_id)
+        _append_setup_filter(clauses, params, "leadership_status", leadership_status)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY calculated_at DESC, primary_setup DESC, setup_quality_score DESC, code ASC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 100)), max(0, int(offset or 0))])
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [_row_to_setup_observation(row) for row in rows]
+
+    def count_setup_observations_latest(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        setup_type: Optional[str] = None,
+        router_status: Optional[str] = None,
+        shape_status: Optional[str] = None,
+        context_status: Optional[str] = None,
+        session_phase: Optional[str] = None,
+        theme_id: Optional[str] = None,
+        leadership_status: Optional[str] = None,
+    ) -> int:
+        query = "SELECT COUNT(*) AS count FROM setup_observations_latest"
+        clauses: list[str] = []
+        params: list[object] = []
+        _append_setup_filter(clauses, params, "trade_date", trade_date)
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        _append_setup_filter(clauses, params, "setup_type", setup_type)
+        _append_setup_filter(clauses, params, "router_status", router_status)
+        _append_setup_filter(clauses, params, "shape_status", shape_status)
+        _append_setup_filter(clauses, params, "context_status", context_status)
+        _append_setup_filter(clauses, params, "session_phase", session_phase)
+        _append_setup_filter(clauses, params, "theme_id", theme_id)
+        _append_setup_filter(clauses, params, "leadership_status", leadership_status)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        row = self.conn.execute(query, tuple(params)).fetchone()
+        return int(row["count"] or 0) if row else 0
+
+    def list_setup_observation_transitions(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        setup_type: Optional[str] = None,
+        router_status: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        query = "SELECT * FROM setup_observation_transitions"
+        clauses: list[str] = []
+        params: list[object] = []
+        _append_setup_filter(clauses, params, "trade_date", trade_date)
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        _append_setup_filter(clauses, params, "setup_type", setup_type)
+        if router_status:
+            clauses.append("current_router_status = ?")
+            params.append(str(router_status))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY transitioned_at DESC, id DESC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 100)), max(0, int(offset or 0))])
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [_row_to_setup_observation_transition(row) for row in rows]
+
+    def list_setup_router_primary_latest(self, *, trade_date: Optional[str] = None, limit: int = 100) -> list[dict]:
+        query = "SELECT * FROM setup_router_primary_latest"
+        params: list[object] = []
+        if trade_date:
+            query += " WHERE trade_date = ?"
+            params.append(str(trade_date))
+        query += " ORDER BY calculated_at DESC, setup_quality_score DESC, code ASC LIMIT ?"
+        params.append(max(1, int(limit or 100)))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [_row_to_setup_router_primary(row) for row in rows]
 
     def save_position_runtime_snapshots(self, snapshots: Iterable[dict]) -> int:
         rows = [dict(item or {}) for item in snapshots or []]
@@ -16138,6 +16581,131 @@ def _row_to_entry_decision_check(row: sqlite3.Row) -> dict:
     return payload
 
 
+def _row_to_setup_router_run(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("id", data.get("id"))
+    payload.setdefault("created_at", data.get("created_at", ""))
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("calculated_at", data.get("calculated_at", ""))
+    payload.setdefault("schema_version", data.get("schema_version", ""))
+    payload.setdefault("enabled", bool(data.get("enabled")))
+    payload.setdefault("observe_only", bool(data.get("observe_only")))
+    for key in (
+        "candidate_count",
+        "evaluated_count",
+        "observation_count",
+        "valid_observe_count",
+        "pending_count",
+        "data_wait_count",
+        "context_blocked_count",
+        "avoid_count",
+        "unknown_count",
+        "invalidated_count",
+        "expired_count",
+        "duration_ms",
+    ):
+        payload.setdefault(key, int(data.get(key) or 0))
+    payload.setdefault("status", data.get("status", ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    return payload
+
+
+def _row_to_setup_observation(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("candidate_instance_id", data.get("candidate_instance_id", ""))
+    payload.setdefault("setup_type", data.get("setup_type", ""))
+    payload.setdefault("candidate_id", data.get("candidate_id"))
+    payload.setdefault("code", data.get("code", ""))
+    payload.setdefault("name", data.get("name", ""))
+    payload.setdefault("calculated_at", data.get("calculated_at", ""))
+    payload.setdefault("schema_version", data.get("schema_version", ""))
+    payload.setdefault("router_status", data.get("router_status", ""))
+    payload.setdefault("shape_status", data.get("shape_status", ""))
+    payload.setdefault("context_status", data.get("context_status", ""))
+    payload.setdefault("entry_alignment_status", data.get("entry_alignment_status", ""))
+    payload.setdefault("primary_setup", bool(data.get("primary_setup")))
+    payload.setdefault("setup_quality_score", _float_value(data.get("setup_quality_score")))
+    payload.setdefault("context_id", data.get("context_id", ""))
+    payload.setdefault("theme_id", data.get("theme_id", ""))
+    payload.setdefault("theme_name", data.get("theme_name", ""))
+    payload.setdefault("theme_state", data.get("theme_state", ""))
+    payload.setdefault("leadership_status", data.get("leadership_status", ""))
+    payload.setdefault("stock_role", data.get("stock_role", ""))
+    payload.setdefault("market_side", data.get("market_side", ""))
+    payload.setdefault("market_action", data.get("market_action", ""))
+    payload.setdefault("session_phase", data.get("session_phase", ""))
+    payload.setdefault("current_price", _float_value(data.get("current_price")))
+    payload.setdefault("fingerprint", data.get("fingerprint", ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    payload.setdefault("price_structure", _safe_json_loads(data.pop("price_structure_json", "{}"), {}))
+    payload.setdefault("safety", _safe_json_loads(data.pop("safety_json", "{}"), {}))
+    payload.setdefault("updated_at", data.get("updated_at", ""))
+    return payload
+
+
+def _row_to_setup_observation_transition(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in (
+        "id",
+        "created_at",
+        "trade_date",
+        "candidate_instance_id",
+        "setup_type",
+        "candidate_id",
+        "code",
+        "name",
+        "transitioned_at",
+        "previous_router_status",
+        "current_router_status",
+        "previous_shape_status",
+        "current_shape_status",
+        "previous_context_status",
+        "current_context_status",
+        "previous_fingerprint",
+        "current_fingerprint",
+    ):
+        payload.setdefault(key, data.get(key, ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    return payload
+
+
+def _row_to_setup_router_primary(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("candidate_instance_id", data.get("candidate_instance_id", ""))
+    payload.setdefault("candidate_id", data.get("candidate_id"))
+    payload.setdefault("code", data.get("code", ""))
+    payload.setdefault("name", data.get("name", ""))
+    payload.setdefault("calculated_at", data.get("calculated_at", ""))
+    payload.setdefault("setup_type", data.get("setup_type", ""))
+    payload.setdefault("router_status", data.get("router_status", ""))
+    payload.setdefault("shape_status", data.get("shape_status", ""))
+    payload.setdefault("context_status", data.get("context_status", ""))
+    payload.setdefault("entry_alignment_status", data.get("entry_alignment_status", ""))
+    payload.setdefault("setup_quality_score", _float_value(data.get("setup_quality_score")))
+    payload.setdefault("context_id", data.get("context_id", ""))
+    payload.setdefault("theme_id", data.get("theme_id", ""))
+    payload.setdefault("theme_name", data.get("theme_name", ""))
+    payload.setdefault("theme_state", data.get("theme_state", ""))
+    payload.setdefault("stock_role", data.get("stock_role", ""))
+    payload.setdefault("fingerprint", data.get("fingerprint", ""))
+    payload.setdefault("updated_at", data.get("updated_at", ""))
+    return payload
+
+
 def _row_to_position_runtime_snapshot(row: sqlite3.Row) -> dict:
     data = dict(row)
     payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
@@ -16730,6 +17298,57 @@ def _json_payload(value: object) -> str:
     if value is None:
         value = {}
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _setup_observation_db_values(
+    payload: dict,
+    trade_date: str,
+    candidate_instance_id: str,
+    setup_type: str,
+    code: str,
+    candidate_id: object,
+) -> tuple:
+    return (
+        trade_date,
+        candidate_instance_id,
+        setup_type,
+        candidate_id,
+        code,
+        str(payload.get("name") or ""),
+        str(payload.get("calculated_at") or ""),
+        str(payload.get("schema_version") or ""),
+        str(payload.get("router_status") or ""),
+        str(payload.get("shape_status") or ""),
+        str(payload.get("context_status") or ""),
+        str(payload.get("entry_alignment_status") or ""),
+        int(bool(payload.get("primary_setup"))),
+        _float_value(payload.get("setup_quality_score")),
+        str(payload.get("context_id") or ""),
+        str(payload.get("theme_id") or ""),
+        str(payload.get("theme_name") or ""),
+        str(payload.get("theme_state") or ""),
+        str(payload.get("leadership_status") or ""),
+        str(payload.get("stock_role") or ""),
+        str(payload.get("market_side") or ""),
+        str(payload.get("market_action") or ""),
+        str(payload.get("session_phase") or ""),
+        _float_value(payload.get("current_price")),
+        str(payload.get("fingerprint") or ""),
+        _json_list(payload.get("reason_codes") or []),
+        _json_payload(payload.get("price_structure") or {}),
+        _json_payload(payload.get("safety") or {}),
+        _json_payload(payload),
+    )
+
+
+def _append_setup_filter(clauses: list[str], params: list[object], column: str, value: object) -> None:
+    if value is None:
+        return
+    text = str(value).strip()
+    if not text:
+        return
+    clauses.append(f"{column} = ?")
+    params.append(text)
 
 
 def _redact_sensitive_payload(value: object) -> object:

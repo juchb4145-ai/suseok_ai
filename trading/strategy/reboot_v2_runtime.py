@@ -43,6 +43,7 @@ class RebootV2Runtime:
     strategy_context_pipeline: Any = None
     entry_engine_pipeline: Any = None
     dirty_strategy_evaluator: Any = None
+    setup_router_v3_pipeline: Any = None
     candidate_state_contract_reconciler: Any = None
     market_dirty_publisher: Any = None
     theme_dirty_publisher: Any = None
@@ -133,6 +134,7 @@ class RebootV2Runtime:
             snapshot["entry_engine"]["dry_run_order_allowed"] = False
         else:
             self._run_pipeline(snapshot, "entry_engine", self.entry_engine_pipeline, current)
+        self._run_pipeline(snapshot, "setup_router_v3", self.setup_router_v3_pipeline, current)
         self._run_pipeline(snapshot, "market_relative_strength_shadow", self.market_relative_strength_shadow_pipeline, current)
         self._run_pipeline(snapshot, "market_relative_strength_outcomes", self.market_relative_strength_outcome_pipeline, current)
         if self._has_open_positions(current.date().isoformat()):
@@ -181,6 +183,7 @@ class RebootV2Runtime:
                 "strategy_context": _component_enabled(self.strategy_context_pipeline),
                 "entry_engine": _component_enabled(self.entry_engine_pipeline),
                 "dirty_strategy_evaluator": _component_enabled(self.dirty_strategy_evaluator),
+                "setup_router_v3": _component_enabled(self.setup_router_v3_pipeline),
                 "market_relative_strength_shadow": _component_enabled(self.market_relative_strength_shadow_pipeline),
                 "market_relative_strength_outcomes": _component_enabled(self.market_relative_strength_outcome_pipeline),
                 "exit_engine": _component_enabled(self.exit_engine_reboot_pipeline),
@@ -576,7 +579,7 @@ class RebootV2Runtime:
             return "NOT_STARTED"
         statuses = [
             str(dict(snapshot.get(name) or {}).get("status") or "").upper()
-            for name in ("opening_burst", "theme_board", "market_regime", "strategy_context", "dirty_evaluator", "entry_engine")
+            for name in ("opening_burst", "theme_board", "market_regime", "strategy_context", "dirty_evaluator", "entry_engine", "setup_router_v3")
         ]
         if any(status == "ERROR" for status in statuses):
             return "ERROR"

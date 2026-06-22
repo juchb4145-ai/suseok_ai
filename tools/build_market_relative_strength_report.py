@@ -16,6 +16,7 @@ from storage.db import TradingDatabase
 from trading.strategy.market_relative_strength_shadow import ACTION_TYPE
 from trading_app.intraday_outcomes import IntradayOutcomeConfig, IntradayOutcomeLabeler
 from trading_app.market_relative_strength_outcomes import (
+    GatewayPriceTickPathProvider,
     MarketRelativeStrengthOutcomeAnalyzer,
     MarketRelativeStrengthOutcomeConfig,
 )
@@ -49,6 +50,8 @@ def main() -> int:
                 db,
                 trade_date=trade_date,
                 horizons_sec=horizons,
+                scenario=args.scenario or "",
+                market_side=args.market_side or "",
                 force=bool(args.force),
                 limit=max(1, int(args.limit or 10000)),
             )
@@ -64,7 +67,7 @@ def main() -> int:
             market_side=args.market_side or None,
             limit=max(1, int(args.limit or 10000)),
         )
-        exports = analyzer.export_all(report) if args.export_all else {}
+        exports = analyzer.export_all(report, stem=_report_stem(trade_date, args.scenario, args.market_side)) if args.export_all else {}
     finally:
         db.close()
 
@@ -108,19 +111,30 @@ def _rebuild_shadow_outcomes(
     *,
     trade_date: str,
     horizons_sec: list[int],
+    scenario: str,
+    market_side: str,
     force: bool,
     limit: int,
 ) -> dict[str, Any]:
     now = datetime.now().replace(microsecond=0)
-    labeler = IntradayOutcomeLabeler(
+    labeler = MarketRsReportOutcomeLabeler(
         db,
         config=IntradayOutcomeConfig(enabled=True, horizons_sec=tuple(horizons_sec), max_batch_size=limit),
+        price_provider=GatewayPriceTickPathProvider(db, cache_by_code=True),
     )
     events = db.list_strategy_decision_events(
         trade_date=trade_date or None,
         action_type=ACTION_TYPE,
         limit=limit,
     )
+    scenario_filter = str(scenario or "").strip().upper()
+    market_side_filter = str(market_side or "").strip().upper()
+    if scenario_filter or market_side_filter:
+        events = [
+            event
+            for event in events
+            if _event_matches_filters(event, scenario=scenario_filter, market_side=market_side_filter)
+        ]
     existing = set()
     if not force:
         for outcome in db.list_strategy_decision_outcomes(
@@ -146,11 +160,21 @@ def _rebuild_shadow_outcomes(
         "status": "OK",
         "trade_date": trade_date,
         "horizons_sec": horizons_sec,
+        "scenario": scenario_filter,
+        "market_side": market_side_filter,
         "force": bool(force),
         "event_count": len(events),
         "outcome_count": len(outcomes),
         "persisted_count": persisted,
     }
+
+
+class MarketRsReportOutcomeLabeler(IntradayOutcomeLabeler):
+    def _postmarket_review_samples(self, decision: dict[str, Any], horizon_sec: int) -> list[dict[str, Any]]:
+        return []
+
+    def _fallback_metrics_from_reviews(self, decision: dict[str, Any], horizon_sec: int) -> None:
+        return None
 
 
 def _normalize_trade_date(value: str) -> str:
@@ -168,6 +192,30 @@ def _parse_horizons(value: str) -> list[int]:
             continue
         horizons.append(max(1, int(raw)))
     return horizons or [300, 600, 1200]
+
+
+def _event_matches_filters(event: dict[str, Any], *, scenario: str, market_side: str) -> bool:
+    details = dict(event.get("details") or {})
+    if scenario and str(details.get("shadow_scenario") or "").upper() != scenario:
+        return False
+    if market_side and str(details.get("market_side") or "").upper() != market_side:
+        return False
+    return True
+
+
+def _report_stem(trade_date: str, scenario: str, market_side: str) -> str:
+    clean_date = str(trade_date or "all").replace("-", "")
+    parts = ["split_market_relative_strength_outcomes", clean_date]
+    if scenario:
+        parts.append(str(scenario).strip().lower())
+    if market_side:
+        parts.append(str(market_side).strip().lower())
+    return "_".join(_safe_stem_part(part) for part in parts if part)
+
+
+def _safe_stem_part(value: str) -> str:
+    text = str(value or "").strip().replace(" ", "_")
+    return "".join(ch for ch in text if ch.isalnum() or ch in {"_", "-"}).strip("_") or "all"
 
 
 def _parse_dt(value: Any) -> datetime | None:

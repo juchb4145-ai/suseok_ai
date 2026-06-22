@@ -4519,6 +4519,202 @@ def theme_rotation_best_theme_changes(trade_date: str | None = Query(None), limi
         close_database(db)
 
 
+@app.get("/api/setup-router-v3/summary")
+def setup_router_v3_summary(trade_date: str | None = Query(None)) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    db = open_database()
+    try:
+        run_loader = getattr(db, "latest_setup_router_run", None)
+        run = dict(run_loader(trade_date=resolved) if callable(run_loader) else {})
+        latest = list(getattr(db, "list_setup_observations_latest", lambda **_: [])(trade_date=resolved, limit=1000) or [])
+        status_counts = Counter(str(item.get("router_status") or "UNKNOWN") for item in latest)
+        type_counts = Counter(str(item.get("setup_type") or "UNKNOWN") for item in latest)
+        return {
+            "trade_date": resolved,
+            "schema_version": run.get("schema_version") or "setup_router_v3.observe.v1",
+            "status": run.get("status") or ("OK" if latest else "EMPTY"),
+            "calculated_at": run.get("calculated_at") or "",
+            "enabled": bool(run.get("enabled", bool(latest))),
+            "observe_only": True,
+            "latest_count": len(latest),
+            "status_counts": dict(status_counts),
+            "setup_type_counts": dict(type_counts),
+            "run": run,
+            "safety": _setup_router_v3_safety(),
+            "read_only": True,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/setup-router-v3/latest")
+def setup_router_v3_latest(
+    trade_date: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+) -> dict[str, Any]:
+    return setup_router_v3_observations(
+        trade_date=trade_date,
+        code=None,
+        setup_type=None,
+        router_status=None,
+        shape_status=None,
+        context_status=None,
+        session_phase=None,
+        theme_id=None,
+        leadership_status=None,
+        limit=_setup_router_v3_limit(limit),
+        offset=0,
+    )
+
+
+@app.get("/api/setup-router-v3/observations")
+def setup_router_v3_observations(
+    trade_date: str | None = Query(None),
+    code: str | None = Query(None),
+    setup_type: str | None = Query(None),
+    router_status: str | None = Query(None),
+    shape_status: str | None = Query(None),
+    context_status: str | None = Query(None),
+    session_phase: str | None = Query(None),
+    theme_id: str | None = Query(None),
+    leadership_status: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    db = open_database()
+    try:
+        limit_value = _setup_router_v3_limit(limit)
+        offset_value = _setup_router_v3_offset(offset)
+        kwargs = {
+            "trade_date": resolved,
+            "code": _setup_router_v3_text(code),
+            "setup_type": _setup_router_v3_text(setup_type),
+            "router_status": _setup_router_v3_text(router_status),
+            "shape_status": _setup_router_v3_text(shape_status),
+            "context_status": _setup_router_v3_text(context_status),
+            "session_phase": _setup_router_v3_text(session_phase),
+            "theme_id": _setup_router_v3_text(theme_id),
+            "leadership_status": _setup_router_v3_text(leadership_status),
+        }
+        items = db.list_setup_observations_latest(limit=limit_value + 1, offset=offset_value, **kwargs)
+        page_items, pagination = _trim_page(items, limit=limit_value, offset=offset_value)
+        total = db.count_setup_observations_latest(**kwargs)
+        pagination["total"] = total
+        return {
+            "trade_date": resolved,
+            "items": page_items,
+            "pagination": pagination,
+            "filters": {**kwargs, "limit": limit_value, "offset": offset_value},
+            "read_only": True,
+            "observe_only": True,
+            "safety": _setup_router_v3_safety(),
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/setup-router-v3/transitions")
+def setup_router_v3_transitions(
+    trade_date: str | None = Query(None),
+    code: str | None = Query(None),
+    setup_type: str | None = Query(None),
+    router_status: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    db = open_database()
+    try:
+        limit_value = _setup_router_v3_limit(limit)
+        offset_value = _setup_router_v3_offset(offset)
+        items = db.list_setup_observation_transitions(
+            trade_date=resolved,
+            code=_setup_router_v3_text(code),
+            setup_type=_setup_router_v3_text(setup_type),
+            router_status=_setup_router_v3_text(router_status),
+            limit=limit_value + 1,
+            offset=offset_value,
+        )
+        page_items, pagination = _trim_page(items, limit=limit_value, offset=offset_value)
+        return {
+            "trade_date": resolved,
+            "transition_count": len(page_items),
+            "transitions": page_items,
+            "pagination": pagination,
+            "filters": {
+                "trade_date": resolved,
+                "code": _setup_router_v3_text(code),
+                "setup_type": _setup_router_v3_text(setup_type),
+                "router_status": _setup_router_v3_text(router_status),
+                "limit": limit_value,
+                "offset": offset_value,
+            },
+            "read_only": True,
+            "observe_only": True,
+            "safety": _setup_router_v3_safety(),
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/setup-router-v3/candidates/{code}")
+def setup_router_v3_candidate(code: str, trade_date: str | None = Query(None), limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    db = open_database()
+    try:
+        limit_value = _setup_router_v3_limit(limit)
+        observations = db.list_setup_observations_latest(trade_date=resolved, code=code, limit=limit_value)
+        transitions = db.list_setup_observation_transitions(trade_date=resolved, code=code, limit=limit_value)
+        return {
+            "trade_date": resolved,
+            "code": code,
+            "observations": observations,
+            "transitions": transitions,
+            "read_only": True,
+            "observe_only": True,
+            "safety": _setup_router_v3_safety(),
+        }
+    finally:
+        close_database(db)
+
+
+def _setup_router_v3_safety() -> dict[str, Any]:
+    return {
+        "ready_allowed": False,
+        "candidate_promotion_allowed": False,
+        "opportunity_rank_allowed": False,
+        "order_intent_allowed": False,
+        "live_order_allowed": False,
+        "recommended_position_size_multiplier": 0,
+    }
+
+
+def _setup_router_v3_text(value: Any) -> str | None:
+    if value is None or value.__class__.__name__ == "Query":
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _setup_router_v3_limit(value: Any) -> int:
+    if value is None or value.__class__.__name__ == "Query":
+        return 100
+    try:
+        return max(1, min(1000, int(value)))
+    except (TypeError, ValueError):
+        return 100
+
+
+def _setup_router_v3_offset(value: Any) -> int:
+    if value is None or value.__class__.__name__ == "Query":
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _theme_rotation_trade_date(trade_date: str | None) -> str:
     return str(trade_date or datetime.now().date().isoformat())
 

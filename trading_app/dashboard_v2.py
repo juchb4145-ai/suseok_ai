@@ -38,6 +38,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
     market = _prefer_runtime_section(base.get("market_regime"), runtime.get("market_regime"))
     themes = _prefer_runtime_section(base.get("theme_board"), runtime.get("theme_board"))
     entry = _prefer_runtime_section(base.get("entry_engine"), runtime.get("entry_engine"))
+    setup_router = _prefer_runtime_section(base.get("setup_router_v3"), runtime.get("setup_router_v3"))
     exit_engine = _prefer_runtime_section(base.get("exit_engine"), runtime.get("exit_engine"))
     pos_risk = _prefer_runtime_section(base.get("position_risk"), runtime.get("position_risk"))
     order_manager = _prefer_runtime_section(base.get("order_manager"), runtime.get("order_manager"))
@@ -58,6 +59,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
         "leading_themes": _leading_themes(themes),
         "theme_rotation": _theme_rotation_summary(themes, runtime),
         "entry_candidates": _entry_candidates(entry, candidates, order_manager),
+        "setup_router_v3": _setup_router_v3_summary(setup_router),
         "position_risk": _position_risk(pos_risk, exit_engine),
         "exit_watch": _exit_watch(exit_engine),
         "order_manager": _order_manager(order_manager, gateway, commands),
@@ -84,6 +86,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
             "market_regime": market,
             "theme_board": themes,
             "entry_engine": entry,
+            "setup_router_v3": setup_router,
             "exit_engine": exit_engine,
             "position_risk": pos_risk,
             "order_manager": order_manager,
@@ -174,6 +177,7 @@ def _v2_status(
             "theme_board": _stage_status("theme_board", runtime.get("theme_board"), pipeline_status),
             "market_regime": _stage_status("market_regime", runtime.get("market_regime"), pipeline_status),
             "entry_engine": _stage_status("entry_engine", runtime.get("entry_engine"), pipeline_status),
+            "setup_router_v3": _stage_status("setup_router_v3", runtime.get("setup_router_v3"), pipeline_status),
             "market_relative_strength_shadow": _stage_status(
                 "market_relative_strength_shadow",
                 runtime.get("market_relative_strength_shadow"),
@@ -397,6 +401,66 @@ def _entry_candidates(entry: dict[str, Any], candidates: dict[str, Any], order_m
         "bucket_counts": dict(bucket_counts),
         "top_wait_reasons": list(entry.get("top_wait_reasons") or []),
         "top_block_reasons": list(entry.get("top_block_reasons") or []),
+    }
+
+
+def _setup_router_v3_summary(section: dict[str, Any]) -> dict[str, Any]:
+    rows = []
+    for raw in list(section.get("observations") or [])[:20]:
+        item = dict(raw or {})
+        reasons = list(item.get("reason_codes") or [])
+        rows.append(
+            {
+                "code": item.get("code", ""),
+                "name": item.get("name", ""),
+                "theme_name": item.get("theme_name", ""),
+                "setup_type": item.get("setup_type", ""),
+                "shape_status": item.get("shape_status", ""),
+                "context_status": item.get("context_status", ""),
+                "router_status": item.get("router_status", ""),
+                "entry_alignment_status": item.get("entry_alignment_status", ""),
+                "setup_quality_score": _num(item.get("setup_quality_score")),
+                "current_price": _num(item.get("current_price")),
+                "price_structure": dict(item.get("price_structure") or {}),
+                "reason_codes": reasons,
+                "reason_summary_ko": _reason_summary_ko(reasons),
+                "updated_at": item.get("updated_at") or item.get("calculated_at") or "",
+                "primary_setup": bool(item.get("primary_setup")),
+                "observe_only": True,
+            }
+        )
+    return {
+        "enabled": bool(section.get("enabled")),
+        "status": section.get("status", "DISABLED" if not section.get("enabled") else "EMPTY"),
+        "schema_version": section.get("schema_version", "setup_router_v3.observe.v1"),
+        "output_mode": section.get("output_mode", "OBSERVE"),
+        "observe_only": True,
+        "calculated_at": section.get("calculated_at", ""),
+        "candidate_count": int(section.get("candidate_count") or 0),
+        "evaluated_count": int(section.get("evaluated_count") or 0),
+        "observation_count": int(section.get("observation_count") or 0),
+        "valid_observe_count": int(section.get("valid_observe_count") or 0),
+        "pending_count": int(section.get("pending_count") or 0),
+        "data_wait_count": int(section.get("data_wait_count") or 0),
+        "context_blocked_count": int(section.get("context_blocked_count") or 0),
+        "avoid_count": int(section.get("avoid_count") or 0),
+        "unknown_count": int(section.get("unknown_count") or 0),
+        "invalidated_count": int(section.get("invalidated_count") or 0),
+        "setup_type_counts": dict(section.get("setup_type_counts") or {}),
+        "status_counts": dict(section.get("status_counts") or {}),
+        "shape_counts": dict(section.get("shape_counts") or {}),
+        "context_counts": dict(section.get("context_counts") or {}),
+        "top_reasons": list(section.get("top_reasons") or [])[:10],
+        "items": rows,
+        "safety": {
+            "ready_allowed": False,
+            "candidate_promotion_allowed": False,
+            "opportunity_rank_allowed": False,
+            "order_intent_allowed": False,
+            "live_order_allowed": False,
+            "recommended_position_size_multiplier": 0,
+        },
+        "operator_message_ko": "SetupRouter V3는 setup 유형만 관측하며 READY/주문으로 승격하지 않습니다.",
     }
 
 
