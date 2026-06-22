@@ -4031,6 +4031,7 @@ class TradingDatabase:
         evaluated_at: str,
         horizons_sec: Iterable[int],
         trade_date: Optional[str] = None,
+        action_type: Optional[str] = None,
         limit: int = 500,
         force: bool = False,
     ) -> list[dict]:
@@ -4052,6 +4053,9 @@ class TradingDatabase:
             if trade_date:
                 clauses.append("d.trade_date = ?")
                 params.append(str(trade_date))
+            if action_type:
+                clauses.append("d.action_type = ?")
+                params.append(str(action_type))
             if not force:
                 clauses.append(
                     """

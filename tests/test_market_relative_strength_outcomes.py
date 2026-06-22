@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from storage.db import TradingDatabase
+from trading.strategy.market_relative_strength_shadow import ACTION_TYPE
 from trading_app.market_relative_strength_outcomes import (
+    GatewayPriceTickPathProvider,
     MarketRelativeStrengthOutcomeAnalyzer,
     MarketRelativeStrengthOutcomeConfig,
+    MarketRelativeStrengthOutcomeRuntimeConfig,
+    MarketRelativeStrengthOutcomeRuntimePipeline,
     label_shadow_outcome,
 )
 
@@ -126,6 +131,111 @@ def test_shadow_outcome_labels_are_risk_adjusted() -> None:
     assert label_shadow_outcome({"mfe_10m": 1.6, "return_10m": 0.6, "mae_10m": -0.9, "data_status_10m": "OK"}) == "SHADOW_EDGE_CANDIDATE"
     assert label_shadow_outcome({"mfe_10m": 3.0, "return_10m": 0.9, "mae_10m": -1.2, "data_status_10m": "OK"}) == "SHADOW_RISK_CASE"
     assert label_shadow_outcome({"mfe_10m": None, "return_10m": None, "mae_10m": None, "data_status_10m": "INSUFFICIENT"}) == "SHADOW_INSUFFICIENT_DATA"
+
+
+def test_runtime_pipeline_persists_due_market_rs_outcomes_only(tmp_path) -> None:
+    db = TradingDatabase(str(tmp_path / "market-rs-runtime-outcomes.db"))
+    decision = _decision_details(
+        decision_id="mrs-due",
+        code="000123",
+        scenario="WEAK_SIDE_STRICT_SHADOW",
+        variant="STRICT",
+        market_side="KOSDAQ",
+        side_regime="WEAK",
+    )
+    ignored = _decision_details(
+        decision_id="entry-due",
+        code="000124",
+        scenario="WEAK_SIDE_STRICT_SHADOW",
+        variant="STRICT",
+        market_side="KOSDAQ",
+        side_regime="WEAK",
+    )
+    ignored_event = _event_from_decision(ignored)
+    ignored_event["action_type"] = "ENTRY_PLAN"
+    db.save_strategy_decision_events([_event_from_decision(decision), ignored_event])
+
+    def provider(raw_decision: dict, horizon_sec: int, now: datetime) -> dict:
+        return {
+            "source": "test_price_path",
+            "samples": [
+                {"at": raw_decision["decision_at"], "price": 10000},
+                {"at": "2026-06-19T09:35:00", "price": 10100},
+                {"at": "2026-06-19T09:40:00", "price": 10200},
+            ],
+        }
+
+    pipeline = MarketRelativeStrengthOutcomeRuntimePipeline(
+        db,
+        config=MarketRelativeStrengthOutcomeRuntimeConfig(enabled=True, horizons_sec=(600,), max_batch_size=10),
+        price_provider=provider,
+    )
+    result = pipeline.run(datetime(2026, 6, 19, 9, 40, 1))
+
+    assert result["status"] == "OK"
+    assert result["due_count"] == 1
+    assert result["persisted_count"] == 1
+    assert result["tracked_event_count"] == 1
+    assert result["persisted_outcome_count"] == 1
+    assert result["matured_pending_count"] == 0
+    assert result["summary"]["labeled_count"] == 1
+    assert db.strategy_decision_outcome_count(trade_date="2026-06-19", action_type=ACTION_TYPE) == 1
+    assert db.strategy_decision_outcome_count(trade_date="2026-06-19", action_type="ENTRY_PLAN") == 0
+
+
+def test_runtime_pipeline_balances_due_horizons_for_dashboard_labels(tmp_path) -> None:
+    db = TradingDatabase(str(tmp_path / "market-rs-balanced-horizons.db"))
+    decision = _decision_details(
+        decision_id="balanced-due",
+        code="000123",
+        scenario="WEAK_SIDE_STRICT_SHADOW",
+        variant="STRICT",
+        market_side="KOSDAQ",
+        side_regime="WEAK",
+    )
+    db.save_strategy_decision_events([_event_from_decision(decision)])
+
+    def provider(raw_decision: dict, horizon_sec: int, now: datetime) -> dict:
+        return {
+            "source": "test_price_path",
+            "samples": [
+                {"at": raw_decision["decision_at"], "price": 10000},
+                {"at": "2026-06-19T09:40:00", "price": 10200},
+            ],
+        }
+
+    pipeline = MarketRelativeStrengthOutcomeRuntimePipeline(
+        db,
+        config=MarketRelativeStrengthOutcomeRuntimeConfig(enabled=True, horizons_sec=(300, 600), max_batch_size=2),
+        price_provider=provider,
+    )
+    result = pipeline.run(datetime(2026, 6, 19, 9, 40, 1))
+
+    assert result["due_count"] == 2
+    rows = db.list_strategy_decision_outcomes(trade_date="2026-06-19", action_type=ACTION_TYPE, limit=10)
+    assert {int(row["horizon_sec"]) for row in rows} == {300, 600}
+    assert result["summary"]["labeled_count"] == 1
+
+
+def test_gateway_price_tick_provider_loads_bounded_decision_window(tmp_path) -> None:
+    db = TradingDatabase(str(tmp_path / "market-rs-gateway-ticks.db"))
+    db.save_gateway_price_ticks_batch(
+        [
+            {"event_id": "before", "trade_date": "2026-06-19", "timestamp": "2026-06-19T09:29:59", "code": "000123", "price": 9900},
+            {"event_id": "in-1", "trade_date": "2026-06-19", "timestamp": "2026-06-19T09:30:01", "code": "000123", "price": 10050},
+            {"event_id": "in-2", "trade_date": "2026-06-19", "timestamp": "2026-06-19T09:39:59", "code": "000123", "price": 10200},
+            {"event_id": "after", "trade_date": "2026-06-19", "timestamp": "2026-06-19T09:40:01", "code": "000123", "price": 10100},
+        ]
+    )
+
+    payload = GatewayPriceTickPathProvider(db)(
+        {"code": "000123", "decision_at": "2026-06-19T09:30:00"},
+        600,
+        datetime(2026, 6, 19, 9, 40, 0),
+    )
+
+    assert payload["source"] == "gateway_price_ticks"
+    assert [sample["price"] for sample in payload["samples"]] == [10050.0, 10200.0]
 
 
 def _decision_details(

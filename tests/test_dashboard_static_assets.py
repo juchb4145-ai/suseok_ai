@@ -187,6 +187,8 @@ def test_dashboard_js_declares_table_state_and_fetch_helpers():
     assert "market_relative_strength_shadow" in js
     assert "function renderDashboardV2MarketRsShadow" in js
     assert "function renderDashboardV2MarketRsShadowRecent" in js
+    assert "matured_pending_count" in js
+    assert "persisted_outcome_count" in js
     assert "RISK_OFF_SIDE_DIAGNOSTIC" in js
     assert "SNAPSHOT_POLL_INTERVAL_MS = 30000" in js
     assert "SNAPSHOT_INITIAL_FALLBACK_MS = 7000" in js

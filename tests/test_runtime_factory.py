@@ -5,6 +5,7 @@ from trading.strategy.runtime import StrategyRuntime
 from trading.theme_engine.core_v3_runtime import ThemeCoreV3RuntimePipeline
 from trading.theme_engine.intraday_discovery import IntradayDiscoveryRuntimePipeline
 from trading_app.dependencies import CoreSettings
+from trading_app.market_relative_strength_outcomes import MarketRelativeStrengthOutcomeRuntimePipeline
 from trading_app.runtime_factory import (
     _cached_report_provider,
     _provider_cache_ttl_sec,
@@ -116,6 +117,8 @@ def test_build_core_runtime_routes_to_reboot_v2_observe_only(tmp_path, monkeypat
     assert bundle.dirty_strategy_evaluator.config.enabled is True
     assert bundle.dirty_strategy_evaluator.config.shadow_mode is True
     assert bundle.dirty_strategy_evaluator.config.order_intent_enabled is False
+    assert isinstance(bundle.market_relative_strength_outcome_pipeline, MarketRelativeStrengthOutcomeRuntimePipeline)
+    assert bundle.runtime.market_relative_strength_outcome_pipeline is bundle.market_relative_strength_outcome_pipeline
     assert bundle.exit_engine_reboot_pipeline.config.enabled is True
     assert bundle.position_risk_pipeline.config.enabled is True
     assert bundle.order_sink is None
@@ -141,6 +144,20 @@ def test_build_core_runtime_accepts_theme_core_v3_profile_alias(tmp_path, monkey
     assert isinstance(bundle.theme_board_pipeline, ThemeCoreV3RuntimePipeline)
     assert bundle.theme_board_pipeline.config.enabled is True
     assert bundle.theme_board_pipeline.config.ingest_candidate_source_events is True
+
+
+def test_build_core_runtime_wires_market_rs_outcome_pipeline_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("STRATEGY_RUNTIME_PROFILE", "V2_OBSERVE")
+    monkeypatch.setenv("TRADING_MARKET_RS_OUTCOME_ENABLED", "1")
+    monkeypatch.setenv("TRADING_MARKET_RS_OUTCOME_HORIZONS_SEC", "300,600")
+    db = TradingDatabase(str(tmp_path / "v2-market-rs-outcomes.db"))
+
+    bundle = build_core_strategy_runtime(db, GatewayStateStore(), settings=_settings(tmp_path))
+
+    assert isinstance(bundle.market_relative_strength_outcome_pipeline, MarketRelativeStrengthOutcomeRuntimePipeline)
+    assert bundle.market_relative_strength_outcome_pipeline.config.enabled is True
+    assert bundle.market_relative_strength_outcome_pipeline.config.horizons_sec == (300, 600)
+    assert bundle.runtime.market_relative_strength_outcome_pipeline is bundle.market_relative_strength_outcome_pipeline
 
 
 def test_build_core_runtime_respects_explicit_reboot_v2_component_disable(tmp_path, monkeypatch):

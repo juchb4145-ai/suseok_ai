@@ -302,6 +302,9 @@ def test_dashboard_v2_market_relative_strength_shadow_panel_is_analysis_only(mon
             },
             "market_relative_strength_outcomes": {
                 "status": "READY",
+                "tracked_event_count": 42,
+                "matured_pending_count": 2,
+                "persisted_outcome_count": 40,
                 "summary": {
                     "shadow_candidate_count": 3,
                     "labeled_count": 10,
@@ -323,6 +326,9 @@ def test_dashboard_v2_market_relative_strength_shadow_panel_is_analysis_only(mon
     assert shadow["actual_order_mode_label"] == "분석/관측전용"
     assert shadow["shadow_candidate_count"] == 3
     assert shadow["avg_mfe_10m"] == 1.7
+    assert shadow["tracked_event_count"] == 42
+    assert shadow["matured_pending_count"] == 2
+    assert shadow["persisted_outcome_count"] == 40
     assert shadow["current_recommendation"] == "WATCH_MORE"
     assert shadow["recent_candidates"][0]["promotion_eligible"] is False
     assert shadow["recent_candidates"][0]["actual_market_action"] == "BLOCK_NEW_ENTRY"

@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import mean, median
 from typing import Any, Iterable
 
 from trading.strategy.market_relative_strength_shadow import ACTION_TYPE
+from trading_app.intraday_outcomes import IntradayOutcomeConfig, IntradayOutcomeLabeler
 
 
 REPORT_ROOT = Path(__file__).resolve().parents[1] / "reports" / "market_relative_strength"
@@ -43,6 +45,265 @@ class MarketRelativeStrengthOutcomeConfig:
     weak_side_max_shadow_risk_case_rate: float = 0.15
     weak_side_min_avg_mae_10m_pct: float = -1.0
     weak_side_min_avg_mfe_10m_pct: float = 1.5
+
+
+@dataclass(frozen=True)
+class MarketRelativeStrengthOutcomeRuntimeConfig:
+    enabled: bool = False
+    interval_sec: int = 60
+    horizons_sec: tuple[int, ...] = (300, 600, 1200)
+    max_batch_size: int = 500
+    min_price_samples: int = 2
+    force: bool = False
+
+    @classmethod
+    def from_env(cls) -> "MarketRelativeStrengthOutcomeRuntimeConfig":
+        return cls(
+            enabled=_env_bool("TRADING_MARKET_RS_OUTCOME_ENABLED", default=False),
+            interval_sec=_env_int("TRADING_MARKET_RS_OUTCOME_INTERVAL_SEC", default=60, minimum=1),
+            horizons_sec=_env_horizons("TRADING_MARKET_RS_OUTCOME_HORIZONS_SEC", default=(300, 600, 1200)),
+            max_batch_size=_env_int("TRADING_MARKET_RS_OUTCOME_MAX_BATCH_SIZE", default=500, minimum=1),
+            min_price_samples=_env_int("TRADING_MARKET_RS_OUTCOME_MIN_PRICE_SAMPLES", default=2, minimum=1),
+            force=_env_bool("TRADING_MARKET_RS_OUTCOME_FORCE", default=False),
+        )
+
+
+class MarketRelativeStrengthOutcomeRuntimePipeline:
+    """Persist read-only outcome labels for the Market RS shadow stream."""
+
+    def __init__(
+        self,
+        db: Any,
+        *,
+        config: MarketRelativeStrengthOutcomeRuntimeConfig | None = None,
+        price_provider: Any | None = None,
+        clock: Any = datetime.now,
+    ) -> None:
+        self.db = db
+        self.config = config or MarketRelativeStrengthOutcomeRuntimeConfig()
+        self.price_provider = price_provider if price_provider is not None else GatewayPriceTickPathProvider(db)
+        self.clock = clock
+        self.last_run_at: datetime | None = None
+        self.last_result: dict[str, Any] = {}
+
+    def run_if_due(self, now: datetime | None = None, **_: Any) -> dict[str, Any]:
+        current = (now or self.clock()).replace(microsecond=0)
+        if not self.config.enabled:
+            result = self._disabled_result(current, "DISABLED")
+            self.last_result = result
+            return result
+        if self.last_run_at is not None:
+            elapsed = (current - self.last_run_at).total_seconds()
+            if elapsed < max(1, int(self.config.interval_sec)):
+                result = dict(self.last_result or self._disabled_result(current, "WAIT_INTERVAL"))
+                result["status"] = "WAIT_INTERVAL"
+                result["calculated_at"] = current.isoformat()
+                return result
+        result = self.run(current)
+        self.last_run_at = current
+        self.last_result = result
+        return result
+
+    def run(self, now: datetime | None = None) -> dict[str, Any]:
+        current = (now or self.clock()).replace(microsecond=0)
+        trade_date = current.date().isoformat()
+        horizons = _normalize_horizons(self.config.horizons_sec)
+        due = self._due_decisions(current, trade_date=trade_date, horizons_sec=horizons)
+        labeler = IntradayOutcomeLabeler(
+            self.db,
+            config=IntradayOutcomeConfig(
+                enabled=True,
+                horizons_sec=horizons,
+                min_price_samples=max(1, int(self.config.min_price_samples)),
+                max_batch_size=max(1, int(self.config.max_batch_size)),
+            ),
+            price_provider=self.price_provider,
+        )
+        outcomes = [
+            labeler.build_outcome_for_decision(decision, int(decision.get("horizon_sec") or 0), now=current)
+            for decision in due
+        ]
+        persisted_count = labeler.persist_outcomes(outcomes, force=bool(self.config.force))
+        report = MarketRelativeStrengthOutcomeAnalyzer(
+            self.db,
+            config=MarketRelativeStrengthOutcomeConfig(horizons_sec=horizons),
+        ).build_report(trade_date=trade_date, limit=max(10000, int(self.config.max_batch_size) * len(horizons) * 4))
+        summary = dict(report.get("summary") or {})
+        counts = self._counts(trade_date=trade_date, now=current, horizons_sec=horizons)
+        return {
+            "enabled": True,
+            "status": "OK",
+            "trade_date": trade_date,
+            "calculated_at": current.isoformat(),
+            "generated_at": report.get("generated_at") or current.isoformat(),
+            "action_type": ACTION_TYPE,
+            "horizons_sec": horizons,
+            "due_count": len(due),
+            "outcome_count": len(outcomes),
+            "persisted_count": int(persisted_count or 0),
+            "tracked_event_count": counts["tracked_event_count"],
+            "matured_pending_count": counts["matured_pending_count"],
+            "persisted_outcome_count": counts["persisted_outcome_count"],
+            "report_status": report.get("status") or "NO_DATA",
+            "available": bool(report.get("available")),
+            "summary": summary,
+            "recommendations": dict(report.get("recommendations") or {}),
+            "order_intent_allowed": False,
+            "dry_run_order_allowed": False,
+            "live_order_allowed": False,
+            "notes": [
+                "analysis_only_market_relative_strength_shadow_outcomes",
+                "does_not_create_orders_or_entry_intents",
+            ],
+        }
+
+    def _due_decisions(self, now: datetime, *, trade_date: str, horizons_sec: tuple[int, ...]) -> list[dict[str, Any]]:
+        loader = getattr(self.db, "list_strategy_decision_events_due_for_outcomes", None)
+        if not callable(loader):
+            return []
+        max_batch = max(1, int(self.config.max_batch_size))
+        ordered_horizons = sorted(horizons_sec, key=lambda horizon: (abs(int(horizon) - 600), int(horizon)))
+        per_horizon = max(1, (max_batch + max(1, len(ordered_horizons)) - 1) // max(1, len(ordered_horizons)))
+        due: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        for horizon in ordered_horizons:
+            rows = list(
+                loader(
+                    evaluated_at=now.isoformat(),
+                    horizons_sec=(horizon,),
+                    trade_date=trade_date,
+                    action_type=ACTION_TYPE,
+                    limit=per_horizon,
+                    force=bool(self.config.force),
+                )
+                or []
+            )
+            for row in rows:
+                key = (str(row.get("decision_id") or ""), int(row.get("horizon_sec") or horizon))
+                if key in seen:
+                    continue
+                seen.add(key)
+                due.append(row)
+                if len(due) >= max_batch:
+                    return due
+        return due
+
+    def _pending_due_count(self, now: datetime, *, trade_date: str, horizons_sec: tuple[int, ...]) -> int:
+        loader = getattr(self.db, "list_strategy_decision_events_due_for_outcomes", None)
+        if not callable(loader):
+            return 0
+        return len(
+            loader(
+                evaluated_at=now.isoformat(),
+                horizons_sec=horizons_sec,
+                trade_date=trade_date,
+                action_type=ACTION_TYPE,
+                limit=max(1, int(self.config.max_batch_size)),
+                force=bool(self.config.force),
+            )
+            or []
+        )
+
+    def _counts(self, *, trade_date: str, now: datetime, horizons_sec: tuple[int, ...]) -> dict[str, int]:
+        tracked_event_count = 0
+        event_counter = getattr(self.db, "strategy_decision_event_count", None)
+        if callable(event_counter):
+            tracked_event_count = int(event_counter(trade_date=trade_date, action_type=ACTION_TYPE) or 0)
+        persisted_outcome_count = 0
+        outcome_counter = getattr(self.db, "strategy_decision_outcome_count", None)
+        if callable(outcome_counter):
+            persisted_outcome_count = int(outcome_counter(trade_date=trade_date, action_type=ACTION_TYPE) or 0)
+        matured_pending_count = 0
+        if bool(self.config.force):
+            matured_pending_count = self._pending_due_count(now, trade_date=trade_date, horizons_sec=horizons_sec)
+        else:
+            pending_loader = getattr(self.db, "list_strategy_decision_events_due_for_outcomes", None)
+            if callable(pending_loader):
+                matured_pending_count = len(
+                    pending_loader(
+                        evaluated_at=now.isoformat(),
+                        horizons_sec=horizons_sec,
+                        trade_date=trade_date,
+                        action_type=ACTION_TYPE,
+                        limit=max(1, int(self.config.max_batch_size)),
+                        force=False,
+                    )
+                    or []
+                )
+        return {
+            "tracked_event_count": tracked_event_count,
+            "persisted_outcome_count": persisted_outcome_count,
+            "matured_pending_count": matured_pending_count,
+        }
+
+    def _disabled_result(self, now: datetime, status: str) -> dict[str, Any]:
+        return {
+            "enabled": False,
+            "status": status,
+            "trade_date": now.date().isoformat(),
+            "calculated_at": now.isoformat(),
+            "action_type": ACTION_TYPE,
+            "horizons_sec": _normalize_horizons(self.config.horizons_sec),
+            "due_count": 0,
+            "outcome_count": 0,
+            "persisted_count": 0,
+            "tracked_event_count": 0,
+            "matured_pending_count": 0,
+            "persisted_outcome_count": 0,
+            "summary": {},
+            "recommendations": {},
+            "order_intent_allowed": False,
+            "dry_run_order_allowed": False,
+            "live_order_allowed": False,
+        }
+
+
+class GatewayPriceTickPathProvider:
+    """Fast runtime price path provider backed by persisted gateway ticks."""
+
+    def __init__(self, db: Any, *, max_rows: int = 300) -> None:
+        self.db = db
+        self.max_rows = max(1, int(max_rows or 300))
+
+    def __call__(self, decision: dict[str, Any], horizon_sec: int, now: datetime) -> dict[str, Any]:
+        code = _normalize_code(decision.get("code"))
+        decision_at = _parse_dt(decision.get("decision_at"))
+        if not code or decision_at is None or not hasattr(self.db, "conn"):
+            return {"source": "gateway_price_ticks", "samples": []}
+        horizon_at = min(decision_at + timedelta(seconds=max(1, int(horizon_sec or 1))), now)
+        try:
+            rows = self.db.conn.execute(
+                """
+                SELECT timestamp, price, source
+                FROM gateway_price_ticks
+                WHERE trade_date = ? AND code = ? AND timestamp >= ? AND timestamp <= ? AND price IS NOT NULL
+                ORDER BY timestamp ASC, id ASC
+                LIMIT ?
+                """,
+                (
+                    decision_at.date().isoformat(),
+                    code,
+                    decision_at.isoformat(timespec="seconds"),
+                    horizon_at.isoformat(timespec="seconds"),
+                    self.max_rows,
+                ),
+            ).fetchall()
+        except Exception:
+            return {"source": "gateway_price_ticks", "samples": []}
+        samples: list[dict[str, Any]] = []
+        seen: set[tuple[str, float]] = set()
+        for row in rows:
+            data = dict(row)
+            price = _positive_float(data.get("price"))
+            at = str(data.get("timestamp") or "")
+            if not price or not at:
+                continue
+            key = (at, price)
+            if key in seen:
+                continue
+            seen.add(key)
+            samples.append({"at": at, "price": price, "source": data.get("source") or "gateway_price_ticks"})
+        return {"source": "gateway_price_ticks", "samples": samples}
 
 
 class MarketRelativeStrengthOutcomeAnalyzer:
@@ -466,6 +727,77 @@ def _sample_distribution_ok(rows: list[dict[str, Any]]) -> bool:
     return len(codes) >= 1 and len(trade_dates) >= 1
 
 
+def _normalize_horizons(values: Iterable[Any]) -> tuple[int, ...]:
+    horizons: set[int] = set()
+    for value in values:
+        try:
+            horizon = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if horizon > 0:
+            horizons.add(horizon)
+    return tuple(sorted(horizons) or (300, 600, 1200))
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _env_int(name: str, *, default: int, minimum: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return max(minimum, int(default))
+    try:
+        return max(minimum, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return max(minimum, int(default))
+
+
+def _env_horizons(name: str, *, default: tuple[int, ...]) -> tuple[int, ...]:
+    raw = os.getenv(name)
+    if raw is None:
+        return _normalize_horizons(default)
+    parts = str(raw).replace(";", ",").split(",")
+    values: list[int] = []
+    for part in parts:
+        text = part.strip()
+        if not text:
+            continue
+        try:
+            values.append(int(text))
+        except ValueError:
+            continue
+    return _normalize_horizons(values or default)
+
+
+def _normalize_code(value: Any) -> str:
+    text = "".join(ch for ch in str(value or "").strip() if ch.isdigit())
+    if not text:
+        return ""
+    return text[-6:].zfill(6)
+
+
+def _positive_float(value: Any) -> float:
+    try:
+        number = float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+    return number if number > 0 else 0.0
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
 def _float(value: Any) -> float:
     if value in (None, ""):
         return 0.0
@@ -488,5 +820,8 @@ def _csv_value(value: Any) -> Any:
 __all__ = [
     "MarketRelativeStrengthOutcomeAnalyzer",
     "MarketRelativeStrengthOutcomeConfig",
+    "MarketRelativeStrengthOutcomeRuntimeConfig",
+    "MarketRelativeStrengthOutcomeRuntimePipeline",
+    "GatewayPriceTickPathProvider",
     "label_shadow_outcome",
 ]

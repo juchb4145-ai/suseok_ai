@@ -1205,6 +1205,9 @@ function renderDashboardV2MarketRsShadow(payload) {
   text("dashboard-v2-market-rs-shadow-riskoff", data.risk_off_side_diagnostic_count || 0);
   text("dashboard-v2-market-rs-shadow-systemic", data.systemic_excluded_count || 0);
   text("dashboard-v2-market-rs-shadow-labeled", data.labeled_count || 0);
+  text("dashboard-v2-market-rs-shadow-tracked", data.tracked_event_count || 0);
+  text("dashboard-v2-market-rs-shadow-pending", data.matured_pending_count || 0);
+  text("dashboard-v2-market-rs-shadow-persisted", data.persisted_outcome_count || 0);
   text("dashboard-v2-market-rs-shadow-mfe10", formatPercentValue(data.avg_mfe_10m));
   text("dashboard-v2-market-rs-shadow-mae10", formatPercentValue(data.avg_mae_10m));
   text("dashboard-v2-market-rs-shadow-edge", formatRate(data.shadow_edge_rate_10m));
