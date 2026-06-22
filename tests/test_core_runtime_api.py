@@ -58,6 +58,7 @@ def test_runtime_dashboard_payload_preserves_reboot_v2_snapshot_fields(monkeypat
                 "runtime": "strategy_reboot_v2",
                 "runtime_profile": "V2_OBSERVE",
                 "reboot_v2_enabled": True,
+                "index_watch_codes_configured": True,
                 "pipeline_status": {"theme_board": True, "market_regime": True},
                 "data_warmup_status": "ready",
                 "theme_board": {"enabled": True, "status": "OK"},
@@ -71,6 +72,7 @@ def test_runtime_dashboard_payload_preserves_reboot_v2_snapshot_fields(monkeypat
 
     assert payload["runtime_profile"] == "V2_OBSERVE"
     assert payload["reboot_v2_enabled"] is True
+    assert payload["index_watch_codes_configured"] is True
     assert payload["pipeline_status"]["theme_board"] is True
     assert payload["data_warmup_status"] == "ready"
     assert payload["theme_board"]["status"] == "OK"

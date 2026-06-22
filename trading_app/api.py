@@ -7664,6 +7664,9 @@ def _build_pre_market_check_report_payload(
         or runtime_payload.get("order_manager")
         or order_manager_dashboard_section(db, gateway_state=gateway_state, trade_date=today)
     )
+    market_regime_payload = dict(base.get("market_regime") or runtime_payload.get("market_regime") or {})
+    if "index_watch_codes_configured" not in market_regime_payload and "index_watch_codes_configured" in runtime_payload:
+        market_regime_payload["index_watch_codes_configured"] = bool(runtime_payload.get("index_watch_codes_configured"))
     context = {
         **base,
         "trade_date": today,
@@ -7673,7 +7676,7 @@ def _build_pre_market_check_report_payload(
         "commands": gateway_state.command_snapshot(),
         "order_manager": order_manager_payload,
         "theme_board": dict(base.get("theme_board") or runtime_payload.get("theme_board") or {}),
-        "market_regime": dict(base.get("market_regime") or runtime_payload.get("market_regime") or {}),
+        "market_regime": market_regime_payload,
         "data_preload": dict(base.get("data_preload") or runtime_payload.get("data_preload") or {}),
         "risk": dict(base.get("risk") or runtime_payload.get("risk") or {}),
         "sqlite": _sqlite_operational_store_health(db),
@@ -10730,6 +10733,7 @@ def _runtime_dashboard_payload(status: dict[str, Any]) -> dict[str, Any]:
         "runtime": snapshot_payload.get("runtime", ""),
         "runtime_profile": snapshot_payload.get("runtime_profile", ""),
         "reboot_v2_enabled": bool(snapshot_payload.get("reboot_v2_enabled", False)),
+        "index_watch_codes_configured": bool(snapshot_payload.get("index_watch_codes_configured", False)),
         "status": snapshot_payload.get("status", ""),
         "pipeline_status": dict(snapshot_payload.get("pipeline_status") or {}),
         "last_cycle_at": status.get("last_cycle_at", ""),

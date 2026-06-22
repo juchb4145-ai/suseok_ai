@@ -1054,6 +1054,7 @@ class MarketRegimeRuntimePipeline:
         self.last_summary = market_regime_dashboard_payload(result.snapshot)
         self.last_summary["enabled"] = True
         self.last_summary["status"] = "OK"
+        self.last_summary["index_watch_codes_configured"] = bool(self.config.kospi_code and self.config.kosdaq_code)
         return dict(self.last_summary)
 
 

@@ -95,6 +95,16 @@ def test_unknown_market_or_data_wait_is_excluded() -> None:
     assert "MARKET_RS_CONTEXT_NOT_READY" in decision.reason_codes
 
 
+def test_evaluator_uses_context_stock_name_when_candidate_name_is_missing() -> None:
+    candidate = _candidate(side_regime="WEAK", market_action="WAIT_MARKET", rs=4.5)
+    candidate.name = ""
+    candidate.metadata["strategy_context_v3"]["stock"]["name"] = "성문전자"
+
+    decision = _evaluate(candidate)
+
+    assert decision.name == "성문전자"
+
+
 def test_stale_data_rejects_otherwise_valid_weak_shadow() -> None:
     candidate = _candidate(side_regime="WEAK", market_action="WAIT_MARKET", rs=5.0, realtime_tick_fresh=False)
 
@@ -185,6 +195,52 @@ def test_pipeline_persists_events_dedupes_material_state_and_never_creates_order
     assert saved is not None
     assert saved.state == CandidateState.WATCHING
     assert db.list_runtime_order_intents(limit=10) == []
+
+
+def test_pipeline_fills_missing_candidate_name_from_opening_seed_rows(tmp_path) -> None:
+    db = TradingDatabase(str(tmp_path / "market-rs-shadow-name.db"))
+    now = datetime(2026, 6, 19, 9, 30)
+    trade_date = now.date().isoformat()
+    db.save_opening_turnover_seed_batch(
+        {
+            "trade_date": trade_date,
+            "batch_time": "09:03",
+            "command_id": "cmd-name-fallback",
+            "row_count": 1,
+            "parsed_count": 1,
+            "parser_status": "OK",
+            "rows": [
+                {
+                    "stock_code": "014940",
+                    "stock_name": "오리엔탈정공",
+                    "rank": 1,
+                    "turnover_krw": 1_000_000_000,
+                    "change_rate_pct": 4.0,
+                    "raw": {},
+                }
+            ],
+        }
+    )
+    candidate = _candidate(
+        trade_date=trade_date,
+        code="014940",
+        market_side="KOSDAQ",
+        side_regime="WEAK",
+        market_action="WAIT_MARKET",
+        rs=4.5,
+    )
+    candidate.name = ""
+    db.save_candidate(candidate)
+    pipeline = MarketRelativeStrengthShadowRuntimePipeline(
+        db=db,
+        config=MarketRelativeStrengthShadowConfig(enabled=True, interval_sec=0, dedupe_sec=60),
+    )
+
+    result = pipeline.run(now)
+    events = db.list_strategy_decision_events(trade_date=trade_date, action_type=ACTION_TYPE, limit=10)
+
+    assert result["recent_candidates"][0]["name"] == "오리엔탈정공"
+    assert events[0]["name"] == "오리엔탈정공"
 
 
 def _evaluate(candidate: Candidate):

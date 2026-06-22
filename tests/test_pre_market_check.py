@@ -186,6 +186,28 @@ def test_order_manager_disabled_observe_can_go_observe():
     assert report["go_no_go"] == "GO_OBSERVE"
 
 
+def test_theme_core_v3_profile_is_reboot_v2_observe():
+    snapshot = _snapshot()
+    snapshot["runtime"]["runtime_profile"] = "THEME_CORE_V3"
+    snapshot["order_manager"]["enabled"] = False
+    snapshot["order_manager"]["mode"] = "OBSERVE"
+    snapshot["order_manager"]["live_sim_orders_allowed"] = False
+
+    config = _config("observe")
+    config = PreMarketCheckConfig(
+        **{
+            **config.__dict__,
+            "order_manager_enabled": False,
+            "order_manager_mode": "OBSERVE",
+            "allow_live_sim_orders": False,
+        }
+    )
+    report = _report(snapshot, config)
+
+    assert report["go_no_go"] == "GO_OBSERVE"
+    assert "REBOOT_V2_ROUTER_DISABLED" not in report["blocking_reasons"]
+
+
 def test_dry_run_flags_can_go_dry_run():
     snapshot = _snapshot()
     snapshot["order_manager"]["enabled"] = False

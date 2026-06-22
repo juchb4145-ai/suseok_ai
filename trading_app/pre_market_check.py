@@ -446,16 +446,18 @@ def _add_reboot_v2_items(
         or os.getenv("STRATEGY_REBOOT_V2_PROFILE")
         or "V2_OBSERVE"
     ).upper()
-    v2_requested = cfg.strategy_reboot_v2_enabled or profile.startswith("V2_")
+    profile_is_reboot_v2 = _is_reboot_v2_profile(profile)
+    v2_requested = cfg.strategy_reboot_v2_enabled or profile_is_reboot_v2
     if requested_mode != "OBSERVE" or not v2_requested:
         return
     pipeline_status = dict(runtime.get("pipeline_status") or {})
+    top_level_enabled = cfg.strategy_reboot_v2_enabled and profile_is_reboot_v2
     add(
         "reboot_v2_top_level",
         "reboot_v2",
         "Reboot V2 top-level router",
-        PreMarketCheckStatus.PASS if cfg.strategy_reboot_v2_enabled and profile.startswith("V2_") else PreMarketCheckStatus.FAIL,
-        reason_code="" if cfg.strategy_reboot_v2_enabled and profile.startswith("V2_") else "REBOOT_V2_ROUTER_DISABLED",
+        PreMarketCheckStatus.PASS if top_level_enabled else PreMarketCheckStatus.FAIL,
+        reason_code="" if top_level_enabled else "REBOOT_V2_ROUTER_DISABLED",
         message_ko=f"profile={profile}, enabled={cfg.strategy_reboot_v2_enabled}",
         details={"runtime_profile": profile, "strategy_reboot_v2_enabled": cfg.strategy_reboot_v2_enabled},
     )
@@ -515,6 +517,11 @@ def _add_reboot_v2_items(
         message_ko="register_realtime ACK 확인",
         details={"acked_count": acked},
     )
+
+
+def _is_reboot_v2_profile(profile: str) -> bool:
+    normalized = str(profile or "").strip().upper()
+    return normalized.startswith("V2_") or normalized in {"THEME_CORE_V3", "V3", "RT_TLS", "OPENING_THEME_BURST"}
 
 
 def _add_v2_component_item(add: Any, key: str, label: str, pipeline_status: dict[str, Any], section: Any) -> None:

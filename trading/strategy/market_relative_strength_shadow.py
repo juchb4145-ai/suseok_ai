@@ -241,7 +241,13 @@ class MarketRelativeStrengthShadowEvaluator:
             candidate_instance_id=str(metadata.get("candidate_instance_id") or candidate.id or code),
             context_id=context_id,
             code=code,
-            name=candidate.name,
+            name=_first_text(
+                candidate.name,
+                stock.get("name"),
+                metadata.get("stock_name"),
+                entry.get("stock_name"),
+                entry.get("name"),
+            ),
             market_side=str(market.get("market_side") or "UNKNOWN"),
             side_market_regime=str(market.get("side_market_regime") or "DATA_WAIT"),
             counterpart_market_regime=str(market.get("counterpart_market_regime") or "DATA_WAIT"),
@@ -508,11 +514,15 @@ class MarketRelativeStrengthShadowRuntimePipeline:
             for candidate in list(self.db.list_candidates(trade_date=trade_date) or [])
             if candidate.state not in {CandidateState.REMOVED, CandidateState.EXPIRED}
         ]
+        name_fallbacks = _candidate_name_fallbacks(self.db, candidates, trade_date=trade_date)
         decisions: list[MarketRelativeStrengthShadowDecision] = []
         suppressed = 0
         for candidate in candidates:
             if len(decisions) >= max(1, int(self.config.max_per_cycle or 1)):
                 break
+            code = normalize_code(candidate.code)
+            if not str(candidate.name or "").strip() and name_fallbacks.get(code):
+                candidate.name = name_fallbacks[code]
             decision = self.evaluator.evaluate_candidate(candidate, now=current)
             if decision.shadow_status == MarketRelativeStrengthShadowStatus.NOT_APPLICABLE.value:
                 continue
@@ -572,6 +582,84 @@ def _decision_id(*, trade_date: str, code: str, candidate_instance_id: str, cont
 def _material_key(values: Mapping[str, Any]) -> str:
     raw = "|".join(f"{key}={values.get(key, '')}" for key in sorted(values))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _candidate_name_fallbacks(db: Any, candidates: Iterable[Candidate], *, trade_date: str) -> dict[str, str]:
+    candidate_rows = list(candidates)
+    codes = sorted({normalize_code(candidate.code) for candidate in candidate_rows if normalize_code(candidate.code)})
+    if not codes:
+        return {}
+    wanted = set(codes)
+    names: dict[str, str] = {}
+    for candidate in candidate_rows:
+        _remember_name(names, wanted, candidate.code, candidate.name)
+    for row in _seed_rows(db, "list_opening_turnover_seed_rows", trade_date=trade_date):
+        _remember_name(names, wanted, _row_value(row, "stock_code") or _row_value(row, "code"), _row_value(row, "stock_name") or _row_value(row, "name"))
+    for row in _seed_rows(db, "list_intraday_theme_discovery_rows", trade_date=trade_date):
+        _remember_name(names, wanted, _row_value(row, "stock_code") or _row_value(row, "code"), _row_value(row, "stock_name") or _row_value(row, "name"))
+    for row in _theme_membership_name_rows(db, codes):
+        _remember_name(names, wanted, _row_value(row, "stock_code") or _row_value(row, "code"), _row_value(row, "stock_name") or _row_value(row, "name"))
+    loader = getattr(db, "list_kiwoom_symbol_master", None)
+    if callable(loader):
+        for row in list(loader(codes) or []):
+            _remember_name(names, wanted, _row_value(row, "code"), _row_value(row, "name"))
+    return names
+
+
+def _seed_rows(db: Any, loader_name: str, *, trade_date: str) -> list[Any]:
+    loader = getattr(db, loader_name, None)
+    if not callable(loader):
+        return []
+    try:
+        return list(loader(trade_date=trade_date, limit=5000) or [])
+    except TypeError:
+        return list(loader(trade_date=trade_date) or [])
+
+
+def _theme_membership_name_rows(db: Any, codes: Iterable[str]) -> list[dict[str, Any]]:
+    conn = getattr(db, "conn", None)
+    clean_codes = sorted({normalize_code(code) for code in codes if normalize_code(code)})
+    if conn is None or not clean_codes:
+        return []
+    placeholders = ",".join("?" for _ in clean_codes)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT stock_code, stock_name
+            FROM theme_membership_current
+            WHERE stock_code IN ({placeholders})
+              AND COALESCE(stock_name, '') <> ''
+            ORDER BY active DESC, trade_eligible DESC, membership_score DESC, updated_at DESC
+            """,
+            tuple(clean_codes),
+        ).fetchall()
+    except Exception:
+        return []
+    return [{"stock_code": _row_value(row, "stock_code"), "stock_name": _row_value(row, "stock_name")} for row in rows]
+
+
+def _remember_name(result: dict[str, str], wanted: set[str], code: Any, name: Any) -> None:
+    clean_code = normalize_code(code)
+    text = str(name or "").strip()
+    if clean_code and clean_code in wanted and text and clean_code not in result:
+        result[clean_code] = text
+
+
+def _row_value(row: Any, key: str) -> Any:
+    if isinstance(row, Mapping):
+        return row.get(key)
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return getattr(row, key, "")
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _relative_strength_band(value: float) -> str:
