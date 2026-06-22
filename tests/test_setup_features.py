@@ -22,7 +22,7 @@ def test_setup_feature_builder_marks_stale_realtime_tick_as_data_wait(tmp_path):
     )
 
     assert "REALTIME_TICK_STALE" in feature.data_wait_reasons
-    assert feature.schema_version == "setup_router_v3.features.v2"
+    assert feature.schema_version == "setup_router_v3.features.v3"
 
 
 def test_setup_feature_builder_uses_market_data_tick_age_contract(tmp_path):
@@ -40,3 +40,25 @@ def test_setup_feature_builder_uses_market_data_tick_age_contract(tmp_path):
     )
 
     assert "REALTIME_TICK_STALE" in feature.data_wait_reasons
+
+
+def test_setup_feature_builder_blocks_missing_required_selected_theme_lease(tmp_path):
+    db = TradingDatabase(str(tmp_path / "setup-features-lease.db"))
+    market_data = MarketDataStore()
+    candles = CandleBuilder()
+    candidate = _candidate(db)
+    _seed_candles(market_data, candles, closes=[980, 970, 960, 1002, 1008], vwap=1000)
+
+    feature = SetupFeatureBuilder(market_data, candles, min_completed_1m_candles=3, max_tick_age_sec=10).build(
+        candidate,
+        now=datetime(2026, 6, 22, 9, 5, 6),
+        strategy_context={**_context(), "selected_theme_lease_required": True},
+        entry_decision=_entry_decision(),
+        selected_theme_lease_required=True,
+        other_theme_lease_count=1,
+    )
+
+    assert feature.post_subscription_tick_verified is False
+    assert feature.post_subscription_tick_reason == "SETUP_SELECTED_THEME_LEASE_MISSING"
+    assert "SETUP_SELECTED_THEME_LEASE_MISSING" in feature.data_wait_reasons
+    assert feature.other_theme_lease_count == 1

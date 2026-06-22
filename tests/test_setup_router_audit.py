@@ -25,3 +25,51 @@ def test_setup_router_audit_writes_reports(tmp_path):
     assert summary["verdict"] == "CONDITIONALLY_STABLE"
     assert summary["invalid_count"] == 0
     assert (out_dir / "report.md").exists()
+
+
+def test_setup_router_audit_counts_only_gateway_order_commands_as_side_effects(tmp_path):
+    db_path = tmp_path / "setup-audit-side-effects.db"
+    out_dir = tmp_path / "reports"
+    db = TradingDatabase(str(db_path))
+    observation = _observation("VALID_OBSERVE", "MATCHED", "fp-audit")
+    db.save_setup_router_states([observation])
+    db.save_setup_observations([observation])
+    db.conn.execute(
+        """
+        INSERT INTO gateway_commands(
+            command_id, command_type, status, priority, source,
+            payload_json, command_json, metadata_json, result_payload_json,
+            created_at, updated_at, trade_date
+        ) VALUES (?, ?, ?, ?, ?, '{}', '{}', '{}', '{}', ?, ?, ?)
+        """,
+        ("cmd-register", "register_realtime", "queued", "normal", "setup_router_v3", "2026-06-22T09:05:00", "2026-06-22T09:05:00", TRADE_DATE),
+    )
+    db.conn.commit()
+    db.conn.close()
+
+    rc = main(["--db", str(db_path), "--trade-date", TRADE_DATE, "--output-dir", str(out_dir)])
+    summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert rc == 0
+    assert summary["side_effect_counts"]["gateway_order_commands"] == 0
+
+    db = TradingDatabase(str(db_path))
+    db.conn.execute(
+        """
+        INSERT INTO gateway_commands(
+            command_id, command_type, status, priority, source,
+            payload_json, command_json, metadata_json, result_payload_json,
+            created_at, updated_at, trade_date
+        ) VALUES (?, ?, ?, ?, ?, '{}', '{}', '{}', '{}', ?, ?, ?)
+        """,
+        ("cmd-send", "send_order", "queued", "high", "setup_router_v3", "2026-06-22T09:06:00", "2026-06-22T09:06:00", TRADE_DATE),
+    )
+    db.conn.commit()
+    db.conn.close()
+
+    rc = main(["--db", str(db_path), "--trade-date", TRADE_DATE, "--output-dir", str(out_dir)])
+    summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert rc == 1
+    assert summary["side_effect_counts"]["gateway_order_commands"] == 1
+    assert "SETUP_ROUTER_ORDER_SIDE_EFFECTS_PRESENT" in summary["failures"]

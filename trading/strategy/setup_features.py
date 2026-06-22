@@ -8,7 +8,7 @@ from trading.strategy.candidates import normalize_code
 from trading.strategy.models import Candidate
 
 
-SETUP_ROUTER_FEATURE_SCHEMA_VERSION = "setup_router_v3.features.v2"
+SETUP_ROUTER_FEATURE_SCHEMA_VERSION = "setup_router_v3.features.v3"
 
 
 @dataclass(frozen=True)
@@ -87,6 +87,8 @@ class SetupFeatureSnapshot:
     entry_reason_codes: tuple[str, ...] = ()
     context_reason_codes: tuple[str, ...] = ()
     expansion_lease_present: bool = False
+    selected_theme_lease_required: bool = False
+    other_theme_lease_count: int = 0
     lease_status: str = ""
     lease_selected_at: str = ""
     lease_first_active_at: str = ""
@@ -118,6 +120,8 @@ class SetupFeatureBuilder:
         previous_observation: Mapping[str, Any] | None = None,
         setup_states: Mapping[str, Any] | None = None,
         expansion_lease: Mapping[str, Any] | None = None,
+        selected_theme_lease_required: bool = False,
+        other_theme_lease_count: int = 0,
     ) -> SetupFeatureSnapshot:
         current = now.replace(microsecond=0)
         code = normalize_code(candidate.code)
@@ -171,6 +175,7 @@ class SetupFeatureBuilder:
             tick_at=tick_at_dt,
             price_source=price_source,
             realtime_tick_fresh=realtime_tick_fresh,
+            required=bool(selected_theme_lease_required),
         )
 
         data_wait = []
@@ -199,7 +204,9 @@ class SetupFeatureBuilder:
         if any("REALTIME_COVERAGE_LOW" in str(reason).upper() for reason in context_reasons):
             data_wait.append("REALTIME_COVERAGE_LOW")
         if lease_check["lease_present"] and not lease_check["post_subscription_tick_verified"]:
-            data_wait.append("SETUP_POST_SUBSCRIPTION_FRESH_TICK_MISSING")
+            data_wait.append(str(lease_check["reason"] or "SETUP_POST_SUBSCRIPTION_FRESH_TICK_MISSING"))
+        if lease_check["reason"] == "SETUP_SELECTED_THEME_LEASE_MISSING":
+            data_wait.append("SETUP_SELECTED_THEME_LEASE_MISSING")
 
         return SetupFeatureSnapshot(
             schema_version=SETUP_ROUTER_FEATURE_SCHEMA_VERSION,
@@ -276,6 +283,8 @@ class SetupFeatureBuilder:
             entry_reason_codes=tuple(_dedupe(entry.get("reason_codes") or [])),
             context_reason_codes=context_reasons,
             expansion_lease_present=bool(lease_check["lease_present"]),
+            selected_theme_lease_required=bool(selected_theme_lease_required),
+            other_theme_lease_count=max(0, int(other_theme_lease_count or 0)),
             lease_status=str(lease_check["lease_status"]),
             lease_selected_at=str(lease_check["selected_at"]),
             lease_first_active_at=str(lease_check["first_active_at"]),
@@ -404,6 +413,7 @@ def _post_subscription_tick_check(
     tick_at: Any,
     price_source: str,
     realtime_tick_fresh: bool,
+    required: bool = False,
 ) -> dict[str, Any]:
     if not lease:
         return {
@@ -412,8 +422,8 @@ def _post_subscription_tick_check(
             "selected_at": "",
             "first_active_at": "",
             "first_fresh_tick_at": "",
-            "post_subscription_tick_verified": True,
-            "reason": "NO_EXPANSION_LEASE",
+            "post_subscription_tick_verified": not required,
+            "reason": "SETUP_SELECTED_THEME_LEASE_MISSING" if required else "NO_SELECTED_THEME_EXPANSION_LEASE_REQUIRED",
         }
     lease_theme = str(lease.get("theme_id") or "")
     status = str(lease.get("status") or "")
@@ -425,8 +435,8 @@ def _post_subscription_tick_check(
             "selected_at": str(lease.get("selected_at") or ""),
             "first_active_at": str(lease.get("first_active_at") or ""),
             "first_fresh_tick_at": str(lease.get("first_fresh_tick_at") or ""),
-            "post_subscription_tick_verified": True,
-            "reason": "LEASE_FOR_OTHER_THEME",
+            "post_subscription_tick_verified": False,
+            "reason": "SETUP_SELECTED_THEME_LEASE_MISMATCH",
         }
     if status.upper() not in active_statuses:
         return {

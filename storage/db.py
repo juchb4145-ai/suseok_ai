@@ -6,7 +6,7 @@ import sqlite3
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable, Optional, Union
+from typing import Iterable, Mapping, Optional, Union
 from uuid import uuid4
 
 from trading.broker.models import BrokerExecutionEvent, BrokerOrderResult
@@ -33,7 +33,7 @@ from trading.strategy.models import (
 from trading.strategy.conditions import ConditionProfile
 
 
-_CURRENT_SETUP_ROUTER_VERSION = "setup_router_v3.2"
+_CURRENT_SETUP_ROUTER_VERSION = "setup_router_v3.3"
 
 
 class TradingDatabase:
@@ -1200,6 +1200,28 @@ class TradingDatabase:
                 ON setup_router_state_transitions_v2(trade_date, occurred_at, transition_id);
             CREATE INDEX IF NOT EXISTS idx_setup_router_state_transitions_v2_code
                 ON setup_router_state_transitions_v2(code, occurred_at);
+            CREATE TABLE IF NOT EXISTS setup_router_candidate_runtime_v3 (
+                trade_date TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                code TEXT NOT NULL DEFAULT '',
+                selected_theme_id TEXT NOT NULL DEFAULT '',
+                last_evaluated_at TEXT NOT NULL DEFAULT '',
+                last_evaluation_source TEXT NOT NULL DEFAULT '',
+                last_context_id TEXT NOT NULL DEFAULT '',
+                last_entry_decision_at TEXT NOT NULL DEFAULT '',
+                last_completed_candle_at TEXT NOT NULL DEFAULT '',
+                evaluation_count INTEGER NOT NULL DEFAULT 0,
+                incremental_evaluation_count INTEGER NOT NULL DEFAULT 0,
+                periodic_evaluation_count INTEGER NOT NULL DEFAULT 0,
+                ttl_evaluation_count INTEGER NOT NULL DEFAULT 0,
+                capacity_deferred_count INTEGER NOT NULL DEFAULT 0,
+                last_deferred_at TEXT NOT NULL DEFAULT '',
+                last_skip_reason TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, candidate_instance_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_candidate_runtime_v3_trade_eval
+                ON setup_router_candidate_runtime_v3(trade_date, last_evaluated_at);
             CREATE TABLE IF NOT EXISTS position_runtime_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -8841,14 +8863,13 @@ class TradingDatabase:
                     (trade_date, candidate_instance_id, setup_type),
                 ).fetchone()
                 previous_payload = _row_to_setup_observation(previous) if previous else {}
-                current_fingerprint = str(payload.get("fingerprint") or "")
+                current_fingerprint = str(payload.get("fingerprint") or payload.get("observation_fingerprint") or "")
+                current_material_fingerprint = str(payload.get("material_state_fingerprint") or current_fingerprint)
                 previous_fingerprint = str(previous_payload.get("fingerprint") or "")
-                transition_needed = (
-                    not previous_payload
-                    or str(previous_payload.get("router_status") or "") != str(payload.get("router_status") or "")
-                    or str(previous_payload.get("shape_status") or "") != str(payload.get("shape_status") or "")
-                    or str(previous_payload.get("context_status") or "") != str(payload.get("context_status") or "")
-                ) and current_fingerprint != previous_fingerprint
+                previous_material_fingerprint = str(previous_payload.get("material_state_fingerprint") or previous_payload.get("fingerprint") or "")
+                transition_needed = bool(current_material_fingerprint) and (
+                    not previous_payload or current_material_fingerprint != previous_material_fingerprint
+                )
                 self.conn.execute(
                     """
                     INSERT INTO setup_observations_latest(
@@ -8862,8 +8883,10 @@ class TradingDatabase:
                         entry_alignment_status, primary_setup, setup_quality_score, context_id,
                         theme_id, theme_name, theme_state, leadership_status, stock_role,
                         market_side, market_action, session_phase, current_price, fingerprint,
+                        observation_fingerprint, material_state_fingerprint, detector_phase,
+                        material_change_kind, first_seen_at, expires_at, expired_at, terminal_at,
                         reason_codes_json, price_structure_json, safety_json, payload_json, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(trade_date, candidate_instance_id, setup_type) DO UPDATE SET
                         candidate_id=excluded.candidate_id,
                         code=excluded.code,
@@ -8902,6 +8925,14 @@ class TradingDatabase:
                         session_phase=excluded.session_phase,
                         current_price=excluded.current_price,
                         fingerprint=excluded.fingerprint,
+                        observation_fingerprint=excluded.observation_fingerprint,
+                        material_state_fingerprint=excluded.material_state_fingerprint,
+                        detector_phase=excluded.detector_phase,
+                        material_change_kind=excluded.material_change_kind,
+                        first_seen_at=excluded.first_seen_at,
+                        expires_at=excluded.expires_at,
+                        expired_at=excluded.expired_at,
+                        terminal_at=excluded.terminal_at,
                         reason_codes_json=excluded.reason_codes_json,
                         price_structure_json=excluded.price_structure_json,
                         safety_json=excluded.safety_json,
@@ -8921,8 +8952,10 @@ class TradingDatabase:
                             transitioned_at, previous_router_status, current_router_status,
                             previous_shape_status, current_shape_status, previous_context_status,
                             current_context_status, previous_fingerprint, current_fingerprint,
+                            detector_phase_from, detector_phase_to, material_change_kind,
+                            material_state_fingerprint_from, material_state_fingerprint_to,
                             reason_codes_json, payload_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             trade_date,
@@ -8946,6 +8979,11 @@ class TradingDatabase:
                             str(payload.get("context_status") or ""),
                             previous_fingerprint,
                             current_fingerprint,
+                            str(previous_payload.get("detector_phase") or ""),
+                            str(payload.get("detector_phase") or ""),
+                            str(payload.get("material_change_kind") or ""),
+                            previous_material_fingerprint,
+                            current_material_fingerprint,
                             _json_list(payload.get("reason_codes") or []),
                             _json_payload({"previous": previous_payload, "current": payload}),
                         ),
@@ -9028,9 +9066,15 @@ class TradingDatabase:
     def save_setup_router_states(self, observations: Iterable[dict]) -> dict:
         cleaned = [dict(item or {}) for item in observations or []]
         if not cleaned:
-            return {"state_write_count": 0, "transition_write_count": 0}
+            return {
+                "state_write_count": 0,
+                "transition_write_count": 0,
+                "observation_update_count": 0,
+                "no_change_skip_count": 0,
+            }
         state_write_count = 0
         transition_write_count = 0
+        no_change_skip_count = 0
         with self.conn:
             for payload in cleaned:
                 trade_date = str(payload.get("trade_date") or "")
@@ -9043,7 +9087,120 @@ class TradingDatabase:
                 setup_instance_id = str(payload.get("setup_instance_id") or "")
                 lifecycle_state = str(payload.get("lifecycle_state") or "")
                 calculated_at = str(payload.get("calculated_at") or "")
-                fingerprint = str(payload.get("fingerprint") or "")
+                observation_fingerprint = str(payload.get("observation_fingerprint") or payload.get("fingerprint") or "")
+                material_fingerprint = str(payload.get("material_state_fingerprint") or observation_fingerprint)
+                detector_phase = str(payload.get("detector_phase") or "")
+                material_change_kind = str(payload.get("material_change_kind") or "NONE")
+                state_payload = dict(payload.get("state_payload") or payload.get("price_structure") or {})
+                terminal_at = str(payload.get("terminal_at") or "")
+                expired_at = str(payload.get("expired_at") or "")
+                selected_theme_id = theme_id
+                other_active_rows = self.conn.execute(
+                    """
+                    SELECT *
+                    FROM setup_router_state_v2
+                    WHERE trade_date = ? AND candidate_instance_id = ?
+                      AND setup_type = ? AND theme_id <> ?
+                      AND lifecycle_state IN ('SEEKING','FORMING','MATCHED')
+                    """,
+                    (trade_date, candidate_instance_id, setup_type, theme_id),
+                ).fetchall()
+                for other in other_active_rows:
+                    other_payload = _row_to_setup_router_state(other)
+                    other_state_payload = dict(other_payload.get("state_payload") or {})
+                    other_state_payload.update(
+                        {
+                            "expired_reason": "SETUP_SELECTED_THEME_CHANGED",
+                            "expired_at": calculated_at,
+                            "terminal_at": calculated_at,
+                            "material_change_kind": "THEME_CHANGED",
+                        }
+                    )
+                    other_material_to = _state_material_hash_from_row_payload(other_payload, other_state_payload, "EXPIRED")
+                    self.conn.execute(
+                        """
+                        UPDATE setup_router_state_v2
+                        SET lifecycle_state = 'EXPIRED',
+                            state_entered_at = ?,
+                            last_evaluated_at = ?,
+                            last_material_change_at = ?,
+                            expired_at = ?,
+                            terminal_at = ?,
+                            detector_phase = 'EXPIRED',
+                            material_change_kind = 'THEME_CHANGED',
+                            material_state_fingerprint = ?,
+                            observation_fingerprint = ?,
+                            state_payload_json = ?,
+                            reason_codes_json = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE trade_date = ? AND candidate_instance_id = ? AND theme_id = ?
+                          AND setup_type = ? AND setup_generation = ?
+                        """,
+                        (
+                            calculated_at,
+                            calculated_at,
+                            calculated_at,
+                            calculated_at,
+                            calculated_at,
+                            other_material_to,
+                            observation_fingerprint,
+                            _json_payload(other_state_payload),
+                            _json_list([*list(other_payload.get("reason_codes") or []), "SETUP_SELECTED_THEME_CHANGED"]),
+                            trade_date,
+                            candidate_instance_id,
+                            str(other_payload.get("theme_id") or ""),
+                            setup_type,
+                            _safe_int(other_payload.get("setup_generation"), 1),
+                        ),
+                    )
+                    transition_id = _setup_state_transition_id(
+                        trade_date,
+                        candidate_instance_id,
+                        str(other_payload.get("theme_id") or ""),
+                        setup_type,
+                        _safe_int(other_payload.get("setup_generation"), 1),
+                        str(other_payload.get("lifecycle_state") or ""),
+                        "EXPIRED",
+                        other_material_to,
+                    )
+                    cursor = self.conn.execute(
+                        """
+                        INSERT OR IGNORE INTO setup_router_state_transitions_v2(
+                            transition_id, trade_date, candidate_instance_id,
+                            theme_id, setup_type, setup_generation, setup_instance_id,
+                            code, candidate_id, previous_state, current_state,
+                            occurred_at, context_id, feature_fingerprint,
+                            detector_phase_from, detector_phase_to, material_change_kind,
+                            material_state_fingerprint_from, material_state_fingerprint_to,
+                            reason_codes_json, state_payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            transition_id,
+                            trade_date,
+                            candidate_instance_id,
+                            str(other_payload.get("theme_id") or ""),
+                            setup_type,
+                            _safe_int(other_payload.get("setup_generation"), 1),
+                            str(other_payload.get("setup_instance_id") or ""),
+                            code,
+                            candidate_id,
+                            str(other_payload.get("lifecycle_state") or ""),
+                            "EXPIRED",
+                            calculated_at,
+                            str(payload.get("context_id") or ""),
+                            observation_fingerprint,
+                            str(other_payload.get("detector_phase") or ""),
+                            "EXPIRED",
+                            "THEME_CHANGED",
+                            str(other_payload.get("material_state_fingerprint") or other_payload.get("feature_fingerprint") or ""),
+                            other_material_to,
+                            _json_list(["SETUP_SELECTED_THEME_CHANGED"]),
+                            _json_payload(other_state_payload),
+                        ),
+                    )
+                    if int(getattr(cursor, "rowcount", 0) or 0) > 0:
+                        transition_write_count += 1
                 previous = self.conn.execute(
                     """
                     SELECT *
@@ -9054,15 +9211,25 @@ class TradingDatabase:
                     (trade_date, candidate_instance_id, theme_id, setup_type, generation),
                 ).fetchone()
                 previous_payload = _row_to_setup_router_state(previous) if previous else {}
-                previous_fingerprint = str(previous_payload.get("feature_fingerprint") or "")
+                previous_material = str(previous_payload.get("material_state_fingerprint") or previous_payload.get("feature_fingerprint") or "")
                 previous_state = str(previous_payload.get("lifecycle_state") or "")
+                previous_phase = str(previous_payload.get("detector_phase") or "")
+                if not previous_payload and material_change_kind == "NONE":
+                    material_change_kind = "STATE_CREATED"
+                elif previous_payload and previous_material != material_fingerprint and material_change_kind == "NONE":
+                    material_change_kind = "PHASE_CHANGED"
                 first_seen_at = str(previous_payload.get("first_seen_at") or calculated_at)
                 state_entered_at = str(previous_payload.get("state_entered_at") or calculated_at)
-                if previous_state != lifecycle_state:
+                if previous_state != lifecycle_state or (previous_phase and previous_phase != detector_phase):
                     state_entered_at = calculated_at
-                material_change_at = str(payload.get("last_material_change_at") or calculated_at)
+                if previous_payload and previous_material == material_fingerprint:
+                    no_change_skip_count += 1
+                    material_change_at = str(previous_payload.get("last_material_change_at") or payload.get("last_material_change_at") or calculated_at)
+                    state_entered_at = str(previous_payload.get("state_entered_at") or state_entered_at)
+                else:
+                    material_change_at = str(payload.get("last_material_change_at") or calculated_at)
                 expires_at = str(payload.get("expires_at") or "")
-                transition_needed = (not previous_payload or previous_state != lifecycle_state or previous_fingerprint != fingerprint) and previous_fingerprint != fingerprint
+                transition_needed = not previous_payload or previous_material != material_fingerprint
                 self.conn.execute(
                     """
                     INSERT INTO setup_router_state_v2(
@@ -9070,10 +9237,12 @@ class TradingDatabase:
                         setup_generation, setup_instance_id, code, candidate_id,
                         lifecycle_state, state_entered_at, first_seen_at,
                         last_evaluated_at, last_material_change_at, expires_at,
-                        context_id, feature_fingerprint, state_payload_json,
+                        context_id, feature_fingerprint, material_state_fingerprint,
+                        observation_fingerprint, detector_phase, material_change_kind,
+                        selected_theme_id, expired_at, terminal_at, state_payload_json,
                         reason_codes_json, schema_version, router_version,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     ON CONFLICT(trade_date, candidate_instance_id, theme_id, setup_type, setup_generation) DO UPDATE SET
                         setup_instance_id=excluded.setup_instance_id,
                         code=excluded.code,
@@ -9085,6 +9254,13 @@ class TradingDatabase:
                         expires_at=excluded.expires_at,
                         context_id=excluded.context_id,
                         feature_fingerprint=excluded.feature_fingerprint,
+                        material_state_fingerprint=excluded.material_state_fingerprint,
+                        observation_fingerprint=excluded.observation_fingerprint,
+                        detector_phase=excluded.detector_phase,
+                        material_change_kind=excluded.material_change_kind,
+                        selected_theme_id=excluded.selected_theme_id,
+                        expired_at=excluded.expired_at,
+                        terminal_at=excluded.terminal_at,
                         state_payload_json=excluded.state_payload_json,
                         reason_codes_json=excluded.reason_codes_json,
                         schema_version=excluded.schema_version,
@@ -9107,8 +9283,15 @@ class TradingDatabase:
                         material_change_at,
                         expires_at,
                         str(payload.get("context_id") or ""),
-                        fingerprint,
-                        _json_payload(payload.get("state_payload") or payload.get("price_structure") or {}),
+                        observation_fingerprint,
+                        material_fingerprint,
+                        observation_fingerprint,
+                        detector_phase,
+                        material_change_kind,
+                        selected_theme_id,
+                        expired_at,
+                        terminal_at,
+                        _json_payload(state_payload),
                         _json_list(payload.get("reason_codes") or []),
                         str(payload.get("state_version") or ""),
                         str(payload.get("router_version") or ""),
@@ -9124,7 +9307,7 @@ class TradingDatabase:
                         generation,
                         previous_state,
                         lifecycle_state,
-                        fingerprint,
+                        material_fingerprint,
                     )
                     cursor = self.conn.execute(
                         """
@@ -9133,8 +9316,10 @@ class TradingDatabase:
                             theme_id, setup_type, setup_generation, setup_instance_id,
                             code, candidate_id, previous_state, current_state,
                             occurred_at, context_id, feature_fingerprint,
+                            detector_phase_from, detector_phase_to, material_change_kind,
+                            material_state_fingerprint_from, material_state_fingerprint_to,
                             reason_codes_json, state_payload_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             transition_id,
@@ -9150,14 +9335,24 @@ class TradingDatabase:
                             lifecycle_state,
                             calculated_at,
                             str(payload.get("context_id") or ""),
-                            fingerprint,
+                            observation_fingerprint,
+                            previous_phase,
+                            detector_phase,
+                            material_change_kind,
+                            previous_material,
+                            material_fingerprint,
                             _json_list(payload.get("reason_codes") or []),
-                            _json_payload(payload.get("state_payload") or payload.get("price_structure") or {}),
+                            _json_payload(state_payload),
                         ),
                     )
                     if int(getattr(cursor, "rowcount", 0) or 0) > 0:
                         transition_write_count += 1
-        return {"state_write_count": state_write_count, "transition_write_count": transition_write_count}
+        return {
+            "state_write_count": state_write_count,
+            "transition_write_count": transition_write_count,
+            "observation_update_count": len(cleaned),
+            "no_change_skip_count": no_change_skip_count,
+        }
 
     def list_setup_router_states(
         self,
@@ -9198,6 +9393,93 @@ class TradingDatabase:
             tuple([*params, max(1, int(limit or 5000))]),
         ).fetchall()
         return [_row_to_setup_router_state(row) for row in rows]
+
+    def save_setup_router_candidate_runtime(self, rows: Iterable[dict]) -> int:
+        cleaned = [dict(item or {}) for item in rows or []]
+        if not cleaned:
+            return 0
+        saved = 0
+        with self.conn:
+            for payload in cleaned:
+                trade_date = str(payload.get("trade_date") or "")
+                candidate_instance_id = str(payload.get("candidate_instance_id") or "")
+                if not trade_date or not candidate_instance_id:
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO setup_router_candidate_runtime_v3(
+                        trade_date, candidate_instance_id, code, selected_theme_id,
+                        last_evaluated_at, last_evaluation_source, last_context_id,
+                        last_entry_decision_at, last_completed_candle_at,
+                        evaluation_count, incremental_evaluation_count,
+                        periodic_evaluation_count, ttl_evaluation_count,
+                        capacity_deferred_count, last_deferred_at, last_skip_reason,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(trade_date, candidate_instance_id) DO UPDATE SET
+                        code=COALESCE(NULLIF(excluded.code, ''), setup_router_candidate_runtime_v3.code),
+                        selected_theme_id=COALESCE(NULLIF(excluded.selected_theme_id, ''), setup_router_candidate_runtime_v3.selected_theme_id),
+                        last_evaluated_at=COALESCE(NULLIF(excluded.last_evaluated_at, ''), setup_router_candidate_runtime_v3.last_evaluated_at),
+                        last_evaluation_source=COALESCE(NULLIF(excluded.last_evaluation_source, ''), setup_router_candidate_runtime_v3.last_evaluation_source),
+                        last_context_id=COALESCE(NULLIF(excluded.last_context_id, ''), setup_router_candidate_runtime_v3.last_context_id),
+                        last_entry_decision_at=COALESCE(NULLIF(excluded.last_entry_decision_at, ''), setup_router_candidate_runtime_v3.last_entry_decision_at),
+                        last_completed_candle_at=COALESCE(NULLIF(excluded.last_completed_candle_at, ''), setup_router_candidate_runtime_v3.last_completed_candle_at),
+                        evaluation_count=setup_router_candidate_runtime_v3.evaluation_count + excluded.evaluation_count,
+                        incremental_evaluation_count=setup_router_candidate_runtime_v3.incremental_evaluation_count + excluded.incremental_evaluation_count,
+                        periodic_evaluation_count=setup_router_candidate_runtime_v3.periodic_evaluation_count + excluded.periodic_evaluation_count,
+                        ttl_evaluation_count=setup_router_candidate_runtime_v3.ttl_evaluation_count + excluded.ttl_evaluation_count,
+                        capacity_deferred_count=setup_router_candidate_runtime_v3.capacity_deferred_count + excluded.capacity_deferred_count,
+                        last_deferred_at=COALESCE(NULLIF(excluded.last_deferred_at, ''), setup_router_candidate_runtime_v3.last_deferred_at),
+                        last_skip_reason=COALESCE(NULLIF(excluded.last_skip_reason, ''), setup_router_candidate_runtime_v3.last_skip_reason),
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (
+                        trade_date,
+                        candidate_instance_id,
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("selected_theme_id") or ""),
+                        str(payload.get("last_evaluated_at") or ""),
+                        str(payload.get("last_evaluation_source") or ""),
+                        str(payload.get("last_context_id") or ""),
+                        str(payload.get("last_entry_decision_at") or ""),
+                        str(payload.get("last_completed_candle_at") or ""),
+                        _safe_int(payload.get("evaluation_count"), 0),
+                        _safe_int(payload.get("incremental_evaluation_count"), 0),
+                        _safe_int(payload.get("periodic_evaluation_count"), 0),
+                        _safe_int(payload.get("ttl_evaluation_count"), 0),
+                        _safe_int(payload.get("capacity_deferred_count"), 0),
+                        str(payload.get("last_deferred_at") or ""),
+                        str(payload.get("last_skip_reason") or ""),
+                    ),
+                )
+                saved += 1
+        return saved
+
+    def list_setup_router_candidate_runtime(
+        self,
+        *,
+        trade_date: str,
+        candidate_instance_ids: Iterable[object] | None = None,
+        limit: int = 5000,
+    ) -> list[dict]:
+        clauses = ["trade_date = ?"]
+        params: list[object] = [str(trade_date)]
+        clean_ids = [str(item) for item in list(candidate_instance_ids or []) if str(item or "")]
+        if clean_ids:
+            placeholders = ",".join("?" for _ in clean_ids)
+            clauses.append(f"candidate_instance_id IN ({placeholders})")
+            params.extend(clean_ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM setup_router_candidate_runtime_v3
+            WHERE {" AND ".join(clauses)}
+            ORDER BY last_evaluated_at ASC, updated_at ASC
+            LIMIT ?
+            """,
+            tuple([*params, max(1, int(limit or 5000))]),
+        ).fetchall()
+        return [_row_to_setup_router_candidate_runtime(row) for row in rows]
 
     def list_setup_observations_latest(
         self,
@@ -14078,6 +14360,14 @@ class TradingDatabase:
             "state_payload_json": "TEXT NOT NULL DEFAULT '{}'",
             "last_material_change_at": "TEXT NOT NULL DEFAULT ''",
             "quantity": "INTEGER NOT NULL DEFAULT 0",
+            "material_state_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "observation_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "detector_phase": "TEXT NOT NULL DEFAULT ''",
+            "material_change_kind": "TEXT NOT NULL DEFAULT ''",
+            "expires_at": "TEXT NOT NULL DEFAULT ''",
+            "expired_at": "TEXT NOT NULL DEFAULT ''",
+            "first_seen_at": "TEXT NOT NULL DEFAULT ''",
+            "terminal_at": "TEXT NOT NULL DEFAULT ''",
         }
         transition_columns = {
             "router_version": "TEXT NOT NULL DEFAULT ''",
@@ -14086,6 +14376,11 @@ class TradingDatabase:
             "theme_id": "TEXT NOT NULL DEFAULT ''",
             "lifecycle_previous_state": "TEXT NOT NULL DEFAULT ''",
             "lifecycle_current_state": "TEXT NOT NULL DEFAULT ''",
+            "detector_phase_from": "TEXT NOT NULL DEFAULT ''",
+            "detector_phase_to": "TEXT NOT NULL DEFAULT ''",
+            "material_change_kind": "TEXT NOT NULL DEFAULT ''",
+            "material_state_fingerprint_from": "TEXT NOT NULL DEFAULT ''",
+            "material_state_fingerprint_to": "TEXT NOT NULL DEFAULT ''",
         }
         primary_columns = {
             "router_version": "TEXT NOT NULL DEFAULT ''",
@@ -14095,6 +14390,22 @@ class TradingDatabase:
             "clear_reason": "TEXT NOT NULL DEFAULT ''",
             "last_material_change_at": "TEXT NOT NULL DEFAULT ''",
         }
+        state_columns = {
+            "material_state_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "observation_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "detector_phase": "TEXT NOT NULL DEFAULT ''",
+            "material_change_kind": "TEXT NOT NULL DEFAULT ''",
+            "selected_theme_id": "TEXT NOT NULL DEFAULT ''",
+            "expired_at": "TEXT NOT NULL DEFAULT ''",
+            "terminal_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        state_transition_columns = {
+            "detector_phase_from": "TEXT NOT NULL DEFAULT ''",
+            "detector_phase_to": "TEXT NOT NULL DEFAULT ''",
+            "material_change_kind": "TEXT NOT NULL DEFAULT ''",
+            "material_state_fingerprint_from": "TEXT NOT NULL DEFAULT ''",
+            "material_state_fingerprint_to": "TEXT NOT NULL DEFAULT ''",
+        }
         for name, definition in run_columns.items():
             self._ensure_column("setup_router_runs", name, definition)
         for name, definition in latest_columns.items():
@@ -14103,6 +14414,10 @@ class TradingDatabase:
             self._ensure_column("setup_observation_transitions", name, definition)
         for name, definition in primary_columns.items():
             self._ensure_column("setup_router_primary_latest", name, definition)
+        for name, definition in state_columns.items():
+            self._ensure_column("setup_router_state_v2", name, definition)
+        for name, definition in state_transition_columns.items():
+            self._ensure_column("setup_router_state_transitions_v2", name, definition)
 
     def _ensure_theme_state_runtime_columns(self) -> None:
         columns = {
@@ -17078,6 +17393,14 @@ def _row_to_setup_observation(row: sqlite3.Row) -> dict:
     payload.setdefault("session_phase", data.get("session_phase", ""))
     payload.setdefault("current_price", _float_value(data.get("current_price")))
     payload.setdefault("fingerprint", data.get("fingerprint", ""))
+    payload.setdefault("observation_fingerprint", data.get("observation_fingerprint", ""))
+    payload.setdefault("material_state_fingerprint", data.get("material_state_fingerprint", ""))
+    payload.setdefault("detector_phase", data.get("detector_phase", ""))
+    payload.setdefault("material_change_kind", data.get("material_change_kind", ""))
+    payload.setdefault("first_seen_at", data.get("first_seen_at", ""))
+    payload.setdefault("expires_at", data.get("expires_at", ""))
+    payload.setdefault("expired_at", data.get("expired_at", ""))
+    payload.setdefault("terminal_at", data.get("terminal_at", ""))
     payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
     payload.setdefault("price_structure", _safe_json_loads(data.pop("price_structure_json", "{}"), {}))
     payload.setdefault("safety", _safe_json_loads(data.pop("safety_json", "{}"), {}))
@@ -17116,6 +17439,11 @@ def _row_to_setup_observation_transition(row: sqlite3.Row) -> dict:
         "current_fingerprint",
         "lifecycle_previous_state",
         "lifecycle_current_state",
+        "detector_phase_from",
+        "detector_phase_to",
+        "material_change_kind",
+        "material_state_fingerprint_from",
+        "material_state_fingerprint_to",
     ):
         payload.setdefault(key, data.get(key, ""))
     payload.setdefault("setup_generation", int(data.get("setup_generation") or 1))
@@ -17173,8 +17501,15 @@ def _row_to_setup_router_state(row: sqlite3.Row) -> dict:
         "last_evaluated_at": data.get("last_evaluated_at", ""),
         "last_material_change_at": data.get("last_material_change_at", ""),
         "expires_at": data.get("expires_at", ""),
+        "expired_at": data.get("expired_at", ""),
+        "terminal_at": data.get("terminal_at", ""),
         "context_id": data.get("context_id", ""),
         "feature_fingerprint": data.get("feature_fingerprint", ""),
+        "material_state_fingerprint": data.get("material_state_fingerprint", ""),
+        "observation_fingerprint": data.get("observation_fingerprint", ""),
+        "detector_phase": data.get("detector_phase", ""),
+        "material_change_kind": data.get("material_change_kind", ""),
+        "selected_theme_id": data.get("selected_theme_id", ""),
         "state_payload": _safe_json_loads(data.get("state_payload_json", "{}"), {}),
         "reason_codes": _safe_json_loads(data.get("reason_codes_json", "[]"), []),
         "schema_version": data.get("schema_version", ""),
@@ -17203,8 +17538,36 @@ def _row_to_setup_router_state_transition(row: sqlite3.Row) -> dict:
         "occurred_at": data.get("occurred_at", ""),
         "context_id": data.get("context_id", ""),
         "feature_fingerprint": data.get("feature_fingerprint", ""),
+        "detector_phase_from": data.get("detector_phase_from", ""),
+        "detector_phase_to": data.get("detector_phase_to", ""),
+        "material_change_kind": data.get("material_change_kind", ""),
+        "material_state_fingerprint_from": data.get("material_state_fingerprint_from", ""),
+        "material_state_fingerprint_to": data.get("material_state_fingerprint_to", ""),
         "reason_codes": _safe_json_loads(data.get("reason_codes_json", "[]"), []),
         "state_payload": _safe_json_loads(data.get("state_payload_json", "{}"), {}),
+    }
+
+
+def _row_to_setup_router_candidate_runtime(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    return {
+        "trade_date": data.get("trade_date", ""),
+        "candidate_instance_id": data.get("candidate_instance_id", ""),
+        "code": data.get("code", ""),
+        "selected_theme_id": data.get("selected_theme_id", ""),
+        "last_evaluated_at": data.get("last_evaluated_at", ""),
+        "last_evaluation_source": data.get("last_evaluation_source", ""),
+        "last_context_id": data.get("last_context_id", ""),
+        "last_entry_decision_at": data.get("last_entry_decision_at", ""),
+        "last_completed_candle_at": data.get("last_completed_candle_at", ""),
+        "evaluation_count": int(data.get("evaluation_count") or 0),
+        "incremental_evaluation_count": int(data.get("incremental_evaluation_count") or 0),
+        "periodic_evaluation_count": int(data.get("periodic_evaluation_count") or 0),
+        "ttl_evaluation_count": int(data.get("ttl_evaluation_count") or 0),
+        "capacity_deferred_count": int(data.get("capacity_deferred_count") or 0),
+        "last_deferred_at": data.get("last_deferred_at", ""),
+        "last_skip_reason": data.get("last_skip_reason", ""),
+        "updated_at": data.get("updated_at", ""),
     }
 
 
@@ -17850,7 +18213,15 @@ def _setup_observation_db_values(
         str(payload.get("market_action") or ""),
         str(payload.get("session_phase") or ""),
         _float_value(payload.get("current_price")),
-        str(payload.get("fingerprint") or ""),
+        str(payload.get("fingerprint") or payload.get("observation_fingerprint") or ""),
+        str(payload.get("observation_fingerprint") or payload.get("fingerprint") or ""),
+        str(payload.get("material_state_fingerprint") or ""),
+        str(payload.get("detector_phase") or ""),
+        str(payload.get("material_change_kind") or "NONE"),
+        str(payload.get("first_seen_at") or ""),
+        str(payload.get("expires_at") or ""),
+        str(payload.get("expired_at") or ""),
+        str(payload.get("terminal_at") or ""),
         _json_list(payload.get("reason_codes") or []),
         _json_payload(payload.get("price_structure") or {}),
         _json_payload(payload.get("safety") or {}),
@@ -17881,6 +18252,28 @@ def _setup_state_transition_id(
         ]
     )
     return hashlib.sha1(material.encode("utf-8")).hexdigest()
+
+
+def _state_material_hash_from_row_payload(row_payload: Mapping[str, object], state_payload: Mapping[str, object], lifecycle_state: str) -> str:
+    material = {
+        "schema": str(row_payload.get("schema_version") or ""),
+        "trade_date": str(row_payload.get("trade_date") or ""),
+        "candidate_instance_id": str(row_payload.get("candidate_instance_id") or ""),
+        "selected_theme_id": str(row_payload.get("theme_id") or row_payload.get("selected_theme_id") or ""),
+        "setup_type": str(row_payload.get("setup_type") or ""),
+        "setup_generation": _safe_int(row_payload.get("setup_generation"), 1),
+        "lifecycle_state": str(lifecycle_state or ""),
+        "detector_phase": str(state_payload.get("phase") or state_payload.get("detector_phase") or lifecycle_state or ""),
+        "local_peak_price": _float_value(state_payload.get("local_peak_price") or state_payload.get("local_peak")),
+        "local_peak_at": str(state_payload.get("local_peak_at") or ""),
+        "below_vwap_candle_at": str(state_payload.get("below_candle_at") or ""),
+        "breakout_reference": _float_value(state_payload.get("breakout_reference_price") or state_payload.get("breakout_level")),
+        "breakout_candle_at": str(state_payload.get("breakout_candle_at") or ""),
+        "first_pullback_consumed": bool(state_payload.get("first_pullback_consumed")),
+        "terminal_reason": str(state_payload.get("expired_reason") or state_payload.get("invalidation_reason") or ""),
+        "expired_at": str(state_payload.get("expired_at") or ""),
+    }
+    return hashlib.sha1(json.dumps(material, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 def _append_setup_filter(clauses: list[str], params: list[object], column: str, value: object) -> None:

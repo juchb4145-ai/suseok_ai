@@ -15,7 +15,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trade-date", default=datetime.now().date().isoformat())
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--limit", type=int, default=10000)
-    parser.add_argument("--router-version", default="setup_router_v3.2")
+    parser.add_argument("--router-version", default="setup_router_v3.3")
     args = parser.parse_args(argv)
 
     db_path = Path(args.db)
@@ -31,6 +31,10 @@ def main(argv: list[str] | None = None) -> int:
         states = _rows(con, "setup_router_state_v2", trade_date, limit=args.limit, router_version=args.router_version)
         state_transitions = _rows(con, "setup_router_state_transitions_v2", trade_date, limit=args.limit)
         runs = _rows(con, "setup_router_runs", trade_date, limit=1000, router_version=args.router_version)
+        runtime_rows = _rows(con, "setup_router_candidate_runtime_v3", trade_date, limit=args.limit)
+        full_counts = _full_counts(con, trade_date, args.router_version)
+        integrity = _state_integrity(con, trade_date, args.router_version)
+        scheduling = _scheduling_checks(con, trade_date, args.router_version)
         side_effects = _side_effect_counts(con, trade_date)
     finally:
         con.close()
@@ -45,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     run_span_min = _run_span_minutes(runs)
     failures: list[str] = []
     warnings: list[str] = []
-    if not _has_table_rows(observations) and not runs:
+    if full_counts.get("observations", 0) == 0 and full_counts.get("runs", 0) == 0:
         warnings.append("NO_SETUP_ROUTER_V3_ROWS")
     if invalid:
         failures.append("INVALID_SETUP_ROUTER_V3_OBSERVATIONS")
@@ -53,31 +57,37 @@ def main(argv: list[str] | None = None) -> int:
         failures.append("VALID_OBSERVE_WITH_BLOCKED_CONTEXT_TRANSITION")
     if any(value > 0 for value in side_effects.values()):
         failures.append("SETUP_ROUTER_ORDER_SIDE_EFFECTS_PRESENT")
-    if status_counts.get("VALID_OBSERVE", 0) == 0:
+    if full_counts.get("valid_observe", 0) == 0:
         warnings.append("NO_VALID_SETUP_SAMPLE")
-    if status_counts.get("VALID_OBSERVE", 0) == 1:
+    if full_counts.get("valid_observe", 0) == 1:
         warnings.append("SINGLE_VALID_SETUP_SAMPLE")
     if run_span_min < 60:
         warnings.append("RUN_SPAN_LT_60_MIN")
-    if observations and not states:
+    if full_counts.get("observations", 0) > 0 and full_counts.get("states", 0) == 0:
         failures.append("TEMPORAL_STATE_ROWS_MISSING")
+    if full_counts.get("eligible_runtime", 0) == 0 and full_counts.get("observations", 0) > 0:
+        warnings.append("CANDIDATE_RUNTIME_SAMPLE_MISSING")
     if any(row.get("router_status") == "VALID_OBSERVE" and not bool(row.get("post_subscription_tick_verified", True)) for row in observations):
         failures.append("VALID_WITH_POST_SUBSCRIPTION_TICK_MISSING")
     if any(row.get("router_status") == "VALID_OBSERVE" and row.get("session_phase") in {"CLOSING_RISK", "MARKET_CLOSED"} for row in observations):
         failures.append("VALID_IN_CLOSING_OR_CLOSED_SESSION")
     if any(row.get("router_status") == "VALID_OBSERVE" and row.get("context_status") != "ELIGIBLE" for row in observations):
         failures.append("VALID_CONTEXT_NOT_ELIGIBLE")
+    failures.extend(integrity["failures"])
+    warnings.extend(integrity["warnings"])
+    failures.extend(scheduling["failures"])
+    warnings.extend(scheduling["warnings"])
     stable_ready = (
         not failures
         and not warnings
-        and status_counts.get("VALID_OBSERVE", 0) > 0
+        and full_counts.get("valid_observe", 0) > 0
         and run_span_min >= 60
-        and len(states) > 0
-        and len(state_transitions) > 0
+        and full_counts.get("states", 0) > 0
+        and full_counts.get("state_transitions", 0) > 0
     )
-    verdict = "STABLE_FOR_OPPORTUNITY_RANKER" if stable_ready else "NOT_STABLE" if failures else "CONDITIONALLY_STABLE"
+    verdict = "STABLE" if stable_ready else "NOT_STABLE" if failures else "CONDITIONALLY_STABLE"
     summary = {
-        "schema_version": "setup_router_v3.audit.v2",
+        "schema_version": "setup_router_v3.audit.v3",
         "trade_date": trade_date,
         "router_version": args.router_version,
         "db_path": str(db_path),
@@ -88,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
         "state_count": len(states),
         "state_transition_count": len(state_transitions),
         "run_count": len(runs),
+        "candidate_runtime_count": len(runtime_rows),
+        "full_counts": full_counts,
         "run_span_minutes": run_span_min,
         "type_counts": dict(type_counts),
         "status_counts": dict(status_counts),
@@ -97,6 +109,8 @@ def main(argv: list[str] | None = None) -> int:
         "failures": failures,
         "warnings": warnings,
         "side_effect_counts": side_effects,
+        "state_integrity": integrity,
+        "scheduling": scheduling,
         "safety": {
             "ready_allowed": False,
             "candidate_promotion_allowed": False,
@@ -110,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     _write_json(output_dir / "transitions.json", transitions[:1000])
     _write_json(output_dir / "states.json", states[:1000])
     _write_json(output_dir / "state_transitions.json", state_transitions[:1000])
+    _write_json(output_dir / "candidate_runtime.json", runtime_rows[:1000])
     _write_json(output_dir / "invalid_observations.json", invalid[:1000])
     _write_json(output_dir / "flip_analysis.json", flip_analysis)
     _write_json(output_dir / "context_alignment.json", context_alignment)
@@ -234,11 +249,11 @@ def _has_table_rows(rows: list[dict[str, Any]]) -> bool:
 
 def _side_effect_counts(con: sqlite3.Connection, trade_date: str) -> dict[str, int]:
     tables = {
+        "entry_plans": "trade_date",
         "runtime_order_intents": "trade_date",
         "managed_order_intents": "trade_date",
         "virtual_orders": "trade_date",
         "virtual_positions": "trade_date",
-        "gateway_commands": "trade_date",
     }
     result: dict[str, int] = {}
     for table, date_col in tables.items():
@@ -250,7 +265,147 @@ def _side_effect_counts(con: sqlite3.Connection, trade_date: str) -> dict[str, i
             result[table] = int(row["count"] or 0) if row else 0
         except sqlite3.Error:
             result[table] = 0
+    result["gateway_order_commands"] = _gateway_order_command_count(con, trade_date)
+    result["candidate_events_setup_router_v3"] = _source_count(con, "candidate_events", trade_date)
+    result["candidate_state_transitions_setup_router_v3"] = _source_count(con, "candidate_state_transitions", trade_date)
     return result
+
+
+def _gateway_order_command_count(con: sqlite3.Connection, trade_date: str) -> int:
+    if not _has_table(con, "gateway_commands"):
+        return 0
+    if not _has_column(con, "gateway_commands", "trade_date") or not _has_column(con, "gateway_commands", "command_type"):
+        return 0
+    row = con.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM gateway_commands
+        WHERE trade_date = ? AND command_type IN ('send_order','cancel_order')
+        """,
+        (trade_date,),
+    ).fetchone()
+    return int(row["count"] or 0) if row else 0
+
+
+def _source_count(con: sqlite3.Connection, table: str, trade_date: str) -> int:
+    if not _has_table(con, table) or not _has_column(con, table, "trade_date"):
+        return 0
+    source_filters = []
+    params: list[Any] = [trade_date]
+    if _has_column(con, table, "source"):
+        source_filters.append("source = ?")
+        params.append("setup_router_v3")
+    if _has_column(con, table, "source_type"):
+        source_filters.append("source_type = ?")
+        params.append("setup_router_v3")
+    if _has_column(con, table, "payload_json"):
+        source_filters.append("payload_json LIKE ?")
+        params.append("%setup_router_v3%")
+    if not source_filters:
+        return 0
+    row = con.execute(
+        f"SELECT COUNT(*) AS count FROM {table} WHERE trade_date = ? AND ({' OR '.join(source_filters)})",
+        tuple(params),
+    ).fetchone()
+    return int(row["count"] or 0) if row else 0
+
+
+def _full_counts(con: sqlite3.Connection, trade_date: str, router_version: str) -> dict[str, int]:
+    return {
+        "observations": _count(con, "setup_observations_latest", trade_date, router_version=router_version),
+        "valid_observe": _count(con, "setup_observations_latest", trade_date, router_version=router_version, extra="router_status = 'VALID_OBSERVE'"),
+        "states": _count(con, "setup_router_state_v2", trade_date, router_version=router_version),
+        "state_transitions": _count(con, "setup_router_state_transitions_v2", trade_date),
+        "runs": _count(con, "setup_router_runs", trade_date, router_version=router_version),
+        "eligible_runtime": _count(con, "setup_router_candidate_runtime_v3", trade_date),
+    }
+
+
+def _count(con: sqlite3.Connection, table: str, trade_date: str, *, router_version: str | None = None, extra: str = "") -> int:
+    if not _has_table(con, table):
+        return 0
+    clauses = ["trade_date = ?"]
+    params: list[Any] = [trade_date]
+    if router_version and _has_column(con, table, "router_version"):
+        clauses.append("(router_version = ? OR router_version = '')")
+        params.append(router_version)
+    if extra:
+        clauses.append(extra)
+    row = con.execute(f"SELECT COUNT(*) AS count FROM {table} WHERE {' AND '.join(clauses)}", tuple(params)).fetchone()
+    return int(row["count"] or 0) if row else 0
+
+
+def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: str) -> dict[str, Any]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    metrics = {
+        "price_only_state_transition_count": 0,
+        "theme_leak_active_state_count": 0,
+        "ttl_violation_count": 0,
+        "invalid_generation_count": 0,
+    }
+    if _has_table(con, "setup_router_state_transitions_v2") and _has_column(con, "setup_router_state_transitions_v2", "material_change_kind"):
+        row = con.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM setup_router_state_transitions_v2
+            WHERE trade_date = ? AND COALESCE(material_change_kind, '') IN ('', 'NONE')
+            """,
+            (trade_date,),
+        ).fetchone()
+        metrics["price_only_state_transition_count"] = int(row["count"] or 0) if row else 0
+    if _has_table(con, "setup_router_state_v2"):
+        if _has_column(con, "setup_router_state_v2", "expires_at"):
+            row = con.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM setup_router_state_v2
+                WHERE trade_date = ? AND lifecycle_state IN ('FORMING','MATCHED')
+                  AND expires_at <> '' AND expires_at <= last_evaluated_at
+                """,
+                (trade_date,),
+            ).fetchone()
+            metrics["ttl_violation_count"] = int(row["count"] or 0) if row else 0
+        row = con.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM setup_router_state_v2
+            WHERE trade_date = ? AND setup_generation < 1
+            """,
+            (trade_date,),
+        ).fetchone()
+        metrics["invalid_generation_count"] = int(row["count"] or 0) if row else 0
+    if metrics["price_only_state_transition_count"] > 0:
+        failures.append("PRICE_ONLY_STATE_TRANSITIONS_PRESENT")
+    if metrics["ttl_violation_count"] > 0:
+        failures.append("TTL_ACTIVE_STATE_VIOLATION")
+    if metrics["invalid_generation_count"] > 0:
+        failures.append("INVALID_SETUP_GENERATION")
+    if _count(con, "setup_router_state_transitions_v2", trade_date) == 0 and _count(con, "setup_router_state_v2", trade_date, router_version=router_version) > 0:
+        warnings.append("STATE_TRANSITION_SAMPLE_MISSING")
+    return {"metrics": metrics, "failures": failures, "warnings": warnings}
+
+
+def _scheduling_checks(con: sqlite3.Connection, trade_date: str, router_version: str) -> dict[str, Any]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    metrics = {
+        "max_actual_starved_candidate_count": 0,
+        "max_deferred_incremental_count": 0,
+        "max_deferred_ttl_count": 0,
+        "run_sample_count": 0,
+    }
+    if not _has_table(con, "setup_router_runs"):
+        return {"metrics": metrics, "failures": failures, "warnings": ["SETUP_ROUTER_RUN_TABLE_MISSING"]}
+    rows = _rows(con, "setup_router_runs", trade_date, limit=100000, router_version=router_version)
+    metrics["run_sample_count"] = len(rows)
+    for row in rows:
+        metrics["max_actual_starved_candidate_count"] = max(metrics["max_actual_starved_candidate_count"], int(row.get("actual_starved_candidate_count") or 0))
+        metrics["max_deferred_incremental_count"] = max(metrics["max_deferred_incremental_count"], int(row.get("deferred_incremental_count") or 0))
+        metrics["max_deferred_ttl_count"] = max(metrics["max_deferred_ttl_count"], int(row.get("deferred_ttl_count") or 0))
+    if metrics["max_actual_starved_candidate_count"] > 0:
+        failures.append("SETUP_ROUTER_STARVATION_PRESENT")
+    return {"metrics": metrics, "failures": failures, "warnings": warnings}
 
 
 def _run_span_minutes(runs: list[dict[str, Any]]) -> float:
