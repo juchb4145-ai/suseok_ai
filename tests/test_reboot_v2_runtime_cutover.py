@@ -24,8 +24,99 @@ class _Pipeline:
         self.config = type("Config", (), {"enabled": True})()
         self.status = status
 
-    def run_if_due(self, now=None):
+    def run_if_due(self, now=None, **_):
         return {"enabled": True, "status": self.status, "calculated_at": now.isoformat() if now else ""}
+
+
+class _CapturePipeline:
+    config = type("Config", (), {"enabled": True})()
+
+    def __init__(self):
+        self.market_context = {}
+        self.last_result = {}
+
+    def run_if_due(self, now=None, **kwargs):
+        self.market_context = dict(kwargs.get("market_context") or {})
+        self.last_result = {"trade_date": now.date().isoformat() if now else "", "top_themes": [], "stocks": []}
+        return {"enabled": True, "status": "OK", "calculated_at": now.isoformat() if now else ""}
+
+
+class _MarketSnapshot:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def to_dict(self):
+        return dict(self.payload)
+
+
+class _MarketResult:
+    def __init__(self, payload):
+        self.snapshot = _MarketSnapshot(payload)
+
+
+class _DashboardMarketPipeline:
+    config = type("Config", (), {"enabled": True})()
+
+    def __init__(self, full_payload):
+        self.last_result = _MarketResult(full_payload)
+        self.full_payload = full_payload
+
+    def run_if_due(self, now=None):
+        self.last_result = _MarketResult(self.full_payload)
+        return {
+            "enabled": True,
+            "status": "OK",
+            "calculated_at": now.isoformat() if now else "",
+            "global_status": self.full_payload["global_status"],
+            "kospi_status": self.full_payload["kospi_status"],
+            "kosdaq_status": self.full_payload["kosdaq_status"],
+        }
+
+
+def test_reboot_v2_passes_full_market_snapshot_to_downstream_context(tmp_path):
+    db = TradingDatabase(str(tmp_path / "v2_market_context.db"))
+    gateway = GatewayStateStore()
+    theme_board = _CapturePipeline()
+    strategy_context = _CapturePipeline()
+    full_market = {
+        "trade_date": "2026-06-17",
+        "calculated_at": "2026-06-17T09:20:00",
+        "global_status": "SELECTIVE",
+        "kospi_status": "SELECTIVE",
+        "kosdaq_status": "WEAK",
+        "kospi_snapshot": {"side": "KOSPI", "status": "SELECTIVE", "index_return_pct": 0.7},
+        "kosdaq_snapshot": {"side": "KOSDAQ", "status": "WEAK", "index_return_pct": -1.2},
+        "candidate_policy_by_code": {
+            "000001": {
+                "code": "000001",
+                "market_side": "KOSPI",
+                "market_status": "SELECTIVE",
+                "global_market_status": "SELECTIVE",
+                "market_action": "ALLOW_REDUCED",
+                "block_new_entry": False,
+                "position_size_multiplier_hint": 0.6,
+                "reason_codes": ["SIDE_MARKET_SELECTIVE_REDUCED"],
+            }
+        },
+    }
+    runtime = RebootV2Runtime(
+        db=db,
+        subscription_manager=RealTimeSubscriptionManager(GatewayCommandRealtimeClient(gateway), max_codes=20),
+        candle_builder=CandleBuilder(),
+        market_data=MarketDataStore(),
+        market_index_store=MarketIndexStore(),
+        config=StrategyRuntimeConfig(max_candidates_to_watch=20, realtime_subscription_limit=20),
+        profile=RebootV2RuntimeProfile.V2_OBSERVE,
+        theme_board_pipeline=theme_board,
+        market_regime_pipeline=_DashboardMarketPipeline(full_market),
+        strategy_context_pipeline=strategy_context,
+    )
+
+    runtime.cycle(datetime(2026, 6, 17, 9, 20, 0))
+
+    assert theme_board.market_context["candidate_policy_by_code"]["000001"]["market_action"] == "ALLOW_REDUCED"
+    assert strategy_context.market_context["candidate_policy_by_code"]["000001"]["market_action"] == "ALLOW_REDUCED"
+    assert strategy_context.market_context["kosdaq_snapshot"]["status"] == "WEAK"
 
 
 def test_reboot_v2_condition_hydration_subscription_cutover_blocks_legacy_orders(tmp_path):

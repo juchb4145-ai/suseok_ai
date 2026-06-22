@@ -59,6 +59,39 @@ def test_strategy_context_id_changes_when_best_theme_selection_changes(tmp_path)
     assert second.context_id != first.context_id
 
 
+def test_strategy_context_uses_side_status_from_dashboard_market_payload(tmp_path):
+    db = TradingDatabase(str(tmp_path / "context-dashboard-market.db"))
+    market_data = MarketDataStore()
+    candidate = _candidate(db)
+    _tick(market_data, "000001")
+    theme_board = _theme_board()
+    market_summary = {
+        "trade_date": TRADE_DATE,
+        "calculated_at": "2026-06-19T09:20:00",
+        "global_status": "EXPANSION",
+        "kospi_status": "SELECTIVE",
+        "kosdaq_status": "EXPANSION",
+        "kospi_return_pct": 0.2,
+        "kosdaq_return_pct": 0.8,
+        "kospi_breadth_pct": 0.52,
+        "kosdaq_breadth_pct": 0.62,
+        "market_session_status": "open",
+        "reason_codes": ["INDEX_UP"],
+    }
+
+    snapshot = StrategyContextAssembler(db, market_data=market_data).assemble_candidate(
+        candidate,
+        now=datetime(2026, 6, 19, 9, 20, 0),
+        market_context=market_summary,
+        theme_board=theme_board,
+    )
+
+    assert snapshot.market.side_market_regime == "EXPANSION"
+    assert snapshot.market.market_action == "ALLOW_NORMAL"
+    assert snapshot.market.index_return_pct == 0.8
+    assert snapshot.data.market_context_fresh is True
+
+
 def test_entry_engine_uses_strategy_context_v3_without_legacy_theme_board_metadata(tmp_path):
     db = TradingDatabase(str(tmp_path / "entry-context.db"))
     market_data = MarketDataStore()

@@ -99,10 +99,11 @@ class RebootV2Runtime:
         self._recover_intraday_discovery(snapshot)
         self._reconcile_base_subscriptions(snapshot)
         self._run_pipeline(snapshot, "market_regime", self.market_regime_pipeline, current)
+        downstream_market_context = self._downstream_market_context(snapshot, current)
         self._publish_market_dirty(snapshot, current)
         self._run_pipeline(snapshot, "opening_burst", self.opening_burst_pipeline, current)
         self._run_pipeline(snapshot, "intraday_discovery", self.intraday_discovery_pipeline, current)
-        self._run_pipeline(snapshot, "theme_board", self.theme_board_pipeline, current, market_context=snapshot.get("market_regime"))
+        self._run_pipeline(snapshot, "theme_board", self.theme_board_pipeline, current, market_context=downstream_market_context)
         self._publish_theme_dirty(snapshot, current)
         self._reconcile_theme_expansion_subscriptions(snapshot, current)
         self._enqueue_hydration(snapshot, current)
@@ -112,7 +113,7 @@ class RebootV2Runtime:
             "strategy_context",
             self.strategy_context_pipeline,
             current,
-            market_context=snapshot.get("market_regime"),
+            market_context=downstream_market_context,
             theme_board=getattr(self.theme_board_pipeline, "last_result", None) or self._latest_theme_board(current.date().isoformat()),
         )
         self._publish_strategy_context_dirty(snapshot, current)
@@ -604,6 +605,22 @@ class RebootV2Runtime:
             return {}
         return dict(loader(trade_date=trade_date) or {})
 
+    def _latest_market_regime(self, trade_date: str) -> dict[str, Any]:
+        loader = getattr(self.db, "latest_market_regime_snapshot", None)
+        if not callable(loader):
+            return {}
+        return dict(loader(trade_date=trade_date) or {})
+
+    def _downstream_market_context(self, snapshot: Mapping[str, Any], now: datetime) -> dict[str, Any]:
+        for payload in (
+            _pipeline_market_snapshot(self.market_regime_pipeline),
+            self._latest_market_regime(now.date().isoformat()),
+            dict(snapshot.get("market_regime") or {}),
+        ):
+            if _market_context_payload_usable(payload):
+                return dict(payload)
+        return {}
+
     def _open_positions(self) -> list[Any]:
         loader = getattr(self.db, "list_open_virtual_positions", None)
         if not callable(loader):
@@ -627,6 +644,26 @@ def _component_enabled(component: Any) -> bool:
     if config is not None and hasattr(config, "enabled"):
         return bool(getattr(config, "enabled"))
     return True
+
+
+def _pipeline_market_snapshot(pipeline: Any) -> dict[str, Any]:
+    result = getattr(pipeline, "last_result", None)
+    snapshot = getattr(result, "snapshot", None)
+    if snapshot is None and isinstance(result, Mapping):
+        snapshot = result.get("snapshot")
+    if hasattr(snapshot, "to_dict"):
+        return dict(snapshot.to_dict() or {})
+    if isinstance(snapshot, Mapping):
+        return dict(snapshot)
+    return {}
+
+
+def _market_context_payload_usable(payload: Mapping[str, Any] | None) -> bool:
+    if not payload:
+        return False
+    if payload.get("candidate_policy_by_code") or payload.get("kospi_snapshot") or payload.get("kosdaq_snapshot"):
+        return True
+    return bool(payload.get("calculated_at") and (payload.get("kospi_status") or payload.get("kosdaq_status") or payload.get("global_status")))
 
 
 def _market_data_max_tick_age_sec() -> int:

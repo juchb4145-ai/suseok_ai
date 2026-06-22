@@ -487,11 +487,11 @@ def _market_context(candidate: Candidate, payload: Mapping[str, Any], code: str)
     policy = dict(policies.get(code) or {})
     side = str(policy.get("market_side") or _candidate_side(candidate) or MarketSide.UNKNOWN.value).upper()
     side_snapshot = _side_snapshot(payload, side)
-    status = str(policy.get("market_status") or side_snapshot.get("status") or "DATA_WAIT").upper()
+    status = str(policy.get("market_status") or side_snapshot.get("status") or _side_status_from_payload(payload, side) or "DATA_WAIT").upper()
     global_status = str(policy.get("global_market_status") or payload.get("global_status") or "DATA_WAIT")
     counterpart_side = _counterpart_side(side)
     counterpart_snapshot = _side_snapshot(payload, counterpart_side)
-    counterpart_status = str(counterpart_snapshot.get("status") or "DATA_WAIT").upper()
+    counterpart_status = str(counterpart_snapshot.get("status") or _side_status_from_payload(payload, counterpart_side) or "DATA_WAIT").upper()
     systemic = _bool(payload.get("systemic_risk_off"))
     if "systemic_risk_off" not in payload:
         systemic, _systemic_reasons = systemic_risk_off_state(
@@ -522,12 +522,14 @@ def _market_context(candidate: Candidate, payload: Mapping[str, Any], code: str)
         market_action=action,
         position_size_multiplier_hint=multiplier,
         block_new_entry=block_new_entry,
-        index_return_pct=_float(side_snapshot.get("index_return_pct")),
-        counterpart_index_return_pct=_float(counterpart_snapshot.get("index_return_pct")),
+        index_return_pct=_float(_mapping_value_or(side_snapshot, "index_return_pct", _side_value_from_payload(payload, side, "return_pct"))),
+        counterpart_index_return_pct=_float(
+            _mapping_value_or(counterpart_snapshot, "index_return_pct", _side_value_from_payload(payload, counterpart_side, "return_pct"))
+        ),
         index_slope_1m_pct=_optional_float(side_snapshot.get("index_slope_1m_pct")),
         index_slope_3m_pct=_optional_float(side_snapshot.get("index_slope_3m_pct")),
         index_slope_5m_pct=_optional_float(side_snapshot.get("index_slope_5m_pct")),
-        breadth_pct=_float(side_snapshot.get("breadth_pct")),
+        breadth_pct=_float(_mapping_value_or(side_snapshot, "breadth_pct", _side_value_from_payload(payload, side, "breadth_pct"))),
         breadth_trust_level="LOW" if "LOW_TRUST_BREADTH" in set(side_snapshot.get("data_quality_flags") or []) else "NORMAL",
         turnover_weighted_return_pct=_float(side_snapshot.get("turnover_weighted_return_pct")),
         risk_score=_float(side_snapshot.get("risk_score")),
@@ -786,6 +788,29 @@ def _counterpart_side(side: str) -> str:
     if str(side or "").upper() == MarketSide.KOSDAQ.value:
         return MarketSide.KOSPI.value
     return MarketSide.UNKNOWN.value
+
+
+def _side_status_from_payload(payload: Mapping[str, Any], side: str) -> str:
+    normalized = str(side or "").upper()
+    if normalized == MarketSide.KOSPI.value:
+        return str(payload.get("kospi_status") or "")
+    if normalized == MarketSide.KOSDAQ.value:
+        return str(payload.get("kosdaq_status") or "")
+    return ""
+
+
+def _side_value_from_payload(payload: Mapping[str, Any], side: str, suffix: str) -> Any:
+    normalized = str(side or "").upper()
+    if normalized == MarketSide.KOSPI.value:
+        return payload.get(f"kospi_{suffix}")
+    if normalized == MarketSide.KOSDAQ.value:
+        return payload.get(f"kosdaq_{suffix}")
+    return None
+
+
+def _mapping_value_or(mapping: Mapping[str, Any], key: str, fallback: Any) -> Any:
+    value = mapping.get(key)
+    return fallback if value in (None, "") else value
 
 
 def _candidate_side(candidate: Candidate) -> str:
