@@ -85,6 +85,38 @@ def test_risk_off_candidate_is_hard_block_without_deleting_candidate(tmp_path):
     assert reloaded.state == CandidateState.WATCHING
 
 
+def test_wait_data_candidate_with_completed_hydration_is_recovered_and_evaluated(tmp_path):
+    db, market_data, candles = _context(tmp_path)
+    candidate = _candidate(db, "000205")
+    candidate.state = CandidateState.WAIT_DATA
+    candidate.metadata["candidate_hydration"] = _complete_hydration("000205")
+    db.save_candidate(candidate)
+    _ready_ticks(market_data, candles, "000205", [1030, 1000, 995, 1005], metadata={"vwap": 1000, "momentum_1m": 1.0})
+
+    result = _engine(db, market_data, candles).build(trade_date=TRADE_DATE, now=OPEN_AT)
+    reloaded = db.load_candidate(TRADE_DATE, "000205")
+
+    assert result.evaluated_count == 1
+    assert result.decisions[0].code == "000205"
+    assert result.decisions[0].details["state_contract"]["evaluation_eligible"] is True
+    assert reloaded.state == CandidateState.WATCHING
+
+
+def test_wait_data_retry_candidate_is_not_evaluated(tmp_path):
+    db, market_data, candles = _context(tmp_path)
+    candidate = _candidate(db, "000206")
+    candidate.state = CandidateState.WAIT_DATA
+    candidate.metadata["candidate_hydration"] = {**_complete_hydration("000206"), "status": "RETRY_WAIT"}
+    db.save_candidate(candidate)
+    _ready_ticks(market_data, candles, "000206", [1030, 1000, 995, 1005], metadata={"vwap": 1000, "momentum_1m": 1.0})
+
+    result = _engine(db, market_data, candles).build(trade_date=TRADE_DATE, now=OPEN_AT)
+    reloaded = db.load_candidate(TRADE_DATE, "000206")
+
+    assert result.evaluated_count == 0
+    assert reloaded.state == CandidateState.WAIT_DATA
+
+
 def test_split_market_reduced_policy_passes_with_scaled_multiplier(tmp_path):
     db, market_data, candles = _context(tmp_path)
     _candidate(
@@ -328,6 +360,20 @@ def _candidate(
         }
     )
     return db.save_candidate(candidate)
+
+
+def _complete_hydration(code: str) -> dict:
+    return {
+        "status": "ACKED",
+        "basic_hydration_complete": True,
+        "basic_hydration_completed_at": OPEN_AT.isoformat(),
+        "parsed": {
+            "code": code,
+            "current_price": 1000,
+            "change_rate": 1.2,
+            "prev_close": 988,
+        },
+    }
 
 
 def _ready_ticks(

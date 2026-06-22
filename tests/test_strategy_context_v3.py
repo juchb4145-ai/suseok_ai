@@ -4,7 +4,7 @@ from storage.db import TradingDatabase
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.entry_engine import EntryDecisionStatus, EntryEngine, EntryEngineConfig
 from trading.strategy.market_data import MarketDataStore, StrategyTick
-from trading.strategy.models import Candidate, CandidateState
+from trading.strategy.models import Candidate, CandidateSourceType, CandidateState
 from trading.strategy.strategy_context import StrategyContextAssembler, session_phase
 
 
@@ -125,6 +125,40 @@ def test_entry_engine_uses_strategy_context_v3_without_legacy_theme_board_metada
     assert decision.entry_status in {EntryDecisionStatus.OBSERVE_READY, EntryDecisionStatus.PRICE_WAIT}
     assert decision.dry_run_intent_allowed is False
     assert decision.live_order_allowed is False
+
+
+def test_assemble_active_candidates_uses_candidate_state_contract(tmp_path):
+    db = TradingDatabase(str(tmp_path / "context-contract.db"))
+    market_data = MarketDataStore()
+    eligible = db.save_candidate(
+        Candidate(
+            trade_date=TRADE_DATE,
+            code="001111",
+            name="Eligible",
+            state=CandidateState.WAIT_DATA,
+            sources=[CandidateSourceType.CONDITION_SEARCH],
+            metadata={"candidate_hydration": _complete_hydration("001111")},
+        )
+    )
+    retry = db.save_candidate(
+        Candidate(
+            trade_date=TRADE_DATE,
+            code="002222",
+            name="Retry",
+            state=CandidateState.WAIT_DATA,
+            sources=[CandidateSourceType.CONDITION_SEARCH],
+            metadata={"candidate_hydration": {**_complete_hydration("002222"), "status": "RETRY_WAIT"}},
+        )
+    )
+
+    snapshots = StrategyContextAssembler(db, market_data=market_data).assemble_active_candidates(
+        now=datetime(2026, 6, 19, 9, 20, 0),
+        save=False,
+    )
+
+    assert [snapshot.code for snapshot in snapshots] == ["001111"]
+    assert db.load_candidate(TRADE_DATE, eligible.code).state == CandidateState.WATCHING
+    assert db.load_candidate(TRADE_DATE, retry.code).state == CandidateState.WAIT_DATA
 
 
 def test_takeover_pending_leadership_policy_waits_new_entry(tmp_path):
@@ -358,6 +392,20 @@ def _candidate(db: TradingDatabase, *, market: str = "KOSDAQ") -> Candidate:
             metadata={},
         )
     )
+
+
+def _complete_hydration(code: str) -> dict:
+    return {
+        "status": "ACKED",
+        "basic_hydration_complete": True,
+        "basic_hydration_completed_at": "2026-06-19T09:20:00",
+        "parsed": {
+            "code": code,
+            "current_price": 1000,
+            "change_rate": 1.2,
+            "prev_close": 988,
+        },
+    }
 
 
 def _entry_decision(db: TradingDatabase, market_data: MarketDataStore):

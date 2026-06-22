@@ -6,6 +6,7 @@ from datetime import datetime, time
 from enum import Enum
 from typing import Any, Iterable, Mapping
 
+from trading.strategy.candidate_state_contract import CandidateStateContractService
 from trading.strategy.candidates import normalize_code
 from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.strategy.market_regime import (
@@ -15,7 +16,7 @@ from trading.strategy.market_regime import (
     market_policy_for_side,
     systemic_risk_off_state,
 )
-from trading.strategy.models import Candidate, CandidateState
+from trading.strategy.models import Candidate
 from trading.theme_engine.context_resolver import BestThemeContextResolver
 
 
@@ -208,12 +209,14 @@ class StrategyContextAssembler:
         market_data: MarketDataStore | None = None,
         candle_builder: Any | None = None,
         best_theme_context_resolver: BestThemeContextResolver | None = None,
+        state_contract: CandidateStateContractService | None = None,
         clock=None,
     ) -> None:
         self.db = db
         self.market_data = market_data
         self.candle_builder = candle_builder
         self.best_theme_context_resolver = best_theme_context_resolver or BestThemeContextResolver()
+        self.state_contract = state_contract or CandidateStateContractService(db, clock=clock or datetime.now)
         self.clock = clock or datetime.now
 
     def assemble_candidate(
@@ -321,7 +324,7 @@ class StrategyContextAssembler:
         candidates = [
             candidate
             for candidate in list(self.db.list_candidates(trade_date=trade_date) or [])
-            if candidate.state not in {CandidateState.REMOVED, CandidateState.EXPIRED}
+            if self._evaluation_eligible(candidate)
         ]
         snapshots = [
             self.assemble_candidate(
@@ -336,6 +339,11 @@ class StrategyContextAssembler:
         if save:
             self.save_snapshots(candidates, snapshots, calculated_at=current.isoformat())
         return snapshots
+
+    def _evaluation_eligible(self, candidate: Candidate) -> bool:
+        if getattr(self.state_contract, "enabled", False):
+            return bool(self.state_contract.reconcile_candidate(candidate).evaluation_eligible)
+        return not self.state_contract.is_terminal(candidate)
 
     def save_snapshots(
         self,

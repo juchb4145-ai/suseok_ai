@@ -115,6 +115,24 @@ def test_market_regime_dirty_reason_evaluates_active_candidates(tmp_path):
     assert result.evaluated_candidate_count == 2
 
 
+def test_dirty_evaluator_recovers_wait_data_candidate_when_hydration_is_complete(tmp_path):
+    db, market_data, candles, service = _context(tmp_path)
+    candidate = _candidate(db, "005908")
+    candidate.state = CandidateState.WAIT_DATA
+    candidate.metadata["candidate_hydration"] = _complete_hydration("005908")
+    db.save_candidate(candidate)
+    _ready_ticks(service, "005908", [1030, 1000, 995, 1005])
+    service.dirty_queue.clear()
+    service.dirty_queue.mark_dirty("005908", DirtyReason.PRICE_TICK)
+
+    result = _evaluator(db, market_data, candles, service).evaluate_dirty(now=OPEN_AT)
+    reloaded = db.load_candidate(TRADE_DATE, "005908")
+
+    assert result.evaluated_candidate_count == 1
+    assert reloaded.state == CandidateState.WATCHING
+    assert reloaded.metadata["entry_status"] == EntryDecisionStatus.OBSERVE_READY.value
+
+
 def test_reboot_v2_snapshot_includes_dirty_evaluator_and_skips_full_scan_when_enabled(tmp_path):
     db, market_data, candles, service = _context(tmp_path)
 
@@ -146,7 +164,8 @@ def test_reboot_v2_snapshot_includes_dirty_evaluator_and_skips_full_scan_when_en
     snapshot = runtime.cycle(OPEN_AT)
 
     assert snapshot["dirty_evaluator"]["status"] == "IDLE"
-    assert snapshot["entry_engine"]["status"] == "SHADOWED_BY_DIRTY_EVALUATOR"
+    assert snapshot["entry_engine"]["status"] == "DIRTY_EVALUATOR_ACTIVE"
+    assert snapshot["entry_engine"]["fallback_full_scan_available"] is True
 
 
 def _context(tmp_path):
@@ -212,6 +231,20 @@ def _candidate(db: TradingDatabase, code: str):
         }
     )
     return db.save_candidate(candidate)
+
+
+def _complete_hydration(code: str) -> dict:
+    return {
+        "status": "ACKED",
+        "basic_hydration_complete": True,
+        "basic_hydration_completed_at": OPEN_AT.isoformat(),
+        "parsed": {
+            "code": code,
+            "current_price": 1000,
+            "change_rate": 1.2,
+            "prev_close": 988,
+        },
+    }
 
 
 def _ready_ticks(service: MarketDataService, code: str, prices: list[int], *, metadata: dict | None = None) -> None:

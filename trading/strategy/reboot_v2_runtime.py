@@ -9,6 +9,7 @@ from typing import Any, Iterable, Mapping
 from trading.strategy.candidates import normalize_code
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.candidate_fsm import build_candidate_fsm_summary
+from trading.strategy.candidate_state_contract import CandidateStateContractReconciler
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import MarketIndexStore
 from trading.strategy.models import Candidate, CandidateState, VirtualOrderStatus
@@ -42,6 +43,7 @@ class RebootV2Runtime:
     strategy_context_pipeline: Any = None
     entry_engine_pipeline: Any = None
     dirty_strategy_evaluator: Any = None
+    candidate_state_contract_reconciler: Any = None
     market_dirty_publisher: Any = None
     theme_dirty_publisher: Any = None
     strategy_context_dirty_publisher: Any = None
@@ -66,6 +68,7 @@ class RebootV2Runtime:
         self.theme_dirty_publisher = self.theme_dirty_publisher or ThemeStateDirtyPublisher()
         self.strategy_context_dirty_publisher = self.strategy_context_dirty_publisher or StrategyContextDirtyPublisher()
         self.expansion_lease_manager = self.expansion_lease_manager or ExpansionLeaseManager()
+        self.candidate_state_contract_reconciler = self.candidate_state_contract_reconciler or CandidateStateContractReconciler(self.db, clock=self.clock)
         self._expansion_lease_restored_trade_date = ""
 
     def start(self, now: datetime | None = None) -> dict[str, Any]:
@@ -108,6 +111,7 @@ class RebootV2Runtime:
         self._publish_theme_dirty(snapshot, current)
         self._reconcile_theme_expansion_subscriptions(snapshot, current)
         self._enqueue_hydration(snapshot, current)
+        self._reconcile_candidate_state_contract(snapshot, current)
         self._reconcile_candidate_subscriptions(snapshot, current)
         self._run_pipeline(
             snapshot,
@@ -120,13 +124,13 @@ class RebootV2Runtime:
         self._publish_strategy_context_dirty(snapshot, current)
         self._run_pipeline(snapshot, "dirty_evaluator", self.dirty_strategy_evaluator, current)
         if _component_enabled(self.dirty_strategy_evaluator):
-            snapshot["entry_engine"] = {
-                "enabled": False,
-                "status": "SHADOWED_BY_DIRTY_EVALUATOR",
-                "fallback_full_scan_available": _component_enabled(self.entry_engine_pipeline),
-                "live_order_allowed": False,
-                "dry_run_order_allowed": False,
-            }
+            dashboard_section = getattr(self.dirty_strategy_evaluator, "dashboard_section", None)
+            snapshot["entry_engine"] = dict(dashboard_section() if callable(dashboard_section) else {})
+            snapshot["entry_engine"].setdefault("enabled", True)
+            snapshot["entry_engine"].setdefault("status", "DIRTY_EVALUATOR_ACTIVE")
+            snapshot["entry_engine"]["fallback_full_scan_available"] = _component_enabled(self.entry_engine_pipeline)
+            snapshot["entry_engine"]["live_order_allowed"] = False
+            snapshot["entry_engine"]["dry_run_order_allowed"] = False
         else:
             self._run_pipeline(snapshot, "entry_engine", self.entry_engine_pipeline, current)
         self._run_pipeline(snapshot, "market_relative_strength_shadow", self.market_relative_strength_shadow_pipeline, current)
@@ -210,6 +214,17 @@ class RebootV2Runtime:
         except Exception as exc:
             snapshot["intraday_discovery_recovery"] = {"status": "ERROR", "error": str(exc)}
             snapshot.setdefault("warnings", []).append(f"INTRADAY_DISCOVERY_RECOVERY_FAILED:{exc}")
+
+    def _reconcile_candidate_state_contract(self, snapshot: dict[str, Any], now: datetime) -> None:
+        reconciler = self.candidate_state_contract_reconciler
+        if reconciler is None:
+            snapshot["candidate_state_contract"] = {"status": "DISABLED"}
+            return
+        try:
+            snapshot["candidate_state_contract"] = dict(reconciler.reconcile_trade_date(now.date().isoformat()) or {})
+        except Exception as exc:
+            snapshot["candidate_state_contract"] = {"status": "ERROR", "error": str(exc)}
+            snapshot.setdefault("warnings", []).append(f"CANDIDATE_STATE_CONTRACT_RECONCILE_FAILED:{exc}")
 
     def _publish_market_dirty(self, snapshot: dict[str, Any], now: datetime) -> None:
         publisher = self.market_dirty_publisher

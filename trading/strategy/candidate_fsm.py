@@ -326,7 +326,8 @@ class CandidateFsmService:
         details: dict[str, Any],
     ) -> CandidateStateTransition:
         previous = self.v2_state(candidate)
-        occurred_at = _format_time(self.clock())
+        current = self.clock()
+        occurred_at = _format_time(current)
         metadata = dict(candidate.metadata or {})
         fsm = dict(metadata.get("candidate_fsm") or {})
         existing_sources = [str(item) for item in list(fsm.get("source_event_ids") or []) if str(item)]
@@ -351,6 +352,7 @@ class CandidateFsmService:
             fsm["price_source"] = str(details.get("price_source") or "")
         metadata["candidate_fsm"] = fsm
         candidate.metadata = metadata
+        self._reconcile_state_contract(candidate, current)
         transition = CandidateStateTransition(
             transition_id=f"cand_tr_{uuid4().hex}",
             trade_date=candidate.trade_date,
@@ -373,6 +375,16 @@ class CandidateFsmService:
         if callable(saver):
             saver(transition)
         return transition
+
+    def _reconcile_state_contract(self, candidate: Candidate, now: datetime) -> None:
+        if self.db is None:
+            return
+        try:
+            from trading.strategy.candidate_state_contract import CandidateStateContractService
+
+            CandidateStateContractService(self.db, clock=self.clock).reconcile_candidate(candidate, now=now)
+        except Exception:
+            return
 
     @staticmethod
     def _candidate_from_input(value: Any) -> Candidate | None:

@@ -10,6 +10,7 @@ from trading.broker.gateway_state import GatewayStateStore
 from trading.broker.models import GatewayCommand, GatewayEvent, new_message_id
 from trading.strategy.candidates import normalize_code
 from trading.strategy.candidate_fsm import CandidateBlockingStage, CandidateFsmService, CandidateReasonCode
+from trading.strategy.candidate_state_contract import CONTRACT_VERSION
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.models import Candidate, CandidateEvent, CandidateState
 from trading.theme_engine.backfill import OPT10001_FIELDS, parse_opt10001_backfill
@@ -271,6 +272,17 @@ class CandidateHydrator:
             metadata["gate_usable_for_entry"] = True
             metadata["entry_timing_source"] = "REALTIME_TICK"
         enough, wait_reasons = _minimum_watching_data(candidate, parsed, metadata)
+        current_metadata = dict(metadata.get("candidate_hydration") or {})
+        current_metadata.update(
+            {
+                "basic_hydration_complete": bool(enough),
+                "basic_hydration_completed_at": _format_time(self.clock()) if enough else "",
+                "basic_hydration_blocking_reasons": [reason for reason in wait_reasons if reason != "theme_unmapped"],
+                "realtime_entry_data_ready": bool(metadata.get("gate_usable_for_entry")),
+                "contract_version": CONTRACT_VERSION,
+            }
+        )
+        metadata["candidate_hydration"] = current_metadata
         if enough:
             candidate.state = CandidateState.WATCHING
             reason_codes = _dedupe([*reason_codes, *wait_reasons])
@@ -350,6 +362,11 @@ class CandidateHydrator:
         hydration.update(
             {
                 "status": "RETRY_WAIT" if retryable else "FAILED",
+                "basic_hydration_complete": False,
+                "basic_hydration_completed_at": "",
+                "basic_hydration_blocking_reasons": [str(reason or "FAILED")],
+                "realtime_entry_data_ready": False,
+                "contract_version": CONTRACT_VERSION,
                 "failure_status": str(reason or "FAILED"),
                 "command_id": command_id,
                 "idempotency_key": str(raw_payload.get("idempotency_key") or command_payload.get("idempotency_key") or ""),

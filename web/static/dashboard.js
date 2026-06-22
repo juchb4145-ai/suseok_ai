@@ -1167,8 +1167,8 @@ function renderDashboardV2(snapshot) {
   renderDashboardV2Themes(themes.items || []);
   text("dashboard-v2-reason-count", (reasons.items || []).length || 0);
   renderDashboardV2Reasons(reasons.items || []);
-  text("dashboard-v2-entry-count", (entry.items || []).length || 0);
-  renderDashboardV2EntryRows(entry.items || []);
+  text("dashboard-v2-entry-count", Number(entry.observe_ready_count || 0));
+  renderDashboardV2EntryRows(entry.items || [], entry);
   text("dashboard-v2-position-count", (positionRisk.positions || []).length || 0);
   renderDashboardV2PositionRows(positionRisk.positions || []);
 
@@ -1268,11 +1268,13 @@ function renderDashboardV2Reasons(rows) {
   `).join("");
 }
 
-function renderDashboardV2EntryRows(rows) {
+function renderDashboardV2EntryRows(rows, meta = {}) {
   const node = document.getElementById("dashboard-v2-entry-rows");
   if (!node) return;
   if (!rows.length) {
-    node.innerHTML = '<tr><td colspan="5" class="empty">진입 준비 관찰 후보가 없습니다</td></tr>';
+    const evaluated = Number(meta.evaluated_count || meta.evaluation_eligible_count || 0);
+    const message = evaluated > 0 ? `진입 준비 관찰 후보는 0건입니다 · 평가 ${evaluated}건` : "진입 준비 관찰 후보가 없습니다";
+    node.innerHTML = `<tr><td colspan="5" class="empty">${escapeHtml(message)}</td></tr>`;
     return;
   }
   node.innerHTML = rows.slice(0, 12).map((item) => `

@@ -374,12 +374,29 @@ def _entry_candidates(entry: dict[str, Any], candidates: dict[str, Any], order_m
     priority = {"ORDER_PENDING": 0, "TIMING_READY": 1, "SETUP_READY": 2, "WAIT": 3, "BLOCK": 4}
     rows = sorted(rows, key=lambda row: (priority.get(row["display_bucket"], 9), row["code"]))[:15]
     bucket_counts = Counter(row["display_bucket"] for row in rows)
+    observe_ready_count = int(
+        entry.get("observe_ready_count")
+        or sum(1 for row in rows if row["display_bucket"] in {"TIMING_READY", "ORDER_PENDING"})
+    )
+    evaluated_count = int(entry.get("evaluated_count") or len(rows))
+    evaluation_eligible_count = int(entry.get("evaluation_eligible_count") or evaluated_count)
     return {
         "status": entry.get("status", "EMPTY"),
         "calculated_at": entry.get("calculated_at", ""),
-        "observe_ready_count": int(entry.get("observe_ready_count") or sum(1 for row in rows if row["display_bucket"] in {"TIMING_READY", "ORDER_PENDING"})),
+        "evaluated_count": evaluated_count,
+        "evaluation_eligible_count": evaluation_eligible_count,
+        "observe_ready_count": observe_ready_count,
+        "wait_count": int(entry.get("wait_count") or bucket_counts.get("WAIT", 0)),
+        "data_wait_count": int(entry.get("data_wait_count") or 0),
+        "theme_wait_count": int(entry.get("theme_wait_count") or 0),
+        "market_wait_count": int(entry.get("market_wait_count") or 0),
+        "price_wait_count": int(entry.get("price_wait_count") or bucket_counts.get("SETUP_READY", 0)),
+        "hard_block_count": int(entry.get("hard_block_count") or bucket_counts.get("BLOCK", 0)),
         "items": rows,
+        "ready_items": [row for row in rows if row["display_bucket"] in {"TIMING_READY", "ORDER_PENDING"}],
         "bucket_counts": dict(bucket_counts),
+        "top_wait_reasons": list(entry.get("top_wait_reasons") or []),
+        "top_block_reasons": list(entry.get("top_block_reasons") or []),
     }
 
 

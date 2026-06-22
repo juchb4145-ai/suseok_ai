@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any, Iterable, Mapping
 
 from trading.strategy.candles import CandleBuilder
+from trading.strategy.candidate_state_contract import CandidateStateContractService
 from trading.strategy.market_data import MarketDataStore, StrategyTick
 from trading.strategy.models import Candidate, CandidateState
 
@@ -203,12 +204,14 @@ class EntryEngine:
         market_data: MarketDataStore | None = None,
         candle_builder: CandleBuilder | None = None,
         config: EntryEngineConfig | None = None,
+        state_contract: CandidateStateContractService | None = None,
         clock=None,
     ) -> None:
         self.db = db
         self.market_data = market_data
         self.candle_builder = candle_builder
         self.config = config or EntryEngineConfig()
+        self.state_contract = state_contract or CandidateStateContractService(db, clock=clock or datetime.now)
         self.clock = clock or datetime.now
 
     def build(
@@ -223,7 +226,7 @@ class EntryEngine:
         candidates = [
             candidate
             for candidate in list(self.db.list_candidates(trade_date=trade_date) or [])
-            if candidate.state in ENTRY_ENGINE_CANDIDATE_STATES
+            if self._evaluation_eligible(candidate, reconcile=True)
         ]
         return self.evaluate_candidates(candidates, trade_date=trade_date, now=current, save=save)
 
@@ -245,7 +248,7 @@ class EntryEngine:
                 continue
             seen.add(code)
             candidate = self.db.load_candidate(trade_date, code)
-            if candidate is not None and candidate.state in ENTRY_ENGINE_CANDIDATE_STATES:
+            if candidate is not None and self._evaluation_eligible(candidate, reconcile=True):
                 candidates.append(candidate)
         return self.evaluate_candidates(candidates, trade_date=trade_date, now=current, save=save)
 
@@ -262,7 +265,7 @@ class EntryEngine:
         candidate_list = [
             candidate
             for candidate in list(candidates or [])
-            if candidate is not None and candidate.state in ENTRY_ENGINE_CANDIDATE_STATES
+            if candidate is not None and self._evaluation_eligible(candidate, reconcile=True)
         ]
         decisions = tuple(self._decision(candidate, trade_date, current) for candidate in candidate_list)
         updated_count = self._merge_candidate_metadata(decisions, trade_date, current) if save else 0
@@ -310,6 +313,9 @@ class EntryEngine:
             {"check_name": "role_ready", **role.to_dict()},
             {"check_name": "price_timing", **price.to_dict()},
         ]
+        state_contract = self.state_contract.snapshot(candidate)
+        state_contract_payload = state_contract.to_dict()
+        contract_metadata = dict(metadata.get("candidate_state_contract") or {})
         details = {
             "checks": checks,
             "data_quality_flags": list(data.data_quality_flags),
@@ -322,6 +328,14 @@ class EntryEngine:
             "strategy_context_version": str(strategy_context.get("schema_version") or ""),
             "strategy_context_id": str(strategy_context.get("context_id") or ""),
             "strategy_context_v3": strategy_context,
+            "durable_candidate_state": state_contract.durable_state,
+            "v2_candidate_state": state_contract.v2_state,
+            "state_contract_version": state_contract.contract_version,
+            "evaluation_eligible": state_contract.evaluation_eligible,
+            "hydration_complete": state_contract.hydration_complete,
+            "blocking_stage_before_evaluation": state_contract.blocking_stage,
+            "state_reconciled_before_evaluation": bool(state_contract.reconciled or contract_metadata.get("reconciled_at")),
+            "state_contract": state_contract_payload,
         }
         current_price = int(getattr(tick, "price", 0) or 0) if tick is not None else 0
         context_theme = _context_theme(strategy_context)
@@ -748,7 +762,7 @@ class EntryEngine:
         updated_at = now.isoformat()
         for decision in decisions:
             candidate = self.db.load_candidate(trade_date, decision.code)
-            if candidate is None or candidate.state not in ENTRY_ENGINE_CANDIDATE_STATES:
+            if candidate is None or not self._evaluation_eligible(candidate, reconcile=False):
                 continue
             metadata = dict(candidate.metadata or {})
             metadata["entry_status"] = decision.entry_status.value
@@ -767,6 +781,12 @@ class EntryEngine:
             self.db.save_candidate(candidate)
             updated += 1
         return updated
+
+    def _evaluation_eligible(self, candidate: Candidate, *, reconcile: bool) -> bool:
+        if getattr(self.state_contract, "enabled", False):
+            snapshot = self.state_contract.reconcile_candidate(candidate) if reconcile else self.state_contract.snapshot(candidate)
+            return bool(snapshot.evaluation_eligible)
+        return candidate.state in ENTRY_ENGINE_CANDIDATE_STATES
 
     def _one_minute_candle_count(self, code: str) -> int:
         if self.candle_builder is None:
@@ -899,6 +919,7 @@ def entry_engine_dashboard_payload(result: EntryDecisionResult | Mapping[str, An
         "calculated_at": calculated_at,
         "trade_date": trade_date,
         "evaluated_count": len(decisions),
+        "evaluation_eligible_count": len(decisions),
         "observe_ready_count": status_counts.get(EntryDecisionStatus.OBSERVE_READY.value, 0),
         "wait_count": status_counts.get(EntryDecisionStatus.WAIT.value, 0),
         "hard_block_count": status_counts.get(EntryDecisionStatus.HARD_BLOCK.value, 0),
@@ -908,6 +929,7 @@ def entry_engine_dashboard_payload(result: EntryDecisionResult | Mapping[str, An
         "price_wait_count": status_counts.get(EntryDecisionStatus.PRICE_WAIT.value, 0),
         "dry_run_intent_allowed_count": sum(1 for item in decisions if bool(item.get("dry_run_intent_allowed"))),
         "top_ready_candidates": sorted(ready, key=lambda item: float(item.get("current_price") or 0.0), reverse=True)[:10],
+        "decisions": decisions[:50],
         "top_wait_reasons": [{"reason": key, "count": count} for key, count in reason_counter.most_common(10) if "WAIT" in key or "MISSING" in key or "UNKNOWN" in key],
         "top_block_reasons": [{"reason": key, "count": count} for key, count in reason_counter.most_common(10) if "BLOCK" in key or "OVEREXTENDED" in key or "CHASE" in key],
         "warnings": [],

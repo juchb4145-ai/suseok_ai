@@ -171,6 +171,25 @@ def test_wait_data_legacy_state_maps_to_blocking_stage_not_v2_state(tmp_path) ->
     db.close()
 
 
+def test_fsm_apply_reconciles_hydration_complete_wait_data_to_watching(tmp_path) -> None:
+    db = TradingDatabase(str(tmp_path / "fsm.db"))
+    candidate = _candidate(db)
+    candidate.state = CandidateState.WAIT_DATA
+    candidate.metadata["candidate_hydration"] = _complete_hydration()
+    candidate = db.save_candidate(candidate)
+
+    CandidateFsmService(db).apply_blocking_reason(
+        candidate,
+        CandidateBlockingStage.DATA,
+        CandidateReasonCode.LATEST_TICK_MISSING,
+    )
+
+    reloaded = db.load_candidate("2026-06-17", "005930")
+    assert reloaded.state == CandidateState.WATCHING
+    assert reloaded.metadata["candidate_fsm"]["v2_state"] == "WATCHING"
+    db.close()
+
+
 def test_risk_block_does_not_mutate_candidate_to_blocked(tmp_path) -> None:
     db = TradingDatabase(str(tmp_path / "fsm.db"))
     candidate = _candidate(db)
@@ -214,3 +233,17 @@ def _candidate(db: TradingDatabase, *, theme_id: str = ""):
         ),
         trade_date="2026-06-17",
     ).candidate
+
+
+def _complete_hydration() -> dict:
+    return {
+        "status": "ACKED",
+        "basic_hydration_complete": True,
+        "basic_hydration_completed_at": "2026-06-17T09:02:00",
+        "parsed": {
+            "code": "005930",
+            "current_price": 70000,
+            "change_rate": 1.2,
+            "prev_close": 69170,
+        },
+    }

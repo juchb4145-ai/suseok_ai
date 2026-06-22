@@ -181,6 +181,32 @@ def test_dashboard_v2_entry_decisions_map_to_operator_buckets(monkeypatch):
     assert buckets["000002"] == "SETUP_READY"
     assert buckets["000003"] == "WAIT"
     assert buckets["000004"] == "BLOCK"
+    assert payload["entry_candidates"]["evaluated_count"] == 4
+    assert payload["entry_candidates"]["observe_ready_count"] == 1
+
+
+def test_dashboard_v2_keeps_wait_rows_when_no_observe_ready_candidates(monkeypatch):
+    monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
+    snapshot = {
+        "entry_engine": {
+            "status": "DIRTY_EVALUATOR_ACTIVE",
+            "evaluated_count": 2,
+            "evaluation_eligible_count": 2,
+            "observe_ready_count": 0,
+            "data_wait_count": 2,
+            "decisions": [
+                {"code": "014910", "name": "", "entry_status": "DATA_WAIT", "reason_codes": ["LATEST_TICK_STALE"]},
+                {"code": "014950", "name": "삼익제약", "entry_status": "DATA_WAIT", "reason_codes": ["MARKET_DATA_WAIT"]},
+            ],
+        },
+    }
+
+    payload = build_dashboard_v2_snapshot(snapshot)
+
+    assert payload["entry_candidates"]["observe_ready_count"] == 0
+    assert payload["entry_candidates"]["evaluated_count"] == 2
+    assert [item["code"] for item in payload["entry_candidates"]["items"]] == ["014910", "014950"]
+    assert all(item["display_bucket"] == "WAIT" for item in payload["entry_candidates"]["items"])
 
 
 def test_dashboard_v2_risk_off_and_real_broker_create_safety_banners(monkeypatch):

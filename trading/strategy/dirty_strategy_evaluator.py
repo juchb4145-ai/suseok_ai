@@ -9,7 +9,8 @@ from typing import Any, Iterable, Mapping
 
 from trading.runtime_ports import CandidateRuntimeState, EntryDecisionEnvelope, EntryEvaluationStep, EntryStep, StepResult
 from trading.strategy.candidate_fsm import CandidateBlockingStage, CandidateFsmService, CandidateReasonCode
-from trading.strategy.entry_engine import EntryCheckStatus, EntryDecision, EntryDecisionResult, EntryDecisionStatus, EntryEngine
+from trading.strategy.candidate_state_contract import CandidateStateContractService
+from trading.strategy.entry_engine import EntryCheckStatus, EntryDecision, EntryDecisionResult, EntryDecisionStatus, EntryEngine, entry_engine_dashboard_payload
 from trading.strategy.market_data_service import DirtyCodeEvent, DirtyReason, MarketDataService
 from trading.strategy.models import Candidate, CandidateState
 
@@ -80,6 +81,7 @@ class DirtyStrategyEvaluator:
         entry_engine: EntryEngine,
         config: DirtyStrategyEvaluatorConfig | None = None,
         fsm: CandidateFsmService | None = None,
+        state_contract: CandidateStateContractService | None = None,
         clock=None,
     ) -> None:
         self.db = db
@@ -88,7 +90,11 @@ class DirtyStrategyEvaluator:
         self.config = config or DirtyStrategyEvaluatorConfig.from_env()
         self.clock = clock or datetime.now
         self.fsm = fsm or CandidateFsmService(db, clock=self.clock)
+        self.state_contract = state_contract or CandidateStateContractService(db, clock=self.clock)
         self.last_result = DirtyStrategyEvaluatorResult(status="DISABLED" if not self.config.enabled else "IDLE", enabled=self.config.enabled, shadow_mode=self.config.shadow_mode)
+        self.last_entry_result: EntryDecisionResult | None = None
+        self.last_decisions: tuple[EntryDecision, ...] = ()
+        self.last_entry_dashboard_payload: dict[str, Any] = {}
         self._last_evaluated_at_by_candidate: dict[str, datetime] = {}
         self._last_context_id_by_candidate: dict[str, str] = {}
 
@@ -191,7 +197,7 @@ class DirtyStrategyEvaluator:
                     pool.append(candidate)
         seen: set[str] = set()
         for candidate in pool:
-            if candidate.state != CandidateState.WATCHING:
+            if not self._evaluation_eligible(candidate, reconcile=True):
                 skipped += 1
                 continue
             key = str(candidate.id or candidate.code)
@@ -225,12 +231,18 @@ class DirtyStrategyEvaluator:
         dirty_events: Iterable[DirtyCodeEvent],
         now: datetime,
     ) -> EntryDecisionResult:
-        return self.entry_engine.evaluate_candidates(
+        result = self.entry_engine.evaluate_candidates(
             candidates,
             trade_date=now.date().isoformat(),
             now=now,
             save=bool(self.config.save_decisions),
         )
+        self.last_entry_result = result
+        self.last_decisions = tuple(result.decisions)
+        self.last_entry_dashboard_payload = entry_engine_dashboard_payload(result)
+        self.last_entry_dashboard_payload["status"] = "DIRTY_EVALUATOR_ACTIVE"
+        self.last_entry_dashboard_payload["enabled"] = True
+        return result
 
     def _sync_candidate_fsm(
         self,
@@ -254,8 +266,25 @@ class DirtyStrategyEvaluator:
                 self._promote_if_changed(candidate, target, reason, dirty_reason=reason_by_code.get(decision.code, ""), decision=decision)
             else:
                 self._block_if_changed(candidate, stage, reason, dirty_reason=reason_by_code.get(decision.code, ""), decision=decision)
+            self.state_contract.reconcile_candidate(candidate, now=now)
             self.db.save_candidate(candidate)
         return stage_counts
+
+    def dashboard_section(self) -> dict[str, Any]:
+        payload = dict(self.last_entry_dashboard_payload or {})
+        if not payload:
+            payload = entry_engine_dashboard_payload([])
+            payload["status"] = "DIRTY_EVALUATOR_ACTIVE"
+            payload["enabled"] = True
+        payload["live_order_allowed"] = False
+        payload["dry_run_order_allowed"] = False
+        return payload
+
+    def _evaluation_eligible(self, candidate: Candidate, *, reconcile: bool) -> bool:
+        if getattr(self.state_contract, "enabled", False):
+            snapshot = self.state_contract.reconcile_candidate(candidate) if reconcile else self.state_contract.snapshot(candidate)
+            return bool(snapshot.evaluation_eligible)
+        return candidate.state == CandidateState.WATCHING
 
     def _promote_if_changed(
         self,
