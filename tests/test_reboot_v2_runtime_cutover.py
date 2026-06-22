@@ -8,7 +8,7 @@ from trading.strategy.candidate_ingestion import CandidateIngestionService, Cand
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import MarketIndexStore
-from trading.strategy.models import CandidateState
+from trading.strategy.models import Candidate, CandidateSourceType, CandidateState, VirtualPosition
 from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.reboot_v2 import RebootV2RuntimeProfile
 from trading.strategy.reboot_v2_runtime import RebootV2Runtime
@@ -117,6 +117,43 @@ def test_reboot_v2_passes_full_market_snapshot_to_downstream_context(tmp_path):
     assert theme_board.market_context["candidate_policy_by_code"]["000001"]["market_action"] == "ALLOW_REDUCED"
     assert strategy_context.market_context["candidate_policy_by_code"]["000001"]["market_action"] == "ALLOW_REDUCED"
     assert strategy_context.market_context["kosdaq_snapshot"]["status"] == "WEAK"
+
+
+def test_reboot_v2_counts_open_positions_for_current_trade_date_only(tmp_path):
+    db = TradingDatabase(str(tmp_path / "v2_positions.db"))
+    old_candidate = db.save_candidate(
+        Candidate(
+            trade_date="2026-06-16",
+            code="005930",
+            name="Samsung",
+            sources=[CandidateSourceType.CONDITION_SEARCH],
+            state=CandidateState.WATCHING,
+        )
+    )
+    db.save_virtual_position(
+        VirtualPosition(
+            candidate_id=old_candidate.id,
+            virtual_order_id=1,
+            entry_price=1000,
+            quantity=1,
+            opened_at="2026-06-16T09:05:00",
+        )
+    )
+    runtime = RebootV2Runtime(
+        db=db,
+        subscription_manager=RealTimeSubscriptionManager(GatewayCommandRealtimeClient(GatewayStateStore()), max_codes=20),
+        candle_builder=CandleBuilder(),
+        market_data=MarketDataStore(),
+        market_index_store=MarketIndexStore(),
+        config=StrategyRuntimeConfig(max_candidates_to_watch=20, realtime_subscription_limit=20),
+        profile=RebootV2RuntimeProfile.V2_OBSERVE,
+    )
+
+    snapshot = runtime.cycle(datetime(2026, 6, 17, 9, 20, 0))
+
+    assert snapshot["open_position_count"] == 0
+    assert snapshot["position_risk"]["status"] == "DISABLED"
+    assert snapshot["position_risk"]["blocking_reason"] == "NO_OPEN_POSITIONS"
 
 
 def test_reboot_v2_condition_hydration_subscription_cutover_blocks_legacy_orders(tmp_path):

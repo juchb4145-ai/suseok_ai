@@ -135,7 +135,7 @@ class RebootV2Runtime:
             self._run_pipeline(snapshot, "entry_engine", self.entry_engine_pipeline, current)
         self._run_pipeline(snapshot, "market_relative_strength_shadow", self.market_relative_strength_shadow_pipeline, current)
         self._run_pipeline(snapshot, "market_relative_strength_outcomes", self.market_relative_strength_outcome_pipeline, current)
-        if self._has_open_positions():
+        if self._has_open_positions(current.date().isoformat()):
             self._run_pipeline(snapshot, "position_risk", self.position_risk_pipeline, current)
             self._run_pipeline(snapshot, "exit_engine_reboot", self.exit_engine_reboot_pipeline, current)
         else:
@@ -562,7 +562,7 @@ class RebootV2Runtime:
         snapshot["watching_candidate_count"] = sum(1 for item in candidates if item.state == CandidateState.WATCHING)
         snapshot["wait_data_candidate_count"] = sum(1 for item in candidates if item.state == CandidateState.WAIT_DATA)
         snapshot["subscription_active_count"] = len(self.subscription_manager.code_to_screen)
-        snapshot["open_position_count"] = len(self._open_positions())
+        snapshot["open_position_count"] = len(self._open_positions(now.date().isoformat()))
         snapshot["entry_plan_count"] = 0
         snapshot["virtual_order_count"] = 0
         snapshot["filled_order_count"] = 0
@@ -639,11 +639,14 @@ class RebootV2Runtime:
                 return dict(payload)
         return {}
 
-    def _open_positions(self) -> list[Any]:
+    def _open_positions(self, trade_date: str | None = None) -> list[Any]:
         loader = getattr(self.db, "list_open_virtual_positions", None)
         if not callable(loader):
             return []
-        return list(loader() or [])
+        positions = list(loader() or [])
+        if not trade_date:
+            return positions
+        return [position for position in positions if self._position_matches_trade_date(position, trade_date)]
 
     def _pending_orders(self) -> list[Any]:
         loader = getattr(self.db, "list_virtual_orders_by_status", None)
@@ -651,8 +654,24 @@ class RebootV2Runtime:
             return []
         return list(loader(VirtualOrderStatus.SUBMITTED) or [])
 
-    def _has_open_positions(self) -> bool:
-        return bool(self._open_positions())
+    def _has_open_positions(self, trade_date: str | None = None) -> bool:
+        return bool(self._open_positions(trade_date))
+
+    def _position_matches_trade_date(self, position: Any, trade_date: str) -> bool:
+        candidate_id = getattr(position, "candidate_id", None)
+        if candidate_id in (None, ""):
+            return True
+        loader = getattr(self.db, "load_candidate_by_id", None)
+        if not callable(loader):
+            return True
+        try:
+            candidate = loader(int(candidate_id))
+        except Exception:
+            return True
+        if candidate is None:
+            return True
+        candidate_trade_date = str(getattr(candidate, "trade_date", "") or "")
+        return candidate_trade_date in {"", str(trade_date or "")}
 
 
 def _component_enabled(component: Any) -> bool:

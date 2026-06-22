@@ -698,6 +698,11 @@ def exit_engine_dashboard_section(db: Any, *, trade_date: str | None = None) -> 
     loader = getattr(db, "latest_exit_decisions_reboot", None)
     if not callable(loader):
         return {"status": "UNAVAILABLE", "output_mode": EXIT_ENGINE_OUTPUT_MODE, "live_order_allowed": False}
+    portfolio_loader = getattr(db, "latest_portfolio_risk_snapshot", None)
+    if callable(portfolio_loader):
+        portfolio = dict(portfolio_loader(trade_date=trade_date) or {})
+        if portfolio and _int_or_default(portfolio.get("open_position_count"), 0) <= 0:
+            return {"status": "EMPTY", "output_mode": EXIT_ENGINE_OUTPUT_MODE, "live_order_allowed": False}
     decisions = loader(trade_date=trade_date)
     if not decisions:
         return {"status": "EMPTY", "output_mode": EXIT_ENGINE_OUTPUT_MODE, "live_order_allowed": False}
@@ -741,6 +746,15 @@ def _float(value: Any, default: float = 0.0) -> float:
         return default
     try:
         return float(str(value).strip().replace(",", "").replace("%", ""))
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_or_default(value: Any, default: int = 0) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        return int(float(str(value).strip().replace(",", "")))
     except (TypeError, ValueError):
         return default
 

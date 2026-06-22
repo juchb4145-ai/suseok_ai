@@ -230,6 +230,24 @@ def test_exit_engine_dashboard_and_runtime_never_create_live_order(tmp_path):
     assert db.conn.execute("SELECT COUNT(*) AS count FROM order_results").fetchone()["count"] == 0
 
 
+def test_exit_engine_dashboard_ignores_stale_decisions_when_latest_portfolio_is_flat(tmp_path):
+    db, _, candles = _context(tmp_path)
+    position = _position(current_price=1060, current_return_pct=6.0)
+    _engine(db, candles).build(trade_date=TRADE_DATE, now=NOW, positions=[position])
+    db.save_portfolio_risk_snapshot(
+        {
+            "trade_date": TRADE_DATE,
+            "calculated_at": (NOW + timedelta(seconds=30)).isoformat(),
+            "open_position_count": 0,
+            "total_exposure": 0,
+        }
+    )
+
+    section = exit_engine_dashboard_section(db, trade_date=TRADE_DATE)
+
+    assert section["status"] == "EMPTY"
+
+
 def _context(tmp_path):
     db = TradingDatabase(str(tmp_path / "test.db"))
     market_data = MarketDataStore()
