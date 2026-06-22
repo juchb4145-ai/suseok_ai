@@ -4,6 +4,7 @@ import hashlib
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, time
 from enum import Enum
+from time import perf_counter
 from typing import Any, Iterable, Mapping
 
 from trading.strategy.candidate_state_contract import CandidateStateContractService
@@ -225,13 +226,13 @@ class StrategyContextAssembler:
         *,
         trade_date: str | None = None,
         now: datetime | None = None,
-        market_context: Mapping[str, Any] | None = None,
+        market_context: Any | None = None,
         theme_board: Mapping[str, Any] | None = None,
     ) -> StrategyContextSnapshot:
         current = (now or self.clock()).replace(microsecond=0)
         trade_date = trade_date or candidate.trade_date or current.date().isoformat()
         code = normalize_code(candidate.code)
-        market_payload = dict(market_context or self._latest_market_context(trade_date) or {})
+        market_payload = market_context if market_context is not None else self._latest_market_context(trade_date)
         theme_payload = dict(theme_board or self._latest_theme_board(trade_date) or {})
         tick = self.market_data.latest_tick(code) if self.market_data is not None else None
         previous_selected_theme_id = self._previous_selected_theme_id(trade_date, code)
@@ -295,7 +296,7 @@ class StrategyContextAssembler:
             source_versions={
                 "strategy_context": STRATEGY_CONTEXT_SCHEMA_VERSION,
                 "theme_core": str(theme_payload.get("output_mode") or ""),
-                "market_regime": str(market_payload.get("output_mode") or ""),
+                "market_regime": str(_payload_get(market_payload, "output_mode", "")),
             },
             source_timestamps={
                 "market_context_at": market.calculated_at,
@@ -315,12 +316,14 @@ class StrategyContextAssembler:
         *,
         trade_date: str | None = None,
         now: datetime | None = None,
-        market_context: Mapping[str, Any] | None = None,
+        market_context: Any | None = None,
         theme_board: Mapping[str, Any] | None = None,
         save: bool = True,
     ) -> list[StrategyContextSnapshot]:
         current = (now or self.clock()).replace(microsecond=0)
         trade_date = trade_date or current.date().isoformat()
+        market_payload = market_context if market_context is not None else self._latest_market_context(trade_date)
+        theme_payload = dict(theme_board or self._latest_theme_board(trade_date) or {})
         candidates = [
             candidate
             for candidate in list(self.db.list_candidates(trade_date=trade_date) or [])
@@ -331,8 +334,8 @@ class StrategyContextAssembler:
                 candidate,
                 trade_date=trade_date,
                 now=current,
-                market_context=market_context,
-                theme_board=theme_board,
+                market_context=market_payload,
+                theme_board=theme_payload,
             )
             for candidate in candidates
         ]
@@ -425,7 +428,7 @@ class StrategyContextRuntimePipeline:
         self,
         now: datetime | None = None,
         *,
-        market_context: Mapping[str, Any] | None = None,
+        market_context: Any | None = None,
         theme_board: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self.run(now, market_context=market_context, theme_board=theme_board)
@@ -434,13 +437,14 @@ class StrategyContextRuntimePipeline:
         self,
         now: datetime | None = None,
         *,
-        market_context: Mapping[str, Any] | None = None,
+        market_context: Any | None = None,
         theme_board: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         current = (now or self.clock()).replace(microsecond=0)
         if not self.enabled:
             self.last_summary = {"enabled": False, "status": "DISABLED", "schema_version": STRATEGY_CONTEXT_SCHEMA_VERSION}
             return dict(self.last_summary)
+        started = perf_counter()
         snapshots = self.assembler.assemble_active_candidates(
             trade_date=current.date().isoformat(),
             now=current,
@@ -461,6 +465,10 @@ class StrategyContextRuntimePipeline:
             "schema_version": STRATEGY_CONTEXT_SCHEMA_VERSION,
             "calculated_at": current.isoformat(),
             "assembled_count": len(rows),
+            "assembly_duration_ms": int(round((perf_counter() - started) * 1000)),
+            "policy_lookup_count": len(rows),
+            "market_context_source": str(_payload_get(market_context, "source", "")),
+            "market_context_policy_count": int(getattr(market_context, "policy_count", 0) or 0),
             "context_fresh_count": sum(1 for row in rows if bool(row.get("context_fresh"))),
             "blocking_stage_counts": stage_counts,
             "top_reason_counts": status_counts,
@@ -488,43 +496,42 @@ def session_phase(now: datetime) -> SessionPhase:
     return SessionPhase.MARKET_CLOSED
 
 
-def _market_context(candidate: Candidate, payload: Mapping[str, Any], code: str) -> StrategyMarketContext:
+def _market_context(candidate: Candidate, payload: Any, code: str) -> StrategyMarketContext:
     if not payload:
         return StrategyMarketContext(reason_codes=("MARKET_CONTEXT_NOT_READY",), block_new_entry=True)
-    policies = dict(payload.get("candidate_policy_by_code") or {})
-    policy = dict(policies.get(code) or {})
-    side = str(policy.get("market_side") or _candidate_side(candidate) or MarketSide.UNKNOWN.value).upper()
+    policy = _policy_payload(payload, code)
+    side = str(_payload_get(policy, "market_side", "") or _candidate_side(candidate) or MarketSide.UNKNOWN.value).upper()
     side_snapshot = _side_snapshot(payload, side)
-    status = str(policy.get("market_status") or side_snapshot.get("status") or _side_status_from_payload(payload, side) or "DATA_WAIT").upper()
-    global_status = str(policy.get("global_market_status") or payload.get("global_status") or "DATA_WAIT")
+    status = str(_payload_get(policy, "market_status", "") or side_snapshot.get("status") or _side_status_from_payload(payload, side) or "DATA_WAIT").upper()
+    global_status = str(_payload_get(policy, "global_market_status", "") or _payload_get(payload, "global_status", "DATA_WAIT"))
     counterpart_side = _counterpart_side(side)
     counterpart_snapshot = _side_snapshot(payload, counterpart_side)
     counterpart_status = str(counterpart_snapshot.get("status") or _side_status_from_payload(payload, counterpart_side) or "DATA_WAIT").upper()
-    systemic = _bool(payload.get("systemic_risk_off"))
-    if "systemic_risk_off" not in payload:
+    systemic = _bool(_payload_get(payload, "systemic_risk_off", False))
+    if not _payload_contains(payload, "systemic_risk_off"):
         systemic, _systemic_reasons = systemic_risk_off_state(
-            str(payload.get("kospi_status") or dict(payload.get("kospi_snapshot") or {}).get("status") or ""),
-            str(payload.get("kosdaq_status") or dict(payload.get("kosdaq_snapshot") or {}).get("status") or ""),
-            market_open=str(payload.get("market_session_status") or "").lower() != "closed",
+            str(_payload_get(payload, "kospi_status", "") or _side_snapshot(payload, "KOSPI").get("status") or ""),
+            str(_payload_get(payload, "kosdaq_status", "") or _side_snapshot(payload, "KOSDAQ").get("status") or ""),
+            market_open=str(_payload_get(payload, "market_session_status", "")).lower() != "closed",
         )
     if policy:
-        action = str(policy.get("market_action") or _market_action_from_status(status, global_status)).upper()
-        multiplier = _float(policy.get("position_size_multiplier_hint"), _multiplier_for_action(action))
-        block_new_entry = bool(policy.get("block_new_entry")) or action in {"BLOCK_NEW_ENTRY", "MARKET_CLOSED", "DATA_WAIT"}
-        policy_reasons = list(policy.get("reason_codes") or [])
+        action = str(_payload_get(policy, "market_action", "") or _market_action_from_status(status, global_status)).upper()
+        multiplier = _float(_payload_get(policy, "position_size_multiplier_hint", None), _multiplier_for_action(action))
+        block_new_entry = bool(_payload_get(policy, "block_new_entry", False)) or action in {"BLOCK_NEW_ENTRY", "MARKET_CLOSED", "DATA_WAIT"}
+        policy_reasons = list(_payload_get(policy, "reason_codes", ()) or [])
     else:
         action, multiplier, block_new_entry, _wait_reason, policy_reasons = _fallback_market_policy(payload, side, status)
         action = str(action)
-    reasons = _dedupe([*list(payload.get("reason_codes") or []), *policy_reasons])
+    reasons = _dedupe([*list(_payload_get(payload, "reason_codes", ()) or []), *policy_reasons])
     if not reasons:
         reasons = ["MARKET_CONTEXT_READY"]
     return StrategyMarketContext(
         market_side=side,
-        market_side_resolution_status=str(policy.get("market_side_resolution_status") or ("RESOLVED" if side in {"KOSPI", "KOSDAQ"} else "UNRESOLVED")),
+        market_side_resolution_status=str(_payload_get(policy, "market_side_resolution_status", "") or ("RESOLVED" if side in {"KOSPI", "KOSDAQ"} else "UNRESOLVED")),
         side_market_regime=status,
         counterpart_market_side=counterpart_side,
         counterpart_market_regime=counterpart_status,
-        composite_market_mode=str(payload.get("composite_market_mode") or "DATA_DEGRADED"),
+        composite_market_mode=str(_payload_get(payload, "composite_market_mode", "DATA_DEGRADED") or "DATA_DEGRADED"),
         systemic_risk_off=systemic,
         global_market_regime=global_status,
         market_action=action,
@@ -542,8 +549,8 @@ def _market_context(candidate: Candidate, payload: Mapping[str, Any], code: str)
         turnover_weighted_return_pct=_float(side_snapshot.get("turnover_weighted_return_pct")),
         risk_score=_float(side_snapshot.get("risk_score")),
         counterpart_risk_score=_float(counterpart_snapshot.get("risk_score")),
-        calculated_at=str(payload.get("calculated_at") or ""),
-        freshness_status="FRESH" if str(payload.get("calculated_at") or "") else "DATA_WAIT",
+        calculated_at=str(_payload_get(payload, "calculated_at", "") or ""),
+        freshness_status="FRESH" if str(_payload_get(payload, "calculated_at", "") or "") else "DATA_WAIT",
         reason_codes=tuple(reasons),
     )
 
@@ -778,15 +785,56 @@ def _theme_payload_for_stock(board: Mapping[str, Any], stock: Mapping[str, Any],
     return {}
 
 
-def _side_snapshot(payload: Mapping[str, Any], side: str) -> dict[str, Any]:
+def _payload_get(payload: Any, key: str, default: Any = None) -> Any:
+    if payload is None:
+        return default
+    if isinstance(payload, Mapping):
+        return payload.get(key, default)
+    getter = getattr(payload, "get", None)
+    if callable(getter):
+        try:
+            return getter(key, default)
+        except TypeError:
+            return getter(key)
+    return getattr(payload, key, default)
+
+
+def _payload_contains(payload: Any, key: str) -> bool:
+    if payload is None:
+        return False
+    if isinstance(payload, Mapping):
+        return key in payload
+    if hasattr(payload, key):
+        return True
+    keys = getattr(payload, "keys", None)
+    return bool(callable(keys) and key in keys())
+
+
+def _policy_payload(payload: Any, code: str) -> Any:
+    policy_for = getattr(payload, "policy_for", None)
+    if callable(policy_for):
+        return policy_for(code)
+    policies = _payload_get(payload, "candidate_policy_by_code", {}) or {}
+    if isinstance(policies, Mapping):
+        return policies.get(normalize_code(code)) or policies.get(str(code or "")) or {}
+    return {}
+
+
+def _side_snapshot(payload: Any, side: str) -> dict[str, Any]:
+    side_context = getattr(payload, "side_context", None)
+    if callable(side_context):
+        context = side_context(side)
+        to_dict = getattr(context, "to_dict", None)
+        if callable(to_dict):
+            return dict(to_dict() or {})
     key = f"{str(side or '').lower()}_snapshot"
-    snapshot = dict(payload.get(key) or {})
+    snapshot = dict(_payload_get(payload, key, {}) or {})
     if snapshot:
         return snapshot
     if side == "KOSPI":
-        return dict(payload.get("kospi_snapshot") or {})
+        return dict(_payload_get(payload, "kospi_snapshot", {}) or {})
     if side == "KOSDAQ":
-        return dict(payload.get("kosdaq_snapshot") or {})
+        return dict(_payload_get(payload, "kosdaq_snapshot", {}) or {})
     return {}
 
 
@@ -798,21 +846,33 @@ def _counterpart_side(side: str) -> str:
     return MarketSide.UNKNOWN.value
 
 
-def _side_status_from_payload(payload: Mapping[str, Any], side: str) -> str:
+def _side_status_from_payload(payload: Any, side: str) -> str:
+    side_status = getattr(payload, "side_status", None)
+    if callable(side_status):
+        return str(side_status(side) or "")
     normalized = str(side or "").upper()
     if normalized == MarketSide.KOSPI.value:
-        return str(payload.get("kospi_status") or "")
+        return str(_payload_get(payload, "kospi_status", "") or "")
     if normalized == MarketSide.KOSDAQ.value:
-        return str(payload.get("kosdaq_status") or "")
+        return str(_payload_get(payload, "kosdaq_status", "") or "")
     return ""
 
 
-def _side_value_from_payload(payload: Mapping[str, Any], side: str, suffix: str) -> Any:
+def _side_value_from_payload(payload: Any, side: str, suffix: str) -> Any:
+    side_context = getattr(payload, "side_context", None)
+    if callable(side_context):
+        context = side_context(side)
+        attr_by_suffix = {
+            "return_pct": "index_return_pct",
+            "breadth_pct": "breadth_pct",
+        }
+        attr = attr_by_suffix.get(str(suffix or ""), str(suffix or ""))
+        return _payload_get(context, attr)
     normalized = str(side or "").upper()
     if normalized == MarketSide.KOSPI.value:
-        return payload.get(f"kospi_{suffix}")
+        return _payload_get(payload, f"kospi_{suffix}")
     if normalized == MarketSide.KOSDAQ.value:
-        return payload.get(f"kosdaq_{suffix}")
+        return _payload_get(payload, f"kosdaq_{suffix}")
     return None
 
 
@@ -842,7 +902,7 @@ def _market_action_from_status(status: str, global_status: str) -> str:
     return "DATA_WAIT" if status == "DATA_WAIT" else "WAIT_MARKET"
 
 
-def _fallback_market_policy(payload: Mapping[str, Any], side: str, status: str) -> tuple[str, float, bool, str, list[str]]:
+def _fallback_market_policy(payload: Any, side: str, status: str) -> tuple[str, float, bool, str, list[str]]:
     normalized_side = side if side in {MarketSide.KOSPI.value, MarketSide.KOSDAQ.value} else MarketSide.UNKNOWN.value
     if normalized_side == MarketSide.UNKNOWN.value:
         return (
@@ -852,11 +912,11 @@ def _fallback_market_policy(payload: Mapping[str, Any], side: str, status: str) 
             "MARKET_SIDE_UNRESOLVED",
             ["MARKET_SIDE_UNKNOWN", "MARKET_SIDE_UNRESOLVED"],
         )
-    market_open = str(payload.get("market_session_status") or "").lower() != "closed"
-    kospi_status = str(payload.get("kospi_status") or dict(payload.get("kospi_snapshot") or {}).get("status") or "")
-    kosdaq_status = str(payload.get("kosdaq_status") or dict(payload.get("kosdaq_snapshot") or {}).get("status") or "")
-    systemic = bool(payload.get("systemic_risk_off"))
-    if "systemic_risk_off" not in payload:
+    market_open = str(_payload_get(payload, "market_session_status", "") or "").lower() != "closed"
+    kospi_status = str(_payload_get(payload, "kospi_status", "") or _side_snapshot(payload, "KOSPI").get("status") or "")
+    kosdaq_status = str(_payload_get(payload, "kosdaq_status", "") or _side_snapshot(payload, "KOSDAQ").get("status") or "")
+    systemic = bool(_payload_get(payload, "systemic_risk_off", False))
+    if not _payload_contains(payload, "systemic_risk_off"):
         systemic, _reasons = systemic_risk_off_state(kospi_status, kosdaq_status, market_open=market_open)
     counterpart = MarketSide.KOSDAQ.value if normalized_side == MarketSide.KOSPI.value else MarketSide.KOSPI.value
     counterpart_snapshot = _side_snapshot(payload, counterpart)

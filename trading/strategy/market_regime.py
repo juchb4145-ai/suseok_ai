@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping
 from trading.strategy.candidates import normalize_code
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.market_data import MarketDataStore, StrategyTick
+from trading.strategy.market_context_view import market_context_view_from_snapshot
 from trading.strategy.market_index import MarketIndexStore, _index_storage_aliases
 from trading.strategy.models import Candidate, CandidateState, StrategyProfile
 from trading.strategy.reason_codes import ReasonCode
@@ -220,9 +221,23 @@ class MarketRegimeResult:
     saved: bool = False
     theme_overlay_applied: bool = False
     warnings: tuple[str, ...] = ()
+    serialized_snapshot: dict[str, Any] = field(default_factory=dict)
+    context_view: Any | None = None
+    dashboard_payload: dict[str, Any] = field(default_factory=dict)
+    full_snapshot_serialize_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return _jsonable(asdict(self))
+        return _jsonable(
+            {
+                "snapshot": self.serialized_snapshot or self.snapshot.to_dict(),
+                "updated_candidate_count": self.updated_candidate_count,
+                "saved": self.saved,
+                "theme_overlay_applied": self.theme_overlay_applied,
+                "warnings": list(self.warnings),
+                "dashboard_payload": self.dashboard_payload,
+                "full_snapshot_serialize_count": self.full_snapshot_serialize_count,
+            }
+        )
 
 
 class MarketSideResolver:
@@ -573,13 +588,20 @@ class MarketRegimeEngine:
             ready_allowed=False,
             order_intent_allowed=False,
         )
+        serialized_snapshot = snapshot.to_dict()
+        context_view = market_context_view_from_snapshot(
+            snapshot,
+            serialized_snapshot=serialized_snapshot,
+            source="PIPELINE_VIEW",
+        )
+        dashboard_payload = market_regime_dashboard_payload(serialized_snapshot)
         updated_count = self._merge_candidate_metadata(trade_date, policies, current)
         theme_overlay_applied = self._apply_theme_board_overlay(snapshot, save=save)
         saved = False
         if save:
             saver = getattr(self.db, "save_market_regime_snapshot", None)
             if callable(saver):
-                saver(snapshot.to_dict())
+                saver(serialized_snapshot)
                 saved = True
         return MarketRegimeResult(
             snapshot=snapshot,
@@ -587,6 +609,10 @@ class MarketRegimeEngine:
             saved=saved,
             theme_overlay_applied=theme_overlay_applied,
             warnings=(),
+            serialized_snapshot=serialized_snapshot,
+            context_view=context_view,
+            dashboard_payload=dashboard_payload,
+            full_snapshot_serialize_count=1,
         )
 
     def _side_snapshot(
@@ -967,16 +993,15 @@ class MarketRegimeEngine:
         theme_board = loader(trade_date=snapshot.trade_date)
         if not theme_board:
             return False
-        policies = {code: policy.to_dict() for code, policy in snapshot.candidate_policy_by_code.items()}
         stocks = [dict(stock or {}) for stock in list(theme_board.get("stocks") or [])]
         for stock in stocks:
-            policy = policies.get(normalize_code(stock.get("code")))
+            policy = snapshot.candidate_policy_by_code.get(normalize_code(stock.get("code")))
             if not policy:
                 continue
-            stock["market_side"] = policy.get("market_side", MarketSide.UNKNOWN.value)
-            stock["market_status"] = policy.get("market_status", "")
-            stock["market_action"] = policy.get("market_action", "")
-            stock["market_reason_codes"] = list(policy.get("reason_codes") or [])
+            stock["market_side"] = _enum_text(getattr(policy, "market_side", MarketSide.UNKNOWN))
+            stock["market_status"] = _enum_text(getattr(policy, "market_status", ""))
+            stock["market_action"] = _enum_text(getattr(policy, "market_action", ""))
+            stock["market_reason_codes"] = list(getattr(policy, "reason_codes", ()) or ())
         top_themes = [dict(theme or {}) for theme in list(theme_board.get("top_themes") or [])]
         stocks_by_theme: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for stock in stocks:
@@ -1038,28 +1063,46 @@ class MarketRegimeRuntimePipeline:
             clock=self.clock,
         )
         self.last_result: MarketRegimeResult | None = None
+        self.last_serialized_snapshot: dict[str, Any] = {}
+        self.last_context_view: Any | None = None
+        self.last_theme_market_summary: Any | None = None
+        self.last_full_snapshot_serialize_count: int = 0
         self.last_summary: dict[str, Any] = {"status": "DISABLED", "enabled": False, "output_mode": MARKET_REGIME_OUTPUT_MODE}
         self.last_run_at: datetime | None = None
 
     def run_if_due(self, now: datetime | None = None) -> dict[str, Any]:
         current = (now or self.clock()).replace(microsecond=0)
         if not self.config.enabled:
+            self.last_context_view = None
+            self.last_theme_market_summary = None
+            self.last_serialized_snapshot = {}
+            self.last_full_snapshot_serialize_count = 0
             self.last_summary = {"status": "DISABLED", "enabled": False, "output_mode": MARKET_REGIME_OUTPUT_MODE}
             return self.last_summary
         if self.last_run_at is not None and (current - self.last_run_at).total_seconds() < self.config.interval_sec:
             return dict(self.last_summary)
         result = self.engine.build(trade_date=current.date().isoformat(), now=current, save=True)
         self.last_result = result
+        self.last_serialized_snapshot = dict(result.serialized_snapshot or {})
+        self.last_context_view = result.context_view
+        self.last_theme_market_summary = result.context_view.to_theme_summary() if result.context_view is not None else None
+        self.last_full_snapshot_serialize_count = int(result.full_snapshot_serialize_count or 0)
         self.last_run_at = current
-        self.last_summary = market_regime_dashboard_payload(result.snapshot)
+        self.last_summary = dict(result.dashboard_payload or market_regime_dashboard_payload(self.last_serialized_snapshot))
         self.last_summary["enabled"] = True
         self.last_summary["status"] = "OK"
         self.last_summary["index_watch_codes_configured"] = bool(self.config.kospi_code and self.config.kosdaq_code)
         return dict(self.last_summary)
 
 
-def market_regime_dashboard_payload(snapshot: MarketRegimeSnapshot | Mapping[str, Any]) -> dict[str, Any]:
-    data = snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot or {})
+def market_regime_dashboard_payload(
+    snapshot: MarketRegimeSnapshot | Mapping[str, Any],
+    *,
+    serialized_snapshot: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    data = dict(serialized_snapshot or {})
+    if not data:
+        data = snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot or {})
     kospi = dict(data.get("kospi_snapshot") or {})
     kosdaq = dict(data.get("kosdaq_snapshot") or {})
     policy_summary = dict(data.get("policy_summary") or {})
@@ -1077,11 +1120,8 @@ def market_regime_dashboard_payload(snapshot: MarketRegimeSnapshot | Mapping[str
     reason_counter = Counter()
     for reason in list(data.get("reason_codes") or []):
         reason_counter[str(reason)] += 1
-    policies = dict(data.get("candidate_policy_by_code") or {})
-    for policy in policies.values():
-        if isinstance(policy, Mapping):
-            for reason in list(policy.get("reason_codes") or []):
-                reason_counter[str(reason)] += 1
+    for reason in list(data.get("systemic_reason_codes") or []) + list(data.get("data_quality_flags") or []):
+        reason_counter[str(reason)] += 1
     return {
         "calculated_at": data.get("calculated_at", ""),
         "trade_date": data.get("trade_date", ""),
@@ -1303,6 +1343,10 @@ def _round_optional(value: Any) -> float | None:
         return round(float(value), 6)
     except (TypeError, ValueError):
         return None
+
+
+def _enum_text(value: Any) -> str:
+    return str(value.value if isinstance(value, Enum) else value or "")
 
 
 def _float(value: Any) -> float:

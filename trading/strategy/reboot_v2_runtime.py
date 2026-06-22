@@ -11,6 +11,12 @@ from trading.strategy.candles import CandleBuilder
 from trading.strategy.candidate_fsm import build_candidate_fsm_summary
 from trading.strategy.candidate_state_contract import CandidateStateContractReconciler
 from trading.strategy.market_data import MarketDataStore
+from trading.strategy.market_context_view import (
+    MarketContextView,
+    market_context_view_from_mapping,
+    market_context_view_max_age_sec,
+    unavailable_market_context_view,
+)
 from trading.strategy.market_index import MarketIndexStore
 from trading.strategy.models import Candidate, CandidateState, VirtualOrderStatus
 from trading.strategy.realtime import RealTimeSubscriptionManager
@@ -104,11 +110,13 @@ class RebootV2Runtime:
         self._recover_intraday_discovery(snapshot)
         self._reconcile_base_subscriptions(snapshot)
         self._run_pipeline(snapshot, "market_regime", self.market_regime_pipeline, current)
-        downstream_market_context = self._downstream_market_context(snapshot, current)
+        downstream_market_context, market_context_transport = self._resolve_market_context_view(snapshot, current)
+        snapshot["market_context_transport"] = market_context_transport
+        theme_market_context = downstream_market_context.to_theme_summary()
         self._publish_market_dirty(snapshot, current)
         self._run_pipeline(snapshot, "opening_burst", self.opening_burst_pipeline, current)
         self._run_pipeline(snapshot, "intraday_discovery", self.intraday_discovery_pipeline, current)
-        self._run_pipeline(snapshot, "theme_board", self.theme_board_pipeline, current, market_context=downstream_market_context)
+        self._run_pipeline(snapshot, "theme_board", self.theme_board_pipeline, current, market_context=theme_market_context)
         self._publish_theme_dirty(snapshot, current)
         self._reconcile_theme_expansion_subscriptions(snapshot, current)
         self._enqueue_hydration(snapshot, current)
@@ -632,15 +640,72 @@ class RebootV2Runtime:
             return {}
         return dict(loader(trade_date=trade_date) or {})
 
-    def _downstream_market_context(self, snapshot: Mapping[str, Any], now: datetime) -> dict[str, Any]:
-        for payload in (
-            _pipeline_market_snapshot(self.market_regime_pipeline),
-            self._latest_market_regime(now.date().isoformat()),
-            dict(snapshot.get("market_regime") or {}),
-        ):
-            if _market_context_payload_usable(payload):
-                return dict(payload)
-        return {}
+    def _resolve_market_context_view(self, snapshot: Mapping[str, Any], now: datetime) -> tuple[MarketContextView, dict[str, Any]]:
+        started = perf_counter()
+        max_age_sec = market_context_view_max_age_sec()
+        db_fallback_count = 0
+        summary_fallback_count = 0
+        warnings: list[str] = []
+        market_section = dict(snapshot.get("market_regime") or {})
+        full_serializes = int(getattr(self.market_regime_pipeline, "last_full_snapshot_serialize_count", 0) or 0)
+
+        view = _pipeline_market_context_view(self.market_regime_pipeline)
+        if str(market_section.get("status") or "").upper() == "ERROR":
+            warnings.append("PIPELINE_SECTION_ERROR")
+        elif view is not None and _market_context_view_usable(view, now, max_age_sec):
+            diagnostics = view.to_transport_diagnostics(
+                now,
+                max_age_sec=max_age_sec,
+                build_ms=int(round((perf_counter() - started) * 1000)),
+                full_snapshot_serialize_count=full_serializes,
+                db_fallback_count=db_fallback_count,
+                summary_fallback_count=summary_fallback_count,
+                warning_codes=tuple(warnings),
+            )
+            return view, diagnostics
+
+        db_payload = self._latest_market_regime(now.date().isoformat())
+        db_fallback_count = 1
+        if db_payload:
+            view = market_context_view_from_mapping(db_payload, source="DB_FALLBACK")
+            if _market_context_view_usable(view, now, max_age_sec):
+                diagnostics = view.to_transport_diagnostics(
+                    now,
+                    max_age_sec=max_age_sec,
+                    build_ms=int(round((perf_counter() - started) * 1000)),
+                    full_snapshot_serialize_count=full_serializes,
+                    db_fallback_count=db_fallback_count,
+                    summary_fallback_count=summary_fallback_count,
+                    warning_codes=tuple(warnings),
+                )
+                return view, diagnostics
+
+        summary_fallback_count = 1 if market_section else 0
+        if market_section:
+            view = market_context_view_from_mapping(market_section, source="DASHBOARD_SUMMARY_FALLBACK")
+            if _market_context_view_usable(view, now, max_age_sec):
+                diagnostics = view.to_transport_diagnostics(
+                    now,
+                    max_age_sec=max_age_sec,
+                    build_ms=int(round((perf_counter() - started) * 1000)),
+                    full_snapshot_serialize_count=full_serializes,
+                    db_fallback_count=db_fallback_count,
+                    summary_fallback_count=summary_fallback_count,
+                    warning_codes=tuple(warnings),
+                )
+                return view, diagnostics
+
+        view = unavailable_market_context_view(now.date().isoformat())
+        diagnostics = view.to_transport_diagnostics(
+            now,
+            max_age_sec=max_age_sec,
+            build_ms=int(round((perf_counter() - started) * 1000)),
+            full_snapshot_serialize_count=full_serializes,
+            db_fallback_count=db_fallback_count,
+            summary_fallback_count=summary_fallback_count,
+            warning_codes=tuple(warnings or ["MARKET_CONTEXT_UNAVAILABLE"]),
+        )
+        return view, diagnostics
 
     def _open_positions(self, trade_date: str | None = None) -> list[Any]:
         loader = getattr(self.db, "list_open_virtual_positions", None)
@@ -696,6 +761,33 @@ def _pipeline_market_snapshot(pipeline: Any) -> dict[str, Any]:
     if isinstance(snapshot, Mapping):
         return dict(snapshot)
     return {}
+
+
+def _pipeline_market_context_view(pipeline: Any) -> MarketContextView | None:
+    view = getattr(pipeline, "last_context_view", None)
+    if view is not None and hasattr(view, "policy_for"):
+        return view
+    result = getattr(pipeline, "last_result", None)
+    view = getattr(result, "context_view", None)
+    if view is not None and hasattr(view, "policy_for"):
+        return view
+    serialized = getattr(result, "serialized_snapshot", None)
+    snapshot = getattr(result, "snapshot", None)
+    if snapshot is not None:
+        from trading.strategy.market_context_view import market_context_view_from_snapshot
+
+        if not isinstance(serialized, Mapping) and hasattr(snapshot, "to_dict"):
+            serialized = snapshot.to_dict()
+        return market_context_view_from_snapshot(snapshot, serialized_snapshot=serialized if isinstance(serialized, Mapping) else None, source="PIPELINE_VIEW")
+    if isinstance(result, Mapping):
+        payload = result.get("serialized_snapshot") or result.get("snapshot")
+        if isinstance(payload, Mapping):
+            return market_context_view_from_mapping(payload, source="PIPELINE_VIEW")
+    return None
+
+
+def _market_context_view_usable(view: MarketContextView | None, now: datetime, max_age_sec: int) -> bool:
+    return bool(view is not None and hasattr(view, "is_fresh") and view.is_fresh(now, max_age_sec))
 
 
 def _market_context_payload_usable(payload: Mapping[str, Any] | None) -> bool:

@@ -32,11 +32,11 @@ class _CapturePipeline:
     config = type("Config", (), {"enabled": True})()
 
     def __init__(self):
-        self.market_context = {}
+        self.market_context = None
         self.last_result = {}
 
     def run_if_due(self, now=None, **kwargs):
-        self.market_context = dict(kwargs.get("market_context") or {})
+        self.market_context = kwargs.get("market_context")
         self.last_result = {"trade_date": now.date().isoformat() if now else "", "top_themes": [], "stocks": []}
         return {"enabled": True, "status": "OK", "calculated_at": now.isoformat() if now else ""}
 
@@ -73,8 +73,17 @@ class _DashboardMarketPipeline:
         }
 
 
-def test_reboot_v2_passes_full_market_snapshot_to_downstream_context(tmp_path):
+def test_reboot_v2_passes_summary_to_theme_and_view_to_strategy_without_db_fallback(tmp_path):
     db = TradingDatabase(str(tmp_path / "v2_market_context.db"))
+    db_fallback_calls = 0
+    original_latest_market_regime = db.latest_market_regime_snapshot
+
+    def _counted_latest_market_regime(*args, **kwargs):
+        nonlocal db_fallback_calls
+        db_fallback_calls += 1
+        return original_latest_market_regime(*args, **kwargs)
+
+    db.latest_market_regime_snapshot = _counted_latest_market_regime
     gateway = GatewayStateStore()
     theme_board = _CapturePipeline()
     strategy_context = _CapturePipeline()
@@ -112,11 +121,23 @@ def test_reboot_v2_passes_full_market_snapshot_to_downstream_context(tmp_path):
         strategy_context_pipeline=strategy_context,
     )
 
-    runtime.cycle(datetime(2026, 6, 17, 9, 20, 0))
+    snapshot = runtime.cycle(datetime(2026, 6, 17, 9, 20, 0))
 
-    assert theme_board.market_context["candidate_policy_by_code"]["000001"]["market_action"] == "ALLOW_REDUCED"
-    assert strategy_context.market_context["candidate_policy_by_code"]["000001"]["market_action"] == "ALLOW_REDUCED"
-    assert strategy_context.market_context["kosdaq_snapshot"]["status"] == "WEAK"
+    theme_context = dict(theme_board.market_context)
+    assert theme_context["global_status"] == "SELECTIVE"
+    assert theme_context["kospi_status"] == "SELECTIVE"
+    assert theme_context["kosdaq_status"] == "WEAK"
+    assert "candidate_policy_by_code" not in theme_context
+    assert "kospi_snapshot" not in theme_context
+    assert "kosdaq_snapshot" not in theme_context
+
+    strategy_view = strategy_context.market_context
+    assert callable(getattr(strategy_view, "policy_for", None))
+    assert strategy_view.policy_for("000001")["market_action"] == "ALLOW_REDUCED"
+    assert strategy_view.side_context("KOSDAQ").status == "WEAK"
+    assert snapshot["market_context_transport"]["source"] == "PIPELINE_VIEW"
+    assert snapshot["market_context_transport"]["db_fallback_count"] == 0
+    assert db_fallback_calls == 0
 
 
 def test_reboot_v2_counts_open_positions_for_current_trade_date_only(tmp_path):

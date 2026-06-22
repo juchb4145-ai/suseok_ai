@@ -10,6 +10,7 @@ from trading.strategy.market_regime import (
     MarketRegimeConfig,
     MarketRegimeEngine,
     MarketRegimeRuntimePipeline,
+    MarketRegimeSnapshot,
     MarketRegimeStatus,
     MarketSide,
     market_regime_dashboard_section,
@@ -431,6 +432,38 @@ def test_runtime_pipeline_enabled_runs_on_interval(tmp_path):
     assert first["status"] == "OK"
     assert second == first
     assert db.latest_market_regime_snapshot(trade_date=TRADE_DATE)
+
+
+def test_market_regime_build_serializes_full_snapshot_once_and_reuses_on_interval(tmp_path, monkeypatch):
+    db, market_data, index_store = _context(tmp_path)
+    _candidate(db, "000016", market="KOSPI")
+    _index(index_store, "KOSPI", 0.7)
+    _tick(market_data, "000016", change=1.3)
+    calls = 0
+    original_to_dict = MarketRegimeSnapshot.to_dict
+
+    def _counted_to_dict(self):
+        nonlocal calls
+        calls += 1
+        return original_to_dict(self)
+
+    monkeypatch.setattr(MarketRegimeSnapshot, "to_dict", _counted_to_dict)
+    pipeline = MarketRegimeRuntimePipeline(
+        db=db,
+        market_data=market_data,
+        market_index_store=index_store,
+        config=_config(enabled=True, interval_sec=5),
+    )
+
+    first = pipeline.run_if_due(OPEN_AT)
+    second = pipeline.run_if_due(OPEN_AT + timedelta(seconds=2))
+
+    assert first["status"] == "OK"
+    assert second == first
+    assert calls == 1
+    assert pipeline.last_full_snapshot_serialize_count == 1
+    assert pipeline.last_context_view is not None
+    assert pipeline.last_theme_market_summary is not None
 
 
 def _context(tmp_path):

@@ -953,7 +953,7 @@ def _theme_core_market_input(market_context: Mapping[str, Any] | None, *, config
             "market_phase_by_side": {"GLOBAL": phase, "UNKNOWN": phase},
             "reason_codes": [],
         }
-    payload = dict(market_context or {})
+    payload = _theme_core_market_payload(market_context)
     if not payload or not str(payload.get("calculated_at") or ""):
         return {
             "status": "DATA_WAIT",
@@ -977,6 +977,31 @@ def _theme_core_market_input(market_context: Mapping[str, Any] | None, *, config
         },
         "reason_codes": list(payload.get("reason_codes") or []),
     }
+
+
+def _theme_core_market_payload(market_context: Any | None) -> dict[str, Any]:
+    if market_context is None:
+        return {}
+    summary = getattr(market_context, "to_theme_summary", None)
+    if callable(summary):
+        market_context = summary()
+    to_dict = getattr(market_context, "to_dict", None)
+    if callable(to_dict):
+        source = dict(to_dict() or {})
+    elif isinstance(market_context, Mapping):
+        source = dict(market_context or {})
+    else:
+        return {}
+    keys = {
+        "calculated_at",
+        "global_status",
+        "kospi_status",
+        "kosdaq_status",
+        "composite_market_mode",
+        "systemic_risk_off",
+        "reason_codes",
+    }
+    return {key: source.get(key) for key in keys if key in source}
 
 
 def _market_phase(status: str) -> str:

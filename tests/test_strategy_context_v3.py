@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from datetime import datetime
 
 from storage.db import TradingDatabase
@@ -9,6 +10,25 @@ from trading.strategy.strategy_context import StrategyContextAssembler, session_
 
 
 TRADE_DATE = "2026-06-19"
+
+
+class _NoIterPolicyMap(Mapping):
+    def __init__(self, items):
+        self._items = dict(items)
+        self.lookup_count = 0
+
+    def __getitem__(self, key):
+        return self._items[key]
+
+    def __iter__(self):
+        raise AssertionError("candidate_policy_by_code must not be copied or iterated per candidate")
+
+    def __len__(self):
+        return len(self._items)
+
+    def get(self, key, default=None):
+        self.lookup_count += 1
+        return self._items.get(key, default)
 
 
 def test_strategy_context_assembler_persists_nested_context_without_order_permissions(tmp_path):
@@ -330,6 +350,49 @@ def test_strategy_context_fallback_infers_systemic_risk_off_from_side_statuses(t
     assert snapshot.market.market_action == "BLOCK_NEW_ENTRY"
     assert snapshot.market.block_new_entry is True
     assert "SYSTEMIC_RISK_OFF_BLOCK" in snapshot.market.reason_codes
+
+
+def test_strategy_context_assembles_200_candidates_without_policy_map_copy(tmp_path):
+    db = TradingDatabase(str(tmp_path / "context-policy-map-copy.db"))
+    market_data = MarketDataStore()
+    policies = {}
+    for index in range(200):
+        code = f"{index:06d}"
+        db.save_candidate(
+            Candidate(
+                trade_date=TRADE_DATE,
+                code=code,
+                name=f"Stock {code}",
+                market="KOSDAQ",
+                state=CandidateState.WATCHING,
+                metadata={},
+            )
+        )
+        policies[code] = {
+            "code": code,
+            "market_side": "KOSDAQ",
+            "market_status": "EXPANSION",
+            "global_market_status": "EXPANSION",
+            "market_action": "ALLOW_NORMAL",
+            "position_size_multiplier_hint": 1.0,
+            "block_new_entry": False,
+            "reason_codes": ["MARKET_EXPANSION_ALLOW"],
+        }
+    market_payload = {
+        **_market_snapshot(),
+        "candidate_policy_by_code": _NoIterPolicyMap(policies),
+    }
+
+    snapshots = StrategyContextAssembler(db, market_data=market_data).assemble_active_candidates(
+        trade_date=TRADE_DATE,
+        now=datetime(2026, 6, 19, 9, 20, 0),
+        market_context=market_payload,
+        theme_board=_theme_board(),
+        save=False,
+    )
+
+    assert len(snapshots) == 200
+    assert market_payload["candidate_policy_by_code"].lookup_count == 200
 
 
 def test_session_phase_boundaries():
