@@ -1302,7 +1302,7 @@ function renderDashboardV2SetupRouter(payload = {}) {
   if (!node) return;
   if (!rows.length) {
     const status = data.status || "EMPTY";
-    const message = status === "DISABLED" ? "SetupRouter V3가 비활성 상태입니다" : "관측된 setup 유형이 없습니다";
+    const message = status === "DISABLED" ? "SetupRouter V3가 비활성 상태입니다" : (data.primary_message_ko || "주요 Setup 없음");
     node.innerHTML = `<tr><td colspan="6" class="empty">${escapeHtml(message)}</td></tr>`;
     return;
   }
@@ -1320,9 +1320,9 @@ function renderDashboardV2SetupRouter(payload = {}) {
       <tr>
         <td>${textCell(`${item.code || "-"} ${item.name || ""}`.trim())}</td>
         <td>${textCell(item.theme_name || "-")}</td>
-        <td>${badge(item.setup_type || "-")}${item.primary_setup ? badge("PRIMARY", "observe") : ""}</td>
-        <td>${textCell(`${item.shape_status || "-"} / ${item.context_status || "-"}`)}</td>
-        <td>${textCell(item.entry_alignment_status || "-")}</td>
+        <td>${badge(item.setup_type || "-")}${item.primary_setup ? badge("PRIMARY", "observe") : ""}${badge(`G${item.setup_generation || 1}`, "observe")}</td>
+        <td>${textCell(`${item.shape_status || "-"} / ${item.lifecycle_state || "-"} / ${item.context_status || "-"}`)}</td>
+        <td>${textCell(`${item.entry_alignment_status || "-"}${item.entry_decision_age_sec !== undefined ? ` · ${fmtOptionalNumber(item.entry_decision_age_sec, 0)}s` : ""}`)}</td>
         <td>${textCell(`${reason}${priceHint ? ` · ${priceHint}` : ""}`)}</td>
       </tr>
     `;

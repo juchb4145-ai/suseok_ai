@@ -30,6 +30,37 @@ def test_setup_observation_storage_upserts_latest_and_dedupes_same_fingerprint(t
     assert transitions[0]["current_router_status"] == "VALID_OBSERVE"
 
 
+def test_latest_entry_decisions_per_candidate_prefers_candidate_specific_rows(tmp_path):
+    db = TradingDatabase(str(tmp_path / "entry-per-candidate.db"))
+    db.save_entry_decisions(
+        [
+            {
+                "trade_date": TRADE_DATE,
+                "calculated_at": "2026-06-22T09:05:00",
+                "candidate_id": None,
+                "code": "000001",
+                "entry_status": "PRICE_WAIT",
+                "price_location": "CODE_FALLBACK",
+            },
+            {
+                "trade_date": TRADE_DATE,
+                "calculated_at": "2026-06-22T09:04:00",
+                "candidate_id": 101,
+                "code": "000001",
+                "entry_status": "OBSERVE_READY",
+                "price_location": "CANDIDATE_SPECIFIC",
+            },
+        ]
+    )
+
+    rows = db.latest_entry_decisions_per_candidate(trade_date=TRADE_DATE, candidate_ids=[101], codes=["000001"])
+    by_candidate = {row.get("candidate_id"): row for row in rows}
+    by_code = {row.get("code"): row for row in rows if row.get("candidate_id") is None}
+
+    assert by_candidate[101]["price_location"] == "CANDIDATE_SPECIFIC"
+    assert by_code["000001"]["price_location"] == "CODE_FALLBACK"
+
+
 def _observation(router_status, shape_status, fingerprint):
     return {
         "trade_date": TRADE_DATE,
@@ -56,6 +87,22 @@ def _observation(router_status, shape_status, fingerprint):
         "session_phase": "MORNING_TREND",
         "current_price": 1000,
         "fingerprint": fingerprint,
+        "schema_version": "setup_router_v3.observe.v2",
+        "feature_schema_version": "setup_router_v3.features.v2",
+        "router_version": "setup_router_v3.2",
+        "state_version": "setup_router_v3.state.v1",
+        "setup_generation": 1,
+        "setup_instance_id": "setup-ci-1-vwap-1",
+        "lifecycle_state": "MATCHED" if shape_status == "MATCHED" else "FORMING",
+        "post_subscription_tick_verified": True,
+        "entry_decision_at": "2026-06-22T09:05:00",
+        "entry_decision_id": 1,
+        "entry_decision_age_sec": 0,
+        "entry_decision_fresh": True,
+        "entry_decision_source": "entry_engine",
+        "state_payload": {"vwap": 990},
+        "last_material_change_at": "2026-06-22T09:05:00",
+        "quantity": 0,
         "reason_codes": ["SETUP_ROUTER_V3_OBSERVE_ONLY"],
         "price_structure": {"vwap": 990},
         "safety": {

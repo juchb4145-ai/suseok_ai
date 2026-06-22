@@ -8,7 +8,7 @@ from trading.strategy.candidates import normalize_code
 from trading.strategy.models import Candidate
 
 
-SETUP_ROUTER_FEATURE_SCHEMA_VERSION = "setup_router_v3.features.v1"
+SETUP_ROUTER_FEATURE_SCHEMA_VERSION = "setup_router_v3.features.v2"
 
 
 @dataclass(frozen=True)
@@ -26,6 +26,7 @@ class SetupFeatureSnapshot:
     strategy_context: dict[str, Any] = field(default_factory=dict)
     entry_decision: dict[str, Any] = field(default_factory=dict)
     previous_observation: dict[str, Any] = field(default_factory=dict)
+    setup_states: dict[str, Any] = field(default_factory=dict)
     expansion_lease: dict[str, Any] = field(default_factory=dict)
     context_id: str = ""
     context_fresh: bool = False
@@ -76,10 +77,22 @@ class SetupFeatureSnapshot:
     momentum_1m_pct: float = 0.0
     momentum_3m_pct: float = 0.0
     momentum_5m_pct: float = 0.0
+    entry_decision_id: int | None = None
+    entry_decision_at: str = ""
+    entry_decision_age_sec: float = 0.0
+    entry_decision_fresh: bool = False
+    entry_decision_source: str = ""
     entry_status: str = ""
     entry_price_location: str = ""
     entry_reason_codes: tuple[str, ...] = ()
     context_reason_codes: tuple[str, ...] = ()
+    expansion_lease_present: bool = False
+    lease_status: str = ""
+    lease_selected_at: str = ""
+    lease_first_active_at: str = ""
+    lease_first_fresh_tick_at: str = ""
+    post_subscription_tick_verified: bool = True
+    post_subscription_tick_reason: str = ""
     data_wait_reasons: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -91,7 +104,8 @@ class SetupFeatureBuilder:
     market_data: Any | None = None
     candle_builder: Any | None = None
     min_completed_1m_candles: int = 3
-    max_tick_age_sec: int = 30
+    max_tick_age_sec: int = 10
+    entry_decision_max_age_sec: int = 60
 
     def build(
         self,
@@ -102,8 +116,10 @@ class SetupFeatureBuilder:
         strategy_context: Mapping[str, Any] | None = None,
         entry_decision: Mapping[str, Any] | None = None,
         previous_observation: Mapping[str, Any] | None = None,
+        setup_states: Mapping[str, Any] | None = None,
         expansion_lease: Mapping[str, Any] | None = None,
     ) -> SetupFeatureSnapshot:
+        current = now.replace(microsecond=0)
         code = normalize_code(candidate.code)
         metadata = dict(candidate.metadata or {})
         context = dict(strategy_context or metadata.get("strategy_context_v3") or {})
@@ -115,9 +131,9 @@ class SetupFeatureBuilder:
         data = dict(context.get("data") or {})
         risk = dict(context.get("risk") or {})
         tick = self.market_data.latest_tick(code) if self.market_data is not None else None
-        tick_at = getattr(tick, "timestamp", None) if tick is not None else None
+        tick_at_dt = getattr(tick, "timestamp", None) if tick is not None else None
         tick_metadata = dict(getattr(tick, "metadata", {}) or {}) if tick is not None else {}
-        tick_age_sec = _age_sec(tick_at, now)
+        tick_age_sec = _age_sec(tick_at_dt, current)
         price_source = str(tick_metadata.get("price_source") or data.get("price_source") or "")
         realtime_tick_available = tick is not None and float(getattr(tick, "price", 0) or 0) > 0
         realtime_tick_fresh = realtime_tick_available and tick_age_sec <= max(1, int(self.max_tick_age_sec))
@@ -133,6 +149,7 @@ class SetupFeatureBuilder:
             tick_metadata.get("vwap"),
             stock.get("vwap"),
             data.get("vwap"),
+            completed[-1].get("derived_vwap_at_close") if completed else 0,
             _vwap_from_candles(completed),
         )
         pullback = _first_nonzero(
@@ -142,6 +159,20 @@ class SetupFeatureBuilder:
         )
         source_timestamps = dict(context.get("source_timestamps") or {})
         context_reasons = tuple(_dedupe([*(context.get("reason_codes") or []), *(data.get("blocking_reason_codes") or [])]))
+        entry_at = str(entry.get("calculated_at") or entry.get("created_at") or "")
+        entry_age_sec = _age_sec(_parse_time(entry_at), current) if entry else 999999.0
+        entry_trade_date = str(entry.get("trade_date") or "")
+        trade_date = str(candidate.trade_date or context.get("trade_date") or current.date().isoformat())
+        entry_fresh = bool(entry) and (not entry_trade_date or entry_trade_date == trade_date) and entry_age_sec <= max(1, int(self.entry_decision_max_age_sec))
+        lease = dict(expansion_lease or {})
+        lease_check = _post_subscription_tick_check(
+            lease,
+            theme_id=str(context.get("selected_theme_id") or theme.get("theme_id") or ""),
+            tick_at=tick_at_dt,
+            price_source=price_source,
+            realtime_tick_fresh=realtime_tick_fresh,
+        )
+
         data_wait = []
         if not context:
             data_wait.append("STRATEGY_CONTEXT_V3_MISSING")
@@ -167,13 +198,15 @@ class SetupFeatureBuilder:
             data_wait.append("SIGNAL_STALE")
         if any("REALTIME_COVERAGE_LOW" in str(reason).upper() for reason in context_reasons):
             data_wait.append("REALTIME_COVERAGE_LOW")
+        if lease_check["lease_present"] and not lease_check["post_subscription_tick_verified"]:
+            data_wait.append("SETUP_POST_SUBSCRIPTION_FRESH_TICK_MISSING")
 
         return SetupFeatureSnapshot(
             schema_version=SETUP_ROUTER_FEATURE_SCHEMA_VERSION,
-            trade_date=str(candidate.trade_date or now.date().isoformat()),
-            calculated_at=now.replace(microsecond=0).isoformat(),
+            trade_date=trade_date,
+            calculated_at=current.isoformat(),
             candidate_id=candidate.id,
-            candidate_instance_id=str(metadata.get("candidate_instance_id") or f"{candidate.trade_date}:{code}:{candidate.id or 0}"),
+            candidate_instance_id=str(metadata.get("candidate_instance_id") or f"{trade_date}:{code}:{candidate.id or 0}"),
             code=code,
             name=str(candidate.name or metadata.get("name") or ""),
             market=str(candidate.market or market.get("market_side") or ""),
@@ -182,7 +215,8 @@ class SetupFeatureBuilder:
             strategy_context=context,
             entry_decision=entry,
             previous_observation=dict(previous_observation or {}),
-            expansion_lease=dict(expansion_lease or {}),
+            setup_states=dict(setup_states or {}),
+            expansion_lease=lease,
             context_id=str(context.get("context_id") or metadata.get("strategy_context_id") or ""),
             context_fresh=bool(context.get("context_fresh")),
             session_phase=str(context.get("session_phase") or ""),
@@ -210,7 +244,7 @@ class SetupFeatureBuilder:
             stale_data_block=bool(risk.get("stale_data_block")),
             realtime_tick_available=realtime_tick_available,
             realtime_tick_fresh=realtime_tick_fresh,
-            tick_at=tick_at.replace(microsecond=0).isoformat() if isinstance(tick_at, datetime) else "",
+            tick_at=tick_at_dt.replace(microsecond=0).isoformat() if isinstance(tick_at_dt, datetime) else "",
             tick_age_sec=round(tick_age_sec, 3),
             price_source=price_source,
             current_price=current_price,
@@ -228,14 +262,26 @@ class SetupFeatureBuilder:
             completed_1m_candles=completed,
             active_1m_candle=active,
             completed_1m_count=len(completed),
-            latest_completed_candle_at=str(completed[-1].get("start_at") or "") if completed else "",
+            latest_completed_candle_at=str(completed[-1].get("candle_at") or completed[-1].get("start_at") or "") if completed else "",
             momentum_1m_pct=_momentum(completed, 1),
             momentum_3m_pct=_momentum(completed, 3),
             momentum_5m_pct=_momentum(completed, 5),
+            entry_decision_id=_int_or_none(entry.get("id")),
+            entry_decision_at=entry_at,
+            entry_decision_age_sec=round(entry_age_sec, 3),
+            entry_decision_fresh=entry_fresh,
+            entry_decision_source=str(entry.get("source") or entry.get("decision_source") or "entry_engine" if entry else ""),
             entry_status=str(entry.get("entry_status") or ""),
             entry_price_location=str(entry.get("price_location") or ""),
             entry_reason_codes=tuple(_dedupe(entry.get("reason_codes") or [])),
             context_reason_codes=context_reasons,
+            expansion_lease_present=bool(lease_check["lease_present"]),
+            lease_status=str(lease_check["lease_status"]),
+            lease_selected_at=str(lease_check["selected_at"]),
+            lease_first_active_at=str(lease_check["first_active_at"]),
+            lease_first_fresh_tick_at=str(lease_check["first_fresh_tick_at"]),
+            post_subscription_tick_verified=bool(lease_check["post_subscription_tick_verified"]),
+            post_subscription_tick_reason=str(lease_check["reason"]),
             data_wait_reasons=tuple(_dedupe(data_wait)),
         )
 
@@ -259,7 +305,7 @@ def _completed_candles(candle_builder: Any | None, code: str) -> list[dict[str, 
     loader = getattr(candle_builder, "completed_candles", None)
     if not callable(loader):
         return []
-    return [_candle_to_dict(candle) for candle in list(loader(code, 1) or [])]
+    return _enrich_completed_candles([_candle_to_dict(candle) for candle in list(loader(code, 1) or [])])
 
 
 def _active_candle(candle_builder: Any | None, code: str) -> dict[str, Any]:
@@ -268,7 +314,11 @@ def _active_candle(candle_builder: Any | None, code: str) -> dict[str, Any]:
     loader = getattr(candle_builder, "active_candle", None)
     if not callable(loader):
         return {}
-    return _candle_to_dict(loader(code, 1))
+    data = _candle_to_dict(loader(code, 1))
+    if data:
+        data.setdefault("completed", False)
+        data.setdefault("candle_at", data.get("start_at") or "")
+    return data
 
 
 def _candle_to_dict(candle: Any) -> dict[str, Any]:
@@ -288,10 +338,130 @@ def _candle_to_dict(candle: Any) -> dict[str, Any]:
             "low": getattr(candle, "low", 0),
             "close": getattr(candle, "close", 0),
             "volume": getattr(candle, "volume", 0),
+            "trade_value": getattr(candle, "trade_value", 0),
         }
-    if isinstance(data.get("start_at"), datetime):
-        data["start_at"] = data["start_at"].replace(microsecond=0).isoformat()
+    for key in ("start_at", "candle_at", "ended_at"):
+        if isinstance(data.get(key), datetime):
+            data[key] = data[key].replace(microsecond=0).isoformat()
     return _jsonable(data)
+
+
+def _enrich_completed_candles(candles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    enriched: list[dict[str, Any]] = []
+    cumulative_volume = 0.0
+    cumulative_value = 0.0
+    for raw in candles:
+        candle = dict(raw or {})
+        candle_at = str(candle.get("candle_at") or candle.get("start_at") or "")
+        open_price = _float(candle.get("open"))
+        high = _float(candle.get("high"))
+        low = _float(candle.get("low"))
+        close = _float(candle.get("close"))
+        volume = _float(candle.get("volume"))
+        explicit_cumulative_volume = _float(candle.get("cumulative_volume") or candle.get("cum_volume"))
+        explicit_cumulative_value = _float(candle.get("cumulative_value") or candle.get("cumulative_trade_value"))
+        trade_value = _float(candle.get("trade_value") or candle.get("value") or candle.get("turnover_krw"))
+        typical = (high + low + close) / 3.0 if high > 0 and low > 0 and close > 0 else close
+        candle_value = trade_value if trade_value > 0 else typical * volume if volume > 0 else 0.0
+        cumulative_volume = explicit_cumulative_volume if explicit_cumulative_volume > 0 else cumulative_volume + max(0.0, volume)
+        cumulative_value = explicit_cumulative_value if explicit_cumulative_value > 0 else cumulative_value + max(0.0, candle_value)
+        explicit_vwap = _first_positive(candle.get("derived_vwap_at_close"), candle.get("vwap_at_close"), candle.get("vwap"))
+        if explicit_vwap > 0:
+            derived_vwap = explicit_vwap
+            vwap_source = str(candle.get("vwap_source") or "explicit")
+        elif cumulative_volume > 0 and cumulative_value > 0:
+            derived_vwap = cumulative_value / cumulative_volume
+            vwap_source = "actual_cumulative" if explicit_cumulative_value > 0 else "typical_price_volume"
+        else:
+            derived_vwap = typical
+            vwap_source = "typical_price"
+        candle.update(
+            {
+                "candle_at": candle_at,
+                "start_at": candle_at or candle.get("start_at") or "",
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": int(volume) if float(volume).is_integer() else volume,
+                "trade_value": candle_value,
+                "cumulative_volume": cumulative_volume,
+                "cumulative_value": cumulative_value,
+                "derived_vwap_at_close": derived_vwap,
+                "vwap_source": vwap_source,
+                "close_vs_vwap_pct": _pct(close - derived_vwap, derived_vwap),
+                "completed": True,
+            }
+        )
+        enriched.append(_jsonable(candle))
+    return enriched
+
+
+def _post_subscription_tick_check(
+    lease: Mapping[str, Any],
+    *,
+    theme_id: str,
+    tick_at: Any,
+    price_source: str,
+    realtime_tick_fresh: bool,
+) -> dict[str, Any]:
+    if not lease:
+        return {
+            "lease_present": False,
+            "lease_status": "",
+            "selected_at": "",
+            "first_active_at": "",
+            "first_fresh_tick_at": "",
+            "post_subscription_tick_verified": True,
+            "reason": "NO_EXPANSION_LEASE",
+        }
+    lease_theme = str(lease.get("theme_id") or "")
+    status = str(lease.get("status") or "")
+    active_statuses = {"ACTIVE", "HOLDING", "PROTECTED"}
+    if lease_theme and theme_id and lease_theme != theme_id:
+        return {
+            "lease_present": True,
+            "lease_status": status,
+            "selected_at": str(lease.get("selected_at") or ""),
+            "first_active_at": str(lease.get("first_active_at") or ""),
+            "first_fresh_tick_at": str(lease.get("first_fresh_tick_at") or ""),
+            "post_subscription_tick_verified": True,
+            "reason": "LEASE_FOR_OTHER_THEME",
+        }
+    if status.upper() not in active_statuses:
+        return {
+            "lease_present": True,
+            "lease_status": status,
+            "selected_at": str(lease.get("selected_at") or ""),
+            "first_active_at": str(lease.get("first_active_at") or ""),
+            "first_fresh_tick_at": str(lease.get("first_fresh_tick_at") or ""),
+            "post_subscription_tick_verified": True,
+            "reason": "LEASE_NOT_ACTIVE",
+        }
+    selected_at = str(lease.get("selected_at") or lease.get("selected_tick_baseline_at") or "")
+    first_active_at = str(lease.get("first_active_at") or "")
+    first_fresh_tick_at = str(lease.get("first_fresh_tick_at") or lease.get("first_post_subscription_tick_at") or "")
+    baselines = [_parse_time(selected_at), _parse_time(first_active_at)]
+    baseline = max([item for item in baselines if item is not None], default=None)
+    tick_dt = tick_at if isinstance(tick_at, datetime) else _parse_time(str(tick_at or ""))
+    verified = bool(
+        tick_dt is not None
+        and realtime_tick_fresh
+        and str(price_source or "").upper() == "REALTIME"
+        and (baseline is None or tick_dt.replace(tzinfo=None) >= baseline.replace(tzinfo=None))
+    )
+    if first_fresh_tick_at:
+        first_fresh = _parse_time(first_fresh_tick_at)
+        verified = verified and (first_fresh is None or tick_dt is None or tick_dt.replace(tzinfo=None) >= first_fresh.replace(tzinfo=None))
+    return {
+        "lease_present": True,
+        "lease_status": status,
+        "selected_at": selected_at,
+        "first_active_at": first_active_at,
+        "first_fresh_tick_at": first_fresh_tick_at,
+        "post_subscription_tick_verified": verified,
+        "reason": "POST_SUBSCRIPTION_FRESH_TICK_VERIFIED" if verified else "SETUP_POST_SUBSCRIPTION_FRESH_TICK_MISSING",
+    }
 
 
 def _day_high_low(market_data: Any | None, code: str) -> tuple[float, float]:
@@ -311,6 +481,18 @@ def _age_sec(value: Any, now: datetime) -> float:
     return max(0.0, (now.replace(tzinfo=None) - timestamp).total_seconds())
 
 
+def _parse_time(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
 def _vwap_from_candles(candles: list[dict[str, Any]]) -> float:
     total_value = 0.0
     total_volume = 0.0
@@ -318,8 +500,11 @@ def _vwap_from_candles(candles: list[dict[str, Any]]) -> float:
         volume = _float(candle.get("volume"))
         if volume <= 0:
             continue
-        typical = (_float(candle.get("high")) + _float(candle.get("low")) + _float(candle.get("close"))) / 3.0
-        total_value += typical * volume
+        value = _float(candle.get("trade_value"))
+        if value <= 0:
+            typical = (_float(candle.get("high")) + _float(candle.get("low")) + _float(candle.get("close"))) / 3.0
+            value = typical * volume
+        total_value += value
         total_volume += volume
     return total_value / total_volume if total_volume > 0 else 0.0
 
@@ -357,6 +542,12 @@ def _first_nonzero(*values: Any) -> float:
     return 0.0
 
 
+def _pct(numerator: float, denominator: float) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(numerator / denominator * 100.0, 4)
+
+
 def _float(value: Any, default: float = 0.0) -> float:
     if value in (None, ""):
         return default
@@ -371,6 +562,15 @@ def _int(value: Any, default: int = 0) -> int:
         return int(float(str(value).strip().replace(",", "")))
     except (TypeError, ValueError):
         return default
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(str(value).strip().replace(",", "")))
+    except (TypeError, ValueError):
+        return None
 
 
 def _dedupe(values: Any) -> list[str]:

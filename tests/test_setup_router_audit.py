@@ -13,13 +13,15 @@ def test_setup_router_audit_writes_reports(tmp_path):
     db_path = tmp_path / "setup-audit.db"
     out_dir = tmp_path / "reports"
     db = TradingDatabase(str(db_path))
-    db.save_setup_observations([_observation("VALID_OBSERVE", "MATCHED", "fp-audit")])
+    observation = _observation("VALID_OBSERVE", "MATCHED", "fp-audit")
+    db.save_setup_router_states([observation])
+    db.save_setup_observations([observation])
     db.conn.close()
 
     rc = main(["--db", str(db_path), "--trade-date", TRADE_DATE, "--output-dir", str(out_dir)])
     summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
 
     assert rc == 0
-    assert summary["verdict"] == "STABLE_FOR_OPPORTUNITY_RANKER"
+    assert summary["verdict"] == "CONDITIONALLY_STABLE"
     assert summary["invalid_count"] == 0
     assert (out_dir / "report.md").exists()

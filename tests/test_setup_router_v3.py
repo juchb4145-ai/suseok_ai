@@ -16,7 +16,7 @@ def test_setup_router_vwap_reclaim_requires_temporal_prior_below_vwap(tmp_path):
     market_data = MarketDataStore()
     candles = CandleBuilder()
     candidate = _candidate(db)
-    _seed_candles(market_data, candles, closes=[990, 995, 998, 1002, 1008], vwap=1000)
+    _seed_candles(market_data, candles, closes=[980, 970, 960, 1002, 1008], vwap=1000)
     feature = SetupFeatureBuilder(market_data, candles, min_completed_1m_candles=3).build(
         candidate,
         now=datetime(2026, 6, 22, 9, 5, 5),
@@ -53,6 +53,47 @@ def test_setup_router_price_above_vwap_without_prior_below_is_not_matched(tmp_pa
 
     assert vwap.shape_status == "NOT_SEEN"
     assert vwap.router_status == "UNKNOWN"
+
+
+def test_setup_router_pre_open_blocks_valid_even_when_shape_matches(tmp_path):
+    db = TradingDatabase(str(tmp_path / "setup-router-pre-open.db"))
+    market_data = MarketDataStore()
+    candles = CandleBuilder()
+    candidate = _candidate(db)
+    _seed_candles(market_data, candles, closes=[980, 970, 960, 1002, 1008], vwap=1000)
+    context = {**_context(), "session_phase": "PRE_OPEN"}
+    feature = SetupFeatureBuilder(market_data, candles, min_completed_1m_candles=3).build(
+        candidate,
+        now=datetime(2026, 6, 22, 9, 5, 5),
+        strategy_context=context,
+        entry_decision=_entry_decision(),
+    )
+
+    observations = SetupRouterV3(SetupRouterConfig(enabled=True)).classify(feature)
+    vwap = next(item for item in observations if item.setup_type == "VWAP_RECLAIM")
+
+    assert vwap.shape_status == "MATCHED"
+    assert vwap.context_status == "BLOCKED"
+    assert vwap.router_status == "CONTEXT_BLOCKED"
+    assert "SETUP_PRE_OPEN_BLOCK" in vwap.reason_codes
+
+
+def test_setup_router_does_not_pick_primary_when_no_active_setup(tmp_path):
+    db = TradingDatabase(str(tmp_path / "setup-router-no-primary.db"))
+    market_data = MarketDataStore()
+    candles = CandleBuilder()
+    candidate = _candidate(db)
+    _seed_candles(market_data, candles, closes=[1002, 1004, 1005, 1006, 1008], vwap=1000)
+    feature = SetupFeatureBuilder(market_data, candles, min_completed_1m_candles=3).build(
+        candidate,
+        now=datetime(2026, 6, 22, 9, 5, 5),
+        strategy_context=_context(),
+        entry_decision=_entry_decision(),
+    )
+
+    observations = SetupRouterV3(SetupRouterConfig(enabled=True)).classify(feature)
+
+    assert not any(item.primary_setup for item in observations if item.shape_status in {"NOT_SEEN", "DATA_WAIT", "INVALIDATED", "EXPIRED"})
 
 
 def _candidate(db):

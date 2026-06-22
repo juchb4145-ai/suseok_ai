@@ -412,14 +412,19 @@ def build_reboot_v2_runtime_bundle(
             config=dirty_evaluator_config,
         )
     )
+    setup_router_config = SetupRouterConfig.from_env()
+    market_data_config = getattr(getattr(market_data_bridge, "service", None), "config", None)
+    setup_router_tick_age = int(getattr(market_data_config, "max_tick_age_sec", setup_router_config.max_tick_age_sec))
     setup_router_v3_pipeline = SetupRouterV3RuntimePipeline(
         db=db,
         market_data=market_data,
         candle_builder=candle_builder,
         config=replace(
-            SetupRouterConfig.from_env(),
+            setup_router_config,
             observe_only=True,
+            max_tick_age_sec=setup_router_tick_age,
         ),
+        dirty_evaluator_provider=dirty_strategy_evaluator,
     )
     market_relative_strength_shadow_pipeline = MarketRelativeStrengthShadowRuntimePipeline(
         db=db,

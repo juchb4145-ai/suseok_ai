@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from collections import Counter
 from datetime import datetime, timedelta
@@ -30,6 +31,9 @@ from trading.strategy.models import (
     VirtualPosition,
 )
 from trading.strategy.conditions import ConditionProfile
+
+
+_CURRENT_SETUP_ROUTER_VERSION = "setup_router_v3.2"
 
 
 class TradingDatabase:
@@ -1144,6 +1148,58 @@ class TradingDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_setup_router_primary_latest_trade_status
                 ON setup_router_primary_latest(trade_date, router_status, code);
+            CREATE TABLE IF NOT EXISTS setup_router_state_v2 (
+                trade_date TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                theme_id TEXT NOT NULL,
+                setup_type TEXT NOT NULL,
+                setup_generation INTEGER NOT NULL DEFAULT 1,
+                setup_instance_id TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL,
+                candidate_id INTEGER,
+                lifecycle_state TEXT NOT NULL DEFAULT '',
+                state_entered_at TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT '',
+                last_evaluated_at TEXT NOT NULL DEFAULT '',
+                last_material_change_at TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                context_id TEXT NOT NULL DEFAULT '',
+                feature_fingerprint TEXT NOT NULL DEFAULT '',
+                state_payload_json TEXT NOT NULL DEFAULT '{}',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                schema_version TEXT NOT NULL DEFAULT '',
+                router_version TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, candidate_instance_id, theme_id, setup_type, setup_generation)
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_state_v2_trade_code
+                ON setup_router_state_v2(trade_date, code, setup_type);
+            CREATE INDEX IF NOT EXISTS idx_setup_router_state_v2_trade_lifecycle
+                ON setup_router_state_v2(trade_date, lifecycle_state, updated_at);
+            CREATE TABLE IF NOT EXISTS setup_router_state_transitions_v2 (
+                transition_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                theme_id TEXT NOT NULL DEFAULT '',
+                setup_type TEXT NOT NULL DEFAULT '',
+                setup_generation INTEGER NOT NULL DEFAULT 1,
+                setup_instance_id TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                previous_state TEXT NOT NULL DEFAULT '',
+                current_state TEXT NOT NULL DEFAULT '',
+                occurred_at TEXT NOT NULL DEFAULT '',
+                context_id TEXT NOT NULL DEFAULT '',
+                feature_fingerprint TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                state_payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_state_transitions_v2_trade
+                ON setup_router_state_transitions_v2(trade_date, occurred_at, transition_id);
+            CREATE INDEX IF NOT EXISTS idx_setup_router_state_transitions_v2_code
+                ON setup_router_state_transitions_v2(code, occurred_at);
             CREATE TABLE IF NOT EXISTS position_runtime_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -3080,6 +3136,7 @@ class TradingDatabase:
         self._ensure_gateway_transport_latency_columns()
         self._ensure_gateway_transport_latency_indexes()
         self._ensure_gateway_event_log_processing_columns()
+        self._ensure_setup_router_v2_columns()
         self._seed_legacy_strategy_runtime_settings()
         self._ensure_trade_review_columns()
         self.conn.execute(
@@ -8629,6 +8686,56 @@ class TradingDatabase:
         rows = self.conn.execute(query, query_params).fetchall()
         return [_row_to_entry_decision(row) for row in rows]
 
+    def latest_entry_decisions_per_candidate(
+        self,
+        *,
+        trade_date: str,
+        candidate_ids: Iterable[object] | None = None,
+        codes: Iterable[object] | None = None,
+    ) -> list[dict]:
+        clean_candidate_ids = []
+        for value in list(candidate_ids or []):
+            try:
+                if value is not None:
+                    clean_candidate_ids.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        clean_codes = [_clean_stock_code(code) or str(code or "") for code in list(codes or [])]
+        clean_codes = [code for code in clean_codes if code]
+        clauses = ["trade_date = ?"]
+        params: list[object] = [str(trade_date)]
+        scopes: list[str] = []
+        if clean_candidate_ids:
+            placeholders = ",".join("?" for _ in clean_candidate_ids)
+            scopes.append(f"candidate_id IN ({placeholders})")
+            params.extend(clean_candidate_ids)
+        if clean_codes:
+            placeholders = ",".join("?" for _ in clean_codes)
+            scopes.append(f"(candidate_id IS NULL AND code IN ({placeholders}))")
+            params.extend(clean_codes)
+        if scopes:
+            clauses.append("(" + " OR ".join(scopes) + ")")
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM entry_decisions
+            WHERE {" AND ".join(clauses)}
+            ORDER BY calculated_at DESC, id DESC
+            """,
+            tuple(params),
+        ).fetchall()
+        latest_by_key: dict[tuple[str, object], dict] = {}
+        for row in rows:
+            payload = _row_to_entry_decision(row)
+            candidate_id = payload.get("candidate_id")
+            code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
+            if candidate_id is not None:
+                key = ("candidate", int(candidate_id))
+            else:
+                key = ("code", code)
+            latest_by_key.setdefault(key, payload)
+        return list(latest_by_key.values())
+
     def list_entry_decision_checks(self, entry_decision_id: int) -> list[dict]:
         rows = self.conn.execute(
             "SELECT * FROM entry_decision_checks WHERE entry_decision_id = ? ORDER BY id ASC",
@@ -8643,18 +8750,23 @@ class TradingDatabase:
             cursor = self.conn.execute(
                 """
                 INSERT INTO setup_router_runs(
-                    trade_date, calculated_at, schema_version, enabled, observe_only,
+                    trade_date, calculated_at, schema_version, feature_schema_version,
+                    router_version, state_version, output_mode, enabled, observe_only,
                     candidate_count, evaluated_count, observation_count,
                     valid_observe_count, pending_count, data_wait_count,
                     context_blocked_count, avoid_count, unknown_count,
                     invalidated_count, expired_count, duration_ms, status,
                     reason_codes_json, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(payload.get("trade_date") or ""),
                     str(payload.get("calculated_at") or ""),
                     str(payload.get("schema_version") or ""),
+                    str(payload.get("feature_schema_version") or ""),
+                    str(payload.get("router_version") or ""),
+                    str(payload.get("state_version") or ""),
+                    str(payload.get("output_mode") or "OBSERVE"),
                     int(bool(payload.get("enabled"))),
                     int(bool(payload.get("observe_only", True))),
                     _safe_int(payload.get("candidate_count"), 0),
@@ -8709,6 +8821,8 @@ class TradingDatabase:
         if not cleaned:
             return 0
         saved_count = 0
+        seen_candidate_keys: set[tuple[str, str]] = set()
+        primary_candidate_keys: set[tuple[str, str]] = set()
         with self.conn:
             for payload in cleaned:
                 trade_date = str(payload.get("trade_date") or "")
@@ -8716,6 +8830,9 @@ class TradingDatabase:
                 candidate_id = payload.get("candidate_id")
                 candidate_instance_id = str(payload.get("candidate_instance_id") or f"{trade_date}:{code}:{candidate_id or 0}")
                 setup_type = str(payload.get("setup_type") or "")
+                seen_candidate_keys.add((trade_date, candidate_instance_id))
+                if bool(payload.get("primary_setup")):
+                    primary_candidate_keys.add((trade_date, candidate_instance_id))
                 previous = self.conn.execute(
                     """
                     SELECT * FROM setup_observations_latest
@@ -8736,18 +8853,38 @@ class TradingDatabase:
                     """
                     INSERT INTO setup_observations_latest(
                         trade_date, candidate_instance_id, setup_type, candidate_id, code, name,
-                        calculated_at, schema_version, router_status, shape_status, context_status,
+                        calculated_at, schema_version, feature_schema_version, router_version,
+                        setup_generation, setup_instance_id, state_version,
+                        post_subscription_tick_verified, entry_decision_at, entry_decision_id,
+                        entry_decision_age_sec, entry_decision_fresh, entry_decision_source,
+                        lifecycle_state, state_payload_json, last_material_change_at, quantity,
+                        router_status, shape_status, context_status,
                         entry_alignment_status, primary_setup, setup_quality_score, context_id,
                         theme_id, theme_name, theme_state, leadership_status, stock_role,
                         market_side, market_action, session_phase, current_price, fingerprint,
                         reason_codes_json, price_structure_json, safety_json, payload_json, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(trade_date, candidate_instance_id, setup_type) DO UPDATE SET
                         candidate_id=excluded.candidate_id,
                         code=excluded.code,
                         name=excluded.name,
                         calculated_at=excluded.calculated_at,
                         schema_version=excluded.schema_version,
+                        feature_schema_version=excluded.feature_schema_version,
+                        router_version=excluded.router_version,
+                        setup_generation=excluded.setup_generation,
+                        setup_instance_id=excluded.setup_instance_id,
+                        state_version=excluded.state_version,
+                        post_subscription_tick_verified=excluded.post_subscription_tick_verified,
+                        entry_decision_at=excluded.entry_decision_at,
+                        entry_decision_id=excluded.entry_decision_id,
+                        entry_decision_age_sec=excluded.entry_decision_age_sec,
+                        entry_decision_fresh=excluded.entry_decision_fresh,
+                        entry_decision_source=excluded.entry_decision_source,
+                        lifecycle_state=excluded.lifecycle_state,
+                        state_payload_json=excluded.state_payload_json,
+                        last_material_change_at=excluded.last_material_change_at,
+                        quantity=excluded.quantity,
                         router_status=excluded.router_status,
                         shape_status=excluded.shape_status,
                         context_status=excluded.context_status,
@@ -8777,17 +8914,26 @@ class TradingDatabase:
                     self.conn.execute(
                         """
                         INSERT INTO setup_observation_transitions(
-                            trade_date, candidate_instance_id, setup_type, candidate_id, code, name,
+                            trade_date, candidate_instance_id, setup_type, theme_id,
+                            setup_generation, setup_instance_id, router_version,
+                            lifecycle_previous_state, lifecycle_current_state,
+                            candidate_id, code, name,
                             transitioned_at, previous_router_status, current_router_status,
                             previous_shape_status, current_shape_status, previous_context_status,
                             current_context_status, previous_fingerprint, current_fingerprint,
                             reason_codes_json, payload_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             trade_date,
                             candidate_instance_id,
                             setup_type,
+                            str(payload.get("theme_id") or ""),
+                            _safe_int(payload.get("setup_generation"), 1),
+                            str(payload.get("setup_instance_id") or ""),
+                            str(payload.get("router_version") or ""),
+                            str(previous_payload.get("lifecycle_state") or ""),
+                            str(payload.get("lifecycle_state") or ""),
                             candidate_id,
                             code,
                             str(payload.get("name") or ""),
@@ -8811,9 +8957,12 @@ class TradingDatabase:
                             trade_date, candidate_instance_id, candidate_id, code, name,
                             calculated_at, setup_type, router_status, shape_status, context_status,
                             entry_alignment_status, setup_quality_score, context_id, theme_id,
-                            theme_name, theme_state, stock_role, fingerprint, payload_json,
+                            theme_name, theme_state, stock_role, fingerprint,
+                            router_version, setup_generation, setup_instance_id,
+                            lifecycle_state, clear_reason, last_material_change_at,
+                            payload_json,
                             updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                         ON CONFLICT(trade_date, candidate_instance_id) DO UPDATE SET
                             candidate_id=excluded.candidate_id,
                             code=excluded.code,
@@ -8831,6 +8980,12 @@ class TradingDatabase:
                             theme_state=excluded.theme_state,
                             stock_role=excluded.stock_role,
                             fingerprint=excluded.fingerprint,
+                            router_version=excluded.router_version,
+                            setup_generation=excluded.setup_generation,
+                            setup_instance_id=excluded.setup_instance_id,
+                            lifecycle_state=excluded.lifecycle_state,
+                            clear_reason=excluded.clear_reason,
+                            last_material_change_at=excluded.last_material_change_at,
                             payload_json=excluded.payload_json,
                             updated_at=CURRENT_TIMESTAMP
                         """,
@@ -8853,11 +9008,196 @@ class TradingDatabase:
                             str(payload.get("theme_state") or ""),
                             str(payload.get("stock_role") or ""),
                             current_fingerprint,
+                            str(payload.get("router_version") or ""),
+                            _safe_int(payload.get("setup_generation"), 1),
+                            str(payload.get("setup_instance_id") or ""),
+                            str(payload.get("lifecycle_state") or ""),
+                            "",
+                            str(payload.get("last_material_change_at") or ""),
                             _json_payload(payload),
                         ),
                     )
                 saved_count += 1
+            for trade_date, candidate_instance_id in sorted(seen_candidate_keys - primary_candidate_keys):
+                self.conn.execute(
+                    "DELETE FROM setup_router_primary_latest WHERE trade_date = ? AND candidate_instance_id = ?",
+                    (trade_date, candidate_instance_id),
+                )
         return saved_count
+
+    def save_setup_router_states(self, observations: Iterable[dict]) -> dict:
+        cleaned = [dict(item or {}) for item in observations or []]
+        if not cleaned:
+            return {"state_write_count": 0, "transition_write_count": 0}
+        state_write_count = 0
+        transition_write_count = 0
+        with self.conn:
+            for payload in cleaned:
+                trade_date = str(payload.get("trade_date") or "")
+                code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
+                candidate_id = payload.get("candidate_id")
+                candidate_instance_id = str(payload.get("candidate_instance_id") or f"{trade_date}:{code}:{candidate_id or 0}")
+                theme_id = str(payload.get("theme_id") or "")
+                setup_type = str(payload.get("setup_type") or "")
+                generation = max(1, _safe_int(payload.get("setup_generation"), 1))
+                setup_instance_id = str(payload.get("setup_instance_id") or "")
+                lifecycle_state = str(payload.get("lifecycle_state") or "")
+                calculated_at = str(payload.get("calculated_at") or "")
+                fingerprint = str(payload.get("fingerprint") or "")
+                previous = self.conn.execute(
+                    """
+                    SELECT *
+                    FROM setup_router_state_v2
+                    WHERE trade_date = ? AND candidate_instance_id = ? AND theme_id = ?
+                      AND setup_type = ? AND setup_generation = ?
+                    """,
+                    (trade_date, candidate_instance_id, theme_id, setup_type, generation),
+                ).fetchone()
+                previous_payload = _row_to_setup_router_state(previous) if previous else {}
+                previous_fingerprint = str(previous_payload.get("feature_fingerprint") or "")
+                previous_state = str(previous_payload.get("lifecycle_state") or "")
+                first_seen_at = str(previous_payload.get("first_seen_at") or calculated_at)
+                state_entered_at = str(previous_payload.get("state_entered_at") or calculated_at)
+                if previous_state != lifecycle_state:
+                    state_entered_at = calculated_at
+                material_change_at = str(payload.get("last_material_change_at") or calculated_at)
+                expires_at = str(payload.get("expires_at") or "")
+                transition_needed = (not previous_payload or previous_state != lifecycle_state or previous_fingerprint != fingerprint) and previous_fingerprint != fingerprint
+                self.conn.execute(
+                    """
+                    INSERT INTO setup_router_state_v2(
+                        trade_date, candidate_instance_id, theme_id, setup_type,
+                        setup_generation, setup_instance_id, code, candidate_id,
+                        lifecycle_state, state_entered_at, first_seen_at,
+                        last_evaluated_at, last_material_change_at, expires_at,
+                        context_id, feature_fingerprint, state_payload_json,
+                        reason_codes_json, schema_version, router_version,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(trade_date, candidate_instance_id, theme_id, setup_type, setup_generation) DO UPDATE SET
+                        setup_instance_id=excluded.setup_instance_id,
+                        code=excluded.code,
+                        candidate_id=excluded.candidate_id,
+                        lifecycle_state=excluded.lifecycle_state,
+                        state_entered_at=excluded.state_entered_at,
+                        last_evaluated_at=excluded.last_evaluated_at,
+                        last_material_change_at=excluded.last_material_change_at,
+                        expires_at=excluded.expires_at,
+                        context_id=excluded.context_id,
+                        feature_fingerprint=excluded.feature_fingerprint,
+                        state_payload_json=excluded.state_payload_json,
+                        reason_codes_json=excluded.reason_codes_json,
+                        schema_version=excluded.schema_version,
+                        router_version=excluded.router_version,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (
+                        trade_date,
+                        candidate_instance_id,
+                        theme_id,
+                        setup_type,
+                        generation,
+                        setup_instance_id,
+                        code,
+                        candidate_id,
+                        lifecycle_state,
+                        state_entered_at,
+                        first_seen_at,
+                        calculated_at,
+                        material_change_at,
+                        expires_at,
+                        str(payload.get("context_id") or ""),
+                        fingerprint,
+                        _json_payload(payload.get("state_payload") or payload.get("price_structure") or {}),
+                        _json_list(payload.get("reason_codes") or []),
+                        str(payload.get("state_version") or ""),
+                        str(payload.get("router_version") or ""),
+                    ),
+                )
+                state_write_count += 1
+                if transition_needed:
+                    transition_id = _setup_state_transition_id(
+                        trade_date,
+                        candidate_instance_id,
+                        theme_id,
+                        setup_type,
+                        generation,
+                        previous_state,
+                        lifecycle_state,
+                        fingerprint,
+                    )
+                    cursor = self.conn.execute(
+                        """
+                        INSERT OR IGNORE INTO setup_router_state_transitions_v2(
+                            transition_id, trade_date, candidate_instance_id,
+                            theme_id, setup_type, setup_generation, setup_instance_id,
+                            code, candidate_id, previous_state, current_state,
+                            occurred_at, context_id, feature_fingerprint,
+                            reason_codes_json, state_payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            transition_id,
+                            trade_date,
+                            candidate_instance_id,
+                            theme_id,
+                            setup_type,
+                            generation,
+                            setup_instance_id,
+                            code,
+                            candidate_id,
+                            previous_state,
+                            lifecycle_state,
+                            calculated_at,
+                            str(payload.get("context_id") or ""),
+                            fingerprint,
+                            _json_list(payload.get("reason_codes") or []),
+                            _json_payload(payload.get("state_payload") or payload.get("price_structure") or {}),
+                        ),
+                    )
+                    if int(getattr(cursor, "rowcount", 0) or 0) > 0:
+                        transition_write_count += 1
+        return {"state_write_count": state_write_count, "transition_write_count": transition_write_count}
+
+    def list_setup_router_states(
+        self,
+        *,
+        trade_date: str,
+        candidate_instance_ids: Iterable[object] | None = None,
+        codes: Iterable[object] | None = None,
+        active_only: bool = False,
+        router_version: Optional[str] = _CURRENT_SETUP_ROUTER_VERSION,
+        limit: int = 5000,
+    ) -> list[dict]:
+        clauses = ["trade_date = ?"]
+        params: list[object] = [str(trade_date)]
+        clean_ids = [str(item) for item in list(candidate_instance_ids or []) if str(item or "")]
+        clean_codes = [_clean_stock_code(code) or str(code or "") for code in list(codes or [])]
+        clean_codes = [code for code in clean_codes if code]
+        if clean_ids:
+            placeholders = ",".join("?" for _ in clean_ids)
+            clauses.append(f"candidate_instance_id IN ({placeholders})")
+            params.extend(clean_ids)
+        if clean_codes:
+            placeholders = ",".join("?" for _ in clean_codes)
+            clauses.append(f"code IN ({placeholders})")
+            params.extend(clean_codes)
+        if active_only:
+            clauses.append("lifecycle_state IN ('SEEKING','FORMING','MATCHED')")
+        if router_version:
+            clauses.append("(router_version = ? OR router_version = '')")
+            params.append(str(router_version))
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM setup_router_state_v2
+            WHERE {" AND ".join(clauses)}
+            ORDER BY updated_at DESC, setup_generation DESC
+            LIMIT ?
+            """,
+            tuple([*params, max(1, int(limit or 5000))]),
+        ).fetchall()
+        return [_row_to_setup_router_state(row) for row in rows]
 
     def list_setup_observations_latest(
         self,
@@ -8871,6 +9211,10 @@ class TradingDatabase:
         session_phase: Optional[str] = None,
         theme_id: Optional[str] = None,
         leadership_status: Optional[str] = None,
+        router_version: Optional[str] = None,
+        setup_generation: Optional[int] = None,
+        lifecycle_state: Optional[str] = None,
+        post_subscription_tick_verified: Optional[bool] = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict]:
@@ -8888,6 +9232,14 @@ class TradingDatabase:
         _append_setup_filter(clauses, params, "session_phase", session_phase)
         _append_setup_filter(clauses, params, "theme_id", theme_id)
         _append_setup_filter(clauses, params, "leadership_status", leadership_status)
+        _append_setup_filter(clauses, params, "router_version", router_version)
+        if setup_generation is not None:
+            clauses.append("setup_generation = ?")
+            params.append(int(setup_generation))
+        _append_setup_filter(clauses, params, "lifecycle_state", lifecycle_state)
+        if post_subscription_tick_verified is not None:
+            clauses.append("post_subscription_tick_verified = ?")
+            params.append(int(bool(post_subscription_tick_verified)))
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY calculated_at DESC, primary_setup DESC, setup_quality_score DESC, code ASC LIMIT ? OFFSET ?"
@@ -8907,6 +9259,10 @@ class TradingDatabase:
         session_phase: Optional[str] = None,
         theme_id: Optional[str] = None,
         leadership_status: Optional[str] = None,
+        router_version: Optional[str] = None,
+        setup_generation: Optional[int] = None,
+        lifecycle_state: Optional[str] = None,
+        post_subscription_tick_verified: Optional[bool] = None,
     ) -> int:
         query = "SELECT COUNT(*) AS count FROM setup_observations_latest"
         clauses: list[str] = []
@@ -8922,6 +9278,14 @@ class TradingDatabase:
         _append_setup_filter(clauses, params, "session_phase", session_phase)
         _append_setup_filter(clauses, params, "theme_id", theme_id)
         _append_setup_filter(clauses, params, "leadership_status", leadership_status)
+        _append_setup_filter(clauses, params, "router_version", router_version)
+        if setup_generation is not None:
+            clauses.append("setup_generation = ?")
+            params.append(int(setup_generation))
+        _append_setup_filter(clauses, params, "lifecycle_state", lifecycle_state)
+        if post_subscription_tick_verified is not None:
+            clauses.append("post_subscription_tick_verified = ?")
+            params.append(int(bool(post_subscription_tick_verified)))
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         row = self.conn.execute(query, tuple(params)).fetchone()
@@ -8934,6 +9298,8 @@ class TradingDatabase:
         code: Optional[str] = None,
         setup_type: Optional[str] = None,
         router_status: Optional[str] = None,
+        router_version: Optional[str] = None,
+        setup_generation: Optional[int] = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict]:
@@ -8945,6 +9311,10 @@ class TradingDatabase:
             clauses.append("code = ?")
             params.append(_clean_stock_code(code) or str(code))
         _append_setup_filter(clauses, params, "setup_type", setup_type)
+        _append_setup_filter(clauses, params, "router_version", router_version)
+        if setup_generation is not None:
+            clauses.append("setup_generation = ?")
+            params.append(int(setup_generation))
         if router_status:
             clauses.append("current_router_status = ?")
             params.append(str(router_status))
@@ -13685,6 +14055,55 @@ class TradingDatabase:
             """
         )
 
+    def _ensure_setup_router_v2_columns(self) -> None:
+        run_columns = {
+            "feature_schema_version": "TEXT NOT NULL DEFAULT ''",
+            "router_version": "TEXT NOT NULL DEFAULT ''",
+            "state_version": "TEXT NOT NULL DEFAULT ''",
+            "output_mode": "TEXT NOT NULL DEFAULT 'OBSERVE'",
+        }
+        latest_columns = {
+            "feature_schema_version": "TEXT NOT NULL DEFAULT ''",
+            "router_version": "TEXT NOT NULL DEFAULT ''",
+            "setup_generation": "INTEGER NOT NULL DEFAULT 1",
+            "setup_instance_id": "TEXT NOT NULL DEFAULT ''",
+            "state_version": "TEXT NOT NULL DEFAULT ''",
+            "post_subscription_tick_verified": "INTEGER NOT NULL DEFAULT 1",
+            "entry_decision_at": "TEXT NOT NULL DEFAULT ''",
+            "entry_decision_id": "INTEGER",
+            "entry_decision_age_sec": "REAL NOT NULL DEFAULT 0",
+            "entry_decision_fresh": "INTEGER NOT NULL DEFAULT 0",
+            "entry_decision_source": "TEXT NOT NULL DEFAULT ''",
+            "lifecycle_state": "TEXT NOT NULL DEFAULT ''",
+            "state_payload_json": "TEXT NOT NULL DEFAULT '{}'",
+            "last_material_change_at": "TEXT NOT NULL DEFAULT ''",
+            "quantity": "INTEGER NOT NULL DEFAULT 0",
+        }
+        transition_columns = {
+            "router_version": "TEXT NOT NULL DEFAULT ''",
+            "setup_generation": "INTEGER NOT NULL DEFAULT 1",
+            "setup_instance_id": "TEXT NOT NULL DEFAULT ''",
+            "theme_id": "TEXT NOT NULL DEFAULT ''",
+            "lifecycle_previous_state": "TEXT NOT NULL DEFAULT ''",
+            "lifecycle_current_state": "TEXT NOT NULL DEFAULT ''",
+        }
+        primary_columns = {
+            "router_version": "TEXT NOT NULL DEFAULT ''",
+            "setup_generation": "INTEGER NOT NULL DEFAULT 1",
+            "setup_instance_id": "TEXT NOT NULL DEFAULT ''",
+            "lifecycle_state": "TEXT NOT NULL DEFAULT ''",
+            "clear_reason": "TEXT NOT NULL DEFAULT ''",
+            "last_material_change_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in run_columns.items():
+            self._ensure_column("setup_router_runs", name, definition)
+        for name, definition in latest_columns.items():
+            self._ensure_column("setup_observations_latest", name, definition)
+        for name, definition in transition_columns.items():
+            self._ensure_column("setup_observation_transitions", name, definition)
+        for name, definition in primary_columns.items():
+            self._ensure_column("setup_router_primary_latest", name, definition)
+
     def _ensure_theme_state_runtime_columns(self) -> None:
         columns = {
             "state_entered_at": "TEXT NOT NULL DEFAULT ''",
@@ -16591,6 +17010,10 @@ def _row_to_setup_router_run(row: sqlite3.Row) -> dict:
     payload.setdefault("trade_date", data.get("trade_date", ""))
     payload.setdefault("calculated_at", data.get("calculated_at", ""))
     payload.setdefault("schema_version", data.get("schema_version", ""))
+    payload.setdefault("feature_schema_version", data.get("feature_schema_version", ""))
+    payload.setdefault("router_version", data.get("router_version", ""))
+    payload.setdefault("state_version", data.get("state_version", ""))
+    payload.setdefault("output_mode", data.get("output_mode", "OBSERVE"))
     payload.setdefault("enabled", bool(data.get("enabled")))
     payload.setdefault("observe_only", bool(data.get("observe_only")))
     for key in (
@@ -16626,6 +17049,18 @@ def _row_to_setup_observation(row: sqlite3.Row) -> dict:
     payload.setdefault("name", data.get("name", ""))
     payload.setdefault("calculated_at", data.get("calculated_at", ""))
     payload.setdefault("schema_version", data.get("schema_version", ""))
+    payload.setdefault("feature_schema_version", data.get("feature_schema_version", ""))
+    payload.setdefault("router_version", data.get("router_version", ""))
+    payload.setdefault("setup_generation", int(data.get("setup_generation") or 1))
+    payload.setdefault("setup_instance_id", data.get("setup_instance_id", ""))
+    payload.setdefault("state_version", data.get("state_version", ""))
+    payload.setdefault("post_subscription_tick_verified", bool(data.get("post_subscription_tick_verified")))
+    payload.setdefault("entry_decision_at", data.get("entry_decision_at", ""))
+    payload.setdefault("entry_decision_id", data.get("entry_decision_id"))
+    payload.setdefault("entry_decision_age_sec", _float_value(data.get("entry_decision_age_sec")))
+    payload.setdefault("entry_decision_fresh", bool(data.get("entry_decision_fresh")))
+    payload.setdefault("entry_decision_source", data.get("entry_decision_source", ""))
+    payload.setdefault("lifecycle_state", data.get("lifecycle_state", ""))
     payload.setdefault("router_status", data.get("router_status", ""))
     payload.setdefault("shape_status", data.get("shape_status", ""))
     payload.setdefault("context_status", data.get("context_status", ""))
@@ -16646,6 +17081,9 @@ def _row_to_setup_observation(row: sqlite3.Row) -> dict:
     payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
     payload.setdefault("price_structure", _safe_json_loads(data.pop("price_structure_json", "{}"), {}))
     payload.setdefault("safety", _safe_json_loads(data.pop("safety_json", "{}"), {}))
+    payload.setdefault("state_payload", _safe_json_loads(data.pop("state_payload_json", "{}"), {}))
+    payload.setdefault("last_material_change_at", data.get("last_material_change_at", ""))
+    payload.setdefault("quantity", int(data.get("quantity") or 0))
     payload.setdefault("updated_at", data.get("updated_at", ""))
     return payload
 
@@ -16661,6 +17099,9 @@ def _row_to_setup_observation_transition(row: sqlite3.Row) -> dict:
         "trade_date",
         "candidate_instance_id",
         "setup_type",
+        "theme_id",
+        "router_version",
+        "setup_instance_id",
         "candidate_id",
         "code",
         "name",
@@ -16673,8 +17114,11 @@ def _row_to_setup_observation_transition(row: sqlite3.Row) -> dict:
         "current_context_status",
         "previous_fingerprint",
         "current_fingerprint",
+        "lifecycle_previous_state",
+        "lifecycle_current_state",
     ):
         payload.setdefault(key, data.get(key, ""))
+    payload.setdefault("setup_generation", int(data.get("setup_generation") or 1))
     payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
     return payload
 
@@ -16702,8 +17146,66 @@ def _row_to_setup_router_primary(row: sqlite3.Row) -> dict:
     payload.setdefault("theme_state", data.get("theme_state", ""))
     payload.setdefault("stock_role", data.get("stock_role", ""))
     payload.setdefault("fingerprint", data.get("fingerprint", ""))
+    payload.setdefault("router_version", data.get("router_version", ""))
+    payload.setdefault("setup_generation", int(data.get("setup_generation") or 1))
+    payload.setdefault("setup_instance_id", data.get("setup_instance_id", ""))
+    payload.setdefault("lifecycle_state", data.get("lifecycle_state", ""))
+    payload.setdefault("clear_reason", data.get("clear_reason", ""))
+    payload.setdefault("last_material_change_at", data.get("last_material_change_at", ""))
     payload.setdefault("updated_at", data.get("updated_at", ""))
     return payload
+
+
+def _row_to_setup_router_state(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = {
+        "trade_date": data.get("trade_date", ""),
+        "candidate_instance_id": data.get("candidate_instance_id", ""),
+        "theme_id": data.get("theme_id", ""),
+        "setup_type": data.get("setup_type", ""),
+        "setup_generation": int(data.get("setup_generation") or 1),
+        "setup_instance_id": data.get("setup_instance_id", ""),
+        "code": data.get("code", ""),
+        "candidate_id": data.get("candidate_id"),
+        "lifecycle_state": data.get("lifecycle_state", ""),
+        "state_entered_at": data.get("state_entered_at", ""),
+        "first_seen_at": data.get("first_seen_at", ""),
+        "last_evaluated_at": data.get("last_evaluated_at", ""),
+        "last_material_change_at": data.get("last_material_change_at", ""),
+        "expires_at": data.get("expires_at", ""),
+        "context_id": data.get("context_id", ""),
+        "feature_fingerprint": data.get("feature_fingerprint", ""),
+        "state_payload": _safe_json_loads(data.get("state_payload_json", "{}"), {}),
+        "reason_codes": _safe_json_loads(data.get("reason_codes_json", "[]"), []),
+        "schema_version": data.get("schema_version", ""),
+        "router_version": data.get("router_version", ""),
+        "created_at": data.get("created_at", ""),
+        "updated_at": data.get("updated_at", ""),
+    }
+    return payload
+
+
+def _row_to_setup_router_state_transition(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    return {
+        "transition_id": data.get("transition_id", ""),
+        "created_at": data.get("created_at", ""),
+        "trade_date": data.get("trade_date", ""),
+        "candidate_instance_id": data.get("candidate_instance_id", ""),
+        "theme_id": data.get("theme_id", ""),
+        "setup_type": data.get("setup_type", ""),
+        "setup_generation": int(data.get("setup_generation") or 1),
+        "setup_instance_id": data.get("setup_instance_id", ""),
+        "code": data.get("code", ""),
+        "candidate_id": data.get("candidate_id"),
+        "previous_state": data.get("previous_state", ""),
+        "current_state": data.get("current_state", ""),
+        "occurred_at": data.get("occurred_at", ""),
+        "context_id": data.get("context_id", ""),
+        "feature_fingerprint": data.get("feature_fingerprint", ""),
+        "reason_codes": _safe_json_loads(data.get("reason_codes_json", "[]"), []),
+        "state_payload": _safe_json_loads(data.get("state_payload_json", "{}"), {}),
+    }
 
 
 def _row_to_position_runtime_snapshot(row: sqlite3.Row) -> dict:
@@ -17317,6 +17819,21 @@ def _setup_observation_db_values(
         str(payload.get("name") or ""),
         str(payload.get("calculated_at") or ""),
         str(payload.get("schema_version") or ""),
+        str(payload.get("feature_schema_version") or ""),
+        str(payload.get("router_version") or ""),
+        _safe_int(payload.get("setup_generation"), 1),
+        str(payload.get("setup_instance_id") or ""),
+        str(payload.get("state_version") or ""),
+        int(bool(payload.get("post_subscription_tick_verified", True))),
+        str(payload.get("entry_decision_at") or ""),
+        payload.get("entry_decision_id"),
+        _float_value(payload.get("entry_decision_age_sec")),
+        int(bool(payload.get("entry_decision_fresh"))),
+        str(payload.get("entry_decision_source") or ""),
+        str(payload.get("lifecycle_state") or ""),
+        _json_payload(payload.get("state_payload") or {}),
+        str(payload.get("last_material_change_at") or ""),
+        _safe_int(payload.get("quantity"), 0),
         str(payload.get("router_status") or ""),
         str(payload.get("shape_status") or ""),
         str(payload.get("context_status") or ""),
@@ -17339,6 +17856,31 @@ def _setup_observation_db_values(
         _json_payload(payload.get("safety") or {}),
         _json_payload(payload),
     )
+
+
+def _setup_state_transition_id(
+    trade_date: str,
+    candidate_instance_id: str,
+    theme_id: str,
+    setup_type: str,
+    generation: int,
+    previous_state: str,
+    current_state: str,
+    fingerprint: str,
+) -> str:
+    material = "|".join(
+        [
+            trade_date,
+            candidate_instance_id,
+            theme_id,
+            setup_type,
+            str(generation),
+            previous_state,
+            current_state,
+            fingerprint,
+        ]
+    )
+    return hashlib.sha1(material.encode("utf-8")).hexdigest()
 
 
 def _append_setup_filter(clauses: list[str], params: list[object], column: str, value: object) -> None:
