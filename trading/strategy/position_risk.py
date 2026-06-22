@@ -322,6 +322,8 @@ class PositionRuntimeService:
         snapshots: list[PositionRuntimeSnapshot] = []
         for position in list(loader() or []):
             candidate = self._candidate(getattr(position, "candidate_id", None), trade_date)
+            if candidate is not None and str(getattr(candidate, "trade_date", "") or "") not in {"", trade_date}:
+                continue
             details = dict(getattr(position, "details", {}) or {})
             source_type = str(details.get("position_source") or details.get("source_type") or "VIRTUAL").upper()
             code = str((candidate.code if candidate else "") or details.get("code") or "")
@@ -1328,7 +1330,7 @@ def position_risk_dashboard_payload(
         "calculated_at": data.get("calculated_at") or portfolio.get("calculated_at", ""),
         "trade_date": data.get("trade_date") or portfolio.get("trade_date", ""),
         "portfolio_risk_level": portfolio.get("risk_level", "NORMAL"),
-        "open_position_count": int(portfolio.get("open_position_count") or len(position_items)),
+        "open_position_count": _int_or_default(portfolio.get("open_position_count"), len(position_items)),
         "total_exposure": int(portfolio.get("total_exposure") or 0),
         "gross_exposure_limit_krw": int(portfolio.get("gross_exposure_limit_krw") or 0),
         "gross_open_exposure_krw": int(portfolio.get("gross_open_exposure_krw") or portfolio.get("total_exposure") or 0),
@@ -1367,9 +1369,15 @@ def position_risk_dashboard_section(db: Any, *, trade_date: str | None = None) -
     portfolio = portfolio_loader(trade_date=trade_date)
     if not portfolio:
         return {"status": "EMPTY", "output_mode": POSITION_RISK_OUTPUT_MODE, "live_order_allowed": False}
+    calculated_at = str(portfolio.get("calculated_at") or "")
+    risks = risk_loader(trade_date=trade_date)
+    positions = position_loader(trade_date=trade_date) if callable(position_loader) else []
+    if calculated_at:
+        risks = [item for item in risks if str(dict(item or {}).get("calculated_at") or "") == calculated_at]
+        positions = [item for item in positions if str(dict(item or {}).get("calculated_at") or "") == calculated_at]
     payload = position_risk_dashboard_payload(
-        {"trade_date": portfolio.get("trade_date", ""), "calculated_at": portfolio.get("calculated_at", ""), "position_risks": risk_loader(trade_date=trade_date), "portfolio_risk": portfolio},
-        positions=position_loader(trade_date=trade_date) if callable(position_loader) else [],
+        {"trade_date": portfolio.get("trade_date", ""), "calculated_at": calculated_at, "position_risks": risks, "portfolio_risk": portfolio},
+        positions=positions,
     )
     payload["status"] = "OK"
     return payload
@@ -1545,6 +1553,15 @@ def _float(value: Any, default: float = 0.0) -> float:
         return default
     try:
         return float(str(value).strip().replace(",", "").replace("%", ""))
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_or_default(value: Any, default: int = 0) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        return int(float(str(value).strip().replace(",", "")))
     except (TypeError, ValueError):
         return default
 

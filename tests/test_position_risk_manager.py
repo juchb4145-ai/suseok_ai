@@ -1,8 +1,9 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from storage.db import TradingDatabase
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.market_data import MarketDataStore
+from trading.strategy.models import Candidate, CandidateSourceType, CandidateState, VirtualPosition
 from trading.strategy.position_risk import (
     MarketSideBudgetAction,
     PortfolioRiskSnapshot,
@@ -10,7 +11,9 @@ from trading.strategy.position_risk import (
     PositionRiskConfig,
     PositionRiskManager,
     PositionRiskRuntimePipeline,
+    PositionRiskSnapshot,
     PositionRiskStatus,
+    PositionRuntimeService,
     PositionRuntimeSnapshot,
     position_risk_dashboard_section,
 )
@@ -98,6 +101,77 @@ def test_position_risk_runtime_pipeline_disabled_by_default(tmp_path):
 
     assert summary["status"] == "DISABLED"
     assert summary["output_mode"] == "OBSERVE"
+
+
+def test_position_runtime_skips_previous_trade_date_virtual_positions(tmp_path):
+    db = TradingDatabase(str(tmp_path / "test.db"))
+    old_candidate = db.save_candidate(
+        Candidate(
+            trade_date="2026-06-17",
+            code="200099",
+            name="Old Position",
+            sources=[CandidateSourceType.CONDITION_SEARCH],
+            state=CandidateState.WATCHING,
+        )
+    )
+    db.save_virtual_position(
+        VirtualPosition(
+            candidate_id=old_candidate.id,
+            virtual_order_id=1,
+            entry_price=1000,
+            quantity=10,
+            opened_at="2026-06-17T09:05:00",
+        )
+    )
+
+    result = PositionRuntimeService(db, market_data=MarketDataStore(), candle_builder=CandleBuilder()).build(
+        trade_date=TRADE_DATE,
+        now=NOW,
+        save=True,
+    )
+
+    assert result.positions == ()
+    assert db.latest_position_runtime_snapshots(trade_date=TRADE_DATE) == []
+
+
+def test_position_risk_dashboard_uses_portfolio_batch_when_positions_are_zero(tmp_path):
+    db = TradingDatabase(str(tmp_path / "test.db"))
+    old_at = (NOW - timedelta(seconds=30)).isoformat()
+    old_position = _position("virtual:old", "200098", calculated_at=old_at)
+    db.save_position_runtime_snapshots([old_position.to_dict()])
+    db.save_position_risk_snapshots(
+        [
+            PositionRiskSnapshot(
+                trade_date=TRADE_DATE,
+                calculated_at=old_at,
+                position_id=old_position.position_id,
+                candidate_id=old_position.candidate_id,
+                code=old_position.code,
+            ).to_dict()
+        ]
+    )
+    db.save_portfolio_risk_snapshot(
+        PortfolioRiskSnapshot(
+            trade_date=TRADE_DATE,
+            calculated_at=old_at,
+            open_position_count=1,
+            total_exposure=10000,
+        ).to_dict()
+    )
+    db.save_portfolio_risk_snapshot(
+        PortfolioRiskSnapshot(
+            trade_date=TRADE_DATE,
+            calculated_at=NOW.isoformat(),
+            open_position_count=0,
+            total_exposure=0,
+        ).to_dict()
+    )
+
+    section = position_risk_dashboard_section(db, trade_date=TRADE_DATE)
+
+    assert section["open_position_count"] == 0
+    assert section["positions"] == []
+    assert section["position_market_action_counts"] == {}
 
 
 def test_portfolio_snapshot_round_trips(tmp_path):
