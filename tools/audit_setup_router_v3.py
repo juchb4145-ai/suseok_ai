@@ -15,7 +15,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trade-date", default=datetime.now().date().isoformat())
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--limit", type=int, default=10000)
-    parser.add_argument("--router-version", default="setup_router_v3.4.1")
+    parser.add_argument("--router-version", default="setup_router_v3.5")
     parser.add_argument("--include-legacy-version", action="store_true")
     args = parser.parse_args(argv)
 
@@ -27,8 +27,8 @@ def main(argv: list[str] | None = None) -> int:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     try:
-        observations = _rows(con, "setup_observations_latest", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
-        transitions = _rows(con, "setup_observation_transitions", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
+        observations = _rows(con, "setup_observations_latest_v2", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
+        transitions = _rows(con, "setup_observation_transitions_v2", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
         states = _rows(con, "setup_router_state_v3", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
         state_transitions = _rows(con, "setup_router_state_transitions_v3", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
         runs = _rows(con, "setup_router_runs", trade_date, limit=1000, router_version=args.router_version)
@@ -37,6 +37,7 @@ def main(argv: list[str] | None = None) -> int:
         integrity = _state_integrity(con, trade_date, args.router_version)
         scheduling = _scheduling_checks(con, trade_date, args.router_version)
         side_effects = _side_effect_counts(con, trade_date)
+        span_metrics = _span_metrics(con, trade_date, args.router_version)
     finally:
         con.close()
 
@@ -47,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
     invalid = _invalid_observations(observations)
     flip_analysis = _flip_analysis(transitions)
     context_alignment = _context_alignment(observations)
-    run_span_min = _run_span_minutes(runs)
+    run_span_min = float(span_metrics.get("run_span_minutes") or 0.0)
     failures: list[str] = []
     warnings: list[str] = []
     if full_counts.get("observations", 0) == 0 and full_counts.get("runs", 0) == 0:
@@ -68,6 +69,12 @@ def main(argv: list[str] | None = None) -> int:
         failures.append("TEMPORAL_STATE_ROWS_MISSING")
     if full_counts.get("eligible_runtime", 0) == 0 and full_counts.get("observations", 0) > 0:
         warnings.append("CANDIDATE_RUNTIME_SAMPLE_MISSING")
+    if full_counts.get("valid_market_closed", 0) > 0:
+        failures.append("VALID_IN_MARKET_CLOSED_SQL")
+    if full_counts.get("valid_post_subscription_unverified", 0) > 0:
+        failures.append("VALID_WITH_POST_SUBSCRIPTION_TICK_MISSING_SQL")
+    if full_counts.get("valid_tr_backfill", 0) > 0:
+        failures.append("VALID_WITH_TR_BACKFILL_SQL")
     if any(row.get("router_status") == "VALID_OBSERVE" and not bool(row.get("post_subscription_tick_verified", True)) for row in observations):
         failures.append("VALID_WITH_POST_SUBSCRIPTION_TICK_MISSING")
     if any(row.get("router_status") == "VALID_OBSERVE" and row.get("session_phase") in {"CLOSING_RISK", "MARKET_CLOSED"} for row in observations):
@@ -88,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     verdict = "STABLE_FOR_OPPORTUNITY_RANKER" if stable_ready else "NOT_STABLE" if failures else "CONDITIONALLY_STABLE"
     summary = {
-        "schema_version": "setup_router_v3.audit.v4.1",
+        "schema_version": "setup_router_v3.audit.v5",
         "trade_date": trade_date,
         "router_version": args.router_version,
         "db_path": str(db_path),
@@ -110,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "full_counts": full_counts,
         "run_span_minutes": run_span_min,
+        "span_metrics": span_metrics,
         "type_counts": dict(type_counts),
         "status_counts": dict(status_counts),
         "shape_counts": dict(shape_counts),
@@ -330,8 +338,12 @@ def _source_count(con: sqlite3.Connection, table: str, trade_date: str) -> int:
 
 def _full_counts(con: sqlite3.Connection, trade_date: str, router_version: str) -> dict[str, int]:
     return {
-        "observations": _count(con, "setup_observations_latest", trade_date, router_version=router_version),
-        "valid_observe": _count(con, "setup_observations_latest", trade_date, router_version=router_version, extra="router_status = 'VALID_OBSERVE'"),
+        "observations": _count(con, "setup_observations_latest_v2", trade_date, router_version=router_version),
+        "valid_observe": _count(con, "setup_observations_latest_v2", trade_date, router_version=router_version, extra="router_status = 'VALID_OBSERVE'"),
+        "valid_market_closed": _count(con, "setup_observations_latest_v2", trade_date, router_version=router_version, extra="router_status = 'VALID_OBSERVE' AND session_phase = 'MARKET_CLOSED'"),
+        "valid_post_subscription_unverified": _count(con, "setup_observations_latest_v2", trade_date, router_version=router_version, extra="router_status = 'VALID_OBSERVE' AND post_subscription_tick_verified = 0"),
+        "valid_tr_backfill": _count(con, "setup_observations_latest_v2", trade_date, router_version=router_version, extra="router_status = 'VALID_OBSERVE' AND payload_json LIKE '%TR_BACKFILL%'"),
+        "commits": _count(con, "setup_router_evaluation_commits_v1", trade_date, router_version=router_version),
         "states": _count(con, "setup_router_state_v3", trade_date, router_version=router_version),
         "state_transitions": _count(con, "setup_router_state_transitions_v3", trade_date, router_version=router_version),
         "runs": _count(con, "setup_router_runs", trade_date, router_version=router_version),
@@ -376,6 +388,10 @@ def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: s
         "version_mismatch_row_count": 0,
     }
     for table in (
+        "setup_observations_latest_v2",
+        "setup_observation_transitions_v2",
+        "setup_router_primary_latest_v2",
+        "setup_router_evaluation_commits_v1",
         "setup_router_state_v3",
         "setup_router_state_transitions_v3",
         "setup_router_candidate_runtime_v4",
@@ -469,6 +485,7 @@ def _scheduling_checks(con: sqlite3.Connection, trade_date: str, router_version:
         "run_sample_count": 0,
         "pending_queue_count": 0,
         "retry_queue_count": 0,
+        "failed_permanent_count": 0,
         "retry_due_count": 0,
         "stale_selected_count": 0,
         "invalid_pending_epoch_count": 0,
@@ -493,13 +510,14 @@ def _scheduling_checks(con: sqlite3.Connection, trade_date: str, router_version:
                 """
                 SELECT *
                 FROM setup_router_pending_evaluations_v5
-                WHERE trade_date = ? AND router_version = ? AND status IN ('PENDING','RETRY','SELECTED')
+                WHERE trade_date = ? AND router_version = ? AND status IN ('PENDING','RETRY','SELECTED','FAILED_PERMANENT')
                 """,
                 (trade_date, router_version),
             ).fetchall()
         ]
         metrics["pending_queue_count"] = len(pending_rows)
         metrics["retry_queue_count"] = sum(1 for row in pending_rows if row.get("status") == "RETRY")
+        metrics["failed_permanent_count"] = sum(1 for row in pending_rows if row.get("status") == "FAILED_PERMANENT")
         now = max([_parse_time(row.get("calculated_at")) for row in rows if _parse_time(row.get("calculated_at")) is not None], default=datetime.now())
         metrics["retry_due_count"] = sum(
             1
@@ -526,6 +544,8 @@ def _scheduling_checks(con: sqlite3.Connection, trade_date: str, router_version:
             failures.append("SETUP_ROUTER_SELECTED_LEASE_STALE")
         if metrics["invalid_pending_epoch_count"] > 0:
             failures.append("SETUP_ROUTER_PENDING_EPOCH_INVALID")
+        if metrics["failed_permanent_count"] > 0:
+            failures.append("SETUP_ROUTER_FAILED_PERMANENT_PRESENT")
         if metrics["oldest_pending_age_sec"] > 300:
             failures.append("SETUP_ROUTER_PENDING_BACKLOG_STALE")
     if _has_table(con, "setup_router_candidate_runtime_v4"):
@@ -631,6 +651,51 @@ def _run_span_minutes(runs: list[dict[str, Any]]) -> float:
     if len(times) < 2:
         return 0.0
     return round((max(times) - min(times)).total_seconds() / 60.0, 3)
+
+
+def _span_metrics(con: sqlite3.Connection, trade_date: str, router_version: str) -> dict[str, Any]:
+    run_first = run_last = ""
+    obs_first = obs_last = ""
+    if _has_table(con, "setup_router_runs"):
+        row = con.execute(
+            """
+            SELECT MIN(calculated_at) AS first_at, MAX(calculated_at) AS last_at
+            FROM setup_router_runs
+            WHERE trade_date = ? AND router_version = ?
+            """,
+            (trade_date, router_version),
+        ).fetchone()
+        if row:
+            run_first = str(row["first_at"] or "")
+            run_last = str(row["last_at"] or "")
+    if _has_table(con, "setup_observations_latest_v2"):
+        row = con.execute(
+            """
+            SELECT MIN(calculated_at) AS first_at, MAX(calculated_at) AS last_at
+            FROM setup_observations_latest_v2
+            WHERE trade_date = ? AND router_version = ?
+            """,
+            (trade_date, router_version),
+        ).fetchone()
+        if row:
+            obs_first = str(row["first_at"] or "")
+            obs_last = str(row["last_at"] or "")
+    return {
+        "first_run_at": run_first,
+        "last_run_at": run_last,
+        "run_span_minutes": _span_between(run_first, run_last),
+        "first_observation_at": obs_first,
+        "last_observation_at": obs_last,
+        "observation_span_minutes": _span_between(obs_first, obs_last),
+    }
+
+
+def _span_between(first: str, last: str) -> float:
+    start = _parse_time(first)
+    end = _parse_time(last)
+    if start is None or end is None:
+        return 0.0
+    return round(max(0.0, (end - start).total_seconds() / 60.0), 3)
 
 
 def _parse_time(value: Any) -> datetime | None:

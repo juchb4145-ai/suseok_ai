@@ -11,9 +11,9 @@ from typing import Any, Iterable, Mapping
 from trading.strategy.setup_features import SETUP_ROUTER_FEATURE_SCHEMA_VERSION, SetupFeatureSnapshot
 
 
-SETUP_ROUTER_SCHEMA_VERSION = "setup_router_v3.observe.v4.1"
-SETUP_ROUTER_VERSION = "setup_router_v3.4.1"
-SETUP_ROUTER_STATE_VERSION = "setup_router_v3.state.v3.1"
+SETUP_ROUTER_SCHEMA_VERSION = "setup_router_v3.observe.v5"
+SETUP_ROUTER_VERSION = "setup_router_v3.5"
+SETUP_ROUTER_STATE_VERSION = "setup_router_v3.state.v3.2"
 SETUP_ROUTER_OUTPUT_MODE = "OBSERVE"
 
 
@@ -717,20 +717,33 @@ class SetupRouterV3:
 
     def _apply_session_shape_guard(self, hypothesis: SetupHypothesis, feature: SetupFeatureSnapshot) -> SetupHypothesis:
         session_phase = feature.session_phase.upper()
-        if bool(dict(hypothesis.state_payload or {}).get("terminal_lock")):
-            return hypothesis
-        if session_phase == "MARKET_CLOSED" and hypothesis.shape_status in {SetupShapeStatus.FORMING, SetupShapeStatus.MATCHED, SetupShapeStatus.DATA_WAIT}:
+        if session_phase == "MARKET_CLOSED" and hypothesis.lifecycle_state in {SetupLifecycleState.FORMING, SetupLifecycleState.MATCHED, SetupLifecycleState.SEEKING} and hypothesis.shape_status not in {SetupShapeStatus.INVALIDATED, SetupShapeStatus.EXPIRED}:
+            previous_payload = dict(hypothesis.state_payload or {})
+            terminal_at = hypothesis.terminal_at or str(previous_payload.get("terminal_at") or feature.calculated_at)
+            matched_at = str(previous_payload.get("matched_at") or terminal_at) if hypothesis.lifecycle_state == SetupLifecycleState.MATCHED else str(previous_payload.get("matched_at") or "")
             return _replace_hypothesis(
                 hypothesis,
                 shape_status=SetupShapeStatus.EXPIRED,
                 lifecycle_state=SetupLifecycleState.EXPIRED,
                 detector_phase="EXPIRED",
                 expired_at=feature.calculated_at,
-                terminal_at=feature.calculated_at,
-                state_payload={**dict(hypothesis.state_payload or {}), "phase": "EXPIRED", "expired_at": feature.calculated_at, "expired_reason": "SETUP_MARKET_CLOSED_EXPIRE", "terminal_at": feature.calculated_at},
+                terminal_at=terminal_at,
+                state_payload={
+                    **previous_payload,
+                    "phase": "EXPIRED",
+                    "expired_at": feature.calculated_at,
+                    "expired_reason": "SETUP_MARKET_CLOSED_EXPIRE",
+                    "terminal_at": terminal_at,
+                    "matched_at": matched_at,
+                    "session_expired_at": feature.calculated_at,
+                    "observation_active": False,
+                    "qualification_active": False,
+                },
                 reason_codes=tuple(_dedupe([*hypothesis.reason_codes, "SETUP_MARKET_CLOSED_EXPIRE"])),
                 quality_score=0.0,
             )
+        if bool(dict(hypothesis.state_payload or {}).get("terminal_lock")):
+            return hypothesis
         if session_phase == "OPENING_DISCOVERY" and hypothesis.shape_status == SetupShapeStatus.MATCHED and feature.completed_1m_count < self.config.min_completed_1m_candles:
             return _replace_hypothesis(
                 hypothesis,

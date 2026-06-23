@@ -98,6 +98,52 @@ def test_matched_terminal_expires_after_ttl_even_with_terminal_lock(tmp_path):
     assert vwap.terminal_at == "2026-06-22T09:05:00"
 
 
+def test_market_closed_expires_matched_even_with_terminal_lock(tmp_path):
+    db = TradingDatabase(str(tmp_path / "market-close-terminal.db"))
+    market_data = MarketDataStore()
+    candles = CandleBuilder()
+    candidate = _candidate(db)
+    _seed_candles(market_data, candles, closes=[980, 970, 960, 1002, 1008], vwap=1000)
+    context = {**_context(), "session_phase": "MARKET_CLOSED", "market": {**_context()["market"], "market_session_status": "CLOSED"}}
+    previous = {
+        "trade_date": TRADE_DATE,
+        "candidate_instance_id": "ci-000001",
+        "theme_id": "ai",
+        "setup_type": "VWAP_RECLAIM",
+        "shape_status": "MATCHED",
+        "lifecycle_state": "MATCHED",
+        "setup_generation": 1,
+        "setup_instance_id": "vwap-1",
+        "terminal_at": "2026-06-22T15:19:00",
+        "expires_at": "2026-06-22T15:30:00",
+        "state_payload": {
+            "phase": "MATCHED",
+            "terminal_at": "2026-06-22T15:19:00",
+            "terminal_lock": True,
+            "observation_active": True,
+            "qualification_active": True,
+        },
+    }
+    feature = SetupFeatureBuilder(market_data, candles, min_completed_1m_candles=3).build(
+        candidate,
+        now=datetime(2026, 6, 22, 15, 20, 0),
+        strategy_context=context,
+        entry_decision=_entry_decision(),
+        setup_states={"VWAP_RECLAIM": previous},
+    )
+
+    observations = SetupRouterV3(SetupRouterConfig(enabled=True)).classify(feature)
+    vwap = next(item for item in observations if item.setup_type == "VWAP_RECLAIM")
+
+    assert vwap.shape_status == "EXPIRED"
+    assert vwap.lifecycle_state == "EXPIRED"
+    assert vwap.router_status == "EXPIRED"
+    assert "SETUP_MARKET_CLOSED_EXPIRE" in vwap.reason_codes
+    assert vwap.state_payload["observation_active"] is False
+    assert vwap.state_payload["qualification_active"] is False
+    assert vwap.terminal_at == "2026-06-22T15:19:00"
+
+
 def test_vwap_anchor_is_fixed_for_active_generation(tmp_path):
     db = TradingDatabase(str(tmp_path / "vwap-anchor.db"))
     market_data = MarketDataStore()

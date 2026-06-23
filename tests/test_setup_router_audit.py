@@ -95,8 +95,8 @@ def test_setup_router_audit_fails_terminal_revival_same_generation(tmp_path):
         (
             "terminal-revival-1",
             TRADE_DATE,
-            "setup_router_v3.4.1",
-            "setup_router_v3.state.v3.1",
+            "setup_router_v3.5",
+            "setup_router_v3.state.v3.2",
             "ci-1",
             "ai",
             "VWAP_RECLAIM",

@@ -4,6 +4,7 @@ import json
 import hashlib
 import sqlite3
 from collections import Counter
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Union
@@ -33,7 +34,7 @@ from trading.strategy.models import (
 from trading.strategy.conditions import ConditionProfile
 
 
-_CURRENT_SETUP_ROUTER_VERSION = "setup_router_v3.4.1"
+_CURRENT_SETUP_ROUTER_VERSION = "setup_router_v3.5"
 
 
 class TradingDatabase:
@@ -50,6 +51,9 @@ class TradingDatabase:
         self.conn.execute("PRAGMA busy_timeout = 5000")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA synchronous = NORMAL")
+
+    def _write_scope(self):
+        return nullcontext() if self.conn.in_transaction else self.conn
 
     def _migrate(self) -> None:
         self._archive_legacy_theme_mappings()
@@ -1148,6 +1152,159 @@ class TradingDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_setup_router_primary_latest_trade_status
                 ON setup_router_primary_latest(trade_date, router_status, code);
+            CREATE TABLE IF NOT EXISTS setup_observations_latest_v2 (
+                trade_date TEXT NOT NULL,
+                router_version TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                setup_type TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                calculated_at TEXT NOT NULL,
+                schema_version TEXT NOT NULL DEFAULT '',
+                feature_schema_version TEXT NOT NULL DEFAULT '',
+                setup_generation INTEGER NOT NULL DEFAULT 1,
+                setup_instance_id TEXT NOT NULL DEFAULT '',
+                state_version TEXT NOT NULL DEFAULT '',
+                post_subscription_tick_verified INTEGER NOT NULL DEFAULT 1,
+                entry_decision_at TEXT NOT NULL DEFAULT '',
+                entry_decision_id INTEGER,
+                entry_decision_age_sec REAL NOT NULL DEFAULT 0,
+                entry_decision_fresh INTEGER NOT NULL DEFAULT 0,
+                entry_decision_source TEXT NOT NULL DEFAULT '',
+                lifecycle_state TEXT NOT NULL DEFAULT '',
+                state_payload_json TEXT NOT NULL DEFAULT '{}',
+                last_material_change_at TEXT NOT NULL DEFAULT '',
+                quantity INTEGER NOT NULL DEFAULT 0,
+                router_status TEXT NOT NULL DEFAULT '',
+                shape_status TEXT NOT NULL DEFAULT '',
+                context_status TEXT NOT NULL DEFAULT '',
+                entry_alignment_status TEXT NOT NULL DEFAULT '',
+                primary_setup INTEGER NOT NULL DEFAULT 0,
+                setup_quality_score REAL NOT NULL DEFAULT 0,
+                context_id TEXT NOT NULL DEFAULT '',
+                theme_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                theme_state TEXT NOT NULL DEFAULT '',
+                leadership_status TEXT NOT NULL DEFAULT '',
+                stock_role TEXT NOT NULL DEFAULT '',
+                market_side TEXT NOT NULL DEFAULT '',
+                market_action TEXT NOT NULL DEFAULT '',
+                session_phase TEXT NOT NULL DEFAULT '',
+                current_price REAL NOT NULL DEFAULT 0,
+                fingerprint TEXT NOT NULL DEFAULT '',
+                observation_fingerprint TEXT NOT NULL DEFAULT '',
+                material_state_fingerprint TEXT NOT NULL DEFAULT '',
+                detector_phase TEXT NOT NULL DEFAULT '',
+                material_change_kind TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                expired_at TEXT NOT NULL DEFAULT '',
+                terminal_at TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                price_structure_json TEXT NOT NULL DEFAULT '{}',
+                safety_json TEXT NOT NULL DEFAULT '{}',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, router_version, candidate_instance_id, setup_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_observations_latest_v2_trade_status
+                ON setup_observations_latest_v2(trade_date, router_version, router_status, calculated_at);
+            CREATE INDEX IF NOT EXISTS idx_setup_observations_latest_v2_type_lifecycle
+                ON setup_observations_latest_v2(trade_date, router_version, setup_type, lifecycle_state);
+            CREATE INDEX IF NOT EXISTS idx_setup_observations_latest_v2_candidate
+                ON setup_observations_latest_v2(candidate_instance_id, router_version, setup_type);
+            CREATE TABLE IF NOT EXISTS setup_observation_transitions_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                router_version TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                setup_type TEXT NOT NULL,
+                theme_id TEXT NOT NULL DEFAULT '',
+                setup_generation INTEGER NOT NULL DEFAULT 1,
+                setup_instance_id TEXT NOT NULL DEFAULT '',
+                lifecycle_previous_state TEXT NOT NULL DEFAULT '',
+                lifecycle_current_state TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                transitioned_at TEXT NOT NULL,
+                previous_router_status TEXT NOT NULL DEFAULT '',
+                current_router_status TEXT NOT NULL DEFAULT '',
+                previous_shape_status TEXT NOT NULL DEFAULT '',
+                current_shape_status TEXT NOT NULL DEFAULT '',
+                previous_context_status TEXT NOT NULL DEFAULT '',
+                current_context_status TEXT NOT NULL DEFAULT '',
+                previous_fingerprint TEXT NOT NULL DEFAULT '',
+                current_fingerprint TEXT NOT NULL DEFAULT '',
+                detector_phase_from TEXT NOT NULL DEFAULT '',
+                detector_phase_to TEXT NOT NULL DEFAULT '',
+                material_change_kind TEXT NOT NULL DEFAULT '',
+                material_state_fingerprint_from TEXT NOT NULL DEFAULT '',
+                material_state_fingerprint_to TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_observation_transitions_v2_trade
+                ON setup_observation_transitions_v2(trade_date, router_version, transitioned_at, id);
+            CREATE INDEX IF NOT EXISTS idx_setup_observation_transitions_v2_candidate
+                ON setup_observation_transitions_v2(candidate_instance_id, router_version, setup_type);
+            CREATE TABLE IF NOT EXISTS setup_router_primary_latest_v2 (
+                trade_date TEXT NOT NULL,
+                router_version TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                calculated_at TEXT NOT NULL,
+                setup_type TEXT NOT NULL DEFAULT '',
+                router_status TEXT NOT NULL DEFAULT '',
+                shape_status TEXT NOT NULL DEFAULT '',
+                context_status TEXT NOT NULL DEFAULT '',
+                entry_alignment_status TEXT NOT NULL DEFAULT '',
+                setup_quality_score REAL NOT NULL DEFAULT 0,
+                context_id TEXT NOT NULL DEFAULT '',
+                theme_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                theme_state TEXT NOT NULL DEFAULT '',
+                stock_role TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '',
+                setup_generation INTEGER NOT NULL DEFAULT 1,
+                setup_instance_id TEXT NOT NULL DEFAULT '',
+                lifecycle_state TEXT NOT NULL DEFAULT '',
+                clear_reason TEXT NOT NULL DEFAULT '',
+                last_material_change_at TEXT NOT NULL DEFAULT '',
+                primary_active INTEGER NOT NULL DEFAULT 1,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, router_version, candidate_instance_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_primary_latest_v2_active
+                ON setup_router_primary_latest_v2(trade_date, router_version, primary_active, updated_at);
+            CREATE TABLE IF NOT EXISTS setup_router_evaluation_commits_v1 (
+                evaluation_commit_id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL,
+                router_version TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                pending_instance_id TEXT NOT NULL DEFAULT '',
+                pending_epoch INTEGER NOT NULL DEFAULT 0,
+                commit_status TEXT NOT NULL DEFAULT '',
+                state_write_count INTEGER NOT NULL DEFAULT 0,
+                observation_write_count INTEGER NOT NULL DEFAULT 0,
+                transition_write_count INTEGER NOT NULL DEFAULT 0,
+                primary_write_count INTEGER NOT NULL DEFAULT 0,
+                committed_at TEXT NOT NULL DEFAULT '',
+                payload_hash TEXT NOT NULL DEFAULT '',
+                error_class TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_evaluation_commits_v1_trade
+                ON setup_router_evaluation_commits_v1(trade_date, router_version, committed_at);
+            CREATE INDEX IF NOT EXISTS idx_setup_router_evaluation_commits_v1_candidate
+                ON setup_router_evaluation_commits_v1(candidate_instance_id, pending_instance_id);
             CREATE TABLE IF NOT EXISTS setup_router_state_v2 (
                 trade_date TEXT NOT NULL,
                 candidate_instance_id TEXT NOT NULL,
@@ -1391,6 +1548,7 @@ class TradingDatabase:
                 selected_at TEXT NOT NULL DEFAULT '',
                 completed_at TEXT NOT NULL DEFAULT '',
                 superseded_at TEXT NOT NULL DEFAULT '',
+                failed_permanent_at TEXT NOT NULL DEFAULT '',
                 next_retry_at TEXT NOT NULL DEFAULT '',
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 failure_count INTEGER NOT NULL DEFAULT 0,
@@ -1403,6 +1561,7 @@ class TradingDatabase:
                 theme_signature TEXT NOT NULL DEFAULT '',
                 lease_signature TEXT NOT NULL DEFAULT '',
                 ttl_signature TEXT NOT NULL DEFAULT '',
+                evaluation_commit_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(trade_date, router_version, candidate_instance_id)
@@ -3419,7 +3578,7 @@ class TradingDatabase:
         self.conn.commit()
 
     def save_order_result(self, result: BrokerOrderResult) -> None:
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 "INSERT INTO order_results(ok, result_code, message, request_json) VALUES (?, ?, ?, ?)",
                 (
@@ -3432,7 +3591,7 @@ class TradingDatabase:
         self._sync_live_sim_order_result(result)
 
     def save_execution(self, event: BrokerExecutionEvent) -> None:
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO executions(
@@ -3951,7 +4110,7 @@ class TradingDatabase:
         now = payload.get("created_at") or payload.get("updated_at") or ""
         payload.setdefault("created_at", now)
         payload.setdefault("updated_at", payload["created_at"])
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO runtime_order_intents(
@@ -4003,7 +4162,7 @@ class TradingDatabase:
             fields.append("reason = ?")
             params.append(reason)
         params.append(intent_id)
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 f"UPDATE runtime_order_intents SET {', '.join(fields)} WHERE intent_id = ?",
                 tuple(params),
@@ -4013,7 +4172,7 @@ class TradingDatabase:
     def link_runtime_order_intent_review(self, intent_id: str, trade_review_id: int) -> bool:
         from trading.broker.models import utc_timestamp
 
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 UPDATE runtime_order_intents
@@ -4098,7 +4257,7 @@ class TradingDatabase:
         if not rows:
             return 0
         before = self.conn.total_changes
-        with self.conn:
+        with self._write_scope():
             self.conn.executemany(
                 """
                 INSERT OR IGNORE INTO gateway_price_ticks(
@@ -4127,7 +4286,7 @@ class TradingDatabase:
         for event in rows:
             trace_rows.extend(_buy_zero_trace_events_from_strategy_decision_event(event))
         before = self.conn.total_changes
-        with self.conn:
+        with self._write_scope():
             self.conn.executemany(
                 """
                 INSERT OR IGNORE INTO strategy_decision_events(
@@ -4263,7 +4422,7 @@ class TradingDatabase:
         if not rows:
             return 0
         before = self.conn.total_changes
-        with self.conn:
+        with self._write_scope():
             self._save_buy_zero_trace_events_no_commit(rows)
         return int(self.conn.total_changes - before)
 
@@ -4541,7 +4700,7 @@ class TradingDatabase:
                     :details_json, :created_at, :updated_at
                 )
                 """
-        with self.conn:
+        with self._write_scope():
             self.conn.executemany(sql, rows)
         return int(self.conn.total_changes - before)
 
@@ -4820,7 +4979,7 @@ class TradingDatabase:
                     :details_json, :created_at, :updated_at
                 )
                 """
-        with self.conn:
+        with self._write_scope():
             self.conn.executemany(sql, rows)
         return int(self.conn.total_changes - before)
 
@@ -4950,7 +5109,7 @@ class TradingDatabase:
         if not replay_id:
             raise ValueError("replay_id is required")
         now = datetime.now().isoformat(timespec="seconds")
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO strategy_replay_runs(
@@ -5050,7 +5209,7 @@ class TradingDatabase:
         if not replay_id:
             raise ValueError("replay_id is required")
         now = datetime.now().isoformat(timespec="seconds")
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO strategy_replay_reports(
@@ -5141,7 +5300,7 @@ class TradingDatabase:
         if not rows:
             return 0
         before = self.conn.total_changes
-        with self.conn:
+        with self._write_scope():
             self.conn.executemany(
                 """
                 INSERT INTO strategy_change_proposals(
@@ -5273,7 +5432,7 @@ class TradingDatabase:
         if not rows:
             return 0
         before = self.conn.total_changes
-        with self.conn:
+        with self._write_scope():
             self.conn.executemany(
                 """
                 INSERT INTO strategy_change_evidence(
@@ -5343,7 +5502,7 @@ class TradingDatabase:
             raise ValueError("proposal_id is required")
         approval_id = str(approval.get("approval_id") or f"approval:{proposal_id}:{uuid4().hex}")
         created_at = str(approval.get("created_at") or datetime.now().isoformat(timespec="seconds"))
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO strategy_change_approvals(
@@ -5404,7 +5563,7 @@ class TradingDatabase:
         config_hash = str(snapshot.get("config_hash") or "")
         if not config_hash:
             raise ValueError("config_hash is required")
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO strategy_config_snapshots(
@@ -5536,7 +5695,7 @@ class TradingDatabase:
 
     def save_live_sim_order(self, record: dict) -> dict:
         payload = _live_sim_order_params(record)
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO live_sim_orders(
@@ -5785,7 +5944,7 @@ class TradingDatabase:
 
     def save_live_sim_cancel_order(self, record: dict) -> dict:
         payload = _live_sim_cancel_params(record)
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO live_sim_cancel_orders(
@@ -5906,7 +6065,7 @@ class TradingDatabase:
 
     def save_live_sim_fill_event(self, payload: dict) -> tuple[bool, dict]:
         params = _live_sim_fill_params(payload)
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT OR IGNORE INTO live_sim_fill_events(
@@ -6041,7 +6200,7 @@ class TradingDatabase:
                 current["closed_at"] = now
         current["updated_at"] = now
         params = _live_sim_position_params(current)
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO live_sim_positions(
@@ -6085,7 +6244,7 @@ class TradingDatabase:
 
     def save_live_sim_position(self, record: dict) -> dict:
         params = _live_sim_position_params(record)
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO live_sim_positions(
@@ -6178,7 +6337,7 @@ class TradingDatabase:
             from trading.broker.models import utc_timestamp
 
             updated_at = utc_timestamp()
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO live_sim_runtime_health(
@@ -6222,7 +6381,7 @@ class TradingDatabase:
 
     def save_live_sim_reconcile_event(self, payload: dict) -> dict:
         params = _live_sim_reconcile_params(payload)
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO live_sim_reconcile_events(
@@ -6673,7 +6832,7 @@ class TradingDatabase:
         recommendations = list(report.get("recommendations") or [])
         filters = dict(report.get("filters") or {})
         items = list(report.get("items") or [])
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO dry_run_performance_reports(
@@ -6784,7 +6943,7 @@ class TradingDatabase:
         recommendations = list(report.get("recommendations") or [])
         filters = dict(report.get("filters") or {})
         items = list(report.get("items") or [])
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO live_sim_canary_performance_reports(
@@ -6946,7 +7105,7 @@ class TradingDatabase:
         blocking = list(snapshot.get("blocking_reasons") or [])
         warnings = list(snapshot.get("warning_reasons") or [])
         payload_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, default=str)
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO live_sim_preflight_snapshots(
@@ -7005,7 +7164,7 @@ class TradingDatabase:
         payload = _live_sim_canary_decision_params(decision)
         if not payload["decision_id"]:
             raise ValueError("decision_id is required")
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO live_sim_canary_decisions(
@@ -7139,7 +7298,7 @@ class TradingDatabase:
         results = dict(report.get("results") or {})
         recommendations = list(report.get("recommendations") or [])
         filters = dict(report.get("filters") or {})
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO dry_run_threshold_ab_reports(
@@ -7254,7 +7413,7 @@ class TradingDatabase:
         sample_id = str(sample.get("sample_id") or "")
         if not sample_id:
             raise ValueError("sample_id is required")
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO gateway_transport_latency_samples(
@@ -7407,7 +7566,7 @@ class TradingDatabase:
         metadata = _safe_json_loads(row["metadata_json"], {})
         stage.update({key: value for key, value in dict(stage_updates or {}).items() if value is not None})
         metadata.update({key: value for key, value in dict(metadata_updates or {}).items() if value is not None})
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 UPDATE gateway_transport_latency_samples
@@ -7536,7 +7695,7 @@ class TradingDatabase:
         report_id = str(report.get("report_id") or "")
         if not report_id:
             raise ValueError("report_id is required")
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO gateway_transport_latency_reports(
@@ -7588,7 +7747,7 @@ class TradingDatabase:
     def prune_gateway_transport_latency_samples(self, older_than_sec: int) -> int:
         if older_than_sec <= 0:
             return 0
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 DELETE FROM gateway_transport_latency_samples
@@ -7599,7 +7758,7 @@ class TradingDatabase:
         return int(cursor.rowcount or 0)
 
     def save_candidate(self, candidate: Candidate) -> Candidate:
-        with self.conn:
+        with self._write_scope():
             return self._save_candidate_no_commit(candidate)
 
     def load_candidate(self, trade_date: str, code: str) -> Optional[Candidate]:
@@ -7673,7 +7832,7 @@ class TradingDatabase:
         return int(row["count"] if row else 0)
 
     def save_candidate_event(self, event: CandidateEvent) -> CandidateEvent:
-        with self.conn:
+        with self._write_scope():
             return self._save_candidate_event_no_commit(event)
 
     def list_candidate_events(self, candidate_id: int) -> list[CandidateEvent]:
@@ -7685,7 +7844,7 @@ class TradingDatabase:
 
     def save_candidate_state_transition(self, transition) -> dict:
         payload = _candidate_state_transition_payload(transition)
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO candidate_state_transitions(
@@ -7764,7 +7923,7 @@ class TradingDatabase:
         }
 
     def save_candidate_with_events(self, candidate: Candidate, events: Iterable[CandidateEvent]) -> Candidate:
-        with self.conn:
+        with self._write_scope():
             saved = self._save_candidate_no_commit(candidate)
             for event in events:
                 if event.candidate_id is None:
@@ -7780,7 +7939,7 @@ class TradingDatabase:
 
     def save_candidate_source_event(self, event: dict) -> dict:
         payload = dict(event or {})
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO candidate_source_events(
@@ -7843,7 +8002,7 @@ class TradingDatabase:
     def save_candidate_hydration_request(self, request: dict) -> dict:
         payload = dict(request or {})
         command_id = str(payload.get("command_id") or "")
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO candidate_hydration_requests(
@@ -7890,7 +8049,7 @@ class TradingDatabase:
         status: str,
         result_status: str = "",
     ) -> bool:
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 UPDATE candidate_hydration_requests
@@ -7926,7 +8085,7 @@ class TradingDatabase:
 
     def save_candidate_hydration_result(self, result: dict) -> dict:
         payload = dict(result or {})
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO candidate_hydration_results(
@@ -7994,7 +8153,7 @@ class TradingDatabase:
         calculated_at = str(payload.get("calculated_at") or "")
         top_themes = list(payload.get("top_themes") or [])
         stocks = list(payload.get("stocks") or [])
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO theme_board_snapshots(
@@ -8124,7 +8283,7 @@ class TradingDatabase:
         leader_stability_sec = _safe_int(payload.get("leader_stability_sec"), 0)
         last_strong_at = str(payload.get("last_strong_at") or "")
         last_fresh_signal_at = str(payload.get("last_fresh_signal_at") or "")
-        with self.conn:
+        with self._write_scope():
             previous = self.load_theme_state_runtime(trade_date=trade_date, theme_id=theme_id)
             self.conn.execute(
                 """
@@ -8253,7 +8412,7 @@ class TradingDatabase:
         theme_id = str(payload.get("theme_id") or "")
         if not trade_date or not theme_id:
             return {}
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO theme_leadership_latest(
@@ -8340,7 +8499,7 @@ class TradingDatabase:
         theme_id = str(payload.get("theme_id") or "")
         if not trade_date or not theme_id:
             return {}
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO theme_leadership_transitions(
@@ -8385,7 +8544,7 @@ class TradingDatabase:
         source = str(payload.get("source") or "reboot_v2_theme_expansion")
         if not trade_date or not code or not source:
             return {}
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO theme_expansion_leases(
@@ -8497,7 +8656,7 @@ class TradingDatabase:
         blocking_stage = str(payload.get("blocking_stage") or "")
         primary_reason_code = str(payload.get("primary_reason_code") or "")
         reason_codes = list(payload.get("reason_codes") or [])
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO strategy_context_latest(
@@ -8588,7 +8747,7 @@ class TradingDatabase:
 
     def save_theme_expansion_subscription_decision(self, decision: dict) -> dict:
         payload = dict(decision or {})
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO theme_expansion_subscription_decisions(
@@ -8621,7 +8780,7 @@ class TradingDatabase:
         kospi_snapshot = dict(payload.get("kospi_snapshot") or {})
         kosdaq_snapshot = dict(payload.get("kosdaq_snapshot") or {})
         policies = dict(payload.get("candidate_policy_by_code") or {})
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO market_regime_snapshots(
@@ -8761,7 +8920,7 @@ class TradingDatabase:
         if not cleaned:
             return 0
         saved_count = 0
-        with self.conn:
+        with self._write_scope():
             for payload in cleaned:
                 trade_date = str(payload.get("trade_date") or "")
                 calculated_at = str(payload.get("calculated_at") or "")
@@ -8957,7 +9116,7 @@ class TradingDatabase:
     def save_setup_router_run(self, summary: dict) -> dict:
         payload = dict(summary or {})
         reason_codes = [str(item.get("reason") if isinstance(item, dict) else item) for item in list(payload.get("top_reasons") or [])]
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO setup_router_runs(
@@ -9031,10 +9190,13 @@ class TradingDatabase:
         cleaned = [dict(item or {}) for item in observations or []]
         if not cleaned:
             return 0
+        if all(str(item.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION) == _CURRENT_SETUP_ROUTER_VERSION for item in cleaned):
+            with self._write_scope():
+                return self._save_setup_observations_v2_tx(cleaned)
         saved_count = 0
         seen_candidate_keys: set[tuple[str, str]] = set()
         primary_candidate_keys: set[tuple[str, str]] = set()
-        with self.conn:
+        with self._write_scope():
             for payload in cleaned:
                 trade_date = str(payload.get("trade_date") or "")
                 code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
@@ -9254,6 +9416,235 @@ class TradingDatabase:
                 )
         return saved_count
 
+    def _save_setup_observations_v2_tx(self, cleaned: list[dict]) -> int:
+        saved_count = 0
+        seen_candidate_keys: set[tuple[str, str, str]] = set()
+        primary_candidate_keys: set[tuple[str, str, str]] = set()
+        for payload in cleaned:
+            trade_date = str(payload.get("trade_date") or "")
+            router_version = str(payload.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION)
+            code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
+            candidate_id = payload.get("candidate_id")
+            candidate_instance_id = str(payload.get("candidate_instance_id") or f"{trade_date}:{code}:{candidate_id or 0}")
+            setup_type = str(payload.get("setup_type") or "")
+            seen_candidate_keys.add((trade_date, router_version, candidate_instance_id))
+            lifecycle_state = str(payload.get("lifecycle_state") or "").upper()
+            primary_active = bool(payload.get("primary_setup")) and lifecycle_state in {"FORMING", "MATCHED"}
+            if primary_active:
+                primary_candidate_keys.add((trade_date, router_version, candidate_instance_id))
+            previous = self.conn.execute(
+                """
+                SELECT * FROM setup_observations_latest_v2
+                WHERE trade_date = ? AND router_version = ? AND candidate_instance_id = ? AND setup_type = ?
+                """,
+                (trade_date, router_version, candidate_instance_id, setup_type),
+            ).fetchone()
+            previous_payload = _row_to_setup_observation(previous) if previous else {}
+            current_fingerprint = str(payload.get("fingerprint") or payload.get("observation_fingerprint") or "")
+            current_material_fingerprint = str(payload.get("material_state_fingerprint") or current_fingerprint)
+            previous_fingerprint = str(previous_payload.get("fingerprint") or "")
+            previous_material_fingerprint = str(previous_payload.get("material_state_fingerprint") or previous_payload.get("fingerprint") or "")
+            if previous_payload and current_fingerprint and current_fingerprint == previous_fingerprint:
+                continue
+            transition_needed = bool(current_material_fingerprint) and (
+                not previous_payload or current_material_fingerprint != previous_material_fingerprint
+            )
+            self.conn.execute(
+                """
+                INSERT INTO setup_observations_latest_v2(
+                    trade_date, candidate_instance_id, setup_type, candidate_id, code, name,
+                    calculated_at, schema_version, feature_schema_version, router_version,
+                    setup_generation, setup_instance_id, state_version,
+                    post_subscription_tick_verified, entry_decision_at, entry_decision_id,
+                    entry_decision_age_sec, entry_decision_fresh, entry_decision_source,
+                    lifecycle_state, state_payload_json, last_material_change_at, quantity,
+                    router_status, shape_status, context_status,
+                    entry_alignment_status, primary_setup, setup_quality_score, context_id,
+                    theme_id, theme_name, theme_state, leadership_status, stock_role,
+                    market_side, market_action, session_phase, current_price, fingerprint,
+                    observation_fingerprint, material_state_fingerprint, detector_phase,
+                    material_change_kind, first_seen_at, expires_at, expired_at, terminal_at,
+                    reason_codes_json, price_structure_json, safety_json, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(trade_date, router_version, candidate_instance_id, setup_type) DO UPDATE SET
+                    candidate_id=excluded.candidate_id,
+                    code=excluded.code,
+                    name=excluded.name,
+                    calculated_at=excluded.calculated_at,
+                    schema_version=excluded.schema_version,
+                    feature_schema_version=excluded.feature_schema_version,
+                    setup_generation=excluded.setup_generation,
+                    setup_instance_id=excluded.setup_instance_id,
+                    state_version=excluded.state_version,
+                    post_subscription_tick_verified=excluded.post_subscription_tick_verified,
+                    entry_decision_at=excluded.entry_decision_at,
+                    entry_decision_id=excluded.entry_decision_id,
+                    entry_decision_age_sec=excluded.entry_decision_age_sec,
+                    entry_decision_fresh=excluded.entry_decision_fresh,
+                    entry_decision_source=excluded.entry_decision_source,
+                    lifecycle_state=excluded.lifecycle_state,
+                    state_payload_json=excluded.state_payload_json,
+                    last_material_change_at=excluded.last_material_change_at,
+                    quantity=excluded.quantity,
+                    router_status=excluded.router_status,
+                    shape_status=excluded.shape_status,
+                    context_status=excluded.context_status,
+                    entry_alignment_status=excluded.entry_alignment_status,
+                    primary_setup=excluded.primary_setup,
+                    setup_quality_score=excluded.setup_quality_score,
+                    context_id=excluded.context_id,
+                    theme_id=excluded.theme_id,
+                    theme_name=excluded.theme_name,
+                    theme_state=excluded.theme_state,
+                    leadership_status=excluded.leadership_status,
+                    stock_role=excluded.stock_role,
+                    market_side=excluded.market_side,
+                    market_action=excluded.market_action,
+                    session_phase=excluded.session_phase,
+                    current_price=excluded.current_price,
+                    fingerprint=excluded.fingerprint,
+                    observation_fingerprint=excluded.observation_fingerprint,
+                    material_state_fingerprint=excluded.material_state_fingerprint,
+                    detector_phase=excluded.detector_phase,
+                    material_change_kind=excluded.material_change_kind,
+                    first_seen_at=excluded.first_seen_at,
+                    expires_at=excluded.expires_at,
+                    expired_at=excluded.expired_at,
+                    terminal_at=excluded.terminal_at,
+                    reason_codes_json=excluded.reason_codes_json,
+                    price_structure_json=excluded.price_structure_json,
+                    safety_json=excluded.safety_json,
+                    payload_json=excluded.payload_json,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                _setup_observation_db_values(payload, trade_date, candidate_instance_id, setup_type, code, candidate_id),
+            )
+            if transition_needed:
+                self.conn.execute(
+                    """
+                    INSERT INTO setup_observation_transitions_v2(
+                        trade_date, router_version, candidate_instance_id, setup_type, theme_id,
+                        setup_generation, setup_instance_id,
+                        lifecycle_previous_state, lifecycle_current_state,
+                        candidate_id, code, name,
+                        transitioned_at, previous_router_status, current_router_status,
+                        previous_shape_status, current_shape_status, previous_context_status,
+                        current_context_status, previous_fingerprint, current_fingerprint,
+                        detector_phase_from, detector_phase_to, material_change_kind,
+                        material_state_fingerprint_from, material_state_fingerprint_to,
+                        reason_codes_json, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade_date,
+                        router_version,
+                        candidate_instance_id,
+                        setup_type,
+                        str(payload.get("theme_id") or ""),
+                        _safe_int(payload.get("setup_generation"), 1),
+                        str(payload.get("setup_instance_id") or ""),
+                        str(previous_payload.get("lifecycle_state") or ""),
+                        str(payload.get("lifecycle_state") or ""),
+                        candidate_id,
+                        code,
+                        str(payload.get("name") or ""),
+                        str(payload.get("calculated_at") or ""),
+                        str(previous_payload.get("router_status") or ""),
+                        str(payload.get("router_status") or ""),
+                        str(previous_payload.get("shape_status") or ""),
+                        str(payload.get("shape_status") or ""),
+                        str(previous_payload.get("context_status") or ""),
+                        str(payload.get("context_status") or ""),
+                        previous_fingerprint,
+                        current_fingerprint,
+                        str(previous_payload.get("detector_phase") or ""),
+                        str(payload.get("detector_phase") or ""),
+                        str(payload.get("material_change_kind") or ""),
+                        previous_material_fingerprint,
+                        current_material_fingerprint,
+                        _json_list(payload.get("reason_codes") or []),
+                        _json_payload({"previous": previous_payload, "current": payload}),
+                    ),
+                )
+            if primary_active:
+                self.conn.execute(
+                    """
+                    INSERT INTO setup_router_primary_latest_v2(
+                        trade_date, router_version, candidate_instance_id, candidate_id, code, name,
+                        calculated_at, setup_type, router_status, shape_status, context_status,
+                        entry_alignment_status, setup_quality_score, context_id, theme_id,
+                        theme_name, theme_state, stock_role, fingerprint,
+                        setup_generation, setup_instance_id, lifecycle_state, clear_reason,
+                        last_material_change_at, primary_active, payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(trade_date, router_version, candidate_instance_id) DO UPDATE SET
+                        candidate_id=excluded.candidate_id,
+                        code=excluded.code,
+                        name=excluded.name,
+                        calculated_at=excluded.calculated_at,
+                        setup_type=excluded.setup_type,
+                        router_status=excluded.router_status,
+                        shape_status=excluded.shape_status,
+                        context_status=excluded.context_status,
+                        entry_alignment_status=excluded.entry_alignment_status,
+                        setup_quality_score=excluded.setup_quality_score,
+                        context_id=excluded.context_id,
+                        theme_id=excluded.theme_id,
+                        theme_name=excluded.theme_name,
+                        theme_state=excluded.theme_state,
+                        stock_role=excluded.stock_role,
+                        fingerprint=excluded.fingerprint,
+                        setup_generation=excluded.setup_generation,
+                        setup_instance_id=excluded.setup_instance_id,
+                        lifecycle_state=excluded.lifecycle_state,
+                        clear_reason='',
+                        last_material_change_at=excluded.last_material_change_at,
+                        primary_active=1,
+                        payload_json=excluded.payload_json,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (
+                        trade_date,
+                        router_version,
+                        candidate_instance_id,
+                        candidate_id,
+                        code,
+                        str(payload.get("name") or ""),
+                        str(payload.get("calculated_at") or ""),
+                        setup_type,
+                        str(payload.get("router_status") or ""),
+                        str(payload.get("shape_status") or ""),
+                        str(payload.get("context_status") or ""),
+                        str(payload.get("entry_alignment_status") or ""),
+                        _float_value(payload.get("setup_quality_score")),
+                        str(payload.get("context_id") or ""),
+                        str(payload.get("theme_id") or ""),
+                        str(payload.get("theme_name") or ""),
+                        str(payload.get("theme_state") or ""),
+                        str(payload.get("stock_role") or ""),
+                        current_fingerprint,
+                        _safe_int(payload.get("setup_generation"), 1),
+                        str(payload.get("setup_instance_id") or ""),
+                        str(payload.get("lifecycle_state") or ""),
+                        "",
+                        str(payload.get("last_material_change_at") or ""),
+                        _json_payload(payload),
+                    ),
+                )
+            saved_count += 1
+        for trade_date, router_version, candidate_instance_id in sorted(seen_candidate_keys - primary_candidate_keys):
+            self.conn.execute(
+                """
+                UPDATE setup_router_primary_latest_v2
+                SET primary_active = 0,
+                    clear_reason = 'NO_ACTIVE_PRIMARY_SETUP',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE trade_date = ? AND router_version = ? AND candidate_instance_id = ?
+                """,
+                (trade_date, router_version, candidate_instance_id),
+            )
+        return saved_count
+
     def save_setup_router_states(self, observations: Iterable[dict]) -> dict:
         cleaned = [dict(item or {}) for item in observations or []]
         if not cleaned:
@@ -9269,7 +9660,7 @@ class TradingDatabase:
         state_write_count = 0
         transition_write_count = 0
         no_change_skip_count = 0
-        with self.conn:
+        with self._write_scope():
             for payload in cleaned:
                 trade_date = str(payload.get("trade_date") or "")
                 code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
@@ -9558,7 +9949,7 @@ class TradingDatabase:
         state_write_count = 0
         transition_write_count = 0
         no_change_skip_count = 0
-        with self.conn:
+        with self._write_scope():
             for payload in cleaned:
                 trade_date = str(payload.get("trade_date") or "")
                 code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
@@ -9883,7 +10274,7 @@ class TradingDatabase:
         if all(str(item.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION) == _CURRENT_SETUP_ROUTER_VERSION for item in cleaned):
             return self._save_setup_router_candidate_runtime_v4(cleaned)
         saved = 0
-        with self.conn:
+        with self._write_scope():
             for payload in cleaned:
                 trade_date = str(payload.get("trade_date") or "")
                 candidate_instance_id = str(payload.get("candidate_instance_id") or "")
@@ -9989,7 +10380,7 @@ class TradingDatabase:
 
     def _save_setup_router_candidate_runtime_v4(self, cleaned: list[dict]) -> int:
         saved = 0
-        with self.conn:
+        with self._write_scope():
             for payload in cleaned:
                 trade_date = str(payload.get("trade_date") or "")
                 candidate_instance_id = str(payload.get("candidate_instance_id") or "")
@@ -10131,7 +10522,7 @@ class TradingDatabase:
         if all(str(item.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION) == _CURRENT_SETUP_ROUTER_VERSION for item in cleaned):
             return self._save_setup_router_pending_evaluations_v5(cleaned)
         saved = 0
-        with self.conn:
+        with self._write_scope():
             for payload in cleaned:
                 trade_date = str(payload.get("trade_date") or "")
                 candidate_instance_id = str(payload.get("candidate_instance_id") or "")
@@ -10214,7 +10605,7 @@ class TradingDatabase:
 
     def _save_setup_router_pending_evaluations_v5(self, cleaned: list[dict]) -> int:
         saved = 0
-        with self.conn:
+        with self._write_scope():
             for payload in cleaned:
                 trade_date = str(payload.get("trade_date") or "")
                 candidate_instance_id = str(payload.get("candidate_instance_id") or "")
@@ -10237,7 +10628,8 @@ class TradingDatabase:
                 incoming_priority = _safe_int(payload.get("pending_priority"), _setup_router_pending_priority(incoming_reasons))
                 existing_status = str(existing_payload.get("status") or "")
                 opened_from_status = existing_status
-                if not existing_payload or existing_status in {"COMPLETED", "SUPERSEDED"}:
+                material_reopen = any(reason in {"ENTRY_DECISION_CHANGED", "DIRTY_EVALUATOR_DECISION", "CONTEXT_CHANGED", "CANDLE_BOUNDARY_CHANGED", "SELECTED_THEME_CHANGED", "LEASE_VERIFICATION_CHANGED", "TTL_DUE"} for reason in incoming_reasons)
+                if not existing_payload or existing_status in {"COMPLETED", "SUPERSEDED"} or (existing_status == "FAILED_PERMANENT" and material_reopen):
                     epoch = _safe_int(existing_payload.get("pending_epoch"), 0) + 1
                     reasons = incoming_reasons
                     priority = incoming_priority
@@ -10252,6 +10644,21 @@ class TradingDatabase:
                     last_error_class = ""
                     next_retry_at = ""
                     status = "PENDING"
+                elif existing_status == "FAILED_PERMANENT":
+                    epoch = max(1, _safe_int(existing_payload.get("pending_epoch"), 1))
+                    reasons = _dedupe([*list(existing_payload.get("pending_reasons") or []), *incoming_reasons])
+                    priority = min(_safe_int(existing_payload.get("pending_priority"), 3), incoming_priority)
+                    first_pending_at = str(existing_payload.get("first_pending_at") or now_text)
+                    selected_at = str(existing_payload.get("selected_at") or "")
+                    completed_at = str(existing_payload.get("completed_at") or "")
+                    superseded_at = str(existing_payload.get("superseded_at") or "")
+                    attempt_count = _safe_int(existing_payload.get("attempt_count"), 0)
+                    failure_count = _safe_int(existing_payload.get("failure_count"), 0)
+                    last_attempt_at = str(existing_payload.get("last_attempt_at") or "")
+                    last_error = str(existing_payload.get("last_error") or "")
+                    last_error_class = str(existing_payload.get("last_error_class") or "")
+                    next_retry_at = ""
+                    status = "FAILED_PERMANENT"
                 else:
                     epoch = max(1, _safe_int(existing_payload.get("pending_epoch"), 1))
                     reasons = _dedupe([*list(existing_payload.get("pending_reasons") or []), *incoming_reasons])
@@ -10266,7 +10673,6 @@ class TradingDatabase:
                     last_error = str(existing_payload.get("last_error") or "")
                     last_error_class = str(existing_payload.get("last_error_class") or "")
                     next_retry_at = str(existing_payload.get("next_retry_at") or "")
-                    material_reopen = any(reason in {"ENTRY_DECISION_CHANGED", "DIRTY_EVALUATOR_DECISION", "CONTEXT_CHANGED", "CANDLE_BOUNDARY_CHANGED", "SELECTED_THEME_CHANGED", "LEASE_VERIFICATION_CHANGED", "TTL_DUE"} for reason in incoming_reasons)
                     if existing_status == "SELECTED":
                         status = "SELECTED"
                     elif existing_status == "RETRY" and not material_reopen:
@@ -10392,7 +10798,7 @@ class TradingDatabase:
         if all(str(item.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION) == _CURRENT_SETUP_ROUTER_VERSION for item in cleaned):
             return self._update_setup_router_pending_evaluations_v5(cleaned)
         updated = 0
-        with self.conn:
+        with self._write_scope():
             for payload in cleaned:
                 trade_date = str(payload.get("trade_date") or "")
                 candidate_instance_id = str(payload.get("candidate_instance_id") or "")
@@ -10424,7 +10830,7 @@ class TradingDatabase:
 
     def _update_setup_router_pending_evaluations_v5(self, cleaned: list[dict]) -> int:
         updated = 0
-        with self.conn:
+        with self._write_scope():
             for payload in cleaned:
                 trade_date = str(payload.get("trade_date") or "")
                 candidate_instance_id = str(payload.get("candidate_instance_id") or "")
@@ -10447,7 +10853,7 @@ class TradingDatabase:
                 set_parts = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
                 params: list[object] = [status]
                 if status == "SELECTED":
-                    set_parts.extend(["selected_at = COALESCE(NULLIF(selected_at, ''), ?)", "last_attempt_at = ?", "attempt_count = attempt_count + 1"])
+                    set_parts.extend(["selected_at = ?", "last_attempt_at = ?", "attempt_count = attempt_count + 1"])
                     params.extend([str(payload.get("selected_at") or current), str(payload.get("last_attempt_at") or current)])
                 elif status == "COMPLETED":
                     set_parts.extend(
@@ -10486,6 +10892,30 @@ class TradingDatabase:
                     reasons = _dedupe([*list(existing_payload.get("pending_reasons") or []), *list(payload.get("pending_reasons") or payload.get("pending_reason_codes") or [])])
                     set_parts.extend(["superseded_at = ?", "pending_reasons_json = ?", "next_retry_at = ''"])
                     params.extend([str(payload.get("superseded_at") or current), _json_list(reasons)])
+                elif status == "FAILED_PERMANENT":
+                    reasons = _dedupe([*list(existing_payload.get("pending_reasons") or []), *list(payload.get("pending_reasons") or payload.get("pending_reason_codes") or []), "RETRY_MAX_FAILURES_EXCEEDED"])
+                    set_parts.extend(
+                        [
+                            "failed_permanent_at = ?",
+                            "pending_reasons_json = ?",
+                            "last_attempt_at = ?",
+                            "last_error = ?",
+                            "last_error_class = ?",
+                            "next_retry_at = ''",
+                            "failure_count = failure_count + 1",
+                            "evaluation_commit_id = ?",
+                        ]
+                    )
+                    params.extend(
+                        [
+                            str(payload.get("failed_permanent_at") or current),
+                            _json_list(reasons),
+                            str(payload.get("last_attempt_at") or current),
+                            str(payload.get("last_error") or ""),
+                            str(payload.get("last_error_class") or ""),
+                            str(payload.get("evaluation_commit_id") or ""),
+                        ]
+                    )
                 if payload.get("last_error") is not None and status not in {"RETRY"}:
                     set_parts.append("last_error = ?")
                     params.append(str(payload.get("last_error") or ""))
@@ -10508,6 +10938,178 @@ class TradingDatabase:
         runtime_update: dict,
         pending_update: dict,
     ) -> dict:
+        return self.complete_setup_router_evaluation_atomic(
+            {
+                "observations": [dict(item or {}) for item in observations or []],
+                "runtime_update": dict(runtime_update or {}),
+                "pending_update": dict(pending_update or {}),
+                "completion_metadata": {},
+            }
+        )
+
+    def complete_setup_router_evaluation_atomic(self, commit: Mapping[str, object]) -> dict:
+        payload = dict(commit or {})
+        observation_rows = [dict(item or {}) for item in payload.get("observations") or []]
+        runtime_payload = dict(payload.get("runtime_update") or {})
+        pending_payload = dict(payload.get("pending_update") or {})
+        metadata = dict(payload.get("completion_metadata") or {})
+        trade_date = str(pending_payload.get("trade_date") or runtime_payload.get("trade_date") or (observation_rows[0].get("trade_date") if observation_rows else ""))
+        router_version = str(pending_payload.get("router_version") or runtime_payload.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION)
+        candidate_instance_id = str(pending_payload.get("candidate_instance_id") or runtime_payload.get("candidate_instance_id") or (observation_rows[0].get("candidate_instance_id") if observation_rows else ""))
+        pending_epoch = _safe_int(pending_payload.get("pending_epoch"), 0)
+        pending_instance_id = str(pending_payload.get("pending_instance_id") or "")
+        calculated_at = str(pending_payload.get("completed_at") or runtime_payload.get("last_success_at") or (observation_rows[0].get("calculated_at") if observation_rows else "") or datetime.utcnow().replace(microsecond=0).isoformat())
+        commit_payload = {
+            "trade_date": trade_date,
+            "router_version": router_version,
+            "candidate_instance_id": candidate_instance_id,
+            "pending_epoch": pending_epoch,
+            "pending_instance_id": pending_instance_id,
+            "observations": observation_rows,
+            "runtime_update": runtime_payload,
+            "pending_update": pending_payload,
+        }
+        payload_hash = hashlib.sha1(_stable_json_db(commit_payload).encode("utf-8")).hexdigest()
+        evaluation_commit_id = str(payload.get("evaluation_commit_id") or _setup_router_evaluation_commit_id(commit_payload))
+        savepoint = "setup_router_eval_atomic"
+        self.conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            existing_commit = self.conn.execute(
+                """
+                SELECT *
+                FROM setup_router_evaluation_commits_v1
+                WHERE evaluation_commit_id = ?
+                """,
+                (evaluation_commit_id,),
+            ).fetchone()
+            if existing_commit:
+                existing_payload = dict(existing_commit)
+                if str(existing_payload.get("payload_hash") or "") == payload_hash and str(existing_payload.get("commit_status") or "") == "COMMITTED":
+                    self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    return {
+                        "status": "IDEMPOTENT_ALREADY_COMMITTED",
+                        "evaluation_commit_id": evaluation_commit_id,
+                        "state_write_count": 0,
+                        "transition_write_count": 0,
+                        "observation_write_count": 0,
+                        "runtime_write_count": 0,
+                        "pending_completed_count": 0,
+                    }
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                return {"status": "VALIDATION_ERROR", "error_class": "COMMIT_PAYLOAD_CONFLICT", "evaluation_commit_id": evaluation_commit_id}
+            pending_row = self.conn.execute(
+                """
+                SELECT *
+                FROM setup_router_pending_evaluations_v5
+                WHERE trade_date = ? AND router_version = ? AND candidate_instance_id = ?
+                """,
+                (trade_date, router_version, candidate_instance_id),
+            ).fetchone()
+            pending_current = _row_to_setup_router_pending_evaluation(pending_row) if pending_row else {}
+            if not pending_current:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                return {"status": "PENDING_STATUS_CONFLICT", "error_class": "PENDING_NOT_FOUND", "evaluation_commit_id": evaluation_commit_id}
+            if pending_epoch <= 0:
+                pending_epoch = _safe_int(pending_current.get("pending_epoch"), 0)
+            if not pending_instance_id:
+                pending_instance_id = str(pending_current.get("pending_instance_id") or "")
+            if _safe_int(pending_current.get("pending_epoch"), 0) != pending_epoch or str(pending_current.get("pending_instance_id") or "") != pending_instance_id:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                return {"status": "STALE_PENDING_EPOCH", "error_class": "STALE_PENDING_EPOCH", "evaluation_commit_id": evaluation_commit_id}
+            if str(pending_current.get("status") or "") != "SELECTED":
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                return {"status": "PENDING_STATUS_CONFLICT", "error_class": str(pending_current.get("status") or "UNKNOWN"), "evaluation_commit_id": evaluation_commit_id}
+            state_counts = dict(self.save_setup_router_states(observation_rows) or {}) if observation_rows else {}
+            if metadata.get("fail_after_state_write"):
+                raise RuntimeError("fail_after_state_write")
+            saved_count = int(self.save_setup_observations(observation_rows) or 0) if observation_rows else 0
+            if metadata.get("fail_after_observation_write"):
+                raise RuntimeError("fail_after_observation_write")
+            runtime_count = int(self.save_setup_router_candidate_runtime([runtime_payload]) or 0) if runtime_payload else 0
+            if metadata.get("fail_before_pending_complete"):
+                raise RuntimeError("fail_before_pending_complete")
+            cursor = self.conn.execute(
+                """
+                UPDATE setup_router_pending_evaluations_v5
+                SET status = 'COMPLETED',
+                    completed_at = ?,
+                    last_error = '',
+                    last_error_class = '',
+                    next_retry_at = '',
+                    failure_count = 0,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE trade_date = ?
+                  AND router_version = ?
+                  AND candidate_instance_id = ?
+                  AND pending_epoch = ?
+                  AND pending_instance_id = ?
+                  AND status = 'SELECTED'
+                """,
+                (calculated_at, trade_date, router_version, candidate_instance_id, pending_epoch, pending_instance_id),
+            )
+            if int(getattr(cursor, "rowcount", 0) or 0) != 1:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                return {"status": "STALE_PENDING_EPOCH", "error_class": "PENDING_COMPLETE_ROWCOUNT_0", "evaluation_commit_id": evaluation_commit_id}
+            self.conn.execute(
+                """
+                INSERT INTO setup_router_evaluation_commits_v1(
+                    evaluation_commit_id, trade_date, router_version, candidate_instance_id,
+                    pending_instance_id, pending_epoch, commit_status, state_write_count,
+                    observation_write_count, transition_write_count, primary_write_count,
+                    committed_at, payload_hash, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, 'COMMITTED', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evaluation_commit_id,
+                    trade_date,
+                    router_version,
+                    candidate_instance_id,
+                    pending_instance_id,
+                    pending_epoch,
+                    int(state_counts.get("state_write_count") or 0),
+                    saved_count,
+                    int(state_counts.get("transition_write_count") or 0),
+                    1 if any(bool(row.get("primary_setup")) and str(row.get("lifecycle_state") or "").upper() in {"FORMING", "MATCHED"} for row in observation_rows) else 0,
+                    calculated_at,
+                    payload_hash,
+                    _json_payload(commit_payload),
+                ),
+            )
+            self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return {
+                "status": "COMMITTED",
+                "evaluation_commit_id": evaluation_commit_id,
+                "state_write_count": int(state_counts.get("state_write_count") or 0),
+                "transition_write_count": int(state_counts.get("transition_write_count") or 0),
+                "no_change_skip_count": int(state_counts.get("no_change_skip_count") or 0),
+                "state_no_change_skip_count": int(state_counts.get("state_no_change_skip_count") or state_counts.get("no_change_skip_count") or 0),
+                "observation_write_count": saved_count,
+                "saved_count": saved_count,
+                "runtime_write_count": runtime_count,
+                "pending_completed_count": 1,
+            }
+        except Exception as exc:
+            self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return {
+                "status": "STORAGE_ERROR",
+                "evaluation_commit_id": evaluation_commit_id,
+                "error_class": exc.__class__.__name__,
+                "error_message": str(exc),
+            }
+
+    def complete_setup_router_evaluation_legacy(
+        self,
+        *,
+        observations: Iterable[dict],
+        runtime_update: dict,
+        pending_update: dict,
+    ) -> dict:
         observation_rows = [dict(item or {}) for item in observations or []]
         runtime_payload = dict(runtime_update or {})
         pending_payload = dict(pending_update or {})
@@ -10515,7 +11117,7 @@ class TradingDatabase:
         saved_count = 0
         runtime_count = 0
         pending_count = 0
-        with self.conn:
+        with self._write_scope():
             if observation_rows:
                 counts = dict(self.save_setup_router_states(observation_rows) or {})
                 state_counts["state_write_count"] += int(counts.get("state_write_count") or 0)
@@ -10548,14 +11150,15 @@ class TradingDatabase:
         session_phase: Optional[str] = None,
         theme_id: Optional[str] = None,
         leadership_status: Optional[str] = None,
-        router_version: Optional[str] = None,
+        router_version: Optional[str] = _CURRENT_SETUP_ROUTER_VERSION,
         setup_generation: Optional[int] = None,
         lifecycle_state: Optional[str] = None,
         post_subscription_tick_verified: Optional[bool] = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict]:
-        query = "SELECT * FROM setup_observations_latest"
+        table = "setup_observations_latest_v2" if str(router_version or "") == _CURRENT_SETUP_ROUTER_VERSION else "setup_observations_latest"
+        query = f"SELECT * FROM {table}"
         clauses: list[str] = []
         params: list[object] = []
         _append_setup_filter(clauses, params, "trade_date", trade_date)
@@ -10596,12 +11199,13 @@ class TradingDatabase:
         session_phase: Optional[str] = None,
         theme_id: Optional[str] = None,
         leadership_status: Optional[str] = None,
-        router_version: Optional[str] = None,
+        router_version: Optional[str] = _CURRENT_SETUP_ROUTER_VERSION,
         setup_generation: Optional[int] = None,
         lifecycle_state: Optional[str] = None,
         post_subscription_tick_verified: Optional[bool] = None,
     ) -> int:
-        query = "SELECT COUNT(*) AS count FROM setup_observations_latest"
+        table = "setup_observations_latest_v2" if str(router_version or "") == _CURRENT_SETUP_ROUTER_VERSION else "setup_observations_latest"
+        query = f"SELECT COUNT(*) AS count FROM {table}"
         clauses: list[str] = []
         params: list[object] = []
         _append_setup_filter(clauses, params, "trade_date", trade_date)
@@ -10635,12 +11239,13 @@ class TradingDatabase:
         code: Optional[str] = None,
         setup_type: Optional[str] = None,
         router_status: Optional[str] = None,
-        router_version: Optional[str] = None,
+        router_version: Optional[str] = _CURRENT_SETUP_ROUTER_VERSION,
         setup_generation: Optional[int] = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict]:
-        query = "SELECT * FROM setup_observation_transitions"
+        table = "setup_observation_transitions_v2" if str(router_version or "") == _CURRENT_SETUP_ROUTER_VERSION else "setup_observation_transitions"
+        query = f"SELECT * FROM {table}"
         clauses: list[str] = []
         params: list[object] = []
         _append_setup_filter(clauses, params, "trade_date", trade_date)
@@ -10662,12 +11267,16 @@ class TradingDatabase:
         rows = self.conn.execute(query, tuple(params)).fetchall()
         return [_row_to_setup_observation_transition(row) for row in rows]
 
-    def list_setup_router_primary_latest(self, *, trade_date: Optional[str] = None, limit: int = 100) -> list[dict]:
-        query = "SELECT * FROM setup_router_primary_latest"
+    def list_setup_router_primary_latest(self, *, trade_date: Optional[str] = None, router_version: Optional[str] = _CURRENT_SETUP_ROUTER_VERSION, limit: int = 100) -> list[dict]:
+        table = "setup_router_primary_latest_v2" if str(router_version or "") == _CURRENT_SETUP_ROUTER_VERSION else "setup_router_primary_latest"
+        query = f"SELECT * FROM {table}"
         params: list[object] = []
         if trade_date:
             query += " WHERE trade_date = ?"
             params.append(str(trade_date))
+            if router_version and _has_column(self.conn, table, "router_version"):
+                query += " AND router_version = ?"
+                params.append(str(router_version))
         query += " ORDER BY calculated_at DESC, setup_quality_score DESC, code ASC LIMIT ?"
         params.append(max(1, int(limit or 100)))
         rows = self.conn.execute(query, tuple(params)).fetchall()
@@ -10677,7 +11286,7 @@ class TradingDatabase:
         rows = [dict(item or {}) for item in snapshots or []]
         if not rows:
             return 0
-        with self.conn:
+        with self._write_scope():
             for payload in rows:
                 self.conn.execute(
                     """
@@ -10775,7 +11384,7 @@ class TradingDatabase:
         rows = [dict(item or {}) for item in decisions or []]
         if not rows:
             return 0
-        with self.conn:
+        with self._write_scope():
             for payload in rows:
                 self.conn.execute(
                     """
@@ -10847,7 +11456,7 @@ class TradingDatabase:
         if not rows:
             return 0
         before = self.conn.total_changes
-        with self.conn:
+        with self._write_scope():
             for payload in rows:
                 self.conn.execute(
                     """
@@ -10912,7 +11521,7 @@ class TradingDatabase:
         rows = [dict(item or {}) for item in snapshots or []]
         if not rows:
             return 0
-        with self.conn:
+        with self._write_scope():
             for payload in rows:
                 self.conn.execute(
                     """
@@ -10969,7 +11578,7 @@ class TradingDatabase:
 
     def save_portfolio_risk_snapshot(self, snapshot: dict) -> dict:
         payload = dict(snapshot or {})
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO portfolio_risk_snapshots(
@@ -11044,7 +11653,7 @@ class TradingDatabase:
         payload = dict(intent or {})
         intent_id = payload.get("id") or payload.get("intent_id")
         params = _managed_order_intent_params(payload)
-        with self.conn:
+        with self._write_scope():
             if intent_id:
                 self.conn.execute(
                     """
@@ -11135,7 +11744,7 @@ class TradingDatabase:
         payload = dict(order or {})
         order_id = payload.get("id") or payload.get("order_id")
         params = _managed_order_params(payload)
-        with self.conn:
+        with self._write_scope():
             if order_id:
                 self.conn.execute(
                     """
@@ -11305,7 +11914,7 @@ class TradingDatabase:
             "message": str(payload.get("message") or ""),
             "payload_json": _json_payload(payload.get("payload") or payload),
         }
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO managed_order_events(
@@ -11369,7 +11978,7 @@ class TradingDatabase:
             params["source_event_id"] = params["dedupe_key"]
         if not params["dedupe_key"]:
             params["dedupe_key"] = params["source_event_id"]
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO order_gateway_event_receipts(
@@ -11438,7 +12047,7 @@ class TradingDatabase:
         }
         if not params["order_no"]:
             return payload
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO broker_order_state(
@@ -11495,7 +12104,7 @@ class TradingDatabase:
         }
         if not params["account"] or not params["code"]:
             return payload
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO broker_position_state(
@@ -11557,7 +12166,7 @@ class TradingDatabase:
         }
         if not params["run_id"]:
             return payload
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO broker_reconcile_runs(
@@ -11627,7 +12236,7 @@ class TradingDatabase:
         }
         if not params["run_id"] or not params["logical_source"]:
             return payload
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO broker_reconcile_source_results(
@@ -11681,7 +12290,7 @@ class TradingDatabase:
         if not run_id:
             return
         now = datetime.utcnow().replace(microsecond=0).isoformat()
-        with self.conn:
+        with self._write_scope():
             if open_orders is not None:
                 self.conn.execute("DELETE FROM broker_reconcile_open_orders WHERE run_id = ?", (run_id,))
                 for item in open_orders:
@@ -11777,7 +12386,7 @@ class TradingDatabase:
         run_id = str(run_id or "")
         if not run_id:
             return
-        with self.conn:
+        with self._write_scope():
             self.conn.execute("DELETE FROM broker_reconcile_discrepancies WHERE run_id = ?", (run_id,))
             for item in discrepancies:
                 self.conn.execute(
@@ -11856,7 +12465,7 @@ class TradingDatabase:
             "details_json": _json_payload(payload.get("details") or {}),
             "payload_json": _json_payload(payload),
         }
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO order_risk_decisions(
@@ -11901,7 +12510,7 @@ class TradingDatabase:
             "details_json": _json_payload(payload.get("details") or {}),
             "payload_json": _json_payload(payload),
         }
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO order_kill_switch_state(
@@ -12009,7 +12618,7 @@ class TradingDatabase:
         return [row_mapper(row) for row in rows]
 
     def save_indicator_snapshot(self, snapshot: IndicatorSnapshot) -> IndicatorSnapshot:
-        with self.conn:
+        with self._write_scope():
             return self._save_indicator_snapshot_no_commit(snapshot)
 
     def list_indicator_snapshots(self, candidate_id: int) -> list[IndicatorSnapshot]:
@@ -12020,7 +12629,7 @@ class TradingDatabase:
         return [self._row_to_indicator_snapshot(row) for row in rows]
 
     def upsert_condition_profile(self, profile: ConditionProfile) -> ConditionProfile:
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO condition_profiles(
@@ -12061,7 +12670,7 @@ class TradingDatabase:
         return [self._row_to_condition_profile(row) for row in rows]
 
     def update_condition_last_resolved_index(self, condition_name: str, condition_index: int) -> None:
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 UPDATE condition_profiles
@@ -12072,7 +12681,7 @@ class TradingDatabase:
             )
 
     def save_theme_lab_flow_result(self, calculated_at: str, payload: dict) -> None:
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO theme_lab_flow_snapshots(
@@ -12127,7 +12736,7 @@ class TradingDatabase:
         rows = list(batch.get("rows") or [])
         missing = batch.get("parser_missing_fields") or []
         raw = batch.get("raw") or {}
-        with self.conn:
+        with self._write_scope():
             existing = None
             if command_id:
                 existing = self.conn.execute(
@@ -12281,7 +12890,7 @@ class TradingDatabase:
         status = str(batch.get("status") or "OK")
         rows = list(batch.get("rows") or [])
         raw_summary = dict(batch.get("raw_summary") or batch.get("raw") or {})
-        with self.conn:
+        with self._write_scope():
             existing = None
             if command_id:
                 existing = self.conn.execute(
@@ -12456,7 +13065,7 @@ class TradingDatabase:
         source_id = str(payload.get("source_id") or "")
         if not trade_date or not code or not source_type:
             return {}
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO active_seed_signals(
@@ -12563,7 +13172,7 @@ class TradingDatabase:
             )
         if not cleaned:
             return 0
-        with self.conn:
+        with self._write_scope():
             before = self.conn.total_changes
             self.conn.executemany(
                 """
@@ -12615,7 +13224,7 @@ class TradingDatabase:
         if not trade_date or not code or not source_id:
             return {}
         now = str(payload.get("updated_at") or datetime.now().replace(microsecond=0).isoformat())
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO candidate_bridge_source_state(
@@ -12690,7 +13299,7 @@ class TradingDatabase:
         payload = dict(result.get("payload") or result)
         selected_symbols = list(result.get("selected_symbols") or payload.get("selected_symbols") or [])
         top_themes = list(result.get("top_themes") or payload.get("top_themes") or [])
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO opening_theme_burst_results(
@@ -12793,7 +13402,7 @@ class TradingDatabase:
             )
         if not cleaned:
             return 0
-        with self.conn:
+        with self._write_scope():
             before = self.conn.total_changes
             self.conn.executemany(
                 """
@@ -13010,7 +13619,7 @@ class TradingDatabase:
 
     def save_operator_event(self, event: dict) -> bool:
         normalized = _normalize_operator_event(event)
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT OR IGNORE INTO dashboard_operator_events(
@@ -13096,7 +13705,7 @@ class TradingDatabase:
             return 0
         acknowledged_at = datetime.now().isoformat(timespec="seconds")
         updated = 0
-        with self.conn:
+        with self._write_scope():
             for event_id in ids:
                 cursor = self.conn.execute(
                     """
@@ -13118,7 +13727,7 @@ class TradingDatabase:
         if not ids:
             return 0
         updated = 0
-        with self.conn:
+        with self._write_scope():
             for event_id in ids:
                 cursor = self.conn.execute(
                     "UPDATE dashboard_operator_events SET hidden = 1 WHERE event_id = ?",
@@ -13167,7 +13776,7 @@ class TradingDatabase:
     def snooze_operator_event(self, event_id: str, snoozed_until: str) -> int:
         if not event_id:
             return 0
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 "UPDATE dashboard_operator_events SET snoozed_until = ? WHERE event_id = ?",
                 (str(snoozed_until or ""), str(event_id)),
@@ -13176,7 +13785,7 @@ class TradingDatabase:
 
     def save_operator_action(self, action: dict) -> dict:
         normalized = _normalize_operator_action(action)
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT OR IGNORE INTO dashboard_operator_actions(
@@ -13216,7 +13825,7 @@ class TradingDatabase:
         if not action_id:
             return None
         completed_at = datetime.now().isoformat(timespec="seconds")
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 UPDATE dashboard_operator_actions
@@ -13295,7 +13904,7 @@ class TradingDatabase:
 
     def save_postmarket_review_item(self, item: dict) -> bool:
         normalized = _normalize_postmarket_review_item(item)
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT OR IGNORE INTO dashboard_postmarket_reviews(
@@ -13448,7 +14057,7 @@ class TradingDatabase:
         if review_scope:
             where.append("review_scope = ?")
             params.append(str(review_scope).lower())
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 f"DELETE FROM dashboard_postmarket_reviews WHERE {' AND '.join(where)}",
                 params,
@@ -13464,7 +14073,7 @@ class TradingDatabase:
 
     def upsert_market_side_confirmation_state(self, payload: dict) -> dict:
         normalized = _market_side_confirmation_state_params(payload)
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO market_side_confirmation_state(
@@ -13587,7 +14196,7 @@ class TradingDatabase:
 
     def save_market_side_confirmation_transition(self, payload: dict) -> bool:
         normalized = _market_side_confirmation_transition_params(payload)
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT OR IGNORE INTO market_side_confirmation_transitions(
@@ -13649,7 +14258,7 @@ class TradingDatabase:
         return [_row_to_market_side_confirmation_transition(row) for row in rows]
 
     def save_entry_plan(self, plan: EntryPlan) -> EntryPlan:
-        with self.conn:
+        with self._write_scope():
             if plan.id is None:
                 cursor = self.conn.execute(
                     """
@@ -13719,7 +14328,7 @@ class TradingDatabase:
         return None
 
     def save_virtual_order(self, order: VirtualOrder) -> VirtualOrder:
-        with self.conn:
+        with self._write_scope():
             if order.id is None:
                 cursor = self.conn.execute(
                     """
@@ -13790,12 +14399,12 @@ class TradingDatabase:
         return None
 
     def save_virtual_position(self, position: VirtualPosition) -> VirtualPosition:
-        with self.conn:
+        with self._write_scope():
             saved = self._save_virtual_position_no_commit(position)
         return saved
 
     def save_position_context_snapshot(self, snapshot: PositionContextSnapshot) -> PositionContextSnapshot:
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO position_context_history(
@@ -13890,7 +14499,7 @@ class TradingDatabase:
         pruned = 0
         error_count = 0
         try:
-            with self.conn:
+            with self._write_scope():
                 cursor = self.conn.execute(
                     """
                     DELETE FROM position_context_history
@@ -13925,7 +14534,7 @@ class TradingDatabase:
 
     def save_position_context_prune_run(self, summary: dict) -> dict:
         payload = dict(summary or {})
-        with self.conn:
+        with self._write_scope():
             cursor = self.conn.execute(
                 """
                 INSERT INTO position_context_history_prune_runs(
@@ -14012,7 +14621,7 @@ class TradingDatabase:
         return [self._row_to_virtual_position(row) for row in rows]
 
     def save_exit_decision(self, decision: ExitDecision) -> ExitDecision:
-        with self.conn:
+        with self._write_scope():
             saved = self._save_exit_decision_no_commit(decision)
         return saved
 
@@ -14036,7 +14645,7 @@ class TradingDatabase:
         position: VirtualPosition,
         decision: ExitDecision,
     ) -> tuple[VirtualPosition, ExitDecision]:
-        with self.conn:
+        with self._write_scope():
             saved_position = self._save_virtual_position_no_commit(position)
             decision.virtual_position_id = saved_position.id
             saved_decision = self._save_exit_decision_no_commit(decision)
@@ -14045,7 +14654,7 @@ class TradingDatabase:
     def save_trade_review(self, review: TradeReview) -> TradeReview:
         if review.candidate_id is None:
             raise ValueError("candidate_id is required for TradeReview")
-        with self.conn:
+        with self._write_scope():
             saved = self._save_trade_review_no_commit(review)
         return saved
 
@@ -14104,7 +14713,7 @@ class TradingDatabase:
         config_version: int,
         config_json: str,
     ) -> dict:
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO strategy_runtime_settings(
@@ -14150,7 +14759,7 @@ class TradingDatabase:
         return dict(row) if row else None
 
     def save_strategy_runtime_settings_profile(self, payload: dict) -> dict:
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO strategy_runtime_settings(
@@ -14202,7 +14811,7 @@ class TradingDatabase:
 
     def save_shadow_small_entry_ops_state(self, payload: dict) -> dict:
         state_key = str(payload.get("state_key") or "default")
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO shadow_small_entry_ops_state(
@@ -14246,7 +14855,7 @@ class TradingDatabase:
 
     def save_shadow_small_entry_ops_token(self, payload: dict) -> dict:
         params = _shadow_small_entry_ops_token_params(payload)
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO shadow_small_entry_ops_tokens(
@@ -14291,7 +14900,7 @@ class TradingDatabase:
         if not assignments:
             return None
         values.append(str(token_id or ""))
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 f"UPDATE shadow_small_entry_ops_tokens SET {', '.join(assignments)} WHERE token_id = ?",
                 tuple(values),
@@ -14304,7 +14913,7 @@ class TradingDatabase:
 
     def append_shadow_small_entry_ops_audit_log(self, payload: dict) -> dict:
         params = _shadow_small_entry_ops_audit_params(payload)
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT OR IGNORE INTO shadow_small_entry_ops_audit_log(
@@ -14351,7 +14960,7 @@ class TradingDatabase:
 
     def save_shadow_small_entry_pilot_run(self, payload: dict) -> dict:
         params = _shadow_small_entry_pilot_run_params(payload)
-        with self.conn:
+        with self._write_scope():
             self.conn.execute(
                 """
                 INSERT INTO shadow_small_entry_pilot_runs(
@@ -14435,7 +15044,7 @@ class TradingDatabase:
         rows = [_shadow_small_entry_pilot_event_params(item) for item in events]
         if not rows:
             return 0
-        with self.conn:
+        with self._write_scope():
             self.conn.executemany(
                 """
                 INSERT OR IGNORE INTO shadow_small_entry_pilot_events(
@@ -14522,7 +15131,7 @@ class TradingDatabase:
             )
         if not cleaned:
             return 0
-        with self.conn:
+        with self._write_scope():
             self.conn.executemany(
                 """
                 INSERT INTO kiwoom_symbol_master(
@@ -14583,7 +15192,7 @@ class TradingDatabase:
         ).fetchone()
         if row is None:
             return
-        with self.conn:
+        with self._write_scope():
             archive_exists = self.conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'legacy_theme_mappings_archive'"
             ).fetchone()
@@ -15483,6 +16092,10 @@ class TradingDatabase:
             "processed_lease_signature": "TEXT NOT NULL DEFAULT ''",
             "pending_reason_codes_json": "TEXT NOT NULL DEFAULT '[]'",
         }
+        pending_v5_columns = {
+            "failed_permanent_at": "TEXT NOT NULL DEFAULT ''",
+            "evaluation_commit_id": "TEXT NOT NULL DEFAULT ''",
+        }
         for name, definition in run_columns.items():
             self._ensure_column("setup_router_runs", name, definition)
         for name, definition in latest_columns.items():
@@ -15497,6 +16110,8 @@ class TradingDatabase:
             self._ensure_column("setup_router_state_transitions_v2", name, definition)
         for name, definition in candidate_runtime_columns.items():
             self._ensure_column("setup_router_candidate_runtime_v3", name, definition)
+        for name, definition in pending_v5_columns.items():
+            self._ensure_column("setup_router_pending_evaluations_v5", name, definition)
 
     def _ensure_theme_state_runtime_columns(self) -> None:
         columns = {
@@ -18694,6 +19309,7 @@ def _row_to_setup_router_pending_evaluation(row: sqlite3.Row | None) -> dict:
         "selected_at": data.get("selected_at", ""),
         "completed_at": data.get("completed_at", ""),
         "superseded_at": data.get("superseded_at", ""),
+        "failed_permanent_at": data.get("failed_permanent_at", ""),
         "next_retry_at": data.get("next_retry_at", ""),
         "attempt_count": int(data.get("attempt_count") or 0),
         "failure_count": int(data.get("failure_count") or 0),
@@ -18707,6 +19323,7 @@ def _row_to_setup_router_pending_evaluation(row: sqlite3.Row | None) -> dict:
         "lease_signature": data.get("lease_signature", ""),
         "ttl_signature": data.get("ttl_signature", data.get("ttl_due_at", "")),
         "ttl_due_at": data.get("ttl_due_at", data.get("ttl_signature", "")),
+        "evaluation_commit_id": data.get("evaluation_commit_id", ""),
         "created_at": data.get("created_at", ""),
         "updated_at": data.get("updated_at", ""),
     }
@@ -19436,6 +20053,28 @@ def _setup_router_pending_priority(reasons: Iterable[object]) -> int:
 def _setup_router_pending_instance_id(trade_date: str, router_version: str, candidate_instance_id: str, epoch: int) -> str:
     material = "|".join([str(trade_date or ""), str(router_version or ""), str(candidate_instance_id or ""), str(max(1, int(epoch or 1)))])
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:24]
+
+
+def _stable_json_db(value: object) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        return str(value)
+
+
+def _setup_router_evaluation_commit_id(payload: Mapping[str, object]) -> str:
+    observations = [dict(item or {}) for item in list(payload.get("observations") or [])]
+    observed = {
+        "trade_date": payload.get("trade_date"),
+        "router_version": payload.get("router_version"),
+        "candidate_instance_id": payload.get("candidate_instance_id"),
+        "pending_instance_id": payload.get("pending_instance_id"),
+        "pending_epoch": payload.get("pending_epoch"),
+        "fingerprints": [str(item.get("observation_fingerprint") or item.get("fingerprint") or "") for item in observations],
+        "candle": (observations[0].get("entry_decision_at") if observations else ""),
+        "context_id": (observations[0].get("context_id") if observations else ""),
+    }
+    return hashlib.sha1(_stable_json_db(observed).encode("utf-8")).hexdigest()
 
 
 def _pending_v5_no_change(existing: Mapping[str, object], values: Mapping[str, object]) -> bool:

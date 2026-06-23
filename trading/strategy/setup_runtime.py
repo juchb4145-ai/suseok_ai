@@ -221,6 +221,9 @@ class SetupRouterV3RuntimePipeline:
         saved_count = 0
         completed_pending_count = 0
         retry_pending_count = 0
+        failed_evaluation_count = 0
+        failed_evaluation_codes: list[str] = []
+        last_commit_error = ""
         for entry in selected_entries:
             candidate = entry["candidate"]
             code = normalize_code(candidate.code)
@@ -256,7 +259,6 @@ class SetupRouterV3RuntimePipeline:
                 signature = self._feature_signature(feature, states)
                 self._last_feature_signature[candidate_instance_id] = signature
                 result = [item.to_dict() for item in self.router.classify(feature)]
-                observations.extend(result)
                 evaluated_count += 1
                 success_runtime_update = self._runtime_update(
                     candidate,
@@ -276,28 +278,67 @@ class SetupRouterV3RuntimePipeline:
                     "trade_date": trade_date,
                     "candidate_instance_id": candidate_instance_id,
                     "router_version": SETUP_ROUTER_VERSION,
+                    "pending_epoch": int(dict(entry.get("pending") or {}).get("pending_epoch") or 0),
+                    "pending_instance_id": str(dict(entry.get("pending") or {}).get("pending_instance_id") or ""),
                     "status": "COMPLETED",
                     "completed_at": current.isoformat(),
                     "last_attempt_at": current.isoformat(),
                     "last_error": "",
                     "last_error_class": "",
                 }
-                completion_writer = getattr(self.db, "complete_setup_router_evaluation", None)
+                completion_writer = getattr(self.db, "complete_setup_router_evaluation_atomic", None) or getattr(self.db, "complete_setup_router_evaluation", None)
                 if callable(completion_writer) and self.config.save_history and result:
-                    counts = dict(
-                        completion_writer(
-                            observations=result,
-                            runtime_update=success_runtime_update,
-                            pending_update=pending_complete_update,
+                    if getattr(completion_writer, "__name__", "") == "complete_setup_router_evaluation_atomic":
+                        counts = dict(
+                            completion_writer(
+                                {
+                                    "observations": result,
+                                    "runtime_update": success_runtime_update,
+                                    "pending_update": pending_complete_update,
+                                }
+                            )
+                            or {}
                         )
-                        or {}
-                    )
-                    state_counts["state_write_count"] += int(counts.get("state_write_count") or 0)
-                    state_counts["transition_write_count"] += int(counts.get("transition_write_count") or 0)
-                    state_counts["no_change_skip_count"] += int(counts.get("no_change_skip_count") or 0)
-                    state_counts["state_no_change_skip_count"] += int(counts.get("state_no_change_skip_count") or counts.get("no_change_skip_count") or 0)
-                    saved_count += int(counts.get("observation_write_count") or counts.get("saved_count") or 0)
-                    completed_pending_count += int(counts.get("pending_completed_count") or 0)
+                    else:
+                        counts = dict(
+                            completion_writer(
+                                observations=result,
+                                runtime_update=success_runtime_update,
+                                pending_update=pending_complete_update,
+                            )
+                            or {}
+                        )
+                    commit_status = str(counts.get("status") or "COMMITTED")
+                    if commit_status in {"COMMITTED", "IDEMPOTENT_ALREADY_COMMITTED"}:
+                        observations.extend(result)
+                        state_counts["state_write_count"] += int(counts.get("state_write_count") or 0)
+                        state_counts["transition_write_count"] += int(counts.get("transition_write_count") or 0)
+                        state_counts["no_change_skip_count"] += int(counts.get("no_change_skip_count") or 0)
+                        state_counts["state_no_change_skip_count"] += int(counts.get("state_no_change_skip_count") or counts.get("no_change_skip_count") or 0)
+                        saved_count += int(counts.get("observation_write_count") or counts.get("saved_count") or 0)
+                        completed_pending_count += int(counts.get("pending_completed_count") or 0)
+                    else:
+                        failed_evaluation_count += 1
+                        failed_evaluation_codes.append(code)
+                        last_commit_error = f"{commit_status}:{counts.get('error_class') or ''}"
+                        warnings.append(f"SETUP_ROUTER_COMMIT_FAILED:{code}:{last_commit_error}")
+                        if callable(pending_updater) and commit_status == "STORAGE_ERROR":
+                            pending_updater(
+                                [
+                                    {
+                                        "trade_date": trade_date,
+                                        "candidate_instance_id": candidate_instance_id,
+                                        "router_version": SETUP_ROUTER_VERSION,
+                                        "status": "RETRY",
+                                        "last_attempt_at": current.isoformat(),
+                                        "last_error": str(counts.get("error_message") or last_commit_error),
+                                        "last_error_class": str(counts.get("error_class") or commit_status),
+                                        "next_retry_at": self._retry_next_at(current, int(dict(entry.get("pending") or {}).get("failure_count") or 0) + 1),
+                                        "pending_reasons": list(entry.get("pending_reasons") or []),
+                                    }
+                                ]
+                            )
+                            retry_pending_count += 1
                 else:
                     state_saver = getattr(self.db, "save_setup_router_states", None)
                     if self.config.save_history and result and callable(state_saver):
@@ -313,13 +354,14 @@ class SetupRouterV3RuntimePipeline:
                     if callable(pending_updater):
                         pending_updater([pending_complete_update])
                         completed_pending_count += 1
+                    observations.extend(result)
             except Exception as exc:  # pragma: no cover - defensive runtime isolation
                 warnings.append(f"SETUP_ROUTER_CANDIDATE_ERROR:{code}:{exc.__class__.__name__}")
                 if callable(pending_updater):
                     pending = dict(entry.get("pending") or {})
                     next_failure_count = int(pending.get("failure_count") or 0) + 1
-                    retry_status = "SUPERSEDED" if next_failure_count >= max(1, int(self.config.retry_max_failures)) else "RETRY"
-                    retry_reasons = [*list(entry.get("pending_reasons") or []), "RETRY_MAX_FAILURES_EXCEEDED"] if retry_status == "SUPERSEDED" else list(entry.get("pending_reasons") or [])
+                    retry_status = "FAILED_PERMANENT" if next_failure_count >= max(1, int(self.config.retry_max_failures)) else "RETRY"
+                    retry_reasons = [*list(entry.get("pending_reasons") or []), "RETRY_MAX_FAILURES_EXCEEDED"] if retry_status == "FAILED_PERMANENT" else list(entry.get("pending_reasons") or [])
                     pending_updater(
                         [
                             {
@@ -332,6 +374,7 @@ class SetupRouterV3RuntimePipeline:
                                 "last_error_class": exc.__class__.__name__,
                                 "next_retry_at": self._retry_next_at(current, next_failure_count),
                                 "pending_reasons": retry_reasons,
+                                "failed_permanent_at": current.isoformat() if retry_status == "FAILED_PERMANENT" else "",
                             }
                         ]
                     )
@@ -433,6 +476,9 @@ class SetupRouterV3RuntimePipeline:
             "selected_pending_count": len(selected_entries),
             "completed_pending_count": completed_pending_count,
             "retry_pending_count": retry_pending_count,
+            "failed_evaluation_count": failed_evaluation_count,
+            "failed_evaluation_codes": failed_evaluation_codes[:20],
+            "last_commit_error": last_commit_error,
             "superseded_pending_count": int(pending_recovery_counts.get("superseded_pending_count") or 0),
             "selected_lease_expired_count": int(pending_recovery_counts.get("selected_lease_expired_count") or 0),
             "deferred_pending_count": deferred_pending_count,

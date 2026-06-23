@@ -84,7 +84,7 @@ def test_setup_router_state_ignores_price_only_observation_transition(tmp_path):
     first_counts = db.save_setup_router_states([first])
     second_counts = db.save_setup_router_states([second])
 
-    states = db.list_setup_router_states(trade_date=TRADE_DATE, candidate_instance_ids=["ci-1"], router_version="setup_router_v3.4.1")
+    states = db.list_setup_router_states(trade_date=TRADE_DATE, candidate_instance_ids=["ci-1"], router_version="setup_router_v3.5")
     transitions = db.conn.execute("SELECT * FROM setup_router_state_transitions_v3 WHERE trade_date = ?", (TRADE_DATE,)).fetchall()
 
     assert len(transitions) == 1
@@ -118,7 +118,7 @@ def test_setup_router_state_is_theme_scoped_and_expires_previous_selected_theme(
     db.save_setup_router_states([theme_a])
     db.save_setup_router_states([theme_b])
 
-    states = db.list_setup_router_states(trade_date=TRADE_DATE, candidate_instance_ids=["ci-1"], router_version="setup_router_v3.4.1")
+    states = db.list_setup_router_states(trade_date=TRADE_DATE, candidate_instance_ids=["ci-1"], router_version="setup_router_v3.5")
     by_theme = {row["theme_id"]: row for row in states}
 
     assert by_theme["theme-a"]["lifecycle_state"] == "EXPIRED"
@@ -132,8 +132,8 @@ def test_pending_completed_reopens_with_new_epoch_and_reset_backlog_fields(tmp_p
         "trade_date": TRADE_DATE,
         "candidate_instance_id": "ci-1",
         "code": "000001",
-        "router_version": "setup_router_v3.4.1",
-        "state_version": "setup_router_v3.state.v3.1",
+        "router_version": "setup_router_v3.5",
+        "state_version": "setup_router_v3.state.v3.2",
         "selected_theme_id": "ai",
         "pending_reasons": ["ENTRY_DECISION_CHANGED"],
         "first_pending_at": "2026-06-22T09:05:00",
@@ -166,8 +166,8 @@ def test_retry_backoff_is_not_reopened_by_periodic_but_material_event_releases_i
         "trade_date": TRADE_DATE,
         "candidate_instance_id": "ci-1",
         "code": "000001",
-        "router_version": "setup_router_v3.4.1",
-        "state_version": "setup_router_v3.state.v3.1",
+        "router_version": "setup_router_v3.5",
+        "state_version": "setup_router_v3.state.v3.2",
         "selected_theme_id": "ai",
         "pending_reasons": ["ENTRY_DECISION_CHANGED"],
         "first_pending_at": "2026-06-22T09:05:00",
@@ -205,27 +205,29 @@ def test_complete_setup_router_evaluation_commits_observation_runtime_and_pendin
         "trade_date": TRADE_DATE,
         "candidate_instance_id": "ci-1",
         "code": "000001",
-        "router_version": "setup_router_v3.4.1",
-        "state_version": "setup_router_v3.state.v3.1",
+        "router_version": "setup_router_v3.5",
+        "state_version": "setup_router_v3.state.v3.2",
         "pending_reasons": ["ENTRY_DECISION_CHANGED"],
         "first_pending_at": "2026-06-22T09:05:00",
         "last_pending_at": "2026-06-22T09:05:00",
     }
     db.save_setup_router_pending_evaluations([pending])
+    selected = db.list_setup_router_pending_evaluations(trade_date=TRADE_DATE)[0]
+    db.update_setup_router_pending_evaluations([{**pending, "status": "SELECTED", "selected_at": "2026-06-22T09:05:01", "last_attempt_at": "2026-06-22T09:05:01"}])
     counts = db.complete_setup_router_evaluation(
         observations=[_observation("VALID_OBSERVE", "MATCHED", "fp-complete")],
         runtime_update={
             "trade_date": TRADE_DATE,
             "candidate_instance_id": "ci-1",
             "code": "000001",
-            "router_version": "setup_router_v3.4.1",
-            "state_version": "setup_router_v3.state.v3.1",
+            "router_version": "setup_router_v3.5",
+            "state_version": "setup_router_v3.state.v3.2",
             "last_evaluated_at": "2026-06-22T09:05:05",
             "last_success_at": "2026-06-22T09:05:05",
             "processed_entry_signature": "entry",
             "evaluation_count": 1,
         },
-        pending_update={**pending, "status": "COMPLETED", "completed_at": "2026-06-22T09:05:05"},
+        pending_update={**pending, "pending_epoch": selected["pending_epoch"], "pending_instance_id": selected["pending_instance_id"], "status": "COMPLETED", "completed_at": "2026-06-22T09:05:05"},
     )
 
     assert counts["observation_write_count"] == 1
@@ -236,7 +238,49 @@ def test_complete_setup_router_evaluation_commits_observation_runtime_and_pendin
     assert db.list_setup_router_pending_evaluations(trade_date=TRADE_DATE, statuses=("COMPLETED",))[0]["status"] == "COMPLETED"
 
 
-def test_setup_router_state_version_isolation_between_v34_and_v341(tmp_path):
+def test_atomic_completion_rolls_back_partial_writes_on_injected_failure(tmp_path):
+    db = TradingDatabase(str(tmp_path / "atomic-rollback.db"))
+    pending = {
+        "trade_date": TRADE_DATE,
+        "candidate_instance_id": "ci-1",
+        "code": "000001",
+        "router_version": "setup_router_v3.5",
+        "state_version": "setup_router_v3.state.v3.2",
+        "pending_reasons": ["ENTRY_DECISION_CHANGED"],
+        "first_pending_at": "2026-06-22T09:05:00",
+        "last_pending_at": "2026-06-22T09:05:00",
+    }
+    db.save_setup_router_pending_evaluations([pending])
+    selected = db.list_setup_router_pending_evaluations(trade_date=TRADE_DATE)[0]
+    db.update_setup_router_pending_evaluations([{**pending, "status": "SELECTED", "selected_at": "2026-06-22T09:05:01", "last_attempt_at": "2026-06-22T09:05:01"}])
+
+    result = db.complete_setup_router_evaluation_atomic(
+        {
+            "observations": [_observation("VALID_OBSERVE", "MATCHED", "fp-rollback")],
+            "runtime_update": {
+                "trade_date": TRADE_DATE,
+                "candidate_instance_id": "ci-1",
+                "code": "000001",
+                "router_version": "setup_router_v3.5",
+                "state_version": "setup_router_v3.state.v3.2",
+                "last_evaluated_at": "2026-06-22T09:05:05",
+                "last_success_at": "2026-06-22T09:05:05",
+                "processed_entry_signature": "entry",
+                "evaluation_count": 1,
+            },
+            "pending_update": {**pending, "pending_epoch": selected["pending_epoch"], "pending_instance_id": selected["pending_instance_id"], "status": "COMPLETED", "completed_at": "2026-06-22T09:05:05"},
+            "completion_metadata": {"fail_after_observation_write": True},
+        }
+    )
+
+    assert result["status"] == "STORAGE_ERROR"
+    assert db.list_setup_observations_latest(trade_date=TRADE_DATE) == []
+    assert db.list_setup_router_states(trade_date=TRADE_DATE, candidate_instance_ids=["ci-1"], router_version="setup_router_v3.5") == []
+    assert db.list_setup_router_candidate_runtime(trade_date=TRADE_DATE, candidate_instance_ids=["ci-1"]) == []
+    assert db.list_setup_router_pending_evaluations(trade_date=TRADE_DATE, statuses=("SELECTED",))[0]["status"] == "SELECTED"
+
+
+def test_setup_router_state_version_isolation_between_v34_and_v35(tmp_path):
     db = TradingDatabase(str(tmp_path / "state-version-isolation.db"))
     legacy = {
         **_observation("PENDING", "FORMING", "legacy-fp"),
@@ -246,8 +290,8 @@ def test_setup_router_state_version_isolation_between_v34_and_v341(tmp_path):
     }
     current = {
         **_observation("PENDING", "FORMING", "current-fp"),
-        "router_version": "setup_router_v3.4.1",
-        "state_version": "setup_router_v3.state.v3.1",
+        "router_version": "setup_router_v3.5",
+        "state_version": "setup_router_v3.state.v3.2",
         "material_state_fingerprint": "current-material",
     }
 
@@ -255,12 +299,12 @@ def test_setup_router_state_version_isolation_between_v34_and_v341(tmp_path):
     db.save_setup_router_states([current])
 
     legacy_rows = db.list_setup_router_states(trade_date=TRADE_DATE, candidate_instance_ids=["ci-1"], router_version="setup_router_v3.4")
-    current_rows = db.list_setup_router_states(trade_date=TRADE_DATE, candidate_instance_ids=["ci-1"], router_version="setup_router_v3.4.1")
+    current_rows = db.list_setup_router_states(trade_date=TRADE_DATE, candidate_instance_ids=["ci-1"], router_version="setup_router_v3.5")
     old_table_count = db.conn.execute("SELECT COUNT(*) FROM setup_router_state_v2 WHERE trade_date = ? AND router_version = 'setup_router_v3.4'", (TRADE_DATE,)).fetchone()[0]
-    new_table_count = db.conn.execute("SELECT COUNT(*) FROM setup_router_state_v3 WHERE trade_date = ? AND router_version = 'setup_router_v3.4.1'", (TRADE_DATE,)).fetchone()[0]
+    new_table_count = db.conn.execute("SELECT COUNT(*) FROM setup_router_state_v3 WHERE trade_date = ? AND router_version = 'setup_router_v3.5'", (TRADE_DATE,)).fetchone()[0]
 
     assert legacy_rows[0]["router_version"] == "setup_router_v3.4"
-    assert current_rows[0]["router_version"] == "setup_router_v3.4.1"
+    assert current_rows[0]["router_version"] == "setup_router_v3.5"
     assert old_table_count == 1
     assert new_table_count == 1
 
@@ -291,10 +335,10 @@ def _observation(router_status, shape_status, fingerprint):
         "session_phase": "MORNING_TREND",
         "current_price": 1000,
         "fingerprint": fingerprint,
-        "schema_version": "setup_router_v3.observe.v4.1",
+        "schema_version": "setup_router_v3.observe.v5",
         "feature_schema_version": "setup_router_v3.features.v4.1",
-        "router_version": "setup_router_v3.4.1",
-        "state_version": "setup_router_v3.state.v3.1",
+        "router_version": "setup_router_v3.5",
+        "state_version": "setup_router_v3.state.v3.2",
         "setup_generation": 1,
         "setup_instance_id": "setup-ci-1-vwap-1",
         "lifecycle_state": "MATCHED" if shape_status == "MATCHED" else "FORMING",
