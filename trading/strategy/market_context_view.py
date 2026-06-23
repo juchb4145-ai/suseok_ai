@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -44,6 +45,8 @@ class MarketSideContextView:
 
 @dataclass(frozen=True)
 class MarketContextSummary(Mapping[str, Any]):
+    market_context_id: str = ""
+    market_context_generation: str = ""
     trade_date: str = ""
     calculated_at: str = ""
     global_status: str = "DATA_WAIT"
@@ -62,6 +65,8 @@ class MarketContextSummary(Mapping[str, Any]):
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "market_context_id": self.market_context_id,
+            "market_context_generation": self.market_context_generation,
             "trade_date": self.trade_date,
             "calculated_at": self.calculated_at,
             "global_status": self.global_status,
@@ -142,16 +147,40 @@ class MarketContextView(Mapping[str, Any]):
         return "UNKNOWN"
 
     def is_fresh(self, now: datetime, max_age_sec: int) -> bool:
+        return self.is_transport_fresh(now, max_age_sec)
+
+    def is_transport_fresh(self, now: datetime, max_age_sec: int) -> bool:
         if not self.trade_date or self.trade_date != now.date().isoformat():
             return False
         if not self.calculated_at:
             return False
-        if self.summary.global_status in {"", "DATA_WAIT"} and self.summary.kospi_status in {"", "DATA_WAIT"} and self.summary.kosdaq_status in {"", "DATA_WAIT"}:
+        if not self.schema_supported():
             return False
         if self.summary.market_closed or self.summary.market_session_status.lower() == "closed" or self.summary.global_status == "MARKET_CLOSED":
             return True
         age = _age_seconds(self.calculated_at, now)
         return age is not None and age <= max(1, int(max_age_sec or 30))
+
+    def schema_supported(self) -> bool:
+        version = str(self.schema_version or self.summary.schema_version or "")
+        return version in {"", MARKET_CONTEXT_VIEW_SCHEMA_VERSION}
+
+    def decision_data_status(self) -> str:
+        statuses = {
+            str(self.summary.global_status or "").upper(),
+            str(self.summary.kospi_status or "").upper(),
+            str(self.summary.kosdaq_status or "").upper(),
+        }
+        if self.summary.market_closed or self.summary.market_session_status.lower() == "closed" or self.summary.global_status == "MARKET_CLOSED":
+            return "MARKET_CLOSED"
+        if statuses <= {"", "DATA_WAIT"}:
+            return "FULL_DATA_WAIT"
+        if "DATA_WAIT" in statuses:
+            return "PARTIAL_DATA_WAIT"
+        return "READY"
+
+    def is_decision_ready(self) -> bool:
+        return self.decision_data_status() == "READY"
 
     def to_theme_summary(self) -> MarketContextSummary:
         return self.summary
@@ -166,18 +195,48 @@ class MarketContextView(Mapping[str, Any]):
         db_fallback_count: int = 0,
         summary_fallback_count: int = 0,
         warning_codes: tuple[str, ...] = (),
+        fallback_reason: str = "",
+        pipeline_view_present: bool | None = None,
+        market_section_status: str = "",
+        current_snapshot_authoritative: bool | None = None,
     ) -> dict[str, Any]:
         age = _age_seconds(self.calculated_at, now)
-        usable = self.is_fresh(now, max_age_sec)
+        transport_fresh = self.is_transport_fresh(now, max_age_sec)
+        decision_status = self.decision_data_status()
+        if not self.calculated_at:
+            transport_status = "MISSING"
+        elif not self.trade_date or self.trade_date != now.date().isoformat():
+            transport_status = "TRADE_DATE_MISMATCH"
+        elif not self.schema_supported():
+            transport_status = "UNSUPPORTED_SCHEMA"
+        elif transport_fresh:
+            transport_status = "AVAILABLE"
+        else:
+            transport_status = "STALE"
         return {
-            "status": "OK" if usable else "DATA_WAIT",
+            "status": "OK" if transport_fresh else "DATA_WAIT",
             "source": self.source,
             "schema_version": self.schema_version,
+            "market_context_id": self.summary.market_context_id,
+            "market_context_generation": self.summary.market_context_generation,
             "calculated_at": self.calculated_at,
             "age_sec": round(age, 3) if age is not None else None,
+            "freshness_age_sec": round(age, 3) if age is not None else None,
             "trade_date_match": bool(self.trade_date and self.trade_date == now.date().isoformat()),
-            "usable": usable,
+            "schema_supported": self.schema_supported(),
+            "usable": transport_fresh,
+            "transport_status": transport_status,
+            "transport_fresh": transport_fresh,
+            "decision_ready": self.is_decision_ready(),
+            "decision_data_status": decision_status,
+            "fallback_reason": str(fallback_reason or ""),
             "policy_count": self.policy_count,
+            "global_status": self.summary.global_status,
+            "kospi_status": self.summary.kospi_status,
+            "kosdaq_status": self.summary.kosdaq_status,
+            "market_section_status": str(market_section_status or ""),
+            "pipeline_view_present": bool(pipeline_view_present) if pipeline_view_present is not None else None,
+            "current_snapshot_authoritative": bool(current_snapshot_authoritative) if current_snapshot_authoritative is not None else None,
             "build_ms": int(build_ms or 0),
             "full_snapshot_serialize_count": int(full_snapshot_serialize_count or 0),
             "db_fallback_count": int(db_fallback_count or 0),
@@ -246,6 +305,31 @@ def unavailable_market_context_view(trade_date: str, *, calculated_at: str = "",
     return MarketContextView(summary=summary, source=source)
 
 
+def market_context_identity(
+    *,
+    trade_date: str,
+    calculated_at: str,
+    global_status: Any,
+    kospi_status: Any,
+    kosdaq_status: Any,
+    composite_market_mode: Any,
+    policy_count: int = 0,
+) -> str:
+    raw = "|".join(
+        [
+            MARKET_CONTEXT_VIEW_SCHEMA_VERSION,
+            str(trade_date or ""),
+            str(calculated_at or ""),
+            str(_enum_value(global_status) or ""),
+            str(_enum_value(kospi_status) or ""),
+            str(_enum_value(kosdaq_status) or ""),
+            str(_enum_value(composite_market_mode) or ""),
+            str(int(policy_count or 0)),
+        ]
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+
 def market_context_view_max_age_sec(default: int = 30) -> int:
     import os
 
@@ -268,7 +352,27 @@ def _summary_from_sources(*, snapshot: Any | None, data: Mapping[str, Any], sour
     if systemic is None:
         systemic = _infer_systemic(kospi_status, kosdaq_status, market_open=market_open)
     reason_codes = tuple(str(item) for item in list(_obj_value(snapshot, "reason_codes", data.get("reason_codes") or ()) or ()))
+    policy_count = len(_obj_value(snapshot, "candidate_policy_by_code", data.get("candidate_policy_by_code") or {}) or {})
+    identity = str(
+        _obj_value(
+            snapshot,
+            "market_context_id",
+            data.get("market_context_id")
+            or market_context_identity(
+                trade_date=trade_date,
+                calculated_at=calculated_at,
+                global_status=global_status,
+                kospi_status=kospi_status,
+                kosdaq_status=kosdaq_status,
+                composite_market_mode=_obj_value(snapshot, "composite_market_mode", data.get("composite_market_mode") or "DATA_DEGRADED"),
+                policy_count=policy_count,
+            ),
+        )
+        or ""
+    )
     return MarketContextSummary(
+        market_context_id=identity,
+        market_context_generation=str(_obj_value(snapshot, "market_context_generation", data.get("market_context_generation") or identity) or ""),
         trade_date=trade_date,
         calculated_at=calculated_at,
         global_status=global_status,

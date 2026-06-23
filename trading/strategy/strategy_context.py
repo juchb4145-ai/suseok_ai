@@ -41,6 +41,10 @@ class SessionPhase(str, Enum):
 
 @dataclass(frozen=True)
 class StrategyMarketContext:
+    market_context_id: str = ""
+    market_context_generation: str = ""
+    market_context_source: str = ""
+    market_context_schema_version: str = ""
     market_side: str = "UNKNOWN"
     market_side_resolution_status: str = "UNRESOLVED"
     side_market_regime: str = "DATA_WAIT"
@@ -270,6 +274,7 @@ class StrategyContextAssembler:
             selected_theme_id=best_theme.selected_theme_id,
             leadership_status=theme.leadership_status,
             leadership_entry_policy=theme.leadership_entry_policy,
+            market_context_id=market.market_context_id,
         )
         return StrategyContextSnapshot(
             context_id=context_id,
@@ -297,9 +302,13 @@ class StrategyContextAssembler:
                 "strategy_context": STRATEGY_CONTEXT_SCHEMA_VERSION,
                 "theme_core": str(theme_payload.get("output_mode") or ""),
                 "market_regime": str(_payload_get(market_payload, "output_mode", "")),
+                "market_context_source": market.market_context_source,
+                "market_context_schema": market.market_context_schema_version,
             },
             source_timestamps={
                 "market_context_at": market.calculated_at,
+                "market_context_id": market.market_context_id,
+                "market_context_generation": market.market_context_generation,
                 "theme_context_at": theme.calculated_at,
             },
             context_fresh=bool(data.theme_context_fresh and data.market_context_fresh),
@@ -526,6 +535,10 @@ def _market_context(candidate: Candidate, payload: Any, code: str) -> StrategyMa
     if not reasons:
         reasons = ["MARKET_CONTEXT_READY"]
     return StrategyMarketContext(
+        market_context_id=str(_payload_get(payload, "market_context_id", "") or ""),
+        market_context_generation=str(_payload_get(payload, "market_context_generation", "") or ""),
+        market_context_source=str(_payload_get(payload, "source", "") or ""),
+        market_context_schema_version=str(_payload_get(payload, "schema_version", "") or ""),
         market_side=side,
         market_side_resolution_status=str(_payload_get(policy, "market_side_resolution_status", "") or ("RESOLVED" if side in {"KOSPI", "KOSDAQ"} else "UNRESOLVED")),
         side_market_regime=status,
@@ -987,6 +1000,7 @@ def _context_id(
     selected_theme_id: str = "",
     leadership_status: str = "",
     leadership_entry_policy: str = "",
+    market_context_id: str = "",
 ) -> str:
     raw = "|".join(
         [
@@ -994,6 +1008,7 @@ def _context_id(
             str(candidate_id or ""),
             normalize_code(code),
             str(selected_theme_id or ""),
+            str(market_context_id or ""),
             str(market_at or ""),
             str(theme_at or ""),
             str(role or ""),

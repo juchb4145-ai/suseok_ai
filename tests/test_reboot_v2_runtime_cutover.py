@@ -140,6 +140,110 @@ def test_reboot_v2_passes_summary_to_theme_and_view_to_strategy_without_db_fallb
     assert db_fallback_calls == 0
 
 
+def test_reboot_v2_current_data_wait_market_context_stays_pipeline_authoritative(tmp_path):
+    db = TradingDatabase(str(tmp_path / "v2_market_context_data_wait.db"))
+    db_fallback_calls = 0
+    original_latest_market_regime = db.latest_market_regime_snapshot
+
+    def _counted_latest_market_regime(*args, **kwargs):
+        nonlocal db_fallback_calls
+        db_fallback_calls += 1
+        return original_latest_market_regime(*args, **kwargs)
+
+    db.latest_market_regime_snapshot = _counted_latest_market_regime
+    theme_board = _CapturePipeline()
+    strategy_context = _CapturePipeline()
+    full_market = {
+        "trade_date": "2026-06-17",
+        "calculated_at": "2026-06-17T09:20:00",
+        "global_status": "DATA_WAIT",
+        "kospi_status": "DATA_WAIT",
+        "kosdaq_status": "DATA_WAIT",
+        "market_session_status": "open",
+        "market_open": True,
+        "market_closed": False,
+        "kospi_snapshot": {"side": "KOSPI", "status": "DATA_WAIT"},
+        "kosdaq_snapshot": {"side": "KOSDAQ", "status": "DATA_WAIT"},
+        "candidate_policy_by_code": {},
+    }
+    runtime = RebootV2Runtime(
+        db=db,
+        subscription_manager=RealTimeSubscriptionManager(GatewayCommandRealtimeClient(GatewayStateStore()), max_codes=20),
+        candle_builder=CandleBuilder(),
+        market_data=MarketDataStore(),
+        market_index_store=MarketIndexStore(),
+        config=StrategyRuntimeConfig(max_candidates_to_watch=20, realtime_subscription_limit=20),
+        profile=RebootV2RuntimeProfile.V2_OBSERVE,
+        theme_board_pipeline=theme_board,
+        market_regime_pipeline=_DashboardMarketPipeline(full_market),
+        strategy_context_pipeline=strategy_context,
+    )
+
+    snapshot = runtime.cycle(datetime(2026, 6, 17, 9, 20, 5))
+
+    transport = snapshot["market_context_transport"]
+    assert transport["source"] == "PIPELINE_VIEW"
+    assert transport["status"] == "OK"
+    assert transport["transport_status"] == "AVAILABLE"
+    assert transport["transport_fresh"] is True
+    assert transport["decision_ready"] is False
+    assert transport["decision_data_status"] == "FULL_DATA_WAIT"
+    assert transport["db_fallback_count"] == 0
+    assert transport["current_snapshot_authoritative"] is True
+    assert db_fallback_calls == 0
+    assert dict(theme_board.market_context)["global_status"] == "DATA_WAIT"
+    assert strategy_context.market_context.calculated_at == "2026-06-17T09:20:00"
+
+
+class _IntradayRecoveryPipeline:
+    config = type("Config", (), {"enabled": True})()
+
+    def __init__(self):
+        self.gateway_state = GatewayStateStore()
+        self.recover_calls = 0
+        self.run_calls = 0
+
+    def recover_from_command_history(self):
+        self.recover_calls += 1
+        return {
+            "status": "OK",
+            "recovery_status": "OK",
+            "recovered_count": 1,
+            "duplicate_skipped_count": 0,
+            "failed_count": 0,
+            "unique_constraint_error_count": 0,
+        }
+
+    def run_if_due(self, now=None, **_):
+        self.run_calls += 1
+        return {"enabled": True, "status": "OK", "calculated_at": now.isoformat() if now else ""}
+
+
+def test_reboot_v2_intraday_discovery_recovery_runs_once_per_generation(tmp_path):
+    db = TradingDatabase(str(tmp_path / "v2_intraday_recovery_once.db"))
+    intraday = _IntradayRecoveryPipeline()
+    runtime = RebootV2Runtime(
+        db=db,
+        subscription_manager=RealTimeSubscriptionManager(GatewayCommandRealtimeClient(GatewayStateStore()), max_codes=20),
+        candle_builder=CandleBuilder(),
+        market_data=MarketDataStore(),
+        market_index_store=MarketIndexStore(),
+        config=StrategyRuntimeConfig(max_candidates_to_watch=20, realtime_subscription_limit=20),
+        profile=RebootV2RuntimeProfile.V2_OBSERVE,
+        intraday_discovery_pipeline=intraday,
+    )
+
+    first = runtime.cycle(datetime(2026, 6, 17, 9, 20, 0))
+    second = runtime.cycle(datetime(2026, 6, 17, 9, 20, 5))
+
+    assert intraday.recover_calls == 1
+    assert first["intraday_discovery_recovery"]["recovery_trigger"] == "STARTUP"
+    assert first["intraday_discovery_recovery"]["recovery_run_count"] == 1
+    assert second["intraday_discovery_recovery"]["status"] == "SKIPPED"
+    assert second["intraday_discovery_recovery"]["recovery_trigger"] == "ALREADY_RECOVERED"
+    assert second["intraday_discovery_recovery"]["recovery_run_count"] == 1
+
+
 def test_reboot_v2_counts_open_positions_for_current_trade_date_only(tmp_path):
     db = TradingDatabase(str(tmp_path / "v2_positions.db"))
     old_candidate = db.save_candidate(

@@ -144,6 +144,49 @@ def test_intraday_discovery_ack_saves_idempotent_batch_rows(tmp_path):
     assert pipeline.last_summary["order_intent_allowed"] is False
 
 
+def test_intraday_discovery_recovery_is_idempotent_across_repeated_runs(tmp_path):
+    db = TradingDatabase(str(tmp_path / "intraday-recovery.db"))
+    gateway_state = GatewayStateStore()
+    pipeline = IntradayDiscoveryRuntimePipeline(
+        gateway_state=gateway_state,
+        db=db,
+        config=IntradayDiscoveryConfig(
+            enabled=True,
+            trading_mode="OBSERVE",
+            max_pending_commands=99,
+            queue_depth_limit=99,
+        ),
+    )
+    queued = pipeline.run_if_due(datetime(2026, 6, 19, 9, 21, 0))
+    command_id = gateway_state.dispatch_commands(limit=1, now=datetime(2026, 6, 19, 9, 21, 1))[0].command_id
+    gateway_state.ack_command(
+        command_id,
+        "ACKED",
+        result_payload={
+            "purpose": INTRADAY_TURNOVER_SEED_PURPOSE,
+            "observed_at": "2026-06-19T09:21:00",
+            "raw": {
+                "tr_rows": [
+                    {"종목코드": "A000001", "종목명": "One", "현재순위": "1", "거래대금": "12000000000", "등락률": "+6.4"},
+                    {"종목코드": "000002", "종목명": "Two", "현재순위": "2", "거래대금": "9000000000", "등락률": "+5.5"},
+                ]
+            },
+        },
+    )
+
+    summaries = [pipeline.recover_from_command_history(limit=100) for _ in range(100)]
+
+    batches = db.list_intraday_theme_discovery_batches(trade_date="2026-06-19")
+    rows = db.list_intraday_theme_discovery_rows(trade_date="2026-06-19")
+
+    assert queued["status"] == "QUEUED"
+    assert sum(summary["recovered_count"] for summary in summaries) == 1
+    assert sum(summary["duplicate_skipped_count"] for summary in summaries) == 99
+    assert sum(summary["unique_constraint_error_count"] for summary in summaries) == 0
+    assert len(batches) == 1
+    assert len(rows) == 2
+
+
 def test_intraday_discovery_failed_ack_saves_batch_without_seed_rows(tmp_path):
     db = TradingDatabase(str(tmp_path / "intraday-failed.db"))
     pipeline = IntradayDiscoveryRuntimePipeline(

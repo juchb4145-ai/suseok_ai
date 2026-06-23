@@ -10,7 +10,7 @@ from typing import Any, Iterable, Mapping
 from trading.strategy.candidates import normalize_code
 from trading.strategy.candles import CandleBuilder
 from trading.strategy.market_data import MarketDataStore, StrategyTick
-from trading.strategy.market_context_view import market_context_view_from_snapshot
+from trading.strategy.market_context_view import market_context_identity, market_context_view_from_snapshot
 from trading.strategy.market_index import MarketIndexStore, _index_storage_aliases
 from trading.strategy.models import Candidate, CandidateState, StrategyProfile
 from trading.strategy.reason_codes import ReasonCode
@@ -183,6 +183,8 @@ class CandidateMarketPolicy:
 
 @dataclass(frozen=True)
 class MarketRegimeSnapshot:
+    market_context_id: str
+    market_context_generation: str
     trade_date: str
     calculated_at: str
     global_status: MarketRegimeStatus
@@ -550,9 +552,21 @@ class MarketRegimeEngine:
             + list(kosdaq_snapshot.reason_codes)
             + list(systemic_reason_codes)
         )
-        snapshot = MarketRegimeSnapshot(
+        calculated_at = current.isoformat()
+        market_context_id = market_context_identity(
             trade_date=trade_date,
-            calculated_at=current.isoformat(),
+            calculated_at=calculated_at,
+            global_status=global_status,
+            kospi_status=kospi_snapshot.status,
+            kosdaq_status=kosdaq_snapshot.status,
+            composite_market_mode=composite_mode,
+            policy_count=len(policies),
+        )
+        snapshot = MarketRegimeSnapshot(
+            market_context_id=market_context_id,
+            market_context_generation=market_context_id,
+            trade_date=trade_date,
+            calculated_at=calculated_at,
             global_status=global_status,
             kospi_status=kospi_snapshot.status,
             kosdaq_status=kosdaq_snapshot.status,
@@ -1123,6 +1137,8 @@ def market_regime_dashboard_payload(
     for reason in list(data.get("systemic_reason_codes") or []) + list(data.get("data_quality_flags") or []):
         reason_counter[str(reason)] += 1
     return {
+        "market_context_id": data.get("market_context_id", ""),
+        "market_context_generation": data.get("market_context_generation", ""),
         "calculated_at": data.get("calculated_at", ""),
         "trade_date": data.get("trade_date", ""),
         "global_status": data.get("global_status", ""),

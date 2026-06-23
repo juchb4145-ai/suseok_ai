@@ -77,6 +77,9 @@ class RebootV2Runtime:
         self.expansion_lease_manager = self.expansion_lease_manager or ExpansionLeaseManager()
         self.candidate_state_contract_reconciler = self.candidate_state_contract_reconciler or CandidateStateContractReconciler(self.db, clock=self.clock)
         self._expansion_lease_restored_trade_date = ""
+        self._intraday_discovery_recovery_key = ""
+        self._intraday_discovery_recovery_run_count = 0
+        self._intraday_discovery_last_recovery: dict[str, Any] = {}
 
     def start(self, now: datetime | None = None) -> dict[str, Any]:
         current = (now or self.clock()).replace(microsecond=0)
@@ -107,7 +110,7 @@ class RebootV2Runtime:
         snapshot["steps"] = []
 
         self._recover_hydration(snapshot)
-        self._recover_intraday_discovery(snapshot)
+        self._recover_intraday_discovery(snapshot, current)
         self._reconcile_base_subscriptions(snapshot)
         self._run_pipeline(snapshot, "market_regime", self.market_regime_pipeline, current)
         downstream_market_context, market_context_transport = self._resolve_market_context_view(snapshot, current)
@@ -214,16 +217,63 @@ class RebootV2Runtime:
             snapshot["candidate_hydration_recovery"] = {"status": "ERROR", "error": str(exc)}
             snapshot.setdefault("warnings", []).append(f"CANDIDATE_HYDRATION_RECOVERY_FAILED:{exc}")
 
-    def _recover_intraday_discovery(self, snapshot: dict[str, Any]) -> None:
+    def _recover_intraday_discovery(self, snapshot: dict[str, Any], now: datetime) -> None:
         pipeline = self.intraday_discovery_pipeline
         recover = getattr(pipeline, "recover_from_command_history", None)
         if not callable(recover):
             snapshot["intraday_discovery_recovery"] = {"status": "DISABLED"}
             return
+        trade_date = now.date().isoformat()
+        gateway_generation = _gateway_generation(getattr(pipeline, "gateway_state", None))
+        recovery_key = f"{trade_date}|{gateway_generation}"
+        if self._intraday_discovery_recovery_key == recovery_key:
+            previous = dict(self._intraday_discovery_last_recovery or {})
+            previous.update(
+                {
+                    "status": "SKIPPED",
+                    "recovery_status": "SKIPPED",
+                    "trade_date": trade_date,
+                    "gateway_generation": gateway_generation,
+                    "recovery_trigger": "ALREADY_RECOVERED",
+                    "recovery_run_count": self._intraday_discovery_recovery_run_count,
+                }
+            )
+            snapshot["intraday_discovery_recovery"] = previous
+            return
+        if not self._intraday_discovery_recovery_key:
+            trigger = "STARTUP"
+        else:
+            previous_trade_date, _, previous_generation = self._intraday_discovery_recovery_key.partition("|")
+            trigger = "TRADE_DATE_CHANGED" if previous_trade_date != trade_date else "GATEWAY_GENERATION_CHANGED"
         try:
-            snapshot["intraday_discovery_recovery"] = dict(recover() or {})
+            self._intraday_discovery_recovery_run_count += 1
+            result = dict(recover() or {})
+            result.setdefault("status", result.get("recovery_status") or "OK")
+            result["recovery_status"] = str(result.get("recovery_status") or result.get("status") or "OK")
+            result["trade_date"] = trade_date
+            result["gateway_generation"] = gateway_generation
+            result["recovery_trigger"] = trigger
+            result["recovery_run_count"] = self._intraday_discovery_recovery_run_count
+            self._intraday_discovery_recovery_key = recovery_key
+            self._intraday_discovery_last_recovery = dict(result)
+            snapshot["intraday_discovery_recovery"] = result
         except Exception as exc:
-            snapshot["intraday_discovery_recovery"] = {"status": "ERROR", "error": str(exc)}
+            result = {
+                "status": "ERROR",
+                "recovery_status": "ERROR",
+                "trade_date": trade_date,
+                "gateway_generation": gateway_generation,
+                "recovery_trigger": trigger,
+                "recovery_run_count": self._intraday_discovery_recovery_run_count,
+                "recovered_count": 0,
+                "duplicate_skipped_count": 0,
+                "failed_count": 1,
+                "unique_constraint_error_count": 0,
+                "error": str(exc),
+            }
+            self._intraday_discovery_recovery_key = recovery_key
+            self._intraday_discovery_last_recovery = dict(result)
+            snapshot["intraday_discovery_recovery"] = result
             snapshot.setdefault("warnings", []).append(f"INTRADAY_DISCOVERY_RECOVERY_FAILED:{exc}")
 
     def _reconcile_candidate_state_contract(self, snapshot: dict[str, Any], now: datetime) -> None:
@@ -650,8 +700,12 @@ class RebootV2Runtime:
         full_serializes = int(getattr(self.market_regime_pipeline, "last_full_snapshot_serialize_count", 0) or 0)
 
         view = _pipeline_market_context_view(self.market_regime_pipeline)
+        pipeline_view_present = view is not None
+        market_section_status = str(market_section.get("status") or "")
+        fallback_reason = ""
         if str(market_section.get("status") or "").upper() == "ERROR":
             warnings.append("PIPELINE_SECTION_ERROR")
+            fallback_reason = "PIPELINE_SECTION_ERROR"
         elif view is not None and _market_context_view_usable(view, now, max_age_sec):
             diagnostics = view.to_transport_diagnostics(
                 now,
@@ -661,8 +715,18 @@ class RebootV2Runtime:
                 db_fallback_count=db_fallback_count,
                 summary_fallback_count=summary_fallback_count,
                 warning_codes=tuple(warnings),
+                fallback_reason="PIPELINE_CURRENT",
+                pipeline_view_present=pipeline_view_present,
+                market_section_status=market_section_status,
+                current_snapshot_authoritative=True,
             )
             return view, diagnostics
+        elif view is None:
+            fallback_reason = "PIPELINE_VIEW_MISSING"
+            warnings.append("PIPELINE_VIEW_MISSING")
+        else:
+            fallback_reason = "PIPELINE_VIEW_NOT_TRANSPORT_FRESH"
+            warnings.append("PIPELINE_VIEW_NOT_TRANSPORT_FRESH")
 
         db_payload = self._latest_market_regime(now.date().isoformat())
         db_fallback_count = 1
@@ -677,6 +741,10 @@ class RebootV2Runtime:
                     db_fallback_count=db_fallback_count,
                     summary_fallback_count=summary_fallback_count,
                     warning_codes=tuple(warnings),
+                    fallback_reason=fallback_reason,
+                    pipeline_view_present=pipeline_view_present,
+                    market_section_status=market_section_status,
+                    current_snapshot_authoritative=False,
                 )
                 return view, diagnostics
 
@@ -692,6 +760,10 @@ class RebootV2Runtime:
                     db_fallback_count=db_fallback_count,
                     summary_fallback_count=summary_fallback_count,
                     warning_codes=tuple(warnings),
+                    fallback_reason=fallback_reason,
+                    pipeline_view_present=pipeline_view_present,
+                    market_section_status=market_section_status,
+                    current_snapshot_authoritative=False,
                 )
                 return view, diagnostics
 
@@ -704,6 +776,10 @@ class RebootV2Runtime:
             db_fallback_count=db_fallback_count,
             summary_fallback_count=summary_fallback_count,
             warning_codes=tuple(warnings or ["MARKET_CONTEXT_UNAVAILABLE"]),
+            fallback_reason=fallback_reason or "NO_FRESH_MARKET_CONTEXT_SOURCE",
+            pipeline_view_present=pipeline_view_present,
+            market_section_status=market_section_status,
+            current_snapshot_authoritative=False,
         )
         return view, diagnostics
 
@@ -787,7 +863,32 @@ def _pipeline_market_context_view(pipeline: Any) -> MarketContextView | None:
 
 
 def _market_context_view_usable(view: MarketContextView | None, now: datetime, max_age_sec: int) -> bool:
-    return bool(view is not None and hasattr(view, "is_fresh") and view.is_fresh(now, max_age_sec))
+    if view is None:
+        return False
+    transport_fresh = getattr(view, "is_transport_fresh", None)
+    if callable(transport_fresh):
+        return bool(transport_fresh(now, max_age_sec))
+    return bool(hasattr(view, "is_fresh") and view.is_fresh(now, max_age_sec))
+
+
+def _gateway_generation(gateway_state: Any) -> str:
+    if gateway_state is None:
+        return "NO_GATEWAY"
+    snapshot = getattr(gateway_state, "snapshot", None)
+    if callable(snapshot):
+        try:
+            value = snapshot()
+            to_dict = getattr(value, "to_dict", None)
+            data = dict(to_dict() if callable(to_dict) else getattr(value, "__dict__", {}) or {})
+        except Exception:
+            data = {}
+    else:
+        data = {}
+    if not data and isinstance(gateway_state, Mapping):
+        data = dict(gateway_state)
+    client_id = str(data.get("gateway_client_id") or getattr(gateway_state, "gateway_client_id", "") or "")
+    reconnect_count = str(data.get("reconnect_count") or getattr(gateway_state, "reconnect_count", "") or 0)
+    return f"{client_id or 'NO_CLIENT'}:{reconnect_count}"
 
 
 def _market_context_payload_usable(payload: Mapping[str, Any] | None) -> bool:

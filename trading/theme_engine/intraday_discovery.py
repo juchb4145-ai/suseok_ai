@@ -217,6 +217,16 @@ class IntradayDiscoveryRuntimePipeline:
         self.config = config or IntradayDiscoveryConfig.from_env()
         self.scheduler = IntradayDiscoveryScheduler(gateway_state, config=self.config)
         self.last_summary: dict[str, Any] = {"enabled": self.config.enabled, "status": "IDLE"}
+        self.recovery_run_count = 0
+        self.last_recovery_summary: dict[str, Any] = {
+            "status": "IDLE",
+            "recovery_status": "IDLE",
+            "recovery_run_count": 0,
+            "recovered_count": 0,
+            "duplicate_skipped_count": 0,
+            "failed_count": 0,
+        }
+        self._recovered_command_keys: set[str] = set()
 
     def run_if_due(self, now: datetime) -> dict[str, Any]:
         self.last_summary = self.scheduler.enqueue_if_due(now)
@@ -260,8 +270,14 @@ class IntradayDiscoveryRuntimePipeline:
     def recover_from_command_history(self, *, limit: int = 100) -> dict[str, Any]:
         if self.db is None:
             return {"status": "DISABLED", "recovered_count": 0, "reason": "DB_UNAVAILABLE"}
+        self.recovery_run_count += 1
         recovered = 0
         skipped = 0
+        duplicate_skipped = 0
+        failed = 0
+        unique_errors = 0
+        last_error = ""
+        seen_this_run: set[str] = set()
         for record in self.gateway_state.list_commands(command_type="tr_request", include_finished=True, limit=limit):
             command = dict(record.get("command") or {})
             command_payload = dict(command.get("payload") or {})
@@ -272,11 +288,38 @@ class IntradayDiscoveryRuntimePipeline:
             payload = {**command_payload, **result_payload}
             payload.setdefault("command_id", record.get("command_id") or command.get("command_id") or "")
             payload.setdefault("idempotency_key", record.get("idempotency_key") or command.get("idempotency_key") or "")
+            recovery_key = _recovery_key(record, payload)
+            if recovery_key in seen_this_run or recovery_key in self._recovered_command_keys:
+                duplicate_skipped += 1
+                continue
+            seen_this_run.add(recovery_key)
             event_type = "command_ack" if str(record.get("status") or "").upper() in {"ACKED", "SUCCEEDED", "SUCCESS"} else "command_failed"
             event = GatewayEvent(type=event_type, command_id=str(payload.get("command_id") or ""), idempotency_key=str(payload.get("idempotency_key") or ""), payload=payload)
-            if self.handle_event(event):
-                recovered += 1
-        return {"status": "OK", "recovered_count": recovered, "skipped_count": skipped}
+            try:
+                if self.handle_event(event):
+                    recovered += 1
+                    self._recovered_command_keys.add(recovery_key)
+            except Exception as exc:
+                failed += 1
+                last_error = str(exc)
+                if "UNIQUE constraint failed" in last_error:
+                    unique_errors += 1
+        status = "OK" if failed == 0 else "PARTIAL"
+        summary = {
+            "status": status,
+            "recovery_status": status,
+            "recovery_run_count": self.recovery_run_count,
+            "recovered_count": recovered,
+            "skipped_count": skipped,
+            "duplicate_skipped_count": duplicate_skipped,
+            "failed_count": failed,
+            "unique_constraint_error_count": unique_errors,
+            "last_recovery_at": datetime.now().replace(microsecond=0).isoformat(),
+        }
+        if last_error:
+            summary["last_error"] = last_error
+        self.last_recovery_summary = dict(summary)
+        return summary
 
     def _batch_from_event(self, event: GatewayEvent, payload: Mapping[str, Any]) -> dict[str, Any]:
         command_id = str(payload.get("command_id") or event.command_id or "")
@@ -440,6 +483,19 @@ def _request_fields_from_idempotency(idempotency_key: str) -> dict[str, str]:
         "session_phase": parts[4],
         "bucket": f"{parts[5]}:{parts[6]}",
     }
+
+
+def _recovery_key(record: Mapping[str, Any], payload: Mapping[str, Any]) -> str:
+    command_id = str(payload.get("command_id") or record.get("command_id") or "")
+    if command_id:
+        return f"command:{command_id}"
+    idempotency_key = str(payload.get("idempotency_key") or record.get("idempotency_key") or "")
+    if idempotency_key:
+        return f"idempotency:{idempotency_key}"
+    trade_date = str(payload.get("trade_date") or "")
+    session_phase = str(payload.get("session_phase") or "")
+    bucket = str(payload.get("bucket") or "")
+    return f"natural:{trade_date}:{session_phase}:{bucket}"
 
 
 def _row_from_parsed(row: ParsedOpeningSeedRow, *, observed_at: str, session_phase: str) -> IntradayDiscoveryRow:

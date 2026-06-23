@@ -12891,6 +12891,7 @@ class TradingDatabase:
         rows = list(batch.get("rows") or [])
         raw_summary = dict(batch.get("raw_summary") or batch.get("raw") or {})
         with self._write_scope():
+            existing_found = False
             existing = None
             if command_id:
                 existing = self.conn.execute(
@@ -12907,31 +12908,44 @@ class TradingDatabase:
                     (trade_date, session_phase, bucket),
                 ).fetchone()
             if existing is None:
-                cursor = self.conn.execute(
-                    """
-                    INSERT INTO intraday_theme_discovery_batches(
-                        trade_date, observed_at, session_phase, bucket, command_id,
-                        idempotency_key, status, parser_status, row_count,
-                        parsed_count, error, raw_summary_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        trade_date,
-                        observed_at,
-                        session_phase,
-                        bucket,
-                        command_id,
-                        idempotency_key,
-                        status,
-                        str(batch.get("parser_status") or ""),
-                        int(batch.get("row_count") or len(rows) or 0),
-                        int(batch.get("parsed_count") or 0),
-                        str(batch.get("error") or ""),
-                        json.dumps(raw_summary, ensure_ascii=False, sort_keys=True, default=str),
-                    ),
-                )
-                batch_id = int(cursor.lastrowid)
-            else:
+                try:
+                    cursor = self.conn.execute(
+                        """
+                        INSERT INTO intraday_theme_discovery_batches(
+                            trade_date, observed_at, session_phase, bucket, command_id,
+                            idempotency_key, status, parser_status, row_count,
+                            parsed_count, error, raw_summary_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            trade_date,
+                            observed_at,
+                            session_phase,
+                            bucket,
+                            command_id,
+                            idempotency_key,
+                            status,
+                            str(batch.get("parser_status") or ""),
+                            int(batch.get("row_count") or len(rows) or 0),
+                            int(batch.get("parsed_count") or 0),
+                            str(batch.get("error") or ""),
+                            json.dumps(raw_summary, ensure_ascii=False, sort_keys=True, default=str),
+                        ),
+                    )
+                    batch_id = int(cursor.lastrowid)
+                except sqlite3.IntegrityError:
+                    existing = self._find_intraday_theme_discovery_batch_row(
+                        command_id=command_id,
+                        trade_date=trade_date,
+                        session_phase=session_phase,
+                        bucket=bucket,
+                    )
+                    if existing is None:
+                        raise
+                    existing_found = True
+                    batch_id = int(existing["id"])
+            if existing is not None:
+                existing_found = True
                 batch_id = int(existing["id"])
                 self.conn.execute(
                     """
@@ -12987,7 +13001,35 @@ class TradingDatabase:
                 """,
                 cleaned_rows,
             )
-        return self.get_intraday_theme_discovery_batch(batch_id) or dict(batch)
+        saved_batch = self.get_intraday_theme_discovery_batch(batch_id) or dict(batch)
+        saved_batch["idempotent_update"] = bool(existing_found)
+        return saved_batch
+
+    def _find_intraday_theme_discovery_batch_row(
+        self,
+        *,
+        command_id: str = "",
+        trade_date: str = "",
+        session_phase: str = "",
+        bucket: str = "",
+    ) -> Optional[sqlite3.Row]:
+        if command_id:
+            row = self.conn.execute(
+                "SELECT id FROM intraday_theme_discovery_batches WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if row is not None:
+                return row
+        if trade_date and session_phase and bucket:
+            return self.conn.execute(
+                """
+                SELECT id
+                FROM intraday_theme_discovery_batches
+                WHERE trade_date = ? AND session_phase = ? AND bucket = ?
+                """,
+                (trade_date, session_phase, bucket),
+            ).fetchone()
+        return None
 
     def get_intraday_theme_discovery_batch(self, batch_id: int) -> Optional[dict]:
         row = self.conn.execute(
