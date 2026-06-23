@@ -57,6 +57,72 @@ def test_deferred_pending_keeps_processed_signature_until_success(tmp_path):
     assert runtime["ci-2"]["last_success_at"]
 
 
+def test_stale_selected_pending_recovers_to_retry_and_evaluates(tmp_path):
+    db = TradingDatabase(str(tmp_path / "selected-recovery.db"))
+    market_data = MarketDataStore()
+    candles = CandleBuilder()
+    candidate = _candidate(db, "000001", "ci-1")
+    _seed(market_data, candles, "000001")
+    db.save_strategy_context_snapshot({**_context(), "code": "000001", "candidate_id": candidate.id})
+    db.save_entry_decisions([{**_entry_decision(), "candidate_id": candidate.id, "code": "000001"}])
+    pending = {
+        "trade_date": TRADE_DATE,
+        "candidate_instance_id": "ci-1",
+        "code": "000001",
+        "router_version": "setup_router_v3.4.1",
+        "state_version": "setup_router_v3.state.v3.1",
+        "selected_theme_id": "ai",
+        "pending_reasons": ["ENTRY_DECISION_CHANGED"],
+        "first_pending_at": "2026-06-22T09:04:00",
+        "last_pending_at": "2026-06-22T09:04:00",
+    }
+    db.save_setup_router_pending_evaluations([pending])
+    db.update_setup_router_pending_evaluations([{**pending, "status": "SELECTED", "selected_at": "2026-06-22T09:04:00", "last_attempt_at": "2026-06-22T09:04:00"}])
+    pipeline = SetupRouterV3RuntimePipeline(
+        db=db,
+        market_data=market_data,
+        candle_builder=candles,
+        config=SetupRouterConfig(enabled=True, save_history=True, max_candidates_per_cycle=1, selected_lease_sec=30, interval_sec=0.1),
+    )
+
+    summary = pipeline.run(datetime(2026, 6, 22, 9, 5, 10))
+    completed = db.list_setup_router_pending_evaluations(trade_date=TRADE_DATE, statuses=("COMPLETED",))[0]
+
+    assert summary["selected_lease_expired_count"] == 1
+    assert summary["evaluated_count"] == 1
+    assert completed["status"] == "COMPLETED"
+    assert "SELECTED_LEASE_EXPIRED" in completed["pending_reasons"]
+
+
+def test_orphan_pending_is_superseded_without_candidate_side_effect(tmp_path):
+    db = TradingDatabase(str(tmp_path / "orphan-pending.db"))
+    pending = {
+        "trade_date": TRADE_DATE,
+        "candidate_instance_id": "missing-ci",
+        "code": "000999",
+        "router_version": "setup_router_v3.4.1",
+        "state_version": "setup_router_v3.state.v3.1",
+        "pending_reasons": ["PERIODIC_RECONCILE"],
+        "first_pending_at": "2026-06-22T09:04:00",
+        "last_pending_at": "2026-06-22T09:04:00",
+    }
+    db.save_setup_router_pending_evaluations([pending])
+    pipeline = SetupRouterV3RuntimePipeline(
+        db=db,
+        market_data=MarketDataStore(),
+        candle_builder=CandleBuilder(),
+        config=SetupRouterConfig(enabled=True, save_history=True, max_candidates_per_cycle=1, interval_sec=0.1),
+    )
+
+    summary = pipeline.run(datetime(2026, 6, 22, 9, 5, 10))
+    superseded = db.list_setup_router_pending_evaluations(trade_date=TRADE_DATE, statuses=("SUPERSEDED",))[0]
+
+    assert summary["superseded_pending_count"] == 1
+    assert summary["evaluated_count"] == 0
+    assert superseded["status"] == "SUPERSEDED"
+    assert "CANDIDATE_NOT_FOUND" in superseded["pending_reasons"]
+
+
 def _candidate(db, code, instance_id):
     return db.save_candidate(
         Candidate(

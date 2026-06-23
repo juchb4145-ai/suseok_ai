@@ -15,7 +15,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trade-date", default=datetime.now().date().isoformat())
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--limit", type=int, default=10000)
-    parser.add_argument("--router-version", default="setup_router_v3.4")
+    parser.add_argument("--router-version", default="setup_router_v3.4.1")
     parser.add_argument("--include-legacy-version", action="store_true")
     args = parser.parse_args(argv)
 
@@ -29,10 +29,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         observations = _rows(con, "setup_observations_latest", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
         transitions = _rows(con, "setup_observation_transitions", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
-        states = _rows(con, "setup_router_state_v2", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
-        state_transitions = _rows(con, "setup_router_state_transitions_v2", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
+        states = _rows(con, "setup_router_state_v3", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
+        state_transitions = _rows(con, "setup_router_state_transitions_v3", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
         runs = _rows(con, "setup_router_runs", trade_date, limit=1000, router_version=args.router_version)
-        runtime_rows = _rows(con, "setup_router_candidate_runtime_v3", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
+        runtime_rows = _rows(con, "setup_router_candidate_runtime_v4", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
         full_counts = _full_counts(con, trade_date, args.router_version)
         integrity = _state_integrity(con, trade_date, args.router_version)
         scheduling = _scheduling_checks(con, trade_date, args.router_version)
@@ -88,7 +88,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     verdict = "STABLE_FOR_OPPORTUNITY_RANKER" if stable_ready else "NOT_STABLE" if failures else "CONDITIONALLY_STABLE"
     summary = {
-        "schema_version": "setup_router_v3.audit.v4",
+        "schema_version": "setup_router_v3.audit.v4.1",
         "trade_date": trade_date,
         "router_version": args.router_version,
         "db_path": str(db_path),
@@ -159,9 +159,9 @@ def _rows(
         clauses.append("(router_version = ? OR router_version = '')" if include_legacy_version else "router_version = ?")
         params.append(router_version)
     order_col = "rowid"
-    if table == "setup_router_state_transitions_v2":
+    if table in {"setup_router_state_transitions_v2", "setup_router_state_transitions_v3"}:
         order_col = "occurred_at"
-    elif table == "setup_router_state_v2":
+    elif table in {"setup_router_state_v2", "setup_router_state_v3"}:
         order_col = "updated_at"
     rows = con.execute(
         f"""
@@ -332,11 +332,11 @@ def _full_counts(con: sqlite3.Connection, trade_date: str, router_version: str) 
     return {
         "observations": _count(con, "setup_observations_latest", trade_date, router_version=router_version),
         "valid_observe": _count(con, "setup_observations_latest", trade_date, router_version=router_version, extra="router_status = 'VALID_OBSERVE'"),
-        "states": _count(con, "setup_router_state_v2", trade_date, router_version=router_version),
-        "state_transitions": _count(con, "setup_router_state_transitions_v2", trade_date, router_version=router_version),
+        "states": _count(con, "setup_router_state_v3", trade_date, router_version=router_version),
+        "state_transitions": _count(con, "setup_router_state_transitions_v3", trade_date, router_version=router_version),
         "runs": _count(con, "setup_router_runs", trade_date, router_version=router_version),
-        "eligible_runtime": _count(con, "setup_router_candidate_runtime_v3", trade_date, router_version=router_version),
-        "pending_queue": _count(con, "setup_router_pending_evaluations_v4", trade_date, router_version=router_version, extra="status IN ('PENDING','RETRY','SELECTED')"),
+        "eligible_runtime": _count(con, "setup_router_candidate_runtime_v4", trade_date, router_version=router_version),
+        "pending_queue": _count(con, "setup_router_pending_evaluations_v5", trade_date, router_version=router_version, extra="status IN ('PENDING','RETRY','SELECTED')"),
     }
 
 
@@ -373,12 +373,29 @@ def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: s
         "vwap_anchor_changed_same_generation_count": 0,
         "duplicate_material_transition_count": 0,
         "material_hash_state_conflict_count": 0,
+        "version_mismatch_row_count": 0,
     }
-    if _has_table(con, "setup_router_state_transitions_v2") and _has_column(con, "setup_router_state_transitions_v2", "material_change_kind"):
+    for table in (
+        "setup_router_state_v3",
+        "setup_router_state_transitions_v3",
+        "setup_router_candidate_runtime_v4",
+        "setup_router_pending_evaluations_v5",
+    ):
+        if _has_table(con, table) and _has_column(con, table, "router_version"):
+            row = con.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM {table}
+                WHERE trade_date = ? AND COALESCE(router_version, '') <> ?
+                """,
+                (trade_date, router_version),
+            ).fetchone()
+            metrics["version_mismatch_row_count"] += int(row["count"] or 0) if row else 0
+    if _has_table(con, "setup_router_state_transitions_v3") and _has_column(con, "setup_router_state_transitions_v3", "material_change_kind"):
         row = con.execute(
             """
             SELECT COUNT(*) AS count
-            FROM setup_router_state_transitions_v2
+            FROM setup_router_state_transitions_v3
             WHERE trade_date = ? AND router_version = ? AND COALESCE(material_change_kind, '') IN ('', 'NONE')
             """,
             (trade_date, router_version),
@@ -389,7 +406,7 @@ def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: s
             for row in con.execute(
                 """
                 SELECT *
-                FROM setup_router_state_transitions_v2
+                FROM setup_router_state_transitions_v3
                 WHERE trade_date = ? AND router_version = ?
                 ORDER BY candidate_instance_id, theme_id, setup_type, setup_generation, occurred_at
                 """,
@@ -397,12 +414,12 @@ def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: s
             ).fetchall()
         ]
         metrics.update(_terminal_integrity_metrics(rows))
-    if _has_table(con, "setup_router_state_v2"):
-        if _has_column(con, "setup_router_state_v2", "expires_at"):
+    if _has_table(con, "setup_router_state_v3"):
+        if _has_column(con, "setup_router_state_v3", "expires_at"):
             row = con.execute(
                 """
                 SELECT COUNT(*) AS count
-                FROM setup_router_state_v2
+                FROM setup_router_state_v3
                 WHERE trade_date = ? AND router_version = ? AND lifecycle_state IN ('FORMING','MATCHED')
                   AND expires_at <> '' AND expires_at <= last_evaluated_at
                 """,
@@ -412,7 +429,7 @@ def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: s
         row = con.execute(
             """
             SELECT COUNT(*) AS count
-            FROM setup_router_state_v2
+            FROM setup_router_state_v3
             WHERE trade_date = ? AND router_version = ? AND setup_generation < 1
             """,
             (trade_date, router_version),
@@ -424,6 +441,8 @@ def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: s
         failures.append("TTL_ACTIVE_STATE_VIOLATION")
     if metrics["invalid_generation_count"] > 0:
         failures.append("INVALID_SETUP_GENERATION")
+    if metrics["version_mismatch_row_count"] > 0:
+        failures.append("SETUP_ROUTER_VERSION_MISMATCH_ROWS_PRESENT")
     for key, failure in (
         ("terminal_revival_same_generation_count", "TERMINAL_REVIVAL_SAME_GENERATION"),
         ("generation_jump_count", "SETUP_GENERATION_JUMP"),
@@ -435,7 +454,7 @@ def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: s
     ):
         if metrics.get(key, 0) > 0:
             failures.append(failure)
-    if _count(con, "setup_router_state_transitions_v2", trade_date, router_version=router_version) == 0 and _count(con, "setup_router_state_v2", trade_date, router_version=router_version) > 0:
+    if _count(con, "setup_router_state_transitions_v3", trade_date, router_version=router_version) == 0 and _count(con, "setup_router_state_v3", trade_date, router_version=router_version) > 0:
         warnings.append("STATE_TRANSITION_SAMPLE_MISSING")
     return {"metrics": metrics, "failures": failures, "warnings": warnings}
 
@@ -450,6 +469,9 @@ def _scheduling_checks(con: sqlite3.Connection, trade_date: str, router_version:
         "run_sample_count": 0,
         "pending_queue_count": 0,
         "retry_queue_count": 0,
+        "retry_due_count": 0,
+        "stale_selected_count": 0,
+        "invalid_pending_epoch_count": 0,
         "oldest_pending_age_sec": 0,
         "processed_signature_without_success_count": 0,
         "never_evaluated_count": 0,
@@ -464,13 +486,13 @@ def _scheduling_checks(con: sqlite3.Connection, trade_date: str, router_version:
         metrics["max_deferred_ttl_count"] = max(metrics["max_deferred_ttl_count"], int(row.get("deferred_ttl_count") or 0))
     if metrics["max_actual_starved_candidate_count"] > 0:
         failures.append("SETUP_ROUTER_STARVATION_PRESENT")
-    if _has_table(con, "setup_router_pending_evaluations_v4"):
+    if _has_table(con, "setup_router_pending_evaluations_v5"):
         pending_rows = [
             _row(row)
             for row in con.execute(
                 """
                 SELECT *
-                FROM setup_router_pending_evaluations_v4
+                FROM setup_router_pending_evaluations_v5
                 WHERE trade_date = ? AND router_version = ? AND status IN ('PENDING','RETRY','SELECTED')
                 """,
                 (trade_date, router_version),
@@ -479,23 +501,40 @@ def _scheduling_checks(con: sqlite3.Connection, trade_date: str, router_version:
         metrics["pending_queue_count"] = len(pending_rows)
         metrics["retry_queue_count"] = sum(1 for row in pending_rows if row.get("status") == "RETRY")
         now = max([_parse_time(row.get("calculated_at")) for row in rows if _parse_time(row.get("calculated_at")) is not None], default=datetime.now())
+        metrics["retry_due_count"] = sum(
+            1
+            for row in pending_rows
+            if row.get("status") == "RETRY"
+            and (not row.get("next_retry_at") or (_parse_time(row.get("next_retry_at")) is not None and _parse_time(row.get("next_retry_at")) <= now))
+        )
+        metrics["stale_selected_count"] = sum(
+            1
+            for row in pending_rows
+            if row.get("status") == "SELECTED"
+            and (now - (_parse_time(row.get("selected_at") or row.get("last_attempt_at")) or now)).total_seconds() > 30
+        )
+        metrics["invalid_pending_epoch_count"] = sum(1 for row in pending_rows if int(row.get("pending_epoch") or 0) < 1 or not str(row.get("pending_instance_id") or ""))
         pending_ages = [
             max(0.0, (now - parsed).total_seconds())
             for parsed in (_parse_time(row.get("first_pending_at") or row.get("last_pending_at")) for row in pending_rows)
             if parsed is not None
         ]
         metrics["oldest_pending_age_sec"] = int(max(pending_ages, default=0.0))
-        if metrics["retry_queue_count"] > 0:
-            failures.append("SETUP_ROUTER_RETRY_PENDING_PRESENT")
+        if metrics["retry_due_count"] > 0:
+            failures.append("SETUP_ROUTER_RETRY_DUE_STALE")
+        if metrics["stale_selected_count"] > 0:
+            failures.append("SETUP_ROUTER_SELECTED_LEASE_STALE")
+        if metrics["invalid_pending_epoch_count"] > 0:
+            failures.append("SETUP_ROUTER_PENDING_EPOCH_INVALID")
         if metrics["oldest_pending_age_sec"] > 300:
             failures.append("SETUP_ROUTER_PENDING_BACKLOG_STALE")
-    if _has_table(con, "setup_router_candidate_runtime_v3"):
+    if _has_table(con, "setup_router_candidate_runtime_v4"):
         runtime_rows = [
             _row(row)
             for row in con.execute(
                 """
                 SELECT *
-                FROM setup_router_candidate_runtime_v3
+                FROM setup_router_candidate_runtime_v4
                 WHERE trade_date = ? AND router_version = ?
                 """,
                 (trade_date, router_version),

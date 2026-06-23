@@ -11,9 +11,9 @@ from typing import Any, Iterable, Mapping
 from trading.strategy.setup_features import SETUP_ROUTER_FEATURE_SCHEMA_VERSION, SetupFeatureSnapshot
 
 
-SETUP_ROUTER_SCHEMA_VERSION = "setup_router_v3.observe.v4"
-SETUP_ROUTER_VERSION = "setup_router_v3.4"
-SETUP_ROUTER_STATE_VERSION = "setup_router_v3.state.v3"
+SETUP_ROUTER_SCHEMA_VERSION = "setup_router_v3.observe.v4.1"
+SETUP_ROUTER_VERSION = "setup_router_v3.4.1"
+SETUP_ROUTER_STATE_VERSION = "setup_router_v3.state.v3.1"
 SETUP_ROUTER_OUTPUT_MODE = "OBSERVE"
 
 
@@ -122,6 +122,10 @@ class SetupRouterConfig:
     breakout_reset_min_bars: int = 2
     breakout_reset_below_reference_pct: float = 0.2
     max_starvation_sec: int = 0
+    retry_base_sec: int = 2
+    retry_max_sec: int = 60
+    retry_max_failures: int = 20
+    selected_lease_sec: int = 30
 
     @classmethod
     def from_env(cls) -> "SetupRouterConfig":
@@ -162,6 +166,10 @@ class SetupRouterConfig:
             breakout_reset_min_bars=max(1, _env_int("TRADING_SETUP_BREAKOUT_RESET_MIN_BARS", 2)),
             breakout_reset_below_reference_pct=_env_float("TRADING_SETUP_BREAKOUT_RESET_BELOW_REFERENCE_PCT", 0.2),
             max_starvation_sec=max(0, _env_int("TRADING_SETUP_ROUTER_V3_MAX_STARVATION_SEC", 0)),
+            retry_base_sec=max(1, _env_int("TRADING_SETUP_ROUTER_RETRY_BASE_SEC", 2)),
+            retry_max_sec=max(1, _env_int("TRADING_SETUP_ROUTER_RETRY_MAX_SEC", 60)),
+            retry_max_failures=max(1, _env_int("TRADING_SETUP_ROUTER_RETRY_MAX_FAILURES", 20)),
+            selected_lease_sec=max(1, _env_int("TRADING_SETUP_ROUTER_SELECTED_LEASE_SEC", 30)),
         )
 
 
@@ -930,17 +938,59 @@ def _freeze_terminal_hypothesis(
     setup_instance_id = str(previous.get("setup_instance_id") or payload.get("setup_instance_id") or _setup_instance_id(feature, setup_type, generation))
     terminal_at = _terminal_at(previous, payload)
     detector_phase = str(previous.get("detector_phase") or payload.get("detector_phase") or payload.get("phase") or lifecycle.value)
+    expires_at = str(previous.get("expires_at") or payload.get("expires_at") or "")
+    if lifecycle == SetupLifecycleState.MATCHED and expires_at and feature.calculated_at and expires_at <= feature.calculated_at:
+        payload.update(
+            {
+                "phase": "EXPIRED",
+                "lifecycle_state": SetupLifecycleState.EXPIRED.value,
+                "setup_generation": generation,
+                "setup_instance_id": setup_instance_id,
+                "matched_at": str(payload.get("matched_at") or terminal_at),
+                "matched_expires_at": expires_at,
+                "expired_at": feature.calculated_at,
+                "expired_reason": "SETUP_MATCHED_TTL_EXPIRED",
+                "terminal_at": terminal_at or feature.calculated_at,
+                "terminal_lock": True,
+                "terminal_lock_reason": "SETUP_MATCHED_TTL_EXPIRED",
+                "last_observed_at": feature.calculated_at,
+                "current_price": feature.current_price,
+                "observation_active": False,
+                "qualification_active": False,
+            }
+        )
+        return SetupHypothesis(
+            setup_type=setup_type,
+            shape_status=SetupShapeStatus.EXPIRED,
+            lifecycle_state=SetupLifecycleState.EXPIRED,
+            setup_generation=generation,
+            setup_instance_id=setup_instance_id,
+            reason_codes=tuple(_dedupe(["SETUP_MATCHED_TTL_EXPIRED", "TERMINAL_LIFECYCLE_LOCKED"])),
+            price_structure=payload,
+            state_payload=payload,
+            quality_score=0.0,
+            detector_phase="EXPIRED",
+            first_seen_at=str(previous.get("first_seen_at") or payload.get("first_seen_at") or feature.calculated_at),
+            expires_at=expires_at,
+            expired_at=feature.calculated_at,
+            terminal_at=terminal_at or feature.calculated_at,
+            last_material_change_at=feature.calculated_at,
+        )
     payload.update(
         {
             "phase": detector_phase,
             "lifecycle_state": lifecycle.value,
             "setup_generation": generation,
             "setup_instance_id": setup_instance_id,
+            "matched_at": str(payload.get("matched_at") or terminal_at) if lifecycle == SetupLifecycleState.MATCHED else str(payload.get("matched_at") or ""),
+            "matched_expires_at": expires_at if lifecycle == SetupLifecycleState.MATCHED else str(payload.get("matched_expires_at") or ""),
             "terminal_at": terminal_at,
             "terminal_lock": True,
             "terminal_lock_reason": reason,
             "last_observed_at": feature.calculated_at,
             "current_price": feature.current_price,
+            "observation_active": lifecycle == SetupLifecycleState.MATCHED,
+            "qualification_active": lifecycle == SetupLifecycleState.MATCHED,
         }
     )
     if lifecycle == SetupLifecycleState.EXPIRED:
@@ -1232,20 +1282,38 @@ def _expire_if_due(
     expires_at = datetime.fromtimestamp(expires_at_dt).replace(microsecond=0).isoformat()
     payload = {**dict(hypothesis.state_payload or {}), "expires_at": expires_at, "first_seen_at": hypothesis.first_seen_at or anchor.isoformat()}
     if now.timestamp() >= expires_at_dt:
-        payload.update({"phase": "EXPIRED", "expired_at": feature.calculated_at, "expired_reason": "SETUP_TTL_EXPIRED", "terminal_at": feature.calculated_at})
+        reason = "SETUP_MATCHED_TTL_EXPIRED" if hypothesis.lifecycle_state == SetupLifecycleState.MATCHED else "SETUP_TTL_EXPIRED"
+        terminal_at = hypothesis.terminal_at if hypothesis.lifecycle_state == SetupLifecycleState.MATCHED and hypothesis.terminal_at else feature.calculated_at
+        payload.update(
+            {
+                "phase": "EXPIRED",
+                "expired_at": feature.calculated_at,
+                "expired_reason": reason,
+                "terminal_at": terminal_at,
+                "matched_at": str(payload.get("matched_at") or hypothesis.terminal_at or feature.calculated_at) if hypothesis.lifecycle_state == SetupLifecycleState.MATCHED else str(payload.get("matched_at") or ""),
+                "matched_expires_at": expires_at if hypothesis.lifecycle_state == SetupLifecycleState.MATCHED else str(payload.get("matched_expires_at") or ""),
+                "observation_active": False,
+                "qualification_active": False,
+            }
+        )
         return replace(
             hypothesis,
             shape_status=SetupShapeStatus.EXPIRED,
             lifecycle_state=SetupLifecycleState.EXPIRED,
-            reason_codes=tuple(_dedupe([*hypothesis.reason_codes, "SETUP_TTL_EXPIRED"])),
+            reason_codes=tuple(_dedupe([*hypothesis.reason_codes, reason])),
             quality_score=0.0,
             detector_phase="EXPIRED",
             state_payload=payload,
             price_structure=payload,
             expires_at=expires_at,
             expired_at=feature.calculated_at,
-            terminal_at=feature.calculated_at,
+            terminal_at=terminal_at,
         )
+    if hypothesis.lifecycle_state == SetupLifecycleState.MATCHED:
+        payload.setdefault("matched_at", hypothesis.terminal_at or feature.calculated_at)
+        payload["matched_expires_at"] = expires_at
+        payload["observation_active"] = True
+        payload["qualification_active"] = True
     return replace(hypothesis, state_payload=payload, price_structure=payload, expires_at=expires_at)
 
 

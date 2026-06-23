@@ -33,7 +33,7 @@ from trading.strategy.models import (
 from trading.strategy.conditions import ConditionProfile
 
 
-_CURRENT_SETUP_ROUTER_VERSION = "setup_router_v3.4"
+_CURRENT_SETUP_ROUTER_VERSION = "setup_router_v3.4.1"
 
 
 class TradingDatabase:
@@ -1200,6 +1200,69 @@ class TradingDatabase:
                 ON setup_router_state_transitions_v2(trade_date, occurred_at, transition_id);
             CREATE INDEX IF NOT EXISTS idx_setup_router_state_transitions_v2_code
                 ON setup_router_state_transitions_v2(code, occurred_at);
+            CREATE TABLE IF NOT EXISTS setup_router_state_v3 (
+                trade_date TEXT NOT NULL,
+                router_version TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                theme_id TEXT NOT NULL DEFAULT '',
+                setup_type TEXT NOT NULL DEFAULT '',
+                setup_generation INTEGER NOT NULL DEFAULT 1,
+                state_version TEXT NOT NULL DEFAULT '',
+                setup_instance_id TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                lifecycle_state TEXT NOT NULL DEFAULT '',
+                detector_phase TEXT NOT NULL DEFAULT '',
+                state_entered_at TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT '',
+                last_evaluated_at TEXT NOT NULL DEFAULT '',
+                last_material_change_at TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                expired_at TEXT NOT NULL DEFAULT '',
+                terminal_at TEXT NOT NULL DEFAULT '',
+                context_id TEXT NOT NULL DEFAULT '',
+                material_state_fingerprint TEXT NOT NULL DEFAULT '',
+                observation_fingerprint TEXT NOT NULL DEFAULT '',
+                material_change_kind TEXT NOT NULL DEFAULT '',
+                state_payload_json TEXT NOT NULL DEFAULT '{}',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, router_version, candidate_instance_id, theme_id, setup_type, setup_generation)
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_state_v3_trade_lifecycle
+                ON setup_router_state_v3(trade_date, router_version, lifecycle_state, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_setup_router_state_v3_candidate
+                ON setup_router_state_v3(candidate_instance_id, router_version, theme_id, setup_type);
+            CREATE TABLE IF NOT EXISTS setup_router_state_transitions_v3 (
+                transition_id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL,
+                router_version TEXT NOT NULL,
+                state_version TEXT NOT NULL DEFAULT '',
+                candidate_instance_id TEXT NOT NULL,
+                theme_id TEXT NOT NULL DEFAULT '',
+                setup_type TEXT NOT NULL DEFAULT '',
+                setup_generation INTEGER NOT NULL DEFAULT 1,
+                setup_instance_id TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                previous_state TEXT NOT NULL DEFAULT '',
+                current_state TEXT NOT NULL DEFAULT '',
+                detector_phase_from TEXT NOT NULL DEFAULT '',
+                detector_phase_to TEXT NOT NULL DEFAULT '',
+                occurred_at TEXT NOT NULL DEFAULT '',
+                context_id TEXT NOT NULL DEFAULT '',
+                material_change_kind TEXT NOT NULL DEFAULT '',
+                material_state_fingerprint_from TEXT NOT NULL DEFAULT '',
+                material_state_fingerprint_to TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                state_payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_state_transitions_v3_trade
+                ON setup_router_state_transitions_v3(trade_date, router_version, occurred_at, transition_id);
+            CREATE INDEX IF NOT EXISTS idx_setup_router_state_transitions_v3_code
+                ON setup_router_state_transitions_v3(code, router_version, occurred_at);
             CREATE TABLE IF NOT EXISTS setup_router_candidate_runtime_v3 (
                 trade_date TEXT NOT NULL,
                 candidate_instance_id TEXT NOT NULL,
@@ -1240,6 +1303,49 @@ class TradingDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_setup_router_candidate_runtime_v3_trade_eval
                 ON setup_router_candidate_runtime_v3(trade_date, last_evaluated_at);
+            CREATE TABLE IF NOT EXISTS setup_router_candidate_runtime_v4 (
+                trade_date TEXT NOT NULL,
+                router_version TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                code TEXT NOT NULL DEFAULT '',
+                state_version TEXT NOT NULL DEFAULT '',
+                selected_theme_id TEXT NOT NULL DEFAULT '',
+                first_eligible_at TEXT NOT NULL DEFAULT '',
+                first_pending_at TEXT NOT NULL DEFAULT '',
+                last_evaluated_at TEXT NOT NULL DEFAULT '',
+                last_success_at TEXT NOT NULL DEFAULT '',
+                last_failure_at TEXT NOT NULL DEFAULT '',
+                consecutive_failure_count INTEGER NOT NULL DEFAULT 0,
+                last_evaluation_source TEXT NOT NULL DEFAULT '',
+                last_context_id TEXT NOT NULL DEFAULT '',
+                last_entry_decision_at TEXT NOT NULL DEFAULT '',
+                last_completed_candle_at TEXT NOT NULL DEFAULT '',
+                observed_entry_signature TEXT NOT NULL DEFAULT '',
+                processed_entry_signature TEXT NOT NULL DEFAULT '',
+                observed_context_id TEXT NOT NULL DEFAULT '',
+                processed_context_id TEXT NOT NULL DEFAULT '',
+                observed_candle_at TEXT NOT NULL DEFAULT '',
+                processed_candle_at TEXT NOT NULL DEFAULT '',
+                observed_theme_id TEXT NOT NULL DEFAULT '',
+                processed_theme_id TEXT NOT NULL DEFAULT '',
+                observed_lease_signature TEXT NOT NULL DEFAULT '',
+                processed_lease_signature TEXT NOT NULL DEFAULT '',
+                pending_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                evaluation_count INTEGER NOT NULL DEFAULT 0,
+                incremental_evaluation_count INTEGER NOT NULL DEFAULT 0,
+                periodic_evaluation_count INTEGER NOT NULL DEFAULT 0,
+                ttl_evaluation_count INTEGER NOT NULL DEFAULT 0,
+                capacity_deferred_count INTEGER NOT NULL DEFAULT 0,
+                last_deferred_at TEXT NOT NULL DEFAULT '',
+                last_skip_reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, router_version, candidate_instance_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_candidate_runtime_v4_trade_success
+                ON setup_router_candidate_runtime_v4(trade_date, router_version, last_success_at);
+            CREATE INDEX IF NOT EXISTS idx_setup_router_candidate_runtime_v4_trade_eligible
+                ON setup_router_candidate_runtime_v4(trade_date, router_version, first_eligible_at);
             CREATE TABLE IF NOT EXISTS setup_router_pending_evaluations_v4 (
                 trade_date TEXT NOT NULL,
                 candidate_instance_id TEXT NOT NULL,
@@ -1267,6 +1373,44 @@ class TradingDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_setup_router_pending_evaluations_v4_trade_status
                 ON setup_router_pending_evaluations_v4(trade_date, router_version, status, pending_priority, first_pending_at);
+            CREATE TABLE IF NOT EXISTS setup_router_pending_evaluations_v5 (
+                trade_date TEXT NOT NULL,
+                router_version TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                code TEXT NOT NULL DEFAULT '',
+                state_version TEXT NOT NULL DEFAULT '',
+                selected_theme_id TEXT NOT NULL DEFAULT '',
+                pending_epoch INTEGER NOT NULL DEFAULT 1,
+                pending_instance_id TEXT NOT NULL DEFAULT '',
+                opened_from_status TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                pending_priority INTEGER NOT NULL DEFAULT 3,
+                pending_reasons_json TEXT NOT NULL DEFAULT '[]',
+                first_pending_at TEXT NOT NULL DEFAULT '',
+                last_pending_at TEXT NOT NULL DEFAULT '',
+                selected_at TEXT NOT NULL DEFAULT '',
+                completed_at TEXT NOT NULL DEFAULT '',
+                superseded_at TEXT NOT NULL DEFAULT '',
+                next_retry_at TEXT NOT NULL DEFAULT '',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                last_error_class TEXT NOT NULL DEFAULT '',
+                entry_signature TEXT NOT NULL DEFAULT '',
+                context_signature TEXT NOT NULL DEFAULT '',
+                candle_signature TEXT NOT NULL DEFAULT '',
+                theme_signature TEXT NOT NULL DEFAULT '',
+                lease_signature TEXT NOT NULL DEFAULT '',
+                ttl_signature TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, router_version, candidate_instance_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_pending_evaluations_v5_trade_status
+                ON setup_router_pending_evaluations_v5(trade_date, router_version, status, pending_priority, first_pending_at);
+            CREATE INDEX IF NOT EXISTS idx_setup_router_pending_evaluations_v5_retry
+                ON setup_router_pending_evaluations_v5(trade_date, router_version, next_retry_at);
             CREATE TABLE IF NOT EXISTS position_runtime_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -9120,6 +9264,8 @@ class TradingDatabase:
                 "no_change_skip_count": 0,
                 "state_no_change_skip_count": 0,
             }
+        if all(str(item.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION) == _CURRENT_SETUP_ROUTER_VERSION for item in cleaned):
+            return self._save_setup_router_states_v3(cleaned)
         state_write_count = 0
         transition_write_count = 0
         no_change_skip_count = 0
@@ -9408,6 +9554,287 @@ class TradingDatabase:
             "state_no_change_skip_count": no_change_skip_count,
         }
 
+    def _save_setup_router_states_v3(self, cleaned: list[dict]) -> dict:
+        state_write_count = 0
+        transition_write_count = 0
+        no_change_skip_count = 0
+        with self.conn:
+            for payload in cleaned:
+                trade_date = str(payload.get("trade_date") or "")
+                code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
+                candidate_id = payload.get("candidate_id")
+                candidate_instance_id = str(payload.get("candidate_instance_id") or f"{trade_date}:{code}:{candidate_id or 0}")
+                theme_id = str(payload.get("theme_id") or "")
+                setup_type = str(payload.get("setup_type") or "")
+                generation = max(1, _safe_int(payload.get("setup_generation"), 1))
+                router_version = str(payload.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION)
+                state_version = str(payload.get("state_version") or "")
+                setup_instance_id = str(payload.get("setup_instance_id") or "")
+                lifecycle_state = str(payload.get("lifecycle_state") or "")
+                calculated_at = str(payload.get("calculated_at") or "")
+                observation_fingerprint = str(payload.get("observation_fingerprint") or payload.get("fingerprint") or "")
+                material_fingerprint = str(payload.get("material_state_fingerprint") or observation_fingerprint)
+                detector_phase = str(payload.get("detector_phase") or "")
+                material_change_kind = str(payload.get("material_change_kind") or "NONE")
+                state_payload = dict(payload.get("state_payload") or payload.get("price_structure") or {})
+                terminal_at = str(payload.get("terminal_at") or "")
+                expired_at = str(payload.get("expired_at") or "")
+                other_active_rows = self.conn.execute(
+                    """
+                    SELECT *
+                    FROM setup_router_state_v3
+                    WHERE trade_date = ? AND router_version = ? AND candidate_instance_id = ?
+                      AND setup_type = ? AND theme_id <> ?
+                      AND lifecycle_state IN ('SEEKING','FORMING','MATCHED')
+                    """,
+                    (trade_date, router_version, candidate_instance_id, setup_type, theme_id),
+                ).fetchall()
+                for other in other_active_rows:
+                    other_payload = _row_to_setup_router_state(other)
+                    other_state_payload = dict(other_payload.get("state_payload") or {})
+                    other_state_payload.update(
+                        {
+                            "phase": "EXPIRED",
+                            "expired_reason": "SETUP_SELECTED_THEME_CHANGED",
+                            "expired_at": calculated_at,
+                            "terminal_at": str(other_payload.get("terminal_at") or calculated_at),
+                            "material_change_kind": "THEME_CHANGED",
+                            "observation_active": False,
+                            "qualification_active": False,
+                        }
+                    )
+                    other_material_to = _state_material_hash_from_row_payload(other_payload, other_state_payload, "EXPIRED")
+                    self.conn.execute(
+                        """
+                        UPDATE setup_router_state_v3
+                        SET lifecycle_state = 'EXPIRED',
+                            state_entered_at = ?,
+                            last_evaluated_at = ?,
+                            last_material_change_at = ?,
+                            expired_at = ?,
+                            terminal_at = COALESCE(NULLIF(terminal_at, ''), ?),
+                            detector_phase = 'EXPIRED',
+                            material_change_kind = 'THEME_CHANGED',
+                            material_state_fingerprint = ?,
+                            observation_fingerprint = ?,
+                            state_payload_json = ?,
+                            reason_codes_json = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE trade_date = ? AND router_version = ? AND candidate_instance_id = ?
+                          AND theme_id = ? AND setup_type = ? AND setup_generation = ?
+                        """,
+                        (
+                            calculated_at,
+                            calculated_at,
+                            calculated_at,
+                            calculated_at,
+                            calculated_at,
+                            other_material_to,
+                            observation_fingerprint,
+                            _json_payload(other_state_payload),
+                            _json_list([*list(other_payload.get("reason_codes") or []), "SETUP_SELECTED_THEME_CHANGED"]),
+                            trade_date,
+                            router_version,
+                            candidate_instance_id,
+                            str(other_payload.get("theme_id") or ""),
+                            setup_type,
+                            _safe_int(other_payload.get("setup_generation"), 1),
+                        ),
+                    )
+                    transition_id = _versioned_setup_state_transition_id(
+                        router_version,
+                        trade_date,
+                        candidate_instance_id,
+                        str(other_payload.get("theme_id") or ""),
+                        setup_type,
+                        _safe_int(other_payload.get("setup_generation"), 1),
+                        str(other_payload.get("lifecycle_state") or ""),
+                        "EXPIRED",
+                        other_material_to,
+                    )
+                    cursor = self.conn.execute(
+                        """
+                        INSERT OR IGNORE INTO setup_router_state_transitions_v3(
+                            transition_id, trade_date, router_version, state_version,
+                            candidate_instance_id, theme_id, setup_type, setup_generation,
+                            setup_instance_id, code, candidate_id, previous_state, current_state,
+                            detector_phase_from, detector_phase_to, occurred_at, context_id,
+                            material_change_kind, material_state_fingerprint_from,
+                            material_state_fingerprint_to, reason_codes_json, state_payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            transition_id,
+                            trade_date,
+                            router_version,
+                            state_version,
+                            candidate_instance_id,
+                            str(other_payload.get("theme_id") or ""),
+                            setup_type,
+                            _safe_int(other_payload.get("setup_generation"), 1),
+                            str(other_payload.get("setup_instance_id") or ""),
+                            code,
+                            candidate_id,
+                            str(other_payload.get("lifecycle_state") or ""),
+                            "EXPIRED",
+                            str(other_payload.get("detector_phase") or ""),
+                            "EXPIRED",
+                            calculated_at,
+                            str(payload.get("context_id") or ""),
+                            "THEME_CHANGED",
+                            str(other_payload.get("material_state_fingerprint") or ""),
+                            other_material_to,
+                            _json_list(["SETUP_SELECTED_THEME_CHANGED"]),
+                            _json_payload(other_state_payload),
+                        ),
+                    )
+                    transition_write_count += int(getattr(cursor, "rowcount", 0) or 0)
+                previous = self.conn.execute(
+                    """
+                    SELECT *
+                    FROM setup_router_state_v3
+                    WHERE trade_date = ? AND router_version = ? AND candidate_instance_id = ?
+                      AND theme_id = ? AND setup_type = ? AND setup_generation = ?
+                    """,
+                    (trade_date, router_version, candidate_instance_id, theme_id, setup_type, generation),
+                ).fetchone()
+                previous_payload = _row_to_setup_router_state(previous) if previous else {}
+                previous_material = str(previous_payload.get("material_state_fingerprint") or "")
+                previous_state = str(previous_payload.get("lifecycle_state") or "")
+                previous_phase = str(previous_payload.get("detector_phase") or "")
+                if not previous_payload and material_change_kind == "NONE":
+                    material_change_kind = "STATE_CREATED"
+                elif previous_payload and previous_material != material_fingerprint and material_change_kind == "NONE":
+                    material_change_kind = "PHASE_CHANGED"
+                if previous_payload and previous_material == material_fingerprint:
+                    no_change_skip_count += 1
+                    continue
+                first_seen_at = str(previous_payload.get("first_seen_at") or payload.get("first_seen_at") or calculated_at)
+                state_entered_at = str(previous_payload.get("state_entered_at") or calculated_at)
+                if previous_state != lifecycle_state or (previous_phase and previous_phase != detector_phase):
+                    state_entered_at = calculated_at
+                material_change_at = str(payload.get("last_material_change_at") or calculated_at)
+                expires_at = str(payload.get("expires_at") or "")
+                transition_needed = not previous_payload or previous_material != material_fingerprint
+                self.conn.execute(
+                    """
+                    INSERT INTO setup_router_state_v3(
+                        trade_date, router_version, candidate_instance_id, theme_id,
+                        setup_type, setup_generation, state_version, setup_instance_id,
+                        code, candidate_id, lifecycle_state, detector_phase,
+                        state_entered_at, first_seen_at, last_evaluated_at,
+                        last_material_change_at, expires_at, expired_at, terminal_at,
+                        context_id, material_state_fingerprint, observation_fingerprint,
+                        material_change_kind, state_payload_json, reason_codes_json,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(trade_date, router_version, candidate_instance_id, theme_id, setup_type, setup_generation) DO UPDATE SET
+                        state_version=excluded.state_version,
+                        setup_instance_id=excluded.setup_instance_id,
+                        code=excluded.code,
+                        candidate_id=excluded.candidate_id,
+                        lifecycle_state=excluded.lifecycle_state,
+                        detector_phase=excluded.detector_phase,
+                        state_entered_at=excluded.state_entered_at,
+                        last_evaluated_at=excluded.last_evaluated_at,
+                        last_material_change_at=excluded.last_material_change_at,
+                        expires_at=excluded.expires_at,
+                        expired_at=excluded.expired_at,
+                        terminal_at=excluded.terminal_at,
+                        context_id=excluded.context_id,
+                        material_state_fingerprint=excluded.material_state_fingerprint,
+                        observation_fingerprint=excluded.observation_fingerprint,
+                        material_change_kind=excluded.material_change_kind,
+                        state_payload_json=excluded.state_payload_json,
+                        reason_codes_json=excluded.reason_codes_json,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (
+                        trade_date,
+                        router_version,
+                        candidate_instance_id,
+                        theme_id,
+                        setup_type,
+                        generation,
+                        state_version,
+                        setup_instance_id,
+                        code,
+                        candidate_id,
+                        lifecycle_state,
+                        detector_phase,
+                        state_entered_at,
+                        first_seen_at,
+                        calculated_at,
+                        material_change_at,
+                        expires_at,
+                        expired_at,
+                        terminal_at,
+                        str(payload.get("context_id") or ""),
+                        material_fingerprint,
+                        observation_fingerprint,
+                        material_change_kind,
+                        _json_payload(state_payload),
+                        _json_list(payload.get("reason_codes") or []),
+                    ),
+                )
+                state_write_count += 1
+                if transition_needed:
+                    transition_id = _versioned_setup_state_transition_id(
+                        router_version,
+                        trade_date,
+                        candidate_instance_id,
+                        theme_id,
+                        setup_type,
+                        generation,
+                        previous_state,
+                        lifecycle_state,
+                        material_fingerprint,
+                    )
+                    cursor = self.conn.execute(
+                        """
+                        INSERT OR IGNORE INTO setup_router_state_transitions_v3(
+                            transition_id, trade_date, router_version, state_version,
+                            candidate_instance_id, theme_id, setup_type, setup_generation,
+                            setup_instance_id, code, candidate_id, previous_state, current_state,
+                            detector_phase_from, detector_phase_to, occurred_at, context_id,
+                            material_change_kind, material_state_fingerprint_from,
+                            material_state_fingerprint_to, reason_codes_json, state_payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            transition_id,
+                            trade_date,
+                            router_version,
+                            state_version,
+                            candidate_instance_id,
+                            theme_id,
+                            setup_type,
+                            generation,
+                            setup_instance_id,
+                            code,
+                            candidate_id,
+                            previous_state,
+                            lifecycle_state,
+                            previous_phase,
+                            detector_phase,
+                            calculated_at,
+                            str(payload.get("context_id") or ""),
+                            material_change_kind,
+                            previous_material,
+                            material_fingerprint,
+                            _json_list(payload.get("reason_codes") or []),
+                            _json_payload(state_payload),
+                        ),
+                    )
+                    transition_write_count += int(getattr(cursor, "rowcount", 0) or 0)
+        return {
+            "state_write_count": state_write_count,
+            "transition_write_count": transition_write_count,
+            "observation_update_count": len(cleaned),
+            "no_change_skip_count": no_change_skip_count,
+            "state_no_change_skip_count": no_change_skip_count,
+        }
+
     def list_setup_router_states(
         self,
         *,
@@ -9436,10 +9863,11 @@ class TradingDatabase:
         if router_version:
             clauses.append("router_version = ?")
             params.append(str(router_version))
+        table = "setup_router_state_v3" if str(router_version or "") == _CURRENT_SETUP_ROUTER_VERSION else "setup_router_state_v2"
         rows = self.conn.execute(
             f"""
             SELECT *
-            FROM setup_router_state_v2
+            FROM {table}
             WHERE {" AND ".join(clauses)}
             ORDER BY updated_at DESC, setup_generation DESC
             LIMIT ?
@@ -9452,6 +9880,8 @@ class TradingDatabase:
         cleaned = [dict(item or {}) for item in rows or []]
         if not cleaned:
             return 0
+        if all(str(item.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION) == _CURRENT_SETUP_ROUTER_VERSION for item in cleaned):
+            return self._save_setup_router_candidate_runtime_v4(cleaned)
         saved = 0
         with self.conn:
             for payload in cleaned:
@@ -9557,6 +9987,112 @@ class TradingDatabase:
                 saved += 1
         return saved
 
+    def _save_setup_router_candidate_runtime_v4(self, cleaned: list[dict]) -> int:
+        saved = 0
+        with self.conn:
+            for payload in cleaned:
+                trade_date = str(payload.get("trade_date") or "")
+                candidate_instance_id = str(payload.get("candidate_instance_id") or "")
+                if not trade_date or not candidate_instance_id:
+                    continue
+                router_version = str(payload.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION)
+                self.conn.execute(
+                    """
+                    INSERT INTO setup_router_candidate_runtime_v4(
+                        trade_date, router_version, candidate_instance_id, code, state_version,
+                        selected_theme_id, first_eligible_at, first_pending_at,
+                        last_evaluated_at, last_success_at, last_failure_at,
+                        consecutive_failure_count, last_evaluation_source, last_context_id,
+                        last_entry_decision_at, last_completed_candle_at,
+                        observed_entry_signature, processed_entry_signature,
+                        observed_context_id, processed_context_id,
+                        observed_candle_at, processed_candle_at,
+                        observed_theme_id, processed_theme_id,
+                        observed_lease_signature, processed_lease_signature,
+                        pending_reason_codes_json,
+                        evaluation_count, incremental_evaluation_count,
+                        periodic_evaluation_count, ttl_evaluation_count,
+                        capacity_deferred_count, last_deferred_at, last_skip_reason,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(trade_date, router_version, candidate_instance_id) DO UPDATE SET
+                        code=COALESCE(NULLIF(excluded.code, ''), setup_router_candidate_runtime_v4.code),
+                        state_version=COALESCE(NULLIF(excluded.state_version, ''), setup_router_candidate_runtime_v4.state_version),
+                        selected_theme_id=COALESCE(NULLIF(excluded.selected_theme_id, ''), setup_router_candidate_runtime_v4.selected_theme_id),
+                        first_eligible_at=COALESCE(NULLIF(setup_router_candidate_runtime_v4.first_eligible_at, ''), excluded.first_eligible_at),
+                        first_pending_at=COALESCE(NULLIF(setup_router_candidate_runtime_v4.first_pending_at, ''), excluded.first_pending_at),
+                        last_evaluated_at=COALESCE(NULLIF(excluded.last_evaluated_at, ''), setup_router_candidate_runtime_v4.last_evaluated_at),
+                        last_success_at=COALESCE(NULLIF(excluded.last_success_at, ''), setup_router_candidate_runtime_v4.last_success_at),
+                        last_failure_at=COALESCE(NULLIF(excluded.last_failure_at, ''), setup_router_candidate_runtime_v4.last_failure_at),
+                        consecutive_failure_count=CASE
+                            WHEN excluded.last_success_at <> '' THEN 0
+                            WHEN excluded.last_failure_at <> '' THEN setup_router_candidate_runtime_v4.consecutive_failure_count + 1
+                            ELSE setup_router_candidate_runtime_v4.consecutive_failure_count
+                        END,
+                        last_evaluation_source=COALESCE(NULLIF(excluded.last_evaluation_source, ''), setup_router_candidate_runtime_v4.last_evaluation_source),
+                        last_context_id=COALESCE(NULLIF(excluded.last_context_id, ''), setup_router_candidate_runtime_v4.last_context_id),
+                        last_entry_decision_at=COALESCE(NULLIF(excluded.last_entry_decision_at, ''), setup_router_candidate_runtime_v4.last_entry_decision_at),
+                        last_completed_candle_at=COALESCE(NULLIF(excluded.last_completed_candle_at, ''), setup_router_candidate_runtime_v4.last_completed_candle_at),
+                        observed_entry_signature=COALESCE(NULLIF(excluded.observed_entry_signature, ''), setup_router_candidate_runtime_v4.observed_entry_signature),
+                        processed_entry_signature=COALESCE(NULLIF(excluded.processed_entry_signature, ''), setup_router_candidate_runtime_v4.processed_entry_signature),
+                        observed_context_id=COALESCE(NULLIF(excluded.observed_context_id, ''), setup_router_candidate_runtime_v4.observed_context_id),
+                        processed_context_id=COALESCE(NULLIF(excluded.processed_context_id, ''), setup_router_candidate_runtime_v4.processed_context_id),
+                        observed_candle_at=COALESCE(NULLIF(excluded.observed_candle_at, ''), setup_router_candidate_runtime_v4.observed_candle_at),
+                        processed_candle_at=COALESCE(NULLIF(excluded.processed_candle_at, ''), setup_router_candidate_runtime_v4.processed_candle_at),
+                        observed_theme_id=COALESCE(NULLIF(excluded.observed_theme_id, ''), setup_router_candidate_runtime_v4.observed_theme_id),
+                        processed_theme_id=COALESCE(NULLIF(excluded.processed_theme_id, ''), setup_router_candidate_runtime_v4.processed_theme_id),
+                        observed_lease_signature=COALESCE(NULLIF(excluded.observed_lease_signature, ''), setup_router_candidate_runtime_v4.observed_lease_signature),
+                        processed_lease_signature=COALESCE(NULLIF(excluded.processed_lease_signature, ''), setup_router_candidate_runtime_v4.processed_lease_signature),
+                        pending_reason_codes_json=COALESCE(NULLIF(excluded.pending_reason_codes_json, '[]'), setup_router_candidate_runtime_v4.pending_reason_codes_json),
+                        evaluation_count=setup_router_candidate_runtime_v4.evaluation_count + excluded.evaluation_count,
+                        incremental_evaluation_count=setup_router_candidate_runtime_v4.incremental_evaluation_count + excluded.incremental_evaluation_count,
+                        periodic_evaluation_count=setup_router_candidate_runtime_v4.periodic_evaluation_count + excluded.periodic_evaluation_count,
+                        ttl_evaluation_count=setup_router_candidate_runtime_v4.ttl_evaluation_count + excluded.ttl_evaluation_count,
+                        capacity_deferred_count=setup_router_candidate_runtime_v4.capacity_deferred_count + excluded.capacity_deferred_count,
+                        last_deferred_at=COALESCE(NULLIF(excluded.last_deferred_at, ''), setup_router_candidate_runtime_v4.last_deferred_at),
+                        last_skip_reason=COALESCE(NULLIF(excluded.last_skip_reason, ''), setup_router_candidate_runtime_v4.last_skip_reason),
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (
+                        trade_date,
+                        router_version,
+                        candidate_instance_id,
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("state_version") or ""),
+                        str(payload.get("selected_theme_id") or ""),
+                        str(payload.get("first_eligible_at") or ""),
+                        str(payload.get("first_pending_at") or ""),
+                        str(payload.get("last_evaluated_at") or ""),
+                        str(payload.get("last_success_at") or ""),
+                        str(payload.get("last_failure_at") or ""),
+                        _safe_int(payload.get("consecutive_failure_count"), 0),
+                        str(payload.get("last_evaluation_source") or ""),
+                        str(payload.get("last_context_id") or ""),
+                        str(payload.get("last_entry_decision_at") or ""),
+                        str(payload.get("last_completed_candle_at") or ""),
+                        str(payload.get("observed_entry_signature") or ""),
+                        str(payload.get("processed_entry_signature") or ""),
+                        str(payload.get("observed_context_id") or ""),
+                        str(payload.get("processed_context_id") or ""),
+                        str(payload.get("observed_candle_at") or ""),
+                        str(payload.get("processed_candle_at") or ""),
+                        str(payload.get("observed_theme_id") or ""),
+                        str(payload.get("processed_theme_id") or ""),
+                        str(payload.get("observed_lease_signature") or ""),
+                        str(payload.get("processed_lease_signature") or ""),
+                        _json_list(payload.get("pending_reason_codes") or []),
+                        _safe_int(payload.get("evaluation_count"), 0),
+                        _safe_int(payload.get("incremental_evaluation_count"), 0),
+                        _safe_int(payload.get("periodic_evaluation_count"), 0),
+                        _safe_int(payload.get("ttl_evaluation_count"), 0),
+                        _safe_int(payload.get("capacity_deferred_count"), 0),
+                        str(payload.get("last_deferred_at") or ""),
+                        str(payload.get("last_skip_reason") or ""),
+                    ),
+                )
+                saved += 1
+        return saved
+
     def list_setup_router_candidate_runtime(
         self,
         *,
@@ -9575,10 +10111,11 @@ class TradingDatabase:
         if router_version:
             clauses.append("router_version = ?")
             params.append(str(router_version))
+        table = "setup_router_candidate_runtime_v4" if str(router_version or "") == _CURRENT_SETUP_ROUTER_VERSION else "setup_router_candidate_runtime_v3"
         rows = self.conn.execute(
             f"""
             SELECT *
-            FROM setup_router_candidate_runtime_v3
+            FROM {table}
             WHERE {" AND ".join(clauses)}
             ORDER BY last_evaluated_at ASC, updated_at ASC
             LIMIT ?
@@ -9591,6 +10128,8 @@ class TradingDatabase:
         cleaned = [dict(item or {}) for item in rows or []]
         if not cleaned:
             return 0
+        if all(str(item.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION) == _CURRENT_SETUP_ROUTER_VERSION for item in cleaned):
+            return self._save_setup_router_pending_evaluations_v5(cleaned)
         saved = 0
         with self.conn:
             for payload in cleaned:
@@ -9673,6 +10212,148 @@ class TradingDatabase:
                 saved += 1
         return saved
 
+    def _save_setup_router_pending_evaluations_v5(self, cleaned: list[dict]) -> int:
+        saved = 0
+        with self.conn:
+            for payload in cleaned:
+                trade_date = str(payload.get("trade_date") or "")
+                candidate_instance_id = str(payload.get("candidate_instance_id") or "")
+                if not trade_date or not candidate_instance_id:
+                    continue
+                router_version = str(payload.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION)
+                now_text = str(payload.get("last_pending_at") or payload.get("first_pending_at") or "")
+                existing = self.conn.execute(
+                    """
+                    SELECT *
+                    FROM setup_router_pending_evaluations_v5
+                    WHERE trade_date = ? AND router_version = ? AND candidate_instance_id = ?
+                    """,
+                    (trade_date, router_version, candidate_instance_id),
+                ).fetchone()
+                existing_payload = _row_to_setup_router_pending_evaluation(existing) if existing else {}
+                incoming_reasons = _dedupe(
+                    [str(reason) for reason in list(payload.get("pending_reasons") or payload.get("pending_reason_codes") or []) if str(reason)]
+                )
+                incoming_priority = _safe_int(payload.get("pending_priority"), _setup_router_pending_priority(incoming_reasons))
+                existing_status = str(existing_payload.get("status") or "")
+                opened_from_status = existing_status
+                if not existing_payload or existing_status in {"COMPLETED", "SUPERSEDED"}:
+                    epoch = _safe_int(existing_payload.get("pending_epoch"), 0) + 1
+                    reasons = incoming_reasons
+                    priority = incoming_priority
+                    first_pending_at = now_text
+                    selected_at = ""
+                    completed_at = ""
+                    superseded_at = ""
+                    attempt_count = 0
+                    failure_count = 0
+                    last_attempt_at = ""
+                    last_error = ""
+                    last_error_class = ""
+                    next_retry_at = ""
+                    status = "PENDING"
+                else:
+                    epoch = max(1, _safe_int(existing_payload.get("pending_epoch"), 1))
+                    reasons = _dedupe([*list(existing_payload.get("pending_reasons") or []), *incoming_reasons])
+                    priority = min(_safe_int(existing_payload.get("pending_priority"), 3), incoming_priority)
+                    first_pending_at = str(existing_payload.get("first_pending_at") or now_text)
+                    selected_at = str(existing_payload.get("selected_at") or "")
+                    completed_at = str(existing_payload.get("completed_at") or "")
+                    superseded_at = str(existing_payload.get("superseded_at") or "")
+                    attempt_count = _safe_int(existing_payload.get("attempt_count"), 0)
+                    failure_count = _safe_int(existing_payload.get("failure_count"), 0)
+                    last_attempt_at = str(existing_payload.get("last_attempt_at") or "")
+                    last_error = str(existing_payload.get("last_error") or "")
+                    last_error_class = str(existing_payload.get("last_error_class") or "")
+                    next_retry_at = str(existing_payload.get("next_retry_at") or "")
+                    material_reopen = any(reason in {"ENTRY_DECISION_CHANGED", "DIRTY_EVALUATOR_DECISION", "CONTEXT_CHANGED", "CANDLE_BOUNDARY_CHANGED", "SELECTED_THEME_CHANGED", "LEASE_VERIFICATION_CHANGED", "TTL_DUE"} for reason in incoming_reasons)
+                    if existing_status == "SELECTED":
+                        status = "SELECTED"
+                    elif existing_status == "RETRY" and not material_reopen:
+                        status = "RETRY"
+                    else:
+                        status = "PENDING"
+                        if material_reopen:
+                            next_retry_at = ""
+                pending_instance_id = str(payload.get("pending_instance_id") or _setup_router_pending_instance_id(trade_date, router_version, candidate_instance_id, epoch))
+                values = {
+                    "trade_date": trade_date,
+                    "router_version": router_version,
+                    "candidate_instance_id": candidate_instance_id,
+                    "code": _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                    "state_version": str(payload.get("state_version") or ""),
+                    "selected_theme_id": str(payload.get("selected_theme_id") or ""),
+                    "pending_epoch": epoch,
+                    "pending_instance_id": pending_instance_id,
+                    "opened_from_status": opened_from_status,
+                    "status": status,
+                    "pending_priority": priority,
+                    "pending_reasons_json": _json_list(reasons),
+                    "first_pending_at": first_pending_at,
+                    "last_pending_at": now_text or first_pending_at,
+                    "selected_at": selected_at,
+                    "completed_at": completed_at,
+                    "superseded_at": superseded_at,
+                    "next_retry_at": next_retry_at,
+                    "attempt_count": attempt_count,
+                    "failure_count": failure_count,
+                    "last_attempt_at": last_attempt_at,
+                    "last_error": last_error,
+                    "last_error_class": last_error_class,
+                    "entry_signature": str(payload.get("entry_signature") or existing_payload.get("entry_signature") or ""),
+                    "context_signature": str(payload.get("context_signature") or existing_payload.get("context_signature") or ""),
+                    "candle_signature": str(payload.get("candle_signature") or existing_payload.get("candle_signature") or ""),
+                    "theme_signature": str(payload.get("theme_signature") or existing_payload.get("theme_signature") or ""),
+                    "lease_signature": str(payload.get("lease_signature") or existing_payload.get("lease_signature") or ""),
+                    "ttl_signature": str(payload.get("ttl_signature") or existing_payload.get("ttl_signature") or ""),
+                }
+                if existing_payload and _pending_v5_no_change(existing_payload, values):
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO setup_router_pending_evaluations_v5(
+                        trade_date, router_version, candidate_instance_id, code, state_version,
+                        selected_theme_id, pending_epoch, pending_instance_id, opened_from_status,
+                        status, pending_priority, pending_reasons_json, first_pending_at,
+                        last_pending_at, selected_at, completed_at, superseded_at, next_retry_at,
+                        attempt_count, failure_count, last_attempt_at, last_error, last_error_class,
+                        entry_signature, context_signature, candle_signature, theme_signature,
+                        lease_signature, ttl_signature, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(trade_date, router_version, candidate_instance_id) DO UPDATE SET
+                        code=excluded.code,
+                        state_version=excluded.state_version,
+                        selected_theme_id=excluded.selected_theme_id,
+                        pending_epoch=excluded.pending_epoch,
+                        pending_instance_id=excluded.pending_instance_id,
+                        opened_from_status=excluded.opened_from_status,
+                        status=excluded.status,
+                        pending_priority=excluded.pending_priority,
+                        pending_reasons_json=excluded.pending_reasons_json,
+                        first_pending_at=excluded.first_pending_at,
+                        last_pending_at=excluded.last_pending_at,
+                        selected_at=excluded.selected_at,
+                        completed_at=excluded.completed_at,
+                        superseded_at=excluded.superseded_at,
+                        next_retry_at=excluded.next_retry_at,
+                        attempt_count=excluded.attempt_count,
+                        failure_count=excluded.failure_count,
+                        last_attempt_at=excluded.last_attempt_at,
+                        last_error=excluded.last_error,
+                        last_error_class=excluded.last_error_class,
+                        entry_signature=excluded.entry_signature,
+                        context_signature=excluded.context_signature,
+                        candle_signature=excluded.candle_signature,
+                        theme_signature=excluded.theme_signature,
+                        lease_signature=excluded.lease_signature,
+                        ttl_signature=excluded.ttl_signature,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    tuple(values.values()),
+                )
+                saved += 1
+        return saved
+
     def list_setup_router_pending_evaluations(
         self,
         *,
@@ -9691,10 +10372,11 @@ class TradingDatabase:
             placeholders = ",".join("?" for _ in clean_statuses)
             clauses.append(f"status IN ({placeholders})")
             params.extend(clean_statuses)
+        table = "setup_router_pending_evaluations_v5" if str(router_version or "") == _CURRENT_SETUP_ROUTER_VERSION else "setup_router_pending_evaluations_v4"
         rows = self.conn.execute(
             f"""
             SELECT *
-            FROM setup_router_pending_evaluations_v4
+            FROM {table}
             WHERE {" AND ".join(clauses)}
             ORDER BY pending_priority ASC, first_pending_at ASC, candidate_instance_id ASC
             LIMIT ?
@@ -9707,6 +10389,8 @@ class TradingDatabase:
         cleaned = [dict(item or {}) for item in rows or []]
         if not cleaned:
             return 0
+        if all(str(item.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION) == _CURRENT_SETUP_ROUTER_VERSION for item in cleaned):
+            return self._update_setup_router_pending_evaluations_v5(cleaned)
         updated = 0
         with self.conn:
             for payload in cleaned:
@@ -9737,6 +10421,120 @@ class TradingDatabase:
                 )
                 updated += int(getattr(cursor, "rowcount", 0) or 0)
         return updated
+
+    def _update_setup_router_pending_evaluations_v5(self, cleaned: list[dict]) -> int:
+        updated = 0
+        with self.conn:
+            for payload in cleaned:
+                trade_date = str(payload.get("trade_date") or "")
+                candidate_instance_id = str(payload.get("candidate_instance_id") or "")
+                router_version = str(payload.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION)
+                status = str(payload.get("status") or "")
+                if not trade_date or not candidate_instance_id or not status:
+                    continue
+                existing = self.conn.execute(
+                    """
+                    SELECT *
+                    FROM setup_router_pending_evaluations_v5
+                    WHERE trade_date = ? AND router_version = ? AND candidate_instance_id = ?
+                    """,
+                    (trade_date, router_version, candidate_instance_id),
+                ).fetchone()
+                existing_payload = _row_to_setup_router_pending_evaluation(existing) if existing else {}
+                if not existing_payload:
+                    continue
+                current = str(payload.get("last_attempt_at") or payload.get("completed_at") or payload.get("superseded_at") or datetime.utcnow().replace(microsecond=0).isoformat())
+                set_parts = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+                params: list[object] = [status]
+                if status == "SELECTED":
+                    set_parts.extend(["selected_at = COALESCE(NULLIF(selected_at, ''), ?)", "last_attempt_at = ?", "attempt_count = attempt_count + 1"])
+                    params.extend([str(payload.get("selected_at") or current), str(payload.get("last_attempt_at") or current)])
+                elif status == "COMPLETED":
+                    set_parts.extend(
+                        [
+                            "completed_at = ?",
+                            "last_error = ''",
+                            "last_error_class = ''",
+                            "next_retry_at = ''",
+                            "failure_count = 0",
+                        ]
+                    )
+                    params.append(str(payload.get("completed_at") or current))
+                elif status == "RETRY":
+                    set_parts.extend(
+                        [
+                            "last_attempt_at = ?",
+                            "last_error = ?",
+                            "last_error_class = ?",
+                            "next_retry_at = ?",
+                            "failure_count = failure_count + 1",
+                        ]
+                    )
+                    params.extend(
+                        [
+                            str(payload.get("last_attempt_at") or current),
+                            str(payload.get("last_error") or ""),
+                            str(payload.get("last_error_class") or ""),
+                            str(payload.get("next_retry_at") or current),
+                        ]
+                    )
+                    if payload.get("pending_reasons") is not None or payload.get("pending_reason_codes") is not None:
+                        reasons = _dedupe([*list(existing_payload.get("pending_reasons") or []), *list(payload.get("pending_reasons") or payload.get("pending_reason_codes") or [])])
+                        set_parts.append("pending_reasons_json = ?")
+                        params.append(_json_list(reasons))
+                elif status == "SUPERSEDED":
+                    reasons = _dedupe([*list(existing_payload.get("pending_reasons") or []), *list(payload.get("pending_reasons") or payload.get("pending_reason_codes") or [])])
+                    set_parts.extend(["superseded_at = ?", "pending_reasons_json = ?", "next_retry_at = ''"])
+                    params.extend([str(payload.get("superseded_at") or current), _json_list(reasons)])
+                if payload.get("last_error") is not None and status not in {"RETRY"}:
+                    set_parts.append("last_error = ?")
+                    params.append(str(payload.get("last_error") or ""))
+                params.extend([trade_date, router_version, candidate_instance_id])
+                cursor = self.conn.execute(
+                    f"""
+                    UPDATE setup_router_pending_evaluations_v5
+                    SET {", ".join(set_parts)}
+                    WHERE trade_date = ? AND router_version = ? AND candidate_instance_id = ?
+                    """,
+                    tuple(params),
+                )
+                updated += int(getattr(cursor, "rowcount", 0) or 0)
+        return updated
+
+    def complete_setup_router_evaluation(
+        self,
+        *,
+        observations: Iterable[dict],
+        runtime_update: dict,
+        pending_update: dict,
+    ) -> dict:
+        observation_rows = [dict(item or {}) for item in observations or []]
+        runtime_payload = dict(runtime_update or {})
+        pending_payload = dict(pending_update or {})
+        state_counts: dict[str, int] = {"state_write_count": 0, "transition_write_count": 0, "no_change_skip_count": 0, "state_no_change_skip_count": 0}
+        saved_count = 0
+        runtime_count = 0
+        pending_count = 0
+        with self.conn:
+            if observation_rows:
+                counts = dict(self.save_setup_router_states(observation_rows) or {})
+                state_counts["state_write_count"] += int(counts.get("state_write_count") or 0)
+                state_counts["transition_write_count"] += int(counts.get("transition_write_count") or 0)
+                state_counts["no_change_skip_count"] += int(counts.get("no_change_skip_count") or 0)
+                state_counts["state_no_change_skip_count"] += int(counts.get("state_no_change_skip_count") or counts.get("no_change_skip_count") or 0)
+                saved_count += int(self.save_setup_observations(observation_rows) or 0)
+            if runtime_payload:
+                runtime_count += int(self.save_setup_router_candidate_runtime([runtime_payload]) or 0)
+            if pending_payload:
+                pending_payload.setdefault("status", "COMPLETED")
+                pending_count += int(self.update_setup_router_pending_evaluations([pending_payload]) or 0)
+        return {
+            **state_counts,
+            "observation_write_count": saved_count,
+            "saved_count": saved_count,
+            "runtime_write_count": runtime_count,
+            "pending_completed_count": pending_count,
+        }
 
     def list_setup_observations_latest(
         self,
@@ -17769,6 +18567,8 @@ def _row_to_setup_router_state(row: sqlite3.Row) -> dict:
     data = dict(row)
     payload = {
         "trade_date": data.get("trade_date", ""),
+        "router_version": data.get("router_version", ""),
+        "state_version": data.get("state_version", data.get("schema_version", "")),
         "candidate_instance_id": data.get("candidate_instance_id", ""),
         "theme_id": data.get("theme_id", ""),
         "setup_type": data.get("setup_type", ""),
@@ -17794,7 +18594,6 @@ def _row_to_setup_router_state(row: sqlite3.Row) -> dict:
         "state_payload": _safe_json_loads(data.get("state_payload_json", "{}"), {}),
         "reason_codes": _safe_json_loads(data.get("reason_codes_json", "[]"), []),
         "schema_version": data.get("schema_version", ""),
-        "router_version": data.get("router_version", ""),
         "created_at": data.get("created_at", ""),
         "updated_at": data.get("updated_at", ""),
     }
@@ -17884,20 +18683,30 @@ def _row_to_setup_router_pending_evaluation(row: sqlite3.Row | None) -> dict:
         "router_version": data.get("router_version", ""),
         "state_version": data.get("state_version", ""),
         "selected_theme_id": data.get("selected_theme_id", ""),
-        "pending_priority": int(data.get("pending_priority") or 3),
+        "pending_epoch": int(data.get("pending_epoch") or 1),
+        "pending_instance_id": data.get("pending_instance_id", ""),
+        "opened_from_status": data.get("opened_from_status", ""),
+        "status": data.get("status", ""),
+        "pending_priority": _safe_int(data.get("pending_priority"), 3),
         "pending_reasons": _safe_json_loads(data.get("pending_reasons_json", "[]"), []),
+        "first_pending_at": data.get("first_pending_at", ""),
+        "last_pending_at": data.get("last_pending_at", ""),
+        "selected_at": data.get("selected_at", ""),
+        "completed_at": data.get("completed_at", ""),
+        "superseded_at": data.get("superseded_at", ""),
+        "next_retry_at": data.get("next_retry_at", ""),
+        "attempt_count": int(data.get("attempt_count") or 0),
+        "failure_count": int(data.get("failure_count") or 0),
+        "last_attempt_at": data.get("last_attempt_at", ""),
+        "last_error": data.get("last_error", ""),
+        "last_error_class": data.get("last_error_class", ""),
         "entry_signature": data.get("entry_signature", ""),
         "context_signature": data.get("context_signature", ""),
         "candle_signature": data.get("candle_signature", ""),
         "theme_signature": data.get("theme_signature", ""),
         "lease_signature": data.get("lease_signature", ""),
-        "ttl_due_at": data.get("ttl_due_at", ""),
-        "first_pending_at": data.get("first_pending_at", ""),
-        "last_pending_at": data.get("last_pending_at", ""),
-        "attempt_count": int(data.get("attempt_count") or 0),
-        "last_attempt_at": data.get("last_attempt_at", ""),
-        "last_error": data.get("last_error", ""),
-        "status": data.get("status", ""),
+        "ttl_signature": data.get("ttl_signature", data.get("ttl_due_at", "")),
+        "ttl_due_at": data.get("ttl_due_at", data.get("ttl_signature", "")),
         "created_at": data.get("created_at", ""),
         "updated_at": data.get("updated_at", ""),
     }
@@ -18584,6 +19393,108 @@ def _setup_state_transition_id(
         ]
     )
     return hashlib.sha1(material.encode("utf-8")).hexdigest()
+
+
+def _versioned_setup_state_transition_id(
+    router_version: str,
+    trade_date: str,
+    candidate_instance_id: str,
+    theme_id: str,
+    setup_type: str,
+    generation: int,
+    previous_state: str,
+    current_state: str,
+    fingerprint: str,
+) -> str:
+    material = "|".join(
+        [
+            str(router_version or ""),
+            trade_date,
+            candidate_instance_id,
+            theme_id,
+            setup_type,
+            str(generation),
+            previous_state,
+            current_state,
+            fingerprint,
+        ]
+    )
+    return hashlib.sha1(material.encode("utf-8")).hexdigest()
+
+
+def _setup_router_pending_priority(reasons: Iterable[object]) -> int:
+    reason_set = {str(reason) for reason in list(reasons or []) if str(reason)}
+    if reason_set & {"ENTRY_DECISION_CHANGED", "DIRTY_EVALUATOR_DECISION"}:
+        return 0
+    if reason_set & {"CONTEXT_CHANGED", "SELECTED_THEME_CHANGED", "LEASE_VERIFICATION_CHANGED"}:
+        return 1
+    if reason_set & {"TTL_DUE", "CANDLE_BOUNDARY_CHANGED"}:
+        return 2
+    return 3
+
+
+def _setup_router_pending_instance_id(trade_date: str, router_version: str, candidate_instance_id: str, epoch: int) -> str:
+    material = "|".join([str(trade_date or ""), str(router_version or ""), str(candidate_instance_id or ""), str(max(1, int(epoch or 1)))])
+    return hashlib.sha1(material.encode("utf-8")).hexdigest()[:24]
+
+
+def _pending_v5_no_change(existing: Mapping[str, object], values: Mapping[str, object]) -> bool:
+    comparable = {
+        "code": values.get("code", ""),
+        "state_version": values.get("state_version", ""),
+        "selected_theme_id": values.get("selected_theme_id", ""),
+        "pending_epoch": _safe_int(values.get("pending_epoch"), 1),
+        "pending_instance_id": values.get("pending_instance_id", ""),
+        "opened_from_status": values.get("opened_from_status", ""),
+        "status": values.get("status", ""),
+        "pending_priority": _safe_int(values.get("pending_priority"), 3),
+        "pending_reasons_json": values.get("pending_reasons_json", "[]"),
+        "first_pending_at": values.get("first_pending_at", ""),
+        "last_pending_at": values.get("last_pending_at", ""),
+        "selected_at": values.get("selected_at", ""),
+        "completed_at": values.get("completed_at", ""),
+        "superseded_at": values.get("superseded_at", ""),
+        "next_retry_at": values.get("next_retry_at", ""),
+        "attempt_count": _safe_int(values.get("attempt_count"), 0),
+        "failure_count": _safe_int(values.get("failure_count"), 0),
+        "last_attempt_at": values.get("last_attempt_at", ""),
+        "last_error": values.get("last_error", ""),
+        "last_error_class": values.get("last_error_class", ""),
+        "entry_signature": values.get("entry_signature", ""),
+        "context_signature": values.get("context_signature", ""),
+        "candle_signature": values.get("candle_signature", ""),
+        "theme_signature": values.get("theme_signature", ""),
+        "lease_signature": values.get("lease_signature", ""),
+        "ttl_signature": values.get("ttl_signature", ""),
+    }
+    return (
+        str(existing.get("code") or "") == str(comparable["code"] or "")
+        and str(existing.get("state_version") or "") == str(comparable["state_version"] or "")
+        and str(existing.get("selected_theme_id") or "") == str(comparable["selected_theme_id"] or "")
+        and _safe_int(existing.get("pending_epoch"), 1) == comparable["pending_epoch"]
+        and str(existing.get("pending_instance_id") or "") == str(comparable["pending_instance_id"] or "")
+        and str(existing.get("opened_from_status") or "") == str(comparable["opened_from_status"] or "")
+        and str(existing.get("status") or "") == str(comparable["status"] or "")
+        and _safe_int(existing.get("pending_priority"), 3) == comparable["pending_priority"]
+        and _json_list(existing.get("pending_reasons") or []) == str(comparable["pending_reasons_json"] or "[]")
+        and str(existing.get("first_pending_at") or "") == str(comparable["first_pending_at"] or "")
+        and str(existing.get("last_pending_at") or "") == str(comparable["last_pending_at"] or "")
+        and str(existing.get("selected_at") or "") == str(comparable["selected_at"] or "")
+        and str(existing.get("completed_at") or "") == str(comparable["completed_at"] or "")
+        and str(existing.get("superseded_at") or "") == str(comparable["superseded_at"] or "")
+        and str(existing.get("next_retry_at") or "") == str(comparable["next_retry_at"] or "")
+        and _safe_int(existing.get("attempt_count"), 0) == comparable["attempt_count"]
+        and _safe_int(existing.get("failure_count"), 0) == comparable["failure_count"]
+        and str(existing.get("last_attempt_at") or "") == str(comparable["last_attempt_at"] or "")
+        and str(existing.get("last_error") or "") == str(comparable["last_error"] or "")
+        and str(existing.get("last_error_class") or "") == str(comparable["last_error_class"] or "")
+        and str(existing.get("entry_signature") or "") == str(comparable["entry_signature"] or "")
+        and str(existing.get("context_signature") or "") == str(comparable["context_signature"] or "")
+        and str(existing.get("candle_signature") or "") == str(comparable["candle_signature"] or "")
+        and str(existing.get("theme_signature") or "") == str(comparable["theme_signature"] or "")
+        and str(existing.get("lease_signature") or "") == str(comparable["lease_signature"] or "")
+        and str(existing.get("ttl_signature") or "") == str(comparable["ttl_signature"] or "")
+    )
 
 
 def _state_material_hash_from_row_payload(row_payload: Mapping[str, object], state_payload: Mapping[str, object], lifecycle_state: str) -> str:

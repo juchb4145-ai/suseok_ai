@@ -8,7 +8,7 @@ from trading.strategy.candidates import normalize_code
 from trading.strategy.models import Candidate
 
 
-SETUP_ROUTER_FEATURE_SCHEMA_VERSION = "setup_router_v3.features.v4"
+SETUP_ROUTER_FEATURE_SCHEMA_VERSION = "setup_router_v3.features.v4.1"
 
 
 @dataclass(frozen=True)

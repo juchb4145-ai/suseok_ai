@@ -22,7 +22,7 @@ def test_setup_feature_builder_marks_stale_realtime_tick_as_data_wait(tmp_path):
     )
 
     assert "REALTIME_TICK_STALE" in feature.data_wait_reasons
-    assert feature.schema_version == "setup_router_v3.features.v4"
+    assert feature.schema_version == "setup_router_v3.features.v4.1"
 
 
 def test_setup_feature_builder_uses_market_data_tick_age_contract(tmp_path):
