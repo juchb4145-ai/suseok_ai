@@ -33,7 +33,7 @@ from trading.strategy.models import (
 from trading.strategy.conditions import ConditionProfile
 
 
-_CURRENT_SETUP_ROUTER_VERSION = "setup_router_v3.3"
+_CURRENT_SETUP_ROUTER_VERSION = "setup_router_v3.4"
 
 
 class TradingDatabase:
@@ -1204,12 +1204,30 @@ class TradingDatabase:
                 trade_date TEXT NOT NULL,
                 candidate_instance_id TEXT NOT NULL,
                 code TEXT NOT NULL DEFAULT '',
+                router_version TEXT NOT NULL DEFAULT '',
+                state_version TEXT NOT NULL DEFAULT '',
                 selected_theme_id TEXT NOT NULL DEFAULT '',
+                first_eligible_at TEXT NOT NULL DEFAULT '',
+                first_pending_at TEXT NOT NULL DEFAULT '',
                 last_evaluated_at TEXT NOT NULL DEFAULT '',
+                last_success_at TEXT NOT NULL DEFAULT '',
+                last_failure_at TEXT NOT NULL DEFAULT '',
+                consecutive_failure_count INTEGER NOT NULL DEFAULT 0,
                 last_evaluation_source TEXT NOT NULL DEFAULT '',
                 last_context_id TEXT NOT NULL DEFAULT '',
                 last_entry_decision_at TEXT NOT NULL DEFAULT '',
                 last_completed_candle_at TEXT NOT NULL DEFAULT '',
+                observed_entry_signature TEXT NOT NULL DEFAULT '',
+                processed_entry_signature TEXT NOT NULL DEFAULT '',
+                observed_context_id TEXT NOT NULL DEFAULT '',
+                processed_context_id TEXT NOT NULL DEFAULT '',
+                observed_candle_at TEXT NOT NULL DEFAULT '',
+                processed_candle_at TEXT NOT NULL DEFAULT '',
+                observed_theme_id TEXT NOT NULL DEFAULT '',
+                processed_theme_id TEXT NOT NULL DEFAULT '',
+                observed_lease_signature TEXT NOT NULL DEFAULT '',
+                processed_lease_signature TEXT NOT NULL DEFAULT '',
+                pending_reason_codes_json TEXT NOT NULL DEFAULT '[]',
                 evaluation_count INTEGER NOT NULL DEFAULT 0,
                 incremental_evaluation_count INTEGER NOT NULL DEFAULT 0,
                 periodic_evaluation_count INTEGER NOT NULL DEFAULT 0,
@@ -1222,6 +1240,33 @@ class TradingDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_setup_router_candidate_runtime_v3_trade_eval
                 ON setup_router_candidate_runtime_v3(trade_date, last_evaluated_at);
+            CREATE TABLE IF NOT EXISTS setup_router_pending_evaluations_v4 (
+                trade_date TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                code TEXT NOT NULL DEFAULT '',
+                router_version TEXT NOT NULL DEFAULT '',
+                state_version TEXT NOT NULL DEFAULT '',
+                selected_theme_id TEXT NOT NULL DEFAULT '',
+                pending_priority INTEGER NOT NULL DEFAULT 3,
+                pending_reasons_json TEXT NOT NULL DEFAULT '[]',
+                entry_signature TEXT NOT NULL DEFAULT '',
+                context_signature TEXT NOT NULL DEFAULT '',
+                candle_signature TEXT NOT NULL DEFAULT '',
+                theme_signature TEXT NOT NULL DEFAULT '',
+                lease_signature TEXT NOT NULL DEFAULT '',
+                ttl_due_at TEXT NOT NULL DEFAULT '',
+                first_pending_at TEXT NOT NULL DEFAULT '',
+                last_pending_at TEXT NOT NULL DEFAULT '',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, candidate_instance_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_pending_evaluations_v4_trade_status
+                ON setup_router_pending_evaluations_v4(trade_date, router_version, status, pending_priority, first_pending_at);
             CREATE TABLE IF NOT EXISTS position_runtime_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -8867,6 +8912,8 @@ class TradingDatabase:
                 current_material_fingerprint = str(payload.get("material_state_fingerprint") or current_fingerprint)
                 previous_fingerprint = str(previous_payload.get("fingerprint") or "")
                 previous_material_fingerprint = str(previous_payload.get("material_state_fingerprint") or previous_payload.get("fingerprint") or "")
+                if previous_payload and current_fingerprint and current_fingerprint == previous_fingerprint:
+                    continue
                 transition_needed = bool(current_material_fingerprint) and (
                     not previous_payload or current_material_fingerprint != previous_material_fingerprint
                 )
@@ -9071,6 +9118,7 @@ class TradingDatabase:
                 "transition_write_count": 0,
                 "observation_update_count": 0,
                 "no_change_skip_count": 0,
+                "state_no_change_skip_count": 0,
             }
         state_write_count = 0
         transition_write_count = 0
@@ -9170,10 +9218,11 @@ class TradingDatabase:
                             theme_id, setup_type, setup_generation, setup_instance_id,
                             code, candidate_id, previous_state, current_state,
                             occurred_at, context_id, feature_fingerprint,
+                            router_version, state_version,
                             detector_phase_from, detector_phase_to, material_change_kind,
                             material_state_fingerprint_from, material_state_fingerprint_to,
                             reason_codes_json, state_payload_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             transition_id,
@@ -9190,6 +9239,8 @@ class TradingDatabase:
                             calculated_at,
                             str(payload.get("context_id") or ""),
                             observation_fingerprint,
+                            str(payload.get("router_version") or ""),
+                            str(payload.get("state_version") or ""),
                             str(other_payload.get("detector_phase") or ""),
                             "EXPIRED",
                             "THEME_CHANGED",
@@ -9224,8 +9275,7 @@ class TradingDatabase:
                     state_entered_at = calculated_at
                 if previous_payload and previous_material == material_fingerprint:
                     no_change_skip_count += 1
-                    material_change_at = str(previous_payload.get("last_material_change_at") or payload.get("last_material_change_at") or calculated_at)
-                    state_entered_at = str(previous_payload.get("state_entered_at") or state_entered_at)
+                    continue
                 else:
                     material_change_at = str(payload.get("last_material_change_at") or calculated_at)
                 expires_at = str(payload.get("expires_at") or "")
@@ -9316,10 +9366,11 @@ class TradingDatabase:
                             theme_id, setup_type, setup_generation, setup_instance_id,
                             code, candidate_id, previous_state, current_state,
                             occurred_at, context_id, feature_fingerprint,
+                            router_version, state_version,
                             detector_phase_from, detector_phase_to, material_change_kind,
                             material_state_fingerprint_from, material_state_fingerprint_to,
                             reason_codes_json, state_payload_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             transition_id,
@@ -9336,6 +9387,8 @@ class TradingDatabase:
                             calculated_at,
                             str(payload.get("context_id") or ""),
                             observation_fingerprint,
+                            str(payload.get("router_version") or ""),
+                            str(payload.get("state_version") or ""),
                             previous_phase,
                             detector_phase,
                             material_change_kind,
@@ -9352,6 +9405,7 @@ class TradingDatabase:
             "transition_write_count": transition_write_count,
             "observation_update_count": len(cleaned),
             "no_change_skip_count": no_change_skip_count,
+            "state_no_change_skip_count": no_change_skip_count,
         }
 
     def list_setup_router_states(
@@ -9380,7 +9434,7 @@ class TradingDatabase:
         if active_only:
             clauses.append("lifecycle_state IN ('SEEKING','FORMING','MATCHED')")
         if router_version:
-            clauses.append("(router_version = ? OR router_version = '')")
+            clauses.append("router_version = ?")
             params.append(str(router_version))
         rows = self.conn.execute(
             f"""
@@ -9408,22 +9462,52 @@ class TradingDatabase:
                 self.conn.execute(
                     """
                     INSERT INTO setup_router_candidate_runtime_v3(
-                        trade_date, candidate_instance_id, code, selected_theme_id,
-                        last_evaluated_at, last_evaluation_source, last_context_id,
+                        trade_date, candidate_instance_id, code, router_version, state_version,
+                        selected_theme_id, first_eligible_at, first_pending_at,
+                        last_evaluated_at, last_success_at, last_failure_at,
+                        consecutive_failure_count, last_evaluation_source, last_context_id,
                         last_entry_decision_at, last_completed_candle_at,
+                        observed_entry_signature, processed_entry_signature,
+                        observed_context_id, processed_context_id,
+                        observed_candle_at, processed_candle_at,
+                        observed_theme_id, processed_theme_id,
+                        observed_lease_signature, processed_lease_signature,
+                        pending_reason_codes_json,
                         evaluation_count, incremental_evaluation_count,
                         periodic_evaluation_count, ttl_evaluation_count,
                         capacity_deferred_count, last_deferred_at, last_skip_reason,
                         updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(trade_date, candidate_instance_id) DO UPDATE SET
                         code=COALESCE(NULLIF(excluded.code, ''), setup_router_candidate_runtime_v3.code),
+                        router_version=COALESCE(NULLIF(excluded.router_version, ''), setup_router_candidate_runtime_v3.router_version),
+                        state_version=COALESCE(NULLIF(excluded.state_version, ''), setup_router_candidate_runtime_v3.state_version),
                         selected_theme_id=COALESCE(NULLIF(excluded.selected_theme_id, ''), setup_router_candidate_runtime_v3.selected_theme_id),
+                        first_eligible_at=COALESCE(NULLIF(setup_router_candidate_runtime_v3.first_eligible_at, ''), excluded.first_eligible_at),
+                        first_pending_at=COALESCE(NULLIF(setup_router_candidate_runtime_v3.first_pending_at, ''), excluded.first_pending_at),
                         last_evaluated_at=COALESCE(NULLIF(excluded.last_evaluated_at, ''), setup_router_candidate_runtime_v3.last_evaluated_at),
+                        last_success_at=COALESCE(NULLIF(excluded.last_success_at, ''), setup_router_candidate_runtime_v3.last_success_at),
+                        last_failure_at=COALESCE(NULLIF(excluded.last_failure_at, ''), setup_router_candidate_runtime_v3.last_failure_at),
+                        consecutive_failure_count=CASE
+                            WHEN excluded.last_success_at <> '' THEN 0
+                            WHEN excluded.last_failure_at <> '' THEN setup_router_candidate_runtime_v3.consecutive_failure_count + 1
+                            ELSE setup_router_candidate_runtime_v3.consecutive_failure_count
+                        END,
                         last_evaluation_source=COALESCE(NULLIF(excluded.last_evaluation_source, ''), setup_router_candidate_runtime_v3.last_evaluation_source),
                         last_context_id=COALESCE(NULLIF(excluded.last_context_id, ''), setup_router_candidate_runtime_v3.last_context_id),
                         last_entry_decision_at=COALESCE(NULLIF(excluded.last_entry_decision_at, ''), setup_router_candidate_runtime_v3.last_entry_decision_at),
                         last_completed_candle_at=COALESCE(NULLIF(excluded.last_completed_candle_at, ''), setup_router_candidate_runtime_v3.last_completed_candle_at),
+                        observed_entry_signature=COALESCE(NULLIF(excluded.observed_entry_signature, ''), setup_router_candidate_runtime_v3.observed_entry_signature),
+                        processed_entry_signature=COALESCE(NULLIF(excluded.processed_entry_signature, ''), setup_router_candidate_runtime_v3.processed_entry_signature),
+                        observed_context_id=COALESCE(NULLIF(excluded.observed_context_id, ''), setup_router_candidate_runtime_v3.observed_context_id),
+                        processed_context_id=COALESCE(NULLIF(excluded.processed_context_id, ''), setup_router_candidate_runtime_v3.processed_context_id),
+                        observed_candle_at=COALESCE(NULLIF(excluded.observed_candle_at, ''), setup_router_candidate_runtime_v3.observed_candle_at),
+                        processed_candle_at=COALESCE(NULLIF(excluded.processed_candle_at, ''), setup_router_candidate_runtime_v3.processed_candle_at),
+                        observed_theme_id=COALESCE(NULLIF(excluded.observed_theme_id, ''), setup_router_candidate_runtime_v3.observed_theme_id),
+                        processed_theme_id=COALESCE(NULLIF(excluded.processed_theme_id, ''), setup_router_candidate_runtime_v3.processed_theme_id),
+                        observed_lease_signature=COALESCE(NULLIF(excluded.observed_lease_signature, ''), setup_router_candidate_runtime_v3.observed_lease_signature),
+                        processed_lease_signature=COALESCE(NULLIF(excluded.processed_lease_signature, ''), setup_router_candidate_runtime_v3.processed_lease_signature),
+                        pending_reason_codes_json=COALESCE(NULLIF(excluded.pending_reason_codes_json, '[]'), setup_router_candidate_runtime_v3.pending_reason_codes_json),
                         evaluation_count=setup_router_candidate_runtime_v3.evaluation_count + excluded.evaluation_count,
                         incremental_evaluation_count=setup_router_candidate_runtime_v3.incremental_evaluation_count + excluded.incremental_evaluation_count,
                         periodic_evaluation_count=setup_router_candidate_runtime_v3.periodic_evaluation_count + excluded.periodic_evaluation_count,
@@ -9437,12 +9521,30 @@ class TradingDatabase:
                         trade_date,
                         candidate_instance_id,
                         _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION),
+                        str(payload.get("state_version") or ""),
                         str(payload.get("selected_theme_id") or ""),
+                        str(payload.get("first_eligible_at") or ""),
+                        str(payload.get("first_pending_at") or ""),
                         str(payload.get("last_evaluated_at") or ""),
+                        str(payload.get("last_success_at") or ""),
+                        str(payload.get("last_failure_at") or ""),
+                        _safe_int(payload.get("consecutive_failure_count"), 0),
                         str(payload.get("last_evaluation_source") or ""),
                         str(payload.get("last_context_id") or ""),
                         str(payload.get("last_entry_decision_at") or ""),
                         str(payload.get("last_completed_candle_at") or ""),
+                        str(payload.get("observed_entry_signature") or ""),
+                        str(payload.get("processed_entry_signature") or ""),
+                        str(payload.get("observed_context_id") or ""),
+                        str(payload.get("processed_context_id") or ""),
+                        str(payload.get("observed_candle_at") or ""),
+                        str(payload.get("processed_candle_at") or ""),
+                        str(payload.get("observed_theme_id") or ""),
+                        str(payload.get("processed_theme_id") or ""),
+                        str(payload.get("observed_lease_signature") or ""),
+                        str(payload.get("processed_lease_signature") or ""),
+                        _json_list(payload.get("pending_reason_codes") or []),
                         _safe_int(payload.get("evaluation_count"), 0),
                         _safe_int(payload.get("incremental_evaluation_count"), 0),
                         _safe_int(payload.get("periodic_evaluation_count"), 0),
@@ -9460,6 +9562,7 @@ class TradingDatabase:
         *,
         trade_date: str,
         candidate_instance_ids: Iterable[object] | None = None,
+        router_version: Optional[str] = _CURRENT_SETUP_ROUTER_VERSION,
         limit: int = 5000,
     ) -> list[dict]:
         clauses = ["trade_date = ?"]
@@ -9469,6 +9572,9 @@ class TradingDatabase:
             placeholders = ",".join("?" for _ in clean_ids)
             clauses.append(f"candidate_instance_id IN ({placeholders})")
             params.extend(clean_ids)
+        if router_version:
+            clauses.append("router_version = ?")
+            params.append(str(router_version))
         rows = self.conn.execute(
             f"""
             SELECT *
@@ -9480,6 +9586,157 @@ class TradingDatabase:
             tuple([*params, max(1, int(limit or 5000))]),
         ).fetchall()
         return [_row_to_setup_router_candidate_runtime(row) for row in rows]
+
+    def save_setup_router_pending_evaluations(self, rows: Iterable[dict]) -> int:
+        cleaned = [dict(item or {}) for item in rows or []]
+        if not cleaned:
+            return 0
+        saved = 0
+        with self.conn:
+            for payload in cleaned:
+                trade_date = str(payload.get("trade_date") or "")
+                candidate_instance_id = str(payload.get("candidate_instance_id") or "")
+                if not trade_date or not candidate_instance_id:
+                    continue
+                router_version = str(payload.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION)
+                existing = self.conn.execute(
+                    """
+                    SELECT *
+                    FROM setup_router_pending_evaluations_v4
+                    WHERE trade_date = ? AND candidate_instance_id = ? AND router_version = ?
+                    """,
+                    (trade_date, candidate_instance_id, router_version),
+                ).fetchone()
+                existing_payload = _row_to_setup_router_pending_evaluation(existing) if existing else {}
+                reasons = _dedupe(
+                    [
+                        *list(existing_payload.get("pending_reasons") or []),
+                        *[str(reason) for reason in list(payload.get("pending_reasons") or payload.get("pending_reason_codes") or []) if str(reason)],
+                    ]
+                )
+                priority = min(_safe_int(payload.get("pending_priority"), 3), _safe_int(existing_payload.get("pending_priority"), 3) if existing_payload else 3)
+                first_pending_at = str(existing_payload.get("first_pending_at") or payload.get("first_pending_at") or payload.get("last_pending_at") or "")
+                self.conn.execute(
+                    """
+                    INSERT INTO setup_router_pending_evaluations_v4(
+                        trade_date, candidate_instance_id, code, router_version, state_version,
+                        selected_theme_id, pending_priority, pending_reasons_json,
+                        entry_signature, context_signature, candle_signature,
+                        theme_signature, lease_signature, ttl_due_at,
+                        first_pending_at, last_pending_at, attempt_count,
+                        last_attempt_at, last_error, status, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(trade_date, candidate_instance_id) DO UPDATE SET
+                        code=COALESCE(NULLIF(excluded.code, ''), setup_router_pending_evaluations_v4.code),
+                        router_version=excluded.router_version,
+                        state_version=COALESCE(NULLIF(excluded.state_version, ''), setup_router_pending_evaluations_v4.state_version),
+                        selected_theme_id=COALESCE(NULLIF(excluded.selected_theme_id, ''), setup_router_pending_evaluations_v4.selected_theme_id),
+                        pending_priority=MIN(setup_router_pending_evaluations_v4.pending_priority, excluded.pending_priority),
+                        pending_reasons_json=excluded.pending_reasons_json,
+                        entry_signature=COALESCE(NULLIF(excluded.entry_signature, ''), setup_router_pending_evaluations_v4.entry_signature),
+                        context_signature=COALESCE(NULLIF(excluded.context_signature, ''), setup_router_pending_evaluations_v4.context_signature),
+                        candle_signature=COALESCE(NULLIF(excluded.candle_signature, ''), setup_router_pending_evaluations_v4.candle_signature),
+                        theme_signature=COALESCE(NULLIF(excluded.theme_signature, ''), setup_router_pending_evaluations_v4.theme_signature),
+                        lease_signature=COALESCE(NULLIF(excluded.lease_signature, ''), setup_router_pending_evaluations_v4.lease_signature),
+                        ttl_due_at=COALESCE(NULLIF(excluded.ttl_due_at, ''), setup_router_pending_evaluations_v4.ttl_due_at),
+                        first_pending_at=COALESCE(NULLIF(setup_router_pending_evaluations_v4.first_pending_at, ''), excluded.first_pending_at),
+                        last_pending_at=excluded.last_pending_at,
+                        status=CASE
+                            WHEN setup_router_pending_evaluations_v4.status = 'SELECTED' THEN setup_router_pending_evaluations_v4.status
+                            ELSE 'PENDING'
+                        END,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (
+                        trade_date,
+                        candidate_instance_id,
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        router_version,
+                        str(payload.get("state_version") or ""),
+                        str(payload.get("selected_theme_id") or ""),
+                        priority,
+                        _json_list(reasons),
+                        str(payload.get("entry_signature") or ""),
+                        str(payload.get("context_signature") or ""),
+                        str(payload.get("candle_signature") or ""),
+                        str(payload.get("theme_signature") or ""),
+                        str(payload.get("lease_signature") or ""),
+                        str(payload.get("ttl_due_at") or ""),
+                        first_pending_at,
+                        str(payload.get("last_pending_at") or first_pending_at),
+                        _safe_int(existing_payload.get("attempt_count"), 0),
+                        str(existing_payload.get("last_attempt_at") or ""),
+                        str(payload.get("last_error") or existing_payload.get("last_error") or ""),
+                        str(payload.get("status") or "PENDING"),
+                    ),
+                )
+                saved += 1
+        return saved
+
+    def list_setup_router_pending_evaluations(
+        self,
+        *,
+        trade_date: str,
+        router_version: Optional[str] = _CURRENT_SETUP_ROUTER_VERSION,
+        statuses: Iterable[str] | None = ("PENDING", "RETRY"),
+        limit: int = 5000,
+    ) -> list[dict]:
+        clauses = ["trade_date = ?"]
+        params: list[object] = [str(trade_date)]
+        if router_version:
+            clauses.append("router_version = ?")
+            params.append(str(router_version))
+        clean_statuses = [str(status) for status in list(statuses or []) if str(status or "")]
+        if clean_statuses:
+            placeholders = ",".join("?" for _ in clean_statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(clean_statuses)
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM setup_router_pending_evaluations_v4
+            WHERE {" AND ".join(clauses)}
+            ORDER BY pending_priority ASC, first_pending_at ASC, candidate_instance_id ASC
+            LIMIT ?
+            """,
+            tuple([*params, max(1, int(limit or 5000))]),
+        ).fetchall()
+        return [_row_to_setup_router_pending_evaluation(row) for row in rows]
+
+    def update_setup_router_pending_evaluations(self, rows: Iterable[dict]) -> int:
+        cleaned = [dict(item or {}) for item in rows or []]
+        if not cleaned:
+            return 0
+        updated = 0
+        with self.conn:
+            for payload in cleaned:
+                trade_date = str(payload.get("trade_date") or "")
+                candidate_instance_id = str(payload.get("candidate_instance_id") or "")
+                router_version = str(payload.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION)
+                status = str(payload.get("status") or "")
+                if not trade_date or not candidate_instance_id or not status:
+                    continue
+                set_parts = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+                params: list[object] = [status]
+                if payload.get("last_attempt_at") is not None:
+                    set_parts.append("last_attempt_at = ?")
+                    params.append(str(payload.get("last_attempt_at") or ""))
+                if payload.get("last_error") is not None:
+                    set_parts.append("last_error = ?")
+                    params.append(str(payload.get("last_error") or ""))
+                if status == "SELECTED":
+                    set_parts.append("attempt_count = attempt_count + 1")
+                params.extend([trade_date, candidate_instance_id, router_version])
+                cursor = self.conn.execute(
+                    f"""
+                    UPDATE setup_router_pending_evaluations_v4
+                    SET {", ".join(set_parts)}
+                    WHERE trade_date = ? AND candidate_instance_id = ? AND router_version = ?
+                    """,
+                    tuple(params),
+                )
+                updated += int(getattr(cursor, "rowcount", 0) or 0)
+        return updated
 
     def list_setup_observations_latest(
         self,
@@ -14400,11 +14657,33 @@ class TradingDatabase:
             "terminal_at": "TEXT NOT NULL DEFAULT ''",
         }
         state_transition_columns = {
+            "router_version": "TEXT NOT NULL DEFAULT ''",
+            "state_version": "TEXT NOT NULL DEFAULT ''",
             "detector_phase_from": "TEXT NOT NULL DEFAULT ''",
             "detector_phase_to": "TEXT NOT NULL DEFAULT ''",
             "material_change_kind": "TEXT NOT NULL DEFAULT ''",
             "material_state_fingerprint_from": "TEXT NOT NULL DEFAULT ''",
             "material_state_fingerprint_to": "TEXT NOT NULL DEFAULT ''",
+        }
+        candidate_runtime_columns = {
+            "router_version": "TEXT NOT NULL DEFAULT ''",
+            "state_version": "TEXT NOT NULL DEFAULT ''",
+            "first_eligible_at": "TEXT NOT NULL DEFAULT ''",
+            "first_pending_at": "TEXT NOT NULL DEFAULT ''",
+            "last_success_at": "TEXT NOT NULL DEFAULT ''",
+            "last_failure_at": "TEXT NOT NULL DEFAULT ''",
+            "consecutive_failure_count": "INTEGER NOT NULL DEFAULT 0",
+            "observed_entry_signature": "TEXT NOT NULL DEFAULT ''",
+            "processed_entry_signature": "TEXT NOT NULL DEFAULT ''",
+            "observed_context_id": "TEXT NOT NULL DEFAULT ''",
+            "processed_context_id": "TEXT NOT NULL DEFAULT ''",
+            "observed_candle_at": "TEXT NOT NULL DEFAULT ''",
+            "processed_candle_at": "TEXT NOT NULL DEFAULT ''",
+            "observed_theme_id": "TEXT NOT NULL DEFAULT ''",
+            "processed_theme_id": "TEXT NOT NULL DEFAULT ''",
+            "observed_lease_signature": "TEXT NOT NULL DEFAULT ''",
+            "processed_lease_signature": "TEXT NOT NULL DEFAULT ''",
+            "pending_reason_codes_json": "TEXT NOT NULL DEFAULT '[]'",
         }
         for name, definition in run_columns.items():
             self._ensure_column("setup_router_runs", name, definition)
@@ -14418,6 +14697,8 @@ class TradingDatabase:
             self._ensure_column("setup_router_state_v2", name, definition)
         for name, definition in state_transition_columns.items():
             self._ensure_column("setup_router_state_transitions_v2", name, definition)
+        for name, definition in candidate_runtime_columns.items():
+            self._ensure_column("setup_router_candidate_runtime_v3", name, definition)
 
     def _ensure_theme_state_runtime_columns(self) -> None:
         columns = {
@@ -17538,6 +17819,8 @@ def _row_to_setup_router_state_transition(row: sqlite3.Row) -> dict:
         "occurred_at": data.get("occurred_at", ""),
         "context_id": data.get("context_id", ""),
         "feature_fingerprint": data.get("feature_fingerprint", ""),
+        "router_version": data.get("router_version", ""),
+        "state_version": data.get("state_version", ""),
         "detector_phase_from": data.get("detector_phase_from", ""),
         "detector_phase_to": data.get("detector_phase_to", ""),
         "material_change_kind": data.get("material_change_kind", ""),
@@ -17554,12 +17837,30 @@ def _row_to_setup_router_candidate_runtime(row: sqlite3.Row) -> dict:
         "trade_date": data.get("trade_date", ""),
         "candidate_instance_id": data.get("candidate_instance_id", ""),
         "code": data.get("code", ""),
+        "router_version": data.get("router_version", ""),
+        "state_version": data.get("state_version", ""),
         "selected_theme_id": data.get("selected_theme_id", ""),
+        "first_eligible_at": data.get("first_eligible_at", ""),
+        "first_pending_at": data.get("first_pending_at", ""),
         "last_evaluated_at": data.get("last_evaluated_at", ""),
+        "last_success_at": data.get("last_success_at", ""),
+        "last_failure_at": data.get("last_failure_at", ""),
+        "consecutive_failure_count": int(data.get("consecutive_failure_count") or 0),
         "last_evaluation_source": data.get("last_evaluation_source", ""),
         "last_context_id": data.get("last_context_id", ""),
         "last_entry_decision_at": data.get("last_entry_decision_at", ""),
         "last_completed_candle_at": data.get("last_completed_candle_at", ""),
+        "observed_entry_signature": data.get("observed_entry_signature", ""),
+        "processed_entry_signature": data.get("processed_entry_signature", ""),
+        "observed_context_id": data.get("observed_context_id", ""),
+        "processed_context_id": data.get("processed_context_id", ""),
+        "observed_candle_at": data.get("observed_candle_at", ""),
+        "processed_candle_at": data.get("processed_candle_at", ""),
+        "observed_theme_id": data.get("observed_theme_id", ""),
+        "processed_theme_id": data.get("processed_theme_id", ""),
+        "observed_lease_signature": data.get("observed_lease_signature", ""),
+        "processed_lease_signature": data.get("processed_lease_signature", ""),
+        "pending_reason_codes": _safe_json_loads(data.get("pending_reason_codes_json", "[]"), []),
         "evaluation_count": int(data.get("evaluation_count") or 0),
         "incremental_evaluation_count": int(data.get("incremental_evaluation_count") or 0),
         "periodic_evaluation_count": int(data.get("periodic_evaluation_count") or 0),
@@ -17567,6 +17868,37 @@ def _row_to_setup_router_candidate_runtime(row: sqlite3.Row) -> dict:
         "capacity_deferred_count": int(data.get("capacity_deferred_count") or 0),
         "last_deferred_at": data.get("last_deferred_at", ""),
         "last_skip_reason": data.get("last_skip_reason", ""),
+        "created_at": data.get("created_at", ""),
+        "updated_at": data.get("updated_at", ""),
+    }
+
+
+def _row_to_setup_router_pending_evaluation(row: sqlite3.Row | None) -> dict:
+    if row is None:
+        return {}
+    data = dict(row)
+    return {
+        "trade_date": data.get("trade_date", ""),
+        "candidate_instance_id": data.get("candidate_instance_id", ""),
+        "code": data.get("code", ""),
+        "router_version": data.get("router_version", ""),
+        "state_version": data.get("state_version", ""),
+        "selected_theme_id": data.get("selected_theme_id", ""),
+        "pending_priority": int(data.get("pending_priority") or 3),
+        "pending_reasons": _safe_json_loads(data.get("pending_reasons_json", "[]"), []),
+        "entry_signature": data.get("entry_signature", ""),
+        "context_signature": data.get("context_signature", ""),
+        "candle_signature": data.get("candle_signature", ""),
+        "theme_signature": data.get("theme_signature", ""),
+        "lease_signature": data.get("lease_signature", ""),
+        "ttl_due_at": data.get("ttl_due_at", ""),
+        "first_pending_at": data.get("first_pending_at", ""),
+        "last_pending_at": data.get("last_pending_at", ""),
+        "attempt_count": int(data.get("attempt_count") or 0),
+        "last_attempt_at": data.get("last_attempt_at", ""),
+        "last_error": data.get("last_error", ""),
+        "status": data.get("status", ""),
+        "created_at": data.get("created_at", ""),
         "updated_at": data.get("updated_at", ""),
     }
 

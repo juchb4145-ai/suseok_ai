@@ -36,7 +36,7 @@ def test_setup_router_runtime_saves_observe_only_outputs_without_candidate_mutat
 
     assert summary["enabled"] is True
     assert summary["valid_observe_count"] >= 1
-    assert summary["router_version"] == "setup_router_v3.3"
+    assert summary["router_version"] == "setup_router_v3.4"
     assert summary["state_write_count"] >= 1
     assert latest
     assert all(item["order_intent_allowed"] is False for item in latest)

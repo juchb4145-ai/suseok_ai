@@ -73,3 +73,57 @@ def test_setup_router_audit_counts_only_gateway_order_commands_as_side_effects(t
     assert rc == 1
     assert summary["side_effect_counts"]["gateway_order_commands"] == 1
     assert "SETUP_ROUTER_ORDER_SIDE_EFFECTS_PRESENT" in summary["failures"]
+
+
+def test_setup_router_audit_fails_terminal_revival_same_generation(tmp_path):
+    db_path = tmp_path / "setup-audit-terminal.db"
+    out_dir = tmp_path / "reports"
+    db = TradingDatabase(str(db_path))
+    observation = _observation("VALID_OBSERVE", "MATCHED", "fp-audit")
+    db.save_setup_router_states([observation])
+    db.conn.execute(
+        """
+        INSERT INTO setup_router_state_transitions_v2(
+            transition_id, trade_date, candidate_instance_id,
+            theme_id, setup_type, setup_generation, setup_instance_id,
+            code, candidate_id, previous_state, current_state,
+            occurred_at, context_id, feature_fingerprint,
+            router_version, state_version,
+            detector_phase_from, detector_phase_to, material_change_kind,
+            material_state_fingerprint_from, material_state_fingerprint_to,
+            reason_codes_json, state_payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', '{}')
+        """,
+        (
+            "terminal-revival-1",
+            TRADE_DATE,
+            "ci-1",
+            "ai",
+            "VWAP_RECLAIM",
+            1,
+            "setup-ci-1-vwap-1",
+            "000001",
+            1,
+            "MATCHED",
+            "FORMING",
+            "2026-06-22T09:06:00",
+            "ctx-1",
+            "fp-revival",
+            "setup_router_v3.4",
+            "setup_router_v3.state.v3",
+            "MATCHED",
+            "BELOW_CONFIRMED",
+            "PHASE_CHANGED",
+            "m1",
+            "m2",
+        ),
+    )
+    db.conn.commit()
+    db.conn.close()
+
+    rc = main(["--db", str(db_path), "--trade-date", TRADE_DATE, "--output-dir", str(out_dir)])
+    summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert rc == 1
+    assert summary["state_integrity"]["metrics"]["terminal_revival_same_generation_count"] == 1
+    assert "TERMINAL_REVIVAL_SAME_GENERATION" in summary["failures"]

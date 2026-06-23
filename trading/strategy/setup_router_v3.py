@@ -11,9 +11,9 @@ from typing import Any, Iterable, Mapping
 from trading.strategy.setup_features import SETUP_ROUTER_FEATURE_SCHEMA_VERSION, SetupFeatureSnapshot
 
 
-SETUP_ROUTER_SCHEMA_VERSION = "setup_router_v3.observe.v3"
-SETUP_ROUTER_VERSION = "setup_router_v3.3"
-SETUP_ROUTER_STATE_VERSION = "setup_router_v3.state.v2"
+SETUP_ROUTER_SCHEMA_VERSION = "setup_router_v3.observe.v4"
+SETUP_ROUTER_VERSION = "setup_router_v3.4"
+SETUP_ROUTER_STATE_VERSION = "setup_router_v3.state.v3"
 SETUP_ROUTER_OUTPUT_MODE = "OBSERVE"
 
 
@@ -78,6 +78,7 @@ class ConfirmedLocalPeak:
     candle_index: int = -1
     confirmed_at: str = ""
     confirmation_candle_at: str = ""
+    confirmation_candle_index: int = -1
 
     @property
     def found(self) -> bool:
@@ -506,15 +507,31 @@ class SetupRouterV3:
     def _classify_leader_first_pullback(self, feature: SetupFeatureSnapshot) -> SetupHypothesis:
         setup_type = SetupType.LEADER_FIRST_PULLBACK
         previous = _previous_state(feature, setup_type)
-        peak = _confirmed_local_peak(feature, self.config)
         previous_payload = dict(previous.get("state_payload") or previous.get("price_structure") or {})
         generation = _generation(previous)
-        if _terminal(previous) and peak.found:
+        peak = _fixed_local_peak(previous_payload) if previous and not _terminal(previous) else ConfirmedLocalPeak()
+        if not peak.found:
+            peak = _confirmed_local_peak(feature, self.config)
+        if _terminal(previous):
+            candidate_peak = _confirmed_local_peak(feature, self.config)
             old_peak = _float(previous_payload.get("local_peak_price") or previous_payload.get("local_peak"))
             old_peak_at = str(previous_payload.get("local_peak_at") or "")
-            if (old_peak <= 0 or peak.price >= old_peak * (1 + self.config.leader_new_peak_generation_min_pct / 100.0)) and peak.candle_at > old_peak_at:
+            terminal_at = _terminal_at(previous, previous_payload)
+            support_after_peak, _support_at = _post_peak_support(feature, candidate_peak)
+            materially_higher = old_peak <= 0 or candidate_peak.price >= old_peak * (1 + self.config.leader_new_peak_generation_min_pct / 100.0)
+            can_start = (
+                candidate_peak.found
+                and (not terminal_at or candidate_peak.candle_at > terminal_at)
+                and candidate_peak.candle_at > old_peak_at
+                and materially_higher
+                and support_after_peak > 0
+            )
+            if can_start:
                 generation += 1
                 previous_payload = {}
+                peak = candidate_peak
+            else:
+                return _freeze_terminal_hypothesis(previous, feature, setup_type, "LFP_NEW_CONFIRMED_PEAK_NOT_READY")
         setup_instance_id = _setup_instance_id(feature, setup_type, generation)
         if feature.completed_1m_count < self.config.min_completed_1m_candles:
             return _hypothesis(feature, setup_type, SetupShapeStatus.DATA_WAIT, SetupLifecycleState.SEEKING, generation, setup_instance_id, ("COMPLETED_1M_CANDLES_INSUFFICIENT",), {}, 0.0)
@@ -535,6 +552,7 @@ class SetupRouterV3:
             "local_peak_at": peak.candle_at,
             "peak_confirmed_at": peak.confirmed_at,
             "peak_confirm_candle_at": peak.confirmation_candle_at,
+            "peak_confirm_candle_index": peak.confirmation_candle_index,
             "pullback_from_high_pct": round(pullback, 4),
             "support": support,
             "support_reference_price": support,
@@ -574,25 +592,41 @@ class SetupRouterV3:
         previous = _previous_state(feature, setup_type)
         previous_payload = dict(previous.get("state_payload") or previous.get("price_structure") or {})
         generation = _generation(previous)
+        if _terminal(previous):
+            below_candidate = _latest_below_vwap_candle(feature, self.config)
+            below_at = str(below_candidate.get("candle_at") or below_candidate.get("start_at") or "")
+            old_below_at = str(previous_payload.get("below_candle_at") or "")
+            terminal_at = _terminal_at(previous, previous_payload)
+            can_start = bool(
+                below_candidate
+                and below_at
+                and below_at != old_below_at
+                and (not terminal_at or below_at > terminal_at)
+            )
+            if can_start:
+                generation += 1
+                previous_payload = {}
+                below = below_candidate
+            else:
+                return _freeze_terminal_hypothesis(previous, feature, setup_type, "VWAP_NEW_BELOW_ANCHOR_NOT_READY")
+        else:
+            below = _below_anchor_from_payload(previous_payload) if previous_payload.get("below_candle_at") else {}
+            if not below:
+                below = _latest_below_vwap_candle(feature, self.config)
         if feature.completed_1m_count < self.config.min_completed_1m_candles:
             return _hypothesis(feature, setup_type, SetupShapeStatus.DATA_WAIT, SetupLifecycleState.SEEKING, generation, _setup_instance_id(feature, setup_type, generation), ("COMPLETED_1M_CANDLES_INSUFFICIENT",), {}, 0.0)
         if feature.vwap <= 0 or feature.current_price <= 0:
             return _hypothesis(feature, setup_type, SetupShapeStatus.DATA_WAIT, SetupLifecycleState.SEEKING, generation, _setup_instance_id(feature, setup_type, generation), ("VWAP_OR_PRICE_MISSING",), {}, 0.0)
-        below = _latest_below_vwap_candle(feature, self.config)
-        if _terminal(previous) and below:
-            old_below_at = str(previous_payload.get("below_candle_at") or "")
-            if not old_below_at or str(below.get("candle_at") or "") > old_below_at:
-                generation += 1
-                previous_payload = {}
         setup_instance_id = _setup_instance_id(feature, setup_type, generation)
-        if not below and previous_payload.get("below_candle_at") and not _terminal(previous):
-            below = dict(previous_payload)
         above_pct = _pct(feature.current_price - feature.vwap, feature.vwap)
         structure = {
             "phase": "SEEK_BELOW",
             "vwap": feature.vwap,
             "below_candle_at": str((below or {}).get("candle_at") or ""),
+            "below_price": _float((below or {}).get("close") or (below or {}).get("below_price")),
+            "below_vwap_at_close": _float((below or {}).get("derived_vwap_at_close") or (below or {}).get("below_vwap_at_close")),
             "below_close_vs_vwap_pct": _float((below or {}).get("close_vs_vwap_pct")),
+            "anchor_fixed_at": str(previous_payload.get("anchor_fixed_at") or (below or {}).get("candle_at") or feature.calculated_at),
             "current_above_vwap_pct": round(above_pct, 4),
             "lookback": min(feature.completed_1m_count, self.config.vwap_lookback),
         }
@@ -624,16 +658,16 @@ class SetupRouterV3:
         breakout = _breakout_close(feature, reference, self.config)
         if _terminal(previous) and breakout:
             old_reference = _float(previous_payload.get("breakout_reference_price") or previous_payload.get("breakout_level"))
-            terminal_at = str(previous_payload.get("terminal_at") or previous.get("last_material_change_at") or "")
+            terminal_at = _terminal_at(previous, previous_payload)
             reset_seen = _breakout_reset_seen(feature, old_reference or reference, terminal_at, self.config)
             materially_new = old_reference <= 0 or abs(reference - old_reference) / old_reference * 100.0 >= self.config.breakout_new_reference_min_pct
             if reset_seen and materially_new and str(breakout.get("candle_at") or "") > terminal_at:
                 generation += 1
                 previous_payload = {}
             else:
-                reference = old_reference or reference
-                reference_source = str(previous_payload.get("breakout_reference_source") or previous_payload.get("reference_source") or reference_source)
-                breakout = {}
+                return _freeze_terminal_hypothesis(previous, feature, setup_type, "BREAKOUT_NEW_REFERENCE_NOT_READY")
+        elif _terminal(previous):
+            return _freeze_terminal_hypothesis(previous, feature, setup_type, "BREAKOUT_NEW_REFERENCE_NOT_READY")
         setup_instance_id = _setup_instance_id(feature, setup_type, generation)
         if not breakout and previous_payload.get("breakout_candle_at") and not _terminal(previous):
             breakout = dict(previous_payload)
@@ -675,6 +709,8 @@ class SetupRouterV3:
 
     def _apply_session_shape_guard(self, hypothesis: SetupHypothesis, feature: SetupFeatureSnapshot) -> SetupHypothesis:
         session_phase = feature.session_phase.upper()
+        if bool(dict(hypothesis.state_payload or {}).get("terminal_lock")):
+            return hypothesis
         if session_phase == "MARKET_CLOSED" and hypothesis.shape_status in {SetupShapeStatus.FORMING, SetupShapeStatus.MATCHED, SetupShapeStatus.DATA_WAIT}:
             return _replace_hypothesis(
                 hypothesis,
@@ -858,10 +894,74 @@ def _generation(previous: Mapping[str, Any]) -> int:
     return max(1, _safe_int(previous.get("setup_generation"), 1)) if previous else 1
 
 
+def is_terminal_state(state: str) -> bool:
+    return str(state or "").upper() in {"MATCHED", "INVALIDATED", "EXPIRED"}
+
+
 def _terminal(previous: Mapping[str, Any]) -> bool:
     state = str(previous.get("lifecycle_state") or "").upper()
     shape = str(previous.get("shape_status") or "").upper()
-    return state in {"MATCHED", "INVALIDATED", "EXPIRED"} or shape in {"MATCHED", "INVALIDATED", "EXPIRED"}
+    return is_terminal_state(state) or is_terminal_state(shape)
+
+
+def _terminal_at(previous: Mapping[str, Any], payload: Mapping[str, Any] | None = None) -> str:
+    data = dict(payload or previous.get("state_payload") or previous.get("price_structure") or {})
+    return str(data.get("terminal_at") or previous.get("terminal_at") or previous.get("last_material_change_at") or previous.get("updated_at") or "")
+
+
+def _terminal_lifecycle(previous: Mapping[str, Any]) -> SetupLifecycleState:
+    value = str(previous.get("lifecycle_state") or _lifecycle_from_shape(str(previous.get("shape_status") or ""))).upper()
+    if value == SetupLifecycleState.INVALIDATED.value:
+        return SetupLifecycleState.INVALIDATED
+    if value == SetupLifecycleState.EXPIRED.value:
+        return SetupLifecycleState.EXPIRED
+    return SetupLifecycleState.MATCHED
+
+
+def _freeze_terminal_hypothesis(
+    previous: Mapping[str, Any],
+    feature: SetupFeatureSnapshot,
+    setup_type: SetupType,
+    reason: str,
+) -> SetupHypothesis:
+    payload = dict(previous.get("state_payload") or previous.get("price_structure") or {})
+    lifecycle = _terminal_lifecycle(previous)
+    generation = _generation(previous)
+    setup_instance_id = str(previous.get("setup_instance_id") or payload.get("setup_instance_id") or _setup_instance_id(feature, setup_type, generation))
+    terminal_at = _terminal_at(previous, payload)
+    detector_phase = str(previous.get("detector_phase") or payload.get("detector_phase") or payload.get("phase") or lifecycle.value)
+    payload.update(
+        {
+            "phase": detector_phase,
+            "lifecycle_state": lifecycle.value,
+            "setup_generation": generation,
+            "setup_instance_id": setup_instance_id,
+            "terminal_at": terminal_at,
+            "terminal_lock": True,
+            "terminal_lock_reason": reason,
+            "last_observed_at": feature.calculated_at,
+            "current_price": feature.current_price,
+        }
+    )
+    if lifecycle == SetupLifecycleState.EXPIRED:
+        payload.setdefault("expired_at", str(previous.get("expired_at") or payload.get("expired_at") or terminal_at))
+    return SetupHypothesis(
+        setup_type=setup_type,
+        shape_status=SetupShapeStatus(lifecycle.value),
+        lifecycle_state=lifecycle,
+        setup_generation=generation,
+        setup_instance_id=setup_instance_id,
+        reason_codes=tuple(_dedupe([reason, "TERMINAL_LIFECYCLE_LOCKED"])),
+        price_structure=payload,
+        state_payload=payload,
+        quality_score=0.0 if lifecycle != SetupLifecycleState.MATCHED else 70.0,
+        detector_phase=detector_phase,
+        first_seen_at=str(previous.get("first_seen_at") or payload.get("first_seen_at") or feature.calculated_at),
+        expires_at=str(previous.get("expires_at") or payload.get("expires_at") or ""),
+        expired_at=str(previous.get("expired_at") or payload.get("expired_at") or ""),
+        terminal_at=terminal_at,
+        last_material_change_at=str(previous.get("last_material_change_at") or terminal_at or feature.calculated_at),
+    )
 
 
 def _lifecycle_from_shape(shape_status: str) -> str:
@@ -891,7 +991,17 @@ def _confirmed_local_peak(feature: SetupFeatureSnapshot, config: SetupRouterConf
         if now and candle_at and (now - candle_at).total_seconds() < config.leader_local_peak_min_age_sec:
             continue
         later = candles[index + 1 :]
-        confirmation = next((item for item in later if _float(item.get("high")) < high or _float(item.get("close")) < high), None)
+        confirmation: dict[str, Any] | None = None
+        confirmation_index = -1
+        for offset, item in enumerate(later, start=index + 1):
+            if _float(item.get("high")) > high:
+                confirmation = None
+                confirmation_index = -1
+                break
+            if _float(item.get("high")) < high and _float(item.get("close")) < high:
+                confirmation = item
+                confirmation_index = offset
+                break
         if confirmation:
             candidates.append(
                 ConfirmedLocalPeak(
@@ -900,18 +1010,35 @@ def _confirmed_local_peak(feature: SetupFeatureSnapshot, config: SetupRouterConf
                     candle_index=index,
                     confirmed_at=str(confirmation.get("candle_at") or confirmation.get("start_at") or feature.calculated_at),
                     confirmation_candle_at=str(confirmation.get("candle_at") or confirmation.get("start_at") or ""),
+                    confirmation_candle_index=confirmation_index,
                 )
             )
-    return max(candidates, key=lambda item: (item.price, item.candle_at)) if candidates else ConfirmedLocalPeak()
+    return max(candidates, key=lambda item: (item.candle_at, item.price)) if candidates else ConfirmedLocalPeak()
+
+
+def _fixed_local_peak(payload: Mapping[str, Any]) -> ConfirmedLocalPeak:
+    price = _float(payload.get("local_peak_price") or payload.get("local_peak"))
+    candle_at = str(payload.get("local_peak_at") or "")
+    if price <= 0 or not candle_at:
+        return ConfirmedLocalPeak()
+    return ConfirmedLocalPeak(
+        price=price,
+        candle_at=candle_at,
+        candle_index=_safe_int(payload.get("local_peak_index"), -1),
+        confirmed_at=str(payload.get("peak_confirmed_at") or payload.get("confirmed_at") or ""),
+        confirmation_candle_at=str(payload.get("peak_confirm_candle_at") or payload.get("confirmation_candle_at") or ""),
+        confirmation_candle_index=_safe_int(payload.get("peak_confirm_candle_index") or payload.get("confirmation_candle_index"), -1),
+    )
 
 
 def _post_peak_support(feature: SetupFeatureSnapshot, peak: ConfirmedLocalPeak) -> tuple[float, str]:
     if not peak.found:
         return 0.0, ""
+    start_at = peak.confirmation_candle_at or peak.candle_at
     candidates = [
         (_float(candle.get("low")), str(candle.get("candle_at") or candle.get("start_at") or ""))
         for candle in _completed(feature)
-        if str(candle.get("candle_at") or candle.get("start_at") or "") > peak.candle_at and 0 < _float(candle.get("low")) < peak.price
+        if str(candle.get("candle_at") or candle.get("start_at") or "") > start_at and 0 < _float(candle.get("low")) < peak.price
     ]
     if not candidates:
         return 0.0, ""
@@ -937,6 +1064,18 @@ def _latest_below_vwap_candle(feature: SetupFeatureSnapshot, config: SetupRouter
         if vwap > 0 and close > 0 and close_vs <= -abs(config.vwap_prior_below_min_pct):
             below = {**candle, "close_vs_vwap_pct": close_vs}
     return below
+
+
+def _below_anchor_from_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    candle_at = str(payload.get("below_candle_at") or "")
+    if not candle_at:
+        return {}
+    return {
+        "candle_at": candle_at,
+        "close": _float(payload.get("below_price")),
+        "derived_vwap_at_close": _float(payload.get("below_vwap_at_close") or payload.get("vwap")),
+        "close_vs_vwap_pct": _float(payload.get("below_close_vs_vwap_pct")),
+    }
 
 
 def _completed_reclaim_after(feature: SetupFeatureSnapshot, below_at: str, config: SetupRouterConfig) -> bool:

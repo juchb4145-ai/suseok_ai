@@ -15,7 +15,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trade-date", default=datetime.now().date().isoformat())
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--limit", type=int, default=10000)
-    parser.add_argument("--router-version", default="setup_router_v3.3")
+    parser.add_argument("--router-version", default="setup_router_v3.4")
+    parser.add_argument("--include-legacy-version", action="store_true")
     args = parser.parse_args(argv)
 
     db_path = Path(args.db)
@@ -26,12 +27,12 @@ def main(argv: list[str] | None = None) -> int:
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     try:
-        observations = _rows(con, "setup_observations_latest", trade_date, limit=args.limit, router_version=args.router_version)
-        transitions = _rows(con, "setup_observation_transitions", trade_date, limit=args.limit, router_version=args.router_version)
-        states = _rows(con, "setup_router_state_v2", trade_date, limit=args.limit, router_version=args.router_version)
-        state_transitions = _rows(con, "setup_router_state_transitions_v2", trade_date, limit=args.limit)
+        observations = _rows(con, "setup_observations_latest", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
+        transitions = _rows(con, "setup_observation_transitions", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
+        states = _rows(con, "setup_router_state_v2", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
+        state_transitions = _rows(con, "setup_router_state_transitions_v2", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
         runs = _rows(con, "setup_router_runs", trade_date, limit=1000, router_version=args.router_version)
-        runtime_rows = _rows(con, "setup_router_candidate_runtime_v3", trade_date, limit=args.limit)
+        runtime_rows = _rows(con, "setup_router_candidate_runtime_v3", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
         full_counts = _full_counts(con, trade_date, args.router_version)
         integrity = _state_integrity(con, trade_date, args.router_version)
         scheduling = _scheduling_checks(con, trade_date, args.router_version)
@@ -85,9 +86,9 @@ def main(argv: list[str] | None = None) -> int:
         and full_counts.get("states", 0) > 0
         and full_counts.get("state_transitions", 0) > 0
     )
-    verdict = "STABLE" if stable_ready else "NOT_STABLE" if failures else "CONDITIONALLY_STABLE"
+    verdict = "STABLE_FOR_OPPORTUNITY_RANKER" if stable_ready else "NOT_STABLE" if failures else "CONDITIONALLY_STABLE"
     summary = {
-        "schema_version": "setup_router_v3.audit.v3",
+        "schema_version": "setup_router_v3.audit.v4",
         "trade_date": trade_date,
         "router_version": args.router_version,
         "db_path": str(db_path),
@@ -99,6 +100,14 @@ def main(argv: list[str] | None = None) -> int:
         "state_transition_count": len(state_transitions),
         "run_count": len(runs),
         "candidate_runtime_count": len(runtime_rows),
+        "sample_counts": {
+            "observations": len(observations),
+            "transitions": len(transitions),
+            "states": len(states),
+            "state_transitions": len(state_transitions),
+            "runs": len(runs),
+            "candidate_runtime": len(runtime_rows),
+        },
         "full_counts": full_counts,
         "run_span_minutes": run_span_min,
         "type_counts": dict(type_counts),
@@ -133,13 +142,21 @@ def main(argv: list[str] | None = None) -> int:
     return 1 if failures else 0
 
 
-def _rows(con: sqlite3.Connection, table: str, trade_date: str, *, limit: int, router_version: str | None = None) -> list[dict[str, Any]]:
+def _rows(
+    con: sqlite3.Connection,
+    table: str,
+    trade_date: str,
+    *,
+    limit: int,
+    router_version: str | None = None,
+    include_legacy_version: bool = False,
+) -> list[dict[str, Any]]:
     if not _has_table(con, table):
         return []
     clauses = ["trade_date = ?"]
     params: list[Any] = [trade_date]
     if router_version and _has_column(con, table, "router_version"):
-        clauses.append("(router_version = ? OR router_version = '')")
+        clauses.append("(router_version = ? OR router_version = '')" if include_legacy_version else "router_version = ?")
         params.append(router_version)
     order_col = "rowid"
     if table == "setup_router_state_transitions_v2":
@@ -168,6 +185,7 @@ def _row(row: sqlite3.Row) -> dict[str, Any]:
     for json_key, target in (
         ("reason_codes_json", "reason_codes"),
         ("price_structure_json", "price_structure"),
+        ("state_payload_json", "state_payload"),
         ("safety_json", "safety"),
     ):
         if json_key in data:
@@ -315,9 +333,10 @@ def _full_counts(con: sqlite3.Connection, trade_date: str, router_version: str) 
         "observations": _count(con, "setup_observations_latest", trade_date, router_version=router_version),
         "valid_observe": _count(con, "setup_observations_latest", trade_date, router_version=router_version, extra="router_status = 'VALID_OBSERVE'"),
         "states": _count(con, "setup_router_state_v2", trade_date, router_version=router_version),
-        "state_transitions": _count(con, "setup_router_state_transitions_v2", trade_date),
+        "state_transitions": _count(con, "setup_router_state_transitions_v2", trade_date, router_version=router_version),
         "runs": _count(con, "setup_router_runs", trade_date, router_version=router_version),
-        "eligible_runtime": _count(con, "setup_router_candidate_runtime_v3", trade_date),
+        "eligible_runtime": _count(con, "setup_router_candidate_runtime_v3", trade_date, router_version=router_version),
+        "pending_queue": _count(con, "setup_router_pending_evaluations_v4", trade_date, router_version=router_version, extra="status IN ('PENDING','RETRY','SELECTED')"),
     }
 
 
@@ -327,7 +346,7 @@ def _count(con: sqlite3.Connection, table: str, trade_date: str, *, router_versi
     clauses = ["trade_date = ?"]
     params: list[Any] = [trade_date]
     if router_version and _has_column(con, table, "router_version"):
-        clauses.append("(router_version = ? OR router_version = '')")
+        clauses.append("router_version = ?")
         params.append(router_version)
     if extra:
         clauses.append(extra)
@@ -343,36 +362,60 @@ def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: s
         "theme_leak_active_state_count": 0,
         "ttl_violation_count": 0,
         "invalid_generation_count": 0,
+        "terminal_revival_same_generation_count": 0,
+        "matched_to_forming_same_generation_count": 0,
+        "matched_to_seeking_same_generation_count": 0,
+        "invalidated_to_active_same_generation_count": 0,
+        "expired_to_active_same_generation_count": 0,
+        "generation_jump_count": 0,
+        "repeated_first_pullback_match_count": 0,
+        "same_reference_breakout_new_generation_count": 0,
+        "vwap_anchor_changed_same_generation_count": 0,
+        "duplicate_material_transition_count": 0,
+        "material_hash_state_conflict_count": 0,
     }
     if _has_table(con, "setup_router_state_transitions_v2") and _has_column(con, "setup_router_state_transitions_v2", "material_change_kind"):
         row = con.execute(
             """
             SELECT COUNT(*) AS count
             FROM setup_router_state_transitions_v2
-            WHERE trade_date = ? AND COALESCE(material_change_kind, '') IN ('', 'NONE')
+            WHERE trade_date = ? AND router_version = ? AND COALESCE(material_change_kind, '') IN ('', 'NONE')
             """,
-            (trade_date,),
+            (trade_date, router_version),
         ).fetchone()
         metrics["price_only_state_transition_count"] = int(row["count"] or 0) if row else 0
+        rows = [
+            _row(row)
+            for row in con.execute(
+                """
+                SELECT *
+                FROM setup_router_state_transitions_v2
+                WHERE trade_date = ? AND router_version = ?
+                ORDER BY candidate_instance_id, theme_id, setup_type, setup_generation, occurred_at
+                """,
+                (trade_date, router_version),
+            ).fetchall()
+        ]
+        metrics.update(_terminal_integrity_metrics(rows))
     if _has_table(con, "setup_router_state_v2"):
         if _has_column(con, "setup_router_state_v2", "expires_at"):
             row = con.execute(
                 """
                 SELECT COUNT(*) AS count
                 FROM setup_router_state_v2
-                WHERE trade_date = ? AND lifecycle_state IN ('FORMING','MATCHED')
+                WHERE trade_date = ? AND router_version = ? AND lifecycle_state IN ('FORMING','MATCHED')
                   AND expires_at <> '' AND expires_at <= last_evaluated_at
                 """,
-                (trade_date,),
+                (trade_date, router_version),
             ).fetchone()
             metrics["ttl_violation_count"] = int(row["count"] or 0) if row else 0
         row = con.execute(
             """
             SELECT COUNT(*) AS count
             FROM setup_router_state_v2
-            WHERE trade_date = ? AND setup_generation < 1
+            WHERE trade_date = ? AND router_version = ? AND setup_generation < 1
             """,
-            (trade_date,),
+            (trade_date, router_version),
         ).fetchone()
         metrics["invalid_generation_count"] = int(row["count"] or 0) if row else 0
     if metrics["price_only_state_transition_count"] > 0:
@@ -381,7 +424,18 @@ def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: s
         failures.append("TTL_ACTIVE_STATE_VIOLATION")
     if metrics["invalid_generation_count"] > 0:
         failures.append("INVALID_SETUP_GENERATION")
-    if _count(con, "setup_router_state_transitions_v2", trade_date) == 0 and _count(con, "setup_router_state_v2", trade_date, router_version=router_version) > 0:
+    for key, failure in (
+        ("terminal_revival_same_generation_count", "TERMINAL_REVIVAL_SAME_GENERATION"),
+        ("generation_jump_count", "SETUP_GENERATION_JUMP"),
+        ("repeated_first_pullback_match_count", "REPEATED_FIRST_PULLBACK_MATCH"),
+        ("same_reference_breakout_new_generation_count", "SAME_REFERENCE_BREAKOUT_GENERATION"),
+        ("vwap_anchor_changed_same_generation_count", "VWAP_ANCHOR_CHANGED_SAME_GENERATION"),
+        ("duplicate_material_transition_count", "DUPLICATE_MATERIAL_TRANSITION"),
+        ("material_hash_state_conflict_count", "MATERIAL_HASH_STATE_CONFLICT"),
+    ):
+        if metrics.get(key, 0) > 0:
+            failures.append(failure)
+    if _count(con, "setup_router_state_transitions_v2", trade_date, router_version=router_version) == 0 and _count(con, "setup_router_state_v2", trade_date, router_version=router_version) > 0:
         warnings.append("STATE_TRANSITION_SAMPLE_MISSING")
     return {"metrics": metrics, "failures": failures, "warnings": warnings}
 
@@ -394,6 +448,11 @@ def _scheduling_checks(con: sqlite3.Connection, trade_date: str, router_version:
         "max_deferred_incremental_count": 0,
         "max_deferred_ttl_count": 0,
         "run_sample_count": 0,
+        "pending_queue_count": 0,
+        "retry_queue_count": 0,
+        "oldest_pending_age_sec": 0,
+        "processed_signature_without_success_count": 0,
+        "never_evaluated_count": 0,
     }
     if not _has_table(con, "setup_router_runs"):
         return {"metrics": metrics, "failures": failures, "warnings": ["SETUP_ROUTER_RUN_TABLE_MISSING"]}
@@ -405,7 +464,123 @@ def _scheduling_checks(con: sqlite3.Connection, trade_date: str, router_version:
         metrics["max_deferred_ttl_count"] = max(metrics["max_deferred_ttl_count"], int(row.get("deferred_ttl_count") or 0))
     if metrics["max_actual_starved_candidate_count"] > 0:
         failures.append("SETUP_ROUTER_STARVATION_PRESENT")
+    if _has_table(con, "setup_router_pending_evaluations_v4"):
+        pending_rows = [
+            _row(row)
+            for row in con.execute(
+                """
+                SELECT *
+                FROM setup_router_pending_evaluations_v4
+                WHERE trade_date = ? AND router_version = ? AND status IN ('PENDING','RETRY','SELECTED')
+                """,
+                (trade_date, router_version),
+            ).fetchall()
+        ]
+        metrics["pending_queue_count"] = len(pending_rows)
+        metrics["retry_queue_count"] = sum(1 for row in pending_rows if row.get("status") == "RETRY")
+        now = max([_parse_time(row.get("calculated_at")) for row in rows if _parse_time(row.get("calculated_at")) is not None], default=datetime.now())
+        pending_ages = [
+            max(0.0, (now - parsed).total_seconds())
+            for parsed in (_parse_time(row.get("first_pending_at") or row.get("last_pending_at")) for row in pending_rows)
+            if parsed is not None
+        ]
+        metrics["oldest_pending_age_sec"] = int(max(pending_ages, default=0.0))
+        if metrics["retry_queue_count"] > 0:
+            failures.append("SETUP_ROUTER_RETRY_PENDING_PRESENT")
+        if metrics["oldest_pending_age_sec"] > 300:
+            failures.append("SETUP_ROUTER_PENDING_BACKLOG_STALE")
+    if _has_table(con, "setup_router_candidate_runtime_v3"):
+        runtime_rows = [
+            _row(row)
+            for row in con.execute(
+                """
+                SELECT *
+                FROM setup_router_candidate_runtime_v3
+                WHERE trade_date = ? AND router_version = ?
+                """,
+                (trade_date, router_version),
+            ).fetchall()
+        ]
+        metrics["processed_signature_without_success_count"] = sum(
+            1
+            for row in runtime_rows
+            if not row.get("last_success_at")
+            and any(row.get(key) for key in ("processed_entry_signature", "processed_context_id", "processed_candle_at", "processed_theme_id", "processed_lease_signature"))
+        )
+        metrics["never_evaluated_count"] = sum(1 for row in runtime_rows if not (row.get("last_success_at") or row.get("last_evaluated_at")))
+        if metrics["processed_signature_without_success_count"] > 0:
+            failures.append("PROCESSED_SIGNATURE_WITHOUT_SUCCESS")
     return {"metrics": metrics, "failures": failures, "warnings": warnings}
+
+
+def _terminal_integrity_metrics(rows: list[dict[str, Any]]) -> dict[str, int]:
+    terminal = {"MATCHED", "INVALIDATED", "EXPIRED"}
+    active = {"SEEKING", "FORMING"}
+    metrics = {
+        "terminal_revival_same_generation_count": 0,
+        "matched_to_forming_same_generation_count": 0,
+        "matched_to_seeking_same_generation_count": 0,
+        "invalidated_to_active_same_generation_count": 0,
+        "expired_to_active_same_generation_count": 0,
+        "generation_jump_count": 0,
+        "repeated_first_pullback_match_count": 0,
+        "same_reference_breakout_new_generation_count": 0,
+        "vwap_anchor_changed_same_generation_count": 0,
+        "duplicate_material_transition_count": 0,
+        "material_hash_state_conflict_count": 0,
+    }
+    previous_generation: dict[tuple[str, str, str], int] = {}
+    lfp_matches: Counter[tuple[str, str, int]] = Counter()
+    breakout_refs_by_generation: dict[tuple[str, str, float], set[int]] = defaultdict(set)
+    vwap_anchor_by_generation: dict[tuple[str, str, int], str] = {}
+    material_states: dict[str, set[str]] = defaultdict(set)
+    material_counts: Counter[str] = Counter()
+    for row in rows:
+        previous_state = str(row.get("previous_state") or "").upper()
+        current_state = str(row.get("current_state") or "").upper()
+        generation = int(row.get("setup_generation") or 0)
+        setup_type = str(row.get("setup_type") or "")
+        candidate = str(row.get("candidate_instance_id") or "")
+        theme = str(row.get("theme_id") or "")
+        key = (candidate, theme, setup_type)
+        if previous_state in terminal and current_state not in terminal:
+            metrics["terminal_revival_same_generation_count"] += 1
+        if previous_state == "MATCHED" and current_state == "FORMING":
+            metrics["matched_to_forming_same_generation_count"] += 1
+        if previous_state == "MATCHED" and current_state == "SEEKING":
+            metrics["matched_to_seeking_same_generation_count"] += 1
+        if previous_state == "INVALIDATED" and current_state in active | {"MATCHED"}:
+            metrics["invalidated_to_active_same_generation_count"] += 1
+        if previous_state == "EXPIRED" and current_state in active | {"MATCHED"}:
+            metrics["expired_to_active_same_generation_count"] += 1
+        old_generation = previous_generation.get(key)
+        if old_generation is not None and generation - old_generation > 1:
+            metrics["generation_jump_count"] += 1
+        previous_generation[key] = max(generation, previous_generation.get(key, 0))
+        payload = dict(row.get("state_payload") or {})
+        if setup_type == "LEADER_FIRST_PULLBACK" and current_state == "MATCHED":
+            lfp_matches[(candidate, theme, generation)] += 1
+        if setup_type == "BREAKOUT_RETEST" and generation > 0:
+            ref = round(_float(row.get("breakout_reference_price") or payload.get("breakout_reference_price") or payload.get("breakout_level")), 4)
+            if ref > 0:
+                breakout_refs_by_generation[(candidate, theme, ref)].add(generation)
+        if setup_type == "VWAP_RECLAIM" and generation > 0:
+            anchor = str(payload.get("below_candle_at") or "")
+            anchor_key = (candidate, theme, generation)
+            old_anchor = vwap_anchor_by_generation.get(anchor_key)
+            if old_anchor and anchor and old_anchor != anchor:
+                metrics["vwap_anchor_changed_same_generation_count"] += 1
+            if anchor:
+                vwap_anchor_by_generation.setdefault(anchor_key, anchor)
+        material = str(row.get("material_state_fingerprint_to") or "")
+        if material:
+            material_counts[material] += 1
+            material_states[material].add(current_state)
+    metrics["repeated_first_pullback_match_count"] = sum(1 for count in lfp_matches.values() if count > 1)
+    metrics["same_reference_breakout_new_generation_count"] = sum(1 for generations in breakout_refs_by_generation.values() if len(generations) > 1)
+    metrics["duplicate_material_transition_count"] = sum(1 for count in material_counts.values() if count > 1)
+    metrics["material_hash_state_conflict_count"] = sum(1 for states in material_states.values() if len(states) > 1)
+    return metrics
 
 
 def _run_span_minutes(runs: list[dict[str, Any]]) -> float:
@@ -432,6 +607,15 @@ def _json(value: Any, default: Any) -> Any:
     try:
         return json.loads(str(value or ""))
     except Exception:
+        return default
+
+
+def _float(value: Any, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(str(value).strip().replace(",", "").replace("%", ""))
+    except (TypeError, ValueError):
         return default
 
 

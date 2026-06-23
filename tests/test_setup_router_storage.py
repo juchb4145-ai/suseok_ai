@@ -9,7 +9,7 @@ def test_setup_observation_storage_upserts_latest_and_dedupes_same_fingerprint(t
     payload = _observation("PENDING", "FORMING", "fp-1")
 
     assert db.save_setup_observations([payload]) == 1
-    assert db.save_setup_observations([payload]) == 1
+    assert db.save_setup_observations([payload]) == 0
 
     latest = db.list_setup_observations_latest(trade_date=TRADE_DATE)
     transitions = db.list_setup_observation_transitions(trade_date=TRADE_DATE)
@@ -81,15 +81,18 @@ def test_setup_router_state_ignores_price_only_observation_transition(tmp_path):
         "current_price": 1001,
     }
 
-    db.save_setup_router_states([first])
-    db.save_setup_router_states([second])
+    first_counts = db.save_setup_router_states([first])
+    second_counts = db.save_setup_router_states([second])
 
-    states = db.list_setup_router_states(trade_date=TRADE_DATE, candidate_instance_ids=["ci-1"], router_version="setup_router_v3.3")
+    states = db.list_setup_router_states(trade_date=TRADE_DATE, candidate_instance_ids=["ci-1"], router_version="setup_router_v3.4")
     transitions = db.conn.execute("SELECT * FROM setup_router_state_transitions_v2 WHERE trade_date = ?", (TRADE_DATE,)).fetchall()
 
     assert len(transitions) == 1
-    assert states[0]["last_evaluated_at"] == "2026-06-22T09:05:05"
+    assert states[0]["last_evaluated_at"] == "2026-06-22T09:05:00"
     assert states[0]["last_material_change_at"] == "2026-06-22T09:05:00"
+    assert first_counts["state_write_count"] == 1
+    assert second_counts["state_write_count"] == 0
+    assert second_counts["state_no_change_skip_count"] == 1
 
 
 def test_setup_router_state_is_theme_scoped_and_expires_previous_selected_theme(tmp_path):
@@ -115,7 +118,7 @@ def test_setup_router_state_is_theme_scoped_and_expires_previous_selected_theme(
     db.save_setup_router_states([theme_a])
     db.save_setup_router_states([theme_b])
 
-    states = db.list_setup_router_states(trade_date=TRADE_DATE, candidate_instance_ids=["ci-1"], router_version="setup_router_v3.3")
+    states = db.list_setup_router_states(trade_date=TRADE_DATE, candidate_instance_ids=["ci-1"], router_version="setup_router_v3.4")
     by_theme = {row["theme_id"]: row for row in states}
 
     assert by_theme["theme-a"]["lifecycle_state"] == "EXPIRED"
@@ -149,10 +152,10 @@ def _observation(router_status, shape_status, fingerprint):
         "session_phase": "MORNING_TREND",
         "current_price": 1000,
         "fingerprint": fingerprint,
-        "schema_version": "setup_router_v3.observe.v3",
-        "feature_schema_version": "setup_router_v3.features.v3",
-        "router_version": "setup_router_v3.3",
-        "state_version": "setup_router_v3.state.v2",
+        "schema_version": "setup_router_v3.observe.v4",
+        "feature_schema_version": "setup_router_v3.features.v4",
+        "router_version": "setup_router_v3.4",
+        "state_version": "setup_router_v3.state.v3",
         "setup_generation": 1,
         "setup_instance_id": "setup-ci-1-vwap-1",
         "lifecycle_state": "MATCHED" if shape_status == "MATCHED" else "FORMING",

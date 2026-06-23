@@ -4526,15 +4526,15 @@ def setup_router_v3_summary(trade_date: str | None = Query(None)) -> dict[str, A
     try:
         run_loader = getattr(db, "latest_setup_router_run", None)
         run = dict(run_loader(trade_date=resolved) if callable(run_loader) else {})
-        latest = list(getattr(db, "list_setup_observations_latest", lambda **_: [])(trade_date=resolved, router_version="setup_router_v3.3", limit=1000) or [])
+        latest = list(getattr(db, "list_setup_observations_latest", lambda **_: [])(trade_date=resolved, router_version="setup_router_v3.4", limit=1000) or [])
         status_counts = Counter(str(item.get("router_status") or "UNKNOWN") for item in latest)
         type_counts = Counter(str(item.get("setup_type") or "UNKNOWN") for item in latest)
         return {
             "trade_date": resolved,
-            "schema_version": run.get("schema_version") or "setup_router_v3.observe.v3",
-            "feature_schema_version": run.get("feature_schema_version") or "setup_router_v3.features.v3",
-            "router_version": run.get("router_version") or "setup_router_v3.3",
-            "state_version": run.get("state_version") or "setup_router_v3.state.v2",
+            "schema_version": run.get("schema_version") or "setup_router_v3.observe.v4",
+            "feature_schema_version": run.get("feature_schema_version") or "setup_router_v3.features.v4",
+            "router_version": run.get("router_version") or "setup_router_v3.4",
+            "state_version": run.get("state_version") or "setup_router_v3.state.v3",
             "status": run.get("status") or ("OK" if latest else "EMPTY"),
             "calculated_at": run.get("calculated_at") or "",
             "enabled": bool(run.get("enabled", bool(latest))),
@@ -4565,7 +4565,7 @@ def setup_router_v3_latest(
         session_phase=None,
         theme_id=None,
         leadership_status=None,
-        router_version="setup_router_v3.3",
+        router_version="setup_router_v3.4",
         setup_generation=None,
         lifecycle_state=None,
         post_subscription_tick_verified=None,
@@ -4585,7 +4585,7 @@ def setup_router_v3_observations(
     session_phase: str | None = Query(None),
     theme_id: str | None = Query(None),
     leadership_status: str | None = Query(None),
-    router_version: str | None = Query("setup_router_v3.3"),
+    router_version: str | None = Query("setup_router_v3.4"),
     setup_generation: int | None = Query(None),
     lifecycle_state: str | None = Query(None),
     post_subscription_tick_verified: bool | None = Query(None),
@@ -4607,7 +4607,7 @@ def setup_router_v3_observations(
             "session_phase": _setup_router_v3_text(session_phase),
             "theme_id": _setup_router_v3_text(theme_id),
             "leadership_status": _setup_router_v3_text(leadership_status),
-            "router_version": _setup_router_v3_text(router_version) or "setup_router_v3.3",
+            "router_version": _setup_router_v3_text(router_version) or "setup_router_v3.4",
             "setup_generation": _setup_router_v3_int_or_none(setup_generation),
             "lifecycle_state": _setup_router_v3_text(lifecycle_state),
             "post_subscription_tick_verified": _setup_router_v3_bool_or_none(post_subscription_tick_verified),
@@ -4635,7 +4635,7 @@ def setup_router_v3_transitions(
     code: str | None = Query(None),
     setup_type: str | None = Query(None),
     router_status: str | None = Query(None),
-    router_version: str | None = Query("setup_router_v3.3"),
+    router_version: str | None = Query("setup_router_v3.4"),
     setup_generation: int | None = Query(None),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
@@ -4650,7 +4650,7 @@ def setup_router_v3_transitions(
             code=_setup_router_v3_text(code),
             setup_type=_setup_router_v3_text(setup_type),
             router_status=_setup_router_v3_text(router_status),
-            router_version=_setup_router_v3_text(router_version) or "setup_router_v3.3",
+            router_version=_setup_router_v3_text(router_version) or "setup_router_v3.4",
             setup_generation=_setup_router_v3_int_or_none(setup_generation),
             limit=limit_value + 1,
             offset=offset_value,
@@ -4666,7 +4666,7 @@ def setup_router_v3_transitions(
                 "code": _setup_router_v3_text(code),
                 "setup_type": _setup_router_v3_text(setup_type),
                 "router_status": _setup_router_v3_text(router_status),
-                "router_version": _setup_router_v3_text(router_version) or "setup_router_v3.3",
+                "router_version": _setup_router_v3_text(router_version) or "setup_router_v3.4",
                 "setup_generation": _setup_router_v3_int_or_none(setup_generation),
                 "limit": limit_value,
                 "offset": offset_value,
@@ -4685,8 +4685,8 @@ def setup_router_v3_candidate(code: str, trade_date: str | None = Query(None), l
     db = open_database()
     try:
         limit_value = _setup_router_v3_limit(limit)
-        observations = db.list_setup_observations_latest(trade_date=resolved, code=code, router_version="setup_router_v3.3", limit=limit_value)
-        transitions = db.list_setup_observation_transitions(trade_date=resolved, code=code, router_version="setup_router_v3.3", limit=limit_value)
+        observations = db.list_setup_observations_latest(trade_date=resolved, code=code, router_version="setup_router_v3.4", limit=limit_value)
+        transitions = db.list_setup_observation_transitions(trade_date=resolved, code=code, router_version="setup_router_v3.4", limit=limit_value)
         return {
             "trade_date": resolved,
             "code": code,

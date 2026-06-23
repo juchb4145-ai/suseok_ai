@@ -8,7 +8,7 @@ from trading.strategy.candidates import normalize_code
 from trading.strategy.models import Candidate
 
 
-SETUP_ROUTER_FEATURE_SCHEMA_VERSION = "setup_router_v3.features.v3"
+SETUP_ROUTER_FEATURE_SCHEMA_VERSION = "setup_router_v3.features.v4"
 
 
 @dataclass(frozen=True)
@@ -445,8 +445,8 @@ def _post_subscription_tick_check(
             "selected_at": str(lease.get("selected_at") or ""),
             "first_active_at": str(lease.get("first_active_at") or ""),
             "first_fresh_tick_at": str(lease.get("first_fresh_tick_at") or ""),
-            "post_subscription_tick_verified": True,
-            "reason": "LEASE_NOT_ACTIVE",
+            "post_subscription_tick_verified": not required,
+            "reason": "SETUP_SELECTED_THEME_LEASE_INACTIVE" if required else "LEASE_NOT_ACTIVE_OPTIONAL",
         }
     selected_at = str(lease.get("selected_at") or lease.get("selected_tick_baseline_at") or "")
     first_active_at = str(lease.get("first_active_at") or "")

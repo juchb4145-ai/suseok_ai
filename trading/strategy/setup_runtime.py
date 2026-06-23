@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -102,46 +104,116 @@ class SetupRouterV3RuntimePipeline:
         state_by_candidate = self._states(trade_date, eligible_candidates)
         leases_by_code = self._leases(trade_date)
         runtime_by_key = self._candidate_runtime(trade_date, eligible_candidates)
-        incremental_codes = self._incremental_codes(latest_entry_by_key)
-        context_changed_codes = self._context_changed_codes(eligible_candidates, latest_context_by_code)
-        candle_changed_codes = self._candle_boundary_changed_codes(eligible_candidates)
         provider_codes = self._provider_codes()
         ttl_due_codes = self._ttl_due_codes(state_by_candidate, current)
-        theme_changed_codes = self._theme_changed_codes(eligible_candidates, latest_context_by_code, runtime_by_key)
         periodic_due = self._periodic_due(current)
-        periodic_candidates = self._periodic_candidates(eligible_candidates) if periodic_due else []
-        queue = self._evaluation_queue(
-            eligible_candidates,
-            incremental_codes=set(incremental_codes) | set(provider_codes),
-            context_codes=set(context_changed_codes) | set(candle_changed_codes) | set(theme_changed_codes),
-            ttl_codes=ttl_due_codes,
-            periodic_candidates=periodic_candidates,
-        )
-        selected_entries, deferred_entries, queue_depth_by_priority = self._select_evaluation_entries(queue, runtime_by_key, current)
-        if not selected_entries and eligible_candidates and self.last_run_at is None:
-            periodic_due = True
-            periodic_candidates = self._periodic_candidates(eligible_candidates)
-            queue = self._evaluation_queue(
-                eligible_candidates,
-                incremental_codes=set(),
-                context_codes=set(),
-                ttl_codes=ttl_due_codes,
-                periodic_candidates=periodic_candidates,
+        periodic_candidates = self._periodic_candidates(eligible_candidates, runtime_by_key) if periodic_due else []
+        periodic_ids = {self._candidate_instance_id(candidate) for candidate in periodic_candidates}
+        observed_by_key: dict[str, dict[str, Any]] = {}
+        pending_seed_rows: list[dict[str, Any]] = []
+        runtime_updates: list[dict[str, Any]] = []
+        for candidate in eligible_candidates:
+            code = normalize_code(candidate.code)
+            candidate_instance_id = self._candidate_instance_id(candidate)
+            context = latest_context_by_code.get(code) or dict(getattr(candidate, "metadata", {}) or {}).get("strategy_context_v3") or {}
+            selected_theme_id = self._selected_theme_id(context)
+            entry_decision = latest_entry_by_key.get((candidate.id, code)) or latest_entry_by_key.get((None, code)) or {}
+            latest_completed_candle_at = self._latest_completed_candle_at(code)
+            lease_info = self._lease_selection(leases_by_code.get(code, ()), context, candidate=candidate)
+            observed = self._observed_signatures(
+                candidate,
+                current,
+                context,
+                entry_decision,
+                latest_completed_candle_at,
+                selected_theme_id,
+                lease_info,
             )
-            selected_entries, deferred_entries, queue_depth_by_priority = self._select_evaluation_entries(queue, runtime_by_key, current)
-        periodic_selected_count = sum(1 for entry in selected_entries if int(entry.get("priority") or 0) == 3)
+            observed_by_key[candidate_instance_id] = observed
+            reasons = self._pending_reason_codes(
+                observed,
+                runtime_by_key.get(candidate_instance_id) or {},
+                dirty=code in provider_codes,
+                ttl_due=code in ttl_due_codes,
+                periodic=candidate_instance_id in periodic_ids,
+            )
+            if reasons:
+                pending_seed_rows.append(self._pending_row(candidate, current, observed, reasons))
+                runtime_updates.append(
+                    self._runtime_update(
+                        candidate,
+                        current,
+                        context,
+                        entry_decision,
+                        latest_completed_candle_at,
+                        source="+".join(reasons),
+                        observed=observed,
+                        pending_reasons=reasons,
+                        first_pending=True,
+                        skipped="PENDING_EVALUATION",
+                    )
+                )
+            elif not runtime_by_key.get(candidate_instance_id):
+                runtime_updates.append(
+                    self._runtime_update(
+                        candidate,
+                        current,
+                        context,
+                        entry_decision,
+                        latest_completed_candle_at,
+                        source="ELIGIBLE_OBSERVED",
+                        observed=observed,
+                        skipped="NO_PENDING_REASON",
+                    )
+                )
+        pending_saver = getattr(self.db, "save_setup_router_pending_evaluations", None)
+        if callable(pending_saver) and pending_seed_rows:
+            try:
+                pending_saver(pending_seed_rows)
+            except Exception as exc:  # pragma: no cover - diagnostics must not stop runtime
+                warnings = [f"SETUP_ROUTER_PENDING_SAVE_ERROR:{exc.__class__.__name__}"]
+            else:
+                warnings = []
+        else:
+            warnings = []
+        runtime_saver = getattr(self.db, "save_setup_router_candidate_runtime", None)
+        if callable(runtime_saver) and runtime_updates:
+            try:
+                runtime_saver(runtime_updates)
+            except Exception as exc:  # pragma: no cover - diagnostics must not stop runtime
+                warnings.append(f"SETUP_ROUTER_RUNTIME_STATE_SAVE_ERROR:{exc.__class__.__name__}")
+        runtime_by_key = self._candidate_runtime(trade_date, eligible_candidates)
+        pending_rows = self._pending_rows(trade_date)
+        queue = self._pending_evaluation_entries(pending_rows, candidate_by_key, runtime_by_key, current)
+        selected_entries, deferred_entries, queue_depth_by_priority = self._select_pending_entries(queue, runtime_by_key, current)
+        periodic_selected_count = sum(1 for entry in selected_entries if "PERIODIC_RECONCILE" in list(entry.get("pending_reasons") or []))
         cursor_advanced_count = 0
-        if periodic_due and periodic_selected_count > 0:
-            cursor_advanced_count = self._advance_periodic_cursor(len(eligible_candidates), periodic_selected_count)
+        if periodic_due:
             self.last_periodic_reconcile_at = current
-        elif periodic_due and not selected_entries:
-            self.last_periodic_reconcile_at = current
+        pending_updater = getattr(self.db, "update_setup_router_pending_evaluations", None)
+        if callable(pending_updater) and selected_entries:
+            pending_updater(
+                [
+                    {
+                        "trade_date": trade_date,
+                        "candidate_instance_id": self._candidate_instance_id(entry["candidate"]),
+                        "router_version": SETUP_ROUTER_VERSION,
+                        "status": "SELECTED",
+                        "last_attempt_at": current.isoformat(),
+                        "last_error": "",
+                    }
+                    for entry in selected_entries
+                ]
+            )
 
         observations: list[dict[str, Any]] = []
-        warnings: list[str] = []
         evaluated_count = 0
         fingerprint_skip_count = 0
-        runtime_updates: list[dict[str, Any]] = []
+        runtime_updates = []
+        state_counts = {"state_write_count": 0, "transition_write_count": 0, "no_change_skip_count": 0, "state_no_change_skip_count": 0}
+        saved_count = 0
+        completed_pending_count = 0
+        retry_pending_count = 0
         for entry in selected_entries:
             candidate = entry["candidate"]
             code = normalize_code(candidate.code)
@@ -151,8 +223,17 @@ class SetupRouterV3RuntimePipeline:
                 context = latest_context_by_code.get(code) or dict(getattr(candidate, "metadata", {}) or {}).get("strategy_context_v3") or {}
                 selected_theme_id = self._selected_theme_id(context)
                 states = self._states_for_theme(state_by_candidate.get(candidate_instance_id, {}), selected_theme_id)
-                lease_info = self._lease_selection(leases_by_code.get(code, ()), context)
+                lease_info = self._lease_selection(leases_by_code.get(code, ()), context, candidate=candidate)
                 entry_decision = latest_entry_by_key.get((candidate.id, code)) or latest_entry_by_key.get((None, code)) or {}
+                observed = observed_by_key.get(candidate_instance_id) or self._observed_signatures(
+                    candidate,
+                    current,
+                    context,
+                    entry_decision,
+                    self._latest_completed_candle_at(code),
+                    selected_theme_id,
+                    lease_info,
+                )
                 feature = self.feature_builder.build(
                     candidate,
                     now=current,
@@ -166,16 +247,21 @@ class SetupRouterV3RuntimePipeline:
                     other_theme_lease_count=int(lease_info.get("other_theme_lease_count") or 0),
                 )
                 signature = self._feature_signature(feature, states)
-                if signature == self._last_feature_signature.get(candidate_instance_id) and not periodic_due:
-                    fingerprint_skip_count += 1
-                    runtime_updates.append(
-                        self._runtime_update(candidate, current, context, entry_decision, feature.latest_completed_candle_at, source=str(entry.get("source") or ""), skipped="FEATURE_SIGNATURE_UNCHANGED")
-                    )
-                    continue
                 self._last_feature_signature[candidate_instance_id] = signature
                 result = [item.to_dict() for item in self.router.classify(feature)]
                 observations.extend(result)
                 evaluated_count += 1
+                if self.config.save_history and result:
+                    state_saver = getattr(self.db, "save_setup_router_states", None)
+                    if callable(state_saver):
+                        counts = dict(state_saver(result) or {})
+                        state_counts["state_write_count"] += int(counts.get("state_write_count") or 0)
+                        state_counts["transition_write_count"] += int(counts.get("transition_write_count") or 0)
+                        state_counts["no_change_skip_count"] += int(counts.get("no_change_skip_count") or 0)
+                        state_counts["state_no_change_skip_count"] += int(counts.get("state_no_change_skip_count") or counts.get("no_change_skip_count") or 0)
+                    saver = getattr(self.db, "save_setup_observations", None)
+                    if callable(saver):
+                        saved_count += int(saver(result) or 0)
                 runtime_updates.append(
                     self._runtime_update(
                         candidate,
@@ -184,13 +270,58 @@ class SetupRouterV3RuntimePipeline:
                         entry_decision,
                         feature.latest_completed_candle_at,
                         source=str(entry.get("source") or ""),
+                        observed=observed,
+                        pending_reasons=entry.get("pending_reasons") or [],
                         incremental=int(entry.get("priority") or 0) == 0,
-                        periodic=int(entry.get("priority") or 0) == 3,
-                        ttl=int(entry.get("priority") or 0) == 2,
+                        periodic="PERIODIC_RECONCILE" in list(entry.get("pending_reasons") or []),
+                        ttl="TTL_DUE" in list(entry.get("pending_reasons") or []),
+                        success=True,
                     )
                 )
+                if callable(pending_updater):
+                    pending_updater(
+                        [
+                            {
+                                "trade_date": trade_date,
+                                "candidate_instance_id": candidate_instance_id,
+                                "router_version": SETUP_ROUTER_VERSION,
+                                "status": "COMPLETED",
+                                "last_attempt_at": current.isoformat(),
+                                "last_error": "",
+                            }
+                        ]
+                    )
+                    completed_pending_count += 1
             except Exception as exc:  # pragma: no cover - defensive runtime isolation
                 warnings.append(f"SETUP_ROUTER_CANDIDATE_ERROR:{code}:{exc.__class__.__name__}")
+                if callable(pending_updater):
+                    pending_updater(
+                        [
+                            {
+                                "trade_date": trade_date,
+                                "candidate_instance_id": candidate_instance_id,
+                                "router_version": SETUP_ROUTER_VERSION,
+                                "status": "RETRY",
+                                "last_attempt_at": current.isoformat(),
+                                "last_error": f"{exc.__class__.__name__}:{exc}",
+                            }
+                        ]
+                    )
+                    retry_pending_count += 1
+                runtime_updates.append(
+                    self._runtime_update(
+                        candidate,
+                        current,
+                        latest_context_by_code.get(code) or dict(getattr(candidate, "metadata", {}) or {}).get("strategy_context_v3") or {},
+                        latest_entry_by_key.get((candidate.id, code)) or latest_entry_by_key.get((None, code)) or {},
+                        self._latest_completed_candle_at(code),
+                        source=str(entry.get("source") or ""),
+                        observed=observed_by_key.get(candidate_instance_id),
+                        pending_reasons=entry.get("pending_reasons") or [],
+                        failure=True,
+                        skipped=f"{exc.__class__.__name__}:{exc}",
+                    )
+                )
                 continue
         for entry in deferred_entries:
             candidate = entry["candidate"]
@@ -204,20 +335,13 @@ class SetupRouterV3RuntimePipeline:
                     latest_entry_by_key.get((candidate.id, code)) or latest_entry_by_key.get((None, code)) or {},
                     "",
                     source=str(entry.get("source") or ""),
+                    observed=observed_by_key.get(self._candidate_instance_id(candidate)),
+                    pending_reasons=entry.get("pending_reasons") or [],
                     deferred=True,
                     skipped=str(entry.get("deferred_reason") or "CAPACITY_DEFERRED"),
                 )
             )
 
-        state_counts = {"state_write_count": 0, "transition_write_count": 0}
-        saved_count = 0
-        if self.config.save_history and observations:
-            state_saver = getattr(self.db, "save_setup_router_states", None)
-            if callable(state_saver):
-                state_counts = dict(state_saver(observations) or state_counts)
-            saver = getattr(self.db, "save_setup_observations", None)
-            if callable(saver):
-                saved_count = int(saver(observations) or 0)
         runtime_saver = getattr(self.db, "save_setup_router_candidate_runtime", None)
         if callable(runtime_saver) and runtime_updates:
             try:
@@ -232,6 +356,13 @@ class SetupRouterV3RuntimePipeline:
         reason_counts = Counter()
         for item in observations:
             reason_counts.update([str(reason) for reason in list(item.get("reason_codes") or []) if str(reason)])
+        pending_reason_counts = Counter()
+        for row in pending_rows:
+            pending_reason_counts.update([str(reason) for reason in list(row.get("pending_reasons") or []) if str(reason)])
+        deferred_pending_count = len(deferred_entries)
+        pending_queue_count = len(queue)
+        oldest_pending_age_sec = self._oldest_pending_age_sec(pending_rows, current)
+        never_evaluated_count = self._never_evaluated_count(eligible_candidates, runtime_by_key)
         duration_ms = int(round((perf_counter() - started) * 1000))
         summary = {
             **_base_summary(enabled=True, status="OK" if observations else "IDLE"),
@@ -258,15 +389,26 @@ class SetupRouterV3RuntimePipeline:
             "top_reasons": [{"reason": key, "count": value} for key, value in reason_counts.most_common(10)],
             "skipped_reasons": dict(skipped_reasons),
             "observations": _dashboard_observations(observations),
-            "incremental_input_count": len(set(incremental_codes) | set(context_changed_codes) | set(candle_changed_codes) | set(provider_codes)),
+            "incremental_input_count": sum(pending_reason_counts.get(reason, 0) for reason in ("ENTRY_DECISION_CHANGED", "DIRTY_EVALUATOR_DECISION")),
             "periodic_input_count": len(periodic_candidates),
             "ttl_input_count": len(ttl_due_codes),
-            "theme_changed_input_count": len(theme_changed_codes),
+            "theme_changed_input_count": pending_reason_counts.get("SELECTED_THEME_CHANGED", 0),
             "duplicate_code_skip_count": duplicate_code_skip_count,
             "fingerprint_skip_count": fingerprint_skip_count,
             "state_write_count": int(state_counts.get("state_write_count") or 0),
             "transition_write_count": int(state_counts.get("transition_write_count") or 0),
             "no_change_skip_count": int(state_counts.get("no_change_skip_count") or 0),
+            "state_no_change_skip_count": int(state_counts.get("state_no_change_skip_count") or state_counts.get("no_change_skip_count") or 0),
+            "observation_write_count": saved_count,
+            "pending_queue_count": pending_queue_count,
+            "pending_count_by_priority": queue_depth_by_priority,
+            "selected_pending_count": len(selected_entries),
+            "completed_pending_count": completed_pending_count,
+            "retry_pending_count": retry_pending_count,
+            "deferred_pending_count": deferred_pending_count,
+            "never_evaluated_count": never_evaluated_count,
+            "oldest_pending_age_sec": oldest_pending_age_sec,
+            "oldest_never_evaluated_age_sec": self._oldest_unevaluated_age_sec(eligible_candidates, runtime_by_key, current),
             "reconcile_cursor": self.reconcile_cursor,
             "reconcile_total_eligible": len(eligible_candidates),
             "deferred_incremental_count": sum(1 for item in deferred_entries if int(item.get("priority") or 0) == 0),
@@ -402,27 +544,29 @@ class SetupRouterV3RuntimePipeline:
             result.setdefault(normalize_code(str(payload.get("code") or "")), []).append(payload)
         return {key: tuple(value) for key, value in result.items()}
 
-    def _lease_selection(self, leases: Iterable[Mapping[str, Any]], context: Mapping[str, Any]) -> dict[str, Any]:
+    def _lease_selection(self, leases: Iterable[Mapping[str, Any]], context: Mapping[str, Any], *, candidate: Any | None = None) -> dict[str, Any]:
         theme = dict(context.get("theme") or {})
         theme_id = str(context.get("selected_theme_id") or theme.get("theme_id") or "")
         payloads = [dict(item or {}) for item in leases or []]
         selected: dict[str, Any] = {}
-        for lease in payloads:
-            if str(lease.get("theme_id") or "") == theme_id:
-                selected = lease
-                break
+        matching_any = [lease for lease in payloads if str(lease.get("theme_id") or "") == theme_id]
+        matching = [lease for lease in payloads if str(lease.get("theme_id") or "") == theme_id and str(lease.get("status") or "").upper() in {"ACTIVE", "HOLDING", "PROTECTED"}]
         data = dict(context.get("data") or {})
+        provenance_required = self._candidate_requires_selected_theme_lease(candidate)
         required = bool(
             theme_id
             and (
-                selected
-                or payloads
-                or context.get("selected_theme_lease_required")
+                context.get("selected_theme_lease_required")
                 or context.get("theme_expansion_lease_required")
                 or data.get("selected_theme_lease_required")
                 or data.get("theme_expansion_lease_required")
+                or provenance_required
             )
         )
+        if matching:
+            selected = max(matching, key=lambda item: str(item.get("first_active_at") or item.get("selected_at") or ""))
+        elif required and matching_any:
+            selected = max(matching_any, key=lambda item: str(item.get("first_active_at") or item.get("selected_at") or ""))
         return {
             "lease": selected,
             "required": required,
@@ -432,6 +576,202 @@ class SetupRouterV3RuntimePipeline:
     def _selected_theme_id(self, context: Mapping[str, Any]) -> str:
         theme = dict(context.get("theme") or {})
         return str(context.get("selected_theme_id") or theme.get("theme_id") or "")
+
+    def _candidate_requires_selected_theme_lease(self, candidate: Any | None) -> bool:
+        if candidate is None:
+            return False
+        source_values = {
+            str(getattr(source, "value", source) or "").lower()
+            for source in list(getattr(candidate, "sources", []) or [])
+        }
+        metadata = dict(getattr(candidate, "metadata", {}) or {})
+        source_values.update(str(item or "").lower() for item in list(metadata.get("sources") or []) if str(item or ""))
+        source_values.add(str(metadata.get("source") or "").lower())
+        return bool(source_values & {"opening_burst", "theme_watch", "theme_board", "leading_stock"})
+
+    def _latest_completed_candle_at(self, code: str) -> str:
+        if self.candle_builder is None:
+            return ""
+        loader = getattr(self.candle_builder, "completed_candles", None)
+        if not callable(loader):
+            return ""
+        candles = list(loader(normalize_code(code), 1) or [])
+        if not candles:
+            return ""
+        last = candles[-1]
+        return str(getattr(last, "start_at", "") if not isinstance(last, Mapping) else last.get("candle_at") or last.get("start_at") or "")
+
+    def _observed_signatures(
+        self,
+        candidate: Any,
+        now: datetime,
+        context: Mapping[str, Any],
+        entry_decision: Mapping[str, Any],
+        latest_completed_candle_at: str,
+        selected_theme_id: str,
+        lease_info: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        entry_signature = _hash_payload(
+            {
+                "id": entry_decision.get("id"),
+                "candidate_id": entry_decision.get("candidate_id"),
+                "calculated_at": entry_decision.get("calculated_at") or entry_decision.get("created_at"),
+                "entry_status": entry_decision.get("entry_status"),
+                "price_location": entry_decision.get("price_location"),
+                "source": entry_decision.get("source") or entry_decision.get("decision_source"),
+            }
+        )
+        lease = dict(lease_info.get("lease") or {})
+        lease_signature = _hash_payload(
+            {
+                "required": bool(lease_info.get("required")),
+                "theme_id": lease.get("theme_id"),
+                "status": lease.get("status"),
+                "selected_at": lease.get("selected_at"),
+                "first_active_at": lease.get("first_active_at"),
+                "first_fresh_tick_at": lease.get("first_fresh_tick_at") or lease.get("first_post_subscription_tick_at"),
+            }
+        )
+        return {
+            "trade_date": now.date().isoformat(),
+            "candidate_instance_id": self._candidate_instance_id(candidate),
+            "code": normalize_code(candidate.code),
+            "selected_theme_id": selected_theme_id,
+            "entry_signature": entry_signature,
+            "context_signature": str(dict(context or {}).get("context_id") or ""),
+            "candle_signature": str(latest_completed_candle_at or ""),
+            "theme_signature": str(selected_theme_id or ""),
+            "lease_signature": lease_signature,
+        }
+
+    def _pending_reason_codes(
+        self,
+        observed: Mapping[str, Any],
+        runtime: Mapping[str, Any],
+        *,
+        dirty: bool,
+        ttl_due: bool,
+        periodic: bool,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if not runtime or not str(runtime.get("last_success_at") or ""):
+            reasons.append("INITIAL_RECOVERY")
+        if dirty:
+            reasons.append("DIRTY_EVALUATOR_DECISION")
+        if str(observed.get("entry_signature") or "") != str(runtime.get("processed_entry_signature") or ""):
+            reasons.append("ENTRY_DECISION_CHANGED")
+        if str(observed.get("context_signature") or "") != str(runtime.get("processed_context_id") or ""):
+            reasons.append("CONTEXT_CHANGED")
+        if str(observed.get("candle_signature") or "") != str(runtime.get("processed_candle_at") or ""):
+            reasons.append("CANDLE_BOUNDARY_CHANGED")
+        if str(observed.get("theme_signature") or "") != str(runtime.get("processed_theme_id") or ""):
+            reasons.append("SELECTED_THEME_CHANGED")
+        if str(observed.get("lease_signature") or "") != str(runtime.get("processed_lease_signature") or ""):
+            reasons.append("LEASE_VERIFICATION_CHANGED")
+        if ttl_due:
+            reasons.append("TTL_DUE")
+        if periodic:
+            reasons.append("PERIODIC_RECONCILE")
+        return _dedupe(reasons)
+
+    def _pending_row(self, candidate: Any, now: datetime, observed: Mapping[str, Any], reasons: Iterable[str]) -> dict[str, Any]:
+        current = now.isoformat()
+        reason_list = _dedupe(reasons)
+        return {
+            "trade_date": now.date().isoformat(),
+            "candidate_instance_id": self._candidate_instance_id(candidate),
+            "code": normalize_code(candidate.code),
+            "router_version": SETUP_ROUTER_VERSION,
+            "state_version": SETUP_ROUTER_STATE_VERSION,
+            "selected_theme_id": str(observed.get("selected_theme_id") or ""),
+            "pending_priority": _pending_priority(reason_list),
+            "pending_reasons": reason_list,
+            "entry_signature": str(observed.get("entry_signature") or ""),
+            "context_signature": str(observed.get("context_signature") or ""),
+            "candle_signature": str(observed.get("candle_signature") or ""),
+            "theme_signature": str(observed.get("theme_signature") or ""),
+            "lease_signature": str(observed.get("lease_signature") or ""),
+            "first_pending_at": current,
+            "last_pending_at": current,
+            "status": "PENDING",
+        }
+
+    def _pending_rows(self, trade_date: str) -> list[dict[str, Any]]:
+        loader = getattr(self.db, "list_setup_router_pending_evaluations", None)
+        if not callable(loader):
+            return []
+        return list(loader(trade_date=trade_date, router_version=SETUP_ROUTER_VERSION, statuses=("PENDING", "RETRY", "SELECTED"), limit=max(1000, self.config.max_candidates_per_cycle * 50)) or [])
+
+    def _pending_evaluation_entries(
+        self,
+        pending_rows: list[dict[str, Any]],
+        candidate_by_key: Mapping[str, Any],
+        runtime_by_key: Mapping[str, dict[str, Any]],
+        now: datetime,
+    ) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for row in pending_rows:
+            candidate_instance_id = str(row.get("candidate_instance_id") or "")
+            candidate = candidate_by_key.get(candidate_instance_id)
+            if candidate is None:
+                continue
+            reasons = list(row.get("pending_reasons") or [])
+            entries.append(
+                {
+                    "candidate": candidate,
+                    "priority": _pending_priority(reasons),
+                    "source": "+".join(reasons),
+                    "pending_reasons": reasons,
+                    "pending": row,
+                }
+            )
+        entries.sort(key=lambda entry: self._pending_sort_key(entry, runtime_by_key, now))
+        return entries
+
+    def _select_pending_entries(
+        self,
+        queue: list[dict[str, Any]],
+        runtime_by_key: Mapping[str, dict[str, Any]],
+        now: datetime,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+        limit = max(1, int(self.config.max_candidates_per_cycle))
+        queue_depth = {str(priority): 0 for priority in range(4)}
+        for entry in queue:
+            priority = min(3, max(0, int(entry.get("priority") or 3)))
+            queue_depth[str(priority)] += 1
+        selected = queue[:limit]
+        deferred = []
+        for item in queue[limit:]:
+            priority = min(3, max(0, int(item.get("priority") or 3)))
+            item["deferred_reason"] = f"P{priority}_CAPACITY_DEFERRED"
+            deferred.append(item)
+        return selected, deferred, queue_depth
+
+    def _pending_sort_key(self, entry: Mapping[str, Any], runtime_by_key: Mapping[str, dict[str, Any]], now: datetime) -> tuple[int, str, float, str]:
+        candidate = entry["candidate"]
+        candidate_instance_id = self._candidate_instance_id(candidate)
+        pending = dict(entry.get("pending") or {})
+        first_pending = str(pending.get("first_pending_at") or "")
+        runtime = dict(runtime_by_key.get(candidate_instance_id) or {})
+        last_success = _parse_time(str(runtime.get("last_success_at") or runtime.get("last_evaluated_at") or ""))
+        success_ts = last_success.timestamp() if last_success else 0.0
+        return (min(3, max(0, int(entry.get("priority") or 3))), first_pending, success_ts, candidate_instance_id)
+
+    def _oldest_pending_age_sec(self, rows: Iterable[Mapping[str, Any]], now: datetime) -> int:
+        ages: list[float] = []
+        for row in rows:
+            parsed = _parse_time(str(row.get("first_pending_at") or row.get("last_pending_at") or ""))
+            if parsed is not None:
+                ages.append(max(0.0, (now - parsed).total_seconds()))
+        return int(max(ages, default=0.0))
+
+    def _never_evaluated_count(self, candidates: list[Any], runtime_by_key: Mapping[str, dict[str, Any]]) -> int:
+        count = 0
+        for candidate in candidates:
+            runtime = dict(runtime_by_key.get(self._candidate_instance_id(candidate)) or {})
+            if not str(runtime.get("last_success_at") or runtime.get("last_evaluated_at") or ""):
+                count += 1
+        return count
 
     def _ttl_due_codes(self, state_by_candidate: Mapping[str, Any], now: datetime) -> set[str]:
         due: set[str] = set()
@@ -532,28 +872,52 @@ class SetupRouterV3RuntimePipeline:
         latest_completed_candle_at: str,
         *,
         source: str,
+        observed: Mapping[str, Any] | None = None,
+        pending_reasons: Iterable[str] | None = None,
         incremental: bool = False,
         periodic: bool = False,
         ttl: bool = False,
         deferred: bool = False,
+        success: bool = False,
+        failure: bool = False,
+        first_pending: bool = False,
         skipped: str = "",
     ) -> dict[str, Any]:
         candidate_instance_id = self._candidate_instance_id(candidate)
         current = now.isoformat()
+        observed_payload = dict(observed or {})
+        reasons = _dedupe(pending_reasons or [])
         return {
             "trade_date": now.date().isoformat(),
             "candidate_instance_id": candidate_instance_id,
             "code": normalize_code(candidate.code),
+            "router_version": SETUP_ROUTER_VERSION,
+            "state_version": SETUP_ROUTER_STATE_VERSION,
             "selected_theme_id": self._selected_theme_id(context),
-            "last_evaluated_at": "" if deferred else current,
+            "first_eligible_at": current,
+            "first_pending_at": current if first_pending or reasons else "",
+            "last_evaluated_at": current if success or failure else "",
+            "last_success_at": current if success else "",
+            "last_failure_at": current if failure else "",
             "last_evaluation_source": source,
             "last_context_id": str(dict(context or {}).get("context_id") or ""),
             "last_entry_decision_at": str(dict(entry_decision or {}).get("calculated_at") or dict(entry_decision or {}).get("created_at") or ""),
             "last_completed_candle_at": latest_completed_candle_at,
-            "evaluation_count": 0 if deferred else 1,
-            "incremental_evaluation_count": int(bool(incremental and not deferred)),
-            "periodic_evaluation_count": int(bool(periodic and not deferred)),
-            "ttl_evaluation_count": int(bool(ttl and not deferred)),
+            "observed_entry_signature": str(observed_payload.get("entry_signature") or ""),
+            "processed_entry_signature": str(observed_payload.get("entry_signature") or "") if success else "",
+            "observed_context_id": str(observed_payload.get("context_signature") or ""),
+            "processed_context_id": str(observed_payload.get("context_signature") or "") if success else "",
+            "observed_candle_at": str(observed_payload.get("candle_signature") or ""),
+            "processed_candle_at": str(observed_payload.get("candle_signature") or "") if success else "",
+            "observed_theme_id": str(observed_payload.get("theme_signature") or ""),
+            "processed_theme_id": str(observed_payload.get("theme_signature") or "") if success else "",
+            "observed_lease_signature": str(observed_payload.get("lease_signature") or ""),
+            "processed_lease_signature": str(observed_payload.get("lease_signature") or "") if success else "",
+            "pending_reason_codes": reasons,
+            "evaluation_count": int(bool(success or failure)),
+            "incremental_evaluation_count": int(bool(incremental and (success or failure))),
+            "periodic_evaluation_count": int(bool(periodic and (success or failure))),
+            "ttl_evaluation_count": int(bool(ttl and (success or failure))),
             "capacity_deferred_count": int(bool(deferred)),
             "last_deferred_at": current if deferred else "",
             "last_skip_reason": skipped,
@@ -575,8 +939,7 @@ class SetupRouterV3RuntimePipeline:
     def _oldest_unevaluated_age_sec(self, candidates: list[Any], runtime_by_key: Mapping[str, dict[str, Any]], now: datetime) -> int:
         ages: list[float] = []
         for candidate in candidates:
-            last = str(dict(runtime_by_key.get(self._candidate_instance_id(candidate)) or {}).get("last_evaluated_at") or "")
-            parsed = _parse_time(last)
+            parsed = self._starvation_anchor(candidate, dict(runtime_by_key.get(self._candidate_instance_id(candidate)) or {}))
             if parsed is None:
                 continue
             ages.append(max(0.0, (now - parsed).total_seconds()))
@@ -596,11 +959,24 @@ class SetupRouterV3RuntimePipeline:
             candidate_instance_id = self._candidate_instance_id(candidate)
             if candidate_instance_id in selected_ids:
                 continue
-            last = str(dict(runtime_by_key.get(candidate_instance_id) or {}).get("last_evaluated_at") or "")
-            parsed = _parse_time(last)
+            parsed = self._starvation_anchor(candidate, dict(runtime_by_key.get(candidate_instance_id) or {}))
             if parsed is not None and (now - parsed).total_seconds() > threshold:
                 count += 1
         return count
+
+    def _starvation_anchor(self, candidate: Any, runtime: Mapping[str, Any]) -> datetime | None:
+        for value in (
+            runtime.get("last_success_at"),
+            runtime.get("first_pending_at"),
+            runtime.get("first_eligible_at"),
+            getattr(candidate, "detected_at", ""),
+            getattr(candidate, "last_seen_at", ""),
+            runtime.get("created_at"),
+        ):
+            parsed = _parse_time(str(value or ""))
+            if parsed is not None:
+                return parsed
+        return None
 
     def _incremental_codes(self, latest_entry_by_key: Mapping[tuple[int | None, str], dict[str, Any]]) -> set[str]:
         codes: set[str] = set()
@@ -610,7 +986,6 @@ class SetupRouterV3RuntimePipeline:
             signature = (payload.get("id"), payload.get("calculated_at"), payload.get("entry_status"), payload.get("price_location"))
             if self._last_entry_signature_by_code.get(code) != signature:
                 codes.add(code)
-                self._last_entry_signature_by_code[code] = signature
         provider = self.dirty_evaluator_provider
         evaluator = getattr(provider, "evaluator", provider)
         for decision in list(getattr(evaluator, "last_decisions", ()) or ()):
@@ -684,13 +1059,21 @@ class SetupRouterV3RuntimePipeline:
             return True
         return (now - self.last_periodic_reconcile_at).total_seconds() >= max(1, int(self.config.periodic_reconcile_sec))
 
-    def _periodic_candidates(self, candidates: list[Any]) -> list[Any]:
+    def _periodic_candidates(self, candidates: list[Any], runtime_by_key: Mapping[str, dict[str, Any]] | None = None) -> list[Any]:
         if not candidates:
             return []
         page_size = max(1, int(self.config.max_candidates_per_cycle))
+        if runtime_by_key is not None:
+            return sorted(candidates, key=lambda candidate: self._last_success_sort_key(candidate, runtime_by_key))[:page_size]
         start = min(self.reconcile_cursor, len(candidates) - 1)
         ordered = candidates[start:] + candidates[:start]
         return ordered[:page_size]
+
+    def _last_success_sort_key(self, candidate: Any, runtime_by_key: Mapping[str, dict[str, Any]]) -> tuple[float, str]:
+        candidate_instance_id = self._candidate_instance_id(candidate)
+        runtime = dict(runtime_by_key.get(candidate_instance_id) or {})
+        parsed = _parse_time(str(runtime.get("last_success_at") or runtime.get("last_evaluated_at") or ""))
+        return (parsed.timestamp() if parsed else 0.0, candidate_instance_id)
 
     def _feature_signature(self, feature: Any, states: Mapping[str, Any]) -> tuple[Any, ...]:
         state_material = tuple(
@@ -716,11 +1099,13 @@ class SetupRouterV3RuntimePipeline:
         )
 
     def _should_save_run(self, summary: Mapping[str, Any], now: datetime, *, periodic_due: bool) -> bool:
-        if int(summary.get("observation_count") or 0) > 0:
+        if int(summary.get("observation_write_count") or summary.get("saved_count") or 0) > 0:
+            return True
+        if int(summary.get("state_write_count") or 0) > 0:
             return True
         if int(summary.get("transition_write_count") or 0) > 0:
             return True
-        if periodic_due:
+        if int(summary.get("retry_pending_count") or 0) > 0:
             return True
         if summary.get("warnings"):
             return True
@@ -840,6 +1225,37 @@ def _parse_time(value: Any) -> datetime | None:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
     except ValueError:
         return None
+
+
+def _pending_priority(reasons: Iterable[str]) -> int:
+    values = {str(reason or "") for reason in list(reasons or [])}
+    if values & {"ENTRY_DECISION_CHANGED", "DIRTY_EVALUATOR_DECISION"}:
+        return 0
+    if values & {"CONTEXT_CHANGED", "CANDLE_BOUNDARY_CHANGED", "SELECTED_THEME_CHANGED", "LEASE_VERIFICATION_CHANGED"}:
+        return 1
+    if "TTL_DUE" in values:
+        return 2
+    return 3
+
+
+def _hash_payload(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha1(_stable_json(payload).encode("utf-8")).hexdigest()
+
+
+def _stable_json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        return str(value)
+
+
+def _dedupe(values: Iterable[Any]) -> list[str]:
+    result: list[str] = []
+    for value in list(values or []):
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def _price_bucket(value: Any) -> int:
