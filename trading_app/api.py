@@ -4525,7 +4525,7 @@ def setup_router_v3_summary(trade_date: str | None = Query(None)) -> dict[str, A
     db = open_database()
     try:
         run_loader = getattr(db, "latest_setup_router_run", None)
-        run = dict(run_loader(trade_date=resolved) if callable(run_loader) else {})
+        run = dict(run_loader(trade_date=resolved, router_version="setup_router_v3.5.1") if callable(run_loader) else {})
         latest = list(getattr(db, "list_setup_observations_latest", lambda **_: [])(trade_date=resolved, router_version="setup_router_v3.5.1", limit=1000) or [])
         readiness = list(getattr(db, "list_setup_router_readiness_latest", lambda **_: [])(trade_date=resolved, router_version="setup_router_v3.5.1", limit=1000) or [])
         status_counts = Counter(str(item.get("router_status") or "UNKNOWN") for item in latest)

@@ -9303,25 +9303,25 @@ class TradingDatabase:
         ).fetchone()
         return _row_to_setup_router_run(row) if row else None
 
-    def latest_setup_router_run(self, *, trade_date: Optional[str] = None) -> dict:
+    def latest_setup_router_run(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        router_version: Optional[str] = _CURRENT_SETUP_ROUTER_VERSION,
+    ) -> dict:
+        clauses: list[str] = []
+        params: list[object] = []
         if trade_date:
-            row = self.conn.execute(
-                """
-                SELECT * FROM setup_router_runs
-                WHERE trade_date = ?
-                ORDER BY calculated_at DESC, id DESC
-                LIMIT 1
-                """,
-                (str(trade_date),),
-            ).fetchone()
-        else:
-            row = self.conn.execute(
-                """
-                SELECT * FROM setup_router_runs
-                ORDER BY calculated_at DESC, id DESC
-                LIMIT 1
-                """
-            ).fetchone()
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if router_version:
+            clauses.append("router_version = ?")
+            params.append(str(router_version))
+        query = "SELECT * FROM setup_router_runs"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY calculated_at DESC, id DESC LIMIT 1"
+        row = self.conn.execute(query, tuple(params)).fetchone()
         return _row_to_setup_router_run(row) if row else {}
 
     def save_setup_router_readiness_snapshots(self, snapshots: Iterable[dict]) -> int:

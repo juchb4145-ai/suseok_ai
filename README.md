@@ -93,6 +93,17 @@ python tools/ops_check.py --core-url http://127.0.0.1:8000 --token change-me-loc
 Invoke-RestMethod "http://127.0.0.1:8000/api/ops/alerts"
 ```
 
+테스트 실행:
+
+```powershell
+python tools/run_tests.py quick
+python tools/run_tests.py full --shard 1/4
+```
+
+테스트가 많아져 전체 실행이 timeout에 걸릴 때는 `quick`, `unit`, `integration`, `slow`, `full`
+프로필과 `--shard=N/M`을 사용한다. 자세한 운영 방식은
+[`docs/testing_strategy.md`](docs/testing_strategy.md)를 참고한다.
+
 대시보드 상단의 `운영 점검 알림`은 Gateway heartbeat, Kiwoom 로그인, command 실패/거부, WebSocket pilot fallback, Runtime 오류, DRY_RUN 오탐/미탐 신호를 한곳에 모아 보여준다. `LIVE` 자동주문은 별도 안전 PR 전까지 항상 차단으로 표시된다.
 
 Core API:

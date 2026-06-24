@@ -209,6 +209,43 @@ def test_dashboard_v2_keeps_wait_rows_when_no_observe_ready_candidates(monkeypat
     assert all(item["display_bucket"] == "WAIT" for item in payload["entry_candidates"]["items"])
 
 
+def test_dashboard_v2_setup_router_exposes_readiness_diagnostics(monkeypatch):
+    monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
+    snapshot = {
+        "runtime": {
+            "setup_router_v3": {
+                "enabled": True,
+                "status": "OK",
+                "router_version": "setup_router_v3.5.1",
+                "readiness_evaluated_count": 5,
+                "readiness_wait_count": 2,
+                "subscription_requested_count": 5,
+                "subscription_target_selected_count": 3,
+                "market_action_unmapped_count": 1,
+                "general_multisource_count": 2,
+                "general_multisource_expansion_ignored_count": 1,
+                "readiness_funnel": {
+                    "evaluation_eligible": 5,
+                    "subscription_budget_deferred": 1,
+                    "fresh_tick": 3,
+                    "market_action_unmapped": 1,
+                },
+            },
+        },
+    }
+
+    payload = build_dashboard_v2_snapshot(snapshot)
+    setup_router = payload["setup_router_v3"]
+
+    assert setup_router["router_version"] == "setup_router_v3.5.1"
+    assert setup_router["subscription_requested_count"] == 5
+    assert setup_router["subscription_target_selected_count"] == 3
+    assert setup_router["market_action_unmapped_count"] == 1
+    assert setup_router["general_multisource_count"] == 2
+    assert setup_router["general_multisource_expansion_ignored_count"] == 1
+    assert setup_router["readiness_funnel"]["subscription_budget_deferred"] == 1
+
+
 def test_dashboard_v2_risk_off_and_real_broker_create_safety_banners(monkeypatch):
     monkeypatch.setenv("TRADING_DASHBOARD_V2_ENABLED", "1")
     snapshot = {

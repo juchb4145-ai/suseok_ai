@@ -99,7 +99,19 @@ def normalize_market_action(
 
 
 def _clean(value: Any) -> str:
-    return str(value or "").strip().upper()
+    raw = getattr(value, "value", value)
+    text = str(raw or "").strip().upper()
+    if "." in text:
+        prefix, suffix = text.rsplit(".", 1)
+        if prefix in {
+            "CANDIDATEMARKETACTION",
+            "MARKETACTION",
+            "MARKETREGIMESTATUS",
+            "MARKETSIDE",
+            "COMPOSITEMARKETMODE",
+        }:
+            return suffix
+    return text
 
 
 def _dedupe(values: list[str]) -> list[str]:

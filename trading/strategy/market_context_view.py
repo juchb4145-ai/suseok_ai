@@ -4,6 +4,7 @@ import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from types import MappingProxyType
 from typing import Any, Iterator
 
@@ -119,7 +120,7 @@ class MarketContextView(Mapping[str, Any]):
         normalized = normalize_code(code)
         if not normalized:
             return None
-        return self.candidate_policy_by_code.get(normalized) or self.candidate_policy_by_code.get(str(code or ""))
+        return _policy_payload(self.candidate_policy_by_code.get(normalized) or self.candidate_policy_by_code.get(str(code or "")))
 
     def side_context(self, side: str) -> MarketSideContextView:
         normalized = str(_enum_value(side) or "").upper()
@@ -272,7 +273,7 @@ def market_context_view_from_snapshot(
         summary=summary,
         kospi=kospi,
         kosdaq=kosdaq,
-        candidate_policy_by_code=MappingProxyType(policies if isinstance(policies, Mapping) else {}),
+        candidate_policy_by_code=MappingProxyType(_policy_payloads(policies)),
         source=source,
     )
 
@@ -287,7 +288,7 @@ def market_context_view_from_mapping(payload: Mapping[str, Any] | None, *, sourc
         summary=summary,
         kospi=kospi,
         kosdaq=kosdaq,
-        candidate_policy_by_code=MappingProxyType(policies if isinstance(policies, Mapping) else {}),
+        candidate_policy_by_code=MappingProxyType(_policy_payloads(policies)),
         source=source,
     )
 
@@ -415,6 +416,30 @@ def _obj_value(obj: Any, key: str, default: Any = None) -> Any:
     return default
 
 
+def _policy_payloads(policies: Any) -> dict[str, Any]:
+    if not isinstance(policies, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for code, policy in policies.items():
+        normalized = normalize_code(str(code or ""))
+        if not normalized:
+            continue
+        result[normalized] = _policy_payload(policy)
+    return result
+
+
+def _policy_payload(policy: Any) -> Any:
+    to_dict = getattr(policy, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return _jsonable(to_dict() or {})
+        except TypeError:
+            return _jsonable(to_dict())
+    if isinstance(policy, Mapping):
+        return _jsonable(dict(policy))
+    return _jsonable(policy)
+
+
 def _nested(data: Mapping[str, Any], outer: str, inner: str) -> Any:
     value = data.get(outer)
     if isinstance(value, Mapping):
@@ -424,6 +449,16 @@ def _nested(data: Mapping[str, Any], outer: str, inner: str) -> Any:
 
 def _enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, Enum):
+        return value.value
+    return value
 
 
 def _status_value(value: Any) -> str:
