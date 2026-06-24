@@ -64,6 +64,10 @@ from trading.strategy.order_reconcile import ManagedOrderReconciler
 from trading.strategy.position_risk import position_risk_dashboard_section
 from trading.strategy.reason_taxonomy import normalize_reason_status, reason_status_family, reason_summary
 from trading.strategy.runtime_settings import StrategyRuntimeSettingsRepository
+from trading.strategy.candidate_funnel import (
+    CandidateFunnelService,
+    TradingDayQualificationService,
+)
 from trading.theme_engine.backfill import ThemeBackfillConfig, apply_dispatch_guard
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSourceSyncService
@@ -1282,6 +1286,170 @@ def rebuild_ops_pre_market_check(
     db = open_database()
     try:
         return _build_pre_market_check_report_payload(db, requested_mode=mode)
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/trading-day-qualification")
+def ops_trading_day_qualification(
+    trade_date: str | None = Query(None),
+    report_state: str = Query("LIVE_PREVIEW"),
+    revision: int | None = Query(None),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    state = "FINAL" if str(report_state or "").upper() == "FINAL" else "LIVE_PREVIEW"
+    db = open_database()
+    try:
+        reports = list(db.list_trading_day_qualification_reports(trade_date=resolved, report_state=state, limit=50) or [])
+        if revision is not None:
+            reports = [item for item in reports if int(item.get("revision") or 0) == int(revision)]
+        if reports:
+            return {**reports[0], "read_only": True}
+        runtime_snapshot = runtime_supervisor.snapshot()
+        return {
+            **TradingDayQualificationService(db).build_report(
+                trade_date=resolved,
+                runtime_snapshot=runtime_snapshot,
+                report_state=state,
+                finalize=state == "FINAL",
+                persist=False,
+            ),
+            "read_only": True,
+        }
+    finally:
+        close_database(db)
+
+
+@app.post("/api/ops/trading-day-qualification/rebuild")
+def rebuild_ops_trading_day_qualification(
+    body: dict[str, Any] | None = Body(default=None),
+    trade_date: str | None = Query(None),
+    finalize: bool = Query(False),
+    export: bool = Query(False),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    payload = dict(body or {})
+    rebuild_reason = str(payload.get("rebuild_reason") or "").strip()
+    if not rebuild_reason:
+        raise HTTPException(status_code=400, detail="rebuild_reason is required")
+    resolved = _theme_rotation_trade_date(trade_date or payload.get("trade_date"))
+    db = open_database()
+    try:
+        return TradingDayQualificationService(db).build_report(
+            trade_date=resolved,
+            runtime_snapshot=runtime_supervisor.snapshot(),
+            report_state="FINAL" if finalize else "LIVE_PREVIEW",
+            finalize=finalize,
+            persist=True,
+            export=export,
+            rebuild_reason=rebuild_reason,
+        )
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/candidate-funnel")
+def ops_candidate_funnel(
+    trade_date: str | None = Query(None),
+    as_of: str | None = Query(None),
+    strict_only: bool = Query(False),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    db = open_database()
+    try:
+        reports = list(db.list_candidate_funnel_reports(trade_date=resolved, report_state="LIVE_PREVIEW", limit=1) or [])
+        if reports and not as_of:
+            report = reports[0]
+            if strict_only:
+                report = {**report, "episodes": [item for item in list(report.get("episodes") or []) if item.get("attribution_confidence") == "HIGH"]}
+            return {**report, "read_only": True}
+        baseline = dict(runtime_supervisor.snapshot().get("strategy_baseline") or {})
+        return {
+            **CandidateFunnelService(db).build_report(
+                trade_date=resolved,
+                as_of=as_of,
+                baseline=baseline,
+                persist=False,
+                strict_only=strict_only,
+            ),
+            "read_only": True,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/candidate-funnel/episodes")
+def ops_candidate_funnel_episodes(
+    trade_date: str | None = Query(None),
+    stage: str | None = Query(None),
+    stop_stage: str | None = Query(None),
+    reason_family: str | None = Query(None),
+    baseline_role: str | None = Query(None),
+    attribution_confidence: str | None = Query(None),
+    code: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    db = open_database()
+    try:
+        items = db.list_candidate_funnel_episodes(
+            trade_date=resolved,
+            stage=stage,
+            stop_stage=stop_stage,
+            reason_family=reason_family,
+            baseline_role=baseline_role,
+            attribution_confidence=attribution_confidence,
+            code=code,
+            limit=limit + 1,
+            offset=offset,
+        )
+        page_items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {"trade_date": resolved, "items": page_items, "pagination": pagination, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/candidate-funnel/candidates/{candidate_instance_id}")
+def ops_candidate_funnel_candidate(candidate_instance_id: str, trade_date: str | None = Query(None)) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    db = open_database()
+    try:
+        item = db.get_candidate_funnel_episode(resolved, candidate_instance_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="candidate funnel episode not found")
+        return {**item, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.post("/api/ops/candidate-funnel/rebuild")
+def rebuild_ops_candidate_funnel(
+    body: dict[str, Any] | None = Body(default=None),
+    trade_date: str | None = Query(None),
+    strict_only: bool = Query(False),
+    export: bool = Query(False),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    payload = dict(body or {})
+    rebuild_reason = str(payload.get("rebuild_reason") or "").strip()
+    if not rebuild_reason:
+        raise HTTPException(status_code=400, detail="rebuild_reason is required")
+    resolved = _theme_rotation_trade_date(trade_date or payload.get("trade_date"))
+    db = open_database()
+    try:
+        baseline = dict(runtime_supervisor.snapshot().get("strategy_baseline") or {})
+        report = CandidateFunnelService(db).build_report(
+            trade_date=resolved,
+            baseline=baseline,
+            persist=True,
+            export=export,
+            strict_only=strict_only,
+        )
+        report["rebuild_reason"] = rebuild_reason
+        report["analysis_only"] = True
+        report["gateway_command_created"] = False
+        return report
     finally:
         close_database(db)
 

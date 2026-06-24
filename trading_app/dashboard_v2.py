@@ -45,6 +45,10 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
     market_rs_shadow = _prefer_runtime_section(base.get("market_relative_strength_shadow"), runtime.get("market_relative_strength_shadow"))
     market_rs_outcomes = _prefer_runtime_section(base.get("market_relative_strength_outcomes"), runtime.get("market_relative_strength_outcomes"))
     strategy_baseline = _strategy_baseline(_prefer_runtime_section(base.get("strategy_baseline"), runtime.get("strategy_baseline")))
+    trading_day_qualification = _trading_day_qualification(
+        _prefer_runtime_section(base.get("trading_day_qualification"), runtime.get("trading_day_qualification"))
+    )
+    candidate_funnel = _candidate_funnel(_prefer_runtime_section(base.get("candidate_funnel"), runtime.get("candidate_funnel")))
     candidates = dict(base.get("candidates") or {})
 
     payload = {
@@ -66,6 +70,8 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
         "order_manager": _order_manager(order_manager, gateway, commands),
         "market_relative_strength_shadow": _market_relative_strength_shadow(market_rs_shadow, market_rs_outcomes),
         "strategy_baseline": strategy_baseline,
+        "trading_day_qualification": trading_day_qualification,
+        "candidate_funnel": candidate_funnel,
         "pre_market_check": _pre_market_check(base),
         "wait_block_reasons": _wait_block_reasons(base, runtime),
         "system_health": _system_health(base, runtime, gateway, commands),
@@ -95,6 +101,8 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
             "market_relative_strength_shadow": market_rs_shadow,
             "market_relative_strength_outcomes": market_rs_outcomes,
             "strategy_baseline": strategy_baseline,
+            "trading_day_qualification": trading_day_qualification,
+            "candidate_funnel": candidate_funnel,
         }
     return payload
 
@@ -879,6 +887,63 @@ def _strategy_baseline_message(payload: dict[str, Any]) -> str:
     return "전략 기준선 상태 확인 필요"
 
 
+def _trading_day_qualification(section: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(section or {})
+    no_trade = dict(payload.get("no_trade_classification") or {})
+    return {
+        "enabled": bool(payload.get("enabled", bool(payload))),
+        "status": payload.get("status", "DISABLED" if not payload else "OK"),
+        "report_id": payload.get("report_id", ""),
+        "trade_date": payload.get("trade_date", ""),
+        "report_state": payload.get("report_state", "LIVE_PREVIEW"),
+        "qualification_status": payload.get("qualification_status", "COLLECTING"),
+        "qualification_score": int(payload.get("qualification_score") or 0),
+        "strict_sample_eligible": bool(payload.get("strict_sample_eligible")),
+        "top_reason_codes": list(payload.get("top_reason_codes") or payload.get("reason_codes") or [])[:3],
+        "no_trade_classification": no_trade,
+        "operator_message_ko": no_trade.get("operator_message_ko") or _qualification_message(payload),
+        "checked_at": payload.get("checked_at") or payload.get("generated_at") or "",
+    }
+
+
+def _qualification_message(payload: dict[str, Any]) -> str:
+    status = str(payload.get("qualification_status") or "COLLECTING")
+    if status == "VALID":
+        return "오늘 표본 품질: VALID"
+    if status == "INVALID":
+        return "오늘 표본 품질: INVALID, 성과 표본 제외"
+    if status == "DEGRADED":
+        return "오늘 표본 품질: DEGRADED, 수동 검토"
+    if status == "NO_SESSION":
+        return "오늘 표본 품질: 세션 없음"
+    return "오늘 표본 품질: 수집 중"
+
+
+def _candidate_funnel(section: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(section or {})
+    no_trade = dict(payload.get("no_trade_classification") or {})
+    return {
+        "enabled": bool(payload.get("enabled", bool(payload))),
+        "status": payload.get("status", "DISABLED" if not payload else "OK"),
+        "report_id": payload.get("report_id", ""),
+        "trade_date": payload.get("trade_date", ""),
+        "candidate_episode_count": int(payload.get("candidate_episode_count") or 0),
+        "strict_attribution_count": int(payload.get("strict_attribution_count") or 0),
+        "low_confidence_attribution_count": int(payload.get("low_confidence_attribution_count") or 0),
+        "evaluation_eligible_count": int(payload.get("evaluation_eligible_count") or 0),
+        "champion_forming_count": int(payload.get("champion_forming_count") or 0),
+        "champion_matched_count": int(payload.get("champion_matched_count") or 0),
+        "champion_context_eligible_count": int(payload.get("champion_context_eligible_count") or 0),
+        "champion_valid_observe_count": int(payload.get("champion_valid_observe_count") or 0),
+        "highest_applicable_stage": payload.get("highest_applicable_stage", ""),
+        "top_stop_reasons": list(payload.get("top_stop_reasons") or [])[:5],
+        "invariant_violation_count": int(payload.get("invariant_violation_count") or 0),
+        "no_trade_classification": no_trade,
+        "operator_message_ko": no_trade.get("operator_message_ko") or "Reboot V2 canonical funnel 수집 중",
+        "checked_at": payload.get("checked_at") or payload.get("generated_at") or "",
+    }
+
+
 def _safety_banners(payload: dict[str, Any]) -> list[dict[str, Any]]:
     status = dict(payload.get("v2_status") or {})
     market = dict(payload.get("market_overview") or {})
@@ -949,6 +1014,32 @@ def _safety_banners(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "severity": "info",
                 "message_ko": "전략 기준선 일부 설정 미확인",
                 "reason_code": "STRATEGY_BASELINE_PARTIAL_SNAPSHOT",
+            }
+        )
+    qualification = dict(payload.get("trading_day_qualification") or {})
+    if str(qualification.get("qualification_status") or "") == "INVALID":
+        banners.append(
+            {
+                "severity": "warning",
+                "message_ko": "오늘 표본 품질 INVALID: 성과 표본 제외",
+                "reason_code": "TRADING_DAY_QUALIFICATION_INVALID",
+            }
+        )
+    elif str(qualification.get("qualification_status") or "") == "DEGRADED":
+        banners.append(
+            {
+                "severity": "info",
+                "message_ko": "오늘 표본 품질 DEGRADED: 수동 검토",
+                "reason_code": "TRADING_DAY_QUALIFICATION_DEGRADED",
+            }
+        )
+    funnel = dict(payload.get("candidate_funnel") or {})
+    if int(funnel.get("invariant_violation_count") or 0) > 0:
+        banners.append(
+            {
+                "severity": "warning",
+                "message_ko": "Candidate funnel invariant violation 감지",
+                "reason_code": "CANDIDATE_FUNNEL_INVARIANT_VIOLATION",
             }
         )
     return banners

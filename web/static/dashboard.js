@@ -1105,10 +1105,13 @@ function renderDashboardV2(snapshot) {
   const positionRisk = payload.position_risk || { positions: [] };
   const orderManager = payload.order_manager || {};
   const marketRsShadow = payload.market_relative_strength_shadow || {};
-  const strategyBaseline = payload.strategy_baseline || (health.strategy_baseline || {});
   const preMarket = payload.pre_market_check || {};
   const reasons = payload.wait_block_reasons || { items: [] };
   const health = payload.system_health || {};
+  const strategyBaseline = payload.strategy_baseline || (health.strategy_baseline || {});
+  const qualification = payload.trading_day_qualification || {};
+  const candidateFunnel = payload.candidate_funnel || {};
+  const noTrade = qualification.no_trade_classification || candidateFunnel.no_trade_classification || {};
   const readModel = payload.read_model || {};
 
   const readModelSuffix = readModel.source
@@ -1183,6 +1186,10 @@ function renderDashboardV2(snapshot) {
   text("dashboard-v2-baseline-status", `${strategyBaseline.status || "-"} / ${strategyBaseline.drift_status || "-"}`);
   text("dashboard-v2-baseline-hash", strategyBaseline.config_hash_short || "-");
   text("dashboard-v2-baseline-git", strategyBaseline.git_sha_short || "-");
+  text("dashboard-v2-qualification-status", `${qualification.qualification_status || "-"} / ${qualification.qualification_score ?? "-"}`);
+  text("dashboard-v2-qualification-strict", qualification.strict_sample_eligible ? "YES" : "NO");
+  text("dashboard-v2-funnel-champion", `${candidateFunnel.champion_forming_count || 0}/${candidateFunnel.champion_matched_count || 0}/${candidateFunnel.champion_valid_observe_count || 0}`);
+  text("dashboard-v2-no-trade", noTrade.operator_message_ko || noTrade.classification || "-");
 }
 
 function renderDashboardV2Banners(rows) {

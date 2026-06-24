@@ -61,6 +61,8 @@ class RebootV2Runtime:
     position_risk_pipeline: Any = None
     order_manager_pipeline: Any = None
     strategy_baseline_service: Any = None
+    candidate_funnel_service: Any = None
+    trading_day_qualification_service: Any = None
     clock: Any = datetime.now
     startup_warnings: list[str] = field(default_factory=list)
     readiness_report: Any = None
@@ -89,6 +91,8 @@ class RebootV2Runtime:
         self.started_at = current.isoformat()
         snapshot = self._base_snapshot(current, status="WARMUP")
         self._attach_strategy_baseline(snapshot, current, runtime_cycle_count=0)
+        self._attach_candidate_funnel(snapshot, current)
+        self._attach_trading_day_qualification(snapshot, current)
         snapshot["blocking_reason"] = "WAITING_FOR_FIRST_RUNTIME_CYCLE"
         snapshot["next_required_action"] = "RUN_RUNTIME_CYCLE"
         self.last_snapshot = snapshot
@@ -162,6 +166,8 @@ class RebootV2Runtime:
         self._run_pipeline(snapshot, "order_manager_v2", self.order_manager_pipeline, current)
 
         self._attach_counts(snapshot, current)
+        self._attach_candidate_funnel(snapshot, current)
+        self._attach_trading_day_qualification(snapshot, current)
         snapshot["order_manager"] = snapshot.get("order_manager_v2") or _disabled_section("ORDER_MANAGER_DISABLED_IN_V2_OBSERVE")
         snapshot["legacy_runtime"] = {
             "enabled": False,
@@ -654,6 +660,69 @@ class RebootV2Runtime:
             or {}
         )
         snapshot["strategy_baseline"] = section
+        for warning in list(section.get("warning_codes") or []):
+            if warning not in snapshot.setdefault("warnings", []):
+                snapshot["warnings"].append(warning)
+
+    def _attach_candidate_funnel(self, snapshot: dict[str, Any], now: datetime) -> None:
+        service = self.candidate_funnel_service
+        if service is None:
+            snapshot["candidate_funnel"] = {
+                "enabled": False,
+                "status": "DISABLED",
+                "candidate_episode_count": 0,
+                "champion_forming_count": 0,
+                "champion_matched_count": 0,
+                "champion_context_eligible_count": 0,
+                "champion_valid_observe_count": 0,
+                "invariant_violation_count": 0,
+                "checked_at": now.isoformat(),
+            }
+            return
+        builder = getattr(service, "runtime_section", None)
+        if not callable(builder):
+            snapshot["candidate_funnel"] = {"enabled": False, "status": "DISABLED", "checked_at": now.isoformat()}
+            return
+        section = dict(
+            builder(
+                trade_date=now.date().isoformat(),
+                as_of=now,
+                baseline=dict(snapshot.get("strategy_baseline") or {}),
+            )
+            or {}
+        )
+        snapshot["candidate_funnel"] = section
+        for warning in list(section.get("warning_codes") or []):
+            if warning not in snapshot.setdefault("warnings", []):
+                snapshot["warnings"].append(warning)
+
+    def _attach_trading_day_qualification(self, snapshot: dict[str, Any], now: datetime) -> None:
+        service = self.trading_day_qualification_service
+        if service is None:
+            snapshot["trading_day_qualification"] = {
+                "enabled": False,
+                "status": "DISABLED",
+                "report_state": "LIVE_PREVIEW",
+                "qualification_status": "COLLECTING",
+                "qualification_score": 0,
+                "strict_sample_eligible": False,
+                "checked_at": now.isoformat(),
+            }
+            return
+        builder = getattr(service, "runtime_section", None)
+        if not callable(builder):
+            snapshot["trading_day_qualification"] = {"enabled": False, "status": "DISABLED", "checked_at": now.isoformat()}
+            return
+        section = dict(
+            builder(
+                trade_date=now.date().isoformat(),
+                as_of=now,
+                runtime_snapshot=snapshot,
+                funnel_report=dict(getattr(self.candidate_funnel_service, "last_full_report", None) or snapshot.get("candidate_funnel") or {}),
+            )
+            or {}
+        )
+        snapshot["trading_day_qualification"] = section
         for warning in list(section.get("warning_codes") or []):
             if warning not in snapshot.setdefault("warnings", []):
                 snapshot["warnings"].append(warning)

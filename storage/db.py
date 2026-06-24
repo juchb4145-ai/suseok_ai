@@ -1075,6 +1075,90 @@ class TradingDatabase:
                 ON strategy_baseline_sessions(trade_date, baseline_id, baseline_version);
             CREATE INDEX IF NOT EXISTS idx_strategy_baseline_sessions_drift
                 ON strategy_baseline_sessions(drift_status, last_checked_at);
+            CREATE TABLE IF NOT EXISTS candidate_funnel_episode_latest (
+                trade_date TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                candidate_id INTEGER,
+                candidate_generation_seq INTEGER NOT NULL DEFAULT 0,
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                max_stage_ordinal INTEGER NOT NULL DEFAULT -1,
+                current_stage TEXT NOT NULL DEFAULT '',
+                stop_stage TEXT NOT NULL DEFAULT '',
+                primary_reason TEXT NOT NULL DEFAULT '',
+                stop_reason_family TEXT NOT NULL DEFAULT '',
+                attribution_confidence TEXT NOT NULL DEFAULT '',
+                baseline_role TEXT NOT NULL DEFAULT '',
+                stage_json TEXT NOT NULL DEFAULT '{}',
+                fingerprint TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY(trade_date, candidate_instance_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_candidate_funnel_episode_stage
+                ON candidate_funnel_episode_latest(trade_date, current_stage, stop_stage);
+            CREATE INDEX IF NOT EXISTS idx_candidate_funnel_episode_code
+                ON candidate_funnel_episode_latest(trade_date, code);
+            CREATE TABLE IF NOT EXISTS candidate_funnel_reports (
+                report_id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL DEFAULT '',
+                report_state TEXT NOT NULL DEFAULT '',
+                baseline_id TEXT NOT NULL DEFAULT '',
+                baseline_version TEXT NOT NULL DEFAULT '',
+                config_hash TEXT NOT NULL DEFAULT '',
+                git_sha TEXT NOT NULL DEFAULT '',
+                revision INTEGER NOT NULL DEFAULT 0,
+                report_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finalized_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_candidate_funnel_reports_trade
+                ON candidate_funnel_reports(trade_date, report_state, revision);
+            CREATE TABLE IF NOT EXISTS trading_day_qualification_reports (
+                report_id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL DEFAULT '',
+                baseline_id TEXT NOT NULL DEFAULT '',
+                baseline_version TEXT NOT NULL DEFAULT '',
+                config_hash TEXT NOT NULL DEFAULT '',
+                git_sha TEXT NOT NULL DEFAULT '',
+                report_state TEXT NOT NULL DEFAULT '',
+                qualification_status TEXT NOT NULL DEFAULT '',
+                qualification_score INTEGER NOT NULL DEFAULT 0,
+                strict_sample_eligible INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 0,
+                source_cutoff_at TEXT NOT NULL DEFAULT '',
+                supersedes_report_id TEXT NOT NULL DEFAULT '',
+                report_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finalized_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_trading_day_qualification_trade
+                ON trading_day_qualification_reports(trade_date, report_state, revision);
+            CREATE TABLE IF NOT EXISTS ops_runtime_health_samples (
+                trade_date TEXT NOT NULL,
+                bucket_at TEXT NOT NULL,
+                sampled_at TEXT NOT NULL DEFAULT '',
+                runtime_cycle_count INTEGER NOT NULL DEFAULT 0,
+                runtime_status TEXT NOT NULL DEFAULT '',
+                runtime_profile TEXT NOT NULL DEFAULT '',
+                market_context_source TEXT NOT NULL DEFAULT '',
+                market_context_available INTEGER NOT NULL DEFAULT 0,
+                dashboard_generation INTEGER NOT NULL DEFAULT 0,
+                dashboard_checksum TEXT NOT NULL DEFAULT '',
+                dashboard_namespace TEXT NOT NULL DEFAULT '',
+                candidate_episode_count INTEGER NOT NULL DEFAULT 0,
+                evaluation_eligible_count INTEGER NOT NULL DEFAULT 0,
+                active_subscription_count INTEGER NOT NULL DEFAULT 0,
+                fresh_realtime_ready_count INTEGER NOT NULL DEFAULT 0,
+                champion_forming_count INTEGER NOT NULL DEFAULT 0,
+                champion_matched_count INTEGER NOT NULL DEFAULT 0,
+                champion_valid_observe_count INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, bucket_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ops_runtime_health_samples_trade
+                ON ops_runtime_health_samples(trade_date, sampled_at);
             CREATE TABLE IF NOT EXISTS setup_router_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -15749,6 +15833,351 @@ class TradingDatabase:
         params.append(max(1, int(limit or 100)))
         return [_row_to_strategy_baseline_session(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
 
+    def save_candidate_funnel_episodes(self, episodes: Iterable[dict]) -> dict:
+        rows = [dict(item or {}) for item in episodes or []]
+        written = 0
+        skipped = 0
+        with self._write_scope():
+            for payload in rows:
+                trade_date = str(payload.get("trade_date") or "")
+                candidate_instance_id = str(payload.get("candidate_instance_id") or "")
+                if not trade_date or not candidate_instance_id:
+                    continue
+                fingerprint = str(payload.get("fingerprint") or "")
+                existing = self.conn.execute(
+                    """
+                    SELECT fingerprint, max_stage_ordinal, stage_json
+                    FROM candidate_funnel_episode_latest
+                    WHERE trade_date = ? AND candidate_instance_id = ?
+                    """,
+                    (trade_date, candidate_instance_id),
+                ).fetchone()
+                existing_stage = _safe_json_loads(existing["stage_json"], {}) if existing else {}
+                existing_max = _safe_int(existing["max_stage_ordinal"], -1) if existing else -1
+                current_max = max(existing_max, _safe_int(payload.get("max_stage_ordinal"), -1))
+                merged_stage = _merge_candidate_funnel_stage(existing_stage, payload)
+                if existing and fingerprint and str(existing["fingerprint"] or "") == fingerprint and current_max == existing_max:
+                    skipped += 1
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO candidate_funnel_episode_latest(
+                        trade_date, candidate_instance_id, candidate_id,
+                        candidate_generation_seq, code, name, max_stage_ordinal,
+                        current_stage, stop_stage, primary_reason, stop_reason_family,
+                        attribution_confidence, baseline_role, stage_json, fingerprint,
+                        updated_at, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(trade_date, candidate_instance_id) DO UPDATE SET
+                        candidate_id=excluded.candidate_id,
+                        candidate_generation_seq=excluded.candidate_generation_seq,
+                        code=excluded.code,
+                        name=excluded.name,
+                        max_stage_ordinal=MAX(candidate_funnel_episode_latest.max_stage_ordinal, excluded.max_stage_ordinal),
+                        current_stage=excluded.current_stage,
+                        stop_stage=excluded.stop_stage,
+                        primary_reason=excluded.primary_reason,
+                        stop_reason_family=excluded.stop_reason_family,
+                        attribution_confidence=excluded.attribution_confidence,
+                        baseline_role=excluded.baseline_role,
+                        stage_json=excluded.stage_json,
+                        fingerprint=excluded.fingerprint,
+                        updated_at=excluded.updated_at,
+                        payload_json=excluded.payload_json
+                    """,
+                    (
+                        trade_date,
+                        candidate_instance_id,
+                        payload.get("candidate_id"),
+                        _safe_int(payload.get("candidate_generation_seq"), 0),
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("name") or ""),
+                        current_max,
+                        str(payload.get("current_stage") or ""),
+                        str(payload.get("stop_stage") or ""),
+                        str(payload.get("primary_reason_code") or payload.get("primary_reason") or ""),
+                        str(payload.get("stop_reason_family") or ""),
+                        str(payload.get("attribution_confidence") or ""),
+                        str(payload.get("baseline_role") or ""),
+                        _json_payload(merged_stage),
+                        fingerprint,
+                        str(payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                        _json_payload(payload),
+                    ),
+                )
+                written += 1
+        return {"written": written, "skipped": skipped}
+
+    def list_candidate_funnel_episodes(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        stage: Optional[str] = None,
+        stop_stage: Optional[str] = None,
+        reason_family: Optional[str] = None,
+        baseline_role: Optional[str] = None,
+        attribution_confidence: Optional[str] = None,
+        code: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if stage:
+            clauses.append("current_stage = ?")
+            params.append(str(stage))
+        if stop_stage:
+            clauses.append("stop_stage = ?")
+            params.append(str(stop_stage))
+        if reason_family:
+            clauses.append("stop_reason_family = ?")
+            params.append(str(reason_family))
+        if baseline_role:
+            clauses.append("baseline_role = ?")
+            params.append(str(baseline_role))
+        if attribution_confidence:
+            clauses.append("attribution_confidence = ?")
+            params.append(str(attribution_confidence))
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        query = "SELECT * FROM candidate_funnel_episode_latest"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY max_stage_ordinal DESC, updated_at DESC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 100)), max(0, int(offset or 0))])
+        return [_row_to_candidate_funnel_episode(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def get_candidate_funnel_episode(self, trade_date: str, candidate_instance_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM candidate_funnel_episode_latest
+            WHERE trade_date = ? AND candidate_instance_id = ?
+            """,
+            (str(trade_date or ""), str(candidate_instance_id or "")),
+        ).fetchone()
+        return _row_to_candidate_funnel_episode(row) if row else None
+
+    def save_candidate_funnel_report(self, payload: dict) -> dict:
+        report = dict(payload or {})
+        report_id = str(report.get("report_id") or "")
+        state = str(report.get("report_state") or "")
+        revision = _safe_int(report.get("revision"), 0)
+        if state == "FINAL" and revision <= 0:
+            row = self.conn.execute(
+                """
+                SELECT MAX(revision) AS revision
+                FROM candidate_funnel_reports
+                WHERE trade_date = ? AND report_state = 'FINAL'
+                """,
+                (str(report.get("trade_date") or ""),),
+            ).fetchone()
+            revision = _safe_int(row["revision"], 0) + 1 if row else 1
+            report["revision"] = revision
+            report_id = f"{report_id}:r{revision}" if f":r{revision}" not in report_id else report_id
+            report["report_id"] = report_id
+        with self._write_scope():
+            self.conn.execute(
+                """
+                INSERT INTO candidate_funnel_reports(
+                    report_id, trade_date, report_state, baseline_id,
+                    baseline_version, config_hash, git_sha, revision,
+                    report_json, finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_id) DO UPDATE SET
+                    report_json=excluded.report_json
+                """,
+                (
+                    report_id,
+                    str(report.get("trade_date") or ""),
+                    state,
+                    str(report.get("baseline_id") or ""),
+                    str(report.get("baseline_version") or ""),
+                    str(report.get("config_hash") or ""),
+                    str(report.get("git_sha") or ""),
+                    revision,
+                    _json_payload(report),
+                    str(report.get("finalized_at") or ""),
+                ),
+            )
+        return self.get_candidate_funnel_report(report_id) or report
+
+    def get_candidate_funnel_report(self, report_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM candidate_funnel_reports WHERE report_id = ?",
+            (str(report_id or ""),),
+        ).fetchone()
+        return _row_to_candidate_funnel_report(row) if row else None
+
+    def list_candidate_funnel_reports(self, *, trade_date: Optional[str] = None, report_state: Optional[str] = None, limit: int = 20) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if report_state:
+            clauses.append("report_state = ?")
+            params.append(str(report_state))
+        query = "SELECT * FROM candidate_funnel_reports"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, revision DESC LIMIT ?"
+        params.append(max(1, int(limit or 20)))
+        return [_row_to_candidate_funnel_report(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def save_trading_day_qualification_report(self, payload: dict) -> dict:
+        report = dict(payload or {})
+        state = str(report.get("report_state") or "")
+        revision = _safe_int(report.get("revision"), 0)
+        if state == "FINAL":
+            row = self.conn.execute(
+                """
+                SELECT MAX(revision) AS revision
+                FROM trading_day_qualification_reports
+                WHERE trade_date = ? AND report_state = 'FINAL'
+                """,
+                (str(report.get("trade_date") or ""),),
+            ).fetchone()
+            revision = max(1, _safe_int(row["revision"], 0) + 1 if row else 1) if revision <= 0 else revision
+            report["revision"] = revision
+            report["report_id"] = f"{report.get('report_id')}:r{revision}" if f":r{revision}" not in str(report.get("report_id") or "") else str(report.get("report_id") or "")
+        report_id = str(report.get("report_id") or "")
+        with self._write_scope():
+            self.conn.execute(
+                """
+                INSERT INTO trading_day_qualification_reports(
+                    report_id, trade_date, baseline_id, baseline_version,
+                    config_hash, git_sha, report_state, qualification_status,
+                    qualification_score, strict_sample_eligible, revision,
+                    source_cutoff_at, supersedes_report_id, report_json, finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_id) DO UPDATE SET
+                    qualification_status=excluded.qualification_status,
+                    qualification_score=excluded.qualification_score,
+                    strict_sample_eligible=excluded.strict_sample_eligible,
+                    source_cutoff_at=excluded.source_cutoff_at,
+                    report_json=excluded.report_json
+                """,
+                (
+                    report_id,
+                    str(report.get("trade_date") or ""),
+                    str(report.get("baseline_id") or ""),
+                    str(report.get("baseline_version") or ""),
+                    str(report.get("config_hash") or ""),
+                    str(report.get("git_sha") or ""),
+                    state,
+                    str(report.get("qualification_status") or ""),
+                    _safe_int(report.get("qualification_score"), 0),
+                    int(bool(report.get("strict_sample_eligible"))),
+                    revision,
+                    str(report.get("source_cutoff_at") or ""),
+                    str(report.get("supersedes_report_id") or ""),
+                    _json_payload(report),
+                    str(report.get("finalized_at") or ""),
+                ),
+            )
+        return self.get_trading_day_qualification_report(report_id) or report
+
+    def get_trading_day_qualification_report(self, report_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM trading_day_qualification_reports WHERE report_id = ?",
+            (str(report_id or ""),),
+        ).fetchone()
+        return _row_to_trading_day_qualification_report(row) if row else None
+
+    def list_trading_day_qualification_reports(self, *, trade_date: Optional[str] = None, report_state: Optional[str] = None, limit: int = 20) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if report_state:
+            clauses.append("report_state = ?")
+            params.append(str(report_state))
+        query = "SELECT * FROM trading_day_qualification_reports"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, revision DESC LIMIT ?"
+        params.append(max(1, int(limit or 20)))
+        return [_row_to_trading_day_qualification_report(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def save_ops_runtime_health_sample(self, payload: dict) -> dict:
+        item = dict(payload or {})
+        with self._write_scope():
+            self.conn.execute(
+                """
+                INSERT INTO ops_runtime_health_samples(
+                    trade_date, bucket_at, sampled_at, runtime_cycle_count,
+                    runtime_status, runtime_profile, market_context_source,
+                    market_context_available, dashboard_generation, dashboard_checksum,
+                    dashboard_namespace, candidate_episode_count,
+                    evaluation_eligible_count, active_subscription_count,
+                    fresh_realtime_ready_count, champion_forming_count,
+                    champion_matched_count, champion_valid_observe_count,
+                    payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(trade_date, bucket_at) DO UPDATE SET
+                    sampled_at=excluded.sampled_at,
+                    runtime_cycle_count=excluded.runtime_cycle_count,
+                    runtime_status=excluded.runtime_status,
+                    runtime_profile=excluded.runtime_profile,
+                    market_context_source=excluded.market_context_source,
+                    market_context_available=excluded.market_context_available,
+                    dashboard_generation=excluded.dashboard_generation,
+                    dashboard_checksum=excluded.dashboard_checksum,
+                    dashboard_namespace=excluded.dashboard_namespace,
+                    candidate_episode_count=excluded.candidate_episode_count,
+                    evaluation_eligible_count=excluded.evaluation_eligible_count,
+                    active_subscription_count=excluded.active_subscription_count,
+                    fresh_realtime_ready_count=excluded.fresh_realtime_ready_count,
+                    champion_forming_count=excluded.champion_forming_count,
+                    champion_matched_count=excluded.champion_matched_count,
+                    champion_valid_observe_count=excluded.champion_valid_observe_count,
+                    payload_json=excluded.payload_json,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    str(item.get("trade_date") or ""),
+                    str(item.get("bucket_at") or ""),
+                    str(item.get("sampled_at") or ""),
+                    _safe_int(item.get("runtime_cycle_count"), 0),
+                    str(item.get("runtime_status") or ""),
+                    str(item.get("runtime_profile") or ""),
+                    str(item.get("market_context_source") or ""),
+                    int(bool(item.get("market_context_available"))),
+                    _safe_int(item.get("dashboard_generation"), 0),
+                    str(item.get("dashboard_checksum") or ""),
+                    str(item.get("dashboard_namespace") or ""),
+                    _safe_int(item.get("candidate_episode_count"), 0),
+                    _safe_int(item.get("evaluation_eligible_count"), 0),
+                    _safe_int(item.get("active_subscription_count"), 0),
+                    _safe_int(item.get("fresh_realtime_ready_count"), 0),
+                    _safe_int(item.get("champion_forming_count"), 0),
+                    _safe_int(item.get("champion_matched_count"), 0),
+                    _safe_int(item.get("champion_valid_observe_count"), 0),
+                    _json_payload(item.get("payload") or item),
+                ),
+            )
+        row = self.conn.execute(
+            "SELECT * FROM ops_runtime_health_samples WHERE trade_date = ? AND bucket_at = ?",
+            (str(item.get("trade_date") or ""), str(item.get("bucket_at") or "")),
+        ).fetchone()
+        return _row_to_ops_runtime_health_sample(row) if row else item
+
+    def list_ops_runtime_health_samples(self, *, trade_date: Optional[str] = None, limit: int = 1000) -> list[dict]:
+        query = "SELECT * FROM ops_runtime_health_samples"
+        params: list[object] = []
+        if trade_date:
+            query += " WHERE trade_date = ?"
+            params.append(str(trade_date))
+        query += " ORDER BY bucket_at ASC LIMIT ?"
+        params.append(max(1, int(limit or 1000)))
+        return [_row_to_ops_runtime_health_sample(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
     def load_strategy_runtime_setting(self, config_key: str) -> Optional[dict]:
         row = self.conn.execute(
             "SELECT * FROM strategy_runtime_settings WHERE config_key = ?",
@@ -21255,6 +21684,77 @@ def _row_to_strategy_baseline_session(row: sqlite3.Row) -> dict:
         payload.update(data)
         payload.setdefault("drift_paths", data["drift_paths"])
         return payload
+    return data
+
+
+def _merge_candidate_funnel_stage(existing_stage: object, payload: dict) -> dict:
+    existing = existing_stage if isinstance(existing_stage, dict) else {}
+    stage_first = dict(existing.get("stage_first_reached_at") or {})
+    stage_last = dict(existing.get("stage_last_seen_at") or {})
+    stage_attempts = dict(existing.get("stage_attempt_counts") or {})
+    for key, value in dict(payload.get("stage_first_reached_at") or {}).items():
+        text = str(value or "")
+        if text and (not stage_first.get(key) or text < str(stage_first.get(key))):
+            stage_first[key] = text
+        elif key not in stage_first:
+            stage_first[key] = text
+    for key, value in dict(payload.get("stage_last_seen_at") or {}).items():
+        text = str(value or "")
+        if text and text > str(stage_last.get(key) or ""):
+            stage_last[key] = text
+        elif key not in stage_last:
+            stage_last[key] = text
+    for key, value in dict(payload.get("stage_attempt_counts") or {}).items():
+        stage_attempts[key] = max(_safe_int(stage_attempts.get(key), 0), _safe_int(value, 0))
+    reached = _dedupe([*list(existing.get("reached_stages") or []), *list(payload.get("reached_stages") or [])])
+    return {
+        "reached_stages": reached,
+        "stage_first_reached_at": stage_first,
+        "stage_last_seen_at": stage_last,
+        "stage_attempt_counts": stage_attempts,
+    }
+
+
+def _row_to_candidate_funnel_episode(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    stage = _safe_json_loads(data.pop("stage_json", "{}"), {})
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.update(data)
+    if isinstance(stage, dict):
+        payload.setdefault("reached_stages", stage.get("reached_stages") or [])
+        payload.setdefault("stage_first_reached_at", stage.get("stage_first_reached_at") or {})
+        payload.setdefault("stage_last_seen_at", stage.get("stage_last_seen_at") or {})
+        payload.setdefault("stage_attempt_counts", stage.get("stage_attempt_counts") or {})
+    payload.setdefault("primary_reason_code", data.get("primary_reason", ""))
+    return payload
+
+
+def _row_to_candidate_funnel_report(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("report_json", "{}"), {})
+    if isinstance(payload, dict):
+        payload.update(data)
+        return payload
+    return data
+
+
+def _row_to_trading_day_qualification_report(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["strict_sample_eligible"] = bool(data.get("strict_sample_eligible"))
+    payload = _safe_json_loads(data.pop("report_json", "{}"), {})
+    if isinstance(payload, dict):
+        payload.update(data)
+        return payload
+    return data
+
+
+def _row_to_ops_runtime_health_sample(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["market_context_available"] = bool(data.get("market_context_available"))
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    data["payload"] = payload if isinstance(payload, dict) else {}
     return data
 
 

@@ -33,6 +33,7 @@ $env:STRATEGY_RUNTIME_PROFILE="LEGACY"
 ```
 
 Strategy baseline freeze details: [docs/strategy_baseline_freeze_v1.md](docs/strategy_baseline_freeze_v1.md).
+Trading day qualification and canonical candidate funnel details: [docs/trading_day_qualification_candidate_funnel_v1.md](docs/trading_day_qualification_candidate_funnel_v1.md).
 
 주요 Core 환경변수:
 

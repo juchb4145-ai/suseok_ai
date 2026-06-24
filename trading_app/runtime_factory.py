@@ -46,6 +46,12 @@ from trading.strategy.strategy_baseline import (
     StrategyBaselineService,
     build_strategy_baseline_snapshot,
 )
+from trading.strategy.candidate_funnel import (
+    CandidateFunnelConfig,
+    CandidateFunnelService,
+    TradingDayQualificationConfig,
+    TradingDayQualificationService,
+)
 from trading.strategy.subscription_lifecycle import RealtimeSubscriptionLifecycleTracker
 from trading.strategy.subscription_readiness import RealtimeSubscriptionReadinessProvider
 from trading.strategy.setup_runtime import SetupRouterV3RuntimePipeline
@@ -107,6 +113,8 @@ class CoreRuntimeBundle:
     order_manager_pipeline: Any = None
     subscription_lifecycle_tracker: Any = None
     strategy_baseline_service: Any = None
+    candidate_funnel_service: Any = None
+    trading_day_qualification_service: Any = None
 
 
 def build_core_strategy_runtime(
@@ -498,6 +506,14 @@ def build_reboot_v2_runtime_bundle(
         ),
     )
     setup_router_v3_pipeline.baseline_section_provider = lambda: baseline_service.last_result
+    candidate_funnel_service = CandidateFunnelService(
+        db=db,
+        config=CandidateFunnelConfig.from_env(),
+    )
+    trading_day_qualification_service = TradingDayQualificationService(
+        db=db,
+        config=TradingDayQualificationConfig.from_env(),
+    )
     expansion_lease_manager = ExpansionLeaseManager()
     runtime = RebootV2Runtime(
         db=db,
@@ -524,6 +540,8 @@ def build_reboot_v2_runtime_bundle(
         order_manager_pipeline=order_manager_pipeline,
         expansion_lease_manager=expansion_lease_manager,
         strategy_baseline_service=baseline_service,
+        candidate_funnel_service=candidate_funnel_service,
+        trading_day_qualification_service=trading_day_qualification_service,
     )
     readiness_report = build_readiness_report(
         db,
@@ -561,6 +579,8 @@ def build_reboot_v2_runtime_bundle(
         order_manager_pipeline=order_manager_pipeline,
         subscription_lifecycle_tracker=subscription_lifecycle_tracker,
         strategy_baseline_service=baseline_service,
+        candidate_funnel_service=candidate_funnel_service,
+        trading_day_qualification_service=trading_day_qualification_service,
     )
 
 
