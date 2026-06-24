@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-DEFAULT_ROUTER_VERSION = "setup_router_v3.5"
+DEFAULT_ROUTER_VERSION = "setup_router_v3.5.1"
 
 
 def main(argv: list[str] | None = None) -> int:

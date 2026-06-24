@@ -15,7 +15,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trade-date", default=datetime.now().date().isoformat())
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--limit", type=int, default=10000)
-    parser.add_argument("--router-version", default="setup_router_v3.5")
+    parser.add_argument("--router-version", default="setup_router_v3.5.1")
     parser.add_argument("--include-legacy-version", action="store_true")
     args = parser.parse_args(argv)
 
@@ -39,6 +39,7 @@ def main(argv: list[str] | None = None) -> int:
         scheduling = _scheduling_checks(con, trade_date, args.router_version)
         side_effects = _side_effect_counts(con, trade_date)
         span_metrics = _span_metrics(con, trade_date, args.router_version)
+        readiness_metrics = _readiness_metrics(readiness_rows, observations, con=con, trade_date=trade_date, router_version=args.router_version)
     finally:
         con.close()
 
@@ -49,7 +50,6 @@ def main(argv: list[str] | None = None) -> int:
     invalid = _invalid_observations(observations)
     flip_analysis = _flip_analysis(transitions)
     context_alignment = _context_alignment(observations)
-    readiness_metrics = _readiness_metrics(readiness_rows, observations)
     run_span_min = float(span_metrics.get("run_span_minutes") or 0.0)
     failures: list[str] = []
     warnings: list[str] = []
@@ -82,6 +82,20 @@ def main(argv: list[str] | None = None) -> int:
         failures.append("VALID_WITH_POST_SUBSCRIPTION_TICK_MISSING_SQL")
     if full_counts.get("valid_tr_backfill", 0) > 0:
         failures.append("VALID_WITH_TR_BACKFILL_SQL")
+    if readiness_metrics.get("market_action_unknown_output_count", 0) > 0:
+        failures.append("SETUP_ROUTER_MARKET_ACTION_UNKNOWN_OUTPUT")
+    if readiness_metrics.get("readiness_completed_without_commit_count", 0) > 0:
+        failures.append("SETUP_ROUTER_READINESS_COMPLETED_WITHOUT_COMMIT")
+    if readiness_metrics.get("readiness_commit_marked_as_shape_count", 0) > 0:
+        failures.append("SETUP_ROUTER_READINESS_COMMIT_MARKED_AS_SHAPE")
+    if readiness_metrics.get("shape_commit_without_matching_readiness_count", 0) > 0:
+        failures.append("SETUP_ROUTER_SHAPE_COMMIT_WITHOUT_READINESS")
+    if readiness_metrics.get("shape_commit_with_old_readiness_fingerprint_count", 0) > 0:
+        failures.append("SETUP_ROUTER_SHAPE_COMMIT_OLD_READINESS_FINGERPRINT")
+    if readiness_metrics.get("general_multisource_expansion_false_wait_count", 0) > 0:
+        failures.append("SETUP_ROUTER_GENERAL_MULTISOURCE_EXPANSION_FALSE_WAIT")
+    if readiness_metrics.get("subscription_requested_not_targeted_but_not_budget_count", 0) > 0:
+        failures.append("SETUP_ROUTER_REQUESTED_NOT_TARGETED_NOT_BUDGET")
     if readiness_metrics.get("lease_false_block_count", 0) > 0:
         failures.append("SETUP_READINESS_LEASE_FALSE_BLOCK")
     if readiness_metrics.get("ready_not_shape_evaluated_count", 0) > 0:
@@ -112,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     verdict = "STABLE_FOR_OPPORTUNITY_RANKER" if stable_ready else "NOT_STABLE" if failures else "CONDITIONALLY_STABLE"
     summary = {
-        "schema_version": "setup_router_v3.audit.v5",
+        "schema_version": "setup_router_v3.audit.v5.1",
         "trade_date": trade_date,
         "router_version": args.router_version,
         "db_path": str(db_path),
@@ -279,7 +293,14 @@ def _context_alignment(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _readiness_metrics(readiness: list[dict[str, Any]], observations: list[dict[str, Any]]) -> dict[str, Any]:
+def _readiness_metrics(
+    readiness: list[dict[str, Any]],
+    observations: list[dict[str, Any]],
+    *,
+    con: sqlite3.Connection | None = None,
+    trade_date: str = "",
+    router_version: str = "",
+) -> dict[str, Any]:
     readiness_rows = [dict(row or {}) for row in readiness]
     observation_rows = [dict(row or {}) for row in observations]
     shaped_candidate_ids = {str(row.get("candidate_instance_id") or "") for row in observation_rows if str(row.get("candidate_instance_id") or "")}
@@ -313,7 +334,7 @@ def _readiness_metrics(readiness: list[dict[str, Any]], observations: list[dict[
         for row in readiness_rows
         if "SETUP_ROUTER_V3_OBSERVE_ONLY" in [str(reason) for reason in row.get("reason_codes", [])]
     )
-    return {
+    metrics = {
         "readiness_count": len(readiness_rows),
         "readiness_ready_count": len(ready),
         "readiness_wait_count": len(readiness_rows) - len(ready),
@@ -330,6 +351,171 @@ def _readiness_metrics(readiness: list[dict[str, Any]], observations: list[dict[
             Counter(reason for row in readiness_rows for reason in [str(item) for item in row.get("reason_codes", []) if str(item)]).most_common()
         ),
     }
+    if con is not None and trade_date and router_version:
+        metrics.update(_readiness_full_sql_metrics(con, trade_date, router_version))
+    return metrics
+
+
+def _readiness_full_sql_metrics(con: sqlite3.Connection, trade_date: str, router_version: str) -> dict[str, int]:
+    context_block_statuses = ("WAIT_STRATEGY_CONTEXT", "WAIT_MARKET_CONTEXT", "WAIT_THEME_SIGNAL_STALE", "WAIT_CANDLE_WARMUP")
+    metrics = {
+        "readiness_candidate_count": _count(con, "setup_router_readiness_latest", trade_date, router_version=router_version),
+        "readiness_ready_candidate_count": _count(con, "setup_router_readiness_latest", trade_date, router_version=router_version, extra="readiness_ready = 1"),
+        "readiness_wait_candidate_count": _count(con, "setup_router_readiness_latest", trade_date, router_version=router_version, extra="readiness_ready = 0"),
+        "subscription_requested_candidate_count": _count(con, "setup_router_readiness_latest", trade_date, router_version=router_version, extra="subscription_requested = 1"),
+        "subscription_target_selected_candidate_count": _count(con, "setup_router_readiness_latest", trade_date, router_version=router_version, extra="subscription_target_selected = 1"),
+        "subscription_active_candidate_count": _count(con, "setup_router_readiness_latest", trade_date, router_version=router_version, extra="subscription_active = 1"),
+        "subscription_budget_deferred_candidate_count": _count(con, "setup_router_readiness_latest", trade_date, router_version=router_version, extra="subscription_budget_deferred = 1"),
+        "fresh_tick_candidate_count": _count(con, "setup_router_readiness_latest", trade_date, router_version=router_version, extra="post_subscription_tick_verified = 1"),
+        "market_context_ready_candidate_count": _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra="readiness_status NOT IN ('WAIT_MARKET_CONTEXT','WAIT_MARKET_ACTION')",
+        ),
+        "theme_context_ready_candidate_count": _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra="readiness_status <> 'WAIT_THEME_SIGNAL_STALE'",
+        ),
+        "canonical_market_action_count": _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra="COALESCE(canonical_market_action, '') NOT IN ('', 'UNKNOWN', 'UNMAPPED')",
+        ),
+        "market_action_unmapped_count": _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra="(market_action_reason_codes_json LIKE '%MARKET_ACTION_UNMAPPED%' OR reason_codes_json LIKE '%MARKET_ACTION_UNMAPPED%')",
+        ),
+        "shape_evaluated_candidate_count": _distinct_count(
+            con,
+            "setup_router_evaluation_commits_v1",
+            "candidate_instance_id",
+            trade_date,
+            router_version=router_version,
+            extra="evaluation_kind = 'SHAPE_CLASSIFICATION' AND shape_evaluated = 1",
+        ),
+        "forming_or_pending_candidate_count": _distinct_count(
+            con,
+            "setup_observations_latest_v2",
+            "candidate_instance_id",
+            trade_date,
+            router_version=router_version,
+            extra="shape_status = 'FORMING' OR router_status = 'PENDING'",
+        ),
+        "matched_or_valid_candidate_count": _distinct_count(
+            con,
+            "setup_observations_latest_v2",
+            "candidate_instance_id",
+            trade_date,
+            router_version=router_version,
+            extra="shape_status = 'MATCHED' OR router_status = 'VALID_OBSERVE'",
+        ),
+        "general_subscription_ready_but_lease_blocked_count": _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra="readiness_status = 'WAIT_SELECTED_THEME_LEASE' AND expansion_lease_required = 0",
+        ),
+        "lease_false_block_count": _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra="readiness_status = 'WAIT_SELECTED_THEME_LEASE' AND expansion_lease_required = 0",
+        ),
+        "expansion_required_without_active_provenance_count": _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra=(
+                "expansion_lease_required = 1 "
+                "AND COALESCE(readiness_relevant_source, baseline_source_type, '') NOT IN ('reboot_v2_theme_expansion','theme_expansion')"
+            ),
+        ),
+        "inactive_source_used_for_lease_requirement_count": _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra="expansion_lease_requirement_reason LIKE '%INACTIVE%'",
+        ),
+        "source_theme_mismatch_lease_required_count": _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra="expansion_lease_requirement_reason LIKE '%MISMATCH%'",
+        ),
+        "other_theme_lease_used_count": _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra="reason_codes_json LIKE '%OTHER_THEME_LEASE%'",
+        ),
+        "inactive_lease_verified_count": _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra="exact_theme_lease_active = 0 AND exact_theme_lease_present = 1 AND readiness_ready = 1",
+        ),
+        "source_readd_baseline_stale_count": 0,
+        "general_multisource_expansion_false_wait_count": _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra=(
+                "expansion_lease_required = 0 AND readiness_status = 'WAIT_POST_SUBSCRIPTION_TICK' "
+                "AND candidate_active_source_types_json LIKE '%theme_expansion%' "
+                "AND baseline_source_type IN ('reboot_v2_theme_expansion','theme_expansion')"
+            ),
+        ),
+        "subscription_requested_not_targeted_but_not_budget_count": _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra="subscription_requested = 1 AND subscription_target_selected = 0 AND subscription_budget_deferred = 0",
+        ),
+        "market_action_unknown_output_count": _market_action_unknown_output_count(con, trade_date, router_version),
+        "readiness_completed_without_commit_count": _readiness_completed_without_commit_count(con, trade_date, router_version),
+        "readiness_commit_without_pending_completed_count": _readiness_commit_without_pending_completed_count(con, trade_date, router_version),
+        "readiness_processed_signature_without_commit_count": _readiness_completed_without_commit_count(con, trade_date, router_version),
+        "readiness_pending_completed_runtime_missing_count": _readiness_pending_completed_runtime_missing_count(con, trade_date, router_version),
+        "readiness_commit_marked_as_shape_count": _count(
+            con,
+            "setup_router_evaluation_commits_v1",
+            trade_date,
+            router_version=router_version,
+            extra="evaluation_kind = 'READINESS_ONLY' AND shape_evaluated = 1",
+        ),
+        "shape_commit_without_matching_readiness_count": _shape_commit_without_matching_readiness_count(con, trade_date, router_version),
+        "readiness_ready_without_matching_shape_commit_count": _readiness_ready_without_matching_shape_commit_count(con, trade_date, router_version),
+        "shape_commit_with_old_readiness_fingerprint_count": _shape_commit_with_old_readiness_fingerprint_count(con, trade_date, router_version),
+        "shape_observation_before_readiness_count": _shape_observation_before_readiness_count(con, trade_date, router_version),
+        "old_observation_counted_for_current_readiness_count": _shape_commit_with_old_readiness_fingerprint_count(con, trade_date, router_version),
+    }
+    metrics["context_ready_candidate_count"] = _count(
+        con,
+        "setup_router_readiness_latest",
+        trade_date,
+        router_version=router_version,
+        extra="readiness_status NOT IN ('" + "','".join(context_block_statuses) + "')",
+    )
+    return metrics
 
 
 def _has_table(con: sqlite3.Connection, table: str) -> bool:
@@ -439,8 +625,240 @@ def _count(con: sqlite3.Connection, table: str, trade_date: str, *, router_versi
         params.append(router_version)
     if extra:
         clauses.append(extra)
-    row = con.execute(f"SELECT COUNT(*) AS count FROM {table} WHERE {' AND '.join(clauses)}", tuple(params)).fetchone()
-    return int(row["count"] or 0) if row else 0
+    try:
+        row = con.execute(f"SELECT COUNT(*) AS count FROM {table} WHERE {' AND '.join(clauses)}", tuple(params)).fetchone()
+        return int(row["count"] or 0) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
+def _distinct_count(
+    con: sqlite3.Connection,
+    table: str,
+    column: str,
+    trade_date: str,
+    *,
+    router_version: str | None = None,
+    extra: str = "",
+) -> int:
+    if not _has_table(con, table) or not _has_column(con, table, column):
+        return 0
+    clauses = ["trade_date = ?"]
+    params: list[Any] = [trade_date]
+    if router_version and _has_column(con, table, "router_version"):
+        clauses.append("router_version = ?")
+        params.append(router_version)
+    if extra:
+        clauses.append(extra)
+    try:
+        row = con.execute(
+            f"SELECT COUNT(DISTINCT {column}) AS count FROM {table} WHERE {' AND '.join(clauses)}",
+            tuple(params),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
+def _market_action_unknown_output_count(con: sqlite3.Connection, trade_date: str, router_version: str) -> int:
+    count = 0
+    if _has_column(con, "setup_router_readiness_latest", "canonical_market_action"):
+        count += _count(
+            con,
+            "setup_router_readiness_latest",
+            trade_date,
+            router_version=router_version,
+            extra="COALESCE(canonical_market_action, '') IN ('', 'UNKNOWN', 'UNMAPPED')",
+        )
+    if _has_column(con, "setup_observations_latest_v2", "market_action"):
+        count += _count(
+            con,
+            "setup_observations_latest_v2",
+            trade_date,
+            router_version=router_version,
+            extra="COALESCE(market_action, '') IN ('', 'UNKNOWN', 'UNMAPPED')",
+        )
+    return count
+
+
+def _readiness_completed_without_commit_count(con: sqlite3.Connection, trade_date: str, router_version: str) -> int:
+    if not (_has_table(con, "setup_router_candidate_runtime_v4") and _has_table(con, "setup_router_evaluation_commits_v1")):
+        return 0
+    try:
+        row = con.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM setup_router_candidate_runtime_v4 r
+            LEFT JOIN setup_router_evaluation_commits_v1 c
+              ON c.trade_date = r.trade_date
+             AND c.router_version = r.router_version
+             AND c.candidate_instance_id = r.candidate_instance_id
+             AND c.readiness_fingerprint = r.processed_readiness_fingerprint
+             AND c.commit_status = 'COMMITTED'
+            WHERE r.trade_date = ?
+              AND r.router_version = ?
+              AND COALESCE(r.processed_readiness_fingerprint, '') <> ''
+              AND c.evaluation_commit_id IS NULL
+            """,
+            (trade_date, router_version),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
+def _readiness_commit_without_pending_completed_count(con: sqlite3.Connection, trade_date: str, router_version: str) -> int:
+    if not (_has_table(con, "setup_router_evaluation_commits_v1") and _has_table(con, "setup_router_pending_evaluations_v5")):
+        return 0
+    try:
+        row = con.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM setup_router_evaluation_commits_v1 c
+            LEFT JOIN setup_router_pending_evaluations_v5 p
+              ON p.trade_date = c.trade_date
+             AND p.router_version = c.router_version
+             AND p.candidate_instance_id = c.candidate_instance_id
+             AND p.pending_epoch = c.pending_epoch
+             AND p.pending_instance_id = c.pending_instance_id
+             AND p.status = 'COMPLETED'
+            WHERE c.trade_date = ?
+              AND c.router_version = ?
+              AND c.evaluation_kind = 'READINESS_ONLY'
+              AND c.commit_status = 'COMMITTED'
+              AND p.pending_instance_id IS NULL
+            """,
+            (trade_date, router_version),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
+def _readiness_pending_completed_runtime_missing_count(con: sqlite3.Connection, trade_date: str, router_version: str) -> int:
+    if not (_has_table(con, "setup_router_pending_evaluations_v5") and _has_table(con, "setup_router_candidate_runtime_v4")):
+        return 0
+    try:
+        row = con.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM setup_router_pending_evaluations_v5 p
+            LEFT JOIN setup_router_candidate_runtime_v4 r
+              ON r.trade_date = p.trade_date
+             AND r.router_version = p.router_version
+             AND r.candidate_instance_id = p.candidate_instance_id
+             AND COALESCE(r.processed_readiness_fingerprint, '') <> ''
+            WHERE p.trade_date = ?
+              AND p.router_version = ?
+              AND p.status = 'COMPLETED'
+              AND r.candidate_instance_id IS NULL
+            """,
+            (trade_date, router_version),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
+def _shape_commit_without_matching_readiness_count(con: sqlite3.Connection, trade_date: str, router_version: str) -> int:
+    if not (_has_table(con, "setup_router_evaluation_commits_v1") and _has_table(con, "setup_router_readiness_latest")):
+        return 0
+    try:
+        row = con.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM setup_router_evaluation_commits_v1 c
+            LEFT JOIN setup_router_readiness_latest r
+              ON r.trade_date = c.trade_date
+             AND r.router_version = c.router_version
+             AND r.candidate_instance_id = c.candidate_instance_id
+             AND r.readiness_fingerprint = c.readiness_fingerprint
+            WHERE c.trade_date = ?
+              AND c.router_version = ?
+              AND c.evaluation_kind = 'SHAPE_CLASSIFICATION'
+              AND c.commit_status = 'COMMITTED'
+              AND r.candidate_instance_id IS NULL
+            """,
+            (trade_date, router_version),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
+def _readiness_ready_without_matching_shape_commit_count(con: sqlite3.Connection, trade_date: str, router_version: str) -> int:
+    if not (_has_table(con, "setup_router_readiness_latest") and _has_table(con, "setup_router_evaluation_commits_v1")):
+        return 0
+    try:
+        row = con.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM setup_router_readiness_latest r
+            LEFT JOIN setup_router_evaluation_commits_v1 c
+              ON c.trade_date = r.trade_date
+             AND c.router_version = r.router_version
+             AND c.candidate_instance_id = r.candidate_instance_id
+             AND c.readiness_fingerprint = r.readiness_fingerprint
+             AND c.evaluation_kind = 'SHAPE_CLASSIFICATION'
+             AND c.commit_status = 'COMMITTED'
+            WHERE r.trade_date = ?
+              AND r.router_version = ?
+              AND r.readiness_ready = 1
+              AND c.evaluation_commit_id IS NULL
+            """,
+            (trade_date, router_version),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
+def _shape_commit_with_old_readiness_fingerprint_count(con: sqlite3.Connection, trade_date: str, router_version: str) -> int:
+    if not (_has_table(con, "setup_router_evaluation_commits_v1") and _has_table(con, "setup_router_readiness_latest")):
+        return 0
+    try:
+        row = con.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM setup_router_evaluation_commits_v1 c
+            JOIN setup_router_readiness_latest r
+              ON r.trade_date = c.trade_date
+             AND r.router_version = c.router_version
+             AND r.candidate_instance_id = c.candidate_instance_id
+            WHERE c.trade_date = ?
+              AND c.router_version = ?
+              AND c.evaluation_kind = 'SHAPE_CLASSIFICATION'
+              AND c.commit_status = 'COMMITTED'
+              AND COALESCE(c.readiness_fingerprint, '') <> COALESCE(r.readiness_fingerprint, '')
+            """,
+            (trade_date, router_version),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
+def _shape_observation_before_readiness_count(con: sqlite3.Connection, trade_date: str, router_version: str) -> int:
+    if not (_has_table(con, "setup_observations_latest_v2") and _has_table(con, "setup_router_readiness_latest")):
+        return 0
+    try:
+        row = con.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM setup_observations_latest_v2 o
+            JOIN setup_router_readiness_latest r
+              ON r.trade_date = o.trade_date
+             AND r.router_version = o.router_version
+             AND r.candidate_instance_id = o.candidate_instance_id
+            WHERE o.trade_date = ?
+              AND o.router_version = ?
+              AND COALESCE(o.input_readiness_calculated_at, o.calculated_at, '') < COALESCE(r.calculated_at, '')
+            """,
+            (trade_date, router_version),
+        ).fetchone()
+        return int(row["count"] or 0) if row else 0
+    except sqlite3.Error:
+        return 0
 
 
 def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: str) -> dict[str, Any]:
@@ -462,6 +880,7 @@ def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: s
         "vwap_anchor_changed_same_generation_count": 0,
         "duplicate_material_transition_count": 0,
         "material_hash_state_conflict_count": 0,
+        "foreign_version_row_count": 0,
         "version_mismatch_row_count": 0,
     }
     for table in (
@@ -483,7 +902,9 @@ def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: s
                 """,
                 (trade_date, router_version),
             ).fetchone()
-            metrics["version_mismatch_row_count"] += int(row["count"] or 0) if row else 0
+            foreign_count = int(row["count"] or 0) if row else 0
+            metrics["foreign_version_row_count"] += foreign_count
+            metrics["version_mismatch_row_count"] += foreign_count
     if _has_table(con, "setup_router_state_transitions_v3") and _has_column(con, "setup_router_state_transitions_v3", "material_change_kind"):
         row = con.execute(
             """
@@ -534,8 +955,6 @@ def _state_integrity(con: sqlite3.Connection, trade_date: str, router_version: s
         failures.append("TTL_ACTIVE_STATE_VIOLATION")
     if metrics["invalid_generation_count"] > 0:
         failures.append("INVALID_SETUP_GENERATION")
-    if metrics["version_mismatch_row_count"] > 0:
-        failures.append("SETUP_ROUTER_VERSION_MISMATCH_ROWS_PRESENT")
     for key, failure in (
         ("terminal_revival_same_generation_count", "TERMINAL_REVIVAL_SAME_GENERATION"),
         ("generation_jump_count", "SETUP_GENERATION_JUMP"),

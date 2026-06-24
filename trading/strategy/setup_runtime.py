@@ -170,6 +170,7 @@ class SetupRouterV3RuntimePipeline:
                         observed=observed,
                         pending_reasons=reasons,
                         first_pending=True,
+                        readiness=readiness,
                         skipped="PENDING_EVALUATION",
                     )
                 )
@@ -183,6 +184,7 @@ class SetupRouterV3RuntimePipeline:
                         latest_completed_candle_at,
                         source="ELIGIBLE_OBSERVED",
                         observed=observed,
+                        readiness=readiness,
                         skipped="NO_PENDING_REASON",
                     )
                 )
@@ -197,12 +199,6 @@ class SetupRouterV3RuntimePipeline:
             except Exception as exc:  # pragma: no cover - diagnostics must not stop runtime
                 warnings.append(f"REALTIME_SUBSCRIPTION_READINESS_SAVE_ERROR:{exc.__class__.__name__}")
         pending_saver = getattr(self.db, "save_setup_router_pending_evaluations", None)
-        readiness_saver = getattr(self.db, "save_setup_router_readiness_snapshots", None)
-        if callable(readiness_saver) and readiness_by_key:
-            try:
-                readiness_saver(list(readiness_by_key.values()))
-            except Exception as exc:  # pragma: no cover - diagnostics must not stop runtime
-                warnings.append(f"SETUP_ROUTER_READINESS_SAVE_ERROR:{exc.__class__.__name__}")
         if callable(pending_saver) and pending_seed_rows:
             try:
                 pending_saver(pending_seed_rows)
@@ -251,6 +247,10 @@ class SetupRouterV3RuntimePipeline:
         completed_pending_count = 0
         retry_pending_count = 0
         failed_evaluation_count = 0
+        readiness_commit_count = 0
+        readiness_commit_failure_count = 0
+        shape_commit_count = 0
+        shape_commit_failure_count = 0
         failed_evaluation_codes: list[str] = []
         last_commit_error = ""
         readiness_wait_count = 0
@@ -300,25 +300,43 @@ class SetupRouterV3RuntimePipeline:
                         periodic="PERIODIC_RECONCILE" in list(entry.get("pending_reasons") or []),
                         ttl="TTL_DUE" in list(entry.get("pending_reasons") or []),
                         success=True,
+                        readiness=readiness,
+                        readiness_success=True,
                         skipped=str(readiness.get("readiness_status") or "READINESS_WAIT"),
                     )
-                    runtime_updates.append(runtime_update)
-                    if callable(pending_updater):
-                        pending_updater(
-                            [
-                                {
-                                    "trade_date": trade_date,
-                                    "candidate_instance_id": candidate_instance_id,
-                                    "router_version": SETUP_ROUTER_VERSION,
-                                    "status": "COMPLETED",
-                                    "completed_at": current.isoformat(),
-                                    "last_attempt_at": current.isoformat(),
-                                    "last_error": "",
-                                    "last_error_class": "",
-                                }
-                            ]
+                    readiness_writer = getattr(self.db, "complete_setup_router_readiness_evaluation_atomic", None)
+                    pending = dict(entry.get("pending") or {})
+                    if callable(readiness_writer):
+                        counts = dict(
+                            readiness_writer(
+                                trade_date=trade_date,
+                                router_version=SETUP_ROUTER_VERSION,
+                                candidate_instance_id=candidate_instance_id,
+                                pending_epoch=int(pending.get("pending_epoch") or 0),
+                                pending_instance_id=str(pending.get("pending_instance_id") or ""),
+                                readiness_snapshot=readiness,
+                                runtime_update=runtime_update,
+                                evaluation_commit={
+                                    "readiness_fingerprint": readiness.get("readiness_fingerprint") or "",
+                                    "readiness_status": readiness.get("readiness_status") or "",
+                                    "readiness_calculated_at": readiness.get("calculated_at") or "",
+                                },
+                            )
+                            or {}
                         )
-                        completed_pending_count += 1
+                        commit_status = str(counts.get("status") or "COMMITTED")
+                        if commit_status in {"COMMITTED", "IDEMPOTENT_ALREADY_COMMITTED"}:
+                            readiness_commit_count += 1
+                            completed_pending_count += int(counts.get("pending_completed_count") or 0)
+                            saved_count += int(counts.get("readiness_write_count") or 0)
+                        else:
+                            failed_evaluation_count += 1
+                            readiness_commit_failure_count += 1
+                            failed_evaluation_codes.append(code)
+                            last_commit_error = f"{commit_status}:{counts.get('error_class') or ''}"
+                            warnings.append(f"SETUP_ROUTER_READINESS_COMMIT_FAILED:{code}:{last_commit_error}")
+                    else:
+                        runtime_updates.append(runtime_update)
                     continue
                 feature = self.feature_builder.build(
                     candidate,
@@ -351,7 +369,34 @@ class SetupRouterV3RuntimePipeline:
                     periodic="PERIODIC_RECONCILE" in list(entry.get("pending_reasons") or []),
                     ttl="TTL_DUE" in list(entry.get("pending_reasons") or []),
                     success=True,
+                    readiness=readiness,
+                    readiness_success=True,
+                    shape_success=True,
+                    shape_result_status="SHAPE_CLASSIFICATION",
                 )
+                input_readiness_fingerprint = str(readiness.get("readiness_fingerprint") or "")
+                input_readiness_calculated_at = str(readiness.get("calculated_at") or "")
+                readiness_commit_id = _hash_payload(
+                    {
+                        "kind": "SHAPE_CLASSIFICATION",
+                        "trade_date": trade_date,
+                        "router_version": SETUP_ROUTER_VERSION,
+                        "candidate_instance_id": candidate_instance_id,
+                        "pending_instance_id": str(dict(entry.get("pending") or {}).get("pending_instance_id") or ""),
+                        "pending_epoch": int(dict(entry.get("pending") or {}).get("pending_epoch") or 0),
+                        "readiness_fingerprint": input_readiness_fingerprint,
+                        "result_count": len(result),
+                    }
+                )
+                result = [
+                    {
+                        **item,
+                        "input_readiness_fingerprint": input_readiness_fingerprint,
+                        "input_readiness_calculated_at": input_readiness_calculated_at,
+                        "readiness_commit_id": readiness_commit_id,
+                    }
+                    for item in result
+                ]
                 pending_complete_update = {
                     "trade_date": trade_date,
                     "candidate_instance_id": candidate_instance_id,
@@ -370,9 +415,20 @@ class SetupRouterV3RuntimePipeline:
                         counts = dict(
                             completion_writer(
                                 {
+                                    "evaluation_commit_id": readiness_commit_id,
                                     "observations": result,
                                     "runtime_update": success_runtime_update,
                                     "pending_update": pending_complete_update,
+                                    "readiness_snapshot": {
+                                        **readiness,
+                                        "shape_evaluated": True,
+                                    },
+                                    "completion_metadata": {
+                                        "evaluation_kind": "SHAPE_CLASSIFICATION",
+                                        "readiness_fingerprint": input_readiness_fingerprint,
+                                        "readiness_status": readiness.get("readiness_status") or "",
+                                        "readiness_calculated_at": input_readiness_calculated_at,
+                                    },
                                 }
                             )
                             or {}
@@ -388,6 +444,7 @@ class SetupRouterV3RuntimePipeline:
                         )
                     commit_status = str(counts.get("status") or "COMMITTED")
                     if commit_status in {"COMMITTED", "IDEMPOTENT_ALREADY_COMMITTED"}:
+                        shape_commit_count += 1
                         observations.extend(result)
                         state_counts["state_write_count"] += int(counts.get("state_write_count") or 0)
                         state_counts["transition_write_count"] += int(counts.get("transition_write_count") or 0)
@@ -397,6 +454,7 @@ class SetupRouterV3RuntimePipeline:
                         completed_pending_count += int(counts.get("pending_completed_count") or 0)
                     else:
                         failed_evaluation_count += 1
+                        shape_commit_failure_count += 1
                         failed_evaluation_codes.append(code)
                         last_commit_error = f"{commit_status}:{counts.get('error_class') or ''}"
                         warnings.append(f"SETUP_ROUTER_COMMIT_FAILED:{code}:{last_commit_error}")
@@ -506,6 +564,23 @@ class SetupRouterV3RuntimePipeline:
         readiness_status_counts = Counter(str(item.get("readiness_status") or "ERROR") for item in readiness_values)
         readiness_ready_count = sum(1 for item in readiness_values if bool(item.get("readiness_ready")))
         data_wait_candidate_count = len(readiness_values) - readiness_ready_count
+        market_action_unmapped_count = sum(
+            1
+            for item in readiness_values
+            if "MARKET_ACTION_UNMAPPED" in [str(reason) for reason in list(item.get("market_action_reason_codes") or item.get("reason_codes") or [])]
+        )
+        general_multisource_count = sum(
+            1
+            for item in readiness_values
+            if not bool(item.get("expansion_lease_required")) and len(list(item.get("candidate_active_source_types") or [])) > 1
+        )
+        general_multisource_expansion_ignored_count = sum(
+            1
+            for item in readiness_values
+            if not bool(item.get("expansion_lease_required"))
+            and any(str(source) in {"reboot_v2_theme_expansion", "theme_expansion"} for source in list(item.get("candidate_active_source_types") or []))
+            and str(item.get("baseline_source_type") or "") not in {"reboot_v2_theme_expansion", "theme_expansion"}
+        )
         status_counts_for_display = Counter(status_counts)
         if data_wait_candidate_count:
             status_counts_for_display["DATA_WAIT"] += data_wait_candidate_count
@@ -532,6 +607,25 @@ class SetupRouterV3RuntimePipeline:
             "readiness_evaluated_count": len(readiness_values),
             "readiness_ready_count": readiness_ready_count,
             "readiness_wait_count": data_wait_candidate_count,
+            "readiness_observed_count": len(readiness_values),
+            "readiness_processed_count": readiness_commit_count + shape_commit_count,
+            "readiness_commit_count": readiness_commit_count,
+            "readiness_commit_failure_count": readiness_commit_failure_count,
+            "shape_commit_count": shape_commit_count,
+            "shape_commit_failure_count": shape_commit_failure_count,
+            "subscription_requested_count": sum(1 for item in readiness_values if bool(item.get("subscription_requested"))),
+            "subscription_target_selected_count": sum(1 for item in readiness_values if bool(item.get("subscription_target_selected"))),
+            "market_action_unmapped_count": market_action_unmapped_count,
+            "source_readd_detected_count": 0,
+            "general_multisource_count": general_multisource_count,
+            "general_multisource_expansion_ignored_count": general_multisource_expansion_ignored_count,
+            "matching_readiness_shape_count": shape_commit_count,
+            "old_readiness_shape_mismatch_count": 0,
+            "feature_flags": {
+                "TRADING_SETUP_ROUTER_READINESS_P01_ENABLED": bool(getattr(self.config, "readiness_p01_enabled", True)),
+                "TRADING_SETUP_ROUTER_ATOMIC_READINESS_COMPLETION_ENABLED": bool(getattr(self.config, "atomic_readiness_completion_enabled", True)),
+                "TRADING_SETUP_ROUTER_CANONICAL_MARKET_ACTION_ENABLED": bool(getattr(self.config, "canonical_market_action_enabled", True)),
+            },
             "shape_evaluated_candidate_count": shape_evaluated_candidate_count,
             "skipped_count": sum(skipped_reasons.values()),
             "observation_count": len(observations),
@@ -613,11 +707,18 @@ class SetupRouterV3RuntimePipeline:
         loader = getattr(self.db, "latest_strategy_context", None)
         for candidate in candidates:
             code = normalize_code(getattr(candidate, "code", ""))
-            context = dict(dict(getattr(candidate, "metadata", {}) or {}).get("strategy_context_v3") or {})
-            if not context and callable(loader):
-                context = dict(loader(trade_date=trade_date, code=code) or {})
-            if context:
-                result[code] = context
+            metadata_context = dict(dict(getattr(candidate, "metadata", {}) or {}).get("strategy_context_v3") or {})
+            db_context = dict(loader(trade_date=trade_date, code=code) or {}) if callable(loader) else {}
+            candidates_by_source = []
+            for source, context in (("metadata", metadata_context), ("db", db_context)):
+                if not context:
+                    continue
+                if str(context.get("trade_date") or trade_date) != trade_date:
+                    continue
+                candidates_by_source.append((source, context, _parse_time(str(context.get("calculated_at") or ""))))
+            if candidates_by_source:
+                source, context, _parsed = max(candidates_by_source, key=lambda item: item[2] or datetime.min)
+                result[code] = {**context, "setup_router_context_source": source}
         return result
 
     def _latest_entries(self, trade_date: str, candidates: list[Any]) -> dict[tuple[int | None, str], dict[str, Any]]:
@@ -721,7 +822,7 @@ class SetupRouterV3RuntimePipeline:
         matching_any = [lease for lease in payloads if str(lease.get("theme_id") or "") == theme_id]
         matching = [lease for lease in payloads if str(lease.get("theme_id") or "") == theme_id and str(lease.get("status") or "").upper() in {"ACTIVE", "HOLDING", "PROTECTED"}]
         data = dict(context.get("data") or {})
-        provenance_required = self._candidate_requires_selected_theme_lease(candidate)
+        provenance_required = self._candidate_requires_selected_theme_lease(candidate, selected_theme_id=theme_id)
         required = bool(
             theme_id
             and (
@@ -746,10 +847,19 @@ class SetupRouterV3RuntimePipeline:
         theme = dict(context.get("theme") or {})
         return str(context.get("selected_theme_id") or theme.get("theme_id") or "")
 
-    def _candidate_requires_selected_theme_lease(self, candidate: Any | None) -> bool:
+    def _candidate_requires_selected_theme_lease(self, candidate: Any | None, *, selected_theme_id: str = "") -> bool:
         if candidate is None:
             return False
         metadata = dict(getattr(candidate, "metadata", {}) or {})
+        selected_theme_id = str(selected_theme_id or metadata.get("selected_theme_id") or metadata.get("primary_theme_id") or metadata.get("best_theme_id") or "")
+        active_sources = _candidate_active_source_map(metadata)
+        if active_sources:
+            for entry in active_sources:
+                source_type = str(entry.get("source_type") or entry.get("source") or "").lower()
+                theme_id = str(entry.get("theme_id") or entry.get("selected_theme_id") or "")
+                if source_type in {"reboot_v2_theme_expansion", "theme_expansion"} and selected_theme_id and theme_id == selected_theme_id:
+                    return True
+            return bool(metadata.get("expansion_only") or metadata.get("theme_expansion_only"))
         if bool(metadata.get("expansion_only") or metadata.get("theme_expansion_only")):
             return True
         explicit_source = str(metadata.get("source_type") or metadata.get("source") or "").lower()
@@ -812,10 +922,13 @@ class SetupRouterV3RuntimePipeline:
                 "first_active_at": lease.get("first_active_at"),
                 "first_fresh_tick_at": lease.get("first_fresh_tick_at") or lease.get("first_post_subscription_tick_at"),
                 "readiness_status": dict(readiness or {}).get("readiness_status"),
+                "readiness_fingerprint": dict(readiness or {}).get("readiness_fingerprint"),
                 "readiness_ready": dict(readiness or {}).get("readiness_ready"),
+                "canonical_market_action": dict(readiness or {}).get("canonical_market_action"),
+                "subscription_requested": dict(readiness or {}).get("subscription_requested"),
+                "subscription_target_selected": dict(readiness or {}).get("subscription_target_selected"),
                 "subscription_generation": dict(readiness or {}).get("subscription_generation"),
                 "subscription_active": dict(readiness or {}).get("subscription_active"),
-                "latest_tick_at": dict(readiness or {}).get("latest_tick_at"),
                 "post_subscription_tick_verified": dict(readiness or {}).get("post_subscription_tick_verified"),
             }
         )
@@ -829,6 +942,7 @@ class SetupRouterV3RuntimePipeline:
             "candle_signature": str(latest_completed_candle_at or ""),
             "theme_signature": str(selected_theme_id or ""),
             "lease_signature": lease_signature,
+            "readiness_fingerprint": dict(readiness or {}).get("readiness_fingerprint") or "",
         }
 
     def _subscription_readiness(
@@ -923,6 +1037,8 @@ class SetupRouterV3RuntimePipeline:
             reasons.append("SELECTED_THEME_CHANGED")
         if str(observed.get("lease_signature") or "") != str(runtime.get("processed_lease_signature") or ""):
             reasons.append("LEASE_VERIFICATION_CHANGED")
+        if str(observed.get("readiness_fingerprint") or "") and str(observed.get("readiness_fingerprint") or "") != str(runtime.get("processed_readiness_fingerprint") or ""):
+            reasons.append("READINESS_CHANGED")
         if ttl_due:
             reasons.append("TTL_DUE")
         if periodic:
@@ -1220,12 +1336,18 @@ class SetupRouterV3RuntimePipeline:
         deferred: bool = False,
         success: bool = False,
         failure: bool = False,
+        readiness: Mapping[str, Any] | None = None,
+        readiness_success: bool = False,
+        shape_success: bool = False,
+        shape_result_status: str = "",
         first_pending: bool = False,
         skipped: str = "",
     ) -> dict[str, Any]:
         candidate_instance_id = self._candidate_instance_id(candidate)
         current = now.isoformat()
         observed_payload = dict(observed or {})
+        readiness_payload = dict(readiness or {})
+        readiness_fingerprint = str(readiness_payload.get("readiness_fingerprint") or observed_payload.get("readiness_fingerprint") or "")
         reasons = _dedupe(pending_reasons or [])
         return {
             "trade_date": now.date().isoformat(),
@@ -1261,6 +1383,20 @@ class SetupRouterV3RuntimePipeline:
             "capacity_deferred_count": int(bool(deferred)),
             "last_deferred_at": current if deferred else "",
             "last_skip_reason": skipped,
+            "last_readiness_observed_at": str(readiness_payload.get("calculated_at") or current) if readiness_payload else "",
+            "last_readiness_evaluated_at": current if readiness_success or readiness_payload else "",
+            "last_readiness_success_at": current if readiness_success else "",
+            "last_readiness_status": str(readiness_payload.get("readiness_status") or ""),
+            "last_readiness_fingerprint": readiness_fingerprint,
+            "processed_readiness_fingerprint": readiness_fingerprint if readiness_success else "",
+            "readiness_evaluation_count": int(bool(readiness_success)),
+            "readiness_wait_count": int(bool(readiness_success and not readiness_payload.get("readiness_ready", False))),
+            "last_shape_evaluated_at": current if shape_success else "",
+            "last_shape_success_at": current if shape_success else "",
+            "last_shape_readiness_fingerprint": readiness_fingerprint if shape_success else "",
+            "shape_evaluation_count": int(bool(shape_success)),
+            "shape_classification_success_count": int(bool(shape_success)),
+            "last_shape_result_status": shape_result_status if shape_success else "",
         }
 
     def _advance_periodic_cursor(self, eligible_count: int, evaluated_periodic_count: int) -> int:
@@ -1543,7 +1679,13 @@ def _dashboard_readiness(readiness: list[dict[str, Any]]) -> list[dict[str, Any]
 
 def _readiness_funnel(readiness: list[dict[str, Any]], observations: list[dict[str, Any]]) -> dict[str, int]:
     rows = [dict(item or {}) for item in readiness]
+    def _candidate_ids(items: Iterable[Mapping[str, Any]]) -> set[str]:
+        return {str(item.get("candidate_instance_id") or "") for item in items if str(item.get("candidate_instance_id") or "")}
+
+    requested = [item for item in rows if bool(item.get("subscription_requested", item.get("subscription_selected")))]
+    target_selected = [item for item in rows if bool(item.get("subscription_target_selected", item.get("subscription_selected")))]
     active = [item for item in rows if bool(item.get("subscription_active"))]
+    budget_deferred = [item for item in rows if bool(item.get("subscription_budget_deferred"))]
     fresh = [item for item in rows if bool(item.get("post_subscription_tick_verified"))]
     context_ready = [
         item
@@ -1554,15 +1696,33 @@ def _readiness_funnel(readiness: list[dict[str, Any]], observations: list[dict[s
             SetupDataReadinessStatus.WAIT_THEME_SIGNAL_STALE.value,
         }
     ]
+    shape_evaluated = _candidate_ids(observations)
+    forming_or_pending = _candidate_ids(
+        item
+        for item in observations
+        if str(item.get("shape_status") or "") == "FORMING" or str(item.get("router_status") or "") == "PENDING"
+    )
+    matched_or_valid = _candidate_ids(
+        item
+        for item in observations
+        if str(item.get("shape_status") or "") == "MATCHED" or str(item.get("router_status") or "") == "VALID_OBSERVE"
+    )
     return {
-        "evaluation_eligible": len(rows),
-        "subscription_selected": sum(1 for item in rows if bool(item.get("subscription_selected"))),
-        "subscription_active": len(active),
-        "fresh_tick": len(fresh),
-        "context_ready": len(context_ready),
-        "shape_evaluated": len({str(item.get("candidate_instance_id") or "") for item in observations if str(item.get("candidate_instance_id") or "")}),
-        "forming_or_pending": sum(1 for item in observations if str(item.get("shape_status") or "") == "FORMING" or str(item.get("router_status") or "") == "PENDING"),
-        "matched_or_valid": sum(1 for item in observations if str(item.get("shape_status") or "") == "MATCHED" or str(item.get("router_status") or "") == "VALID_OBSERVE"),
+        "evaluation_eligible": len(_candidate_ids(rows)),
+        "subscription_requested": len(_candidate_ids(requested)),
+        "subscription_target_selected": len(_candidate_ids(target_selected)),
+        "subscription_selected": len(_candidate_ids(target_selected)),
+        "subscription_active": len(_candidate_ids(active)),
+        "subscription_budget_deferred": len(_candidate_ids(budget_deferred)),
+        "fresh_tick": len(_candidate_ids(fresh)),
+        "context_ready": len(_candidate_ids(context_ready)),
+        "canonical_market_action": len(_candidate_ids(item for item in rows if str(item.get("canonical_market_action") or "") not in {"", "UNKNOWN", "UNMAPPED"})),
+        "market_action_unmapped": len(_candidate_ids(item for item in rows if "MARKET_ACTION_UNMAPPED" in [str(reason) for reason in list(item.get("market_action_reason_codes") or item.get("reason_codes") or [])])),
+        "readiness_ready": len(_candidate_ids(item for item in rows if bool(item.get("readiness_ready")))),
+        "shape_evaluated": len(shape_evaluated),
+        "forming_or_pending": len(forming_or_pending),
+        "matched_or_valid": len(matched_or_valid),
+        "setup_observation_count": len(observations),
     }
 
 
@@ -1627,6 +1787,17 @@ def _entry_payload(item: Any) -> dict[str, Any]:
     return dict(data or {})
 
 
+def _candidate_active_source_map(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
+    ingestion = dict(metadata.get("candidate_ingestion") or {})
+    source_map = dict(ingestion.get("source_map") or {})
+    result: list[dict[str, Any]] = []
+    for value in source_map.values():
+        item = dict(value or {}) if isinstance(value, Mapping) else {}
+        if item and bool(item.get("active", True)):
+            result.append(item)
+    return result
+
+
 def _parse_time(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value.replace(tzinfo=None)
@@ -1643,7 +1814,7 @@ def _pending_priority(reasons: Iterable[str]) -> int:
     values = {str(reason or "") for reason in list(reasons or [])}
     if values & {"ENTRY_DECISION_CHANGED", "DIRTY_EVALUATOR_DECISION"}:
         return 0
-    if values & {"CONTEXT_CHANGED", "CANDLE_BOUNDARY_CHANGED", "SELECTED_THEME_CHANGED", "LEASE_VERIFICATION_CHANGED"}:
+    if values & {"CONTEXT_CHANGED", "CANDLE_BOUNDARY_CHANGED", "SELECTED_THEME_CHANGED", "LEASE_VERIFICATION_CHANGED", "READINESS_CHANGED"}:
         return 1
     if "TTL_DUE" in values:
         return 2

@@ -80,7 +80,8 @@ def test_setup_router_runtime_saves_observe_only_outputs_without_candidate_mutat
     assert summary["valid_observe_count"] >= 1
     assert summary["readiness_ready_count"] >= 1
     assert summary["shape_evaluated_candidate_count"] >= 1
-    assert summary["router_version"] == "setup_router_v3.5"
+    assert summary["router_version"] == "setup_router_v3.5.1"
+    assert summary["feature_flags"]["TRADING_SETUP_ROUTER_READINESS_P01_ENABLED"] is True
     assert summary["state_write_count"] >= 1
     assert latest
     assert subscription_readiness

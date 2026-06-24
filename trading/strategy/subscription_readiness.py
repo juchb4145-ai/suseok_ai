@@ -12,6 +12,8 @@ from trading.strategy.setup_data_readiness import RealtimeCoverageType
 class RealtimeSubscriptionReadinessSnapshot:
     code: str
     calculated_at: str
+    subscription_requested: bool = False
+    subscription_target_selected: bool = False
     subscription_selected: bool = False
     subscription_active: bool = False
     subscription_budget_deferred: bool = False
@@ -21,6 +23,12 @@ class RealtimeSubscriptionReadinessSnapshot:
     subscription_generation: int = 0
     subscription_active_since: str = ""
     relevant_source_added_at: str = ""
+    readiness_relevant_source: str = ""
+    readiness_relevant_source_reason: str = ""
+    readiness_relevant_source_generation: int = 0
+    baseline_source_type: str = ""
+    candidate_active_source_types: tuple[str, ...] = ()
+    candidate_primary_source: str = ""
     coverage_type: str = RealtimeCoverageType.NONE.value
     latest_tick_at: str = ""
     latest_tick_age_sec: float = 999999.0
@@ -34,6 +42,7 @@ class RealtimeSubscriptionReadinessSnapshot:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["subscription_sources"] = list(self.subscription_sources)
+        payload["candidate_active_source_types"] = list(self.candidate_active_source_types)
         payload["source_priorities"] = dict(self.source_priorities or {})
         return payload
 
@@ -52,15 +61,23 @@ class RealtimeSubscriptionReadinessProvider:
         records = getattr(manager, "records", {}) or {}
         record = records.get(clean_code)
         target_codes = self._target_codes()
-        subscription_selected = record is not None
+        subscription_requested = bool(record and getattr(record, "sources", None))
+        subscription_target_selected = clean_code in target_codes
+        subscription_selected = subscription_target_selected
         subscription_active = bool(record and getattr(record, "active", False) and clean_code in getattr(manager, "code_to_screen", {}))
-        budget_deferred = bool(record and clean_code not in target_codes and not subscription_active)
+        budget_deferred = bool(subscription_requested and not subscription_target_selected and not subscription_active)
         sources = tuple(sorted(str(source) for source in list(getattr(record, "sources", set()) or []) if str(source))) if record else ()
         primary_source = str(getattr(record, "primary_source", "") if record else "")
         active_since = str(getattr(record, "active_since", "") if record else "")
         source_added = dict(getattr(record, "source_added_at_by_source", {}) or {}) if record else {}
-        relevant_source = self._relevant_source(sources, candidate)
+        source_generations = dict(getattr(record, "source_generation_by_source", {}) or {}) if record else {}
+        active_source_map = self._candidate_active_source_map(candidate)
+        expansion_required = self._expansion_required(candidate, active_source_map, selected_theme_id)
+        relevant_source, relevant_reason = self._relevant_source(sources, candidate, expansion_required=expansion_required)
         relevant_source_added_at = str(source_added.get(relevant_source) or max(source_added.values(), default=""))
+        relevant_generation = int(source_generations.get(relevant_source, 0) or 0)
+        active_source_types = tuple(sorted({str(item.get("source_type") or "") for item in active_source_map if str(item.get("source_type") or "")}))
+        candidate_primary_source = str(dict(getattr(candidate, "metadata", {}) or {}).get("primary_source") or "")
         tick_payload = self._tick_payload(clean_code, current)
         post_subscription_tick_verified = self._post_subscription_tick_verified(
             tick_payload,
@@ -71,6 +88,8 @@ class RealtimeSubscriptionReadinessProvider:
         return RealtimeSubscriptionReadinessSnapshot(
             code=clean_code,
             calculated_at=current.isoformat(),
+            subscription_requested=subscription_requested,
+            subscription_target_selected=subscription_target_selected,
             subscription_selected=subscription_selected,
             subscription_active=subscription_active,
             subscription_budget_deferred=budget_deferred,
@@ -80,6 +99,12 @@ class RealtimeSubscriptionReadinessProvider:
             subscription_generation=int(getattr(record, "subscription_generation", 0) if record else 0),
             subscription_active_since=active_since,
             relevant_source_added_at=relevant_source_added_at,
+            readiness_relevant_source=relevant_source,
+            readiness_relevant_source_reason=relevant_reason,
+            readiness_relevant_source_generation=relevant_generation,
+            baseline_source_type=relevant_source,
+            candidate_active_source_types=active_source_types,
+            candidate_primary_source=candidate_primary_source,
             coverage_type=self._coverage_type(sources),
             latest_tick_at=str(tick_payload.get("latest_tick_at") or ""),
             latest_tick_age_sec=float(tick_payload.get("latest_tick_age_sec") or 999999.0),
@@ -191,16 +216,53 @@ class RealtimeSubscriptionReadinessProvider:
         return RealtimeCoverageType.CANDIDATE.value
 
     @staticmethod
-    def _relevant_source(sources: Iterable[str], candidate: Any | None = None) -> str:
+    def _relevant_source(sources: Iterable[str], candidate: Any | None = None, *, expansion_required: bool = False) -> tuple[str, str]:
         values = set(str(source or "") for source in list(sources or []) if str(source or ""))
         metadata = dict(getattr(candidate, "metadata", {}) or {}) if candidate is not None else {}
         requested = str(metadata.get("realtime_subscription_source") or "")
         if requested and requested in values:
-            return requested
-        for preferred in ("reboot_v2_theme_expansion", "reboot_v2_candidate", "reboot_v2_theme_board", "reboot_v2_opening_seed"):
+            return requested, "CANDIDATE_REQUESTED_SOURCE"
+        if expansion_required:
+            for preferred in ("reboot_v2_theme_expansion", "theme_expansion"):
+                if preferred in values:
+                    return preferred, "EXPANSION_REQUIRED_SOURCE"
+        for preferred in ("reboot_v2_candidate", "candidate_watch", "reboot_v2_theme_board", "theme_board_watch", "reboot_v2_opening_seed"):
             if preferred in values:
-                return preferred
-        return sorted(values)[0] if values else ""
+                return preferred, "GENERAL_CANDIDATE_SOURCE"
+        for fallback in ("reboot_v2_theme_expansion", "theme_expansion"):
+            if fallback in values:
+                return fallback, "GENERAL_ONLY_EXPANSION_COVERAGE_SOURCE"
+        selected = sorted(values)[0] if values else ""
+        return selected, "FALLBACK_ACTIVE_SOURCE" if selected else "NO_ACTIVE_SOURCE"
+
+    @staticmethod
+    def _candidate_active_source_map(candidate: Any | None) -> list[dict[str, Any]]:
+        metadata = dict(getattr(candidate, "metadata", {}) or {}) if candidate is not None else {}
+        ingestion = dict(metadata.get("candidate_ingestion") or {})
+        source_map = dict(ingestion.get("source_map") or {})
+        result: list[dict[str, Any]] = []
+        for item in source_map.values():
+            entry = dict(item or {}) if isinstance(item, Mapping) else {}
+            if entry and bool(entry.get("active", True)):
+                result.append(entry)
+        return result
+
+    @staticmethod
+    def _expansion_required(candidate: Any | None, active_source_map: list[dict[str, Any]], selected_theme_id: str) -> bool:
+        metadata = dict(getattr(candidate, "metadata", {}) or {}) if candidate is not None else {}
+        selected = str(selected_theme_id or "")
+        for entry in active_source_map:
+            source_type = str(entry.get("source_type") or entry.get("source") or "").lower()
+            theme_id = str(entry.get("theme_id") or entry.get("selected_theme_id") or "")
+            if source_type in {"reboot_v2_theme_expansion", "theme_expansion"} and selected and theme_id == selected:
+                return True
+        if active_source_map:
+            return bool(metadata.get("expansion_only") or metadata.get("theme_expansion_only"))
+        if bool(metadata.get("expansion_only") or metadata.get("theme_expansion_only")):
+            return True
+        source_type = str(metadata.get("source_type") or metadata.get("source") or "").lower()
+        source_theme = str(metadata.get("theme_id") or metadata.get("selected_theme_id") or metadata.get("primary_theme_id") or "")
+        return source_type in {"reboot_v2_theme_expansion", "theme_expansion"} and bool(selected and source_theme == selected)
 
 
 def _parse_time(value: Any) -> datetime | None:

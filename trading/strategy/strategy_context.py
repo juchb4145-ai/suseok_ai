@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping
 from trading.strategy.candidate_state_contract import CandidateStateContractService
 from trading.strategy.candidates import normalize_code
 from trading.strategy.market_data import MarketDataStore, StrategyTick
+from trading.strategy.market_action import normalize_market_action
 from trading.strategy.market_regime import (
     CandidateMarketAction,
     MarketRegimeStatus,
@@ -524,13 +525,27 @@ def _market_context(candidate: Candidate, payload: Any, code: str) -> StrategyMa
             market_open=str(_payload_get(payload, "market_session_status", "")).lower() != "closed",
         )
     if policy:
-        action = str(_payload_get(policy, "market_action", "") or _market_action_from_status(status, global_status)).upper()
+        raw_action = str(_payload_get(policy, "market_action", "") or "").upper()
+        normalized_action = normalize_market_action(
+            raw_action,
+            side_market_regime=status,
+            global_market_regime=global_status,
+            market_session_status=_payload_get(payload, "market_session_status", ""),
+        )
+        action = normalized_action.action
         multiplier = _float(_payload_get(policy, "position_size_multiplier_hint", None), _multiplier_for_action(action))
         block_new_entry = bool(_payload_get(policy, "block_new_entry", False)) or action in {"BLOCK_NEW_ENTRY", "MARKET_CLOSED", "DATA_WAIT"}
-        policy_reasons = list(_payload_get(policy, "reason_codes", ()) or [])
+        policy_reasons = [*list(_payload_get(policy, "reason_codes", ()) or []), *list(normalized_action.reason_codes)]
     else:
         action, multiplier, block_new_entry, _wait_reason, policy_reasons = _fallback_market_policy(payload, side, status)
-        action = str(action)
+        normalized_action = normalize_market_action(
+            action,
+            side_market_regime=status,
+            global_market_regime=global_status,
+            market_session_status=_payload_get(payload, "market_session_status", ""),
+        )
+        action = normalized_action.action
+        policy_reasons = [*list(policy_reasons or []), *list(normalized_action.reason_codes)]
     reasons = _dedupe([*list(_payload_get(payload, "reason_codes", ()) or []), *policy_reasons])
     if not reasons:
         reasons = ["MARKET_CONTEXT_READY"]

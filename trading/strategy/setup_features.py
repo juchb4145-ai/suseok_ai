@@ -5,10 +5,11 @@ from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 from trading.strategy.candidates import normalize_code
+from trading.strategy.market_action import normalize_market_action
 from trading.strategy.models import Candidate
 
 
-SETUP_ROUTER_FEATURE_SCHEMA_VERSION = "setup_router_v3.features.v4.1"
+SETUP_ROUTER_FEATURE_SCHEMA_VERSION = "setup_router_v3.features.v4.2"
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,8 @@ class SetupFeatureSnapshot:
     market_side: str = ""
     side_market_regime: str = ""
     market_action: str = ""
+    market_action_normalized: bool = False
+    market_action_reason_codes: tuple[str, ...] = ()
     market_session_status: str = ""
     systemic_risk_off: bool = False
     market_block_new_entry: bool = False
@@ -140,6 +143,12 @@ class SetupFeatureBuilder:
         stock = dict(context.get("stock") or {})
         data = dict(context.get("data") or {})
         risk = dict(context.get("risk") or {})
+        normalized_market_action = normalize_market_action(
+            market.get("market_action"),
+            side_market_regime=market.get("side_market_regime") or market.get("market_status"),
+            global_market_regime=market.get("global_market_regime") or market.get("global_market_status"),
+            market_session_status=market.get("market_session_status"),
+        )
         tick = self.market_data.latest_tick(code) if self.market_data is not None else None
         tick_at_dt = getattr(tick, "timestamp", None) if tick is not None else None
         tick_metadata = dict(getattr(tick, "metadata", {}) or {}) if tick is not None else {}
@@ -168,7 +177,7 @@ class SetupFeatureBuilder:
             _pullback_pct(current_price, day_high),
         )
         source_timestamps = dict(context.get("source_timestamps") or {})
-        context_reasons = tuple(_dedupe([*(context.get("reason_codes") or []), *(data.get("blocking_reason_codes") or [])]))
+        context_reasons = tuple(_dedupe([*(context.get("reason_codes") or []), *(data.get("blocking_reason_codes") or []), *list(normalized_market_action.reason_codes)]))
         entry_at = str(entry.get("calculated_at") or entry.get("created_at") or "")
         entry_age_sec = _age_sec(_parse_time(entry_at), current) if entry else 999999.0
         entry_trade_date = str(entry.get("trade_date") or "")
@@ -255,7 +264,9 @@ class SetupFeatureBuilder:
             stock_data_quality_status=str(stock.get("stock_data_quality_status") or ""),
             market_side=str(market.get("market_side") or ""),
             side_market_regime=str(market.get("side_market_regime") or market.get("market_status") or ""),
-            market_action=str(market.get("market_action") or ""),
+            market_action=normalized_market_action.action,
+            market_action_normalized=normalized_market_action.normalized,
+            market_action_reason_codes=normalized_market_action.reason_codes,
             market_session_status=str(market.get("market_session_status") or ""),
             systemic_risk_off=bool(market.get("systemic_risk_off") or market.get("risk_off_detected")),
             market_block_new_entry=bool(risk.get("market_block_new_entry") or market.get("block_new_entry")),

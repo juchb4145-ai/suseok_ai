@@ -34,7 +34,7 @@ from trading.strategy.models import (
 from trading.strategy.conditions import ConditionProfile
 
 
-_CURRENT_SETUP_ROUTER_VERSION = "setup_router_v3.5"
+_CURRENT_SETUP_ROUTER_VERSION = "setup_router_v3.5.1"
 
 
 class TradingDatabase:
@@ -1167,6 +1167,9 @@ class TradingDatabase:
                 setup_instance_id TEXT NOT NULL DEFAULT '',
                 state_version TEXT NOT NULL DEFAULT '',
                 post_subscription_tick_verified INTEGER NOT NULL DEFAULT 1,
+                input_readiness_fingerprint TEXT NOT NULL DEFAULT '',
+                input_readiness_calculated_at TEXT NOT NULL DEFAULT '',
+                readiness_commit_id TEXT NOT NULL DEFAULT '',
                 entry_decision_at TEXT NOT NULL DEFAULT '',
                 entry_decision_id INTEGER,
                 entry_decision_age_sec REAL NOT NULL DEFAULT 0,
@@ -1259,9 +1262,16 @@ class TradingDatabase:
                 name TEXT NOT NULL DEFAULT '',
                 selected_theme_id TEXT NOT NULL DEFAULT '',
                 selected_theme_name TEXT NOT NULL DEFAULT '',
+                readiness_schema_version TEXT NOT NULL DEFAULT '',
                 readiness_status TEXT NOT NULL DEFAULT '',
                 readiness_ready INTEGER NOT NULL DEFAULT 0,
+                readiness_fingerprint TEXT NOT NULL DEFAULT '',
+                canonical_market_action TEXT NOT NULL DEFAULT '',
+                market_action_normalized INTEGER NOT NULL DEFAULT 0,
+                market_action_reason_codes_json TEXT NOT NULL DEFAULT '[]',
                 coverage_type TEXT NOT NULL DEFAULT '',
+                subscription_requested INTEGER NOT NULL DEFAULT 0,
+                subscription_target_selected INTEGER NOT NULL DEFAULT 0,
                 subscription_selected INTEGER NOT NULL DEFAULT 0,
                 subscription_active INTEGER NOT NULL DEFAULT 0,
                 subscription_sources_json TEXT NOT NULL DEFAULT '[]',
@@ -1271,6 +1281,12 @@ class TradingDatabase:
                 subscription_active_since TEXT NOT NULL DEFAULT '',
                 relevant_source_added_at TEXT NOT NULL DEFAULT '',
                 subscription_budget_deferred INTEGER NOT NULL DEFAULT 0,
+                readiness_relevant_source TEXT NOT NULL DEFAULT '',
+                readiness_relevant_source_reason TEXT NOT NULL DEFAULT '',
+                readiness_relevant_source_generation INTEGER NOT NULL DEFAULT 0,
+                baseline_source_type TEXT NOT NULL DEFAULT '',
+                candidate_active_source_types_json TEXT NOT NULL DEFAULT '[]',
+                candidate_primary_source TEXT NOT NULL DEFAULT '',
                 expansion_lease_required INTEGER NOT NULL DEFAULT 0,
                 expansion_lease_requirement TEXT NOT NULL DEFAULT '',
                 expansion_lease_requirement_reason TEXT NOT NULL DEFAULT '',
@@ -1293,6 +1309,10 @@ class TradingDatabase:
                 baseline_at TEXT NOT NULL DEFAULT '',
                 reason_codes_json TEXT NOT NULL DEFAULT '[]',
                 informational_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                readiness_processed INTEGER NOT NULL DEFAULT 0,
+                readiness_commit_id TEXT NOT NULL DEFAULT '',
+                shape_evaluated INTEGER NOT NULL DEFAULT 0,
+                matching_shape_commit_id TEXT NOT NULL DEFAULT '',
                 payload_json TEXT NOT NULL DEFAULT '{}',
                 calculated_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1323,6 +1343,8 @@ class TradingDatabase:
                 subscription_generation INTEGER NOT NULL DEFAULT 0,
                 code TEXT NOT NULL,
                 calculated_at TEXT NOT NULL DEFAULT '',
+                subscription_requested INTEGER NOT NULL DEFAULT 0,
+                subscription_target_selected INTEGER NOT NULL DEFAULT 0,
                 subscription_selected INTEGER NOT NULL DEFAULT 0,
                 subscription_active INTEGER NOT NULL DEFAULT 0,
                 subscription_budget_deferred INTEGER NOT NULL DEFAULT 0,
@@ -1331,6 +1353,12 @@ class TradingDatabase:
                 subscription_screen_no TEXT NOT NULL DEFAULT '',
                 subscription_active_since TEXT NOT NULL DEFAULT '',
                 relevant_source_added_at TEXT NOT NULL DEFAULT '',
+                readiness_relevant_source TEXT NOT NULL DEFAULT '',
+                readiness_relevant_source_reason TEXT NOT NULL DEFAULT '',
+                readiness_relevant_source_generation INTEGER NOT NULL DEFAULT 0,
+                baseline_source_type TEXT NOT NULL DEFAULT '',
+                candidate_active_source_types_json TEXT NOT NULL DEFAULT '[]',
+                candidate_primary_source TEXT NOT NULL DEFAULT '',
                 coverage_type TEXT NOT NULL DEFAULT '',
                 latest_tick_at TEXT NOT NULL DEFAULT '',
                 latest_tick_age_sec REAL NOT NULL DEFAULT 0,
@@ -1384,6 +1412,12 @@ class TradingDatabase:
                 observation_write_count INTEGER NOT NULL DEFAULT 0,
                 transition_write_count INTEGER NOT NULL DEFAULT 0,
                 primary_write_count INTEGER NOT NULL DEFAULT 0,
+                evaluation_kind TEXT NOT NULL DEFAULT '',
+                readiness_fingerprint TEXT NOT NULL DEFAULT '',
+                readiness_status TEXT NOT NULL DEFAULT '',
+                readiness_calculated_at TEXT NOT NULL DEFAULT '',
+                shape_evaluated INTEGER NOT NULL DEFAULT 0,
+                shape_result_count INTEGER NOT NULL DEFAULT 0,
                 committed_at TEXT NOT NULL DEFAULT '',
                 payload_hash TEXT NOT NULL DEFAULT '',
                 error_class TEXT NOT NULL DEFAULT '',
@@ -1585,6 +1619,20 @@ class TradingDatabase:
                 capacity_deferred_count INTEGER NOT NULL DEFAULT 0,
                 last_deferred_at TEXT NOT NULL DEFAULT '',
                 last_skip_reason TEXT NOT NULL DEFAULT '',
+                last_readiness_observed_at TEXT NOT NULL DEFAULT '',
+                last_readiness_evaluated_at TEXT NOT NULL DEFAULT '',
+                last_readiness_success_at TEXT NOT NULL DEFAULT '',
+                last_readiness_status TEXT NOT NULL DEFAULT '',
+                last_readiness_fingerprint TEXT NOT NULL DEFAULT '',
+                processed_readiness_fingerprint TEXT NOT NULL DEFAULT '',
+                readiness_evaluation_count INTEGER NOT NULL DEFAULT 0,
+                readiness_wait_count INTEGER NOT NULL DEFAULT 0,
+                last_shape_evaluated_at TEXT NOT NULL DEFAULT '',
+                last_shape_success_at TEXT NOT NULL DEFAULT '',
+                last_shape_readiness_fingerprint TEXT NOT NULL DEFAULT '',
+                shape_evaluation_count INTEGER NOT NULL DEFAULT 0,
+                shape_classification_success_count INTEGER NOT NULL DEFAULT 0,
+                last_shape_result_status TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(trade_date, router_version, candidate_instance_id)
@@ -9411,6 +9459,52 @@ class TradingDatabase:
                         str(payload.get("calculated_at") or ""),
                     ),
                 )
+                self.conn.execute(
+                    """
+                    UPDATE setup_router_readiness_latest
+                    SET readiness_schema_version = ?,
+                        readiness_fingerprint = ?,
+                        canonical_market_action = ?,
+                        market_action_normalized = ?,
+                        market_action_reason_codes_json = ?,
+                        subscription_requested = ?,
+                        subscription_target_selected = ?,
+                        readiness_relevant_source = ?,
+                        readiness_relevant_source_reason = ?,
+                        readiness_relevant_source_generation = ?,
+                        baseline_source_type = ?,
+                        candidate_active_source_types_json = ?,
+                        candidate_primary_source = ?,
+                        readiness_processed = ?,
+                        readiness_commit_id = COALESCE(NULLIF(?, ''), readiness_commit_id),
+                        shape_evaluated = ?,
+                        matching_shape_commit_id = COALESCE(NULLIF(?, ''), matching_shape_commit_id),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE trade_date = ? AND router_version = ? AND candidate_instance_id = ?
+                    """,
+                    (
+                        str(payload.get("readiness_schema_version") or ""),
+                        str(payload.get("readiness_fingerprint") or ""),
+                        str(payload.get("canonical_market_action") or ""),
+                        int(bool(payload.get("market_action_normalized"))),
+                        _json_list(payload.get("market_action_reason_codes") or []),
+                        int(bool(payload.get("subscription_requested"))),
+                        int(bool(payload.get("subscription_target_selected"))),
+                        str(payload.get("readiness_relevant_source") or ""),
+                        str(payload.get("readiness_relevant_source_reason") or ""),
+                        _safe_int(payload.get("readiness_relevant_source_generation"), 0),
+                        str(payload.get("baseline_source_type") or ""),
+                        _json_list(payload.get("candidate_active_source_types") or []),
+                        str(payload.get("candidate_primary_source") or ""),
+                        int(bool(payload.get("readiness_processed"))),
+                        str(payload.get("readiness_commit_id") or ""),
+                        int(bool(payload.get("shape_evaluated"))),
+                        str(payload.get("matching_shape_commit_id") or ""),
+                        trade_date,
+                        router_version,
+                        candidate_instance_id,
+                    ),
+                )
                 if current_fingerprint != previous_fingerprint:
                     self.conn.execute(
                         """
@@ -9498,6 +9592,34 @@ class TradingDatabase:
                         str(payload.get("latest_tick_source") or ""),
                         int(bool(payload.get("post_subscription_tick_verified"))),
                         _json_payload(payload),
+                    ),
+                )
+                self.conn.execute(
+                    """
+                    UPDATE realtime_subscription_readiness_latest
+                    SET subscription_requested = ?,
+                        subscription_target_selected = ?,
+                        readiness_relevant_source = ?,
+                        readiness_relevant_source_reason = ?,
+                        readiness_relevant_source_generation = ?,
+                        baseline_source_type = ?,
+                        candidate_active_source_types_json = ?,
+                        candidate_primary_source = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE trade_date = ? AND subscription_generation = ? AND code = ?
+                    """,
+                    (
+                        int(bool(payload.get("subscription_requested"))),
+                        int(bool(payload.get("subscription_target_selected"))),
+                        str(payload.get("readiness_relevant_source") or ""),
+                        str(payload.get("readiness_relevant_source_reason") or ""),
+                        _safe_int(payload.get("readiness_relevant_source_generation"), 0),
+                        str(payload.get("baseline_source_type") or ""),
+                        _json_list(payload.get("candidate_active_source_types") or []),
+                        str(payload.get("candidate_primary_source") or ""),
+                        resolved_trade_date,
+                        _safe_int(payload.get("subscription_generation"), 0),
+                        code,
                     ),
                 )
                 saved += 1
@@ -9885,6 +10007,25 @@ class TradingDatabase:
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 _setup_observation_db_values(payload, trade_date, candidate_instance_id, setup_type, code, candidate_id),
+            )
+            self.conn.execute(
+                """
+                UPDATE setup_observations_latest_v2
+                SET input_readiness_fingerprint = ?,
+                    input_readiness_calculated_at = ?,
+                    readiness_commit_id = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE trade_date = ? AND router_version = ? AND candidate_instance_id = ? AND setup_type = ?
+                """,
+                (
+                    str(payload.get("input_readiness_fingerprint") or ""),
+                    str(payload.get("input_readiness_calculated_at") or ""),
+                    str(payload.get("readiness_commit_id") or ""),
+                    trade_date,
+                    router_version,
+                    candidate_instance_id,
+                    setup_type,
+                ),
             )
             if transition_needed:
                 self.conn.execute(
@@ -10848,8 +10989,53 @@ class TradingDatabase:
                         str(payload.get("last_skip_reason") or ""),
                     ),
                 )
+                self._update_setup_router_candidate_runtime_v4_phase_fields(payload, trade_date, router_version, candidate_instance_id)
                 saved += 1
         return saved
+
+    def _update_setup_router_candidate_runtime_v4_phase_fields(self, payload: Mapping[str, object], trade_date: str, router_version: str, candidate_instance_id: str) -> None:
+        if router_version != _CURRENT_SETUP_ROUTER_VERSION:
+            return
+        self.conn.execute(
+            """
+            UPDATE setup_router_candidate_runtime_v4
+            SET last_readiness_observed_at=COALESCE(NULLIF(?, ''), last_readiness_observed_at),
+                last_readiness_evaluated_at=COALESCE(NULLIF(?, ''), last_readiness_evaluated_at),
+                last_readiness_success_at=COALESCE(NULLIF(?, ''), last_readiness_success_at),
+                last_readiness_status=COALESCE(NULLIF(?, ''), last_readiness_status),
+                last_readiness_fingerprint=COALESCE(NULLIF(?, ''), last_readiness_fingerprint),
+                processed_readiness_fingerprint=COALESCE(NULLIF(?, ''), processed_readiness_fingerprint),
+                readiness_evaluation_count=readiness_evaluation_count + ?,
+                readiness_wait_count=readiness_wait_count + ?,
+                last_shape_evaluated_at=COALESCE(NULLIF(?, ''), last_shape_evaluated_at),
+                last_shape_success_at=COALESCE(NULLIF(?, ''), last_shape_success_at),
+                last_shape_readiness_fingerprint=COALESCE(NULLIF(?, ''), last_shape_readiness_fingerprint),
+                shape_evaluation_count=shape_evaluation_count + ?,
+                shape_classification_success_count=shape_classification_success_count + ?,
+                last_shape_result_status=COALESCE(NULLIF(?, ''), last_shape_result_status),
+                updated_at=CURRENT_TIMESTAMP
+            WHERE trade_date = ? AND router_version = ? AND candidate_instance_id = ?
+            """,
+            (
+                str(payload.get("last_readiness_observed_at") or ""),
+                str(payload.get("last_readiness_evaluated_at") or ""),
+                str(payload.get("last_readiness_success_at") or ""),
+                str(payload.get("last_readiness_status") or ""),
+                str(payload.get("last_readiness_fingerprint") or ""),
+                str(payload.get("processed_readiness_fingerprint") or ""),
+                _safe_int(payload.get("readiness_evaluation_count"), 0),
+                _safe_int(payload.get("readiness_wait_count"), 0),
+                str(payload.get("last_shape_evaluated_at") or ""),
+                str(payload.get("last_shape_success_at") or ""),
+                str(payload.get("last_shape_readiness_fingerprint") or ""),
+                _safe_int(payload.get("shape_evaluation_count"), 0),
+                _safe_int(payload.get("shape_classification_success_count"), 0),
+                str(payload.get("last_shape_result_status") or ""),
+                trade_date,
+                router_version,
+                candidate_instance_id,
+            ),
+        )
 
     def list_setup_router_candidate_runtime(
         self,
@@ -11317,12 +11503,14 @@ class TradingDatabase:
     def complete_setup_router_evaluation_atomic(self, commit: Mapping[str, object]) -> dict:
         payload = dict(commit or {})
         observation_rows = [dict(item or {}) for item in payload.get("observations") or []]
+        readiness_payload = dict(payload.get("readiness_snapshot") or {})
         runtime_payload = dict(payload.get("runtime_update") or {})
         pending_payload = dict(payload.get("pending_update") or {})
         metadata = dict(payload.get("completion_metadata") or {})
-        trade_date = str(pending_payload.get("trade_date") or runtime_payload.get("trade_date") or (observation_rows[0].get("trade_date") if observation_rows else ""))
+        evaluation_kind = str(metadata.get("evaluation_kind") or ("SHAPE_CLASSIFICATION" if observation_rows else "READINESS_ONLY"))
+        trade_date = str(pending_payload.get("trade_date") or runtime_payload.get("trade_date") or readiness_payload.get("trade_date") or (observation_rows[0].get("trade_date") if observation_rows else ""))
         router_version = str(pending_payload.get("router_version") or runtime_payload.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION)
-        candidate_instance_id = str(pending_payload.get("candidate_instance_id") or runtime_payload.get("candidate_instance_id") or (observation_rows[0].get("candidate_instance_id") if observation_rows else ""))
+        candidate_instance_id = str(pending_payload.get("candidate_instance_id") or runtime_payload.get("candidate_instance_id") or readiness_payload.get("candidate_instance_id") or (observation_rows[0].get("candidate_instance_id") if observation_rows else ""))
         pending_epoch = _safe_int(pending_payload.get("pending_epoch"), 0)
         pending_instance_id = str(pending_payload.get("pending_instance_id") or "")
         calculated_at = str(pending_payload.get("completed_at") or runtime_payload.get("last_success_at") or (observation_rows[0].get("calculated_at") if observation_rows else "") or datetime.utcnow().replace(microsecond=0).isoformat())
@@ -11335,6 +11523,8 @@ class TradingDatabase:
             "observations": observation_rows,
             "runtime_update": runtime_payload,
             "pending_update": pending_payload,
+            "readiness_snapshot": readiness_payload,
+            "evaluation_kind": evaluation_kind,
         }
         payload_hash = hashlib.sha1(_stable_json_db(commit_payload).encode("utf-8")).hexdigest()
         evaluation_commit_id = str(payload.get("evaluation_commit_id") or _setup_router_evaluation_commit_id(commit_payload))
@@ -11390,6 +11580,16 @@ class TradingDatabase:
                 self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 return {"status": "PENDING_STATUS_CONFLICT", "error_class": str(pending_current.get("status") or "UNKNOWN"), "evaluation_commit_id": evaluation_commit_id}
+            readiness_count = 0
+            if readiness_payload:
+                readiness_payload = {
+                    **readiness_payload,
+                    "router_version": router_version,
+                    "readiness_processed": True,
+                    "readiness_commit_id": evaluation_commit_id,
+                    "shape_evaluated": bool(observation_rows),
+                }
+                readiness_count = int(self.save_setup_router_readiness_snapshots([readiness_payload]) or 0)
             state_counts = dict(self.save_setup_router_states(observation_rows) or {}) if observation_rows else {}
             if metadata.get("fail_after_state_write"):
                 raise RuntimeError("fail_after_state_write")
@@ -11428,8 +11628,10 @@ class TradingDatabase:
                     evaluation_commit_id, trade_date, router_version, candidate_instance_id,
                     pending_instance_id, pending_epoch, commit_status, state_write_count,
                     observation_write_count, transition_write_count, primary_write_count,
+                    evaluation_kind, readiness_fingerprint, readiness_status,
+                    readiness_calculated_at, shape_evaluated, shape_result_count,
                     committed_at, payload_hash, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, 'COMMITTED', ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'COMMITTED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     evaluation_commit_id,
@@ -11442,6 +11644,12 @@ class TradingDatabase:
                     saved_count,
                     int(state_counts.get("transition_write_count") or 0),
                     1 if any(bool(row.get("primary_setup")) and str(row.get("lifecycle_state") or "").upper() in {"FORMING", "MATCHED"} for row in observation_rows) else 0,
+                    evaluation_kind,
+                    str(readiness_payload.get("readiness_fingerprint") or metadata.get("readiness_fingerprint") or ""),
+                    str(readiness_payload.get("readiness_status") or metadata.get("readiness_status") or ""),
+                    str(readiness_payload.get("calculated_at") or metadata.get("readiness_calculated_at") or ""),
+                    int(bool(observation_rows)),
+                    len(observation_rows),
                     calculated_at,
                     payload_hash,
                     _json_payload(commit_payload),
@@ -11456,6 +11664,7 @@ class TradingDatabase:
                 "no_change_skip_count": int(state_counts.get("no_change_skip_count") or 0),
                 "state_no_change_skip_count": int(state_counts.get("state_no_change_skip_count") or state_counts.get("no_change_skip_count") or 0),
                 "observation_write_count": saved_count,
+                "readiness_write_count": readiness_count,
                 "saved_count": saved_count,
                 "runtime_write_count": runtime_count,
                 "pending_completed_count": 1,
@@ -11469,6 +11678,46 @@ class TradingDatabase:
                 "error_class": exc.__class__.__name__,
                 "error_message": str(exc),
             }
+
+    def complete_setup_router_readiness_evaluation_atomic(
+        self,
+        *,
+        trade_date: str,
+        router_version: str,
+        candidate_instance_id: str,
+        pending_epoch: int,
+        pending_instance_id: str,
+        readiness_snapshot: Mapping[str, object],
+        runtime_update: Mapping[str, object],
+        evaluation_commit: Mapping[str, object] | None = None,
+    ) -> dict:
+        completed_at = str(dict(runtime_update or {}).get("last_readiness_success_at") or dict(readiness_snapshot or {}).get("calculated_at") or datetime.utcnow().replace(microsecond=0).isoformat())
+        pending_update = {
+            "trade_date": trade_date,
+            "router_version": router_version,
+            "candidate_instance_id": candidate_instance_id,
+            "pending_epoch": pending_epoch,
+            "pending_instance_id": pending_instance_id,
+            "status": "COMPLETED",
+            "completed_at": completed_at,
+            "last_attempt_at": completed_at,
+        }
+        metadata = {
+            "evaluation_kind": "READINESS_ONLY",
+            "readiness_fingerprint": dict(readiness_snapshot or {}).get("readiness_fingerprint") or "",
+            "readiness_status": dict(readiness_snapshot or {}).get("readiness_status") or "",
+            "readiness_calculated_at": dict(readiness_snapshot or {}).get("calculated_at") or "",
+            **dict(evaluation_commit or {}),
+        }
+        return self.complete_setup_router_evaluation_atomic(
+            {
+                "observations": [],
+                "readiness_snapshot": dict(readiness_snapshot or {}),
+                "runtime_update": dict(runtime_update or {}),
+                "pending_update": pending_update,
+                "completion_metadata": metadata,
+            }
+        )
 
     def complete_setup_router_evaluation_legacy(
         self,
@@ -16500,6 +16749,62 @@ class TradingDatabase:
             "observed_lease_signature": "TEXT NOT NULL DEFAULT ''",
             "processed_lease_signature": "TEXT NOT NULL DEFAULT ''",
             "pending_reason_codes_json": "TEXT NOT NULL DEFAULT '[]'",
+            "last_readiness_observed_at": "TEXT NOT NULL DEFAULT ''",
+            "last_readiness_evaluated_at": "TEXT NOT NULL DEFAULT ''",
+            "last_readiness_success_at": "TEXT NOT NULL DEFAULT ''",
+            "last_readiness_status": "TEXT NOT NULL DEFAULT ''",
+            "last_readiness_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "processed_readiness_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "readiness_evaluation_count": "INTEGER NOT NULL DEFAULT 0",
+            "readiness_wait_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_shape_evaluated_at": "TEXT NOT NULL DEFAULT ''",
+            "last_shape_success_at": "TEXT NOT NULL DEFAULT ''",
+            "last_shape_readiness_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "shape_evaluation_count": "INTEGER NOT NULL DEFAULT 0",
+            "shape_classification_success_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_shape_result_status": "TEXT NOT NULL DEFAULT ''",
+        }
+        commit_columns = {
+            "evaluation_kind": "TEXT NOT NULL DEFAULT ''",
+            "readiness_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "readiness_status": "TEXT NOT NULL DEFAULT ''",
+            "readiness_calculated_at": "TEXT NOT NULL DEFAULT ''",
+            "shape_evaluated": "INTEGER NOT NULL DEFAULT 0",
+            "shape_result_count": "INTEGER NOT NULL DEFAULT 0",
+        }
+        readiness_columns = {
+            "readiness_schema_version": "TEXT NOT NULL DEFAULT ''",
+            "readiness_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "canonical_market_action": "TEXT NOT NULL DEFAULT ''",
+            "market_action_normalized": "INTEGER NOT NULL DEFAULT 0",
+            "market_action_reason_codes_json": "TEXT NOT NULL DEFAULT '[]'",
+            "subscription_requested": "INTEGER NOT NULL DEFAULT 0",
+            "subscription_target_selected": "INTEGER NOT NULL DEFAULT 0",
+            "readiness_relevant_source": "TEXT NOT NULL DEFAULT ''",
+            "readiness_relevant_source_reason": "TEXT NOT NULL DEFAULT ''",
+            "readiness_relevant_source_generation": "INTEGER NOT NULL DEFAULT 0",
+            "baseline_source_type": "TEXT NOT NULL DEFAULT ''",
+            "candidate_active_source_types_json": "TEXT NOT NULL DEFAULT '[]'",
+            "candidate_primary_source": "TEXT NOT NULL DEFAULT ''",
+            "readiness_processed": "INTEGER NOT NULL DEFAULT 0",
+            "readiness_commit_id": "TEXT NOT NULL DEFAULT ''",
+            "shape_evaluated": "INTEGER NOT NULL DEFAULT 0",
+            "matching_shape_commit_id": "TEXT NOT NULL DEFAULT ''",
+        }
+        realtime_readiness_columns = {
+            "subscription_requested": "INTEGER NOT NULL DEFAULT 0",
+            "subscription_target_selected": "INTEGER NOT NULL DEFAULT 0",
+            "readiness_relevant_source": "TEXT NOT NULL DEFAULT ''",
+            "readiness_relevant_source_reason": "TEXT NOT NULL DEFAULT ''",
+            "readiness_relevant_source_generation": "INTEGER NOT NULL DEFAULT 0",
+            "baseline_source_type": "TEXT NOT NULL DEFAULT ''",
+            "candidate_active_source_types_json": "TEXT NOT NULL DEFAULT '[]'",
+            "candidate_primary_source": "TEXT NOT NULL DEFAULT ''",
+        }
+        observation_v2_columns = {
+            "input_readiness_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "input_readiness_calculated_at": "TEXT NOT NULL DEFAULT ''",
+            "readiness_commit_id": "TEXT NOT NULL DEFAULT ''",
         }
         pending_v5_columns = {
             "failed_permanent_at": "TEXT NOT NULL DEFAULT ''",
@@ -16519,6 +16824,15 @@ class TradingDatabase:
             self._ensure_column("setup_router_state_transitions_v2", name, definition)
         for name, definition in candidate_runtime_columns.items():
             self._ensure_column("setup_router_candidate_runtime_v3", name, definition)
+            self._ensure_column("setup_router_candidate_runtime_v4", name, definition)
+        for name, definition in commit_columns.items():
+            self._ensure_column("setup_router_evaluation_commits_v1", name, definition)
+        for name, definition in readiness_columns.items():
+            self._ensure_column("setup_router_readiness_latest", name, definition)
+        for name, definition in realtime_readiness_columns.items():
+            self._ensure_column("realtime_subscription_readiness_latest", name, definition)
+        for name, definition in observation_v2_columns.items():
+            self._ensure_column("setup_observations_latest_v2", name, definition)
         for name, definition in pending_v5_columns.items():
             self._ensure_column("setup_router_pending_evaluations_v5", name, definition)
 
@@ -19467,9 +19781,16 @@ def _row_to_setup_router_readiness(row: sqlite3.Row) -> dict:
     payload.setdefault("name", data.get("name", ""))
     payload.setdefault("selected_theme_id", data.get("selected_theme_id", ""))
     payload.setdefault("selected_theme_name", data.get("selected_theme_name", ""))
+    payload.setdefault("readiness_schema_version", data.get("readiness_schema_version", ""))
     payload.setdefault("readiness_status", data.get("readiness_status", ""))
     payload.setdefault("readiness_ready", bool(data.get("readiness_ready")))
+    payload.setdefault("readiness_fingerprint", data.get("readiness_fingerprint", ""))
+    payload.setdefault("canonical_market_action", data.get("canonical_market_action", ""))
+    payload.setdefault("market_action_normalized", bool(data.get("market_action_normalized")))
+    payload.setdefault("market_action_reason_codes", _safe_json_loads(data.pop("market_action_reason_codes_json", "[]"), []))
     payload.setdefault("coverage_type", data.get("coverage_type", ""))
+    payload.setdefault("subscription_requested", bool(data.get("subscription_requested")))
+    payload.setdefault("subscription_target_selected", bool(data.get("subscription_target_selected")))
     payload.setdefault("subscription_selected", bool(data.get("subscription_selected")))
     payload.setdefault("subscription_active", bool(data.get("subscription_active")))
     payload.setdefault("subscription_sources", _safe_json_loads(data.pop("subscription_sources_json", "[]"), []))
@@ -19479,6 +19800,12 @@ def _row_to_setup_router_readiness(row: sqlite3.Row) -> dict:
     payload.setdefault("subscription_active_since", data.get("subscription_active_since", ""))
     payload.setdefault("relevant_source_added_at", data.get("relevant_source_added_at", ""))
     payload.setdefault("subscription_budget_deferred", bool(data.get("subscription_budget_deferred")))
+    payload.setdefault("readiness_relevant_source", data.get("readiness_relevant_source", ""))
+    payload.setdefault("readiness_relevant_source_reason", data.get("readiness_relevant_source_reason", ""))
+    payload.setdefault("readiness_relevant_source_generation", int(data.get("readiness_relevant_source_generation") or 0))
+    payload.setdefault("baseline_source_type", data.get("baseline_source_type", ""))
+    payload.setdefault("candidate_active_source_types", _safe_json_loads(data.pop("candidate_active_source_types_json", "[]"), []))
+    payload.setdefault("candidate_primary_source", data.get("candidate_primary_source", ""))
     payload.setdefault("expansion_lease_required", bool(data.get("expansion_lease_required")))
     payload.setdefault("expansion_lease_requirement", data.get("expansion_lease_requirement", ""))
     payload.setdefault("expansion_lease_requirement_reason", data.get("expansion_lease_requirement_reason", ""))
@@ -19501,6 +19828,10 @@ def _row_to_setup_router_readiness(row: sqlite3.Row) -> dict:
     payload.setdefault("baseline_at", data.get("baseline_at", ""))
     payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
     payload.setdefault("informational_reason_codes", _safe_json_loads(data.pop("informational_reason_codes_json", "[]"), []))
+    payload.setdefault("readiness_processed", bool(data.get("readiness_processed")))
+    payload.setdefault("readiness_commit_id", data.get("readiness_commit_id", ""))
+    payload.setdefault("shape_evaluated", bool(data.get("shape_evaluated")))
+    payload.setdefault("matching_shape_commit_id", data.get("matching_shape_commit_id", ""))
     payload.setdefault("calculated_at", data.get("calculated_at", ""))
     payload.setdefault("updated_at", data.get("updated_at", ""))
     return payload
@@ -19515,6 +19846,8 @@ def _row_to_realtime_subscription_readiness(row: sqlite3.Row) -> dict:
     payload.setdefault("subscription_generation", int(data.get("subscription_generation") or 0))
     payload.setdefault("code", data.get("code", ""))
     payload.setdefault("calculated_at", data.get("calculated_at", ""))
+    payload.setdefault("subscription_requested", bool(data.get("subscription_requested")))
+    payload.setdefault("subscription_target_selected", bool(data.get("subscription_target_selected")))
     payload.setdefault("subscription_selected", bool(data.get("subscription_selected")))
     payload.setdefault("subscription_active", bool(data.get("subscription_active")))
     payload.setdefault("subscription_budget_deferred", bool(data.get("subscription_budget_deferred")))
@@ -19523,6 +19856,12 @@ def _row_to_realtime_subscription_readiness(row: sqlite3.Row) -> dict:
     payload.setdefault("subscription_screen_no", data.get("subscription_screen_no", ""))
     payload.setdefault("subscription_active_since", data.get("subscription_active_since", ""))
     payload.setdefault("relevant_source_added_at", data.get("relevant_source_added_at", ""))
+    payload.setdefault("readiness_relevant_source", data.get("readiness_relevant_source", ""))
+    payload.setdefault("readiness_relevant_source_reason", data.get("readiness_relevant_source_reason", ""))
+    payload.setdefault("readiness_relevant_source_generation", int(data.get("readiness_relevant_source_generation") or 0))
+    payload.setdefault("baseline_source_type", data.get("baseline_source_type", ""))
+    payload.setdefault("candidate_active_source_types", _safe_json_loads(data.pop("candidate_active_source_types_json", "[]"), []))
+    payload.setdefault("candidate_primary_source", data.get("candidate_primary_source", ""))
     payload.setdefault("coverage_type", data.get("coverage_type", ""))
     payload.setdefault("latest_tick_at", data.get("latest_tick_at", ""))
     payload.setdefault("latest_tick_age_sec", _float_value(data.get("latest_tick_age_sec")))
@@ -19551,6 +19890,9 @@ def _row_to_setup_observation(row: sqlite3.Row) -> dict:
     payload.setdefault("setup_instance_id", data.get("setup_instance_id", ""))
     payload.setdefault("state_version", data.get("state_version", ""))
     payload.setdefault("post_subscription_tick_verified", bool(data.get("post_subscription_tick_verified")))
+    payload.setdefault("input_readiness_fingerprint", data.get("input_readiness_fingerprint", ""))
+    payload.setdefault("input_readiness_calculated_at", data.get("input_readiness_calculated_at", ""))
+    payload.setdefault("readiness_commit_id", data.get("readiness_commit_id", ""))
     payload.setdefault("entry_decision_at", data.get("entry_decision_at", ""))
     payload.setdefault("entry_decision_id", data.get("entry_decision_id"))
     payload.setdefault("entry_decision_age_sec", _float_value(data.get("entry_decision_age_sec")))
@@ -19769,6 +20111,20 @@ def _row_to_setup_router_candidate_runtime(row: sqlite3.Row) -> dict:
         "capacity_deferred_count": int(data.get("capacity_deferred_count") or 0),
         "last_deferred_at": data.get("last_deferred_at", ""),
         "last_skip_reason": data.get("last_skip_reason", ""),
+        "last_readiness_observed_at": data.get("last_readiness_observed_at", ""),
+        "last_readiness_evaluated_at": data.get("last_readiness_evaluated_at", ""),
+        "last_readiness_success_at": data.get("last_readiness_success_at", ""),
+        "last_readiness_status": data.get("last_readiness_status", ""),
+        "last_readiness_fingerprint": data.get("last_readiness_fingerprint", ""),
+        "processed_readiness_fingerprint": data.get("processed_readiness_fingerprint", ""),
+        "readiness_evaluation_count": int(data.get("readiness_evaluation_count") or 0),
+        "readiness_wait_count": int(data.get("readiness_wait_count") or 0),
+        "last_shape_evaluated_at": data.get("last_shape_evaluated_at", ""),
+        "last_shape_success_at": data.get("last_shape_success_at", ""),
+        "last_shape_readiness_fingerprint": data.get("last_shape_readiness_fingerprint", ""),
+        "shape_evaluation_count": int(data.get("shape_evaluation_count") or 0),
+        "shape_classification_success_count": int(data.get("shape_classification_success_count") or 0),
+        "last_shape_result_status": data.get("last_shape_result_status", ""),
         "created_at": data.get("created_at", ""),
         "updated_at": data.get("updated_at", ""),
     }

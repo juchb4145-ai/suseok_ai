@@ -59,7 +59,9 @@ def test_subscription_readiness_provider_separates_budget_deferred_from_stale_ti
     provider = RealtimeSubscriptionReadinessProvider(manager, market_data=MarketDataStore(), clock=clock, max_tick_age_sec=10)
     snapshot = provider.snapshot("000002", now=datetime(2026, 6, 22, 9, 5, 10))
 
-    assert snapshot["subscription_selected"] is True
+    assert snapshot["subscription_requested"] is True
+    assert snapshot["subscription_target_selected"] is False
+    assert snapshot["subscription_selected"] is False
     assert snapshot["subscription_active"] is False
     assert snapshot["subscription_budget_deferred"] is True
     assert snapshot["latest_tick_at"] == ""

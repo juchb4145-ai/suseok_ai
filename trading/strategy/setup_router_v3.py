@@ -11,8 +11,8 @@ from typing import Any, Iterable, Mapping
 from trading.strategy.setup_features import SETUP_ROUTER_FEATURE_SCHEMA_VERSION, SetupFeatureSnapshot
 
 
-SETUP_ROUTER_SCHEMA_VERSION = "setup_router_v3.observe.v5"
-SETUP_ROUTER_VERSION = "setup_router_v3.5"
+SETUP_ROUTER_SCHEMA_VERSION = "setup_router_v3.observe.v5.1"
+SETUP_ROUTER_VERSION = "setup_router_v3.5.1"
 SETUP_ROUTER_STATE_VERSION = "setup_router_v3.state.v3.2"
 SETUP_ROUTER_OUTPUT_MODE = "OBSERVE"
 
@@ -126,6 +126,9 @@ class SetupRouterConfig:
     retry_max_sec: int = 60
     retry_max_failures: int = 20
     selected_lease_sec: int = 30
+    readiness_p01_enabled: bool = True
+    atomic_readiness_completion_enabled: bool = True
+    canonical_market_action_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "SetupRouterConfig":
@@ -170,6 +173,9 @@ class SetupRouterConfig:
             retry_max_sec=max(1, _env_int("TRADING_SETUP_ROUTER_RETRY_MAX_SEC", 60)),
             retry_max_failures=max(1, _env_int("TRADING_SETUP_ROUTER_RETRY_MAX_FAILURES", 20)),
             selected_lease_sec=max(1, _env_int("TRADING_SETUP_ROUTER_SELECTED_LEASE_SEC", 30)),
+            readiness_p01_enabled=_env_bool("TRADING_SETUP_ROUTER_READINESS_P01_ENABLED", True),
+            atomic_readiness_completion_enabled=_env_bool("TRADING_SETUP_ROUTER_ATOMIC_READINESS_COMPLETION_ENABLED", True),
+            canonical_market_action_enabled=_env_bool("TRADING_SETUP_ROUTER_CANONICAL_MARKET_ACTION_ENABLED", True),
         )
 
 

@@ -75,6 +75,7 @@ class SubscriptionRecord:
     subscription_generation: int = 0
     source_added_at_by_source: dict[str, str] = field(default_factory=dict)
     source_removed_at_by_source: dict[str, str] = field(default_factory=dict)
+    source_generation_by_source: dict[str, int] = field(default_factory=dict)
     last_registered_at: str = ""
     last_deactivated_at: str = ""
 
@@ -82,10 +83,13 @@ class SubscriptionRecord:
         timestamp = _timestamp(now)
         if not self.created_at:
             self.created_at = timestamp
+        already_active = source in self.sources
         self.sources.add(source)
         self.source_priorities[source] = priority
         self.source_protected[source] = protected
-        self.source_added_at_by_source.setdefault(source, timestamp)
+        if not already_active:
+            self.source_added_at_by_source[source] = timestamp
+            self.source_generation_by_source[source] = int(self.source_generation_by_source.get(source, 0) or 0) + 1
         self.refresh()
 
     def remove_source(self, source: str, now: Optional[datetime] = None) -> None:
@@ -93,6 +97,7 @@ class SubscriptionRecord:
         self.sources.discard(source)
         self.source_priorities.pop(source, None)
         self.source_protected.pop(source, None)
+        self.source_added_at_by_source.pop(source, None)
         self.source_removed_at_by_source[source] = timestamp
         self.refresh()
 
@@ -125,6 +130,8 @@ class RealTimeSubscriptionManager:
         self.code_to_screen: dict[str, str] = {}
         self.screen_to_codes: dict[str, set[str]] = {}
         self.warnings: list[str] = []
+        self._source_generation_by_code_source: dict[tuple[str, str], int] = {}
+        self._source_removed_at_by_code_source: dict[tuple[str, str], str] = {}
 
     def ensure_subscription(
         self,
@@ -141,7 +148,13 @@ class RealTimeSubscriptionManager:
         if record is None:
             record = SubscriptionRecord(code=clean_code, created_at=_timestamp(now))
             self.records[clean_code] = record
+        already_active = source in record.sources
         record.add_source(source, resolved_priority, resolved_protected, now=now)
+        if not already_active:
+            generation_key = (clean_code, source)
+            generation = int(self._source_generation_by_code_source.get(generation_key, 0) or 0) + 1
+            record.source_generation_by_source[source] = generation
+            self._source_generation_by_code_source[generation_key] = generation
         return record
 
     def remove_subscription(self, code: str, source: str) -> None:
@@ -151,6 +164,9 @@ class RealTimeSubscriptionManager:
         if record is None:
             return
         record.remove_source(source, now=now)
+        removed_at = str(record.source_removed_at_by_source.get(source) or _timestamp(now))
+        self._source_removed_at_by_code_source[(clean_code, source)] = removed_at
+        self._source_generation_by_code_source[(clean_code, source)] = int(record.source_generation_by_source.get(source, 0) or self._source_generation_by_code_source.get((clean_code, source), 0) or 0)
         if not record.sources:
             self.records.pop(clean_code, None)
 

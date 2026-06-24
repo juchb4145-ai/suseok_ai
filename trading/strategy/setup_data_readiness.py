@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+import hashlib
+import json
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from typing import Any, Iterable, Mapping
 
 from trading.strategy.candidates import normalize_code
+from trading.strategy.market_action import MARKET_ACTION_UNMAPPED, normalize_market_action
+
+
+READINESS_SCHEMA_VERSION = "setup_router_readiness.v2"
 
 
 class RealtimeCoverageType(str, Enum):
@@ -33,6 +39,7 @@ class SetupDataReadinessStatus(str, Enum):
     WAIT_REALTIME_TICK_STALE = "WAIT_REALTIME_TICK_STALE"
     WAIT_THEME_SIGNAL_STALE = "WAIT_THEME_SIGNAL_STALE"
     WAIT_MARKET_CONTEXT = "WAIT_MARKET_CONTEXT"
+    WAIT_MARKET_ACTION = "WAIT_MARKET_ACTION"
     WAIT_STRATEGY_CONTEXT = "WAIT_STRATEGY_CONTEXT"
     WAIT_CANDLE_WARMUP = "WAIT_CANDLE_WARMUP"
     ERROR = "ERROR"
@@ -53,11 +60,18 @@ class SetupDataReadinessSnapshot:
     candidate_id: int | None
     candidate_instance_id: str
     code: str
+    readiness_schema_version: str = READINESS_SCHEMA_VERSION
     selected_theme_id: str = ""
     evaluation_eligible: bool = True
     readiness_status: str = SetupDataReadinessStatus.ERROR.value
     readiness_ready: bool = False
+    readiness_fingerprint: str = ""
     coverage_type: str = RealtimeCoverageType.NONE.value
+    canonical_market_action: str = "DATA_WAIT"
+    market_action_normalized: bool = False
+    market_action_reason_codes: tuple[str, ...] = ()
+    subscription_requested: bool = False
+    subscription_target_selected: bool = False
     subscription_active: bool = False
     subscription_selected: bool = False
     subscription_sources: tuple[str, ...] = ()
@@ -67,6 +81,12 @@ class SetupDataReadinessSnapshot:
     subscription_active_since: str = ""
     relevant_source_added_at: str = ""
     subscription_budget_deferred: bool = False
+    readiness_relevant_source: str = ""
+    readiness_relevant_source_reason: str = ""
+    readiness_relevant_source_generation: int = 0
+    baseline_source_type: str = ""
+    candidate_active_source_types: tuple[str, ...] = ()
+    candidate_primary_source: str = ""
     expansion_lease_required: bool = False
     expansion_lease_requirement: str = LeaseRequirement.NOT_REQUIRED.value
     expansion_lease_requirement_reason: str = ""
@@ -119,9 +139,18 @@ def build_setup_data_readiness(
     active_statuses = {"ACTIVE", "HOLDING", "PROTECTED"}
     exact_lease_status = str(lease.get("status") or "")
     exact_lease_active = bool(lease) and exact_lease_status.upper() in active_statuses
+    market = dict(context.get("market") or {})
+    normalized_action = normalize_market_action(
+        market.get("market_action"),
+        side_market_regime=market.get("side_market_regime") or market.get("market_status"),
+        global_market_regime=market.get("global_market_regime") or market.get("global_market_status"),
+        market_session_status=market.get("market_session_status"),
+    )
     subscription_sources = tuple(sorted(str(source) for source in list(subscription.get("subscription_sources") or subscription.get("sources") or []) if str(source)))
+    subscription_requested = bool(subscription.get("subscription_requested", subscription.get("requested", bool(subscription_sources) or subscription.get("subscription_selected"))))
+    subscription_target_selected = bool(subscription.get("subscription_target_selected", subscription.get("target_selected", subscription.get("subscription_selected"))))
     subscription_active = bool(subscription.get("subscription_active") or subscription.get("active"))
-    subscription_selected = bool(subscription.get("subscription_selected") or subscription_sources)
+    subscription_selected = subscription_target_selected
     budget_deferred = bool(subscription.get("subscription_budget_deferred") or subscription.get("budget_deferred"))
     latest_tick_at = str(subscription.get("latest_tick_at") or subscription.get("core_tick_at") or "")
     tick_age_sec = _float(subscription.get("latest_tick_age_sec"), 999999.0)
@@ -145,7 +174,7 @@ def build_setup_data_readiness(
     market_fresh = bool(data.get("market_context_fresh", True))
     theme_fresh = bool(data.get("theme_context_fresh", True))
     context_fresh = bool(context.get("context_fresh")) if context else False
-    context_reasons = [str(reason) for reason in list(context.get("reason_codes") or []) + list(data.get("blocking_reason_codes") or [])]
+    context_reasons = [str(reason) for reason in list(context.get("reason_codes") or []) + list(data.get("blocking_reason_codes") or []) + list(normalized_action.reason_codes)]
     signal_stale = any("SIGNAL_STALE" in reason.upper() for reason in context_reasons)
     candle_ready = completed_1m_count >= max(0, int(min_completed_1m_candles or 0))
 
@@ -158,7 +187,13 @@ def build_setup_data_readiness(
     elif budget_deferred:
         status = SetupDataReadinessStatus.WAIT_SUBSCRIPTION_BUDGET
         reasons.append(SUBSCRIPTION_BUDGET_DEFERRED)
-    elif not subscription_selected or not subscription_active:
+    elif not subscription_requested:
+        status = SetupDataReadinessStatus.WAIT_SUBSCRIPTION_NOT_ACTIVE
+        reasons.append("SUBSCRIPTION_NOT_REQUESTED")
+    elif not subscription_target_selected:
+        status = SetupDataReadinessStatus.WAIT_SUBSCRIPTION_BUDGET
+        reasons.append(SUBSCRIPTION_BUDGET_DEFERRED)
+    elif not subscription_active:
         status = SetupDataReadinessStatus.WAIT_SUBSCRIPTION_NOT_ACTIVE
         reasons.append("SUBSCRIPTION_NOT_ACTIVE")
     elif lease_required and not exact_lease_active:
@@ -173,15 +208,18 @@ def build_setup_data_readiness(
     elif not tick_after_baseline:
         status = SetupDataReadinessStatus.WAIT_POST_SUBSCRIPTION_TICK
         reasons.append("ACTIVE_SUBSCRIPTION_NO_POST_ACTIVE_TICK")
-    elif not context_fresh:
-        status = SetupDataReadinessStatus.WAIT_STRATEGY_CONTEXT
-        reasons.append("STRATEGY_CONTEXT_REFRESH_LAG")
+    elif normalized_action.action == "DATA_WAIT" and MARKET_ACTION_UNMAPPED in normalized_action.reason_codes:
+        status = SetupDataReadinessStatus.WAIT_MARKET_ACTION
+        reasons.append(MARKET_ACTION_UNMAPPED)
     elif signal_stale or not theme_fresh:
         status = SetupDataReadinessStatus.WAIT_THEME_SIGNAL_STALE
         reasons.append("SIGNAL_STALE")
     elif not market_fresh:
         status = SetupDataReadinessStatus.WAIT_MARKET_CONTEXT
         reasons.append("MARKET_CONTEXT_NOT_FRESH")
+    elif not context_fresh:
+        status = SetupDataReadinessStatus.WAIT_STRATEGY_CONTEXT
+        reasons.append("STRATEGY_CONTEXT_REFRESH_LAG")
     elif not candle_ready:
         status = SetupDataReadinessStatus.WAIT_CANDLE_WARMUP
         reasons.append("COMPLETED_1M_CANDLES_INSUFFICIENT")
@@ -196,7 +234,7 @@ def build_setup_data_readiness(
         else:
             informational.append(GENERAL_SUBSCRIPTION_READY)
 
-    return SetupDataReadinessSnapshot(
+    payload = SetupDataReadinessSnapshot(
         trade_date=trade_date,
         calculated_at=current.isoformat(),
         candidate_id=getattr(candidate, "id", None),
@@ -206,7 +244,13 @@ def build_setup_data_readiness(
         evaluation_eligible=bool(evaluation_eligible),
         readiness_status=status.value,
         readiness_ready=status == SetupDataReadinessStatus.READY,
+        readiness_fingerprint="",
         coverage_type=str(subscription.get("coverage_type") or RealtimeCoverageType.NONE.value),
+        canonical_market_action=normalized_action.action,
+        market_action_normalized=normalized_action.normalized,
+        market_action_reason_codes=tuple(normalized_action.reason_codes),
+        subscription_requested=subscription_requested,
+        subscription_target_selected=subscription_target_selected,
         subscription_active=subscription_active,
         subscription_selected=subscription_selected,
         subscription_sources=subscription_sources,
@@ -216,6 +260,12 @@ def build_setup_data_readiness(
         subscription_active_since=str(subscription.get("subscription_active_since") or ""),
         relevant_source_added_at=str(subscription.get("relevant_source_added_at") or ""),
         subscription_budget_deferred=budget_deferred,
+        readiness_relevant_source=str(subscription.get("readiness_relevant_source") or ""),
+        readiness_relevant_source_reason=str(subscription.get("readiness_relevant_source_reason") or ""),
+        readiness_relevant_source_generation=_int(subscription.get("readiness_relevant_source_generation")),
+        baseline_source_type=str(subscription.get("baseline_source_type") or ""),
+        candidate_active_source_types=tuple(str(item) for item in list(subscription.get("candidate_active_source_types") or []) if str(item)),
+        candidate_primary_source=str(subscription.get("candidate_primary_source") or ""),
         expansion_lease_required=lease_required,
         expansion_lease_requirement=requirement.value,
         expansion_lease_requirement_reason=requirement_reason,
@@ -239,6 +289,8 @@ def build_setup_data_readiness(
         reason_codes=tuple(_dedupe(reasons)),
         informational_reason_codes=tuple(_dedupe(informational)),
     )
+    fingerprint = _fingerprint(payload.to_dict())
+    return replace(payload, readiness_fingerprint=fingerprint)
 
 
 def _lease_requirement(candidate: Any, context: Mapping[str, Any], selected_theme_id: str) -> tuple[LeaseRequirement, str]:
@@ -246,9 +298,19 @@ def _lease_requirement(candidate: Any, context: Mapping[str, Any], selected_them
     if bool(context.get("selected_theme_lease_required") or context.get("theme_expansion_lease_required") or data.get("selected_theme_lease_required") or data.get("theme_expansion_lease_required")):
         return LeaseRequirement.REQUIRED_EXACT_THEME, "EXPLICIT_CONTEXT_FLAG"
     metadata = dict(getattr(candidate, "metadata", {}) or {})
+    active_sources = _active_source_map(metadata)
+    selected = str(selected_theme_id or "")
+    if active_sources:
+        for entry in active_sources:
+            source_type = str(entry.get("source_type") or entry.get("source") or "").lower()
+            source_theme = str(entry.get("theme_id") or entry.get("selected_theme_id") or "")
+            if source_type in {"reboot_v2_theme_expansion", "theme_expansion"} and selected and source_theme == selected:
+                return LeaseRequirement.REQUIRED_EXACT_THEME, "ACTIVE_EXPANSION_SOURCE_PROVENANCE"
+        if bool(metadata.get("expansion_only") or metadata.get("theme_expansion_only")):
+            return LeaseRequirement.REQUIRED_EXACT_THEME, "EXPANSION_ONLY_PROVENANCE"
+        return LeaseRequirement.NOT_REQUIRED, "ACTIVE_SOURCE_MAP_GENERAL_SUBSCRIPTION_ALLOWED"
     if bool(metadata.get("expansion_only") or metadata.get("theme_expansion_only")):
         return LeaseRequirement.REQUIRED_EXACT_THEME, "EXPANSION_ONLY_PROVENANCE"
-    selected = str(selected_theme_id or "")
     sources = list(metadata.get("source_events") or []) + list(metadata.get("sources_detail") or [])
     source_type = str(metadata.get("source_type") or metadata.get("source") or "")
     if source_type:
@@ -260,6 +322,17 @@ def _lease_requirement(candidate: Any, context: Mapping[str, Any], selected_them
         if raw_type in {"reboot_v2_theme_expansion", "theme_expansion"} and (not selected or not source_theme or source_theme == selected):
             return LeaseRequirement.REQUIRED_EXACT_THEME, "EXPANSION_SOURCE_PROVENANCE"
     return LeaseRequirement.NOT_REQUIRED, "GENERAL_SUBSCRIPTION_ALLOWED"
+
+
+def _active_source_map(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
+    ingestion = dict(metadata.get("candidate_ingestion") or {})
+    source_map = dict(ingestion.get("source_map") or {})
+    result: list[dict[str, Any]] = []
+    for value in source_map.values():
+        item = dict(value or {}) if isinstance(value, Mapping) else {}
+        if item and bool(item.get("active", True)):
+            result.append(item)
+    return result
 
 
 def _candidate_eligible_at(candidate: Any) -> str:
@@ -320,3 +393,30 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _jsonable(item) for key, item in value.items()}
     return value
+
+
+def _fingerprint(payload: Mapping[str, Any]) -> str:
+    keys = (
+        "code",
+        "selected_theme_id",
+        "readiness_status",
+        "coverage_type",
+        "canonical_market_action",
+        "subscription_requested",
+        "subscription_target_selected",
+        "subscription_active",
+        "subscription_budget_deferred",
+        "subscription_generation",
+        "readiness_relevant_source",
+        "readiness_relevant_source_generation",
+        "expansion_lease_required",
+        "exact_theme_lease_active",
+        "post_subscription_tick_verified",
+        "market_context_fresh",
+        "theme_context_fresh",
+        "candle_ready",
+        "baseline_at",
+        "reason_codes",
+    )
+    compact = {key: payload.get(key) for key in keys}
+    return hashlib.sha1(json.dumps(compact, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
