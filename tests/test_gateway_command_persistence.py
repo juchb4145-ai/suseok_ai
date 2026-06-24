@@ -127,6 +127,20 @@ def test_prune_finished_keeps_order_dedupe_until_retention(tmp_path):
     assert duplicate.duplicate_of == "cmd-order-retain"
 
 
+def test_control_command_dedupe_survives_command_ttl_expiry(tmp_path):
+    state = _state(tmp_path, dedupe_retention_sec=86400)
+    now = datetime(2026, 6, 19, tzinfo=timezone.utc)
+
+    first = GatewayCommand(type="register_realtime", command_id="cmd-register-1", idempotency_key="rt-once")
+    state.enqueue_command(first, ttl_sec=1, now=now)
+    state.expire_old_commands(now + timedelta(seconds=2))
+    second = GatewayCommand(type="register_realtime", command_id="cmd-register-2", idempotency_key="rt-once")
+    result = state.enqueue_command(second, ttl_sec=1, now=now + timedelta(seconds=3))
+
+    assert result.accepted is False
+    assert result.duplicate_of == "cmd-register-1"
+
+
 def test_dedupe_key_can_be_pruned_after_retention_expires(tmp_path):
     state = _state(tmp_path, dedupe_retention_sec=1)
     command = GatewayCommand(

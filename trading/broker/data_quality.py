@@ -16,6 +16,13 @@ PRICE_TICK_FIELDS = (
     "day_high_low",
     "momentum",
 )
+INDEX_PRICE_TICK_FIELDS = (
+    "price",
+    "change_rate",
+    "trade_value",
+    "volume",
+    "day_high_low",
+)
 
 FIELD_RELIABILITY_WEIGHTS = {
     "price": 30.0,
@@ -26,6 +33,13 @@ FIELD_RELIABILITY_WEIGHTS = {
     "day_high_low": 8.0,
     "momentum": 7.0,
     "change_rate": 5.0,
+}
+INDEX_FIELD_RELIABILITY_WEIGHTS = {
+    "price": 50.0,
+    "change_rate": 25.0,
+    "trade_value": 15.0,
+    "volume": 5.0,
+    "day_high_low": 5.0,
 }
 
 REASON_PENALTIES = {
@@ -39,6 +53,12 @@ REASON_PENALTIES = {
     "BEST_BID_ASK_MISSING": 6.0,
     "DAY_HIGH_LOW_MISSING": 4.0,
     "MOMENTUM_WARMUP": 2.0,
+}
+INDEX_IGNORED_REASONS = {
+    "BEST_BID_ASK_MISSING",
+    "DAY_HIGH_LOW_MISSING",
+    "EXECUTION_STRENGTH_MISSING",
+    "MOMENTUM_WARMUP",
 }
 
 
@@ -82,6 +102,8 @@ class RealtimeDataQualityTracker:
     def assess_price_tick(self, payload: dict[str, Any]) -> RealtimeReliabilityAssessment:
         payload = dict(payload or {})
         metadata = dict(payload.get("metadata") or {})
+        if _is_index_payload(payload, metadata):
+            return _assess_index_price_tick(payload, metadata)
         present_fields = {field for field in PRICE_TICK_FIELDS if _field_present(field, payload, metadata)}
         missing_fields = tuple(field for field in PRICE_TICK_FIELDS if field not in present_fields)
         field_score = sum(FIELD_RELIABILITY_WEIGHTS.get(field, 0.0) for field in present_fields)
@@ -125,7 +147,7 @@ class RealtimeDataQualityTracker:
             if _field_present(field, payload, metadata):
                 self._field_counts[field] += 1
 
-        reason_codes = _reason_codes(payload, metadata)
+        reason_codes = list(assessment.reasons)
         self._reason_code_counts.update(reason_codes)
         self._reliability_bucket_counts.update([assessment.bucket])
         self._reliability_reason_counts.update(assessment.reasons)
@@ -222,6 +244,43 @@ def _field_present(field: str, payload: dict[str, Any], metadata: dict[str, Any]
     if field == "momentum":
         return all(key in metadata or key in payload for key in ("momentum_1m", "momentum_3m", "momentum_5m"))
     return False
+
+
+def _assess_index_price_tick(payload: dict[str, Any], metadata: dict[str, Any]) -> RealtimeReliabilityAssessment:
+    present_fields = {field for field in INDEX_PRICE_TICK_FIELDS if _field_present(field, payload, metadata)}
+    missing_fields = tuple(field for field in INDEX_PRICE_TICK_FIELDS if field not in present_fields)
+    field_score = sum(INDEX_FIELD_RELIABILITY_WEIGHTS.get(field, 0.0) for field in present_fields)
+    reasons = {reason for reason in _reason_codes(payload, metadata) if reason not in INDEX_IGNORED_REASONS}
+    if "price" not in present_fields:
+        reasons.add("PRICE_MISSING")
+    latency_ms = _transport_latency_ms(payload, metadata)
+    latency_bucket, latency_penalty = _latency_bucket_penalty(latency_ms)
+    penalty = min(60.0, sum(REASON_PENALTIES.get(reason, 0.0) for reason in reasons)) + latency_penalty
+    score = round(max(0.0, min(100.0, field_score - penalty)), 2)
+    return RealtimeReliabilityAssessment(
+        score=score,
+        bucket=_reliability_bucket(score),
+        field_score=round(field_score, 2),
+        penalty=round(penalty, 2),
+        reasons=tuple(sorted(reasons)),
+        missing_fields=missing_fields,
+        transport_latency_ms=round(latency_ms, 3) if latency_ms is not None else None,
+        transport_latency_bucket=latency_bucket,
+    )
+
+
+def _is_index_payload(payload: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    instrument_type = str(payload.get("instrument_type") or metadata.get("instrument_type") or "").strip().lower()
+    if instrument_type == "index":
+        return True
+    code = "".join(ch for ch in str(payload.get("code") or "").strip().upper() if ch.isdigit())
+    if code in {"001", "101", "000001", "000101"}:
+        return True
+    real_type = str(metadata.get("real_type") or payload.get("real_type") or "")
+    if "업종" in real_type:
+        return True
+    name = str(payload.get("name") or metadata.get("name") or "").strip().upper()
+    return name in {"KOSPI", "KOSDAQ", "코스피", "코스닥"}
 
 
 def _reason_codes(payload: dict[str, Any], metadata: dict[str, Any]) -> list[str]:

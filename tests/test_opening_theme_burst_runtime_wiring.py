@@ -341,6 +341,39 @@ def test_register_realtime_targets_respect_max_limit(tmp_path):
         db.close()
 
 
+def test_register_realtime_is_latched_when_opening_seed_is_unchanged(tmp_path):
+    db = TradingDatabase(str(tmp_path / "trader.sqlite3"))
+    try:
+        gateway_state = GatewayStateStore()
+        repo = ThemeEngineRepository(db)
+        _seed_batch(
+            db,
+            "2026-06-15",
+            [(f"{index:06d}", index, 10_000_000_000 - index) for index in range(1, 6)],
+        )
+        pipeline = OpeningThemeBurstRuntimePipeline(
+            db=db,
+            gateway_state=gateway_state,
+            market_data=MarketDataStore(),
+            repository=repo,
+            config=_config(max_realtime_register=5),
+        )
+
+        first = pipeline.run(_dt("2026-06-15T09:04:00"))
+        duplicate = pipeline.run(_dt("2026-06-15T09:04:30"))
+        register_commands = [
+            item for item in gateway_state.list_commands(include_finished=True, limit=10) if item["command_type"] == "register_realtime"
+        ]
+
+        assert first["realtime_registration"]["status"] == "QUEUED"
+        assert duplicate["realtime_registration"]["status"] == "DUPLICATE"
+        assert duplicate["realtime_registration"]["reason"] == "ALREADY_REGISTERED_IN_PIPELINE"
+        assert duplicate["realtime_registered_count"] == 0
+        assert len(register_commands) == 1
+    finally:
+        db.close()
+
+
 def test_leader_only_theme_runtime_excludes_late_laggard_and_overheated():
     result = OpeningThemeBurstEngine().run(
         theme_inputs=[

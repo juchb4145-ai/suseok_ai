@@ -92,6 +92,37 @@ def test_gateway_runtime_uses_rich_price_tick_signal_payload():
     assert runtime.data_quality.snapshot()["reliability"]["bucket_counts"]["HIGH"] == 1
 
 
+def test_gateway_runtime_marks_known_index_tick_before_reliability_assessment():
+    runtime = GatewayRuntime(FakeCoreClient())
+    client = SignalClient(rich=True)
+    _wire_kiwoom_signals(client, runtime)
+
+    client.price_tick_received.emit(
+        BrokerPriceTick(
+            code="001",
+            price=330000,
+            change_rate=0.8,
+            volume=1000,
+            trade_value=10_000_000,
+            instrument_type="stock",
+            name="KOSPI",
+            metadata={
+                "real_type": "업종등락",
+                "reason_codes": ["BEST_BID_ASK_MISSING", "EXECUTION_STRENGTH_MISSING"],
+            },
+        )
+    )
+
+    event = runtime.events.drain()[0]
+    payload = event.payload
+    reliability = payload["gateway_realtime_reliability"]
+    assert payload["instrument_type"] == "index"
+    assert payload["metadata"]["instrument_type"] == "index"
+    assert reliability["bucket"] == "HIGH"
+    assert "BEST_BID_ASK_MISSING" not in reliability["reasons"]
+    assert "EXECUTION_STRENGTH_MISSING" not in reliability["reasons"]
+
+
 def test_gateway_runtime_keeps_old_price_received_fallback_path():
     runtime = GatewayRuntime(FakeCoreClient())
     client = SignalClient(rich=False)

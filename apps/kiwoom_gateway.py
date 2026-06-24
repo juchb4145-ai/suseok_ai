@@ -943,14 +943,21 @@ def _price_tick_payload(tick: BrokerPriceTick | dict[str, Any]) -> dict[str, Any
     if isinstance(tick, BrokerPriceTick):
         payload = tick.to_dict()
     else:
-        payload = BrokerPriceTick.from_dict(dict(tick or {})).to_dict()
-        metadata = dict(dict(tick or {}).get("metadata") or {})
+        raw_tick = dict(tick or {})
+        payload = BrokerPriceTick.from_dict(raw_tick).to_dict()
+        metadata = dict(raw_tick.get("metadata") or {})
+        for key in ("real_type", "raw_fids_present", "reason_codes"):
+            if key in raw_tick and key not in metadata:
+                metadata[key] = raw_tick.get(key)
         if metadata:
             payload["metadata"] = metadata
     payload["cum_volume"] = payload.get("volume", 0)
     payload.setdefault("instrument_type", "stock")
     payload.setdefault("metadata", {})
     metadata = dict(payload.get("metadata") or {})
+    if _is_index_tick_payload(payload, metadata):
+        payload["instrument_type"] = "index"
+        metadata.setdefault("instrument_type", "index")
     if payload.get("trade_time"):
         metadata.setdefault("trade_time", payload.get("trade_time"))
     if payload.get("day_high"):
@@ -959,6 +966,20 @@ def _price_tick_payload(tick: BrokerPriceTick | dict[str, Any]) -> dict[str, Any
         metadata.setdefault("session_low", payload.get("day_low"))
     payload["metadata"] = metadata
     return payload
+
+
+def _is_index_tick_payload(payload: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    instrument_type = str(payload.get("instrument_type") or metadata.get("instrument_type") or "").strip().lower()
+    if instrument_type == "index":
+        return True
+    code = "".join(ch for ch in str(payload.get("code") or "").strip().upper() if ch.isdigit())
+    if code in {"001", "101", "000001", "000101"}:
+        return True
+    real_type = str(metadata.get("real_type") or payload.get("real_type") or "")
+    if "업종" in real_type:
+        return True
+    name = str(payload.get("name") or metadata.get("name") or "").strip().upper()
+    return name in {"KOSPI", "KOSDAQ", "코스피", "코스닥"}
 
 
 def _payload_with_gateway_reliability(payload: dict[str, Any], assessment) -> dict[str, Any]:

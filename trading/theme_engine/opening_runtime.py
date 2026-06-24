@@ -250,6 +250,9 @@ class OpeningThemeBurstRuntimePipeline:
         self.last_summary = empty_opening_theme_burst_section(enabled=self.config.enabled, observe_only=self.config.observe_only)
         self.last_result: OpeningThemeBurstResult | None = None
         self.warnings: list[str] = []
+        self._last_realtime_registration_key = ""
+        self._last_realtime_registration_trade_date = ""
+        self._last_realtime_registration_command_id = ""
 
     def run(self, now: datetime) -> dict[str, Any]:
         current = _as_kst(now)
@@ -409,6 +412,37 @@ class OpeningThemeBurstRuntimePipeline:
         codes = [seed.stock_code for seed in selected]
         digest = hashlib.sha256(",".join(codes).encode("utf-8")).hexdigest()[:16]
         idempotency_key = f"opening_burst:register_realtime:{trade_date}:{digest}"
+        if (
+            self._last_realtime_registration_key == idempotency_key
+            and self._last_realtime_registration_trade_date == trade_date
+        ):
+            summary["realtime_registered_count"] = 0
+            summary["realtime_registration"] = {
+                "status": "DUPLICATE",
+                "reason": "ALREADY_REGISTERED_IN_PIPELINE",
+                "duplicate_of": self._last_realtime_registration_command_id,
+                "command_id": self._last_realtime_registration_command_id,
+                "idempotency_key": idempotency_key,
+                "target_count": len(codes),
+                "limit": self.config.max_realtime_register,
+            }
+            return
+        if self.gateway_state.has_duplicate(idempotency_key):
+            duplicate_of = self.gateway_state.duplicate_of(idempotency_key)
+            self._last_realtime_registration_key = idempotency_key
+            self._last_realtime_registration_trade_date = trade_date
+            self._last_realtime_registration_command_id = duplicate_of
+            summary["realtime_registered_count"] = 0
+            summary["realtime_registration"] = {
+                "status": "DUPLICATE",
+                "reason": "DUPLICATE_COMMAND",
+                "duplicate_of": duplicate_of,
+                "command_id": duplicate_of,
+                "idempotency_key": idempotency_key,
+                "target_count": len(codes),
+                "limit": self.config.max_realtime_register,
+            }
+            return
         command = GatewayCommand(
             type="register_realtime",
             command_id=new_message_id("cmd_opening_rt"),
@@ -436,6 +470,10 @@ class OpeningThemeBurstRuntimePipeline:
         status = "QUEUED" if enqueue.accepted else "REJECTED"
         if not enqueue.accepted and enqueue.reason == "DUPLICATE_COMMAND":
             status = "DUPLICATE"
+        if enqueue.accepted:
+            self._last_realtime_registration_key = idempotency_key
+            self._last_realtime_registration_trade_date = trade_date
+            self._last_realtime_registration_command_id = command.command_id
         summary["realtime_registered_count"] = len(codes) if enqueue.accepted else 0
         summary["realtime_registration"] = {
             "status": status,

@@ -90,3 +90,36 @@ def test_realtime_data_quality_scores_latency_and_missing_fields():
     assert snapshot["reliability"]["bucket_counts"]["BROKEN"] == 1
     assert snapshot["reliability"]["low_reliability_count"] == 1
     assert snapshot["reliability"]["transport_latency_sample_count"] == 2
+
+
+def test_index_price_tick_ignores_stock_only_missing_fields():
+    tracker = RealtimeDataQualityTracker()
+
+    assessment = tracker.observe_price_tick(
+        {
+            "code": "001",
+            "instrument_type": "stock",
+            "name": "KOSPI",
+            "price": 330000,
+            "change_rate": 0.8,
+            "volume": 1000,
+            "trade_value": 10_000_000,
+            "metadata": {
+                "real_type": "업종등락",
+                "reason_codes": [
+                    "BEST_BID_ASK_MISSING",
+                    "EXECUTION_STRENGTH_MISSING",
+                    "DAY_HIGH_LOW_MISSING",
+                ],
+            },
+        }
+    )
+
+    snapshot = tracker.snapshot()
+    assert assessment.bucket == "HIGH"
+    assert "BEST_BID_ASK_MISSING" not in assessment.reasons
+    assert "EXECUTION_STRENGTH_MISSING" not in assessment.reasons
+    assert "DAY_HIGH_LOW_MISSING" not in assessment.reasons
+    assert "best_bid_ask" not in assessment.missing_fields
+    assert "execution_strength" not in assessment.missing_fields
+    assert snapshot["reason_code_counts"] == {}

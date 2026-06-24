@@ -205,8 +205,11 @@ class RealTimeSubscriptionManager:
 
     def mark_all_stale(self, reason: str = "") -> None:
         now = self._now()
-        generation = self._advance_client_generation(reason)
-        self._remove_all_client_realtime(reason)
+        had_active_realtime = bool(self.code_to_screen or self.screen_to_codes)
+        generation = None
+        if had_active_realtime:
+            generation = self._advance_client_generation(reason)
+            self._remove_all_client_realtime(reason)
         self.code_to_screen.clear()
         self.screen_to_codes.clear()
         for record in self.records.values():
@@ -287,7 +290,7 @@ class RealTimeSubscriptionManager:
         missing_mapping = [code for code in codes if code not in self.code_to_screen]
         if missing_mapping:
             self.warnings.append("REALTIME_REMOVE_ALL_FALLBACK")
-            self.client.remove_all_realtime()
+            self._remove_all_client_realtime("REALTIME_REMOVE_ALL_FALLBACK")
             self.code_to_screen.clear()
             self.screen_to_codes.clear()
             for record in self.records.values():
@@ -344,7 +347,10 @@ class RealTimeSubscriptionManager:
         if not callable(remove_all):
             return
         try:
-            remove_all()
+            try:
+                remove_all(reason=reason)
+            except TypeError:
+                remove_all()
         except Exception as exc:
             self.warnings.append(f"REALTIME_REMOVE_ALL_ON_STALE_FAILED:{reason}:{exc}")
 

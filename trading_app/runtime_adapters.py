@@ -256,15 +256,20 @@ class GatewayCommandRealtimeClient:
             key=f"runtime:remove_realtime:{screen_no}:{','.join(clean_codes)}",
         )
 
-    def remove_all_realtime(self) -> None:
+    def remove_all_realtime(self, reason: str = "") -> None:
+        clean_reason = _clean_idempotency_part(reason) or "unspecified"
         self._enqueue(
             "remove_all_realtime",
             payload={
                 "scope": "runtime",
+                "reason": clean_reason,
                 "subscription_session_id": self.subscription_session_id,
                 "subscription_generation": self.subscription_generation,
             },
-            key=f"runtime:remove_all_realtime:{new_message_id('scope')}",
+            key=(
+                "runtime:remove_all_realtime:"
+                f"{self.subscription_session_id}:g{self.subscription_generation}:{clean_reason}"
+            ),
         )
 
     def expire_stale_register_commands(self, now: datetime | None = None) -> int:
@@ -692,6 +697,21 @@ def _gateway_session_tokens(payload: Any) -> set[str]:
     if isinstance(trace, dict):
         tokens.update(_gateway_session_tokens(trace))
     return tokens
+
+
+def _clean_idempotency_part(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    result = []
+    for char in text:
+        if char.isalnum():
+            result.append(char)
+        elif char in {"-", "_", ".", ":"}:
+            result.append(char)
+        else:
+            result.append("_")
+    return "".join(result).strip("_")[:120]
 
 
 def _stale_dispatched(record: dict[str, Any], current: datetime, timeout_sec: int) -> bool:

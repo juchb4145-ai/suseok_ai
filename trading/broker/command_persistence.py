@@ -16,6 +16,11 @@ from trading.broker.command_queue import (
     EnqueueResult,
 )
 
+RETAINED_CONTROL_DEDUPE_COMMAND_TYPES = {
+    "register_realtime",
+    "remove_all_realtime",
+}
+
 
 class CommandStoreProtocol(Protocol):
     def save_record(self, record: CommandRecord) -> None: ...
@@ -754,7 +759,7 @@ def _loads(value: Any) -> dict[str, Any]:
 
 
 def _dedupe_expires_at(record: CommandRecord, retention_sec: int) -> str:
-    if record.command_type in ORDER_COMMAND_TYPES:
+    if record.command_type in ORDER_COMMAND_TYPES or record.command_type in RETAINED_CONTROL_DEDUPE_COMMAND_TYPES:
         return _format_time(_now() + timedelta(seconds=max(1, int(retention_sec))))
     if record.expires_at:
         return record.expires_at

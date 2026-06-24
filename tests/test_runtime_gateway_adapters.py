@@ -213,6 +213,38 @@ def test_realtime_adapter_register_key_advances_for_repair_and_restart(tmp_path)
         restarted_store.close()
 
 
+def test_realtime_remove_all_uses_stable_reason_dedupe_key():
+    state = GatewayStateStore()
+    warnings = []
+    client = GatewayCommandRealtimeClient(state, warning_sink=warnings.append)
+
+    client.remove_all_realtime("LATEST_TICK_STALE")
+    client.remove_all_realtime("LATEST_TICK_STALE")
+
+    commands = [
+        item for item in state.list_commands(limit=10, include_finished=True) if item["command_type"] == "remove_all_realtime"
+    ]
+    assert len(commands) == 1
+    assert commands[0]["command"]["payload"]["reason"] == "latest_tick_stale"
+    assert any(warning.startswith("REALTIME_COMMAND_REJECTED:remove_all_realtime:DUPLICATE") for warning in warnings)
+
+
+def test_realtime_manager_does_not_reissue_remove_all_after_mapping_is_stale():
+    state = GatewayStateStore()
+    client = GatewayCommandRealtimeClient(state)
+    manager = RealTimeSubscriptionManager(client, max_codes=10)
+
+    manager.ensure_subscription("001", "index")
+    manager.sync()
+    manager.mark_all_stale("LATEST_TICK_STALE")
+    manager.mark_all_stale("LATEST_TICK_STALE")
+
+    commands = [
+        item for item in state.list_commands(limit=10, include_finished=True) if item["command_type"] == "remove_all_realtime"
+    ]
+    assert len(commands) == 1
+
+
 def test_realtime_adapter_expires_stale_dispatched_register_command():
     state = GatewayStateStore()
     state.status.connected = True
