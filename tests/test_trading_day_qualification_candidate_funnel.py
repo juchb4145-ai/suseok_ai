@@ -189,7 +189,6 @@ def test_market_context_and_realtime_thresholds(tmp_path):
 
 def test_market_context_degraded_and_fallback_thresholds(tmp_path):
     degraded_db = TradingDatabase(str(tmp_path / "market-degraded.db"))
-    _seed_candidate(degraded_db)
     for index in range(20):
         _save_health_sample(degraded_db, index, source="PIPELINE_VIEW")
     _save_health_sample(degraded_db, 21, source="UNAVAILABLE", available=False)
@@ -249,7 +248,7 @@ def test_snapshot_integrity_regression_conflict_and_namespace_invalid(tmp_path):
 
     report = TradingDayQualificationService(db).build_report(
         trade_date=TRADE_DATE,
-        as_of=NOW,
+        as_of=datetime(2026, 6, 22, 9, 10, 0),
         report_state="FINAL",
         finalize=True,
         runtime_snapshot=_runtime_snapshot(),
