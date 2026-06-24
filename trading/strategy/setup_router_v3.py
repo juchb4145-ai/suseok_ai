@@ -11,8 +11,8 @@ from typing import Any, Iterable, Mapping
 from trading.strategy.setup_features import SETUP_ROUTER_FEATURE_SCHEMA_VERSION, SetupFeatureSnapshot
 
 
-SETUP_ROUTER_SCHEMA_VERSION = "setup_router_v3.observe.v5.1"
-SETUP_ROUTER_VERSION = "setup_router_v3.5.1"
+SETUP_ROUTER_SCHEMA_VERSION = "setup_router_v3.observe.v5.2"
+SETUP_ROUTER_VERSION = "setup_router_v3.5.2"
 SETUP_ROUTER_STATE_VERSION = "setup_router_v3.state.v3.2"
 SETUP_ROUTER_OUTPUT_MODE = "OBSERVE"
 

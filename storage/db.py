@@ -34,7 +34,7 @@ from trading.strategy.models import (
 from trading.strategy.conditions import ConditionProfile
 
 
-_CURRENT_SETUP_ROUTER_VERSION = "setup_router_v3.5.1"
+_CURRENT_SETUP_ROUTER_VERSION = "setup_router_v3.5.2"
 
 
 class TradingDatabase:
@@ -1368,6 +1368,74 @@ class TradingDatabase:
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(trade_date, subscription_generation, code)
             );
+            CREATE TABLE IF NOT EXISTS realtime_subscription_lifecycle_latest (
+                trade_date TEXT NOT NULL,
+                code TEXT NOT NULL,
+                schema_version TEXT NOT NULL DEFAULT '',
+                lifecycle_state TEXT NOT NULL DEFAULT '',
+                requested INTEGER NOT NULL DEFAULT 0,
+                target_selected INTEGER NOT NULL DEFAULT 0,
+                budget_deferred INTEGER NOT NULL DEFAULT 0,
+                command_enqueued INTEGER NOT NULL DEFAULT 0,
+                command_dispatched INTEGER NOT NULL DEFAULT 0,
+                acked INTEGER NOT NULL DEFAULT 0,
+                transport_active INTEGER NOT NULL DEFAULT 0,
+                first_tick_verified INTEGER NOT NULL DEFAULT 0,
+                decision_fresh INTEGER NOT NULL DEFAULT 0,
+                stale INTEGER NOT NULL DEFAULT 0,
+                released INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                screen_no TEXT NOT NULL DEFAULT '',
+                register_command_id TEXT NOT NULL DEFAULT '',
+                release_command_id TEXT NOT NULL DEFAULT '',
+                subscription_session_id TEXT NOT NULL DEFAULT '',
+                subscription_generation INTEGER NOT NULL DEFAULT 0,
+                target_digest TEXT NOT NULL DEFAULT '',
+                requested_at_utc TEXT NOT NULL DEFAULT '',
+                target_selected_at_utc TEXT NOT NULL DEFAULT '',
+                command_enqueued_at_utc TEXT NOT NULL DEFAULT '',
+                command_dispatched_at_utc TEXT NOT NULL DEFAULT '',
+                command_acked_at_utc TEXT NOT NULL DEFAULT '',
+                registration_ack_baseline_at_utc TEXT NOT NULL DEFAULT '',
+                first_tick_at_utc TEXT NOT NULL DEFAULT '',
+                last_tick_at_utc TEXT NOT NULL DEFAULT '',
+                stale_since_utc TEXT NOT NULL DEFAULT '',
+                failed_at_utc TEXT NOT NULL DEFAULT '',
+                failure_reason TEXT NOT NULL DEFAULT '',
+                latest_tick_age_sec REAL NOT NULL DEFAULT 999999,
+                ack_to_first_tick_ms REAL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at_utc TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, code)
+            );
+            CREATE INDEX IF NOT EXISTS idx_realtime_subscription_lifecycle_latest_state
+                ON realtime_subscription_lifecycle_latest(trade_date, lifecycle_state, code);
+            CREATE INDEX IF NOT EXISTS idx_realtime_subscription_lifecycle_latest_first_tick
+                ON realtime_subscription_lifecycle_latest(trade_date, first_tick_verified, code);
+            CREATE INDEX IF NOT EXISTS idx_realtime_subscription_lifecycle_latest_command
+                ON realtime_subscription_lifecycle_latest(register_command_id);
+            CREATE INDEX IF NOT EXISTS idx_realtime_subscription_lifecycle_latest_session
+                ON realtime_subscription_lifecycle_latest(subscription_session_id, subscription_generation, code);
+            CREATE TABLE IF NOT EXISTS realtime_subscription_lifecycle_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                code TEXT NOT NULL,
+                previous_state TEXT NOT NULL DEFAULT '',
+                current_state TEXT NOT NULL DEFAULT '',
+                occurred_at_utc TEXT NOT NULL DEFAULT '',
+                command_id TEXT NOT NULL DEFAULT '',
+                subscription_session_id TEXT NOT NULL DEFAULT '',
+                subscription_generation INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_realtime_subscription_lifecycle_events_trade
+                ON realtime_subscription_lifecycle_events(trade_date, occurred_at_utc, id);
+            CREATE INDEX IF NOT EXISTS idx_realtime_subscription_lifecycle_events_command
+                ON realtime_subscription_lifecycle_events(command_id);
+            CREATE INDEX IF NOT EXISTS idx_realtime_subscription_lifecycle_events_code
+                ON realtime_subscription_lifecycle_events(code, occurred_at_utc);
             CREATE TABLE IF NOT EXISTS setup_router_primary_latest_v2 (
                 trade_date TEXT NOT NULL,
                 router_version TEXT NOT NULL,
@@ -9646,6 +9714,188 @@ class TradingDatabase:
         params.extend([max(1, int(limit or 100)), max(0, int(offset or 0))])
         return [_row_to_realtime_subscription_readiness(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
 
+    def save_realtime_subscription_lifecycle_latest(self, payload: Mapping[str, object]) -> int:
+        data = dict(payload or {})
+        trade_date = str(data.get("trade_date") or str(data.get("updated_at_utc") or "")[:10])
+        code = _clean_stock_code(data.get("code")) or str(data.get("code") or "")
+        if not trade_date or not code:
+            return 0
+        with self._write_scope():
+            self.conn.execute(
+                """
+                INSERT INTO realtime_subscription_lifecycle_latest(
+                    trade_date, code, schema_version, lifecycle_state,
+                    requested, target_selected, budget_deferred, command_enqueued, command_dispatched, acked,
+                    transport_active, first_tick_verified, decision_fresh, stale, released, failed,
+                    screen_no, register_command_id, release_command_id,
+                    subscription_session_id, subscription_generation, target_digest,
+                    requested_at_utc, target_selected_at_utc, command_enqueued_at_utc,
+                    command_dispatched_at_utc, command_acked_at_utc, registration_ack_baseline_at_utc,
+                    first_tick_at_utc, last_tick_at_utc, stale_since_utc, failed_at_utc,
+                    failure_reason, latest_tick_age_sec, ack_to_first_tick_ms, payload_json, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_date, code) DO UPDATE SET
+                    schema_version=excluded.schema_version,
+                    lifecycle_state=excluded.lifecycle_state,
+                    requested=excluded.requested,
+                    target_selected=excluded.target_selected,
+                    budget_deferred=excluded.budget_deferred,
+                    command_enqueued=excluded.command_enqueued,
+                    command_dispatched=excluded.command_dispatched,
+                    acked=excluded.acked,
+                    transport_active=excluded.transport_active,
+                    first_tick_verified=excluded.first_tick_verified,
+                    decision_fresh=excluded.decision_fresh,
+                    stale=excluded.stale,
+                    released=excluded.released,
+                    failed=excluded.failed,
+                    screen_no=excluded.screen_no,
+                    register_command_id=excluded.register_command_id,
+                    release_command_id=excluded.release_command_id,
+                    subscription_session_id=excluded.subscription_session_id,
+                    subscription_generation=excluded.subscription_generation,
+                    target_digest=excluded.target_digest,
+                    requested_at_utc=excluded.requested_at_utc,
+                    target_selected_at_utc=excluded.target_selected_at_utc,
+                    command_enqueued_at_utc=excluded.command_enqueued_at_utc,
+                    command_dispatched_at_utc=excluded.command_dispatched_at_utc,
+                    command_acked_at_utc=excluded.command_acked_at_utc,
+                    registration_ack_baseline_at_utc=excluded.registration_ack_baseline_at_utc,
+                    first_tick_at_utc=excluded.first_tick_at_utc,
+                    last_tick_at_utc=excluded.last_tick_at_utc,
+                    stale_since_utc=excluded.stale_since_utc,
+                    failed_at_utc=excluded.failed_at_utc,
+                    failure_reason=excluded.failure_reason,
+                    latest_tick_age_sec=excluded.latest_tick_age_sec,
+                    ack_to_first_tick_ms=excluded.ack_to_first_tick_ms,
+                    payload_json=excluded.payload_json,
+                    updated_at_utc=excluded.updated_at_utc,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    trade_date,
+                    code,
+                    str(data.get("schema_version") or ""),
+                    str(data.get("lifecycle_state") or ""),
+                    int(bool(data.get("requested"))),
+                    int(bool(data.get("target_selected"))),
+                    int(bool(data.get("budget_deferred"))),
+                    int(bool(data.get("command_enqueued"))),
+                    int(bool(data.get("command_dispatched"))),
+                    int(bool(data.get("acked"))),
+                    int(bool(data.get("transport_active"))),
+                    int(bool(data.get("first_tick_verified"))),
+                    int(bool(data.get("decision_fresh"))),
+                    int(bool(data.get("stale"))),
+                    int(bool(data.get("released"))),
+                    int(bool(data.get("failed"))),
+                    str(data.get("screen_no") or ""),
+                    str(data.get("register_command_id") or ""),
+                    str(data.get("release_command_id") or ""),
+                    str(data.get("subscription_session_id") or ""),
+                    _safe_int(data.get("subscription_generation"), 0),
+                    str(data.get("target_digest") or ""),
+                    str(data.get("requested_at_utc") or ""),
+                    str(data.get("target_selected_at_utc") or ""),
+                    str(data.get("command_enqueued_at_utc") or ""),
+                    str(data.get("command_dispatched_at_utc") or ""),
+                    str(data.get("command_acked_at_utc") or ""),
+                    str(data.get("registration_ack_baseline_at_utc") or ""),
+                    str(data.get("first_tick_at_utc") or ""),
+                    str(data.get("last_tick_at_utc") or ""),
+                    str(data.get("stale_since_utc") or ""),
+                    str(data.get("failed_at_utc") or ""),
+                    str(data.get("failure_reason") or ""),
+                    _float_value(data.get("latest_tick_age_sec")),
+                    _nullable_float(data.get("ack_to_first_tick_ms")),
+                    _json_payload(data),
+                    str(data.get("updated_at_utc") or ""),
+                ),
+            )
+        return 1
+
+    def save_realtime_subscription_lifecycle_event(self, payload: Mapping[str, object]) -> int:
+        data = dict(payload or {})
+        trade_date = str(data.get("trade_date") or str(data.get("occurred_at_utc") or "")[:10])
+        code = _clean_stock_code(data.get("code")) or str(data.get("code") or "")
+        if not trade_date or not code:
+            return 0
+        with self._write_scope():
+            self.conn.execute(
+                """
+                INSERT INTO realtime_subscription_lifecycle_events(
+                    trade_date, code, previous_state, current_state, occurred_at_utc,
+                    command_id, subscription_session_id, subscription_generation, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_date,
+                    code,
+                    str(data.get("previous_state") or ""),
+                    str(data.get("current_state") or data.get("lifecycle_state") or ""),
+                    str(data.get("occurred_at_utc") or data.get("updated_at_utc") or ""),
+                    str(data.get("register_command_id") or data.get("release_command_id") or ""),
+                    str(data.get("subscription_session_id") or ""),
+                    _safe_int(data.get("subscription_generation"), 0),
+                    _json_payload(data),
+                ),
+            )
+        return 1
+
+    def list_realtime_subscription_lifecycle_latest(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        lifecycle_state: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        query = "SELECT * FROM realtime_subscription_lifecycle_latest"
+        clauses: list[str] = []
+        params: list[object] = []
+        _append_setup_filter(clauses, params, "trade_date", trade_date)
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        if lifecycle_state:
+            clauses.append("lifecycle_state = ?")
+            params.append(str(lifecycle_state))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at_utc DESC, code ASC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 100)), max(0, int(offset or 0))])
+        return [_row_to_realtime_subscription_lifecycle(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def list_realtime_subscription_lifecycle_events(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        command_id: Optional[str] = None,
+        current_state: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        query = "SELECT * FROM realtime_subscription_lifecycle_events"
+        clauses: list[str] = []
+        params: list[object] = []
+        _append_setup_filter(clauses, params, "trade_date", trade_date)
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        if command_id:
+            clauses.append("command_id = ?")
+            params.append(str(command_id))
+        if current_state:
+            clauses.append("current_state = ?")
+            params.append(str(current_state))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY occurred_at_utc DESC, id DESC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 100)), max(0, int(offset or 0))])
+        return [_row_to_realtime_subscription_lifecycle_event(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
     def list_setup_router_readiness_latest(
         self,
         *,
@@ -16801,6 +17051,9 @@ class TradingDatabase:
             "candidate_active_source_types_json": "TEXT NOT NULL DEFAULT '[]'",
             "candidate_primary_source": "TEXT NOT NULL DEFAULT ''",
         }
+        realtime_lifecycle_columns = {
+            "budget_deferred": "INTEGER NOT NULL DEFAULT 0",
+        }
         observation_v2_columns = {
             "input_readiness_fingerprint": "TEXT NOT NULL DEFAULT ''",
             "input_readiness_calculated_at": "TEXT NOT NULL DEFAULT ''",
@@ -16831,6 +17084,8 @@ class TradingDatabase:
             self._ensure_column("setup_router_readiness_latest", name, definition)
         for name, definition in realtime_readiness_columns.items():
             self._ensure_column("realtime_subscription_readiness_latest", name, definition)
+        for name, definition in realtime_lifecycle_columns.items():
+            self._ensure_column("realtime_subscription_lifecycle_latest", name, definition)
         for name, definition in observation_v2_columns.items():
             self._ensure_column("setup_observations_latest_v2", name, definition)
         for name, definition in pending_v5_columns.items():
@@ -19868,6 +20123,78 @@ def _row_to_realtime_subscription_readiness(row: sqlite3.Row) -> dict:
     payload.setdefault("latest_tick_source", data.get("latest_tick_source", ""))
     payload.setdefault("post_subscription_tick_verified", bool(data.get("post_subscription_tick_verified")))
     payload.setdefault("updated_at", data.get("updated_at", ""))
+    return payload
+
+
+def _row_to_realtime_subscription_lifecycle(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in (
+        "trade_date",
+        "code",
+        "schema_version",
+        "lifecycle_state",
+        "screen_no",
+        "register_command_id",
+        "release_command_id",
+        "subscription_session_id",
+        "target_digest",
+        "requested_at_utc",
+        "target_selected_at_utc",
+        "command_enqueued_at_utc",
+        "command_dispatched_at_utc",
+        "command_acked_at_utc",
+        "registration_ack_baseline_at_utc",
+        "first_tick_at_utc",
+        "last_tick_at_utc",
+        "stale_since_utc",
+        "failed_at_utc",
+        "failure_reason",
+        "updated_at_utc",
+        "updated_at",
+    ):
+        payload.setdefault(key, data.get(key, ""))
+    for key in (
+        "requested",
+        "target_selected",
+        "budget_deferred",
+        "command_enqueued",
+        "command_dispatched",
+        "acked",
+        "transport_active",
+        "first_tick_verified",
+        "decision_fresh",
+        "stale",
+        "released",
+        "failed",
+    ):
+        payload.setdefault(key, bool(data.get(key)))
+    payload.setdefault("subscription_generation", int(data.get("subscription_generation") or 0))
+    payload.setdefault("latest_tick_age_sec", _float_value(data.get("latest_tick_age_sec")))
+    payload.setdefault("ack_to_first_tick_ms", _nullable_float(data.get("ack_to_first_tick_ms")))
+    return payload
+
+
+def _row_to_realtime_subscription_lifecycle_event(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    for key in (
+        "id",
+        "created_at",
+        "trade_date",
+        "code",
+        "previous_state",
+        "current_state",
+        "occurred_at_utc",
+        "command_id",
+        "subscription_session_id",
+    ):
+        payload.setdefault(key, data.get(key, ""))
+    payload.setdefault("subscription_generation", int(data.get("subscription_generation") or 0))
     return payload
 
 

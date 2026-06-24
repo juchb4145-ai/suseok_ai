@@ -206,14 +206,14 @@ class MarketRelativeStrengthShadowEvaluator:
                 "scenario": scenario.value,
                 "variant": variant.value,
                 "status": shadow_status.value,
-                "side": market.get("market_side"),
-                "side_regime": market.get("side_market_regime"),
-                "composite": market.get("composite_market_mode"),
-                "action": market.get("market_action"),
-                "role": stock.get("trade_stock_role"),
-                "theme": theme.get("theme_state"),
-                "price_location": entry.get("price_location"),
-                "rs_band": stock.get("relative_strength_band"),
+                "side": _enum_text(market.get("market_side")),
+                "side_regime": _enum_text(market.get("side_market_regime")),
+                "composite": _enum_text(market.get("composite_market_mode")),
+                "action": _enum_text(market.get("market_action")),
+                "role": _enum_text(stock.get("trade_stock_role")),
+                "theme": _enum_text(theme.get("theme_state")),
+                "price_location": _enum_text(entry.get("price_location")),
+                "rs_band": _enum_text(stock.get("relative_strength_band")),
             }
         )
         code = normalize_code(candidate.code)
@@ -248,14 +248,14 @@ class MarketRelativeStrengthShadowEvaluator:
                 entry.get("stock_name"),
                 entry.get("name"),
             ),
-            market_side=str(market.get("market_side") or "UNKNOWN"),
-            side_market_regime=str(market.get("side_market_regime") or "DATA_WAIT"),
-            counterpart_market_regime=str(market.get("counterpart_market_regime") or "DATA_WAIT"),
-            composite_market_mode=str(market.get("composite_market_mode") or "DATA_DEGRADED"),
+            market_side=_enum_text(market.get("market_side"), default="UNKNOWN"),
+            side_market_regime=_enum_text(market.get("side_market_regime"), default="DATA_WAIT"),
+            counterpart_market_regime=_enum_text(market.get("counterpart_market_regime"), default="DATA_WAIT"),
+            composite_market_mode=_enum_text(market.get("composite_market_mode"), default="DATA_DEGRADED"),
             systemic_risk_off=_bool(market.get("systemic_risk_off")),
-            actual_market_action=str(market.get("market_action") or "DATA_WAIT"),
+            actual_market_action=_enum_text(market.get("market_action"), default="DATA_WAIT"),
             actual_position_size_multiplier_hint=_float(market.get("position_size_multiplier_hint")),
-            actual_entry_status=str(entry.get("entry_status") or ""),
+            actual_entry_status=_enum_text(entry.get("entry_status")),
             actual_ready_allowed=_bool(entry.get("ready_allowed")),
             actual_dry_run_intent_allowed=_bool(entry.get("dry_run_intent_allowed")),
             shadow_scenario=scenario.value,
@@ -266,17 +266,17 @@ class MarketRelativeStrengthShadowEvaluator:
             shadow_filter_passed=shadow_filter_passed,
             review_candidate=review_candidate,
             promotion_eligible=False,
-            trade_stock_role=str(stock.get("trade_stock_role") or ""),
+            trade_stock_role=_enum_text(stock.get("trade_stock_role")),
             theme_id=str(theme.get("theme_id") or ""),
             theme_name=str(theme.get("theme_name") or ""),
-            theme_state=str(theme.get("theme_state") or ""),
+            theme_state=_enum_text(theme.get("theme_state")),
             theme_score=_float(theme.get("theme_score")),
             persistence_count=_int(theme.get("persistence_count")),
             relative_strength_vs_index_pct=_float(stock.get("relative_strength_vs_index_pct")),
-            relative_strength_band=str(stock.get("relative_strength_band") or _relative_strength_band(_float(stock.get("relative_strength_vs_index_pct")))),
+            relative_strength_band=_enum_text(stock.get("relative_strength_band"), default=_relative_strength_band(_float(stock.get("relative_strength_vs_index_pct")))),
             change_rate_pct=_float(stock.get("change_rate_pct")),
             index_return_pct=_float(market.get("index_return_pct")),
-            price_location=str(entry.get("price_location") or ""),
+            price_location=_enum_text(entry.get("price_location")),
             current_price=_float(entry.get("current_price")),
             vwap=_float(stock.get("vwap") or entry.get("vwap")),
             price_vs_vwap_pct=_float(stock.get("price_vs_vwap_pct")),
@@ -303,9 +303,9 @@ class MarketRelativeStrengthShadowEvaluator:
     def _scenario(self, market: Mapping[str, Any], data: Mapping[str, Any]) -> MarketRelativeStrengthShadowScenario:
         if _bool(market.get("systemic_risk_off")):
             return MarketRelativeStrengthShadowScenario.SYSTEMIC_RISK_EXCLUDED
-        side = str(market.get("market_side") or "UNKNOWN").upper()
-        action = str(market.get("market_action") or "").upper()
-        side_regime = str(market.get("side_market_regime") or "").upper()
+        side = _enum_text(market.get("market_side"), default="UNKNOWN").upper()
+        action = _enum_text(market.get("market_action")).upper()
+        side_regime = _enum_text(market.get("side_market_regime")).upper()
         reasons = set(str(item).upper() for item in _list(market.get("reason_codes")))
         if side not in {"KOSPI", "KOSDAQ"} or action == "DATA_WAIT" or not _bool(data.get("market_context_fresh")):
             return MarketRelativeStrengthShadowScenario.DATA_WAIT_EXCLUDED
@@ -340,11 +340,11 @@ class MarketRelativeStrengthShadowEvaluator:
         if not _bool(data.get("realtime_tick_fresh")):
             reasons.append(ReasonCode.MARKET_RS_STALE_DATA.value)
         if scenario == MarketRelativeStrengthShadowScenario.DATA_WAIT_EXCLUDED:
-            if str(market.get("market_side") or "").upper() not in {"KOSPI", "KOSDAQ"}:
+            if _enum_text(market.get("market_side")).upper() not in {"KOSPI", "KOSDAQ"}:
                 reasons.append(ReasonCode.MARKET_SIDE_UNRESOLVED.value)
             return _dedupe(reasons + [ReasonCode.MARKET_RS_CONTEXT_NOT_READY.value])
-        role = str(stock.get("trade_stock_role") or "").upper()
-        raw_role = str(stock.get("raw_stock_role") or "").upper()
+        role = _enum_text(stock.get("trade_stock_role")).upper()
+        raw_role = _enum_text(stock.get("raw_stock_role")).upper()
         if role not in {"LEADER_CONFIRMED", "CO_LEADER_CONFIRMED", "LEADER", "CO_LEADER"} and raw_role not in {"LEADER", "CO_LEADER"}:
             reasons.append(ReasonCode.MARKET_RS_ROLE_NOT_ALLOWED.value)
         theme_state = str(theme.get("theme_state") or "").upper()
@@ -352,13 +352,13 @@ class MarketRelativeStrengthShadowEvaluator:
             reasons.append(ReasonCode.MARKET_RS_THEME_NOT_ALLOWED.value)
         if _int(theme.get("persistence_count")) < self.config.min_theme_persistence_count:
             reasons.append(ReasonCode.MARKET_RS_PERSISTENCE_INSUFFICIENT.value)
-        if str(entry.get("price_location") or "").upper() not in {"GOOD_PULLBACK", "PULLBACK_RECLAIM", "VWAP_RECLAIM"}:
+        if _enum_text(entry.get("price_location")).upper() not in {"GOOD_PULLBACK", "PULLBACK_RECLAIM", "VWAP_RECLAIM"}:
             reasons.append(ReasonCode.MARKET_RS_PRICE_LOCATION_NOT_ALLOWED.value)
         if _bool(stock.get("vi_active")) or _bool(risk.get("vi_block")):
             reasons.append(ReasonCode.MARKET_RS_VI_BLOCK.value)
         if _bool(stock.get("upper_limit_near")) or _bool(stock.get("overheated")) or _bool(risk.get("overheat_block")):
             reasons.append(ReasonCode.MARKET_RS_OVERHEAT_BLOCK.value)
-        if _bool(risk.get("chase_risk")) or str(entry.get("price_location") or "").upper() in {"CHASE_HIGH", "VWAP_OVEREXTENDED"}:
+        if _bool(risk.get("chase_risk")) or _enum_text(entry.get("price_location")).upper() in {"CHASE_HIGH", "VWAP_OVEREXTENDED"}:
             reasons.append(ReasonCode.MARKET_RS_CHASE_BLOCK.value)
         if not self._threshold_passes(market, stock, scenario, balanced=False):
             reasons.append(ReasonCode.MARKET_RS_BELOW_THRESHOLD.value)
@@ -715,6 +715,16 @@ def _bool(value: Any) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _enum_text(value: Any, *, default: str = "") -> str:
+    raw = getattr(value, "value", value)
+    text = str(raw if raw not in (None, "") else default).strip()
+    if "." in text:
+        head, _, tail = text.rpartition(".")
+        if head and tail:
+            return tail
+    return text
 
 
 def _list(value: Any) -> list[Any]:

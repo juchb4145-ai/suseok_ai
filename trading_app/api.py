@@ -4525,17 +4525,17 @@ def setup_router_v3_summary(trade_date: str | None = Query(None)) -> dict[str, A
     db = open_database()
     try:
         run_loader = getattr(db, "latest_setup_router_run", None)
-        run = dict(run_loader(trade_date=resolved, router_version="setup_router_v3.5.1") if callable(run_loader) else {})
-        latest = list(getattr(db, "list_setup_observations_latest", lambda **_: [])(trade_date=resolved, router_version="setup_router_v3.5.1", limit=1000) or [])
-        readiness = list(getattr(db, "list_setup_router_readiness_latest", lambda **_: [])(trade_date=resolved, router_version="setup_router_v3.5.1", limit=1000) or [])
+        run = dict(run_loader(trade_date=resolved, router_version="setup_router_v3.5.2") if callable(run_loader) else {})
+        latest = list(getattr(db, "list_setup_observations_latest", lambda **_: [])(trade_date=resolved, router_version="setup_router_v3.5.2", limit=1000) or [])
+        readiness = list(getattr(db, "list_setup_router_readiness_latest", lambda **_: [])(trade_date=resolved, router_version="setup_router_v3.5.2", limit=1000) or [])
         status_counts = Counter(str(item.get("router_status") or "UNKNOWN") for item in latest)
         type_counts = Counter(str(item.get("setup_type") or "UNKNOWN") for item in latest)
         readiness_status_counts = Counter(str(item.get("readiness_status") or "ERROR") for item in readiness)
         return {
             "trade_date": resolved,
-            "schema_version": run.get("schema_version") or "setup_router_v3.observe.v5.1",
+            "schema_version": run.get("schema_version") or "setup_router_v3.observe.v5.2",
             "feature_schema_version": run.get("feature_schema_version") or "setup_router_v3.features.v4.2",
-            "router_version": run.get("router_version") or "setup_router_v3.5.1",
+            "router_version": run.get("router_version") or "setup_router_v3.5.2",
             "state_version": run.get("state_version") or "setup_router_v3.state.v3.2",
             "status": run.get("status") or ("OK" if latest else "EMPTY"),
             "calculated_at": run.get("calculated_at") or "",
@@ -4561,7 +4561,7 @@ def setup_router_v3_readiness(
     code: str | None = Query(None),
     readiness_status: str | None = Query(None),
     readiness_ready: bool | None = Query(None),
-    router_version: str | None = Query("setup_router_v3.5.1"),
+    router_version: str | None = Query("setup_router_v3.5.2"),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
@@ -4574,7 +4574,7 @@ def setup_router_v3_readiness(
                 code=_setup_router_v3_text(code),
                 readiness_status=_setup_router_v3_text(readiness_status),
                 readiness_ready=_setup_router_v3_bool_or_none(readiness_ready),
-                router_version=_setup_router_v3_text(router_version) or "setup_router_v3.5.1",
+                router_version=_setup_router_v3_text(router_version) or "setup_router_v3.5.2",
                 limit=_setup_router_v3_limit(limit) + 1,
                 offset=_setup_router_v3_offset(offset),
             )
@@ -4608,7 +4608,7 @@ def setup_router_v3_latest(
         session_phase=None,
         theme_id=None,
         leadership_status=None,
-        router_version="setup_router_v3.5.1",
+        router_version="setup_router_v3.5.2",
         setup_generation=None,
         lifecycle_state=None,
         post_subscription_tick_verified=None,
@@ -4628,7 +4628,7 @@ def setup_router_v3_observations(
     session_phase: str | None = Query(None),
     theme_id: str | None = Query(None),
     leadership_status: str | None = Query(None),
-    router_version: str | None = Query("setup_router_v3.5.1"),
+    router_version: str | None = Query("setup_router_v3.5.2"),
     setup_generation: int | None = Query(None),
     lifecycle_state: str | None = Query(None),
     post_subscription_tick_verified: bool | None = Query(None),
@@ -4650,7 +4650,7 @@ def setup_router_v3_observations(
             "session_phase": _setup_router_v3_text(session_phase),
             "theme_id": _setup_router_v3_text(theme_id),
             "leadership_status": _setup_router_v3_text(leadership_status),
-            "router_version": _setup_router_v3_text(router_version) or "setup_router_v3.5.1",
+            "router_version": _setup_router_v3_text(router_version) or "setup_router_v3.5.2",
             "setup_generation": _setup_router_v3_int_or_none(setup_generation),
             "lifecycle_state": _setup_router_v3_text(lifecycle_state),
             "post_subscription_tick_verified": _setup_router_v3_bool_or_none(post_subscription_tick_verified),
@@ -4678,7 +4678,7 @@ def setup_router_v3_transitions(
     code: str | None = Query(None),
     setup_type: str | None = Query(None),
     router_status: str | None = Query(None),
-    router_version: str | None = Query("setup_router_v3.5.1"),
+    router_version: str | None = Query("setup_router_v3.5.2"),
     setup_generation: int | None = Query(None),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
@@ -4693,7 +4693,7 @@ def setup_router_v3_transitions(
             code=_setup_router_v3_text(code),
             setup_type=_setup_router_v3_text(setup_type),
             router_status=_setup_router_v3_text(router_status),
-            router_version=_setup_router_v3_text(router_version) or "setup_router_v3.5.1",
+            router_version=_setup_router_v3_text(router_version) or "setup_router_v3.5.2",
             setup_generation=_setup_router_v3_int_or_none(setup_generation),
             limit=limit_value + 1,
             offset=offset_value,
@@ -4709,7 +4709,7 @@ def setup_router_v3_transitions(
                 "code": _setup_router_v3_text(code),
                 "setup_type": _setup_router_v3_text(setup_type),
                 "router_status": _setup_router_v3_text(router_status),
-                "router_version": _setup_router_v3_text(router_version) or "setup_router_v3.5.1",
+                "router_version": _setup_router_v3_text(router_version) or "setup_router_v3.5.2",
                 "setup_generation": _setup_router_v3_int_or_none(setup_generation),
                 "limit": limit_value,
                 "offset": offset_value,
@@ -4728,8 +4728,8 @@ def setup_router_v3_candidate(code: str, trade_date: str | None = Query(None), l
     db = open_database()
     try:
         limit_value = _setup_router_v3_limit(limit)
-        observations = db.list_setup_observations_latest(trade_date=resolved, code=code, router_version="setup_router_v3.5.1", limit=limit_value)
-        transitions = db.list_setup_observation_transitions(trade_date=resolved, code=code, router_version="setup_router_v3.5.1", limit=limit_value)
+        observations = db.list_setup_observations_latest(trade_date=resolved, code=code, router_version="setup_router_v3.5.2", limit=limit_value)
+        transitions = db.list_setup_observation_transitions(trade_date=resolved, code=code, router_version="setup_router_v3.5.2", limit=limit_value)
         return {
             "trade_date": resolved,
             "code": code,
@@ -4741,6 +4741,371 @@ def setup_router_v3_candidate(code: str, trade_date: str | None = Query(None), l
         }
     finally:
         close_database(db)
+
+
+@app.get("/api/runtime/realtime-subscriptions/lifecycle")
+def realtime_subscription_lifecycle(
+    trade_date: str | None = Query(None),
+    code: str | None = Query(None),
+    lifecycle_state: str | None = Query(None),
+    requested: bool | None = Query(None),
+    target_selected: bool | None = Query(None),
+    acked: bool | None = Query(None),
+    first_tick_verified: bool | None = Query(None),
+    decision_fresh: bool | None = Query(None),
+    budget_deferred: bool | None = Query(None),
+    source: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    limit_value = _setup_router_v3_limit(limit)
+    offset_value = _setup_router_v3_offset(offset)
+    post_filters = any(value is not None for value in (requested, target_selected, acked, first_tick_verified, decision_fresh, budget_deferred, source))
+    db = open_database()
+    try:
+        loader = getattr(db, "list_realtime_subscription_lifecycle_latest", None)
+        if not callable(loader):
+            items: list[dict[str, Any]] = []
+        else:
+            items = list(
+                loader(
+                    trade_date=resolved,
+                    code=_setup_router_v3_text(code),
+                    lifecycle_state=_setup_router_v3_text(lifecycle_state),
+                    limit=(min(10000, offset_value + limit_value + 1) if post_filters else limit_value + 1),
+                    offset=(0 if post_filters else offset_value),
+                )
+                or []
+            )
+        items = _filter_realtime_subscription_lifecycle(
+            items,
+            requested=requested,
+            target_selected=target_selected,
+            acked=acked,
+            first_tick_verified=first_tick_verified,
+            decision_fresh=decision_fresh,
+            budget_deferred=budget_deferred,
+            source=_setup_router_v3_text(source),
+        )
+        if post_filters:
+            page_source = items[offset_value : offset_value + limit_value + 1]
+        else:
+            page_source = items
+        page_items, pagination = _trim_page(page_source, limit=limit_value, offset=offset_value)
+        state_counts = Counter(str(item.get("lifecycle_state") or "UNKNOWN") for item in items)
+        return {
+            "trade_date": resolved,
+            "items": page_items,
+            "pagination": pagination,
+            "lifecycle_state_counts": dict(state_counts),
+            "filters": {
+                "trade_date": resolved,
+                "code": _setup_router_v3_text(code),
+                "lifecycle_state": _setup_router_v3_text(lifecycle_state),
+                "requested": requested,
+                "target_selected": target_selected,
+                "acked": acked,
+                "first_tick_verified": first_tick_verified,
+                "decision_fresh": decision_fresh,
+                "budget_deferred": budget_deferred,
+                "source": _setup_router_v3_text(source),
+                "limit": limit_value,
+                "offset": offset_value,
+            },
+            "read_only": True,
+            "observe_only": True,
+            "safety": _setup_router_v3_safety(),
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/realtime-subscriptions/events")
+def realtime_subscription_lifecycle_events(
+    trade_date: str | None = Query(None),
+    code: str | None = Query(None),
+    command_id: str | None = Query(None),
+    current_state: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    limit_value = _setup_router_v3_limit(limit)
+    offset_value = _setup_router_v3_offset(offset)
+    db = open_database()
+    try:
+        loader = getattr(db, "list_realtime_subscription_lifecycle_events", None)
+        events = list(
+            loader(
+                trade_date=resolved,
+                code=_setup_router_v3_text(code),
+                command_id=_setup_router_v3_text(command_id),
+                current_state=_setup_router_v3_text(current_state),
+                limit=limit_value + 1,
+                offset=offset_value,
+            )
+            or []
+        ) if callable(loader) else []
+        page_items, pagination = _trim_page(events, limit=limit_value, offset=offset_value)
+        return {
+            "trade_date": resolved,
+            "events": page_items,
+            "pagination": pagination,
+            "filters": {
+                "trade_date": resolved,
+                "code": _setup_router_v3_text(code),
+                "command_id": _setup_router_v3_text(command_id),
+                "current_state": _setup_router_v3_text(current_state),
+                "limit": limit_value,
+                "offset": offset_value,
+            },
+            "read_only": True,
+            "observe_only": True,
+            "safety": _setup_router_v3_safety(),
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/runtime/setup-router-v3/intraday-qualification")
+def setup_router_v3_intraday_qualification(
+    trade_date: str | None = Query(None),
+    router_version: str | None = Query("setup_router_v3.5.2"),
+    limit: int = Query(100, ge=1, le=1000),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    version = _setup_router_v3_text(router_version) or "setup_router_v3.5.2"
+    limit_value = _setup_router_v3_limit(limit)
+    db = open_database()
+    try:
+        latest = list(db.list_setup_router_readiness_latest(trade_date=resolved, router_version=version, limit=limit_value) or [])
+        readiness_history = _setup_router_intraday_rows(db, "setup_router_readiness_history", resolved, version, limit=100000)
+        commits = _setup_router_intraday_rows(db, "setup_router_evaluation_commits_v1", resolved, version, limit=100000)
+        observations = list(db.list_setup_observations_latest(trade_date=resolved, router_version=version, limit=100000) or [])
+        lifecycle = list(getattr(db, "list_realtime_subscription_lifecycle_latest", lambda **_: [])(trade_date=resolved, limit=10000) or [])
+        qualification = _setup_router_intraday_qualification_summary(
+            latest=latest,
+            readiness_history=readiness_history,
+            commits=commits,
+            observations=observations,
+            lifecycle=lifecycle,
+        )
+        return {
+            "trade_date": resolved,
+            "router_version": version,
+            "schema_version": "setup_router_v3.intraday_qualification.v1",
+            "qualification": qualification,
+            "latest_readiness": latest[:limit_value],
+            "read_only": True,
+            "observe_only": True,
+            "safety": _setup_router_v3_safety(),
+        }
+    finally:
+        close_database(db)
+
+
+def _filter_realtime_subscription_lifecycle(
+    rows: list[dict[str, Any]],
+    *,
+    requested: bool | None,
+    target_selected: bool | None,
+    acked: bool | None,
+    first_tick_verified: bool | None,
+    decision_fresh: bool | None,
+    budget_deferred: bool | None,
+    source: str | None,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        if requested is not None and bool(row.get("requested")) is not bool(requested):
+            continue
+        if target_selected is not None and bool(row.get("target_selected")) is not bool(target_selected):
+            continue
+        if acked is not None and bool(row.get("acked")) is not bool(acked):
+            continue
+        if first_tick_verified is not None and bool(row.get("first_tick_verified")) is not bool(first_tick_verified):
+            continue
+        if decision_fresh is not None and bool(row.get("decision_fresh")) is not bool(decision_fresh):
+            continue
+        if budget_deferred is not None:
+            row_budget = bool(row.get("budget_deferred")) or str(row.get("lifecycle_state") or "") == "BUDGET_DEFERRED"
+            if row_budget is not bool(budget_deferred):
+                continue
+        if source:
+            sources = {str(item) for item in list(row.get("sources") or row.get("subscription_sources") or []) if str(item)}
+            if source not in sources and source != str(row.get("primary_source") or row.get("subscription_primary_source") or ""):
+                continue
+        result.append(row)
+    return result
+
+
+def _setup_router_intraday_rows(db: TradingDatabase, table: str, trade_date: str, router_version: str, *, limit: int) -> list[dict[str, Any]]:
+    conn = getattr(db, "conn", None)
+    if conn is None or table not in {
+        "setup_router_readiness_history",
+        "setup_router_evaluation_commits_v1",
+    }:
+        return []
+    try:
+        exists = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", (table,)).fetchone()
+        if exists is None:
+            return []
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM {table}
+            WHERE trade_date = ? AND router_version = ?
+            ORDER BY rowid ASC
+            LIMIT ?
+            """,
+            (trade_date, router_version, max(1, int(limit or 100000))),
+        ).fetchall()
+    except Exception:
+        return []
+    return [_api_row(row) for row in rows]
+
+
+def _setup_router_intraday_qualification_summary(
+    *,
+    latest: list[dict[str, Any]],
+    readiness_history: list[dict[str, Any]],
+    commits: list[dict[str, Any]],
+    observations: list[dict[str, Any]],
+    lifecycle: list[dict[str, Any]],
+) -> dict[str, Any]:
+    latest_rows = [dict(row or {}) for row in latest]
+    history_rows = [dict(row or {}) for row in readiness_history]
+    commit_rows = [dict(row or {}) for row in commits]
+    observation_rows = [dict(row or {}) for row in observations]
+    lifecycle_rows = [dict(row or {}) for row in lifecycle]
+    latest_ready = [row for row in latest_rows if bool(row.get("readiness_ready"))]
+    history_ready = [
+        row
+        for row in history_rows
+        if str(row.get("current_readiness_status") or row.get("readiness_status") or "") == "READY"
+    ]
+    non_data_wait = [
+        row
+        for row in history_rows
+        if str(row.get("current_readiness_status") or row.get("readiness_status") or "") not in {"", "DATA_WAIT"}
+    ]
+    shape_commits = [
+        row
+        for row in commit_rows
+        if str(row.get("evaluation_kind") or "") == "SHAPE_CLASSIFICATION"
+        and bool(row.get("shape_evaluated", True))
+        and str(row.get("commit_status") or "COMMITTED") == "COMMITTED"
+    ]
+    ready_times = [
+        _api_parse_time(row.get("calculated_at") or row.get("occurred_at") or row.get("created_at"))
+        for row in history_ready
+    ]
+    ready_times = [item for item in ready_times if item is not None]
+    lifecycle_state_counts = Counter(str(row.get("lifecycle_state") or "UNKNOWN") for row in lifecycle_rows)
+    acked_count = sum(1 for row in lifecycle_rows if bool(row.get("acked")))
+    first_tick_count = sum(1 for row in lifecycle_rows if bool(row.get("first_tick_verified")))
+    ready_durations = _ready_durations_sec(history_rows)
+    return {
+        "latest_ready_distinct_count": len(_api_candidate_ids(latest_ready)),
+        "ever_ready_distinct_count": len(_api_candidate_ids(history_ready)),
+        "shape_evaluated_distinct_count": len(_api_candidate_ids(shape_commits)),
+        "non_data_wait_distinct_count": len(_api_candidate_ids(non_data_wait)),
+        "forming_distinct_count": len(_api_candidate_ids(row for row in observation_rows if str(row.get("shape_status") or "") == "FORMING")),
+        "matched_distinct_count": len(_api_candidate_ids(row for row in observation_rows if str(row.get("shape_status") or "") == "MATCHED")),
+        "valid_observe_distinct_count": len(_api_candidate_ids(row for row in observation_rows if str(row.get("router_status") or "") == "VALID_OBSERVE")),
+        "first_ready_at": min(ready_times).isoformat() if ready_times else "",
+        "last_ready_at": max(ready_times).isoformat() if ready_times else "",
+        "ready_duration_p50_sec": _api_percentile(ready_durations, 0.50),
+        "ready_duration_p95_sec": _api_percentile(ready_durations, 0.95),
+        "register_ack_success_distinct_count": acked_count,
+        "first_tick_verified_distinct_count": first_tick_count,
+        "first_tick_verified_rate": round(first_tick_count / acked_count, 4) if acked_count else 0.0,
+        "lifecycle_state_counts": dict(lifecycle_state_counts),
+        "market_open_last_readiness_status_counts": dict(Counter(str(row.get("readiness_status") or "UNKNOWN") for row in latest_rows)),
+        "latest_at_close_separate_from_intraday": True,
+        "opportunity_rank_allowed": False,
+    }
+
+
+def _api_row(row: Any) -> dict[str, Any]:
+    data = dict(row)
+    for key in list(data):
+        if key.endswith("_json"):
+            target = key[:-5]
+            data[target] = _json_loads_for_api(data.get(key), [] if key.endswith("codes_json") or key.endswith("reasons_json") else {})
+    payload = data.pop("payload", None)
+    if payload is None:
+        payload = data.get("payload_json")
+    parsed = _json_loads_for_api(payload, {})
+    if isinstance(parsed, dict):
+        merged = dict(parsed)
+        merged.update({key: value for key, value in data.items() if key not in merged and key != "payload_json"})
+        return merged
+    return data
+
+
+def _json_loads_for_api(value: Any, default: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value or ""))
+    except Exception:
+        return default
+
+
+def _api_candidate_ids(rows: Any) -> set[str]:
+    result: set[str] = set()
+    for row in rows:
+        item = dict(row or {})
+        candidate = str(item.get("candidate_instance_id") or item.get("candidate_id") or item.get("code") or "")
+        if candidate:
+            result.add(candidate)
+    return result
+
+
+def _api_parse_time(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def _ready_durations_sec(rows: list[dict[str, Any]]) -> list[float]:
+    by_candidate: dict[str, list[tuple[datetime, str]]] = {}
+    for row in rows:
+        candidate = str(row.get("candidate_instance_id") or row.get("candidate_id") or row.get("code") or "")
+        when = _api_parse_time(row.get("calculated_at") or row.get("occurred_at") or row.get("created_at"))
+        status = str(row.get("current_readiness_status") or row.get("readiness_status") or "")
+        if not candidate or when is None:
+            continue
+        by_candidate.setdefault(candidate, []).append((when, status))
+    durations: list[float] = []
+    for items in by_candidate.values():
+        ordered = sorted(items, key=lambda item: item[0])
+        ready_started: datetime | None = None
+        previous_time: datetime | None = None
+        for when, status in ordered:
+            if status == "READY" and ready_started is None:
+                ready_started = when
+            elif status != "READY" and ready_started is not None:
+                durations.append(max(0.0, (when - ready_started).total_seconds()))
+                ready_started = None
+            previous_time = when
+        if ready_started is not None and previous_time is not None:
+            durations.append(max(0.0, (previous_time - ready_started).total_seconds()))
+    return durations
+
+
+def _api_percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * float(percentile)))))
+    return round(ordered[index], 3)
 
 
 def _setup_router_v3_safety() -> dict[str, Any]:

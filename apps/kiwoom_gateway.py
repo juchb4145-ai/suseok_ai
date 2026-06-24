@@ -1586,16 +1586,29 @@ def _apply_realtime_subscription_transport_update(core_client, command: GatewayC
 
 
 def _command_event_payload(command: GatewayCommand, trace_updates: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = dict(command.payload or {})
     trace = trace_from_payload(command.payload)
     if trace_updates:
         trace.update(trace_updates)
-    return {
+    event_payload = {
         "command_id": command.command_id,
         "command_type": command.type,
         "idempotency_key": command.idempotency_key,
         "request_id": command.request_id,
         "transport_trace": trace,
     }
+    if command.type in {"register_realtime", "remove_realtime", "remove_all_realtime"}:
+        for key in (
+            "codes",
+            "screen_no",
+            "subscription_session_id",
+            "subscription_generation",
+            "target_digest",
+            "requested_at_utc",
+        ):
+            if key in payload:
+                event_payload[key] = payload.get(key)
+    return event_payload
 
 
 def _result_payload(

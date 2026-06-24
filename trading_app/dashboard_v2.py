@@ -448,9 +448,9 @@ def _setup_router_v3_summary(section: dict[str, Any]) -> dict[str, Any]:
     return {
         "enabled": bool(section.get("enabled")),
         "status": section.get("status", "DISABLED" if not section.get("enabled") else "EMPTY"),
-        "schema_version": section.get("schema_version", "setup_router_v3.observe.v5.1"),
+        "schema_version": section.get("schema_version", "setup_router_v3.observe.v5.2"),
         "feature_schema_version": section.get("feature_schema_version", "setup_router_v3.features.v4.2"),
-        "router_version": section.get("router_version", "setup_router_v3.5.1"),
+        "router_version": section.get("router_version", "setup_router_v3.5.2"),
         "state_version": section.get("state_version", "setup_router_v3.state.v3.2"),
         "output_mode": section.get("output_mode", "OBSERVE"),
         "observe_only": True,

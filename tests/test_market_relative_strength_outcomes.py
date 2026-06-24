@@ -51,6 +51,31 @@ def test_report_groups_shadow_outcomes_across_5_10_20_minutes_and_exports(tmp_pa
     assert all(Path(path).exists() for path in exported.values())
 
 
+def test_report_normalizes_enum_style_shadow_details() -> None:
+    decision = _decision_details(
+        decision_id="enum-style-1",
+        code="000777",
+        scenario="MarketRelativeStrengthShadowScenario.WEAK_SIDE_STRICT_SHADOW",
+        variant="MarketRelativeStrengthShadowVariant.STRICT",
+        market_side="MarketSide.KOSDAQ",
+        side_regime="MarketRegimeStatus.WEAK",
+    )
+    decision["actual_market_action"] = "CandidateMarketAction.WAIT_MARKET"
+    decision["shadow_status"] = "MarketRelativeStrengthShadowStatus.SHADOW_CANDIDATE"
+    decision["counterfactual_action"] = "MarketRelativeStrengthCounterfactualAction.OBSERVE_SMALL"
+    report = MarketRelativeStrengthOutcomeAnalyzer(db=None).build_report(
+        source_items=[_outcome(decision, 600, mfe=2.0, mae=-0.2, ret=0.8)]
+    )
+
+    row = report["rows"][0]
+    assert row["market_side"] == "KOSDAQ"
+    assert row["side_market_regime"] == "WEAK"
+    assert row["actual_market_action"] == "WAIT_MARKET"
+    assert row["shadow_scenario"] == "WEAK_SIDE_STRICT_SHADOW"
+    assert row["shadow_status"] == "SHADOW_CANDIDATE"
+    assert report["summary"]["weak_side_shadow_candidate_count"] == 1
+
+
 def test_weak_side_review_recommendation_requires_sample_distribution() -> None:
     rows = []
     for idx in range(30):

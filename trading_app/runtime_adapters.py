@@ -11,6 +11,7 @@ from trading.strategy.conditions import ConditionProfileRepository, RegisteredCo
 from trading.strategy.market_data import MarketDataStore
 from trading.strategy.market_index import IndexCodeMapper, MarketIndexStore, zero_padded_index_logical_code
 from trading.strategy.market_data_service import MarketDataService, MarketDataServiceConfig
+from trading.strategy.subscription_lifecycle import RealtimeCommandReceipt
 from trading.theme_engine.runtime import RealTimeThemeRuntime
 
 
@@ -203,26 +204,28 @@ class GatewayCommandRealtimeClient:
         self.subscription_generation += 1
         return self.subscription_generation
 
-    def register_realtime(self, codes: Iterable[str], screen_no: str = "") -> None:
+    def register_realtime(self, codes: Iterable[str], screen_no: str = "") -> RealtimeCommandReceipt | None:
         clean_codes = _clean_codes(codes)
         if not clean_codes:
-            return
-        self._enqueue(
+            return None
+        return self._enqueue(
             "register_realtime",
             payload={
                 "codes": clean_codes,
                 "screen_no": str(screen_no or ""),
                 "subscription_session_id": self.subscription_session_id,
                 "subscription_generation": self.subscription_generation,
+                "target_digest": _target_digest(clean_codes),
+                "requested_at_utc": _utc_text(datetime.now(timezone.utc)),
             },
             key=self._register_key(screen_no, clean_codes),
         )
 
-    def register_realtime_records(self, records: Iterable[Any], screen_no: str = "") -> None:
+    def register_realtime_records(self, records: Iterable[Any], screen_no: str = "") -> RealtimeCommandReceipt | None:
         record_list = list(records or [])
         clean_codes = _clean_codes(getattr(record, "code", "") for record in record_list)
         if not clean_codes:
-            return
+            return None
         code_sources: dict[str, list[str]] = {}
         code_protected: dict[str, bool] = {}
         for record in record_list:
@@ -233,7 +236,7 @@ class GatewayCommandRealtimeClient:
             sources = sorted(str(source) for source in getattr(record, "sources", set()) or [])
             code_sources[code] = sources
             code_protected[code] = bool(getattr(record, "protected", False))
-        self._enqueue(
+        return self._enqueue(
             "register_realtime",
             payload={
                 "codes": clean_codes,
@@ -242,29 +245,40 @@ class GatewayCommandRealtimeClient:
                 "code_protected": code_protected,
                 "subscription_session_id": self.subscription_session_id,
                 "subscription_generation": self.subscription_generation,
+                "target_digest": _target_digest(clean_codes),
+                "requested_at_utc": _utc_text(datetime.now(timezone.utc)),
             },
             key=self._register_key(screen_no, clean_codes),
         )
 
-    def remove_realtime(self, codes: Iterable[str], screen_no: str = "") -> None:
+    def remove_realtime(self, codes: Iterable[str], screen_no: str = "") -> RealtimeCommandReceipt | None:
         clean_codes = _clean_codes(codes)
         if not clean_codes:
-            return
-        self._enqueue(
+            return None
+        return self._enqueue(
             "remove_realtime",
-            payload={"codes": clean_codes, "screen_no": str(screen_no or "")},
+            payload={
+                "codes": clean_codes,
+                "screen_no": str(screen_no or ""),
+                "subscription_session_id": self.subscription_session_id,
+                "subscription_generation": self.subscription_generation,
+                "target_digest": _target_digest(clean_codes),
+                "requested_at_utc": _utc_text(datetime.now(timezone.utc)),
+            },
             key=f"runtime:remove_realtime:{screen_no}:{','.join(clean_codes)}",
         )
 
-    def remove_all_realtime(self, reason: str = "") -> None:
+    def remove_all_realtime(self, reason: str = "") -> RealtimeCommandReceipt:
         clean_reason = _clean_idempotency_part(reason) or "unspecified"
-        self._enqueue(
+        return self._enqueue(
             "remove_all_realtime",
             payload={
                 "scope": "runtime",
                 "reason": clean_reason,
                 "subscription_session_id": self.subscription_session_id,
                 "subscription_generation": self.subscription_generation,
+                "target_digest": "all",
+                "requested_at_utc": _utc_text(datetime.now(timezone.utc)),
             },
             key=(
                 "runtime:remove_all_realtime:"
@@ -296,7 +310,7 @@ class GatewayCommandRealtimeClient:
                 self._warn(f"REALTIME_REGISTER_STALE_EXPIRED:{command_id}")
         return expired
 
-    def _enqueue(self, command_type: str, *, payload: dict[str, Any], key: str) -> None:
+    def _enqueue(self, command_type: str, *, payload: dict[str, Any], key: str) -> RealtimeCommandReceipt:
         command = GatewayCommand(
             type=command_type,
             command_id=new_message_id("cmd_rt"),
@@ -309,8 +323,27 @@ class GatewayCommandRealtimeClient:
             priority=CommandPriority.NORMAL,
             metadata={"runtime": "strategy", "adapter": "realtime"},
         )
+        record = result.record
         if not result.accepted:
             self._warn(f"REALTIME_COMMAND_REJECTED:{command_type}:{result.reason}:{result.duplicate_of}")
+        command_payload = dict(command.payload or {})
+        if record is not None:
+            command_payload = dict(record.command.payload or command_payload)
+        return RealtimeCommandReceipt(
+            accepted=bool(result.accepted),
+            command_id=str(command.command_id or ""),
+            command_type=command_type,
+            idempotency_key=key,
+            duplicate_of=str(result.duplicate_of or ""),
+            status="QUEUED" if result.accepted else "DUPLICATE" if result.reason == "DUPLICATE_COMMAND" else "REJECTED",
+            reason=str(result.reason or ""),
+            enqueued_at_utc=_utc_text(getattr(record, "created_at", "") or datetime.now(timezone.utc)),
+            screen_no=str(command_payload.get("screen_no") or ""),
+            codes=tuple(_clean_codes(command_payload.get("codes") or [])),
+            subscription_session_id=str(command_payload.get("subscription_session_id") or self.subscription_session_id),
+            subscription_generation=int(command_payload.get("subscription_generation") or self.subscription_generation),
+            target_digest=str(command_payload.get("target_digest") or _target_digest(command_payload.get("codes") or [])),
+        )
 
     def _register_key(self, screen_no: str, clean_codes: list[str]) -> str:
         return (
@@ -712,6 +745,32 @@ def _clean_idempotency_part(value: Any) -> str:
         else:
             result.append("_")
     return "".join(result).strip("_")[:120]
+
+
+def _target_digest(codes: Iterable[Any]) -> str:
+    import hashlib
+
+    clean = _clean_codes(codes)
+    if not clean:
+        return ""
+    return hashlib.sha1(",".join(clean).encode("utf-8")).hexdigest()[:16]
+
+
+def _utc_text(value: Any) -> str:
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            dt = datetime.now(timezone.utc)
+        else:
+            try:
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return text
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _stale_dispatched(record: dict[str, Any], current: datetime, timeout_sec: int) -> bool:

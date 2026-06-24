@@ -15,7 +15,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trade-date", default=datetime.now().date().isoformat())
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--limit", type=int, default=10000)
-    parser.add_argument("--router-version", default="setup_router_v3.5.1")
+    parser.add_argument("--router-version", default="setup_router_v3.5.2")
     parser.add_argument("--include-legacy-version", action="store_true")
     args = parser.parse_args(argv)
 
@@ -34,12 +34,20 @@ def main(argv: list[str] | None = None) -> int:
         runs = _rows(con, "setup_router_runs", trade_date, limit=1000, router_version=args.router_version)
         runtime_rows = _rows(con, "setup_router_candidate_runtime_v4", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
         readiness_rows = _rows(con, "setup_router_readiness_latest", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
+        lifecycle_rows = _rows(con, "realtime_subscription_lifecycle_latest", trade_date, limit=args.limit)
         full_counts = _full_counts(con, trade_date, args.router_version)
         integrity = _state_integrity(con, trade_date, args.router_version)
         scheduling = _scheduling_checks(con, trade_date, args.router_version)
         side_effects = _side_effect_counts(con, trade_date)
         span_metrics = _span_metrics(con, trade_date, args.router_version)
         readiness_metrics = _readiness_metrics(readiness_rows, observations, con=con, trade_date=trade_date, router_version=args.router_version)
+        lifecycle_metrics = _subscription_lifecycle_metrics(
+            con,
+            trade_date,
+            args.router_version,
+            lifecycle_rows=lifecycle_rows,
+            readiness_rows=readiness_rows,
+        )
     finally:
         con.close()
 
@@ -106,6 +114,24 @@ def main(argv: list[str] | None = None) -> int:
         failures.append("SETUP_ROUTER_OBSERVE_ONLY_COUNTED_AS_WAIT")
     if readiness_metrics.get("readiness_count", 0) == 0 and full_counts.get("observations", 0) > 0:
         warnings.append("SETUP_READINESS_ROWS_MISSING")
+    if lifecycle_metrics.get("active_without_ack_count", 0) > 0:
+        failures.append("REALTIME_LIFECYCLE_ACTIVE_WITHOUT_ACK")
+    if lifecycle_metrics.get("first_tick_without_ack_count", 0) > 0:
+        failures.append("REALTIME_LIFECYCLE_FIRST_TICK_WITHOUT_ACK")
+    if lifecycle_metrics.get("command_enqueued_active_count", 0) > 0:
+        failures.append("REALTIME_LIFECYCLE_ENQUEUED_MARKED_ACTIVE")
+    if lifecycle_metrics.get("active_fresh_without_first_tick_count", 0) > 0:
+        failures.append("REALTIME_LIFECYCLE_ACTIVE_FRESH_WITHOUT_FIRST_TICK")
+    if lifecycle_metrics.get("first_tick_before_ack_baseline_count", 0) > 0:
+        failures.append("REALTIME_LIFECYCLE_FIRST_TICK_BEFORE_ACK_BASELINE")
+    if lifecycle_metrics.get("ack_without_enqueued_command_count", 0) > 0:
+        failures.append("REALTIME_LIFECYCLE_ACK_WITHOUT_COMMAND")
+    if lifecycle_metrics.get("released_but_active_count", 0) > 0:
+        failures.append("REALTIME_LIFECYCLE_RELEASED_BUT_ACTIVE")
+    if lifecycle_metrics.get("failed_command_marked_active_count", 0) > 0:
+        failures.append("REALTIME_LIFECYCLE_FAILED_MARKED_ACTIVE")
+    if lifecycle_metrics.get("requested_readiness_lifecycle_missing_count", 0) > 0:
+        warnings.append("REALTIME_LIFECYCLE_MISSING_FOR_REQUESTED_READINESS")
     if any(row.get("router_status") == "VALID_OBSERVE" and not bool(row.get("post_subscription_tick_verified", True)) for row in observations):
         failures.append("VALID_WITH_POST_SUBSCRIPTION_TICK_MISSING")
     if any(row.get("router_status") == "VALID_OBSERVE" and row.get("session_phase") in {"CLOSING_RISK", "MARKET_CLOSED"} for row in observations):
@@ -125,13 +151,15 @@ def main(argv: list[str] | None = None) -> int:
         and full_counts.get("state_transitions", 0) > 0
     )
     verdict = "STABLE_FOR_OPPORTUNITY_RANKER" if stable_ready else "NOT_STABLE" if failures else "CONDITIONALLY_STABLE"
+    subscription_lifecycle_verdict = _subscription_lifecycle_verdict(lifecycle_metrics, run_span_min=run_span_min)
     summary = {
-        "schema_version": "setup_router_v3.audit.v5.1",
+        "schema_version": "setup_router_v3.audit.v5.2",
         "trade_date": trade_date,
         "router_version": args.router_version,
         "db_path": str(db_path),
         "generated_at": datetime.now().replace(microsecond=0).isoformat(),
         "verdict": verdict,
+        "subscription_lifecycle_verdict": subscription_lifecycle_verdict,
         "observation_count": len(observations),
         "transition_count": len(transitions),
         "state_count": len(states),
@@ -139,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         "run_count": len(runs),
         "candidate_runtime_count": len(runtime_rows),
         "readiness_count": len(readiness_rows),
+        "subscription_lifecycle_count": len(lifecycle_rows),
         "sample_counts": {
             "observations": len(observations),
             "transitions": len(transitions),
@@ -147,9 +176,11 @@ def main(argv: list[str] | None = None) -> int:
             "runs": len(runs),
             "candidate_runtime": len(runtime_rows),
             "readiness": len(readiness_rows),
+            "subscription_lifecycle": len(lifecycle_rows),
         },
         "full_counts": full_counts,
         "readiness_metrics": readiness_metrics,
+        "subscription_lifecycle_metrics": lifecycle_metrics,
         "run_span_minutes": run_span_min,
         "span_metrics": span_metrics,
         "type_counts": dict(type_counts),
@@ -354,6 +385,103 @@ def _readiness_metrics(
     if con is not None and trade_date and router_version:
         metrics.update(_readiness_full_sql_metrics(con, trade_date, router_version))
     return metrics
+
+
+def _subscription_lifecycle_metrics(
+    con: sqlite3.Connection,
+    trade_date: str,
+    router_version: str,
+    *,
+    lifecycle_rows: list[dict[str, Any]],
+    readiness_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rows = [dict(row or {}) for row in lifecycle_rows]
+    readiness = [dict(row or {}) for row in readiness_rows]
+    state_counts = Counter(str(row.get("lifecycle_state") or "UNKNOWN") for row in rows)
+    requested_readiness_codes = {
+        str(row.get("code") or "")
+        for row in readiness
+        if bool(row.get("subscription_requested")) and str(row.get("code") or "")
+    }
+    lifecycle_codes = {str(row.get("code") or "") for row in rows if str(row.get("code") or "")}
+    first_tick_before_ack = 0
+    for row in rows:
+        first_tick_at = _parse_time(row.get("first_tick_at_utc"))
+        ack_baseline = _parse_time(row.get("registration_ack_baseline_at_utc"))
+        if first_tick_at is not None and ack_baseline is not None and first_tick_at < ack_baseline:
+            first_tick_before_ack += 1
+    metrics: dict[str, Any] = {
+        "lifecycle_count": len(rows),
+        "lifecycle_event_count": _count(con, "realtime_subscription_lifecycle_events", trade_date),
+        "lifecycle_state_counts": dict(state_counts),
+        "acked_count": sum(1 for row in rows if bool(row.get("acked"))),
+        "transport_active_count": sum(1 for row in rows if bool(row.get("transport_active"))),
+        "first_tick_verified_count": sum(1 for row in rows if bool(row.get("first_tick_verified"))),
+        "decision_fresh_count": sum(1 for row in rows if bool(row.get("decision_fresh"))),
+        "active_stale_count": state_counts.get("ACTIVE_STALE", 0),
+        "acked_wait_first_tick_count": state_counts.get("ACKED_WAIT_FIRST_TICK", 0),
+        "failed_count": state_counts.get("FAILED", 0),
+        "active_without_ack_count": sum(1 for row in rows if bool(row.get("transport_active")) and not bool(row.get("acked"))),
+        "first_tick_without_ack_count": sum(1 for row in rows if bool(row.get("first_tick_verified")) and not bool(row.get("acked"))),
+        "command_enqueued_active_count": sum(
+            1
+            for row in rows
+            if str(row.get("lifecycle_state") or "") in {"COMMAND_ENQUEUED", "COMMAND_DISPATCHED"}
+            and bool(row.get("transport_active"))
+        ),
+        "active_fresh_without_first_tick_count": sum(
+            1
+            for row in rows
+            if str(row.get("lifecycle_state") or "") == "ACTIVE_FRESH" and not bool(row.get("first_tick_verified"))
+        ),
+        "first_tick_before_ack_baseline_count": first_tick_before_ack,
+        "ack_without_enqueued_command_count": sum(1 for row in rows if bool(row.get("acked")) and not str(row.get("register_command_id") or "")),
+        "released_but_active_count": sum(1 for row in rows if bool(row.get("released")) and bool(row.get("transport_active"))),
+        "failed_command_marked_active_count": sum(1 for row in rows if bool(row.get("failed")) and bool(row.get("transport_active"))),
+        "requested_readiness_lifecycle_missing_count": len(requested_readiness_codes - lifecycle_codes),
+    }
+    if _has_table(con, "setup_router_readiness_latest") and _has_table(con, "realtime_subscription_lifecycle_latest"):
+        try:
+            row = con.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM setup_router_readiness_latest r
+                LEFT JOIN realtime_subscription_lifecycle_latest l
+                  ON l.trade_date = r.trade_date
+                 AND l.code = r.code
+                WHERE r.trade_date = ?
+                  AND r.router_version = ?
+                  AND r.subscription_requested = 1
+                  AND l.code IS NULL
+                """,
+                (trade_date, router_version),
+            ).fetchone()
+            metrics["requested_readiness_lifecycle_missing_count"] = int(row["count"] or 0) if row else metrics["requested_readiness_lifecycle_missing_count"]
+        except sqlite3.Error:
+            pass
+    return metrics
+
+
+def _subscription_lifecycle_verdict(metrics: dict[str, Any], *, run_span_min: float) -> str:
+    failure_keys = {
+        "active_without_ack_count",
+        "first_tick_without_ack_count",
+        "command_enqueued_active_count",
+        "active_fresh_without_first_tick_count",
+        "first_tick_before_ack_baseline_count",
+        "ack_without_enqueued_command_count",
+        "released_but_active_count",
+        "failed_command_marked_active_count",
+    }
+    if any(int(metrics.get(key) or 0) > 0 for key in failure_keys):
+        return "NOT_STABLE"
+    if (
+        int(metrics.get("acked_count") or 0) > 0
+        and int(metrics.get("first_tick_verified_count") or 0) > 0
+        and float(run_span_min or 0.0) >= 60.0
+    ):
+        return "STABLE"
+    return "CONDITIONALLY_STABLE"
 
 
 def _readiness_full_sql_metrics(con: sqlite3.Connection, trade_date: str, router_version: str) -> dict[str, int]:
@@ -1196,7 +1324,7 @@ def _span_between(first: str, last: str) -> float:
 
 def _parse_time(value: Any) -> datetime | None:
     try:
-        return datetime.fromisoformat(str(value or ""))
+        return datetime.fromisoformat(str(value or "").replace("Z", "+00:00")).replace(tzinfo=None)
     except ValueError:
         return None
 
@@ -1225,16 +1353,22 @@ def _write_json(path: Path, payload: Any) -> None:
 
 def _markdown(summary: dict[str, Any], flip: dict[str, Any], alignment: dict[str, Any]) -> str:
     readiness = dict(summary.get("readiness_metrics") or {})
+    lifecycle = dict(summary.get("subscription_lifecycle_metrics") or {})
     return "\n".join(
         [
             "# SetupRouter V3 Audit",
             "",
             f"- verdict: `{summary['verdict']}`",
+            f"- subscription_lifecycle_verdict: `{summary.get('subscription_lifecycle_verdict', '')}`",
             f"- observation_count: {summary['observation_count']}",
             f"- readiness_count: {summary.get('readiness_count', 0)}",
             f"- readiness_ready_count: {readiness.get('readiness_ready_count', 0)}",
             f"- shape_evaluated_count: {readiness.get('shape_evaluated_count', 0)}",
             f"- lease_false_block_count: {readiness.get('lease_false_block_count', 0)}",
+            f"- subscription_lifecycle_count: {lifecycle.get('lifecycle_count', 0)}",
+            f"- lifecycle_state_counts: `{json.dumps(lifecycle.get('lifecycle_state_counts', {}), ensure_ascii=False, sort_keys=True)}`",
+            f"- acked_wait_first_tick_count: {lifecycle.get('acked_wait_first_tick_count', 0)}",
+            f"- active_stale_count: {lifecycle.get('active_stale_count', 0)}",
             f"- transition_count: {summary['transition_count']}",
             f"- invalid_count: {summary['invalid_count']}",
             f"- frequent_flip_count: {flip['frequent_flip_count']}",

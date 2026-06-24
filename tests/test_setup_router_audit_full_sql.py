@@ -15,7 +15,7 @@ def test_audit_uses_full_sql_for_market_action_unknown_beyond_limit(tmp_path):
             [
                 {
                     "trade_date": TRADE_DATE,
-                    "router_version": "setup_router_v3.5.1",
+                    "router_version": "setup_router_v3.5.2",
                     "candidate_instance_id": f"ci-{index}",
                     "candidate_id": index,
                     "code": f"00000{index}",

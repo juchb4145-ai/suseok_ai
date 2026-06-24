@@ -533,30 +533,30 @@ class MarketRelativeStrengthOutcomeAnalyzer:
             "calculated_at": str(details.get("calculated_at") or outcome.get("decision_at") or ""),
             "code": str(outcome.get("code") or ""),
             "name": details.get("name") or outcome.get("name") or "",
-            "market_side": details.get("market_side") or "",
-            "side_market_regime": details.get("side_market_regime") or "",
-            "counterpart_market_regime": details.get("counterpart_market_regime") or "",
-            "composite_market_mode": details.get("composite_market_mode") or "",
+            "market_side": _enum_text(details.get("market_side")),
+            "side_market_regime": _enum_text(details.get("side_market_regime")),
+            "counterpart_market_regime": _enum_text(details.get("counterpart_market_regime")),
+            "composite_market_mode": _enum_text(details.get("composite_market_mode")),
             "systemic_risk_off": bool(details.get("systemic_risk_off")),
-            "actual_market_action": details.get("actual_market_action") or "",
-            "actual_entry_status": details.get("actual_entry_status") or "",
+            "actual_market_action": _enum_text(details.get("actual_market_action")),
+            "actual_entry_status": _enum_text(details.get("actual_entry_status")),
             "actual_ready_allowed": bool(details.get("actual_ready_allowed")),
-            "shadow_scenario": details.get("shadow_scenario") or "",
-            "shadow_variant": details.get("shadow_variant") or "",
-            "shadow_status": details.get("shadow_status") or "",
-            "counterfactual_action": details.get("counterfactual_action") or "",
+            "shadow_scenario": _enum_text(details.get("shadow_scenario")),
+            "shadow_variant": _enum_text(details.get("shadow_variant")),
+            "shadow_status": _enum_text(details.get("shadow_status")),
+            "counterfactual_action": _enum_text(details.get("counterfactual_action")),
             "counterfactual_position_size_multiplier_hint": _round(details.get("counterfactual_position_size_multiplier_hint")),
-            "trade_stock_role": details.get("trade_stock_role") or "",
+            "trade_stock_role": _enum_text(details.get("trade_stock_role")),
             "theme_id": details.get("theme_id") or "",
             "theme_name": details.get("theme_name") or outcome.get("theme_name") or "",
-            "theme_state": details.get("theme_state") or "",
+            "theme_state": _enum_text(details.get("theme_state")),
             "theme_score": _round(details.get("theme_score")),
             "persistence_count": int(details.get("persistence_count") or 0),
             "relative_strength_vs_index_pct": _round(details.get("relative_strength_vs_index_pct")),
-            "relative_strength_band": details.get("relative_strength_band") or _relative_strength_band(details.get("relative_strength_vs_index_pct")),
-            "price_location": details.get("price_location") or "",
+            "relative_strength_band": _enum_text(details.get("relative_strength_band")) or _relative_strength_band(details.get("relative_strength_vs_index_pct")),
+            "price_location": _enum_text(details.get("price_location")),
             "session_phase": dict(details.get("feature_snapshot") or {}).get("context", {}).get("session_phase", ""),
-            "data_quality_status": details.get("data_quality_status") or "",
+            "data_quality_status": _enum_text(details.get("data_quality_status")),
             "reason_codes": list(details.get("reason_codes") or []),
             "reject_reason_codes": list(details.get("reject_reason_codes") or []),
         }
@@ -843,6 +843,16 @@ def _float(value: Any) -> float:
 
 def _round(value: Any, digits: int = 4) -> float:
     return round(_float(value), digits)
+
+
+def _enum_text(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    text = str(raw or "").strip()
+    if "." in text:
+        head, _, tail = text.rpartition(".")
+        if head and tail:
+            return tail
+    return text
 
 
 def _csv_value(value: Any) -> Any:

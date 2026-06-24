@@ -48,11 +48,20 @@ class RealtimeSubscriptionReadinessSnapshot:
 
 
 class RealtimeSubscriptionReadinessProvider:
-    def __init__(self, subscription_manager: Any, market_data: Any | None = None, *, clock: Any = datetime.now, max_tick_age_sec: int = 10) -> None:
+    def __init__(
+        self,
+        subscription_manager: Any,
+        market_data: Any | None = None,
+        *,
+        clock: Any = datetime.now,
+        max_tick_age_sec: int = 10,
+        lifecycle_tracker: Any | None = None,
+    ) -> None:
         self.subscription_manager = subscription_manager
         self.market_data = market_data
         self.clock = clock
         self.max_tick_age_sec = max(1, int(max_tick_age_sec or 10))
+        self.lifecycle_tracker = lifecycle_tracker
 
     def snapshot(self, code: str, selected_theme_id: str = "", candidate: Any | None = None, now: datetime | None = None) -> dict[str, Any]:
         current = (now or self.clock()).replace(microsecond=0)
@@ -85,7 +94,27 @@ class RealtimeSubscriptionReadinessProvider:
             relevant_source_added_at=relevant_source_added_at,
             subscription_active=subscription_active,
         )
-        return RealtimeSubscriptionReadinessSnapshot(
+        lifecycle = self._lifecycle_snapshot(clean_code, now=current)
+        if lifecycle:
+            lifecycle_state = str(lifecycle.get("lifecycle_state") or "")
+            subscription_active = bool(lifecycle.get("transport_active"))
+            active_since = str(lifecycle.get("registration_ack_baseline_at_utc") or active_since)
+            post_subscription_tick_verified = bool(lifecycle.get("first_tick_verified") and lifecycle.get("decision_fresh"))
+            tick_payload = {
+                **tick_payload,
+                "latest_tick_at": lifecycle.get("last_tick_at_utc") or tick_payload.get("latest_tick_at") or "",
+                "latest_tick_age_sec": lifecycle.get("latest_tick_age_sec", tick_payload.get("latest_tick_age_sec")),
+                "latest_tick_source": "REALTIME" if lifecycle.get("last_tick_at_utc") else tick_payload.get("latest_tick_source") or "",
+                "core_tick_at": lifecycle.get("last_tick_at_utc") or tick_payload.get("core_tick_at") or "",
+                "gateway_tick_at": lifecycle.get("first_tick_gateway_at_utc") or tick_payload.get("gateway_tick_at") or "",
+            }
+            if lifecycle_state in {"COMMAND_ENQUEUED", "COMMAND_DISPATCHED"}:
+                subscription_active = False
+                post_subscription_tick_verified = False
+            elif lifecycle_state == "ACKED_WAIT_FIRST_TICK":
+                subscription_active = True
+                post_subscription_tick_verified = False
+        payload = RealtimeSubscriptionReadinessSnapshot(
             code=clean_code,
             calculated_at=current.isoformat(),
             subscription_requested=subscription_requested,
@@ -115,6 +144,29 @@ class RealtimeSubscriptionReadinessProvider:
             price=float(tick_payload.get("price") or 0.0),
             source_priorities=dict(getattr(record, "source_priorities", {}) or {}) if record else {},
         ).to_dict()
+        if lifecycle:
+            payload.update(
+                {
+                    "subscription_lifecycle_schema_version": lifecycle.get("schema_version") or "",
+                    "subscription_lifecycle_state": lifecycle.get("lifecycle_state") or "",
+                    "budget_deferred": bool(lifecycle.get("budget_deferred")),
+                    "command_enqueued": bool(lifecycle.get("command_enqueued")),
+                    "command_dispatched": bool(lifecycle.get("command_dispatched")),
+                    "acked": bool(lifecycle.get("acked")),
+                    "transport_active": bool(lifecycle.get("transport_active")),
+                    "first_tick_verified": bool(lifecycle.get("first_tick_verified")),
+                    "decision_fresh": bool(lifecycle.get("decision_fresh")),
+                    "stale": bool(lifecycle.get("stale")),
+                    "released": bool(lifecycle.get("released")),
+                    "failed": bool(lifecycle.get("failed")),
+                    "register_command_id": lifecycle.get("register_command_id") or "",
+                    "registration_ack_baseline_at_utc": lifecycle.get("registration_ack_baseline_at_utc") or "",
+                    "first_tick_at_utc": lifecycle.get("first_tick_at_utc") or "",
+                    "last_tick_at_utc": lifecycle.get("last_tick_at_utc") or "",
+                    "ack_to_first_tick_ms": lifecycle.get("ack_to_first_tick_ms"),
+                }
+            )
+        return payload
 
     def snapshots(
         self,
@@ -143,6 +195,22 @@ class RealtimeSubscriptionReadinessProvider:
             return {normalize_code(getattr(record, "code", "")) for record in list(target_loader() or []) if normalize_code(getattr(record, "code", ""))}
         except Exception:
             return set(getattr(self.subscription_manager, "code_to_screen", {}) or {})
+
+    def _lifecycle_snapshot(self, code: str, now: datetime | None = None) -> dict[str, Any]:
+        tracker = self.lifecycle_tracker or getattr(self.subscription_manager, "lifecycle_tracker", None)
+        refresher = getattr(tracker, "refresh_staleness", None)
+        if callable(refresher):
+            try:
+                return dict(refresher(code, now=now) or {})
+            except Exception:
+                pass
+        snapshot = getattr(tracker, "snapshot", None)
+        if not callable(snapshot):
+            return {}
+        try:
+            return dict(snapshot(code) or {})
+        except Exception:
+            return {}
 
     def _tick_payload(self, code: str, now: datetime) -> dict[str, Any]:
         if self.market_data is None:

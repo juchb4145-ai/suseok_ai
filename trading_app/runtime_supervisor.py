@@ -484,7 +484,7 @@ class RuntimeSupervisor:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
             return
-        if event.type in {"command_ack", "command_failed", "command_timeout", "command_expired"}:
+        if event.type in {"command_started", "command_ack", "command_failed", "command_timeout", "command_expired"}:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._executor, self._handle_gateway_event_in_worker, event)
             return
@@ -756,6 +756,9 @@ class RuntimeSupervisor:
         if self._bundle is None:
             return
         v2_runtime = self._is_reboot_v2_bundle()
+        if v2_runtime and event.type in {"command_started", "command_ack", "command_failed", "command_timeout", "command_expired"}:
+            if self._handle_realtime_subscription_command_event(event):
+                return
         candidate_hydrator = getattr(self._bundle, "candidate_hydrator", None)
         if v2_runtime and candidate_hydrator is not None:
             handler = getattr(candidate_hydrator, "handle_event", None)
@@ -817,6 +820,10 @@ class RuntimeSupervisor:
                     forwarded_count += 1
             except Exception as exc:
                 self._warn(f"RUNTIME_GATEWAY_EVENT_FAILED:{event.type}:{exc}")
+            try:
+                self._handle_realtime_subscription_price_tick(event)
+            except Exception as exc:
+                self._warn(f"RUNTIME_REALTIME_SUBSCRIPTION_TICK_FAILED:{exc}")
         if forwarded_count:
             self._clear_realtime_subscription_stale_warnings()
         theme_bridge = getattr(self._bundle, "theme_runtime_bridge", None)
@@ -831,6 +838,27 @@ class RuntimeSupervisor:
             except Exception as exc:
                 self._warn(f"RUNTIME_GATEWAY_EVENT_FAILED:theme_batch:{exc}")
         return forwarded_count
+
+    def _handle_realtime_subscription_command_event(self, event: GatewayEvent) -> bool:
+        if self._bundle is None:
+            return False
+        manager = getattr(self._bundle.runtime, "subscription_manager", None)
+        handler = getattr(manager, "handle_realtime_command_event", None)
+        if not callable(handler):
+            return False
+        try:
+            return bool(handler(event))
+        except Exception as exc:
+            self._warn(f"RUNTIME_REALTIME_SUBSCRIPTION_COMMAND_EVENT_FAILED:{event.type}:{exc}")
+            return False
+
+    def _handle_realtime_subscription_price_tick(self, event: GatewayEvent) -> None:
+        if self._bundle is None or event.type != "price_tick":
+            return
+        manager = getattr(self._bundle.runtime, "subscription_manager", None)
+        handler = getattr(manager, "handle_price_tick", None)
+        if callable(handler):
+            handler(dict(event.payload or {}))
 
     def _clear_pending_price_ticks(self) -> None:
         with self._event_lock:

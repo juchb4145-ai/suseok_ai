@@ -35,7 +35,7 @@ def test_readiness_wait_completion_is_atomic_and_not_shape_success(tmp_path):
         """
         SELECT *
         FROM setup_router_evaluation_commits_v1
-        WHERE trade_date = ? AND router_version = 'setup_router_v3.5.1'
+        WHERE trade_date = ? AND router_version = 'setup_router_v3.5.2'
         """,
         (TRADE_DATE,),
     ).fetchall()
@@ -61,7 +61,7 @@ def test_readiness_atomic_rejects_stale_pending_epoch(tmp_path):
         "trade_date": TRADE_DATE,
         "candidate_instance_id": "ci-1",
         "code": "000001",
-        "router_version": "setup_router_v3.5.1",
+        "router_version": "setup_router_v3.5.2",
         "state_version": "setup_router_v3.state.v3.2",
         "pending_reasons": ["READINESS_CHANGED"],
         "first_pending_at": "2026-06-22T09:04:00",
@@ -73,7 +73,7 @@ def test_readiness_atomic_rejects_stale_pending_epoch(tmp_path):
 
     result = db.complete_setup_router_readiness_evaluation_atomic(
         trade_date=TRADE_DATE,
-        router_version="setup_router_v3.5.1",
+        router_version="setup_router_v3.5.2",
         candidate_instance_id="ci-1",
         pending_epoch=int(selected["pending_epoch"]) + 1,
         pending_instance_id=selected["pending_instance_id"],
@@ -91,7 +91,7 @@ def test_readiness_atomic_rejects_stale_pending_epoch(tmp_path):
             "trade_date": TRADE_DATE,
             "candidate_instance_id": "ci-1",
             "code": "000001",
-            "router_version": "setup_router_v3.5.1",
+            "router_version": "setup_router_v3.5.2",
             "last_readiness_status": "WAIT_SUBSCRIPTION_NOT_ACTIVE",
             "processed_readiness_fingerprint": "rf-stale",
         },

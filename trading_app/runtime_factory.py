@@ -41,6 +41,7 @@ from trading.strategy.readiness import build_readiness_report, dedupe_warnings
 from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.reboot_v2 import RebootV2RuntimeProfile, reboot_v2_runtime_profile
 from trading.strategy.reboot_v2_runtime import RebootV2Runtime
+from trading.strategy.subscription_lifecycle import RealtimeSubscriptionLifecycleTracker
 from trading.strategy.subscription_readiness import RealtimeSubscriptionReadinessProvider
 from trading.strategy.setup_runtime import SetupRouterV3RuntimePipeline
 from trading.strategy.setup_router_v3 import SetupRouterConfig
@@ -99,6 +100,7 @@ class CoreRuntimeBundle:
     exit_engine_reboot_pipeline: Any = None
     position_risk_pipeline: Any = None
     order_manager_pipeline: Any = None
+    subscription_lifecycle_tracker: Any = None
 
 
 def build_core_strategy_runtime(
@@ -327,8 +329,17 @@ def build_reboot_v2_runtime_bundle(
         warning_sink=warning_sink,
     )
     theme_repository = ThemeEngineRepository(db)
+    setup_router_config = SetupRouterConfig.from_env()
+    subscription_lifecycle_tracker = RealtimeSubscriptionLifecycleTracker(
+        db,
+        max_tick_age_sec=setup_router_config.max_tick_age_sec,
+    )
     realtime_client = GatewayCommandRealtimeClient(gateway_state, warning_sink=warning_sink)
-    subscription_manager = RealTimeSubscriptionManager(realtime_client, max_codes=config.realtime_subscription_limit)
+    subscription_manager = RealTimeSubscriptionManager(
+        realtime_client,
+        max_codes=config.realtime_subscription_limit,
+        lifecycle_tracker=subscription_lifecycle_tracker,
+    )
     candidate_ingestion_service = CandidateIngestionService(db)
     candidate_hydrator = CandidateHydrator(db, gateway_state, market_data=market_data)
     opening_burst_pipeline = OpeningThemeBurstRuntimePipeline(
@@ -413,13 +424,14 @@ def build_reboot_v2_runtime_bundle(
             config=dirty_evaluator_config,
         )
     )
-    setup_router_config = SetupRouterConfig.from_env()
     market_data_config = getattr(getattr(market_data_bridge, "service", None), "config", None)
     setup_router_tick_age = int(getattr(market_data_config, "max_tick_age_sec", setup_router_config.max_tick_age_sec))
+    subscription_lifecycle_tracker.max_tick_age_sec = max(1, setup_router_tick_age)
     subscription_readiness_provider = RealtimeSubscriptionReadinessProvider(
         subscription_manager,
         market_data=market_data,
         max_tick_age_sec=setup_router_tick_age,
+        lifecycle_tracker=subscription_lifecycle_tracker,
     )
     setup_router_v3_pipeline = SetupRouterV3RuntimePipeline(
         db=db,
@@ -519,6 +531,7 @@ def build_reboot_v2_runtime_bundle(
         exit_engine_reboot_pipeline=exit_engine_reboot_pipeline,
         position_risk_pipeline=position_risk_pipeline,
         order_manager_pipeline=order_manager_pipeline,
+        subscription_lifecycle_tracker=subscription_lifecycle_tracker,
     )
 
 

@@ -58,6 +58,27 @@ def test_weak_side_strict_shadow_keeps_actual_wait_market_contract() -> None:
     assert decision.promotion_eligible is False
 
 
+def test_evaluator_normalizes_enum_style_market_fields() -> None:
+    candidate = _candidate(
+        market_side="MarketSide.KOSDAQ",
+        side_regime="MarketRegimeStatus.WEAK",
+        market_action="CandidateMarketAction.WAIT_MARKET",
+        rs=4.3,
+        entry_status="EntryStatus.MARKET_WAIT",
+        price_location="PriceLocation.GOOD_PULLBACK",
+    )
+
+    decision = _evaluate(candidate)
+
+    assert decision.market_side == "KOSDAQ"
+    assert decision.side_market_regime == "WEAK"
+    assert decision.actual_market_action == "WAIT_MARKET"
+    assert decision.actual_entry_status == "MARKET_WAIT"
+    assert decision.price_location == "GOOD_PULLBACK"
+    assert decision.shadow_scenario == MarketRelativeStrengthShadowScenario.WEAK_SIDE_STRICT_SHADOW.value
+    assert decision.shadow_status == MarketRelativeStrengthShadowStatus.SHADOW_CANDIDATE.value
+
+
 def test_risk_off_side_diagnostic_is_observe_only_and_never_promotion_eligible() -> None:
     candidate = _candidate(side_regime="RISK_OFF", market_action="BLOCK_NEW_ENTRY", rs=5.0, entry_status="HARD_BLOCK")
 

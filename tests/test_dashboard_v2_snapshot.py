@@ -216,7 +216,7 @@ def test_dashboard_v2_setup_router_exposes_readiness_diagnostics(monkeypatch):
             "setup_router_v3": {
                 "enabled": True,
                 "status": "OK",
-                "router_version": "setup_router_v3.5.1",
+                "router_version": "setup_router_v3.5.2",
                 "readiness_evaluated_count": 5,
                 "readiness_wait_count": 2,
                 "subscription_requested_count": 5,
@@ -237,7 +237,7 @@ def test_dashboard_v2_setup_router_exposes_readiness_diagnostics(monkeypatch):
     payload = build_dashboard_v2_snapshot(snapshot)
     setup_router = payload["setup_router_v3"]
 
-    assert setup_router["router_version"] == "setup_router_v3.5.1"
+    assert setup_router["router_version"] == "setup_router_v3.5.2"
     assert setup_router["subscription_requested_count"] == 5
     assert setup_router["subscription_target_selected_count"] == 3
     assert setup_router["market_action_unmapped_count"] == 1

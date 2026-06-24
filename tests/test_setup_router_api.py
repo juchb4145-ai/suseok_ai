@@ -39,9 +39,9 @@ def test_setup_router_v3_summary_ignores_newer_legacy_run(tmp_path, monkeypatch)
         {
             "trade_date": TRADE_DATE,
             "calculated_at": "2026-06-22T09:05:00",
-            "schema_version": "setup_router_v3.observe.v5.1",
+            "schema_version": "setup_router_v3.observe.v5.2",
             "feature_schema_version": "setup_router_v3.features.v4.2",
-            "router_version": "setup_router_v3.5.1",
+            "router_version": "setup_router_v3.5.2",
             "state_version": "setup_router_v3.state.v3.2",
             "output_mode": "OBSERVE",
             "enabled": True,
@@ -78,8 +78,8 @@ def test_setup_router_v3_summary_ignores_newer_legacy_run(tmp_path, monkeypatch)
     api = importlib.reload(api)
     summary = api.setup_router_v3_summary(trade_date=TRADE_DATE)
 
-    assert summary["router_version"] == "setup_router_v3.5.1"
+    assert summary["router_version"] == "setup_router_v3.5.2"
     assert summary["status"] == "OK"
     assert summary["latest_count"] == 1
-    assert summary["run"]["router_version"] == "setup_router_v3.5.1"
+    assert summary["run"]["router_version"] == "setup_router_v3.5.2"
     assert summary["run"]["candidate_count"] == 1

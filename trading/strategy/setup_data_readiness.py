@@ -11,7 +11,7 @@ from trading.strategy.candidates import normalize_code
 from trading.strategy.market_action import MARKET_ACTION_UNMAPPED, normalize_market_action
 
 
-READINESS_SCHEMA_VERSION = "setup_router_readiness.v2"
+READINESS_SCHEMA_VERSION = "setup_router_readiness.v3"
 
 
 class RealtimeCoverageType(str, Enum):
@@ -34,6 +34,9 @@ class SetupDataReadinessStatus(str, Enum):
     READY = "READY"
     WAIT_SUBSCRIPTION_NOT_ACTIVE = "WAIT_SUBSCRIPTION_NOT_ACTIVE"
     WAIT_SUBSCRIPTION_BUDGET = "WAIT_SUBSCRIPTION_BUDGET"
+    WAIT_REGISTER_COMMAND = "WAIT_REGISTER_COMMAND"
+    WAIT_REGISTER_ACK = "WAIT_REGISTER_ACK"
+    WAIT_FIRST_TICK = "WAIT_FIRST_TICK"
     WAIT_POST_SUBSCRIPTION_TICK = "WAIT_POST_SUBSCRIPTION_TICK"
     WAIT_SELECTED_THEME_LEASE = "WAIT_SELECTED_THEME_LEASE"
     WAIT_REALTIME_TICK_STALE = "WAIT_REALTIME_TICK_STALE"
@@ -81,6 +84,22 @@ class SetupDataReadinessSnapshot:
     subscription_active_since: str = ""
     relevant_source_added_at: str = ""
     subscription_budget_deferred: bool = False
+    subscription_lifecycle_schema_version: str = ""
+    subscription_lifecycle_state: str = ""
+    command_enqueued: bool = False
+    command_dispatched: bool = False
+    acked: bool = False
+    transport_active: bool = False
+    first_tick_verified: bool = False
+    decision_fresh: bool = False
+    stale: bool = False
+    released: bool = False
+    failed: bool = False
+    register_command_id: str = ""
+    registration_ack_baseline_at_utc: str = ""
+    first_tick_at_utc: str = ""
+    last_tick_at_utc: str = ""
+    ack_to_first_tick_ms: float | None = None
     readiness_relevant_source: str = ""
     readiness_relevant_source_reason: str = ""
     readiness_relevant_source_generation: int = 0
@@ -152,6 +171,12 @@ def build_setup_data_readiness(
     subscription_active = bool(subscription.get("subscription_active") or subscription.get("active"))
     subscription_selected = subscription_target_selected
     budget_deferred = bool(subscription.get("subscription_budget_deferred") or subscription.get("budget_deferred"))
+    lifecycle_state = str(subscription.get("subscription_lifecycle_state") or "")
+    command_enqueued = bool(subscription.get("command_enqueued"))
+    command_dispatched = bool(subscription.get("command_dispatched"))
+    acked = bool(subscription.get("acked"))
+    first_tick_verified = bool(subscription.get("first_tick_verified"))
+    failed = bool(subscription.get("failed"))
     latest_tick_at = str(subscription.get("latest_tick_at") or subscription.get("core_tick_at") or "")
     tick_age_sec = _float(subscription.get("latest_tick_age_sec"), 999999.0)
     latest_tick_source = str(subscription.get("latest_tick_source") or "")
@@ -187,18 +212,30 @@ def build_setup_data_readiness(
     elif budget_deferred:
         status = SetupDataReadinessStatus.WAIT_SUBSCRIPTION_BUDGET
         reasons.append(SUBSCRIPTION_BUDGET_DEFERRED)
+    elif failed or lifecycle_state == "FAILED":
+        status = SetupDataReadinessStatus.ERROR
+        reasons.append("REALTIME_SUBSCRIPTION_FAILED")
     elif not subscription_requested:
         status = SetupDataReadinessStatus.WAIT_SUBSCRIPTION_NOT_ACTIVE
         reasons.append("SUBSCRIPTION_NOT_REQUESTED")
     elif not subscription_target_selected:
         status = SetupDataReadinessStatus.WAIT_SUBSCRIPTION_BUDGET
         reasons.append(SUBSCRIPTION_BUDGET_DEFERRED)
+    elif command_enqueued and not command_dispatched and not acked:
+        status = SetupDataReadinessStatus.WAIT_REGISTER_COMMAND
+        reasons.append("REGISTER_COMMAND_ENQUEUED")
+    elif command_dispatched and not acked:
+        status = SetupDataReadinessStatus.WAIT_REGISTER_ACK
+        reasons.append("REGISTER_COMMAND_DISPATCHED")
     elif not subscription_active:
         status = SetupDataReadinessStatus.WAIT_SUBSCRIPTION_NOT_ACTIVE
         reasons.append("SUBSCRIPTION_NOT_ACTIVE")
     elif lease_required and not exact_lease_active:
         status = SetupDataReadinessStatus.WAIT_SELECTED_THEME_LEASE
         reasons.append(SETUP_SELECTED_THEME_ACTIVE_LEASE_MISSING)
+    elif acked and not first_tick_verified:
+        status = SetupDataReadinessStatus.WAIT_FIRST_TICK
+        reasons.append("ACKED_WAIT_FIRST_TICK")
     elif not latest_tick_at:
         status = SetupDataReadinessStatus.WAIT_POST_SUBSCRIPTION_TICK
         reasons.append("ACTIVE_SUBSCRIPTION_NO_POST_ACTIVE_TICK")
@@ -260,6 +297,22 @@ def build_setup_data_readiness(
         subscription_active_since=str(subscription.get("subscription_active_since") or ""),
         relevant_source_added_at=str(subscription.get("relevant_source_added_at") or ""),
         subscription_budget_deferred=budget_deferred,
+        subscription_lifecycle_schema_version=str(subscription.get("subscription_lifecycle_schema_version") or ""),
+        subscription_lifecycle_state=lifecycle_state,
+        command_enqueued=command_enqueued,
+        command_dispatched=command_dispatched,
+        acked=acked,
+        transport_active=bool(subscription.get("transport_active")),
+        first_tick_verified=first_tick_verified,
+        decision_fresh=bool(subscription.get("decision_fresh")),
+        stale=bool(subscription.get("stale")),
+        released=bool(subscription.get("released")),
+        failed=failed,
+        register_command_id=str(subscription.get("register_command_id") or ""),
+        registration_ack_baseline_at_utc=str(subscription.get("registration_ack_baseline_at_utc") or ""),
+        first_tick_at_utc=str(subscription.get("first_tick_at_utc") or ""),
+        last_tick_at_utc=str(subscription.get("last_tick_at_utc") or ""),
+        ack_to_first_tick_ms=subscription.get("ack_to_first_tick_ms"),
         readiness_relevant_source=str(subscription.get("readiness_relevant_source") or ""),
         readiness_relevant_source_reason=str(subscription.get("readiness_relevant_source_reason") or ""),
         readiness_relevant_source_generation=_int(subscription.get("readiness_relevant_source_generation")),

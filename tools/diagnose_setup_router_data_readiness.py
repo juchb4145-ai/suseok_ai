@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-DEFAULT_ROUTER_VERSION = "setup_router_v3.5.1"
+DEFAULT_ROUTER_VERSION = "setup_router_v3.5.2"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,13 +48,22 @@ def main(argv: list[str] | None = None) -> int:
         leases = _lease_rows(con, trade_date, codes)
         ticks = _latest_ticks(con, trade_date, codes)
         candidates = _candidate_rows(con, trade_date, codes)
+        lifecycle = _lifecycle_rows(con, trade_date, codes)
     finally:
         con.close()
 
     reason_counts = _reason_counts(readiness, observations)
-    freshness_chain = _freshness_chain(readiness, ticks)
+    freshness_chain = _freshness_chain(readiness, ticks, lifecycle)
     subscription_mismatch = _subscription_mismatch(readiness, leases, ticks)
-    candidate_readiness = [_compact_readiness(row, ticks.get(str(row.get("code") or "")), candidates.get(str(row.get("code") or ""))) for row in readiness]
+    candidate_readiness = [
+        _compact_readiness(
+            row,
+            ticks.get(str(row.get("code") or "")),
+            candidates.get(str(row.get("code") or "")),
+            lifecycle.get(str(row.get("code") or "")),
+        )
+        for row in readiness
+    ]
     summary = _summary(
         trade_date=trade_date,
         router_version=str(args.router_version),
@@ -63,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
         observations=observations,
         leases=leases,
         ticks=ticks,
+        lifecycle=lifecycle,
         reason_counts=reason_counts,
         mismatches=subscription_mismatch,
     )
@@ -183,6 +193,26 @@ def _candidate_rows(con: sqlite3.Connection, trade_date: str, codes: Iterable[st
     return result
 
 
+def _lifecycle_rows(con: sqlite3.Connection, trade_date: str, codes: Iterable[str]) -> dict[str, dict[str, Any]]:
+    if not _has_table(con, "realtime_subscription_lifecycle_latest"):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for code in codes:
+        row = con.execute(
+            """
+            SELECT *
+            FROM realtime_subscription_lifecycle_latest
+            WHERE trade_date = ? AND code = ?
+            ORDER BY updated_at_utc DESC, updated_at DESC
+            LIMIT 1
+            """,
+            (trade_date, code),
+        ).fetchone()
+        if row:
+            result[code] = _row(row)
+    return result
+
+
 def _codes(*row_sets: list[dict[str, Any]]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -211,11 +241,16 @@ def _reason_counts(readiness: list[dict[str, Any]], observations: list[dict[str,
     }
 
 
-def _freshness_chain(readiness: list[dict[str, Any]], ticks: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+def _freshness_chain(
+    readiness: list[dict[str, Any]],
+    ticks: dict[str, dict[str, Any]],
+    lifecycle: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for row in readiness:
         code = str(row.get("code") or "")
         tick = ticks.get(code) or {}
+        life = lifecycle.get(code) or {}
         rows.append(
             {
                 "code": code,
@@ -230,6 +265,11 @@ def _freshness_chain(readiness: list[dict[str, Any]], ticks: dict[str, dict[str,
                 "gateway_latest_tick_at": tick.get("timestamp", ""),
                 "gateway_latest_received_at": tick.get("received_at", ""),
                 "gateway_tick_source": tick.get("source", ""),
+                "subscription_lifecycle_state": life.get("lifecycle_state", row.get("subscription_lifecycle_state", "")),
+                "acked": bool(life.get("acked", row.get("acked", False))),
+                "first_tick_verified": bool(life.get("first_tick_verified", row.get("first_tick_verified", False))),
+                "registration_ack_baseline_at_utc": life.get("registration_ack_baseline_at_utc", row.get("registration_ack_baseline_at_utc", "")),
+                "lifecycle_last_tick_at_utc": life.get("last_tick_at_utc", row.get("last_tick_at_utc", "")),
                 "post_subscription_tick_verified": bool(row.get("post_subscription_tick_verified")),
                 "reason_codes": row.get("reason_codes", []),
             }
@@ -280,7 +320,12 @@ def _mismatch(row: dict[str, Any], kind: str, leases: list[dict[str, Any]] | Non
     }
 
 
-def _compact_readiness(row: dict[str, Any], tick: dict[str, Any] | None, candidate: dict[str, Any] | None) -> dict[str, Any]:
+def _compact_readiness(
+    row: dict[str, Any],
+    tick: dict[str, Any] | None,
+    candidate: dict[str, Any] | None,
+    lifecycle: dict[str, Any] | None,
+) -> dict[str, Any]:
     return {
         "code": row.get("code", ""),
         "name": row.get("name", ""),
@@ -297,6 +342,9 @@ def _compact_readiness(row: dict[str, Any], tick: dict[str, Any] | None, candida
         "post_subscription_tick_verified": bool(row.get("post_subscription_tick_verified")),
         "latest_tick_at": row.get("latest_tick_at", ""),
         "gateway_latest_tick_at": (tick or {}).get("timestamp", ""),
+        "subscription_lifecycle_state": (lifecycle or {}).get("lifecycle_state", row.get("subscription_lifecycle_state", "")),
+        "acked": bool((lifecycle or {}).get("acked", row.get("acked", False))),
+        "first_tick_verified": bool((lifecycle or {}).get("first_tick_verified", row.get("first_tick_verified", False))),
         "baseline_at": row.get("baseline_at", ""),
         "reason_codes": row.get("reason_codes", []),
         "informational_reason_codes": row.get("informational_reason_codes", []),
@@ -312,6 +360,7 @@ def _summary(
     observations: list[dict[str, Any]],
     leases: dict[str, list[dict[str, Any]]],
     ticks: dict[str, dict[str, Any]],
+    lifecycle: dict[str, dict[str, Any]],
     reason_counts: dict[str, Any],
     mismatches: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -322,6 +371,8 @@ def _summary(
     ready = [row for row in readiness if bool(row.get("readiness_ready"))]
     shape_candidates = {str(row.get("candidate_instance_id") or "") for row in observations if str(row.get("candidate_instance_id") or "")}
     lease_false_blocks = [row for row in mismatches if str(row.get("kind") or "").startswith("LEASE_")]
+    lifecycle_state_counts = Counter(str(row.get("lifecycle_state") or "UNKNOWN") for row in lifecycle.values())
+    requested_codes = {str(row.get("code") or "") for row in readiness if bool(row.get("subscription_requested")) and str(row.get("code") or "")}
     return {
         "schema_version": "setup_router_data_readiness.diagnostic.v1",
         "trade_date": trade_date,
@@ -338,6 +389,11 @@ def _summary(
         "shape_evaluated_candidate_count": len(shape_candidates),
         "lease_row_count": sum(len(items) for items in leases.values()),
         "latest_gateway_tick_code_count": len(ticks),
+        "subscription_lifecycle_count": len(lifecycle),
+        "subscription_lifecycle_state_counts": dict(lifecycle_state_counts),
+        "acked_wait_first_tick_count": lifecycle_state_counts.get("ACKED_WAIT_FIRST_TICK", 0),
+        "active_stale_count": lifecycle_state_counts.get("ACTIVE_STALE", 0),
+        "requested_readiness_lifecycle_missing_count": len(requested_codes - set(lifecycle)),
         "funnel": {
             "evaluation_eligible": len(readiness),
             "subscription_active": len(active),
@@ -368,6 +424,10 @@ def _markdown(summary: dict[str, Any], mismatches: list[dict[str, Any]], candida
         f"- readiness_ready_count: {summary['readiness_ready_count']}",
         f"- shape_evaluated_candidate_count: {summary['shape_evaluated_candidate_count']}",
         f"- lease_false_block_count: {summary['lease_false_block_count']}",
+        f"- subscription_lifecycle_count: {summary.get('subscription_lifecycle_count', 0)}",
+        f"- subscription_lifecycle_state_counts: `{json.dumps(summary.get('subscription_lifecycle_state_counts', {}), ensure_ascii=False, sort_keys=True)}`",
+        f"- acked_wait_first_tick_count: {summary.get('acked_wait_first_tick_count', 0)}",
+        f"- active_stale_count: {summary.get('active_stale_count', 0)}",
         f"- mismatch_count: {summary['mismatch_count']}",
         "",
         "## Funnel",

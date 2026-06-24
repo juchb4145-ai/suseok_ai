@@ -6,6 +6,7 @@ from typing import Callable, Iterable, Optional
 
 from trading.strategy.candidates import normalize_code
 from trading.strategy.models import BlockType, Candidate, CandidateState
+from trading.strategy.subscription_lifecycle import RealtimeSubscriptionLifecycleState
 
 
 SOURCE_PRIORITIES = {
@@ -120,15 +121,21 @@ class RealTimeSubscriptionManager:
         screen_base: int = 7000,
         screen_size: int = 100,
         clock: Callable[[], datetime] | None = None,
+        lifecycle_tracker: object | None = None,
     ) -> None:
         self.client = client
         self.max_codes = max_codes
         self.screen_base = screen_base
         self.screen_size = screen_size
         self.clock = clock or datetime.now
+        self.lifecycle_tracker = lifecycle_tracker
         self.records: dict[str, SubscriptionRecord] = {}
         self.code_to_screen: dict[str, str] = {}
         self.screen_to_codes: dict[str, set[str]] = {}
+        self.target_screen_by_code: dict[str, str] = {}
+        self.pending_register_by_code: dict[str, str] = {}
+        self.acked_screen_by_code: dict[str, str] = {}
+        self.pending_release_by_code: dict[str, str] = {}
         self.warnings: list[str] = []
         self._source_generation_by_code_source: dict[tuple[str, str], int] = {}
         self._source_removed_at_by_code_source: dict[tuple[str, str], str] = {}
@@ -155,6 +162,7 @@ class RealTimeSubscriptionManager:
             generation = int(self._source_generation_by_code_source.get(generation_key, 0) or 0) + 1
             record.source_generation_by_source[source] = generation
             self._source_generation_by_code_source[generation_key] = generation
+        self._lifecycle_call("on_requested", record, now=now)
         return record
 
     def remove_subscription(self, code: str, source: str) -> None:
@@ -192,10 +200,17 @@ class RealTimeSubscriptionManager:
         self.warnings = []
         target_records = self._target_records()
         target_codes = {record.code for record in target_records}
+        self._lifecycle_call("on_target_selected", target_records, now=now)
+        deferred_records = [record for record in self.records.values() if record.code not in target_codes and record.sources]
+        self._lifecycle_call("on_budget_deferred", deferred_records, now=now)
         active_codes = set(self.code_to_screen)
 
         self._remove_codes(active_codes - target_codes, now=now)
-        self._register_records([record for record in target_records if record.code not in self.code_to_screen], now=now)
+        pending_codes = set(self.pending_register_by_code)
+        self._register_records(
+            [record for record in target_records if record.code not in self.code_to_screen and record.code not in pending_codes],
+            now=now,
+        )
 
         for record in self.records.values():
             record.active = record.code in self.code_to_screen
@@ -212,6 +227,10 @@ class RealTimeSubscriptionManager:
             self._remove_all_client_realtime(reason)
         self.code_to_screen.clear()
         self.screen_to_codes.clear()
+        self.target_screen_by_code.clear()
+        self.pending_register_by_code.clear()
+        self.acked_screen_by_code.clear()
+        self.pending_release_by_code.clear()
         for record in self.records.values():
             record.active = False
             record.screen_no = ""
@@ -251,6 +270,8 @@ class RealTimeSubscriptionManager:
         current = now or self._now()
         timestamp = _timestamp(current)
         screen_to_codes = {screen_no: set(codes) for screen_no, codes in self.screen_to_codes.items()}
+        for code, screen_no in self.pending_register_by_code.items():
+            screen_to_codes.setdefault(screen_no, set()).add(code)
         batches: dict[str, list[SubscriptionRecord]] = {}
         for record in sorted(records, key=self._registration_sort_key):
             screen_no = self._screen_for_new_code(screen_to_codes)
@@ -261,12 +282,17 @@ class RealTimeSubscriptionManager:
             codes = [record.code for record in records_for_screen]
             register_records = getattr(self.client, "register_realtime_records", None)
             if callable(register_records):
-                register_records(records_for_screen, screen_no=screen_no)
+                receipt = register_records(records_for_screen, screen_no=screen_no)
             else:
-                self.client.register_realtime(codes, screen_no=screen_no)
+                receipt = self.client.register_realtime(codes, screen_no=screen_no)
+            self._lifecycle_call("on_command_enqueued", receipt, records_for_screen, now=current)
             for code in codes:
-                self.code_to_screen[code] = screen_no
-            self.screen_to_codes.setdefault(screen_no, set()).update(codes)
+                self.target_screen_by_code[code] = screen_no
+                if self.lifecycle_tracker is not None:
+                    self.pending_register_by_code[code] = screen_no
+                else:
+                    self.code_to_screen[code] = screen_no
+                    self.screen_to_codes.setdefault(screen_no, set()).update(codes)
 
         for screen_no, records_for_screen in batches.items():
             for record_for_screen in records_for_screen:
@@ -274,10 +300,10 @@ class RealTimeSubscriptionManager:
                 record = self.records.get(code)
                 if record is not None:
                     record.screen_no = screen_no
-                    if not record.active:
+                    if self.lifecycle_tracker is None and not record.active:
                         record.active_since = timestamp
                         record.subscription_generation += 1
-                    record.active = True
+                    record.active = self.lifecycle_tracker is None
                     record.last_registered_at = timestamp
                     record.last_sync_at = timestamp
 
@@ -308,7 +334,9 @@ class RealTimeSubscriptionManager:
             return
         for code in codes:
             screen_no = self.code_to_screen.pop(code)
-            self.client.remove_realtime([code], screen_no=screen_no)
+            receipt = self.client.remove_realtime([code], screen_no=screen_no)
+            self._lifecycle_call("on_release_requested", receipt, [code], now=current)
+            self.pending_release_by_code[code] = screen_no
             record = self.records.get(code)
             if record is not None:
                 record.active = False
@@ -354,6 +382,98 @@ class RealTimeSubscriptionManager:
         except Exception as exc:
             self.warnings.append(f"REALTIME_REMOVE_ALL_ON_STALE_FAILED:{reason}:{exc}")
 
+    def handle_realtime_command_event(self, event) -> bool:
+        payload = dict(getattr(event, "payload", {}) or {})
+        command_type = str(payload.get("command_type") or "")
+        if command_type not in {"register_realtime", "remove_realtime", "remove_all_realtime"}:
+            return False
+        event_type = str(getattr(event, "type", "") or "")
+        if event_type == "command_started":
+            self._lifecycle_call("on_command_started", payload, now=self._now())
+            return True
+        if event_type == "command_ack":
+            status = str(payload.get("status") or "ACKED").upper()
+            if status == "ACKED":
+                self._apply_realtime_command_ack(payload)
+                self._lifecycle_call("on_command_ack", payload, now=self._now())
+            else:
+                self._apply_realtime_command_failed(payload)
+                self._lifecycle_call("on_command_failed", payload, now=self._now())
+            return True
+        if event_type in {"command_failed", "command_timeout", "command_expired"}:
+            self._apply_realtime_command_failed(payload)
+            self._lifecycle_call("on_command_failed", payload, now=self._now())
+            return True
+        return False
+
+    def handle_price_tick(self, payload: dict) -> None:
+        self._lifecycle_call("on_price_tick", dict(payload or {}), now=self._now())
+
+    def _apply_realtime_command_ack(self, payload: dict) -> None:
+        command_type = str(payload.get("command_type") or "")
+        codes = [normalize_code(code) for code in list(payload.get("codes") or []) if normalize_code(code)]
+        screen_no = str(payload.get("screen_no") or "")
+        timestamp = _timestamp(self._now())
+        if command_type == "register_realtime":
+            for code in codes:
+                resolved_screen = screen_no or self.pending_register_by_code.get(code) or self.target_screen_by_code.get(code) or self.code_to_screen.get(code) or self._screen_for_new_code()
+                self.pending_register_by_code.pop(code, None)
+                self.code_to_screen[code] = resolved_screen
+                self.acked_screen_by_code[code] = resolved_screen
+                self.screen_to_codes.setdefault(resolved_screen, set()).add(code)
+                record = self.records.get(code)
+                if record is not None:
+                    record.active = True
+                    record.screen_no = resolved_screen
+                    record.active_since = _payload_text(
+                        payload,
+                        "gateway_kiwoom_call_finished_at_utc",
+                        "gateway_command_ack_created_at_utc",
+                    ) or timestamp
+                    record.last_sync_at = timestamp
+                    record.subscription_generation = int(payload.get("subscription_generation") or record.subscription_generation)
+            return
+        if command_type == "remove_all_realtime":
+            codes = list(self.code_to_screen)
+        for code in codes:
+            screen = self.code_to_screen.pop(code, "")
+            self.pending_release_by_code.pop(code, None)
+            self.pending_register_by_code.pop(code, None)
+            if screen and screen in self.screen_to_codes:
+                self.screen_to_codes[screen].discard(code)
+                if not self.screen_to_codes[screen]:
+                    self.screen_to_codes.pop(screen, None)
+            record = self.records.get(code)
+            if record is not None:
+                record.active = False
+                record.screen_no = ""
+                record.active_since = ""
+                record.last_deactivated_at = timestamp
+
+    def _apply_realtime_command_failed(self, payload: dict) -> None:
+        codes = [normalize_code(code) for code in list(payload.get("codes") or []) if normalize_code(code)]
+        command_type = str(payload.get("command_type") or "")
+        if command_type == "remove_all_realtime":
+            codes = list(self.pending_register_by_code) + list(self.code_to_screen)
+        for code in codes:
+            if command_type == "register_realtime":
+                self.pending_register_by_code.pop(code, None)
+            if command_type.startswith("remove"):
+                self.pending_release_by_code.pop(code, None)
+
+    def _lifecycle_call(self, method_name: str, *args, **kwargs):
+        tracker = self.lifecycle_tracker
+        if tracker is None:
+            return None
+        method = getattr(tracker, method_name, None)
+        if not callable(method):
+            return None
+        try:
+            return method(*args, **kwargs)
+        except Exception as exc:
+            self.warnings.append(f"REALTIME_LIFECYCLE_{method_name.upper()}_FAILED:{exc}")
+            return None
+
     def _now(self) -> datetime:
         return self.clock().replace(microsecond=0)
 
@@ -376,3 +496,14 @@ def _candidate_watchable(candidate: Candidate) -> bool:
 
 def _timestamp(value: Optional[datetime] = None) -> str:
     return (value or datetime.now()).replace(microsecond=0).isoformat()
+
+
+def _payload_text(payload: dict, *keys: str) -> str:
+    trace = dict(payload.get("transport_trace") or {})
+    metadata = dict(payload.get("metadata") or {})
+    metadata_trace = dict(metadata.get("transport_trace") or {})
+    for key in keys:
+        value = payload.get(key) or trace.get(key) or metadata.get(key) or metadata_trace.get(key)
+        if value:
+            return str(value)
+    return ""
