@@ -4527,8 +4527,10 @@ def setup_router_v3_summary(trade_date: str | None = Query(None)) -> dict[str, A
         run_loader = getattr(db, "latest_setup_router_run", None)
         run = dict(run_loader(trade_date=resolved) if callable(run_loader) else {})
         latest = list(getattr(db, "list_setup_observations_latest", lambda **_: [])(trade_date=resolved, router_version="setup_router_v3.5", limit=1000) or [])
+        readiness = list(getattr(db, "list_setup_router_readiness_latest", lambda **_: [])(trade_date=resolved, router_version="setup_router_v3.5", limit=1000) or [])
         status_counts = Counter(str(item.get("router_status") or "UNKNOWN") for item in latest)
         type_counts = Counter(str(item.get("setup_type") or "UNKNOWN") for item in latest)
+        readiness_status_counts = Counter(str(item.get("readiness_status") or "ERROR") for item in readiness)
         return {
             "trade_date": resolved,
             "schema_version": run.get("schema_version") or "setup_router_v3.observe.v5",
@@ -4540,11 +4542,52 @@ def setup_router_v3_summary(trade_date: str | None = Query(None)) -> dict[str, A
             "enabled": bool(run.get("enabled", bool(latest))),
             "observe_only": True,
             "latest_count": len(latest),
+            "readiness_count": len(readiness),
+            "readiness_ready_count": sum(1 for item in readiness if bool(item.get("readiness_ready"))),
             "status_counts": dict(status_counts),
+            "readiness_status_counts": dict(readiness_status_counts),
             "setup_type_counts": dict(type_counts),
             "run": run,
             "safety": _setup_router_v3_safety(),
             "read_only": True,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/setup-router-v3/readiness")
+def setup_router_v3_readiness(
+    trade_date: str | None = Query(None),
+    code: str | None = Query(None),
+    readiness_status: str | None = Query(None),
+    readiness_ready: bool | None = Query(None),
+    router_version: str | None = Query("setup_router_v3.5"),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    db = open_database()
+    try:
+        items = list(
+            getattr(db, "list_setup_router_readiness_latest", lambda **_: [])(
+                trade_date=resolved,
+                code=_setup_router_v3_text(code),
+                readiness_status=_setup_router_v3_text(readiness_status),
+                readiness_ready=_setup_router_v3_bool_or_none(readiness_ready),
+                router_version=_setup_router_v3_text(router_version) or "setup_router_v3.5",
+                limit=_setup_router_v3_limit(limit) + 1,
+                offset=_setup_router_v3_offset(offset),
+            )
+            or []
+        )
+        page_items, pagination = _trim_page(items, limit=_setup_router_v3_limit(limit), offset=_setup_router_v3_offset(offset))
+        return {
+            "trade_date": resolved,
+            "items": page_items,
+            "pagination": pagination,
+            "read_only": True,
+            "observe_only": True,
+            "safety": _setup_router_v3_safety(),
         }
     finally:
         close_database(db)

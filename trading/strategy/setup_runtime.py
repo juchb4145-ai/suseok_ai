@@ -11,6 +11,10 @@ from typing import Any, Iterable, Mapping
 
 from trading.strategy.candidate_state_contract import CandidateStateContractService
 from trading.strategy.candidates import normalize_code
+from trading.strategy.setup_data_readiness import (
+    SetupDataReadinessStatus,
+    build_setup_data_readiness,
+)
 from trading.strategy.setup_features import SETUP_ROUTER_FEATURE_SCHEMA_VERSION, SetupFeatureBuilder
 from trading.strategy.setup_router_v3 import (
     SETUP_ROUTER_OUTPUT_MODE,
@@ -32,6 +36,7 @@ class SetupRouterV3RuntimePipeline:
     dirty_evaluator_provider: Any | None = None
     latest_entry_decision_provider: Any | None = None
     candidate_code_provider: Any | None = None
+    subscription_readiness_provider: Any | None = None
     clock: Any = datetime.now
 
     def __post_init__(self) -> None:
@@ -106,6 +111,7 @@ class SetupRouterV3RuntimePipeline:
         previous_by_key = self._previous_observations(trade_date)
         state_by_candidate = self._states(trade_date, eligible_candidates)
         leases_by_code = self._leases(trade_date)
+        subscription_by_code = self._subscription_readiness(trade_date, eligible_candidates, latest_context_by_code, current)
         runtime_by_key = self._candidate_runtime(trade_date, eligible_candidates)
         provider_codes = self._provider_codes()
         ttl_due_codes = self._ttl_due_codes(state_by_candidate, current)
@@ -113,6 +119,7 @@ class SetupRouterV3RuntimePipeline:
         periodic_candidates = self._periodic_candidates(eligible_candidates, runtime_by_key) if periodic_due else []
         periodic_ids = {self._candidate_instance_id(candidate) for candidate in periodic_candidates}
         observed_by_key: dict[str, dict[str, Any]] = {}
+        readiness_by_key: dict[str, dict[str, Any]] = {}
         pending_seed_rows: list[dict[str, Any]] = []
         runtime_updates: list[dict[str, Any]] = []
         for candidate in eligible_candidates:
@@ -123,6 +130,15 @@ class SetupRouterV3RuntimePipeline:
             entry_decision = latest_entry_by_key.get((candidate.id, code)) or latest_entry_by_key.get((None, code)) or {}
             latest_completed_candle_at = self._latest_completed_candle_at(code)
             lease_info = self._lease_selection(leases_by_code.get(code, ()), context, candidate=candidate)
+            readiness = self._setup_data_readiness(
+                candidate,
+                current,
+                context,
+                subscription_by_code.get(code, {}),
+                lease_info,
+                contracts.get(candidate_instance_id),
+            )
+            readiness_by_key[candidate_instance_id] = readiness
             observed = self._observed_signatures(
                 candidate,
                 current,
@@ -131,6 +147,7 @@ class SetupRouterV3RuntimePipeline:
                 latest_completed_candle_at,
                 selected_theme_id,
                 lease_info,
+                readiness,
             )
             observed_by_key[candidate_instance_id] = observed
             reasons = self._pending_reason_codes(
@@ -169,16 +186,28 @@ class SetupRouterV3RuntimePipeline:
                         skipped="NO_PENDING_REASON",
                     )
                 )
+        warnings: list[str] = []
+        subscription_readiness_saver = getattr(self.db, "save_realtime_subscription_readiness_snapshots", None)
+        if callable(subscription_readiness_saver) and subscription_by_code:
+            try:
+                subscription_readiness_saver(
+                    [{**dict(item or {}), "trade_date": trade_date} for item in subscription_by_code.values()],
+                    trade_date=trade_date,
+                )
+            except Exception as exc:  # pragma: no cover - diagnostics must not stop runtime
+                warnings.append(f"REALTIME_SUBSCRIPTION_READINESS_SAVE_ERROR:{exc.__class__.__name__}")
         pending_saver = getattr(self.db, "save_setup_router_pending_evaluations", None)
+        readiness_saver = getattr(self.db, "save_setup_router_readiness_snapshots", None)
+        if callable(readiness_saver) and readiness_by_key:
+            try:
+                readiness_saver(list(readiness_by_key.values()))
+            except Exception as exc:  # pragma: no cover - diagnostics must not stop runtime
+                warnings.append(f"SETUP_ROUTER_READINESS_SAVE_ERROR:{exc.__class__.__name__}")
         if callable(pending_saver) and pending_seed_rows:
             try:
                 pending_saver(pending_seed_rows)
             except Exception as exc:  # pragma: no cover - diagnostics must not stop runtime
-                warnings = [f"SETUP_ROUTER_PENDING_SAVE_ERROR:{exc.__class__.__name__}"]
-            else:
-                warnings = []
-        else:
-            warnings = []
+                warnings.append(f"SETUP_ROUTER_PENDING_SAVE_ERROR:{exc.__class__.__name__}")
         runtime_saver = getattr(self.db, "save_setup_router_candidate_runtime", None)
         if callable(runtime_saver) and runtime_updates:
             try:
@@ -224,6 +253,8 @@ class SetupRouterV3RuntimePipeline:
         failed_evaluation_count = 0
         failed_evaluation_codes: list[str] = []
         last_commit_error = ""
+        readiness_wait_count = 0
+        shape_evaluated_candidate_count = 0
         for entry in selected_entries:
             candidate = entry["candidate"]
             code = normalize_code(candidate.code)
@@ -234,6 +265,14 @@ class SetupRouterV3RuntimePipeline:
                 selected_theme_id = self._selected_theme_id(context)
                 states = self._states_for_theme(state_by_candidate.get(candidate_instance_id, {}), selected_theme_id)
                 lease_info = self._lease_selection(leases_by_code.get(code, ()), context, candidate=candidate)
+                readiness = readiness_by_key.get(candidate_instance_id) or self._setup_data_readiness(
+                    candidate,
+                    current,
+                    context,
+                    subscription_by_code.get(code, {}),
+                    lease_info,
+                    contracts.get(candidate_instance_id),
+                )
                 entry_decision = latest_entry_by_key.get((candidate.id, code)) or latest_entry_by_key.get((None, code)) or {}
                 observed = observed_by_key.get(candidate_instance_id) or self._observed_signatures(
                     candidate,
@@ -243,7 +282,44 @@ class SetupRouterV3RuntimePipeline:
                     self._latest_completed_candle_at(code),
                     selected_theme_id,
                     lease_info,
+                    readiness,
                 )
+                if not bool(readiness.get("readiness_ready")):
+                    evaluated_count += 1
+                    readiness_wait_count += 1
+                    runtime_update = self._runtime_update(
+                        candidate,
+                        current,
+                        context,
+                        entry_decision,
+                        self._latest_completed_candle_at(code),
+                        source=str(entry.get("source") or "READINESS_WAIT"),
+                        observed=observed,
+                        pending_reasons=entry.get("pending_reasons") or [],
+                        incremental=int(entry.get("priority") or 0) == 0,
+                        periodic="PERIODIC_RECONCILE" in list(entry.get("pending_reasons") or []),
+                        ttl="TTL_DUE" in list(entry.get("pending_reasons") or []),
+                        success=True,
+                        skipped=str(readiness.get("readiness_status") or "READINESS_WAIT"),
+                    )
+                    runtime_updates.append(runtime_update)
+                    if callable(pending_updater):
+                        pending_updater(
+                            [
+                                {
+                                    "trade_date": trade_date,
+                                    "candidate_instance_id": candidate_instance_id,
+                                    "router_version": SETUP_ROUTER_VERSION,
+                                    "status": "COMPLETED",
+                                    "completed_at": current.isoformat(),
+                                    "last_attempt_at": current.isoformat(),
+                                    "last_error": "",
+                                    "last_error_class": "",
+                                }
+                            ]
+                        )
+                        completed_pending_count += 1
+                    continue
                 feature = self.feature_builder.build(
                     candidate,
                     now=current,
@@ -253,13 +329,15 @@ class SetupRouterV3RuntimePipeline:
                     previous_observation=previous,
                     setup_states=states,
                     expansion_lease=dict(lease_info.get("lease") or {}),
-                    selected_theme_lease_required=bool(lease_info.get("required")),
+                    selected_theme_lease_required=bool(readiness.get("expansion_lease_required", lease_info.get("required"))),
                     other_theme_lease_count=int(lease_info.get("other_theme_lease_count") or 0),
+                    setup_data_readiness=readiness,
                 )
                 signature = self._feature_signature(feature, states)
                 self._last_feature_signature[candidate_instance_id] = signature
                 result = [item.to_dict() for item in self.router.classify(feature)]
                 evaluated_count += 1
+                shape_evaluated_candidate_count += 1
                 success_runtime_update = self._runtime_update(
                     candidate,
                     current,
@@ -424,8 +502,17 @@ class SetupRouterV3RuntimePipeline:
         shape_counts = Counter(str(item.get("shape_status") or "UNKNOWN") for item in observations)
         context_counts = Counter(str(item.get("context_status") or "UNKNOWN") for item in observations)
         type_counts = Counter(str(item.get("setup_type") or "UNKNOWN") for item in observations)
+        readiness_values = list(readiness_by_key.values())
+        readiness_status_counts = Counter(str(item.get("readiness_status") or "ERROR") for item in readiness_values)
+        readiness_ready_count = sum(1 for item in readiness_values if bool(item.get("readiness_ready")))
+        data_wait_candidate_count = len(readiness_values) - readiness_ready_count
+        status_counts_for_display = Counter(status_counts)
+        if data_wait_candidate_count:
+            status_counts_for_display["DATA_WAIT"] += data_wait_candidate_count
         reason_counts = Counter()
         for item in observations:
+            reason_counts.update([str(reason) for reason in list(item.get("reason_codes") or []) if str(reason) and str(reason) != "SETUP_ROUTER_V3_OBSERVE_ONLY"])
+        for item in readiness_values:
             reason_counts.update([str(reason) for reason in list(item.get("reason_codes") or []) if str(reason)])
         pending_reason_counts = Counter()
         for row in pending_rows:
@@ -436,30 +523,36 @@ class SetupRouterV3RuntimePipeline:
         never_evaluated_count = self._never_evaluated_count(eligible_candidates, runtime_by_key)
         duration_ms = int(round((perf_counter() - started) * 1000))
         summary = {
-            **_base_summary(enabled=True, status="OK" if observations else "IDLE"),
+            **_base_summary(enabled=True, status="OK" if observations or readiness_values else "IDLE"),
             "calculated_at": current.isoformat(),
             "trade_date": trade_date,
             "candidate_count": len(candidates),
             "eligible_candidate_count": len(eligible_candidates),
             "evaluated_count": evaluated_count,
+            "readiness_evaluated_count": len(readiness_values),
+            "readiness_ready_count": readiness_ready_count,
+            "readiness_wait_count": data_wait_candidate_count,
+            "shape_evaluated_candidate_count": shape_evaluated_candidate_count,
             "skipped_count": sum(skipped_reasons.values()),
             "observation_count": len(observations),
             "saved_count": saved_count,
             "valid_observe_count": status_counts.get("VALID_OBSERVE", 0),
             "pending_count": status_counts.get("PENDING", 0),
-            "data_wait_count": status_counts.get("DATA_WAIT", 0),
+            "data_wait_count": data_wait_candidate_count + status_counts.get("DATA_WAIT", 0),
             "context_blocked_count": status_counts.get("CONTEXT_BLOCKED", 0),
             "avoid_count": status_counts.get("AVOID", 0),
             "unknown_count": status_counts.get("UNKNOWN", 0),
             "invalidated_count": status_counts.get("INVALIDATED", 0),
             "expired_count": status_counts.get("EXPIRED", 0),
-            "status_counts": dict(status_counts),
+            "status_counts": dict(status_counts_for_display),
             "shape_counts": dict(shape_counts),
             "context_counts": dict(context_counts),
             "setup_type_counts": dict(type_counts),
+            "readiness_status_counts": dict(readiness_status_counts),
+            "readiness_funnel": _readiness_funnel(readiness_values, observations),
             "top_reasons": [{"reason": key, "count": value} for key, value in reason_counts.most_common(10)],
             "skipped_reasons": dict(skipped_reasons),
-            "observations": _dashboard_observations(observations),
+            "observations": _dashboard_readiness(readiness_values) + _dashboard_observations(observations),
             "incremental_input_count": sum(pending_reason_counts.get(reason, 0) for reason in ("ENTRY_DECISION_CHANGED", "DIRTY_EVALUATOR_DECISION")),
             "periodic_input_count": len(periodic_candidates),
             "ttl_input_count": len(ttl_due_codes),
@@ -656,14 +749,17 @@ class SetupRouterV3RuntimePipeline:
     def _candidate_requires_selected_theme_lease(self, candidate: Any | None) -> bool:
         if candidate is None:
             return False
-        source_values = {
-            str(getattr(source, "value", source) or "").lower()
-            for source in list(getattr(candidate, "sources", []) or [])
-        }
         metadata = dict(getattr(candidate, "metadata", {}) or {})
-        source_values.update(str(item or "").lower() for item in list(metadata.get("sources") or []) if str(item or ""))
-        source_values.add(str(metadata.get("source") or "").lower())
-        return bool(source_values & {"opening_burst", "theme_watch", "theme_board", "leading_stock"})
+        if bool(metadata.get("expansion_only") or metadata.get("theme_expansion_only")):
+            return True
+        explicit_source = str(metadata.get("source_type") or metadata.get("source") or "").lower()
+        if explicit_source in {"reboot_v2_theme_expansion", "theme_expansion"}:
+            return True
+        for raw in list(metadata.get("source_events") or []) + list(metadata.get("sources_detail") or []):
+            item = dict(raw or {}) if isinstance(raw, Mapping) else {"source_type": str(raw or "")}
+            if str(item.get("source_type") or item.get("source") or "").lower() in {"reboot_v2_theme_expansion", "theme_expansion"}:
+                return True
+        return False
 
     def _latest_completed_candle_at(self, code: str) -> str:
         if self.candle_builder is None:
@@ -677,6 +773,14 @@ class SetupRouterV3RuntimePipeline:
         last = candles[-1]
         return str(getattr(last, "start_at", "") if not isinstance(last, Mapping) else last.get("candle_at") or last.get("start_at") or "")
 
+    def _completed_1m_count(self, code: str) -> int:
+        if self.candle_builder is None:
+            return 0
+        loader = getattr(self.candle_builder, "completed_candles", None)
+        if not callable(loader):
+            return 0
+        return len(list(loader(normalize_code(code), 1) or []))
+
     def _observed_signatures(
         self,
         candidate: Any,
@@ -686,6 +790,7 @@ class SetupRouterV3RuntimePipeline:
         latest_completed_candle_at: str,
         selected_theme_id: str,
         lease_info: Mapping[str, Any],
+        readiness: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         entry_signature = _hash_payload(
             {
@@ -706,6 +811,12 @@ class SetupRouterV3RuntimePipeline:
                 "selected_at": lease.get("selected_at"),
                 "first_active_at": lease.get("first_active_at"),
                 "first_fresh_tick_at": lease.get("first_fresh_tick_at") or lease.get("first_post_subscription_tick_at"),
+                "readiness_status": dict(readiness or {}).get("readiness_status"),
+                "readiness_ready": dict(readiness or {}).get("readiness_ready"),
+                "subscription_generation": dict(readiness or {}).get("subscription_generation"),
+                "subscription_active": dict(readiness or {}).get("subscription_active"),
+                "latest_tick_at": dict(readiness or {}).get("latest_tick_at"),
+                "post_subscription_tick_verified": dict(readiness or {}).get("post_subscription_tick_verified"),
             }
         )
         return {
@@ -719,6 +830,74 @@ class SetupRouterV3RuntimePipeline:
             "theme_signature": str(selected_theme_id or ""),
             "lease_signature": lease_signature,
         }
+
+    def _subscription_readiness(
+        self,
+        trade_date: str,
+        candidates: list[Any],
+        contexts: Mapping[str, dict[str, Any]],
+        now: datetime,
+    ) -> dict[str, dict[str, Any]]:
+        provider = self.subscription_readiness_provider
+        codes = [normalize_code(candidate.code) for candidate in candidates]
+        if provider is None:
+            return {code: {"code": code, "calculated_at": now.isoformat()} for code in codes}
+        snapshots = getattr(provider, "snapshots", None)
+        if callable(snapshots):
+            try:
+                return dict(snapshots(codes, context_by_code=contexts, candidate_by_code={normalize_code(candidate.code): candidate for candidate in candidates}, now=now) or {})
+            except Exception:
+                return {code: {"code": code, "calculated_at": now.isoformat(), "readiness_provider_error": True} for code in codes}
+        single = getattr(provider, "snapshot", None)
+        if not callable(single):
+            return {code: {"code": code, "calculated_at": now.isoformat()} for code in codes}
+        result: dict[str, dict[str, Any]] = {}
+        for candidate in candidates:
+            code = normalize_code(candidate.code)
+            context = dict(contexts.get(code) or {})
+            theme = dict(context.get("theme") or {})
+            selected_theme_id = str(context.get("selected_theme_id") or theme.get("theme_id") or "")
+            try:
+                result[code] = dict(single(code, selected_theme_id=selected_theme_id, candidate=candidate, now=now) or {})
+            except Exception:
+                result[code] = {"code": code, "calculated_at": now.isoformat(), "readiness_provider_error": True}
+        return result
+
+    def _setup_data_readiness(
+        self,
+        candidate: Any,
+        now: datetime,
+        context: Mapping[str, Any],
+        subscription: Mapping[str, Any],
+        lease_info: Mapping[str, Any],
+        contract: Any | None,
+    ) -> dict[str, Any]:
+        candidate_instance_id = self._candidate_instance_id(candidate)
+        selected_theme_id = self._selected_theme_id(context)
+        contract_eligible = bool(getattr(contract, "evaluation_eligible", True))
+        snapshot = build_setup_data_readiness(
+            trade_date=now.date().isoformat(),
+            calculated_at=now,
+            candidate=candidate,
+            candidate_instance_id=candidate_instance_id,
+            selected_theme_id=selected_theme_id,
+            context=context,
+            subscription=subscription,
+            exact_lease=dict(lease_info.get("lease") or {}),
+            other_theme_lease_count=int(lease_info.get("other_theme_lease_count") or 0),
+            evaluation_eligible=contract_eligible,
+            max_tick_age_sec=self.config.max_tick_age_sec,
+            min_completed_1m_candles=self.config.min_completed_1m_candles,
+            completed_1m_count=self._completed_1m_count(normalize_code(candidate.code)),
+        )
+        payload = snapshot.to_dict()
+        payload["router_version"] = SETUP_ROUTER_VERSION
+        payload["state_version"] = SETUP_ROUTER_STATE_VERSION
+        payload["name"] = str(getattr(candidate, "name", "") or "")
+        payload["current_price"] = float(subscription.get("price") or 0.0)
+        theme = dict(context.get("theme") or {})
+        payload["selected_theme_name"] = str(theme.get("theme_name") or "")
+        return payload
 
     def _pending_reason_codes(
         self,
@@ -1317,6 +1496,74 @@ def _dashboard_observations(observations: list[dict[str, Any]]) -> list[dict[str
         }
         for item in rows[:50]
     ]
+
+
+def _dashboard_readiness(readiness: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = sorted(
+        [dict(item or {}) for item in readiness if not bool(dict(item or {}).get("readiness_ready"))],
+        key=lambda item: (str(item.get("readiness_status") or ""), str(item.get("code") or "")),
+    )
+    return [
+        {
+            "code": item.get("code", ""),
+            "name": item.get("name", ""),
+            "theme_name": item.get("selected_theme_name", item.get("theme_name", "")),
+            "setup_type": "DATA_READINESS",
+            "shape_status": "DATA_WAIT",
+            "lifecycle_state": "DATA_WAIT",
+            "context_status": item.get("readiness_status", "DATA_WAIT"),
+            "router_status": "DATA_WAIT",
+            "entry_alignment_status": "ENTRY_DATA_WAIT",
+            "setup_quality_score": 0.0,
+            "current_price": item.get("current_price", item.get("price", 0.0)),
+            "price_structure": {},
+            "reason_codes": list(item.get("reason_codes") or [])[:8],
+            "informational_reason_codes": list(item.get("informational_reason_codes") or [])[:8],
+            "updated_at": item.get("calculated_at", ""),
+            "primary_setup": False,
+            "setup_generation": 0,
+            "setup_instance_id": "",
+            "post_subscription_tick_verified": bool(item.get("post_subscription_tick_verified")),
+            "entry_decision_age_sec": 0.0,
+            "router_version": SETUP_ROUTER_VERSION,
+            "last_material_change_at": "",
+            "observe_only": True,
+            "readiness_status": item.get("readiness_status", ""),
+            "coverage_type": item.get("coverage_type", ""),
+            "subscription_active": bool(item.get("subscription_active")),
+            "subscription_sources": list(item.get("subscription_sources") or []),
+            "subscription_budget_deferred": bool(item.get("subscription_budget_deferred")),
+            "expansion_lease_required": bool(item.get("expansion_lease_required")),
+            "exact_theme_lease_active": bool(item.get("exact_theme_lease_active")),
+            "latest_tick_age_sec": item.get("latest_tick_age_sec", 0.0),
+        }
+        for item in rows[:50]
+    ]
+
+
+def _readiness_funnel(readiness: list[dict[str, Any]], observations: list[dict[str, Any]]) -> dict[str, int]:
+    rows = [dict(item or {}) for item in readiness]
+    active = [item for item in rows if bool(item.get("subscription_active"))]
+    fresh = [item for item in rows if bool(item.get("post_subscription_tick_verified"))]
+    context_ready = [
+        item
+        for item in fresh
+        if str(item.get("readiness_status") or "") not in {
+            SetupDataReadinessStatus.WAIT_STRATEGY_CONTEXT.value,
+            SetupDataReadinessStatus.WAIT_MARKET_CONTEXT.value,
+            SetupDataReadinessStatus.WAIT_THEME_SIGNAL_STALE.value,
+        }
+    ]
+    return {
+        "evaluation_eligible": len(rows),
+        "subscription_selected": sum(1 for item in rows if bool(item.get("subscription_selected"))),
+        "subscription_active": len(active),
+        "fresh_tick": len(fresh),
+        "context_ready": len(context_ready),
+        "shape_evaluated": len({str(item.get("candidate_instance_id") or "") for item in observations if str(item.get("candidate_instance_id") or "")}),
+        "forming_or_pending": sum(1 for item in observations if str(item.get("shape_status") or "") == "FORMING" or str(item.get("router_status") or "") == "PENDING"),
+        "matched_or_valid": sum(1 for item in observations if str(item.get("shape_status") or "") == "MATCHED" or str(item.get("router_status") or "") == "VALID_OBSERVE"),
+    }
 
 
 def _disabled_summary(reason: str, now: datetime) -> dict[str, Any]:

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from datetime import datetime
+from typing import Callable, Iterable, Optional
 
 from trading.strategy.candidates import normalize_code
 from trading.strategy.models import BlockType, Candidate, CandidateState
@@ -68,17 +69,31 @@ class SubscriptionRecord:
     screen_no: str = ""
     protected: bool = False
     active: bool = False
+    created_at: str = ""
+    active_since: str = ""
+    last_sync_at: str = ""
+    subscription_generation: int = 0
+    source_added_at_by_source: dict[str, str] = field(default_factory=dict)
+    source_removed_at_by_source: dict[str, str] = field(default_factory=dict)
+    last_registered_at: str = ""
+    last_deactivated_at: str = ""
 
-    def add_source(self, source: str, priority: int, protected: bool) -> None:
+    def add_source(self, source: str, priority: int, protected: bool, now: Optional[datetime] = None) -> None:
+        timestamp = _timestamp(now)
+        if not self.created_at:
+            self.created_at = timestamp
         self.sources.add(source)
         self.source_priorities[source] = priority
         self.source_protected[source] = protected
+        self.source_added_at_by_source.setdefault(source, timestamp)
         self.refresh()
 
-    def remove_source(self, source: str) -> None:
+    def remove_source(self, source: str, now: Optional[datetime] = None) -> None:
+        timestamp = _timestamp(now)
         self.sources.discard(source)
         self.source_priorities.pop(source, None)
         self.source_protected.pop(source, None)
+        self.source_removed_at_by_source[source] = timestamp
         self.refresh()
 
     def refresh(self) -> None:
@@ -99,11 +114,13 @@ class RealTimeSubscriptionManager:
         max_codes: int = 100,
         screen_base: int = 7000,
         screen_size: int = 100,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.client = client
         self.max_codes = max_codes
         self.screen_base = screen_base
         self.screen_size = screen_size
+        self.clock = clock or datetime.now
         self.records: dict[str, SubscriptionRecord] = {}
         self.code_to_screen: dict[str, str] = {}
         self.screen_to_codes: dict[str, set[str]] = {}
@@ -116,22 +133,24 @@ class RealTimeSubscriptionManager:
         priority: Optional[int] = None,
         protected: Optional[bool] = None,
     ) -> SubscriptionRecord:
+        now = self._now()
         clean_code = normalize_code(code)
         resolved_priority = SOURCE_PRIORITIES.get(source, 0) if priority is None else priority
         resolved_protected = source in PROTECTED_SOURCES if protected is None else protected
         record = self.records.get(clean_code)
         if record is None:
-            record = SubscriptionRecord(code=clean_code)
+            record = SubscriptionRecord(code=clean_code, created_at=_timestamp(now))
             self.records[clean_code] = record
-        record.add_source(source, resolved_priority, resolved_protected)
+        record.add_source(source, resolved_priority, resolved_protected, now=now)
         return record
 
     def remove_subscription(self, code: str, source: str) -> None:
+        now = self._now()
         clean_code = normalize_code(code)
         record = self.records.get(clean_code)
         if record is None:
             return
-        record.remove_source(source)
+        record.remove_source(source, now=now)
         if not record.sources:
             self.records.pop(clean_code, None)
 
@@ -153,20 +172,23 @@ class RealTimeSubscriptionManager:
         return registered
 
     def sync(self) -> set[str]:
+        now = self._now()
         self.warnings = []
         target_records = self._target_records()
         target_codes = {record.code for record in target_records}
         active_codes = set(self.code_to_screen)
 
-        self._remove_codes(active_codes - target_codes)
-        self._register_records([record for record in target_records if record.code not in self.code_to_screen])
+        self._remove_codes(active_codes - target_codes, now=now)
+        self._register_records([record for record in target_records if record.code not in self.code_to_screen], now=now)
 
         for record in self.records.values():
             record.active = record.code in self.code_to_screen
             record.screen_no = self.code_to_screen.get(record.code, "")
+            record.last_sync_at = _timestamp(now)
         return set(self.code_to_screen)
 
     def mark_all_stale(self, reason: str = "") -> None:
+        now = self._now()
         generation = self._advance_client_generation(reason)
         self._remove_all_client_realtime(reason)
         self.code_to_screen.clear()
@@ -174,13 +196,17 @@ class RealTimeSubscriptionManager:
         for record in self.records.values():
             record.active = False
             record.screen_no = ""
+            record.active_since = ""
+            record.last_deactivated_at = _timestamp(now)
+            record.subscription_generation += 1
         suffix = f":{reason}" if reason else ""
         generation_suffix = f":g{generation}" if generation is not None else ""
         self.warnings.append(f"REALTIME_SUBSCRIPTIONS_MARKED_STALE{suffix}{generation_suffix}")
 
     def remove_realtime(self, codes: Iterable[str]) -> None:
+        now = self._now()
         self.warnings = []
-        self._remove_codes([normalize_code(code) for code in codes])
+        self._remove_codes([normalize_code(code) for code in codes], now=now)
 
     def _target_records(self) -> list[SubscriptionRecord]:
         protected_records = [record for record in self.records.values() if record.protected]
@@ -202,7 +228,9 @@ class RealTimeSubscriptionManager:
         source_order = min((FALLBACK_SOURCE_ORDER.get(source, 99) for source in record.sources), default=99)
         return (source_order, 0 if record.protected else 1, -record.priority, record.code)
 
-    def _register_records(self, records: list[SubscriptionRecord]) -> None:
+    def _register_records(self, records: list[SubscriptionRecord], now: Optional[datetime] = None) -> None:
+        current = now or self._now()
+        timestamp = _timestamp(current)
         screen_to_codes = {screen_no: set(codes) for screen_no, codes in self.screen_to_codes.items()}
         batches: dict[str, list[SubscriptionRecord]] = {}
         for record in sorted(records, key=self._registration_sort_key):
@@ -227,8 +255,16 @@ class RealTimeSubscriptionManager:
                 record = self.records.get(code)
                 if record is not None:
                     record.screen_no = screen_no
+                    if not record.active:
+                        record.active_since = timestamp
+                        record.subscription_generation += 1
+                    record.active = True
+                    record.last_registered_at = timestamp
+                    record.last_sync_at = timestamp
 
-    def _remove_codes(self, codes: Iterable[str]) -> None:
+    def _remove_codes(self, codes: Iterable[str], now: Optional[datetime] = None) -> None:
+        current = now or self._now()
+        timestamp = _timestamp(current)
         codes = [code for code in codes if code]
         if not codes:
             return
@@ -238,8 +274,15 @@ class RealTimeSubscriptionManager:
             self.client.remove_all_realtime()
             self.code_to_screen.clear()
             self.screen_to_codes.clear()
+            for record in self.records.values():
+                if record.active:
+                    record.subscription_generation += 1
+                record.active = False
+                record.screen_no = ""
+                record.active_since = ""
+                record.last_deactivated_at = timestamp
             try:
-                self._register_records(self._target_records())
+                self._register_records(self._target_records(), now=current)
             except Exception as exc:
                 self.warnings.append(f"PROTECTED_REREGISTER_FAILED:{exc}")
                 raise
@@ -247,6 +290,14 @@ class RealTimeSubscriptionManager:
         for code in codes:
             screen_no = self.code_to_screen.pop(code)
             self.client.remove_realtime([code], screen_no=screen_no)
+            record = self.records.get(code)
+            if record is not None:
+                record.active = False
+                record.screen_no = ""
+                record.active_since = ""
+                record.last_deactivated_at = timestamp
+                record.last_sync_at = timestamp
+                record.subscription_generation += 1
             codes_for_screen = self.screen_to_codes.get(screen_no)
             if codes_for_screen is not None:
                 codes_for_screen.discard(code)
@@ -281,6 +332,9 @@ class RealTimeSubscriptionManager:
         except Exception as exc:
             self.warnings.append(f"REALTIME_REMOVE_ALL_ON_STALE_FAILED:{reason}:{exc}")
 
+    def _now(self) -> datetime:
+        return self.clock().replace(microsecond=0)
+
 
 def _candidate_watchable(candidate: Candidate) -> bool:
     if candidate.state in {
@@ -296,3 +350,7 @@ def _candidate_watchable(candidate: Candidate) -> bool:
         and candidate.block_type == BlockType.TEMPORARY
         and candidate.can_recover
     )
+
+
+def _timestamp(value: Optional[datetime] = None) -> str:
+    return (value or datetime.now()).replace(microsecond=0).isoformat()

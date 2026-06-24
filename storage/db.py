@@ -1250,6 +1250,96 @@ class TradingDatabase:
                 ON setup_observation_transitions_v2(trade_date, router_version, transitioned_at, id);
             CREATE INDEX IF NOT EXISTS idx_setup_observation_transitions_v2_candidate
                 ON setup_observation_transitions_v2(candidate_instance_id, router_version, setup_type);
+            CREATE TABLE IF NOT EXISTS setup_router_readiness_latest (
+                trade_date TEXT NOT NULL,
+                router_version TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                candidate_id INTEGER,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                selected_theme_id TEXT NOT NULL DEFAULT '',
+                selected_theme_name TEXT NOT NULL DEFAULT '',
+                readiness_status TEXT NOT NULL DEFAULT '',
+                readiness_ready INTEGER NOT NULL DEFAULT 0,
+                coverage_type TEXT NOT NULL DEFAULT '',
+                subscription_selected INTEGER NOT NULL DEFAULT 0,
+                subscription_active INTEGER NOT NULL DEFAULT 0,
+                subscription_sources_json TEXT NOT NULL DEFAULT '[]',
+                subscription_primary_source TEXT NOT NULL DEFAULT '',
+                subscription_screen_no TEXT NOT NULL DEFAULT '',
+                subscription_generation INTEGER NOT NULL DEFAULT 0,
+                subscription_active_since TEXT NOT NULL DEFAULT '',
+                relevant_source_added_at TEXT NOT NULL DEFAULT '',
+                subscription_budget_deferred INTEGER NOT NULL DEFAULT 0,
+                expansion_lease_required INTEGER NOT NULL DEFAULT 0,
+                expansion_lease_requirement TEXT NOT NULL DEFAULT '',
+                expansion_lease_requirement_reason TEXT NOT NULL DEFAULT '',
+                exact_theme_lease_present INTEGER NOT NULL DEFAULT 0,
+                exact_theme_lease_active INTEGER NOT NULL DEFAULT 0,
+                exact_theme_lease_status TEXT NOT NULL DEFAULT '',
+                exact_theme_lease_selected_at TEXT NOT NULL DEFAULT '',
+                exact_theme_lease_first_active_at TEXT NOT NULL DEFAULT '',
+                latest_tick_at TEXT NOT NULL DEFAULT '',
+                latest_tick_age_sec REAL NOT NULL DEFAULT 0,
+                latest_tick_source TEXT NOT NULL DEFAULT '',
+                post_subscription_tick_verified INTEGER NOT NULL DEFAULT 0,
+                gateway_tick_at TEXT NOT NULL DEFAULT '',
+                core_tick_at TEXT NOT NULL DEFAULT '',
+                strategy_context_tick_at TEXT NOT NULL DEFAULT '',
+                setup_feature_tick_at TEXT NOT NULL DEFAULT '',
+                market_context_fresh INTEGER NOT NULL DEFAULT 1,
+                theme_context_fresh INTEGER NOT NULL DEFAULT 1,
+                candle_ready INTEGER NOT NULL DEFAULT 1,
+                baseline_at TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                informational_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                calculated_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, router_version, candidate_instance_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_readiness_latest_status
+                ON setup_router_readiness_latest(trade_date, router_version, readiness_status, code);
+            CREATE TABLE IF NOT EXISTS setup_router_readiness_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trade_date TEXT NOT NULL,
+                router_version TEXT NOT NULL,
+                candidate_instance_id TEXT NOT NULL,
+                code TEXT NOT NULL,
+                selected_theme_id TEXT NOT NULL DEFAULT '',
+                previous_readiness_status TEXT NOT NULL DEFAULT '',
+                current_readiness_status TEXT NOT NULL DEFAULT '',
+                previous_fingerprint TEXT NOT NULL DEFAULT '',
+                current_fingerprint TEXT NOT NULL DEFAULT '',
+                calculated_at TEXT NOT NULL DEFAULT '',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_router_readiness_history_trade
+                ON setup_router_readiness_history(trade_date, router_version, calculated_at, id);
+            CREATE TABLE IF NOT EXISTS realtime_subscription_readiness_latest (
+                trade_date TEXT NOT NULL,
+                subscription_generation INTEGER NOT NULL DEFAULT 0,
+                code TEXT NOT NULL,
+                calculated_at TEXT NOT NULL DEFAULT '',
+                subscription_selected INTEGER NOT NULL DEFAULT 0,
+                subscription_active INTEGER NOT NULL DEFAULT 0,
+                subscription_budget_deferred INTEGER NOT NULL DEFAULT 0,
+                subscription_sources_json TEXT NOT NULL DEFAULT '[]',
+                subscription_primary_source TEXT NOT NULL DEFAULT '',
+                subscription_screen_no TEXT NOT NULL DEFAULT '',
+                subscription_active_since TEXT NOT NULL DEFAULT '',
+                relevant_source_added_at TEXT NOT NULL DEFAULT '',
+                coverage_type TEXT NOT NULL DEFAULT '',
+                latest_tick_at TEXT NOT NULL DEFAULT '',
+                latest_tick_age_sec REAL NOT NULL DEFAULT 0,
+                latest_tick_source TEXT NOT NULL DEFAULT '',
+                post_subscription_tick_verified INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(trade_date, subscription_generation, code)
+            );
             CREATE TABLE IF NOT EXISTS setup_router_primary_latest_v2 (
                 trade_date TEXT NOT NULL,
                 router_version TEXT NOT NULL,
@@ -9185,6 +9275,283 @@ class TradingDatabase:
                 """
             ).fetchone()
         return _row_to_setup_router_run(row) if row else {}
+
+    def save_setup_router_readiness_snapshots(self, snapshots: Iterable[dict]) -> int:
+        rows = [dict(item or {}) for item in snapshots or []]
+        if not rows:
+            return 0
+        saved = 0
+        with self._write_scope():
+            for payload in rows:
+                trade_date = str(payload.get("trade_date") or "")
+                router_version = str(payload.get("router_version") or _CURRENT_SETUP_ROUTER_VERSION)
+                candidate_instance_id = str(payload.get("candidate_instance_id") or "")
+                code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
+                if not trade_date or not candidate_instance_id or not code:
+                    continue
+                current_fingerprint = _setup_readiness_fingerprint(payload)
+                previous = self.conn.execute(
+                    """
+                    SELECT readiness_status, payload_json
+                    FROM setup_router_readiness_latest
+                    WHERE trade_date = ? AND router_version = ? AND candidate_instance_id = ?
+                    """,
+                    (trade_date, router_version, candidate_instance_id),
+                ).fetchone()
+                previous_fingerprint = ""
+                previous_status = ""
+                if previous:
+                    previous_payload = _safe_json_loads(previous["payload_json"], {})
+                    previous_fingerprint = _setup_readiness_fingerprint(previous_payload)
+                    previous_status = str(previous["readiness_status"] or "")
+                self.conn.execute(
+                    """
+                    INSERT INTO setup_router_readiness_latest(
+                        trade_date, router_version, candidate_instance_id, candidate_id, code, name,
+                        selected_theme_id, selected_theme_name, readiness_status, readiness_ready,
+                        coverage_type, subscription_selected, subscription_active,
+                        subscription_sources_json, subscription_primary_source, subscription_screen_no,
+                        subscription_generation, subscription_active_since, relevant_source_added_at,
+                        subscription_budget_deferred, expansion_lease_required, expansion_lease_requirement,
+                        expansion_lease_requirement_reason, exact_theme_lease_present, exact_theme_lease_active,
+                        exact_theme_lease_status, exact_theme_lease_selected_at, exact_theme_lease_first_active_at,
+                        latest_tick_at, latest_tick_age_sec, latest_tick_source, post_subscription_tick_verified,
+                        gateway_tick_at, core_tick_at, strategy_context_tick_at, setup_feature_tick_at,
+                        market_context_fresh, theme_context_fresh, candle_ready, baseline_at,
+                        reason_codes_json, informational_reason_codes_json, payload_json, calculated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(trade_date, router_version, candidate_instance_id) DO UPDATE SET
+                        candidate_id=excluded.candidate_id,
+                        code=excluded.code,
+                        name=excluded.name,
+                        selected_theme_id=excluded.selected_theme_id,
+                        selected_theme_name=excluded.selected_theme_name,
+                        readiness_status=excluded.readiness_status,
+                        readiness_ready=excluded.readiness_ready,
+                        coverage_type=excluded.coverage_type,
+                        subscription_selected=excluded.subscription_selected,
+                        subscription_active=excluded.subscription_active,
+                        subscription_sources_json=excluded.subscription_sources_json,
+                        subscription_primary_source=excluded.subscription_primary_source,
+                        subscription_screen_no=excluded.subscription_screen_no,
+                        subscription_generation=excluded.subscription_generation,
+                        subscription_active_since=excluded.subscription_active_since,
+                        relevant_source_added_at=excluded.relevant_source_added_at,
+                        subscription_budget_deferred=excluded.subscription_budget_deferred,
+                        expansion_lease_required=excluded.expansion_lease_required,
+                        expansion_lease_requirement=excluded.expansion_lease_requirement,
+                        expansion_lease_requirement_reason=excluded.expansion_lease_requirement_reason,
+                        exact_theme_lease_present=excluded.exact_theme_lease_present,
+                        exact_theme_lease_active=excluded.exact_theme_lease_active,
+                        exact_theme_lease_status=excluded.exact_theme_lease_status,
+                        exact_theme_lease_selected_at=excluded.exact_theme_lease_selected_at,
+                        exact_theme_lease_first_active_at=excluded.exact_theme_lease_first_active_at,
+                        latest_tick_at=excluded.latest_tick_at,
+                        latest_tick_age_sec=excluded.latest_tick_age_sec,
+                        latest_tick_source=excluded.latest_tick_source,
+                        post_subscription_tick_verified=excluded.post_subscription_tick_verified,
+                        gateway_tick_at=excluded.gateway_tick_at,
+                        core_tick_at=excluded.core_tick_at,
+                        strategy_context_tick_at=excluded.strategy_context_tick_at,
+                        setup_feature_tick_at=excluded.setup_feature_tick_at,
+                        market_context_fresh=excluded.market_context_fresh,
+                        theme_context_fresh=excluded.theme_context_fresh,
+                        candle_ready=excluded.candle_ready,
+                        baseline_at=excluded.baseline_at,
+                        reason_codes_json=excluded.reason_codes_json,
+                        informational_reason_codes_json=excluded.informational_reason_codes_json,
+                        payload_json=excluded.payload_json,
+                        calculated_at=excluded.calculated_at,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (
+                        trade_date,
+                        router_version,
+                        candidate_instance_id,
+                        _safe_int(payload.get("candidate_id"), 0) if payload.get("candidate_id") is not None else None,
+                        code,
+                        str(payload.get("name") or ""),
+                        str(payload.get("selected_theme_id") or ""),
+                        str(payload.get("selected_theme_name") or ""),
+                        str(payload.get("readiness_status") or ""),
+                        int(bool(payload.get("readiness_ready"))),
+                        str(payload.get("coverage_type") or ""),
+                        int(bool(payload.get("subscription_selected"))),
+                        int(bool(payload.get("subscription_active"))),
+                        _json_list(payload.get("subscription_sources") or []),
+                        str(payload.get("subscription_primary_source") or ""),
+                        str(payload.get("subscription_screen_no") or ""),
+                        _safe_int(payload.get("subscription_generation"), 0),
+                        str(payload.get("subscription_active_since") or ""),
+                        str(payload.get("relevant_source_added_at") or ""),
+                        int(bool(payload.get("subscription_budget_deferred"))),
+                        int(bool(payload.get("expansion_lease_required"))),
+                        str(payload.get("expansion_lease_requirement") or ""),
+                        str(payload.get("expansion_lease_requirement_reason") or ""),
+                        int(bool(payload.get("exact_theme_lease_present"))),
+                        int(bool(payload.get("exact_theme_lease_active"))),
+                        str(payload.get("exact_theme_lease_status") or ""),
+                        str(payload.get("exact_theme_lease_selected_at") or ""),
+                        str(payload.get("exact_theme_lease_first_active_at") or ""),
+                        str(payload.get("latest_tick_at") or ""),
+                        _float_value(payload.get("latest_tick_age_sec")),
+                        str(payload.get("latest_tick_source") or ""),
+                        int(bool(payload.get("post_subscription_tick_verified"))),
+                        str(payload.get("gateway_tick_at") or ""),
+                        str(payload.get("core_tick_at") or ""),
+                        str(payload.get("strategy_context_tick_at") or ""),
+                        str(payload.get("setup_feature_tick_at") or ""),
+                        int(bool(payload.get("market_context_fresh", True))),
+                        int(bool(payload.get("theme_context_fresh", True))),
+                        int(bool(payload.get("candle_ready", True))),
+                        str(payload.get("baseline_at") or ""),
+                        _json_list(payload.get("reason_codes") or []),
+                        _json_list(payload.get("informational_reason_codes") or []),
+                        _json_payload(payload),
+                        str(payload.get("calculated_at") or ""),
+                    ),
+                )
+                if current_fingerprint != previous_fingerprint:
+                    self.conn.execute(
+                        """
+                        INSERT INTO setup_router_readiness_history(
+                            trade_date, router_version, candidate_instance_id, code, selected_theme_id,
+                            previous_readiness_status, current_readiness_status,
+                            previous_fingerprint, current_fingerprint, calculated_at,
+                            reason_codes_json, payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            trade_date,
+                            router_version,
+                            candidate_instance_id,
+                            code,
+                            str(payload.get("selected_theme_id") or ""),
+                            previous_status,
+                            str(payload.get("readiness_status") or ""),
+                            previous_fingerprint,
+                            current_fingerprint,
+                            str(payload.get("calculated_at") or ""),
+                            _json_list(payload.get("reason_codes") or []),
+                            _json_payload(payload),
+                        ),
+                    )
+                saved += 1
+        return saved
+
+    def save_realtime_subscription_readiness_snapshots(self, snapshots: Iterable[dict], *, trade_date: Optional[str] = None) -> int:
+        rows = [dict(item or {}) for item in snapshots or []]
+        if not rows:
+            return 0
+        saved = 0
+        with self._write_scope():
+            for payload in rows:
+                calculated_at = str(payload.get("calculated_at") or "")
+                resolved_trade_date = str(payload.get("trade_date") or trade_date or calculated_at[:10])
+                code = _clean_stock_code(payload.get("code")) or str(payload.get("code") or "")
+                if not resolved_trade_date or not code:
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO realtime_subscription_readiness_latest(
+                        trade_date, subscription_generation, code, calculated_at,
+                        subscription_selected, subscription_active, subscription_budget_deferred,
+                        subscription_sources_json, subscription_primary_source, subscription_screen_no,
+                        subscription_active_since, relevant_source_added_at, coverage_type,
+                        latest_tick_at, latest_tick_age_sec, latest_tick_source,
+                        post_subscription_tick_verified, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(trade_date, subscription_generation, code) DO UPDATE SET
+                        calculated_at=excluded.calculated_at,
+                        subscription_selected=excluded.subscription_selected,
+                        subscription_active=excluded.subscription_active,
+                        subscription_budget_deferred=excluded.subscription_budget_deferred,
+                        subscription_sources_json=excluded.subscription_sources_json,
+                        subscription_primary_source=excluded.subscription_primary_source,
+                        subscription_screen_no=excluded.subscription_screen_no,
+                        subscription_active_since=excluded.subscription_active_since,
+                        relevant_source_added_at=excluded.relevant_source_added_at,
+                        coverage_type=excluded.coverage_type,
+                        latest_tick_at=excluded.latest_tick_at,
+                        latest_tick_age_sec=excluded.latest_tick_age_sec,
+                        latest_tick_source=excluded.latest_tick_source,
+                        post_subscription_tick_verified=excluded.post_subscription_tick_verified,
+                        payload_json=excluded.payload_json,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (
+                        resolved_trade_date,
+                        _safe_int(payload.get("subscription_generation"), 0),
+                        code,
+                        calculated_at,
+                        int(bool(payload.get("subscription_selected"))),
+                        int(bool(payload.get("subscription_active"))),
+                        int(bool(payload.get("subscription_budget_deferred"))),
+                        _json_list(payload.get("subscription_sources") or []),
+                        str(payload.get("subscription_primary_source") or ""),
+                        str(payload.get("subscription_screen_no") or ""),
+                        str(payload.get("subscription_active_since") or ""),
+                        str(payload.get("relevant_source_added_at") or ""),
+                        str(payload.get("coverage_type") or ""),
+                        str(payload.get("latest_tick_at") or ""),
+                        _float_value(payload.get("latest_tick_age_sec")),
+                        str(payload.get("latest_tick_source") or ""),
+                        int(bool(payload.get("post_subscription_tick_verified"))),
+                        _json_payload(payload),
+                    ),
+                )
+                saved += 1
+        return saved
+
+    def list_realtime_subscription_readiness_latest(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        query = "SELECT * FROM realtime_subscription_readiness_latest"
+        clauses: list[str] = []
+        params: list[object] = []
+        _append_setup_filter(clauses, params, "trade_date", trade_date)
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY calculated_at DESC, subscription_active DESC, code ASC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 100)), max(0, int(offset or 0))])
+        return [_row_to_realtime_subscription_readiness(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def list_setup_router_readiness_latest(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        router_version: Optional[str] = _CURRENT_SETUP_ROUTER_VERSION,
+        code: Optional[str] = None,
+        readiness_status: Optional[str] = None,
+        readiness_ready: Optional[bool] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        query = "SELECT * FROM setup_router_readiness_latest"
+        clauses: list[str] = []
+        params: list[object] = []
+        _append_setup_filter(clauses, params, "trade_date", trade_date)
+        _append_setup_filter(clauses, params, "router_version", router_version)
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        _append_setup_filter(clauses, params, "readiness_status", readiness_status)
+        if readiness_ready is not None:
+            clauses.append("readiness_ready = ?")
+            params.append(int(bool(readiness_ready)))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY calculated_at DESC, readiness_ready ASC, code ASC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 100)), max(0, int(offset or 0))])
+        return [_row_to_setup_router_readiness(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
 
     def save_setup_observations(self, observations: Iterable[dict]) -> int:
         cleaned = [dict(item or {}) for item in observations or []]
@@ -19087,6 +19454,84 @@ def _row_to_setup_router_run(row: sqlite3.Row) -> dict:
     return payload
 
 
+def _row_to_setup_router_readiness(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("router_version", data.get("router_version", ""))
+    payload.setdefault("candidate_instance_id", data.get("candidate_instance_id", ""))
+    payload.setdefault("candidate_id", data.get("candidate_id"))
+    payload.setdefault("code", data.get("code", ""))
+    payload.setdefault("name", data.get("name", ""))
+    payload.setdefault("selected_theme_id", data.get("selected_theme_id", ""))
+    payload.setdefault("selected_theme_name", data.get("selected_theme_name", ""))
+    payload.setdefault("readiness_status", data.get("readiness_status", ""))
+    payload.setdefault("readiness_ready", bool(data.get("readiness_ready")))
+    payload.setdefault("coverage_type", data.get("coverage_type", ""))
+    payload.setdefault("subscription_selected", bool(data.get("subscription_selected")))
+    payload.setdefault("subscription_active", bool(data.get("subscription_active")))
+    payload.setdefault("subscription_sources", _safe_json_loads(data.pop("subscription_sources_json", "[]"), []))
+    payload.setdefault("subscription_primary_source", data.get("subscription_primary_source", ""))
+    payload.setdefault("subscription_screen_no", data.get("subscription_screen_no", ""))
+    payload.setdefault("subscription_generation", int(data.get("subscription_generation") or 0))
+    payload.setdefault("subscription_active_since", data.get("subscription_active_since", ""))
+    payload.setdefault("relevant_source_added_at", data.get("relevant_source_added_at", ""))
+    payload.setdefault("subscription_budget_deferred", bool(data.get("subscription_budget_deferred")))
+    payload.setdefault("expansion_lease_required", bool(data.get("expansion_lease_required")))
+    payload.setdefault("expansion_lease_requirement", data.get("expansion_lease_requirement", ""))
+    payload.setdefault("expansion_lease_requirement_reason", data.get("expansion_lease_requirement_reason", ""))
+    payload.setdefault("exact_theme_lease_present", bool(data.get("exact_theme_lease_present")))
+    payload.setdefault("exact_theme_lease_active", bool(data.get("exact_theme_lease_active")))
+    payload.setdefault("exact_theme_lease_status", data.get("exact_theme_lease_status", ""))
+    payload.setdefault("exact_theme_lease_selected_at", data.get("exact_theme_lease_selected_at", ""))
+    payload.setdefault("exact_theme_lease_first_active_at", data.get("exact_theme_lease_first_active_at", ""))
+    payload.setdefault("latest_tick_at", data.get("latest_tick_at", ""))
+    payload.setdefault("latest_tick_age_sec", _float_value(data.get("latest_tick_age_sec")))
+    payload.setdefault("latest_tick_source", data.get("latest_tick_source", ""))
+    payload.setdefault("post_subscription_tick_verified", bool(data.get("post_subscription_tick_verified")))
+    payload.setdefault("gateway_tick_at", data.get("gateway_tick_at", ""))
+    payload.setdefault("core_tick_at", data.get("core_tick_at", ""))
+    payload.setdefault("strategy_context_tick_at", data.get("strategy_context_tick_at", ""))
+    payload.setdefault("setup_feature_tick_at", data.get("setup_feature_tick_at", ""))
+    payload.setdefault("market_context_fresh", bool(data.get("market_context_fresh")))
+    payload.setdefault("theme_context_fresh", bool(data.get("theme_context_fresh")))
+    payload.setdefault("candle_ready", bool(data.get("candle_ready")))
+    payload.setdefault("baseline_at", data.get("baseline_at", ""))
+    payload.setdefault("reason_codes", _safe_json_loads(data.pop("reason_codes_json", "[]"), []))
+    payload.setdefault("informational_reason_codes", _safe_json_loads(data.pop("informational_reason_codes_json", "[]"), []))
+    payload.setdefault("calculated_at", data.get("calculated_at", ""))
+    payload.setdefault("updated_at", data.get("updated_at", ""))
+    return payload
+
+
+def _row_to_realtime_subscription_readiness(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("trade_date", data.get("trade_date", ""))
+    payload.setdefault("subscription_generation", int(data.get("subscription_generation") or 0))
+    payload.setdefault("code", data.get("code", ""))
+    payload.setdefault("calculated_at", data.get("calculated_at", ""))
+    payload.setdefault("subscription_selected", bool(data.get("subscription_selected")))
+    payload.setdefault("subscription_active", bool(data.get("subscription_active")))
+    payload.setdefault("subscription_budget_deferred", bool(data.get("subscription_budget_deferred")))
+    payload.setdefault("subscription_sources", _safe_json_loads(data.pop("subscription_sources_json", "[]"), []))
+    payload.setdefault("subscription_primary_source", data.get("subscription_primary_source", ""))
+    payload.setdefault("subscription_screen_no", data.get("subscription_screen_no", ""))
+    payload.setdefault("subscription_active_since", data.get("subscription_active_since", ""))
+    payload.setdefault("relevant_source_added_at", data.get("relevant_source_added_at", ""))
+    payload.setdefault("coverage_type", data.get("coverage_type", ""))
+    payload.setdefault("latest_tick_at", data.get("latest_tick_at", ""))
+    payload.setdefault("latest_tick_age_sec", _float_value(data.get("latest_tick_age_sec")))
+    payload.setdefault("latest_tick_source", data.get("latest_tick_source", ""))
+    payload.setdefault("post_subscription_tick_verified", bool(data.get("post_subscription_tick_verified")))
+    payload.setdefault("updated_at", data.get("updated_at", ""))
+    return payload
+
+
 def _row_to_setup_observation(row: sqlite3.Row) -> dict:
     data = dict(row)
     payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
@@ -19963,6 +20408,25 @@ def _json_payload(value: object) -> str:
     if value is None:
         value = {}
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _setup_readiness_fingerprint(payload: Mapping[str, object]) -> str:
+    material = {
+        "router_version": str(payload.get("router_version") or ""),
+        "candidate_instance_id": str(payload.get("candidate_instance_id") or ""),
+        "selected_theme_id": str(payload.get("selected_theme_id") or ""),
+        "readiness_status": str(payload.get("readiness_status") or ""),
+        "readiness_ready": bool(payload.get("readiness_ready")),
+        "subscription_active": bool(payload.get("subscription_active")),
+        "subscription_budget_deferred": bool(payload.get("subscription_budget_deferred")),
+        "subscription_generation": _safe_int(payload.get("subscription_generation"), 0),
+        "expansion_lease_required": bool(payload.get("expansion_lease_required")),
+        "exact_theme_lease_active": bool(payload.get("exact_theme_lease_active")),
+        "latest_tick_at": str(payload.get("latest_tick_at") or ""),
+        "post_subscription_tick_verified": bool(payload.get("post_subscription_tick_verified")),
+        "reason_codes": list(payload.get("reason_codes") or []),
+    }
+    return hashlib.sha1(_json_payload(material).encode("utf-8")).hexdigest()
 
 
 def _setup_observation_db_values(

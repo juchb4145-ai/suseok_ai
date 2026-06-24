@@ -11,7 +11,7 @@ from trading.strategy.setup_runtime import SetupRouterV3RuntimePipeline
 from tests.test_setup_router_v3 import TRADE_DATE, _context, _entry_decision, _seed_candles
 
 
-def test_lease_selection_requires_exact_active_selected_theme(tmp_path):
+def test_opening_burst_candidate_does_not_require_expansion_lease_by_source(tmp_path):
     db = TradingDatabase(str(tmp_path / "lease-exact.db"))
     pipeline = SetupRouterV3RuntimePipeline(db=db, config=SetupRouterConfig(enabled=True))
     candidate = Candidate(
@@ -19,6 +19,32 @@ def test_lease_selection_requires_exact_active_selected_theme(tmp_path):
         code="000001",
         state=CandidateState.WATCHING,
         sources=[CandidateSourceType.OPENING_BURST],
+    )
+    context = {**_context(), "selected_theme_id": "theme-b", "theme": {**_context()["theme"], "theme_id": "theme-b"}}
+
+    selection = pipeline._lease_selection(
+        [
+            {"code": "000001", "theme_id": "theme-a", "status": "ACTIVE", "selected_at": "2026-06-22T09:00:00"},
+            {"code": "000001", "theme_id": "theme-b", "status": "EXPIRED", "selected_at": "2026-06-22T09:01:00"},
+        ],
+        context,
+        candidate=candidate,
+    )
+
+    assert selection["required"] is False
+    assert selection["lease"] == {}
+    assert selection["other_theme_lease_count"] == 1
+
+
+def test_expansion_only_candidate_requires_exact_selected_theme_lease(tmp_path):
+    db = TradingDatabase(str(tmp_path / "lease-expansion-only.db"))
+    pipeline = SetupRouterV3RuntimePipeline(db=db, config=SetupRouterConfig(enabled=True))
+    candidate = Candidate(
+        trade_date=TRADE_DATE,
+        code="000001",
+        state=CandidateState.WATCHING,
+        sources=[CandidateSourceType.OPENING_BURST],
+        metadata={"expansion_only": True},
     )
     context = {**_context(), "selected_theme_id": "theme-b", "theme": {**_context()["theme"], "theme_id": "theme-b"}}
 

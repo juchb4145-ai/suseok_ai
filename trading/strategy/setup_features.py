@@ -28,6 +28,7 @@ class SetupFeatureSnapshot:
     previous_observation: dict[str, Any] = field(default_factory=dict)
     setup_states: dict[str, Any] = field(default_factory=dict)
     expansion_lease: dict[str, Any] = field(default_factory=dict)
+    setup_data_readiness: dict[str, Any] = field(default_factory=dict)
     context_id: str = ""
     context_fresh: bool = False
     session_phase: str = ""
@@ -95,6 +96,10 @@ class SetupFeatureSnapshot:
     lease_first_fresh_tick_at: str = ""
     post_subscription_tick_verified: bool = True
     post_subscription_tick_reason: str = ""
+    readiness_status: str = ""
+    readiness_ready: bool = True
+    readiness_reason_codes: tuple[str, ...] = ()
+    readiness_informational_reason_codes: tuple[str, ...] = ()
     data_wait_reasons: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -122,6 +127,7 @@ class SetupFeatureBuilder:
         expansion_lease: Mapping[str, Any] | None = None,
         selected_theme_lease_required: bool = False,
         other_theme_lease_count: int = 0,
+        setup_data_readiness: Mapping[str, Any] | None = None,
     ) -> SetupFeatureSnapshot:
         current = now.replace(microsecond=0)
         code = normalize_code(candidate.code)
@@ -169,13 +175,16 @@ class SetupFeatureBuilder:
         trade_date = str(candidate.trade_date or context.get("trade_date") or current.date().isoformat())
         entry_fresh = bool(entry) and (not entry_trade_date or entry_trade_date == trade_date) and entry_age_sec <= max(1, int(self.entry_decision_max_age_sec))
         lease = dict(expansion_lease or {})
+        readiness = dict(setup_data_readiness or {})
+        readiness_reasons = tuple(_dedupe(readiness.get("reason_codes") or []))
+        readiness_info = tuple(_dedupe(readiness.get("informational_reason_codes") or []))
         lease_check = _post_subscription_tick_check(
             lease,
             theme_id=str(context.get("selected_theme_id") or theme.get("theme_id") or ""),
             tick_at=tick_at_dt,
             price_source=price_source,
             realtime_tick_fresh=realtime_tick_fresh,
-            required=bool(selected_theme_lease_required),
+            required=bool(readiness.get("expansion_lease_required", selected_theme_lease_required)),
         )
 
         data_wait = []
@@ -203,10 +212,17 @@ class SetupFeatureBuilder:
             data_wait.append("SIGNAL_STALE")
         if any("REALTIME_COVERAGE_LOW" in str(reason).upper() for reason in context_reasons):
             data_wait.append("REALTIME_COVERAGE_LOW")
-        if lease_check["lease_present"] and not lease_check["post_subscription_tick_verified"]:
+        if readiness:
+            data_wait.extend(readiness_reasons)
+        elif lease_check["lease_present"] and not lease_check["post_subscription_tick_verified"]:
             data_wait.append(str(lease_check["reason"] or "SETUP_POST_SUBSCRIPTION_FRESH_TICK_MISSING"))
-        if lease_check["reason"] == "SETUP_SELECTED_THEME_LEASE_MISSING":
+        if not readiness and lease_check["reason"] == "SETUP_SELECTED_THEME_LEASE_MISSING":
             data_wait.append("SETUP_SELECTED_THEME_LEASE_MISSING")
+        post_subscription_tick_verified = bool(readiness.get("post_subscription_tick_verified", lease_check["post_subscription_tick_verified"])) if readiness else bool(lease_check["post_subscription_tick_verified"])
+        post_subscription_tick_reason = str(
+            readiness.get("readiness_status")
+            or lease_check["reason"]
+        )
 
         return SetupFeatureSnapshot(
             schema_version=SETUP_ROUTER_FEATURE_SCHEMA_VERSION,
@@ -224,6 +240,7 @@ class SetupFeatureBuilder:
             previous_observation=dict(previous_observation or {}),
             setup_states=dict(setup_states or {}),
             expansion_lease=lease,
+            setup_data_readiness=readiness,
             context_id=str(context.get("context_id") or metadata.get("strategy_context_id") or ""),
             context_fresh=bool(context.get("context_fresh")),
             session_phase=str(context.get("session_phase") or ""),
@@ -282,15 +299,19 @@ class SetupFeatureBuilder:
             entry_price_location=str(entry.get("price_location") or ""),
             entry_reason_codes=tuple(_dedupe(entry.get("reason_codes") or [])),
             context_reason_codes=context_reasons,
-            expansion_lease_present=bool(lease_check["lease_present"]),
-            selected_theme_lease_required=bool(selected_theme_lease_required),
+            expansion_lease_present=bool(readiness.get("exact_theme_lease_present", lease_check["lease_present"])) if readiness else bool(lease_check["lease_present"]),
+            selected_theme_lease_required=bool(readiness.get("expansion_lease_required", selected_theme_lease_required)) if readiness else bool(selected_theme_lease_required),
             other_theme_lease_count=max(0, int(other_theme_lease_count or 0)),
-            lease_status=str(lease_check["lease_status"]),
-            lease_selected_at=str(lease_check["selected_at"]),
-            lease_first_active_at=str(lease_check["first_active_at"]),
+            lease_status=str(readiness.get("exact_theme_lease_status", lease_check["lease_status"])) if readiness else str(lease_check["lease_status"]),
+            lease_selected_at=str(readiness.get("exact_theme_lease_selected_at", lease_check["selected_at"])) if readiness else str(lease_check["selected_at"]),
+            lease_first_active_at=str(readiness.get("exact_theme_lease_first_active_at", lease_check["first_active_at"])) if readiness else str(lease_check["first_active_at"]),
             lease_first_fresh_tick_at=str(lease_check["first_fresh_tick_at"]),
-            post_subscription_tick_verified=bool(lease_check["post_subscription_tick_verified"]),
-            post_subscription_tick_reason=str(lease_check["reason"]),
+            post_subscription_tick_verified=post_subscription_tick_verified,
+            post_subscription_tick_reason=post_subscription_tick_reason,
+            readiness_status=str(readiness.get("readiness_status") or ""),
+            readiness_ready=bool(readiness.get("readiness_ready", True)),
+            readiness_reason_codes=readiness_reasons,
+            readiness_informational_reason_codes=readiness_info,
             data_wait_reasons=tuple(_dedupe(data_wait)),
         )
 

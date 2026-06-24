@@ -33,6 +33,7 @@ def main(argv: list[str] | None = None) -> int:
         state_transitions = _rows(con, "setup_router_state_transitions_v3", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
         runs = _rows(con, "setup_router_runs", trade_date, limit=1000, router_version=args.router_version)
         runtime_rows = _rows(con, "setup_router_candidate_runtime_v4", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
+        readiness_rows = _rows(con, "setup_router_readiness_latest", trade_date, limit=args.limit, router_version=args.router_version, include_legacy_version=args.include_legacy_version)
         full_counts = _full_counts(con, trade_date, args.router_version)
         integrity = _state_integrity(con, trade_date, args.router_version)
         scheduling = _scheduling_checks(con, trade_date, args.router_version)
@@ -48,6 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     invalid = _invalid_observations(observations)
     flip_analysis = _flip_analysis(transitions)
     context_alignment = _context_alignment(observations)
+    readiness_metrics = _readiness_metrics(readiness_rows, observations)
     run_span_min = float(span_metrics.get("run_span_minutes") or 0.0)
     failures: list[str] = []
     warnings: list[str] = []
@@ -60,7 +62,12 @@ def main(argv: list[str] | None = None) -> int:
     if any(value > 0 for value in side_effects.values()):
         failures.append("SETUP_ROUTER_ORDER_SIDE_EFFECTS_PRESENT")
     if full_counts.get("valid_observe", 0) == 0:
-        warnings.append("NO_VALID_SETUP_SAMPLE")
+        if readiness_metrics.get("readiness_ready_count", 0) == 0:
+            warnings.append("NO_VALID_SETUP_SAMPLE_DATA_NOT_READY")
+        elif readiness_metrics.get("shape_evaluated_count", 0) == 0:
+            failures.append("READY_CANDIDATES_NOT_SHAPE_EVALUATED")
+        else:
+            warnings.append("NO_VALID_SETUP_SAMPLE_NO_MATCHED_PATTERN")
     if full_counts.get("valid_observe", 0) == 1:
         warnings.append("SINGLE_VALID_SETUP_SAMPLE")
     if run_span_min < 60:
@@ -75,6 +82,16 @@ def main(argv: list[str] | None = None) -> int:
         failures.append("VALID_WITH_POST_SUBSCRIPTION_TICK_MISSING_SQL")
     if full_counts.get("valid_tr_backfill", 0) > 0:
         failures.append("VALID_WITH_TR_BACKFILL_SQL")
+    if readiness_metrics.get("lease_false_block_count", 0) > 0:
+        failures.append("SETUP_READINESS_LEASE_FALSE_BLOCK")
+    if readiness_metrics.get("ready_not_shape_evaluated_count", 0) > 0:
+        failures.append("SETUP_READINESS_READY_NOT_SHAPE_EVALUATED")
+    if readiness_metrics.get("active_fresh_unexpected_wait_count", 0) > 0:
+        failures.append("SETUP_READINESS_ACTIVE_FRESH_UNEXPECTED_WAIT")
+    if readiness_metrics.get("observe_only_readiness_wait_reason_count", 0) > 0:
+        failures.append("SETUP_ROUTER_OBSERVE_ONLY_COUNTED_AS_WAIT")
+    if readiness_metrics.get("readiness_count", 0) == 0 and full_counts.get("observations", 0) > 0:
+        warnings.append("SETUP_READINESS_ROWS_MISSING")
     if any(row.get("router_status") == "VALID_OBSERVE" and not bool(row.get("post_subscription_tick_verified", True)) for row in observations):
         failures.append("VALID_WITH_POST_SUBSCRIPTION_TICK_MISSING")
     if any(row.get("router_status") == "VALID_OBSERVE" and row.get("session_phase") in {"CLOSING_RISK", "MARKET_CLOSED"} for row in observations):
@@ -107,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         "state_transition_count": len(state_transitions),
         "run_count": len(runs),
         "candidate_runtime_count": len(runtime_rows),
+        "readiness_count": len(readiness_rows),
         "sample_counts": {
             "observations": len(observations),
             "transitions": len(transitions),
@@ -114,8 +132,10 @@ def main(argv: list[str] | None = None) -> int:
             "state_transitions": len(state_transitions),
             "runs": len(runs),
             "candidate_runtime": len(runtime_rows),
+            "readiness": len(readiness_rows),
         },
         "full_counts": full_counts,
+        "readiness_metrics": readiness_metrics,
         "run_span_minutes": run_span_min,
         "span_metrics": span_metrics,
         "type_counts": dict(type_counts),
@@ -142,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
     _write_json(output_dir / "states.json", states[:1000])
     _write_json(output_dir / "state_transitions.json", state_transitions[:1000])
     _write_json(output_dir / "candidate_runtime.json", runtime_rows[:1000])
+    _write_json(output_dir / "readiness_latest.json", readiness_rows[:1000])
     _write_json(output_dir / "invalid_observations.json", invalid[:1000])
     _write_json(output_dir / "flip_analysis.json", flip_analysis)
     _write_json(output_dir / "context_alignment.json", context_alignment)
@@ -258,6 +279,59 @@ def _context_alignment(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _readiness_metrics(readiness: list[dict[str, Any]], observations: list[dict[str, Any]]) -> dict[str, Any]:
+    readiness_rows = [dict(row or {}) for row in readiness]
+    observation_rows = [dict(row or {}) for row in observations]
+    shaped_candidate_ids = {str(row.get("candidate_instance_id") or "") for row in observation_rows if str(row.get("candidate_instance_id") or "")}
+    active = [row for row in readiness_rows if bool(row.get("subscription_active"))]
+    fresh = [row for row in readiness_rows if bool(row.get("post_subscription_tick_verified"))]
+    ready = [row for row in readiness_rows if bool(row.get("readiness_ready"))]
+    context_block_statuses = {"WAIT_STRATEGY_CONTEXT", "WAIT_MARKET_CONTEXT", "WAIT_THEME_SIGNAL_STALE", "WAIT_CANDLE_WARMUP"}
+    context_ready = [row for row in fresh if str(row.get("readiness_status") or "") not in context_block_statuses]
+    lease_false_blocks = [
+        row
+        for row in readiness_rows
+        if (
+            str(row.get("readiness_status") or "") == "WAIT_SELECTED_THEME_LEASE"
+            or "SETUP_SELECTED_THEME_ACTIVE_LEASE_MISSING" in [str(reason) for reason in row.get("reason_codes", [])]
+        )
+        and not bool(row.get("expansion_lease_required"))
+    ]
+    ready_not_shape = [
+        row
+        for row in ready
+        if str(row.get("candidate_instance_id") or "") not in shaped_candidate_ids
+    ]
+    active_fresh_unexpected_wait = [
+        row
+        for row in context_ready
+        if not bool(row.get("readiness_ready"))
+        and str(row.get("readiness_status") or "") not in {"WAIT_SELECTED_THEME_LEASE", *context_block_statuses}
+    ]
+    observe_only_wait_reason_count = sum(
+        1
+        for row in readiness_rows
+        if "SETUP_ROUTER_V3_OBSERVE_ONLY" in [str(reason) for reason in row.get("reason_codes", [])]
+    )
+    return {
+        "readiness_count": len(readiness_rows),
+        "readiness_ready_count": len(ready),
+        "readiness_wait_count": len(readiness_rows) - len(ready),
+        "subscription_active_count": len(active),
+        "active_fresh_count": len(fresh),
+        "context_ready_count": len(context_ready),
+        "shape_evaluated_count": len(shaped_candidate_ids),
+        "lease_false_block_count": len(lease_false_blocks),
+        "ready_not_shape_evaluated_count": len(ready_not_shape),
+        "active_fresh_unexpected_wait_count": len(active_fresh_unexpected_wait),
+        "observe_only_readiness_wait_reason_count": observe_only_wait_reason_count,
+        "readiness_status_counts": dict(Counter(str(row.get("readiness_status") or "UNKNOWN") for row in readiness_rows)),
+        "readiness_reason_counts": dict(
+            Counter(reason for row in readiness_rows for reason in [str(item) for item in row.get("reason_codes", []) if str(item)]).most_common()
+        ),
+    }
+
+
 def _has_table(con: sqlite3.Connection, table: str) -> bool:
     row = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name = ?", (table,)).fetchone()
     return row is not None
@@ -349,6 +423,9 @@ def _full_counts(con: sqlite3.Connection, trade_date: str, router_version: str) 
         "runs": _count(con, "setup_router_runs", trade_date, router_version=router_version),
         "eligible_runtime": _count(con, "setup_router_candidate_runtime_v4", trade_date, router_version=router_version),
         "pending_queue": _count(con, "setup_router_pending_evaluations_v5", trade_date, router_version=router_version, extra="status IN ('PENDING','RETRY','SELECTED')"),
+        "readiness": _count(con, "setup_router_readiness_latest", trade_date, router_version=router_version),
+        "readiness_ready": _count(con, "setup_router_readiness_latest", trade_date, router_version=router_version, extra="readiness_ready = 1"),
+        "readiness_wait": _count(con, "setup_router_readiness_latest", trade_date, router_version=router_version, extra="readiness_ready = 0"),
     }
 
 
@@ -728,12 +805,17 @@ def _write_json(path: Path, payload: Any) -> None:
 
 
 def _markdown(summary: dict[str, Any], flip: dict[str, Any], alignment: dict[str, Any]) -> str:
+    readiness = dict(summary.get("readiness_metrics") or {})
     return "\n".join(
         [
             "# SetupRouter V3 Audit",
             "",
             f"- verdict: `{summary['verdict']}`",
             f"- observation_count: {summary['observation_count']}",
+            f"- readiness_count: {summary.get('readiness_count', 0)}",
+            f"- readiness_ready_count: {readiness.get('readiness_ready_count', 0)}",
+            f"- shape_evaluated_count: {readiness.get('shape_evaluated_count', 0)}",
+            f"- lease_false_block_count: {readiness.get('lease_false_block_count', 0)}",
             f"- transition_count: {summary['transition_count']}",
             f"- invalid_count: {summary['invalid_count']}",
             f"- frequent_flip_count: {flip['frequent_flip_count']}",

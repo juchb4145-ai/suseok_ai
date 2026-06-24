@@ -41,6 +41,7 @@ from trading.strategy.readiness import build_readiness_report, dedupe_warnings
 from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.reboot_v2 import RebootV2RuntimeProfile, reboot_v2_runtime_profile
 from trading.strategy.reboot_v2_runtime import RebootV2Runtime
+from trading.strategy.subscription_readiness import RealtimeSubscriptionReadinessProvider
 from trading.strategy.setup_runtime import SetupRouterV3RuntimePipeline
 from trading.strategy.setup_router_v3 import SetupRouterConfig
 from trading.strategy.strategy_context import StrategyContextRuntimePipeline
@@ -415,6 +416,11 @@ def build_reboot_v2_runtime_bundle(
     setup_router_config = SetupRouterConfig.from_env()
     market_data_config = getattr(getattr(market_data_bridge, "service", None), "config", None)
     setup_router_tick_age = int(getattr(market_data_config, "max_tick_age_sec", setup_router_config.max_tick_age_sec))
+    subscription_readiness_provider = RealtimeSubscriptionReadinessProvider(
+        subscription_manager,
+        market_data=market_data,
+        max_tick_age_sec=setup_router_tick_age,
+    )
     setup_router_v3_pipeline = SetupRouterV3RuntimePipeline(
         db=db,
         market_data=market_data,
@@ -425,6 +431,7 @@ def build_reboot_v2_runtime_bundle(
             max_tick_age_sec=setup_router_tick_age,
         ),
         dirty_evaluator_provider=dirty_strategy_evaluator,
+        subscription_readiness_provider=subscription_readiness_provider,
     )
     market_relative_strength_shadow_pipeline = MarketRelativeStrengthShadowRuntimePipeline(
         db=db,
