@@ -126,6 +126,9 @@ def test_decision_led_replay_uses_separate_db_and_builds_report(tmp_path):
     assert result.status == "OK"
     assert result.summary["outcome_labeled_count"] >= 1
     assert result.summary["shadow_evaluation_count"] >= 1
+    assert result.summary["fill_simulation"]["sample_count"] == 1
+    assert result.summary["fill_simulation"]["filled_count"] == 1
+    assert result.summary["fill_simulation"]["samples"][0]["code"] == "000002"
     assert result.report["recommendations"]
     source = TradingDatabase(str(db_path))
     replay = TradingDatabase(str(replay_db))

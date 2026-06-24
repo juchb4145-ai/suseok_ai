@@ -306,6 +306,76 @@ def test_cost_slippage_and_entry_delay_scenarios_are_reported(tmp_path):
     assert item["partial_fill_risk"] == "LOW"
 
 
+def test_fill_simulation_metrics_are_reported_without_live_side_effects(tmp_path):
+    db = _db(tmp_path)
+    try:
+        position = db.save_virtual_position(
+            VirtualPosition(
+                candidate_id=1,
+                virtual_order_id=20,
+                entry_price=10000,
+                quantity=10,
+                opened_at="2026-05-30T09:01:00",
+                closed_at="2026-05-30T09:20:00",
+                close_price=10300,
+                close_reason="TAKE_PROFIT",
+                realized_return_pct=3.0,
+            )
+        )
+        db.save_runtime_order_intent(
+            _intent(
+                "entry-fill",
+                virtual_position_id=position.id,
+                price=10010,
+                quantity=10,
+                order_amount=100100,
+                metadata={"session_bucket": "OPEN", "simulated_latency_ms": 0},
+            )
+        )
+        db.save_trade_review(
+            _review(
+                virtual_position_id=position.id,
+                final_status=ReviewFinalStatus.VIRTUAL_CLOSED_TAKE_PROFIT.value,
+                exit_price=10300,
+                max_return_20m=3.5,
+                max_drawdown_20m=-0.5,
+            )
+        )
+        db.save_gateway_price_ticks_batch(
+            [
+                {
+                    "event_id": "tick-fill",
+                    "trade_date": "2026-05-30",
+                    "timestamp": "2026-05-30T09:01:00",
+                    "code": "005930",
+                    "price": 10000,
+                    "trade_value": 50_000_000,
+                    "execution_strength": 160,
+                    "best_bid": 9990,
+                    "best_ask": 10000,
+                    "spread_ticks": 1,
+                }
+            ]
+        )
+        before_commands = db.conn.execute("SELECT COUNT(*) AS count FROM gateway_commands").fetchone()["count"]
+        report = DryRunPerformanceAnalyzer(db).build_report(trade_date="2026-05-30")
+        after_commands = db.conn.execute("SELECT COUNT(*) AS count FROM gateway_commands").fetchone()["count"]
+    finally:
+        db.close()
+
+    item = report["items"][0]
+    assert item["requested_price"] == 10010.0
+    assert item["fill_price"] == 10000.0
+    assert item["fill_ratio"] == 1.0
+    assert item["partial_fill"] is False
+    assert item["reject_or_skip_reason"] == "OK"
+    assert item["fill_adjusted_net_return_pct"] is not None
+    assert report["summary"]["fill_quality"]["sample_count"] == 1
+    assert report["summary"]["avg_slippage_bps"] < 0
+    assert report["summary"]["profit_factor"] is not None
+    assert before_commands == after_commands == 0
+
+
 def test_hybrid_validation_event_join_and_bucket_grouping(tmp_path):
     db = _db(tmp_path)
     try:

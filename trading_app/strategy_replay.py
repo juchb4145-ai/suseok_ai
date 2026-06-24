@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from storage.db import TradingDatabase
 from trading.strategy.replay import TickReplayRunner
+from trading_app.fill_simulator import FillSimulationConfig, simulate_fill, summarize_fill_simulations
 from trading_app.intraday_outcomes import IntradayOutcomeLabeler
 from trading_app.shadow_strategy import ShadowStrategyEvaluator
 
@@ -823,6 +824,7 @@ class StrategyRuntimeReplayRunner:
         rejected_orders = order_rejected
         data_insufficient = int(outcome_summary.get("insufficient_count") or 0)
         data_insufficient += sum(int(row.get("count") or 0) for row in decision_summary.get("top_data_quality_issues") or [])
+        fill_simulation = _build_replay_fill_simulation(bundle)
         return {
             "trade_date": bundle.manifest.trade_date,
             "mode": mode,
@@ -846,6 +848,7 @@ class StrategyRuntimeReplayRunner:
             "outcome_labeled_count": int(outcome_summary.get("labeled_count") or 0),
             "shadow_evaluation_count": int(shadow_summary.get("total_evaluations") or 0),
             "data_insufficient_count": data_insufficient,
+            "fill_simulation": fill_simulation,
             "cycle_count": max(
                 int(quality.get("tick_count") or 0),
                 int(quality.get("candidate_event_count") or 0),
@@ -1198,6 +1201,15 @@ def _loads(value: Any, default: Any) -> Any:
         return default
 
 
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _hash_payload(payload: Any) -> str:
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
 
@@ -1260,6 +1272,78 @@ def _bundle_price_provider(ticks: list[dict[str, Any]]):
         return {"source": "replay_bundle_ticks", "samples": samples}
 
     return provider
+
+
+def _build_replay_fill_simulation(bundle: StrategyReplayBundle) -> dict[str, Any]:
+    ticks = _read_ticks(bundle.ticks_path)
+    decisions = _read_jsonl(bundle.decision_events_path)
+    ticks_by_code: dict[str, list[dict[str, Any]]] = {}
+    for tick in ticks:
+        code = _clean_code(tick.get("code"))
+        if not code:
+            continue
+        ticks_by_code.setdefault(code, []).append(tick)
+    for values in ticks_by_code.values():
+        values.sort(key=lambda row: _parse_dt(row.get("timestamp") or row.get("received_at") or row.get("created_at")))
+
+    results: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+    for decision in decisions:
+        if not _decision_fill_candidate(decision):
+            continue
+        code = _clean_code(decision.get("code"))
+        price = _optional_float(decision.get("price"))
+        order_amount = price or 0.0
+        order = {
+            "intent_id": decision.get("order_intent_id") or decision.get("decision_id") or "",
+            "decision_id": decision.get("decision_id") or "",
+            "trade_date": decision.get("trade_date") or bundle.manifest.trade_date,
+            "code": code,
+            "side": "buy",
+            "quantity": 1,
+            "price": price or 0,
+            "order_amount": order_amount,
+            "order_type": 1,
+            "hoga": "00",
+            "created_at": decision.get("decision_at") or decision.get("created_at") or "",
+            "metadata": {
+                "source": "strategy_replay_decision_event",
+                "gate_status": decision.get("gate_status") or "",
+                "action_type": decision.get("action_type") or "",
+            },
+        }
+        result = simulate_fill(
+            order,
+            ticks_by_code.get(code, []),
+            config=FillSimulationConfig(),
+        ).to_dict()
+        results.append(result)
+        if len(samples) < 20:
+            samples.append(
+                {
+                    "decision_id": decision.get("decision_id") or "",
+                    "code": code,
+                    "gate_status": decision.get("gate_status") or "",
+                    "action_type": decision.get("action_type") or "",
+                    "requested_price": result.get("requested_price"),
+                    "fill_price": result.get("fill_price"),
+                    "slippage_bps": result.get("slippage_bps"),
+                    "fill_ratio": result.get("fill_ratio"),
+                    "partial_fill": result.get("partial_fill"),
+                    "simulated_latency_ms": result.get("simulated_latency_ms"),
+                    "reject_or_skip_reason": result.get("reject_or_skip_reason"),
+                    "stale_tick": result.get("stale_tick"),
+                }
+            )
+    return {**summarize_fill_simulations(results), "samples": samples}
+
+
+def _decision_fill_candidate(decision: dict[str, Any]) -> bool:
+    status = str(decision.get("gate_status") or "").upper()
+    action = str(decision.get("action_type") or "").upper()
+    if status in {"READY", "READY_SMALL", "READY_SHADOW_SMALL_ENTRY"}:
+        return True
+    return action in {"READY", "ENTRY_PLAN", "ENTRY_ORDER_INTENT"}
 
 
 def _save_replay_source_metadata(db: TradingDatabase, bundle: StrategyReplayBundle, mode: str) -> None:

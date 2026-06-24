@@ -12,6 +12,7 @@ from storage.db import TradingDatabase
 from trading.broker.models import new_message_id, utc_timestamp
 from trading.strategy.models import ReviewFinalStatus
 from trading.strategy.reason_taxonomy import normalize_reason_status, reason_status_family, reason_summary
+from trading_app.fill_simulator import FillSimulationConfig, simulate_fill, summarize_fill_simulations
 
 
 REPORT_ROOT = Path(__file__).resolve().parents[1] / "reports" / "dry_run_performance"
@@ -132,6 +133,17 @@ class DryRunTradeLifecycle:
     entry_tick_age_sec: Optional[float] = None
     gateway_command_latency_ms: Optional[float] = None
     execution_realism: dict[str, Any] = field(default_factory=dict)
+    fill_simulation: dict[str, Any] = field(default_factory=dict)
+    fill_price: Optional[float] = None
+    requested_price: Optional[float] = None
+    slippage_bps: Optional[float] = None
+    fill_ratio: Optional[float] = None
+    partial_fill: bool = False
+    simulated_latency_ms: Optional[float] = None
+    reject_or_skip_reason: str = ""
+    stale_tick: bool = False
+    fill_adjusted_return_pct: Optional[float] = None
+    fill_adjusted_net_return_pct: Optional[float] = None
     details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -766,6 +778,23 @@ class DryRunPerformanceAnalyzer:
         lifecycle.liquidity_bucket = str(lifecycle.execution_realism.get("liquidity_bucket") or "")
         lifecycle.entry_tick_age_sec = _optional_float(lifecycle.execution_realism.get("entry_tick_age_sec"))
         lifecycle.gateway_command_latency_ms = _optional_float(lifecycle.execution_realism.get("gateway_command_latency_ms"))
+        if entry:
+            fill_result = simulate_fill(
+                entry,
+                tick_rows,
+                config=FillSimulationConfig(stale_tick_age_sec=self.config.stale_tick_age_sec),
+            ).to_dict()
+            lifecycle.fill_simulation = fill_result
+            lifecycle.fill_price = _optional_float(fill_result.get("fill_price"))
+            lifecycle.requested_price = _optional_float(fill_result.get("requested_price"))
+            lifecycle.slippage_bps = _optional_float(fill_result.get("slippage_bps"))
+            lifecycle.fill_ratio = _optional_float(fill_result.get("fill_ratio"))
+            lifecycle.partial_fill = bool(fill_result.get("partial_fill"))
+            lifecycle.simulated_latency_ms = _optional_float(fill_result.get("simulated_latency_ms"))
+            lifecycle.reject_or_skip_reason = str(fill_result.get("reject_or_skip_reason") or "")
+            lifecycle.stale_tick = bool(fill_result.get("stale_tick"))
+            lifecycle.fill_adjusted_return_pct = _fill_adjusted_return_pct(lifecycle)
+            lifecycle.fill_adjusted_net_return_pct = _fill_adjusted_net_return_pct(lifecycle, self.config)
         cost_payload = _cost_adjusted_payload(lifecycle, entry, tick_rows, self.config)
         lifecycle.cost_scenarios = list(cost_payload.get("cost_scenarios") or [])
         lifecycle.net_return_pct = _optional_float(cost_payload.get("net_return_pct"))
@@ -776,6 +805,7 @@ class DryRunPerformanceAnalyzer:
         lifecycle.net_opportunity_type = str(cost_payload.get("net_opportunity_type") or "")
         lifecycle.details["cost_assumptions"] = cost_payload.get("cost_assumptions", {})
         lifecycle.details["execution_realism"] = dict(lifecycle.execution_realism)
+        lifecycle.details["fill_simulation"] = dict(lifecycle.fill_simulation)
         lifecycle.data_quality_issue_reasons = _data_quality_issue_reasons(
             lifecycle,
             entry,
@@ -805,11 +835,17 @@ class DryRunPerformanceAnalyzer:
         net_values = [_optional_float(item.get("net_return_pct")) for item in accepted_completed]
         net_values = [value for value in net_values if value is not None]
         net_wins = [value for value in net_values if value > 0.0]
+        fill_net_values = [_optional_float(item.get("fill_adjusted_net_return_pct")) for item in accepted_completed]
+        fill_net_values = [value for value in fill_net_values if value is not None]
         generation_summary = _generation_summary(items)
         position_context_summary = _position_context_history_summary(items)
         execution_realism = _execution_realism_summary(items, self.config)
+        fill_quality = _fill_quality_summary(items)
         cost_adjusted = _cost_adjusted_summary(items)
         go_no_go = _go_no_go_summary(items, self.config, net_values, cost_adjusted, execution_realism)
+        opportunity_loss_count = sum(1 for item in items if item.get("opportunity_loss_type"))
+        false_positive_count = sum(1 for item in items if item.get("dry_run_false_positive_type"))
+        false_negative_count = sum(1 for item in items if item.get("dry_run_false_negative_type"))
         return {
             "total_lifecycle_count": len(items),
             "trade_day_count": len({str(item.get("trade_date") or "") for item in items if item.get("trade_date")}),
@@ -835,21 +871,32 @@ class DryRunPerformanceAnalyzer:
             "median_realized_return_pct": median(realized_values) if realized_values else None,
             "win_rate": _ratio(len(wins), len(completed)),
             "loss_rate": _ratio(len(losses), len(completed)),
+            "profit_factor": _profit_factor(net_values or realized_values),
+            "expectancy_pct": _avg(net_values or realized_values),
             "accepted_completed_lifecycle_count": len(accepted_completed),
             "net_expectancy": _avg(net_values),
             "avg_net_return_pct": _avg(net_values),
             "median_net_return_pct": median(net_values) if net_values else None,
             "net_win_rate": _ratio(len(net_wins), len(net_values)),
             "net_loss_rate": _ratio(len(net_values) - len(net_wins), len(net_values)),
+            "fill_adjusted_expectancy_pct": _avg(fill_net_values),
+            "fill_adjusted_profit_factor": _profit_factor(fill_net_values),
+            "fill_adjusted_win_rate": _ratio(sum(1 for value in fill_net_values if value > 0.0), len(fill_net_values)),
             "primary_cost_assumption": _primary_cost_assumption(self.config),
             "cost_scenario_expectancy": _aggregate_cost_scenarios(items),
             "cost_adjusted": cost_adjusted,
             "execution_realism": execution_realism,
+            "fill_quality": fill_quality,
+            "avg_slippage_bps": fill_quality.get("avg_slippage_bps"),
+            "median_slippage_bps": fill_quality.get("median_slippage_bps"),
+            "partial_fill_rate": fill_quality.get("partial_fill_rate"),
+            "stale_tick_rate": fill_quality.get("stale_tick_rate"),
             "go_no_go": go_no_go,
             "avg_max_return_5m": _avg([item.get("max_return_5m") for item in items]),
             "avg_max_return_10m": _avg([item.get("max_return_10m") for item in items]),
             "avg_max_return_20m": _avg([item.get("max_return_20m") for item in items]),
             "avg_max_drawdown_20m": _avg([item.get("max_drawdown_20m") for item in items]),
+            "max_drawdown_pct": _min_float([item.get("max_drawdown_20m") for item in items] + [item.get("max_drawdown_pct") for item in items]),
             "take_profit_count": sum(1 for item in items if "TAKE_PROFIT" in item.get("exit_decision_types", [])),
             "support_loss_count": sum(1 for item in items if "SUPPORT_LOSS" in item.get("exit_decision_types", [])),
             "time_exit_count": sum(1 for item in items if "TIME_EXIT" in item.get("exit_decision_types", [])),
@@ -864,14 +911,15 @@ class DryRunPerformanceAnalyzer:
             "live_would_pass_win_rate": _ratio(len(live_pass_wins), len(live_pass_completed)),
             "live_would_reject_but_rallied_count": sum(1 for item in items if item.get("dry_run_false_negative_type") == "LIVE_REJECTED_BUT_RALLIED"),
             "rejected_but_rallied_count": sum(1 for item in items if item.get("dry_run_false_negative_type") in {"DRY_RUN_REJECTED_BUT_RALLIED", "LIVE_REJECTED_BUT_RALLIED"}),
-            "false_positive_count": sum(1 for item in items if item.get("dry_run_false_positive_type")),
-            "false_negative_count": sum(1 for item in items if item.get("dry_run_false_negative_type")),
+            "false_positive_count": false_positive_count,
+            "false_negative_count": false_negative_count,
             "true_positive_count": sum(1 for item in items if item.get("signal_classification") == "true_positive"),
             "true_negative_count": sum(1 for item in items if item.get("signal_classification") == "true_negative"),
             "pending_count": sum(1 for item in items if item.get("signal_classification") in {"pending", "insufficient_data"}),
-            "false_positive_rate": _ratio(sum(1 for item in items if item.get("dry_run_false_positive_type")), len(items)),
-            "false_negative_rate": _ratio(sum(1 for item in items if item.get("dry_run_false_negative_type")), len(items)),
-            "opportunity_loss_count": sum(1 for item in items if item.get("opportunity_loss_type")),
+            "false_positive_rate": _ratio(false_positive_count, len(items)),
+            "false_negative_rate": _ratio(false_negative_count, len(items)),
+            "opportunity_loss_count": opportunity_loss_count,
+            "missed_opportunity_rate": _ratio(opportunity_loss_count, len(items)),
             "cost_adjusted_bad_ready_count": cost_adjusted.get("bad_ready_count", 0),
             "cost_adjusted_bad_ready_rate": cost_adjusted.get("bad_ready_rate"),
             "cost_adjusted_opportunity_loss_count": cost_adjusted.get("opportunity_loss_count", 0),
@@ -1025,6 +1073,8 @@ class DryRunPerformanceAnalyzer:
             "final_status",
             "realized_return_pct",
             "net_return_pct",
+            "fill_adjusted_return_pct",
+            "fill_adjusted_net_return_pct",
             "cost_adjusted_classification",
             "net_bad_ready_type",
             "net_opportunity_type",
@@ -1051,6 +1101,14 @@ class DryRunPerformanceAnalyzer:
             "membership_score_bucket",
             "stock_role",
             "limit_price_hit",
+            "requested_price",
+            "fill_price",
+            "slippage_bps",
+            "fill_ratio",
+            "partial_fill",
+            "simulated_latency_ms",
+            "reject_or_skip_reason",
+            "stale_tick",
             "partial_fill_risk",
             "spread_risk",
             "liquidity_bucket",
@@ -1082,6 +1140,8 @@ class DryRunPerformanceAnalyzer:
             f"- Completed lifecycles: {summary.get('completed_lifecycle_count', 0)}",
             f"- Win rate: {_pct(summary.get('win_rate'))}",
             f"- Avg realized return: {_num(summary.get('avg_realized_return_pct'))}",
+            f"- Profit factor: {summary.get('profit_factor') if summary.get('profit_factor') is not None else '-'}",
+            f"- Expectancy: {_num(summary.get('expectancy_pct'))}",
             f"- Net expectancy: {_num(summary.get('net_expectancy'))}",
             f"- Net win rate: {_pct(summary.get('net_win_rate'))}",
             f"- Review-only: {bool(report.get('review_only', True))}",
@@ -1093,6 +1153,9 @@ class DryRunPerformanceAnalyzer:
             *_markdown_cost_assumption_lines(summary.get("primary_cost_assumption", {})),
             "### Scenario Expectancy",
             *_markdown_cost_scenario_lines(summary.get("cost_scenario_expectancy", [])),
+            "",
+            "## Fill Simulation",
+            *_markdown_fill_quality_lines(summary.get("fill_quality", {})),
             "",
             "## Execution Realism",
             *_markdown_execution_realism_lines(summary.get("execution_realism", {})),
@@ -1891,6 +1954,22 @@ def _gross_return_pct(lifecycle: DryRunTradeLifecycle, *, entry_price_override: 
     return _optional_float(lifecycle.realized_return_pct)
 
 
+def _fill_adjusted_return_pct(lifecycle: DryRunTradeLifecycle) -> Optional[float]:
+    fill_price = _first_float(lifecycle.fill_price)
+    exit_price = _first_float(lifecycle.exit_price)
+    fill_ratio = _first_float(lifecycle.fill_ratio)
+    if not fill_price or fill_price <= 0 or not exit_price or fill_ratio is None or fill_ratio <= 0:
+        return None
+    return round(((exit_price / fill_price) - 1.0) * 100.0, 4)
+
+
+def _fill_adjusted_net_return_pct(lifecycle: DryRunTradeLifecycle, config: DryRunPerformanceConfig) -> Optional[float]:
+    gross = _fill_adjusted_return_pct(lifecycle)
+    if gross is None:
+        return None
+    return round(gross - _round_trip_cost_pct(config, 0.0), 4)
+
+
 def _round_trip_cost_pct(config: DryRunPerformanceConfig, slippage_bp: float) -> float:
     total_bp = (float(config.commission_bp_per_side) * 2.0) + float(config.sell_tax_bp) + (float(slippage_bp) * 2.0)
     return total_bp / 100.0
@@ -2053,6 +2132,24 @@ def _execution_realism_summary(items: list[dict], config: DryRunPerformanceConfi
         "by_partial_fill_risk": _top_counts((item.get("partial_fill_risk") for item in items), key="risk"),
         "by_spread_risk": _top_counts((item.get("spread_risk") for item in items), key="risk"),
     }
+
+
+def _fill_quality_summary(items: list[dict]) -> dict[str, Any]:
+    summary = summarize_fill_simulations(
+        item.get("fill_simulation") or {}
+        for item in items
+        if item.get("fill_simulation")
+    )
+    fill_net_values = [_optional_float(item.get("fill_adjusted_net_return_pct")) for item in items]
+    fill_net_values = [value for value in fill_net_values if value is not None]
+    summary.update(
+        {
+            "fill_adjusted_expectancy_pct": _avg(fill_net_values),
+            "fill_adjusted_profit_factor": _profit_factor(fill_net_values),
+            "fill_adjusted_win_rate": _ratio(sum(1 for value in fill_net_values if value > 0.0), len(fill_net_values)),
+        }
+    )
+    return summary
 
 
 def _aggregate_cost_scenarios(items: list[dict]) -> list[dict[str, Any]]:
@@ -2703,6 +2800,26 @@ def _avg(values: Iterable[Any]) -> Optional[float]:
     return round(sum(parsed) / len(parsed), 4)
 
 
+def _min_float(values: Iterable[Any]) -> Optional[float]:
+    parsed = [_optional_float(value) for value in values]
+    parsed = [value for value in parsed if value is not None]
+    if not parsed:
+        return None
+    return round(min(parsed), 4)
+
+
+def _profit_factor(values: Iterable[Any]) -> Optional[float]:
+    parsed = [_optional_float(value) for value in values]
+    parsed = [value for value in parsed if value is not None]
+    if not parsed:
+        return None
+    gross_profit = sum(value for value in parsed if value > 0.0)
+    gross_loss = abs(sum(value for value in parsed if value < 0.0))
+    if gross_loss == 0.0:
+        return None if gross_profit == 0.0 else round(gross_profit, 4)
+    return round(gross_profit / gross_loss, 4)
+
+
 def _ratio(numerator: int, denominator: int) -> Optional[float]:
     if denominator <= 0:
         return None
@@ -2806,6 +2923,22 @@ def _markdown_cost_scenario_lines(rows: list[dict]) -> list[str]:
             win=_pct(row.get("net_win_rate")),
         )
         for row in rows[:20]
+    ]
+
+
+def _markdown_fill_quality_lines(fill_quality: dict) -> list[str]:
+    if not fill_quality:
+        return ["- no fill simulation data"]
+    return [
+        f"- samples: {fill_quality.get('sample_count', 0)}",
+        f"- filled: {fill_quality.get('filled_count', 0)} ({_pct(fill_quality.get('filled_rate'))})",
+        f"- skipped: {fill_quality.get('skipped_count', 0)} ({_pct(fill_quality.get('skipped_rate'))})",
+        f"- partial_fill_rate: {_pct(fill_quality.get('partial_fill_rate'))}",
+        f"- stale_tick_rate: {_pct(fill_quality.get('stale_tick_rate'))}",
+        f"- avg_slippage_bps: {fill_quality.get('avg_slippage_bps')}",
+        f"- median_slippage_bps: {fill_quality.get('median_slippage_bps')}",
+        f"- fill_adjusted_expectancy: {_num(fill_quality.get('fill_adjusted_expectancy_pct'))}",
+        f"- fill_adjusted_profit_factor: {fill_quality.get('fill_adjusted_profit_factor') if fill_quality.get('fill_adjusted_profit_factor') is not None else '-'}",
     ]
 
 
