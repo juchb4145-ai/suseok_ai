@@ -41,6 +41,11 @@ from trading.strategy.readiness import build_readiness_report, dedupe_warnings
 from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.reboot_v2 import RebootV2RuntimeProfile, reboot_v2_runtime_profile
 from trading.strategy.reboot_v2_runtime import RebootV2Runtime
+from trading.strategy.strategy_baseline import (
+    StrategyBaselineRuntimeConfig,
+    StrategyBaselineService,
+    build_strategy_baseline_snapshot,
+)
 from trading.strategy.subscription_lifecycle import RealtimeSubscriptionLifecycleTracker
 from trading.strategy.subscription_readiness import RealtimeSubscriptionReadinessProvider
 from trading.strategy.setup_runtime import SetupRouterV3RuntimePipeline
@@ -101,6 +106,7 @@ class CoreRuntimeBundle:
     position_risk_pipeline: Any = None
     order_manager_pipeline: Any = None
     subscription_lifecycle_tracker: Any = None
+    strategy_baseline_service: Any = None
 
 
 def build_core_strategy_runtime(
@@ -471,6 +477,27 @@ def build_reboot_v2_runtime_bundle(
         market_data=market_data,
         config=OrderManagerConfig.from_env(),
     )
+    market_data_service_config = getattr(getattr(market_data_bridge, "service", None), "config", None)
+    baseline_service = StrategyBaselineService(
+        db=db,
+        runtime_profile=profile.value,
+        config=StrategyBaselineRuntimeConfig.from_env(),
+        config_snapshot_provider=lambda: build_strategy_baseline_snapshot(
+            runtime_profile=profile.value,
+            runtime_config=config,
+            runtime_settings=runtime_settings,
+            setup_router_config=setup_router_v3_pipeline.config,
+            entry_engine_config=entry_engine_config,
+            market_regime_config=market_regime_config,
+            theme_core_v3_config=theme_core_v3_config,
+            market_data_config=market_data_service_config,
+            position_risk_config=position_risk_config,
+            exit_engine_config=exit_engine_config,
+            order_manager_config=order_manager_pipeline.config,
+            core_settings=settings,
+        ),
+    )
+    setup_router_v3_pipeline.baseline_section_provider = lambda: baseline_service.last_result
     expansion_lease_manager = ExpansionLeaseManager()
     runtime = RebootV2Runtime(
         db=db,
@@ -496,6 +523,7 @@ def build_reboot_v2_runtime_bundle(
         position_risk_pipeline=position_risk_pipeline,
         order_manager_pipeline=order_manager_pipeline,
         expansion_lease_manager=expansion_lease_manager,
+        strategy_baseline_service=baseline_service,
     )
     readiness_report = build_readiness_report(
         db,
@@ -532,6 +560,7 @@ def build_reboot_v2_runtime_bundle(
         position_risk_pipeline=position_risk_pipeline,
         order_manager_pipeline=order_manager_pipeline,
         subscription_lifecycle_tracker=subscription_lifecycle_tracker,
+        strategy_baseline_service=baseline_service,
     )
 
 

@@ -24,6 +24,7 @@ from trading.strategy.setup_router_v3 import (
     SetupRouterConfig,
     SetupRouterV3,
 )
+from trading.strategy.strategy_baseline import apply_baseline_metadata_to_observations
 
 
 @dataclass
@@ -37,6 +38,7 @@ class SetupRouterV3RuntimePipeline:
     latest_entry_decision_provider: Any | None = None
     candidate_code_provider: Any | None = None
     subscription_readiness_provider: Any | None = None
+    baseline_section_provider: Any | None = None
     clock: Any = datetime.now
 
     def __post_init__(self) -> None:
@@ -58,6 +60,16 @@ class SetupRouterV3RuntimePipeline:
         self.last_summary: dict[str, Any] = _base_summary(enabled=bool(self.config.enabled), status="IDLE" if self.config.enabled else "DISABLED")
         self._last_feature_signature: dict[str, tuple[Any, ...]] = {}
         self._last_entry_signature_by_code: dict[str, tuple[Any, ...]] = {}
+
+    def _baseline_section(self) -> dict[str, Any]:
+        provider = self.baseline_section_provider
+        if provider is None:
+            return {}
+        try:
+            value = provider() if callable(provider) else provider
+        except Exception:
+            return {}
+        return dict(value or {})
 
     def run_if_due(self, now: datetime | None = None, **_: Any) -> dict[str, Any]:
         current = (now or self.clock()).replace(microsecond=0)
@@ -354,6 +366,7 @@ class SetupRouterV3RuntimePipeline:
                 signature = self._feature_signature(feature, states)
                 self._last_feature_signature[candidate_instance_id] = signature
                 result = [item.to_dict() for item in self.router.classify(feature)]
+                result = apply_baseline_metadata_to_observations(result, self._baseline_section())
                 evaluated_count += 1
                 shape_evaluated_candidate_count += 1
                 success_runtime_update = self._runtime_update(
@@ -1629,6 +1642,11 @@ def _dashboard_observations(observations: list[dict[str, Any]]) -> list[dict[str
             "router_version": item.get("router_version", SETUP_ROUTER_VERSION),
             "last_material_change_at": item.get("last_material_change_at", ""),
             "observe_only": True,
+            "baseline_role": item.get("baseline_role", ""),
+            "baseline_id": item.get("baseline_id", ""),
+            "baseline_version": item.get("baseline_version", ""),
+            "baseline_config_hash": item.get("baseline_config_hash", ""),
+            "baseline_frozen": bool(item.get("baseline_frozen", False)),
         }
         for item in rows[:50]
     ]

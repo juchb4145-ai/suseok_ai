@@ -32,6 +32,8 @@ This script sets `STRATEGY_RUNTIME_PROFILE=THEME_CORE_V3`, enables Dashboard V2 
 $env:STRATEGY_RUNTIME_PROFILE="LEGACY"
 ```
 
+Strategy baseline freeze details: [docs/strategy_baseline_freeze_v1.md](docs/strategy_baseline_freeze_v1.md).
+
 주요 Core 환경변수:
 
 - `TRADING_CORE_TOKEN`: local Gateway/Core token.

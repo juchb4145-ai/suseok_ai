@@ -60,6 +60,7 @@ class RebootV2Runtime:
     exit_engine_reboot_pipeline: Any = None
     position_risk_pipeline: Any = None
     order_manager_pipeline: Any = None
+    strategy_baseline_service: Any = None
     clock: Any = datetime.now
     startup_warnings: list[str] = field(default_factory=list)
     readiness_report: Any = None
@@ -80,12 +81,14 @@ class RebootV2Runtime:
         self._intraday_discovery_recovery_key = ""
         self._intraday_discovery_recovery_run_count = 0
         self._intraday_discovery_last_recovery: dict[str, Any] = {}
+        self._baseline_cycle_count = 0
 
     def start(self, now: datetime | None = None) -> dict[str, Any]:
         current = (now or self.clock()).replace(microsecond=0)
         self.started = True
         self.started_at = current.isoformat()
         snapshot = self._base_snapshot(current, status="WARMUP")
+        self._attach_strategy_baseline(snapshot, current, runtime_cycle_count=0)
         snapshot["blocking_reason"] = "WAITING_FOR_FIRST_RUNTIME_CYCLE"
         snapshot["next_required_action"] = "RUN_RUNTIME_CYCLE"
         self.last_snapshot = snapshot
@@ -106,8 +109,10 @@ class RebootV2Runtime:
         if not self.started:
             self.started = True
             self.started_at = current.isoformat()
+        baseline_cycle_count = self._baseline_cycle_count + 1
         snapshot = self._base_snapshot(current, status="WARMUP")
         snapshot["steps"] = []
+        self._attach_strategy_baseline(snapshot, current, runtime_cycle_count=baseline_cycle_count)
 
         self._recover_hydration(snapshot)
         self._recover_intraday_discovery(snapshot, current)
@@ -167,6 +172,7 @@ class RebootV2Runtime:
         }
         snapshot["status"] = self._overall_status(snapshot)
         snapshot["cycle_duration_ms"] = int(round((perf_counter() - started) * 1000))
+        self._baseline_cycle_count = baseline_cycle_count
         self.last_snapshot = snapshot
         return dict(snapshot)
 
@@ -615,6 +621,42 @@ class RebootV2Runtime:
         except Exception as exc:
             snapshot[name] = {"enabled": True, "status": "ERROR", "blocking_reason": str(exc), "next_required_action": "CHECK_RUNTIME_LOG"}
             snapshot.setdefault("warnings", []).append(f"{name.upper()}_FAILED:{exc}")
+
+    def _attach_strategy_baseline(self, snapshot: dict[str, Any], now: datetime, *, runtime_cycle_count: int) -> None:
+        service = self.strategy_baseline_service
+        if service is None:
+            snapshot["strategy_baseline"] = {
+                "enabled": False,
+                "status": "DISABLED",
+                "drift_status": "UNKNOWN",
+                "order_intent_allowed": False,
+                "live_order_allowed": False,
+                "checked_at": now.isoformat(),
+            }
+            return
+        checker = getattr(service, "check", None)
+        if not callable(checker):
+            snapshot["strategy_baseline"] = {
+                "enabled": False,
+                "status": "DISABLED",
+                "drift_status": "UNKNOWN",
+                "order_intent_allowed": False,
+                "live_order_allowed": False,
+                "checked_at": now.isoformat(),
+            }
+            return
+        section = dict(
+            checker(
+                now=now,
+                runtime_started_at=self.started_at,
+                runtime_cycle_count=runtime_cycle_count,
+            )
+            or {}
+        )
+        snapshot["strategy_baseline"] = section
+        for warning in list(section.get("warning_codes") or []):
+            if warning not in snapshot.setdefault("warnings", []):
+                snapshot["warnings"].append(warning)
 
     def _attach_counts(self, snapshot: dict[str, Any], now: datetime) -> None:
         candidates = list(self.db.list_candidates(trade_date=now.date().isoformat()) or [])

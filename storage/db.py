@@ -1039,6 +1039,42 @@ class TradingDatabase:
                 ON entry_decision_checks(entry_decision_id, id);
             CREATE INDEX IF NOT EXISTS idx_entry_decision_checks_trade_status
                 ON entry_decision_checks(trade_date, check_name, check_status, id);
+            CREATE TABLE IF NOT EXISTS strategy_baseline_definitions (
+                baseline_id TEXT NOT NULL,
+                baseline_version TEXT NOT NULL,
+                schema_version TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                champion_setup TEXT NOT NULL DEFAULT '',
+                challenger_setups_json TEXT NOT NULL DEFAULT '[]',
+                canonical_config_json TEXT NOT NULL DEFAULT '{}',
+                config_hash TEXT NOT NULL DEFAULT '',
+                git_sha TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY(baseline_id, baseline_version)
+            );
+            CREATE TABLE IF NOT EXISTS strategy_baseline_sessions (
+                session_id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL DEFAULT '',
+                runtime_started_at TEXT NOT NULL DEFAULT '',
+                runtime_profile TEXT NOT NULL DEFAULT '',
+                baseline_id TEXT NOT NULL DEFAULT '',
+                baseline_version TEXT NOT NULL DEFAULT '',
+                config_hash TEXT NOT NULL DEFAULT '',
+                git_sha TEXT NOT NULL DEFAULT '',
+                operation_mode TEXT NOT NULL DEFAULT '',
+                drift_status TEXT NOT NULL DEFAULT '',
+                drift_paths_json TEXT NOT NULL DEFAULT '[]',
+                last_checked_at TEXT NOT NULL DEFAULT '',
+                runtime_cycle_count INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_strategy_baseline_sessions_trade
+                ON strategy_baseline_sessions(trade_date, baseline_id, baseline_version);
+            CREATE INDEX IF NOT EXISTS idx_strategy_baseline_sessions_drift
+                ON strategy_baseline_sessions(drift_status, last_checked_at);
             CREATE TABLE IF NOT EXISTS setup_router_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -15608,6 +15644,111 @@ class TradingDatabase:
         row = self.conn.execute("SELECT * FROM trade_reviews WHERE id = ?", (trade_review_id,)).fetchone()
         return self._row_to_trade_review(row) if row else None
 
+    def load_strategy_baseline_definition(self, baseline_id: str, baseline_version: str) -> Optional[dict]:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM strategy_baseline_definitions
+            WHERE baseline_id = ? AND baseline_version = ?
+            """,
+            (str(baseline_id or ""), str(baseline_version or "")),
+        ).fetchone()
+        return _row_to_strategy_baseline_definition(row) if row else None
+
+    def save_strategy_baseline_definition(self, payload: dict) -> dict:
+        baseline_id = str(payload.get("baseline_id") or "")
+        baseline_version = str(payload.get("baseline_version") or "")
+        canonical_config = payload.get("config_snapshot") or payload.get("canonical_config") or {}
+        config_hash = str(payload.get("config_hash") or "")
+        with self._write_scope():
+            existing = self.load_strategy_baseline_definition(baseline_id, baseline_version)
+            if existing:
+                status = "EXISTS" if str(existing.get("config_hash") or "") == config_hash else "CONFLICT"
+                return {"status": status, "inserted": False, "definition": existing}
+            self.conn.execute(
+                """
+                INSERT INTO strategy_baseline_definitions(
+                    baseline_id, baseline_version, schema_version, status,
+                    champion_setup, challenger_setups_json, canonical_config_json,
+                    config_hash, git_sha, created_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    baseline_id,
+                    baseline_version,
+                    str(payload.get("schema_version") or ""),
+                    str(payload.get("baseline_status") or payload.get("status") or ""),
+                    str(payload.get("champion_setup") or ""),
+                    _json_list(payload.get("challenger_setups") or []),
+                    _json_payload(canonical_config),
+                    config_hash,
+                    str(payload.get("git_sha") or ""),
+                    str(payload.get("created_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                    _json_payload(payload),
+                ),
+            )
+            definition = self.load_strategy_baseline_definition(baseline_id, baseline_version) or {}
+            return {"status": "INSERTED", "inserted": True, "definition": definition}
+
+    def upsert_strategy_baseline_session(self, payload: dict) -> dict:
+        session_id = str(payload.get("session_id") or "")
+        with self._write_scope():
+            self.conn.execute(
+                """
+                INSERT INTO strategy_baseline_sessions(
+                    session_id, trade_date, runtime_started_at, runtime_profile,
+                    baseline_id, baseline_version, config_hash, git_sha, operation_mode,
+                    drift_status, drift_paths_json, last_checked_at, runtime_cycle_count,
+                    payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    drift_status=excluded.drift_status,
+                    drift_paths_json=excluded.drift_paths_json,
+                    last_checked_at=excluded.last_checked_at,
+                    runtime_cycle_count=excluded.runtime_cycle_count,
+                    payload_json=excluded.payload_json,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    session_id,
+                    str(payload.get("trade_date") or ""),
+                    str(payload.get("runtime_started_at") or ""),
+                    str(payload.get("runtime_profile") or ""),
+                    str(payload.get("baseline_id") or ""),
+                    str(payload.get("baseline_version") or ""),
+                    str(payload.get("config_hash") or ""),
+                    str(payload.get("git_sha") or ""),
+                    str(payload.get("operation_mode") or ""),
+                    str(payload.get("drift_status") or ""),
+                    _json_list(payload.get("drift_paths") or []),
+                    str(payload.get("last_checked_at") or ""),
+                    _safe_int(payload.get("runtime_cycle_count"), 0),
+                    _json_payload(payload.get("payload") or payload),
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM strategy_baseline_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return _row_to_strategy_baseline_session(row)
+
+    def load_strategy_baseline_session(self, session_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM strategy_baseline_sessions WHERE session_id = ?",
+            (str(session_id or ""),),
+        ).fetchone()
+        return _row_to_strategy_baseline_session(row) if row else None
+
+    def list_strategy_baseline_sessions(self, *, trade_date: Optional[str] = None, limit: int = 100) -> list[dict]:
+        query = "SELECT * FROM strategy_baseline_sessions"
+        params: list[object] = []
+        if trade_date:
+            query += " WHERE trade_date = ?"
+            params.append(str(trade_date))
+        query += " ORDER BY last_checked_at DESC, created_at DESC LIMIT ?"
+        params.append(max(1, int(limit or 100)))
+        return [_row_to_strategy_baseline_session(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
     def load_strategy_runtime_setting(self, config_key: str) -> Optional[dict]:
         row = self.conn.execute(
             "SELECT * FROM strategy_runtime_settings WHERE config_key = ?",
@@ -21091,6 +21232,30 @@ def _json_payload(value: object) -> str:
     if value is None:
         value = {}
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _row_to_strategy_baseline_definition(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["challenger_setups"] = _safe_json_loads(data.pop("challenger_setups_json", "[]"), [])
+    data["config_snapshot"] = _safe_json_loads(data.pop("canonical_config_json", "{}"), {})
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if isinstance(payload, dict):
+        payload.update(data)
+        payload.setdefault("challenger_setups", data["challenger_setups"])
+        payload.setdefault("config_snapshot", data["config_snapshot"])
+        return payload
+    return data
+
+
+def _row_to_strategy_baseline_session(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["drift_paths"] = _safe_json_loads(data.pop("drift_paths_json", "[]"), [])
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if isinstance(payload, dict):
+        payload.update(data)
+        payload.setdefault("drift_paths", data["drift_paths"])
+        return payload
+    return data
 
 
 def _setup_readiness_fingerprint(payload: Mapping[str, object]) -> str:

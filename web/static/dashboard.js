@@ -1105,6 +1105,7 @@ function renderDashboardV2(snapshot) {
   const positionRisk = payload.position_risk || { positions: [] };
   const orderManager = payload.order_manager || {};
   const marketRsShadow = payload.market_relative_strength_shadow || {};
+  const strategyBaseline = payload.strategy_baseline || (health.strategy_baseline || {});
   const preMarket = payload.pre_market_check || {};
   const reasons = payload.wait_block_reasons || { items: [] };
   const health = payload.system_health || {};
@@ -1178,6 +1179,10 @@ function renderDashboardV2(snapshot) {
   text("dashboard-v2-health-queue", health.command_queue_depth || 0);
   text("dashboard-v2-health-transport", health.transport_status || "-");
   text("dashboard-v2-health-exception", health.last_exception || "-");
+  text("dashboard-v2-baseline-name", strategyBaseline.champion_setup ? `${strategyBaseline.champion_setup} ${strategyBaseline.version || ""}`.trim() : "-");
+  text("dashboard-v2-baseline-status", `${strategyBaseline.status || "-"} / ${strategyBaseline.drift_status || "-"}`);
+  text("dashboard-v2-baseline-hash", strategyBaseline.config_hash_short || "-");
+  text("dashboard-v2-baseline-git", strategyBaseline.git_sha_short || "-");
 }
 
 function renderDashboardV2Banners(rows) {
@@ -1320,7 +1325,7 @@ function renderDashboardV2SetupRouter(payload = {}) {
       <tr>
         <td>${textCell(`${item.code || "-"} ${item.name || ""}`.trim())}</td>
         <td>${textCell(item.theme_name || "-")}</td>
-        <td>${badge(item.setup_type || "-")}${item.primary_setup ? badge("PRIMARY", "observe") : ""}${badge(`G${item.setup_generation || 1}`, "observe")}</td>
+        <td>${badge(item.setup_type || "-")}${item.baseline_role ? badge(item.baseline_role, item.baseline_role === "CHAMPION" ? "ok" : "observe") : ""}${item.primary_setup ? badge("PRIMARY", "observe") : ""}${badge(`G${item.setup_generation || 1}`, "observe")}</td>
         <td>${textCell(`${item.shape_status || "-"} / ${item.lifecycle_state || "-"} / ${item.context_status || "-"}`)}</td>
         <td>${textCell(`${item.entry_alignment_status || "-"}${item.entry_decision_age_sec !== undefined ? ` · ${fmtOptionalNumber(item.entry_decision_age_sec, 0)}s` : ""}`)}</td>
         <td>${textCell(`${reason}${priceHint ? ` · ${priceHint}` : ""}`)}</td>

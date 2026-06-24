@@ -44,6 +44,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
     order_manager = _prefer_runtime_section(base.get("order_manager"), runtime.get("order_manager"))
     market_rs_shadow = _prefer_runtime_section(base.get("market_relative_strength_shadow"), runtime.get("market_relative_strength_shadow"))
     market_rs_outcomes = _prefer_runtime_section(base.get("market_relative_strength_outcomes"), runtime.get("market_relative_strength_outcomes"))
+    strategy_baseline = _strategy_baseline(_prefer_runtime_section(base.get("strategy_baseline"), runtime.get("strategy_baseline")))
     candidates = dict(base.get("candidates") or {})
 
     payload = {
@@ -64,6 +65,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
         "exit_watch": _exit_watch(exit_engine),
         "order_manager": _order_manager(order_manager, gateway, commands),
         "market_relative_strength_shadow": _market_relative_strength_shadow(market_rs_shadow, market_rs_outcomes),
+        "strategy_baseline": strategy_baseline,
         "pre_market_check": _pre_market_check(base),
         "wait_block_reasons": _wait_block_reasons(base, runtime),
         "system_health": _system_health(base, runtime, gateway, commands),
@@ -92,6 +94,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
             "order_manager": order_manager,
             "market_relative_strength_shadow": market_rs_shadow,
             "market_relative_strength_outcomes": market_rs_outcomes,
+            "strategy_baseline": strategy_baseline,
         }
     return payload
 
@@ -443,6 +446,11 @@ def _setup_router_v3_summary(section: dict[str, Any]) -> dict[str, Any]:
                 "exact_theme_lease_active": bool(item.get("exact_theme_lease_active", False)),
                 "latest_tick_age_sec": _num(item.get("latest_tick_age_sec")),
                 "informational_reason_codes": list(item.get("informational_reason_codes") or []),
+                "baseline_role": item.get("baseline_role", ""),
+                "baseline_id": item.get("baseline_id", ""),
+                "baseline_version": item.get("baseline_version", ""),
+                "baseline_config_hash": item.get("baseline_config_hash", ""),
+                "baseline_frozen": bool(item.get("baseline_frozen", False)),
             }
         )
     return {
@@ -804,6 +812,7 @@ def _system_health(base: dict[str, Any], runtime: dict[str, Any], gateway: dict[
     themes = _prefer_runtime_section(base.get("theme_board"), runtime.get("theme_board"))
     entry = _prefer_runtime_section(base.get("entry_engine"), runtime.get("entry_engine"))
     exit_engine = _prefer_runtime_section(base.get("exit_engine"), runtime.get("exit_engine"))
+    strategy_baseline = _strategy_baseline(_prefer_runtime_section(base.get("strategy_baseline"), runtime.get("strategy_baseline")))
     return {
         "summary_status": "정상" if bool(gateway.get("heartbeat_ok")) and not runtime.get("last_error") else "점검",
         "gateway_heartbeat": {
@@ -830,8 +839,44 @@ def _system_health(base: dict[str, Any], runtime: dict[str, Any], gateway: dict[
         "latest_market_regime_at": market.get("calculated_at", ""),
         "latest_entry_engine_at": entry.get("calculated_at", ""),
         "latest_exit_engine_at": exit_engine.get("calculated_at", ""),
+        "strategy_baseline": strategy_baseline,
         "collapsed_by_default": True,
     }
+
+
+def _strategy_baseline(section: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(section or {})
+    challengers = list(payload.get("challenger_setups") or [])
+    return {
+        "enabled": bool(payload.get("enabled")),
+        "status": payload.get("status", "DISABLED"),
+        "baseline_id": payload.get("baseline_id", ""),
+        "version": payload.get("version") or payload.get("baseline_version") or "",
+        "champion_setup": payload.get("champion_setup", ""),
+        "challenger_setups": challengers,
+        "challenger_count": int(payload.get("challenger_count") or len(challengers)),
+        "config_hash_short": payload.get("config_hash_short") or str(payload.get("config_hash") or "")[:12],
+        "git_sha_short": payload.get("git_sha_short") or str(payload.get("git_sha") or "")[:8],
+        "drift_status": payload.get("drift_status", "UNKNOWN"),
+        "config_snapshot_completeness": payload.get("config_snapshot_completeness", ""),
+        "order_intent_allowed": bool(payload.get("order_intent_allowed")),
+        "live_order_allowed": bool(payload.get("live_order_allowed")),
+        "checked_at": payload.get("checked_at", ""),
+        "operator_message_ko": _strategy_baseline_message(payload),
+    }
+
+
+def _strategy_baseline_message(payload: dict[str, Any]) -> str:
+    drift = str(payload.get("drift_status") or "UNKNOWN")
+    if drift == "DRIFT_DETECTED":
+        return "전략 기준선 변경 감지: 성과 표본 제외 검토 필요"
+    if drift == "PARTIAL":
+        return "전략 기준선 일부 설정 미확인: 성과 표본 검토 필요"
+    if drift == "CLEAN":
+        return "전략 기준선 고정 상태"
+    if not bool(payload.get("enabled")):
+        return "전략 기준선 비활성"
+    return "전략 기준선 상태 확인 필요"
 
 
 def _safety_banners(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -889,6 +934,23 @@ def _safety_banners(payload: dict[str, Any]) -> list[dict[str, Any]]:
         banners.append({"severity": "warning", "message_ko": "Gateway heartbeat 지연: 데이터 신선도 점검", "reason_code": "GATEWAY_HEARTBEAT_STALE"})
     if not order.get("order_manager_enabled"):
         banners.append({"severity": "info", "message_ko": "OrderManager 비활성: 관찰 전용", "reason_code": "ORDER_MANAGER_DISABLED"})
+    baseline = dict(payload.get("strategy_baseline") or {})
+    if str(baseline.get("drift_status") or "") == "DRIFT_DETECTED":
+        banners.append(
+            {
+                "severity": "warning",
+                "message_ko": "전략 기준선 변경 감지: 성과 표본 제외 검토 필요",
+                "reason_code": "STRATEGY_BASELINE_DRIFT_DETECTED",
+            }
+        )
+    elif str(baseline.get("drift_status") or "") == "PARTIAL":
+        banners.append(
+            {
+                "severity": "info",
+                "message_ko": "전략 기준선 일부 설정 미확인",
+                "reason_code": "STRATEGY_BASELINE_PARTIAL_SNAPSHOT",
+            }
+        )
     return banners
 
 
