@@ -215,7 +215,7 @@ class OpportunityBenchmarkService:
                 as_of=current,
                 baseline=baseline,
                 runtime_snapshot=runtime_snapshot,
-                persist=True,
+                persist=False,
             )
             return _runtime_section(report)
         except Exception as exc:
@@ -1514,11 +1514,11 @@ def _is_int(value: Any) -> bool:
 
 def _as_datetime(value: Any) -> datetime | None:
     if isinstance(value, datetime):
-        return value.replace(microsecond=0)
+        return value.replace(tzinfo=None, microsecond=0)
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(microsecond=0)
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None, microsecond=0)
     except Exception:
         return None
 

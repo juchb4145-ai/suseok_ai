@@ -69,6 +69,22 @@ def test_read_model_normalizes_disabled_order_manager_warning_in_observe_mode(tm
     assert "ORDER_MANAGER_DISABLED" not in reasons
 
 
+def test_read_model_uses_gateway_heartbeat_transport_mode(tmp_path):
+    clock = _Clock()
+    service = _service(tmp_path, clock)
+    runtime = _runtime_snapshot()
+    runtime.pop("transport", None)
+
+    payload = service.build_from_runtime(
+        runtime,
+        {"heartbeat_ok": True, "last_heartbeat_payload": {"transport_mode": "rest_long_poll"}},
+        {"queued_count": 0},
+        {"running": True, "cycle_count": 1, "last_cycle_at": "2026-06-18T00:00:00+00:00"},
+    )
+
+    assert payload["system_health"]["transport_status"] == "rest_long_poll"
+
+
 def test_writer_coalesces_many_dirty_signals_within_one_second(tmp_path):
     clock = _Clock()
     service = _service(tmp_path, clock)

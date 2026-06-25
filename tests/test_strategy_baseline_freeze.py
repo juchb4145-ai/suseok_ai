@@ -9,6 +9,7 @@ from trading.strategy.realtime import RealTimeSubscriptionManager
 from trading.strategy.reboot_v2 import RebootV2RuntimeProfile
 from trading.strategy.reboot_v2_runtime import RebootV2Runtime
 from trading.strategy.runtime import StrategyRuntimeConfig
+from trading.strategy.runtime_settings import LEGACY_DEFAULT_SETTINGS, StrategyRuntimeSettings
 from trading.strategy.strategy_baseline import (
     GitInfo,
     StrategyBaselineRuntimeConfig,
@@ -195,6 +196,16 @@ def test_strategy_baseline_builder_marks_missing_registry_paths_partial():
     assert snapshot["setup_router_v3"]["leader_pullback_min_pct"] == 0.7
     assert "entry_engine" in missing
     assert "market_regime" in missing
+
+
+def test_strategy_baseline_runtime_settings_allowlist_matches_defaults():
+    snapshot, missing = build_strategy_baseline_snapshot(
+        runtime_profile="THEME_CORE_V3",
+        runtime_settings=StrategyRuntimeSettings.from_settings_json(LEGACY_DEFAULT_SETTINGS),
+    )
+
+    assert snapshot["runtime_settings"]["settings"]["live_sim_exit_guard"]["enabled"] is True
+    assert not any(path.startswith("runtime_settings.") for path in missing)
 
 
 def _baseline_service(db, snapshot, missing=None):

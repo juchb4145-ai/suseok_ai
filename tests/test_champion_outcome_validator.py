@@ -126,6 +126,23 @@ def test_same_bar_ambiguity_is_labeled(tmp_path):
     assert report["valid_observe_metrics"]["ambiguous_count"] == 1
 
 
+def test_runtime_section_builds_live_preview_without_persisted_report(tmp_path):
+    db = TradingDatabase(str(tmp_path / "runtime-live-preview.db"))
+    _seed_linked_champion(db)
+
+    section = ChampionOutcomeValidatorService(db, config=_config()).runtime_section(
+        trade_date=TRADE_DATE,
+        as_of="2026-06-22T09:20:00",
+        baseline=_baseline(),
+    )
+
+    assert section["status"] == "OK"
+    assert section["report_id"]
+    assert section["champion_matched_count"] == 1
+    assert section["strict_labeled_signal_count"] == 1
+    assert db.conn.execute("SELECT COUNT(*) FROM champion_outcome_reports").fetchone()[0] == 0
+
+
 def test_cost_model_matches_dry_run_performance_helper():
     dry_config = DryRunPerformanceConfig(commission_bp_per_side=1.5, sell_tax_bp=15.0)
     shared = round_trip_cost_pct(

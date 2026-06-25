@@ -122,7 +122,31 @@ class ChampionOutcomeValidatorService:
         if not self.config.enabled:
             self.last_report = _disabled_runtime_section(current)
             return self.last_report
-        report = self._latest_persisted_report(trade_date_from=trade_date, trade_date_to=trade_date)
+        try:
+            report = self._latest_persisted_report(trade_date_from=trade_date, trade_date_to=trade_date)
+            if not report:
+                report = self.build_report(
+                    trade_date_from=trade_date,
+                    trade_date_to=trade_date,
+                    report_state="LIVE_PREVIEW",
+                    as_of=current,
+                    baseline=baseline,
+                    runtime_snapshot=runtime_snapshot,
+                    persist=False,
+                )
+        except Exception as exc:
+            section = _empty_runtime_section(current)
+            section.update(
+                {
+                    "status": "ERROR",
+                    "error": str(exc),
+                    "warning_codes": ["CHAMPION_OUTCOME_FAILED"],
+                    "baseline_id": (baseline or {}).get("baseline_id", ""),
+                    "checked_at": current.isoformat(),
+                }
+            )
+            self.last_report = section
+            return section
         if not report:
             section = _empty_runtime_section(current)
             section.update({"baseline_id": (baseline or {}).get("baseline_id", ""), "checked_at": current.isoformat()})
@@ -1760,11 +1784,11 @@ def _pct(delta: float, base: float) -> float | None:
 
 def _as_datetime(value: Any) -> datetime | None:
     if isinstance(value, datetime):
-        return value.replace(microsecond=0)
+        return value.replace(tzinfo=None, microsecond=0)
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(microsecond=0)
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None, microsecond=0)
     except Exception:
         return None
 

@@ -98,6 +98,44 @@ def test_outcome_pending_until_horizon_and_uses_only_cutoff_data(tmp_path):
     assert all(item["observed_at"] <= "2026-06-22T09:06:00" for item in complete["observations"])
 
 
+def test_opportunity_benchmark_normalizes_aware_cutoff_for_runtime(tmp_path):
+    db = TradingDatabase(str(tmp_path / "aware-cutoff.db"))
+    _seed_opening_batch(db, "09:00", [_row("000001", 1, price=1000, turnover=10_000_000)])
+
+    report = OpportunityBenchmarkService(db, config=_config(horizons_min=(5,))).build_report(
+        trade_date=TRADE_DATE,
+        as_of="2026-06-22T09:06:00+09:00",
+        source_cutoff_at="2026-06-22T09:06:00+09:00",
+        persist=False,
+    )
+
+    assert report["episode_count"] == 1
+    assert report["source_batch_count"] == 1
+
+
+def test_opportunity_benchmark_runtime_section_is_read_only(tmp_path):
+    db = TradingDatabase(str(tmp_path / "runtime-read-only.db"))
+    _seed_opening_batch(db, "09:00", [_row("000001", 1, price=1000, turnover=10_000_000)])
+    db.conn.execute(
+        """
+        INSERT INTO opportunity_benchmark_batches(
+            benchmark_batch_id, trade_date, observed_at, source_type, source_batch_id
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        ("legacy-id-for-same-source", TRADE_DATE, f"{TRADE_DATE}T09:00:00", "OPENING_OPT10032", "1"),
+    )
+    db.conn.commit()
+
+    section = OpportunityBenchmarkService(db, config=_config(horizons_min=(5,))).runtime_section(
+        trade_date=TRADE_DATE,
+        as_of="2026-06-22T09:06:00+09:00",
+    )
+
+    assert section["status"] == "OK"
+    assert section["episode_count"] == 1
+    assert db.conn.execute("SELECT COUNT(*) FROM opportunity_benchmark_batches").fetchone()[0] == 1
+
+
 def test_opportunity_benchmark_api_rebuild_requires_token_and_filters(monkeypatch, tmp_path):
     db_path = tmp_path / "api.db"
     db = TradingDatabase(str(db_path))

@@ -51,7 +51,6 @@ RUNTIME_SETTINGS_ALLOWLIST = (
     "shadow_small_entry_promotion",
     "shadow_small_entry_ops",
     "live_sim_hybrid_ready_canary",
-    "live_sim_trade_limits",
     "live_sim_exit_guard",
     "live_sim_order_lifecycle",
     "live_sim_reconcile",

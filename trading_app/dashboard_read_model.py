@@ -690,6 +690,11 @@ class DashboardReadModelService:
                     "Reduce-only 검토가 필요합니다.",
                     "BROKER_RECONCILE_REDUCE_ONLY",
                 )
+        if not str(health.get("transport_status") or ""):
+            heartbeat_payload = dict(gateway.get("last_heartbeat_payload") or {})
+            transport_mode = gateway.get("transport_mode") or heartbeat_payload.get("transport_mode")
+            if transport_mode:
+                health["transport_status"] = str(transport_mode)
         health["read_model"] = {
             "generation": dict(payload.get("read_model") or {}).get("generation", 0),
             "age_sec": dict(payload.get("read_model") or {}).get("snapshot_age_sec", 0),
