@@ -13,7 +13,7 @@ python tools/run_tests.py slow
 python tools/run_tests.py full
 ```
 
-- `quick`: 기본 개발/PR 확인용. `slow`, `e2e`로 분류된 테스트를 제외합니다.
+- `quick`: 기본 개발/PR 확인용. 빠른 unit smoke만 실행하고 integration, slow, e2e 성격 테스트는 제외합니다.
 - `unit`: 빠른 단위 테스트만 실행합니다.
 - `integration`: API, runtime, storage, gateway, dashboard 같은 경계를 건드리되 `slow`, `e2e`는 제외합니다.
 - `slow`: wall-clock을 크게 잡아먹는 테스트와 e2e 성격 테스트를 실행합니다.
@@ -51,5 +51,7 @@ python tools/run_tests.py quick --durations 50
 python tools/run_tests.py slow --durations 50
 ```
 
-새로 추가한 테스트가 시간이 많이 걸리면 `tests/conftest.py`의 `SLOW_TEST_FILES`에 추가해서 quick 프로필에서 제외합니다.
-반대로 빠른 테스트가 slow에 잘못 들어갔다면 같은 목록에서 제거하면 됩니다.
+새로 추가한 테스트가 시간이 많이 걸리거나 DB/API/CLI/report/replay 성격이면 `tests/conftest.py`의
+`SLOW_TEST_FILES` 또는 `INTEGRATION_FILE_KEYWORDS`에 추가해서 quick 프로필에서 제외합니다.
+또한 8KB 이상 테스트 파일은 기본적으로 slow로 분류합니다.
+반대로 빠른 테스트가 slow에 잘못 들어갔다면 `FAST_TEST_FILES`에 추가하면 됩니다.

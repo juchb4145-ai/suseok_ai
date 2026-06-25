@@ -7,6 +7,7 @@ import pytest
 
 
 PROFILE_CHOICES = ("quick", "unit", "integration", "slow", "full")
+SLOW_FILE_SIZE_BYTES = 8_000
 
 E2E_TEST_FILES = {
     "test_market_open_live_sim_script.py",
@@ -14,47 +15,97 @@ E2E_TEST_FILES = {
     "test_websocket_real_pilot.py",
 }
 
+FAST_TEST_FILES = set()
+
 SLOW_TEST_FILES = {
+    "test_buy_zero_rca.py",
+    "test_conservative_reason_outcomes.py",
     "test_core_runtime_api.py",
+    "test_dry_run_threshold_ab_api.py",
     "test_dry_run_performance_analyzer.py",
+    "test_dynamic_theme_demo_and_retired_scripts.py",
     "test_exit_decisions.py",
     "test_gateway_transport_ws_endpoint.py",
+    "test_intraday_decision_events.py",
+    "test_intraday_outcomes.py",
     "test_live_sim_canary.py",
     "test_live_sim_order_execution.py",
+    "test_live_sim_preflight.py",
+    "test_market_gate_review.py",
     "test_market_regime.py",
     "test_market_side_confirmation_persistence.py",
     "test_opening_theme_burst_runtime_wiring.py",
+    "test_operator_action_center.py",
+    "test_operator_event_journal.py",
+    "test_order_enqueue_persistent_dedupe.py",
     "test_phase2_acceptance.py",
+    "test_reliability_cli.py",
+    "test_reliability_faults.py",
+    "test_reliability_qualification.py",
     "test_reboot_v2_runtime_cutover.py",
+    "test_replay_tick_buffer.py",
     "test_runtime_gateway_adapters.py",
     "test_runtime_supervisor.py",
+    "test_shadow_small_entry_ops.py",
+    "test_shadow_small_entry_pilot.py",
+    "test_shadow_small_entry_promotion.py",
+    "test_shadow_strategy.py",
+    "test_strategy_change_proposals.py",
     "test_strategy_context_v3.py",
+    "test_strategy_feedback_loop_validation.py",
+    "test_strategy_replay.py",
     "test_theme_backfill.py",
+    "test_theme_benchmark_compare_command.py",
+    "test_theme_benchmark_internal_export.py",
     "test_theme_core_v3_runtime.py",
     "test_theme_lab_flow.py",
     "test_theme_lab_runtime_wiring.py",
+    "test_theme_rotation_api.py",
     "test_themelab_dry_run_bridge.py",
     "test_themelab_web_dashboard.py",
     "test_trade_reviews.py",
+    "test_trading_day_qualification_candidate_funnel.py",
     "test_websocket_real_pilot.py",
 }
 
 INTEGRATION_FILE_KEYWORDS = (
     "_api",
+    "_benchmark",
+    "_cli",
     "_db",
+    "_event",
+    "_export",
     "_gateway",
+    "_journal",
+    "_qualification",
+    "_replay",
+    "_report",
+    "_validation",
     "_runtime",
     "_storage",
     "_websocket",
     "_ws_",
+    "benchmark",
+    "cli",
     "dashboard",
+    "enqueue",
+    "audit",
     "kiwoom",
     "live_sim",
     "market_open",
+    "ops",
+    "operator",
     "phase2",
+    "policy_validation",
     "pre_market",
+    "proposal",
     "postmarket",
+    "qualification",
     "reconcile",
+    "replay",
+    "review",
+    "risk_manager",
+    "shadow_small_entry",
     "themelab",
     "theme_lab",
     "transport",
@@ -74,9 +125,9 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store",
         choices=PROFILE_CHOICES,
         help=(
-            "Select a test profile: quick excludes slow/e2e, unit selects fast unit "
-            "tests, integration selects non-slow integration tests, slow selects "
-            "slow/e2e tests, and full keeps the complete suite."
+            "Select a test profile: quick selects fast unit smoke tests, unit "
+            "selects fast unit tests, integration selects non-slow integration "
+            "tests, slow selects slow/e2e tests, and full keeps the complete suite."
         ),
     )
     group.addoption(
@@ -128,7 +179,7 @@ def _mark_item_by_file(item: pytest.Item) -> None:
         item.add_marker(pytest.mark.e2e)
         item.add_marker(pytest.mark.integration)
         item.add_marker(pytest.mark.slow)
-    elif filename in SLOW_TEST_FILES:
+    elif _is_slow_file(path):
         item.add_marker(pytest.mark.slow)
 
     if filename in SERIAL_TEST_FILES:
@@ -160,7 +211,7 @@ def _select_profile(
 
 def _profile_matches(markers: set[str], profile: str) -> bool:
     if profile == "quick":
-        return "slow" not in markers and "e2e" not in markers
+        return "unit" in markers and "slow" not in markers
     if profile == "unit":
         return "unit" in markers and "slow" not in markers
     if profile == "integration":
@@ -208,6 +259,15 @@ def _parse_shard(shard_value: str) -> tuple[int, int]:
 
 def _is_integration_file(filename: str) -> bool:
     return any(keyword in filename for keyword in INTEGRATION_FILE_KEYWORDS)
+
+
+def _is_slow_file(path: Path) -> bool:
+    filename = path.name
+    if filename in FAST_TEST_FILES:
+        return False
+    if filename in SLOW_TEST_FILES:
+        return True
+    return path.stat().st_size >= SLOW_FILE_SIZE_BYTES
 
 
 def _has_any_marker(item: pytest.Item, marker_names: set[str]) -> bool:

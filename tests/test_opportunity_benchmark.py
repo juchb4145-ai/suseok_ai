@@ -127,6 +127,34 @@ def test_opportunity_benchmark_api_rebuild_requires_token_and_filters(monkeypatc
     assert missing.status_code == 404
 
 
+def test_performance_fixture_5000_observations_500_episodes(tmp_path):
+    db = TradingDatabase(str(tmp_path / "perf.db"))
+    for batch_index in range(50):
+        hour = 9 + ((20 + batch_index) // 60)
+        minute = (20 + batch_index) % 60
+        bucket = f"{hour:02d}:{minute:02d}"
+        base_code = (batch_index % 5) * 100
+        rows = [
+            _row(f"{base_code + rank:06d}", rank, price=1000 + rank, turnover=10_000_000 + batch_index * 100_000 + rank)
+            for rank in range(1, 101)
+        ]
+        _seed_intraday_batch(db, bucket, "MORNING", rows)
+
+    report = OpportunityBenchmarkService(db, config=_config()).build_report(
+        trade_date=TRADE_DATE,
+        as_of="2026-06-22T10:10:00",
+        source_cutoff_at="2026-06-22T10:10:00",
+        persist=True,
+    )
+
+    assert report["source_batch_count"] == 50
+    assert report["observation_count"] == 5000
+    assert report["episode_count"] == 500
+    assert report["build_ms"] < 10_000
+    assert db.conn.execute("SELECT COUNT(*) FROM opportunity_benchmark_observations").fetchone()[0] == 5000
+    assert db.conn.execute("SELECT COUNT(*) FROM opportunity_benchmark_episodes").fetchone()[0] == 500
+
+
 def _config(**overrides):
     data = {
         "enabled": True,
