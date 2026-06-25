@@ -99,21 +99,31 @@ class RealtimeSubscriptionReadinessProvider:
             lifecycle_state = str(lifecycle.get("lifecycle_state") or "")
             subscription_active = bool(lifecycle.get("transport_active"))
             active_since = str(lifecycle.get("registration_ack_baseline_at_utc") or active_since)
-            post_subscription_tick_verified = bool(lifecycle.get("first_tick_verified") and lifecycle.get("decision_fresh"))
-            tick_payload = {
-                **tick_payload,
+            lifecycle_tick_payload = {
                 "latest_tick_at": lifecycle.get("last_tick_at_utc") or tick_payload.get("latest_tick_at") or "",
                 "latest_tick_age_sec": lifecycle.get("latest_tick_age_sec", tick_payload.get("latest_tick_age_sec")),
                 "latest_tick_source": "REALTIME" if lifecycle.get("last_tick_at_utc") else tick_payload.get("latest_tick_source") or "",
                 "core_tick_at": lifecycle.get("last_tick_at_utc") or tick_payload.get("core_tick_at") or "",
                 "gateway_tick_at": lifecycle.get("first_tick_gateway_at_utc") or tick_payload.get("gateway_tick_at") or "",
             }
+            tick_payload = _newer_tick_payload(tick_payload, lifecycle_tick_payload)
+            post_subscription_tick_verified = self._post_subscription_tick_verified(
+                tick_payload,
+                active_since=active_since,
+                relevant_source_added_at=relevant_source_added_at,
+                subscription_active=subscription_active,
+            )
             if lifecycle_state in {"COMMAND_ENQUEUED", "COMMAND_DISPATCHED"}:
                 subscription_active = False
                 post_subscription_tick_verified = False
             elif lifecycle_state == "ACKED_WAIT_FIRST_TICK":
                 subscription_active = True
-                post_subscription_tick_verified = False
+                post_subscription_tick_verified = self._post_subscription_tick_verified(
+                    tick_payload,
+                    active_since=active_since,
+                    relevant_source_added_at=relevant_source_added_at,
+                    subscription_active=subscription_active,
+                )
         payload = RealtimeSubscriptionReadinessSnapshot(
             code=clean_code,
             calculated_at=current.isoformat(),
@@ -334,6 +344,18 @@ class RealtimeSubscriptionReadinessProvider:
 
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=9))
+
+
+def _newer_tick_payload(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, Any]:
+    left_payload = dict(left or {})
+    right_payload = dict(right or {})
+    left_at = _parse_time(left_payload.get("latest_tick_at"))
+    right_at = _parse_time(right_payload.get("latest_tick_at"))
+    if left_at is None:
+        return right_payload
+    if right_at is None:
+        return left_payload
+    return left_payload if left_at >= right_at else right_payload
 
 
 def _parse_time(value: Any) -> datetime | None:

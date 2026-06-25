@@ -95,3 +95,58 @@ def test_subscription_readiness_compares_utc_baseline_to_kst_tick_time():
         relevant_source_added_at="",
         subscription_active=True,
     ) is True
+
+
+def test_subscription_readiness_prefers_fresher_market_tick_over_lifecycle_tick():
+    clock = _Clock(datetime(2026, 6, 22, 18, 5, 0))
+    manager = RealTimeSubscriptionManager(MockKiwoomClient(), max_codes=10, clock=clock)
+    manager.ensure_subscription("000001", "reboot_v2_candidate")
+    manager.sync()
+    clock.value = datetime(2026, 6, 22, 18, 5, 13)
+
+    market_data = MarketDataStore()
+    market_data.update_tick(
+        StrategyTick.from_realtime(
+            "000001",
+            price=1000,
+            change_rate=4.5,
+            cum_volume=1000,
+            trade_value=1_000_000,
+            execution_strength=130,
+            timestamp=datetime(2026, 6, 22, 18, 5, 12),
+            metadata={"price_source": "REALTIME"},
+        )
+    )
+
+    class _Lifecycle:
+        def refresh_staleness(self, code, now=None):
+            return {
+                "schema_version": "realtime_subscription_lifecycle.v1",
+                "lifecycle_state": "ACTIVE_STALE",
+                "transport_active": True,
+                "first_tick_verified": True,
+                "decision_fresh": False,
+                "stale": True,
+                "released": False,
+                "failed": False,
+                "register_command_id": "cmd-old",
+                "registration_ack_baseline_at_utc": "2026-06-22T09:05:10Z",
+                "first_tick_at_utc": "2026-06-22T09:00:00Z",
+                "last_tick_at_utc": "2026-06-22T09:00:00Z",
+                "latest_tick_age_sec": 313,
+            }
+
+    provider = RealtimeSubscriptionReadinessProvider(
+        manager,
+        market_data=market_data,
+        clock=clock,
+        lifecycle_tracker=_Lifecycle(),
+        max_tick_age_sec=10,
+    )
+
+    snapshot = provider.snapshot("000001", now=clock.value)
+
+    assert snapshot["subscription_active"] is True
+    assert snapshot["latest_tick_at"] == "2026-06-22T18:05:12"
+    assert snapshot["latest_tick_age_sec"] == 1.0
+    assert snapshot["post_subscription_tick_verified"] is True
