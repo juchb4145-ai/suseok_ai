@@ -166,7 +166,7 @@ class CandidateFunnelService:
             self.last_report = _disabled_candidate_funnel_section(current)
             return dict(self.last_report)
         baseline_payload = dict(baseline or {})
-        episodes = _build_episodes(self.db, trade_date=trade_date, as_of=current)
+        episodes = _build_episodes(self.db, trade_date=trade_date, as_of=current, persist_readiness_reconcile=persist)
         order_policy = _order_policy(baseline_payload)
         order_counts = _order_counts(self.db, trade_date)
         for episode in episodes.values():
@@ -466,11 +466,17 @@ def export_trading_day_qualification_report(report: Mapping[str, Any], *, root: 
     return {"json": str(report_json), "md": str(report_md), "checks_csv": str(checks_csv)}
 
 
-def _build_episodes(db: Any, *, trade_date: str, as_of: datetime) -> dict[str, dict[str, Any]]:
+def _build_episodes(db: Any, *, trade_date: str, as_of: datetime, persist_readiness_reconcile: bool = False) -> dict[str, dict[str, Any]]:
     contract_service = CandidateStateContractService(db=None)
     candidates = list(db.list_candidates(trade_date=trade_date) or [])
     source_events = _safe_call(getattr(db, "list_candidate_source_events", None), trade_date=trade_date, limit=100000)
     readiness_rows = _safe_call(getattr(db, "list_setup_router_readiness_latest", None), trade_date=trade_date, router_version=ROUTER_VERSION, limit=100000)
+    lifecycle_rows = _safe_call(
+        getattr(db, "list_realtime_subscription_lifecycle_latest", None),
+        trade_date=trade_date,
+        lifecycle_state="ACTIVE_FRESH",
+        limit=100000,
+    )
     observations = _safe_call(getattr(db, "list_setup_observations_latest", None), trade_date=trade_date, router_version=ROUTER_VERSION, limit=100000)
     runtime_rows = _safe_call(getattr(db, "list_setup_router_candidate_runtime", None), trade_date=trade_date, router_version=ROUTER_VERSION, limit=100000)
     contexts = _rows(db, "SELECT * FROM strategy_context_latest WHERE trade_date = ?", (trade_date,))
@@ -556,6 +562,15 @@ def _build_episodes(db: Any, *, trade_date: str, as_of: datetime) -> dict[str, d
             by_candidate_id[int(candidate_id)] = episode
         if code and code not in by_code:
             by_code[code] = episode
+
+    readiness_rows = _reconcile_readiness_rows_with_active_lifecycle(
+        readiness_rows,
+        lifecycle_rows,
+        episodes.values(),
+        as_of=as_of,
+    )
+    if persist_readiness_reconcile:
+        _persist_reconciled_readiness_rows(db, readiness_rows)
 
     for event in source_events:
         candidate_id = _maybe_int(event.get("candidate_id"))
@@ -887,6 +902,18 @@ def _qualification_evidence(
 ) -> dict[str, Any]:
     samples = _safe_call(getattr(db, "list_ops_runtime_health_samples", None), trade_date=trade_date, limit=100000)
     readiness = _safe_call(getattr(db, "list_setup_router_readiness_latest", None), trade_date=trade_date, router_version=ROUTER_VERSION, limit=100000)
+    lifecycle_rows = _safe_call(
+        getattr(db, "list_realtime_subscription_lifecycle_latest", None),
+        trade_date=trade_date,
+        lifecycle_state="ACTIVE_FRESH",
+        limit=100000,
+    )
+    readiness = _reconcile_readiness_rows_with_active_lifecycle(
+        readiness,
+        lifecycle_rows,
+        list(funnel_report.get("episodes") or []),
+        as_of=_as_datetime(funnel_report.get("as_of")) or datetime.now().replace(microsecond=0),
+    )
     order_counts = _order_counts(db, trade_date)
     current_eval_instances = _current_eval_instances(funnel_report)
     if current_eval_instances:
@@ -1333,6 +1360,219 @@ def _fresh_readiness(row: Mapping[str, Any]) -> bool:
     return bool(row.get("latest_tick_at") or row.get("core_tick_at"))
 
 
+_REALTIME_WAIT_STATUSES = {
+    "WAIT_SUBSCRIPTION_NOT_ACTIVE",
+    "WAIT_SUBSCRIPTION_BUDGET",
+    "WAIT_REGISTER_COMMAND",
+    "WAIT_REGISTER_ACK",
+    "WAIT_FIRST_TICK",
+    "WAIT_POST_SUBSCRIPTION_TICK",
+    "WAIT_REALTIME_TICK_STALE",
+}
+
+_REALTIME_WAIT_REASONS = {
+    "SUBSCRIPTION_NOT_REQUESTED",
+    "SUBSCRIPTION_BUDGET_DEFERRED",
+    "REGISTER_COMMAND_ENQUEUED",
+    "REGISTER_COMMAND_DISPATCHED",
+    "SUBSCRIPTION_NOT_ACTIVE",
+    "ACKED_WAIT_FIRST_TICK",
+    "ACTIVE_SUBSCRIPTION_NO_POST_ACTIVE_TICK",
+    "LATEST_TICK_STALE",
+}
+
+
+def _reconcile_readiness_rows_with_active_lifecycle(
+    readiness_rows: Iterable[Mapping[str, Any]],
+    lifecycle_rows: Iterable[Mapping[str, Any]],
+    episodes: Iterable[Mapping[str, Any]],
+    *,
+    as_of: datetime,
+) -> list[dict[str, Any]]:
+    rows_by_ci = {str(row.get("candidate_instance_id") or ""): dict(row or {}) for row in readiness_rows if str(row.get("candidate_instance_id") or "")}
+    current_eval_by_code: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for episode in episodes:
+        ci = str(episode.get("candidate_instance_id") or "")
+        code = normalize_code(episode.get("code"))
+        if ci and code and "EVALUATION_ELIGIBLE" in set(episode.get("reached_stages") or []):
+            current_eval_by_code[code].append(episode)
+
+    for lifecycle in lifecycle_rows:
+        if not _lifecycle_active_fresh(lifecycle):
+            continue
+        code = normalize_code(lifecycle.get("code"))
+        current = current_eval_by_code.get(code) or []
+        if len(current) != 1:
+            continue
+        tick_at = str(lifecycle.get("last_tick_at_utc") or "")
+        active_since = _lifecycle_active_since(lifecycle)
+        if not _timestamp_at_or_after(tick_at, active_since):
+            continue
+        episode = current[0]
+        ci = str(episode.get("candidate_instance_id") or "")
+        existing = dict(rows_by_ci.get(ci) or {})
+        rows_by_ci[ci] = _reconciled_active_fresh_readiness(existing, lifecycle, episode, as_of=as_of)
+    return list(rows_by_ci.values())
+
+
+def _lifecycle_active_fresh(row: Mapping[str, Any]) -> bool:
+    if str(row.get("lifecycle_state") or "").upper() != "ACTIVE_FRESH":
+        return False
+    if row.get("released") or row.get("stale") or row.get("failed"):
+        return False
+    return bool(row.get("transport_active") and row.get("first_tick_verified") and row.get("decision_fresh"))
+
+
+def _lifecycle_active_since(row: Mapping[str, Any]) -> str:
+    return str(
+        row.get("registration_ack_baseline_at_utc")
+        or row.get("command_acked_at_utc")
+        or row.get("target_selected_at_utc")
+        or row.get("requested_at_utc")
+        or ""
+    )
+
+
+def _timestamp_at_or_after(left: Any, right: Any) -> bool:
+    left_dt = _as_datetime(left)
+    if left_dt is None:
+        return False
+    right_dt = _as_datetime(right)
+    return right_dt is None or left_dt >= right_dt
+
+
+def _reconciled_active_fresh_readiness(
+    existing: Mapping[str, Any],
+    lifecycle: Mapping[str, Any],
+    episode: Mapping[str, Any],
+    *,
+    as_of: datetime,
+) -> dict[str, Any]:
+    row = dict(existing or {})
+    had_existing = bool(existing)
+    active_since = _lifecycle_active_since(lifecycle)
+    tick_at = str(lifecycle.get("last_tick_at_utc") or "")
+    reason_codes = [
+        str(reason)
+        for reason in list(row.get("reason_codes") or [])
+        if str(reason) and str(reason) not in _REALTIME_WAIT_REASONS
+    ]
+    previous_status = str(row.get("readiness_status") or "")
+    realtime_blocked = previous_status in _REALTIME_WAIT_STATUSES or not previous_status
+    readiness_ready = bool(row.get("readiness_ready"))
+    non_realtime_status, non_realtime_reason = _non_realtime_readiness_blocker(row)
+    if non_realtime_status:
+        readiness_ready = False
+        readiness_status = non_realtime_status
+        reason_codes = _dedupe([*reason_codes, non_realtime_reason])
+    elif realtime_blocked and not reason_codes:
+        readiness_ready = True
+        readiness_status = "READY"
+    else:
+        readiness_status = previous_status or ("READY" if readiness_ready else "WAIT_POST_SUBSCRIPTION_TICK")
+    informational = _dedupe(
+        [
+            *[str(reason) for reason in list(row.get("informational_reason_codes") or []) if str(reason)],
+            "LIFECYCLE_ACTIVE_FRESH_CURRENT_CANDIDATE_BIND",
+        ]
+    )
+    row.update(
+        {
+            "trade_date": row.get("trade_date") or episode.get("trade_date") or lifecycle.get("trade_date") or "",
+            "router_version": row.get("router_version") or ROUTER_VERSION,
+            "candidate_instance_id": episode.get("candidate_instance_id") or row.get("candidate_instance_id") or "",
+            "candidate_id": row.get("candidate_id", episode.get("candidate_id")),
+            "candidate_generation_seq": row.get("candidate_generation_seq", episode.get("candidate_generation_seq")),
+            "code": normalize_code(episode.get("code") or lifecycle.get("code")),
+            "name": row.get("name") or episode.get("name") or "",
+            "readiness_status": readiness_status,
+            "readiness_ready": readiness_ready,
+            "readiness_schema_version": row.get("readiness_schema_version") or "setup_router_readiness.v3",
+            "readiness_fingerprint": _reconciled_readiness_fingerprint(
+                episode=episode,
+                lifecycle=lifecycle,
+                readiness_status=readiness_status,
+                readiness_ready=readiness_ready,
+            ),
+            "coverage_type": row.get("coverage_type") or "CANDIDATE",
+            "subscription_requested": True,
+            "subscription_target_selected": True,
+            "subscription_selected": True,
+            "subscription_active": True,
+            "subscription_sources": list(row.get("subscription_sources") or ["realtime_subscription_lifecycle"]),
+            "subscription_primary_source": row.get("subscription_primary_source") or "realtime_subscription_lifecycle",
+            "subscription_budget_deferred": False,
+            "subscription_screen_no": row.get("subscription_screen_no") or lifecycle.get("screen_no") or "",
+            "subscription_generation": _int(lifecycle.get("subscription_generation"), _int(row.get("subscription_generation"), 0)),
+            "subscription_active_since": row.get("subscription_active_since") or active_since,
+            "latest_tick_at": tick_at,
+            "latest_tick_age_sec": _float(lifecycle.get("latest_tick_age_sec"), _float(row.get("latest_tick_age_sec"), 999999.0)),
+            "latest_tick_source": "REALTIME",
+            "post_subscription_tick_verified": True,
+            "gateway_tick_at": row.get("gateway_tick_at") or tick_at,
+            "core_tick_at": tick_at,
+            "setup_feature_tick_at": tick_at,
+            "market_context_fresh": bool(row.get("market_context_fresh", True)),
+            "theme_context_fresh": bool(row.get("theme_context_fresh", True)),
+            "candle_ready": bool(row.get("candle_ready", True)),
+            "calculated_at": max(str(row.get("calculated_at") or ""), as_of.replace(microsecond=0).isoformat()),
+            "updated_at": max(str(row.get("updated_at") or ""), str(lifecycle.get("updated_at_utc") or lifecycle.get("updated_at") or "")),
+            "reason_codes": _dedupe(reason_codes),
+            "informational_reason_codes": informational,
+            "readiness_reconcile_source": "realtime_subscription_lifecycle_latest",
+            "readiness_reconcile_status": "ACTIVE_FRESH_BOUND_TO_CURRENT_CANDIDATE",
+            "readiness_reconcile_existing_row": had_existing,
+        }
+    )
+    return row
+
+
+def _non_realtime_readiness_blocker(row: Mapping[str, Any]) -> tuple[str, str]:
+    if row.get("candle_ready") is False:
+        return "WAIT_CANDLE_WARMUP", "COMPLETED_1M_CANDLES_INSUFFICIENT"
+    if row.get("market_context_fresh") is False:
+        return "WAIT_MARKET_CONTEXT", "MARKET_CONTEXT_NOT_FRESH"
+    if row.get("theme_context_fresh") is False:
+        return "WAIT_THEME_SIGNAL_STALE", "SIGNAL_STALE"
+    return "", ""
+
+
+def _reconciled_readiness_fingerprint(
+    *,
+    episode: Mapping[str, Any],
+    lifecycle: Mapping[str, Any],
+    readiness_status: str,
+    readiness_ready: bool,
+) -> str:
+    material = {
+        "candidate_instance_id": episode.get("candidate_instance_id") or "",
+        "code": normalize_code(episode.get("code") or lifecycle.get("code")),
+        "readiness_status": readiness_status,
+        "readiness_ready": bool(readiness_ready),
+        "subscription_generation": _int(lifecycle.get("subscription_generation"), 0),
+        "last_tick_at_utc": lifecycle.get("last_tick_at_utc") or "",
+        "updated_at_utc": lifecycle.get("updated_at_utc") or lifecycle.get("updated_at") or "",
+    }
+    return hashlib.sha1(json.dumps(material, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _persist_reconciled_readiness_rows(db: Any, readiness_rows: Iterable[Mapping[str, Any]]) -> int:
+    saver = getattr(db, "save_setup_router_readiness_snapshots", None)
+    if not callable(saver):
+        return 0
+    rows = [
+        dict(row)
+        for row in readiness_rows
+        if str(row.get("readiness_reconcile_status") or "") == "ACTIVE_FRESH_BOUND_TO_CURRENT_CANDIDATE"
+    ]
+    if not rows:
+        return 0
+    try:
+        return int(saver(rows) or 0)
+    except Exception:
+        return 0
+
+
 def _order_policy(baseline: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "order_intent_allowed": bool(baseline.get("order_intent_allowed")),
@@ -1727,6 +1967,13 @@ def _maybe_int(value: Any) -> int | None:
 def _int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
+    except Exception:
+        return default
+
+
+def _float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(str(value).strip().replace(",", ""))
     except Exception:
         return default
 

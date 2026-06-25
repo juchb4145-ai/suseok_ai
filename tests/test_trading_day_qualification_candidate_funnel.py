@@ -4,7 +4,11 @@ from fastapi.testclient import TestClient
 
 import trading_app.api as api
 from storage.db import TradingDatabase
-from trading.strategy.candidate_funnel import CandidateFunnelService, TradingDayQualificationService
+from trading.strategy.candidate_funnel import (
+    CandidateFunnelService,
+    TradingDayQualificationService,
+    _reconcile_readiness_rows_with_active_lifecycle,
+)
 from trading.strategy.models import Candidate, CandidateSourceType, CandidateState
 
 
@@ -126,6 +130,98 @@ def test_candidate_identity_same_code_new_instance_is_separate_episode(tmp_path)
     assert report["candidate_episode_count"] == 2
     assert report["strict_attribution_count"] == 2
     assert ids == {"ci-old", "ci-new"}
+
+
+def test_candidate_funnel_reconciles_active_fresh_lifecycle_to_current_readiness(tmp_path):
+    db = TradingDatabase(str(tmp_path / "lifecycle-current.db"))
+    candidate = _seed_candidate(db)
+    _seed_readiness(db, candidate.id, active=True, fresh=False, candle_ready=True)
+    _seed_lifecycle_active_fresh(db)
+
+    report = CandidateFunnelService(db).build_report(trade_date=TRADE_DATE, as_of=NOW, baseline=_baseline(), persist=True)
+    qualification = TradingDayQualificationService(db).build_report(
+        trade_date=TRADE_DATE,
+        as_of=NOW,
+        runtime_snapshot=_runtime_snapshot(),
+        funnel_report=report,
+        persist=False,
+    )
+
+    assert _stage_count(report, "FRESH_REALTIME_READY") == 1
+    assert "FRESH_REALTIME_READY" in report["episodes"][0]["reached_stages"]
+    assert qualification["evidence_summary"]["fresh_realtime_ready_count"] == 1
+    assert qualification["evidence_summary"]["readiness_wait_count"] == 0
+    readiness = db.list_setup_router_readiness_latest(trade_date=TRADE_DATE, code="000001")[0]
+    assert readiness["candidate_instance_id"] == "ci-000001"
+    assert readiness["readiness_ready"] is True
+    assert readiness["post_subscription_tick_verified"] is True
+
+
+def test_candidate_funnel_reconciles_active_fresh_when_old_readiness_row_exists(tmp_path):
+    db = TradingDatabase(str(tmp_path / "lifecycle-old-row.db"))
+    candidate = _seed_candidate(db, code="000002", instance_id="ci-new")
+    _seed_readiness(db, 999, active=True, fresh=False, code="000002", instance_id="ci-old")
+    _seed_lifecycle_active_fresh(db, code="000002")
+
+    report = CandidateFunnelService(db).build_report(trade_date=TRADE_DATE, as_of=NOW, baseline=_baseline(), persist=False)
+    by_ci = {item["candidate_instance_id"]: item for item in report["episodes"]}
+
+    assert candidate.id is not None
+    assert _stage_count(report, "FRESH_REALTIME_READY") == 1
+    assert "FRESH_REALTIME_READY" in by_ci["ci-new"]["reached_stages"]
+    assert "FRESH_REALTIME_READY" not in by_ci["ci-old"]["reached_stages"]
+
+
+def test_active_fresh_lifecycle_reconcile_is_ambiguous_for_multiple_current_candidates():
+    episodes = [
+        _episode_row("ci-a", "000003"),
+        _episode_row("ci-b", "000003"),
+    ]
+    rows = _reconcile_readiness_rows_with_active_lifecycle(
+        [],
+        [_lifecycle_row(code="000003")],
+        episodes,
+        as_of=NOW,
+    )
+
+    assert rows == []
+
+
+def test_active_fresh_lifecycle_reconcile_requires_post_active_tick():
+    rows = _reconcile_readiness_rows_with_active_lifecycle(
+        [],
+        [_lifecycle_row(code="000003", last_tick_at="2026-06-22T09:03:59Z")],
+        [_episode_row("ci-a", "000003")],
+        as_of=NOW,
+    )
+
+    assert rows == []
+
+
+def test_active_fresh_lifecycle_reconcile_preserves_non_realtime_blockers():
+    rows = _reconcile_readiness_rows_with_active_lifecycle(
+        [
+            {
+                "trade_date": TRADE_DATE,
+                "router_version": "setup_router_v3.5.2",
+                "candidate_instance_id": "ci-a",
+                "code": "000003",
+                "readiness_status": "WAIT_REGISTER_COMMAND",
+                "readiness_ready": False,
+                "candle_ready": False,
+                "market_context_fresh": True,
+                "theme_context_fresh": True,
+            }
+        ],
+        [_lifecycle_row(code="000003")],
+        [_episode_row("ci-a", "000003")],
+        as_of=NOW,
+    )
+
+    assert rows[0]["post_subscription_tick_verified"] is True
+    assert rows[0]["readiness_ready"] is False
+    assert rows[0]["readiness_status"] == "WAIT_CANDLE_WARMUP"
+    assert "COMPLETED_1M_CANDLES_INSUFFICIENT" in rows[0]["reason_codes"]
 
 
 def test_trading_day_qualification_valid_final_with_clean_baseline(tmp_path):
@@ -417,7 +513,9 @@ def _seed_candidate(db, *, code="000001", instance_id="ci-000001", detected_at="
     )
 
 
-def _seed_readiness(db, candidate_id, *, active=True, fresh=True, code="000001", instance_id="ci-000001"):
+def _seed_readiness(db, candidate_id, *, active=True, fresh=True, code="000001", instance_id="ci-000001", candle_ready=None):
+    if candle_ready is None:
+        candle_ready = fresh
     db.save_setup_router_readiness_snapshots(
         [
             {
@@ -437,11 +535,61 @@ def _seed_readiness(db, candidate_id, *, active=True, fresh=True, code="000001",
                 "latest_tick_age_sec": 1.0 if fresh else 999.0,
                 "latest_tick_source": "REALTIME" if fresh else "TR_BACKFILL",
                 "post_subscription_tick_verified": fresh,
-                "candle_ready": fresh,
+                "candle_ready": candle_ready,
                 "calculated_at": "2026-06-22T09:05:00",
             }
         ]
     )
+
+
+def _seed_lifecycle_active_fresh(db, *, code="000001"):
+    db.save_realtime_subscription_lifecycle_latest(_lifecycle_row(code=code))
+
+
+def _lifecycle_row(*, code="000001", last_tick_at="2026-06-22T09:04:10Z"):
+    return {
+        "trade_date": TRADE_DATE,
+        "code": code,
+        "schema_version": "realtime_subscription_lifecycle.v1",
+        "lifecycle_state": "ACTIVE_FRESH",
+        "requested": True,
+        "target_selected": True,
+        "budget_deferred": False,
+        "command_enqueued": True,
+        "command_dispatched": True,
+        "acked": True,
+        "transport_active": True,
+        "first_tick_verified": True,
+        "decision_fresh": True,
+        "stale": False,
+        "released": False,
+        "failed": False,
+        "screen_no": "7000",
+        "register_command_id": "cmd-register",
+        "subscription_generation": 1,
+        "requested_at_utc": "2026-06-22T09:03:00Z",
+        "target_selected_at_utc": "2026-06-22T09:03:00Z",
+        "command_enqueued_at_utc": "2026-06-22T09:03:01Z",
+        "command_dispatched_at_utc": "2026-06-22T09:03:02Z",
+        "command_acked_at_utc": "2026-06-22T09:03:03Z",
+        "registration_ack_baseline_at_utc": "2026-06-22T09:04:00Z",
+        "first_tick_at_utc": last_tick_at,
+        "last_tick_at_utc": last_tick_at,
+        "latest_tick_age_sec": 1.0,
+        "updated_at_utc": last_tick_at,
+    }
+
+
+def _episode_row(candidate_instance_id, code):
+    return {
+        "trade_date": TRADE_DATE,
+        "candidate_instance_id": candidate_instance_id,
+        "candidate_id": None,
+        "candidate_generation_seq": 1,
+        "code": code,
+        "name": "테스트",
+        "reached_stages": ["SOURCE_DETECTED", "CANDIDATE_CREATED", "ACTIVE_SOURCE_PRESENT", "HYDRATION_COMPLETE", "EVALUATION_ELIGIBLE"],
+    }
 
 
 def _seed_context_entry(db, candidate_id, *, code="000001"):
