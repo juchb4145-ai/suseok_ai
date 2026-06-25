@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 
 from trading.strategy.candidates import normalize_code
@@ -333,13 +333,20 @@ class RealtimeSubscriptionReadinessProvider:
         return source_type in {"reboot_v2_theme_expansion", "theme_expansion"} and bool(selected and source_theme == selected)
 
 
+LOCAL_TIMEZONE = timezone(timedelta(hours=9))
+
+
 def _parse_time(value: Any) -> datetime | None:
     if isinstance(value, datetime):
-        return value.replace(tzinfo=None, microsecond=0)
+        dt = value if value.tzinfo else value.replace(tzinfo=LOCAL_TIMEZONE)
+        return dt.astimezone(timezone.utc).replace(microsecond=0)
     text = str(value or "").strip()
     if not text:
         return None
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None, microsecond=0)
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=LOCAL_TIMEZONE)
+    return dt.astimezone(timezone.utc).replace(microsecond=0)

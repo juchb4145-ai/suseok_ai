@@ -286,13 +286,21 @@ class RealTimeSubscriptionManager:
             else:
                 receipt = self.client.register_realtime(codes, screen_no=screen_no)
             self._lifecycle_call("on_command_enqueued", receipt, records_for_screen, now=current)
+            pending_trackable = receipt is not None and (
+                bool(getattr(receipt, "accepted", False))
+                or (
+                    bool(getattr(receipt, "duplicate_of", ""))
+                    and str(getattr(receipt, "status", "") or "").upper() in {"QUEUED", "DISPATCHED"}
+                )
+            )
             for code in codes:
                 self.target_screen_by_code[code] = screen_no
-                if self.lifecycle_tracker is not None:
+                if self.lifecycle_tracker is not None and pending_trackable:
                     self.pending_register_by_code[code] = screen_no
                 else:
-                    self.code_to_screen[code] = screen_no
-                    self.screen_to_codes.setdefault(screen_no, set()).update(codes)
+                    if self.lifecycle_tracker is None:
+                        self.code_to_screen[code] = screen_no
+                        self.screen_to_codes.setdefault(screen_no, set()).update(codes)
 
         for screen_no, records_for_screen in batches.items():
             for record_for_screen in records_for_screen:
@@ -304,7 +312,8 @@ class RealTimeSubscriptionManager:
                         record.active_since = timestamp
                         record.subscription_generation += 1
                     record.active = self.lifecycle_tracker is None
-                    record.last_registered_at = timestamp
+                    if self.lifecycle_tracker is None or self.pending_register_by_code.get(code) == screen_no:
+                        record.last_registered_at = timestamp
                     record.last_sync_at = timestamp
 
     def _remove_codes(self, codes: Iterable[str], now: Optional[datetime] = None) -> None:

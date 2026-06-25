@@ -327,15 +327,20 @@ class GatewayCommandRealtimeClient:
         if not result.accepted:
             self._warn(f"REALTIME_COMMAND_REJECTED:{command_type}:{result.reason}:{result.duplicate_of}")
         command_payload = dict(command.payload or {})
+        receipt_command_id = str(command.command_id or "")
+        receipt_status = "QUEUED" if result.accepted else "DUPLICATE" if result.reason == "DUPLICATE_COMMAND" else "REJECTED"
         if record is not None:
             command_payload = dict(record.command.payload or command_payload)
+            receipt_command_id = str(record.command.command_id or receipt_command_id)
+            record_status = getattr(record, "status", "")
+            receipt_status = str(getattr(record_status, "value", record_status) or receipt_status)
         return RealtimeCommandReceipt(
             accepted=bool(result.accepted),
-            command_id=str(command.command_id or ""),
+            command_id=receipt_command_id,
             command_type=command_type,
             idempotency_key=key,
             duplicate_of=str(result.duplicate_of or ""),
-            status="QUEUED" if result.accepted else "DUPLICATE" if result.reason == "DUPLICATE_COMMAND" else "REJECTED",
+            status=receipt_status,
             reason=str(result.reason or ""),
             enqueued_at_utc=_utc_text(getattr(record, "created_at", "") or datetime.now(timezone.utc)),
             screen_no=str(command_payload.get("screen_no") or ""),

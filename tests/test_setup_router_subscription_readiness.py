@@ -65,3 +65,33 @@ def test_subscription_readiness_provider_separates_budget_deferred_from_stale_ti
     assert snapshot["subscription_active"] is False
     assert snapshot["subscription_budget_deferred"] is True
     assert snapshot["latest_tick_at"] == ""
+
+
+def test_subscription_readiness_compares_utc_baseline_to_kst_tick_time():
+    provider = RealtimeSubscriptionReadinessProvider(
+        RealTimeSubscriptionManager(MockKiwoomClient(), max_codes=10),
+        market_data=MarketDataStore(),
+        max_tick_age_sec=10,
+    )
+
+    assert provider._post_subscription_tick_verified(
+        {
+            "latest_tick_at": "2026-06-22T18:05:03",
+            "latest_tick_age_sec": 1,
+            "latest_tick_source": "REALTIME",
+        },
+        active_since="2026-06-22T09:05:10Z",
+        relevant_source_added_at="",
+        subscription_active=True,
+    ) is False
+
+    assert provider._post_subscription_tick_verified(
+        {
+            "latest_tick_at": "2026-06-22T18:05:12",
+            "latest_tick_age_sec": 1,
+            "latest_tick_source": "REALTIME",
+        },
+        active_since="2026-06-22T09:05:10Z",
+        relevant_source_added_at="",
+        subscription_active=True,
+    ) is True

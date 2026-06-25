@@ -223,6 +223,154 @@ def test_target_selection_refresh_does_not_regress_active_fresh_lifecycle(tmp_pa
         db.close()
 
 
+def test_target_selection_refresh_repairs_regressed_active_flags(tmp_path):
+    db, clock, state, tracker, manager = _runtime(tmp_path)
+    try:
+        manager.ensure_subscription("005930", "reboot_v2_candidate")
+        manager.sync()
+        command = state.dispatch_commands(limit=1)[0]
+        payload = {
+            "command_id": command.command_id,
+            "command_type": command.type,
+            "codes": list(command.payload.get("codes") or []),
+            "screen_no": command.payload.get("screen_no"),
+            "status": "ACKED",
+            "transport_trace": {
+                "gateway_kiwoom_call_finished_at_utc": "2026-06-22T09:05:02Z",
+                "gateway_command_ack_created_at_utc": "2026-06-22T09:05:02Z",
+            },
+        }
+        clock.value = _utc(2026, 6, 22, 9, 5, 2)
+        manager.handle_realtime_command_event(GatewayEvent(type="command_ack", payload=payload))
+        clock.value = _utc(2026, 6, 22, 9, 5, 4)
+        manager.handle_price_tick({"code": "005930", "timestamp": "2026-06-22T09:05:03Z"})
+
+        tracker._snapshots["005930"].lifecycle_state = "TARGET_SELECTED"
+        tracker.on_target_selected(
+            [SimpleNamespace(code="005930", screen_no="7000", sources={"reboot_v2_candidate"}, primary_source="reboot_v2_candidate")],
+            now=_utc(2026, 6, 22, 9, 5, 5),
+        )
+
+        snapshot = tracker.snapshot("005930")
+        assert snapshot["lifecycle_state"] == "ACTIVE_FRESH"
+        assert snapshot["transport_active"] is True
+        assert snapshot["first_tick_verified"] is True
+        assert snapshot["decision_fresh"] is True
+    finally:
+        db.close()
+
+
+def test_target_selection_refresh_does_not_reuse_pre_baseline_tick(tmp_path):
+    db, clock, state, tracker, manager = _runtime(tmp_path)
+    try:
+        manager.ensure_subscription("005930", "reboot_v2_candidate")
+        manager.sync()
+        command = state.dispatch_commands(limit=1)[0]
+        payload = {
+            "command_id": command.command_id,
+            "command_type": command.type,
+            "codes": list(command.payload.get("codes") or []),
+            "screen_no": command.payload.get("screen_no"),
+            "status": "ACKED",
+            "transport_trace": {
+                "gateway_kiwoom_call_finished_at_utc": "2026-06-22T09:05:10Z",
+                "gateway_command_ack_created_at_utc": "2026-06-22T09:05:10Z",
+            },
+        }
+        clock.value = _utc(2026, 6, 22, 9, 5, 10)
+        manager.handle_realtime_command_event(GatewayEvent(type="command_ack", payload=payload))
+        snapshot = tracker._snapshots["005930"]
+        snapshot.lifecycle_state = "TARGET_SELECTED"
+        snapshot.first_tick_verified = True
+        snapshot.decision_fresh = True
+        snapshot.last_tick_at_utc = "2026-06-22T09:05:03Z"
+        snapshot.first_tick_at_utc = "2026-06-22T09:05:03Z"
+
+        tracker.on_target_selected(
+            [SimpleNamespace(code="005930", screen_no="7000", sources={"reboot_v2_candidate"}, primary_source="reboot_v2_candidate")],
+            now=_utc(2026, 6, 22, 9, 5, 11),
+        )
+
+        refreshed = tracker.snapshot("005930")
+        assert refreshed["lifecycle_state"] == "ACKED_WAIT_FIRST_TICK"
+        assert refreshed["transport_active"] is True
+        assert refreshed["first_tick_verified"] is False
+        assert refreshed["last_tick_at_utc"] == ""
+
+        clock.value = _utc(2026, 6, 22, 9, 5, 12)
+        manager.handle_price_tick({"code": "005930", "timestamp": "2026-06-22T09:05:12Z"})
+        fresh = tracker.snapshot("005930")
+        assert fresh["lifecycle_state"] == "ACTIVE_FRESH"
+        assert fresh["first_tick_at_utc"] == "2026-06-22T09:05:12.000Z"
+    finally:
+        db.close()
+
+
+def test_budget_deferred_clears_stale_active_and_release_evidence(tmp_path):
+    db, clock, state, tracker, manager = _runtime(tmp_path)
+    try:
+        manager.ensure_subscription("005930", "reboot_v2_candidate")
+        manager.sync()
+        command = state.dispatch_commands(limit=1)[0]
+        payload = {
+            "command_id": command.command_id,
+            "command_type": command.type,
+            "codes": list(command.payload.get("codes") or []),
+            "screen_no": command.payload.get("screen_no"),
+            "status": "ACKED",
+            "transport_trace": {
+                "gateway_kiwoom_call_finished_at_utc": "2026-06-22T09:05:02Z",
+                "gateway_command_ack_created_at_utc": "2026-06-22T09:05:02Z",
+            },
+        }
+        clock.value = _utc(2026, 6, 22, 9, 5, 2)
+        manager.handle_realtime_command_event(GatewayEvent(type="command_ack", payload=payload))
+        clock.value = _utc(2026, 6, 22, 9, 5, 4)
+        manager.handle_price_tick({"code": "005930", "timestamp": "2026-06-22T09:05:03Z"})
+        tracker._snapshots["005930"].released = True
+
+        tracker.on_budget_deferred(
+            [SimpleNamespace(code="005930", screen_no="7000", sources={"reboot_v2_candidate"}, primary_source="reboot_v2_candidate")],
+            now=_utc(2026, 6, 22, 9, 5, 5),
+        )
+
+        snapshot = tracker.snapshot("005930")
+        assert snapshot["lifecycle_state"] == "BUDGET_DEFERRED"
+        assert snapshot["target_selected"] is False
+        assert snapshot["acked"] is False
+        assert snapshot["transport_active"] is False
+        assert snapshot["first_tick_verified"] is False
+        assert snapshot["decision_fresh"] is False
+        assert snapshot["released"] is False
+        assert snapshot["register_command_id"] == ""
+        assert snapshot["registration_ack_baseline_at_utc"] == ""
+        assert snapshot["last_tick_at_utc"] == ""
+    finally:
+        db.close()
+
+
+def test_duplicate_queued_register_keeps_existing_command_pending(tmp_path):
+    db, clock, state, tracker, manager = _runtime(tmp_path)
+    try:
+        manager.ensure_subscription("005930", "reboot_v2_candidate")
+        manager.sync()
+        first_command = state.list_commands(limit=10)[0]
+        first_command_id = first_command["command_id"]
+        assert manager.pending_register_by_code == {"005930": "7000"}
+
+        manager.pending_register_by_code.clear()
+        manager.sync()
+
+        commands = state.list_commands(limit=10)
+        assert [item["command_id"] for item in commands] == [first_command_id]
+        assert manager.pending_register_by_code == {"005930": "7000"}
+        snapshot = tracker.snapshot("005930")
+        assert snapshot["lifecycle_state"] == "COMMAND_ENQUEUED"
+        assert snapshot["register_command_id"] == first_command_id
+    finally:
+        db.close()
+
+
 def test_new_register_ack_after_release_clears_old_release_and_tick_evidence(tmp_path):
     db = TradingDatabase(str(tmp_path / "subscription-lifecycle-reregister.db"))
     clock = _Clock(_utc(2026, 6, 22, 9, 5, 0))

@@ -151,23 +151,20 @@ class RealtimeSubscriptionLifecycleTracker:
             if not code:
                 continue
             previous = self._snapshots.get(code)
-            state = RealtimeSubscriptionLifecycleState.TARGET_SELECTED
-            if previous is not None and previous.lifecycle_state in TARGET_SELECTION_PRESERVE_STATES:
-                state = RealtimeSubscriptionLifecycleState(previous.lifecycle_state)
-            self._transition(
-                code,
-                state,
-                current,
-                requested=True,
-                target_selected=True,
-                budget_deferred=False,
-                released=False,
-                failed=False,
-                screen_no=str(getattr(record, "screen_no", "") or ""),
-                target_selected_at_utc=current,
-                sources=tuple(sorted(str(source) for source in getattr(record, "sources", set()) or [] if str(source))),
-                primary_source=str(getattr(record, "primary_source", "") or ""),
-            )
+            state, preserved_updates = _target_selection_preserved_state(previous)
+            updates = {
+                "requested": True,
+                "target_selected": True,
+                "budget_deferred": False,
+                "released": False,
+                "failed": False,
+                "screen_no": str(getattr(record, "screen_no", "") or ""),
+                "target_selected_at_utc": current,
+                "sources": tuple(sorted(str(source) for source in getattr(record, "sources", set()) or [] if str(source))),
+                "primary_source": str(getattr(record, "primary_source", "") or ""),
+            }
+            updates.update(preserved_updates)
+            self._transition(code, state, current, **updates)
 
     def on_budget_deferred(self, records: Iterable[Any], now: datetime | None = None) -> None:
         current = _utc_text(now or self._now())
@@ -182,8 +179,33 @@ class RealtimeSubscriptionLifecycleTracker:
                 requested=True,
                 target_selected=False,
                 budget_deferred=True,
+                command_enqueued=False,
+                command_dispatched=False,
+                acked=False,
+                transport_active=False,
+                first_tick_verified=False,
                 decision_fresh=False,
                 stale=False,
+                released=False,
+                failed=False,
+                screen_no="",
+                register_command_id="",
+                command_enqueued_at_utc="",
+                command_dispatched_at_utc="",
+                command_acked_at_utc="",
+                core_ack_received_at_utc="",
+                registration_ack_baseline_at_utc="",
+                first_tick_at_utc="",
+                first_tick_gateway_at_utc="",
+                first_tick_core_at_utc="",
+                last_tick_at_utc="",
+                stale_since_utc="",
+                release_requested_at_utc="",
+                released_at_utc="",
+                latest_tick_age_sec=999999.0,
+                ack_to_first_tick_ms=None,
+                enqueue_to_ack_ms=None,
+                dispatch_to_ack_ms=None,
                 target_selected_at_utc="",
             )
 
@@ -196,20 +218,22 @@ class RealtimeSubscriptionLifecycleTracker:
             self._command_codes[receipt.command_id] = codes
         if receipt.duplicate_of:
             self._command_codes[receipt.duplicate_of] = codes
-        if not receipt.accepted and receipt.duplicate_of:
+        duplicate_status = str(receipt.status or "").upper()
+        if not receipt.accepted and receipt.duplicate_of and duplicate_status not in {"QUEUED", "DISPATCHED"}:
             return
         record_by_code = {normalize_code(getattr(record, "code", "")): record for record in records or []}
         for code in codes:
             record = record_by_code.get(code)
+            state = RealtimeSubscriptionLifecycleState.COMMAND_DISPATCHED if duplicate_status == "DISPATCHED" else RealtimeSubscriptionLifecycleState.COMMAND_ENQUEUED
             self._transition(
                 code,
-                RealtimeSubscriptionLifecycleState.COMMAND_ENQUEUED,
+                state,
                 current,
                 requested=True,
                 target_selected=True,
                 budget_deferred=False,
                 command_enqueued=True,
-                command_dispatched=False,
+                command_dispatched=duplicate_status == "DISPATCHED",
                 acked=False,
                 transport_active=False,
                 first_tick_verified=False,
@@ -233,6 +257,7 @@ class RealtimeSubscriptionLifecycleTracker:
                 subscription_generation=receipt.subscription_generation,
                 target_digest=receipt.target_digest,
                 command_enqueued_at_utc=current,
+                command_dispatched_at_utc=current if duplicate_status == "DISPATCHED" else "",
                 sources=tuple(sorted(str(source) for source in getattr(record, "sources", set()) or [] if str(source))) if record is not None else (),
                 primary_source=str(getattr(record, "primary_source", "") or "") if record is not None else "",
             )
@@ -531,6 +556,46 @@ def _event_codes(payload: Mapping[str, Any], command_codes: Mapping[str, tuple[s
     if command_id and command_id in command_codes:
         return command_codes[command_id]
     return ()
+
+
+def _target_selection_preserved_state(
+    previous: RealtimeSubscriptionLifecycleSnapshot | None,
+) -> tuple[RealtimeSubscriptionLifecycleState, dict[str, Any]]:
+    if previous is None:
+        return RealtimeSubscriptionLifecycleState.TARGET_SELECTED, {}
+    if previous.lifecycle_state in TARGET_SELECTION_PRESERVE_STATES:
+        state = RealtimeSubscriptionLifecycleState(previous.lifecycle_state)
+    elif previous.transport_active and previous.first_tick_verified:
+        state = RealtimeSubscriptionLifecycleState.ACTIVE_FRESH if previous.decision_fresh else RealtimeSubscriptionLifecycleState.ACTIVE_STALE
+    elif previous.acked or previous.transport_active:
+        state = RealtimeSubscriptionLifecycleState.ACKED_WAIT_FIRST_TICK
+    elif previous.command_dispatched:
+        state = RealtimeSubscriptionLifecycleState.COMMAND_DISPATCHED
+    elif previous.command_enqueued:
+        state = RealtimeSubscriptionLifecycleState.COMMAND_ENQUEUED
+    else:
+        return RealtimeSubscriptionLifecycleState.TARGET_SELECTED, {}
+
+    if state in {RealtimeSubscriptionLifecycleState.ACTIVE_FRESH, RealtimeSubscriptionLifecycleState.ACTIVE_STALE}:
+        baseline = _parse_time(previous.registration_ack_baseline_at_utc)
+        tick_at = _parse_time(previous.last_tick_at_utc or previous.first_tick_at_utc)
+        if baseline is not None and tick_at is not None and tick_at < baseline:
+            return (
+                RealtimeSubscriptionLifecycleState.ACKED_WAIT_FIRST_TICK,
+                {
+                    "first_tick_verified": False,
+                    "decision_fresh": False,
+                    "stale": False,
+                    "first_tick_at_utc": "",
+                    "first_tick_gateway_at_utc": "",
+                    "first_tick_core_at_utc": "",
+                    "last_tick_at_utc": "",
+                    "stale_since_utc": "",
+                    "latest_tick_age_sec": 999999.0,
+                    "ack_to_first_tick_ms": None,
+                },
+            )
+    return state, {}
 
 
 def _tick_time(payload: Mapping[str, Any], fallback: str) -> str:
