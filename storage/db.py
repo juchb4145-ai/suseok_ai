@@ -1159,6 +1159,203 @@ class TradingDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_ops_runtime_health_samples_trade
                 ON ops_runtime_health_samples(trade_date, sampled_at);
+            CREATE TABLE IF NOT EXISTS opportunity_benchmark_batches (
+                benchmark_batch_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                observed_at TEXT NOT NULL DEFAULT '',
+                session_bucket TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL DEFAULT '',
+                source_batch_id TEXT NOT NULL DEFAULT '',
+                source_command_id TEXT NOT NULL DEFAULT '',
+                source_idempotency_key TEXT NOT NULL DEFAULT '',
+                market_scope TEXT NOT NULL DEFAULT '',
+                exchange_scope TEXT NOT NULL DEFAULT '',
+                requested_top_n INTEGER NOT NULL DEFAULT 0,
+                raw_row_count INTEGER NOT NULL DEFAULT 0,
+                parsed_row_count INTEGER NOT NULL DEFAULT 0,
+                accepted_row_count INTEGER NOT NULL DEFAULT 0,
+                duplicate_row_count INTEGER NOT NULL DEFAULT 0,
+                invalid_code_count INTEGER NOT NULL DEFAULT 0,
+                missing_price_count INTEGER NOT NULL DEFAULT 0,
+                parser_status TEXT NOT NULL DEFAULT '',
+                completeness_status TEXT NOT NULL DEFAULT '',
+                baseline_id TEXT NOT NULL DEFAULT '',
+                baseline_version TEXT NOT NULL DEFAULT '',
+                config_hash TEXT NOT NULL DEFAULT '',
+                git_sha TEXT NOT NULL DEFAULT '',
+                qualification_status_at_capture TEXT NOT NULL DEFAULT '',
+                source_fingerprint TEXT NOT NULL DEFAULT '',
+                raw_source_fingerprint TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(source_type, source_batch_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_batches_trade
+                ON opportunity_benchmark_batches(trade_date, observed_at, source_type);
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_batches_command
+                ON opportunity_benchmark_batches(source_command_id);
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_batches_idempotency
+                ON opportunity_benchmark_batches(source_idempotency_key);
+            CREATE TABLE IF NOT EXISTS opportunity_benchmark_observations (
+                observation_id TEXT PRIMARY KEY,
+                benchmark_batch_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                observed_at TEXT NOT NULL DEFAULT '',
+                session_bucket TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                market_side TEXT NOT NULL DEFAULT '',
+                rank INTEGER NOT NULL DEFAULT 0,
+                previous_rank INTEGER,
+                rank_delta INTEGER,
+                current_price REAL NOT NULL DEFAULT 0,
+                price_source TEXT NOT NULL DEFAULT '',
+                turnover_krw REAL NOT NULL DEFAULT 0,
+                turnover_rank INTEGER NOT NULL DEFAULT 0,
+                change_rate_pct REAL NOT NULL DEFAULT 0,
+                volume INTEGER NOT NULL DEFAULT 0,
+                best_ask REAL NOT NULL DEFAULT 0,
+                best_bid REAL NOT NULL DEFAULT 0,
+                spread_pct REAL,
+                parser_status TEXT NOT NULL DEFAULT '',
+                parser_missing_fields_json TEXT NOT NULL DEFAULT '[]',
+                raw_fingerprint TEXT NOT NULL DEFAULT '',
+                instrument_type TEXT NOT NULL DEFAULT '',
+                instrument_filter_status TEXT NOT NULL DEFAULT '',
+                candidate_present_at_observation INTEGER NOT NULL DEFAULT 0,
+                candidate_instance_ids_json TEXT NOT NULL DEFAULT '[]',
+                baseline_id TEXT NOT NULL DEFAULT '',
+                baseline_version TEXT NOT NULL DEFAULT '',
+                qualification_status_at_capture TEXT NOT NULL DEFAULT '',
+                strict_sample_eligible_at_capture INTEGER NOT NULL DEFAULT 0,
+                included_in_universe INTEGER NOT NULL DEFAULT 0,
+                source_batch_id TEXT NOT NULL DEFAULT '',
+                source_idempotency_key TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_observations_trade
+                ON opportunity_benchmark_observations(trade_date, observed_at, code);
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_observations_batch
+                ON opportunity_benchmark_observations(benchmark_batch_id, rank, code);
+            CREATE TABLE IF NOT EXISTS opportunity_benchmark_episodes (
+                benchmark_episode_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                generation_seq INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TEXT NOT NULL DEFAULT '',
+                last_seen_at TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 0,
+                best_rank INTEGER NOT NULL DEFAULT 0,
+                max_turnover_krw REAL NOT NULL DEFAULT 0,
+                anchor_at TEXT NOT NULL DEFAULT '',
+                anchor_price REAL NOT NULL DEFAULT 0,
+                anchor_price_source TEXT NOT NULL DEFAULT '',
+                session_bucket TEXT NOT NULL DEFAULT '',
+                market_side TEXT NOT NULL DEFAULT '',
+                episode_quality TEXT NOT NULL DEFAULT '',
+                candidate_capture_status TEXT NOT NULL DEFAULT '',
+                candidate_link_count INTEGER NOT NULL DEFAULT 0,
+                qualification_status TEXT NOT NULL DEFAULT '',
+                strict_sample_eligible INTEGER NOT NULL DEFAULT 0,
+                fingerprint TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_episodes_trade
+                ON opportunity_benchmark_episodes(trade_date, code, generation_seq);
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_episodes_capture
+                ON opportunity_benchmark_episodes(trade_date, candidate_capture_status, best_rank);
+            CREATE TABLE IF NOT EXISTS opportunity_benchmark_candidate_links (
+                link_id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL DEFAULT '',
+                benchmark_episode_id TEXT NOT NULL DEFAULT '',
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                candidate_generation_seq INTEGER NOT NULL DEFAULT 0,
+                code TEXT NOT NULL DEFAULT '',
+                benchmark_anchor_at TEXT NOT NULL DEFAULT '',
+                candidate_first_seen_at TEXT NOT NULL DEFAULT '',
+                detection_delay_sec INTEGER,
+                detection_window TEXT NOT NULL DEFAULT '',
+                link_confidence TEXT NOT NULL DEFAULT '',
+                primary_link INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_links_episode
+                ON opportunity_benchmark_candidate_links(benchmark_episode_id, primary_link);
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_links_candidate
+                ON opportunity_benchmark_candidate_links(candidate_instance_id);
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_links_trade_window
+                ON opportunity_benchmark_candidate_links(trade_date, detection_window);
+            CREATE TABLE IF NOT EXISTS opportunity_benchmark_price_observations (
+                price_observation_id TEXT PRIMARY KEY,
+                benchmark_episode_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                observed_at TEXT NOT NULL DEFAULT '',
+                price REAL NOT NULL DEFAULT 0,
+                high REAL NOT NULL DEFAULT 0,
+                low REAL NOT NULL DEFAULT 0,
+                volume INTEGER NOT NULL DEFAULT 0,
+                source_type TEXT NOT NULL DEFAULT '',
+                source_resolution TEXT NOT NULL DEFAULT '',
+                source_quality TEXT NOT NULL DEFAULT '',
+                source_event_id TEXT NOT NULL DEFAULT '',
+                source_fingerprint TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_price_episode
+                ON opportunity_benchmark_price_observations(benchmark_episode_id, observed_at);
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_price_trade
+                ON opportunity_benchmark_price_observations(trade_date, code, observed_at);
+            CREATE TABLE IF NOT EXISTS opportunity_benchmark_outcomes (
+                outcome_id TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
+                benchmark_episode_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                horizon_min INTEGER NOT NULL DEFAULT 0,
+                label_status TEXT NOT NULL DEFAULT '',
+                label_quality TEXT NOT NULL DEFAULT '',
+                source_cutoff_at TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(outcome_id, revision)
+            );
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_outcomes_episode
+                ON opportunity_benchmark_outcomes(benchmark_episode_id, horizon_min, revision);
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_outcomes_status
+                ON opportunity_benchmark_outcomes(trade_date, label_status, label_quality);
+            CREATE TABLE IF NOT EXISTS opportunity_benchmark_reports (
+                report_id TEXT PRIMARY KEY,
+                trade_date TEXT NOT NULL DEFAULT '',
+                report_state TEXT NOT NULL DEFAULT '',
+                baseline_id TEXT NOT NULL DEFAULT '',
+                baseline_version TEXT NOT NULL DEFAULT '',
+                config_hash TEXT NOT NULL DEFAULT '',
+                git_sha TEXT NOT NULL DEFAULT '',
+                qualification_status TEXT NOT NULL DEFAULT '',
+                strict_sample_eligible INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 0,
+                report_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finalized_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_reports_trade
+                ON opportunity_benchmark_reports(trade_date, report_state, revision);
             CREATE TABLE IF NOT EXISTS setup_router_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -15833,6 +16030,638 @@ class TradingDatabase:
         params.append(max(1, int(limit or 100)))
         return [_row_to_strategy_baseline_session(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
 
+    def save_opportunity_benchmark_batches(self, batches: Iterable[dict]) -> dict:
+        rows = [dict(item or {}) for item in episodes_or_empty(batches)]
+        written = 0
+        skipped = 0
+        with self._write_scope():
+            for payload in rows:
+                batch_id = str(payload.get("benchmark_batch_id") or "")
+                if not batch_id:
+                    continue
+                fingerprint = str(payload.get("source_fingerprint") or "")
+                existing = self.conn.execute(
+                    "SELECT source_fingerprint FROM opportunity_benchmark_batches WHERE benchmark_batch_id = ?",
+                    (batch_id,),
+                ).fetchone()
+                if existing and fingerprint and str(existing["source_fingerprint"] or "") == fingerprint:
+                    skipped += 1
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO opportunity_benchmark_batches(
+                        benchmark_batch_id, schema_version, trade_date, observed_at,
+                        session_bucket, source_type, source_batch_id, source_command_id,
+                        source_idempotency_key, market_scope, exchange_scope,
+                        requested_top_n, raw_row_count, parsed_row_count,
+                        accepted_row_count, duplicate_row_count, invalid_code_count,
+                        missing_price_count, parser_status, completeness_status,
+                        baseline_id, baseline_version, config_hash, git_sha,
+                        qualification_status_at_capture, source_fingerprint,
+                        raw_source_fingerprint, payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(benchmark_batch_id) DO UPDATE SET
+                        observed_at=excluded.observed_at,
+                        source_command_id=excluded.source_command_id,
+                        source_idempotency_key=excluded.source_idempotency_key,
+                        raw_row_count=excluded.raw_row_count,
+                        parsed_row_count=excluded.parsed_row_count,
+                        accepted_row_count=excluded.accepted_row_count,
+                        duplicate_row_count=excluded.duplicate_row_count,
+                        invalid_code_count=excluded.invalid_code_count,
+                        missing_price_count=excluded.missing_price_count,
+                        parser_status=excluded.parser_status,
+                        completeness_status=excluded.completeness_status,
+                        qualification_status_at_capture=excluded.qualification_status_at_capture,
+                        source_fingerprint=excluded.source_fingerprint,
+                        raw_source_fingerprint=excluded.raw_source_fingerprint,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        batch_id,
+                        str(payload.get("schema_version") or ""),
+                        str(payload.get("trade_date") or ""),
+                        str(payload.get("observed_at") or ""),
+                        str(payload.get("session_bucket") or ""),
+                        str(payload.get("source_type") or ""),
+                        str(payload.get("source_batch_id") or ""),
+                        str(payload.get("source_command_id") or ""),
+                        str(payload.get("source_idempotency_key") or ""),
+                        str(payload.get("market_scope") or ""),
+                        str(payload.get("exchange_scope") or ""),
+                        _safe_int(payload.get("requested_top_n"), 0),
+                        _safe_int(payload.get("raw_row_count"), 0),
+                        _safe_int(payload.get("parsed_row_count"), 0),
+                        _safe_int(payload.get("accepted_row_count"), 0),
+                        _safe_int(payload.get("duplicate_row_count"), 0),
+                        _safe_int(payload.get("invalid_code_count"), 0),
+                        _safe_int(payload.get("missing_price_count"), 0),
+                        str(payload.get("parser_status") or ""),
+                        str(payload.get("completeness_status") or ""),
+                        str(payload.get("baseline_id") or ""),
+                        str(payload.get("baseline_version") or ""),
+                        str(payload.get("config_hash") or ""),
+                        str(payload.get("git_sha") or ""),
+                        str(payload.get("qualification_status_at_capture") or ""),
+                        fingerprint,
+                        str(payload.get("raw_source_fingerprint") or ""),
+                        _json_payload(payload),
+                        str(payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                    ),
+                )
+                written += 1
+        return {"written": written, "skipped": skipped}
+
+    def list_opportunity_benchmark_batches(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        source_type: Optional[str] = None,
+        completeness_status: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if source_type:
+            clauses.append("source_type = ?")
+            params.append(str(source_type))
+        if completeness_status:
+            clauses.append("completeness_status = ?")
+            params.append(str(completeness_status))
+        query = "SELECT * FROM opportunity_benchmark_batches"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY observed_at ASC, source_type ASC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 100)), max(0, int(offset or 0))])
+        return [_row_to_opportunity_benchmark_batch(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def save_opportunity_benchmark_observations(self, observations: Iterable[dict]) -> dict:
+        rows = [dict(item or {}) for item in episodes_or_empty(observations)]
+        written = 0
+        skipped = 0
+        with self._write_scope():
+            for payload in rows:
+                observation_id = str(payload.get("observation_id") or "")
+                if not observation_id:
+                    continue
+                fingerprint = str(payload.get("raw_fingerprint") or "")
+                existing = self.conn.execute(
+                    "SELECT raw_fingerprint FROM opportunity_benchmark_observations WHERE observation_id = ?",
+                    (observation_id,),
+                ).fetchone()
+                if existing and fingerprint and str(existing["raw_fingerprint"] or "") == fingerprint:
+                    skipped += 1
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO opportunity_benchmark_observations(
+                        observation_id, benchmark_batch_id, trade_date, observed_at,
+                        session_bucket, source_type, code, name, market_side, rank,
+                        previous_rank, rank_delta, current_price, price_source,
+                        turnover_krw, turnover_rank, change_rate_pct, volume,
+                        best_ask, best_bid, spread_pct, parser_status,
+                        parser_missing_fields_json, raw_fingerprint, instrument_type,
+                        instrument_filter_status, candidate_present_at_observation,
+                        candidate_instance_ids_json, baseline_id, baseline_version,
+                        qualification_status_at_capture, strict_sample_eligible_at_capture,
+                        included_in_universe, source_batch_id, source_idempotency_key,
+                        payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(observation_id) DO UPDATE SET
+                        current_price=excluded.current_price,
+                        price_source=excluded.price_source,
+                        turnover_krw=excluded.turnover_krw,
+                        candidate_present_at_observation=excluded.candidate_present_at_observation,
+                        candidate_instance_ids_json=excluded.candidate_instance_ids_json,
+                        qualification_status_at_capture=excluded.qualification_status_at_capture,
+                        strict_sample_eligible_at_capture=excluded.strict_sample_eligible_at_capture,
+                        raw_fingerprint=excluded.raw_fingerprint,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        observation_id,
+                        str(payload.get("benchmark_batch_id") or ""),
+                        str(payload.get("trade_date") or ""),
+                        str(payload.get("observed_at") or ""),
+                        str(payload.get("session_bucket") or ""),
+                        str(payload.get("source_type") or ""),
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("name") or ""),
+                        str(payload.get("market_side") or ""),
+                        _safe_int(payload.get("rank"), 0),
+                        _nullable_int(payload.get("previous_rank")),
+                        _nullable_int(payload.get("rank_delta")),
+                        _float_value(payload.get("current_price")),
+                        str(payload.get("price_source") or ""),
+                        _float_value(payload.get("turnover_krw")),
+                        _safe_int(payload.get("turnover_rank"), 0),
+                        _float_value(payload.get("change_rate_pct")),
+                        _safe_int(payload.get("volume"), 0),
+                        _float_value(payload.get("best_ask")),
+                        _float_value(payload.get("best_bid")),
+                        _nullable_float(payload.get("spread_pct")),
+                        str(payload.get("parser_status") or ""),
+                        json.dumps(list(payload.get("parser_missing_fields") or []), ensure_ascii=False, sort_keys=True, default=str),
+                        fingerprint,
+                        str(payload.get("instrument_type") or ""),
+                        str(payload.get("instrument_filter_status") or ""),
+                        int(bool(payload.get("candidate_present_at_observation"))),
+                        json.dumps(list(payload.get("candidate_instance_ids") or []), ensure_ascii=False, sort_keys=True, default=str),
+                        str(payload.get("baseline_id") or ""),
+                        str(payload.get("baseline_version") or ""),
+                        str(payload.get("qualification_status_at_capture") or ""),
+                        int(bool(payload.get("strict_sample_eligible_at_capture"))),
+                        int(bool(payload.get("included_in_universe"))),
+                        str(payload.get("source_batch_id") or ""),
+                        str(payload.get("source_idempotency_key") or ""),
+                        _json_payload(payload),
+                        str(payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                    ),
+                )
+                written += 1
+        return {"written": written, "skipped": skipped}
+
+    def list_opportunity_benchmark_observations(self, *, trade_date: Optional[str] = None, benchmark_batch_id: Optional[str] = None, limit: int = 1000, offset: int = 0) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if benchmark_batch_id:
+            clauses.append("benchmark_batch_id = ?")
+            params.append(str(benchmark_batch_id))
+        query = "SELECT * FROM opportunity_benchmark_observations"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY observed_at ASC, rank ASC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 1000)), max(0, int(offset or 0))])
+        return [_row_to_opportunity_benchmark_observation(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def save_opportunity_benchmark_episodes(self, episodes: Iterable[dict]) -> dict:
+        rows = [dict(item or {}) for item in episodes_or_empty(episodes)]
+        written = 0
+        skipped = 0
+        with self._write_scope():
+            for payload in rows:
+                episode_id = str(payload.get("benchmark_episode_id") or "")
+                if not episode_id:
+                    continue
+                fingerprint = str(payload.get("fingerprint") or "")
+                existing = self.conn.execute(
+                    "SELECT fingerprint FROM opportunity_benchmark_episodes WHERE benchmark_episode_id = ?",
+                    (episode_id,),
+                ).fetchone()
+                if existing and fingerprint and str(existing["fingerprint"] or "") == fingerprint:
+                    skipped += 1
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO opportunity_benchmark_episodes(
+                        benchmark_episode_id, schema_version, trade_date, code, name,
+                        generation_seq, first_seen_at, last_seen_at, active, best_rank,
+                        max_turnover_krw, anchor_at, anchor_price, anchor_price_source,
+                        session_bucket, market_side, episode_quality,
+                        candidate_capture_status, candidate_link_count,
+                        qualification_status, strict_sample_eligible, fingerprint,
+                        payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(benchmark_episode_id) DO UPDATE SET
+                        last_seen_at=excluded.last_seen_at,
+                        active=excluded.active,
+                        best_rank=excluded.best_rank,
+                        max_turnover_krw=excluded.max_turnover_krw,
+                        anchor_price=excluded.anchor_price,
+                        anchor_price_source=excluded.anchor_price_source,
+                        episode_quality=excluded.episode_quality,
+                        candidate_capture_status=excluded.candidate_capture_status,
+                        candidate_link_count=excluded.candidate_link_count,
+                        qualification_status=excluded.qualification_status,
+                        strict_sample_eligible=excluded.strict_sample_eligible,
+                        fingerprint=excluded.fingerprint,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        episode_id,
+                        str(payload.get("schema_version") or ""),
+                        str(payload.get("trade_date") or ""),
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("name") or ""),
+                        _safe_int(payload.get("generation_seq"), 0),
+                        str(payload.get("first_seen_at") or ""),
+                        str(payload.get("last_seen_at") or ""),
+                        int(bool(payload.get("active"))),
+                        _safe_int(payload.get("best_rank"), 0),
+                        _float_value(payload.get("max_turnover_krw")),
+                        str(payload.get("anchor_at") or ""),
+                        _float_value(payload.get("anchor_price")),
+                        str(payload.get("anchor_price_source") or ""),
+                        str(payload.get("session_bucket") or ""),
+                        str(payload.get("market_side") or ""),
+                        str(payload.get("episode_quality") or ""),
+                        str(payload.get("candidate_capture_status") or ""),
+                        _safe_int(payload.get("candidate_link_count"), 0),
+                        str(payload.get("qualification_status") or ""),
+                        int(bool(payload.get("strict_sample_eligible"))),
+                        fingerprint,
+                        _json_payload(payload),
+                        str(payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                    ),
+                )
+                written += 1
+        return {"written": written, "skipped": skipped}
+
+    def list_opportunity_benchmark_episodes(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        code: Optional[str] = None,
+        session_bucket: Optional[str] = None,
+        market_side: Optional[str] = None,
+        rank_bucket: Optional[str] = None,
+        candidate_capture_status: Optional[str] = None,
+        label_status: Optional[str] = None,
+        label_quality: Optional[str] = None,
+        strict_only: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("e.trade_date = ?")
+            params.append(str(trade_date))
+        if code:
+            clauses.append("e.code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        if session_bucket:
+            clauses.append("e.session_bucket = ?")
+            params.append(str(session_bucket))
+        if market_side:
+            clauses.append("e.market_side = ?")
+            params.append(str(market_side))
+        if candidate_capture_status:
+            clauses.append("e.candidate_capture_status = ?")
+            params.append(str(candidate_capture_status))
+        if strict_only:
+            clauses.append("e.strict_sample_eligible = 1")
+        bounds = _rank_bucket_bounds(str(rank_bucket or ""))
+        if bounds:
+            clauses.append("e.best_rank BETWEEN ? AND ?")
+            params.extend(bounds)
+        if label_status or label_quality:
+            if label_status:
+                clauses.append("o.label_status = ?")
+                params.append(str(label_status))
+            if label_quality:
+                clauses.append("o.label_quality = ?")
+                params.append(str(label_quality))
+        query = "SELECT DISTINCT e.* FROM opportunity_benchmark_episodes e"
+        if label_status or label_quality:
+            query += " JOIN opportunity_benchmark_outcomes o ON o.benchmark_episode_id = e.benchmark_episode_id"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY e.best_rank ASC, e.max_turnover_krw DESC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 100)), max(0, int(offset or 0))])
+        return [_row_to_opportunity_benchmark_episode(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def get_opportunity_benchmark_episode(self, benchmark_episode_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM opportunity_benchmark_episodes WHERE benchmark_episode_id = ?",
+            (str(benchmark_episode_id or ""),),
+        ).fetchone()
+        return _row_to_opportunity_benchmark_episode(row) if row else None
+
+    def save_opportunity_benchmark_candidate_links(self, links: Iterable[dict]) -> dict:
+        rows = [dict(item or {}) for item in episodes_or_empty(links)]
+        with self._write_scope():
+            for payload in rows:
+                link_id = str(payload.get("link_id") or "")
+                if not link_id:
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO opportunity_benchmark_candidate_links(
+                        link_id, trade_date, benchmark_episode_id, candidate_instance_id,
+                        candidate_id, candidate_generation_seq, code, benchmark_anchor_at,
+                        candidate_first_seen_at, detection_delay_sec, detection_window,
+                        link_confidence, primary_link, payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(link_id) DO UPDATE SET
+                        detection_delay_sec=excluded.detection_delay_sec,
+                        detection_window=excluded.detection_window,
+                        link_confidence=excluded.link_confidence,
+                        primary_link=excluded.primary_link,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        link_id,
+                        str(payload.get("trade_date") or ""),
+                        str(payload.get("benchmark_episode_id") or ""),
+                        str(payload.get("candidate_instance_id") or ""),
+                        payload.get("candidate_id"),
+                        _safe_int(payload.get("candidate_generation_seq"), 0),
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("benchmark_anchor_at") or ""),
+                        str(payload.get("candidate_first_seen_at") or ""),
+                        _nullable_int(payload.get("detection_delay_sec")),
+                        str(payload.get("detection_window") or ""),
+                        str(payload.get("link_confidence") or ""),
+                        int(bool(payload.get("primary_link"))),
+                        _json_payload(payload),
+                        str(payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                    ),
+                )
+        return {"written": len(rows), "skipped": 0}
+
+    def list_opportunity_benchmark_candidate_links(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        benchmark_episode_id: Optional[str] = None,
+        detection_window: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if benchmark_episode_id:
+            clauses.append("benchmark_episode_id = ?")
+            params.append(str(benchmark_episode_id))
+        if detection_window:
+            clauses.append("detection_window = ?")
+            params.append(str(detection_window))
+        query = "SELECT * FROM opportunity_benchmark_candidate_links"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY benchmark_anchor_at ASC, detection_delay_sec ASC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 100)), max(0, int(offset or 0))])
+        return [_row_to_opportunity_benchmark_candidate_link(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def save_opportunity_benchmark_price_observations(self, observations: Iterable[dict]) -> dict:
+        rows = [dict(item or {}) for item in episodes_or_empty(observations)]
+        written = 0
+        skipped = 0
+        with self._write_scope():
+            for payload in rows:
+                observation_id = str(payload.get("price_observation_id") or "")
+                if not observation_id:
+                    continue
+                fingerprint = str(payload.get("source_fingerprint") or "")
+                existing = self.conn.execute(
+                    "SELECT source_fingerprint FROM opportunity_benchmark_price_observations WHERE price_observation_id = ?",
+                    (observation_id,),
+                ).fetchone()
+                if existing and fingerprint and str(existing["source_fingerprint"] or "") == fingerprint:
+                    skipped += 1
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO opportunity_benchmark_price_observations(
+                        price_observation_id, benchmark_episode_id, trade_date, code,
+                        observed_at, price, high, low, volume, source_type,
+                        source_resolution, source_quality, source_event_id,
+                        source_fingerprint, payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(price_observation_id) DO UPDATE SET
+                        price=excluded.price,
+                        high=excluded.high,
+                        low=excluded.low,
+                        volume=excluded.volume,
+                        source_fingerprint=excluded.source_fingerprint,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        observation_id,
+                        str(payload.get("benchmark_episode_id") or ""),
+                        str(payload.get("trade_date") or ""),
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("observed_at") or ""),
+                        _float_value(payload.get("price")),
+                        _float_value(payload.get("high")),
+                        _float_value(payload.get("low")),
+                        _safe_int(payload.get("volume"), 0),
+                        str(payload.get("source_type") or ""),
+                        str(payload.get("source_resolution") or ""),
+                        str(payload.get("source_quality") or ""),
+                        str(payload.get("source_event_id") or ""),
+                        fingerprint,
+                        _json_payload(payload),
+                        str(payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                    ),
+                )
+                written += 1
+        return {"written": written, "skipped": skipped}
+
+    def list_opportunity_benchmark_price_observations(self, *, benchmark_episode_id: Optional[str] = None, trade_date: Optional[str] = None, limit: int = 1000) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if benchmark_episode_id:
+            clauses.append("benchmark_episode_id = ?")
+            params.append(str(benchmark_episode_id))
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        query = "SELECT * FROM opportunity_benchmark_price_observations"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY observed_at ASC LIMIT ?"
+        params.append(max(1, int(limit or 1000)))
+        return [_row_to_opportunity_benchmark_price_observation(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def save_opportunity_benchmark_outcomes(self, outcomes: Iterable[dict]) -> dict:
+        rows = [dict(item or {}) for item in episodes_or_empty(outcomes)]
+        written = 0
+        skipped = 0
+        with self._write_scope():
+            for payload in rows:
+                outcome_id = str(payload.get("outcome_id") or "")
+                if not outcome_id:
+                    continue
+                fingerprint = str(payload.get("fingerprint") or "")
+                existing = self.conn.execute(
+                    """
+                    SELECT revision, fingerprint
+                    FROM opportunity_benchmark_outcomes
+                    WHERE outcome_id = ?
+                    ORDER BY revision DESC
+                    LIMIT 1
+                    """,
+                    (outcome_id,),
+                ).fetchone()
+                if existing and fingerprint and str(existing["fingerprint"] or "") == fingerprint:
+                    skipped += 1
+                    continue
+                revision = _safe_int(existing["revision"], 0) + 1 if existing else max(1, _safe_int(payload.get("revision"), 0) or 1)
+                payload["revision"] = revision
+                self.conn.execute(
+                    """
+                    INSERT INTO opportunity_benchmark_outcomes(
+                        outcome_id, revision, benchmark_episode_id, trade_date, code,
+                        horizon_min, label_status, label_quality, source_cutoff_at,
+                        fingerprint, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        outcome_id,
+                        revision,
+                        str(payload.get("benchmark_episode_id") or ""),
+                        str(payload.get("trade_date") or ""),
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        _safe_int(payload.get("horizon_min"), 0),
+                        str(payload.get("label_status") or ""),
+                        str(payload.get("label_quality") or ""),
+                        str(payload.get("source_cutoff_at") or ""),
+                        fingerprint,
+                        _json_payload(payload),
+                    ),
+                )
+                written += 1
+        return {"written": written, "skipped": skipped}
+
+    def list_opportunity_benchmark_outcomes(self, *, trade_date: Optional[str] = None, benchmark_episode_id: Optional[str] = None, label_status: Optional[str] = None, label_quality: Optional[str] = None, limit: int = 1000) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if benchmark_episode_id:
+            clauses.append("benchmark_episode_id = ?")
+            params.append(str(benchmark_episode_id))
+        if label_status:
+            clauses.append("label_status = ?")
+            params.append(str(label_status))
+        if label_quality:
+            clauses.append("label_quality = ?")
+            params.append(str(label_quality))
+        query = "SELECT * FROM opportunity_benchmark_outcomes"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, revision DESC LIMIT ?"
+        params.append(max(1, int(limit or 1000)))
+        return [_row_to_opportunity_benchmark_outcome(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def save_opportunity_benchmark_report(self, payload: dict) -> dict:
+        report = dict(payload or {})
+        state = str(report.get("report_state") or "")
+        revision = _safe_int(report.get("revision"), 0)
+        if state == "FINAL":
+            row = self.conn.execute(
+                """
+                SELECT MAX(revision) AS revision
+                FROM opportunity_benchmark_reports
+                WHERE trade_date = ? AND report_state = 'FINAL'
+                """,
+                (str(report.get("trade_date") or ""),),
+            ).fetchone()
+            revision = max(1, _safe_int(row["revision"], 0) + 1 if row else 1) if revision <= 0 else revision
+            report["revision"] = revision
+            report["report_id"] = f"{report.get('report_id')}:r{revision}" if f":r{revision}" not in str(report.get("report_id") or "") else str(report.get("report_id") or "")
+        report_id = str(report.get("report_id") or "")
+        with self._write_scope():
+            self.conn.execute(
+                """
+                INSERT INTO opportunity_benchmark_reports(
+                    report_id, trade_date, report_state, baseline_id,
+                    baseline_version, config_hash, git_sha, qualification_status,
+                    strict_sample_eligible, revision, report_json, finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_id) DO UPDATE SET
+                    qualification_status=excluded.qualification_status,
+                    strict_sample_eligible=excluded.strict_sample_eligible,
+                    report_json=excluded.report_json
+                """,
+                (
+                    report_id,
+                    str(report.get("trade_date") or ""),
+                    state,
+                    str(report.get("baseline_id") or ""),
+                    str(report.get("baseline_version") or ""),
+                    str(report.get("config_hash") or ""),
+                    str(report.get("git_sha") or ""),
+                    str(report.get("qualification_status") or ""),
+                    int(bool(report.get("strict_sample_eligible"))),
+                    revision,
+                    _json_payload(report),
+                    str(report.get("finalized_at") or ""),
+                ),
+            )
+        return self.get_opportunity_benchmark_report(report_id) or report
+
+    def get_opportunity_benchmark_report(self, report_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM opportunity_benchmark_reports WHERE report_id = ?",
+            (str(report_id or ""),),
+        ).fetchone()
+        return _row_to_opportunity_benchmark_report(row) if row else None
+
+    def list_opportunity_benchmark_reports(self, *, trade_date: Optional[str] = None, report_state: Optional[str] = None, limit: int = 20) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if report_state:
+            clauses.append("report_state = ?")
+            params.append(str(report_state))
+        query = "SELECT * FROM opportunity_benchmark_reports"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, revision DESC LIMIT ?"
+        params.append(max(1, int(limit or 20)))
+        return [_row_to_opportunity_benchmark_report(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
     def save_candidate_funnel_episodes(self, episodes: Iterable[dict]) -> dict:
         rows = [dict(item or {}) for item in episodes or []]
         written = 0
@@ -21663,6 +22492,19 @@ def _json_payload(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
+def episodes_or_empty(value: Iterable[dict] | None) -> Iterable[dict]:
+    return value or []
+
+
+def _rank_bucket_bounds(value: str) -> tuple[int, int] | None:
+    return {
+        "1~10": (1, 10),
+        "11~30": (11, 30),
+        "31~50": (31, 50),
+        "51~100": (51, 100),
+    }.get(str(value or ""))
+
+
 def _row_to_strategy_baseline_definition(row: sqlite3.Row) -> dict:
     data = dict(row)
     data["challenger_setups"] = _safe_json_loads(data.pop("challenger_setups_json", "[]"), [])
@@ -21755,6 +22597,54 @@ def _row_to_ops_runtime_health_sample(row: sqlite3.Row) -> dict:
     data["market_context_available"] = bool(data.get("market_context_available"))
     payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
     data["payload"] = payload if isinstance(payload, dict) else {}
+    return data
+
+
+def _row_to_opportunity_payload(row: sqlite3.Row, *bool_keys: str) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.update(data)
+    for key in bool_keys:
+        payload[key] = bool(payload.get(key))
+    return payload
+
+
+def _row_to_opportunity_benchmark_batch(row: sqlite3.Row) -> dict:
+    return _row_to_opportunity_payload(row)
+
+
+def _row_to_opportunity_benchmark_observation(row: sqlite3.Row) -> dict:
+    payload = _row_to_opportunity_payload(row, "candidate_present_at_observation", "strict_sample_eligible_at_capture", "included_in_universe")
+    payload["parser_missing_fields"] = _safe_json_loads(payload.pop("parser_missing_fields_json", "[]"), [])
+    payload["candidate_instance_ids"] = _safe_json_loads(payload.pop("candidate_instance_ids_json", "[]"), [])
+    return payload
+
+
+def _row_to_opportunity_benchmark_episode(row: sqlite3.Row) -> dict:
+    return _row_to_opportunity_payload(row, "active", "strict_sample_eligible")
+
+
+def _row_to_opportunity_benchmark_candidate_link(row: sqlite3.Row) -> dict:
+    return _row_to_opportunity_payload(row, "primary_link")
+
+
+def _row_to_opportunity_benchmark_price_observation(row: sqlite3.Row) -> dict:
+    return _row_to_opportunity_payload(row)
+
+
+def _row_to_opportunity_benchmark_outcome(row: sqlite3.Row) -> dict:
+    return _row_to_opportunity_payload(row)
+
+
+def _row_to_opportunity_benchmark_report(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["strict_sample_eligible"] = bool(data.get("strict_sample_eligible"))
+    payload = _safe_json_loads(data.pop("report_json", "{}"), {})
+    if isinstance(payload, dict):
+        payload.update(data)
+        return payload
     return data
 
 

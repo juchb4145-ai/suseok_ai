@@ -62,6 +62,7 @@ class RebootV2Runtime:
     order_manager_pipeline: Any = None
     strategy_baseline_service: Any = None
     candidate_funnel_service: Any = None
+    opportunity_benchmark_service: Any = None
     trading_day_qualification_service: Any = None
     clock: Any = datetime.now
     startup_warnings: list[str] = field(default_factory=list)
@@ -92,6 +93,7 @@ class RebootV2Runtime:
         snapshot = self._base_snapshot(current, status="WARMUP")
         self._attach_strategy_baseline(snapshot, current, runtime_cycle_count=0)
         self._attach_candidate_funnel(snapshot, current)
+        self._attach_opportunity_benchmark(snapshot, current)
         self._attach_trading_day_qualification(snapshot, current)
         snapshot["blocking_reason"] = "WAITING_FOR_FIRST_RUNTIME_CYCLE"
         snapshot["next_required_action"] = "RUN_RUNTIME_CYCLE"
@@ -167,6 +169,7 @@ class RebootV2Runtime:
 
         self._attach_counts(snapshot, current)
         self._attach_candidate_funnel(snapshot, current)
+        self._attach_opportunity_benchmark(snapshot, current)
         self._attach_trading_day_qualification(snapshot, current)
         snapshot["order_manager"] = snapshot.get("order_manager_v2") or _disabled_section("ORDER_MANAGER_DISABLED_IN_V2_OBSERVE")
         snapshot["legacy_runtime"] = {
@@ -212,6 +215,7 @@ class RebootV2Runtime:
                 "exit_engine": _component_enabled(self.exit_engine_reboot_pipeline),
                 "position_risk": _component_enabled(self.position_risk_pipeline),
                 "order_manager": _component_enabled(self.order_manager_pipeline),
+                "opportunity_benchmark": _component_enabled(self.opportunity_benchmark_service),
                 "legacy_entry_path": False,
             },
             "warnings": list(self.startup_warnings or []),
@@ -692,6 +696,38 @@ class RebootV2Runtime:
             or {}
         )
         snapshot["candidate_funnel"] = section
+        for warning in list(section.get("warning_codes") or []):
+            if warning not in snapshot.setdefault("warnings", []):
+                snapshot["warnings"].append(warning)
+
+    def _attach_opportunity_benchmark(self, snapshot: dict[str, Any], now: datetime) -> None:
+        service = self.opportunity_benchmark_service
+        if service is None:
+            snapshot["opportunity_benchmark"] = {
+                "enabled": False,
+                "status": "DISABLED",
+                "batch_count": 0,
+                "observation_count": 0,
+                "episode_count": 0,
+                "candidate_captured_count": 0,
+                "candidate_not_captured_count": 0,
+                "checked_at": now.isoformat(),
+            }
+            return
+        builder = getattr(service, "runtime_section", None)
+        if not callable(builder):
+            snapshot["opportunity_benchmark"] = {"enabled": False, "status": "DISABLED", "checked_at": now.isoformat()}
+            return
+        section = dict(
+            builder(
+                trade_date=now.date().isoformat(),
+                as_of=now,
+                baseline=dict(snapshot.get("strategy_baseline") or {}),
+                runtime_snapshot=snapshot,
+            )
+            or {}
+        )
+        snapshot["opportunity_benchmark"] = section
         for warning in list(section.get("warning_codes") or []):
             if warning not in snapshot.setdefault("warnings", []):
                 snapshot["warnings"].append(warning)

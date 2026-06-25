@@ -1111,6 +1111,7 @@ function renderDashboardV2(snapshot) {
   const strategyBaseline = payload.strategy_baseline || (health.strategy_baseline || {});
   const qualification = payload.trading_day_qualification || {};
   const candidateFunnel = payload.candidate_funnel || {};
+  const opportunityBenchmark = payload.opportunity_benchmark || {};
   const noTrade = qualification.no_trade_classification || candidateFunnel.no_trade_classification || {};
   const readModel = payload.read_model || {};
 
@@ -1189,6 +1190,9 @@ function renderDashboardV2(snapshot) {
   text("dashboard-v2-qualification-status", `${qualification.qualification_status || "-"} / ${qualification.qualification_score ?? "-"}`);
   text("dashboard-v2-qualification-strict", qualification.strict_sample_eligible ? "YES" : "NO");
   text("dashboard-v2-funnel-champion", `${candidateFunnel.champion_forming_count || 0}/${candidateFunnel.champion_matched_count || 0}/${candidateFunnel.champion_valid_observe_count || 0}`);
+  text("dashboard-v2-benchmark-capture", `${opportunityBenchmark.episode_count || 0}/${opportunityBenchmark.candidate_captured_count || 0}/${opportunityBenchmark.candidate_not_captured_count || 0}`);
+  text("dashboard-v2-benchmark-labels", `${opportunityBenchmark.label_complete_count || 0}/${opportunityBenchmark.label_sampled_count || 0}/${opportunityBenchmark.label_insufficient_count || 0}`);
+  text("dashboard-v2-benchmark-last", formatDateTime(opportunityBenchmark.last_batch_at || opportunityBenchmark.checked_at));
   text("dashboard-v2-no-trade", noTrade.operator_message_ko || noTrade.classification || "-");
 }
 

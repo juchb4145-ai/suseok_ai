@@ -52,6 +52,10 @@ from trading.strategy.candidate_funnel import (
     TradingDayQualificationConfig,
     TradingDayQualificationService,
 )
+from trading.strategy.opportunity_benchmark import (
+    OpportunityBenchmarkConfig,
+    OpportunityBenchmarkService,
+)
 from trading.strategy.subscription_lifecycle import RealtimeSubscriptionLifecycleTracker
 from trading.strategy.subscription_readiness import RealtimeSubscriptionReadinessProvider
 from trading.strategy.setup_runtime import SetupRouterV3RuntimePipeline
@@ -114,6 +118,7 @@ class CoreRuntimeBundle:
     subscription_lifecycle_tracker: Any = None
     strategy_baseline_service: Any = None
     candidate_funnel_service: Any = None
+    opportunity_benchmark_service: Any = None
     trading_day_qualification_service: Any = None
 
 
@@ -510,6 +515,12 @@ def build_reboot_v2_runtime_bundle(
         db=db,
         config=CandidateFunnelConfig.from_env(),
     )
+    opportunity_benchmark_service = OpportunityBenchmarkService(
+        db=db,
+        market_data=market_data,
+        candle_builder=candle_builder,
+        config=OpportunityBenchmarkConfig.from_env(),
+    )
     trading_day_qualification_service = TradingDayQualificationService(
         db=db,
         config=TradingDayQualificationConfig.from_env(),
@@ -541,6 +552,7 @@ def build_reboot_v2_runtime_bundle(
         expansion_lease_manager=expansion_lease_manager,
         strategy_baseline_service=baseline_service,
         candidate_funnel_service=candidate_funnel_service,
+        opportunity_benchmark_service=opportunity_benchmark_service,
         trading_day_qualification_service=trading_day_qualification_service,
     )
     readiness_report = build_readiness_report(
@@ -580,6 +592,7 @@ def build_reboot_v2_runtime_bundle(
         subscription_lifecycle_tracker=subscription_lifecycle_tracker,
         strategy_baseline_service=baseline_service,
         candidate_funnel_service=candidate_funnel_service,
+        opportunity_benchmark_service=opportunity_benchmark_service,
         trading_day_qualification_service=trading_day_qualification_service,
     )
 

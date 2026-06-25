@@ -68,6 +68,7 @@ from trading.strategy.candidate_funnel import (
     CandidateFunnelService,
     TradingDayQualificationService,
 )
+from trading.strategy.opportunity_benchmark import OpportunityBenchmarkService
 from trading.theme_engine.backfill import ThemeBackfillConfig, apply_dispatch_guard
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSourceSyncService
@@ -1449,6 +1450,191 @@ def rebuild_ops_candidate_funnel(
         report["rebuild_reason"] = rebuild_reason
         report["analysis_only"] = True
         report["gateway_command_created"] = False
+        return report
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/opportunity-benchmark/summary")
+def ops_opportunity_benchmark_summary(
+    trade_date: str | None = Query(None),
+    report_state: str = Query("LIVE_PREVIEW"),
+    strict_only: bool = Query(False),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    state = "FINAL" if str(report_state or "").upper() == "FINAL" else "LIVE_PREVIEW"
+    db = open_database()
+    try:
+        reports = list(db.list_opportunity_benchmark_reports(trade_date=resolved, report_state=state, limit=1) or [])
+        if reports:
+            report = dict(reports[0])
+            if strict_only:
+                report["episodes"] = [item for item in list(report.get("episodes") or []) if item.get("strict_sample_eligible")]
+            return {**report, "read_only": True}
+        snapshot = runtime_supervisor.snapshot()
+        return {
+            **OpportunityBenchmarkService(db).build_report(
+                trade_date=resolved,
+                report_state=state,
+                runtime_snapshot=snapshot,
+                baseline=dict(snapshot.get("strategy_baseline") or {}),
+                persist=False,
+                strict_only=strict_only,
+            ),
+            "read_only": True,
+        }
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/opportunity-benchmark/batches")
+def ops_opportunity_benchmark_batches(
+    trade_date: str | None = Query(None),
+    source_type: str | None = Query(None),
+    completeness_status: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    db = open_database()
+    try:
+        items = db.list_opportunity_benchmark_batches(
+            trade_date=resolved,
+            source_type=source_type,
+            completeness_status=completeness_status,
+            limit=limit + 1,
+            offset=offset,
+        )
+        page_items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {"trade_date": resolved, "items": page_items, "pagination": pagination, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/opportunity-benchmark/episodes")
+def ops_opportunity_benchmark_episodes(
+    trade_date: str | None = Query(None),
+    code: str | None = Query(None),
+    session_bucket: str | None = Query(None),
+    market_side: str | None = Query(None),
+    rank_bucket: str | None = Query(None),
+    candidate_capture_status: str | None = Query(None),
+    label_status: str | None = Query(None),
+    label_quality: str | None = Query(None),
+    strict_only: bool = Query(False),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    db = open_database()
+    try:
+        items = db.list_opportunity_benchmark_episodes(
+            trade_date=resolved,
+            code=code,
+            session_bucket=session_bucket,
+            market_side=market_side,
+            rank_bucket=rank_bucket,
+            candidate_capture_status=candidate_capture_status,
+            label_status=label_status,
+            label_quality=label_quality,
+            strict_only=strict_only,
+            limit=limit + 1,
+            offset=offset,
+        )
+        page_items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {"trade_date": resolved, "items": page_items, "pagination": pagination, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/opportunity-benchmark/episodes/{benchmark_episode_id}")
+def ops_opportunity_benchmark_episode_detail(benchmark_episode_id: str) -> dict[str, Any]:
+    db = open_database()
+    try:
+        item = db.get_opportunity_benchmark_episode(benchmark_episode_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="opportunity benchmark episode not found")
+        links = db.list_opportunity_benchmark_candidate_links(benchmark_episode_id=benchmark_episode_id, limit=1000)
+        outcomes = db.list_opportunity_benchmark_outcomes(benchmark_episode_id=benchmark_episode_id, limit=1000)
+        prices = db.list_opportunity_benchmark_price_observations(benchmark_episode_id=benchmark_episode_id, limit=1000)
+        return {**item, "candidate_links": links, "outcomes": outcomes, "price_observations": prices, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/opportunity-benchmark/uncaptured")
+def ops_opportunity_benchmark_uncaptured(
+    trade_date: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    db = open_database()
+    try:
+        items = db.list_opportunity_benchmark_episodes(
+            trade_date=resolved,
+            candidate_capture_status="NOT_CAPTURED",
+            limit=limit + 1,
+            offset=offset,
+        )
+        page_items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {"trade_date": resolved, "items": page_items, "pagination": pagination, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/opportunity-benchmark/capture-delay")
+def ops_opportunity_benchmark_capture_delay(
+    trade_date: str | None = Query(None),
+    detection_window: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    resolved = _theme_rotation_trade_date(trade_date)
+    db = open_database()
+    try:
+        items = db.list_opportunity_benchmark_candidate_links(
+            trade_date=resolved,
+            detection_window=detection_window,
+            limit=limit + 1,
+            offset=offset,
+        )
+        page_items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {"trade_date": resolved, "items": page_items, "pagination": pagination, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.post("/api/ops/opportunity-benchmark/rebuild")
+def rebuild_ops_opportunity_benchmark(
+    body: dict[str, Any] | None = Body(default=None),
+    trade_date: str | None = Query(None),
+    report_state: str = Query("LIVE_PREVIEW"),
+    export: bool = Query(False),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    payload = dict(body or {})
+    rebuild_reason = str(payload.get("rebuild_reason") or "").strip()
+    if not rebuild_reason:
+        raise HTTPException(status_code=400, detail="rebuild_reason is required")
+    resolved = _theme_rotation_trade_date(trade_date or payload.get("trade_date"))
+    snapshot = runtime_supervisor.snapshot()
+    db = open_database()
+    try:
+        report = OpportunityBenchmarkService(db).build_report(
+            trade_date=resolved,
+            report_state="FINAL" if str(report_state or "").upper() == "FINAL" else "LIVE_PREVIEW",
+            runtime_snapshot=snapshot,
+            baseline=dict(snapshot.get("strategy_baseline") or {}),
+            persist=True,
+            export=export,
+            rebuild_reason=rebuild_reason,
+            source_cutoff_at=payload.get("source_cutoff_at"),
+        )
+        report["analysis_only"] = True
+        report["gateway_command_created"] = False
+        report["strategy_settings_changed"] = False
+        report["orders_created"] = False
         return report
     finally:
         close_database(db)

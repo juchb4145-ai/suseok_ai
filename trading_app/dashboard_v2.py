@@ -49,6 +49,9 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
         _prefer_runtime_section(base.get("trading_day_qualification"), runtime.get("trading_day_qualification"))
     )
     candidate_funnel = _candidate_funnel(_prefer_runtime_section(base.get("candidate_funnel"), runtime.get("candidate_funnel")))
+    opportunity_benchmark = _opportunity_benchmark(
+        _prefer_runtime_section(base.get("opportunity_benchmark"), runtime.get("opportunity_benchmark"))
+    )
     candidates = dict(base.get("candidates") or {})
 
     payload = {
@@ -72,6 +75,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
         "strategy_baseline": strategy_baseline,
         "trading_day_qualification": trading_day_qualification,
         "candidate_funnel": candidate_funnel,
+        "opportunity_benchmark": opportunity_benchmark,
         "pre_market_check": _pre_market_check(base),
         "wait_block_reasons": _wait_block_reasons(base, runtime),
         "system_health": _system_health(base, runtime, gateway, commands),
@@ -103,6 +107,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
             "strategy_baseline": strategy_baseline,
             "trading_day_qualification": trading_day_qualification,
             "candidate_funnel": candidate_funnel,
+            "opportunity_benchmark": opportunity_benchmark,
         }
     return payload
 
@@ -941,6 +946,34 @@ def _candidate_funnel(section: dict[str, Any]) -> dict[str, Any]:
         "no_trade_classification": no_trade,
         "operator_message_ko": no_trade.get("operator_message_ko") or "Reboot V2 canonical funnel 수집 중",
         "checked_at": payload.get("checked_at") or payload.get("generated_at") or "",
+    }
+
+
+def _opportunity_benchmark(section: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(section or {})
+    return {
+        "enabled": bool(payload.get("enabled", bool(payload))),
+        "status": payload.get("status", "DISABLED" if not payload else "OK"),
+        "last_batch_at": payload.get("last_batch_at", ""),
+        "batch_count": int(payload.get("batch_count") or payload.get("source_batch_count") or 0),
+        "observation_count": int(payload.get("observation_count") or 0),
+        "episode_count": int(payload.get("episode_count") or 0),
+        "candidate_captured_count": int(payload.get("candidate_captured_count") or payload.get("candidate_captured_episode_count") or 0),
+        "candidate_not_captured_count": int(payload.get("candidate_not_captured_count") or payload.get("candidate_not_captured_episode_count") or 0),
+        "captured_within_5m_count": int(payload.get("captured_within_5m_count") or 0),
+        "label_complete_count": int(payload.get("label_complete_count") or payload.get("exact_label_count") or 0),
+        "label_sampled_count": int(payload.get("label_sampled_count") or payload.get("sampled_label_count") or 0),
+        "label_insufficient_count": int(payload.get("label_insufficient_count") or payload.get("insufficient_label_count") or 0),
+        "capture_rate": payload.get("capture_rate") or payload.get("candidate_capture_rate"),
+        "qualification_status": payload.get("qualification_status", ""),
+        "warning_codes": list(payload.get("warning_codes") or [])[:5],
+        "build_ms": float(payload.get("build_ms") or 0.0),
+        "checked_at": payload.get("checked_at") or payload.get("generated_at") or "",
+        "links": {
+            "uncaptured": "/api/ops/opportunity-benchmark/uncaptured",
+            "capture_delay": "/api/ops/opportunity-benchmark/capture-delay",
+            "episodes": "/api/ops/opportunity-benchmark/episodes",
+        },
     }
 
 
