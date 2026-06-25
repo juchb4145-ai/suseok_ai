@@ -49,6 +49,37 @@ STAGE_ORDER = [
 ]
 STAGE_ORDINAL = {stage: index for index, stage in enumerate(STAGE_ORDER)}
 ORDER_STAGES = set(STAGE_ORDER[13:])
+STAGE_REQUIRED_PREDECESSORS = {
+    "ACTIVE_SOURCE_PRESENT": ("CANDIDATE_CREATED",),
+    "HYDRATION_COMPLETE": ("CANDIDATE_CREATED",),
+    "EVALUATION_ELIGIBLE": ("ACTIVE_SOURCE_PRESENT", "HYDRATION_COMPLETE"),
+    "REALTIME_SUBSCRIPTION_ACTIVE": ("CANDIDATE_CREATED",),
+    "FRESH_REALTIME_READY": ("REALTIME_SUBSCRIPTION_ACTIVE",),
+    "STRATEGY_CONTEXT_READY": ("CANDIDATE_CREATED",),
+    "ENTRY_EVALUATED": ("CANDIDATE_CREATED",),
+    "CHAMPION_FORMING": ("ENTRY_EVALUATED", "FRESH_REALTIME_READY"),
+    "CHAMPION_MATCHED": ("CHAMPION_FORMING",),
+    "CHAMPION_CONTEXT_ELIGIBLE": ("CHAMPION_MATCHED", "STRATEGY_CONTEXT_READY"),
+    "CHAMPION_VALID_OBSERVE": ("CHAMPION_CONTEXT_ELIGIBLE", "FRESH_REALTIME_READY"),
+    "ORDER_INTENT_CREATED": ("CHAMPION_VALID_OBSERVE",),
+    "GATEWAY_COMMAND_QUEUED": ("ORDER_INTENT_CREATED",),
+    "BROKER_ACCEPTED": ("GATEWAY_COMMAND_QUEUED",),
+    "PARTIAL_FILLED": ("BROKER_ACCEPTED",),
+    "FILLED": ("BROKER_ACCEPTED",),
+}
+STRICT_LATENCY_STAGES = {
+    "EVALUATION_ELIGIBLE",
+    "FRESH_REALTIME_READY",
+    "CHAMPION_FORMING",
+    "CHAMPION_MATCHED",
+    "CHAMPION_CONTEXT_ELIGIBLE",
+    "CHAMPION_VALID_OBSERVE",
+    "ORDER_INTENT_CREATED",
+    "GATEWAY_COMMAND_QUEUED",
+    "BROKER_ACCEPTED",
+    "PARTIAL_FILLED",
+    "FILLED",
+}
 
 
 @dataclass(frozen=True)
@@ -171,6 +202,8 @@ class CandidateFunnelService:
             "top_stop_reasons": _top_counts(episode["stop_reason_family"] for episode in episodes.values()),
             "invariant_violations": invariant_violations,
             "invariant_violation_count": len(invariant_violations),
+            "critical_invariant_violation_count": sum(1 for item in invariant_violations if item.get("severity") == "CRITICAL"),
+            "warning_invariant_violation_count": sum(1 for item in invariant_violations if item.get("severity") != "CRITICAL"),
             "no_trade_classification": no_trade,
             "episodes": sorted(detail_episodes, key=lambda item: (item["max_stage_ordinal"], item["candidate_instance_id"]), reverse=True),
             "generated_at": current.isoformat(),
@@ -768,35 +801,81 @@ def _stage_summary(episodes: Iterable[Mapping[str, Any]], *, order_policy: Mappi
 
 def _invariant_violations(episodes: Iterable[Mapping[str, Any]], *, as_of: datetime) -> list[dict[str, Any]]:
     violations: list[dict[str, Any]] = []
+    episode_rows = list(episodes)
     as_of_text = as_of.isoformat()
-    for episode in episodes:
+    for episode in episode_rows:
         ci = str(episode.get("candidate_instance_id") or "")
         reached = set(episode.get("reached_stages") or [])
         times = dict(episode.get("stage_first_reached_at") or {})
+        emitted_missing: dict[tuple[str, str], dict[str, Any]] = {}
         for stage in reached:
-            ordinal = STAGE_ORDINAL[stage]
-            if ordinal > 0:
-                missing = [prev for prev in STAGE_ORDER[:ordinal] if prev not in reached and prev not in ORDER_STAGES]
-                if missing:
-                    violations.append({"candidate_instance_id": ci, "type": "DOWNSTREAM_WITHOUT_UPSTREAM", "stage": stage, "missing_stage": missing[0]})
+            for required in STAGE_REQUIRED_PREDECESSORS.get(stage, ()):
+                if required in reached:
+                    continue
+                key = (ci, required)
+                blocked = sorted(
+                    item
+                    for item in reached
+                    if required in STAGE_REQUIRED_PREDECESSORS.get(item, ())
+                )
+                severity = _missing_predecessor_severity(stage, required)
+                existing = emitted_missing.get(key)
+                if existing is not None:
+                    existing["blocked_stages"] = sorted(set(existing.get("blocked_stages") or []) | set(blocked))
+                    if severity == "CRITICAL" and existing.get("severity") != "CRITICAL":
+                        existing["severity"] = "CRITICAL"
+                        existing["stage"] = stage
+                    continue
+                violation = {
+                    "candidate_instance_id": ci,
+                    "type": "DOWNSTREAM_WITHOUT_UPSTREAM",
+                    "severity": severity,
+                    "stage": stage,
+                    "missing_stage": required,
+                    "blocked_stages": blocked,
+                }
+                emitted_missing[key] = violation
+                violations.append(violation)
             at = str(times.get(stage) or "")
             if at and at > as_of_text:
-                violations.append({"candidate_instance_id": ci, "type": "FUTURE_TIMESTAMP", "stage": stage, "timestamp": at, "as_of": as_of_text})
-            if ordinal > 0:
-                prev = STAGE_ORDER[ordinal - 1]
-                prev_at = str(times.get(prev) or "")
-                if at and prev_at and at < prev_at:
-                    violations.append({"candidate_instance_id": ci, "type": "NEGATIVE_STAGE_LATENCY", "stage": stage, "previous_stage": prev, "stage_at": at, "previous_at": prev_at})
+                violations.append({"candidate_instance_id": ci, "type": "FUTURE_TIMESTAMP", "severity": "CRITICAL", "stage": stage, "timestamp": at, "as_of": as_of_text})
+            if stage in STRICT_LATENCY_STAGES:
+                for prev in STAGE_REQUIRED_PREDECESSORS.get(stage, ()):
+                    prev_at = str(times.get(prev) or "")
+                    if at and prev_at and at < prev_at:
+                        violations.append(
+                            {
+                                "candidate_instance_id": ci,
+                                "type": "NEGATIVE_STAGE_LATENCY",
+                                "severity": "CRITICAL",
+                                "stage": stage,
+                                "previous_stage": prev,
+                                "stage_at": at,
+                                "previous_at": prev_at,
+                            }
+                        )
         if int(episode.get("max_stage_ordinal") or -1) < max([STAGE_ORDINAL[item] for item in reached], default=-1):
-            violations.append({"candidate_instance_id": ci, "type": "MAX_STAGE_REGRESSION", "stage": episode.get("current_stage") or ""})
+            violations.append({"candidate_instance_id": ci, "type": "MAX_STAGE_REGRESSION", "severity": "CRITICAL", "stage": episode.get("current_stage") or ""})
     code_by_instance: dict[str, str] = {}
-    for episode in episodes:
+    for episode in episode_rows:
         ci = str(episode.get("candidate_instance_id") or "")
         code = str(episode.get("code") or "")
         if ci in code_by_instance and code_by_instance[ci] != code:
-            violations.append({"candidate_instance_id": ci, "type": "IDENTITY_CONFLICT", "code": code, "previous_code": code_by_instance[ci]})
+            violations.append({"candidate_instance_id": ci, "type": "IDENTITY_CONFLICT", "severity": "CRITICAL", "code": code, "previous_code": code_by_instance[ci]})
         code_by_instance[ci] = code
     return violations
+
+
+def _missing_predecessor_severity(stage: str, missing_stage: str) -> str:
+    if stage in ORDER_STAGES:
+        return "CRITICAL"
+    if stage.startswith("CHAMPION_"):
+        return "CRITICAL"
+    if stage in {"EVALUATION_ELIGIBLE", "FRESH_REALTIME_READY"}:
+        return "CRITICAL"
+    if missing_stage in {"FRESH_REALTIME_READY", "REALTIME_SUBSCRIPTION_ACTIVE"} and stage in {"STRATEGY_CONTEXT_READY", "ENTRY_EVALUATED"}:
+        return "WARNING"
+    return "WARNING"
 
 
 def _qualification_evidence(
@@ -809,6 +888,9 @@ def _qualification_evidence(
     samples = _safe_call(getattr(db, "list_ops_runtime_health_samples", None), trade_date=trade_date, limit=100000)
     readiness = _safe_call(getattr(db, "list_setup_router_readiness_latest", None), trade_date=trade_date, router_version=ROUTER_VERSION, limit=100000)
     order_counts = _order_counts(db, trade_date)
+    current_eval_instances = _current_eval_instances(funnel_report)
+    if current_eval_instances:
+        readiness = [item for item in readiness if str(item.get("candidate_instance_id") or "") in current_eval_instances]
     market_sources = Counter(str(item.get("market_context_source") or "UNAVAILABLE") for item in samples)
     if not market_sources:
         source = str(dict(runtime_snapshot.get("market_context_transport") or {}).get("source") or "UNAVAILABLE")
@@ -818,8 +900,8 @@ def _qualification_evidence(
     unavailable_count = market_sources.get("UNAVAILABLE", 0)
     selected = sum(1 for item in readiness if item.get("subscription_selected") or item.get("subscription_target_selected"))
     active = sum(1 for item in readiness if item.get("subscription_active"))
-    eval_count = _stage_count(funnel_report, "EVALUATION_ELIGIBLE")
-    fresh_count = _stage_count(funnel_report, "FRESH_REALTIME_READY")
+    eval_count = len(current_eval_instances) if current_eval_instances else _stage_count(funnel_report, "EVALUATION_ELIGIBLE")
+    fresh_count = sum(1 for item in readiness if item.get("post_subscription_tick_verified")) if current_eval_instances else _stage_count(funnel_report, "FRESH_REALTIME_READY")
     snapshot_integrity = _snapshot_integrity(samples, db)
     return {
         "runtime_cycle_count": _int(runtime_snapshot.get("cycle_count") or runtime_snapshot.get("runtime_cycle_count"), 0),
@@ -839,10 +921,21 @@ def _qualification_evidence(
         "fresh_realtime_ready_count": fresh_count,
         "readiness_wait_count": sum(1 for item in readiness if not item.get("readiness_ready")),
         "tr_backfill_only_count": sum(1 for item in readiness if str(item.get("latest_tick_source") or "").upper() == "TR_BACKFILL"),
+        "coverage_denominator_candidate_instance_count": len(current_eval_instances),
         "order_counts": order_counts,
         "snapshot_integrity": snapshot_integrity,
         "health_sample_count": len(samples),
     }
+
+
+def _current_eval_instances(funnel_report: Mapping[str, Any]) -> set[str]:
+    result: set[str] = set()
+    for episode in list(funnel_report.get("episodes") or []):
+        reached = set(episode.get("reached_stages") or [])
+        ci = str(episode.get("candidate_instance_id") or "")
+        if ci and "EVALUATION_ELIGIBLE" in reached:
+            result.add(ci)
+    return result
 
 
 def _baseline_check(baseline: Mapping[str, Any]) -> dict[str, Any]:
@@ -995,14 +1088,21 @@ def _order_safety_check(evidence: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _funnel_integrity_check(funnel: Mapping[str, Any]) -> dict[str, Any]:
-    count = _int(funnel.get("invariant_violation_count"), 0)
+    total = _int(funnel.get("invariant_violation_count"), 0)
+    explicit_critical = "critical_invariant_violation_count" in funnel
+    count = _int(funnel.get("critical_invariant_violation_count"), 0) if explicit_critical else total
+    warning_count = _int(funnel.get("warning_invariant_violation_count"), 0)
     return _check(
         "FUNNEL_INTEGRITY",
         "FAIL" if count else "PASS",
         critical=bool(count),
         reason_codes=["FUNNEL_INVARIANT_VIOLATION"] if count else [],
         score_weight=5,
-        evidence={"invariant_violation_count": count},
+        evidence={
+            "invariant_violation_count": total,
+            "critical_invariant_violation_count": count,
+            "warning_invariant_violation_count": warning_count,
+        },
     )
 
 
@@ -1139,6 +1239,8 @@ def _candidate_funnel_runtime_section(report: Mapping[str, Any]) -> dict[str, An
         "highest_applicable_stage": _highest_applicable_stage(report),
         "top_stop_reasons": list(report.get("top_stop_reasons") or [])[:5],
         "invariant_violation_count": _int(report.get("invariant_violation_count"), 0),
+        "critical_invariant_violation_count": _int(report.get("critical_invariant_violation_count"), 0),
+        "warning_invariant_violation_count": _int(report.get("warning_invariant_violation_count"), 0),
         "no_trade_classification": dict(report.get("no_trade_classification") or {}),
         "checked_at": report.get("generated_at", ""),
         "build_duration_ms": report.get("build_duration_ms", 0),

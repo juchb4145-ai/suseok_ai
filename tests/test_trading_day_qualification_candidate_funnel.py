@@ -77,6 +77,42 @@ def test_candidate_funnel_flags_future_and_negative_stage_timestamps(tmp_path):
     assert future.id is not None
     assert "FUTURE_TIMESTAMP" in types
     assert "NEGATIVE_STAGE_LATENCY" in types
+    assert report["critical_invariant_violation_count"] >= 2
+
+
+def test_candidate_funnel_context_entry_without_realtime_is_not_critical_invariant(tmp_path):
+    db = TradingDatabase(str(tmp_path / "context-entry-only.db"))
+    candidate = _seed_candidate(db)
+    _seed_context_entry(db, candidate.id)
+
+    report = CandidateFunnelService(db).build_report(trade_date=TRADE_DATE, as_of=NOW, baseline=_baseline(), persist=False)
+
+    assert _stage_count(report, "STRATEGY_CONTEXT_READY") == 1
+    assert _stage_count(report, "ENTRY_EVALUATED") == 1
+    assert report["critical_invariant_violation_count"] == 0
+    assert all(
+        item.get("missing_stage") not in {"REALTIME_SUBSCRIPTION_ACTIVE", "FRESH_REALTIME_READY"}
+        for item in report["invariant_violations"]
+    )
+
+
+def test_candidate_funnel_missing_root_is_deduped_and_escalated_to_critical(tmp_path):
+    db = TradingDatabase(str(tmp_path / "missing-root.db"))
+    candidate = _seed_candidate(db)
+    _seed_context_entry(db, candidate.id)
+    _seed_setup_observation(db, candidate.id, shape_status="MATCHED", router_status="VALID_OBSERVE", context_status="ELIGIBLE")
+
+    report = CandidateFunnelService(db).build_report(trade_date=TRADE_DATE, as_of=NOW, baseline=_baseline(), persist=False)
+    fresh_missing = [
+        item
+        for item in report["invariant_violations"]
+        if item.get("candidate_instance_id") == candidate.metadata["candidate_instance_id"]
+        and item.get("missing_stage") == "FRESH_REALTIME_READY"
+    ]
+
+    assert len(fresh_missing) == 1
+    assert fresh_missing[0]["severity"] == "CRITICAL"
+    assert "CHAMPION_VALID_OBSERVE" in fresh_missing[0]["blocked_stages"]
 
 
 def test_candidate_identity_same_code_new_instance_is_separate_episode(tmp_path):

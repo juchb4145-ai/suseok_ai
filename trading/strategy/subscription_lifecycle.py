@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Iterable, Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from trading.strategy.candidates import normalize_code
 
 
 SUBSCRIPTION_LIFECYCLE_SCHEMA_VERSION = "realtime_subscription_lifecycle.v1"
+try:
+    LOCAL_TIMEZONE = ZoneInfo(os.getenv("TRADING_LOCAL_TIMEZONE", "Asia/Seoul"))
+except ZoneInfoNotFoundError:  # pragma: no cover - defensive fallback for stripped runtimes
+    LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
+TARGET_SELECTION_PRESERVE_STATES = {
+    "COMMAND_ENQUEUED",
+    "COMMAND_DISPATCHED",
+    "ACKED_WAIT_FIRST_TICK",
+    "ACTIVE_FRESH",
+    "ACTIVE_STALE",
+}
 
 
 class RealtimeSubscriptionLifecycleState(str, Enum):
@@ -137,13 +150,19 @@ class RealtimeSubscriptionLifecycleTracker:
             code = normalize_code(getattr(record, "code", ""))
             if not code:
                 continue
+            previous = self._snapshots.get(code)
+            state = RealtimeSubscriptionLifecycleState.TARGET_SELECTED
+            if previous is not None and previous.lifecycle_state in TARGET_SELECTION_PRESERVE_STATES:
+                state = RealtimeSubscriptionLifecycleState(previous.lifecycle_state)
             self._transition(
                 code,
-                RealtimeSubscriptionLifecycleState.TARGET_SELECTED,
+                state,
                 current,
                 requested=True,
                 target_selected=True,
                 budget_deferred=False,
+                released=False,
+                failed=False,
                 screen_no=str(getattr(record, "screen_no", "") or ""),
                 target_selected_at_utc=current,
                 sources=tuple(sorted(str(source) for source in getattr(record, "sources", set()) or [] if str(source))),
@@ -198,6 +217,16 @@ class RealtimeSubscriptionLifecycleTracker:
                 stale=False,
                 released=False,
                 failed=False,
+                release_requested_at_utc="",
+                released_at_utc="",
+                first_tick_at_utc="",
+                first_tick_gateway_at_utc="",
+                first_tick_core_at_utc="",
+                last_tick_at_utc="",
+                stale_since_utc="",
+                registration_ack_baseline_at_utc="",
+                latest_tick_age_sec=999999.0,
+                ack_to_first_tick_ms=None,
                 screen_no=receipt.screen_no,
                 register_command_id=receipt.command_id,
                 subscription_session_id=receipt.subscription_session_id,
@@ -251,6 +280,8 @@ class RealtimeSubscriptionLifecycleTracker:
                     first_tick_verified=False,
                     decision_fresh=False,
                     stale=False,
+                    released=False,
+                    failed=False,
                     register_command_id=str(payload.get("command_id") or ""),
                     screen_no=str(payload.get("screen_no") or ""),
                     gateway_call_started_at_utc=_metadata_text(payload, "gateway_kiwoom_call_started_at_utc"),
@@ -258,6 +289,15 @@ class RealtimeSubscriptionLifecycleTracker:
                     command_acked_at_utc=ack_time,
                     core_ack_received_at_utc=current,
                     registration_ack_baseline_at_utc=baseline,
+                    release_requested_at_utc="",
+                    released_at_utc="",
+                    first_tick_at_utc="",
+                    first_tick_gateway_at_utc="",
+                    first_tick_core_at_utc="",
+                    last_tick_at_utc="",
+                    stale_since_utc="",
+                    latest_tick_age_sec=999999.0,
+                    ack_to_first_tick_ms=None,
                     enqueue_to_ack_ms=_latency_ms(self.snapshot(code).get("command_enqueued_at_utc"), ack_time),
                     dispatch_to_ack_ms=_latency_ms(self.snapshot(code).get("command_dispatched_at_utc"), ack_time),
                 )
@@ -477,7 +517,9 @@ class RealtimeSubscriptionLifecycleTracker:
     def _now(self) -> datetime:
         value = self.clock()
         if isinstance(value, datetime):
-            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            if value.tzinfo:
+                return value.astimezone(timezone.utc)
+            return value.replace(tzinfo=LOCAL_TIMEZONE).astimezone(timezone.utc)
         return datetime.now(timezone.utc)
 
 
@@ -537,13 +579,13 @@ def _utc_text(value: Any) -> str:
             except ValueError:
                 return text
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=LOCAL_TIMEZONE)
     return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _parse_time(value: Any) -> datetime | None:
     if isinstance(value, datetime):
-        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=LOCAL_TIMEZONE).astimezone(timezone.utc)
     text = str(value or "").strip()
     if not text:
         return None
@@ -551,7 +593,7 @@ def _parse_time(value: Any) -> datetime | None:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=LOCAL_TIMEZONE).astimezone(timezone.utc)
 
 
 def _latency_ms(start: Any, end: Any) -> float | None:
