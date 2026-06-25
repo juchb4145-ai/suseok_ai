@@ -5375,7 +5375,18 @@ def realtime_subscription_lifecycle(
         loader = getattr(db, "list_realtime_subscription_lifecycle_latest", None)
         if not callable(loader):
             items: list[dict[str, Any]] = []
+            count_items: list[dict[str, Any]] = []
         else:
+            count_items = list(
+                loader(
+                    trade_date=resolved,
+                    code=_setup_router_v3_text(code),
+                    lifecycle_state=_setup_router_v3_text(lifecycle_state),
+                    limit=100000,
+                    offset=0,
+                )
+                or []
+            )
             items = list(
                 loader(
                     trade_date=resolved,
@@ -5386,6 +5397,16 @@ def realtime_subscription_lifecycle(
                 )
                 or []
             )
+        count_items = _filter_realtime_subscription_lifecycle(
+            count_items,
+            requested=requested,
+            target_selected=target_selected,
+            acked=acked,
+            first_tick_verified=first_tick_verified,
+            decision_fresh=decision_fresh,
+            budget_deferred=budget_deferred,
+            source=_setup_router_v3_text(source),
+        )
         items = _filter_realtime_subscription_lifecycle(
             items,
             requested=requested,
@@ -5401,7 +5422,7 @@ def realtime_subscription_lifecycle(
         else:
             page_source = items
         page_items, pagination = _trim_page(page_source, limit=limit_value, offset=offset_value)
-        state_counts = Counter(str(item.get("lifecycle_state") or "UNKNOWN") for item in items)
+        state_counts = Counter(str(item.get("lifecycle_state") or "UNKNOWN") for item in count_items)
         return {
             "trade_date": resolved,
             "items": page_items,

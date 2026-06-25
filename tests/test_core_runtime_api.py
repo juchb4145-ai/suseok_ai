@@ -45,6 +45,45 @@ def test_root_defaults_to_dashboard_v2_and_legacy_route_keeps_themelab(tmp_path,
     assert "/static/themelab.js" in themelab.text
 
 
+def test_realtime_subscription_lifecycle_counts_use_full_filtered_set(tmp_path, monkeypatch):
+    db_path = tmp_path / "trader.sqlite3"
+    with _client(tmp_path, monkeypatch, enabled="0") as client:
+        db = TradingDatabase(str(db_path))
+        try:
+            for code, state, updated_at in [
+                ("000001", "BUDGET_DEFERRED", "2026-06-22T09:05:03Z"),
+                ("000002", "BUDGET_DEFERRED", "2026-06-22T09:05:02Z"),
+                ("000003", "ACTIVE_FRESH", "2026-06-22T09:05:01Z"),
+            ]:
+                db.save_realtime_subscription_lifecycle_latest(
+                    {
+                        "trade_date": "2026-06-22",
+                        "code": code,
+                        "schema_version": "realtime_subscription_lifecycle.v1",
+                        "lifecycle_state": state,
+                        "requested": True,
+                        "target_selected": state != "BUDGET_DEFERRED",
+                        "budget_deferred": state == "BUDGET_DEFERRED",
+                        "command_enqueued": state == "ACTIVE_FRESH",
+                        "command_dispatched": state == "ACTIVE_FRESH",
+                        "acked": state == "ACTIVE_FRESH",
+                        "transport_active": state == "ACTIVE_FRESH",
+                        "first_tick_verified": state == "ACTIVE_FRESH",
+                        "decision_fresh": state == "ACTIVE_FRESH",
+                        "updated_at_utc": updated_at,
+                    }
+                )
+        finally:
+            db.close()
+
+        response = client.get("/api/runtime/realtime-subscriptions/lifecycle?trade_date=2026-06-22&limit=1")
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["pagination"]["count"] == 1
+    assert payload["lifecycle_state_counts"] == {"BUDGET_DEFERRED": 2, "ACTIVE_FRESH": 1}
+
+
 def test_runtime_dashboard_payload_preserves_reboot_v2_snapshot_fields(monkeypatch):
     monkeypatch.setenv("TRADING_DB_PATH", "unused.db")
     import trading_app.api as api

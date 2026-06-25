@@ -371,6 +371,55 @@ def test_duplicate_queued_register_keeps_existing_command_pending(tmp_path):
         db.close()
 
 
+def test_register_enqueue_preserves_active_fresh_until_new_ack(tmp_path):
+    db, clock, state, tracker, manager = _runtime(tmp_path)
+    try:
+        manager.ensure_subscription("005930", "reboot_v2_candidate")
+        manager.sync()
+        command = state.dispatch_commands(limit=1)[0]
+        ack_payload = {
+            "command_id": command.command_id,
+            "command_type": command.type,
+            "codes": list(command.payload.get("codes") or []),
+            "screen_no": command.payload.get("screen_no"),
+            "status": "ACKED",
+            "transport_trace": {
+                "gateway_kiwoom_call_finished_at_utc": "2026-06-22T09:05:02Z",
+                "gateway_command_ack_created_at_utc": "2026-06-22T09:05:02Z",
+            },
+        }
+        clock.value = _utc(2026, 6, 22, 9, 5, 2)
+        manager.handle_realtime_command_event(GatewayEvent(type="command_ack", payload=ack_payload))
+        clock.value = _utc(2026, 6, 22, 9, 5, 4)
+        manager.handle_price_tick({"code": "005930", "timestamp": "2026-06-22T09:05:03Z"})
+
+        receipt = RealtimeCommandReceipt(
+            accepted=True,
+            command_id="cmd-refresh",
+            command_type="register_realtime",
+            enqueued_at_utc="2026-06-22T09:05:05.000Z",
+            screen_no="7000",
+            codes=("005930",),
+            subscription_session_id="rt-session-2",
+            subscription_generation=2,
+            target_digest="digest-2",
+        )
+        tracker.on_command_enqueued(
+            receipt,
+            [SimpleNamespace(code="005930", screen_no="7000", sources={"reboot_v2_candidate"}, primary_source="reboot_v2_candidate")],
+            now=_utc(2026, 6, 22, 9, 5, 5),
+        )
+
+        snapshot = tracker.snapshot("005930")
+        assert snapshot["lifecycle_state"] == "ACTIVE_FRESH"
+        assert snapshot["register_command_id"] == "cmd-refresh"
+        assert snapshot["first_tick_verified"] is True
+        assert snapshot["decision_fresh"] is True
+        assert snapshot["last_tick_at_utc"] == "2026-06-22T09:05:03.000Z"
+    finally:
+        db.close()
+
+
 def test_new_register_ack_after_release_clears_old_release_and_tick_evidence(tmp_path):
     db = TradingDatabase(str(tmp_path / "subscription-lifecycle-reregister.db"))
     clock = _Clock(_utc(2026, 6, 22, 9, 5, 0))

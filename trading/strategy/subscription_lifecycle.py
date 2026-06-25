@@ -225,6 +225,20 @@ class RealtimeSubscriptionLifecycleTracker:
         for code in codes:
             record = record_by_code.get(code)
             state = RealtimeSubscriptionLifecycleState.COMMAND_DISPATCHED if duplicate_status == "DISPATCHED" else RealtimeSubscriptionLifecycleState.COMMAND_ENQUEUED
+            previous = self._snapshots.get(code)
+            preserve_active = bool(
+                previous
+                and not previous.released
+                and not previous.failed
+                and previous.transport_active
+                and previous.first_tick_verified
+                and previous.lifecycle_state in {
+                    RealtimeSubscriptionLifecycleState.ACTIVE_FRESH.value,
+                    RealtimeSubscriptionLifecycleState.ACTIVE_STALE.value,
+                }
+            )
+            if preserve_active:
+                state = RealtimeSubscriptionLifecycleState(previous.lifecycle_state)
             self._transition(
                 code,
                 state,
@@ -233,24 +247,24 @@ class RealtimeSubscriptionLifecycleTracker:
                 target_selected=True,
                 budget_deferred=False,
                 command_enqueued=True,
-                command_dispatched=duplicate_status == "DISPATCHED",
-                acked=False,
-                transport_active=False,
-                first_tick_verified=False,
-                decision_fresh=False,
-                stale=False,
+                command_dispatched=duplicate_status == "DISPATCHED" or (previous.command_dispatched if preserve_active and previous else False),
+                acked=previous.acked if preserve_active and previous else False,
+                transport_active=previous.transport_active if preserve_active and previous else False,
+                first_tick_verified=previous.first_tick_verified if preserve_active and previous else False,
+                decision_fresh=previous.decision_fresh if preserve_active and previous else False,
+                stale=previous.stale if preserve_active and previous else False,
                 released=False,
                 failed=False,
                 release_requested_at_utc="",
                 released_at_utc="",
-                first_tick_at_utc="",
-                first_tick_gateway_at_utc="",
-                first_tick_core_at_utc="",
-                last_tick_at_utc="",
-                stale_since_utc="",
-                registration_ack_baseline_at_utc="",
-                latest_tick_age_sec=999999.0,
-                ack_to_first_tick_ms=None,
+                first_tick_at_utc=previous.first_tick_at_utc if preserve_active and previous else "",
+                first_tick_gateway_at_utc=previous.first_tick_gateway_at_utc if preserve_active and previous else "",
+                first_tick_core_at_utc=previous.first_tick_core_at_utc if preserve_active and previous else "",
+                last_tick_at_utc=previous.last_tick_at_utc if preserve_active and previous else "",
+                stale_since_utc=previous.stale_since_utc if preserve_active and previous else "",
+                registration_ack_baseline_at_utc=previous.registration_ack_baseline_at_utc if preserve_active and previous else "",
+                latest_tick_age_sec=previous.latest_tick_age_sec if preserve_active and previous else 999999.0,
+                ack_to_first_tick_ms=previous.ack_to_first_tick_ms if preserve_active and previous else None,
                 screen_no=receipt.screen_no,
                 register_command_id=receipt.command_id,
                 subscription_session_id=receipt.subscription_session_id,
