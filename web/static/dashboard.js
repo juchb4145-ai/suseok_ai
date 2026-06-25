@@ -490,6 +490,11 @@ function formatRate(value) {
   return `${(number * 100).toFixed(1)}%`;
 }
 
+function formatMetricRate(value) {
+  if (value && typeof value === "object") return formatRate(value.rate);
+  return formatRate(value);
+}
+
 function formatPercentValue(value) {
   if (value == null || value === "") return "-";
   const number = Number(value);
@@ -1112,6 +1117,7 @@ function renderDashboardV2(snapshot) {
   const qualification = payload.trading_day_qualification || {};
   const candidateFunnel = payload.candidate_funnel || {};
   const opportunityBenchmark = payload.opportunity_benchmark || {};
+  const championOutcomes = payload.champion_outcomes || {};
   const noTrade = qualification.no_trade_classification || candidateFunnel.no_trade_classification || {};
   const readModel = payload.read_model || {};
 
@@ -1193,6 +1199,10 @@ function renderDashboardV2(snapshot) {
   text("dashboard-v2-benchmark-capture", `${opportunityBenchmark.episode_count || 0}/${opportunityBenchmark.candidate_captured_count || 0}/${opportunityBenchmark.candidate_not_captured_count || 0}`);
   text("dashboard-v2-benchmark-labels", `${opportunityBenchmark.label_complete_count || 0}/${opportunityBenchmark.label_sampled_count || 0}/${opportunityBenchmark.label_insufficient_count || 0}`);
   text("dashboard-v2-benchmark-last", formatDateTime(opportunityBenchmark.last_batch_at || opportunityBenchmark.checked_at));
+  text("dashboard-v2-champion-outcome-status", `${championOutcomes.evidence_tier || "EMPTY"} / ${championOutcomes.status || "-"}`);
+  text("dashboard-v2-champion-outcome-sample", `${championOutcomes.strict_labeled_signal_count || 0}건 / ${championOutcomes.valid_trade_days || 0}일`);
+  text("dashboard-v2-champion-outcome-net", `${formatPercentValue(championOutcomes.primary_avg_cost_adjusted_return)} / T ${formatMetricRate(championOutcomes.target_first_rate)} / S ${formatMetricRate(championOutcomes.stop_first_rate)}`);
+  text("dashboard-v2-champion-outcome-recommendation", championOutcomes.primary_recommendation || "-");
   text("dashboard-v2-no-trade", noTrade.operator_message_ko || noTrade.classification || "-");
 }
 

@@ -56,6 +56,10 @@ from trading.strategy.opportunity_benchmark import (
     OpportunityBenchmarkConfig,
     OpportunityBenchmarkService,
 )
+from trading.strategy.champion_outcome_validator import (
+    ChampionOutcomeValidatorConfig,
+    ChampionOutcomeValidatorService,
+)
 from trading.strategy.subscription_lifecycle import RealtimeSubscriptionLifecycleTracker
 from trading.strategy.subscription_readiness import RealtimeSubscriptionReadinessProvider
 from trading.strategy.setup_runtime import SetupRouterV3RuntimePipeline
@@ -119,6 +123,7 @@ class CoreRuntimeBundle:
     strategy_baseline_service: Any = None
     candidate_funnel_service: Any = None
     opportunity_benchmark_service: Any = None
+    champion_outcome_service: Any = None
     trading_day_qualification_service: Any = None
 
 
@@ -521,6 +526,10 @@ def build_reboot_v2_runtime_bundle(
         candle_builder=candle_builder,
         config=OpportunityBenchmarkConfig.from_env(),
     )
+    champion_outcome_service = ChampionOutcomeValidatorService(
+        db=db,
+        config=ChampionOutcomeValidatorConfig.from_env(),
+    )
     trading_day_qualification_service = TradingDayQualificationService(
         db=db,
         config=TradingDayQualificationConfig.from_env(),
@@ -553,6 +562,7 @@ def build_reboot_v2_runtime_bundle(
         strategy_baseline_service=baseline_service,
         candidate_funnel_service=candidate_funnel_service,
         opportunity_benchmark_service=opportunity_benchmark_service,
+        champion_outcome_service=champion_outcome_service,
         trading_day_qualification_service=trading_day_qualification_service,
     )
     readiness_report = build_readiness_report(
@@ -593,6 +603,7 @@ def build_reboot_v2_runtime_bundle(
         strategy_baseline_service=baseline_service,
         candidate_funnel_service=candidate_funnel_service,
         opportunity_benchmark_service=opportunity_benchmark_service,
+        champion_outcome_service=champion_outcome_service,
         trading_day_qualification_service=trading_day_qualification_service,
     )
 

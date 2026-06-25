@@ -1356,6 +1356,165 @@ class TradingDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_opportunity_benchmark_reports_trade
                 ON opportunity_benchmark_reports(trade_date, report_state, revision);
+            CREATE TABLE IF NOT EXISTS champion_signal_episodes (
+                champion_signal_episode_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                setup_instance_id TEXT NOT NULL DEFAULT '',
+                setup_generation INTEGER NOT NULL DEFAULT 0,
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                candidate_id INTEGER,
+                candidate_generation_seq INTEGER NOT NULL DEFAULT 0,
+                benchmark_episode_id TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                theme_id TEXT NOT NULL DEFAULT '',
+                theme_name TEXT NOT NULL DEFAULT '',
+                stock_role TEXT NOT NULL DEFAULT '',
+                market_side TEXT NOT NULL DEFAULT '',
+                market_action TEXT NOT NULL DEFAULT '',
+                session_phase TEXT NOT NULL DEFAULT '',
+                first_forming_at TEXT NOT NULL DEFAULT '',
+                first_matched_at TEXT NOT NULL DEFAULT '',
+                first_context_eligible_at TEXT NOT NULL DEFAULT '',
+                first_valid_observe_at TEXT NOT NULL DEFAULT '',
+                final_shape_status TEXT NOT NULL DEFAULT '',
+                final_context_status TEXT NOT NULL DEFAULT '',
+                final_router_status TEXT NOT NULL DEFAULT '',
+                benchmark_link_status TEXT NOT NULL DEFAULT '',
+                qualification_status TEXT NOT NULL DEFAULT '',
+                strict_sample_eligible INTEGER NOT NULL DEFAULT 0,
+                fingerprint TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_champion_signal_episodes_trade
+                ON champion_signal_episodes(trade_date, first_valid_observe_at, code);
+            CREATE INDEX IF NOT EXISTS idx_champion_signal_episodes_candidate
+                ON champion_signal_episodes(candidate_instance_id, setup_instance_id);
+            CREATE INDEX IF NOT EXISTS idx_champion_signal_episodes_benchmark
+                ON champion_signal_episodes(benchmark_episode_id, benchmark_link_status);
+            CREATE TABLE IF NOT EXISTS champion_signal_anchors (
+                anchor_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL DEFAULT '',
+                champion_signal_episode_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                setup_instance_id TEXT NOT NULL DEFAULT '',
+                benchmark_episode_id TEXT NOT NULL DEFAULT '',
+                anchor_type TEXT NOT NULL DEFAULT '',
+                anchor_at TEXT NOT NULL DEFAULT '',
+                anchor_price REAL NOT NULL DEFAULT 0,
+                anchor_price_source TEXT NOT NULL DEFAULT '',
+                anchor_delay_sec INTEGER NOT NULL DEFAULT 0,
+                source_observation_id TEXT NOT NULL DEFAULT '',
+                source_fingerprint TEXT NOT NULL DEFAULT '',
+                anchor_quality TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_champion_signal_anchors_episode
+                ON champion_signal_anchors(champion_signal_episode_id, anchor_type);
+            CREATE INDEX IF NOT EXISTS idx_champion_signal_anchors_trade
+                ON champion_signal_anchors(trade_date, anchor_type, anchor_at);
+            CREATE TABLE IF NOT EXISTS champion_signal_outcomes (
+                outcome_id TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
+                champion_signal_episode_id TEXT NOT NULL DEFAULT '',
+                candidate_instance_id TEXT NOT NULL DEFAULT '',
+                setup_instance_id TEXT NOT NULL DEFAULT '',
+                benchmark_episode_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                theme_id TEXT NOT NULL DEFAULT '',
+                anchor_type TEXT NOT NULL DEFAULT '',
+                anchor_at TEXT NOT NULL DEFAULT '',
+                horizon_min INTEGER NOT NULL DEFAULT 0,
+                label_status TEXT NOT NULL DEFAULT '',
+                label_quality TEXT NOT NULL DEFAULT '',
+                strict_sample_eligible INTEGER NOT NULL DEFAULT 0,
+                barrier_outcome TEXT NOT NULL DEFAULT '',
+                cost_scenario_id TEXT NOT NULL DEFAULT '',
+                source_cutoff_at TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(outcome_id, revision)
+            );
+            CREATE INDEX IF NOT EXISTS idx_champion_signal_outcomes_episode
+                ON champion_signal_outcomes(champion_signal_episode_id, anchor_type, horizon_min, revision);
+            CREATE INDEX IF NOT EXISTS idx_champion_signal_outcomes_trade
+                ON champion_signal_outcomes(trade_date, anchor_type, label_status, label_quality);
+            CREATE TABLE IF NOT EXISTS champion_context_reason_outcomes (
+                reason_outcome_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL DEFAULT '',
+                reason_code TEXT NOT NULL DEFAULT '',
+                signal_count INTEGER NOT NULL DEFAULT 0,
+                labeled_count INTEGER NOT NULL DEFAULT 0,
+                target_first_count INTEGER NOT NULL DEFAULT 0,
+                stop_first_count INTEGER NOT NULL DEFAULT 0,
+                fingerprint TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_champion_context_reason_outcomes_reason
+                ON champion_context_reason_outcomes(reason_code, updated_at);
+            CREATE TABLE IF NOT EXISTS champion_opportunity_loss_labels (
+                loss_label_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL DEFAULT '',
+                champion_signal_episode_id TEXT NOT NULL DEFAULT '',
+                trade_date TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                opportunity_loss_label TEXT NOT NULL DEFAULT '',
+                benchmark_link_status TEXT NOT NULL DEFAULT '',
+                barrier_outcome TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_champion_opportunity_loss_labels_trade
+                ON champion_opportunity_loss_labels(trade_date, opportunity_loss_label);
+            CREATE TABLE IF NOT EXISTS champion_outcome_reports (
+                report_id TEXT PRIMARY KEY,
+                report_state TEXT NOT NULL DEFAULT '',
+                trade_date_from TEXT NOT NULL DEFAULT '',
+                trade_date_to TEXT NOT NULL DEFAULT '',
+                baseline_id TEXT NOT NULL DEFAULT '',
+                baseline_version TEXT NOT NULL DEFAULT '',
+                config_hash TEXT NOT NULL DEFAULT '',
+                git_sha TEXT NOT NULL DEFAULT '',
+                evidence_tier TEXT NOT NULL DEFAULT '',
+                primary_recommendation TEXT NOT NULL DEFAULT '',
+                strict_labeled_signal_count INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 0,
+                report_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finalized_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_champion_outcome_reports_period
+                ON champion_outcome_reports(trade_date_from, trade_date_to, report_state, revision);
+            CREATE TABLE IF NOT EXISTS champion_outcome_recommendations (
+                recommendation_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL DEFAULT '',
+                report_id TEXT NOT NULL DEFAULT '',
+                trade_date_from TEXT NOT NULL DEFAULT '',
+                trade_date_to TEXT NOT NULL DEFAULT '',
+                evidence_tier TEXT NOT NULL DEFAULT '',
+                primary_recommendation TEXT NOT NULL DEFAULT '',
+                auto_apply_allowed INTEGER NOT NULL DEFAULT 0,
+                dry_run_auto_enable_allowed INTEGER NOT NULL DEFAULT 0,
+                fingerprint TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_champion_outcome_recommendations_period
+                ON champion_outcome_recommendations(trade_date_from, trade_date_to, primary_recommendation);
             CREATE TABLE IF NOT EXISTS setup_router_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -16662,6 +16821,621 @@ class TradingDatabase:
         params.append(max(1, int(limit or 20)))
         return [_row_to_opportunity_benchmark_report(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
 
+    def save_champion_signal_episodes(self, episodes: Iterable[dict]) -> dict:
+        rows = [dict(item or {}) for item in episodes_or_empty(episodes)]
+        written = 0
+        skipped = 0
+        with self._write_scope():
+            for payload in rows:
+                episode_id = str(payload.get("champion_signal_episode_id") or "")
+                if not episode_id:
+                    continue
+                fingerprint = str(payload.get("fingerprint") or "")
+                existing = self.conn.execute(
+                    "SELECT fingerprint FROM champion_signal_episodes WHERE champion_signal_episode_id = ?",
+                    (episode_id,),
+                ).fetchone()
+                if existing and fingerprint and str(existing["fingerprint"] or "") == fingerprint:
+                    skipped += 1
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO champion_signal_episodes(
+                        champion_signal_episode_id, schema_version, trade_date,
+                        setup_instance_id, setup_generation, candidate_instance_id,
+                        candidate_id, candidate_generation_seq, benchmark_episode_id,
+                        code, name, theme_id, theme_name, stock_role, market_side,
+                        market_action, session_phase, first_forming_at, first_matched_at,
+                        first_context_eligible_at, first_valid_observe_at,
+                        final_shape_status, final_context_status, final_router_status,
+                        benchmark_link_status, qualification_status,
+                        strict_sample_eligible, fingerprint, payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(champion_signal_episode_id) DO UPDATE SET
+                        first_forming_at=excluded.first_forming_at,
+                        first_matched_at=excluded.first_matched_at,
+                        first_context_eligible_at=excluded.first_context_eligible_at,
+                        first_valid_observe_at=excluded.first_valid_observe_at,
+                        final_shape_status=excluded.final_shape_status,
+                        final_context_status=excluded.final_context_status,
+                        final_router_status=excluded.final_router_status,
+                        benchmark_link_status=excluded.benchmark_link_status,
+                        qualification_status=excluded.qualification_status,
+                        strict_sample_eligible=excluded.strict_sample_eligible,
+                        fingerprint=excluded.fingerprint,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        episode_id,
+                        str(payload.get("schema_version") or ""),
+                        str(payload.get("trade_date") or ""),
+                        str(payload.get("setup_instance_id") or ""),
+                        _safe_int(payload.get("setup_generation"), 0),
+                        str(payload.get("candidate_instance_id") or ""),
+                        payload.get("candidate_id"),
+                        _safe_int(payload.get("candidate_generation_seq"), 0),
+                        str(payload.get("benchmark_episode_id") or ""),
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("name") or ""),
+                        str(payload.get("theme_id") or ""),
+                        str(payload.get("theme_name") or ""),
+                        str(payload.get("stock_role") or ""),
+                        str(payload.get("market_side") or ""),
+                        str(payload.get("market_action") or ""),
+                        str(payload.get("session_phase") or ""),
+                        str(payload.get("first_forming_at") or ""),
+                        str(payload.get("first_matched_at") or ""),
+                        str(payload.get("first_context_eligible_at") or ""),
+                        str(payload.get("first_valid_observe_at") or ""),
+                        str(payload.get("final_shape_status") or ""),
+                        str(payload.get("final_context_status") or ""),
+                        str(payload.get("final_router_status") or ""),
+                        str(payload.get("benchmark_link_status") or ""),
+                        str(payload.get("qualification_status") or ""),
+                        int(bool(payload.get("strict_sample_eligible"))),
+                        fingerprint,
+                        _json_payload(payload),
+                        str(payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                    ),
+                )
+                written += 1
+        return {"written": written, "skipped": skipped}
+
+    def list_champion_signal_episodes(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        trade_date_from: Optional[str] = None,
+        trade_date_to: Optional[str] = None,
+        code: Optional[str] = None,
+        benchmark_link_status: Optional[str] = None,
+        strict_only: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if trade_date_from:
+            clauses.append("trade_date >= ?")
+            params.append(str(trade_date_from))
+        if trade_date_to:
+            clauses.append("trade_date <= ?")
+            params.append(str(trade_date_to))
+        if code:
+            clauses.append("code = ?")
+            params.append(_clean_stock_code(code) or str(code))
+        if benchmark_link_status:
+            clauses.append("benchmark_link_status = ?")
+            params.append(str(benchmark_link_status))
+        if strict_only:
+            clauses.append("strict_sample_eligible = 1")
+        query = "SELECT * FROM champion_signal_episodes"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY trade_date DESC, first_valid_observe_at DESC, first_matched_at DESC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 100)), max(0, int(offset or 0))])
+        return [_row_to_champion_signal_episode(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def get_champion_signal_episode(self, champion_signal_episode_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM champion_signal_episodes WHERE champion_signal_episode_id = ?",
+            (str(champion_signal_episode_id or ""),),
+        ).fetchone()
+        return _row_to_champion_signal_episode(row) if row else None
+
+    def save_champion_signal_anchors(self, anchors: Iterable[dict]) -> dict:
+        rows = [dict(item or {}) for item in episodes_or_empty(anchors)]
+        written = 0
+        skipped = 0
+        with self._write_scope():
+            for payload in rows:
+                anchor_id = str(payload.get("anchor_id") or "")
+                if not anchor_id:
+                    continue
+                fingerprint = str(payload.get("fingerprint") or "")
+                existing = self.conn.execute(
+                    "SELECT fingerprint FROM champion_signal_anchors WHERE anchor_id = ?",
+                    (anchor_id,),
+                ).fetchone()
+                if existing and fingerprint and str(existing["fingerprint"] or "") == fingerprint:
+                    skipped += 1
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO champion_signal_anchors(
+                        anchor_id, schema_version, champion_signal_episode_id,
+                        trade_date, candidate_instance_id, setup_instance_id,
+                        benchmark_episode_id, anchor_type, anchor_at, anchor_price,
+                        anchor_price_source, anchor_delay_sec, source_observation_id,
+                        source_fingerprint, anchor_quality, fingerprint,
+                        payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(anchor_id) DO UPDATE SET
+                        anchor_at=excluded.anchor_at,
+                        anchor_price=excluded.anchor_price,
+                        anchor_price_source=excluded.anchor_price_source,
+                        anchor_delay_sec=excluded.anchor_delay_sec,
+                        source_fingerprint=excluded.source_fingerprint,
+                        anchor_quality=excluded.anchor_quality,
+                        fingerprint=excluded.fingerprint,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        anchor_id,
+                        str(payload.get("schema_version") or ""),
+                        str(payload.get("champion_signal_episode_id") or ""),
+                        str(payload.get("trade_date") or ""),
+                        str(payload.get("candidate_instance_id") or ""),
+                        str(payload.get("setup_instance_id") or ""),
+                        str(payload.get("benchmark_episode_id") or ""),
+                        str(payload.get("anchor_type") or ""),
+                        str(payload.get("anchor_at") or ""),
+                        _float_value(payload.get("anchor_price")),
+                        str(payload.get("anchor_price_source") or ""),
+                        _safe_int(payload.get("anchor_delay_sec"), 0),
+                        str(payload.get("source_observation_id") or ""),
+                        str(payload.get("source_fingerprint") or ""),
+                        str(payload.get("anchor_quality") or ""),
+                        fingerprint,
+                        _json_payload(payload),
+                        str(payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                    ),
+                )
+                written += 1
+        return {"written": written, "skipped": skipped}
+
+    def list_champion_signal_anchors(
+        self,
+        *,
+        champion_signal_episode_id: Optional[str] = None,
+        trade_date: Optional[str] = None,
+        anchor_type: Optional[str] = None,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if champion_signal_episode_id:
+            clauses.append("champion_signal_episode_id = ?")
+            params.append(str(champion_signal_episode_id))
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if anchor_type:
+            clauses.append("anchor_type = ?")
+            params.append(str(anchor_type))
+        query = "SELECT * FROM champion_signal_anchors"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY anchor_at ASC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 1000)), max(0, int(offset or 0))])
+        return [_row_to_champion_signal_anchor(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def save_champion_signal_outcomes(self, outcomes: Iterable[dict]) -> dict:
+        rows = [dict(item or {}) for item in episodes_or_empty(outcomes)]
+        written = 0
+        skipped = 0
+        with self._write_scope():
+            for payload in rows:
+                outcome_id = str(payload.get("outcome_id") or "")
+                if not outcome_id:
+                    continue
+                fingerprint = str(payload.get("fingerprint") or "")
+                existing = self.conn.execute(
+                    """
+                    SELECT revision, fingerprint
+                    FROM champion_signal_outcomes
+                    WHERE outcome_id = ?
+                    ORDER BY revision DESC
+                    LIMIT 1
+                    """,
+                    (outcome_id,),
+                ).fetchone()
+                if existing and fingerprint and str(existing["fingerprint"] or "") == fingerprint:
+                    skipped += 1
+                    continue
+                revision = _safe_int(existing["revision"], 0) + 1 if existing else max(1, _safe_int(payload.get("revision"), 0) or 1)
+                payload["revision"] = revision
+                self.conn.execute(
+                    """
+                    INSERT INTO champion_signal_outcomes(
+                        outcome_id, revision, champion_signal_episode_id,
+                        candidate_instance_id, setup_instance_id, benchmark_episode_id,
+                        trade_date, code, theme_id, anchor_type, anchor_at,
+                        horizon_min, label_status, label_quality,
+                        strict_sample_eligible, barrier_outcome, cost_scenario_id,
+                        source_cutoff_at, fingerprint, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        outcome_id,
+                        revision,
+                        str(payload.get("champion_signal_episode_id") or ""),
+                        str(payload.get("candidate_instance_id") or ""),
+                        str(payload.get("setup_instance_id") or ""),
+                        str(payload.get("benchmark_episode_id") or ""),
+                        str(payload.get("trade_date") or ""),
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("theme_id") or ""),
+                        str(payload.get("anchor_type") or ""),
+                        str(payload.get("anchor_at") or ""),
+                        _safe_int(payload.get("horizon_min"), 0),
+                        str(payload.get("label_status") or ""),
+                        str(payload.get("label_quality") or ""),
+                        int(bool(payload.get("strict_sample_eligible"))),
+                        str(payload.get("barrier_outcome") or ""),
+                        str(payload.get("cost_scenario_id") or ""),
+                        str(payload.get("source_cutoff_at") or ""),
+                        fingerprint,
+                        _json_payload(payload),
+                    ),
+                )
+                written += 1
+        return {"written": written, "skipped": skipped}
+
+    def list_champion_signal_outcomes(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        champion_signal_episode_id: Optional[str] = None,
+        anchor_type: Optional[str] = None,
+        horizon_min: Optional[int] = None,
+        label_status: Optional[str] = None,
+        strict_only: bool = False,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if champion_signal_episode_id:
+            clauses.append("champion_signal_episode_id = ?")
+            params.append(str(champion_signal_episode_id))
+        if anchor_type:
+            clauses.append("anchor_type = ?")
+            params.append(str(anchor_type))
+        if horizon_min is not None:
+            clauses.append("horizon_min = ?")
+            params.append(_safe_int(horizon_min, 0))
+        if label_status:
+            clauses.append("label_status = ?")
+            params.append(str(label_status))
+        if strict_only:
+            clauses.append("strict_sample_eligible = 1")
+        query = "SELECT * FROM champion_signal_outcomes"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, revision DESC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 1000)), max(0, int(offset or 0))])
+        return [_row_to_champion_signal_outcome(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def save_champion_context_reason_outcomes(self, rows: Iterable[dict]) -> dict:
+        items = [dict(item or {}) for item in episodes_or_empty(rows)]
+        written = 0
+        skipped = 0
+        with self._write_scope():
+            for payload in items:
+                reason_id = str(payload.get("reason_outcome_id") or "")
+                if not reason_id:
+                    continue
+                fingerprint = str(payload.get("fingerprint") or "")
+                existing = self.conn.execute(
+                    "SELECT fingerprint FROM champion_context_reason_outcomes WHERE reason_outcome_id = ?",
+                    (reason_id,),
+                ).fetchone()
+                if existing and fingerprint and str(existing["fingerprint"] or "") == fingerprint:
+                    skipped += 1
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO champion_context_reason_outcomes(
+                        reason_outcome_id, schema_version, reason_code, signal_count,
+                        labeled_count, target_first_count, stop_first_count,
+                        fingerprint, payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(reason_outcome_id) DO UPDATE SET
+                        signal_count=excluded.signal_count,
+                        labeled_count=excluded.labeled_count,
+                        target_first_count=excluded.target_first_count,
+                        stop_first_count=excluded.stop_first_count,
+                        fingerprint=excluded.fingerprint,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        reason_id,
+                        str(payload.get("schema_version") or ""),
+                        str(payload.get("reason_code") or ""),
+                        _safe_int(payload.get("signal_count"), 0),
+                        _safe_int(payload.get("labeled_count"), 0),
+                        _safe_int(payload.get("target_first_count"), 0),
+                        _safe_int(payload.get("stop_first_count"), 0),
+                        fingerprint,
+                        _json_payload(payload),
+                        str(payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                    ),
+                )
+                written += 1
+        return {"written": written, "skipped": skipped}
+
+    def list_champion_context_reason_outcomes(self, *, reason_code: Optional[str] = None, limit: int = 1000, offset: int = 0) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if reason_code:
+            clauses.append("reason_code = ?")
+            params.append(str(reason_code))
+        query = "SELECT * FROM champion_context_reason_outcomes"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at DESC, signal_count DESC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 1000)), max(0, int(offset or 0))])
+        return [_row_to_champion_context_reason_outcome(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def save_champion_opportunity_loss_labels(self, rows: Iterable[dict]) -> dict:
+        items = [dict(item or {}) for item in episodes_or_empty(rows)]
+        written = 0
+        skipped = 0
+        with self._write_scope():
+            for payload in items:
+                label_id = str(payload.get("loss_label_id") or "")
+                if not label_id:
+                    continue
+                fingerprint = str(payload.get("fingerprint") or "")
+                existing = self.conn.execute(
+                    "SELECT fingerprint FROM champion_opportunity_loss_labels WHERE loss_label_id = ?",
+                    (label_id,),
+                ).fetchone()
+                if existing and fingerprint and str(existing["fingerprint"] or "") == fingerprint:
+                    skipped += 1
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO champion_opportunity_loss_labels(
+                        loss_label_id, schema_version, champion_signal_episode_id,
+                        trade_date, code, opportunity_loss_label,
+                        benchmark_link_status, barrier_outcome, fingerprint,
+                        payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(loss_label_id) DO UPDATE SET
+                        opportunity_loss_label=excluded.opportunity_loss_label,
+                        benchmark_link_status=excluded.benchmark_link_status,
+                        barrier_outcome=excluded.barrier_outcome,
+                        fingerprint=excluded.fingerprint,
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        label_id,
+                        str(payload.get("schema_version") or ""),
+                        str(payload.get("champion_signal_episode_id") or ""),
+                        str(payload.get("trade_date") or ""),
+                        _clean_stock_code(payload.get("code")) or str(payload.get("code") or ""),
+                        str(payload.get("opportunity_loss_label") or ""),
+                        str(payload.get("benchmark_link_status") or ""),
+                        str(payload.get("barrier_outcome") or ""),
+                        fingerprint,
+                        _json_payload(payload),
+                        str(payload.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                    ),
+                )
+                written += 1
+        return {"written": written, "skipped": skipped}
+
+    def list_champion_opportunity_loss_labels(
+        self,
+        *,
+        trade_date: Optional[str] = None,
+        champion_signal_episode_id: Optional[str] = None,
+        opportunity_loss_label: Optional[str] = None,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date:
+            clauses.append("trade_date = ?")
+            params.append(str(trade_date))
+        if champion_signal_episode_id:
+            clauses.append("champion_signal_episode_id = ?")
+            params.append(str(champion_signal_episode_id))
+        if opportunity_loss_label:
+            clauses.append("opportunity_loss_label = ?")
+            params.append(str(opportunity_loss_label))
+        query = "SELECT * FROM champion_opportunity_loss_labels"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY trade_date DESC, updated_at DESC LIMIT ? OFFSET ?"
+        params.extend([max(1, int(limit or 1000)), max(0, int(offset or 0))])
+        return [_row_to_champion_opportunity_loss_label(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def save_champion_outcome_recommendation(self, payload: dict) -> dict:
+        item = dict(payload or {})
+        recommendation_id = str(item.get("recommendation_id") or "")
+        if not recommendation_id:
+            return item
+        with self._write_scope():
+            self.conn.execute(
+                """
+                INSERT INTO champion_outcome_recommendations(
+                    recommendation_id, schema_version, report_id, trade_date_from,
+                    trade_date_to, evidence_tier, primary_recommendation,
+                    auto_apply_allowed, dry_run_auto_enable_allowed,
+                    fingerprint, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(recommendation_id) DO UPDATE SET
+                    report_id=excluded.report_id,
+                    trade_date_from=excluded.trade_date_from,
+                    trade_date_to=excluded.trade_date_to,
+                    evidence_tier=excluded.evidence_tier,
+                    primary_recommendation=excluded.primary_recommendation,
+                    auto_apply_allowed=excluded.auto_apply_allowed,
+                    dry_run_auto_enable_allowed=excluded.dry_run_auto_enable_allowed,
+                    fingerprint=excluded.fingerprint,
+                    payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    recommendation_id,
+                    str(item.get("schema_version") or ""),
+                    str(item.get("report_id") or ""),
+                    str(item.get("trade_date_from") or ""),
+                    str(item.get("trade_date_to") or ""),
+                    str(item.get("evidence_tier") or ""),
+                    str(item.get("primary_recommendation") or ""),
+                    int(bool(item.get("auto_apply_allowed"))),
+                    int(bool(item.get("dry_run_auto_enable_allowed"))),
+                    str(item.get("fingerprint") or ""),
+                    _json_payload(item),
+                    str(item.get("updated_at") or datetime.utcnow().replace(microsecond=0).isoformat()),
+                ),
+            )
+        return self.get_champion_outcome_recommendation(recommendation_id) or item
+
+    def get_champion_outcome_recommendation(self, recommendation_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM champion_outcome_recommendations WHERE recommendation_id = ?",
+            (str(recommendation_id or ""),),
+        ).fetchone()
+        return _row_to_champion_outcome_recommendation(row) if row else None
+
+    def list_champion_outcome_recommendations(
+        self,
+        *,
+        trade_date_from: Optional[str] = None,
+        trade_date_to: Optional[str] = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date_from:
+            clauses.append("trade_date_from = ?")
+            params.append(str(trade_date_from))
+        if trade_date_to:
+            clauses.append("trade_date_to = ?")
+            params.append(str(trade_date_to))
+        query = "SELECT * FROM champion_outcome_recommendations"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(max(1, int(limit or 20)))
+        return [_row_to_champion_outcome_recommendation(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
+    def save_champion_outcome_report(self, payload: dict) -> dict:
+        report = dict(payload or {})
+        state = "FINAL" if str(report.get("report_state") or "").upper() == "FINAL" else "LIVE_PREVIEW"
+        revision = _safe_int(report.get("revision"), 0)
+        if state == "FINAL":
+            row = self.conn.execute(
+                """
+                SELECT MAX(revision) AS revision
+                FROM champion_outcome_reports
+                WHERE trade_date_from = ? AND trade_date_to = ? AND report_state = 'FINAL'
+                """,
+                (str(report.get("trade_date_from") or ""), str(report.get("trade_date_to") or "")),
+            ).fetchone()
+            revision = max(1, _safe_int(row["revision"], 0) + 1 if row else 1) if revision <= 0 else revision
+            report["revision"] = revision
+            report_id = str(report.get("report_id") or "")
+            report["report_id"] = f"{report_id}:r{revision}" if f":r{revision}" not in report_id else report_id
+        report_id = str(report.get("report_id") or "")
+        recommendation = dict(report.get("recommendation") or {})
+        valid_metrics = dict(report.get("valid_observe_metrics") or {})
+        with self._write_scope():
+            self.conn.execute(
+                """
+                INSERT INTO champion_outcome_reports(
+                    report_id, report_state, trade_date_from, trade_date_to,
+                    baseline_id, baseline_version, config_hash, git_sha,
+                    evidence_tier, primary_recommendation,
+                    strict_labeled_signal_count, revision, report_json,
+                    finalized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_id) DO UPDATE SET
+                    evidence_tier=excluded.evidence_tier,
+                    primary_recommendation=excluded.primary_recommendation,
+                    strict_labeled_signal_count=excluded.strict_labeled_signal_count,
+                    report_json=excluded.report_json,
+                    finalized_at=excluded.finalized_at
+                """,
+                (
+                    report_id,
+                    state,
+                    str(report.get("trade_date_from") or ""),
+                    str(report.get("trade_date_to") or ""),
+                    str(report.get("baseline_id") or ""),
+                    str(report.get("baseline_version") or ""),
+                    str(report.get("config_hash") or ""),
+                    str(report.get("git_sha") or ""),
+                    str(report.get("evidence_tier") or ""),
+                    str(recommendation.get("primary_recommendation") or ""),
+                    _safe_int(valid_metrics.get("strict_labeled_count"), 0),
+                    revision,
+                    _json_payload(report),
+                    str(report.get("finalized_at") or ""),
+                ),
+            )
+        return self.get_champion_outcome_report(report_id) or report
+
+    def get_champion_outcome_report(self, report_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM champion_outcome_reports WHERE report_id = ?",
+            (str(report_id or ""),),
+        ).fetchone()
+        return _row_to_champion_outcome_report(row) if row else None
+
+    def list_champion_outcome_reports(
+        self,
+        *,
+        trade_date_from: Optional[str] = None,
+        trade_date_to: Optional[str] = None,
+        report_state: Optional[str] = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date_from:
+            clauses.append("trade_date_from = ?")
+            params.append(str(trade_date_from))
+        if trade_date_to:
+            clauses.append("trade_date_to = ?")
+            params.append(str(trade_date_to))
+        if report_state:
+            clauses.append("report_state = ?")
+            params.append(str(report_state))
+        query = "SELECT * FROM champion_outcome_reports"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, revision DESC LIMIT ?"
+        params.append(max(1, int(limit or 20)))
+        return [_row_to_champion_outcome_report(row) for row in self.conn.execute(query, tuple(params)).fetchall()]
+
     def save_candidate_funnel_episodes(self, episodes: Iterable[dict]) -> dict:
         rows = [dict(item or {}) for item in episodes or []]
         written = 0
@@ -22641,6 +23415,50 @@ def _row_to_opportunity_benchmark_outcome(row: sqlite3.Row) -> dict:
 def _row_to_opportunity_benchmark_report(row: sqlite3.Row) -> dict:
     data = dict(row)
     data["strict_sample_eligible"] = bool(data.get("strict_sample_eligible"))
+    payload = _safe_json_loads(data.pop("report_json", "{}"), {})
+    if isinstance(payload, dict):
+        payload.update(data)
+        return payload
+    return data
+
+
+def _row_to_champion_payload(row: sqlite3.Row, *bool_keys: str) -> dict:
+    data = dict(row)
+    payload = _safe_json_loads(data.pop("payload_json", "{}"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.update(data)
+    for key in bool_keys:
+        payload[key] = bool(payload.get(key))
+    return payload
+
+
+def _row_to_champion_signal_episode(row: sqlite3.Row) -> dict:
+    return _row_to_champion_payload(row, "strict_sample_eligible")
+
+
+def _row_to_champion_signal_anchor(row: sqlite3.Row) -> dict:
+    return _row_to_champion_payload(row)
+
+
+def _row_to_champion_signal_outcome(row: sqlite3.Row) -> dict:
+    return _row_to_champion_payload(row, "strict_sample_eligible")
+
+
+def _row_to_champion_context_reason_outcome(row: sqlite3.Row) -> dict:
+    return _row_to_champion_payload(row)
+
+
+def _row_to_champion_opportunity_loss_label(row: sqlite3.Row) -> dict:
+    return _row_to_champion_payload(row)
+
+
+def _row_to_champion_outcome_recommendation(row: sqlite3.Row) -> dict:
+    return _row_to_champion_payload(row, "auto_apply_allowed", "dry_run_auto_enable_allowed")
+
+
+def _row_to_champion_outcome_report(row: sqlite3.Row) -> dict:
+    data = dict(row)
     payload = _safe_json_loads(data.pop("report_json", "{}"), {})
     if isinstance(payload, dict):
         payload.update(data)

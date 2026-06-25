@@ -10,6 +10,7 @@ from typing import Any, Iterable, Optional
 
 from storage.db import TradingDatabase
 from trading.broker.models import new_message_id, utc_timestamp
+from trading.strategy.costs import RoundTripCostConfig, round_trip_cost_pct
 from trading.strategy.models import ReviewFinalStatus
 from trading.strategy.reason_taxonomy import normalize_reason_status, reason_status_family, reason_summary
 from trading_app.fill_simulator import FillSimulationConfig, simulate_fill, summarize_fill_simulations
@@ -1971,8 +1972,14 @@ def _fill_adjusted_net_return_pct(lifecycle: DryRunTradeLifecycle, config: DryRu
 
 
 def _round_trip_cost_pct(config: DryRunPerformanceConfig, slippage_bp: float) -> float:
-    total_bp = (float(config.commission_bp_per_side) * 2.0) + float(config.sell_tax_bp) + (float(slippage_bp) * 2.0)
-    return total_bp / 100.0
+    return round_trip_cost_pct(
+        RoundTripCostConfig(
+            commission_bp_per_side=float(config.commission_bp_per_side),
+            sell_tax_bp=float(config.sell_tax_bp),
+            entry_slippage_bp=float(slippage_bp),
+            exit_slippage_bp=float(slippage_bp),
+        )
+    )
 
 
 def _primary_cost_assumption(config: DryRunPerformanceConfig) -> dict[str, Any]:

@@ -63,6 +63,7 @@ class RebootV2Runtime:
     strategy_baseline_service: Any = None
     candidate_funnel_service: Any = None
     opportunity_benchmark_service: Any = None
+    champion_outcome_service: Any = None
     trading_day_qualification_service: Any = None
     clock: Any = datetime.now
     startup_warnings: list[str] = field(default_factory=list)
@@ -94,6 +95,7 @@ class RebootV2Runtime:
         self._attach_strategy_baseline(snapshot, current, runtime_cycle_count=0)
         self._attach_candidate_funnel(snapshot, current)
         self._attach_opportunity_benchmark(snapshot, current)
+        self._attach_champion_outcomes(snapshot, current)
         self._attach_trading_day_qualification(snapshot, current)
         snapshot["blocking_reason"] = "WAITING_FOR_FIRST_RUNTIME_CYCLE"
         snapshot["next_required_action"] = "RUN_RUNTIME_CYCLE"
@@ -170,6 +172,7 @@ class RebootV2Runtime:
         self._attach_counts(snapshot, current)
         self._attach_candidate_funnel(snapshot, current)
         self._attach_opportunity_benchmark(snapshot, current)
+        self._attach_champion_outcomes(snapshot, current)
         self._attach_trading_day_qualification(snapshot, current)
         snapshot["order_manager"] = snapshot.get("order_manager_v2") or _disabled_section("ORDER_MANAGER_DISABLED_IN_V2_OBSERVE")
         snapshot["legacy_runtime"] = {
@@ -216,6 +219,7 @@ class RebootV2Runtime:
                 "position_risk": _component_enabled(self.position_risk_pipeline),
                 "order_manager": _component_enabled(self.order_manager_pipeline),
                 "opportunity_benchmark": _component_enabled(self.opportunity_benchmark_service),
+                "champion_outcomes": _component_enabled(self.champion_outcome_service),
                 "legacy_entry_path": False,
             },
             "warnings": list(self.startup_warnings or []),
@@ -728,6 +732,38 @@ class RebootV2Runtime:
             or {}
         )
         snapshot["opportunity_benchmark"] = section
+        for warning in list(section.get("warning_codes") or []):
+            if warning not in snapshot.setdefault("warnings", []):
+                snapshot["warnings"].append(warning)
+
+    def _attach_champion_outcomes(self, snapshot: dict[str, Any], now: datetime) -> None:
+        service = self.champion_outcome_service
+        if service is None:
+            snapshot["champion_outcomes"] = {
+                "enabled": False,
+                "status": "DISABLED",
+                "evidence_tier": "EMPTY",
+                "primary_recommendation": "DISABLED",
+                "checked_at": now.isoformat(),
+            }
+            return
+        builder = getattr(service, "runtime_section", None)
+        if not callable(builder):
+            snapshot["champion_outcomes"] = {"enabled": False, "status": "DISABLED", "checked_at": now.isoformat()}
+            return
+        section = dict(
+            builder(
+                trade_date=now.date().isoformat(),
+                as_of=now,
+                baseline=dict(snapshot.get("strategy_baseline") or {}),
+                runtime_snapshot=snapshot,
+            )
+            or {}
+        )
+        section.setdefault("analysis_only", True)
+        section.setdefault("auto_apply_allowed", False)
+        section.setdefault("dry_run_auto_enable_allowed", False)
+        snapshot["champion_outcomes"] = section
         for warning in list(section.get("warning_codes") or []):
             if warning not in snapshot.setdefault("warnings", []):
                 snapshot["warnings"].append(warning)

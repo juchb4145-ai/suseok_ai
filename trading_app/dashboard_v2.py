@@ -52,6 +52,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
     opportunity_benchmark = _opportunity_benchmark(
         _prefer_runtime_section(base.get("opportunity_benchmark"), runtime.get("opportunity_benchmark"))
     )
+    champion_outcomes = _champion_outcomes(_prefer_runtime_section(base.get("champion_outcomes"), runtime.get("champion_outcomes")))
     candidates = dict(base.get("candidates") or {})
 
     payload = {
@@ -76,6 +77,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
         "trading_day_qualification": trading_day_qualification,
         "candidate_funnel": candidate_funnel,
         "opportunity_benchmark": opportunity_benchmark,
+        "champion_outcomes": champion_outcomes,
         "pre_market_check": _pre_market_check(base),
         "wait_block_reasons": _wait_block_reasons(base, runtime),
         "system_health": _system_health(base, runtime, gateway, commands),
@@ -108,6 +110,7 @@ def build_dashboard_v2_snapshot(snapshot: dict[str, Any] | None, *, detail: str 
             "trading_day_qualification": trading_day_qualification,
             "candidate_funnel": candidate_funnel,
             "opportunity_benchmark": opportunity_benchmark,
+            "champion_outcomes": champion_outcomes,
         }
     return payload
 
@@ -973,6 +976,42 @@ def _opportunity_benchmark(section: dict[str, Any]) -> dict[str, Any]:
             "uncaptured": "/api/ops/opportunity-benchmark/uncaptured",
             "capture_delay": "/api/ops/opportunity-benchmark/capture-delay",
             "episodes": "/api/ops/opportunity-benchmark/episodes",
+        },
+    }
+
+
+def _champion_outcomes(section: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(section or {})
+    return {
+        "enabled": bool(payload.get("enabled", bool(payload))),
+        "status": payload.get("status", "DISABLED" if not payload else "OK"),
+        "report_id": payload.get("report_id", ""),
+        "report_state": payload.get("report_state", "LIVE_PREVIEW"),
+        "trade_date_from": payload.get("trade_date_from", ""),
+        "trade_date_to": payload.get("trade_date_to", ""),
+        "evidence_tier": payload.get("evidence_tier", "EMPTY"),
+        "valid_trade_days": int(payload.get("valid_trade_days") or 0),
+        "strict_labeled_signal_count": int(payload.get("strict_labeled_signal_count") or 0),
+        "champion_matched_count": int(payload.get("champion_matched_count") or 0),
+        "champion_valid_observe_count": int(payload.get("champion_valid_observe_count") or 0),
+        "controlled_recall_5m": payload.get("controlled_recall_5m"),
+        "primary_avg_cost_adjusted_return": payload.get("primary_avg_cost_adjusted_return"),
+        "primary_median_cost_adjusted_return": payload.get("primary_median_cost_adjusted_return"),
+        "target_first_rate": payload.get("target_first_rate"),
+        "stop_first_rate": payload.get("stop_first_rate"),
+        "context_false_block_candidate_rate": payload.get("context_false_block_candidate_rate"),
+        "benchmark_to_valid_median_delay_sec": payload.get("benchmark_to_valid_median_delay_sec"),
+        "primary_recommendation": payload.get("primary_recommendation", "CONTINUE_COLLECTING"),
+        "analysis_only": bool(payload.get("analysis_only", True)),
+        "auto_apply_allowed": bool(payload.get("auto_apply_allowed", False)),
+        "dry_run_auto_enable_allowed": bool(payload.get("dry_run_auto_enable_allowed", False)),
+        "warning_codes": list(payload.get("warning_codes") or [])[:5],
+        "build_ms": float(payload.get("build_ms") or 0.0),
+        "checked_at": payload.get("checked_at") or payload.get("generated_at") or "",
+        "links": {
+            "summary": "/api/ops/champion-outcomes/summary",
+            "signals": "/api/ops/champion-outcomes/signals",
+            "recommendation": "/api/ops/champion-outcomes/recommendation",
         },
     }
 

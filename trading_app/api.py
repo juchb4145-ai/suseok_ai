@@ -69,6 +69,10 @@ from trading.strategy.candidate_funnel import (
     TradingDayQualificationService,
 )
 from trading.strategy.opportunity_benchmark import OpportunityBenchmarkService
+from trading.strategy.champion_outcome_validator import (
+    ChampionOutcomeValidatorConfig,
+    ChampionOutcomeValidatorService,
+)
 from trading.theme_engine.backfill import ThemeBackfillConfig, apply_dispatch_guard
 from trading.theme_engine.repository import ThemeEngineRepository
 from trading.theme_engine.source_sync import RETIRED_THEME_SOURCE_NAMES, ThemeSourceSyncService
@@ -1635,6 +1639,256 @@ def rebuild_ops_opportunity_benchmark(
         report["gateway_command_created"] = False
         report["strategy_settings_changed"] = False
         report["orders_created"] = False
+        return report
+    finally:
+        close_database(db)
+
+
+def _champion_outcome_period(
+    trade_date: str | None,
+    trade_date_from: str | None,
+    trade_date_to: str | None,
+) -> tuple[str, str]:
+    start = _theme_rotation_trade_date(trade_date_from or trade_date)
+    end = _theme_rotation_trade_date(trade_date_to) if trade_date_to else start
+    return start, end
+
+
+def _champion_report_state(report_state: str | None) -> str:
+    return "FINAL" if str(report_state or "").upper() == "FINAL" else "LIVE_PREVIEW"
+
+
+def _champion_outcome_report(
+    db: TradingDatabase,
+    *,
+    trade_date_from: str,
+    trade_date_to: str,
+    report_state: str,
+    strict_only: bool = False,
+) -> dict[str, Any]:
+    state = _champion_report_state(report_state)
+    reports = list(
+        db.list_champion_outcome_reports(
+            trade_date_from=trade_date_from,
+            trade_date_to=trade_date_to,
+            report_state=state,
+            limit=1,
+        )
+        or []
+    )
+    if reports:
+        report = dict(reports[0])
+        if strict_only:
+            report["signals"] = [item for item in list(report.get("signals") or []) if item.get("strict_sample_eligible")]
+            report["signal_outcomes"] = [item for item in list(report.get("signal_outcomes") or []) if item.get("strict_sample_eligible")]
+        return {**report, "read_only": True}
+    snapshot = runtime_supervisor.snapshot()
+    report = ChampionOutcomeValidatorService(db, config=ChampionOutcomeValidatorConfig.from_env()).build_report(
+        trade_date_from=trade_date_from,
+        trade_date_to=trade_date_to,
+        report_state=state,
+        runtime_snapshot=snapshot,
+        baseline=dict(snapshot.get("strategy_baseline") or {}),
+        persist=False,
+        strict_only=strict_only,
+    )
+    return {**report, "read_only": True}
+
+
+@app.get("/api/ops/champion-outcomes/summary")
+def ops_champion_outcomes_summary(
+    trade_date: str | None = Query(None),
+    trade_date_from: str | None = Query(None),
+    trade_date_to: str | None = Query(None),
+    report_state: str = Query("LIVE_PREVIEW"),
+    strict_only: bool = Query(False),
+) -> dict[str, Any]:
+    start, end = _champion_outcome_period(trade_date, trade_date_from, trade_date_to)
+    db = open_database()
+    try:
+        return _champion_outcome_report(
+            db,
+            trade_date_from=start,
+            trade_date_to=end,
+            report_state=report_state,
+            strict_only=strict_only,
+        )
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/champion-outcomes/signals")
+def ops_champion_outcome_signals(
+    trade_date: str | None = Query(None),
+    trade_date_from: str | None = Query(None),
+    trade_date_to: str | None = Query(None),
+    code: str | None = Query(None),
+    benchmark_link_status: str | None = Query(None),
+    strict_only: bool = Query(False),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    start, end = _champion_outcome_period(trade_date, trade_date_from, trade_date_to)
+    db = open_database()
+    try:
+        items = db.list_champion_signal_episodes(
+            trade_date_from=start,
+            trade_date_to=end,
+            code=code,
+            benchmark_link_status=benchmark_link_status,
+            strict_only=strict_only,
+            limit=limit + 1,
+            offset=offset,
+        )
+        page_items, pagination = _trim_page(items, limit=limit, offset=offset)
+        return {"trade_date_from": start, "trade_date_to": end, "items": page_items, "pagination": pagination, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/champion-outcomes/signals/{champion_signal_episode_id}")
+def ops_champion_outcome_signal_detail(champion_signal_episode_id: str) -> dict[str, Any]:
+    db = open_database()
+    try:
+        item = db.get_champion_signal_episode(champion_signal_episode_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="champion signal episode not found")
+        anchors = db.list_champion_signal_anchors(champion_signal_episode_id=champion_signal_episode_id, limit=1000)
+        outcomes = db.list_champion_signal_outcomes(champion_signal_episode_id=champion_signal_episode_id, limit=1000)
+        opportunity_loss = db.list_champion_opportunity_loss_labels(champion_signal_episode_id=champion_signal_episode_id, limit=1000)
+        return {**item, "anchors": anchors, "outcomes": outcomes, "opportunity_loss_labels": opportunity_loss, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/champion-outcomes/discovery")
+def ops_champion_outcome_discovery(
+    trade_date: str | None = Query(None),
+    trade_date_from: str | None = Query(None),
+    trade_date_to: str | None = Query(None),
+    report_state: str = Query("LIVE_PREVIEW"),
+) -> dict[str, Any]:
+    start, end = _champion_outcome_period(trade_date, trade_date_from, trade_date_to)
+    db = open_database()
+    try:
+        report = _champion_outcome_report(db, trade_date_from=start, trade_date_to=end, report_state=report_state)
+        return {"trade_date_from": start, "trade_date_to": end, "metrics": report.get("discovery_metrics") or {}, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/champion-outcomes/context-gates")
+def ops_champion_outcome_context_gates(
+    trade_date: str | None = Query(None),
+    trade_date_from: str | None = Query(None),
+    trade_date_to: str | None = Query(None),
+    report_state: str = Query("LIVE_PREVIEW"),
+) -> dict[str, Any]:
+    start, end = _champion_outcome_period(trade_date, trade_date_from, trade_date_to)
+    db = open_database()
+    try:
+        report = _champion_outcome_report(db, trade_date_from=start, trade_date_to=end, report_state=report_state)
+        return {"trade_date_from": start, "trade_date_to": end, "metrics": report.get("context_gate_metrics") or {}, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/champion-outcomes/timing")
+def ops_champion_outcome_timing(
+    trade_date: str | None = Query(None),
+    trade_date_from: str | None = Query(None),
+    trade_date_to: str | None = Query(None),
+    report_state: str = Query("LIVE_PREVIEW"),
+) -> dict[str, Any]:
+    start, end = _champion_outcome_period(trade_date, trade_date_from, trade_date_to)
+    db = open_database()
+    try:
+        report = _champion_outcome_report(db, trade_date_from=start, trade_date_to=end, report_state=report_state)
+        return {"trade_date_from": start, "trade_date_to": end, "metrics": report.get("timing_metrics") or {}, "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/champion-outcomes/reasons")
+def ops_champion_outcome_reasons(
+    trade_date: str | None = Query(None),
+    trade_date_from: str | None = Query(None),
+    trade_date_to: str | None = Query(None),
+    report_state: str = Query("LIVE_PREVIEW"),
+) -> dict[str, Any]:
+    start, end = _champion_outcome_period(trade_date, trade_date_from, trade_date_to)
+    db = open_database()
+    try:
+        report = _champion_outcome_report(db, trade_date_from=start, trade_date_to=end, report_state=report_state)
+        return {"trade_date_from": start, "trade_date_to": end, "items": list(report.get("reason_outcomes") or []), "read_only": True}
+    finally:
+        close_database(db)
+
+
+@app.get("/api/ops/champion-outcomes/recommendation")
+def ops_champion_outcome_recommendation(
+    trade_date: str | None = Query(None),
+    trade_date_from: str | None = Query(None),
+    trade_date_to: str | None = Query(None),
+    report_state: str = Query("LIVE_PREVIEW"),
+) -> dict[str, Any]:
+    start, end = _champion_outcome_period(trade_date, trade_date_from, trade_date_to)
+    db = open_database()
+    try:
+        report = _champion_outcome_report(db, trade_date_from=start, trade_date_to=end, report_state=report_state)
+        recommendation = dict(report.get("recommendation") or {})
+        recommendation["auto_apply_allowed"] = False
+        recommendation["dry_run_auto_enable_allowed"] = False
+        return {"trade_date_from": start, "trade_date_to": end, "recommendation": recommendation, "read_only": True, "analysis_only": True}
+    finally:
+        close_database(db)
+
+
+@app.post("/api/ops/champion-outcomes/rebuild")
+def rebuild_ops_champion_outcomes(
+    body: dict[str, Any] | None = Body(default=None),
+    trade_date: str | None = Query(None),
+    trade_date_from: str | None = Query(None),
+    trade_date_to: str | None = Query(None),
+    report_state: str = Query("LIVE_PREVIEW"),
+    strict_only: bool = Query(False),
+    export: bool = Query(False),
+    _: None = Depends(verify_gateway_token),
+) -> dict[str, Any]:
+    payload = dict(body or {})
+    rebuild_reason = str(payload.get("rebuild_reason") or "").strip()
+    if not rebuild_reason:
+        raise HTTPException(status_code=400, detail="rebuild_reason is required")
+    start, end = _champion_outcome_period(
+        trade_date or payload.get("trade_date"),
+        trade_date_from or payload.get("trade_date_from"),
+        trade_date_to or payload.get("trade_date_to"),
+    )
+    snapshot = runtime_supervisor.snapshot()
+    db = open_database()
+    try:
+        report = ChampionOutcomeValidatorService(db, config=ChampionOutcomeValidatorConfig.from_env()).build_report(
+            trade_date_from=start,
+            trade_date_to=end,
+            report_state=_champion_report_state(report_state),
+            runtime_snapshot=snapshot,
+            baseline=dict(snapshot.get("strategy_baseline") or {}),
+            persist=True,
+            export=export,
+            strict_only=strict_only,
+            rebuild_reason=rebuild_reason,
+            source_cutoff_at=payload.get("source_cutoff_at"),
+        )
+        report["analysis_only"] = True
+        report["read_only"] = True
+        report["gateway_command_created"] = False
+        report["strategy_settings_changed"] = False
+        report["orders_created"] = False
+        report["opt10032_increment_count"] = 0
+        report["tr_command_increment_count"] = 0
+        report["realtime_registration_increment_count"] = 0
+        report["auto_apply_allowed"] = False
+        report["dry_run_auto_enable_allowed"] = False
         return report
     finally:
         close_database(db)
