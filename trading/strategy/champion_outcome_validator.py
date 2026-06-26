@@ -561,6 +561,7 @@ def _empty_signal_episode(
         "first_match_setup_quality_score": None,
         "first_match_price_structure": {},
         "first_match_evidence": {},
+        "first_forming_price": 0.0,
         "first_match_price": 0.0,
         "valid_observe_price": 0.0,
         "attribution_confidence": attribution,
@@ -580,7 +581,10 @@ def _merge_signal_row(episode: dict[str, Any], row: Mapping[str, Any], candidate
     context = str(row.get("context_status") or "").upper()
     router = str(row.get("router_status") or "").upper()
     if shape == "FORMING" or lifecycle == "FORMING":
-        _set_min_time(episode, "first_forming_at", _first_text(row.get("state_entered_at"), row.get("first_seen_at"), at))
+        if _set_min_time(episode, "first_forming_at", _first_text(row.get("state_entered_at"), row.get("first_seen_at"), at)):
+            episode["first_forming_price"] = _float(row.get("current_price"))
+        elif _float(episode.get("first_forming_price")) <= 0:
+            episode["first_forming_price"] = _float(row.get("current_price"))
     if shape == "MATCHED" or lifecycle == "MATCHED" or router == "VALID_OBSERVE":
         matched_at = _first_text(row.get("state_entered_at"), row.get("last_material_change_at"), at)
         if _set_min_time(episode, "first_matched_at", matched_at):
@@ -650,7 +654,7 @@ def _build_signal_anchors(signal_episodes: list[dict[str, Any]], source: Mapping
         anchor_specs = [
             (DISCOVERY_ANCHOR_TYPE, benchmark.get("anchor_at"), benchmark.get("anchor_price"), "BENCHMARK_ANCHOR", 0, benchmark.get("benchmark_episode_id"), benchmark.get("fingerprint")),
             ("CANDIDATE_FIRST_SEEN", candidate.get("first_seen_at"), None, "", 0, signal.get("candidate_instance_id"), candidate.get("fingerprint")),
-            ("CHAMPION_FIRST_FORMING", signal.get("first_forming_at"), None, "", 0, signal.get("champion_signal_episode_id"), signal.get("fingerprint")),
+            ("CHAMPION_FIRST_FORMING", signal.get("first_forming_at"), signal.get("first_forming_price"), "SETUP_OBSERVATION_CURRENT_PRICE", 0, signal.get("champion_signal_episode_id"), signal.get("fingerprint")),
             (GATE_ANCHOR_TYPE, signal.get("first_matched_at"), signal.get("first_match_price"), "SETUP_OBSERVATION_CURRENT_PRICE", 0, signal.get("champion_signal_episode_id"), signal.get("fingerprint")),
             ("CHAMPION_FIRST_CONTEXT_ELIGIBLE", signal.get("first_context_eligible_at"), None, "", 0, signal.get("champion_signal_episode_id"), signal.get("fingerprint")),
             (PRIMARY_ANCHOR_TYPE, signal.get("first_valid_observe_at"), signal.get("valid_observe_price"), "SETUP_OBSERVATION_CURRENT_PRICE", 0, signal.get("champion_signal_episode_id"), signal.get("fingerprint")),

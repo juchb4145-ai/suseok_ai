@@ -57,6 +57,37 @@ def test_condition_include_cannot_promote_to_setup_or_timing_ready(tmp_path) -> 
     db.close()
 
 
+def test_condition_reinclude_recovers_hydrated_active_candidate_to_watching(tmp_path) -> None:
+    db = TradingDatabase(str(tmp_path / "fsm.db"))
+    service = CandidateIngestionService(db)
+    candidate = service.handle_condition_event(
+        BrokerConditionEvent(condition_name="entry", code="005930", condition_index=1, timestamp="2026-06-17T09:01:00"),
+        trade_date="2026-06-17",
+    ).candidate
+    candidate.state = CandidateState.REMOVED
+    metadata = dict(candidate.metadata or {})
+    metadata["candidate_hydration"] = _complete_hydration()
+    metadata["candidate_fsm"] = {
+        "v2_state": "REMOVED",
+        "blocking_stage": "NONE",
+        "primary_reason_code": "CONDITION_REMOVE",
+    }
+    candidate.metadata = metadata
+    db.save_candidate(candidate)
+
+    service.handle_condition_event(
+        BrokerConditionEvent(condition_name="entry", code="005930", condition_index=1, timestamp="2026-06-17T09:02:00"),
+        trade_date="2026-06-17",
+    )
+
+    reloaded = db.load_candidate("2026-06-17", "005930")
+    assert reloaded.state == CandidateState.WATCHING
+    assert reloaded.metadata["candidate_fsm"]["v2_state"] == "WATCHING"
+    assert reloaded.metadata["candidate_fsm"]["primary_reason_code"] == "CONDITION_INCLUDE"
+    assert reloaded.metadata["candidate_fsm"]["v2_state"] not in {"SETUP_READY", "TIMING_READY"}
+    db.close()
+
+
 def test_hydration_requested_records_discovered_to_hydrating(tmp_path) -> None:
     db = TradingDatabase(str(tmp_path / "fsm.db"))
     gateway = GatewayStateStore()

@@ -634,6 +634,10 @@ def _build_episodes(db: Any, *, trade_date: str, as_of: datetime, persist_readin
         episode = episodes.get(ci)
         if episode is None:
             continue
+        readiness_at = str(row.get("input_readiness_calculated_at") or row.get("calculated_at") or row.get("updated_at") or "")
+        if _observation_fresh_readiness(row):
+            _reach(episode, "REALTIME_SUBSCRIPTION_ACTIVE", readiness_at)
+            _reach(episode, "FRESH_REALTIME_READY", readiness_at)
         setup_type = str(row.get("setup_type") or "")
         role = str(row.get("baseline_role") or _baseline_role(setup_type))
         if role != "OUT_OF_SCOPE":
@@ -1358,6 +1362,20 @@ def _fresh_readiness(row: Mapping[str, Any]) -> bool:
     if row.get("readiness_ready") is False:
         return False
     return bool(row.get("latest_tick_at") or row.get("core_tick_at"))
+
+
+def _observation_fresh_readiness(row: Mapping[str, Any]) -> bool:
+    if not row.get("post_subscription_tick_verified"):
+        return False
+    payload = _json(row.get("payload_json"), {})
+    evidence = dict(row.get("evidence") or payload.get("evidence") or {})
+    data = dict(evidence.get("data") or {})
+    source = str(data.get("price_source") or row.get("latest_tick_source") or "").upper()
+    if source == "TR_BACKFILL":
+        return False
+    if data.get("realtime_tick_fresh") is False:
+        return False
+    return bool(data.get("tick_at") or _float(row.get("current_price")) > 0)
 
 
 _REALTIME_WAIT_STATUSES = {

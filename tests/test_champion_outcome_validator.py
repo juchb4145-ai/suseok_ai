@@ -82,6 +82,90 @@ def test_build_report_persists_signal_outcomes_and_safety_flags(tmp_path):
     assert db.conn.execute("SELECT COUNT(*) FROM gateway_commands").fetchone()[0] == 0
 
 
+def test_champion_first_forming_anchor_uses_setup_observation_price_without_benchmark_path(tmp_path):
+    db = TradingDatabase(str(tmp_path / "forming-anchor.db"))
+    db.save_candidate_funnel_episodes(
+        [
+            {
+                "trade_date": TRADE_DATE,
+                "candidate_instance_id": "ci-forming",
+                "candidate_id": 1,
+                "candidate_generation_seq": 1,
+                "code": "000001",
+                "name": "Alpha",
+                "max_stage_ordinal": 9,
+                "current_stage": "CHAMPION_FORMING",
+                "stop_stage": "CHAMPION_FORMING",
+                "primary_reason": "LEADER_FIRST_PULLBACK_FORMING",
+                "stop_reason_family": "CHAMPION_FORMING",
+                "attribution_confidence": "HIGH",
+                "baseline_role": "CHAMPION",
+                "reached_stages": [
+                    "SOURCE_DETECTED",
+                    "CANDIDATE_CREATED",
+                    "ACTIVE_SOURCE_PRESENT",
+                    "HYDRATION_COMPLETE",
+                    "EVALUATION_ELIGIBLE",
+                    "REALTIME_SUBSCRIPTION_ACTIVE",
+                    "FRESH_REALTIME_READY",
+                    "STRATEGY_CONTEXT_READY",
+                    "ENTRY_EVALUATED",
+                    "CHAMPION_FORMING",
+                ],
+                "stage_first_reached_at": {
+                    "FRESH_REALTIME_READY": "2026-06-22T09:01:00",
+                    "ENTRY_EVALUATED": "2026-06-22T09:01:00",
+                    "CHAMPION_FORMING": "2026-06-22T09:02:00",
+                },
+                "fingerprint": "cf-forming",
+            }
+        ]
+    )
+    db.save_setup_observations(
+        [
+            {
+                "trade_date": TRADE_DATE,
+                "candidate_instance_id": "ci-forming",
+                "candidate_id": 1,
+                "code": "000001",
+                "name": "Alpha",
+                "calculated_at": "2026-06-22T09:02:00",
+                "router_version": "setup_router_v3.5.2",
+                "setup_type": "LEADER_FIRST_PULLBACK",
+                "setup_generation": 1,
+                "setup_instance_id": "setup-forming",
+                "lifecycle_state": "FORMING",
+                "shape_status": "FORMING",
+                "context_status": "BLOCKED",
+                "router_status": "CONTEXT_BLOCKED",
+                "current_price": 1010,
+                "primary_setup": True,
+                "fingerprint": "setup-forming",
+                "material_state_fingerprint": "setup-forming",
+                "last_material_change_at": "2026-06-22T09:02:00",
+            }
+        ]
+    )
+
+    report = ChampionOutcomeValidatorService(db, config=_config()).build_report(
+        trade_date_from=TRADE_DATE,
+        trade_date_to=TRADE_DATE,
+        as_of="2026-06-22T09:03:00",
+        source_cutoff_at="2026-06-22T09:03:00",
+        persist=False,
+    )
+    forming = [
+        item
+        for item in report["signal_outcomes"]
+        if item["anchor_type"] == "CHAMPION_FIRST_FORMING" and item["horizon_min"] == 15
+    ]
+
+    assert len(report["signals"]) == 1
+    assert report["signals"][0]["first_forming_price"] == 1010
+    assert forming[0]["anchor_price"] == 1010
+    assert forming[0]["anchor_price_source"] == "SETUP_OBSERVATION_CURRENT_PRICE"
+
+
 def test_signal_identity_deduplicates_same_setup_and_splits_generation(tmp_path):
     db = TradingDatabase(str(tmp_path / "identity.db"))
     _seed_linked_champion(db)

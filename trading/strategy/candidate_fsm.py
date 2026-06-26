@@ -114,9 +114,10 @@ class CandidateFsmService:
         if candidate is None:
             return None
         payload = self._payload(event_or_payload)
+        target = self._condition_include_target(candidate)
         return self.promote(
             candidate,
-            CandidateRuntimeState.DISCOVERED,
+            target,
             CandidateReasonCode.CONDITION_INCLUDE.value,
             source_event_id=str(payload.get("source_event_id") or payload.get("event_id") or ""),
             source_event_type="condition_include",
@@ -386,6 +387,22 @@ class CandidateFsmService:
         except Exception:
             return
 
+    def _condition_include_target(self, candidate: Candidate) -> CandidateRuntimeState:
+        current = self.v2_state(candidate)
+        if current in {CandidateRuntimeState.WATCHING, CandidateRuntimeState.SETUP_READY, CandidateRuntimeState.TIMING_READY}:
+            return current
+        if current in {CandidateRuntimeState.REMOVED, CandidateRuntimeState.EXPIRED, CandidateRuntimeState.CLOSED}:
+            if _contract_hydrated_active(self.db, self.clock, candidate):
+                return CandidateRuntimeState.WATCHING
+            return CandidateRuntimeState.DISCOVERED
+        if candidate.state in {CandidateState.WAIT_DATA, CandidateState.WATCHING} and _contract_hydrated_active(
+            self.db,
+            self.clock,
+            candidate,
+        ):
+            return CandidateRuntimeState.WATCHING
+        return CandidateRuntimeState.DISCOVERED
+
     @staticmethod
     def _candidate_from_input(value: Any) -> Candidate | None:
         if isinstance(value, Candidate):
@@ -425,6 +442,18 @@ def legacy_to_v2_state(state: CandidateState | str | None) -> CandidateRuntimeSt
         return LEGACY_TO_V2_STATE.get(CandidateState(str(state or "")), CandidateRuntimeState.DISCOVERED)
     except ValueError:
         return CandidateRuntimeState.DISCOVERED
+
+
+def _contract_hydrated_active(db: Any | None, clock: Any, candidate: Candidate) -> bool:
+    if db is None:
+        return False
+    try:
+        from trading.strategy.candidate_state_contract import CandidateStateContractService
+
+        snapshot = CandidateStateContractService(db, clock=clock).snapshot(candidate)
+        return bool(snapshot.hydration_complete and snapshot.active_source_exists and not snapshot.terminal)
+    except Exception:
+        return False
 
 
 def build_candidate_fsm_summary(db: Any, *, trade_date: str | None = None) -> dict[str, Any]:

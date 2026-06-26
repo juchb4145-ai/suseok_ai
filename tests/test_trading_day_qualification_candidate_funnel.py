@@ -172,6 +172,41 @@ def test_candidate_funnel_reconciles_active_fresh_when_old_readiness_row_exists(
     assert "FRESH_REALTIME_READY" not in by_ci["ci-old"]["reached_stages"]
 
 
+def test_candidate_funnel_uses_setup_observation_readiness_for_champion_forming_latency(tmp_path):
+    db = TradingDatabase(str(tmp_path / "observation-readiness.db"))
+    candidate = _seed_candidate(db, last_seen_at="2026-06-22T09:06:00")
+    _seed_context_entry(db, candidate.id)
+    _seed_setup_observation(
+        db,
+        candidate.id,
+        shape_status="FORMING",
+        router_status="CONTEXT_BLOCKED",
+        context_status="BLOCKED",
+        current_price=1010,
+        post_subscription_tick_verified=True,
+        input_readiness_calculated_at="2026-06-22T09:05:00",
+    )
+
+    report = CandidateFunnelService(db).build_report(
+        trade_date=TRADE_DATE,
+        as_of=datetime(2026, 6, 22, 9, 7, 0),
+        baseline=_baseline(),
+        persist=False,
+    )
+    episode = next(item for item in report["episodes"] if item["candidate_instance_id"] == "ci-000001")
+
+    assert "FRESH_REALTIME_READY" in episode["reached_stages"]
+    assert "CHAMPION_FORMING" in episode["reached_stages"]
+    assert episode["stage_first_reached_at"]["FRESH_REALTIME_READY"] == "2026-06-22T09:05:00"
+    assert not [
+        item
+        for item in report["invariant_violations"]
+        if item.get("candidate_instance_id") == "ci-000001"
+        and item.get("type") == "NEGATIVE_STAGE_LATENCY"
+        and item.get("stage") == "CHAMPION_FORMING"
+    ]
+
+
 def test_active_fresh_lifecycle_reconcile_is_ambiguous_for_multiple_current_candidates():
     episodes = [
         _episode_row("ci-a", "000003"),
@@ -498,7 +533,14 @@ def test_candidate_funnel_api_rebuild_requires_token_and_filters(monkeypatch, tm
     assert missing.status_code == 404
 
 
-def _seed_candidate(db, *, code="000001", instance_id="ci-000001", detected_at="2026-06-22T09:01:00"):
+def _seed_candidate(
+    db,
+    *,
+    code="000001",
+    instance_id="ci-000001",
+    detected_at="2026-06-22T09:01:00",
+    last_seen_at="2026-06-22T09:05:00",
+):
     return db.save_candidate(
         Candidate(
             trade_date=TRADE_DATE,
@@ -507,7 +549,7 @@ def _seed_candidate(db, *, code="000001", instance_id="ci-000001", detected_at="
             state=CandidateState.WATCHING,
             sources=[CandidateSourceType.CONDITION_SEARCH],
             detected_at=detected_at,
-            last_seen_at="2026-06-22T09:05:00",
+            last_seen_at=last_seen_at,
             metadata={"candidate_instance_id": instance_id, "candidate_generation_seq": 1},
         )
     )
@@ -632,6 +674,9 @@ def _seed_setup_observation(
     code="000001",
     instance_id="ci-000001",
     calculated_at="2026-06-22T09:05:00",
+    current_price=0,
+    post_subscription_tick_verified=False,
+    input_readiness_calculated_at="",
 ):
     db.save_setup_observations(
         [
@@ -650,6 +695,9 @@ def _seed_setup_observation(
                 "baseline_role": "CHAMPION" if setup_type == "LEADER_FIRST_PULLBACK" else "CHALLENGER",
                 "primary_setup": setup_type == "LEADER_FIRST_PULLBACK",
                 "setup_quality_score": 80.0,
+                "current_price": current_price,
+                "post_subscription_tick_verified": post_subscription_tick_verified,
+                "input_readiness_calculated_at": input_readiness_calculated_at,
                 "fingerprint": f"{setup_type}:{shape_status}:{router_status}:{context_status}",
                 "observation_fingerprint": f"{setup_type}:{shape_status}:{router_status}:{context_status}",
                 "material_state_fingerprint": f"{setup_type}:{shape_status}:{router_status}:{context_status}",
