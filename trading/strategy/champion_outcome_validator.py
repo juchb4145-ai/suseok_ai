@@ -669,6 +669,8 @@ def _build_signal_anchors(signal_episodes: list[dict[str, Any]], source: Mapping
             quality = "HIGH"
             if anchor_price <= 0:
                 anchor_price, price_source, anchor_delay, quality = _anchor_price_from_path(anchor_at, price_rows, config)
+            if anchor_type == "CHAMPION_FIRST_FORMING" and anchor_price <= 0:
+                continue
             if anchor_price <= 0:
                 quality = "INSUFFICIENT"
                 price_source = "MISSING"
